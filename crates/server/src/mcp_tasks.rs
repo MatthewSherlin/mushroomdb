@@ -1,12 +1,14 @@
-//! The nine MCP tools that answer a question about a graphed repository.
+//! The ten MCP tools that answer a question in prose rather than in JSON.
 //!
 //! `explore`, `map`, `context`, `impact`, `owners`, `why`, `recall`,
-//! `remember` and `sync` sit in front of the sixteen graph tools in
+//! `remember` and `sync` sit in front of the fifteen graph tools in
 //! `mcp::tools_list`, because they are what an assistant working in a checkout
 //! actually reaches for: find me this thing, what is this repository, what is
 //! this symbol, what does my diff touch, who wrote this, why are these two
 //! linked, what do I already know, remember this, and bring the store up to
-//! date.
+//! date. `explain_association` is the tenth, and the one that answers on a
+//! store with no repository in it: why these two entities are associated, with
+//! the rule that derived each edge.
 //!
 //! `explore` is the composition of `context`, `impact` and `owners` behind one
 //! name, and on a store a repository was ingested into it is the *only* task
@@ -60,7 +62,7 @@ use core_api::repograph::{
     self, ContextOptions, ImpactOptions, MapOptions, RememberInput, DEFAULT_EXCLUDES,
     MAX_OUTPUT_BYTES, NOTE_KINDS, UNTRUSTED_FRAMING,
 };
-use core_api::{GraphError, SharedDb};
+use core_api::{Explanation, GraphError, PredicateSummary, SharedDb};
 use serde_json::{json, Value as Js};
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -77,17 +79,29 @@ const SYNC_REPO_PROP: &str = "repo";
 /// The host's project directory: the checkout an assistant is working in.
 const PROJECT_DIR_VAR: &str = "CLAUDE_PROJECT_DIR";
 
-/// The nine names this module answers to. Listed once, so the `json` argument
+/// The ten names this module answers to. Listed once, so the `json` argument
 /// below is read for exactly the tools that declare it.
 ///
 /// `explore` comes first because it is the whole default surface of a
 /// code-graph store: the one tool a session finds, composed from the three
-/// beneath it.
-pub(crate) const TASK_TOOLS: [&str; 9] = [
-    "explore", "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
+/// beneath it. `explain_association` sits beside `why` because they are the
+/// same question asked of the two doors: what links these two, with the
+/// evidence — `why` from a code graph, `explain_association` from the rules
+/// that derived the edge.
+pub(crate) const TASK_TOOLS: [&str; 10] = [
+    "explore",
+    "map",
+    "context",
+    "impact",
+    "owners",
+    "why",
+    "explain_association",
+    "recall",
+    "remember",
+    "sync",
 ];
 
-/// Route a task tool. `None` when `name` is not one of the eight.
+/// Route a task tool. `None` when `name` is not one of the ten.
 pub(crate) fn dispatch(
     db: &SharedDb,
     db_dir: Option<&Path>,
@@ -98,7 +112,7 @@ pub(crate) fn dispatch(
         return None;
     }
     // Every task tool takes the same optional `json`, so it is read and
-    // type-checked once here rather than eight times — and before any work, so
+    // type-checked once here rather than ten times — and before any work, so
     // a caller that mistyped it is told so rather than served a digest it did
     // not ask for.
     let json_out = match bool_arg(args, "json") {
@@ -120,10 +134,11 @@ pub(crate) fn dispatch(
         ),
         "owners" => tool_owners(db, args, json_out),
         "why" => tool_why(db, args, json_out),
+        "explain_association" => tool_explain_association(db, args, json_out),
         "recall" => tool_recall(db, db_dir, args, json_out),
         "remember" => tool_remember(db, args, json_out),
         "sync" => tool_sync(db_dir, json_out),
-        _ => unreachable!("TASK_TOOLS and this match list the same nine names"),
+        _ => unreachable!("TASK_TOOLS and this match list the same ten names"),
     })
 }
 
@@ -512,6 +527,109 @@ fn tool_why(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     ok(json_out, &report, repograph::render_why)
 }
 
+// ── explain_association ──────────────────────────────────────────────────────
+
+/// Why two entities are associated: every rule-derived edge between them, with
+/// the rule that wrote it and the predicate it matched on.
+///
+/// The report is the same `Vec<Explanation>` the `explain` graph tool has
+/// always returned — `json: true` hands it back unchanged. What is new is the
+/// default: on an entity store this is the question the door exists for, and
+/// an assistant asking it was getting a JSON array to parse where every other
+/// question here answers in prose. `explain` is left as it was, for the caller
+/// that wants the array without asking.
+fn tool_explain_association(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
+    let a = match str_arg(args, "a") {
+        Ok(v) => v.to_string(),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let b = match str_arg(args, "b") {
+        Ok(v) => v.to_string(),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    // Unlike `why`, a key the graph does not hold is an error here rather than
+    // an `unknown:` line: `explain` resolves both keys to dense ids before it
+    // looks at a single edge, and that is the engine's answer to give.
+    let report = {
+        let g = db.read();
+        match g.explain(&a, &b) {
+            Ok(v) => v,
+            Err(e) => {
+                return CallOutcome::ToolErr(match e {
+                    GraphError::QueryError { detail } | GraphError::IngestError { detail } => {
+                        detail
+                    }
+                    other => other.to_string(),
+                })
+            }
+        }
+    };
+    ok(json_out, &report, |found| {
+        render_explanations(&a, &b, found)
+    })
+}
+
+/// One header, then one line per rule-derived edge, capped like every other
+/// task digest.
+///
+/// Rule names, edge types and predicate fields are all graph content — a rule
+/// is named by whoever created it — so each goes through
+/// [`repograph::sanitize`] before it reaches a line-structured digest.
+fn render_explanations(a: &str, b: &str, found: &[Explanation]) -> String {
+    let mut out = format!(
+        "mushroomdb explain — {} ↔ {}: {} relationship(s)\n",
+        repograph::sanitize(a),
+        repograph::sanitize(b),
+        found.len()
+    );
+    if found.is_empty() {
+        out.push_str("  none\n");
+        return out;
+    }
+    for e in found {
+        out.push_str(&format!(
+            "  {} via rule {}",
+            repograph::sanitize(&e.edge_type),
+            repograph::sanitize(&e.rule)
+        ));
+        if let Some(weight) = e.weight {
+            out.push_str(&format!(" (score {weight:.2})"));
+        }
+        if let Some(via) = &e.via_edge {
+            out.push_str(&format!(" via {}", repograph::sanitize(via)));
+        }
+        out.push_str(&format!(" — {}\n", predicate_summary(&e.predicate)));
+    }
+    repograph::cap_lines(&out, repograph::MAX_TOOL_LINES)
+}
+
+/// A predicate in one clause: what it compares, on which fields, and the
+/// threshold it had to clear.
+fn predicate_summary(p: &PredicateSummary) -> String {
+    let mut out = repograph::sanitize(&p.kind);
+    if !p.fields.is_empty() {
+        let fields: Vec<String> = p.fields.iter().map(|f| repograph::sanitize(f)).collect();
+        out.push_str(&format!(" on {}", fields.join(", ")));
+    }
+    if let Some(min) = p.min {
+        out.push_str(&format!(" >= {min}"));
+    }
+    if let Some(tolerance) = p.tolerance {
+        out.push_str(&format!(" +/- {tolerance}"));
+    }
+    if let Some(km) = p.km {
+        out.push_str(&format!(" within {km} km"));
+    }
+    if let Some(parts) = &p.parts {
+        let inner: Vec<String> = parts.iter().map(predicate_summary).collect();
+        out.push_str(&format!(" ({})", inner.join("; ")));
+    }
+    if p.approximate {
+        out.push_str(" (approximate)");
+    }
+    out
+}
+
 // ── recall ───────────────────────────────────────────────────────────────────
 
 fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) -> CallOutcome {
@@ -688,8 +806,8 @@ fn tool_sync(db_dir: Option<&Path>, json_out: bool) -> CallOutcome {
 
 // ── tools/list ───────────────────────────────────────────────────────────────
 
-/// The `json` argument every task tool takes, added to all nine schemas by
-/// [`task_tools`] rather than written out nine times.
+/// The `json` argument every task tool takes, added to all ten schemas by
+/// [`task_tools`] rather than written out ten times.
 fn json_arg() -> Js {
     json!({
         "type": "boolean",
@@ -697,7 +815,7 @@ fn json_arg() -> Js {
     })
 }
 
-/// The nine task tools, in the order `tools/list` puts them: the question an
+/// The ten task tools, in the order `tools/list` puts them: the question an
 /// assistant asks first comes first.
 pub(crate) fn task_tools() -> Vec<Js> {
     let mut tools = task_tool_schemas();
@@ -795,6 +913,18 @@ fn task_tool_schemas() -> Vec<Js> {
         json!({
             "name": "why",
             "description": "What links two files, symbols, or people, with the evidence for each link: shared commits, the importing line, every calling line, the file two authors both know. With no rule edge it reports the commits the two share, and failing that the shortest path between them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "a": { "type": "string", "minLength": 1, "description": "First node key." },
+                    "b": { "type": "string", "minLength": 1, "description": "Second node key." }
+                },
+                "required": ["a", "b"]
+            }
+        }),
+        json!({
+            "name": "explain_association",
+            "description": "Why two entities are associated: every rule-derived edge between the two keys, with the rule that wrote it, its edge type, the match score, and the predicate it matched on. Both keys must already exist.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1066,6 +1196,53 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Binding: an explanation's line carries the score and the hop a via-rule
+    /// went over, and the digest never runs past the line budget.
+    ///
+    /// `tests/mcp.rs` covers the plain rule and the empty case end to end; what
+    /// is only reachable from here is a via-hop rule and a report longer than
+    /// [`repograph::MAX_TOOL_LINES`], neither of which a two-node fixture
+    /// produces.
+    #[test]
+    fn an_explanation_line_names_the_score_the_hop_and_the_predicate() {
+        let one = |rule: &str, via: Option<&str>| Explanation {
+            rule: rule.to_string(),
+            edge_type: "SIMILAR".to_string(),
+            src_key: "a".to_string(),
+            dst_key: "b".to_string(),
+            weight: Some(0.9625),
+            predicate: PredicateSummary {
+                kind: "vector_similar".to_string(),
+                fields: vec!["emb".to_string()],
+                min: Some(0.85),
+                tolerance: None,
+                km: None,
+                parts: None,
+                approximate: false,
+            },
+            via_edge: via.map(str::to_string),
+        };
+
+        let text = render_explanations("a", "b", &[one("close", Some("WORKS_AT"))]);
+        assert_eq!(
+            text,
+            "mushroomdb explain — a ↔ b: 1 relationship(s)\n  SIMILAR via rule close (score 0.96) \
+             via WORKS_AT — vector_similar on emb >= 0.85\n"
+        );
+
+        let many: Vec<Explanation> = (0..40).map(|i| one(&format!("r{i}"), None)).collect();
+        let capped = render_explanations("a", "b", &many);
+        assert_eq!(
+            capped.lines().count(),
+            repograph::MAX_TOOL_LINES,
+            "the digest is capped like every other one"
+        );
+        assert!(
+            capped.starts_with("mushroomdb explain — a ↔ b: 40 relationship(s)"),
+            "and the header still says how many there were: {capped}"
+        );
     }
 
     /// Binding: an explicit `files` list never looks at a repository at all.

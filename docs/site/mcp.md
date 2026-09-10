@@ -171,8 +171,8 @@ direction and whether the edge is rule-derived.
 
 ### 4. Explain associations
 
-`explain_association` (or `explain`) shows which rules fired and what scores
-produced the connection:
+`explain_association` shows which rules fired and what scores produced the
+connection. It answers in prose; `json: true` returns the array below:
 
 ```json
 // tool: explain_association
@@ -244,11 +244,12 @@ break in an agent's context.
 | `impact` | `files?` | Per changed file: co-change partners — by similarity score, or by how many commits the two share when the score floor hid them — and whether each is itself modified, plus importers, symbols used elsewhere, and the owner. Defaults to the working tree's diff against `HEAD` plus untracked files. |
 | `owners` | `path` | Top author and share, authors who know the file, the last commit to touch it, and the split by quarter. |
 | `why` | `a`, `b` | Every rule edge between two nodes with its score and evidence, or the shortest path between them when there is no direct link. |
+| `explain_association` | `a`, `b` | Every rule-derived edge between two node keys, one line each: the edge type, the rule that wrote it, the score, and the predicate it matched on. Both keys must already exist. `json: true` returns the array of explanations instead. |
 | `recall` | `topic` | One pointer per hit — `path:line symbol — first doc line` — for the identifiers a topic names: a path, a `mod::name`, a snake_case word, or any word in backticks. |
 | `remember` | `text`, `about?`, `kind?` | Writes a note into the graph and returns its key. Every key in `about` must already exist. |
 | `sync` | — | Brings the store up to date with the repository it was built from: the commits since the last sync, then the files that differ from `HEAD`. |
 
-Each of the nine also accepts `json` (boolean, default false), which swaps the
+Each of the ten also accepts `json` (boolean, default false), which swaps the
 rendered digest for the report.
 
 `context` and `impact` are the two that read anything outside the graph.
@@ -267,7 +268,7 @@ re-invoking the binary the server is running from.
 
 ## Tool reference
 
-The sixteen tools below are the graph API itself. Their `tools/list`
+The fifteen tools below are the graph API itself. Their `tools/list`
 descriptions all begin `Advanced:`, which marks them as the lower-level surface
 beneath the repository tools above.
 
@@ -278,17 +279,16 @@ serves both kinds and neither has to be configured for:
 | Store | Default listing |
 |---|---|
 | Built by `ingest-git` (a code graph) | **three** — `explore`, `query`, `stats` |
-| Anything else (a memory store) | **eleven** — the eight task tools other than `explore`, plus `query`, `ingest_json` and `stats` |
+| Anything else (a memory store) | **thirteen** — the association surface: `query`, `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `node_history`, `edge_history`, `find_similar`, `hybrid_search`, `remember`, `recall`, `stats` |
 
 All 25 stay served on either surface: the surface decides what is listed, not
 what the server answers. A session can only call what its client was shown,
 though — on a code-graph store that is `explore`, `query` and `stats`, so a
 note is written with `query` and the sync is the git `post-commit` hook's job.
 `mushroomdb mcp <db> --all-tools` lists the whole set with their schemas on
-either store. Measured on this repository's
-store, the default listing a coding session pays for before its first turn is
-1,593 bytes on a code-graph store against 5,622 on a memory store; the full 25
-are 14,419.
+either store. The default listing a session pays for before its first turn is
+1,670 bytes on a code-graph store against 8,442 on a memory store; the full 25
+are 14,681.
 
 `ingest_json` is deliberately not on the code-graph surface: a store built by
 `ingest-git` is written by `sync` and `touch`, not by an assistant bulk-loading
@@ -301,9 +301,8 @@ rows into it.
 | `create_rule` | Declare a derivation rule; backfills existing nodes immediately. Propose it and wait for approval — it is a store-wide write. |
 | `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity using HNSW when available; (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). |
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
-| `explain_association` | Show which rules and scores produced edges between two nodes. |
-| `explain` | Alias for `explain_association`. |
-| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read. See [Trust model](#trust-model) below. |
+| `explain` | The rules and scores that produced the edges between two nodes, as JSON. `explain_association` above is the same question answered in prose. |
+| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels resolved to that same allow-list. Pass one or the other, never both. See [Trust model](#trust-model) below. |
 | `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter. |
 | `node_info` | Return a node's key, label, and all properties. |
 | `node_edges` | Return all edges incident on a node. |

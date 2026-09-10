@@ -2581,9 +2581,10 @@ fn uninstall_leaves_mixed_hook_group_with_user_hook_intact() {
 //       the assistant with no instruction to call it.
 // ---------------------------------------------------------------------------
 
-/// The task tools plus the two entry points the skill has to name, written the
-/// way the text writes them so a bare word inside another word cannot pass.
-const REQUIRED_TOOL_MENTIONS: &[&str] = &[
+/// The code door's task tools plus the two entry points the skill has to name,
+/// written the way the text writes them so a bare word inside another word
+/// cannot pass.
+const CODE_TOOL_MENTIONS: &[&str] = &[
     "`explore`",
     "`map`",
     "`context`",
@@ -2595,6 +2596,20 @@ const REQUIRED_TOOL_MENTIONS: &[&str] = &[
     "`sync`",
     "`learn`",
     "`serve`",
+];
+
+/// The association surface: what a store with no repository in it answers
+/// with. A skill that names only the code tools leaves an assistant on a
+/// memory store with no instruction to call any of these, which is the whole
+/// failure the thirteen-tool listing exists to fix.
+const ASSOCIATION_TOOL_MENTIONS: &[&str] = &[
+    "`explain_association`",
+    "`node_history`",
+    "`was_linked`",
+    "`neighborhood`",
+    "`role`",
+    "`remember`",
+    "`recall`",
 ];
 
 #[test]
@@ -2651,7 +2666,7 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
             text.contains("ingest-git"),
             "{name}: ingest-git bootstrap undocumented"
         );
-        for tool in REQUIRED_TOOL_MENTIONS {
+        for tool in CODE_TOOL_MENTIONS.iter().chain(ASSOCIATION_TOOL_MENTIONS) {
             assert!(
                 text.contains(tool),
                 "{name}: {tool} is never named — the assistant has no cue to call it"
@@ -2716,7 +2731,7 @@ fn every_delivery_variant_names_every_tool_and_fits_the_budget() {
             delivery,
         )
         .expect("the committed template's regions are well formed");
-        for tool in REQUIRED_TOOL_MENTIONS {
+        for tool in CODE_TOOL_MENTIONS.iter().chain(ASSOCIATION_TOOL_MENTIONS) {
             assert!(
                 skill.contains(tool),
                 "{label}: {tool} is never named — the assistant has no cue to call it"

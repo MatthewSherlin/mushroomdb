@@ -11,9 +11,9 @@
 //! - `notifications/initialized` — ignored
 //! - `tools/list` — the default listing follows the store the server opened
 //!   (see [`Surface`]): a store a repository was ingested into lists three —
-//!   `explore`, `query`, `stats` — and any other store lists today's eleven,
-//!   the eight memory task tools of [`mcp_tasks`](crate::mcp_tasks) followed by
-//!   `query`, `ingest_json` and `stats`. Graph-tool descriptions carry the
+//!   `explore`, `query`, `stats` — and any other store lists the thirteen of
+//!   [`ASSOCIATION_TOOLS`], the tools that answer a question about an entity
+//!   graph, in that order. Graph-tool descriptions carry the
 //!   prefix `Advanced: ` so a host ranking tools by description puts the task
 //!   tools in front. `mushroomdb mcp --all-tools` lists all twenty-five; the
 //!   rest are callable either way, just not advertised
@@ -79,7 +79,7 @@ pub fn run_mcp_stdio(
 /// [`run_mcp_stdio`], with the tool list chosen by the caller.
 ///
 /// `all_tools` false lists what the store's [`Surface`] names — three on a
-/// code graph, eleven on a memory store; true lists all twenty-five. Either
+/// code graph, thirteen on a memory store; true lists all twenty-five. Either
 /// way every tool remains callable — the flag decides what is advertised, not
 /// what is served.
 ///
@@ -229,7 +229,6 @@ fn dispatch_call(db: &SharedDb, db_dir: Option<&Path>, params: Option<&Js>) -> C
         "node_edges" => tool_node_edges(db, args),
         "upsert_entity" => tool_upsert_entity(db, args),
         "find_similar" => tool_find_similar(db, args),
-        "explain_association" => tool_explain(db, args),
         "hybrid_search" => tool_hybrid_search(db, args),
         "node_history" => tool_node_history(db, args),
         "edge_history" => tool_edge_history(db, args),
@@ -255,35 +254,50 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
         Err(e) => return CallOutcome::ToolErr(e),
     };
 
-    // Optional mask: when present, route to query_masked (read-only).
-    if let Some(mask_val) = args.get("mask") {
-        let keys = match mask_val.as_array() {
-            Some(arr) => {
-                let mut ks: Vec<String> = Vec::with_capacity(arr.len());
-                for v in arr {
-                    match v.as_str() {
-                        Some(s) => ks.push(s.to_string()),
-                        None => {
-                            return CallOutcome::ToolErr("mask must be an array of strings".into())
-                        }
-                    }
-                }
-                ks
-            }
-            None => return CallOutcome::ToolErr("mask must be an array of strings".into()),
-        };
+    // Two ways to ask the same restricted question: a `role` names one the
+    // store already defines, a `mask` writes the allow-list out by hand. Both
+    // route to `query_masked` (read-only). Passing both is not a merge of the
+    // two — it is a caller that has not decided which restriction applies, so
+    // it is refused rather than silently resolved one way.
+    let role = match args.get("role") {
+        None | Some(Js::Null) => None,
+        Some(Js::String(s)) if !s.is_empty() => Some(s.as_str()),
+        Some(_) => return CallOutcome::ToolErr("role must be a non-empty string".into()),
+    };
+    let mask_keys = match args.get("mask") {
+        None => None,
+        Some(v) => match mask_key_list(v) {
+            Ok(keys) => Some(keys),
+            Err(e) => return CallOutcome::ToolErr(e),
+        },
+    };
+    if role.is_some() && mask_keys.is_some() {
+        return CallOutcome::ToolErr("pass role or mask, not both".into());
+    }
+
+    if role.is_some() || mask_keys.is_some() {
         let stub_hidden = args
             .get("stub_hidden")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         let g = db.read();
-        let mask = {
-            let m = NodeMask::from_keys(&*g, keys.iter().map(String::as_str));
-            if stub_hidden {
-                m.with_mode(MaskMode::Stub)
-            } else {
-                m
-            }
+        let mask = match (role, &mask_keys) {
+            (Some(role), _) => match g.mask_for_role(role) {
+                Ok(m) => m,
+                // The one error a caller can fix by rereading `roles.json`,
+                // told apart from a store whose roles never loaded at all.
+                Err(GraphError::KeyNotFound { .. }) => {
+                    return CallOutcome::ToolErr(format!("unknown role '{role}'"))
+                }
+                Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+            },
+            (None, Some(keys)) => NodeMask::from_keys(&*g, keys.iter().map(String::as_str)),
+            (None, None) => unreachable!("one of the two is Some in this branch"),
+        };
+        let mask = if stub_hidden {
+            mask.with_mode(MaskMode::Stub)
+        } else {
+            mask
         };
         return match g.query_masked(cypher, &params, &mask) {
             Ok(rs) => CallOutcome::ToolOk(result_set_json(&rs)),
@@ -306,6 +320,21 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
         Ok(rs) => CallOutcome::ToolOk(result_set_json(&rs)),
         Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
     }
+}
+
+/// A `mask` argument as a key list. `Err` when it is anything but an array of
+/// strings — including `null`, which is a caller that meant to pass one.
+fn mask_key_list(mask: &Js) -> Result<Vec<String>, String> {
+    let arr = mask
+        .as_array()
+        .ok_or_else(|| "mask must be an array of strings".to_string())?;
+    arr.iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "mask must be an array of strings".to_string())
+        })
+        .collect()
 }
 
 fn tool_ingest(db: &SharedDb, args: &Js) -> CallOutcome {
@@ -909,18 +938,6 @@ fn initialize_result() -> Js {
 /// under this prefix is the lower-level surface beneath them.
 const ADVANCED_PREFIX: &str = "Advanced: ";
 
-/// The graph tools a default `tools/list` keeps on a [`Surface::Memory`] store,
-/// in the order they appear in [`graph_tools`].
-///
-/// The sixteen graph schemas cost 9,054 of the 12,238 bytes a session paid
-/// before it did anything — 74% of the payload, for a surface a coding agent
-/// rarely reaches: `find_similar` (2,015 B) and `hybrid_search` (1,456 B)
-/// alone outweigh every task tool put together. These three stay because they
-/// are the ones the task tools do not cover and the skill sends an assistant to
-/// by name: an arbitrary Cypher read, a bulk load, and the store's own counts.
-/// The rest are one `--all-tools` away.
-const DEFAULT_GRAPH_TOOLS: [&str; 3] = ["query", "ingest_json", "stats"];
-
 /// The three a code-graph store advertises: one tool to find, one to ask an
 /// arbitrary question, one to size the store.
 ///
@@ -930,17 +947,38 @@ const DEFAULT_GRAPH_TOOLS: [&str; 3] = ["query", "ingest_json", "stats"];
 /// listing.
 const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 
-/// The task tools a memory store advertises: every one but `explore`, which
-/// answers from a code graph there is none of.
+/// The thirteen a memory store advertises, in the order it lists them.
 ///
-/// Written out rather than derived by subtracting a name from
-/// [`mcp_tasks::TASK_TOOLS`](crate::mcp_tasks): the two lists answer different
-/// questions — what this module *serves* and what a memory store *lists* — and
-/// a tenth task tool should have to say which surface it belongs to rather than
-/// join this one by default. [`memory_surface_is_every_task_tool_but_explore`]
-/// holds the two in step.
-const MEMORY_TASK_TOOLS: [&str; 8] = [
-    "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
+/// A store with no repository in it used to be handed the code door's own task
+/// tools — `map`, `context`, `impact`, `owners`, `why`, `sync` — which answer
+/// from a code graph there is none of, plus `ingest_json`. Six of the eleven
+/// names an assistant found answered from a repository the store did not
+/// hold. These are
+/// the questions an entity graph *can* answer: what is there (`query` — now
+/// with a `role`), why two things are associated, what is around a node, what
+/// it is and what it is joined to, whether a link held at a commit and when it
+/// changed, what is like it, and what was written down about it.
+///
+/// Listing order is ranking: a host that defers schemas shows this list in
+/// order, so the two questions this door exists for come first.
+///
+/// The code task tools stay served on a memory store, as these stay served on
+/// a code-graph one — [`tools_list`] decides what is *advertised*, never what
+/// is answered.
+const ASSOCIATION_TOOLS: [&str; 13] = [
+    "query",
+    "explain_association",
+    "neighborhood",
+    "node_info",
+    "node_edges",
+    "was_linked",
+    "node_history",
+    "edge_history",
+    "find_similar",
+    "hybrid_search",
+    "remember",
+    "recall",
+    "stats",
 ];
 
 /// Which door a store is: which default tool list it gets.
@@ -953,19 +991,18 @@ pub(crate) enum Surface {
     /// A repository was ingested into this store: the `GitSync` marker is
     /// there, and `explore` has a code graph to explore.
     CodeGraph,
-    /// Any other store, including an empty one: today's eleven-tool memory
+    /// Any other store, including an empty one: the thirteen-tool association
     /// surface, where `explore` would have nothing to answer from.
     Memory,
 }
 
 impl Surface {
-    /// Whether a default `tools/list` on this surface advertises `name`.
-    fn lists(self, name: &str) -> bool {
+    /// The tools a default `tools/list` on this surface advertises, in the
+    /// order it advertises them.
+    fn listing(self) -> &'static [&'static str] {
         match self {
-            Surface::CodeGraph => CODE_GRAPH_TOOLS.contains(&name),
-            Surface::Memory => {
-                MEMORY_TASK_TOOLS.contains(&name) || DEFAULT_GRAPH_TOOLS.contains(&name)
-            }
+            Surface::CodeGraph => &CODE_GRAPH_TOOLS,
+            Surface::Memory => &ASSOCIATION_TOOLS,
         }
     }
 }
@@ -984,37 +1021,51 @@ fn surface_of(db: &SharedDb) -> Surface {
     }
 }
 
-/// The tools `tools/list` advertises: the nine repository task tools, then the
-/// graph tools with their descriptions prefixed, filtered by `surface`.
+/// The tools `tools/list` advertises: the ten repository task tools, then the
+/// graph tools with their descriptions prefixed.
 ///
-/// `all` false — the default — lists what `surface` names: three on a code
-/// graph, eleven on a memory store. `all` true lists all twenty-five whichever
-/// the store is, which is what `mushroomdb mcp --all-tools` runs. Either way
-/// every tool stays callable: the flag and the surface decide what is
-/// advertised, not what is served.
+/// `all` false — the default — lists what `surface` names, **in the order that
+/// surface names it**: three on a code graph, thirteen on a memory store. The
+/// order is the point. A host that defers tool schemas makes a model search
+/// for them, and the list it searches is read top-down, so each surface ranks
+/// its own tools rather than inheriting the task-tools-then-graph-tools order
+/// that only the code door has a reason for.
+///
+/// `all` true lists all twenty-five in that established order whichever store
+/// this is, which is what `mushroomdb mcp --all-tools` runs and what the
+/// published server card documents: a caller that asked for everything asked
+/// for the whole surface, not for one door's ranking of it.
+///
+/// Either way every tool stays callable: the flag and the surface decide what
+/// is advertised, not what is served.
 fn tools_list(all: bool, surface: Surface) -> Js {
-    let mut tools: Vec<Js> = Vec::new();
-    for tool in crate::mcp_tasks::task_tools() {
-        let name = tool.get("name").and_then(Js::as_str).unwrap_or_default();
-        if all || surface.lists(name) {
-            tools.push(tool);
-        }
-    }
+    let mut served: Vec<Js> = crate::mcp_tasks::task_tools();
     for mut tool in graph_tools() {
-        let name = tool.get("name").and_then(Js::as_str).unwrap_or_default();
-        if !all && !surface.lists(name) {
-            continue;
-        }
         if let Some(d) = tool.get("description").and_then(Js::as_str) {
             let prefixed = format!("{ADVANCED_PREFIX}{d}");
             tool["description"] = Js::String(prefixed);
         }
-        tools.push(tool);
+        served.push(tool);
+    }
+    if all {
+        return json!({ "tools": served });
+    }
+    let listing = surface.listing();
+    let mut tools: Vec<Js> = Vec::with_capacity(listing.len());
+    for name in listing {
+        let Some(tool) = served
+            .iter()
+            .find(|t| t.get("name").and_then(Js::as_str) == Some(*name))
+        else {
+            debug_assert!(false, "{surface:?} lists {name}, which is not served");
+            continue;
+        };
+        tools.push(tool.clone());
     }
     json!({ "tools": tools })
 }
 
-/// The sixteen graph tools, in the order they have always been listed, with
+/// The fifteen graph tools, in the order they have always been listed, with
 /// their descriptions unprefixed. [`tools_list`] adds the prefix.
 fn graph_tools() -> Vec<Js> {
     let Js::Array(tools) = json!([
@@ -1033,6 +1084,10 @@ fn graph_tools() -> Vec<Js> {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Optional node key allow-list. When present, only these nodes are visible; write statements are rejected."
+                        },
+                        "role": {
+                            "type": "string",
+                            "description": "Answer as this role from the store's roles: only the nodes it may see."
                         }
                     },
                     "required": ["cypher"]
@@ -1181,18 +1236,6 @@ fn graph_tools() -> Vec<Js> {
                         "edge_type": { "type": "string", "description": "Edge type to filter by in edge-traversal mode (default: SIMILAR)." },
                         "limit": { "type": "integer", "description": "Maximum neighbors to return in edge-traversal mode (default: 10)." }
                     }
-                }
-            },
-            {
-                "name": "explain_association",
-                "description": "Explain rule-derived associations between two node keys. Returns the rules, edge types, and match scores that connect them. Useful for agent memory: understand why two entities are associated.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "a": { "type": "string", "minLength": 1 },
-                        "b": { "type": "string", "minLength": 1 }
-                    },
-                    "required": ["a", "b"]
                 }
             },
             {
@@ -1467,17 +1510,18 @@ mod tests {
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
         for expected in &[
-            // The nine repository task tools, first and in order.
+            // The ten task tools, first and in order.
             "explore",
             "map",
             "context",
             "impact",
             "owners",
             "why",
+            "explain_association",
             "recall",
             "remember",
             "sync",
-            // The sixteen graph tools.
+            // The fifteen graph tools.
             "query",
             "ingest_json",
             "create_rule",
@@ -1488,7 +1532,6 @@ mod tests {
             "node_edges",
             "upsert_entity",
             "find_similar",
-            "explain_association",
             "hybrid_search",
             "node_history",
             "edge_history",
@@ -1504,21 +1547,29 @@ mod tests {
             names.len()
         );
         assert_eq!(
-            &names[..9],
+            &names[..10],
             [
-                "explore", "map", "context", "impact", "owners", "why", "recall", "remember",
+                "explore",
+                "map",
+                "context",
+                "impact",
+                "owners",
+                "why",
+                "explain_association",
+                "recall",
+                "remember",
                 "sync"
             ],
             "the task tools come first, in order"
         );
-        assert_eq!(names[9], "query", "the graph tools follow them");
+        assert_eq!(names[10], "query", "the graph tools follow them");
     }
 
     /// Binding: on a store no repository was ingested into, the default
-    /// listing is the eight memory task tools plus the three graph tools a
-    /// coding agent reaches for, and nothing else.
+    /// listing is the thirteen association tools, in [`ASSOCIATION_TOOLS`]
+    /// order, and nothing else.
     #[test]
-    fn tools_list_defaults_to_eleven_on_a_memory_store() {
+    fn tools_list_defaults_to_thirteen_on_a_memory_store() {
         let db = demo_db();
         let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let names: Vec<&str> = resp["result"]["tools"]
@@ -1527,41 +1578,43 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
-        assert_eq!(
-            names,
-            [
-                "map",
-                "context",
-                "impact",
-                "owners",
-                "why",
-                "recall",
-                "remember",
-                "sync",
-                "query",
-                "ingest_json",
-                "stats"
-            ]
-        );
+        assert_eq!(names, ASSOCIATION_TOOLS.to_vec());
     }
 
-    /// Binding: [`MEMORY_TASK_TOOLS`] is exactly the task tools this crate
-    /// serves, less `explore`.
+    /// Binding: [`ASSOCIATION_TOOLS`] is a surface of its own, not the code
+    /// door's list with a name changed.
     ///
-    /// The two lists are written out separately on purpose — see the const's
-    /// own note — so this is what keeps a tenth task tool from being served and
-    /// silently unlisted on every memory store.
+    /// It keeps the two task tools an entity store can answer with — the notes
+    /// it wrote and the notes it kept — and none of the seven that read a code
+    /// graph there is none of. Every name in it is served.
     #[test]
-    fn memory_surface_is_every_task_tool_but_explore() {
-        let served: Vec<&str> = crate::mcp_tasks::TASK_TOOLS
-            .into_iter()
-            .filter(|n| *n != "explore")
+    fn the_association_surface_is_entity_tools_only() {
+        for kept in ["remember", "recall", "explain_association"] {
+            assert!(
+                ASSOCIATION_TOOLS.contains(&kept),
+                "{kept} answers on an entity graph and must be listed"
+            );
+        }
+        for code_only in [
+            "explore", "map", "context", "impact", "owners", "why", "sync",
+        ] {
+            assert!(
+                !ASSOCIATION_TOOLS.contains(&code_only),
+                "{code_only} reads a code graph and must not be listed on a memory store"
+            );
+        }
+        let served: Vec<String> = crate::mcp_tasks::task_tools()
+            .iter()
+            .chain(graph_tools().iter())
+            .filter_map(|t| t.get("name").and_then(Js::as_str))
+            .map(str::to_string)
             .collect();
-        assert_eq!(
-            MEMORY_TASK_TOOLS.to_vec(),
-            served,
-            "MEMORY_TASK_TOOLS has drifted from mcp_tasks::TASK_TOOLS"
-        );
+        for name in ASSOCIATION_TOOLS {
+            assert!(
+                served.iter().any(|s| s == name),
+                "{name} is listed but not served"
+            );
+        }
         assert!(
             CODE_GRAPH_TOOLS.contains(&"explore"),
             "and `explore` is the task tool the other surface lists"
@@ -2060,6 +2113,9 @@ mod tests {
         );
     }
 
+    /// Binding: `explain_association` now answers in prose, and the report
+    /// behind it — what `json: true` returns — is still `explain`'s array,
+    /// unchanged.
     #[test]
     fn test_explain_association_same_as_explain() {
         let db = demo_db();
@@ -2073,10 +2129,23 @@ mod tests {
             &db,
             2,
             "explain_association",
-            json!({ "a": "alice", "b": "bob" }),
+            json!({ "a": "alice", "b": "bob", "json": true }),
         ));
-        // Both tools return identical results.
         assert_eq!(explain, assoc);
+
+        let prose = tool_call(
+            &db,
+            3,
+            "explain_association",
+            json!({ "a": "alice", "b": "bob" }),
+        );
+        let text = prose["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text content");
+        assert!(
+            text.contains("mushroomdb explain — alice ↔ bob:"),
+            "the default reply is the digest: {text}"
+        );
     }
 
     // ── history tools ──────────────────────────────────────────────────────────

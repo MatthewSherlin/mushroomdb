@@ -1002,13 +1002,22 @@ fn hybrid_search_text_only_and_missing_field_errors() {
 // `json: true` and gets it *as* the text.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The nine task tools, in the order `tools/list` must list them.
-const TASK_TOOLS: [&str; 9] = [
-    "explore", "map", "context", "impact", "owners", "why", "recall", "remember", "sync",
+/// The ten task tools, in the order `tools/list` must list them.
+const TASK_TOOLS: [&str; 10] = [
+    "explore",
+    "map",
+    "context",
+    "impact",
+    "owners",
+    "why",
+    "explain_association",
+    "recall",
+    "remember",
+    "sync",
 ];
 
-/// The sixteen graph tools, in their established order, after the task tools.
-const ADVANCED_TOOLS: [&str; 16] = [
+/// The fifteen graph tools, in their established order, after the task tools.
+const ADVANCED_TOOLS: [&str; 15] = [
     "query",
     "ingest_json",
     "create_rule",
@@ -1019,7 +1028,6 @@ const ADVANCED_TOOLS: [&str; 16] = [
     "node_edges",
     "upsert_entity",
     "find_similar",
-    "explain_association",
     "hybrid_search",
     "node_history",
     "edge_history",
@@ -1380,21 +1388,29 @@ fn one_task_call(db: SharedDb, name: &str, args: Js) -> Js {
     parse_lines(&out).remove(0)
 }
 
-/// The graph tools a default `tools/list` keeps: an arbitrary Cypher read, a
-/// bulk load, and the store's own counts. The other thirteen are `--all-tools`.
-const DEFAULT_GRAPH_TOOLS: [&str; 3] = ["query", "ingest_json", "stats"];
+/// The thirteen a memory store lists, in the order it lists them: the entity
+/// questions first, the store's own counts last.
+const ASSOCIATION_TOOLS: [&str; 13] = [
+    "query",
+    "explain_association",
+    "neighborhood",
+    "node_info",
+    "node_edges",
+    "was_linked",
+    "node_history",
+    "edge_history",
+    "find_similar",
+    "hybrid_search",
+    "remember",
+    "recall",
+    "stats",
+];
 
-/// The eight a memory store lists: [`TASK_TOOLS`] less `explore`, which has no
-/// code graph to explore there. Derived from the one list this file keeps, so
-/// adding a task tool above cannot leave two lists disagreeing here.
-fn memory_task_tools() -> Vec<&'static str> {
-    TASK_TOOLS.into_iter().filter(|n| *n != "explore").collect()
-}
-
-/// Binding: a store no repository was ingested into keeps today's eleven — the
-/// eight memory task tools plus those three graph tools, in that order.
+/// Binding: a store no repository was ingested into lists the association
+/// surface — the thirteen tools that answer a question about an entity graph,
+/// in that order — and none of the code-door task tools.
 #[test]
-fn a_memory_store_keeps_the_eleven_tool_surface() {
+fn a_memory_store_lists_the_association_surface() {
     let (res, out) = exchange(open("list-default"), &req(json!(1), "tools/list", None));
     assert!(res.is_ok(), "{res:?}");
     let replies = parse_lines(&out);
@@ -1403,12 +1419,177 @@ fn a_memory_store_keeps_the_eleven_tool_surface() {
         .iter()
         .map(|t| t["name"].as_str().expect("name"))
         .collect();
-    let expected: Vec<&str> = memory_task_tools()
-        .into_iter()
-        .chain(DEFAULT_GRAPH_TOOLS.iter().copied())
-        .collect();
-    assert_eq!(names, expected, "default tools/list on a memory store");
-    assert_eq!(tools.len(), 11);
+    assert_eq!(
+        names,
+        ASSOCIATION_TOOLS.to_vec(),
+        "default tools/list on a memory store"
+    );
+    assert_eq!(tools.len(), 13);
+    for hidden in [
+        "explore", "map", "context", "impact", "owners", "why", "sync",
+    ] {
+        assert!(
+            !names.contains(&hidden),
+            "{hidden} answers from a code graph there is none of, so it must not be listed"
+        );
+    }
+}
+
+/// A memory store holding one `Person`, one `Org`, and the `works_at` rule
+/// that derives a `WORKS_AT` edge between them.
+fn association_store(name: &str) -> SharedDb {
+    let db = open(name);
+    {
+        let mut w = db.write();
+        w.insert_node(
+            "Org",
+            "acme",
+            vec![("id".into(), Value::Str("acme".into()))],
+        )
+        .unwrap();
+        w.insert_node(
+            "Person",
+            "p1",
+            vec![
+                ("id".into(), Value::Str("p1".into())),
+                ("org_id".into(), Value::Str("acme".into())),
+            ],
+        )
+        .unwrap();
+        w.create_rule(core_api::RuleDef {
+            name: "works_at".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: core_api::Predicate::KeyMatch {
+                field: "org_id".into(),
+            },
+            edge_type: "WORKS_AT".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })
+        .unwrap();
+    }
+    db
+}
+
+/// Binding: `explain_association` answers in prose like every other task tool,
+/// and hands back the same array of explanations to a caller that asks for the
+/// report with `json: true`.
+#[test]
+fn explain_association_answers_with_text_and_json_on_request() {
+    let db = association_store("explain-text");
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "explain_association",
+        json!({"a": "p1", "b": "acme"}),
+    ));
+    assert!(
+        text.starts_with("mushroomdb explain — p1 ↔ acme: 1 relationship(s)"),
+        "{text}"
+    );
+    assert!(text.contains("WORKS_AT via rule works_at"), "{text}");
+    assert!(text.contains("key_match on org_id"), "{text}");
+
+    let report = task_report(db, "explain_association", json!({"a": "p1", "b": "acme"}));
+    assert!(report.is_array(), "{report}");
+    assert_eq!(report[0]["rule"], json!("works_at"));
+    assert_eq!(report[0]["edge_type"], json!("WORKS_AT"));
+}
+
+/// Binding: two keys the graph holds with no rule edge between them are an
+/// answer, not a failure.
+#[test]
+fn explain_association_says_none_when_nothing_links_the_two() {
+    let db = association_store("explain-none");
+    seed_person(&db, "p2");
+    let text = task_reply(&one_task_call(
+        db,
+        "explain_association",
+        json!({"a": "p2", "b": "acme"}),
+    ));
+    assert!(
+        text.starts_with("mushroomdb explain — p2 ↔ acme: 0 relationship(s)"),
+        "{text}"
+    );
+    assert!(text.contains("\n  none"), "{text}");
+}
+
+/// A memory store with two labels and a `client` role that may see only one of
+/// them.
+fn roles_store(name: &str) -> SharedDb {
+    let db = open(name);
+    {
+        let mut w = db.write();
+        for key in ["company-1", "company-2"] {
+            w.insert_node("Company", key, vec![("id".into(), Value::Str(key.into()))])
+                .unwrap();
+        }
+        for key in ["talent-1", "talent-2"] {
+            w.insert_node("Talent", key, vec![("id".into(), Value::Str(key.into()))])
+                .unwrap();
+        }
+        w.apply_schema(&core_api::Schema {
+            roles: vec![core_api::RoleDef {
+                name: "client".into(),
+                keys: vec![],
+                labels: vec!["Company".into()],
+                write: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    db
+}
+
+/// Binding: `query` with a `role` answers as that role — only the nodes the
+/// store's `roles.json` lets it see — and says so plainly when the role is not
+/// one of them or when the caller passed a mask as well.
+#[test]
+fn query_with_a_role_sees_only_that_roles_labels() {
+    let db = roles_store("query-role");
+    let rows = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n.id ORDER BY n.id", "role": "client"}),
+    ));
+    assert_eq!(
+        rows["rows"],
+        json!([["company-1"], ["company-2"]]),
+        "a role sees its own labels and nothing else"
+    );
+
+    let unmasked = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n.id ORDER BY n.id"}),
+    ));
+    assert_eq!(
+        unmasked["rows"].as_array().map(Vec::len),
+        Some(4),
+        "and the same query without a role still sees everything"
+    );
+
+    let unknown = error_text(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "role": "nobody"}),
+    ));
+    assert!(unknown.contains("unknown role 'nobody'"), "{unknown}");
+
+    let both = error_text(&one_task_call(
+        db,
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "role": "client", "mask": ["company-1"]}),
+    ));
+    assert!(
+        both.contains("role") && both.contains("mask"),
+        "one restriction or the other, never both: {both}"
+    );
 }
 
 /// Binding: a store carrying the `GitSync` marker — a repository was ingested
@@ -1473,7 +1654,7 @@ fn an_unlisted_graph_tool_is_still_callable() {
 }
 
 /// Binding: `--all-tools` lists 25, task tools first in their fixed order, and
-/// every one of the sixteen graph tools carries the `Advanced:` prefix.
+/// every one of the fifteen graph tools carries the `Advanced:` prefix.
 #[test]
 fn tools_list_has_25_tools_task_tools_first_and_advanced_prefix() {
     let (res, out) = exchange_all_tools(open("list-order"), &req(json!(1), "tools/list", None));
@@ -1581,7 +1762,7 @@ fn tools_list_has_25_tools_task_tools_first_and_advanced_prefix() {
 ///
 /// The card is the whole surface, not the default listing: it says what
 /// `mushroomdb mcp --all-tools` advertises and what every name in it can be
-/// called as, so it is compared against that list rather than the eleven a
+/// called as, so it is compared against that list rather than the thirteen a
 /// default session sees.
 #[test]
 fn server_card_lists_the_same_tools_in_the_same_order() {
@@ -2105,7 +2286,7 @@ fn every_task_tool_frames_its_text_as_untrusted() {
         "explore" | "context" => json!({"target": "core::init"}),
         "impact" => json!({"files": ["src/core.rs"]}),
         "owners" => json!({"path": "src/core.rs"}),
-        "why" => json!({"a": "src/core.rs", "b": "src/web.rs"}),
+        "why" | "explain_association" => json!({"a": "src/core.rs", "b": "src/web.rs"}),
         "recall" => json!({"topic": "src/core.rs"}),
         "remember" => json!({"text": "framing check", "about": ["src/core.rs"]}),
         _ => json!({}),

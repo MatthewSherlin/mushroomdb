@@ -67,7 +67,7 @@ Docker, `install.sh`, and the build-from-source path are in
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
 - [Codebase graph](ingest-git.md) — `ingest-git`, its rules, submodules, pull requests, incremental sync
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
-- [MCP tools](mcp.md) — the nine task tools, the sixteen graph tools, and the listing each store gets
+- [MCP tools](mcp.md) — the ten task tools, the fifteen graph tools, and the listing each store gets
 - [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
 - [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error

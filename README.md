@@ -201,8 +201,8 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
-**Nine task tools** answer a question about the repository in one call. They are what the skill
-reaches for, and what `tools/list` shows first:
+**Ten task tools** answer a question in prose in one call. They are what the skill reaches for,
+and what `tools/list` shows first:
 
 | Tool | Purpose |
 |---|---|
@@ -212,19 +212,22 @@ reaches for, and what `tools/list` shows first:
 | `impact` | What changing these files reaches: partners with scores, importers, symbols other files call, owner. Defaults to the working tree's diff |
 | `owners` | Top author and share, who else knows the file, last touch, the split by quarter |
 | `why` | Every rule edge between two nodes with its evidence, or the shortest path when there is none |
+| `explain_association` | Why two entities are associated: every rule-derived edge between them, with the rule, the score and the predicate it matched |
 | `recall` | One pointer per hit — `path:line symbol — first doc line` — for the identifiers in a topic |
 | `remember` | Write a note into the graph and return its key |
 | `sync` | Bring the store up to date: commits since the last sync, then the dirty working tree |
 
-Each of the nine also takes `json: true`, which answers with the raw report instead of the
+Each of the ten also takes `json: true`, which answers with the raw report instead of the
 rendered digest.
 
-**The sixteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
+**The fifteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
 in `tools/list`, so an assistant knows which surface is the front door. The default listing follows
 the store: a store built by `ingest-git` lists three tools in all — `explore`, `query` and `stats` —
-and any other store lists eleven, the eight task tools other than `explore` plus `query`,
-`ingest_json` and `stats`. All 25 stay served either way — the listing decides what a session can
-call, not what the server answers — and `mushroomdb mcp <db> --all-tools` lists the whole set:
+and any other store lists thirteen, the association surface: `query` (with an optional `role`),
+`explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `node_history`,
+`edge_history`, `find_similar`, `hybrid_search`, `remember`, `recall` and `stats`. All 25 stay
+served either way — the listing decides what a session can call, not what the server answers — and
+`mushroomdb mcp <db> --all-tools` lists the whole set:
 
 | Tool | Purpose |
 |---|---|
@@ -233,8 +236,7 @@ call, not what the server answers — and `mushroomdb mcp <db> --all-tools` list
 | `create_rule` | Declare a derivation rule; backfills existing nodes immediately |
 | `find_similar` | Find similar nodes by query vector (HNSW) or by derived edge traversal |
 | `hybrid_search` | RRF over fulltext + vector results |
-| `explain_association` | Show rules and scores that link two nodes |
-| `explain` | Alias for `explain_association` |
+| `explain` | The rules and scores that link two nodes, as JSON — `explain_association` above answers the same question in prose |
 | `query` | Cypher query (read or write); pass `mask` for ACL-scoped read |
 | `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter |
 | `node_info` | Return a node's key, label, and properties |
