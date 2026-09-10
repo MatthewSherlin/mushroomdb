@@ -119,3 +119,44 @@ fn the_hook_body_is_silent_on_a_missing_store_or_bad_json() {
         "no store means no opinion"
     );
 }
+
+/// A hook left behind by an uninstall runs in front of every `Grep`. It must
+/// stay silent — and, above all, it must not create the store it was pointed
+/// at: `RealFs::new` runs `create_dir_all`, so an unguarded open would leave
+/// an empty `mushroom-memory/` in the user's repository.
+#[test]
+fn a_missing_store_is_never_created_by_the_hook() {
+    let absent = tmp("never-created");
+    assert_eq!(
+        run_intercept(
+            &absent,
+            r#"{"tool_name":"Grep","tool_input":{"pattern":"render_map"}}"#
+        ),
+        None,
+        "no store, no redirect"
+    );
+    assert!(!absent.exists(), "the hook created {}", absent.display());
+
+    // And through the binary, which is how the hook actually runs: exit 0,
+    // nothing on either stream, and still no directory.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("intercept")
+        .arg(&absent)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"tool_name":"Grep","tool_input":{"pattern":"render_map"}}"#)?;
+            child.wait_with_output()
+        })
+        .expect("run the hook");
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+    assert!(!absent.exists(), "the binary created {}", absent.display());
+}

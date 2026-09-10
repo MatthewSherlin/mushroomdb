@@ -1739,7 +1739,16 @@ fn reach_line(db_dir: &Path, tool: &str) -> String {
 /// Open a store the way every question about it is asked: read-only, with both
 /// write paths off, so asking never migrates a snapshot, rewrites a torn WAL
 /// tail, or makes a writer wait on the cross-process lock.
+///
+/// A directory that is not there is an error rather than an empty store:
+/// `RealFs::new` runs `create_dir_all`, so without this guard a `brief` hook
+/// left behind by an uninstall — or any read of a mistyped path — would create
+/// the very store it then reports as empty. The same guard `run_recall` and
+/// `run_intercept` open behind.
 fn open_for_reading(db_dir: &Path) -> Result<structure::Db, CliError> {
+    if !db_dir.exists() {
+        return Err(CliError(format!("no store at {}", db_dir.display())));
+    }
     Ok(GraphDb::open_with_options(
         db_dir,
         core_api::OpenOptions {
