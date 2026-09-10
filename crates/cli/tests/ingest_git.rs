@@ -1825,7 +1825,8 @@ fn reach_line_of(db_dir: &Path) -> String {
 /// The two lines track the two MCP surfaces. A store with no `GitSync` marker
 /// lists neither `explore` nor `context`, so naming either would send a
 /// session at a tool it cannot see. The shell half names `query`, the one of
-/// the two that has a CLI subcommand.
+/// the two that has a CLI subcommand, and it is introduced with the same
+/// `SEP`-then-`or:` the code-graph line uses.
 #[test]
 fn the_reach_line_names_the_association_door_on_a_store_with_no_git_sync_marker() {
     let db_dir = memory_store("brief-memory-db");
@@ -1835,7 +1836,7 @@ fn the_reach_line_names_the_association_door_on_a_store_with_no_git_sync_marker(
         reach,
         format!(
             "explain_association <a> <b> · query '<cypher>' (MCP tools; add role: <name> to see \
-             as a role) — or: {} query '{}' '<cypher>'",
+             as a role) · or: {} query '{}' '<cypher>'",
             cli::install::detect_mcp_command(None).shell(),
             db_dir.display()
         ),

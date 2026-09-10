@@ -1739,9 +1739,9 @@ fn reach_line(db_dir: &Path, code_graph: bool) -> String {
     } else {
         (
             format!(
-                "explain_association <a> <b>{}query '<cypher>' (MCP tools; add role: <name> to \
-                 see as a role) — or:",
-                repograph::render::SEP
+                "explain_association <a> <b>{sep}query '<cypher>' (MCP tools; add role: <name> \
+                 to see as a role){sep}or:",
+                sep = repograph::render::SEP
             ),
             format!("{bin} query {db} '<cypher>'"),
         )
