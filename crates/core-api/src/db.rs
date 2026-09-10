@@ -8929,20 +8929,29 @@ impl<F: Fs> GraphDb<F> {
                             value: value.clone(),
                         })
                     }
-                    WalRecord::SetPropId { id, field, value } => match self.ids.key_of(*id) {
-                        // key_of returns the current (post-rename) key; compare to queried key.
-                        Some(resolved) if resolved == key => {
-                            let field_str = match self.syms.resolve(*field) {
-                                Some(s) => s.to_string(),
-                                None => continue,
-                            };
-                            Some(HistoryChange::PropSet {
-                                field: field_str,
-                                value: value.clone(),
-                            })
+                    WalRecord::SetPropId { id, field, value } => {
+                        // Use key_of_historical (not key_of) so a node's prop_set
+                        // events remain visible after the node is later deleted:
+                        // key_of returns None for a tombstoned id, which would
+                        // silently drop every PropSet between insert and delete.
+                        // Mirrors the InsertEdgeId arm below and edge_history's
+                        // own id-keyed arms.
+                        match self.ids.key_of_historical(*id) {
+                            // key_of_historical returns the last-known (possibly
+                            // post-rename, possibly post-delete) key; compare to queried key.
+                            Some(resolved) if resolved == key => {
+                                let field_str = match self.syms.resolve(*field) {
+                                    Some(s) => s.to_string(),
+                                    None => continue,
+                                };
+                                Some(HistoryChange::PropSet {
+                                    field: field_str,
+                                    value: value.clone(),
+                                })
+                            }
+                            _ => None,
                         }
-                        _ => None,
-                    },
+                    }
                     WalRecord::RemoveProp { key: k, field }
                         if Self::aliases_match(&alias_intervals, k, commit) =>
                     {
@@ -8976,8 +8985,13 @@ impl<F: Fs> GraphDb<F> {
                             Some(s) => s.to_string(),
                             None => continue,
                         };
-                        let src_key = self.ids.key_of(*src);
-                        let dst_key = self.ids.key_of(*dst);
+                        // key_of_historical (not key_of): an edge added before
+                        // either endpoint was later deleted must still resolve —
+                        // see the SetPropId arm above and edge_history's
+                        // InsertEdgeId arm, which use the same lookup for the
+                        // same reason.
+                        let src_key = self.ids.key_of_historical(*src);
+                        let dst_key = self.ids.key_of_historical(*dst);
                         if src_key == Some(key) {
                             let other = match dst_key {
                                 Some(s) => s.to_string(),

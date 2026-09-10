@@ -105,8 +105,9 @@ fn node_history_delete_node() {
 
     let history = db.node_history("x").unwrap();
 
-    // NodeInserted then NodeDeleted.  Dense-id prop records for a tombstoned node are
-    // unresolvable (documented), so we don't set props here to keep the test unambiguous.
+    // NodeInserted then NodeDeleted; no props set here, kept minimal on purpose.
+    // See node_history_delete_node_keeps_prop_set_events for dense-id (SetPropId)
+    // prop records surviving a later delete.
     assert_eq!(history.len(), 2, "history: {history:?}");
     assert!(
         matches!(&history[0].change, HistoryChange::NodeInserted { label } if label == "Thing"),
@@ -122,6 +123,92 @@ fn node_history_delete_node() {
         history[0].commit < history[1].commit,
         "commits not ordered: {:?}",
         history
+    );
+}
+
+#[test]
+fn node_history_delete_node_keeps_prop_set_events() {
+    // Regression test: `set_prop` is dense-rewritten to `WalRecord::SetPropId`
+    // once the field/label interning has happened, so a deleted node's prop_set
+    // events must resolve via a tombstone-aware id lookup (`key_of_historical`),
+    // not the live-only `key_of`. Before the fix, `key_of` returned `None` for
+    // the tombstoned id and both `PropSet` events were silently dropped.
+    let dir = tmp("deleted_with_props");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node("Thing", "x", vec![]).unwrap();
+    db.set_prop("x", "count", Value::Int(1)).unwrap();
+    db.set_prop("x", "count", Value::Int(2)).unwrap();
+    db.delete_node("x").unwrap();
+
+    let history = db.node_history("x").unwrap();
+
+    assert_eq!(history.len(), 4, "history: {history:?}");
+
+    for w in history.windows(2) {
+        assert!(
+            w[0].commit < w[1].commit,
+            "commits not strictly increasing: {:?} >= {:?}",
+            w[0].commit,
+            w[1].commit
+        );
+    }
+
+    assert!(
+        matches!(&history[0].change, HistoryChange::NodeInserted { label } if label == "Thing"),
+        "expected NodeInserted, got {:?}",
+        history[0]
+    );
+    assert!(
+        matches!(&history[1].change, HistoryChange::PropSet { field, value }
+            if field == "count" && *value == Value::Int(1)),
+        "expected PropSet(count, 1), got {:?}",
+        history[1]
+    );
+    assert!(
+        matches!(&history[2].change, HistoryChange::PropSet { field, value }
+            if field == "count" && *value == Value::Int(2)),
+        "expected PropSet(count, 2), got {:?}",
+        history[2]
+    );
+    assert!(
+        matches!(&history[3].change, HistoryChange::NodeDeleted),
+        "expected NodeDeleted, got {:?}",
+        history[3]
+    );
+}
+
+#[test]
+fn node_history_delete_node_keeps_edge_added_event() {
+    // Same defect, different id-keyed arm: `insert_edge` dense-rewrites to
+    // `WalRecord::InsertEdgeId`, so a deleted node's earlier EdgeAdded event
+    // must also resolve via `key_of_historical`.
+    let dir = tmp("deleted_with_edge");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node("Person", "a", vec![]).unwrap();
+    db.insert_node("Person", "b", vec![]).unwrap();
+    db.insert_edge("Knows", "a", "b").unwrap();
+    db.delete_node("a").unwrap();
+
+    let history = db.node_history("a").unwrap();
+
+    assert_eq!(history.len(), 3, "history: {history:?}");
+    assert!(
+        matches!(&history[0].change, HistoryChange::NodeInserted { label } if label == "Person"),
+        "expected NodeInserted, got {:?}",
+        history[0]
+    );
+    assert!(
+        matches!(&history[1].change, HistoryChange::EdgeAdded { edge_type, other, outgoing }
+            if edge_type == "Knows" && other == "b" && *outgoing),
+        "expected EdgeAdded{{outgoing:true}}, got {:?}",
+        history[1]
+    );
+    assert!(
+        matches!(&history[2].change, HistoryChange::NodeDeleted),
+        "expected NodeDeleted, got {:?}",
+        history[2]
     );
 }
 
