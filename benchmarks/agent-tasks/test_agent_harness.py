@@ -1114,17 +1114,24 @@ def test_load_tasks_reads_the_suites_own_file():
 
 
 def test_suites_pin_the_arms_baseline_and_gate_of_each_suite():
-    from run import SUITES
+    import run
+    import subjects
+    from run import PILOT_MIN_TURNS, SUITES
+    # One table, read by the runner and by the report: `report.py` renders a
+    # suite's gate legs from it and cannot import `run.py`.
+    assert SUITES is subjects.SUITES
+    assert run.PILOT_MIN_TURNS == SUITES["code"]["pilot_floor"] == PILOT_MIN_TURNS
+
     code, assoc = SUITES["code"], SUITES["association"]
     assert code["arms"] == ["A", "B", "C", "D"] and code["baseline"] == "A"
-    assert code["gate"] == {"require_ci": False, "adoption_gate": True}
+    assert code["gate"] == {"cost_ci": False, "adoption_gate": True}
     assert code["graph_arms"] is None            # every arm but A is gated
     assert code["pilot_floor"] == 6 and code["pilot_arm"] == "A"
     assert code["turns_field"] == "min_stock_turns"
     assert code["tasks"].name == "tasks.json"
 
     assert assoc["arms"] == ["P", "Q", "R"] and assoc["baseline"] == "Q"
-    assert assoc["gate"] == {"require_ci": True, "adoption_gate": False}
+    assert assoc["gate"] == {"cost_ci": True, "adoption_gate": False}
     assert assoc["graph_arms"] == ["R"]          # P is the second baseline
     assert assoc["pilot_floor"] == 5 and assoc["pilot_arm"] == "Q"
     assert assoc["turns_field"] == "min_baseline_turns"
@@ -1144,82 +1151,116 @@ def test_paired_deltas_measures_against_the_baseline_it_is_given():
     assert paired_deltas(rows, "R", "score", baseline="A") == []
 
 
-def _assoc_rows(r_scores, p_scores=None, q_score=0.4, r_cost=0.05,
+def _assoc_rows(r_scores, p_scores=None, q_score=1.0, r_costs=0.05,
                 q_cost=0.10, adopted=True):
-    """One rep per task for arms P, Q and R, with R's score per task given."""
-    p_scores = p_scores or [0.2] * len(r_scores)
+    """One rep per task for arms P, Q and R.
+
+    Defaults model what the pilot actually measured: the SQLite baseline
+    answers every task (1.00), so the gate turns on cost. `r_costs` takes
+    either one number or one per task.
+    """
+    p_scores = p_scores if p_scores is not None else [q_score] * len(r_scores)
+    if not isinstance(r_costs, (list, tuple)):
+        r_costs = [r_costs] * len(r_scores)
     rows = []
-    for t, (rs, ps) in enumerate(zip(r_scores, p_scores), start=1):
+    for t, (rs, ps, rc) in enumerate(zip(r_scores, p_scores, r_costs), start=1):
         rows += [_row("Q", t, q_score, q_cost, False),
                  _row("P", t, ps, q_cost, False),
-                 _row("R", t, rs, r_cost, adopted)]
+                 _row("R", t, rs, rc, adopted)]
     return rows
 
 
-ASSOC_GATE = {"baseline": "Q", "require_ci": True, "adoption_gate": False,
+ASSOC_GATE = {"baseline": "Q", "cost_ci": True, "adoption_gate": False,
               "graph_arms": ["R"]}
 
 
-def test_association_gate_passes_when_the_graph_beats_both_baselines():
+def test_association_gate_passes_on_a_score_tie_and_a_real_cost_win():
+    """§1 as amended: correctness is saturated, so a tie on score passes and
+    cost — mean and interval — is what the gate turns on."""
     from report import gate_verdict
-    rows = _assoc_rows([0.9] * 6)
+    rows = _assoc_rows([1.0] * 6)                  # every arm scores 1.00
     v = gate_verdict(rows, **ASSOC_GATE)
     assert v["passed"] and v["best_arm"] == "R", v["reasons"]
+    assert v["arms"]["R"]["paired_score"] == 0.0   # a tie, and it passed
 
 
-def test_association_gate_fails_when_the_score_interval_includes_zero():
-    """A positive paired mean is not enough: §1.1 wants the interval clear."""
+def test_association_gate_fails_when_the_cost_interval_includes_zero():
+    """Cheaper on the mean is not enough: the paired cost difference has to be
+    consistent across tasks, or the win is noise."""
     from report import gate_verdict
-    rows = _assoc_rows([1.0, 0.0, 0.5, 0.5, 1.0, 0.0], q_score=0.4)
+    # Mean cost 0.095 < 0.10, but the per-task difference swings either way.
+    rows = _assoc_rows([1.0] * 6,
+                       r_costs=[0.02, 0.18, 0.02, 0.18, 0.02, 0.15])
     v = gate_verdict(rows, **ASSOC_GATE)
     assert not v["passed"]
-    assert any("interval" in r for r in v["reasons"]), v["reasons"]
+    assert any("cost interval" in r for r in v["reasons"]), v["reasons"]
+    # ... and no correctness complaint: the scores tie.
+    assert not any("correctness" in r for r in v["reasons"]), v["reasons"]
 
 
-def test_association_gate_fails_when_a_baseline_matches_the_graph():
-    """The correctness leg is 'beats every other arm', not 'beats the
-    baseline': a files arm that scores as well as the graph sinks it, and P
-    winning is never itself a pass — it is the second baseline, not a
-    contender."""
+def test_association_gate_fails_when_another_arm_is_more_correct():
+    """A tie passes; being *below* another arm does not. P winning is never
+    itself a pass — it is the second baseline, not a contender."""
     from report import gate_verdict
-    rows = _assoc_rows([0.9] * 6, p_scores=[0.95] * 6)
+    rows = _assoc_rows([0.9] * 6, p_scores=[0.95] * 6, q_score=0.9)
     v = gate_verdict(rows, **ASSOC_GATE)
     assert not v["passed"] and v["best_arm"] == "R"
     assert sorted(v["arms"]) == ["R"]
-    assert any("P" in r for r in v["reasons"]), v["reasons"]
+    assert any("P" in r and "correctness" in r for r in v["reasons"]), v["reasons"]
+
+
+def test_association_gate_fails_when_the_graph_is_below_the_baseline():
+    from report import gate_verdict
+    rows = _assoc_rows([0.6] * 6, p_scores=[0.6] * 6, q_score=1.0)
+    reasons = gate_verdict(rows, **ASSOC_GATE)["reasons"]
+    assert any("correctness" in r and "arm Q" in r for r in reasons), reasons
 
 
 def test_association_gate_records_adoption_without_gating_it():
     """In arm R the store is the only data path, so adoption is not a leg."""
     from report import gate_verdict
-    rows = _assoc_rows([0.9] * 6, adopted=False)
+    rows = _assoc_rows([1.0] * 6, adopted=False)
     v = gate_verdict(rows, **ASSOC_GATE)
     assert v["passed"], v["reasons"]
+    assert v["arms"]["R"]["adoption"] == 0.0      # recorded all the same
     # ... and the same rows fail the code suite's gate, which does gate on it.
     assert not gate_verdict(rows, baseline="Q")["passed"]
 
 
 def test_association_gate_still_fails_on_cost_and_on_max_turns():
     from report import gate_verdict
-    dear = _assoc_rows([0.9] * 6, r_cost=0.20)
-    assert any("cost" in r for r in gate_verdict(dear, **ASSOC_GATE)["reasons"])
-    rows = _assoc_rows([0.9] * 6)
+    dear = _assoc_rows([1.0] * 6, r_costs=0.20)
+    assert any("cost 0.2" in r for r in gate_verdict(dear, **ASSOC_GATE)["reasons"])
+    rows = _assoc_rows([1.0] * 6)
     rows[2]["result_subtype"] = "error_max_turns"
     reasons = gate_verdict(rows, **ASSOC_GATE)["reasons"]
     assert any("max-turns" in r for r in reasons), reasons
 
 
+def test_the_code_suite_gate_is_untouched_by_the_amendment():
+    """The 0.6.2 gate still has no interval leg and still gates on adoption:
+    the same rows that pass it would fail the association variant on cost."""
+    from report import gate_verdict
+    rows = []
+    for t in range(1, 5):
+        rows += [_row("A", t, 0.8, 0.10, False), _row("C", t, 0.9, 0.10, True)]
+    assert gate_verdict(rows)["passed"]                 # cost equal, no CI leg
+    v = gate_verdict(rows, baseline="A", cost_ci=True, graph_arms=["C"])
+    assert not v["passed"]
+    assert any("cost interval" in r for r in v["reasons"]), v["reasons"]
+
+
 def test_write_summary_names_the_suite_and_the_baseline_arm(tmp_path):
     from report import write_summary
     rows = []
-    for t in (1, 2, 3):
-        rows.append(_cell("Q", t, score=0.4, cost_usd=0.10))
-        rows.append(_cell("P", t, score=0.2, cost_usd=0.10))
-        rows.append(_cell("R", t, score=0.9, cost_usd=0.05, adopted=True,
+    for t in (1, 2, 3, 4, 5, 6):
+        rows.append(_cell("Q", t, score=1.0, cost_usd=0.10))
+        rows.append(_cell("P", t, score=1.0, cost_usd=0.10))
+        rows.append(_cell("R", t, score=1.0, cost_usd=0.05, adopted=True,
                           mcp_calls=3, graph_calls=3))
+    # No gate keys in the meta: the variant is looked up from `SUITES`.
     text = write_summary(tmp_path, rows, {
-        "suite": "association", "baseline": "Q", "require_ci": True,
-        "adoption_gate": False, "graph_arms": ["R"],
+        "suite": "association", "baseline": "Q", "graph_arms": ["R"],
         "world_digest": "abc123def456", "max_turns": 30}).read_text()
     assert "- suite: association" in text
     assert "- baseline arm: Q" in text
@@ -1230,17 +1271,27 @@ def test_write_summary_names_the_suite_and_the_baseline_arm(tmp_path):
         assert f"- arm {arm} (" in text and ARM_PROVENANCE[arm] in text
     # The code suite's own footnotes describe a run this one did not do.
     assert "DEVIATION" not in text and "R2 subject" not in text
+    # The amended legs, in words: a score tie passes, the cost interval is the
+    # discriminator, adoption is recorded rather than gated.
+    assert "at or above every other arm's paired mean (a tie passes)" in text
+    assert "the 95% cost interval vs arm Q excludes zero" in text
+    assert "adoption >=" not in text
+    assert "Adoption is recorded below, not gated" in text
+    assert "amended 2026-09-11" in text
     assert "PASSED" in text
 
 
 def test_write_summary_keeps_the_code_suites_own_provenance(tmp_path):
-    from report import write_summary
+    from report import GATE_ADOPTION, write_summary
     rows = [_cell("A", 1, score=0.5, cost_usd=0.2),
             _cell("B", 1, score=0.6, cost_usd=0.1, adopted=True, mcp_calls=1)]
     text = write_summary(tmp_path, rows, {"head_short": "abc1234"}).read_text()
     assert "- suite: code" in text and "- baseline arm: A" in text
     assert "DEVIATION" in text and "R2 subject" in text
     assert "## Deltas vs arm A" in text
+    # The 0.6.2 legs, unchanged by the association amendment.
+    assert f"adoption >= {GATE_ADOPTION:.0%}" in text
+    assert "cost interval" not in text and "a tie passes" not in text
 
 
 def test_the_graph_subject_holds_the_store_the_install_and_nothing_else(tmp_path):
@@ -1261,6 +1312,156 @@ def test_the_graph_subject_holds_the_store_the_install_and_nothing_else(tmp_path
     # Idempotent: setup runs it on every invocation, not only the first.
     install_association_graph(graph)
     assert {p.name for p in graph.iterdir()} == set(ASSOC_GRAPH_CONTENTS)
+
+    # And a cell copy of that real install must name its own store everywhere
+    # the install wrote a path — `.mcp.json`, all three hooks, the manifest —
+    # and the subject nowhere. This is the whole of arm R's isolation.
+    from subjects import ASSOC_STORE_NAME, make_cell_copy
+    cell = make_cell_copy(graph, tmp_path / "cells" / "assoc-R")
+    subject_store = str((graph / ASSOC_STORE_NAME).resolve())
+    cell_store = str((cell / ASSOC_STORE_NAME).resolve())
+    wrote_a_path = []
+    for path in [cell / ".mcp.json", *sorted((cell / ".claude").rglob("*"))]:
+        if not path.is_file():
+            continue
+        body = path.read_text(errors="replace")
+        assert subject_store not in body, path
+        assert str(graph.resolve()) not in body, path
+        if cell_store in body:
+            wrote_a_path.append(path.name)
+    assert ".mcp.json" in wrote_a_path
+    assert "settings.json" in wrote_a_path
+    assert ".install-manifest.json" in wrote_a_path
+
+    mcp = json.loads((cell / ".mcp.json").read_text())
+    assert mcp["mcpServers"]["mushroomdb"]["args"][-1] == cell_store
+    hooks = json.loads((cell / ".claude" / "settings.json").read_text())["hooks"]
+    assert set(hooks) == {"UserPromptSubmit", "PostToolUse", "SessionStart"}
+    for entries in hooks.values():
+        for entry in entries:
+            for hook in entry["hooks"]:
+                assert cell_store in hook["command"], hook["command"]
+
+
+def _assoc_task(i, prompt, target=None, kind="why"):
+    return {"id": i, "key": f"assoc-{kind}-{i}", "kind": kind,
+            "full_prompt": prompt, "verify": None,
+            "truth": {"size": i, **({"target": target} if target else {})}}
+
+
+def test_replace_dropped_tasks_rebuilds_in_place_and_accumulates_avoid(
+        tmp_path, monkeypatch):
+    """The replacement loop, without paying `build_tasks.py` to run: a canned
+    rebuild stands in for it, and what is asserted is what this function owns —
+    the avoid list it passes, the file it rewrites, and the stamps it carries.
+    """
+    import subprocess
+    import run
+
+    out = tmp_path / "tasks.json"
+    canned: list[dict] = []
+    seen_avoid: list[str] = []
+
+    def fake_run(cmd, **kw):
+        seen_avoid.append(cmd[cmd.index("--avoid") + 1])
+        dest = Path(cmd[cmd.index("--out") + 1])
+        dest.write_text(json.dumps({"suite": "association", "seed": 1,
+                                    "tasks": canned.pop(0)}) + "\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    # The function imports `subprocess` itself at call time, so patching the
+    # module's own attribute is what it will see.
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # Round 1: three tasks, two of them sized; task 2 was under the floor.
+    kept_a = _assoc_task(1, "why a?", ["talent-1", "company-1"])
+    kept_b = _assoc_task(3, "why c?", ["talent-3", "company-3"])
+    dropped = _assoc_task(2, "why b?", ["talent-2", "company-2"])
+    data = {"tasks": [kept_a, kept_b], "pilot": {"run": "round-1"}}
+    for t in data["tasks"]:
+        t["min_baseline_turns"] = 9
+        t["pilot_fingerprint"] = run.task_fingerprint(t)
+
+    # The rebuild reproduces 1 and 3 and puts a new task in 2's place.
+    canned.append([dict(kept_a), _assoc_task(2, "why d?", ["talent-9"]),
+                   dict(kept_b)])
+    fresh = run.replace_dropped_association_tasks(
+        data, [dropped], tmp_path / "build", out=out)
+
+    assert seen_avoid == ["company-2,talent-2"]
+    assert json.loads(out.read_text()) == fresh          # rewritten in place
+    stamped = {t["key"]: t.get("min_baseline_turns") for t in fresh["tasks"]}
+    assert stamped == {"assoc-why-1": 9, "assoc-why-2": None, "assoc-why-3": 9}
+    assert fresh["dropped_targets"] == ["company-2", "talent-2"]
+    assert fresh["pilot"] == {"run": "round-1"}          # provenance survives
+
+    # Round 2: the replacement is itself too easy. The avoid list accumulates —
+    # a rebuild that forgot round 1 would hand back the task it just replaced.
+    canned.append([dict(kept_a), _assoc_task(2, "why e?", ["talent-8"]),
+                   dict(kept_b)])
+    fresh2 = run.replace_dropped_association_tasks(
+        fresh, [fresh["tasks"][1]], tmp_path / "build", out=out)
+    assert seen_avoid[-1] == "company-2,talent-2,talent-9"
+    assert fresh2["dropped_targets"] == ["company-2", "talent-2", "talent-9"]
+    assert [t["full_prompt"] for t in fresh2["tasks"]] == [
+        "why a?", "why e?", "why c?"]
+
+
+def test_replace_dropped_tasks_refuses_a_task_it_cannot_avoid(tmp_path):
+    """A multihop truth names no target, so `--avoid` cannot exclude it and a
+    rebuild would reproduce it — the pilot would drop it again for ever. Say
+    so instead of looping."""
+    import pytest
+    import run
+    multihop = _assoc_task(5, "which companies?", kind="multihop")
+    assert "target" not in multihop["truth"]
+    with pytest.raises(SystemExit, match="names no target"):
+        run.replace_dropped_association_tasks(
+            {"tasks": []}, [multihop], tmp_path / "build",
+            out=tmp_path / "tasks.json")
+
+
+def test_an_empty_build_directory_is_not_a_built_world(tmp_path, monkeypatch):
+    """Three empty directories are what an interrupted build leaves. Skipping
+    on the directories alone would hand a run three subjects with no data."""
+    import subjects
+    monkeypatch.setattr(subjects, "ASSOC_BUILD", tmp_path / "assoc-build")
+    monkeypatch.setattr(subjects, "ensure_binary", lambda: None)
+    rebuilt = []
+    monkeypatch.setattr(subjects, "sh",
+                        lambda cmd, **kw: rebuilt.append(cmd) or "")
+    for form in ("files", "sqlite", "graph"):
+        (tmp_path / "assoc-build" / form).mkdir(parents=True)
+
+    subjects.build_association_world()
+    assert len(rebuilt) == 1, "an empty build directory was accepted as built"
+    assert str(tmp_path / "assoc-build") in rebuilt[0]
+
+    # It also cleared the incomplete tree rather than building on top of it.
+    assert not (tmp_path / "assoc-build").exists()
+
+    # With the three markers present it is left alone.
+    for form in ("files", "sqlite", "graph"):
+        (tmp_path / "assoc-build" / form).mkdir(parents=True)
+    (tmp_path / "assoc-build" / "files" / "entities").mkdir()
+    (tmp_path / "assoc-build" / "sqlite" / "world.sqlite").write_text("x")
+    (tmp_path / "assoc-build" / "graph" / "world.mushroomdb").mkdir()
+    subjects.build_association_world()
+    assert len(rebuilt) == 1, "a complete world was rebuilt anyway"
+
+
+def test_a_copy_that_repoints_nothing_is_an_error(tmp_path):
+    """`repoint_install` returning zero on a tree that carries an install
+    means the paths did not match what was expected — the cell would run
+    against the subject's store and nothing would say so."""
+    import pytest
+    from subjects import make_cell_copy
+    subject = tmp_path / "graph"
+    subject.mkdir()
+    # An install whose `.mcp.json` names no path under the subject at all.
+    (subject / ".mcp.json").write_text('{"mcpServers": {"x": {"args": []}}}')
+    with pytest.raises(SystemExit, match="repointed nothing"):
+        make_cell_copy(subject, tmp_path / "cells" / "assoc-R")
 
 
 def test_a_rebuilt_association_set_keeps_the_measurements_it_earned():

@@ -26,7 +26,8 @@ sys.path.insert(0, str(HERE))
 import truth_r2 as TRUTH_R2                                      # noqa: E402
 from ground_truth import unit_passed                             # noqa: E402
 from subjects import (ARM_LABEL, ARM_PROVENANCE, BASE_TOOLS,     # noqa: E402
-                      CELL_TIMEOUT_S, DEFAULT_MAX_TURNS, MCP_ARMS, MCP_TOOL)
+                      CELL_TIMEOUT_S, DEFAULT_MAX_TURNS, MCP_ARMS, MCP_TOOL,
+                      SUITES)
 
 
 def fmt(v, nd=0):
@@ -88,7 +89,7 @@ GATE_ADOPTION = 0.80
 
 
 def gate_verdict(rows: list[dict], baseline: str = "A",
-                 require_ci: bool = False, adoption_gate: bool = True,
+                 cost_ci: bool = False, adoption_gate: bool = True,
                  graph_arms: Iterable[str] | None = None) -> dict:
     """A pre-registered gate, evaluated over every cell of a run.
 
@@ -99,14 +100,15 @@ def gate_verdict(rows: list[dict], baseline: str = "A",
       run that skipped a task in one arm cannot flatter the other), costs no
       more per cell, reaches the graph in 80% of its sessions, and never runs
       out of turns on a task stock finished.
-    - **the association suite** (0.6.3 §1, `baseline="Q", require_ci=True,
-      adoption_gate=False`): correctness becomes *strictly* better than the
-      baseline **and better than every other arm in the run** — the graph has
-      to beat both honest baselines, not just the one it is measured against —
-      with the 95% bootstrap interval of the paired score differences
-      excluding zero. Cost and max-turns are unchanged. Adoption is recorded
-      but not gated: in arm R the store is the agent's only data path, so it
-      measures nothing.
+    - **the association suite** (0.6.3 §1 as amended 2026-09-11,
+      `baseline="Q", cost_ci=True, adoption_gate=False`): correctness is at or
+      above **every other arm's** paired mean — a tie passes, and there is no
+      interval requirement on score, because the SQLite pilot scored 1.00 on
+      all twenty tasks and correctness is saturated. Cost is the discriminator
+      instead: mean cost at or below the baseline **and** the 95% bootstrap
+      interval of the paired cost differences excluding zero. Max-turns is
+      unchanged. Adoption is recorded but not gated: in arm R the store is the
+      agent's only data path, so it measures nothing.
 
     `graph_arms` is which arms the gate is *about*. It defaults to every arm
     that is not the baseline, which is the code suite: every arm there but A
@@ -143,27 +145,28 @@ def gate_verdict(rows: list[dict], baseline: str = "A",
         reasons: list[str] = []
         diffs = paired_deltas(rows, arm, "score", baseline)
         paired = paired_score[arm]
-        if require_ci:
-            if paired <= 0:
-                reasons.append(f"{arm}: correctness {paired:+.3f} vs arm "
-                               f"{baseline}, paired over {len(diffs)} task(s)")
-            beaten = [o for o in others
-                      if o != arm and paired <= paired_score[o]]
-            if beaten:
-                reasons.append(
-                    f"{arm}: correctness {paired:+.3f} does not beat arm(s) "
-                    + ", ".join(f"{o} ({paired_score[o]:+.3f})" for o in beaten))
-            lo, hi = bootstrap_ci(diffs)
-            if lo <= 0 <= hi:
-                reasons.append(f"{arm}: score interval [{lo:+.3f}, {hi:+.3f}] "
-                               f"vs arm {baseline} includes zero")
-        elif paired < 0:
+        if paired < 0:
             reasons.append(f"{arm}: correctness {paired:+.3f} vs arm "
                            f"{baseline}, paired over {len(diffs)} task(s)")
+        if cost_ci:
+            # "at or above every other arm" — a tie passes, so only an arm
+            # that is strictly more correct sinks this one.
+            beaten = [o for o in others
+                      if o != arm and paired < paired_score[o]]
+            if beaten:
+                reasons.append(
+                    f"{arm}: correctness {paired:+.3f} is below arm(s) "
+                    + ", ".join(f"{o} ({paired_score[o]:+.3f})" for o in beaten))
         cost = mean_of(rs, "cost_usd")
         if cost is not None and base_cost is not None and cost > base_cost:
             reasons.append(f"{arm}: cost {cost:.4f} > arm {baseline} "
                            f"{base_cost:.4f}")
+        if cost_ci:
+            cost_diffs = paired_deltas(rows, arm, "cost_usd", baseline)
+            lo, hi = bootstrap_ci(cost_diffs)
+            if not cost_diffs or lo <= 0 <= hi:
+                reasons.append(f"{arm}: cost interval [{lo:+.4f}, {hi:+.4f}] "
+                               f"vs arm {baseline} includes zero")
         adoption = sum(1 for r in rs if r["adopted"]) / len(rs)
         if adoption_gate and adoption < GATE_ADOPTION:
             reasons.append(f"{arm}: adoption {adoption:.0%} < {GATE_ADOPTION:.0%}")
@@ -193,8 +196,14 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
     by_arm = {a: [r for r in rows if r["arm"] == a] for a in arms}
     suite = meta.get("suite", "code")
     baseline = meta.get("baseline", "A")
-    require_ci = bool(meta.get("require_ci", False))
-    adoption_gate = bool(meta.get("adoption_gate", suite == "code"))
+    # The gate variant comes from the suite's own entry in `SUITES`, so a
+    # summary rendered without one (a replay, a hand-built meta) still
+    # describes the gate that suite is run with rather than a second copy of
+    # the table kept here.
+    variant = SUITES.get(suite, {}).get("gate", {})
+    cost_ci = bool(meta.get("cost_ci", variant.get("cost_ci", False)))
+    adoption_gate = bool(meta.get("adoption_gate",
+                                  variant.get("adoption_gate", True)))
     lines: list[str] = []
     lines.append(f"# Agent benchmark run{meta.get('title_suffix', '')}")
     lines.append("")
@@ -239,21 +248,27 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
     lines.append("")
 
     # ---- the gate --------------------------------------------------------
-    verdict = gate_verdict(rows, baseline=baseline, require_ci=require_ci,
+    verdict = gate_verdict(rows, baseline=baseline, cost_ci=cost_ci,
                            adoption_gate=adoption_gate,
                            graph_arms=meta.get("graph_arms"))
     lines.append("## Gate")
     lines.append("")
-    legs = [f"correctness {'>' if require_ci else '>='} arm {baseline} "
-            "(paired by task)"]
-    if require_ci:
-        legs.append("better than every other arm")
-        legs.append(f"the 95% score interval vs arm {baseline} excludes zero")
+    legs = [f"correctness >= arm {baseline} (paired by task)"]
+    if cost_ci:
+        legs.append("at or above every other arm's paired mean (a tie passes)")
     legs.append(f"cost <= arm {baseline}")
+    if cost_ci:
+        legs.append(f"the 95% cost interval vs arm {baseline} excludes zero")
     if adoption_gate:
         legs.append(f"adoption >= {GATE_ADOPTION:.0%}")
     legs.append(f"no max-turns failure on a task arm {baseline} finished")
     lines.append("The pre-registered §1 gate: " + ", ".join(legs) + ".")
+    if cost_ci:
+        lines.append("")
+        lines.append("Correctness carries no interval requirement: the "
+                     f"baseline arm {baseline} saturated it in the pilot "
+                     "(1.00 on every task), so cost is the discriminator (§1, "
+                     "amended 2026-09-11).")
     if not adoption_gate:
         lines.append("")
         lines.append("Adoption is recorded below, not gated: in the graph arm "

@@ -45,7 +45,7 @@ from report import write_summary                                 # noqa: E402
 from subjects import (ASSOC_ARMS, ASSOC_SUBJECTS, BASE_TOOLS,    # noqa: E402
                       CELL_TIMEOUT_S,
                       DEFAULT_MAX_TURNS, EMPTY_MCP, MCP_TOOL, SUBJECT_A,
-                      SUBJECT_B, SUBJECT_D, SUBJECT_E, SUBJECT_F,
+                      SUBJECT_B, SUBJECT_D, SUBJECT_E, SUBJECT_F, SUITES,
                       assoc_cell_dir, cell_worktree, changed_files,
                       child_env, drop_worktree, make_cell_copy, make_worktree,
                       restore_subject, setup, subject_root)
@@ -54,37 +54,8 @@ from subjects import (ASSOC_ARMS, ASSOC_SUBJECTS, BASE_TOOLS,    # noqa: E402
 # --------------------------------------------------------------------------
 # the suites
 # --------------------------------------------------------------------------
-
-# What differs between the code suite (0.6.2, §6) and the association suite
-# (0.6.3, §3): where the tasks come from, which arms run, which arm everything
-# is measured against, which of the two gate variants applies, and what the
-# pilot means. Everything else — cells, metrics, summary — is shared.
-SUITES: dict[str, dict] = {
-    "code": {
-        "tasks": HERE / "tasks.json",
-        "arms": ["A", "B", "C", "D"],
-        "baseline": "A",
-        "gate": {"require_ci": False, "adoption_gate": True},
-        # Every arm but A carries the graph, so every arm but A is gated.
-        "graph_arms": None,
-        "pilot_floor": 6,
-        "pilot_arm": "A",
-        "turns_field": "min_stock_turns",
-    },
-    "association": {
-        "tasks": HERE / "association" / "tasks.json",
-        "arms": ["P", "Q", "R"],
-        "baseline": "Q",
-        "gate": {"require_ci": True, "adoption_gate": False},
-        # P is the second baseline (§1: the graph must beat both), not a
-        # contender: a verdict of "passed, best arm P" would read as a pass
-        # for a run in which files beat the graph.
-        "graph_arms": ["R"],
-        "pilot_floor": 5,
-        "pilot_arm": "Q",
-        "turns_field": "min_baseline_turns",
-    },
-}
+# `SUITES` itself lives in `subjects.py`: `report.py` needs the gate variant a
+# suite is run with and cannot import this module, which imports it.
 
 
 def load_tasks(suite: str = "code") -> dict:
@@ -383,7 +354,9 @@ def _run_cell_in(task: dict, arm: str, rep: int, outdir: Path, stem: str,
 # the pilot: does the baseline agent have to work for this answer?
 # --------------------------------------------------------------------------
 
-PILOT_MIN_TURNS = 6
+# The code suite's floor, kept as a name because `apply_pilot` defaults to it.
+# Read off `SUITES` rather than repeated: one table owns what a suite is.
+PILOT_MIN_TURNS = SUITES["code"]["pilot_floor"]
 
 
 def task_fingerprint(task: dict) -> str:
@@ -474,7 +447,8 @@ def carry_pilot_stamps(old: list[dict], fresh: list[dict],
 
 
 def replace_dropped_association_tasks(data: dict, dropped: list[dict],
-                                      build_dir: Path) -> dict:
+                                      build_dir: Path,
+                                      out: Path | None = None) -> dict:
     """Rebuild the association set with the dropped tasks' targets avoided.
 
     The code suite shrinks when a task is too easy; the association suite is
@@ -484,14 +458,30 @@ def replace_dropped_association_tasks(data: dict, dropped: list[dict],
     carries every surviving stamp across by fingerprint: a task the rebuild
     reproduced unchanged was already sized, and re-piloting it would spend
     money to learn what is written down.
+
+    The avoid list is cumulative — `dropped_targets` from earlier rounds plus
+    this round's — because a rebuild that forgot an earlier round would put the
+    task it already replaced straight back.
+
+    A dropped task that names no target cannot be avoided, so the rebuild would
+    reproduce it and the next round would drop it again, for ever. That is an
+    error here, not a warning: `multihop` truths carry no `target`, so a
+    multihop task under the floor needs the suite's generator changed, not
+    another pilot round.
     """
     import subprocess as sp
     from association.build_tasks import task_targets
+    untargeted = [t["key"] for t in dropped if not task_targets(t)]
+    if untargeted:
+        raise SystemExit(
+            f"cannot replace {untargeted}: the task names no target to avoid, "
+            f"so `build_tasks.py --avoid` would rebuild it unchanged and the "
+            f"pilot would drop it again. Change the generator for this kind.")
     avoid = set(data.get("dropped_targets", []))
     for t in dropped:
         avoid |= task_targets(t)
     avoid = sorted(avoid)
-    out = SUITES["association"]["tasks"]
+    out = out if out is not None else SUITES["association"]["tasks"]
     print(f"rebuilding the association set, avoiding {avoid}")
     p = sp.run([sys.executable, str(HERE / "association" / "build_tasks.py"),
                 "--build", str(build_dir), "--avoid", ",".join(avoid),
@@ -501,7 +491,12 @@ def replace_dropped_association_tasks(data: dict, dropped: list[dict],
     fresh = json.loads(out.read_text())
     tasks, carried = carry_pilot_stamps(
         data["tasks"], fresh["tasks"], SUITES["association"]["turns_field"])
-    fresh = {**fresh, "tasks": tasks, "pilot": data.get("pilot", {})}
+    # `build_tasks.py` records its own dropped targets when the engine
+    # disputed a candidate during the rebuild; keep both, or the next round
+    # would hand back a target one of the two had already ruled out.
+    fresh = {**fresh, "tasks": tasks, "pilot": data.get("pilot", {}),
+             "dropped_targets": sorted(set(avoid)
+                                       | set(fresh.get("dropped_targets", [])))}
     out.write_text(json.dumps(fresh, indent=2) + "\n")
     print(f"carried {carried} existing measurement(s) into the rebuilt set")
     return fresh

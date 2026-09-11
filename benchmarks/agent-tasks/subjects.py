@@ -141,6 +141,43 @@ MCP_TOOL = "mcp__mushroomdb"
 CELL_TIMEOUT_S = 900
 DEFAULT_MAX_TURNS = 30
 
+# What differs between the code suite (0.6.2 §1) and the association suite
+# (0.6.3 §1): where the tasks come from, which arms run, which arm everything
+# is measured against, which gate variant applies, which arms that gate is
+# about, and what the pilot means. Everything else — cells, metrics, summary —
+# is shared.
+#
+# It lives here rather than in `run.py` because `report.py` needs a suite's
+# gate variant to render the legs, and `run.py` imports `report.py`.
+SUITES: dict[str, dict] = {
+    "code": {
+        "tasks": HERE / "tasks.json",
+        "arms": ["A", "B", "C", "D"],
+        "baseline": "A",
+        "gate": {"cost_ci": False, "adoption_gate": True},
+        # Every arm but A carries the graph, so every arm but A is gated.
+        "graph_arms": None,
+        "pilot_floor": 6,
+        "pilot_arm": "A",
+        "turns_field": "min_stock_turns",
+    },
+    "association": {
+        "tasks": HERE / "association" / "tasks.json",
+        "arms": ["P", "Q", "R"],
+        "baseline": "Q",
+        # §1 as amended 2026-09-11: the SQLite pilot scored 1.00 on all twenty
+        # tasks, so correctness is saturated and cost is the discriminator. A
+        # tie on score passes; the cost difference is what must be real.
+        "gate": {"cost_ci": True, "adoption_gate": False},
+        # P is the second baseline, not a contender: a verdict of "passed,
+        # best arm P" would read as a pass for a run in which files won.
+        "graph_arms": ["R"],
+        "pilot_floor": 5,
+        "pilot_arm": "Q",
+        "turns_field": "min_baseline_turns",
+    },
+}
+
 
 def sh(cmd: list[str], cwd: Path | None = None, timeout: int = 900) -> str:
     p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
@@ -279,9 +316,23 @@ def build_association_world(force: bool = False) -> Path:
     where = form_paths(ASSOC_BUILD)
     if force:
         shutil.rmtree(ASSOC_BUILD, ignore_errors=True)
-    if all(where[f].exists() for f in ("files", "sqlite", "graph")):
+    # What each form must actually contain. Three empty directories — a build
+    # that was interrupted, or one whose store was deleted by hand — are not a
+    # built world, and skipping on the directories alone would hand a run three
+    # subjects with no data in them.
+    built = {
+        "files": where["files"] / "entities",
+        "sqlite": where["sqlite_db"],
+        "graph": where["graph"] / ASSOC_STORE_NAME,
+    }
+    missing = sorted(str(p) for p in built.values() if not p.exists())
+    if not missing:
         print(f"association world already built at {ASSOC_BUILD}; keeping it")
         return ASSOC_BUILD
+    if ASSOC_BUILD.exists():
+        print(f"association world at {ASSOC_BUILD} is incomplete "
+              f"({len(missing)} missing: {missing[0]}...); rebuilding")
+        shutil.rmtree(ASSOC_BUILD, ignore_errors=True)
     print(f"building the association world -> {ASSOC_BUILD} (5-6 minutes)")
     sh([sys.executable, str(HERE / "association" / "build.py"),
         "--seed", str(ASSOC_SEED), "--scale", str(ASSOC_SCALE),
@@ -513,11 +564,20 @@ def make_cell_copy(subject: Path, dest: Path) -> Path:
     `symlinks=False` on purpose: a link out of the tree would let one cell's
     writes reach the subject the next cell is copied from — and so would the
     install's absolute paths, which `repoint_install` moves onto the copy.
+
+    A copy that carries an install must have had something repointed. A silent
+    zero there is the failure worth dying on: the cell would run against the
+    subject's store while every record of the run said it was isolated.
     """
     shutil.rmtree(dest, ignore_errors=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(subject, dest, symlinks=False)
-    repoint_install(dest, subject)
+    changed = repoint_install(dest, subject)
+    if (dest / ".mcp.json").exists() and changed < 1:
+        raise SystemExit(
+            f"{dest}: copied an install but repointed nothing — its "
+            f".mcp.json and hooks would still name {Path(subject).resolve()}, "
+            f"so this cell would run against the subject's store")
     return dest
 
 
