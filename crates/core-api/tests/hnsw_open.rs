@@ -396,3 +396,43 @@ fn query_results_identical_across_snapshot_and_reopen() {
         "derived edge set must be identical across snapshot + reopen"
     );
 }
+
+/// Clean open, **before any mutation**: the first approximate query must be
+/// answered by the persisted graph, not by the brute-force fallback.
+///
+/// This is the `ensure_hnsw_loaded` path (`engine.rs`), which decodes the
+/// retained blobs on the read side under a shared lock. It is separate from
+/// `ensure_indexes_populated`, and a decode failure there is silent: the
+/// results are still correct — brute force gets the same answer — so only a
+/// counter can tell the two apart. 0.6.6's versioned blob broke exactly this
+/// site by leaving it on a bare `bincode::deserialize::<HnswIndex>`.
+#[test]
+fn clean_open_first_query_is_served_by_the_index() {
+    let dir = tmp("hnsw-open-lazy");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+    }
+
+    let db = GraphDb::open(&dir).unwrap();
+    core_rules::hnsw_search_count_reset();
+    let hits = db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 2, 0.0);
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "the first query on a clean open fell back to a full scan: the retained \
+         HNSW blob did not decode"
+    );
+    assert!(
+        hits.iter().any(|(k, _)| k == "d0"),
+        "persisted HNSW must still find d0; got {hits:?}"
+    );
+
+    // Same for the cross-label entry point used by hybrid search.
+    core_rules::hnsw_search_count_reset();
+    let any = db.find_similar_vector("emb", None, &[1.0, 0.0], 2, 0.0);
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "the label-less query fell back to a full scan"
+    );
+    assert!(any.iter().any(|(k, _)| k == "d0"), "got {any:?}");
+}

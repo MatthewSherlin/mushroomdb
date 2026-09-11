@@ -11,6 +11,27 @@ use core_storage::v8::encode::{decode_ivf_bytes, decode_provenance_bytes};
 use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::{EdgeProps, IdMap, Interner, Topology, Value};
 
+/// Decode one side's retained HNSW blob for the lazy clean-open read path.
+///
+/// Empty means "this side had no graph"; a decode failure is reported once on
+/// stderr, because the consequence — every ANN query on this store running
+/// brute force until the first write — is otherwise invisible.
+fn lazy_decode(rule: &str, side: &str, blob: &[u8]) -> Option<HnswIndex> {
+    if blob.is_empty() {
+        return None;
+    }
+    match crate::hnsw::decode_hnsw_blob(blob) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!(
+                "[mushroomdb] rule {rule:?}: persisted {side}-side HNSW index failed to load \
+                 ({e}); approximate queries fall back to a full scan until the next write"
+            );
+            None
+        }
+    }
+}
+
 /// Decode raw IVF section bytes into the `RuleIvfExport` format consumed by
 /// `reindex_all_load_state`.  Returns an empty map when `bytes` is empty.
 fn decode_ivf_bytes_to_export(bytes: &[u8]) -> BTreeMap<String, RuleIvfExport> {
@@ -2369,16 +2390,14 @@ impl RuleEngine {
             snapshot
                 .into_iter()
                 .map(|(name, sb, db)| {
-                    let src = if !sb.is_empty() {
-                        bincode::deserialize::<HnswIndex>(&sb).ok()
-                    } else {
-                        None
-                    };
-                    let dst = if !db.is_empty() {
-                        bincode::deserialize::<HnswIndex>(&db).ok()
-                    } else {
-                        None
-                    };
+                    // Must go through `decode_hnsw_blob`, not a bare bincode
+                    // decode: the persisted bytes are the versioned `MHNS`
+                    // wrapper, and a 0.6.5 store's bytes are the old id-keyed
+                    // shape.  Getting this wrong is silent — `lazy_hnsw` stays
+                    // empty and every ANN query on a clean-open store falls
+                    // back to brute force until the first write.
+                    let src = lazy_decode(&name, "src", &sb);
+                    let dst = lazy_decode(&name, "dst", &db);
                     (name, (src, dst))
                 })
                 .collect()
@@ -2534,31 +2553,27 @@ impl RuleEngine {
             if !predicate_covers_field(&def.predicate, field) {
                 continue;
             }
-            let hits: Option<Vec<(u32, f64)>> = if let Some(idx) = self.indexes.get(name) {
-                if let Some(h) = idx.dst_side.hnsw_ref() {
-                    if !h.is_empty() {
-                        found_index = true;
-                        Some(h.search(q, k))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else if let Some(lazy) = self.lazy_hnsw.get() {
-                if let Some((_, Some(h))) = lazy.get(name) {
-                    if !h.is_empty() {
-                        found_index = true;
-                        Some(h.search(q, k))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            // Live index first, then the lazily-decoded blobs — as a *fallback*,
+            // not an alternative. `self.indexes` holds an entry for every rule
+            // from `from_persist` onwards, so an `else if` here would mean a
+            // clean-open handle never reached `lazy_hnsw` at all and answered
+            // every label-less query by brute force. `hnsw_search_dst` has
+            // always chained these correctly; this arm had not.
+            let live = self
+                .indexes
+                .get(name)
+                .and_then(|idx| idx.dst_side.hnsw_ref())
+                .filter(|h| !h.is_empty());
+            let lazy = self
+                .lazy_hnsw
+                .get()
+                .and_then(|l| l.get(name))
+                .and_then(|(_, dst)| dst.as_ref())
+                .filter(|h| !h.is_empty());
+            let hits: Option<Vec<(u32, f64)>> = live.or(lazy).map(|h| {
+                found_index = true;
+                h.search(q, k)
+            });
 
             if let Some(hits) = hits {
                 for (id, score) in hits {

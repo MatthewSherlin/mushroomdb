@@ -58,9 +58,12 @@ pub const EF_SEARCH: usize = 400;
 thread_local! {
     static HNSW_INSERT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static HNSW_REMOVE_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static HNSW_SEARCH_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Count one `HnswIndex::insert` call. Compiles away without `test-hooks`.
+/// Count one vector actually indexed. Called *after* the zero-vector early
+/// return, so the count is "vectors the graph took", not "calls made".
+/// Compiles away without `test-hooks`.
 #[inline]
 fn note_insert() {
     #[cfg(any(test, feature = "test-hooks"))]
@@ -77,29 +80,55 @@ fn note_remove_scanned(n: usize) {
     let _ = n;
 }
 
+/// Count one query answered by the graph itself (past the empty-index guards).
+#[inline]
+fn note_search() {
+    #[cfg(any(test, feature = "test-hooks"))]
+    HNSW_SEARCH_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+}
+
 /// Nodes whose adjacency lists `HnswIndex::remove` has touched on this thread
 /// since the last reset.
+#[doc(hidden)]
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn hnsw_remove_scanned() -> u64 {
     HNSW_REMOVE_SCANNED.with(|c| c.get())
 }
 
 /// Reset this thread's removal-scan counter to zero.
+#[doc(hidden)]
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn hnsw_remove_scanned_reset() {
     HNSW_REMOVE_SCANNED.with(|c| c.set(0));
 }
 
-/// Vectors inserted into any `HnswIndex` on this thread since the last reset.
+/// Vectors indexed by any `HnswIndex` on this thread since the last reset.
+#[doc(hidden)]
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn hnsw_insert_count() -> u64 {
     HNSW_INSERT_COUNT.with(|c| c.get())
 }
 
-/// Reset this thread's `HnswIndex::insert` counter to zero.
+/// Reset this thread's indexed-vector counter to zero.
+#[doc(hidden)]
 #[cfg(any(test, feature = "test-hooks"))]
 pub fn hnsw_insert_count_reset() {
     HNSW_INSERT_COUNT.with(|c| c.set(0));
+}
+
+/// Queries answered by an `HnswIndex` graph on this thread since the last
+/// reset. Zero means every approximate query fell back to a full scan.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_search_count() -> u64 {
+    HNSW_SEARCH_COUNT.with(|c| c.get())
+}
+
+/// Reset this thread's graph-query counter to zero.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_search_count_reset() {
+    HNSW_SEARCH_COUNT.with(|c| c.set(0));
 }
 
 // ---------------------------------------------------------------------------
@@ -516,10 +545,10 @@ impl HnswIndex {
     /// Zero vectors are silently skipped (cosine is undefined for them).
     /// If `id` already exists it is replaced (remove + re-insert semantics).
     pub fn insert(&mut self, id: u32, v: &[f64]) {
-        note_insert();
         let Some(unit) = l2_normalize(v) else {
-            return; // zero vector — skip
+            return; // zero vector — skip, and do not count it as indexed
         };
+        note_insert();
 
         // Remove existing entry if any (handles update = remove + re-insert).
         if self.slot_of.contains_key(&id) {
@@ -696,13 +725,16 @@ impl HnswIndex {
         let Some(unit_q) = l2_normalize(q) else {
             return vec![];
         };
-        let Some(ep) = self.entry_point else {
+        let Some(ep) = self.entry_point.filter(|&s| Self::is_live(&self.id_of, s)) else {
+            // No entry point, or one left dangling by a bug: answer nothing
+            // rather than walk from a freed slot and hand back a `u32::MAX` id.
             return vec![];
         };
         if k == 0 {
             return vec![];
         }
 
+        note_search();
         let ef = k.max(EF_SEARCH);
         let mut curr_ep = ep;
 
@@ -1103,6 +1135,91 @@ mod tests {
                 "removed id {i} is still reachable through the graph"
             );
         }
+    }
+
+    /// Removing the entry point — the node that owns the top layer — must
+    /// re-elect a live one and leave the graph searchable. A dangling entry
+    /// point would either panic in `dist_to` or hand back a freed slot's id.
+    #[test]
+    fn removing_the_entry_point_re_elects_and_still_searches() {
+        let vecs = make_unit_vecs(300, 16, 0xE47E_9001);
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"ep-churn"));
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert(i as u32, v);
+        }
+
+        // Peel off the entry point repeatedly: each removal must re-elect the
+        // highest-level node still present, and the top layer eventually
+        // collapses onto a lower one.
+        let mut seen_levels = Vec::new();
+        for _ in 0..12 {
+            let ep_slot = idx
+                .entry_point
+                .expect("a non-empty index has an entry point");
+            let ep_id = idx.id_of[ep_slot as usize];
+            assert_ne!(ep_id, DEAD, "the entry point must name a live node");
+            seen_levels.push(idx.max_level);
+
+            idx.remove(ep_id);
+
+            let new_ep = idx.entry_point.expect("re-election must find a live node");
+            assert!(
+                HnswIndex::is_live(&idx.id_of, new_ep),
+                "the re-elected entry point is a freed slot"
+            );
+            assert_ne!(new_ep, ep_slot, "the removed slot is still the entry point");
+            assert_eq!(
+                idx.max_level, idx.slots[new_ep as usize].level,
+                "max_level must follow the re-elected entry point"
+            );
+            let highest = idx
+                .slot_of
+                .values()
+                .map(|&s| idx.slots[s as usize].level)
+                .max()
+                .unwrap();
+            assert_eq!(
+                idx.max_level, highest,
+                "the entry point must be a highest-level node"
+            );
+            assert!(
+                !idx.node_ids().contains(&ep_id),
+                "the old entry point lingers"
+            );
+
+            // The graph still answers, and never with a removed id.
+            let hits = idx.search(&vecs[200], 5);
+            assert!(
+                !hits.is_empty(),
+                "the graph stopped answering after re-election"
+            );
+            for (id, _) in &hits {
+                assert!(
+                    idx.node_ids().contains(id),
+                    "search returned {id}, which is not in the index"
+                );
+            }
+            for &id in idx.node_ids().iter() {
+                assert_eq!(
+                    idx.back_refs_for_test(id),
+                    idx.scan_back_refs_for_test(id),
+                    "back_refs[{id}] disagrees with a full scan after an entry-point removal"
+                );
+            }
+        }
+        assert!(
+            seen_levels.iter().any(|&l| l > 0),
+            "the fixture never had a multi-layer entry point, so this proved nothing"
+        );
+
+        // Drain it entirely: the last removal must clear the entry point.
+        for id in idx.node_ids() {
+            idx.remove(id);
+        }
+        assert!(idx.is_empty());
+        assert_eq!(idx.entry_point, None);
+        assert_eq!(idx.max_level, 0);
+        assert!(idx.search(&vecs[0], 5).is_empty());
     }
 
     /// A removal must not touch every node in the index. Asserted on the

@@ -12,9 +12,11 @@ pub use engine::{
     EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport, MAX_CHAIN_DEPTH,
 };
 pub use hnsw::HnswIndex;
+#[doc(hidden)]
 #[cfg(any(test, feature = "test-hooks"))]
 pub use hnsw::{
     hnsw_insert_count, hnsw_insert_count_reset, hnsw_remove_scanned, hnsw_remove_scanned_reset,
+    hnsw_search_count, hnsw_search_count_reset,
 };
 pub use index::{
     candidate_spec, with_ivf_drift_rebuild, CandidateSpec, RuleIndex, SideIndex, IVF_DRIFT_REBUILD,

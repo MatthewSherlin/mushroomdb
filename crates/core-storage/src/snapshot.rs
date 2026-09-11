@@ -85,7 +85,10 @@ pub struct SnapshotState {
     #[serde(skip)]
     pub wal_truncated: bool,
     /// Per-approximate-rule HNSW graph blobs: rule name → `(src_blob, dst_blob)`.
-    /// Each blob is an opaque bincoded `HnswIndex`.  Serialized in the V7 meta
+    /// Each blob is opaque to this crate and carries its own magic and version
+    /// (`MHNS`, v2 as of 0.6.6; a 0.6.5 store's blobs are a bare bincoded
+    /// `HnswIndex` and are read as v1).  Nothing here parses them, which is why
+    /// the blob format can change without a snapshot format bump.  Serialized in the V7 meta
     /// section only; V5/V6 payloads never carried it — skipped here so their
     /// bincode wire shape is frozen (missing → default empty map).
     #[serde(skip)]

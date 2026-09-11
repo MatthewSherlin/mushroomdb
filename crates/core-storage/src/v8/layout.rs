@@ -163,16 +163,22 @@ pub struct EdgePropsData {
 // HNSW (section 6)
 // ---------------------------------------------------------------------------
 
-/// Blob-per-rule HNSW storage.  Each entry holds the bincoded `HnswIndex`
-/// for src and dst sides of one rule.  Stored as opaque bytes so core-storage
-/// remains independent of core-rules; zero-copy blob slicing avoids loading
-/// unused rules.
+/// Blob-per-rule HNSW storage.  Each entry holds one rule's persisted graph for
+/// the src and dst sides.  Stored as **opaque** bytes so core-storage remains
+/// independent of core-rules; zero-copy blob slicing avoids loading unused
+/// rules.
+///
+/// The blobs are self-describing: since 0.6.6 each carries its own magic
+/// (`MHNS`) and version, and core-rules' decoder also accepts a 0.6.5 store's
+/// bare bincoded index as version 1.  Because this section never parses them,
+/// the blob format evolves without a snapshot format bump — and a reader that
+/// does not recognise a blob ignores it and falls back to a full scan.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct HnswRuleEntry {
     pub name: String,
-    /// bincoded `HnswIndex` for the source side.
+    /// Opaque versioned HNSW blob for the source side.
     pub src_blob: Vec<u8>,
-    /// bincoded `HnswIndex` for the destination side.
+    /// Opaque versioned HNSW blob for the destination side.
     pub dst_blob: Vec<u8>,
 }
 

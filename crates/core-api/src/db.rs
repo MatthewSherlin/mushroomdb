@@ -7764,7 +7764,13 @@ impl<F: Fs> GraphDb<F> {
         min: f64,
     ) -> Vec<(String, f64)> {
         // Ensure any HNSW blobs retained from the snapshot are deserialized
-        // before the first ANN query on a clean-open (no-WAL) path.
+        // before the first ANN query on a clean-open (no-WAL) path.  The
+        // section read has to come first: on a clean open nothing else has
+        // called it, so without it `retained_hnsw_blobs` is empty,
+        // `ensure_hnsw_loaded` caches an empty map in its `OnceLock`, and every
+        // approximate query on the handle runs brute force — correct results,
+        // silently off the index.  Both calls are idempotent and cheap once hot.
+        self.ensure_v8_base_sections_loaded();
         self.engine.ensure_hnsw_loaded();
         // L2-normalise query for cosine via dot product.
         let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -7858,6 +7864,8 @@ impl<F: Fs> GraphDb<F> {
         min: f64,
         mask: &crate::mask::NodeMask,
     ) -> Vec<(String, f64)> {
+        // Section read before the blob decode — see `find_similar_vector`.
+        self.ensure_v8_base_sections_loaded();
         self.engine.ensure_hnsw_loaded();
         let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
         if norm == 0.0 {
