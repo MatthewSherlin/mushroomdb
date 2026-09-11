@@ -1099,6 +1099,46 @@ fn render_edges_at(key: &str, at: u64, total: usize, groups: &[EdgeAtGroup]) -> 
     repograph::cap_lines(&out, MAX_EDGE_LINES)
 }
 
+/// The node's canonical current key, recovered from `edges` — every one of
+/// them already reported by [`GraphDb::edges_at`] under the name the node
+/// carries today, even when the caller queried by an old alias of a renamed
+/// node (see `edges_at_reports_a_renamed_nodes_edges_under_the_current_key`
+/// in `crates/core-api/tests/edges_at.rs`). A stale `key` therefore never
+/// appears as one of its own edges' endpoints: comparing it directly against
+/// `src_key`/`dst_key` (as this tool used to) inverts every arrow and swaps
+/// the node for its partner.
+///
+/// There is no public accessor for the canonicalization `edges_at` does
+/// internally, so this recovers it from the data instead: the one endpoint
+/// every returned edge has in common is the node itself, found by
+/// intersecting each edge's `{src_key, dst_key}` (a self-loop contributes
+/// just the one key). A single edge to a single partner has nothing to
+/// triangulate from — the two endpoints are symmetric from the outside — so
+/// `key` is kept as-is in that case, and whenever there are no edges at all
+/// (an unrecognized key and a recognized one with nothing at `at` look
+/// identical here, matching `edges_at`'s own "unknown key is not an error"
+/// contract).
+fn canonical_self(edges: &[core_api::EdgeAt], key: &str) -> String {
+    let mut candidates: Option<BTreeSet<&str>> = None;
+    for e in edges {
+        let this_edge: BTreeSet<&str> = if e.src_key == e.dst_key {
+            std::iter::once(e.src_key.as_str()).collect()
+        } else {
+            [e.src_key.as_str(), e.dst_key.as_str()]
+                .into_iter()
+                .collect()
+        };
+        candidates = Some(match candidates {
+            None => this_edge,
+            Some(prev) => prev.intersection(&this_edge).copied().collect(),
+        });
+    }
+    match candidates {
+        Some(c) if c.len() == 1 => c.into_iter().next().unwrap().to_string(),
+        _ => key.to_string(),
+    }
+}
+
 fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let key = match str_arg(args, "key") {
         Ok(k) => k,
@@ -1123,14 +1163,15 @@ fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             Err(e) => return CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
         }
     };
+    let self_key = canonical_self(&edges, key);
     let report = json!({
-        "key": key,
+        "key": self_key,
         "at": at,
         "edges": edges.iter().map(edge_at_json).collect::<Vec<_>>(),
     });
-    let (total, groups) = edges_at_groups(edges, key, limit);
+    let (total, groups) = edges_at_groups(edges, &self_key, limit);
     ok(json_out, &report, |_| {
-        render_edges_at(key, at, total, &groups)
+        render_edges_at(&self_key, at, total, &groups)
     })
 }
 
@@ -2016,5 +2057,52 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn edge_at(edge_type: &str, src: &str, dst: &str) -> core_api::EdgeAt {
+        core_api::EdgeAt {
+            edge_type: edge_type.into(),
+            src_key: src.into(),
+            dst_key: dst.into(),
+            derived: false,
+            rule: None,
+        }
+    }
+
+    /// Binding: `canonical_self` recovers the node's identity by intersecting
+    /// the endpoints of every edge it appears in — the fix for `edges_at`
+    /// comparing a stale alias against the engine's already-canonicalized
+    /// endpoints (which would otherwise invert every arrow and report the
+    /// node as its own partner).
+    #[test]
+    fn canonical_self_intersects_endpoints_across_edges() {
+        // Two edges to two different partners narrow to exactly one shared
+        // endpoint: the node itself, even though `key` ("old") never appears
+        // in either edge — this is what querying `edges_at` by a stale alias
+        // of a renamed node looks like once the engine has canonicalized the
+        // output to the current key ("new").
+        let edges = vec![edge_at("Knows", "new", "p1"), edge_at("Knows", "p2", "new")];
+        assert_eq!(canonical_self(&edges, "old"), "new");
+
+        // A single edge to a single partner is symmetric — there is nothing
+        // to triangulate from — so the raw key is kept rather than guessed.
+        let one_edge = vec![edge_at("Knows", "new", "p1")];
+        assert_eq!(canonical_self(&one_edge, "old"), "old");
+
+        // The common, non-renamed case: `key` already appears in the edges,
+        // so it is returned unchanged even when candidates cannot narrow to
+        // one (self-loop aside, this is the fallback path's every-day case).
+        let unrenamed = vec![edge_at("Knows", "a", "b")];
+        assert_eq!(canonical_self(&unrenamed, "a"), "a");
+
+        // No edges at all: nothing to recover from, `key` is kept as-is.
+        assert_eq!(canonical_self(&[], "whatever"), "whatever");
+
+        // A self-loop contributes just the one key to the candidate set.
+        let self_loop = vec![
+            edge_at("Knows", "new", "new"),
+            edge_at("Likes", "new", "p1"),
+        ];
+        assert_eq!(canonical_self(&self_loop, "old"), "new");
     }
 }

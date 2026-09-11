@@ -1809,6 +1809,134 @@ fn edges_at_answers_from_the_engine_at_a_past_commit() {
     assert!(msg.contains(&total.to_string()), "{msg}");
 }
 
+/// Binding: after a rename, `edges_at` queried by the node's *current* key
+/// still shows edges written under its old name — with both sides
+/// canonicalized to the current key. That canonicalization is exactly why
+/// comparing a caller's `key` directly against a returned `src_key`/`dst_key`
+/// is unsafe in general: the endpoint that used to equal `key` no longer
+/// does, once `key` itself is stale. Two edges to two different partners so
+/// there is something to triangulate self from (`canonical_self`'s own unit
+/// test in `mcp_tasks.rs` covers the intersection logic directly, including
+/// the single-edge case, which is symmetric and cannot be resolved from the
+/// edges alone).
+///
+/// Querying by the *old*, now-stale key is checked too — verified against
+/// the real engine rather than assumed: `insert_edge`/`insert_node` are
+/// rewritten to id-keyed WAL records (`rewrite_wal_dense`), and `edges_at`'s
+/// id-keyed match arm compares directly against the live key with no
+/// alias-walk in that direction, so today it answers with zero edges rather
+/// than the wrong direction or partner. The assertion here is that it stays
+/// that way — empty, not corrupted data — which is what would regress if a
+/// future engine change made that direction resolve to *something* without
+/// this tool's endpoint comparison being alias-safe.
+#[test]
+fn edges_at_after_a_rename_is_correct_by_current_key_and_empty_by_the_old_one() {
+    let db = open("edges-at-alias");
+    {
+        let mut w = db.write();
+        w.insert_node("Person", "old", vec![]).unwrap();
+        w.insert_node("Person", "p1", vec![]).unwrap();
+        w.insert_node("Person", "p2", vec![]).unwrap();
+        w.insert_edge("Knows", "old", "p1").unwrap();
+        w.insert_edge("Knows", "p2", "old").unwrap();
+    }
+    db.write().rename_node("old", "new").unwrap();
+    let at = db.read().wal_total_commits().unwrap() - 1;
+
+    // Queried by the current key: both edges, written under the old name,
+    // show up with the right direction and partner.
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "edges_at",
+        json!({"key": "new", "at": at}),
+    ));
+    assert!(
+        text.starts_with(&format!(
+            "mushroomdb edges_at — new as of commit {at}: 2 edge(s)"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("→ p1"), "{text}");
+    assert!(text.contains("← p2"), "{text}");
+    assert!(
+        !text.contains("→ new") && !text.contains("← new"),
+        "the node must not be reported as its own partner: {text}"
+    );
+
+    let report = task_report(db.clone(), "edges_at", json!({"key": "new", "at": at}));
+    assert_eq!(report["key"], json!("new"));
+    let edges = report["edges"].as_array().expect("edges array");
+    assert_eq!(edges.len(), 2);
+    for e in edges {
+        assert!(
+            e["src"] == json!("new") || e["dst"] == json!("new"),
+            "every edge is incident to the current key: {e}"
+        );
+    }
+
+    // Queried by the stale "old" key: empty — never the two edges shown
+    // under a wrong direction or with the node named as its own partner.
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "edges_at",
+        json!({"key": "old", "at": at}),
+    ));
+    assert!(
+        text.starts_with(&format!(
+            "mushroomdb edges_at — old as of commit {at}: 0 edge(s)"
+        )),
+        "{text}"
+    );
+
+    let report = task_report(db, "edges_at", json!({"key": "old", "at": at}));
+    assert_eq!(report["edges"], json!([]));
+}
+
+/// Binding: `edges_at` caps the edges listed per type at `limit` (default 10)
+/// and counts the rest as "… and N more", the same contract `node_edges` has.
+#[test]
+fn edges_at_caps_each_type_and_counts_what_it_did_not_list() {
+    let db = open("edges-at-limit");
+    {
+        let mut w = db.write();
+        w.insert_node("Person", "hub", vec![]).unwrap();
+        for i in 0..12 {
+            let partner = format!("p{i:02}");
+            w.insert_node("Person", &partner, vec![]).unwrap();
+            w.insert_edge("Knows", "hub", &partner).unwrap();
+        }
+    }
+    let at = db.read().wal_total_commits().unwrap() - 1;
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "edges_at",
+        json!({"key": "hub", "at": at}),
+    ));
+    assert!(
+        text.starts_with(&format!(
+            "mushroomdb edges_at — hub as of commit {at}: 12 edge(s)"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("Knows (12)"), "{text}");
+    assert_eq!(
+        text.matches("→ p").count(),
+        10,
+        "default limit lists 10: {text}"
+    );
+    assert!(text.contains("… and 2 more"), "{text}");
+
+    // A caller-specified limit is honored too.
+    let text = task_reply(&one_task_call(
+        db,
+        "edges_at",
+        json!({"key": "hub", "at": at, "limit": 3}),
+    ));
+    assert_eq!(text.matches("→ p").count(), 3, "{text}");
+    assert!(text.contains("… and 9 more"), "{text}");
+}
+
 // ── what_if ──────────────────────────────────────────────────────────────────
 
 /// A memory store on a known directory, holding two `Org`s, one `Person` at
@@ -1974,6 +2102,47 @@ fn what_if_refuses_an_unknown_key_and_an_unsupported_value() {
     );
     let text = task_reply(&reply);
     assert!(text.contains("would gain 1"), "{text}");
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Binding: a list-valued `value` — not just a scalar — is accepted, and the
+/// reply is well-formed on both the text and `json: true` paths.
+#[test]
+fn what_if_accepts_a_list_valued_change() {
+    let (db, dir) = what_if_store("what-if-list-value");
+
+    let reply = what_if_call(
+        db.clone(),
+        &dir,
+        json!({"key": "p1", "field": "specialties", "value": ["a", "b"]}),
+    );
+    let text = task_reply(&reply);
+    assert!(
+        text.starts_with(
+            "mushroomdb what_if — p1.specialties = [\"a\",\"b\"]: would lose 0, would gain 0"
+        ),
+        "{text}"
+    );
+    assert_eq!(text.matches("  none\n").count(), 2, "{text}");
+
+    let reply = what_if_call(
+        db.clone(),
+        &dir,
+        json!({"key": "p1", "field": "specialties", "value": ["a", "b"], "json": true}),
+    );
+    let report: Js = serde_json::from_str(
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
+    assert_eq!(report["key"], json!("p1"));
+    assert_eq!(report["field"], json!("specialties"));
+    assert_eq!(report["value"], json!(["a", "b"]));
+    assert_eq!(report["lost"], json!([]));
+    assert_eq!(report["gained"], json!([]));
 
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
