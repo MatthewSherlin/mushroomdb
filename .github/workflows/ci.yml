@@ -269,6 +269,9 @@ jobs:
             --expect-tools query,explain_association,neighborhood,node_info,node_edges,was_linked,edges_at,what_if,node_history,edge_history,find_similar,hybrid_search,remember,recall,stats
         working-directory: scripts/mcp-handshake
 
+  # DEPRECATED DOOR, STILL GATED. The code graph is deprecated in 0.6.4 and removed in 0.7;
+  # this job keeps running until then, because a deprecated feature that still ships is a
+  # feature that still has to work.
   # The v0.6 code-graph acceptance run: ingest, map, determinism, freshness,
   # the recall nudge, a 20-writer concurrency stress against a live MCP server,
   # and timings — all driven through the shipped binary on a real checkout
@@ -317,3 +320,7 @@ jobs:
       - run: npm i -g @anthropic-ai/claude-code@2
       - run: claude plugin validate packaging/plugin --strict
       - run: bash scripts/render-plugin.sh --check
+      # The v0.6.4 claim scrub: no "faster coding" / "fewer tokens" claim in a
+      # product-facing file, and no skill telling an agent to call the graph
+      # ahead of a search. See scripts/check-claims.sh for why.
+      - run: bash scripts/check-claims.sh

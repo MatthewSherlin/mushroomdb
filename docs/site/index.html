@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>mushroomdb — the graph that stays true</title>
-<meta name="description" content="An embedded Rust graph database where edges are a schema declaration: write a rule once, and every write creates, maintains, and retracts the matching edges." />
+<meta name="description" content="The data layer for agents that reason over entities: an embedded Rust graph database in which a relationship is a schema declaration — write a rule once, and every write derives, maintains and retracts the matching edges." />
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
 <style>
   :root {
@@ -47,7 +47,15 @@
   }
   .tagline { font-size: 21px; line-height: 1.35; margin: 0 auto 14px; max-width: 34ch; font-weight: 600; }
   .lede { color: var(--muted); margin: 0 auto 18px; max-width: 60ch; }
-  .alpha { color: var(--muted); font-size: 14px; font-style: italic; margin: 0 0 26px; }
+  .alpha { color: var(--muted); font-size: 14px; font-style: italic; margin: 0 0 18px; }
+  .notice {
+    color: var(--muted); font-size: 14px; text-align: left;
+    max-width: 60ch; margin: 0 auto 26px;
+    background: var(--panel); border: 1px solid var(--line);
+    border-left: 3px solid var(--accent); border-radius: 8px; padding: 12px 14px;
+  }
+  .notice strong { color: var(--ink); }
+  .notice code { font-size: 13px; }
 
   pre, code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
   pre {
@@ -90,14 +98,24 @@
     <h1>mushroomdb</h1>
     <p class="tagline">The graph that stays true — and knows who's allowed to see it.</p>
     <p class="lede">
-      An embedded Rust graph database where edges are a schema declaration: write a rule once, and
-      every write creates, maintains, and retracts the matching edges. Ships a 16-tool MCP server.
+      mushroomdb is the data layer for agents that reason over entities. It is an embedded Rust
+      graph database in which a relationship is a schema declaration: write a rule once, and every
+      write derives, maintains and <strong>retracts</strong> the matching edges, each one carrying
+      the rule, the score and the values that produced it.
     </p>
     <p class="alpha">Pre-1.0 alpha — APIs and formats may change between minor versions.</p>
-    <div class="install"><pre><code>npx mushroomdb install</code></pre></div>
-    <p class="install-note">Writes the <code>/mushroom</code> skill, the MCP server entry, and the recall hook for Claude Code or Cursor.</p>
+    <p class="notice">
+      <strong>Deprecated in 0.6.4:</strong> the code-graph door — the <code>explore</code>,
+      <code>map</code>, <code>context</code>, <code>impact</code>, <code>owners</code>,
+      <code>why</code> and <code>sync</code> tools, the three grep/edit hooks, and the plugin's
+      coding-assistant positioning. It still works and is still tested; it is
+      <strong>removed in 0.7</strong>. See
+      <a href="https://github.com/MatthewSherlin/mushroomdb#deprecations">Deprecations</a>.
+    </p>
+    <div class="install"><pre><code>npx mushroomdb install --db ./memory</code></pre></div>
+    <p class="install-note">Writes the <code>/mushroom</code> skill, an MCP server listing the fifteen-tool association surface, and the session hooks, for Claude Code or Cursor.</p>
     <figure>
-      <img src="assets/ingest-git-cascade.gif" alt="Ingesting a repository, querying which files co-change, handing one file to a new owner, and watching the KNOWS edges follow in the same write" />
+      <img src="assets/ingest-git-cascade.gif" alt="A single SET changes one property; the rule fires, new scored edges are derived and the stale ones retracted, inside the same write" />
     </figure>
   </header>
 
@@ -146,8 +164,8 @@
         <h3>What it is</h3>
         <ul>
           <li>An embedded, single-binary graph database with a rule engine that maintains edges for you.</li>
-          <li>A 16-tool MCP server plus a <code>/mushroom</code> skill for Claude Code and Cursor.</li>
-          <li>Local-first: your data stays on disk, no cloud service, no LLM in the write path.</li>
+          <li>A 27-tool MCP server — fifteen listed on an entity store, three on a store built by <code>ingest-git</code> — plus a <code>/mushroom</code> skill for Claude Code and Cursor.</li>
+          <li>Local-first: your data stays on disk, no cloud service, no model call in the write path unless you enable embeddings.</li>
         </ul>
       </div>
       <div class="card">

@@ -346,8 +346,11 @@ Summary:
 
 | Operation | Live WAL commits | Archive commits (intact genesis chain) | Archive commits (pruned/incomplete) |
 |---|---|---|---|
-| `node_history` / `edge_history` / `was_linked` | Always reachable | Always reachable | Always reachable |
-| `open_at` (as-of) | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
+| `node_history` / `edge_history` | Always reachable | Always reachable | Reachable, but pruned events are silently omitted |
+| `was_linked` / `edges_at` | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
+| `open_at` / `query_at` (as-of) | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
+
+`node_history`/`edge_history` take no commit bound and just scan whatever WAL/archives remain, so a pruned commit's events are missing with no error, while `was_linked`, `edges_at`, and `open_at`/`query_at` all check the horizon floor explicitly and refuse instead.
 
 ### Retention and pruning
 
@@ -363,6 +366,20 @@ being persisted first.
 **Effect on as-of:** pruning archives breaks the genesis chain. After any
 prune, `open_at` for pruned-archive commits returns `CommitOutOfRange`. History
 scans are unaffected.
+
+### How far back history reaches
+
+Automatic snapshots (`serve`, git ingest) keep only the newest **8** WAL
+archives by default (`AUTO_SNAPSHOT_RETENTION`, `crates/cli/src/lib.rs`),
+pruning the rest on every run. Below that horizon (`commit <
+wal_horizon_floor`): `was_linked`, `edges_at`, and `open_at`/`query_at` check
+the floor and return `GraphError::CommitOutOfRange`, while `node_history` and
+`edge_history` take no commit bound and just omit the pruned events — no
+error, no notice.
+
+To keep everything, don't rely on the automatic path: take an explicit
+`mushroomdb snapshot <db-dir>` with no `--retention` (keeps every archive),
+or add `--keep-wal` to never truncate the WAL.
 
 ---
 

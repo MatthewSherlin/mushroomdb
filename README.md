@@ -11,93 +11,107 @@
 
 **The graph that stays true — and knows who's allowed to see it.**
 
-An embedded Rust graph database where edges are a schema declaration: write a rule once, and
-every write creates, maintains, and retracts the matching edges. Ships a 24-tool MCP server and
-a live graph of the repository it is pointed at.
+mushroomdb is the data layer for agents that reason over entities. It is an embedded Rust graph
+database in which a relationship is a schema declaration: write a rule once, and every write
+derives, maintains and **retracts** the matching edges, each one carrying the rule, the score and
+the values that produced it. An agent reaches it over MCP — fifteen tools on an entity store — or
+you embed it as a Rust library, a Python module, or a sidecar beside your own service. Four
+questions are what it exists for: **why are these two related** (`explain_association`, answered
+with the evidence rather than an assertion), **what did that look like then** (`edges_at`, the edges
+a node had at any past commit), **what would this change do** (`what_if`, computed without writing
+anything), and **who may see it** (`query` with a `role`, so one graph answers differently per
+caller). Local-first: a directory on disk, no account, no endpoint, no model call in the write path
+unless you enable embeddings.
+
+`ingest-git` stays supported as a **data source**: commits, pull requests, files and authors become
+entities with rule-derived relationships, which is what makes a ticket↔commit link a rule rather
+than a script.
+
+> **Deprecated in 0.6.4:** the code-graph door — the `explore`, `map`, `context`, `impact`,
+> `owners`, `why` and `sync` tools, the three grep/edit hooks, and the plugin's coding-assistant
+> positioning. It still works and is still tested; it is **removed in 0.7**. See
+> [Deprecations](#deprecations).
 
 *Pre-1.0 alpha — APIs and formats may change between minor versions.*
 
 [Docs](docs/site/index.md) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/MatthewSherlin/mushroomdb/issues)
 
-![Ingest this repository, query which files co-change, hand one file to a new owner, and watch the KNOWS edges follow in the same write](docs/assets/ingest-git-cascade.gif)
+![A single SET changes one property; the rule fires, new scored edges are derived and the stale ones retracted, inside the same write](docs/assets/ingest-git-cascade.gif)
 
 ## Quick start
 
-Install the Claude Code plugin, from any directory:
-
 ```sh
-claude marketplace add MatthewSherlin/mushroomdb
-claude plugin install mushroom@mushroomdb
+npx mushroomdb install --db ./memory
 ```
 
-Open the repository you want graphed and type `/mushroom:mushroom`. The skill builds the graph on
-first use and answers with it from then on.
-
-Or install into one project (or your home directory) without the plugin — same skill, invoked
-bare as `/mushroom`:
-
-```sh
-npx mushroomdb install    # /mushroom skill + MCP server + session, prompt, post-edit and git hooks
-```
-
-Either way, the first thing the assistant does is read the repository back to you. This is a real
-run against this repository — `ingest-git` took 2.5 s, `map` 0.18 s:
+One command writes the `/mushroom` skill, an MCP server listing the fifteen-tool association
+surface, and the session hooks. Then a worked flow, four tool calls:
 
 ```text
-mushroomdb map — 431 files, 6,226 symbols, 652 commits, 2 authors · synced 3s ago at 94719fe
-clusters (co-change + imports)
-  1. <mixed> crates, tests  (86 files, cohesion 0.73)  crates/server/tests/http.rs, algo.rs, crates/server/src/http.rs
-  2. <mixed> crates, src  (45 files, cohesion 0.67)  pack.rs, lib.rs, types.rs
-  3. ui src, e2e  (26 files, cohesion 0.89)  api.ts, store.ts, classify.ts
-  4. crates/code-extract tests, fixtures  (21 files, cohesion 0.99)  lib.rs, extract.rs, mod.rs
-  5. ui fonts, public  (18 files, cohesion 0.89)  IBMPlexMono-Medium.woff2, IBMPlexMono-Regular.woff2, IBMPlexSans-Medium.woff2
-  6. crates/core-api src, repograph  (17 files, cohesion 0.72)  facts.rs, render.rs, context.rs
-  7. <mixed> crates, bindings  (16 files, cohesion 0.99)  crates/core-bench/Cargo.toml, package.json, crates/sim-harness/Cargo.toml
-  8. benchmarks adapters, results  (15 files, cohesion 1.00)  run_handrolled.py, datasets.py, handrolled.py
-key files (most depended-on)
-  crates/code-extract/src/lib.rs 0.05 · crates/server/tests/http.rs 0.04 · crates/code-extract/tests/extract.rs 0.04 · crates/core-api/tests/algo.rs 0.04 · crates/server/src/http.rs 0.03
-owners
-  Matthew Sherlin 431 files
-hot (last 90 days)
-  crates/core-api/src/db.rs 175 · README.md 109 · crates/core-rules/src/engine.rs 56 · crates/core-query/src/cypher/exec.rs 54 · crates/cli/src/lib.rs 51
-ask me: why does lib.rs co-change with extract.rs? · who owns ui? · what imports http.rs?
+upsert_entity  →  create_rule  →  find_similar  →  explain_association
+  (store)           (link)           (recall)          (explain)
 ```
 
-From there: `context` for one file or symbol from every side, `impact` before an edit, `owners`,
-`why` with the commits that prove a link, `recall` and `remember` for durable notes.
-Full walkthrough: [`docs/site/code-graph.md`](docs/site/code-graph.md).
+Full tool reference: [`docs/site/mcp.md`](docs/site/mcp.md).
 
-- **Live, not a snapshot.** One `SET f.top_author_id = …` moves the `TOP_AUTHOR` edge *and*
-  re-derives that author's `KNOWS` edges before the write closes — the `SET` in the GIF above is
-  that one write. An editor hook does the same for your code: `touch` re-extracts an edited file
-  after every `Edit`, `Write` and `MultiEdit`, in about 180 ms on this repository's graph.
-- **Retracts instead of going stale.** Re-run `ingest-git` to sync: only new commits replay,
-  deleted files drop their derived edges, and renamed files carry their history to the new path.
-- **Explains any link.** `explain` names the rule and the score behind an edge, so *"which files
-  change together with `src/api.rs`, and why?"* has an answer your assistant can quote instead of
-  a guess.
-- **Knows who's allowed to see it.** Pass a `mask` with a query and the same graph answers
-  differently per caller; write statements are rejected on masked queries.
-- **Answers what it said last week.** `mushroomdb asof ./db --commit 5 --query "…"` replays the
-  WAL to a past commit, derived edges included.
+- **Live, not a snapshot.** One `SET` on a property re-derives the matching edges — added, scored
+  and retracted — before the write closes. The `SET` in the GIF above is that one write.
+- **Retracts instead of going stale.** A property drifting out of a rule's predicate doesn't leave
+  a stale edge behind; the engine retracts it in the same write that caused the drift.
+- **Explains any link.** `explain_association` names the rule, the score, and the values the two
+  entities actually share, so *"why are these two related?"* has an answer your assistant can quote
+  instead of a guess.
+- **Knows who's allowed to see it.** Pass a `role` or a `mask` with a query and the same graph
+  answers differently per caller; write statements are rejected on masked queries.
+- **Answers what it said last week.** `edges_at` returns the edges a node had at a past commit;
+  `mushroomdb asof ./db --commit 5 --query "…"` replays the WAL to that commit, derived edges
+  included.
 
 ## Where it fits
 
 **What it is**
 
 - An embedded, single-binary graph database with a rule engine that maintains edges for you.
-- A 24-tool MCP server plus a `/mushroom` skill and a Claude Code plugin.
+- A 27-tool MCP server — fifteen listed on an entity store, three on a store built by
+  `ingest-git` — plus a `/mushroom` skill and a Claude Code plugin.
 - Safe for several processes at once: one writer at a time behind an advisory `LOCK` file, any
   number of readers, and every handle picks up a peer's commits by `refresh()` rather than
   reopening — so a running `serve`, an editor hook, a git hook and a CLI command can share one
   store. [`docs/site/concurrency.md`](docs/site/concurrency.md)
-- Local-first: your data stays on disk, no cloud service, no LLM in the write path.
+- Local-first: your data stays on disk, no cloud service, no model call in the write path unless
+  you enable embeddings.
 
 **What it isn't**
 
 - Not a hosted memory service — there is no account, no endpoint, nothing to sign up for.
 - Not a vector database. Vector predicates and HNSW are built in; bring your own embeddings.
 - Not a Postgres replacement. Single writer, no interactive transactions, memory-first storage.
+
+---
+
+## Deprecations
+
+**What "deprecated" means here.** It still works in 0.6.4, it is still tested on every release, and
+nothing is removed. It is no longer promoted — not on this page, not in the skill's task rules, not
+in the plugin's description — its documentation page opens with a notice, and an `install` that
+turns one of the hooks on prints a deprecation line. It is **removed in 0.7**. The migration is
+**nothing to do**, unless you relied on the specific thing named below.
+
+| Deprecated | If you relied on it |
+|---|---|
+| The tools `explore`, `map`, `context`, `impact`, `owners`, `why`, `sync` | Pin `mushroomdb@0.6.x`. Nothing on the entity surface replaces them: they answer from a repository graph, which 0.7 stops shipping tools for. `ingest-git` and `query` keep answering the same facts as Cypher. |
+| The hooks `--intercept-grep`, `--impact-before-edit`, `--enrich-grep` | Re-run `install` without the flag; the hook comes out the way any other manifest entry does. Nothing replaces them. |
+| The plugin's coding-assistant positioning | The plugin is not going away. Its description and skill now lead with entity memory. |
+| Code-suite benchmark runs | `python3 benchmarks/agent-tasks/run.py --suite code` still runs. No further runs are committed; the committed summaries stay as the record. |
+
+**Why, measured.** Across 240 cells — arms stock / installed / invoked / cli × 3 reps × 20 tasks over
+two repositories — the invoked graph arm scored 0.924 against stock's 0.927 (paired difference
+`-0.0035 [-0.0112, 0.0017]`) and cost $0.2713 against $0.2267 (`+0.04463 [+0.01312, +0.07471]`,
+about +20%), and the two installed-but-not-invoked arms made **0 graph calls in 120 sessions**:
+[`results/20260910T000418Z`](benchmarks/agent-tasks/results/20260910T000418Z/summary.md). An agent
+holding `grep` neither needs a graph for those questions nor chooses one. What the engine is for is
+measured separately, on the association suite, and reported under
+[Benchmarks](#benchmarks).
 
 ---
 
@@ -201,17 +215,18 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
-**Fourteen task tools** answer a question in prose in one call. They are what the skill reaches for,
-and what `tools/list` shows first:
+**Fourteen task tools** answer a question in prose in one call. Seven answer on any store; seven
+are the deprecated code door. They are what the skill reaches for, and what `tools/list` shows
+first:
 
 | Tool | Purpose |
 |---|---|
-| `explore` | One tool to find: `context`, `impact`, `history` or `all` for one target in one reply, capped by a token `budget` |
-| `map` | The repository in one screen: size, last sync, clusters, key files, owners, hot files |
-| `context` | One file or symbol from every side: where it is as `path:start-end`, signature, callers, callees, importers, co-change partners, commits, notes. `full` adds the body |
-| `impact` | What changing these files reaches: partners with scores, importers, symbols other files call, owner. Defaults to the working tree's diff |
-| `owners` | Top author and share, who else knows the file, last touch, the split by quarter |
-| `why` | Every rule edge between two nodes with its evidence, or the shortest path when there is none |
+| `explore` | **Deprecated (0.7).** One tool to find: `context`, `impact`, `history` or `all` for one target in one reply, capped by a token `budget` |
+| `map` | **Deprecated (0.7).** The repository in one screen: size, last sync, clusters, key files, owners, hot files |
+| `context` | **Deprecated (0.7).** One file or symbol from every side: where it is as `path:start-end`, signature, callers, callees, importers, co-change partners, commits, notes. `full` adds the body |
+| `impact` | **Deprecated (0.7).** What changing these files reaches: partners with scores, importers, symbols other files call, owner. Defaults to the working tree's diff |
+| `owners` | **Deprecated (0.7).** Top author and share, who else knows the file, last touch, the split by quarter |
+| `why` | **Deprecated (0.7).** Every rule edge between two nodes with its evidence, or the shortest path when there is none |
 | `explain_association` | Why two entities are associated: every rule-derived edge between them, with the rule, the score, the predicate it matched, and the values the two actually share |
 | `node_edges` | Every edge on one node, grouped by edge type, with the rule and score behind each. `all_of: [types]` answers with the partners linked by every one of them, as keys; `edge_type`, `label`, `direction` and `limit` narrow it further |
 | `neighborhood` | At depth 1 the same grouped listing; above 1 the breadth-first `(key, label, depth)` table |
@@ -219,7 +234,7 @@ and what `tools/list` shows first:
 | `what_if` | The derived edges a property change would lose and gain, computed without writing anything. `edge_type` prints both sides as partner keys |
 | `recall` | One pointer per hit — `path:line symbol — first doc line` — for the identifiers in a topic |
 | `remember` | Write a note into the graph and return its key |
-| `sync` | Bring the store up to date: commits since the last sync, then the dirty working tree |
+| `sync` | **Deprecated (0.7).** Bring the store up to date: commits since the last sync, then the dirty working tree |
 
 Each of the fourteen also takes `json: true`, which answers with the raw report instead of
 the rendered digest.
@@ -303,13 +318,13 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb doctor [--project\|--user] [--platform …]` | Verify an install: config entry, npx reachability, store, lock, hooks, git hooks, a real stdio handshake, and duplicate-scope servers. Exit 1 on any `fail` |
 | `mushroomdb ingest-git <dir> <repo> [--exclude <pattern>]... [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]` | Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHANGED`, `KNOWS`, `IMPORTS`, `CALLS` and `MENTIONS` rules. Re-run to sync. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
 | `mushroomdb brief <dir>\|--auto` | The repository's shape from the graph alone — counts, last sync, most central files, most called symbols — capped at 4,000 bytes and byte-stable between runs. Hook body for `SessionStart` |
-| `mushroomdb explore <dir> <target> [--depth context\|impact\|history\|all] [--full]` | One tool to find: `context`, `impact` and `owners` composed behind one depth |
-| `mushroomdb map <dir> [--json]` | The repository in one screen: clusters, key files, owners, hot files, and three questions worth asking |
-| `mushroomdb context <dir> <target> [--full]` | One file or symbol from every side. `<target>` is a path, a symbol key, or a bare symbol name. The body is quoted only with `--full` |
-| `mushroomdb impact <dir> <file>...` | What changing these files reaches: co-change partners, importers, and the symbols other files call |
-| `mushroomdb owners <dir> <path>` | Top author and share, who else knows it, last touch, the last four quarters |
-| `mushroomdb why <dir> <a> <b>` | Every rule edge between two nodes with its evidence, or the shortest path between them |
-| `mushroomdb sync <dir>\|--auto [--json]` | Re-sync the repository the store was built from: new commits, then the working tree where it differs from `HEAD`. Takes no repo argument — reads it off the graph. `--json` prints the counts as one object. The git hooks `install` writes use `--auto`, so each worktree syncs its own store |
+| `mushroomdb explore <dir> <target> [--depth context\|impact\|history\|all] [--full]` | **Deprecated (0.7).** One tool to find: `context`, `impact` and `owners` composed behind one depth |
+| `mushroomdb map <dir> [--json]` | **Deprecated (0.7).** The repository in one screen: clusters, key files, owners, hot files, and three questions worth asking |
+| `mushroomdb context <dir> <target> [--full]` | **Deprecated (0.7).** One file or symbol from every side. `<target>` is a path, a symbol key, or a bare symbol name. The body is quoted only with `--full` |
+| `mushroomdb impact <dir> <file>...` | **Deprecated (0.7).** What changing these files reaches: co-change partners, importers, and the symbols other files call |
+| `mushroomdb owners <dir> <path>` | **Deprecated (0.7).** Top author and share, who else knows it, last touch, the last four quarters |
+| `mushroomdb why <dir> <a> <b>` | **Deprecated (0.7).** Every rule edge between two nodes with its evidence, or the shortest path between them |
+| `mushroomdb sync <dir>\|--auto [--json]` | **Deprecated (0.7).** Re-sync the repository the store was built from: new commits, then the working tree where it differs from `HEAD`. Takes no repo argument — reads it off the graph. `--json` prints the counts as one object. The git hooks `install` writes use `--auto`, so each worktree syncs its own store |
 | `mushroomdb touch <dir>\|--auto [<file>...]` | Re-extract just these files. With no `<file>` reads them from a `PostToolUse` payload on stdin (hook body) |
 | `mushroomdb recall <dir>\|--auto` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin, prints one pointer per hit for the identifiers the prompt names, and nothing when it names none. Wired automatically by `install` |
 | `mushroomdb intercept <dir>\|--auto` | Hook body for the optional `PreToolUse` grep redirect (`install --intercept-grep`): reads a `Grep` payload on stdin and exits 2 with a pointer at `explore` when the pattern is a symbol the graph holds |
@@ -399,14 +414,17 @@ Full methodology and honesty notes:
   retraction semantics — drift = 0 is a property of that, not of hand-rolling in general.
   [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-vs-rules.md)
 
-**Agent benchmarks** are separate and less flattering. `benchmarks/agent-tasks/` runs real
+**Agent benchmarks** measure the entity engine directly. `benchmarks/agent-tasks/` runs real
 `claude -p` sessions against executable truth. The association suite (`--suite association`) asks
 twenty relationship questions of one generated world written three ways — as JSON files, as a
-single relational file, and as a mushroomdb store — and its first committed run
-[**failed its gate**](benchmarks/agent-tasks/results/20260911T005749Z/summary.md): the graph arm
-scored 0.795 against the relational baseline's 0.987, at four times the cost. The v0.6.3 CHANGELOG
-entry reports it in full, and [`docs/site/association-bench.md`](docs/site/association-bench.md)
-describes the suite and how to rebuild the world.
+single relational file, and as a mushroomdb store. The graph arm moved from 0.795 at $0.5089
+([`20260911T005749Z`](benchmarks/agent-tasks/results/20260911T005749Z/summary.md)) to 0.967 at
+$0.0923 ([`20260911T065400Z`](benchmarks/agent-tasks/results/20260911T065400Z/summary.md)) against
+the relational baseline's 0.974 at $0.1158 — a correctness tie at a lower mean cost, and still
+behind files + grep (1.000 at $0.0949) on a 2,000-entity world; the gate failed on the cost
+interval. The code suite (`--suite code`) is retired; its committed summaries stay as the record.
+[`docs/site/association-bench.md`](docs/site/association-bench.md) describes the suite and how to
+rebuild the world.
 
 ---
 
@@ -457,7 +475,7 @@ Phases 1–4 and Plan 18 all landed. What remains:
 ## Docs
 
 - [Quickstart](docs/site/quickstart.md) · [Rules](docs/site/rules.md) · [Cypher reference](docs/site/query.md) · [HTTP + MCP API](docs/site/api.md)
-- [The live code graph](docs/site/code-graph.md) · [Concurrency](docs/site/concurrency.md) · [Codebase graph](docs/site/ingest-git.md)
+- [The live code graph](docs/site/code-graph.md) (deprecated in 0.6.4, removed in 0.7) · [Concurrency](docs/site/concurrency.md) · [Codebase graph](docs/site/ingest-git.md)
 - [Install, plugin and hooks](docs/site/skill.md) · [MCP tools](docs/site/mcp.md) · [Association benchmark](docs/site/association-bench.md)
 - [Time travel](docs/site/timetravel.md) · [Subscriptions](docs/site/subscriptions.md) · [Views](docs/site/views.md) · [Rule suggestions](docs/site/suggest.md)
 - [Masks and access control](docs/site/masks.md) · [Full-text search](docs/site/fulltext.md) · [Property indexes](docs/site/indexes.md) · [Graph algorithms](docs/site/algorithms.md)

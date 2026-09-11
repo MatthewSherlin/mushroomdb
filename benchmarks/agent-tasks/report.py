@@ -100,7 +100,7 @@ def gate_verdict(rows: list[dict], baseline: str = "A",
       run that skipped a task in one arm cannot flatter the other), costs no
       more per cell, reaches the graph in 80% of its sessions, and never runs
       out of turns on a task stock finished.
-    - **the association suite** (0.6.3 §1 as amended 2026-09-11,
+    - **the association suite** (the association spec §1 as amended 2026-09-11,
       `baseline="Q", cost_ci=True, adoption_gate=False`): correctness is at or
       above **every other arm's** paired mean — a tie passes, and there is no
       interval requirement on score, because the SQLite pilot scored 1.00 on

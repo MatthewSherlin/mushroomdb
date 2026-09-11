@@ -8,6 +8,13 @@ after the recorded head are replayed, so deleted files drop out and renamed
 files carry their history to the new path instead of leaving a stale node
 behind.
 
+`ingest-git` is supported as a **data source**: commits, pull requests, files and
+authors become entities with rule-derived relationships, which is what makes a
+ticket↔commit link a rule rather than a script. The tools that read the result as
+a *code graph* — `explore`, `map`, `context`, `impact`, `owners`, `why` and
+`sync` — are **deprecated in 0.6.4 and removed in 0.7**; they still work and are
+still tested. The entities, the rules and `query` are not deprecated.
+
 ```
 mushroomdb ingest-git ~/.mushroomdb/code ~/src/myproject \
   --exclude 'target/' --exclude 'node_modules' --exclude '*.lock'
@@ -122,8 +129,9 @@ edge at all.
 
 Lowering the floor does not fix that and costs a lot elsewhere — on this
 repository 1,118 pairs clear 0.25, 1,581 clear 0.15, and `lib.rs` is still under
-both. So the floor stays where it is and `impact` and `why` answer the other
-half of the question directly from the commit lists, naming any file that shares
+both. So the floor stays where it is and `impact` and `why` (both **deprecated in
+0.6.4, removed in 0.7**) answer the other half of the question directly from the
+commit lists, naming any file that shares
 at least three commits with the one you asked about and labelling it with the
 count rather than a score. The graph keeps the edges it can defend; the tools
 read the commits when the edges do not have the answer.
@@ -399,6 +407,12 @@ commit's `message`; the sha and the graph are unaffected.
 
 ## Keeping it current: `sync` and `touch`
 
+**`sync` is deprecated in 0.6.4 and removed in 0.7**, with the rest of the
+code-graph door. It still works and is still tested. `ingest-git` is not
+deprecated — re-running it against the same store is the same commit walk from
+the recorded marker, without the dirty-working-tree pass `sync` adds — and
+neither is `touch`.
+
 `ingest-git` is the command you run. `sync` and `touch` are the two a hook runs,
 and neither takes a repository argument — both read it off the `GitSync` node,
 so a hook line carries only the database and keeps working when the checkout
@@ -512,7 +526,9 @@ is why an ingest writes one. Run both in the background from a hook.
 
 ### Git hook
 
-`sync` is meant to be backgrounded and silenced, so a commit never waits on it:
+`sync` is meant to be backgrounded and silenced, so a commit never waits on it
+(**deprecated in 0.6.4, removed in 0.7**; `install --no-git-hooks` skips writing
+this block at all):
 
 ```sh
 # >>> mushroomdb >>>

@@ -1,5 +1,13 @@
 # The live code graph
 
+> **Deprecated in 0.6.4:** the code-graph door — the `explore`, `map`, `context`, `impact`,
+> `owners`, `why` and `sync` tools, the three grep/edit hooks, and the plugin's coding-assistant
+> positioning. It still works and is still tested; it is **removed in 0.7**. See
+> [Deprecations](../../README.md#deprecations).
+> Everything on this page still ships — `ingest-git` stays supported as a **data source**, and the
+> tools stay served, listed on a store `ingest-git` built and reachable anywhere through
+> `mushroomdb mcp <db> --all-tools`.
+
 `mushroomdb ingest-git` turns a git repository into a graph: authors, commits,
 files, symbols, imports, calls, merged pull requests, and the notes an assistant
 writes into it. `explore` reads that graph back as text an assistant can quote,
@@ -264,7 +272,7 @@ key files (by centrality):
 key symbols (most called):
   crates/core-api/tests/algo.rs#insert_node — fn insert_node(db: &mut GraphDb<core_storage::fs::RealFs>, label: &str, key: &str)
   crates/core-api/tests/algo.rs#insert_edge — fn insert_edge(db: &mut GraphDb<core_storage::fs::RealFs>, etype: &str, src: &str, dst: &str)
-reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.3 explore './mushroom-memory' <target>
+reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.4 explore './mushroom-memory' <target>
 ```
 
 The first line is the untrusted-data marker every digest rendered out of a store
@@ -415,6 +423,8 @@ Whichever door is opened, three hooks are written: `SessionStart` runs `brief`,
 runs `touch` so an edited file reaches the graph without the tool call waiting.
 
 ### The three experimental hooks
+
+**Deprecated in 0.6.4, removed in 0.7.** All three still install and still work; `install` prints a deprecation line for each.
 
 Three more are off by default, one flag each. All three are Claude Code only,
 all three are recorded in the install manifest — so `disable`, `enable` and

@@ -3428,7 +3428,7 @@ const ELISION_LINE: &str = "  …";
 
 /// The synthetic store with the full set of fields `ingest-git`, `structure`
 /// and `remember` index between them (see the doc table in
-/// `docs/roadmap/v0.6-code-graph-plan.md`), enabled here because this fixture
+/// `docs/roadmap/closed/v0.6-code-graph-plan.md`), enabled here because this fixture
 /// is built by hand rather than by the CLI's own ingest path.
 fn recall_store(dir: &Path) -> core_api::GraphDb<core_storage::fs::RealFs> {
     let mut db = synthetic_repo_store(dir);

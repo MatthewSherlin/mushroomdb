@@ -647,7 +647,7 @@ MATCH (n:Person) RETURN key(n) AS id, labels(n) AS kinds
 ## Cypher coverage
 
 Tested against the current binary (2026-08-24, release build, maturin develop --release);
-the forms added in v0.6.3 — node key and label, comma-separated patterns, infix string
+the forms below — node key and label, comma-separated patterns, infix string
 predicates, list subscripts, `DISTINCT` aggregates, `WITH` alias scoping — are covered by the
 workspace test suite. Classification: **Supported** = executes without error; **Named-error** =
 rejected with a clear, actionable message; **Absent** = not implemented (not tested here).

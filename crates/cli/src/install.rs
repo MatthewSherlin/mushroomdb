@@ -1671,6 +1671,19 @@ pub fn run_install_with(
     if was_disabled {
         notes.push("this install was disabled — install re-enabled it".to_string());
     }
+    // Deprecated in 0.6.4, removed in 0.7. The hook still installs and still
+    // works; the person who asked for it is told once, by the command they ran.
+    for (on, flag) in [
+        (opts.intercept_grep, "--intercept-grep"),
+        (opts.impact_before_edit, "--impact-before-edit"),
+        (opts.enrich_grep, "--enrich-grep"),
+    ] {
+        if on {
+            notes.push(format!(
+                "deprecated  {flag} — the code-graph hooks are deprecated and are removed in 0.7"
+            ));
+        }
+    }
 
     let outcome = write_everything(&ctx, &stores, &mut manifest, &mut notes);
     if let Err(e) = outcome {

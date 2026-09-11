@@ -1,6 +1,6 @@
 # mushroom — Claude Code plugin
 
-A live code graph of your repository, wired into Claude Code as an MCP server, a `/mushroom:mushroom` skill, and three hooks: `SessionStart` (the session brief), `UserPromptSubmit` (recall) and `PostToolUse` (re-extract what you just edited). Every file under this directory *except this README* is rendered by `scripts/render-plugin.sh` from `crates/cli/skills/mushroom/SKILL.md` and the templates in `scripts/plugin-templates/` — do not hand-edit those, or `.claude-plugin/marketplace.json`; re-run the script instead.
+Graph memory for agents, wired into Claude Code as an MCP server, a `/mushroom:mushroom` skill, and three hooks: `SessionStart` (the session brief), `UserPromptSubmit` (recall) and `PostToolUse` (re-extract what you just edited). On an entity store the session gets the fifteen-tool association surface — query, explain, time travel, visibility — and a brief that prints the store's own schema with one worked call per question kind. Every file under this directory *except this README* is rendered by `scripts/render-plugin.sh` from `crates/cli/skills/mushroom/SKILL.md` and the templates in `scripts/plugin-templates/` — do not hand-edit those, or `.claude-plugin/marketplace.json`; re-run the script instead.
 
 ## Install
 
@@ -9,17 +9,19 @@ claude marketplace add MatthewSherlin/mushroomdb
 claude plugin install mushroom@mushroomdb
 ```
 
-Then open a repository and type `/mushroom:mushroom`. On the first turn the skill builds the graph if it does not exist yet — one `ingest-git` pass over the git history and the working tree — and prints `map`: the repository's file clusters, most-depended-on files, owners, recently-hot files, and three questions worth asking next. About 2.5 s on a 431-file repository.
+Then open a repository and type `/mushroom:mushroom`. On the first turn the skill builds the store if it does not exist yet and prints a brief: the store's own schema, with one worked call per question kind — why are two entities related, what did the graph look like at a past commit, what would a change do, who may see it.
 
-After that it is task-first: `impact` before an edit, `context` on a file or symbol, `owners`, `why` with the commits that prove a link, `recall` and `remember` for durable notes. What the graph guarantees and what it does not: [`docs/site/code-graph.md`](../../docs/site/code-graph.md).
+After that it is task-first: one named call per question kind — `explain_association`, `node_edges`, `edges_at`, `what_if`, `query` with a `role`, `remember` and `recall` — copied from the worked calls the brief printed, against the store's own keys. What the engine guarantees and what it does not: [`docs/site/mcp.md`](../../docs/site/mcp.md).
 
 (`mushroomdb install` — the npx path, not this plugin — writes the same skill into a project's or user's own `.claude/skills/mushroom/`, where Claude Code invokes it bare as `/mushroom`. The plugin and the npx install are two separate ways to get the same skill; a plugin-provided skill is always namespaced by Claude Code as `/<plugin-name>:<skill-name>`, which for this plugin is `/mushroom:mushroom`.)
+
+> **Deprecated in 0.6.4:** the code-graph door — the `explore`, `map`, `context`, `impact`, `owners`, `why` and `sync` tools, the three grep/edit hooks, and the plugin's coding-assistant positioning. It still works and is still tested; it is **removed in 0.7**. See [Deprecations](../../README.md#deprecations). The plugin itself is not going away.
 
 ## What it wires up
 
 - **MCP server** (`.mcp.json`) — runs `npx -y mushroomdb@<version> mcp --auto`, one process per project, talking to the graph over stdio.
 - **Skill** (`skills/mushroom/SKILL.md`, invoked as `/mushroom:mushroom`).
-- **`SessionStart` hook** — runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh brief --auto` (5 s timeout) as a session opens, printing the repository in one block: how big the graph is, the sha it is synced to, the most central files and the most called symbols. Byte-stable for a given store, so Claude Code caches it for the whole session.
+- **`SessionStart` hook** — runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh brief --auto` (5 s timeout) as a session opens. On an entity store it prints the store's own schema in one block — the labels, the edge types and the rules that derive them — with one worked call per question kind against the store's own keys. On a store built by `ingest-git` it prints the repository summary instead (deprecated, removed in 0.7). Byte-stable for a given store, so Claude Code caches it for the whole session.
 - **`UserPromptSubmit` hook** — runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh recall --auto` (5 s timeout) before each turn, printing a recall digest of related graph facts as context.
 - **`PostToolUse` hook** (matcher `Edit|Write|MultiEdit`) — runs `${CLAUDE_PLUGIN_ROOT}/hooks/run.sh touch --auto` (30 s timeout, async) after an edit, so the graph re-extracts the changed file without blocking the turn.
 

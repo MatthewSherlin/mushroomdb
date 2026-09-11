@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.6.4 — the data-layer release
+
+No engine change, no tool added or removed, no format change. This release is the product saying
+what it is: the data layer for agents that reason over entities — rules that derive and retract
+relationships, `explain_association` with the evidence, `edges_at` for the graph as it was,
+`what_if` for a change not yet made, and `query` by `role` — served over MCP or embedded. The
+code-graph door is deprecated: it still works, it is still tested, it is off the front door, and
+0.7 removes it.
+
+#### Why, measured
+
+The code door's pre-registered gate was evaluated in full and failed on every arm
+([`results/20260910T000418Z`](benchmarks/agent-tasks/results/20260910T000418Z/summary.md), 240
+cells): the invoked arm scored 0.924 against stock's 0.927 (`-0.0035 [-0.0112, 0.0017]`) and cost
+$0.2713 against $0.2267 (`+0.04463 [+0.01312, +0.07471]`), and the two installed-but-not-invoked
+arms made **0 graph calls across 120 sessions**. The association suite measures the engine instead:
+the graph arm moved from 0.795 / $0.5089 to 0.967 / $0.0923 against the relational baseline's 0.974
+/ $0.1158 — a correctness tie at a lower mean cost — and files + grep remain the cheapest way to
+answer those twenty questions on a 2,000-entity world
+([`results/20260911T065400Z`](benchmarks/agent-tasks/results/20260911T065400Z/summary.md)).
+
+#### Changed
+
+- `README.md` and `docs/site/index.md` lead with the entity data layer. `ingest-git` is documented
+  as a **data source** — commits, pull requests, files and authors as entities with rule-derived
+  relationships — rather than as the product.
+- The `/mushroom` skill and the Cursor rules file answer one named call per question kind on an
+  entity store. The rows telling an agent to call the graph before a search are gone.
+- The Claude Code plugin's description leads with graph memory.
+- Every "faster coding" / "fewer tokens" claim is removed from README, the docs site, `llms.txt`,
+  `llms-full.txt` and the plugin description, and `scripts/check-claims.sh` keeps them out in CI.
+- The publish smoke expects the entity surface.
+
+#### Deprecated — still working, still tested, removed in 0.7
+
+- **The code task tools** `explore`, `map`, `context`, `impact`, `owners`, `why`, `sync`. Listings
+  are unchanged: three on a store built by `ingest-git`, fifteen on any other, 27 served either way
+  and all of them through `mushroomdb mcp <db> --all-tools`. If you call them, pin
+  `mushroomdb@0.6.x` — nothing on the entity surface replaces them.
+- **The three experimental hooks** `--intercept-grep`, `--impact-before-edit`, `--enrich-grep`.
+  `install` now prints `deprecated  <flag> — the code-graph hooks are deprecated and are removed in
+  0.7` for each. Re-run `install` without the flag to take one back out.
+- **The plugin's coding-assistant positioning.** The plugin is not going away.
+- **The code benchmark suite.** `run.py --suite code` still runs; no further runs are committed, and
+  the committed summaries stay as the record.
+
+Nothing in this release removes anything. The `code-graph` CI acceptance job still runs, because a
+deprecated feature that still ships is one that still has to work.
+
 ## v0.6.3 — the association release
 
 A release about the question the graph is supposed to be best at: *why are these two things

@@ -27,7 +27,7 @@ Claude Desktop has no installer path, so add mushroomdb by hand in
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.6.3", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.6.4", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -301,6 +301,9 @@ same answer at any commit because a label is fixed when a node is inserted — w
 one consequence: a node deleted since `at` carries no label and drops out of a
 labelled historical answer.
 
+`edges_at` errors below the retention horizon; `node_history` instead just omits
+what's been pruned — see [How far back history reaches](timetravel.md#how-far-back-history-reaches).
+
 `json: true` without a filter → `{key, at, edges, listed, total}`, listing at most
 `limit` edges **per edge type** (default 10, max 100 in that form).
 
@@ -359,11 +362,16 @@ where there is no intersection to take.
 
 ## Repository tools
 
+> **Deprecated in 0.6.4:** the code-graph door — the `explore`, `map`, `context`, `impact`,
+> `owners`, `why` and `sync` tools, the three grep/edit hooks, and the plugin's coding-assistant
+> positioning. It still works and is still tested; it is **removed in 0.7**. See
+> [Deprecations](../../README.md#deprecations).
+> Of the fourteen task tools, those seven answer from a repository the store was built from with
+> `ingest-git`; the other seven answer on any store.
+
 Fourteen task tools answer a question in one call rather than exposing the graph
-API. Nine of them are about a repository the store was built from with
-`mushroomdb ingest-git`; the five association tools above answer on any store.
-They are listed first in `tools/list`, and each returns a short rendered digest
-as its text content — one text block, and nothing else.
+API. They are listed first in `tools/list`, and each returns a short rendered
+digest as its text content — one text block, and nothing else.
 
 Every one of them also takes an optional `json` boolean. With `json: true` the
 reply is the serialised report *as* the text content, with no rendered digest:

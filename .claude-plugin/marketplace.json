@@ -5,7 +5,7 @@
     {
       "name": "mushroom",
       "source": "./packaging/plugin",
-      "description": "Live code graph for your repo: map, context, impact, owners, why, recall, remember."
+      "description": "Graph memory for agents: entities, rule-derived relationships, explain, time travel, visibility."
     }
   ]
 }

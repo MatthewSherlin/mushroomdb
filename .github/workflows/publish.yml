@@ -349,13 +349,16 @@ jobs:
               ;;
           esac
 
+          # A fresh `--db`-less install resolves to an empty entity store at
+          # `--auto` (the memory surface, 15 tools), not a code graph — so the
+          # handshake below expects that surface, not the code-door tools.
           OUT=$(node "$GITHUB_WORKSPACE/scripts/mcp-handshake/handshake.mjs" \
             --config .mcp.json --server mushroomdb \
             --expect-version "$VER" \
-            --expect-tools map,context,why \
-            --call why '{"a":"nope1","b":"nope2"}')
+            --expect-tools query,explain_association,node_edges,edges_at,what_if,stats \
+            --call stats '{}')
           echo "$OUT"
-          echo "$OUT" | grep -q "unknown:"
+          echo "$OUT" | grep -q "nodes_live"
 
   publish-npm-client:
     name: npm (mushroomdb-client)
