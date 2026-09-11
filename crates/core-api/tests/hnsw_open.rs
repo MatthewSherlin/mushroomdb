@@ -166,6 +166,54 @@ fn wal_replayed_embeddings_are_searchable_after_open() {
     );
 }
 
+/// The lazy populate path must not drop an embedding the persisted blob
+/// predates.
+///
+/// Clean open (the snapshot truncated the WAL), so the indexes populate through
+/// `ensure_indexes_populated` on the first write — and that first write is
+/// itself the post-snapshot embedding, so the node scan runs with `late`
+/// already in the graph while the blob only knows `d0..d7`.
+#[test]
+fn lazy_open_indexes_an_embedding_the_blob_predates() {
+    let dir = tmp("hnsw-open-lazy-late");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Doc", "late", vec![("emb".into(), emb(&[0.995, 0.1]))])
+        .unwrap();
+    assert_eq!(
+        db.hnsw_build_count(),
+        0,
+        "the lazy populate rebuilt a graph the snapshot already holds"
+    );
+
+    let keys = keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 3, 0.5));
+    assert!(
+        keys.iter().any(|k| k == "late"),
+        "the post-snapshot embedding must be in the adopted index; got {keys:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k == "d0"),
+        "a pre-snapshot embedding must still be in the adopted index; got {keys:?}"
+    );
+
+    // Discriminating: k = 1 at `late`'s exact vector. An id the scan tracked but
+    // never inserted into the graph cannot win this search at all.
+    let exact = db.find_similar_vector("emb", Some("Doc"), &[0.995, 0.1], 1, 0.0);
+    assert_eq!(
+        exact.len(),
+        1,
+        "top-1 at the post-snapshot vector came back empty; got {exact:?}"
+    );
+    assert_eq!(
+        exact[0].0, "late",
+        "top-1 at `late`'s own vector must be `late`; got {exact:?}"
+    );
+}
+
 /// Post-snapshot writes of every shape the index has to absorb: an INSERT, an
 /// embedding UPDATE that moves a node between clusters, and a DELETE.
 ///
