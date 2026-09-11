@@ -1119,8 +1119,35 @@ fn build_props_view<'a>(
                 .columns()
                 .expect("base columns section bounds validated at open");
             core_storage::v8::seam::ColumnsView::with_base_cached(props, archived, b.mixed_cache())
+                .with_shared_strings(base_string_table(b))
         }
     }
+}
+
+/// The base columns section paired with the string table that resolves its
+/// string ids — what `ViewStore` needs to read a neighbour's string property
+/// out of a V9 snapshot.
+fn base_columns(
+    base: &Option<std::sync::Arc<core_storage::v8::MappedBase>>,
+) -> Option<core_storage::v8::seam::BaseColumns<'_>> {
+    base.as_ref().map(|b| core_storage::v8::seam::BaseColumns {
+        cols: b
+            .columns()
+            .expect("base columns section bounds validated at open"),
+        strings: base_string_table(b),
+    })
+}
+
+/// The shared string table of a V9 base, or `None` for a pre-V9 one.
+///
+/// Every `ColumnsView` built over a base must carry it: without it a V9
+/// snapshot's string columns, whose own tables are empty, read back as absent.
+fn base_string_table(
+    base: &core_storage::v8::MappedBase,
+) -> Option<&core_storage::v8::layout::ArchivedStringTable> {
+    base.string_table()
+        .transpose()
+        .expect("base strings section bounds validated at open")
 }
 
 fn build_topo_view<'a>(
@@ -1856,10 +1883,13 @@ impl<F: Fs> GraphDb<F> {
         // file. For RealFs this is a true partial read (O(1)); for SimFs the
         // default impl reads all bytes and truncates (still correct).
         let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
+        // V8 and V9 share the mmap-able container; V9 only adds section 12.
         let is_v8 = snap_header.len() >= 6
             && &snap_header[0..4] == b"GDB1"
-            && u16::from_le_bytes([snap_header[4], snap_header[5]])
-                == core_storage::snapshot::VERSION_8;
+            && matches!(
+                u16::from_le_bytes([snap_header[4], snap_header[5]]),
+                core_storage::snapshot::VERSION_8 | core_storage::snapshot::VERSION_9
+            );
         if is_v8 {
             // V8: map the file zero-copy (RealFs) or read full bytes (SimFs).
             // No 2.4GB heap Vec is allocated on RealFs.
@@ -2536,6 +2566,7 @@ impl<F: Fs> GraphDb<F> {
                     archived,
                     base.mixed_cache(),
                 )
+                .with_shared_strings(base_string_table(base))
             }
         }
     }
@@ -2650,8 +2681,10 @@ impl<F: Fs> GraphDb<F> {
             let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
             let is_v8 = snap_header.len() >= 6
                 && &snap_header[0..4] == b"GDB1"
-                && u16::from_le_bytes([snap_header[4], snap_header[5]])
-                    == core_storage::snapshot::VERSION_8;
+                && matches!(
+                    u16::from_le_bytes([snap_header[4], snap_header[5]]),
+                    core_storage::snapshot::VERSION_8 | core_storage::snapshot::VERSION_9
+                );
             if is_v8 {
                 let state = if let Some(snap_path) = db.fs.snapshot_path() {
                     let mapped = core_storage::v8::MappedBase::map(&snap_path).map_err(|e| {
@@ -2822,10 +2855,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -2880,10 +2910,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 // Rule engine: via-hop rules must update when user edges change.
                 let cursor = self.engine.pending_delta_count();
@@ -2914,10 +2941,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -2962,10 +2986,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -2978,10 +2999,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 // Full-text index maintenance: update tokens for this field if indexed.
                 if self.fulltext.field_indexed(field) {
@@ -3089,10 +3107,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3148,10 +3163,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 // Rule engine: via-hop rules fire when user via-edges are inserted.
                 // Resolve etype back to string so on_edge_changed can match rules by name.
@@ -3184,10 +3196,7 @@ impl<F: Fs> GraphDb<F> {
                                 &self.ids,
                                 &self.syms,
                                 &self.labels,
-                                self.base.as_ref().map(|b| {
-                                    b.columns()
-                                        .expect("base columns section bounds validated at open")
-                                }),
+                                base_columns(&self.base),
                             );
                         }
                     }
@@ -3238,10 +3247,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3253,10 +3259,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 if self.fulltext.field_indexed(&field_str) {
                     let label_opt = self.labels.get(*id as usize).and_then(|&sym| {
@@ -3330,10 +3333,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3378,10 +3378,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3444,10 +3441,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3460,10 +3454,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 // Full-text index maintenance: remove tokens for this field.
                 if self.fulltext.field_indexed(field) {
@@ -3520,10 +3511,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 // Rule engine: via-hop rules must retract when user via-edges are deleted.
                 let cursor = self.engine.pending_delta_count();
@@ -3554,10 +3542,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3607,10 +3592,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3649,10 +3631,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &self.syms,
                         &self.labels,
-                        self.base.as_ref().map(|b| {
-                            b.columns()
-                                .expect("base columns section bounds validated at open")
-                        }),
+                        base_columns(&self.base),
                     );
                 }
 
@@ -3714,10 +3693,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -10195,6 +10171,16 @@ impl<F: Fs> GraphDb<F> {
                 let archived_cols = old_base.columns().map_err(|e| GraphError::Corrupt {
                     detail: format!("v8 snapshot: columns section: {e:?}"),
                 })?;
+                // `None` when the base predates V9 — the migration path: its
+                // string columns still carry their own tables and this snapshot
+                // is the rewrite that collapses them into section 12.
+                let archived_strings =
+                    old_base
+                        .string_table()
+                        .transpose()
+                        .map_err(|e| GraphError::Corrupt {
+                            detail: format!("v8 snapshot: strings section: {e:?}"),
+                        })?;
                 let archived_edge_props =
                     old_base
                         .edge_props_section()
@@ -10216,6 +10202,7 @@ impl<F: Fs> GraphDb<F> {
                 encode_v8(
                     Some(archived_csr),
                     Some(archived_cols),
+                    archived_strings,
                     Some((archived_edge_props, edge_props_raw)),
                     Some(prov_raw),
                     &self.topo,
@@ -10272,6 +10259,7 @@ impl<F: Fs> GraphDb<F> {
             };
             let mut buf = Vec::new();
             encode_v8(
+                None,
                 None,
                 None,
                 None,
