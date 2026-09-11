@@ -883,6 +883,66 @@ fn seeded_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::RealFs
     db
 }
 
+/// A memory store whose busiest source label reaches a second label by two
+/// edge types, not one — unlike [`seeded_memory_store`], where `Person` only
+/// ever reaches `Project` by `ASSIGNED_TO`. This is the shape that exercises
+/// the `all_of:`/`label:` form of the `as of` and `relationships` recipes
+/// rather than their single-type `edge_type:` fallback.
+fn seeded_memory_store_with_two_source_edge_types(
+    name: &str,
+) -> core_api::GraphDb<core_storage::fs::RealFs> {
+    use core_api::schema::Schema;
+    use core_api::{Predicate, RuleDef, Value};
+
+    let dir = tmp(name);
+    let mut db = open(&dir);
+    db.apply_schema(&Schema {
+        fulltext: vec![],
+        indexes: vec![],
+        rules: vec![RuleDef {
+            name: "assigned_to".into(),
+            src_label: "Person".into(),
+            dst_label: "Project".into(),
+            predicate: Predicate::KeyMatch {
+                field: "project_id".into(),
+            },
+            edge_type: "ASSIGNED_TO".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        }],
+        views: vec![],
+        roles: vec![],
+    })
+    .expect("schema");
+
+    for key in ["project:apollo", "project:borealis"] {
+        db.insert_node("Project", key, vec![]).expect("project");
+    }
+    for (key, project) in [
+        ("person:ada", "project:apollo"),
+        ("person:bob", "project:apollo"),
+    ] {
+        db.insert_node(
+            "Person",
+            key,
+            vec![("project_id".into(), Value::Str(project.to_string()))],
+        )
+        .expect("person");
+    }
+    // A second, hand-written edge type between the same two labels the rule
+    // already connects — `Project` stays the label `ASSIGNED_TO` and
+    // `REVIEWED` both most often reach, so the census picks up both.
+    db.insert_edge("REVIEWED", "person:ada", "project:apollo")
+        .expect("edge");
+    db.insert_edge("REVIEWED", "person:bob", "project:apollo")
+        .expect("edge");
+    db
+}
+
 /// The schema section: every label with its property names and node count,
 /// every edge type with the rule that derives it, the labels it runs between
 /// and how many there are, how deep the history runs, and who may read it.
@@ -979,19 +1039,36 @@ fn brief_on_a_memory_store_works_one_call_per_question_kind() {
                  relationship's rule and the values the two share, so there is no \
                  need to fetch raw lists to compare by hand",
             ),
-            ("relationships", "node_edges person:ada"),
+            // Person is the only source label, and only `ASSIGNED_TO` runs
+            // from it to the target label (`Project`) its edges most often
+            // reach — `KNOWS` lands on `Person`, not `Project` — so there is
+            // only one type to name and the recipe shows `edge_type:` rather
+            // than a one-element `all_of:`.
+            (
+                "relationships",
+                "node_edges person:ada all_of: [ASSIGNED_TO] label: Project — or \
+                 edge_type: ASSIGNED_TO for one type's partner keys",
+            ),
             // The newest commit `edges_at` accepts, which is one below the
             // count on a store nothing has pruned — the off-by-one that made
             // this recipe `CommitOutOfRange` is pinned by
             // `the_as_of_recipe_names_a_commit_edges_at_accepts`.
             (
                 "as of",
-                &*format!("edges_at person:ada {}", s.commits.expect("counted") - 1),
+                &*format!(
+                    "edges_at person:ada {} edge_type: ASSIGNED_TO — partners linked by \
+                     every listed type, keys only; omit all_of for the grouped view",
+                    s.commits.expect("counted") - 1
+                ),
             ),
             // `project_id`, not `name`: the field the `assigned_to` rule
             // reads, so the call shown is one that would really lose and gain
             // an edge. Only the new value stays a placeholder.
-            ("what if", "what_if person:ada project_id <value>"),
+            (
+                "what if",
+                "what_if person:ada project_id <value> edge_type: ASSIGNED_TO — the \
+                 partners that would be lost or gained under that type",
+            ),
             // `key(n)`, not `n.key`: a node's key is not a property, so
             // `n.key` renders a column of nulls. Pinned by
             // `every_cypher_recipe_answers_on_the_store_it_came_from`.
@@ -1036,6 +1113,40 @@ fn brief_on_a_memory_store_works_one_call_per_question_kind() {
     );
 }
 
+/// Binding: when the key's own source label runs more than one edge type to
+/// the label it most often reaches, `as of` and `relationships` show the
+/// `all_of:`/`label:` intersection form rather than the single-type
+/// `edge_type:` fallback, and `what if` always names `edge_type:` — the
+/// one-call form the time-travel question needs, over the grouped view that
+/// caps at 10 partners a type and never lets an agent ask for the
+/// intersection directly.
+#[test]
+fn as_of_relationships_and_what_if_show_the_one_call_intersection_form() {
+    let db = seeded_memory_store_with_two_source_edge_types("brief-memory-intersection");
+    let b = brief(&db, &BriefOptions::default());
+    let s = b.schema.as_ref().expect("a memory store has a schema");
+
+    let call = |question: &str| {
+        s.recipes
+            .iter()
+            .find(|r| r.question == question)
+            .unwrap_or_else(|| panic!("no {question:?} recipe: {:?}", s.recipes))
+            .call
+            .clone()
+    };
+
+    let as_of = call("as of");
+    assert!(as_of.contains("all_of:"), "{as_of}");
+    assert!(as_of.contains("label:"), "{as_of}");
+
+    let relationships = call("relationships");
+    assert!(relationships.contains("all_of:"), "{relationships}");
+    assert!(relationships.contains("label:"), "{relationships}");
+
+    let what_if = call("what if");
+    assert!(what_if.contains("edge_type:"), "{what_if}");
+}
+
 /// Binding: the `as of` recipe is a call that *works*, not a line that reads
 /// like one — the commit it names is inside `edges_at`'s accepted range.
 ///
@@ -1058,8 +1169,16 @@ fn the_as_of_recipe_names_a_commit_edges_at_accepts() {
         .lines()
         .find_map(|l| l.strip_prefix("  as of: edges_at "))
         .expect("the brief prints an `as of` recipe");
-    let (key, at) = line.split_once(' ').expect("edges_at <key> <commit>");
-    let at: u64 = at.parse().expect("the commit argument is a number");
+    // The call carries the intersection form after the commit —
+    // `all_of:`/`edge_type:`/`label:` and a trailing note — so only the
+    // first two whitespace-separated tokens are `<key>` and `<commit>`.
+    let mut tokens = line.split_whitespace();
+    let key = tokens.next().expect("edges_at <key> <commit> …");
+    let at: u64 = tokens
+        .next()
+        .expect("edges_at <key> <commit> …")
+        .parse()
+        .expect("the commit argument is a number");
 
     let edges = db
         .edges_at(key, at)
@@ -1113,8 +1232,13 @@ fn a_store_with_no_reachable_history_shows_no_as_of_recipe() {
             .lines()
             .find_map(|l| l.strip_prefix("  as of: edges_at "))
             .expect("history means an `as of` recipe");
-        let (key, at) = line.split_once(' ').expect("edges_at <key> <commit>");
-        let at: u64 = at.parse().expect("a commit number");
+        let mut tokens = line.split_whitespace();
+        let key = tokens.next().expect("edges_at <key> <commit> …");
+        let at: u64 = tokens
+            .next()
+            .expect("edges_at <key> <commit> …")
+            .parse()
+            .expect("a commit number");
         db.edges_at(key, at)
             .unwrap_or_else(|e| panic!("the brief's own worked call must answer: {e}"));
     }
