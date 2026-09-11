@@ -819,12 +819,21 @@ fn relationships_call(key: &str, intersection: &Option<(Vec<String>, String)>) -
 /// The `as of` recipe: `edges_at` with the same intersection, at commit `at`.
 ///
 /// Unlike [`relationships_call`], a single type switches the call itself to
-/// `edge_type` rather than an `all_of` of one — this recipe's note is about
-/// the grouped view, not the `edge_type` shortcut, so nothing else names it
-/// when only one type is on offer.
+/// `edge_type` rather than an `all_of` of one.
+///
+/// # The note is about where `at` comes from
+///
+/// The first association run lost two time-travel cells the same way: the
+/// agent had the right data and still answered from an arbitrary late commit,
+/// because the question named a *date* and `at` is a commit index. Nothing in
+/// a commit carries a date, so guessing one from the end of the WAL is the
+/// failure this note exists to stop — the two history tools are where a date
+/// turns into a commit number. That is worth more here than the `all_of`
+/// explanation the note used to carry, which `relationships_call` already
+/// gives on the line above.
 fn as_of_call(key: &str, at: u64, intersection: &Option<(Vec<String>, String)>) -> String {
-    let note =
-        "— partners linked by every listed type, keys only; omit all_of for the grouped view";
+    let note = "— commits carry no dates: take `at` from node_history/edge_history \
+                commit numbers or the dataset's date→commit map";
     match intersection {
         Some((types, dst)) if types.len() >= 2 => format!(
             "edges_at {key} {at} all_of: [{}] label: {dst} {note}",

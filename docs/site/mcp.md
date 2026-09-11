@@ -340,7 +340,7 @@ to probe Cypher to learn the schema:
 ```
   why: explain_association person:ada project:apollo — returns each relationship's rule and the values the two share, so there is no need to fetch raw lists to compare by hand
   relationships: node_edges person:ada all_of: [ASSIGNED_TO] label: Project — or edge_type: ASSIGNED_TO for one type's partner keys
-  as of: edges_at person:ada 8 all_of: [ASSIGNED_TO] label: Project — partners linked by every listed type, keys only; omit all_of for the grouped view
+  as of: edges_at person:ada 8 all_of: [ASSIGNED_TO] label: Project — commits carry no dates: take `at` from node_history/edge_history commit numbers or the dataset's date→commit map
   what if: what_if person:ada project_id <value> edge_type: ASSIGNED_TO — the partners that would be lost or gained under that type
   linked by all of: MATCH (a:Person)-[:ASSIGNED_TO]->(b:Project) WITH b, count(DISTINCT a) AS n WHERE n >= 1 RETURN key(b), n ORDER BY n DESC LIMIT 20
 ```
