@@ -191,6 +191,40 @@ fn what_if_set_prop_on_a_read_only_handle_works() {
     assert!(!wi.gained.is_empty(), "expected gained edges, got {wi:?}");
 }
 
+/// A store opened cold from a snapshot keeps its provenance in the mmap'd base
+/// section until something asks for it. `what_if_set_prop` must ask — otherwise
+/// it clones an empty provenance map and reports no retractions at all.
+#[test]
+fn what_if_set_prop_is_correct_as_the_first_read_after_a_cold_open() {
+    let dir = tmp("cold");
+    seed(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.snapshot().unwrap();
+    drop(db);
+
+    // Warm answer: a read that loads the base sections first, then what_if.
+    let warm = {
+        let db = GraphDb::open(&dir).unwrap();
+        let _ = db.node_edges("a").unwrap();
+        db.what_if_set_prop("a", "team", Value::Str("green".into()))
+            .unwrap()
+    };
+    assert!(
+        !warm.lost.is_empty(),
+        "fixture must lose derived edges, got {warm:?}"
+    );
+
+    // Cold: what_if is the very first call on the handle.
+    let cold = {
+        let db = GraphDb::open(&dir).unwrap();
+        db.what_if_set_prop("a", "team", Value::Str("green".into()))
+            .unwrap()
+    };
+
+    assert_eq!(as_triples(&cold.lost), as_triples(&warm.lost), "lost");
+    assert_eq!(as_triples(&cold.gained), as_triples(&warm.gained), "gained");
+}
+
 #[test]
 fn what_if_set_prop_unknown_key_errors() {
     let dir = tmp("unknown");

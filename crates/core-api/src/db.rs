@@ -9820,6 +9820,12 @@ impl<F: Fs> GraphDb<F> {
     /// directory, but it is not free — this is an interactive "what if", not a
     /// hot path.
     pub fn what_if_set_prop(&self, key: &str, field: &str, value: Value) -> Result<WhatIf> {
+        // The engine's provenance, HNSW and IVF state live in the mmap'd base
+        // until something asks for them. On a store opened cold from a snapshot
+        // this is the first ask, and without it the clone below starts from an
+        // empty provenance map: nothing to retract, so `lost` comes back empty.
+        self.ensure_v8_base_sections_loaded();
+
         let empty = WhatIf {
             lost: Vec::new(),
             gained: Vec::new(),
