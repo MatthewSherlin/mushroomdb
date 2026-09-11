@@ -156,7 +156,7 @@ pub(crate) fn dispatch(
         "node_edges" => tool_node_edges(db, args, json_out),
         "neighborhood" => tool_neighborhood(db, args, json_out),
         "edges_at" => tool_edges_at(db, args, json_out),
-        "what_if" => tool_what_if(db, db_dir, args, json_out),
+        "what_if" => tool_what_if(db, args, json_out),
         "recall" => tool_recall(db, db_dir, args, json_out),
         "remember" => tool_remember(db, args, json_out),
         "sync" => tool_sync(db_dir, json_out),
@@ -998,7 +998,106 @@ fn tool_neighborhood(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     }
 }
 
+// ── edges_at / what_if shared rendering ─────────────────────────────────────
+
+/// One edge in an `edges_at` or `what_if` reply, as a document: the same
+/// shape whichever tool built it, so a caller reading `json: true` sees one
+/// edge schema across both.
+fn edge_at_json(e: &core_api::EdgeAt) -> Js {
+    json!({
+        "edge_type": e.edge_type,
+        "src": e.src_key,
+        "dst": e.dst_key,
+        "derived": e.derived,
+        "rule": e.rule,
+    })
+}
+
 // ── edges_at ─────────────────────────────────────────────────────────────────
+
+/// One edge in an `edges_at` text reply, direction already resolved relative
+/// to the node the call was about.
+struct EdgeAtLine {
+    other: String,
+    outgoing: bool,
+    rule: Option<String>,
+}
+
+/// Every edge of one type at the queried commit, and the slice of them listed.
+struct EdgeAtGroup {
+    edge_type: String,
+    count: usize,
+    listed: Vec<EdgeAtLine>,
+}
+
+/// Group `edges` — every one of them already incident to `key`, sorted by
+/// `(edge_type, src_key, dst_key)` by the engine — by edge type, keeping at
+/// most `limit` per type for the digest.
+fn edges_at_groups(
+    edges: Vec<core_api::EdgeAt>,
+    key: &str,
+    limit: usize,
+) -> (usize, Vec<EdgeAtGroup>) {
+    let mut by_type: BTreeMap<String, Vec<core_api::EdgeAt>> = BTreeMap::new();
+    let mut total = 0usize;
+    for e in edges {
+        total += 1;
+        by_type.entry(e.edge_type.clone()).or_default().push(e);
+    }
+    let mut groups = Vec::with_capacity(by_type.len());
+    for (edge_type, rows) in by_type {
+        let count = rows.len();
+        let listed = rows
+            .into_iter()
+            .take(limit)
+            .map(|e| {
+                let outgoing = e.src_key == key;
+                let other = if outgoing { e.dst_key } else { e.src_key };
+                EdgeAtLine {
+                    other,
+                    outgoing,
+                    rule: e.rule,
+                }
+            })
+            .collect();
+        groups.push(EdgeAtGroup {
+            edge_type,
+            count,
+            listed,
+        });
+    }
+    (total, groups)
+}
+
+fn render_edges_at(key: &str, at: u64, total: usize, groups: &[EdgeAtGroup]) -> String {
+    let mut out = format!(
+        "mushroomdb edges_at — {} as of commit {at}: {total} edge(s)\n",
+        repograph::sanitize(key)
+    );
+    if groups.is_empty() {
+        out.push_str("  none\n");
+        return out;
+    }
+    for g in groups {
+        out.push_str(&format!(
+            "{} ({})\n",
+            repograph::sanitize(&g.edge_type),
+            g.count
+        ));
+        for e in &g.listed {
+            let arrow = if e.outgoing { "→" } else { "←" };
+            out.push_str(&format!("  {arrow} {}", repograph::sanitize(&e.other)));
+            if let Some(rule) = &e.rule {
+                out.push_str(&format!("  rule {}", repograph::sanitize(rule)));
+            }
+            out.push('\n');
+        }
+        if g.count > g.listed.len() {
+            out.push_str(&format!("  … and {} more\n", g.count - g.listed.len()));
+        }
+    }
+    repograph::cap_lines(&out, MAX_EDGE_LINES)
+}
 
 fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let key = match str_arg(args, "key") {
@@ -1012,56 +1111,147 @@ fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             None => return CallOutcome::ToolErr("at must be a non-negative integer".into()),
         },
     };
-    engine_edges_at(db, key, at, json_out)
-}
+    let limit = match edge_limit_arg(args) {
+        Ok(n) => n,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
 
-/// The point-in-time edge listing.
-///
-/// The engine call this needs is being added on another branch, so the
-/// dispatch arm, the schema and the argument checks above are in place and the
-/// answer is not: a caller is told the build cannot serve it rather than being
-/// handed a listing from the wrong commit.
-// wired to GraphDb::edges_at when the engine stream merges
-fn engine_edges_at(_db: &SharedDb, _key: &str, _at: u64, _json_out: bool) -> CallOutcome {
-    CallOutcome::ToolErr("edges_at is not available in this build".into())
+    let edges = {
+        let g = db.read();
+        match g.edges_at(key, at) {
+            Ok(v) => v,
+            Err(e) => return CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
+        }
+    };
+    let report = json!({
+        "key": key,
+        "at": at,
+        "edges": edges.iter().map(edge_at_json).collect::<Vec<_>>(),
+    });
+    let (total, groups) = edges_at_groups(edges, key, limit);
+    ok(json_out, &report, |_| {
+        render_edges_at(key, at, total, &groups)
+    })
 }
 
 // ── what_if ──────────────────────────────────────────────────────────────────
 
-/// One edge the change would lose or gain.
-struct DiffEdge {
-    edge_type: String,
-    other: String,
-    outgoing: bool,
-    derived: bool,
+/// One edge in a `what_if` text reply. `incident` is `false` for a derived
+/// edge the change churns elsewhere in the graph — [`GraphDb::what_if_set_prop`]
+/// can report those alongside the ones touching the changed node, and they
+/// still need a rule and a partner even though neither endpoint is `key`.
+struct WhatIfLine {
+    src: String,
+    dst: String,
     rule: Option<String>,
-    score: Option<f64>,
+    incident: bool,
+    outgoing: bool,
 }
 
-/// The identity of an incident edge: type, partner, direction. Two edges with
-/// the same triple are the same edge, so this is what a diff compares.
-type EdgeId = (String, String, bool);
+struct WhatIfGroup {
+    edge_type: String,
+    count: usize,
+    lines: Vec<WhatIfLine>,
+}
 
-/// What a change to one property would do to one node's relationships.
-///
-/// The change is never applied to the live store. The store directory is
-/// copied to a fresh temp directory, the copy is opened read-write, the
-/// property is set there, and the node's edges before and after are diffed;
-/// the copy is deleted whichever way that goes. A copy of 166 MiB takes about
-/// 0.2 s, which is the price of answering "what would happen" without it
-/// having happened.
-///
-/// The rules behind the **gained** edges are read from the copy, which is the
-/// only place they exist. The rules behind the **lost** ones are read from the
-/// live store, whose state is the copy's "before" — asked for after the diff
-/// is known, so only the partners that actually changed cost a call.
-fn tool_what_if(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) -> CallOutcome {
+/// Group `edges` by type, incident edges first within each group — the ones
+/// that touch `key` are the answer to the question asked; edges churned
+/// elsewhere are secondary and sort after them, in the engine's own order.
+fn what_if_groups(edges: &[core_api::EdgeAt], key: &str) -> Vec<WhatIfGroup> {
+    let mut by_type: BTreeMap<String, Vec<WhatIfLine>> = BTreeMap::new();
+    for e in edges {
+        let outgoing = e.src_key == key;
+        let incident = outgoing || e.dst_key == key;
+        by_type
+            .entry(e.edge_type.clone())
+            .or_default()
+            .push(WhatIfLine {
+                src: e.src_key.clone(),
+                dst: e.dst_key.clone(),
+                rule: e.rule.clone(),
+                incident,
+                outgoing,
+            });
+    }
+    let mut groups = Vec::with_capacity(by_type.len());
+    for (edge_type, mut lines) in by_type {
+        // Stable sort: incident edges keep their engine order ahead of the
+        // non-incident ones, which keep theirs.
+        lines.sort_by_key(|l| !l.incident);
+        let count = lines.len();
+        groups.push(WhatIfGroup {
+            edge_type,
+            count,
+            lines,
+        });
+    }
+    groups
+}
+
+fn render_what_if_groups(out: &mut String, groups: &[WhatIfGroup]) {
+    if groups.is_empty() {
+        out.push_str("  none\n");
+        return;
+    }
+    for g in groups {
+        out.push_str(&format!(
+            "  {} ({})\n",
+            repograph::sanitize(&g.edge_type),
+            g.count
+        ));
+        for l in &g.lines {
+            if l.incident {
+                let arrow = if l.outgoing { "→" } else { "←" };
+                let other = if l.outgoing { &l.dst } else { &l.src };
+                out.push_str(&format!("    {arrow} {}", repograph::sanitize(other)));
+            } else {
+                out.push_str(&format!(
+                    "    {} → {}",
+                    repograph::sanitize(&l.src),
+                    repograph::sanitize(&l.dst)
+                ));
+            }
+            if let Some(rule) = &l.rule {
+                out.push_str(&format!("  rule {}", repograph::sanitize(rule)));
+            }
+            out.push('\n');
+        }
+    }
+}
+
+fn render_what_if(
+    key: &str,
+    field: &str,
+    value: &Js,
+    lost_total: usize,
+    gained_total: usize,
+    lost: &[WhatIfGroup],
+    gained: &[WhatIfGroup],
+) -> String {
+    let mut out = format!(
+        "mushroomdb what_if — {}.{} = {}: would lose {lost_total}, would gain {gained_total}\n",
+        repograph::sanitize(key),
+        repograph::sanitize(field),
+        repograph::sanitize(&value.to_string()),
+    );
+    out.push_str("lost\n");
+    render_what_if_groups(&mut out, lost);
+    out.push_str("gained\n");
+    render_what_if_groups(&mut out, gained);
+    repograph::cap_lines(&out, MAX_EDGE_LINES)
+}
+
+/// What changes if `key.field` became `value` — computed directly by the
+/// engine ([`GraphDb::what_if_set_prop`]) without writing anything: no copy
+/// of the store is made, so nothing here needs to know where it lives on
+/// disk.
+fn tool_what_if(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let key = match str_arg(args, "key") {
-        Ok(k) => k.to_string(),
+        Ok(k) => k,
         Err(e) => return CallOutcome::ToolErr(e),
     };
     let field = match str_arg(args, "field") {
-        Ok(f) => f.to_string(),
+        Ok(f) => f,
         Err(e) => return CallOutcome::ToolErr(e),
     };
     let Some(raw) = args.get("value").filter(|v| !v.is_null()) else {
@@ -1073,245 +1263,36 @@ fn tool_what_if(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool)
             repograph::sanitize(&raw.to_string())
         ));
     };
-    let Some(db_dir) = db_dir else {
-        return CallOutcome::ToolErr(
-            "store path unknown: what_if needs the directory this server was started on".into(),
-        );
-    };
-    // Checked before a byte is copied: a mistyped key is the likeliest way to
-    // call this, and it is not worth 0.2 s to find out.
-    {
+
+    let wi = {
         let g = db.read();
-        if !g.has_node(&key) {
-            return CallOutcome::ToolErr(crate::mcp::graph_err_msg(GraphError::KeyNotFound {
-                key: key.clone(),
-            }));
-        }
-    }
-
-    let copy_dir = what_if_dir();
-    let diffed = what_if_on_copy(db_dir, &copy_dir, &key, &field, value);
-    let _ = std::fs::remove_dir_all(&copy_dir);
-    let (lost_ids, gained) = match diffed {
-        Ok(v) => v,
-        Err(e) => return CallOutcome::ToolErr(e),
+        g.what_if_set_prop(key, field, value)
     };
-
-    // The live store still holds the state the copy started from, so it is
-    // what says which rule wrote an edge the change would remove.
-    let mut lost: Vec<DiffEdge> = Vec::with_capacity(lost_ids.len());
-    let mut explained: BTreeMap<String, Vec<Explanation>> = BTreeMap::new();
-    for ((edge_type, other, outgoing), derived) in lost_ids {
-        let mut edge = DiffEdge {
-            edge_type,
-            other,
-            outgoing,
-            derived,
-            rule: None,
-            score: None,
-        };
-        if derived {
-            if !explained.contains_key(&edge.other) {
-                let found = {
-                    let g = db.read();
-                    g.explain(&key, &edge.other).unwrap_or_default()
-                };
-                explained.insert(edge.other.clone(), found);
-            }
-            let found = explained.get(&edge.other).map(Vec::as_slice).unwrap_or(&[]);
-            if let Some(e) = found
-                .iter()
-                .find(|e| e.edge_type == edge.edge_type && endpoints_match(e, &key, &edge))
-            {
-                edge.rule = Some(e.rule.clone());
-                edge.score = e.weight;
-            }
-        }
-        lost.push(edge);
-    }
+    let wi = match wi {
+        Ok(w) => w,
+        Err(e) => return CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
+    };
 
     let report = json!({
         "key": key,
         "field": field,
-        "value": raw.clone(),
-        "lost": lost.iter().map(diff_edge_json).collect::<Vec<_>>(),
-        "gained": gained.iter().map(diff_edge_json).collect::<Vec<_>>(),
+        "value": raw,
+        "lost": wi.lost.iter().map(edge_at_json).collect::<Vec<_>>(),
+        "gained": wi.gained.iter().map(edge_at_json).collect::<Vec<_>>(),
     });
+    let lost_groups = what_if_groups(&wi.lost, key);
+    let gained_groups = what_if_groups(&wi.gained, key);
     ok(json_out, &report, |_| {
-        render_what_if(&key, &field, raw, &lost, &gained)
-    })
-}
-
-fn endpoints_match(e: &Explanation, key: &str, edge: &DiffEdge) -> bool {
-    if edge.outgoing {
-        e.src_key == key && e.dst_key == edge.other
-    } else {
-        e.src_key == edge.other && e.dst_key == key
-    }
-}
-
-/// A fresh directory for one `what_if` copy: this process, this call.
-fn what_if_dir() -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("mushroomdb-what-if-{}-{n}", std::process::id()))
-}
-
-/// Copy, open, set, diff. Returns the lost edges as identities (their rules
-/// are read from the live store afterwards) and the gained ones already
-/// attributed, since the copy is the only place their rules exist.
-#[allow(clippy::type_complexity)]
-fn what_if_on_copy(
-    src: &Path,
-    copy_dir: &Path,
-    key: &str,
-    field: &str,
-    value: core_api::Value,
-) -> Result<(Vec<(EdgeId, bool)>, Vec<DiffEdge>), String> {
-    copy_dir_all(src, copy_dir).map_err(|e| format!("what_if could not copy the store: {e}"))?;
-    let copy = SharedDb::open(copy_dir).map_err(|e| {
-        format!(
-            "what_if could not open the copy: {}",
-            crate::mcp::graph_err_msg(e)
+        render_what_if(
+            key,
+            field,
+            raw,
+            wi.lost.len(),
+            wi.gained.len(),
+            &lost_groups,
+            &gained_groups,
         )
-    })?;
-
-    let before = incident_edges(&copy, key)?;
-    {
-        let mut g = copy.write();
-        g.set_prop(key, field, value)
-            .map_err(crate::mcp::graph_err_msg)?;
-    }
-    let after = incident_edges(&copy, key)?;
-
-    let lost: Vec<(EdgeId, bool)> = before
-        .iter()
-        .filter(|(id, _)| !after.contains_key(*id))
-        .map(|(id, derived)| (id.clone(), *derived))
-        .collect();
-
-    let mut gained: Vec<DiffEdge> = Vec::new();
-    let mut explained: BTreeMap<String, Vec<Explanation>> = BTreeMap::new();
-    for ((edge_type, other, outgoing), derived) in &after {
-        if before.contains_key(&(edge_type.clone(), other.clone(), *outgoing)) {
-            continue;
-        }
-        let mut edge = DiffEdge {
-            edge_type: edge_type.clone(),
-            other: other.clone(),
-            outgoing: *outgoing,
-            derived: *derived,
-            rule: None,
-            score: None,
-        };
-        if *derived {
-            if !explained.contains_key(other) {
-                let found = {
-                    let g = copy.read();
-                    g.explain(key, other).unwrap_or_default()
-                };
-                explained.insert(other.clone(), found);
-            }
-            let found = explained.get(other).map(Vec::as_slice).unwrap_or(&[]);
-            if let Some(e) = found
-                .iter()
-                .find(|e| &e.edge_type == edge_type && endpoints_match(e, key, &edge))
-            {
-                edge.rule = Some(e.rule.clone());
-                edge.score = e.weight;
-            }
-        }
-        gained.push(edge);
-    }
-
-    // The handle owns a drain thread and the copy's files; it has to be gone
-    // before the caller deletes the directory under it.
-    drop(copy);
-    Ok((lost, gained))
-}
-
-/// Every edge incident on `key`, keyed by identity, with its derived flag.
-fn incident_edges(db: &SharedDb, key: &str) -> Result<BTreeMap<EdgeId, bool>, String> {
-    let edges = {
-        let g = db.read();
-        g.node_edges(key).map_err(crate::mcp::graph_err_msg)?
-    };
-    let mut out = BTreeMap::new();
-    for e in edges {
-        let outgoing = e.src_key == key;
-        let other = if outgoing { e.dst_key } else { e.src_key };
-        out.insert((e.edge_type, other, outgoing), e.derived);
-    }
-    Ok(out)
-}
-
-/// Copy a directory tree. Symlinks are skipped: a store is a directory of
-/// plain files, and following one would copy something outside it.
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let to = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &to)?;
-        } else if ty.is_file() {
-            std::fs::copy(entry.path(), &to)?;
-        }
-    }
-    Ok(())
-}
-
-fn diff_edge_json(e: &DiffEdge) -> Js {
-    json!({
-        "edge_type": e.edge_type,
-        "other": e.other,
-        "direction": if e.outgoing { "out" } else { "in" },
-        "derived": e.derived,
-        "rule": e.rule,
-        "score": e.score,
     })
-}
-
-fn render_what_if(
-    key: &str,
-    field: &str,
-    value: &Js,
-    lost: &[DiffEdge],
-    gained: &[DiffEdge],
-) -> String {
-    let mut out = format!(
-        "mushroomdb what_if — {}.{} = {}: {} lost, {} gained\n",
-        repograph::sanitize(key),
-        repograph::sanitize(field),
-        repograph::sanitize(&value.to_string()),
-        lost.len(),
-        gained.len()
-    );
-    for (heading, edges) in [("lost", lost), ("gained", gained)] {
-        out.push_str(&format!("{heading} ({})\n", edges.len()));
-        if edges.is_empty() {
-            out.push_str("  none\n");
-            continue;
-        }
-        for e in edges {
-            let arrow = if e.outgoing { "→" } else { "←" };
-            out.push_str(&format!(
-                "  {arrow} {} {}",
-                repograph::sanitize(&e.edge_type),
-                repograph::sanitize(&e.other)
-            ));
-            if let Some(rule) = &e.rule {
-                out.push_str(&format!("  rule {}", repograph::sanitize(rule)));
-            }
-            if let Some(score) = e.score {
-                out.push_str(&format!("  score {score:.2}"));
-            }
-            out.push('\n');
-        }
-    }
-    repograph::cap_lines(&out, MAX_EDGE_LINES)
 }
 
 // ── recall ───────────────────────────────────────────────────────────────────
@@ -1674,7 +1655,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "edges_at",
-            "description": "What did K's relationships look like at commit C — the edges that were live at one point in the store's history, with the rule that had derived each. Use this instead of replaying node_history or edge_history by hand.",
+            "description": "What did K's relationships look like at commit C — the edges that were live at one point in the store's history, with the rule that had derived each. `at` is a 0-based WAL commit index; use node_history or edge_history first to find the commit you want, then read this instead of replaying either by hand.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1683,6 +1664,12 @@ fn task_tool_schemas() -> Vec<Js> {
                         "type": "integer",
                         "minimum": 0,
                         "description": "0-based WAL commit index to read the edges at."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Edges listed per edge type (default 10). The rest are counted as '… and N more'."
                     }
                 },
                 "required": ["key", "at"]
@@ -1690,7 +1677,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "what_if",
-            "description": "What changes if K's FIELD became VALUE — the relationships lost and gained, with the rule behind each. Nothing is written: the store is copied, the change is made on the copy, the copy is diffed and deleted.",
+            "description": "What changes if K's FIELD became VALUE — the relationships lost and gained, with the rule behind each. Does not change the store: nothing is written, nothing on disk is copied, and the live graph answers the same way before and after the call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -1736,22 +1736,77 @@ fn neighborhood_answers_one_hop_with_edges_and_deeper_with_the_table() {
 
 // ── edges_at ─────────────────────────────────────────────────────────────────
 
-/// Binding: `edges_at` checks its arguments and then says plainly that this
-/// build cannot answer, rather than guessing from the live edges.
+/// Binding: `edges_at` checks its arguments before touching the graph.
 #[test]
-fn edges_at_checks_its_arguments_then_says_it_is_unavailable() {
-    let db = association_store("edges-at");
+fn edges_at_checks_its_arguments() {
+    let db = association_store("edges-at-args");
     let reply = one_task_call(db.clone(), "edges_at", json!({"at": 0}));
     assert!(error_text(&reply).contains("missing key"), "{reply}");
 
-    let reply = one_task_call(db.clone(), "edges_at", json!({"key": "p1"}));
+    let reply = one_task_call(db, "edges_at", json!({"key": "p1"}));
     assert!(error_text(&reply).contains("missing at"), "{reply}");
+}
 
-    let reply = one_task_call(db, "edges_at", json!({"key": "p1", "at": 0}));
-    assert_eq!(
-        error_text(&reply),
-        "edges_at is not available in this build"
+/// Binding: `edges_at` answers from the engine now — an edge is listed at the
+/// commit it was still live and gone from the commit after it was deleted —
+/// and an out-of-range commit is a clear tool error naming the valid range.
+#[test]
+fn edges_at_answers_from_the_engine_at_a_past_commit() {
+    let db = open("edges-at");
+    {
+        let mut w = db.write();
+        w.insert_node("Person", "a", vec![]).unwrap();
+        w.insert_node("Person", "b", vec![]).unwrap();
+        w.insert_edge("Knows", "a", "b").unwrap();
+    }
+    let linked = db.read().wal_total_commits().unwrap() - 1;
+    db.write().delete_edge("Knows", "a", "b").unwrap();
+    let gone = db.read().wal_total_commits().unwrap() - 1;
+
+    // At the commit the edge was still live, it is listed with its direction.
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "edges_at",
+        json!({"key": "a", "at": linked}),
+    ));
+    assert!(
+        text.starts_with(&format!(
+            "mushroomdb edges_at — a as of commit {linked}: 1 edge(s)"
+        )),
+        "{text}"
     );
+    assert!(text.contains("Knows (1)"), "{text}");
+    assert!(text.contains("→ b"), "{text}");
+
+    // After the delete, the same node has none at the later commit.
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "edges_at",
+        json!({"key": "a", "at": gone}),
+    ));
+    assert!(
+        text.starts_with(&format!(
+            "mushroomdb edges_at — a as of commit {gone}: 0 edge(s)"
+        )),
+        "{text}"
+    );
+
+    // `json: true` reports the same edge as a document.
+    let report = task_report(db.clone(), "edges_at", json!({"key": "a", "at": linked}));
+    assert_eq!(report["key"], json!("a"));
+    assert_eq!(report["at"], json!(linked));
+    assert_eq!(report["edges"][0]["edge_type"], json!("Knows"));
+    assert_eq!(report["edges"][0]["src"], json!("a"));
+    assert_eq!(report["edges"][0]["dst"], json!("b"));
+    assert_eq!(report["edges"][0]["derived"], json!(false));
+    assert_eq!(report["edges"][0]["rule"], json!(null));
+
+    // Out of range is a tool error that names the valid range.
+    let total = db.read().wal_total_commits().unwrap();
+    let reply = one_task_call(db, "edges_at", json!({"key": "a", "at": total}));
+    let msg = error_text(&reply);
+    assert!(msg.contains("out of range"), "{msg}");
+    assert!(msg.contains(&total.to_string()), "{msg}");
 }
 
 // ── what_if ──────────────────────────────────────────────────────────────────
@@ -1803,10 +1858,12 @@ fn what_if_call(db: SharedDb, dir: &Path, args: Js) -> Js {
 }
 
 /// Binding: `what_if` names the edges a change would lose and gain, with the
-/// rule behind each — and the live store is untouched afterwards.
+/// rule behind each — computed by the engine directly, with nothing written
+/// and nothing copied, so the live store is untouched afterwards.
 #[test]
 fn what_if_lists_the_edges_a_change_would_lose_and_gain() {
     let (db, dir) = what_if_store("what-if-flip");
+    let commits_before = db.read().wal_total_commits().unwrap();
 
     let reply = what_if_call(
         db.clone(),
@@ -1816,11 +1873,13 @@ fn what_if_lists_the_edges_a_change_would_lose_and_gain() {
     let text = task_reply(&reply);
     assert_eq!(
         text,
-        "mushroomdb what_if — p1.org_id = \"globex\": 1 lost, 1 gained\n\
-         lost (1)\n\
-         \x20 → WORKS_AT acme  rule works_at  score 1.00\n\
-         gained (1)\n\
-         \x20 → WORKS_AT globex  rule works_at  score 1.00\n",
+        "mushroomdb what_if — p1.org_id = \"globex\": would lose 1, would gain 1\n\
+         lost\n\
+         \x20 WORKS_AT (1)\n\
+         \x20   → acme  rule works_at\n\
+         gained\n\
+         \x20 WORKS_AT (1)\n\
+         \x20   → globex  rule works_at\n",
         "{text}"
     );
 
@@ -1835,12 +1894,20 @@ fn what_if_lists_the_edges_a_change_would_lose_and_gain() {
             .expect("text"),
     )
     .expect("json");
-    assert_eq!(report["lost"][0]["other"], json!("acme"));
+    assert_eq!(report["key"], json!("p1"));
+    assert_eq!(report["field"], json!("org_id"));
+    assert_eq!(report["value"], json!("globex"));
+    assert_eq!(report["lost"][0]["edge_type"], json!("WORKS_AT"));
+    assert_eq!(report["lost"][0]["src"], json!("p1"));
+    assert_eq!(report["lost"][0]["dst"], json!("acme"));
+    assert_eq!(report["lost"][0]["derived"], json!(true));
     assert_eq!(report["lost"][0]["rule"], json!("works_at"));
-    assert_eq!(report["gained"][0]["other"], json!("globex"));
+    assert_eq!(report["gained"][0]["dst"], json!("globex"));
     assert_eq!(report["gained"][0]["rule"], json!("works_at"));
 
-    // Nothing was written here: the change happened on a copy that is gone.
+    // Nothing was written: the store's own commit count and its live edges
+    // are exactly what they were before the call.
+    assert_eq!(db.read().wal_total_commits().unwrap(), commits_before);
     let live = task_report(db.clone(), "node_edges", json!({"key": "p1"}));
     assert_eq!(live["types"][0]["edges"][0]["other"], json!("acme"));
 
@@ -1860,7 +1927,7 @@ fn what_if_says_nothing_changes_when_nothing_does() {
     );
     let text = task_reply(&reply);
     assert!(
-        text.starts_with("mushroomdb what_if — p1.nickname = \"pip\": 0 lost, 0 gained"),
+        text.starts_with("mushroomdb what_if — p1.nickname = \"pip\": would lose 0, would gain 0"),
         "{text}"
     );
     assert_eq!(text.matches("  none\n").count(), 2, "{text}");
@@ -1869,8 +1936,9 @@ fn what_if_says_nothing_changes_when_nothing_does() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Binding: the three ways to call `what_if` wrong are tool errors, and the
-/// unknown key is refused before a byte of the store is copied.
+/// Binding: the three ways to call `what_if` wrong are tool errors, the
+/// unknown key is refused as a plain `KeyNotFound`, and no store path is
+/// needed any more — the same call succeeds without one.
 #[test]
 fn what_if_refuses_an_unknown_key_and_an_unsupported_value() {
     let (db, dir) = what_if_store("what-if-bad");
@@ -1897,13 +1965,15 @@ fn what_if_refuses_an_unknown_key_and_an_unsupported_value() {
     let reply = what_if_call(db.clone(), &dir, json!({"key": "p1", "field": "org_id"}));
     assert!(error_text(&reply).contains("missing value"), "{reply}");
 
-    // Without the store path there is nothing to copy, and the tool says so.
+    // There is no store to copy any more, so no store path is required: the
+    // same call succeeds without one, unlike `sync`.
     let reply = one_task_call(
         db.clone(),
         "what_if",
         json!({"key": "p1", "field": "org_id", "value": "globex"}),
     );
-    assert!(error_text(&reply).contains("store path unknown"), "{reply}");
+    let text = task_reply(&reply);
+    assert!(text.contains("would gain 1"), "{text}");
 
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
@@ -2783,11 +2853,11 @@ fn every_task_tool_frames_its_text_as_untrusted() {
         _ => json!({}),
     };
     for tool in TASK_TOOLS {
-        // Three answer with an error here: `sync` and `what_if` need the store
-        // path this transcript does not pass, and `edges_at` waits on the
-        // engine call. A tool error is a message to the caller, not graph
-        // content, and carries no framing by design.
-        if matches!(tool, "sync" | "what_if" | "edges_at") {
+        // `sync` is the one tool left that answers with an error here: it
+        // needs the store path this transcript does not pass. A tool error is
+        // a message to the caller, not graph content, and carries no framing
+        // by design.
+        if tool == "sync" {
             let reply = one_task_call(db.clone(), tool, args(tool));
             assert!(
                 !error_text(&reply).starts_with(UNTRUSTED_FRAMING),
