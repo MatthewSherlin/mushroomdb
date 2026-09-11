@@ -61,10 +61,7 @@ fn copy_store(src: &std::path::Path, dst: &std::path::Path) {
 type Triple = (String, String, String);
 
 /// Derived edges incident to `key`, as (edge_type, src, dst).
-fn derived_edges(
-    db: &GraphDb<core_storage::fs::RealFs>,
-    key: &str,
-) -> BTreeSet<Triple> {
+fn derived_edges(db: &GraphDb<core_storage::fs::RealFs>, key: &str) -> BTreeSet<Triple> {
     db.node_edges(key)
         .unwrap()
         .into_iter()

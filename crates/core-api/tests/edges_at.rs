@@ -275,7 +275,10 @@ fn edges_at_bench_on_large_store() {
                     &std::collections::BTreeMap::new(),
                 )
                 .expect("sample query");
-            assert!(!rs.is_empty(), "store has no nodes; set MUSHROOMDB_BENCH_KEY");
+            assert!(
+                !rs.is_empty(),
+                "store has no nodes; set MUSHROOMDB_BENCH_KEY"
+            );
             match rs.row(0).first().and_then(|c| c.as_ref()) {
                 Some(Value::Str(s)) => s.clone(),
                 other => panic!("unexpected node cell {other:?}; set MUSHROOMDB_BENCH_KEY"),
