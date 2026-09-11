@@ -471,7 +471,8 @@ Usage:
   mushroomdb install [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
                      [--command <path>] [--no-git-hooks] [--no-prewarm]
                      [--delivery cli|mcp|both] [--intercept-grep]
-                     [--impact-before-edit] [--enrich-grep] [--always-load]
+                     [--impact-before-edit] [--enrich-grep]
+                     [--always-load|--no-always-load]
                      --delivery cli writes the skill and the hooks and registers no MCP
                      server: the skill teaches `mushroomdb <command>` instead (claude-code
                      only; cursor and codex are always registered as MCP servers)
@@ -481,7 +482,10 @@ Usage:
                      Edit|Write|MultiEdit) that injects the file's blast radius before the edit
                      --enrich-grep adds an experimental PostToolUse hook (matcher Grep) that
                      appends what the graph knows about the symbols the search matched
-                     --always-load marks the registered MCP server alwaysLoad
+                     --always-load marks the registered MCP server alwaysLoad, so the host
+                     keeps its tools in context instead of deferring them; already the
+                     default when --db names a store and a server is registered
+                     (--delivery mcp|both) — --no-always-load opts out
   mushroomdb uninstall [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
   mushroomdb disable [--platform claude-code|cursor|codex|all] [--project|--user]
                      turn an install off without removing it: hooks, MCP entry and git hook
@@ -597,7 +601,9 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
     let mut intercept_grep = false;
     let mut impact_before_edit = false;
     let mut enrich_grep = false;
-    let mut always_load = false;
+    // Tri-state on purpose: `None` is "the user said nothing", which is the
+    // only case the default below is allowed to decide.
+    let mut always_load: Option<bool> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -647,7 +653,10 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
             enrich_grep = true;
             i += 1;
         } else if a == "--always-load" {
-            always_load = true;
+            always_load = Some(true);
+            i += 1;
+        } else if a == "--no-always-load" {
+            always_load = Some(false);
             i += 1;
         } else if a == "--no-prewarm" {
             prewarm = false;
@@ -678,6 +687,19 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
             return Err(format!("unexpected argument: {a}"));
         }
     }
+    // An install that named its store with `--db` and registers a server is
+    // an entity-store install: the session is being pointed at a graph it
+    // could not otherwise find, and the first association run showed what a
+    // deferred tool list costs it — turns spent searching for the tools
+    // before the first question. So `alwaysLoad` is the default there, and
+    // `--no-always-load` is the way out.
+    //
+    // An install with no `--db` takes whatever store the working directory
+    // resolves to, which is usually the code graph: three tools, a skill that
+    // teaches them, and no discovery problem worth pinning context for. That
+    // one stays opt-in through `--always-load`.
+    let always_load =
+        always_load.unwrap_or(db.is_some() && !matches!(delivery, install::Delivery::Cli));
     Ok(install::InstallOpts {
         platform,
         scope,
@@ -3176,6 +3198,59 @@ mod tests {
                         assert!(opts.always_load);
                     }
                     other => panic!("install with the code-door flags, got {other:?}"),
+                },
+            },
+            Case {
+                // An install that names its store and registers a server is
+                // an entity-store install: `alwaysLoad` without asking, so a
+                // session meets the tools rather than searching for them.
+                args: &["install", "--delivery", "mcp", "--db", "./mem"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(opts.always_load),
+                    other => panic!("install --delivery mcp --db, got {other:?}"),
+                },
+            },
+            Case {
+                // `both` registers a server too, so it defaults the same way.
+                args: &["install", "--delivery", "both", "--db=./mem"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(opts.always_load),
+                    other => panic!("install --delivery both --db, got {other:?}"),
+                },
+            },
+            Case {
+                // …and `--no-always-load` is the way out of it.
+                args: &[
+                    "install",
+                    "--delivery",
+                    "mcp",
+                    "--db",
+                    "./mem",
+                    "--no-always-load",
+                ],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(!opts.always_load),
+                    other => panic!("install --no-always-load, got {other:?}"),
+                },
+            },
+            Case {
+                // A `--delivery cli` install registers no server, so there is
+                // no entry for the key to go on: naming a store cannot turn
+                // it on.
+                args: &["install", "--delivery", "cli", "--db", "./mem"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(!opts.always_load),
+                    other => panic!("install --delivery cli --db, got {other:?}"),
+                },
+            },
+            Case {
+                // An install with no `--db` resolves whatever store the
+                // directory has — usually the code graph — and stays opt-in.
+                // `--always-load` still forces it.
+                args: &["install", "--always-load"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(opts.always_load),
+                    other => panic!("install --always-load, got {other:?}"),
                 },
             },
             Case {
