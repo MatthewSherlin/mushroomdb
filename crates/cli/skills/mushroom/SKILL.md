@@ -21,7 +21,7 @@ A live graph of this repository at `{{DB_PATH}}`: files, symbols, imports, calls
 
 **2. Take your bearings from the `SessionStart` brief** already in your context — size, central files, or the whole schema — not from a search.
 
-**3. Call `explore <target>`** (depth `context`) on the first file or symbol the task names, and quote what it prints — before any `Grep`, file read or plan. On a memory store, where `explore` is unlisted, the brief's worked calls (row 4) open instead.
+**3. Call `explore <target>`** (depth `context`) on the first file or symbol the task names, and quote what it prints — before any `Grep`, file read or plan. On a memory store `explore` is unlisted; row 4 opens instead.
 <!-- cli -->
 
 Or through `Bash`, store first; `query` runs any Cypher, read or write:
@@ -38,8 +38,6 @@ The first row that matches the turn is what to call, before you answer.
 
 1. **Anything cross-file — call `explore` before `Grep`.** One `target` (a path, a symbol key `path#name`, or a bare name — an ambiguous one returns candidates) and one `depth`:
    `context` (default) — where it is, its signature, call sites into it, callees, importers, co-change partners, commits, notes; `impact` — that plus the file's blast radius (**call it before you edit**); `history` — that plus the owner and what it changes with; `all` — all three.
-
-   Grep finds strings; `explore` answers who calls this and what breaks.
 2. **The user states a decision or a durable fact** → say the key back (`note:` plus 16 hex): `query` a `CREATE (n:Note {id: "note:…", text: "…"})`.
 <!-- mcp -->
    Or `remember` — the `text`, and the existing keys it is `about` — on a store that lists it; a code-graph store does not.
@@ -48,13 +46,19 @@ The first row that matches the turn is what to call, before you answer.
    There is no `remember` subcommand.
 <!-- /cli -->
 3. **Commits have landed, or the brief reports an old sync** → `sync`: commits since the last sync, then files that differ from HEAD. On a code-graph store that is the git `post-commit` hook's job, not a listed tool.
-4. **On a memory store** — entities, no repository — rows 1–3 do not apply and fifteen other tools are listed. One call answers each question, and the brief prints all six worked against your own keys — copy them, do not probe Cypher for the schema: **why** → `explain_association a b`; **relationships** → `node_edges a` (by type, rule and score per edge); **as of** → `edges_at a <commit>`; **what if** → `what_if a <field> <value>`; **who may see** → `query` with `role`, one name from the store's `roles.json`; **how many** → a counting Cypher over the labels the brief names. Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `hybrid_search`. A durable fact → `remember`; what was remembered → `recall`.
+4. **On a memory store** — entities, no repository — rows 1–3 do not apply. The brief prints six worked calls against your own keys — copy them, do not probe Cypher for the schema.
+<!-- mcp -->
+   Fifteen tools are listed; the six are one call each: **why** → `explain_association a b`; **relationships** → `node_edges a` (type, rule, score per edge); **as of** → `edges_at a <commit>`; **what if** → `what_if a <field> <value>`; **who may see** → `query` with a `role` from `roles.json`; **how many** → a counting Cypher over the brief's labels. Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `hybrid_search`.
+<!-- /mcp -->
+<!-- cli -->
+   Those have no subcommand — `explain_association`, `node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked`, `neighborhood` — and none is wired here: `why <a> <b>`, `asof --commit N --query`, `query` (no `role`). The rest need `--delivery mcp`.
+<!-- /cli -->
 
 `explore` composes `context`, `impact` (bare, it reads the current diff) and `owners`; those, `why` (what links two keys, with evidence), `recall`, `map` and the rest stay served — `--all-tools` lists them.
 
 ### What runs without you
 
-`SessionStart` put that brief in your context. `UserPromptSubmit` prints a recall digest when the prompt names an identifier and nothing otherwise; on a dirty tree it prints the diff instead: unmodified partners and importers, the owner, stale concepts. `PostToolUse` runs `touch` after an edit; the git `post-commit` hook runs a silenced `sync`. They add context; the tools answer.
+`SessionStart` put that brief in your context. `UserPromptSubmit` prints a recall digest when the prompt names an identifier and nothing otherwise; on a dirty tree it prints the diff instead: unmodified partners and importers, the owner, stale concepts. `PostToolUse` runs `touch` after an edit; the git `post-commit` hook runs a silenced `sync`.
 
 ## Learn
 
