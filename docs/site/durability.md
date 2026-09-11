@@ -41,6 +41,10 @@ The tooling already bounds WAL-only-from-genesis exposure:
 (or snapshot on a schedule). The cost of a periodic snapshot is far smaller than
 a from-genesis rebuild, and it caps how much WAL a crash can leave to replay.
 
+For the operational side of all this — which directory to mount, how to back it
+up, and how `serve --restore-from` seeds a fresh volume on boot — see
+[Running it as a service](service.md).
+
 ## A snapshot does not cost you the past
 
 Folding the WAL into a snapshot is what makes the next open fast, but the WAL is

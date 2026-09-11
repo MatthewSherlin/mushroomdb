@@ -479,7 +479,7 @@ Phases 1–4 and Plan 18 all landed. What remains:
 - [Install, plugin and hooks](docs/site/skill.md) · [MCP tools](docs/site/mcp.md) · [Association benchmark](docs/site/association-bench.md)
 - [Time travel](docs/site/timetravel.md) · [Subscriptions](docs/site/subscriptions.md) · [Views](docs/site/views.md) · [Rule suggestions](docs/site/suggest.md)
 - [Masks and access control](docs/site/masks.md) · [Full-text search](docs/site/fulltext.md) · [Property indexes](docs/site/indexes.md) · [Graph algorithms](docs/site/algorithms.md)
-- [Durability and recovery](docs/site/durability.md) · [Panic policy](docs/site/panic-policy.md) · [Testing](docs/site/testing.md) · [Format stability](docs/format-stability.md)
+- [Durability and recovery](docs/site/durability.md) · [Running it as a service](docs/site/service.md) · [Panic policy](docs/site/panic-policy.md) · [Testing](docs/site/testing.md) · [Format stability](docs/format-stability.md)
 - [Design spec](docs/design.md) · [Moat roadmap](docs/site/roadmap-moat.md) · [Case study](docs/dogfood-report.md)
 
 Building from source, Docker, packaging, and the test gates are in
