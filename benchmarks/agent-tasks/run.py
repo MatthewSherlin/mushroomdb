@@ -7,7 +7,7 @@
   graded on what they edited and whether the task's own tests pass afterwards.
   **Retired as of v0.6.4** — still runnable, no further runs committed; see
   `README.md` in this directory.
-- **association** (v0.6.3 §3): one generated world in three forms — files (P),
+- **association** (the association spec §3): one generated world in three forms — files (P),
   SQLite (Q), a mushroomdb store (R) — asked relationship questions no form
   answers without work. There is no repository: a cell is a fresh copy of its
   arm's subject directory, and the baseline everything is measured against is

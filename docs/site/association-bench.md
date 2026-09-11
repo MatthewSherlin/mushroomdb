@@ -134,7 +134,7 @@ summary states how many cells it dropped.
 The first run of this suite is committed at
 [`benchmarks/agent-tasks/results/20260911T005749Z/summary.md`](../../benchmarks/agent-tasks/results/20260911T005749Z/summary.md),
 and it **failed**: the graph arm scored 0.795 against arm Q's 0.987 and cost
-$0.5089 against $0.1257. The v0.6.3 CHANGELOG entry reports it in full, and the
+$0.5089 against $0.1257. The v0.6.4 CHANGELOG entry reports it in full, and the
 association tools in [`mcp.md`](mcp.md) are what that run's failures turned into.
 
 The run after those fixes is committed at

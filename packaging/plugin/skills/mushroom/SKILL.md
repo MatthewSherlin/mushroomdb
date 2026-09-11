@@ -33,7 +33,7 @@ One call per question, on the store's own keys. The `SessionStart` brief printed
 
 Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `hybrid_search`.
 
-**Deprecated, removed in 0.7.** A store built by `npx -y mushroomdb@0.6.3 ingest-git './mushroom-memory' . --prs --ensure-gitignore` is a repository as entities — commits, pull requests, files, authors — and lists `explore`, `query` and `stats` instead. The code tools `map`, `context`, `impact`, `owners`, `why` and `sync` stay served behind `--all-tools`. Use the repository as a data source; do not reach for it ahead of a search.
+**Deprecated, removed in 0.7.** A store built by `npx -y mushroomdb@0.6.4 ingest-git './mushroom-memory' . --prs --ensure-gitignore` is a repository as entities — commits, pull requests, files, authors — and lists `explore`, `query` and `stats` instead. The code tools `map`, `context`, `impact`, `owners`, `why` and `sync` stay served behind `--all-tools`. Use the repository as a data source; do not reach for it ahead of a search.
 
 ### What runs without you
 
@@ -47,8 +47,8 @@ The `concept_sources` rule links each concept to its sources with `DESCRIBED_IN`
 
 ## Advanced
 
-`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the fifteen above. All are served either way; `npx -y mushroomdb@0.6.3 mcp <db> --all-tools` lists the rest with schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
+`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the fifteen above. All are served either way; `npx -y mushroomdb@0.6.4 mcp <db> --all-tools` lists the rest with schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
 
-Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`npx -y mushroomdb@0.6.3 serve './mushroom-memory'`), and `doctor` checks the install.
+Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`npx -y mushroomdb@0.6.4 serve './mushroom-memory'`), and `doctor` checks the install.
 
 More: [docs](https://github.com/MatthewSherlin/mushroomdb/tree/main/docs/site)

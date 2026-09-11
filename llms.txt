@@ -234,7 +234,7 @@ descriptions are prefixed `Advanced:`.
 | `rename_node` | Rename a node's key; params: old_key, new_key; errors on absent old or duplicate new |
 
 `explain_association`, `node_edges` and `neighborhood` moved to the task tools
-above in v0.6.3 and answer in text, not JSON; `json: true` returns the report.
+above and answer in text, not JSON; `json: true` returns the report.
 
 MCP is a trusted-local stdio interface — no bearer-token or role enforcement.
 `role` and `mask` on the `query` tool are cooperative, never a security boundary.
@@ -273,7 +273,7 @@ Claude Desktop config (Claude Code and Cursor should use the plugin or
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.6.3", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.6.4", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -296,7 +296,7 @@ Predicates compose via `All(...)` (AND, score = min) and `Any(...)` (OR, score =
 
 ## Cypher key idiom
 
-Node keys are NOT stored as a property. `n.id` is always null — but since v0.6.3
+Node keys are NOT stored as a property. `n.id` is always null — but
 `key(n)` and `n.key` both read the key, and `labels(n)` and `n.label` read the
 label (a stored property of either name still wins). They work in `WHERE`, in
 `ORDER BY`, in an inline pattern filter (`MATCH (c {key: 'c3'})`) and after a

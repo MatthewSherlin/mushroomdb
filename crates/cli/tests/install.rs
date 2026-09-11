@@ -2813,7 +2813,7 @@ fn every_delivery_variant_names_every_tool_and_fits_the_budget() {
         // written as a call there sends the session after a subcommand that
         // does not exist. Naming the tools is fine — and required above, so an
         // assistant knows what the other delivery holds — but a call form is
-        // not. This is the 0.6.3 finding, kept fixed.
+        // not. This is a past finding, kept fixed.
         if matches!(delivery, Delivery::Cli) {
             for banned in [
                 "explain_association(",

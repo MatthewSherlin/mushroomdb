@@ -46,7 +46,7 @@ SUBJECT2_J = SCRATCH / "subject2-mdb-j"
 SUBJECT2_H = SCRATCH / "subject2-mdb-h"
 R2_VENV = SCRATCH / "venv-r2"            # what `python` means in an R2 verify
 
-# The association suite (v0.6.3 §3): one built world in three forms, each its
+# The association suite (the association spec §3): one built world in three forms, each its
 # own self-contained directory. There is no repository and no clone here — a
 # cell is given a copy of one of these three directories.
 ASSOC_BUILD = SCRATCH / "assoc-build"
@@ -177,7 +177,7 @@ CELL_TIMEOUT_S = 900
 DEFAULT_MAX_TURNS = 30
 
 # What differs between the code suite (0.6.2 §1) and the association suite
-# (0.6.3 §1): where the tasks come from, which arms run, which arm everything
+# (the association spec §1): where the tasks come from, which arms run, which arm everything
 # is measured against, which gate variant applies, which arms that gate is
 # about, and what the pilot means. Everything else — cells, metrics, summary —
 # is shared.
