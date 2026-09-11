@@ -1055,9 +1055,13 @@ fn brief_on_a_memory_store_works_one_call_per_question_kind() {
             // `the_as_of_recipe_names_a_commit_edges_at_accepts`.
             (
                 "as of",
+                // The note names where `at` comes from: two time-travel cells
+                // were lost to an agent picking an arbitrary late commit for a
+                // date, and no commit carries one.
                 &*format!(
-                    "edges_at person:ada {} edge_type: ASSIGNED_TO — partners linked by \
-                     every listed type, keys only; omit all_of for the grouped view",
+                    "edges_at person:ada {} edge_type: ASSIGNED_TO — commits carry no \
+                     dates: take `at` from node_history/edge_history commit numbers or \
+                     the dataset's date→commit map",
                     s.commits.expect("counted") - 1
                 ),
             ),
@@ -1421,6 +1425,104 @@ fn a_wide_memory_schema_is_counted_off_and_keeps_every_worked_call() {
     assert!(
         !text.contains("linked by all of"),
         "a single edge type has nothing to intersect:\n{text}"
+    );
+}
+
+/// Binding: the 4,000-byte cap is a ceiling, not a loop that stops when it
+/// runs out of lines to drop.
+///
+/// A store whose labels and edge types are 250 characters each spends the
+/// budget *inside* the lines rather than across them: dropping every listing
+/// entry still left 5,986 bytes, because the header, the recipes and the
+/// roles all quote those same names. The names are cut, and the worked calls
+/// come off from the end with the brief saying it was truncated.
+#[test]
+fn a_brief_of_very_long_names_is_still_capped_at_four_thousand_bytes() {
+    use core_api::Value;
+
+    let dir = tmp("brief-memory-long-names");
+    let mut db = open(&dir);
+    let long = |prefix: &str, i: usize| format!("{prefix}{i:03}{}", "X".repeat(240));
+    for i in 0..12 {
+        for n in 0..2 {
+            db.insert_node(
+                &long("Label", i),
+                &format!("node:{i:03}:{n}"),
+                vec![(long("prop", i), Value::Str("v".to_string()))],
+            )
+            .expect("node");
+        }
+    }
+    for i in 0..12 {
+        db.insert_edge(
+            &long("EDGETYPE", i),
+            &format!("node:{i:03}:0"),
+            &format!("node:{i:03}:1"),
+        )
+        .expect("edge");
+    }
+
+    let b = brief(&db, &BriefOptions::default());
+    let text = render_brief(&b, "query '<cypher>'");
+    assert!(
+        text.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        "the cap is hard: {} bytes\n{text}",
+        text.len()
+    );
+    // Nothing was left to cut, so the worked calls came off from the end —
+    // and the brief says it was cut rather than reading as a whole one.
+    assert!(
+        text.contains("(brief truncated at 4,000 bytes)\n"),
+        "a brief that lost recipes says so:\n{text}"
+    );
+    let all = b.schema.as_ref().expect("a memory store has a schema").recipes.len();
+    let printed = text
+        .lines()
+        .filter(|l| {
+            l.starts_with("  ")
+                && b.schema
+                    .as_ref()
+                    .expect("schema")
+                    .recipes
+                    .iter()
+                    .any(|r| l.starts_with(&format!("  {}: ", r.question)))
+        })
+        .count();
+    assert!(
+        printed < all,
+        "the recipes are cut from the end: {printed} of {all} printed\n{text}"
+    );
+    // And the reach line is still the last thing a reader sees.
+    assert!(
+        text.ends_with("reach the graph: query '<cypher>'\n"),
+        "{text}"
+    );
+
+    // The cut round itself, on a store whose schema fits once its names do:
+    // every entry survives, each name ending in the ellipsis that says it was
+    // cut, where the uncut listing would have had to drop entries instead.
+    let dir = tmp("brief-memory-long-names-narrow");
+    let mut narrow = open(&dir);
+    for i in 0..14 {
+        narrow
+            .insert_node(&long("Label", i), &format!("node:{i:03}"), vec![])
+            .expect("node");
+    }
+    let nb = brief(&narrow, &BriefOptions::default());
+    let ntext = render_brief(&nb, "query '<cypher>'");
+    assert!(
+        ntext.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        "{} bytes\n{ntext}",
+        ntext.len()
+    );
+    assert_eq!(
+        ntext.matches("XXX…").count(),
+        14,
+        "every label line survives with its name cut:\n{ntext}"
+    );
+    assert!(
+        !ntext.contains("  … and "),
+        "cutting the names kept every entry:\n{ntext}"
     );
 }
 

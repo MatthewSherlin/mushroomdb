@@ -532,12 +532,32 @@ fn brief_body(header: &str, files: &[String], symbols: &[String], dropped: usize
 /// against, and the worked calls come last, where a reader who skimmed the
 /// schema still lands on them.
 ///
-/// **The calls never come off.** When the budget is short, entries drop from
-/// the listings above — edge types first, then labels, since a label with no
-/// edge type is still a thing to query and an edge type with no labels is
-/// not — and the cut is counted in the same `… and N more` every other digest
-/// uses. Dropping a recipe instead would save a line and cost the session the
-/// round trip the whole section exists to remove.
+/// **The calls come off last, and only when nothing else is left.** When the
+/// budget is short, entries drop from the listings above — edge types first,
+/// then labels, since a label with no edge type is still a thing to query and
+/// an edge type with no labels is not — and the cut is counted in the same
+/// `… and N more` every other digest uses. Dropping a recipe first would save
+/// a line and cost the session the round trip the whole section exists to
+/// remove.
+///
+/// # The cap is hard
+///
+/// Dropping lines alone is not a ceiling: a store whose names are themselves
+/// hundreds of bytes long spends the budget inside the lines that remain — a
+/// schema of 250-character edge types rendered 5,986 bytes against a 4,000
+/// byte cap, because the loop stopped when it ran out of *lines* rather than
+/// when it fit. So three measures run in order, each only when the one before
+/// it was not enough:
+///
+/// 1. the listings render whole, which is what every ordinary store gets;
+/// 2. every name is cut to [`BRIEF_NAME_CAP`] characters, and entries then
+///    drop from the listings against the shorter lines, counted;
+/// 3. the worked calls come off from the end, and the brief says so on a
+///    final `(brief truncated at 4,000 bytes)` line.
+///
+/// A brief whose header, history and roles alone overrun the budget — nothing
+/// left to drop — is cut on whole lines by [`cap_bytes`], so the returned
+/// string is never longer than the budget whatever the store holds.
 fn render_memory_brief(b: &BriefReport, s: &SchemaBrief, budget: usize) -> String {
     // A partial schema counts what it reached, so every count it produced is
     // a lower bound. Marked once in the header rather than on each line — the
@@ -565,42 +585,50 @@ fn render_memory_brief(b: &BriefReport, s: &SchemaBrief, budget: usize) -> Strin
         if s.partial { " (partial)" } else { "" }
     );
 
-    let mut labels: Vec<String> = s
-        .labels
-        .iter()
-        .map(|l| {
-            let mut line = format!("  {} ({})", sanitize(&l.label), at_least(l.nodes));
-            if !l.props.is_empty() {
-                let _ = write!(line, " — {}", l.props.join(", "));
-            }
-            if l.hidden_props > 0 {
-                let _ = write!(line, ", … +{}", l.hidden_props);
-            }
-            line.push('\n');
-            line
-        })
-        .collect();
-    let mut edge_types: Vec<String> = s
-        .edge_types
-        .iter()
-        .map(|t| {
-            let mut line = format!("  {} ({})", sanitize(&t.edge_type), at_least(t.edges));
-            if let Some(rule) = &t.rule {
-                let _ = write!(line, " — rule {}", sanitize(rule));
-                if t.hidden_rules > 0 {
-                    let _ = write!(line, " +{}", t.hidden_rules);
+    let label_lines = |cap: usize| -> Vec<String> {
+        s.labels
+            .iter()
+            .map(|l| {
+                let mut line = format!("  {} ({})", cap_name(&sanitize(&l.label), cap), at_least(l.nodes));
+                if !l.props.is_empty() {
+                    let props: Vec<String> =
+                        l.props.iter().map(|p| cap_name(p, cap)).collect();
+                    let _ = write!(line, " — {}", props.join(", "));
                 }
-            }
-            let _ = writeln!(line, " — {} → {}", ends(&t.src), ends(&t.dst));
-            line
-        })
-        .collect();
+                if l.hidden_props > 0 {
+                    let _ = write!(line, ", … +{}", l.hidden_props);
+                }
+                line.push('\n');
+                line
+            })
+            .collect()
+    };
+    let edge_type_lines = |cap: usize| -> Vec<String> {
+        s.edge_types
+            .iter()
+            .map(|t| {
+                let mut line = format!(
+                    "  {} ({})",
+                    cap_name(&sanitize(&t.edge_type), cap),
+                    at_least(t.edges)
+                );
+                if let Some(rule) = &t.rule {
+                    let _ = write!(line, " — rule {}", cap_name(&sanitize(rule), cap));
+                    if t.hidden_rules > 0 {
+                        let _ = write!(line, " +{}", t.hidden_rules);
+                    }
+                }
+                let _ = writeln!(line, " — {} → {}", ends(&t.src, cap), ends(&t.dst, cap));
+                line
+            })
+            .collect()
+    };
 
-    // The part that never gives way: how deep the history runs, who may read
+    // The part that gives way last: how deep the history runs, who may read
     // it, and the calls.
     // `unknown`, not `0`: a history the budget never counted is not a history
     // that is not there, and the two lead a reader to opposite conclusions.
-    let mut fixed = match s.commits {
+    let mut prefix = match s.commits {
         Some(n) => format!("history: {n} commits\n"),
         None => "history: unknown\n".to_string(),
     };
@@ -616,24 +644,103 @@ fn render_memory_brief(b: &BriefReport, s: &SchemaBrief, budget: usize) -> Strin
                 }
             })
             .collect();
-        let _ = writeln!(fixed, "roles: {}", roles.join(SEP));
+        let _ = writeln!(prefix, "roles: {}", roles.join(SEP));
     }
-    fixed.push_str(BRIEF_RECIPES_HEADING);
-    for r in &s.recipes {
-        let _ = writeln!(fixed, "  {}: {}", sanitize(&r.question), sanitize(&r.call));
+    let recipes: Vec<String> = s
+        .recipes
+        .iter()
+        .map(|r| format!("  {}: {}\n", sanitize(&r.question), sanitize(&r.call)))
+        .collect();
+    let with_recipes = |kept: usize| -> String {
+        let mut fixed = prefix.clone();
+        if kept > 0 {
+            fixed.push_str(BRIEF_RECIPES_HEADING);
+            fixed.extend(recipes[..kept].iter().map(String::as_str));
+        }
+        fixed
+    };
+    let fixed = with_recipes(recipes.len());
+
+    // Measure one: the listings whole. A store whose brief already fits — every
+    // ordinary one — renders exactly the bytes it always did, since nothing
+    // below runs.
+    let whole = memory_body(
+        &header,
+        &label_lines(usize::MAX),
+        &edge_type_lines(usize::MAX),
+        &fixed,
+        0,
+    );
+    if whole.len() <= budget {
+        return whole;
     }
 
+    // Measure two: every name cut to [`BRIEF_NAME_CAP`], and *then* entries
+    // dropped against the shorter lines. Cutting before dropping rather than
+    // after is the order that does anything: a brief over budget because one
+    // name is 250 characters keeps its whole schema once the name is cut,
+    // where dropping first would throw away entries to pay for the names
+    // inside the few that remain — and by the time dropping alone has run out
+    // of entries there are no names left to cut.
+    let mut labels = label_lines(BRIEF_NAME_CAP);
+    let mut edge_types = edge_type_lines(BRIEF_NAME_CAP);
     let mut dropped = 0;
     loop {
         let body = memory_body(&header, &labels, &edge_types, &fixed, dropped);
-        if body.len() <= budget || (labels.is_empty() && edge_types.is_empty()) {
+        if body.len() <= budget {
             return body;
         }
-        if edge_types.pop().is_none() {
-            labels.pop();
+        if edge_types.pop().is_none() && labels.pop().is_none() {
+            break;
         }
         dropped += 1;
     }
+
+    // Measure three: the worked calls, from the end, and a line that says the
+    // brief was cut — without it a session reads a truncated set of recipes as
+    // the whole set.
+    let truncated = format!("(brief truncated at {} bytes)\n", thousands(MAX_BRIEF_BYTES));
+    let mut kept = recipes.len();
+    loop {
+        let body =
+            memory_body(&header, &[], &[], &with_recipes(kept), dropped) + &truncated;
+        if body.len() <= budget {
+            return body;
+        }
+        if kept == 0 {
+            // Nothing droppable is left: the header, the history and the roles
+            // alone overrun the budget. Whole lines come off the end so the
+            // ceiling holds whatever the store is named.
+            return cap_bytes(&body, budget);
+        }
+        kept -= 1;
+    }
+}
+
+/// Longest a name may print in a memory brief that did not fit its budget
+/// with every droppable listing entry already gone.
+///
+/// Sixty characters is longer than any name written to be read and short
+/// enough that a line spends its budget on the schema rather than on one
+/// identifier. It applies only to the cut round: a store whose names are
+/// ordinary never reaches it, and renders exactly what it rendered before.
+const BRIEF_NAME_CAP: usize = 60;
+
+/// `name` cut to at most `cap` characters, the last of them `…` when anything
+/// came off.
+///
+/// Counted in characters and cut on a character boundary, so a name of runes
+/// is never halved mid-rune. `usize::MAX` is the uncut round and returns the
+/// name whole.
+fn cap_name(name: &str, cap: usize) -> String {
+    if cap == 0 || name.chars().count() <= cap {
+        return name.to_string();
+    }
+    let end = name
+        .char_indices()
+        .nth(cap - 1)
+        .map_or(name.len(), |(i, _)| i);
+    format!("{}…", &name[..end])
 }
 
 /// A memory store's brief above its `reach` line, for one candidate schema.
@@ -660,16 +767,17 @@ fn memory_body(
     out
 }
 
-/// The labels on one end of an edge type, as one phrase. An edge type seen
-/// between nodes of no known label — every endpoint tombstoned — says `?`
-/// rather than leaving the arrow with nothing on one side.
-fn ends(labels: &[String]) -> String {
+/// The labels on one end of an edge type, as one phrase, each cut to `cap`
+/// characters. An edge type seen between nodes of no known label — every
+/// endpoint tombstoned — says `?` rather than leaving the arrow with nothing
+/// on one side.
+fn ends(labels: &[String], cap: usize) -> String {
     if labels.is_empty() {
         "?".to_string()
     } else {
         labels
             .iter()
-            .map(|l| sanitize(l))
+            .map(|l| cap_name(&sanitize(l), cap))
             .collect::<Vec<_>>()
             .join("|")
     }
