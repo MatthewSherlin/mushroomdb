@@ -51,22 +51,36 @@ GREP_PATTERNS=(
   'instead[[:space:]]+of[[:space:]]+`?[Gg]rep'
 )
 
-scan() {
-  local -n files=$1 pats=$2
-  local label="$3" f p
-  for f in "${files[@]}"; do
+# Two hand-unrolled scans rather than one generic function taking array names:
+# `local -n` (nameref) needs bash 4.3+, and stock macOS `/bin/bash` is 3.2.57.
+scan_claim_files() {
+  local f p
+  for f in "${CLAIM_FILES[@]}"; do
     [[ -f "$f" ]] || continue
-    for p in "${pats[@]}"; do
+    for p in "${CLAIM_PATTERNS[@]}"; do
       if grep -nEi "$p" "$f"; then
-        echo "check-claims.sh: $f matches the $label pattern /$p/" >&2
+        echo "check-claims.sh: $f matches the retired-claim pattern /$p/" >&2
         fail=1
       fi
     done
   done
 }
 
-scan CLAIM_FILES CLAIM_PATTERNS "retired-claim"
-scan GREP_FILES GREP_PATTERNS "grep-redirect"
+scan_grep_files() {
+  local f p
+  for f in "${GREP_FILES[@]}"; do
+    [[ -f "$f" ]] || continue
+    for p in "${GREP_PATTERNS[@]}"; do
+      if grep -nEi "$p" "$f"; then
+        echo "check-claims.sh: $f matches the grep-redirect pattern /$p/" >&2
+        fail=1
+      fi
+    done
+  done
+}
+
+scan_claim_files
+scan_grep_files
 
 if [[ "$fail" -ne 0 ]]; then
   echo "check-claims.sh: FAILED — see the lines above" >&2
