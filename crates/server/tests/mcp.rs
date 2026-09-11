@@ -3467,6 +3467,7 @@ fn roles_store(name: &str) -> SharedDb {
                 name: "client".into(),
                 keys: vec![],
                 labels: vec!["Company".into()],
+                visible_where: None,
                 write: None,
             }],
             ..Default::default()
@@ -3539,6 +3540,7 @@ fn query_as_of_composes_with_a_role_and_a_mask() {
                 name: "reader".into(),
                 keys: vec![],
                 labels: vec!["Public".into()],
+                visible_where: None,
                 write: None,
             }],
             ..Default::default()
@@ -4495,4 +4497,71 @@ fn history_replies_carry_the_horizon() {
         err.contains("valid range is"),
         "the refusal must name the range it accepts: {err}"
     );
+}
+
+/// Binding: a role narrowed by `visible_where` answers through `query` with
+/// only the nodes that pass the predicate, live and at a past commit alike.
+#[test]
+fn query_with_a_role_honours_a_visible_where_predicate() {
+    let db = open("query-role-predicate");
+    let at_one = {
+        let mut w = db.write();
+        w.insert_node(
+            "Doc",
+            "d1",
+            vec![
+                ("id".into(), Value::Str("d1".into())),
+                ("status".into(), Value::Str("published".into())),
+            ],
+        )
+        .unwrap();
+        let at = w.wal_total_commits().unwrap() - 1;
+        w.insert_node(
+            "Doc",
+            "d2",
+            vec![
+                ("id".into(), Value::Str("d2".into())),
+                ("status".into(), Value::Str("draft".into())),
+            ],
+        )
+        .unwrap();
+        // No status at all: absent is not a match.
+        w.insert_node("Doc", "d3", vec![("id".into(), Value::Str("d3".into()))])
+            .unwrap();
+        w.apply_schema(&core_api::Schema {
+            roles: vec![core_api::RoleDef {
+                name: "publisher".into(),
+                keys: vec![],
+                labels: vec!["Doc".into()],
+                visible_where: Some(core_api::PropPredicate {
+                    field: "status".into(),
+                    eq: None,
+                    in_: Some(vec![Value::Str("published".into())]),
+                }),
+                write: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        at
+    };
+
+    let rows = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n.id ORDER BY n.id", "role": "publisher"}),
+    ));
+    assert_eq!(
+        rows["rows"],
+        json!([["d1"]]),
+        "only the published document passes the predicate"
+    );
+
+    // The predicate is part of the same one resolver, so as_of honours it too.
+    let then = content_json(&one_task_call(
+        db,
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n.id", "role": "publisher", "as_of": at_one}),
+    ));
+    assert_eq!(then["rows"], json!([["d1"]]));
 }

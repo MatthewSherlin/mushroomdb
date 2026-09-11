@@ -177,6 +177,23 @@ impl<F: Fs> GraphDb<F> {
                         detail: format!("duplicate role name: {}", role_def.name),
                     });
                 }
+                if let Some(pred) = &role_def.visible_where {
+                    pred.validate().map_err(|e| GraphError::RuleInvalid {
+                        detail: format!("role '{}': {e}", role_def.name),
+                    })?;
+                    // A predicate narrows the label leg. With no labels there is
+                    // nothing to narrow, so the role would quietly be its `keys`
+                    // alone under a name that reads like a restriction.
+                    if role_def.labels.is_empty() {
+                        return Err(GraphError::RuleInvalid {
+                            detail: format!(
+                                "role '{}': visible_where narrows the labels leg and the role \
+                                 declares no labels",
+                                role_def.name
+                            ),
+                        });
+                    }
+                }
                 if let Some(write) = &role_def.write {
                     let read_labels: std::collections::HashSet<&str> =
                         role_def.labels.iter().map(String::as_str).collect();

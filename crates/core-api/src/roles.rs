@@ -15,14 +15,22 @@
 //! # Persistence
 //!
 //! `roles.json` format: `{ "version": 1, "roles": [...] }` (no write scopes)
-//! or `{ "version": 2, "roles": [...] }` (at least one role has a write scope).
-//! Version 2 is written only when a write scope is present; version 1 is kept
-//! for forward-compat honesty — a v0.2 server can load v1 safely and the
-//! `write` field (absent from v1) is ignored by serde's `#[serde(default)]`
-//! when a v2 sidecar is loaded by an older binary.
+//! or `{ "version": 2, "roles": [...] }` (at least one role has a write scope)
+//! or `{ "version": 3, "roles": [...] }` (at least one role has a
+//! [`visible_where`](RoleDef::visible_where) predicate).
+//! The highest applicable version is written and no higher: version 2 is
+//! written only when a write scope is present, version 3 only when a predicate
+//! is. Version 1 is kept for forward-compat honesty — a v0.2 server can load v1
+//! safely and the `write` field (absent from v1) is ignored by serde's
+//! `#[serde(default)]` when a v2 sidecar is loaded by an older binary.
+//! Version 3 is deliberately *not* loadable by an older binary: a binary that
+//! does not know `visible_where` would resolve a narrowed role to its full
+//! label set, so an unrecognised version poisons instead, which denies rather
+//! than over-grants.
 //! Files are written atomically (temp → fsync → rename → dir-sync); a no-change
 //! re-apply leaves the file byte-identical.
 
+use core_storage::Value;
 use serde::{Deserialize, Serialize};
 
 /// Write permissions granted to a role.
@@ -58,6 +66,70 @@ pub struct WriteScope {
     pub delete_edge_types: Vec<String>,
 }
 
+/// One property test a role's visibility may carry, beside `labels`.
+///
+/// Equality and membership only: no ranges, no negation, no nesting. A mask
+/// that can express arbitrary predicates is a query language with a security
+/// boundary attached — every operator added is another shape the resolver has
+/// to be right about, on the deny side, forever. Two operators are enough for
+/// the case that motivates them (`status in ["published"]`) and small enough to
+/// be obviously correct.
+///
+/// Exactly one of `eq` and `in` is set; `validate` enforces it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct PropPredicate {
+    /// The property to test. Never empty.
+    pub field: String,
+    /// Single-value form: the property must equal this value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eq: Option<Value>,
+    /// Membership form: the property must equal one of these values. An empty
+    /// list matches nothing — it is a valid, fully-closed predicate.
+    #[serde(default, rename = "in", skip_serializing_if = "Option::is_none")]
+    pub in_: Option<Vec<Value>>,
+}
+
+impl PropPredicate {
+    /// Test one node's property value against the predicate.
+    ///
+    /// `visible = keys ∪ { n : label(n) ∈ labels ∧ holds(n) }`.
+    ///
+    /// A missing property does **not** hold: absent is not a match. A node that
+    /// never carried the field is outside a narrowed role, which is the
+    /// deny-side answer — a role narrowed to `status in ["published"]` must not
+    /// see a document that has no status at all.
+    pub fn holds(&self, value: Option<&Value>) -> bool {
+        let Some(value) = value else {
+            return false;
+        };
+        match (&self.eq, &self.in_) {
+            (Some(expected), None) => value == expected,
+            (None, Some(allowed)) => allowed.iter().any(|a| a == value),
+            // Neither or both is refused by `validate`; hold nothing if a
+            // hand-edited sidecar slips one through.
+            _ => false,
+        }
+    }
+
+    /// Reject a predicate that does not name exactly one test of one field.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.field.is_empty() {
+            return Err("visible_where.field must not be empty".into());
+        }
+        match (&self.eq, &self.in_) {
+            (Some(_), None) | (None, Some(_)) => Ok(()),
+            (None, None) => Err(format!(
+                "visible_where on field '{}' sets neither 'eq' nor 'in'",
+                self.field
+            )),
+            (Some(_), Some(_)) => Err(format!(
+                "visible_where on field '{}' sets both 'eq' and 'in'; use one",
+                self.field
+            )),
+        }
+    }
+}
+
 /// A named RBAC role: resolves to a node-visibility mask at query time.
 ///
 /// `keys` and `labels` both default to empty when absent from JSON, so a
@@ -82,6 +154,18 @@ pub struct RoleDef {
     /// All nodes carrying any of these labels are visible (resolved live).
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Optional property test that narrows the **label leg only**.
+    ///
+    /// Absent = the role is exactly what it was before version 3: every node of
+    /// an allowed label. Present = a node of an allowed label is visible only
+    /// when it also passes the predicate. `keys` is an administrative grant and
+    /// is never narrowed by it.
+    ///
+    /// A predicate with no labels is refused at `apply_schema`: it would narrow
+    /// nothing, and silently granting the key leg under a name that reads like
+    /// a restriction is the wrong way to be wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_where: Option<PropPredicate>,
     /// Absent or null = read-only role (v1 behavior, backward compatible).
     #[serde(default)]
     pub write: Option<WriteScope>,
@@ -91,7 +175,8 @@ pub struct RoleDef {
 ///
 /// Version 1: no write scopes (all roles read-only, v0.2 compatible).
 /// Version 2: at least one role carries a `write` field.
-/// Version >2: unrecognised — roles state is poisoned on load.
+/// Version 3: at least one role carries a `visible_where` predicate.
+/// Version >3: unrecognised — roles state is poisoned on load.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct RolesFile {
     pub version: u32,
@@ -101,14 +186,23 @@ pub(crate) struct RolesFile {
 impl RolesFile {
     /// Build a `RolesFile` choosing the correct version automatically.
     ///
-    /// Writes version 2 iff any role carries a write scope; otherwise writes
-    /// version 1. This preserves forward-compatibility: a v0.2 server loading
-    /// a v1 sidecar sees no behavioral change, and a v0.2 server loading a v2
+    /// Picks 3 > 2 > 1, the highest the content actually needs: version 3 iff
+    /// any role carries a `visible_where` predicate, else version 2 iff any
+    /// role carries a write scope, else version 1. This preserves
+    /// forward-compatibility where it is safe to: a v0.2 server loading a v1
+    /// sidecar sees no behavioral change, and a v0.2 server loading a v2
     /// sidecar silently ignores the `write` field (serde default) and treats
     /// all roles as read-only — safe because v0.2 denies all writes from role
     /// tokens anyway.
+    ///
+    /// A predicate is different: an older binary ignoring `visible_where` would
+    /// resolve a narrowed role to its whole label set, which widens. Version 3
+    /// is therefore unrecognised by every binary that predates it, and an
+    /// unrecognised version poisons the roles state rather than loading it.
     pub(crate) fn new_versioned(roles: Vec<RoleDef>) -> Self {
-        let version = if roles.iter().any(|r| r.write.is_some()) {
+        let version = if roles.iter().any(|r| r.visible_where.is_some()) {
+            3
+        } else if roles.iter().any(|r| r.write.is_some()) {
             2
         } else {
             1

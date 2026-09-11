@@ -20,7 +20,7 @@
 //! W7. zero-byte file is still healthy-empty
 
 use core_api::schema::Schema;
-use core_api::{GraphDb, RoleDef, Value, WriteScope};
+use core_api::{GraphDb, PropPredicate, RoleDef, Value, WriteScope};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -45,6 +45,7 @@ fn analyst_role() -> RoleDef {
         name: "analyst".into(),
         keys: vec!["alice".into()],
         labels: vec!["Public".into()],
+        visible_where: None,
         write: None,
     }
 }
@@ -194,6 +195,7 @@ fn mask_for_role_keys_and_labels_union() {
             name: "viewer".into(),
             keys: vec!["alice".into()],
             labels: vec!["Public".into()],
+            visible_where: None,
             write: None,
         }],
     };
@@ -245,6 +247,7 @@ fn mask_for_role_label_resolves_live() {
             name: "viewer".into(),
             keys: vec![],
             labels: vec!["Public".into()],
+            visible_where: None,
             write: None,
         }],
     };
@@ -305,6 +308,7 @@ fn empty_role_yields_empty_visibility() {
             name: "nothing".into(),
             keys: vec![],
             labels: vec![],
+            visible_where: None,
             write: None,
         }],
     };
@@ -378,6 +382,7 @@ fn apply_schema_rejects_empty_role_name() {
             name: "".into(),
             keys: vec![],
             labels: vec![],
+            visible_where: None,
             write: None,
         }],
     };
@@ -403,12 +408,14 @@ fn apply_schema_rejects_duplicate_role_names() {
                 name: "viewer".into(),
                 keys: vec![],
                 labels: vec![],
+                visible_where: None,
                 write: None,
             },
             RoleDef {
                 name: "viewer".into(),
                 keys: vec!["alice".into()],
                 labels: vec![],
+                visible_where: None,
                 write: None,
             },
         ],
@@ -567,6 +574,7 @@ fn v2_write_scope_round_trips() {
         name: "agent-memory".into(),
         keys: vec![],
         labels: vec!["AgentNote".into(), "AgentContext".into()],
+        visible_where: None,
         write: Some(WriteScope {
             create_labels: vec!["AgentNote".into(), "AgentContext".into()],
             update_labels: vec!["AgentNote".into()],
@@ -616,6 +624,7 @@ fn version_written_is_v2_when_write_present() {
         name: "writer".into(),
         keys: vec![],
         labels: vec!["AgentNote".into()],
+        visible_where: None,
         write: Some(WriteScope {
             create_labels: vec!["AgentNote".into()],
             update_labels: vec![],
@@ -685,6 +694,7 @@ fn subset_violation_create_labels_not_in_read_labels_rejected() {
         name: "agent".into(),
         keys: vec![],
         labels: vec!["AgentNote".into()],
+        visible_where: None,
         write: Some(WriteScope {
             create_labels: vec!["AgentNote".into(), "Secret".into()],
             update_labels: vec![],
@@ -723,6 +733,7 @@ fn subset_violation_update_labels_not_in_read_labels_rejected() {
         name: "editor".into(),
         keys: vec![],
         labels: vec!["Doc".into()],
+        visible_where: None,
         write: Some(WriteScope {
             create_labels: vec!["Doc".into()],
             update_labels: vec!["Hidden".into()], // not in labels
@@ -761,6 +772,7 @@ fn subset_violation_delete_labels_not_in_read_labels_rejected() {
         name: "deleter".into(),
         keys: vec![],
         labels: vec!["Doc".into()],
+        visible_where: None,
         write: Some(WriteScope {
             create_labels: vec![],
             update_labels: vec![],
@@ -800,6 +812,7 @@ fn edge_types_not_subset_validated() {
         name: "linker".into(),
         keys: vec![],
         labels: vec!["Doc".into()],
+        visible_where: None,
         write: Some(WriteScope {
             create_labels: vec![],
             update_labels: vec![],
@@ -839,6 +852,7 @@ fn write_scope_only_change_produces_updated_diff() {
             name: "scoped".into(),
             keys: vec![],
             labels: vec!["Doc".into()],
+            visible_where: None,
             write: None,
         }],
     };
@@ -855,6 +869,7 @@ fn write_scope_only_change_produces_updated_diff() {
             name: "scoped".into(),
             keys: vec![],
             labels: vec!["Doc".into()],
+            visible_where: None,
             write: Some(WriteScope {
                 create_labels: vec!["Doc".into()],
                 update_labels: vec![],
@@ -938,6 +953,7 @@ fn empty_write_scope_still_writes_v2_and_round_trips_as_some() {
         name: "noop-writer".into(),
         keys: vec![],
         labels: vec!["Doc".into()],
+        visible_where: None,
         write: Some(WriteScope::default()), // all vecs empty, but Some(...)
     };
     let schema = Schema {
@@ -995,12 +1011,14 @@ fn multi_role_v1_to_v2_transition_writeless_role_unchanged() {
                 name: "reader".into(),
                 keys: vec!["key1".into()],
                 labels: vec!["Public".into()],
+                visible_where: None,
                 write: None,
             },
             RoleDef {
                 name: "admin".into(),
                 keys: vec!["key2".into()],
                 labels: vec!["Admin".into()],
+                visible_where: None,
                 write: None,
             },
         ],
@@ -1028,12 +1046,14 @@ fn multi_role_v1_to_v2_transition_writeless_role_unchanged() {
                 name: "reader".into(),
                 keys: vec!["key1".into()],
                 labels: vec!["Public".into()],
+                visible_where: None,
                 write: None, // unchanged
             },
             RoleDef {
                 name: "admin".into(),
                 keys: vec!["key2".into()],
                 labels: vec!["Admin".into()],
+                visible_where: None,
                 write: Some(WriteScope {
                     create_labels: vec!["Admin".into()],
                     update_labels: vec![],
@@ -1089,4 +1109,526 @@ fn multi_role_v1_to_v2_transition_writeless_role_unchanged() {
         .as_ref()
         .expect("admin.write must be Some after v2 reload");
     assert_eq!(ws.create_labels, vec!["Admin"]);
+}
+
+// ---------------------------------------------------------------------------
+// Task 6 (v0.6.5): predicate masks (`visible_where`) and the per-commit memo.
+// ---------------------------------------------------------------------------
+
+/// Resolve `role` and return the keys it can actually read, sorted.
+fn mask_keys(db: &GraphDb<core_storage::fs::RealFs>, role: &str) -> Vec<String> {
+    let mask = db.mask_for_role(role).expect("mask_for_role");
+    let rs = db
+        .query_masked("MATCH (n) RETURN n", &no_params(), &mask)
+        .expect("masked query");
+    let mut keys: Vec<String> = (0..rs.len())
+        .filter_map(|i| match rs.row(i)[0].as_ref() {
+            Some(Value::Str(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+fn published() -> PropPredicate {
+    PropPredicate {
+        field: "status".into(),
+        eq: None,
+        in_: Some(vec![Value::Str("published".into())]),
+    }
+}
+
+fn reader_role(vw: Option<PropPredicate>, keys: Vec<String>) -> RoleDef {
+    RoleDef {
+        name: "reader".into(),
+        keys,
+        labels: vec!["Document".into()],
+        visible_where: vw,
+        write: None,
+    }
+}
+
+fn roles_schema(roles: Vec<RoleDef>) -> Schema {
+    Schema {
+        roles,
+        ..Default::default()
+    }
+}
+
+/// `visible_where` narrows the labels leg and never the keys leg.
+#[test]
+fn visible_where_narrows_the_label_leg() {
+    let dir = tmp("predicate-mask");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node(
+        "Document",
+        "pub",
+        vec![("status".into(), Value::Str("published".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Document",
+        "draft",
+        vec![("status".into(), Value::Str("draft".into()))],
+    )
+    .unwrap();
+    db.insert_node("Document", "bare", vec![]).unwrap(); // no status at all
+    db.insert_node(
+        "Secret",
+        "s",
+        vec![("status".into(), Value::Str("published".into()))],
+    )
+    .unwrap();
+
+    db.apply_schema(&roles_schema(vec![reader_role(Some(published()), vec![])]))
+        .unwrap();
+    assert_eq!(
+        mask_keys(&db, "reader"),
+        vec!["pub"],
+        "draft fails the predicate; bare has no status and absent is not a match; \
+         Secret is not in labels"
+    );
+
+    // keys is an administrative grant and is never narrowed.
+    db.apply_schema(&roles_schema(vec![reader_role(
+        Some(published()),
+        vec!["draft".into()],
+    )]))
+    .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["draft", "pub"]);
+
+    // `eq` is the single-value form.
+    db.apply_schema(&roles_schema(vec![reader_role(
+        Some(PropPredicate {
+            field: "status".into(),
+            eq: Some(Value::Str("draft".into())),
+            in_: None,
+        }),
+        vec![],
+    )]))
+    .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["draft"]);
+
+    // An empty `in` matches nothing.
+    db.apply_schema(&roles_schema(vec![reader_role(
+        Some(PropPredicate {
+            field: "status".into(),
+            eq: None,
+            in_: Some(vec![]),
+        }),
+        vec![],
+    )]))
+    .unwrap();
+    assert!(
+        mask_keys(&db, "reader").is_empty(),
+        "empty `in` matches nothing"
+    );
+
+    // No `visible_where` at all is exactly the pre-v3 behaviour.
+    db.apply_schema(&roles_schema(vec![reader_role(None, vec![])]))
+        .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["bare", "draft", "pub"]);
+
+    // Neither `eq` nor `in` is not a predicate.
+    assert!(
+        db.apply_schema(&roles_schema(vec![reader_role(
+            Some(PropPredicate {
+                field: "status".into(),
+                eq: None,
+                in_: None,
+            }),
+            vec![],
+        )]))
+        .is_err(),
+        "a predicate with neither eq nor in must be refused"
+    );
+
+    // Both at once is ambiguous.
+    assert!(
+        db.apply_schema(&roles_schema(vec![reader_role(
+            Some(PropPredicate {
+                field: "status".into(),
+                eq: Some(Value::Str("x".into())),
+                in_: Some(vec![Value::Str("y".into())]),
+            }),
+            vec![],
+        )]))
+        .is_err(),
+        "a predicate with both eq and in must be refused"
+    );
+
+    // An empty field name names nothing.
+    assert!(
+        db.apply_schema(&roles_schema(vec![reader_role(
+            Some(PropPredicate {
+                field: String::new(),
+                eq: Some(Value::Str("x".into())),
+                in_: None,
+            }),
+            vec![],
+        )]))
+        .is_err(),
+        "an empty field must be refused"
+    );
+
+    // A visible_where with no labels is a mistake, not a no-op.
+    assert!(
+        db.apply_schema(&roles_schema(vec![RoleDef {
+            name: "r2".into(),
+            keys: vec![],
+            labels: vec![],
+            visible_where: Some(PropPredicate {
+                field: "status".into(),
+                eq: Some(Value::Str("x".into())),
+                in_: None,
+            }),
+            write: None,
+        }]))
+        .is_err(),
+        "visible_where with no labels must be refused"
+    );
+}
+
+/// A non-string predicate value compares by value, not by rendering.
+#[test]
+fn visible_where_matches_non_string_values() {
+    let dir = tmp("predicate-nonstring");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node("Document", "n1", vec![("tier".into(), Value::Int(1))])
+        .unwrap();
+    db.insert_node("Document", "n2", vec![("tier".into(), Value::Int(2))])
+        .unwrap();
+    db.insert_node("Document", "n3", vec![("tier".into(), Value::Bool(true))])
+        .unwrap();
+
+    db.apply_schema(&roles_schema(vec![reader_role(
+        Some(PropPredicate {
+            field: "tier".into(),
+            eq: None,
+            in_: Some(vec![Value::Int(2), Value::Bool(true)]),
+        }),
+        vec![],
+    )]))
+    .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["n2", "n3"]);
+}
+
+/// `roles.json` version 3 round-trips; an unchanged v2 file still loads.
+#[test]
+fn roles_json_version_3_round_trips() {
+    let dir = tmp("roles-v3");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node(
+        "Document",
+        "pub",
+        vec![("status".into(), Value::Str("published".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Document",
+        "draft",
+        vec![("status".into(), Value::Str("draft".into()))],
+    )
+    .unwrap();
+
+    db.apply_schema(&roles_schema(vec![reader_role(Some(published()), vec![])]))
+        .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["pub"]);
+    drop(db);
+
+    let bytes = std::fs::read(dir.join("roles.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        parsed["version"].as_u64().unwrap(),
+        3,
+        "a role carrying visible_where lifts the sidecar to version 3"
+    );
+    // The on-disk shape docs/site/masks.md documents, asserted so it stays true.
+    assert_eq!(
+        parsed["roles"][0]["visible_where"],
+        serde_json::json!({"field": "status", "in": [{"Str": "published"}]}),
+        "the predicate's on-disk shape is the one masks.md shows"
+    );
+
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.roles()[0].visible_where.as_ref().unwrap(),
+        &published(),
+        "the predicate must survive the round trip"
+    );
+    assert_eq!(
+        mask_keys(&db, "reader"),
+        vec!["pub"],
+        "and resolve the same"
+    );
+}
+
+/// A version 2 sidecar written before predicates existed still loads, and a
+/// role without `visible_where` behaves exactly as it did.
+#[test]
+fn roles_json_version_2_still_loads() {
+    let dir = tmp("roles-v2-compat");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("roles.json"),
+        br#"{"version":2,"roles":[{"name":"reader","keys":["k"],"labels":["Document"],
+             "write":{"create_labels":["Document"],"update_labels":[],"delete_labels":[],
+                      "create_edge_types":[],"delete_edge_types":[]}}]}"#,
+    )
+    .unwrap();
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node(
+        "Document",
+        "pub",
+        vec![("status".into(), Value::Str("published".into()))],
+    )
+    .unwrap();
+    db.insert_node("Document", "bare", vec![]).unwrap();
+
+    let roles = db.roles();
+    assert!(
+        roles[0].visible_where.is_none(),
+        "a v2 role has no predicate"
+    );
+    assert!(roles[0].write.is_some(), "and keeps its write scope");
+    assert_eq!(
+        mask_keys(&db, "reader"),
+        vec!["bare", "pub"],
+        "no predicate = every node of the label, exactly as before"
+    );
+}
+
+/// Version 4 and up still poisons — never-widen holds in the new direction too.
+#[test]
+fn roles_json_version_4_poisons() {
+    let dir = tmp("roles-v4-poison");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("roles.json"),
+        br#"{"version":4,"roles":[{"name":"reader","labels":["Document"]}]}"#,
+    )
+    .unwrap();
+
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(
+        db.mask_for_role("reader").is_err(),
+        "version 4 must poison the roles state"
+    );
+}
+
+/// The memo is keyed by commit sequence, so a write invalidates it.
+#[test]
+fn mask_memo_is_invalidated_by_a_write() {
+    let dir = tmp("mask-memo");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node(
+        "Document",
+        "pub",
+        vec![("status".into(), Value::Str("published".into()))],
+    )
+    .unwrap();
+    db.apply_schema(&roles_schema(vec![reader_role(Some(published()), vec![])]))
+        .unwrap();
+
+    assert_eq!(mask_keys(&db, "reader"), vec!["pub"]);
+
+    // A write the predicate admits. A stale memo would still answer "pub".
+    db.insert_node(
+        "Document",
+        "pub2",
+        vec![("status".into(), Value::Str("published".into()))],
+    )
+    .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["pub", "pub2"]);
+
+    // A property change that takes a node out of the predicate is seen too.
+    db.set_prop("pub", "status", Value::Str("draft".into()))
+        .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["pub2"]);
+
+    // Narrowing the role itself is not a commit, and must still be seen.
+    db.apply_schema(&roles_schema(vec![reader_role(
+        Some(PropPredicate {
+            field: "status".into(),
+            eq: Some(Value::Str("draft".into())),
+            in_: None,
+        }),
+        vec![],
+    )]))
+    .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["pub"]);
+}
+
+/// The reader snapshot resolves the same predicate mask as the live handle.
+#[test]
+fn reader_snapshot_honours_the_predicate() {
+    let dir = tmp("mask-memo-reader");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node(
+        "Document",
+        "pub",
+        vec![("status".into(), Value::Str("published".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Document",
+        "draft",
+        vec![("status".into(), Value::Str("draft".into()))],
+    )
+    .unwrap();
+    db.apply_schema(&roles_schema(vec![reader_role(Some(published()), vec![])]))
+        .unwrap();
+
+    let snap = db.reader();
+    let mask = snap.mask_for_role("reader").unwrap();
+    assert_eq!(mask.len(), 1, "reader snapshot applies the predicate too");
+    let rs = snap
+        .query_masked("MATCH (n) RETURN n.id", &no_params(), &mask)
+        .unwrap();
+    assert_eq!(rs.len(), 1);
+
+    // A snapshot taken after a write sees the new node; the memo is per-commit.
+    db.insert_node(
+        "Document",
+        "pub2",
+        vec![("status".into(), Value::Str("published".into()))],
+    )
+    .unwrap();
+    let snap2 = db.reader();
+    assert_eq!(snap2.mask_for_role("reader").unwrap().len(), 2);
+    // The old snapshot still answers for the state it froze.
+    assert_eq!(snap.mask_for_role("reader").unwrap().len(), 1);
+}
+
+/// An as-of read applies the current predicate to the historical graph.
+#[test]
+fn visible_where_applies_to_an_as_of_read() {
+    use core_api::AsOfScope;
+
+    let dir = tmp("predicate-asof");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node(
+        "Document",
+        "pub",
+        vec![("status".into(), Value::Str("published".into()))],
+    )
+    .unwrap(); // commit 0
+    db.insert_node(
+        "Document",
+        "draft",
+        vec![("status".into(), Value::Str("draft".into()))],
+    )
+    .unwrap(); // commit 1
+    db.set_prop("draft", "status", Value::Str("published".into()))
+        .unwrap(); // commit 2
+    db.apply_schema(&roles_schema(vec![reader_role(Some(published()), vec![])]))
+        .unwrap();
+
+    // At the latest commit both are published.
+    let rs = db
+        .query_at_scoped(
+            2,
+            "MATCH (n) RETURN n",
+            &no_params(),
+            AsOfScope::Role("reader"),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 2, "both documents are published at commit 2");
+
+    // At commit 2 `draft` was still a draft — the predicate evaluates against
+    // the property values AT the commit being read.
+    let rs = db
+        .query_at_scoped(
+            1,
+            "MATCH (n) RETURN n",
+            &no_params(),
+            AsOfScope::Role("reader"),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 1, "draft fails the predicate at commit 1");
+}
+
+/// Measurement, not an assertion: the cost of a scoped read's mask resolution
+/// with the memo cold versus warm, on a store with ~2k readable nodes.
+///
+/// Run with `cargo test -p mushroomdb --test rbac -- --ignored --nocapture`.
+/// Debug build numbers; they are a ratio, not a throughput claim.
+#[test]
+#[ignore = "measurement, printed not asserted"]
+fn mask_memo_cost_before_and_after() {
+    let dir = tmp("mask-memo-cost");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.write_batch(|b| {
+        for i in 0..2000 {
+            b.insert_node(
+                "Document",
+                &format!("d{i}"),
+                vec![("status".into(), Value::Str("published".into()))],
+            );
+        }
+        for i in 0..500 {
+            b.insert_node(
+                "Document",
+                &format!("x{i}"),
+                vec![("status".into(), Value::Str("draft".into()))],
+            );
+        }
+    })
+    .unwrap();
+    db.apply_schema(&roles_schema(vec![reader_role(Some(published()), vec![])]))
+        .unwrap();
+
+    // Cold: every resolve follows a write, so the memo never matches.
+    let reps = 200;
+    let cold = {
+        let mut total = std::time::Duration::ZERO;
+        for i in 0..reps {
+            // The write is what invalidates the memo; it is not what is timed.
+            db.set_prop(&format!("d{i}"), "touched", Value::Int(i as i64))
+                .unwrap();
+            let start = std::time::Instant::now();
+            let m = db.mask_for_role("reader").unwrap();
+            total += start.elapsed();
+            assert_eq!(m.len(), 2000);
+        }
+        total
+    };
+
+    // Warm: no write between resolves, so the memo answers every time.
+    let warm = {
+        let start = std::time::Instant::now();
+        for _ in 0..reps {
+            let m = db.mask_for_role("reader").unwrap();
+            assert_eq!(m.len(), 2000);
+        }
+        start.elapsed()
+    };
+
+    eprintln!(
+        "mask_for_role over 2000 readable / 2500 total nodes, {reps} resolves (debug build):\n  \
+         cold (a write before each): {:?} total, {:?} each\n  \
+         warm (memo hit):            {:?} total, {:?} each",
+        cold,
+        cold / reps,
+        warm,
+        warm / reps,
+    );
 }

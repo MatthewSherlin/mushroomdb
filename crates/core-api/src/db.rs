@@ -1227,6 +1227,14 @@ pub struct GraphDb<F: Fs> {
     /// `None` — `roles.json` was present but corrupt; `mask_for_role` returns
     /// `Err` for any request (fail-loud, never silently grant empty visibility).
     roles: Option<Vec<RoleDef>>,
+    /// Memo for [`mask_for_role`](GraphDb::mask_for_role), keyed by
+    /// `(role, commit_seq)` — a scoped reader between two writes resolves once.
+    ///
+    /// Shared by `Arc` with every [`ReaderSnapshot`](crate::reader::ReaderSnapshot)
+    /// taken from this handle. Replaced (not cleared) whenever the role
+    /// definitions change or the store is reloaded, which `commit_seq` does not
+    /// record; see [`RoleMaskCache`](crate::mask::RoleMaskCache).
+    role_masks: Arc<crate::mask::RoleMaskCache>,
     /// Live subscriptions.  Entries with a dead `Weak` are pruned on the next
     /// distribute_events call.
     subscriptions: Vec<SubEntry>,
@@ -1825,6 +1833,7 @@ impl<F: Fs> GraphDb<F> {
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
             roles: Some(vec![]),
+            role_masks: Arc::new(crate::mask::RoleMaskCache::new()),
             subscriptions: Vec::new(),
             query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -1882,6 +1891,10 @@ impl<F: Fs> GraphDb<F> {
         self.prop_index = PropertyIndex::new();
         self.commit_seq = 0;
         self.roles = Some(vec![]);
+        // A fresh cache, not a cleared one: any reader snapshot still holding
+        // the old `Arc` keeps it to itself, so nothing it memoised against the
+        // pre-reload store can be read back through this handle.
+        self.role_masks = Arc::new(crate::mask::RoleMaskCache::new());
         self.total_wal_commits = 0;
         self.base = None;
         self.fold_overlay = None;
@@ -2837,6 +2850,10 @@ impl<F: Fs> GraphDb<F> {
                 .expect("fold_overlay is always Some after open_with; call reader() after open"),
             self.base.clone(),
             self.delta_tail.clone(),
+            // The snapshot's effective state is exactly this handle's state at
+            // this commit, so it shares the memo and its version key.
+            self.commit_seq,
+            Arc::clone(&self.role_masks),
         )
     }
 
@@ -6414,8 +6431,10 @@ impl<F: Fs> GraphDb<F> {
             return Ok(Some(vec![]));
         }
         match serde_json::from_slice::<RolesFile>(&bytes) {
-            Ok(f) if f.version == 1 || f.version == 2 => Ok(Some(f.roles)),
-            // Corrupt or unrecognised version (>2): poison the roles state.
+            Ok(f) if matches!(f.version, 1..=3) => Ok(Some(f.roles)),
+            // Corrupt or unrecognised version (>3): poison the roles state.
+            // Never widen: a version this binary does not know may carry a
+            // narrowing this binary would not apply.
             _ => Ok(None),
         }
     }
@@ -6427,10 +6446,31 @@ impl<F: Fs> GraphDb<F> {
     /// - `role` does not match any defined role name.
     ///
     /// The mask union is: explicit `keys` (unknown keys silently ignored) plus
-    /// all live nodes carrying any label in `labels`.  Label resolution is live
-    /// — new nodes of an allowed label are visible without re-applying the
-    /// schema.  An empty union = empty mask = sees nothing.
+    /// all live nodes carrying any label in `labels` that also pass the role's
+    /// [`visible_where`](crate::roles::RoleDef::visible_where) predicate, if it
+    /// has one.  Label resolution is live — new nodes of an allowed label are
+    /// visible without re-applying the schema, and a property edited out of the
+    /// predicate takes its node out of the mask on the next read.  An empty
+    /// union = empty mask = sees nothing.
+    ///
+    /// This is the one resolver every read path calls, live and as-of alike, so
+    /// the predicate applies everywhere at once.  On an as-of handle the role
+    /// *definition* is the current one and the graph is the historical one: the
+    /// predicate is evaluated against the property values at the commit being
+    /// read.
+    ///
+    /// The result is memoised per `(role, commit_seq)`, so a scoped reader
+    /// between two writes resolves the role once.  See
+    /// [`RoleMaskCache`](crate::mask::RoleMaskCache) for why that cannot go
+    /// stale.
     pub fn mask_for_role(&self, role: &str) -> Result<crate::mask::NodeMask> {
+        self.role_masks
+            .get_or_build(role, self.commit_seq, || self.build_mask_for_role(role))
+            .map(|m| (*m).clone())
+    }
+
+    /// Resolve `role` against the current graph, ignoring the memo.
+    fn build_mask_for_role(&self, role: &str) -> Result<crate::mask::NodeMask> {
         let roles = self.roles.as_ref().ok_or_else(|| GraphError::Corrupt {
             detail:
                 "roles.json was corrupt at open; fix the file and re-open to restore role access"
@@ -6446,18 +6486,35 @@ impl<F: Fs> GraphDb<F> {
         let mut visible = std::collections::HashSet::new();
 
         // Key leg: resolve explicit keys to dense ids (unknown keys ignored).
+        // An administrative grant, never narrowed by the predicate.
         for key in &def.keys {
             if let Some(id) = self.ids.get(key) {
                 visible.insert(id);
             }
         }
 
-        // Label leg: live scan — iterate labels vec for matching symbol.
+        // Label leg: live scan — iterate labels vec for matching symbol, and
+        // when the role carries a predicate, test the property as well.  The
+        // property comes from the store's own merged view (overlay over the
+        // mmap'd base), so an as-of handle reads the values of its own commit.
+        let props = def.visible_where.as_ref().map(|_| self.props_view());
         for label_name in &def.labels {
             if let Some(sym) = self.syms.get(label_name) {
                 for (i, &s) in self.labels.iter().enumerate() {
-                    if s == sym {
-                        visible.insert(i as u32);
+                    if s != sym {
+                        continue;
+                    }
+                    let id = i as u32;
+                    match (&def.visible_where, &props) {
+                        (Some(pred), Some(view)) => {
+                            let value = view.get(id, &pred.field).map(|vr| vr.into_value());
+                            if pred.holds(value.as_ref()) {
+                                visible.insert(id);
+                            }
+                        }
+                        _ => {
+                            visible.insert(id);
+                        }
                     }
                 }
             }
@@ -6953,6 +7010,12 @@ impl<F: Fs> GraphDb<F> {
             .write_atomic(FileId::Roles, &bytes)
             .map_err(GraphError::Io)?;
         self.roles = Some(roles);
+        // Rewriting the sidecar is not a commit, so `commit_seq` does not move
+        // and a memoised mask would still match its version. Install a fresh
+        // cache instead of clearing the shared one: a reader snapshot frozen
+        // against the old definitions keeps the old `Arc` to itself and can
+        // never publish an answer this handle would read back.
+        self.role_masks = Arc::new(crate::mask::RoleMaskCache::new());
         // Refresh the MVCC frozen overlay so that reader() immediately sees the
         // updated role definitions without waiting for the next K-commit fold.
         self.fold_now();

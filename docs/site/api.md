@@ -29,9 +29,27 @@ query param. Grants access to all endpoints.
 
 **Role-bound tokens** (`--role-token TOKEN:ROLE` / `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`):
 bearer-only. A role token receives a node-visibility mask derived from the
-named role's label selectors (defined in `schema.json` or `roles.json`). The
-mask is resolved live at request time against the same DB snapshot used for
-the query — one read-lock acquisition.
+named role's label selectors (defined in `schema.json` or `roles.json`), and
+optionally narrowed by one property test on those labels. The mask is resolved
+live at request time against the same DB snapshot used for the query — one
+read-lock acquisition, memoised per commit so a scoped reader between two writes
+resolves its role once.
+
+A role may carry a `visible_where` predicate beside its labels:
+
+```json
+{
+  "name": "reader",
+  "labels": ["Document"],
+  "visible_where": { "field": "status", "in": [{ "Str": "published" }] }
+}
+```
+
+`visible = keys ∪ { n : label(n) ∈ labels ∧ predicate(n) }` — the predicate
+narrows the labels leg only, never `keys`, and a node missing the property fails
+it. Only `eq` (one value) and `in` (a list) exist, exactly one per predicate, and
+a predicate on a role with no labels is refused. See
+[masks.md](masks.md#narrowing-a-role-by-a-property).
 
 Role-token behavior per endpoint:
 
@@ -68,7 +86,9 @@ write endpoints — exactly the v1 read-only behavior.
 present in `roles.json` at open time → 401; corrupt `roles.json` → 500 for
 role tokens (full-access token unaffected); empty role → sees zero nodes.
 Role sidecar is stored in `<db-dir>/roles.json` (v1 for read-only roles, v2 when
-any role carries a write scope).
+any role carries a write scope, v3 when any role carries a `visible_where`
+predicate). A version this binary does not recognise poisons the roles state
+rather than loading it — denying beats over-granting.
 
 ---
 
