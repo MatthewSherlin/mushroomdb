@@ -4,12 +4,13 @@
   "repository": "https://github.com/MatthewSherlin/mushroomdb",
   "version": "0.6.2",
   "transport": "stdio",
-  "tools_note": "Every tool here is callable. A default `tools/list` follows the store the server opened: a store a repository was ingested into advertises three — explore, query, stats — and any other store advertises thirteen, the association surface — query, explain_association, neighborhood, node_info, node_edges, was_linked, node_history, edge_history, find_similar, hybrid_search, remember, recall, stats. The rest are hidden rather than absent, because the schemas cost more than a session gets back. Run `mushroomdb mcp <db> --all-tools` to advertise this whole list.",
+  "tools_note": "Every tool here is callable. A default `tools/list` follows the store the server opened: a store a repository was ingested into advertises three — explore, query, stats — and any other store advertises fifteen, the association surface — query, explain_association, neighborhood, node_info, node_edges, was_linked, edges_at, what_if, node_history, edge_history, find_similar, hybrid_search, remember, recall, stats. The rest are hidden rather than absent, because the schemas cost more than a session gets back. Run `mushroomdb mcp <db> --all-tools` to advertise this whole list.",
   "tools": [
     "explore", "map", "context", "impact", "owners", "why", "explain_association",
+    "node_edges", "neighborhood", "edges_at", "what_if",
     "recall", "remember", "sync",
     "query", "ingest_json", "create_rule", "explain",
-    "stats", "neighborhood", "node_info", "node_edges",
+    "stats", "node_info",
     "upsert_entity", "find_similar", "hybrid_search",
     "node_history", "edge_history", "was_linked", "rename_node"
   ]
