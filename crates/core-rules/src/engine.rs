@@ -2146,8 +2146,12 @@ impl RuleEngine {
         self.hnsw_build_batch = batch.map(|b| b.max(1));
     }
 
+    /// Never zero: a zero slice would insert nothing per pump, and
+    /// `build_index_on` would spin forever on a build that cannot advance.
     fn build_batch(&self) -> usize {
-        self.hnsw_build_batch.unwrap_or_else(hnsw_build_batch)
+        self.hnsw_build_batch
+            .unwrap_or_else(hnsw_build_batch)
+            .max(1)
     }
 
     /// Rules whose vector index is still being built, in name order.
@@ -2492,14 +2496,19 @@ impl RuleEngine {
         // Re-derive the pending builds a mid-build snapshot left behind.
         //
         // `pending_builds` is never persisted, so the evidence that a build was
-        // unfinished is that the scan had to supply a vector for a node the
-        // snapshot already held and the adopted graph did not carry. The
-        // qualifier is the whole of it: this runs from `ensure_indexes_populated`
-        // too, which fires *inside* the apply of the first write after a clean
-        // reopen, with that write's node already labelled and propped. Comparing
-        // raw graph sizes made every completed rule look interrupted on that
-        // write and cost a full `RebuildRule`. Ids are dense and never reused,
-        // so "the snapshot already held it" is exactly "id < retained_node_count".
+        // unfinished is that the scan had to supply a vector the adopted graph
+        // did not carry. That is only sound because the write path populates
+        // the indexes *before* it applies a record (`needs_index_population`):
+        // the scan sees exactly the persisted state, so a vector it has to
+        // supply really was missing from the snapshot's graph rather than being
+        // the in-flight write's own.
+        //
+        // `retained_node_count` is the belt to that's braces. Ids are dense and
+        // never reused, so a node the snapshot did not hold has an id at or
+        // above the count it recorded; restricting the evidence to ids below
+        // the line keeps any path that still populates lazily — a `what_if`
+        // clone, or a caller reaching the engine directly — from reading its
+        // own newer nodes as an interrupted build.
         //
         // The scan has already finished the graph; what is still owed is the
         // backfill, so the entry is registered complete and the next pump turns
@@ -2767,6 +2776,27 @@ impl RuleEngine {
     /// taken, so it re-initializes to an empty map.
     fn release_lazy_hnsw(&mut self) {
         self.lazy_hnsw = OnceLock::new();
+    }
+
+    /// True when a write has to populate the candidate indexes before it
+    /// mutates anything.
+    ///
+    /// The lazy population is a full node scan, and it reads the graph it is
+    /// handed. Run from inside a hook it therefore reads the *half-applied*
+    /// record — the in-flight node's new label and props are already in the
+    /// columns — and the scan then attributes that node's vector to the
+    /// snapshot, which is how a perfectly ordinary write came to look like a
+    /// build the store had been killed in the middle of. Hoisting it to before
+    /// the mutation makes the scan see exactly the persisted state, and the
+    /// write's own hook then inserts its vector through the normal path.
+    pub fn needs_index_population(&self) -> bool {
+        !self.indexes_populated && !self.rules.is_empty()
+    }
+
+    /// Build every rule's candidate index from `g` if that has not happened
+    /// yet. The `&mut self` entry point behind [`RuleEngine::needs_index_population`].
+    pub fn populate_indexes(&mut self, g: &GraphMut<'_>) {
+        self.ensure_indexes_populated(g);
     }
 
     /// Returns `true` if candidate indexes have been built (either eagerly or

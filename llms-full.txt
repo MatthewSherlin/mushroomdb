@@ -2042,9 +2042,23 @@ While a rule is in that state:
 
 A store killed mid-build reopens with the rule present and its index partly
 built; the snapshot's graph covers what it carried, the open-time scan covers
-the rest, and the next pump issues the backfill. Node ids are dense and never
-reused, so "the snapshot held this node but its graph did not" is decided
-exactly, and an ordinary write after a clean reopen is never mistaken for one.
+the rest, and the next pump issues the backfill.
+
+How that is told apart from an ordinary write: a store restored from a snapshot
+defers building its candidate indexes until the first write, and the write path
+runs that build **before** it applies the record. The scan therefore reads
+exactly the state the snapshot persisted, so a vector it has to supply really
+was missing from the persisted graph rather than being the in-flight write's
+own; the record's own hook files that write a moment later through the normal
+insert path. (Ids are dense and never reused, so the snapshot's id count is kept
+as a second line of defence for any caller that still populates lazily — a
+`what_if` clone, say.)
+
+**`what_if` while a build is pending.** `what_if_set_prop` answers from a clone
+of the engine, and the clone carries no pending-build state. During a real
+pending build it therefore reports the `gained` edges the rule *would* derive,
+which the live store will not derive until its backfill runs. The preview is
+right about the end state and early about the timing.
 
 **Breaking change in 0.6.6:** code that created an approximate rule over more
 than 2,048 vectors and immediately asserted an edge count must now pump first.

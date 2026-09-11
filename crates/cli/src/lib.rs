@@ -1518,10 +1518,15 @@ pub fn run_build_index(db_dir: &Path, rule: Option<&str>) -> Result<String, CliE
 
 /// [`run_build_index`] against an already-open handle.
 ///
-/// Whether a build is outstanding at all is decided when the rule is created,
-/// so a test that wants one has to hold the handle that created it; opening the
-/// store again would replay `CreateRule` at the production slice size and find
-/// nothing left to do.
+/// Terminates: every pump advances each pending build's cursor by at least one
+/// node (the slice size is never zero), so the outstanding list empties.
+///
+/// Exposed for tests that need a build this handle itself deferred. Whether a
+/// build is outstanding is decided when the rule is created, so a test using a
+/// reduced slice size has to keep the handle that created the rule; reopening
+/// replays `CreateRule` at the production slice size. A build a *snapshot* cut
+/// short needs no such care — the reopen recognises it, which is what
+/// [`run_build_index`] relies on.
 pub fn build_index_on(db: &mut GraphDb<RealFs>, rule: Option<&str>) -> Result<String, CliError> {
     let mut out = String::new();
     let interesting = |name: &str| rule.is_none_or(|r| r == name);

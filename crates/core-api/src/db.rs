@@ -2917,6 +2917,17 @@ impl<F: Fs> GraphDb<F> {
     /// Apply a record to in-memory state. Used by both live writes and replay,
     /// so replay is definitionally identical to the original execution.
     fn apply(&mut self, rec: &WalRecord) -> Result<()> {
+        // Before the record mutates anything: a store restored from a snapshot
+        // defers building its candidate indexes until the first write, and that
+        // build is a full node scan. Left where it used to fire — inside the
+        // engine hook, after `props.set` and the label assignment — the scan
+        // read the half-applied record and took the in-flight node's vector for
+        // one the snapshot should have carried, which read as an interrupted
+        // vector-index build and cost a full `RebuildRule` on the first
+        // embedded write after every reopen. Hoisted here the scan sees exactly
+        // the persisted state; the record's own hook then files its vector
+        // through the ordinary insert path a line later.
+        self.populate_indexes_before_write();
         match rec {
             WalRecord::InsertNode { label, key, props } => {
                 let id = self.ids.try_insert(key)?;
@@ -5732,6 +5743,37 @@ impl<F: Fs> GraphDb<F> {
             })?;
         }
         Ok((finished, self.engine.builds_in_progress()))
+    }
+
+    /// Run the deferred candidate-index build, if it is still owed, against the
+    /// graph as it stands *now* — before the caller applies anything.
+    ///
+    /// A no-op bool test once the indexes are populated, which is after the
+    /// first write of the handle's life, and for a store with no rules at all.
+    fn populate_indexes_before_write(&mut self) {
+        if !self.engine.needs_index_population() {
+            return;
+        }
+        // The retained snapshot blobs arrive with the V8 base sections; without
+        // them the scan would rebuild every graph the snapshot already holds.
+        self.ensure_v8_base_sections_loaded();
+        if !self.engine.needs_index_population() {
+            return;
+        }
+        let mut eng = std::mem::take(&mut self.engine);
+        {
+            let gm = make_graph_mut(
+                &self.ids,
+                &mut self.syms,
+                &self.labels,
+                build_props_view(&self.props, &self.base),
+                &mut self.topo,
+                &self.base,
+                &mut self.edge_props,
+            );
+            eng.populate_indexes(&gm);
+        }
+        self.engine = eng;
     }
 
     /// One slice of build work for every pending rule. Returns the rules whose
@@ -10112,6 +10154,11 @@ impl<F: Fs> GraphDb<F> {
     /// via-hops, chaining, weights — are the engine's, not a re-implementation.
     ///
     /// Works on a read-only handle.
+    ///
+    /// **While a rule's vector index is still building** (`RuleStats::building`)
+    /// the clone carries no pending-build state, so this reports the edges that
+    /// rule would derive — which the live store will not derive until its
+    /// backfill runs. Right about the end state, early about the timing.
     ///
     /// Returns `Err(KeyNotFound)` for an unknown or tombstoned key and
     /// `Err(ViewPropReadOnly)` for a field a view owns — matching

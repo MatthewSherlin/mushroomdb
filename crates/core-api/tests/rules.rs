@@ -1930,65 +1930,99 @@ fn an_interrupted_build_resumes_on_reopen() {
     );
 }
 
-/// The first embedded write after a clean reopen must not look like an
-/// interrupted build.
+/// No write after a clean reopen may be mistaken for an interrupted build.
 ///
-/// `ensure_indexes_populated` runs *inside* the apply of that write, with the
-/// in-flight node already labelled and propped, so comparing the rebuilt graph
-/// against the adopted one by size alone made every completed rule look
-/// mid-build — one full `RebuildRule` (every node re-scanned, every edge
-/// re-derived) on the first embedded write after every reopen.
+/// The deferred candidate-index build is a full node scan, and it used to fire
+/// from inside the engine hook — after `props.set` and the label assignment had
+/// already landed. The scan therefore read the half-applied record and took the
+/// in-flight node's vector for one the snapshot's graph should have carried,
+/// which is the signature of a build the store was killed in the middle of. The
+/// cost was a full `RebuildRule` — every node re-scanned, every edge re-derived
+/// — on the first embedded write after every reopen.
+///
+/// Three shapes, because they fail for different reasons: (b) a brand-new
+/// embedded node, (c) an embedding *update* on a node the snapshot held, and
+/// (d) a node the snapshot held **without** an embedding that gains one. (d) is
+/// the one an id-based cutoff cannot catch on its own: its id is below the
+/// snapshot's line and the persisted graph genuinely does not contain it.
 #[test]
-fn a_reopened_complete_store_does_not_rebuild_on_the_first_write() {
-    let dir = tmp("slice-reopen-complete");
-    {
-        let mut db = GraphDb::open(&dir).unwrap();
-        for i in 0..300 {
-            db.insert_node("V", &format!("v{i}"), vec![("emb".into(), slice_vec(i))])
-                .unwrap();
+fn no_write_after_a_clean_reopen_looks_like_an_interrupted_build() {
+    for (case, dir_name) in [
+        ("b-new", "slice-reopen-b"),
+        ("c-update", "slice-reopen-c"),
+        ("d-gains", "slice-reopen-d"),
+    ] {
+        let dir = tmp(dir_name);
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            for i in 0..300 {
+                db.insert_node("V", &format!("v{i}"), vec![("emb".into(), slice_vec(i))])
+                    .unwrap();
+            }
+            // A `V` the snapshot holds with no embedding at all — case (d)'s
+            // subject. It is in the rule's dst label and below the snapshot's
+            // id line, but no persisted HNSW graph can contain it.
+            db.insert_node(
+                "V",
+                "bare",
+                vec![("note".into(), Value::Str("no emb".into()))],
+            )
+            .unwrap();
+            db.create_rule(slice_rule()).unwrap();
+            assert!(
+                db.stats().rules[0].building.is_none(),
+                "{case}: 300 vectors is one commit at the production slice"
+            );
+            db.snapshot().unwrap();
         }
-        db.create_rule(slice_rule()).unwrap();
+
+        let mut db = GraphDb::open(&dir).unwrap();
+        let fires_before = db.stats().rules[0].fires;
+        let wal_before = std::fs::metadata(dir.join("wal.bin")).map_or(0, |m| m.len());
+
+        let subject = match case {
+            "b-new" => {
+                db.insert_node("V", "late", vec![("emb".into(), slice_vec(3))])
+                    .unwrap();
+                "late"
+            }
+            "c-update" => {
+                db.set_prop("v0", "emb", slice_vec(3)).unwrap();
+                "v0"
+            }
+            _ => {
+                db.set_prop("bare", "emb", slice_vec(3)).unwrap();
+                "bare"
+            }
+        };
+
+        let wal = std::fs::read(dir.join("wal.bin")).unwrap();
+        let (tail, _) = decode_all(&wal[wal_before as usize..]);
+        assert!(
+            !tail
+                .iter()
+                .any(|r| matches!(r, WalRecord::RebuildRule { .. })),
+            "{case}: the first write after a reopen must not trigger a rebuild; \
+             WAL tail: {tail:?}"
+        );
         assert!(
             db.stats().rules[0].building.is_none(),
-            "built in one commit"
+            "{case}: a completed rule must not be reported as building"
         );
-        db.snapshot().unwrap();
+        assert_eq!(
+            db.stats().rules[0].fires - fires_before,
+            1,
+            "{case}: one write must evaluate the rule once, not once per node"
+        );
+        assert!(
+            db.neighbors(subject, "SIM", Direction::Out)
+                .unwrap()
+                .contains(&"v0".to_string())
+                || subject == "v0",
+            "{case}: the write still derives its own edges"
+        );
     }
-
-    let mut db = GraphDb::open(&dir).unwrap();
-    let fires_before = db.stats().rules[0].fires;
-    let wal_before = std::fs::metadata(dir.join("wal.bin")).map_or(0, |m| m.len());
-
-    db.insert_node("V", "late", vec![("emb".into(), slice_vec(3))])
-        .unwrap();
-
-    let wal = std::fs::read(dir.join("wal.bin")).unwrap();
-    let (tail, _) = decode_all(&wal[wal_before as usize..]);
-    assert!(
-        !tail
-            .iter()
-            .any(|r| matches!(r, WalRecord::RebuildRule { .. })),
-        "the first write after a reopen must not trigger a rebuild; WAL tail: {tail:?}"
-    );
-
-    assert!(
-        db.stats().rules[0].building.is_none(),
-        "a completed rule must not be reported as building after a reopen"
-    );
-    assert_eq!(
-        db.stats().rules[0].fires - fires_before,
-        1,
-        "one write must evaluate the rule once, not once per node: a full \
-         RebuildRule ran"
-    );
-    assert!(
-        db.neighbors("late", "SIM", Direction::Out)
-            .unwrap()
-            .contains(&"v0".to_string()),
-        "the write still derives its own edges"
-    );
 }
-
 /// A rule that is still building derives nothing, including for writes that
 /// land while it builds; the backfill then derives the whole set.
 #[test]
@@ -2033,9 +2067,13 @@ fn a_write_during_a_pending_build_derives_no_edges() {
         .contains(&"v0".to_string()));
 }
 
-/// A store killed between `CreateRule` and the `RebuildRule` that finishes it
-/// reopens resumable: the replayed `CreateRule` re-derives the build, and a
-/// pump completes it to the one-shot edge set.
+/// A store killed between `CreateRule` and the `RebuildRule` that finishes its
+/// build reopens resumable.
+///
+/// The kill is real: the WAL is truncated back to the byte offset `create_rule`
+/// left it at, which discards the finishing `RebuildRule` frame and everything
+/// after it. The reopen replays `CreateRule` under the same small slice, so the
+/// replayed rule defers exactly as the original did.
 #[test]
 fn a_truncated_wal_replay_leaves_the_build_resumable() {
     let want = {
@@ -2045,9 +2083,9 @@ fn a_truncated_wal_replay_leaves_the_build_resumable() {
     };
 
     let dir = tmp("slice-truncwal");
+    let after_create;
     {
-        // No snapshot: the WAL holds InsertNode ×300 + CreateRule and nothing
-        // else, because the build never finished.
+        // No snapshot: the WAL is the whole store.
         let mut db = GraphDb::open(&dir).unwrap();
         for i in 0..300 {
             db.insert_node("V", &format!("v{i}"), vec![("emb".into(), slice_vec(i))])
@@ -2056,13 +2094,40 @@ fn a_truncated_wal_replay_leaves_the_build_resumable() {
         db.set_hnsw_build_batch(Some(64));
         db.create_rule(slice_rule()).unwrap();
         assert_eq!(edges_of(&db, "sim"), 0);
+        // A frame boundary: everything the deferred create wrote, and nothing
+        // the build's completion will write.
+        after_create = std::fs::metadata(dir.join("wal.bin")).unwrap().len();
+        while !db.pump_index_build().unwrap().is_empty() {}
+        assert!(
+            edges_of(&db, "sim") > 0,
+            "the build finished before the kill"
+        );
     }
 
-    // Replay re-runs `create_rule`, which defers again at the production slice
-    // size only if the corpus warrants it; at 300 vectors it does not, so the
-    // replay builds it whole. Either way the store must be consistent.
-    let mut db = GraphDb::open(&dir).unwrap();
-    while !db.pump_index_build().unwrap().is_empty() {}
+    // Kill it: drop the finishing RebuildRule and everything after.
+    let full = std::fs::read(dir.join("wal.bin")).unwrap();
+    let (discarded, _) = decode_all(&full[after_create as usize..]);
+    assert!(
+        discarded
+            .iter()
+            .any(|r| matches!(r, WalRecord::RebuildRule { .. })),
+        "the bytes being truncated must include the finishing RebuildRule, \
+         else this test proves nothing; got {discarded:?}"
+    );
+    std::fs::write(dir.join("wal.bin"), &full[..after_create as usize]).unwrap();
+
+    // Replay under the same slice the original write used, so the replayed
+    // `create_rule` defers rather than building the corpus in one commit.
+    let mut db = core_rules::with_hnsw_build_batch(64, || GraphDb::open(&dir).unwrap());
+    let p = building_of(&db, "sim").expect("the replayed build is reported as outstanding");
+    assert_eq!(p.total, 300);
+    assert_eq!(
+        edges_of(&db, "sim"),
+        0,
+        "a rule still building owns no edges"
+    );
+
+    core_rules::with_hnsw_build_batch(64, || while !db.pump_index_build().unwrap().is_empty() {});
     assert!(building_of(&db, "sim").is_none());
     assert_eq!(
         edge_set(&db, "SIM", 300),
