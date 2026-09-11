@@ -225,9 +225,9 @@ pub enum Command {
         /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
         db_dir: Option<PathBuf>,
         auto: bool,
-        /// `--all-tools`: advertise all twenty-five tools in `tools/list`
+        /// `--all-tools`: advertise all twenty-seven tools in `tools/list`
         /// rather than the surface the store chose — three on a store
-        /// `ingest-git` built, thirteen on any other. The rest are callable
+        /// `ingest-git` built, fifteen on any other. The rest are callable
         /// either way; the flag decides what is listed, and what every session
         /// pays for before its first turn.
         all_tools: bool,
@@ -497,8 +497,8 @@ Usage:
                      stdio handshake with the configured MCP command; exits 1 on any `fail`
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
   mushroomdb mcp <db-dir>|--auto [--all-tools]
-                     --all-tools lists all 25 tools; the default follows the store — 3 on a
-                     store `ingest-git` built (explore, query, stats), 13 on any other
+                     --all-tools lists all 27 tools; the default follows the store — 3 on a
+                     store `ingest-git` built (explore, query, stats), 15 on any other
                      (the rest stay callable, just unlisted)
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
