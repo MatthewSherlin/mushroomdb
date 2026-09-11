@@ -5,8 +5,8 @@
 //! *start* node of a MATCH whose variable is already bound.
 
 use super::ast::{
-    AggArg, AggFunc, Expr, LimitSkip, NodePat, Operand, OptionalClause, OrderItem, OrderTarget,
-    Pattern, Query, RelDir, RelPat, RetItem, RetVal, UnwindExpr, WithStage,
+    ret_val_label, AggArg, AggFunc, Expr, LimitSkip, NodePat, Operand, OptionalClause, OrderItem,
+    OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, UnwindExpr, WithStage,
 };
 use crate::filter::CmpOp;
 use std::collections::BTreeSet;
@@ -639,17 +639,25 @@ fn compile_with_stage(
         // Non-aggregate WITH → validate items and emit PlanOp::With.
         check_return_bound(&stage.items, bound, rel_bound)?;
 
-        // Optional WHERE filter on the current (pre-WITH) rows.
-        // This also handles bare-variable operands (Operand::Var) referencing
-        // scalar aliases produced by earlier stages.
+        // `WITH … WHERE …` filters *after* the projection — the executor
+        // projects each row through the WITH items and only then runs the
+        // filter, exactly so that `WITH t, t.age AS age WHERE age > 30`
+        // works. The pre-flight check has to scope the same way: against the
+        // variables that survive the WITH as well as those already in scope.
+        // Checking the pre-WITH set alone rejected every alias a
+        // non-aggregate WITH introduced (`unbound variable `age` in WHERE`)
+        // even though the plan it would have produced ran correctly, while
+        // the aggregate branch above has always scoped its HAVING clause to
+        // the group's output columns.
+        let with_col_names: BTreeSet<String> = stage.items.iter().map(column_name).collect();
+        let with_scope: BTreeSet<String> = bound.union(&with_col_names).cloned().collect();
         if let Some(expr) = &stage.where_expr {
-            check_expr_bound(expr, bound)?;
+            check_expr_bound(expr, &with_scope)?;
         }
         // ORDER BY items reference either var names or prop paths — no rewrite needed
         // here; exec_order_by_rows handles raw row ordering.
         // ORDER BY may reference the WITH output columns (aliases) in addition to
         // variables already in scope before the WITH.
-        let with_col_names: BTreeSet<String> = stage.items.iter().map(column_name).collect();
         for item in &stage.order_by {
             match &item.target {
                 OrderTarget::Prop { var, .. } | OrderTarget::Var(var) => {
@@ -1212,6 +1220,10 @@ fn check_operand_bound(
             check_operand_bound(left, bound, clause)?;
             check_operand_bound(right, bound, clause)
         }
+        Operand::Index { base, index } => {
+            check_operand_bound(base, bound, clause)?;
+            check_operand_bound(index, bound, clause)
+        }
         Operand::FuncCall { args, .. } => {
             for arg in args {
                 check_operand_bound(arg, bound, clause)?;
@@ -1272,15 +1284,7 @@ fn check_return_bound(
             RetVal::Prop { var, .. } => {
                 require_bound(var, bound, "RETURN")?;
             }
-            RetVal::Agg { arg, .. } => match arg {
-                AggArg::Star => {}
-                AggArg::Var(v) => {
-                    require_bound(v, bound, "RETURN")?;
-                }
-                AggArg::Prop { var, .. } => {
-                    require_bound(var, bound, "RETURN")?;
-                }
-            },
+            RetVal::Agg { arg, .. } => check_agg_arg_bound(arg, bound)?,
             RetVal::FuncCall { args, .. } => {
                 for arg in args {
                     check_operand_bound(arg, bound, "RETURN")?;
@@ -1323,39 +1327,37 @@ fn column_name(item: &RetItem) -> String {
     if let Some(alias) = &item.alias {
         return alias.clone();
     }
-    match &item.value {
-        RetVal::Var(v) => v.clone(),
-        RetVal::Prop { var, field } => format!("{var}.{field}"),
+    ret_val_label(&item.value).unwrap_or_else(|| match &item.value {
         RetVal::Agg { func, arg } => agg_column_name(func, arg),
-        RetVal::FuncCall { name, args } => {
-            let arg_strs: Vec<String> = args
-                .iter()
-                .map(|a| match a {
-                    Operand::Var(v) => v.clone(),
-                    Operand::Prop { var, field } => format!("{var}.{field}"),
-                    Operand::Lit(_) => "<lit>".to_string(),
-                    Operand::Param(p) => format!("${p}"),
-                    Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
-                    Operand::BinArith { .. } => "<arith>".to_string(),
-                    Operand::Case { .. } => "<case>".to_string(),
-                })
-                .collect();
-            format!("{name}({})", arg_strs.join(", "))
-        }
-        RetVal::ScalarExpr(_) => "<expr>".to_string(),
+        _ => unreachable!("ret_val_label names every non-aggregate item"),
+    })
+}
+
+/// Every variable an aggregate argument reads must be bound, through any
+/// `DISTINCT` wrapper.
+fn check_agg_arg_bound(arg: &AggArg, bound: &BTreeSet<String>) -> Result<(), String> {
+    match arg {
+        AggArg::Star => Ok(()),
+        AggArg::Var(v) => require_bound(v, bound, "RETURN"),
+        AggArg::Prop { var, .. } => require_bound(var, bound, "RETURN"),
+        AggArg::Distinct(inner) => check_agg_arg_bound(inner, bound),
     }
 }
 
 /// Canonical string for an aggregate without an alias, e.g. `COUNT(*)`,
-/// `SUM(n.age)`.
+/// `SUM(n.age)`, `COUNT(DISTINCT t)`.
 fn agg_column_name(func: &AggFunc, arg: &AggArg) -> String {
     let f = func_name(func);
-    let a = match arg {
+    format!("{f}({})", agg_arg_name(arg))
+}
+
+fn agg_arg_name(arg: &AggArg) -> String {
+    match arg {
         AggArg::Star => "*".to_string(),
         AggArg::Var(v) => v.clone(),
         AggArg::Prop { var, field } => format!("{var}.{field}"),
-    };
-    format!("{f}({a})")
+        AggArg::Distinct(inner) => format!("DISTINCT {}", agg_arg_name(inner)),
+    }
 }
 
 fn func_name(func: &AggFunc) -> &'static str {

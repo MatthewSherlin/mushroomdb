@@ -67,6 +67,9 @@ fn install_opts(scope: Scope, db: &Path, command: &Path) -> InstallOpts {
         prewarm: false,
         delivery: Delivery::Both,
         intercept_grep: false,
+        impact_before_edit: false,
+        enrich_grep: false,
+        always_load: false,
     }
 }
 
@@ -122,16 +125,15 @@ fn doctor_passes_on_fresh_project_install() {
 
     let handshake = find_check(&report.output, "handshake");
     assert!(handshake.starts_with("ok"), "handshake check: {handshake}");
-    // The eleven a default `mushroomdb mcp` advertises on a memory store —
-    // which is what a fresh install points at: the eight memory task tools
-    // plus `query`, `ingest_json` and `stats`. The other fourteen stay
-    // callable, and `--all-tools` lists them.
+    // The fifteen a default `mushroomdb mcp` advertises on a memory store —
+    // which is what a fresh install points at: the association surface. The
+    // other twelve stay callable, and `--all-tools` lists all twenty-seven.
     assert!(
-        handshake.contains("11 tools"),
-        "expected the handshake to report 11 tools: {handshake}"
+        handshake.contains("15 tools"),
+        "expected the handshake to report 15 tools: {handshake}"
     );
     assert!(
-        handshake.contains("map present"),
+        handshake.contains("explain_association present"),
         "the handshake must prove the task path: {handshake}"
     );
 }
@@ -203,6 +205,9 @@ fn doctor_understands_auto_entries() {
         prewarm: false,
         delivery: Delivery::Both,
         intercept_grep: false,
+        impact_before_edit: false,
+        enrich_grep: false,
+        always_load: false,
     };
     run_install_with(
         &root,
@@ -465,4 +470,90 @@ fn doctor_reports_the_grep_redirect_only_when_it_is_installed() {
             assert_eq!(line, None, "unasked-for line:\n{}", report.output);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test: always-load is reported from `.mcp.json`, not from the manifest flag
+// ---------------------------------------------------------------------------
+
+/// Install with `--always-load` and hand back the doctor report.
+fn install_with_always_load(
+    root: &Path,
+    home: &Path,
+    delivery: Delivery,
+) -> cli::doctor::DoctorReport {
+    git_repo(root);
+    let db = root.join("mushroom-memory");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+    let opts = InstallOpts {
+        always_load: true,
+        delivery,
+        ..install_opts(Scope::Project, &db, &bin)
+    };
+    run_install_with(
+        root,
+        home,
+        &opts,
+        &McpCommand::Explicit(bin),
+        &no_externals(),
+    )
+    .expect("install failed");
+    run_doctor_with(root, home, &doctor_project_opts(), &no_externals()).expect("doctor errored")
+}
+
+#[test]
+fn always_load_is_ok_when_the_entry_carries_the_key() {
+    let root = temp_dir("always-ok");
+    let home = temp_dir("always-ok-home");
+    let report = install_with_always_load(&root, &home, Delivery::Both);
+
+    let line = find_check(&report.output, "always-load");
+    assert!(line.starts_with("ok"), "{line}");
+    assert!(line.contains("alwaysLoad"), "{line}");
+    assert!(!report.had_fail, "{}", report.output);
+}
+
+/// The manifest flag is a record of what was asked for; `.mcp.json` is what
+/// the host actually reads. Hand-editing the key away has to show up, or a
+/// benchmark arm would quietly measure the install it was meant to replace.
+#[test]
+fn always_load_warns_when_the_entry_lost_the_key() {
+    let root = temp_dir("always-drift");
+    let home = temp_dir("always-drift-home");
+    install_with_always_load(&root, &home, Delivery::Both);
+
+    let mcp_file = root.join(".mcp.json");
+    let mut mcp: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&mcp_file).unwrap()).unwrap();
+    mcp["mcpServers"]["mushroomdb"]
+        .as_object_mut()
+        .unwrap()
+        .remove("alwaysLoad");
+    fs::write(&mcp_file, serde_json::to_string_pretty(&mcp).unwrap()).unwrap();
+
+    let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+        .expect("doctor errored");
+    let line = find_check(&report.output, "always-load");
+    assert!(line.starts_with("warn"), "{line}");
+    assert!(line.contains("manifest records it but"), "{line}");
+    assert!(line.contains(".mcp.json"), "{line}");
+    // A warn is informational: it must not fail the exit code.
+    assert!(!report.had_fail, "{}", report.output);
+}
+
+/// `--delivery cli` registers no server, so there is no entry for the key to
+/// sit on. The flag is still recorded, and doctor has to say the truth about
+/// it rather than echoing the manifest.
+#[test]
+fn always_load_warns_on_a_cli_delivery_install() {
+    let root = temp_dir("always-cli");
+    let home = temp_dir("always-cli-home");
+    let report = install_with_always_load(&root, &home, Delivery::Cli);
+
+    let line = find_check(&report.output, "always-load");
+    assert!(
+        line.starts_with("warn"),
+        "a cli install has no entry to mark: {line}"
+    );
+    assert!(!report.had_fail, "{}", report.output);
 }

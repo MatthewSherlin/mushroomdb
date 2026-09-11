@@ -1794,15 +1794,9 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
     assert!(!absent.exists(), "the hook created {}", absent.display());
 }
 
-/// Binding: on a store no repository was ingested into, the brief's last line
-/// names `context`, not `explore`.
-///
-/// The two lines track the two MCP surfaces: a store with no `GitSync` marker
-/// lists `context` among its eleven and does not list `explore` at all, so
-/// naming `explore` there would send a session at a tool it cannot see.
-#[test]
-fn the_reach_line_names_context_on_a_store_with_no_git_sync_marker() {
-    let db_dir = tmp("brief-memory-db");
+/// A store with one node and no `GitSync` marker: the memory surface.
+fn memory_store(name: &str) -> PathBuf {
+    let db_dir = tmp(name);
     let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
         .arg("query")
         .arg(&db_dir)
@@ -1810,21 +1804,111 @@ fn the_reach_line_names_context_on_a_store_with_no_git_sync_marker() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{out:?}");
+    db_dir
+}
 
-    let text = cli::run_brief(&db_dir).expect("brief");
-    let reach = text.lines().next_back().unwrap();
-    assert!(
-        reach.starts_with("reach the graph: context <target> (MCP tool)"),
-        "{reach}"
+/// The brief's last line, without its `reach the graph: ` label.
+fn reach_line_of(db_dir: &Path) -> String {
+    let text = cli::run_brief(db_dir).expect("brief");
+    text.lines()
+        .next_back()
+        .expect("a brief ends with its reach line")
+        .strip_prefix("reach the graph: ")
+        .expect("the last line is the reach line")
+        .to_string()
+}
+
+/// Binding: on a store no repository was ingested into, the brief's last line
+/// names the association door — `explain_association` and `query`, with the
+/// `role` argument — and not one code-graph tool.
+///
+/// The two lines track the two MCP surfaces. A store with no `GitSync` marker
+/// lists neither `explore` nor `context`, so naming either would send a
+/// session at a tool it cannot see. The shell half names `query`, the one of
+/// the two that has a CLI subcommand, and it is introduced with the same
+/// `SEP`-then-`or:` the code-graph line uses.
+#[test]
+fn the_reach_line_names_the_association_door_on_a_store_with_no_git_sync_marker() {
+    let db_dir = memory_store("brief-memory-db");
+    let reach = reach_line_of(&db_dir);
+
+    assert_eq!(
+        reach,
+        format!(
+            "explain_association <a> <b> · query '<cypher>' (MCP tools; add role: <name> to see \
+             as a role) · or: {} query '{}' '<cypher>'",
+            cli::install::detect_mcp_command(None).shell(),
+            db_dir.display()
+        ),
+        "the memory store's reach line"
     );
-    assert!(
-        !reach.contains("explore"),
-        "a memory store must not be sent at the code-graph tool: {reach}"
+    for code_only in ["explore", "context", "map", "impact", "owners"] {
+        assert!(
+            !reach.contains(code_only),
+            "a memory store must not be sent at the code-graph tool {code_only}: {reach}"
+        );
+    }
+}
+
+/// Binding: every MCP tool the reach line names is one the store's own
+/// `tools/list` advertises — on both surfaces.
+///
+/// This is the guard on the class of break the thirteen-tool listing caused:
+/// the line named `context`, which stayed *served* on a memory store but
+/// stopped being *listed*, and nothing failed. The lists come from the server
+/// crate itself ([`server::ASSOCIATION_TOOLS`], [`server::CODE_GRAPH_TOOLS`]),
+/// so a surface that drops a tool this line names cannot pass silently again.
+#[test]
+fn the_reach_line_names_only_tools_its_surface_lists() {
+    // The first word of each ` · `-separated clause of the MCP half — the half
+    // before ` or: `, which is where the shell command starts. A clause that
+    // is all punctuation or whitespace yields nothing.
+    fn tools_named_in(reach: &str) -> Vec<String> {
+        let mcp_half = reach.split(" or: ").next().expect("split yields one part");
+        mcp_half
+            .split(core_api::repograph::render::SEP)
+            .filter_map(|clause| clause.split_whitespace().next())
+            .filter(|word| {
+                !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
+    let repo = tmp("reach-surface-repo");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit(
+        &repo,
+        "alice",
+        "core",
+        &[("src/core.rs", "pub fn core() {}\n")],
     );
-    assert!(
-        reach.ends_with(&format!(" context '{}' <target>", db_dir.display())),
-        "{reach}"
-    );
+    let code_db = tmp("reach-surface-code");
+    run_ingest_git(&code_db, &opts(&repo)).unwrap();
+    let memory_db = memory_store("reach-surface-memory");
+
+    for (label, db_dir, listed) in [
+        ("code graph", code_db, server::CODE_GRAPH_TOOLS.to_vec()),
+        ("memory", memory_db, server::ASSOCIATION_TOOLS.to_vec()),
+    ] {
+        let reach = reach_line_of(&db_dir);
+        assert!(
+            reach.contains("(MCP tool"),
+            "{label}: this store's install has an MCP door, so the line must name it: {reach}"
+        );
+        let named = tools_named_in(&reach);
+        assert!(
+            !named.is_empty(),
+            "{label}: no tool name was parsed out of {reach}"
+        );
+        for tool in &named {
+            assert!(
+                listed.contains(&tool.as_str()),
+                "{label}: the reach line sends a session at `{tool}`, which this surface's \
+                 tools/list does not advertise (it lists {listed:?}): {reach}"
+            );
+        }
+    }
 }
 
 /// Binding: on a `--delivery cli` install the brief's last line names the
@@ -1853,6 +1937,9 @@ fn the_reach_line_on_a_cli_delivery_install_names_only_the_binary() {
             prewarm: false,
             delivery: cli::install::Delivery::Cli,
             intercept_grep: false,
+            impact_before_edit: false,
+            enrich_grep: false,
+            always_load: false,
         },
         &cli::install::McpCommand::OnPath,
         &cli::install::Externals::with_path(None),
@@ -1874,7 +1961,7 @@ fn the_reach_line_on_a_cli_delivery_install_names_only_the_binary() {
         "a cli install has no server to name: {reach}"
     );
     assert!(
-        reach.ends_with(&format!(" context '{}' <target>", db_dir.display())),
+        reach.ends_with(&format!(" query '{}' '<cypher>'", db_dir.display())),
         "{reach}"
     );
 }

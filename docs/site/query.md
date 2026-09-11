@@ -9,31 +9,47 @@ variable-length paths and `shortestPath`.
 
 ## Key idiom — how to filter and read node keys
 
-**Node keys are NOT properties.** There is no `id` property and no `key()`
-function. Accessing `n.id` returns `null` (or `None` in Python); filtering with
-`{id: 'alice'}` matches nothing because the key is not stored as a property
-named `id`.
+**A node key is not stored as a property**, so there is no `id` property:
+`n.id` returns `null` (or `None` in Python), and `{id: 'alice'}` matches
+nothing. Four spellings reach the key and the label instead, and all four work
+anywhere a scalar does — `WHERE`, `ORDER BY`, `RETURN`, an inline pattern
+filter, and after a grouping `WITH`:
 
-**To filter by key:** use `WHERE n = 'alice'` (equality between a node variable
-and a string literal matches on the node key).
+| Spelling | Gives |
+|---|---|
+| `n.key` | the node's key, as a string |
+| `n.label` | the node's label |
+| `key(n)` | the same key, as a function call |
+| `labels(n)` | a one-element list holding the label |
 
-**To read the key:** use a bare `RETURN n`. The result row value for a node
-variable is the key string, not a node object.
+`n.key` and `n.label` are a **fallback**: a stored property of either name
+always wins, so a graph that really has a `key` property keeps reading it.
 
 ```cypher
--- correct: filter by key
-MATCH (n:Person) WHERE n = 'alice' RETURN n
+-- filter by key
+MATCH (n:Person) WHERE n.key = 'alice' RETURN n.key, n.name
+MATCH (n:Person {key: 'alice'}) RETURN n.name
+MATCH (n:Person) WHERE n = 'alice' RETURN n        -- the older spelling, still correct
 
--- correct: read key and a property
-MATCH (n:Person)-[:KNOWS]->(m:Person)
-WHERE n = 'alice'
-RETURN n, m, m.age
+-- read key and label
+MATCH (n:Person) RETURN key(n) AS id, n.label AS kind ORDER BY n.key
+
+-- and after a grouping WITH, which used to flatten `c` to a scalar
+MATCH (t:Talent)-[:FIT]->(c:Company)
+WITH c, count(DISTINCT t) AS n WHERE n >= 2
+RETURN key(c), n ORDER BY n DESC
 
 -- WRONG: n.id is always null
 MATCH (n:Person) WHERE n.id = 'alice' RETURN n   -- returns nothing
 ```
 
-In Python: `row["n"]` is the key string `"alice"`, not a dict.
+A bare `RETURN n` also works: the result row value for a node variable is the
+key string, not a node object. In Python, `row["n"]` is `"alice"`, not a dict.
+
+**Performance note.** `n.key` and `n.label` resolve through a label scan plus a
+retain, not an index lookup, so `WHERE c.key = 'x'` on a large store is O(nodes
+of that label). `MATCH (c {id: 'x'})` on a real indexed property still plans to
+a key scan.
 
 ---
 
@@ -55,7 +71,10 @@ LIMIT 10
 
 - `var` — optional binding name
 - `:Label` — optional label filter
-- `{key: 'value'}` — zero or more property equality filters (not the node key — see Key idiom above)
+- `{key: 'value'}` — zero or more property equality filters. The names `key` and
+  `label` fall back to the node's own key and label when no stored property of
+  that name exists, so `(n {key: 'alice'})` does select by key (see Key idiom
+  above)
 
 ### Relationship patterns
 
@@ -67,6 +86,30 @@ LIMIT 10
 
 The relationship variable (`r`) is optional.  Omitting the brackets entirely
 (`-->`) is also accepted.
+
+### Multiple patterns in one MATCH
+
+Patterns separated by commas inside a single `MATCH` are equivalent to the same
+patterns as consecutive `MATCH` clauses — they plan and execute identically.
+Sharing a variable between them is a join; sharing none is a cartesian product,
+which is the openCypher meaning.
+
+```cypher
+-- the intersection: a talent joined to a company by all three types
+MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company),
+      (t)-[:SPECIALTY_MATCH]->(c),
+      (t)-[:LOCATION_FIT]->(c)
+WHERE t.status = 'published'
+WITH c, count(DISTINCT t) AS n WHERE n >= 14
+RETURN key(c), n ORDER BY n DESC
+```
+
+`count(DISTINCT …)` is what makes that correct: three edge types between the
+same pair yield three rows per talent under an alternation, and only `DISTINCT`
+counts the talent once. A company joined by only two of the three types does not
+appear at all.
+
+Comma-separated patterns after `CREATE` are still a named parse error.
 
 ---
 
@@ -189,6 +232,36 @@ ORDER BY cnt DESC
 The `WHERE` clause after an aggregating `WITH` acts as a HAVING filter —
 evaluated against the group result, not the raw matched rows.
 
+A grouping key that is a **bare variable** stays a node through the group, so
+`key(c)`, `c.key` and `c.label` all still read after `WITH c, count(*) AS n`. A
+*computed* key (`c.city`, `toLower(c.name)`) becomes a scalar, as it must.
+
+An aggregating `WITH` projects its `RETURN` whether or not a `WHERE` follows it:
+
+```cypher
+MATCH (p:Person)-[:WORKS_AT]->(c:Company)
+WITH c, COUNT(p) AS n
+RETURN key(c), n * 2 AS doubled
+```
+
+### A WITH alias is in scope for its own WHERE
+
+An alias a non-aggregate `WITH` introduces is visible to the `WHERE`,
+`ORDER BY`, `SKIP` and `LIMIT` that follow it, because the stage projects before
+it filters:
+
+```cypher
+MATCH (t:Talent)
+WITH t, t.years_of_experience AS x
+WHERE x > 11
+ORDER BY x DESC
+RETURN key(t), x
+```
+
+An unknown name in that `WHERE` is still an error (``unbound variable `nope` in
+WHERE``). A name the `WITH` dropped is accepted and reads null at runtime, so the
+predicate is false rather than wrong.
+
 ### ORDER BY and LIMIT inside WITH
 
 ```cypher
@@ -248,6 +321,20 @@ RETURN AVG(r.score)
 
 Supported functions: `COUNT(*)`, `COUNT(var)`, `SUM(var.field)`,
 `AVG(var.field)`, `MIN(var.field)`, `MAX(var.field)`.
+
+### DISTINCT inside an aggregate
+
+`count(DISTINCT x)` and `collect(DISTINCT x)` deduplicate within each group
+before aggregating, keyed by the same normalisation grouping uses (so an `Int`
+`1` and a `Float` `1.0` are one value).
+
+```cypher
+MATCH (t:Talent)-[:FIT|:NEAR]->(c:Company)
+RETURN key(c), count(DISTINCT t) AS talents
+```
+
+`count(DISTINCT *)` is a named parse error. A variable actually named `distinct`
+still parses as an ordinary argument.
 
 ### Grouped aggregation
 
@@ -497,10 +584,12 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `toFloat(x)` | `Int`/`Float`/`String` | `Float` | parse; unparseable → null |
 | `toString(x)` | scalar | `String` | scalar to text |
 | `decay(base, age, halflife)` | `Int`/`Float` ×3 | `Float` | `base * 0.5^(age / halflife)`; error if `halflife <= 0` |
-| `key(n)` | node variable | `String` | the node's key; `n.key` is not a property so this is the only way to project it. Non-node argument is a named error |
+| `key(n)` | node variable | `String` | the node's key; `n.key` reads the same value. Non-node argument is a named error |
+| `labels(n)` | node variable | `List` | a one-element list holding the node's label; `n.label` reads it as a scalar |
 
 Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
-row's value into a list, per group when grouping keys are present).
+row's value into a list, per group when grouping keys are present). `count` and
+`collect` accept `DISTINCT`.
 
 `CASE WHEN <cond> THEN <value> … [ELSE <value>] END` is supported anywhere a
 scalar expression is (RETURN/WITH/WHERE/SET). `UNION` and `UNION ALL` combine
@@ -510,8 +599,36 @@ type alternation: `(a)-[:A|:B]->(b)`.
 Calling an unknown function name returns:
 
 ```
-unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key
+unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key, labels
 ```
+
+### Infix string predicates
+
+`STARTS WITH`, `ENDS WITH` and `CONTAINS` are infix spellings of the
+`startsWith` / `endsWith` / `contains` functions above, and share their null and
+non-string handling: a missing property is `false`, not an error.
+
+```cypher
+MATCH (c:Company) WHERE c.name STARTS WITH 'Acme'   RETURN c.name
+MATCH (c:Company) WHERE c.name ENDS WITH 'Works'    RETURN c.name
+MATCH (c:Company) WHERE NOT c.name CONTAINS 'Design' RETURN c.name
+```
+
+`STARTS` or `ENDS` without its `WITH` is a named parse error.
+
+### List subscripts
+
+A subscript reads one element of a list-valued property or expression. A
+negative index counts from the end.
+
+```cypher
+MATCH (n:Place) RETURN n.location[0] AS lat, n.location[1] AS lon
+MATCH (n:Place) WHERE n.tags[-1] = 'primary' RETURN key(n)
+```
+
+Out of range, a non-list base and a non-integer index all evaluate to `null` —
+never an error, and never a match. An unaliased subscript names its own column
+(`n.location[0]`), so two subscripts of one list are two distinct columns.
 
 ### Examples
 
@@ -522,16 +639,18 @@ MATCH (n:Person) RETURN coalesce(n.nickname, n.name)
 MATCH (a:Person)-[r]->(b:Person) RETURN type(r)
 MATCH (n:Person) RETURN abs(n.score)
 MATCH (n:Measurement) RETURN round(n.value)
-MATCH (n:Person) RETURN key(n) AS id
+MATCH (n:Person) RETURN key(n) AS id, labels(n) AS kinds
 ```
 
 ---
 
 ## Cypher coverage
 
-Tested against the current binary (2026-08-24, release build, maturin develop --release).
-Classification: **Supported** = executes without error; **Named-error** = rejected with a
-clear, actionable message; **Absent** = not implemented (not tested here).
+Tested against the current binary (2026-08-24, release build, maturin develop --release);
+the forms added in v0.6.3 — node key and label, comma-separated patterns, infix string
+predicates, list subscripts, `DISTINCT` aggregates, `WITH` alias scoping — are covered by the
+workspace test suite. Classification: **Supported** = executes without error; **Named-error** =
+rejected with a clear, actionable message; **Absent** = not implemented (not tested here).
 
 ### Supported
 
@@ -539,6 +658,13 @@ clear, actionable message; **Absent** = not implemented (not tested here).
 |---|---|
 | `MATCH (n:Label)` | `MATCH (n:Person) RETURN n.name` |
 | `MATCH (n {key: val})` inline property filter | `MATCH (n:Person {city: 'Austin'}) RETURN n` |
+| `n.key` / `n.label` / `key(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.key = 'alice' RETURN key(n), labels(n)` — a stored property of that name wins |
+| Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — identical to consecutive `MATCH` clauses; no shared variable is a product |
+| `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is false, not an error |
+| List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range / non-list / non-integer index → null |
+| `count(DISTINCT x)` / `collect(DISTINCT x)` | `WITH c, count(DISTINCT t) AS n RETURN key(c), n` |
+| `WITH … WHERE <alias>` (non-aggregate) | `WITH t, t.age AS x WHERE x > 11 RETURN key(t), x` — the alias is in scope for WHERE, ORDER BY, SKIP and LIMIT |
+| Aggregate `WITH` projecting its `RETURN` | `WITH c, COUNT(p) AS n RETURN key(c), n * 2 AS d` — projects with or without a HAVING clause |
 | `MATCH (n)-[r:TYPE]->(m)` directed edge | `MATCH (a)-[:KNOWS]->(b) RETURN a` |
 | `MATCH (n)-[r:TYPE]-(m)` undirected edge | `MATCH (a)-[:KNOWS]-(b) RETURN a` |
 | `MATCH (n)-[r]->(m)` any relationship type | `MATCH (n)-[r]->(m) RETURN type(r)` |
@@ -605,8 +731,11 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | `UNWIND scalar` (non-list value) | `execute: UNWIND requires a list; got … value for …` |
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH (found …)` |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
-| `shortestPath` with endpoints bound via comma-sep `MATCH (a), (b)` | `parse error: unexpected tokens after CREATE pattern (found Comma)` — comma-separated MATCH is not supported; use sequential `MATCH (a) MATCH (b)` forms |
-| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key` |
+| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key, labels` |
+| `STARTS` / `ENDS` without `WITH` | `expected WITH after STARTS` |
+| `count(DISTINCT *)` | named parse error — `DISTINCT` needs an expression, not `*` |
+| Unknown name in a `WITH … WHERE` | ``unbound variable `nope` in WHERE`` |
+| A list subscript in a **write**-statement RETURN projection | `use a read query` — as `CASE` is already handled there |
 | `$param` referenced but not supplied | `execute: missing parameter …` |
 | `SET n.prop = n.other` (bare property-to-property copy) | `SET RHS: bare property/variable reference is not supported; use a literal, $parameter, or arithmetic expression` |
 | Integer division by zero | `execute: division by zero` |
@@ -639,7 +768,9 @@ unexpected-token parse error or other unspecified result.
 | Bare DELETE on node with edges | Error — use DETACH DELETE |
 | MERGE ON CREATE / ON MATCH | Supported in the same MERGE / write batch |
 | Grouped aggregation | Supported (multiple keys and multiple aggregates allowed; group count capped at 1,000,000) |
-| WITH pipeline stages | Supported — projection, aliasing, WHERE (HAVING), ORDER BY, LIMIT, and re-entry MATCH |
+| WITH pipeline stages | Supported — projection, aliasing, WHERE (HAVING, and an alias the stage itself introduced), ORDER BY, LIMIT, and re-entry MATCH |
+| Multiple patterns in one MATCH | Supported, comma-separated — identical to consecutive MATCH clauses. Still a named error after CREATE |
+| `n.key` / `n.label` as index-scan keys | Not indexed — they resolve through a label scan plus a retain, so an equality filter on them is O(nodes of that label) |
 | UNWIND | Supported — list literals, list-valued properties, and scalar aliases from prior WITH; non-list → named error |
 | Variable-length paths: max hops | Capped at 10 |
 | shortestPath with unbound endpoints | Rejected at planning time |

@@ -41,7 +41,7 @@ const DB_PATH_PLACEHOLDER: &str = "{{DB_PATH}}";
 const BIN_PLACEHOLDER: &str = "{{BIN}}";
 
 /// The MCP server name we write. Must not be changed without a migration.
-const SERVER_NAME: &str = "mushroomdb";
+pub(crate) const SERVER_NAME: &str = "mushroomdb";
 
 /// The binary name looked up on PATH and used as the bare MCP command.
 const BIN_NAME: &str = "mushroomdb";
@@ -519,6 +519,17 @@ pub struct InstallOpts {
     /// redirects a `Grep` for a known symbol name to `explore`. Off by
     /// default — it is the one hook of ours that can block a tool call.
     pub intercept_grep: bool,
+    /// `--impact-before-edit`: also write the experimental `PreToolUse` hook
+    /// that puts a file's blast radius in front of an edit. Off by default.
+    pub impact_before_edit: bool,
+    /// `--enrich-grep`: also write the experimental `PostToolUse` hook that
+    /// appends what the graph knows about the symbols a `Grep` matched. Off by
+    /// default.
+    pub enrich_grep: bool,
+    /// `--always-load`: mark the registered server `alwaysLoad` so the host
+    /// keeps its tools in context rather than deferring them. Off by default,
+    /// and meaningless on a `--delivery cli` install, which registers none.
+    pub always_load: bool,
 }
 
 /// Options parsed from `mushroomdb enable [flags]` or `mushroomdb disable [flags]`.
@@ -994,6 +1005,19 @@ struct Manifest {
     /// false, which is what every manifest written before it existed means.
     #[serde(default)]
     intercept_grep: bool,
+    /// Whether this install asked for the pre-edit impact hook. Read for the
+    /// same three reasons as `intercept_grep`, and defaulted the same way.
+    #[serde(default)]
+    impact_before_edit: bool,
+    /// Whether this install asked for the grep enrichment hook.
+    #[serde(default)]
+    enrich_grep: bool,
+    /// Whether the registered server entry carries `alwaysLoad`. The key lives
+    /// in the MCP JSON, which `uninstall` removes whole, so nothing needs this
+    /// to undo it; `enable` reads it to put the same entry back, and `doctor`
+    /// to report it.
+    #[serde(default)]
+    always_load: bool,
 }
 
 impl Manifest {
@@ -1136,6 +1160,36 @@ pub(crate) const INTERCEPT_EVENT: &str = "PreToolUse";
 /// redirected: the graph has no better answer to those.
 const INTERCEPT_MATCHER: &str = "Grep";
 
+/// The optional fifth hook: the blast radius of a file, in front of the edit
+/// that is about to change it.
+///
+/// Written only for `install --impact-before-edit`. It shares `PreToolUse`
+/// with the redirect but is a different group, matched to the editing tools
+/// rather than to `Grep`, so the two are independent: each is recognised by
+/// its own subcommand word (see [`is_our_hook_command`]) and turning one off
+/// leaves the other alone. It never blocks — it prints one
+/// `hookSpecificOutput` object with `additionalContext` and exits 0 — but it
+/// is awaited, because context that arrives after the edit is context nobody
+/// read.
+pub(crate) const IMPACT_EVENT: &str = "PreToolUse";
+
+/// The tools it fires for: the ones that change a file, the same set
+/// [`TOUCH_MATCHER`] names.
+const IMPACT_MATCHER: &str = TOUCH_MATCHER;
+
+/// The optional sixth hook: what the graph knows about the symbols a `Grep`
+/// just matched, appended to the result.
+///
+/// Written only for `install --enrich-grep`. It shares `PostToolUse` with the
+/// `touch` re-extraction and, like the impact hook, is a separate group with
+/// its own matcher and its own subcommand word. Awaited on the short budget:
+/// the facts have to reach the transcript with the tool result, and an `async`
+/// hook's output arrives too late to be part of it.
+pub(crate) const ENRICH_EVENT: &str = "PostToolUse";
+
+/// The one tool it fires for.
+const ENRICH_MATCHER: &str = "Grep";
+
 /// Single-quote `s` for embedding in a POSIX shell command line, escaping
 /// embedded single quotes as `'\''`. Claude Code runs a `type: "command"`
 /// hook through a shell, so an unquoted path containing whitespace or shell
@@ -1145,58 +1199,57 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The exact command string written into the hook entry. Both halves arrive
-/// already quoted where quoting is needed.
-fn recall_hook_command(shell: &str, store: &StoreRef) -> String {
-    format!("{shell} recall {}", store.shell_arg())
+/// The exact command string written into a hook entry: the resolved binary,
+/// the subcommand that is that hook's body, and the store. Both outer halves
+/// arrive already quoted where quoting is needed.
+///
+/// One function for all six hooks, because the shape is the thing every other
+/// part of the installer depends on: [`is_our_hook_command`] recognises a hook
+/// of ours by exactly this tail, and a second spelling of the same line would
+/// be a hook nothing could later find to replace or remove.
+fn hook_command(shell: &str, sub: &str, store: &StoreRef) -> String {
+    format!("{shell} {sub} {}", store.shell_arg())
 }
 
-/// The exact command string written into the post-edit hook entry. `touch` in
-/// hook mode prints nothing and exits 0 whatever it is handed.
-fn touch_hook_command(shell: &str, store: &StoreRef) -> String {
-    format!("{shell} touch {}", store.shell_arg())
-}
-
-/// The exact command string written into the session-start hook entry.
-fn brief_hook_command(shell: &str, store: &StoreRef) -> String {
-    format!("{shell} brief {}", store.shell_arg())
-}
-
-/// The exact command string written into the grep-redirect hook entry.
-fn intercept_hook_command(shell: &str, store: &StoreRef) -> String {
-    format!("{shell} intercept {}", store.shell_arg())
-}
-
-/// One `hooks.<event>` array entry in Claude Code's settings.json shape.
+/// One `hooks.<event>` array entry in Claude Code's settings.json shape, for a
+/// hook that fires on every occurrence of its event.
+///
+/// `SessionStart` and `UserPromptSubmit` are not tool calls, so there is
+/// nothing to match on and the key is left out entirely — an empty `matcher`
+/// is not the same as no matcher.
 fn hook_entry(command: &str) -> serde_json::Value {
     serde_json::json!({ "hooks": [ { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS } ] })
 }
 
-/// The `PostToolUse` entry: matched to the file-editing tools, and `async` so
-/// the assistant's tool call returns without waiting for the re-extraction.
-fn touch_hook_entry(command: &str) -> serde_json::Value {
-    serde_json::json!({
-        "matcher": TOUCH_MATCHER,
-        "hooks": [ {
-            "type": "command",
-            "command": command,
-            "timeout": TOUCH_TIMEOUT_SECS,
-            "async": true
-        } ]
-    })
-}
-
-/// The `PreToolUse` entry: matched to `Grep` alone, and awaited — an `async`
-/// hook has already let the tool call through by the time it decides.
-fn intercept_hook_entry(command: &str) -> serde_json::Value {
-    serde_json::json!({
-        "matcher": INTERCEPT_MATCHER,
-        "hooks": [ {
-            "type": "command",
-            "command": command,
-            "timeout": HOOK_TIMEOUT_SECS
-        } ]
-    })
+/// One `hooks.<event>` array entry matched to a set of tools.
+///
+/// Four of our hooks are this shape and differ only in three values, so they
+/// share one builder: two events hold two hooks of ours each (`PreToolUse` has
+/// the redirect and the impact hook, `PostToolUse` has `touch` and the grep
+/// enrichment), and what keeps each pair apart on disk is the matcher plus the
+/// subcommand inside `command`.
+///
+/// `async` is written only when asked for, because the key's *absence* is what
+/// makes a hook awaited, and every hook here but `touch` has to be: a hook
+/// that decides after the tool call has gone through has decided nothing, and
+/// context that arrives after the edit is context nobody read. `touch` is the
+/// exception — nothing waits on a re-extraction — and pays for it with the
+/// longer [`TOUCH_TIMEOUT_SECS`] budget.
+fn matched_hook_entry(
+    matcher: &str,
+    command: &str,
+    timeout: u64,
+    run_async: bool,
+) -> serde_json::Value {
+    let mut hook = serde_json::json!({
+        "type": "command",
+        "command": command,
+        "timeout": timeout,
+    });
+    if run_async {
+        hook["async"] = serde_json::Value::Bool(true);
+    }
+    serde_json::json!({ "matcher": matcher, "hooks": [hook] })
 }
 
 /// True if any hook group under `event` contains a command hook equal to `command`.
@@ -1438,6 +1491,16 @@ struct Ctx<'a> {
     /// Whether to write the experimental grep redirect. Claude Code only —
     /// it is a Claude Code hook.
     intercept_grep: bool,
+    /// Whether to write the experimental pre-edit impact hook. Claude Code
+    /// only, for the same reason.
+    impact_before_edit: bool,
+    /// Whether to write the experimental grep enrichment hook. Claude Code
+    /// only, for the same reason.
+    enrich_grep: bool,
+    /// Whether the server entry this install writes carries `alwaysLoad`.
+    /// Claude Code's `.mcp.json` only: it is a Claude Code key, and a Cursor
+    /// or Codex registration has no equivalent to set.
+    always_load: bool,
 }
 
 /// Anchor a user-supplied path to `base` when it is relative, and drop any
@@ -1569,6 +1632,9 @@ pub fn run_install_with(
         prewarm: opts.prewarm && !package_fetched,
         delivery: opts.delivery,
         intercept_grep: opts.intercept_grep,
+        impact_before_edit: opts.impact_before_edit,
+        enrich_grep: opts.enrich_grep,
+        always_load: opts.always_load,
     };
 
     let manifest_path = manifest_path(project_root, home, scope, &platforms);
@@ -1583,14 +1649,21 @@ pub fn run_install_with(
     // other drift, so the only extra step is clearing the flag once that
     // write lands, and saying so in the summary.
     let was_disabled = existing.disabled;
-    // Turning the redirect off writes nothing new, so the manifest would
-    // otherwise go on claiming a hook this run just removed.
-    let intercept_changed = existing.intercept_grep != opts.intercept_grep;
+    // Turning an experiment off writes nothing new, so the manifest would
+    // otherwise go on claiming a hook — or an `alwaysLoad` key — this run just
+    // removed.
+    let doors_changed = existing.intercept_grep != opts.intercept_grep
+        || existing.impact_before_edit != opts.impact_before_edit
+        || existing.enrich_grep != opts.enrich_grep
+        || existing.always_load != opts.always_load;
 
     let mut manifest = Manifest {
         requested_cmd,
         delivery: opts.delivery,
         intercept_grep: opts.intercept_grep,
+        impact_before_edit: opts.impact_before_edit,
+        enrich_grep: opts.enrich_grep,
+        always_load: opts.always_load,
         ..Manifest::default()
     };
     let mut notes: Vec<String> = Vec::new();
@@ -1612,7 +1685,7 @@ pub fn run_install_with(
     }
 
     let anything_written = !manifest.is_empty();
-    if anything_written || was_disabled || intercept_changed {
+    if anything_written || was_disabled || doors_changed {
         // Union this-run entries with the existing manifest (dedup by path/key).
         let mut merged = if anything_written {
             union_manifests(existing, &manifest)
@@ -1629,11 +1702,32 @@ pub fn run_install_with(
         if !opts.delivery.wires_mcp() {
             merged.mcp_keys.retain(|k| has_our_server(&k.file));
         }
-        // Same for the redirect: an install without the flag has just taken
-        // the hook off disk, so the manifest must stop owning it.
+        // Same for each experiment: an install without the flag has just taken
+        // that hook off disk, so the manifest must stop owning it.
+        //
+        // Matched with [`is_our_hook_command`], the same predicate the removal
+        // itself used — not on the event, because the three opt-in hooks share
+        // two events between them and with `touch`, and not on the subcommand
+        // word alone, because a `--db` or `--command` path may contain it (a
+        // store at `~/my enrich tools/memory` would otherwise make the prune
+        // drop every hook it owns). Matching the whole ` <sub> <store>` tail
+        // can only ever be true of the hook that is actually going away.
         merged.intercept_grep = opts.intercept_grep;
-        if !opts.intercept_grep {
-            merged.hooks.retain(|h| h.event != INTERCEPT_EVENT);
+        merged.impact_before_edit = opts.impact_before_edit;
+        merged.enrich_grep = opts.enrich_grep;
+        merged.always_load = opts.always_load;
+        for (on, sub) in [
+            (opts.intercept_grep, "intercept"),
+            (opts.impact_before_edit, "impact-hook"),
+            (opts.enrich_grep, "enrich"),
+        ] {
+            if !on {
+                merged.hooks.retain(|h| {
+                    !stores
+                        .iter()
+                        .any(|(_, store)| is_our_hook_command(&h.command, sub, store))
+                });
+            }
         }
         write_manifest(&manifest_path, &merged)?;
     }
@@ -2254,9 +2348,12 @@ pub fn run_enable_with(
         // `cli` install has no server to put back, and its skill is the one
         // that teaches the binary.
         delivery: manifest.delivery,
-        // Likewise the redirect: `enable` never adds an experiment the
-        // install it is restoring never had.
+        // Likewise the experiments: `enable` never adds one the install it is
+        // restoring never had, and never drops one it did.
         intercept_grep: manifest.intercept_grep,
+        impact_before_edit: manifest.impact_before_edit,
+        enrich_grep: manifest.enrich_grep,
+        always_load: manifest.always_load,
     };
 
     let mut fresh = Manifest::default();
@@ -2675,7 +2772,7 @@ fn install_claude_code(
     // binary talking to the session, not the session talking to a server.
     let mcp_file = claude_mcp_file(ctx.project_root, ctx.home, ctx.scope);
     if ctx.delivery.wires_mcp() {
-        merge_mcp_entry(&mcp_file, ctx, store, manifest, notes)?;
+        merge_mcp_entry(&mcp_file, ctx, store, ctx.always_load, manifest, notes)?;
     } else if remove_mcp_key(&mcp_file, SERVER_NAME)? {
         // Switching an existing install to `cli` has to take the server it
         // already registered back out, or the door this delivery exists to
@@ -2697,7 +2794,7 @@ fn install_claude_code(
     // An earlier install of ours for this same store is replaced, not joined:
     // its command names a binary this version no longer writes, and leaving it
     // would run both on every prompt.
-    let recall = recall_hook_command(&shell, store);
+    let recall = hook_command(&shell, "recall", store);
     if remove_stale_hooks(&settings_file, HOOK_EVENT, "recall", store, &recall)? {
         notes.push(format!("replaced stale {HOOK_EVENT} hook"));
     }
@@ -2708,7 +2805,7 @@ fn install_claude_code(
         hook_entry(&recall),
         manifest,
     )?;
-    let touch = touch_hook_command(&shell, store);
+    let touch = hook_command(&shell, "touch", store);
     if remove_stale_hooks(&settings_file, TOUCH_EVENT, "touch", store, &touch)? {
         notes.push(format!("replaced stale {TOUCH_EVENT} hook"));
     }
@@ -2716,10 +2813,10 @@ fn install_claude_code(
         &settings_file,
         TOUCH_EVENT,
         &touch,
-        touch_hook_entry(&touch),
+        matched_hook_entry(TOUCH_MATCHER, &touch, TOUCH_TIMEOUT_SECS, true),
         manifest,
     )?;
-    let brief = brief_hook_command(&shell, store);
+    let brief = hook_command(&shell, "brief", store);
     if remove_stale_hooks(&settings_file, BRIEF_EVENT, "brief", store, &brief)? {
         notes.push(format!("replaced stale {BRIEF_EVENT} hook"));
     }
@@ -2734,7 +2831,7 @@ fn install_claude_code(
     // The fourth hook is opt-in, and an install that does not ask for it takes
     // back any earlier one of ours for this store — otherwise the experiment
     // could only ever be turned on.
-    let intercept = intercept_hook_command(&shell, store);
+    let intercept = hook_command(&shell, "intercept", store);
     if ctx.intercept_grep {
         if remove_stale_hooks(
             &settings_file,
@@ -2749,7 +2846,7 @@ fn install_claude_code(
             &settings_file,
             INTERCEPT_EVENT,
             &intercept,
-            intercept_hook_entry(&intercept),
+            matched_hook_entry(INTERCEPT_MATCHER, &intercept, HOOK_TIMEOUT_SECS, false),
             manifest,
         )?;
     } else if drop_hooks(&settings_file, INTERCEPT_EVENT, |c| {
@@ -2757,6 +2854,51 @@ fn install_claude_code(
     })? {
         notes.push(format!(
             "removed {INTERCEPT_EVENT} hook — no --intercept-grep"
+        ));
+    }
+
+    // The fifth and sixth are opt-in the same way, and each shares its event
+    // with a hook that is not it: the impact hook sits beside the redirect
+    // under `PreToolUse`, the enrichment beside `touch` under `PostToolUse`.
+    // The subcommand word keeps them apart, so turning one off leaves its
+    // neighbour exactly where it was.
+    let impact = hook_command(&shell, "impact-hook", store);
+    if ctx.impact_before_edit {
+        if remove_stale_hooks(&settings_file, IMPACT_EVENT, "impact-hook", store, &impact)? {
+            notes.push(format!("replaced stale {IMPACT_EVENT} impact hook"));
+        }
+        merge_hook_entry(
+            &settings_file,
+            IMPACT_EVENT,
+            &impact,
+            matched_hook_entry(IMPACT_MATCHER, &impact, HOOK_TIMEOUT_SECS, false),
+            manifest,
+        )?;
+    } else if drop_hooks(&settings_file, IMPACT_EVENT, |c| {
+        is_our_hook_command(c, "impact-hook", store)
+    })? {
+        notes.push(format!(
+            "removed {IMPACT_EVENT} impact hook — no --impact-before-edit"
+        ));
+    }
+
+    let enrich = hook_command(&shell, "enrich", store);
+    if ctx.enrich_grep {
+        if remove_stale_hooks(&settings_file, ENRICH_EVENT, "enrich", store, &enrich)? {
+            notes.push(format!("replaced stale {ENRICH_EVENT} enrichment hook"));
+        }
+        merge_hook_entry(
+            &settings_file,
+            ENRICH_EVENT,
+            &enrich,
+            matched_hook_entry(ENRICH_MATCHER, &enrich, HOOK_TIMEOUT_SECS, false),
+            manifest,
+        )?;
+    } else if drop_hooks(&settings_file, ENRICH_EVENT, |c| {
+        is_our_hook_command(c, "enrich", store)
+    })? {
+        notes.push(format!(
+            "removed {ENRICH_EVENT} enrichment hook — no --enrich-grep"
         ));
     }
 
@@ -2794,7 +2936,7 @@ fn install_cursor(
     }
 
     let mcp_file = cursor_mcp_file(ctx.project_root, ctx.home, ctx.scope);
-    merge_mcp_entry(&mcp_file, ctx, store, manifest, notes)?;
+    merge_mcp_entry(&mcp_file, ctx, store, false, manifest, notes)?;
 
     Ok(())
 }
@@ -3077,10 +3219,17 @@ fn prewarm(ctx: &Ctx<'_>) -> Option<String> {
 /// absent. No-op if the entry already matches (idempotent). An entry that is
 /// present but different is an upgrade: it is rewritten, and the summary says
 /// so, because a stale command is exactly the failure this replaces.
+///
+/// `always_load` adds the `alwaysLoad` key to the entry. It is a parameter
+/// rather than a read of `ctx` because it belongs to one platform: the key is
+/// Claude Code's, and the Cursor writer passes `false` whatever the flag said.
+/// Comparing the whole entry is also what takes the key back off on a
+/// re-install without the flag — the desired entry simply no longer has it.
 fn merge_mcp_entry(
     mcp_file: &Path,
     ctx: &Ctx<'_>,
     store: &StoreRef,
+    always_load: bool,
     manifest: &mut Manifest,
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
@@ -3098,7 +3247,10 @@ fn merge_mcp_entry(
         root["mcpServers"] = serde_json::json!({});
     }
 
-    let desired = ctx.cmd.json_entry("mcp", &store.arg());
+    let mut desired = ctx.cmd.json_entry("mcp", &store.arg());
+    if always_load {
+        desired["alwaysLoad"] = serde_json::Value::Bool(true);
+    }
     let existing = &root["mcpServers"][SERVER_NAME];
 
     if existing == &desired {
@@ -3259,16 +3411,33 @@ pub(crate) fn is_disabled(
     load_manifest(&manifest_path(project_root, home, scope, platforms)).disabled
 }
 
-/// Whether an install at this scope asked for the experimental grep redirect.
-/// `false` for a scope with no manifest, and for every manifest written before
-/// the flag existed — `doctor` reports the hook only where one was asked for.
-pub(crate) fn intercept_installed(
+/// Which of the four opt-in experiments an install asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OptIns {
+    pub(crate) intercept_grep: bool,
+    pub(crate) impact_before_edit: bool,
+    pub(crate) enrich_grep: bool,
+    pub(crate) always_load: bool,
+}
+
+/// What an install at this scope opted into. Every field is `false` for a
+/// scope with no manifest, and for a manifest written before the flag existed
+/// — `doctor` reports each of these only where one was asked for, because a
+/// line about an experiment nobody enabled says something about every install
+/// that is true of none.
+pub(crate) fn opt_ins(
     project_root: &Path,
     home: &Path,
     scope: Scope,
     platforms: &[Platform],
-) -> bool {
-    load_manifest(&manifest_path(project_root, home, scope, platforms)).intercept_grep
+) -> OptIns {
+    let m = load_manifest(&manifest_path(project_root, home, scope, platforms));
+    OptIns {
+        intercept_grep: m.intercept_grep,
+        impact_before_edit: m.impact_before_edit,
+        enrich_grep: m.enrich_grep,
+        always_load: m.always_load,
+    }
 }
 
 /// Union `existing` with `this_run`, deduplicating by path (files, git hooks),
@@ -3313,9 +3482,12 @@ fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
     // is how a user changes it, and the manifest has to describe what is on
     // disk now, not what an earlier run put there.
     existing.delivery = this_run.delivery;
-    // Same rule for the redirect (and `run_install_with` prunes the hook entry
-    // when the latest run turned it off).
+    // Same rule for the three experiments (and `run_install_with` prunes the
+    // hook entries when the latest run turned one off).
     existing.intercept_grep = this_run.intercept_grep;
+    existing.impact_before_edit = this_run.impact_before_edit;
+    existing.enrich_grep = this_run.enrich_grep;
+    existing.always_load = this_run.always_load;
     existing
 }
 

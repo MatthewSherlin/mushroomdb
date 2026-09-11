@@ -134,7 +134,7 @@ impl<'a> Parser<'a> {
     fn query(&mut self) -> Result<Query, String> {
         let mut matches = Vec::new();
         while self.peek() == Some(&Tok::Match) {
-            matches.push(self.match_clause()?);
+            matches.extend(self.match_clause()?);
         }
         if matches.is_empty() {
             return Err(self.err("expected MATCH"));
@@ -296,7 +296,7 @@ impl<'a> Parser<'a> {
         // Optional MATCH clauses that follow this WITH.
         let mut matches = Vec::new();
         while self.peek() == Some(&Tok::Match) {
-            matches.push(self.match_clause()?);
+            matches.extend(self.match_clause()?);
         }
         // Optional OPTIONAL MATCH clauses that follow those MATCHes.
         let mut optional_clauses = Vec::new();
@@ -373,9 +373,26 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn match_clause(&mut self) -> Result<Pattern, String> {
+    /// Parse one `MATCH p1 [, p2, …]` clause.
+    ///
+    /// Comma-separated patterns in a single MATCH are the openCypher way to
+    /// write an intersection — `MATCH (t)-[:A]->(c), (t)-[:B]->(c)` binds the
+    /// *same* `t` and `c` across both patterns — and every multihop question
+    /// an assistant asks is that shape. The returned patterns are appended to
+    /// the same `Vec<Pattern>` a run of separate MATCH clauses produces, so
+    /// the two spellings plan and execute identically.
+    fn match_clause(&mut self) -> Result<Vec<Pattern>, String> {
         self.expect(&Tok::Match, "expected MATCH")?;
-        // Detect `MATCH shortestPath(...)`.
+        let mut out = vec![self.match_pattern()?];
+        while self.eat(&Tok::Comma) {
+            out.push(self.match_pattern()?);
+        }
+        Ok(out)
+    }
+
+    /// One pattern inside a MATCH clause: `shortestPath(…)` or a plain chain.
+    fn match_pattern(&mut self) -> Result<Pattern, String> {
+        // Detect `shortestPath(...)`.
         if let Some(Tok::Ident(s)) = self.peek() {
             if s.eq_ignore_ascii_case("shortestpath") {
                 return self.shortest_path_clause();
@@ -686,6 +703,18 @@ impl<'a> Parser<'a> {
             let list = self.in_list()?;
             return Ok(Expr::In { expr: lhs, list });
         }
+        // Infix string predicates: `STARTS WITH`, `ENDS WITH`, `CONTAINS`.
+        // These desugar to the scalar functions of the same name that the
+        // executor already implements, so null- and non-string handling is
+        // shared with the `startsWith(a, b)` call spelling. Only the infix
+        // form is what an assistant writes, and it used to be a parse error.
+        if let Some(name) = self.eat_infix_string_op()? {
+            let rhs = self.arith_expr()?;
+            return Ok(Expr::Truthy(Operand::FuncCall {
+                name: name.to_string(),
+                args: vec![lhs, rhs],
+            }));
+        }
         // If no comparison operator follows, treat the operand as a standalone
         // boolean predicate (Expr::Truthy).  This enables:
         //   WHERE textMatches(n.bio, 'query')
@@ -696,6 +725,39 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Cmp { lhs, op, rhs })
             }
             Err(_) => Ok(Expr::Truthy(lhs)),
+        }
+    }
+
+    /// Consume `STARTS WITH` / `ENDS WITH` / `CONTAINS` if one follows, and
+    /// return the scalar function it desugars to.
+    ///
+    /// `STARTS` and `ENDS` are ordinary identifiers to the lexer, so a bare
+    /// `STARTS` not followed by `WITH` is a named error rather than a silent
+    /// reinterpretation of the token as a variable.
+    fn eat_infix_string_op(&mut self) -> Result<Option<&'static str>, String> {
+        let Some(Tok::Ident(s)) = self.peek() else {
+            return Ok(None);
+        };
+        let word = s.to_ascii_lowercase();
+        match word.as_str() {
+            "contains" => {
+                self.pos += 1;
+                Ok(Some("contains"))
+            }
+            "starts" | "ends" => {
+                self.pos += 1;
+                // `WITH` is a lexer keyword token here, not an identifier.
+                if !self.eat(&Tok::With) {
+                    let kw = if word == "starts" { "STARTS" } else { "ENDS" };
+                    return Err(self.err(&format!("expected WITH after {kw}")));
+                }
+                Ok(Some(if word == "starts" {
+                    "startsWith"
+                } else {
+                    "endsWith"
+                }))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -807,7 +869,26 @@ impl<'a> Parser<'a> {
             return Ok(inner);
         }
         // Delegate to the existing atom parser (no unary minus here — handled above).
-        self.operand_atom()
+        let atom = self.operand_atom()?;
+        self.subscripts(atom)
+    }
+
+    /// Apply any postfix `[index]` subscripts to an already-parsed operand.
+    ///
+    /// `n.location[0]` is how an assistant reads one end of a `[lat, lon]`
+    /// pair, and it used to stop the parse dead at the `[`. Chained
+    /// subscripts (`n.grid[0][1]`) parse; only the first level is ever
+    /// non-null for the list shapes the graph stores.
+    fn subscripts(&mut self, mut base: Operand) -> Result<Operand, String> {
+        while self.eat(&Tok::LBracket) {
+            let index = self.arith_expr()?;
+            self.expect(&Tok::RBracket, "expected ']' to close a list subscript")?;
+            base = Operand::Index {
+                base: Box::new(base),
+                index: Box::new(index),
+            };
+        }
+        Ok(base)
     }
 
     fn cmp_op(&mut self) -> Result<CmpOp, String> {
@@ -968,6 +1049,17 @@ impl<'a> Parser<'a> {
             if let Some(func) = func {
                 self.pos += 1; // consume the function name
                 self.expect(&Tok::LParen, "expected '(' after aggregate function name")?;
+                // `count(DISTINCT t)` — DISTINCT is an ordinary identifier to
+                // the lexer, so it is only a modifier here when something
+                // follows it inside the parens.
+                let distinct = matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("distinct"))
+                    && !matches!(self.toks.get(self.pos + 1), Some(Tok::RParen));
+                if distinct {
+                    self.pos += 1;
+                    if self.peek() == Some(&Tok::Star) {
+                        return Err(self.err("DISTINCT * is not a valid aggregate argument"));
+                    }
+                }
                 let arg = if self.eat(&Tok::Star) {
                     AggArg::Star
                 } else {
@@ -979,6 +1071,11 @@ impl<'a> Parser<'a> {
                     } else {
                         AggArg::Var(var)
                     }
+                };
+                let arg = if distinct {
+                    AggArg::Distinct(Box::new(arg))
+                } else {
+                    arg
                 };
                 self.expect(&Tok::RParen, "expected ')' to close aggregate function")?;
                 let alias = if self.eat(&Tok::As) {
@@ -1341,7 +1438,7 @@ impl<'a> Parser<'a> {
         // Parse MATCH clauses (same as read query).
         let mut matches = Vec::new();
         while self.peek() == Some(&Tok::Match) {
-            matches.push(self.match_clause()?);
+            matches.extend(self.match_clause()?);
         }
         if matches.is_empty() {
             return Err(self.err("expected MATCH"));
@@ -1454,6 +1551,7 @@ impl<'a> Parser<'a> {
                     | Operand::Param(_)
                     | Operand::BinArith { .. }
                     | Operand::FuncCall { .. }
+                    | Operand::Index { .. }
                     | Operand::Case { .. } => op,
                     Operand::Prop { .. } | Operand::Var(_) => {
                         return Err(self.err(

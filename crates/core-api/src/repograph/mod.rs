@@ -53,7 +53,7 @@ pub mod render;
 pub mod rules;
 mod why;
 
-pub use brief::{brief, BriefOptions, BriefReport};
+pub use brief::{brief, BriefOptions, BriefReport, EdgeTypeBrief, LabelBrief, Recipe, SchemaBrief};
 pub use concepts::stale_concepts;
 pub use context::{
     context, context_with, named_symbols, CallSites, ContextOptions, ContextReport, Target,
@@ -73,8 +73,8 @@ pub use recall::{
 };
 pub use remember::{remember, RememberInput, NOTE_KINDS};
 pub use render::{
-    render_brief, render_context, render_explore, render_impact, render_map, render_owners,
-    render_why, sanitize, DEFAULT_EXPLORE_BYTES, EMPTY_BRIEF, MAX_BRIEF_BYTES, MAX_CONTEXT_LINES,
-    MAX_MAP_LINES, MAX_TOOL_LINES,
+    cap_lines, render_brief, render_context, render_explore, render_impact, render_map,
+    render_owners, render_why, sanitize, DEFAULT_EXPLORE_BYTES, EMPTY_BRIEF, MAX_BRIEF_BYTES,
+    MAX_CONTEXT_LINES, MAX_MAP_LINES, MAX_TOOL_LINES,
 };
 pub use why::{why, SharedCommits, WhyLink, WhyReport};

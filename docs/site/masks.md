@@ -118,6 +118,12 @@ use; it operates without bearer-token authentication and is not subject to role
 enforcement. The `stub_hidden` arg on the MCP `query` tool applies the client mask
 in stub mode, but there is no role layer enforcing minimum visibility.
 
+The MCP `query` tool also takes a `role`, which resolves a name from `roles.json`
+to the same node mask the HTTP role path would compute and applies it as a client
+mask. It is a convenience for asking "what would this role see", not a credential:
+any caller may name any role, and passing both `role` and `mask` is rejected. Real
+enforcement is the HTTP server's role tokens (`serve --role-token`).
+
 ---
 
 ## Composing masks

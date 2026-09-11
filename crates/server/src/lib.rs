@@ -9,7 +9,7 @@ mod ws;
 
 use core_api::{MutationEvent, SharedDb};
 
-pub use mcp::{run_mcp_stdio, run_mcp_stdio_with};
+pub use mcp::{run_mcp_stdio, run_mcp_stdio_with, ASSOCIATION_TOOLS, CODE_GRAPH_TOOLS};
 
 /// Resolved authentication identity for a single request.
 ///

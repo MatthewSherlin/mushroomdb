@@ -1,18 +1,28 @@
 #!/usr/bin/env python3
-"""Run the agent benchmark: stock Claude Code (arm A) vs. mushroomdb.
+"""Run the agent benchmark. Two suites, one harness.
 
-Each cell is one `claude -p` session in a subject clone, captured as
-stream-json so tool calls can be counted and the final `result` event
-supplies usage/cost/turns/duration. Change-and-pass cells run in a worktree of
-their arm's clone and are graded on what they edited and whether the task's own
-tests pass afterwards.
+- **code** (default): stock Claude Code (arm A) against arms that carry
+  mushroomdb, over two repositories. Each cell is one `claude -p` session in a
+  subject clone; change-and-pass cells run in a worktree of that clone and are
+  graded on what they edited and whether the task's own tests pass afterwards.
+- **association** (v0.6.3 §3): one generated world in three forms — files (P),
+  SQLite (Q), a mushroomdb store (R) — asked relationship questions no form
+  answers without work. There is no repository: a cell is a fresh copy of its
+  arm's subject directory, and the baseline everything is measured against is
+  Q, not A.
 
-`subjects.py` owns the clones and worktrees; `report.py` owns the summary.
+Either way a session is captured as stream-json, so tool calls can be counted
+and the final `result` event supplies usage/cost/turns/duration.
+
+`subjects.py` owns the subjects; `report.py` owns the summary and the gate.
 
 Usage:
   python3 run.py --setup-only
   python3 run.py --pilot
   python3 run.py --tasks 1,2 --reps 1
+  python3 run.py --suite association --setup-only
+  python3 run.py --suite association --pilot
+  python3 run.py --suite association --reps 3
 """
 
 from __future__ import annotations
@@ -32,12 +42,31 @@ sys.path.insert(0, str(HERE))
 
 from ground_truth import grade, unit_passed                      # noqa: E402
 from report import write_summary                                 # noqa: E402
-from subjects import (BASE_TOOLS, CELL_TIMEOUT_S,                # noqa: E402
+from subjects import (ARM_DISALLOWED, ASSOC_ARMS, ASSOC_SUBJECTS,  # noqa: E402
+                      BASE_TOOLS, CELL_TIMEOUT_S,
                       DEFAULT_MAX_TURNS, EMPTY_MCP, MCP_TOOL, SUBJECT_A,
-                      SUBJECT_B, SUBJECT_D, SUBJECT_E, SUBJECT_F,
-                      cell_worktree, changed_files,
-                      child_env, drop_worktree, make_worktree, restore_subject,
-                      setup, subject_root)
+                      SUBJECT_B, SUBJECT_D, SUBJECT_E, SUBJECT_F, SUBJECT_H,
+                      SUBJECT_J, SUBJECT_L, SUITES,
+                      assoc_cell_dir, cell_worktree, changed_files,
+                      child_env, drop_worktree, make_cell_copy, make_worktree,
+                      restore_subject, setup, subject_root)
+
+
+# --------------------------------------------------------------------------
+# the suites
+# --------------------------------------------------------------------------
+# `SUITES` itself lives in `subjects.py`: `report.py` needs the gate variant a
+# suite is run with and cannot import this module, which imports it.
+
+
+def load_tasks(suite: str = "code") -> dict:
+    """The suite's own task file, parsed.
+
+    One reader for both suites, so nothing downstream has to know which file a
+    run came from. The association tasks already carry `full_prompt`; the code
+    suite's `ground_truth.py` writes theirs the same way.
+    """
+    return json.loads(SUITES[suite]["tasks"].read_text())
 
 
 # --------------------------------------------------------------------------
@@ -47,7 +76,16 @@ from subjects import (BASE_TOOLS, CELL_TIMEOUT_S,                # noqa: E402
 
 def cell_command(arm: str, prompt: str, max_turns: int = DEFAULT_MAX_TURNS,
                  cwd_override: Path | None = None) -> tuple[list[str], Path]:
-    if arm == "A":
+    if arm in ("P", "Q"):
+        # The two honest baselines: the world as files or as SQLite, the same
+        # tools as every other arm, and no MCP server at all.
+        cwd, mcp_config, tools = ASSOC_SUBJECTS[arm], str(EMPTY_MCP), list(BASE_TOOLS)
+    elif arm == "R":
+        # §5: the store is the data path, reached through the install's own
+        # MCP entry. Plain prompt — nothing points the agent at it.
+        cwd, mcp_config, tools = (ASSOC_SUBJECTS[arm], ".mcp.json",
+                                  list(BASE_TOOLS) + [MCP_TOOL])
+    elif arm == "A":
         cwd, mcp_config, tools = SUBJECT_A, str(EMPTY_MCP), list(BASE_TOOLS)
     elif arm == "D":
         cwd, mcp_config, tools = SUBJECT_D, str(EMPTY_MCP), list(BASE_TOOLS)
@@ -57,6 +95,15 @@ def cell_command(arm: str, prompt: str, max_turns: int = DEFAULT_MAX_TURNS,
     elif arm == "E":
         # B's install plus --intercept-grep: MCP present, plain prompt.
         cwd, mcp_config, tools = SUBJECT_E, ".mcp.json", list(BASE_TOOLS) + [MCP_TOOL]
+    elif arm == "L":
+        # B's install plus --impact-before-edit: MCP present, plain prompt.
+        cwd, mcp_config, tools = SUBJECT_L, ".mcp.json", list(BASE_TOOLS) + [MCP_TOOL]
+    elif arm == "J":
+        # B's install plus --enrich-grep: MCP present, plain prompt.
+        cwd, mcp_config, tools = SUBJECT_J, ".mcp.json", list(BASE_TOOLS) + [MCP_TOOL]
+    elif arm == "H":
+        # B's install plus --always-load: MCP present, plain prompt.
+        cwd, mcp_config, tools = SUBJECT_H, ".mcp.json", list(BASE_TOOLS) + [MCP_TOOL]
     else:
         # B and C share the arm B clone; C differs only by invoking the
         # project skill with its own trigger.
@@ -76,6 +123,15 @@ def cell_command(arm: str, prompt: str, max_turns: int = DEFAULT_MAX_TURNS,
         "--setting-sources", "project",
         "--allowedTools", ",".join(tools),
     ]
+    # `--allowedTools` only grants permission; a tool it omits is still on the
+    # model's tool list, just denied when called (the 0.6.2 finding — an arm
+    # meant to go Grep-less by permission alone still had Grep offered).
+    # `--disallowedTools` is the actual removal mechanism, for a future arm
+    # whose point is that a tool is gone. `ARM_DISALLOWED` is empty for every
+    # current arm, so this is a no-op today.
+    disallowed = ARM_DISALLOWED.get(arm, [])
+    if disallowed:
+        cmd += ["--disallowedTools", ",".join(disallowed)]
     return cmd, cwd
 
 
@@ -201,10 +257,19 @@ def run_verify(task: dict, cwd: Path, log: Path) -> int | None:
 def run_cell(task: dict, arm: str, rep: int, outdir: Path) -> dict:
     root = subject_root(arm, task)
     stem = f"task{task['id']:02d}_rep{rep}_arm{arm}"
+    if arm in ASSOC_ARMS:
+        # No repository, so no worktree and nothing to restore: the cell is a
+        # fresh copy of the subject and the copy is thrown away with the next
+        # one. `changed_files` and `dirtied` mean nothing here and are not
+        # recorded.
+        cell = make_cell_copy(root, assoc_cell_dir(arm))
+        return _run_cell_in(task, arm, rep, outdir, stem, cell, None, None)
     worktree = make_worktree(root, cell_worktree(arm, task)) \
         if task.get("verify") else None
     try:
-        return _run_cell_in(task, arm, rep, outdir, stem, root, worktree)
+        return _run_cell_in(task, arm, rep, outdir, stem,
+                            worktree if worktree is not None else root,
+                            worktree, None if worktree is not None else root)
     finally:
         # A crash between the checkout and the grading must not leave a
         # worktree behind: the next cell's `git worktree add` would fail on
@@ -214,8 +279,8 @@ def run_cell(task: dict, arm: str, rep: int, outdir: Path) -> dict:
 
 
 def _run_cell_in(task: dict, arm: str, rep: int, outdir: Path, stem: str,
-                 root: Path, worktree: Path | None) -> dict:
-    cwd_override = worktree if worktree is not None else root
+                 cwd_override: Path, worktree: Path | None,
+                 restore_root: Path | None) -> dict:
     cmd, cwd = cell_command(
         arm, task["full_prompt"], task.get("max_turns", DEFAULT_MAX_TURNS),
         cwd_override)
@@ -251,24 +316,27 @@ def _run_cell_in(task: dict, arm: str, rep: int, outdir: Path, stem: str,
     diff_files: set[str] | None = None
     verify_rc: int | None = None
     verify_seconds = None
+    dirtied: bool | None = None
     if worktree is not None:
         diff_files = changed_files(worktree)
         v_started = time.time()
         verify_rc = run_verify(task, worktree, outdir / f"{stem}.verify.txt")
         verify_seconds = round(time.time() - v_started, 1)
         dirtied = bool(diff_files)
-    else:
+    elif restore_root is not None:
         # Every cell may Edit and Write. A non-change cell that did so was
         # working in the clone the next cell gets, so put it back and say it
-        # happened.
-        dirtied = restore_subject(root)
+        # happened. A copy-based cell has nothing to put back.
+        dirtied = restore_subject(restore_root)
 
     graded = grade(task, answer, diff_files, verify_rc)
     return {
         "task": task["id"],
         "key": task.get("key"),
         "kind": task.get("kind"),
-        "subject": task.get("repo", "R1"),
+        # The code suite's subject is one of the two repositories; the
+        # association suite's is the world, the same for every arm.
+        "subject": task.get("repo") or task.get("suite") or "R1",
         "arm": arm,
         "rep": rep,
         "ok": (not timed_out) and rc == 0 and res is not None,
@@ -302,10 +370,12 @@ def _run_cell_in(task: dict, arm: str, rep: int, outdir: Path, stem: str,
 
 
 # --------------------------------------------------------------------------
-# the pilot: does a stock agent have to work for this answer?
+# the pilot: does the baseline agent have to work for this answer?
 # --------------------------------------------------------------------------
 
-PILOT_MIN_TURNS = 6
+# The code suite's floor, kept as a name because `apply_pilot` defaults to it.
+# Read off `SUITES` rather than repeated: one table owns what a suite is.
+PILOT_MIN_TURNS = SUITES["code"]["pilot_floor"]
 
 
 def task_fingerprint(task: dict) -> str:
@@ -333,16 +403,17 @@ def pilot_turns(row: dict, cap: int) -> int:
     return row["num_turns"] or cap
 
 
-def already_sized(task: dict) -> bool:
+def already_sized(task: dict, field: str = "min_stock_turns") -> bool:
     """Whether this exact task already carries a measurement of its own."""
-    return (task.get("min_stock_turns") is not None
+    return (task.get(field) is not None
             and task.get("pilot_fingerprint") == task_fingerprint(task))
 
 
-def apply_pilot(data: dict, rows: list[dict], cap: int,
-                run_name: str) -> tuple[dict, dict[int, int], list[tuple[str, int]]]:
-    """Stamp `min_stock_turns` on the tasks a stock agent had to work for, and
-    drop the ones it answered in fewer than six turns (§3.2).
+def apply_pilot(data: dict, rows: list[dict], cap: int, run_name: str,
+                floor: int = PILOT_MIN_TURNS, field: str = "min_stock_turns",
+                ) -> tuple[dict, dict[int, int], list[tuple[str, int]]]:
+    """Stamp the turn count on the tasks the baseline agent had to work for,
+    and drop the ones it answered under the floor (§3.2).
 
     Tasks this round did not run keep the stamp they have, and `pilot.rounds`
     is appended to: the provenance of the set is cumulative, and a later round
@@ -353,8 +424,8 @@ def apply_pilot(data: dict, rows: list[dict], cap: int,
     for t in data["tasks"]:
         if t["id"] not in turns:
             kept.append(t)                       # not piloted this round
-        elif turns[t["id"]] >= PILOT_MIN_TURNS:
-            kept.append({**t, "min_stock_turns": turns[t["id"]],
+        elif turns[t["id"]] >= floor:
+            kept.append({**t, field: turns[t["id"]],
                          "pilot_fingerprint": task_fingerprint(t)})
         else:
             dropped.append((t["key"], turns[t["id"]]))
@@ -365,57 +436,150 @@ def apply_pilot(data: dict, rows: list[dict], cap: int,
         "dropped_under_the_floor": [k for k, _ in dropped],
     })
     data = {**data, "tasks": kept,
-            "pilot": {"run": run_name, "min_turns": PILOT_MIN_TURNS,
+            "pilot": {"run": run_name, "min_turns": floor,
                       "dropped": [{"key": k, "turns": n} for k, n in dropped],
                       "rounds": rounds}}
     return data, turns, dropped
 
 
-def pilot(max_turns: int, only: list[int] | None = None) -> int:
-    """One stock (arm A) session per task, to size the tasks.
+def carry_pilot_stamps(old: list[dict], fresh: list[dict],
+                       field: str = "min_baseline_turns") -> tuple[list[dict], int]:
+    """Give every rebuilt task the measurement its identical predecessor had.
 
-    §3.2's rule: a task a stock Sonnet agent finishes in fewer than six turns
-    cannot show a graph win, so it leaves the set. Surviving tasks record what
-    stock needed as `min_stock_turns`, and a task whose prompt, truth and test
-    command are unchanged since it was measured is not measured again.
+    Keyed on the fingerprint — prompt, truth and test command — so a task the
+    rebuild reproduced word for word keeps the turn count it was measured at,
+    and a task whose prompt moved at all does not. Replacements come out
+    unstamped, which is what makes the next pilot round run exactly them.
     """
-    tasks_path = HERE / "tasks.json"
+    stamps = {task_fingerprint(t): t for t in old
+              if t.get(field) is not None
+              and t.get("pilot_fingerprint") == task_fingerprint(t)}
+    out, carried = [], 0
+    for t in fresh:
+        was = stamps.get(task_fingerprint(t))
+        if was is not None:
+            t = {**t, field: was[field],
+                 "pilot_fingerprint": was["pilot_fingerprint"]}
+            carried += 1
+        out.append(t)
+    return out, carried
+
+
+def replace_dropped_association_tasks(data: dict, dropped: list[dict],
+                                      build_dir: Path,
+                                      out: Path | None = None) -> dict:
+    """Rebuild the association set with the dropped tasks' targets avoided.
+
+    The code suite shrinks when a task is too easy; the association suite is
+    exactly four tasks per kind, so it replaces instead. `build_tasks.main`
+    already owns the drop-and-rebuild loop (and re-asks the engine every claim
+    the new tasks make), so this hands it the accumulated avoid list and then
+    carries every surviving stamp across by fingerprint: a task the rebuild
+    reproduced unchanged was already sized, and re-piloting it would spend
+    money to learn what is written down.
+
+    The avoid list is cumulative — `dropped_targets` from earlier rounds plus
+    this round's — because a rebuild that forgot an earlier round would put the
+    task it already replaced straight back.
+
+    A dropped task that names no target cannot be avoided, so the rebuild would
+    reproduce it and the next round would drop it again, for ever. That is an
+    error here, not a warning: `multihop` truths carry no `target`, so a
+    multihop task under the floor needs the suite's generator changed, not
+    another pilot round.
+    """
+    import subprocess as sp
+    from association.build_tasks import task_targets
+    untargeted = [t["key"] for t in dropped if not task_targets(t)]
+    if untargeted:
+        raise SystemExit(
+            f"cannot replace {untargeted}: the task names no target to avoid, "
+            f"so `build_tasks.py --avoid` would rebuild it unchanged and the "
+            f"pilot would drop it again. Change the generator for this kind.")
+    avoid = set(data.get("dropped_targets", []))
+    for t in dropped:
+        avoid |= task_targets(t)
+    avoid = sorted(avoid)
+    out = out if out is not None else SUITES["association"]["tasks"]
+    print(f"rebuilding the association set, avoiding {avoid}")
+    p = sp.run([sys.executable, str(HERE / "association" / "build_tasks.py"),
+                "--build", str(build_dir), "--avoid", ",".join(avoid),
+                "--out", str(out)], cwd=HERE, text=True)
+    if p.returncode != 0:
+        raise SystemExit(f"build_tasks.py failed ({p.returncode})")
+    fresh = json.loads(out.read_text())
+    tasks, carried = carry_pilot_stamps(
+        data["tasks"], fresh["tasks"], SUITES["association"]["turns_field"])
+    # `build_tasks.py` records its own dropped targets when the engine
+    # disputed a candidate during the rebuild; keep both, or the next round
+    # would hand back a target one of the two had already ruled out.
+    fresh = {**fresh, "tasks": tasks, "pilot": data.get("pilot", {}),
+             "dropped_targets": sorted(set(avoid)
+                                       | set(fresh.get("dropped_targets", [])))}
+    out.write_text(json.dumps(fresh, indent=2) + "\n")
+    print(f"carried {carried} existing measurement(s) into the rebuilt set")
+    return fresh
+
+
+def pilot(max_turns: int, only: list[int] | None = None,
+          suite: str = "code") -> int:
+    """One baseline session per task, to size the tasks.
+
+    §3.2's rule: a task the baseline agent finishes under the floor cannot show
+    a graph win. On the code suite (arm A, six turns) such a task leaves the
+    set; on the association suite (arm Q, five turns) it is replaced, because
+    the set is four tasks per kind by construction. Surviving tasks record what
+    the baseline needed, and a task whose prompt, truth and test command are
+    unchanged since it was measured is not measured again.
+    """
+    cfg = SUITES[suite]
+    arm, floor, field = cfg["pilot_arm"], cfg["pilot_floor"], cfg["turns_field"]
+    tasks_path = cfg["tasks"]
     data = json.loads(tasks_path.read_text())
+    by_key = {t["key"]: t for t in data["tasks"]}
     asked = [t for t in data["tasks"] if only is None or t["id"] in only]
-    tasks = [t for t in asked if not already_sized(t)]
-    skipped = [t for t in asked if already_sized(t)]
+    tasks = [t for t in asked if not already_sized(t, field)]
+    skipped = [t for t in asked if already_sized(t, field)]
     if skipped:
         print("already sized, not re-running: "
-              + ", ".join(f"{t['key']} ({t['min_stock_turns']})" for t in skipped))
+              + ", ".join(f"{t['key']} ({t[field]})" for t in skipped))
     if not tasks:
         print("nothing to pilot")
         return 0
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    outdir = HERE / "results" / f"{ts}-pilot"
+    outdir = HERE / "results" / f"{ts}-pilot-{suite}"
     outdir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict] = []
     for i, t in enumerate(tasks, start=1):
         print(f"[{i}/{len(tasks)}] pilot {t['key']} ({t['kind']}) ...", flush=True)
-        row = run_cell({**t, "max_turns": max_turns}, "A", 1, outdir)
+        row = run_cell({**t, "max_turns": max_turns}, arm, 1, outdir)
         rows.append(row)
         (outdir / "pilot.json").write_text(json.dumps(rows, indent=2) + "\n")
         print(f"    turns {row['num_turns']} score {row['score']:.2f} "
               f"cost ${row['cost_usd'] or 0:.4f} {row['wall_seconds']}s"
               f" [{row.get('result_subtype')}]", flush=True)
 
-    data, turns, dropped = apply_pilot(data, rows, max_turns, outdir.name)
+    data, turns, dropped = apply_pilot(data, rows, max_turns, outdir.name,
+                                       floor, field)
     tasks_path.write_text(json.dumps(data, indent=2) + "\n")
 
-    print("\n| task | kind | stock turns | kept |")
+    print(f"\n| task | kind | arm {arm} turns | score | kept |")
     for r in rows:
         n = turns[r["task"]]
-        print(f"| {r.get('key')} | {r.get('kind')} | {n} |"
-              f" {'kept' if n >= PILOT_MIN_TURNS else 'DROPPED'} |")
+        print(f"| {r.get('key')} | {r.get('kind')} | {n} | {r['score']:.2f} |"
+              f" {'kept' if n >= floor else 'REPLACED' if suite == 'association' else 'DROPPED'} |")
     total = sum(r["cost_usd"] or 0 for r in rows)
-    print(f"\npilot cost ${total:.2f}; {len(data['tasks'])} tasks in tasks.json"
-          f"; dropped {dropped if dropped else 'none'}")
+    if dropped and suite == "association":
+        from subjects import ASSOC_BUILD
+        data = replace_dropped_association_tasks(
+            data, [by_key[k] for k, _ in dropped], ASSOC_BUILD)
+        print("re-run `run.py --suite association --pilot` to size the "
+              "replacements")
+    print(f"\npilot cost ${total:.2f}; {len(data['tasks'])} tasks in "
+          f"{tasks_path.name}; under the floor "
+          f"{[k for k, _ in dropped] if dropped else 'none'}")
     return 0
 
 
@@ -424,24 +588,34 @@ def pilot(max_turns: int, only: list[int] | None = None) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--suite", default="code", choices=sorted(SUITES))
     ap.add_argument("--tasks", default="all")
     ap.add_argument("--reps", type=int, default=3)
-    ap.add_argument("--arms", default="A,B,C,D")
+    ap.add_argument("--arms", default=None,
+                    help="default: the suite's own arms")
     ap.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     ap.add_argument("--setup-only", action="store_true")
     ap.add_argument("--force-setup", action="store_true")
+    ap.add_argument("--reprovision", action="store_true",
+                    help="association suite: remove the graph subject's "
+                         "install before setup, so the current binary writes "
+                         "the skill and hooks again (the world is kept)")
     ap.add_argument("--pilot", action="store_true",
-                    help="arm A only, one rep, to size the tasks (§3.2)")
+                    help="the baseline arm only, one rep, to size the tasks "
+                         "(§3.2)")
     a = ap.parse_args()
 
-    asked = [x.strip() for x in a.arms.split(",") if x.strip()]
+    cfg = SUITES[a.suite]
+    asked = ([x.strip() for x in a.arms.split(",") if x.strip()]
+             if a.arms else list(cfg["arms"]))
     provisioned = setup(force=a.force_setup,
-                        arms={"A"} if a.pilot else set(asked))
+                        arms={cfg["pilot_arm"]} if a.pilot else set(asked),
+                        suite=a.suite, reprovision=a.reprovision)
     if a.setup_only:
         return 0
     if a.pilot:
         only = None if a.tasks == "all" else [int(x) for x in a.tasks.split(",")]
-        return pilot(a.max_turns, only)
+        return pilot(a.max_turns, only, a.suite)
 
     # An arm with no subject has no cells: scheduling it would fail inside the
     # first `Popen` and take the run with it.
@@ -452,7 +626,7 @@ def main() -> int:
     if not arms:
         raise SystemExit("no requested arm is available")
 
-    data = json.loads((HERE / "tasks.json").read_text())
+    data = load_tasks(a.suite)
     wanted = (
         [t["id"] for t in data["tasks"]]
         if a.tasks == "all"
@@ -484,8 +658,14 @@ def main() -> int:
               f"{row['wall_seconds']}s"
               f"{' TIMEOUT' if row['timed_out'] else ''}", flush=True)
 
-    path = write_summary(
-        outdir, rows, {"head_short": data["head_short"], "max_turns": a.max_turns})
+    meta = {"suite": a.suite, "baseline": cfg["baseline"],
+            "graph_arms": cfg["graph_arms"],
+            "max_turns": a.max_turns, **cfg["gate"]}
+    if a.suite == "association":
+        meta["world_digest"] = data["world_digest"]
+    else:
+        meta["head_short"] = data["head_short"]
+    path = write_summary(outdir, rows, meta)
     print(f"\nsummary: {path}")
     return 0
 

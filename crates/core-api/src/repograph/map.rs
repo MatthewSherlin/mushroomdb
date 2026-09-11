@@ -158,7 +158,7 @@ pub struct RepoMap {
 }
 
 /// Whether the deadline has passed. `None` is a run with no budget.
-fn spent(deadline: Option<Instant>) -> bool {
+pub(super) fn spent(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|dl| Instant::now() >= dl)
 }
 

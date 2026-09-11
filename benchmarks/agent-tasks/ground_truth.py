@@ -615,6 +615,10 @@ def _has_line(answer: str, n: int, tol: int) -> bool:
 
 MIN_SHA_PREFIX = 6
 
+# What one near-miss costs a `set` answer. Four of them cancel a perfect
+# recall, so an answer that shotguns the plausible candidates scores nothing.
+SET_PENALTY = 0.25
+
 
 def _sha_tokens(answer: str) -> set[str]:
     """Every hex run in the answer that is long enough to name a commit."""
@@ -673,6 +677,7 @@ def grade(task: dict, answer: str, diff_files: set[str] | None = None,
     low = text.lower()
     tokens = _sha_tokens(text)
     units: list[dict] = []
+    forbidden_hits = 0
 
     def unit(fact: str, got: float, matched: str | None = None) -> None:
         u = {"fact": fact, "got": got}
@@ -705,14 +710,28 @@ def grade(task: dict, answer: str, diff_files: set[str] | None = None,
             hits = [v for v in c["values"] if _sha_match(v, tokens)]
             unit(f"any_of_sha>={need}", min(len(hits), need) / need,
                  ", ".join(hits[:need]) if hits else None)
+        elif kind == "set":
+            # A whole answer set: recall over the truth, less a penalty for
+            # every near-miss the answer names. An arm that lists half the
+            # world scores no better than one that lists half the truth.
+            values, forbid = c["values"], c.get("forbid", [])
+            hits = [v for v in values if v.lower() in low]
+            bad = [v for v in forbid if v.lower() in low]
+            forbidden_hits += len(bad)
+            got = (len(hits) / len(values)) - SET_PENALTY * len(bad) if values else 0.0
+            fact = f"set {len(hits)}/{len(values)}"
+            if bad:
+                fact += f" -{len(bad)}"
+            unit(fact, max(0.0, round(got, 4)),
+                 ", ".join(hits[:8]) if hits else None)
     score = sum(u["got"] for u in units) / len(units) if units else 0.0
-    extras = 0
+    extras = forbidden_hits
     ex = task.get("extras", {})
     if ex.get("kind") == "sha":
         allowed = {a.lower() for a in ex.get("allowed", [])}
-        extras = len([c for c in tokens
-                      if not any(a.startswith(c) or c.startswith(a)
-                                 for a in allowed)])
+        extras += len([c for c in tokens
+                       if not any(a.startswith(c) or c.startswith(a)
+                                  for a in allowed)])
     return {
         "score": round(score, 4),
         "units": units,

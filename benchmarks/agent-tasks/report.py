@@ -18,6 +18,7 @@ import random
 import statistics
 import sys
 from pathlib import Path
+from typing import Iterable
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -25,7 +26,8 @@ sys.path.insert(0, str(HERE))
 import truth_r2 as TRUTH_R2                                      # noqa: E402
 from ground_truth import unit_passed                             # noqa: E402
 from subjects import (ARM_LABEL, ARM_PROVENANCE, BASE_TOOLS,     # noqa: E402
-                      CELL_TIMEOUT_S, DEFAULT_MAX_TURNS, MCP_ARMS, MCP_TOOL)
+                      CELL_TIMEOUT_S, DEFAULT_MAX_TURNS, MCP_ARMS, MCP_TOOL,
+                      SUITES)
 
 
 def fmt(v, nd=0):
@@ -62,16 +64,21 @@ def bootstrap_ci(xs: list[float], n: int = 2000, seed: int = 0) -> tuple[float, 
     return (means[int(0.025 * n)], means[int(0.975 * n) - 1])
 
 
-def paired_deltas(rows: list[dict], arm: str, key: str) -> list[float]:
-    """One difference per task: this arm's mean minus stock's mean.
+def paired_deltas(rows: list[dict], arm: str, key: str,
+                  baseline: str = "A") -> list[float]:
+    """One difference per task: this arm's mean minus the baseline arm's mean.
 
     Pairing by task is what makes the interval narrow enough to read: task
     difficulty is the largest source of variance in a cell's numbers. A task
     where either side has no usable value contributes no difference.
+
+    The baseline is a parameter because the two suites measure against
+    different arms: stock (A) for the code suite, SQLite (Q) for the
+    association suite, where "stock" is not one of the three data paths.
     """
     out = []
     for t in sorted({r["task"] for r in rows}):
-        a = values([r for r in rows if r["task"] == t and r["arm"] == "A"], key)
+        a = values([r for r in rows if r["task"] == t and r["arm"] == baseline], key)
         b = values([r for r in rows if r["task"] == t and r["arm"] == arm], key)
         if a and b:
             out.append(statistics.fmean(b) - statistics.fmean(a))
@@ -81,60 +88,127 @@ def paired_deltas(rows: list[dict], arm: str, key: str) -> list[float]:
 GATE_ADOPTION = 0.80
 
 
-def gate_verdict(rows: list[dict]) -> dict:
-    """The spec's §1 gate, evaluated over every cell of a run.
+def gate_verdict(rows: list[dict], baseline: str = "A",
+                 cost_ci: bool = False, adoption_gate: bool = True,
+                 graph_arms: Iterable[str] | None = None) -> dict:
+    """A pre-registered gate, evaluated over every cell of a run.
 
-    A graph arm passes when it is at least as correct as stock **paired by
-    task** (§1.1 is a paired statistic, so a run that skipped a task in one arm
-    cannot flatter the other), costs no more per cell, reaches the graph in 80%
-    of its sessions, and never runs out of turns on a task stock finished. The
-    best passing arm is the one that passes; among several, the most correct,
-    then the cheapest.
+    Two variants, one function, because the legs are the same statistics:
+
+    - **the code suite** (0.6.2 §1, `baseline="A"`): an arm passes when it is
+      at least as correct as stock **paired by task** (a paired statistic, so a
+      run that skipped a task in one arm cannot flatter the other), costs no
+      more per cell, reaches the graph in 80% of its sessions, and never runs
+      out of turns on a task stock finished.
+    - **the association suite** (0.6.3 §1 as amended 2026-09-11,
+      `baseline="Q", cost_ci=True, adoption_gate=False`): correctness is at or
+      above **every other arm's** paired mean — a tie passes, and there is no
+      interval requirement on score, because the SQLite pilot scored 1.00 on
+      all twenty tasks and correctness is saturated. Cost is the discriminator
+      instead: mean cost at or below the baseline **and** the 95% bootstrap
+      interval of the paired cost differences lying entirely below zero — an
+      interval straddling zero is noise, one above it is the graph reliably
+      costing more, and neither is a win. Max-turns is
+      unchanged. Adoption is recorded but not gated: in arm R the store is the
+      agent's only data path, so it measures nothing.
+
+    `graph_arms` is which arms the gate is *about*. It defaults to every arm
+    that is not the baseline, which is the code suite: every arm there but A
+    carries the graph in some form. The association suite passes `{"R"}`,
+    because arm P is the second baseline, not a contender — a verdict of
+    "passed, best arm P" would mean files beat the graph and read as a pass.
+    Every other arm's paired mean is still computed: that is what the
+    "beats every other arm" leg is measured against.
+
+    The best passing arm is the one that passes; among several, the most
+    correct, then the cheapest. `arms` in the result carries every contender's
+    own legs, passing or not.
     """
     by_arm: dict[str, list[dict]] = {}
     for r in rows:
         by_arm.setdefault(r["arm"], []).append(r)
-    stock = by_arm.get("A", [])
-    if not stock:
-        return {"passed": False, "best_arm": None, "reasons": ["no stock arm"]}
+    base_rows = by_arm.get(baseline, [])
+    if not base_rows:
+        return {"passed": False, "best_arm": None, "arms": {},
+                "reasons": [f"no baseline arm {baseline}"]}
 
-    stock_ok = {r["task"] for r in stock if r["result_subtype"] == "success"}
-    stock_cost = mean_of(stock, "cost_usd")
+    base_ok = {r["task"] for r in base_rows if r["result_subtype"] == "success"}
+    base_cost = mean_of(base_rows, "cost_usd")
+    others = [a for a in sorted(by_arm) if a != baseline]
+    contenders = ([a for a in others if a in set(graph_arms)]
+                  if graph_arms is not None else others)
+    paired_score = {a: (statistics.fmean(d) if d else 0.0)
+                    for a in others
+                    for d in [paired_deltas(rows, a, "score", baseline)]}
     verdicts = []
-    for arm, rs in sorted(by_arm.items()):
-        if arm == "A":
-            continue
-        reasons = []
-        diffs = paired_deltas(rows, arm, "score")
-        paired = statistics.fmean(diffs) if diffs else 0.0
+    per_arm: dict[str, dict] = {}
+    for arm in contenders:
+        rs = by_arm[arm]
+        reasons: list[str] = []
+        diffs = paired_deltas(rows, arm, "score", baseline)
+        paired = paired_score[arm]
         if paired < 0:
-            reasons.append(f"{arm}: correctness {paired:+.3f} vs stock, paired "
-                           f"over {len(diffs)} task(s)")
+            reasons.append(f"{arm}: correctness {paired:+.3f} vs arm "
+                           f"{baseline}, paired over {len(diffs)} task(s)")
+        if cost_ci:
+            # "at or above every other arm" — a tie passes, so only an arm
+            # that is strictly more correct sinks this one.
+            beaten = [o for o in others
+                      if o != arm and paired < paired_score[o]]
+            if beaten:
+                reasons.append(
+                    f"{arm}: correctness {paired:+.3f} is below arm(s) "
+                    + ", ".join(f"{o} ({paired_score[o]:+.3f})" for o in beaten))
         cost = mean_of(rs, "cost_usd")
-        if cost is not None and stock_cost is not None and cost > stock_cost:
-            reasons.append(f"{arm}: cost {cost:.4f} > stock {stock_cost:.4f}")
+        if cost is not None and base_cost is not None and cost > base_cost:
+            reasons.append(f"{arm}: cost {cost:.4f} > arm {baseline} "
+                           f"{base_cost:.4f}")
+        if cost_ci:
+            cost_diffs = paired_deltas(rows, arm, "cost_usd", baseline)
+            lo, hi = bootstrap_ci(cost_diffs)
+            # Only an interval entirely below zero is a cost win. One that
+            # straddles zero is noise; one entirely above zero is the graph
+            # reliably costing more, which is a failure, not a pass.
+            if not cost_diffs or hi >= 0:
+                reasons.append(f"{arm}: cost interval [{lo:+.4f}, {hi:+.4f}] "
+                               f"vs arm {baseline} is not entirely below zero")
         adoption = sum(1 for r in rs if r["adopted"]) / len(rs)
-        if adoption < GATE_ADOPTION:
+        if adoption_gate and adoption < GATE_ADOPTION:
             reasons.append(f"{arm}: adoption {adoption:.0%} < {GATE_ADOPTION:.0%}")
         turned = [r["task"] for r in rs
-                  if r["result_subtype"] == "error_max_turns" and r["task"] in stock_ok]
+                  if r["result_subtype"] == "error_max_turns" and r["task"] in base_ok]
         if turned:
             reasons.append(f"{arm}: max-turns on tasks {sorted(set(turned))} "
-                           "where stock succeeded")
+                           f"where arm {baseline} succeeded")
         verdicts.append((arm, reasons, paired, -(cost if cost is not None else 0.0)))
+        per_arm[arm] = {"passed": not reasons, "reasons": reasons,
+                        "paired_score": paired, "cost_usd": cost,
+                        "adoption": adoption}
     passing = [v for v in verdicts if not v[1]]
     if passing:
         best = max(passing, key=lambda v: (v[2], v[3]))
-        return {"passed": True, "best_arm": best[0], "reasons": []}
+        return {"passed": True, "best_arm": best[0], "reasons": [],
+                "arms": per_arm}
     best = max(verdicts, key=lambda v: (v[2], v[3])) if verdicts else \
         (None, ["no graph arm"], 0.0, 0.0)
-    return {"passed": False, "best_arm": best[0], "reasons": best[1]}
+    return {"passed": False, "best_arm": best[0], "reasons": best[1],
+            "arms": per_arm}
 
 
 def write_summary(outdir: Path, rows: list[dict], meta: dict,
                   filename: str = "summary.md") -> Path:
     arms = sorted({r["arm"] for r in rows})
     by_arm = {a: [r for r in rows if r["arm"] == a] for a in arms}
+    suite = meta.get("suite", "code")
+    baseline = meta.get("baseline", "A")
+    # The gate variant comes from the suite's own entry in `SUITES`, so a
+    # summary rendered without one (a replay, a hand-built meta) still
+    # describes the gate that suite is run with rather than a second copy of
+    # the table kept here.
+    variant = SUITES.get(suite, {}).get("gate", {})
+    cost_ci = bool(meta.get("cost_ci", variant.get("cost_ci", False)))
+    adoption_gate = bool(meta.get("adoption_gate",
+                                  variant.get("adoption_gate", True)))
     lines: list[str] = []
     lines.append(f"# Agent benchmark run{meta.get('title_suffix', '')}")
     lines.append("")
@@ -142,7 +216,12 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
         lines.append(meta["note"])
         lines.append("")
     lines.append(f"- run: `{outdir.name}`")
-    lines.append(f"- subject HEAD: `{meta['head_short']}`")
+    lines.append(f"- suite: {suite}")
+    lines.append(f"- baseline arm: {baseline} ({ARM_LABEL.get(baseline, baseline)})")
+    if suite == "association":
+        lines.append(f"- world digest: `{meta.get('world_digest', '-')}`")
+    else:
+        lines.append(f"- subject HEAD: `{meta.get('head_short', '-')}`")
     lines.append(f"- model: sonnet, max-turns {meta.get('max_turns', DEFAULT_MAX_TURNS)}, "
                  f"cell timeout {CELL_TIMEOUT_S}s")
     # One line per arm this run actually has rows for, from the arm table the
@@ -150,17 +229,23 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
     for a in arms:
         lines.append(f"- arm {a} ({ARM_LABEL.get(a, a)}): "
                      f"{ARM_PROVENANCE.get(a, 'no provenance recorded')}")
-    lines.append(f"- R2 subject: {TRUTH_R2.R2['url']} at tag "
-                 f"{TRUTH_R2.R2['tag']} (`{TRUTH_R2.R2['sha'][:12]}`), cloned per arm")
+    if suite == "code":
+        lines.append(f"- R2 subject: {TRUTH_R2.R2['url']} at tag "
+                     f"{TRUTH_R2.R2['tag']} (`{TRUTH_R2.R2['sha'][:12]}`), "
+                     "cloned per arm")
     mcp_here = [a for a in arms if a in MCP_ARMS]
     mcp_note = (f" (+ `{MCP_TOOL}` for "
                 f"{', '.join(mcp_here)})" if mcp_here else "")
     lines.append(f"- allowed tools, every arm: `{','.join(BASE_TOOLS)}`{mcp_note}")
-    lines.append("- DEVIATION from the original design: `Bash` is unqualified "
-                 "rather than the per-command `Bash(git:*)`, `Bash(rg:*)`, ... "
-                 "list. That list denies every pipeline, which made the "
-                 "co-change and most-imported tasks unanswerable in all arms. "
-                 "All arms carry the same deviation.")
+    if suite == "code":
+        lines.append("- DEVIATION from the original design: `Bash` is unqualified "
+                     "rather than the per-command `Bash(git:*)`, `Bash(rg:*)`, ... "
+                     "list. That list denies every pipeline, which made the "
+                     "co-change and most-imported tasks unanswerable in all arms. "
+                     "All arms carry the same deviation.")
+    else:
+        lines.append("- every cell runs in a fresh copy of its arm's subject "
+                     "directory; nothing is carried from one cell to the next.")
     lines.append("- a cell that timed out or errored carries no cost, turns or "
                  "duration; it is excluded from those means and from their "
                  "paired differences, never counted as zero. Each section says "
@@ -168,20 +253,50 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
     lines.append("")
 
     # ---- the gate --------------------------------------------------------
-    verdict = gate_verdict(rows)
+    verdict = gate_verdict(rows, baseline=baseline, cost_ci=cost_ci,
+                           adoption_gate=adoption_gate,
+                           graph_arms=meta.get("graph_arms"))
     lines.append("## Gate")
     lines.append("")
-    lines.append("The pre-registered §1 gate: correctness >= stock (paired by "
-                 f"task), cost <= stock, adoption >= {GATE_ADOPTION:.0%}, and no "
-                 "max-turns failure on a task stock finished.")
+    legs = [f"correctness >= arm {baseline} (paired by task)"]
+    if cost_ci:
+        legs.append("at or above every other arm's paired mean (a tie passes)")
+    legs.append(f"cost <= arm {baseline}")
+    if cost_ci:
+        legs.append(f"the 95% cost interval vs arm {baseline} lies entirely "
+                    "below zero")
+    if adoption_gate:
+        legs.append(f"adoption >= {GATE_ADOPTION:.0%}")
+    legs.append(f"no max-turns failure on a task arm {baseline} finished")
+    lines.append("The pre-registered §1 gate: " + ", ".join(legs) + ".")
+    if cost_ci:
+        lines.append("")
+        lines.append("Correctness carries no interval requirement: the "
+                     f"baseline arm {baseline} saturated it in the pilot "
+                     "(1.00 on every task), so cost is the discriminator (§1, "
+                     "amended 2026-09-11).")
+    if not adoption_gate:
+        lines.append("")
+        lines.append("Adoption is recorded below, not gated: in the graph arm "
+                     "the store is the agent's only data path (§1).")
     lines.append("")
     lines.append("| | |")
     lines.append("|---|---|")
     lines.append(f"| verdict | **{'PASSED' if verdict['passed'] else 'FAILED'}** |")
     lines.append(f"| best arm | {verdict['best_arm'] or '-'} |")
+    gated = sorted(verdict.get("arms") or {})
+    lines.append(f"| arms under the gate | {', '.join(gated) or '-'} |")
     no_cost = missing(rows, "cost_usd")
     lines.append(f"| cells with no cost recorded | {no_cost} of {len(rows)} |")
     lines.append("")
+    if len(gated) > 1:
+        lines.append("| arm | gate | why not |")
+        lines.append("|---|---|---|")
+        for a in gated:
+            v = verdict["arms"][a]
+            lines.append(f"| {a} | {'pass' if v['passed'] else 'fail'} |"
+                         f" {'; '.join(v['reasons']) or '-'} |")
+        lines.append("")
     if verdict["reasons"]:
         lines.append("Why it failed:")
         lines.append("")
@@ -249,14 +364,14 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
 
     head = "| metric |" + "".join(
         f" arm {a} ({ARM_LABEL.get(a, a)}) |" for a in arms)
-    deltas = [a for a in arms if a != "A"]
-    head += "".join(f" {a} vs A |" for a in deltas)
+    deltas = [a for a in arms if a != baseline]
+    head += "".join(f" {a} vs {baseline} |" for a in deltas)
     lines.append(head)
     lines.append("|" + "---|" * (1 + len(arms) + len(deltas)))
     for key, label, nd in metrics:
         vals = {a: mean_of(by_arm[a], key) for a in arms}
         row = f"| {label} |" + "".join(f" {fmt(vals[a], nd)} |" for a in arms)
-        row += "".join(f" {pct(vals.get('A'), vals[a])} |" for a in deltas)
+        row += "".join(f" {pct(vals.get(baseline), vals[a])} |" for a in deltas)
         lines.append(row)
     lines.append("")
     lines.append("; ".join(f"arm {a}: {len(by_arm[a])} cells" for a in arms)
@@ -266,10 +381,10 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
     lines.append("")
 
     # ---- paired deltas with bootstrap intervals ---------------------------
-    lines.append("## Deltas vs stock")
+    lines.append(f"## Deltas vs arm {baseline}")
     lines.append("")
-    lines.append("Paired by task: one difference per task, arm mean minus arm A "
-                 "mean. The interval is a 95% percentile bootstrap over those "
+    lines.append(f"Paired by task: one difference per task, arm mean minus arm "
+                 f"{baseline} mean. The interval is a 95% percentile bootstrap over those "
                  "differences (2000 resamples, seeded). An interval that does not "
                  "contain 0 is the only kind worth quoting. `tasks` is how many "
                  "tasks contributed a difference — a task where either side "
@@ -282,16 +397,17 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
         ("num_turns", "turns", 2),
         ("cache_hit_ratio", "cache hit ratio", 3),
     ]
-    lines.append("| arm | metric | arm mean | stock mean | delta | 95% CI | tasks |")
+    lines.append(f"| arm | metric | arm mean | arm {baseline} mean | delta |"
+                 " 95% CI | tasks |")
     lines.append("|" + "---|" * 7)
     for a in deltas:
         for key, label, nd in delta_metrics:
-            diffs = paired_deltas(rows, a, key)
+            diffs = paired_deltas(rows, a, key, baseline)
             lo, hi = bootstrap_ci(diffs)
             delta = statistics.fmean(diffs) if diffs else None
             lines.append(
                 f"| {a} | {label} | {fmt(mean_of(by_arm[a], key), nd)} |"
-                f" {fmt(mean_of(by_arm.get('A', []), key), nd)} |"
+                f" {fmt(mean_of(by_arm.get(baseline, []), key), nd)} |"
                 f" {fmt(delta, nd + 1)} | [{lo:.{nd + 1}f}, {hi:.{nd + 1}f}] |"
                 f" {len(diffs)} |")
     lines.append("")

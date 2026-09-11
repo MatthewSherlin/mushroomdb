@@ -17,9 +17,10 @@
 
 use crate::install::{
     claude_mcp_file, cursor_mcp_file, default_db, entry_db, expand_platform, git_hooks_dir,
-    has_our_server, installed_shape, intercept_installed, is_disabled, is_our_hook_command,
-    line_runs_for_store, resolve_platform, resolve_scope, Externals, Platform, Scope, StoreRef,
-    AUTO_ARG, BRIEF_EVENT, GIT_HOOKS, HOOK_BEGIN, HOOK_EVENT, INTERCEPT_EVENT, TOUCH_EVENT,
+    has_our_server, installed_shape, is_disabled, is_our_hook_command, line_runs_for_store,
+    opt_ins, resolve_platform, resolve_scope, Externals, Platform, Scope, StoreRef, AUTO_ARG,
+    BRIEF_EVENT, ENRICH_EVENT, GIT_HOOKS, HOOK_BEGIN, HOOK_EVENT, IMPACT_EVENT, INTERCEPT_EVENT,
+    SERVER_NAME, TOUCH_EVENT,
 };
 use crate::CliError;
 use core_api::{GraphDb, GraphError, OpenOptions};
@@ -109,8 +110,10 @@ impl Check {
         }
     }
     fn render(&self) -> String {
+        // 11 is the longest check name (`impact-hook`, `always-load`), so the
+        // message column lines up for every row rather than for most of them.
         let mut line = format!(
-            "{:<4} {:<9} {}",
+            "{:<4} {:<11} {}",
             self.status.word(),
             self.name,
             self.message
@@ -244,11 +247,49 @@ pub fn run_doctor_with(
     if platforms.contains(&Platform::ClaudeCode) {
         if let Some(store) = &store {
             checks.push(check_hooks(project_root, home, scope, store));
-            // The fourth hook is opt-in, so it earns a line only where the
-            // manifest says this install asked for it. Reporting it otherwise
-            // would say something about every install that is true of none.
-            if intercept_installed(project_root, home, scope, &platforms) {
-                checks.push(check_intercept(project_root, home, scope, store));
+            // The opt-in hooks each earn a line only where the manifest says
+            // this install asked for one. Reporting them otherwise would say
+            // something about every install that is true of none.
+            let opted = opt_ins(project_root, home, scope, &platforms);
+            let settings_file = settings_file(project_root, home, scope);
+            let settings = read_json(&settings_file).unwrap_or(Js::Null);
+            for (asked, sub, event, matcher, flag) in [
+                (
+                    opted.intercept_grep,
+                    "intercept",
+                    INTERCEPT_EVENT,
+                    "Grep",
+                    "--intercept-grep",
+                ),
+                (
+                    opted.impact_before_edit,
+                    "impact-hook",
+                    IMPACT_EVENT,
+                    "Edit|Write|MultiEdit",
+                    "--impact-before-edit",
+                ),
+                (
+                    opted.enrich_grep,
+                    "enrich",
+                    ENRICH_EVENT,
+                    "Grep",
+                    "--enrich-grep",
+                ),
+            ] {
+                if asked {
+                    checks.push(check_opt_in_hook(
+                        sub,
+                        event,
+                        matcher,
+                        flag,
+                        &settings_file,
+                        &settings,
+                        store,
+                    ));
+                }
+            }
+            if opted.always_load {
+                checks.push(check_always_load(project_root, home, scope));
             }
         }
     }
@@ -666,26 +707,68 @@ fn check_hooks(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef)
     }
 }
 
-/// The experimental grep redirect, for an install whose manifest asked for it.
-fn check_intercept(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef) -> Check {
-    let settings_file = match scope {
-        Scope::Project => project_root.join(".claude").join("settings.json"),
-        Scope::User => home.join(".claude").join("settings.json"),
-    };
-    let root = read_json(&settings_file).unwrap_or(Js::Null);
-    if has_hook_matching(&root, INTERCEPT_EVENT, "intercept", store) {
+/// `alwaysLoad` on the registered server, for an install whose manifest asked
+/// for it.
+///
+/// Reads the file rather than trusting the flag. The two can disagree for
+/// ordinary reasons — the entry hand-edited, a `--delivery cli` install that
+/// records the flag but registers no server for it to sit on, another tool
+/// rewriting `.mcp.json` — and in every one of them the manifest says the
+/// experiment is on while the host is deferring the server exactly as before.
+/// That is the failure a benchmark arm would silently record as "no effect",
+/// so it is a `warn` naming the file, not an `ok`.
+fn check_always_load(project_root: &Path, home: &Path, scope: Scope) -> Check {
+    let mcp_file = claude_mcp_file(project_root, home, scope);
+    let entry = read_json(&mcp_file).unwrap_or(Js::Null);
+    if entry["mcpServers"][SERVER_NAME]["alwaysLoad"] == Js::Bool(true) {
         Check::ok(
-            "intercept",
+            "always-load",
             format!(
-                "{INTERCEPT_EVENT} (Grep) present in {}",
-                settings_file.display()
+                "mcpServers.{SERVER_NAME} is marked alwaysLoad in {}",
+                mcp_file.display()
             ),
         )
     } else {
         Check::warn(
-            "intercept",
-            format!("missing {INTERCEPT_EVENT} in {}", settings_file.display()),
-            Some("mushroomdb install --platform claude-code --intercept-grep".to_string()),
+            "always-load",
+            format!("manifest records it but {} does not", mcp_file.display()),
+            Some("mushroomdb install --platform claude-code --always-load".to_string()),
+        )
+    }
+}
+
+/// The `settings.json` a Claude Code install at this scope writes its hooks to.
+fn settings_file(project_root: &Path, home: &Path, scope: Scope) -> PathBuf {
+    match scope {
+        Scope::Project => project_root.join(".claude").join("settings.json"),
+        Scope::User => home.join(".claude").join("settings.json"),
+    }
+}
+
+/// One experimental hook, for an install whose manifest asked for it.
+///
+/// `sub` is the subcommand word, which is what tells two hooks sharing an
+/// event apart; `matcher` and `flag` only ever reach the reported text. The
+/// parsed settings arrive from the caller so three checks cost one read.
+fn check_opt_in_hook(
+    sub: &'static str,
+    event: &str,
+    matcher: &str,
+    flag: &str,
+    settings_file: &Path,
+    root: &Js,
+    store: &StoreRef,
+) -> Check {
+    if has_hook_matching(root, event, sub, store) {
+        Check::ok(
+            sub,
+            format!("{event} ({matcher}) present in {}", settings_file.display()),
+        )
+    } else {
+        Check::warn(
+            sub,
+            format!("missing {event} in {}", settings_file.display()),
+            Some(format!("mushroomdb install --platform claude-code {flag}")),
         )
     }
 }
@@ -945,6 +1028,7 @@ fn self_handshake(command: &str, args: &[String]) -> Result<HandshakeOk, String>
 ///
 /// Either is enough, because which one is listed follows the store: a store
 /// `ingest-git` built advertises `explore` and hides the rest, and any other
-/// store advertises `map` among its eleven. Requiring one particular name would
-/// fail `doctor` on exactly the stores the other surface exists for.
-const TASK_PATH_TOOLS: [&str; 2] = ["explore", "map"];
+/// store advertises `explain_association` among its fifteen. Requiring one
+/// particular name would fail `doctor` on exactly the stores the other surface
+/// exists for.
+const TASK_PATH_TOOLS: [&str; 2] = ["explore", "explain_association"];

@@ -1,0 +1,1663 @@
+{
+  "suite": "association",
+  "seed": 20260910,
+  "scale": 2000,
+  "day_zero": "2026-06-01",
+  "last_day": "2026-08-29",
+  "world_digest": "f2b689ba52c80241",
+  "prefix": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.",
+  "tasks": [
+    {
+      "id": 1,
+      "key": "assoc-why-1",
+      "suite": "association",
+      "kind": "why",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. Why is `talent-000141` associated with `company-000153`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "target": [
+          "talent-000141",
+          "company-000153"
+        ],
+        "as_of": "2026-08-29",
+        "types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "shared_specialties": [
+          "hospitality",
+          "residential"
+        ],
+        "unshared_specialties": [
+          "commercial",
+          "single-family",
+          "retail"
+        ],
+        "answer": [
+          "INDUSTRY_ALIGNMENT",
+          "LOCATION_FIT",
+          "SPECIALTY_MATCH",
+          "hospitality",
+          "residential"
+        ],
+        "size": 5,
+        "forbid": [
+          "MATCHES_DESIGN_STYLE",
+          "SIMILAR_SIZE",
+          "commercial",
+          "retail",
+          "single-family"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "INDUSTRY_ALIGNMENT",
+            "LOCATION_FIT",
+            "SPECIALTY_MATCH",
+            "hospitality",
+            "residential"
+          ],
+          "forbid": [
+            "MATCHES_DESIGN_STYLE",
+            "SIMILAR_SIZE",
+            "commercial",
+            "retail",
+            "single-family"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-000141` associated with `company-000153`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 6,
+      "pilot_fingerprint": "1b5febf5a43ba895"
+    },
+    {
+      "id": 2,
+      "key": "assoc-why-2",
+      "suite": "association",
+      "kind": "why",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. Why is `talent-000512` associated with `company-000054`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "target": [
+          "talent-000512",
+          "company-000054"
+        ],
+        "as_of": "2026-08-29",
+        "types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "MATCHES_DESIGN_STYLE"
+        ],
+        "shared_specialties": [
+          "multi-family",
+          "residential"
+        ],
+        "unshared_specialties": [
+          "civic",
+          "healthcare",
+          "large-scale"
+        ],
+        "answer": [
+          "INDUSTRY_ALIGNMENT",
+          "MATCHES_DESIGN_STYLE",
+          "SPECIALTY_MATCH",
+          "multi-family",
+          "residential"
+        ],
+        "size": 5,
+        "forbid": [
+          "LOCATION_FIT",
+          "SIMILAR_SIZE",
+          "civic",
+          "healthcare",
+          "large-scale"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "INDUSTRY_ALIGNMENT",
+            "MATCHES_DESIGN_STYLE",
+            "SPECIALTY_MATCH",
+            "multi-family",
+            "residential"
+          ],
+          "forbid": [
+            "LOCATION_FIT",
+            "SIMILAR_SIZE",
+            "civic",
+            "healthcare",
+            "large-scale"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-000512` associated with `company-000054`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 5,
+      "pilot_fingerprint": "7364ef33b807372d"
+    },
+    {
+      "id": 3,
+      "key": "assoc-why-3",
+      "suite": "association",
+      "kind": "why",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. Why is `talent-001202` associated with `company-000014`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "target": [
+          "talent-001202",
+          "company-000014"
+        ],
+        "as_of": "2026-08-29",
+        "types": [
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT",
+          "MATCHES_DESIGN_STYLE"
+        ],
+        "shared_specialties": [
+          "commercial",
+          "multi-family"
+        ],
+        "unshared_specialties": [
+          "residential",
+          "retail",
+          "large-scale"
+        ],
+        "answer": [
+          "LOCATION_FIT",
+          "MATCHES_DESIGN_STYLE",
+          "SPECIALTY_MATCH",
+          "commercial",
+          "multi-family"
+        ],
+        "size": 5,
+        "forbid": [
+          "INDUSTRY_ALIGNMENT",
+          "SIMILAR_SIZE",
+          "large-scale",
+          "residential",
+          "retail"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "LOCATION_FIT",
+            "MATCHES_DESIGN_STYLE",
+            "SPECIALTY_MATCH",
+            "commercial",
+            "multi-family"
+          ],
+          "forbid": [
+            "INDUSTRY_ALIGNMENT",
+            "SIMILAR_SIZE",
+            "large-scale",
+            "residential",
+            "retail"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-001202` associated with `company-000014`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 7,
+      "pilot_fingerprint": "af6576206069404c"
+    },
+    {
+      "id": 4,
+      "key": "assoc-why-4",
+      "suite": "association",
+      "kind": "why",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. Why is `talent-001307` associated with `company-000220`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "target": [
+          "talent-001307",
+          "company-000220"
+        ],
+        "as_of": "2026-08-29",
+        "types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "MATCHES_DESIGN_STYLE"
+        ],
+        "shared_specialties": [
+          "civic",
+          "institutional"
+        ],
+        "unshared_specialties": [
+          "commercial",
+          "educational",
+          "residential"
+        ],
+        "answer": [
+          "INDUSTRY_ALIGNMENT",
+          "MATCHES_DESIGN_STYLE",
+          "SPECIALTY_MATCH",
+          "civic",
+          "institutional"
+        ],
+        "size": 5,
+        "forbid": [
+          "LOCATION_FIT",
+          "SIMILAR_SIZE",
+          "commercial",
+          "educational",
+          "residential"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "INDUSTRY_ALIGNMENT",
+            "MATCHES_DESIGN_STYLE",
+            "SPECIALTY_MATCH",
+            "civic",
+            "institutional"
+          ],
+          "forbid": [
+            "LOCATION_FIT",
+            "SIMILAR_SIZE",
+            "commercial",
+            "educational",
+            "residential"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Why is `talent-001307` associated with `company-000220`? Name every relationship type the rules derive between them, one per line, and then the specialties the two of them have in common, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 5,
+      "pilot_fingerprint": "fe804d93c6886573"
+    },
+    {
+      "id": 5,
+      "key": "assoc-multihop-1",
+      "suite": "association",
+      "kind": "multihop",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 14 different talents whose `status` is `published` and whose `years_of_experience` is 10 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "min_talents": 14,
+        "talent_filter": {
+          "status": "published",
+          "years_of_experience_min": 10
+        },
+        "answer": [
+          "company-000010",
+          "company-000013",
+          "company-000018",
+          "company-000026",
+          "company-000039",
+          "company-000056",
+          "company-000071",
+          "company-000098",
+          "company-000111",
+          "company-000112",
+          "company-000127",
+          "company-000135",
+          "company-000141",
+          "company-000159",
+          "company-000186",
+          "company-000193",
+          "company-000230",
+          "company-000243",
+          "company-000291",
+          "company-000320",
+          "company-000343",
+          "company-000361",
+          "company-000373",
+          "company-000381",
+          "company-000399",
+          "company-000405",
+          "company-000414"
+        ],
+        "size": 27,
+        "forbid": [
+          "company-000153",
+          "company-000182",
+          "company-000237",
+          "company-000269",
+          "company-000347"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "company-000010",
+            "company-000013",
+            "company-000018",
+            "company-000026",
+            "company-000039",
+            "company-000056",
+            "company-000071",
+            "company-000098",
+            "company-000111",
+            "company-000112",
+            "company-000127",
+            "company-000135",
+            "company-000141",
+            "company-000159",
+            "company-000186",
+            "company-000193",
+            "company-000230",
+            "company-000243",
+            "company-000291",
+            "company-000320",
+            "company-000343",
+            "company-000361",
+            "company-000373",
+            "company-000381",
+            "company-000399",
+            "company-000405",
+            "company-000414"
+          ],
+          "forbid": [
+            "company-000153",
+            "company-000182",
+            "company-000237",
+            "company-000269",
+            "company-000347"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 14 different talents whose `status` is `published` and whose `years_of_experience` is 10 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "714cbc0b5b76f125"
+    },
+    {
+      "id": 6,
+      "key": "assoc-multihop-2",
+      "suite": "association",
+      "kind": "multihop",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 16 different talents whose `status` is `published` and whose `years_of_experience` is 10 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "min_talents": 16,
+        "talent_filter": {
+          "status": "published",
+          "years_of_experience_min": 10
+        },
+        "answer": [
+          "company-000013",
+          "company-000039",
+          "company-000056",
+          "company-000098",
+          "company-000135",
+          "company-000141",
+          "company-000186",
+          "company-000230",
+          "company-000243",
+          "company-000320"
+        ],
+        "size": 10,
+        "forbid": [
+          "company-000071",
+          "company-000159",
+          "company-000193",
+          "company-000343",
+          "company-000361"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "company-000013",
+            "company-000039",
+            "company-000056",
+            "company-000098",
+            "company-000135",
+            "company-000141",
+            "company-000186",
+            "company-000230",
+            "company-000243",
+            "company-000320"
+          ],
+          "forbid": [
+            "company-000071",
+            "company-000159",
+            "company-000193",
+            "company-000343",
+            "company-000361"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 16 different talents whose `status` is `published` and whose `years_of_experience` is 10 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 13,
+      "pilot_fingerprint": "dbaac4851a5a61c4"
+    },
+    {
+      "id": 7,
+      "key": "assoc-multihop-3",
+      "suite": "association",
+      "kind": "multihop",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 8 different talents whose `status` is `published` and whose `years_of_experience` is 15 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "min_talents": 8,
+        "talent_filter": {
+          "status": "published",
+          "years_of_experience_min": 15
+        },
+        "answer": [
+          "company-000006",
+          "company-000010",
+          "company-000013",
+          "company-000026",
+          "company-000098",
+          "company-000102",
+          "company-000103",
+          "company-000112",
+          "company-000127",
+          "company-000141",
+          "company-000193",
+          "company-000196",
+          "company-000230",
+          "company-000265",
+          "company-000321",
+          "company-000340",
+          "company-000343",
+          "company-000390",
+          "company-000405",
+          "company-000410"
+        ],
+        "size": 20,
+        "forbid": [
+          "company-000037",
+          "company-000039",
+          "company-000105",
+          "company-000199",
+          "company-000401"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "company-000006",
+            "company-000010",
+            "company-000013",
+            "company-000026",
+            "company-000098",
+            "company-000102",
+            "company-000103",
+            "company-000112",
+            "company-000127",
+            "company-000141",
+            "company-000193",
+            "company-000196",
+            "company-000230",
+            "company-000265",
+            "company-000321",
+            "company-000340",
+            "company-000343",
+            "company-000390",
+            "company-000405",
+            "company-000410"
+          ],
+          "forbid": [
+            "company-000037",
+            "company-000039",
+            "company-000105",
+            "company-000199",
+            "company-000401"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 8 different talents whose `status` is `published` and whose `years_of_experience` is 15 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "2e374a45b1542f30"
+    },
+    {
+      "id": 8,
+      "key": "assoc-multihop-4",
+      "suite": "association",
+      "kind": "multihop",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 9 different talents whose `status` is `published` and whose `years_of_experience` is 15 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "min_talents": 9,
+        "talent_filter": {
+          "status": "published",
+          "years_of_experience_min": 15
+        },
+        "answer": [
+          "company-000006",
+          "company-000013",
+          "company-000098",
+          "company-000112",
+          "company-000141",
+          "company-000193",
+          "company-000321",
+          "company-000343",
+          "company-000405"
+        ],
+        "size": 9,
+        "forbid": [
+          "company-000103",
+          "company-000196",
+          "company-000265",
+          "company-000340",
+          "company-000390"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "company-000006",
+            "company-000013",
+            "company-000098",
+            "company-000112",
+            "company-000141",
+            "company-000193",
+            "company-000321",
+            "company-000343",
+            "company-000405"
+          ],
+          "forbid": [
+            "company-000103",
+            "company-000196",
+            "company-000265",
+            "company-000340",
+            "company-000390"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. Which companies are linked by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT` to at least 9 different talents whose `status` is `published` and whose `years_of_experience` is 15 or more? Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 7,
+      "pilot_fingerprint": "a8dea7e70aea876e"
+    },
+    {
+      "id": 9,
+      "key": "assoc-retraction-1",
+      "suite": "association",
+      "kind": "retraction",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. `company-000239` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`. Suppose its `specialties` became [\"institutional\", \"landscape\"] and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "target": "company-000239",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "field": "specialties",
+        "value": [
+          "institutional",
+          "landscape"
+        ],
+        "base": [
+          "talent-000083",
+          "talent-000143",
+          "talent-000227",
+          "talent-000329",
+          "talent-000335",
+          "talent-000455",
+          "talent-000479",
+          "talent-000671",
+          "talent-000767",
+          "talent-000791",
+          "talent-000851",
+          "talent-000923",
+          "talent-000947",
+          "talent-001031",
+          "talent-001091",
+          "talent-001163",
+          "talent-001175",
+          "talent-001199",
+          "talent-001259",
+          "talent-001331",
+          "talent-001439"
+        ],
+        "linked_before": 21,
+        "answer": [
+          "talent-000083",
+          "talent-000143",
+          "talent-000227",
+          "talent-000329",
+          "talent-000335",
+          "talent-000479",
+          "talent-000671",
+          "talent-000767",
+          "talent-000851",
+          "talent-000923",
+          "talent-001163",
+          "talent-001175",
+          "talent-001199",
+          "talent-001259",
+          "talent-001331"
+        ],
+        "size": 15,
+        "forbid": [
+          "talent-000455",
+          "talent-000791",
+          "talent-001031",
+          "talent-001091",
+          "talent-001439"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "talent-000083",
+            "talent-000143",
+            "talent-000227",
+            "talent-000329",
+            "talent-000335",
+            "talent-000479",
+            "talent-000671",
+            "talent-000767",
+            "talent-000851",
+            "talent-000923",
+            "talent-001163",
+            "talent-001175",
+            "talent-001199",
+            "talent-001259",
+            "talent-001331"
+          ],
+          "forbid": [
+            "talent-000455",
+            "talent-000791",
+            "talent-001031",
+            "talent-001091",
+            "talent-001439"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000239` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`. Suppose its `specialties` became [\"institutional\", \"landscape\"] and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 10,
+      "pilot_fingerprint": "720a21b1fa882955"
+    },
+    {
+      "id": 10,
+      "key": "assoc-retraction-2",
+      "suite": "association",
+      "kind": "retraction",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. `company-000376` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`. Suppose its `specialties` became [\"civic\", \"hospitality\", \"institutional\"] and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "target": "company-000376",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "field": "specialties",
+        "value": [
+          "civic",
+          "hospitality",
+          "institutional"
+        ],
+        "base": [
+          "talent-000100",
+          "talent-000112",
+          "talent-000184",
+          "talent-000220",
+          "talent-000376",
+          "talent-000424",
+          "talent-000520",
+          "talent-000532",
+          "talent-000652",
+          "talent-000736",
+          "talent-000832",
+          "talent-000892",
+          "talent-000952",
+          "talent-000988",
+          "talent-001024",
+          "talent-001048",
+          "talent-001192",
+          "talent-001204",
+          "talent-001252",
+          "talent-001300",
+          "talent-001348",
+          "talent-001360",
+          "talent-001444"
+        ],
+        "linked_before": 23,
+        "answer": [
+          "talent-000112",
+          "talent-000184",
+          "talent-000424",
+          "talent-000736",
+          "talent-000832",
+          "talent-000988",
+          "talent-001024",
+          "talent-001048",
+          "talent-001252",
+          "talent-001300",
+          "talent-001360",
+          "talent-001444"
+        ],
+        "size": 12,
+        "forbid": [
+          "talent-000100",
+          "talent-000220",
+          "talent-000376",
+          "talent-000520",
+          "talent-000532"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "talent-000112",
+            "talent-000184",
+            "talent-000424",
+            "talent-000736",
+            "talent-000832",
+            "talent-000988",
+            "talent-001024",
+            "talent-001048",
+            "talent-001252",
+            "talent-001300",
+            "talent-001360",
+            "talent-001444"
+          ],
+          "forbid": [
+            "talent-000100",
+            "talent-000220",
+            "talent-000376",
+            "talent-000520",
+            "talent-000532"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000376` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`. Suppose its `specialties` became [\"civic\", \"hospitality\", \"institutional\"] and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "87b4d70469a993f4"
+    },
+    {
+      "id": 11,
+      "key": "assoc-retraction-3",
+      "suite": "association",
+      "kind": "retraction",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. `company-000244` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SIMILAR_SIZE` and `LOCATION_FIT`. Suppose its `size_bucket` became 3 and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "target": "company-000244",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SIMILAR_SIZE",
+          "LOCATION_FIT"
+        ],
+        "field": "size_bucket",
+        "value": 3,
+        "base": [
+          "talent-000124",
+          "talent-000184",
+          "talent-000244",
+          "talent-000304",
+          "talent-000328",
+          "talent-000424",
+          "talent-000508",
+          "talent-000544",
+          "talent-000664",
+          "talent-000724",
+          "talent-000784",
+          "talent-000928",
+          "talent-000964",
+          "talent-000988",
+          "talent-001024",
+          "talent-001048",
+          "talent-001108",
+          "talent-001204",
+          "talent-001228",
+          "talent-001324",
+          "talent-001348",
+          "talent-001444"
+        ],
+        "linked_before": 22,
+        "answer": [
+          "talent-000124",
+          "talent-000184",
+          "talent-000244",
+          "talent-000304",
+          "talent-000424",
+          "talent-000544",
+          "talent-000664",
+          "talent-000724",
+          "talent-000784",
+          "talent-000964",
+          "talent-001024",
+          "talent-001204",
+          "talent-001324",
+          "talent-001444"
+        ],
+        "size": 14,
+        "forbid": [
+          "talent-000328",
+          "talent-001048",
+          "talent-001108",
+          "talent-001228",
+          "talent-001348"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "talent-000124",
+            "talent-000184",
+            "talent-000244",
+            "talent-000304",
+            "talent-000424",
+            "talent-000544",
+            "talent-000664",
+            "talent-000724",
+            "talent-000784",
+            "talent-000964",
+            "talent-001024",
+            "talent-001204",
+            "talent-001324",
+            "talent-001444"
+          ],
+          "forbid": [
+            "talent-000328",
+            "talent-001048",
+            "talent-001108",
+            "talent-001228",
+            "talent-001348"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000244` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SIMILAR_SIZE` and `LOCATION_FIT`. Suppose its `size_bucket` became 3 and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "9ed4a3628254348c"
+    },
+    {
+      "id": 12,
+      "key": "assoc-retraction-4",
+      "suite": "association",
+      "kind": "retraction",
+      "prompt": "Answer for the data as it stands after every change in the history has been applied. `company-000235` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SIMILAR_SIZE` and `LOCATION_FIT`. Suppose its `size_bucket` became 3 and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "target": "company-000235",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SIMILAR_SIZE",
+          "LOCATION_FIT"
+        ],
+        "field": "size_bucket",
+        "value": 3,
+        "base": [
+          "talent-000031",
+          "talent-000055",
+          "talent-000091",
+          "talent-000175",
+          "talent-000235",
+          "talent-000331",
+          "talent-000391",
+          "talent-000475",
+          "talent-000631",
+          "talent-000715",
+          "talent-000756",
+          "talent-000775",
+          "talent-000931",
+          "talent-001015",
+          "talent-001111",
+          "talent-001135",
+          "talent-001171",
+          "talent-001195",
+          "talent-001200",
+          "talent-001231",
+          "talent-001351",
+          "talent-001411"
+        ],
+        "linked_before": 22,
+        "answer": [
+          "talent-000055",
+          "talent-000175",
+          "talent-000235",
+          "talent-000475",
+          "talent-000715",
+          "talent-000775",
+          "talent-001015",
+          "talent-001135",
+          "talent-001195",
+          "talent-001200"
+        ],
+        "size": 10,
+        "forbid": [
+          "talent-000631",
+          "talent-001111",
+          "talent-001171",
+          "talent-001231",
+          "talent-001411"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "talent-000055",
+            "talent-000175",
+            "talent-000235",
+            "talent-000475",
+            "talent-000715",
+            "talent-000775",
+            "talent-001015",
+            "talent-001135",
+            "talent-001195",
+            "talent-001200"
+          ],
+          "forbid": [
+            "talent-000631",
+            "talent-001111",
+            "talent-001171",
+            "talent-001231",
+            "talent-001411"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nAnswer for the data as it stands after every change in the history has been applied. `company-000235` is linked to a number of talents by all three of `INDUSTRY_ALIGNMENT`, `SIMILAR_SIZE` and `LOCATION_FIT`. Suppose its `size_bucket` became 3 and nothing else about the data changed. Which of those talents would no longer be linked to it by all three? Name the talent keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "9a96ef9fac676a15"
+    },
+    {
+      "id": 13,
+      "key": "assoc-timetravel-1",
+      "suite": "association",
+      "kind": "timetravel",
+      "prompt": "On 2026-06-19, which companies was `talent-000501` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-06-19",
+        "day": 18,
+        "target": "talent-000501",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "moved_next_day": "specialties",
+        "linked_today": 7,
+        "answer": [
+          "company-000057",
+          "company-000069",
+          "company-000129",
+          "company-000165",
+          "company-000201",
+          "company-000237",
+          "company-000345",
+          "company-000369"
+        ],
+        "size": 8,
+        "forbid": [
+          "company-000093",
+          "company-000249",
+          "company-000297",
+          "company-000309",
+          "company-000393"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "company-000057",
+            "company-000069",
+            "company-000129",
+            "company-000165",
+            "company-000201",
+            "company-000237",
+            "company-000345",
+            "company-000369"
+          ],
+          "forbid": [
+            "company-000093",
+            "company-000249",
+            "company-000297",
+            "company-000309",
+            "company-000393"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-06-19, which companies was `talent-000501` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 6,
+      "pilot_fingerprint": "4f44f82daafcb60b"
+    },
+    {
+      "id": 14,
+      "key": "assoc-timetravel-2",
+      "suite": "association",
+      "kind": "timetravel",
+      "prompt": "On 2026-07-12, which companies was `talent-001026` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-07-12",
+        "day": 41,
+        "target": "talent-001026",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "moved_next_day": "location",
+        "linked_today": 8,
+        "answer": [
+          "company-000042",
+          "company-000066",
+          "company-000138",
+          "company-000246",
+          "company-000354",
+          "company-000402"
+        ],
+        "size": 6,
+        "forbid": [
+          "company-000024",
+          "company-000036",
+          "company-000084",
+          "company-000204",
+          "company-000324"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "company-000042",
+            "company-000066",
+            "company-000138",
+            "company-000246",
+            "company-000354",
+            "company-000402"
+          ],
+          "forbid": [
+            "company-000024",
+            "company-000036",
+            "company-000084",
+            "company-000204",
+            "company-000324"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-07-12, which companies was `talent-001026` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 10,
+      "pilot_fingerprint": "2ef432b7c1f720ba"
+    },
+    {
+      "id": 15,
+      "key": "assoc-timetravel-3",
+      "suite": "association",
+      "kind": "timetravel",
+      "prompt": "On 2026-07-13, which companies was `talent-000641` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-07-13",
+        "day": 42,
+        "target": "talent-000641",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "moved_next_day": "industry",
+        "linked_today": 7,
+        "answer": [
+          "company-000017",
+          "company-000101",
+          "company-000281",
+          "company-000293",
+          "company-000329",
+          "company-000389",
+          "company-000401"
+        ],
+        "size": 7,
+        "forbid": [
+          "company-000005",
+          "company-000089",
+          "company-000149",
+          "company-000233",
+          "company-000245"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "company-000017",
+            "company-000101",
+            "company-000281",
+            "company-000293",
+            "company-000329",
+            "company-000389",
+            "company-000401"
+          ],
+          "forbid": [
+            "company-000005",
+            "company-000089",
+            "company-000149",
+            "company-000233",
+            "company-000245"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-07-13, which companies was `talent-000641` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 7,
+      "pilot_fingerprint": "5266b089bc47b386"
+    },
+    {
+      "id": 16,
+      "key": "assoc-timetravel-4",
+      "suite": "association",
+      "kind": "timetravel",
+      "prompt": "On 2026-07-14, which companies was `talent-000396` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-07-14",
+        "day": 43,
+        "target": "talent-000396",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "moved_next_day": "industry",
+        "linked_today": 11,
+        "answer": [
+          "company-000048",
+          "company-000120",
+          "company-000132",
+          "company-000192",
+          "company-000288",
+          "company-000294",
+          "company-000312",
+          "company-000360"
+        ],
+        "size": 8,
+        "forbid": [
+          "company-000084",
+          "company-000144",
+          "company-000228",
+          "company-000300",
+          "company-000324"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "company-000048",
+            "company-000120",
+            "company-000132",
+            "company-000192",
+            "company-000288",
+            "company-000294",
+            "company-000312",
+            "company-000360"
+          ],
+          "forbid": [
+            "company-000084",
+            "company-000144",
+            "company-000228",
+            "company-000300",
+            "company-000324"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nOn 2026-07-14, which companies was `talent-000396` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? The answer is the one for that date, not the one for the end of the history. Name the company keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "eaa4c55beb75100f"
+    },
+    {
+      "id": 17,
+      "key": "assoc-visibility-1",
+      "suite": "association",
+      "kind": "visibility",
+      "prompt": "You are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-000104` linked to by both `INDUSTRY_ALIGNMENT` and `SPECIALTY_MATCH`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "target": "talent-000104",
+        "role": "recruiter",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH"
+        ],
+        "hidden_matches": 60,
+        "answer": [
+          "job-000003",
+          "job-000031",
+          "job-000040",
+          "job-000041",
+          "job-000051",
+          "job-000052",
+          "job-000057",
+          "job-000063",
+          "job-000064",
+          "job-000066",
+          "job-000076",
+          "job-000078",
+          "job-000080",
+          "job-000093",
+          "job-000102",
+          "job-000108",
+          "job-000115",
+          "job-000117",
+          "job-000128",
+          "job-000142",
+          "job-000150",
+          "job-000154",
+          "job-000163",
+          "job-000180",
+          "job-000184",
+          "job-000188",
+          "job-000193",
+          "job-000206"
+        ],
+        "size": 28,
+        "forbid": [
+          "company-000048",
+          "company-000070",
+          "company-000288",
+          "company-000293",
+          "company-000383"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "job-000003",
+            "job-000031",
+            "job-000040",
+            "job-000041",
+            "job-000051",
+            "job-000052",
+            "job-000057",
+            "job-000063",
+            "job-000064",
+            "job-000066",
+            "job-000076",
+            "job-000078",
+            "job-000080",
+            "job-000093",
+            "job-000102",
+            "job-000108",
+            "job-000115",
+            "job-000117",
+            "job-000128",
+            "job-000142",
+            "job-000150",
+            "job-000154",
+            "job-000163",
+            "job-000180",
+            "job-000184",
+            "job-000188",
+            "job-000193",
+            "job-000206"
+          ],
+          "forbid": [
+            "company-000048",
+            "company-000070",
+            "company-000288",
+            "company-000293",
+            "company-000383"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-000104` linked to by both `INDUSTRY_ALIGNMENT` and `SPECIALTY_MATCH`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 10,
+      "pilot_fingerprint": "d7004c772c2b2dfa"
+    },
+    {
+      "id": 18,
+      "key": "assoc-visibility-2",
+      "suite": "association",
+      "kind": "visibility",
+      "prompt": "You are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-000450` linked to by both `INDUSTRY_ALIGNMENT` and `SPECIALTY_MATCH`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "target": "talent-000450",
+        "role": "recruiter",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH"
+        ],
+        "hidden_matches": 75,
+        "answer": [
+          "job-000002",
+          "job-000009",
+          "job-000014",
+          "job-000015",
+          "job-000017",
+          "job-000019",
+          "job-000034",
+          "job-000037",
+          "job-000049",
+          "job-000070",
+          "job-000086",
+          "job-000090",
+          "job-000099",
+          "job-000104",
+          "job-000105",
+          "job-000106",
+          "job-000112",
+          "job-000125",
+          "job-000126",
+          "job-000130",
+          "job-000135",
+          "job-000138",
+          "job-000139",
+          "job-000143",
+          "job-000149",
+          "job-000152",
+          "job-000158",
+          "job-000164",
+          "job-000165",
+          "job-000169",
+          "job-000176",
+          "job-000177",
+          "job-000178",
+          "job-000199",
+          "job-000203"
+        ],
+        "size": 35,
+        "forbid": [
+          "company-000151",
+          "company-000196",
+          "company-000319",
+          "company-000334",
+          "company-000399"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "job-000002",
+            "job-000009",
+            "job-000014",
+            "job-000015",
+            "job-000017",
+            "job-000019",
+            "job-000034",
+            "job-000037",
+            "job-000049",
+            "job-000070",
+            "job-000086",
+            "job-000090",
+            "job-000099",
+            "job-000104",
+            "job-000105",
+            "job-000106",
+            "job-000112",
+            "job-000125",
+            "job-000126",
+            "job-000130",
+            "job-000135",
+            "job-000138",
+            "job-000139",
+            "job-000143",
+            "job-000149",
+            "job-000152",
+            "job-000158",
+            "job-000164",
+            "job-000165",
+            "job-000169",
+            "job-000176",
+            "job-000177",
+            "job-000178",
+            "job-000199",
+            "job-000203"
+          ],
+          "forbid": [
+            "company-000151",
+            "company-000196",
+            "company-000319",
+            "company-000334",
+            "company-000399"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-000450` linked to by both `INDUSTRY_ALIGNMENT` and `SPECIALTY_MATCH`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 8,
+      "pilot_fingerprint": "8d6d62aff0dc0549"
+    },
+    {
+      "id": 19,
+      "key": "assoc-visibility-3",
+      "suite": "association",
+      "kind": "visibility",
+      "prompt": "You are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-001161` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "target": "talent-001161",
+        "role": "recruiter",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "hidden_matches": 6,
+        "answer": [
+          "job-000045",
+          "job-000069",
+          "job-000153",
+          "job-000189"
+        ],
+        "size": 4,
+        "forbid": [
+          "company-000069",
+          "company-000129",
+          "company-000165",
+          "company-000201",
+          "company-000369"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "job-000045",
+            "job-000069",
+            "job-000153",
+            "job-000189"
+          ],
+          "forbid": [
+            "company-000069",
+            "company-000129",
+            "company-000165",
+            "company-000201",
+            "company-000369"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-001161` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 5,
+      "pilot_fingerprint": "20cb509360d09b8d"
+    },
+    {
+      "id": 20,
+      "key": "assoc-visibility-4",
+      "suite": "association",
+      "kind": "visibility",
+      "prompt": "You are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-001408` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "truth": {
+        "as_of": "2026-08-29",
+        "target": "talent-001408",
+        "role": "recruiter",
+        "edge_types": [
+          "INDUSTRY_ALIGNMENT",
+          "SPECIALTY_MATCH",
+          "LOCATION_FIT"
+        ],
+        "hidden_matches": 5,
+        "answer": [
+          "job-000040",
+          "job-000046",
+          "job-000052",
+          "job-000124",
+          "job-000155"
+        ],
+        "size": 5,
+        "forbid": [
+          "company-000028",
+          "company-000040",
+          "company-000160",
+          "company-000352",
+          "company-000364"
+        ]
+      },
+      "checks": [
+        {
+          "kind": "set",
+          "values": [
+            "job-000040",
+            "job-000046",
+            "job-000052",
+            "job-000124",
+            "job-000155"
+          ],
+          "forbid": [
+            "company-000028",
+            "company-000040",
+            "company-000160",
+            "company-000352",
+            "company-000364"
+          ]
+        }
+      ],
+      "extras": {
+        "kind": "none"
+      },
+      "verify": null,
+      "full_prompt": "Answer using only the data in this directory. Be concise: give the keys asked for, one per line.\n\nYou are acting as the `recruiter` role and may name only what that role is allowed to see. Answer for the data as it stands after every change in the history has been applied. Which entities is `talent-001408` linked to by all three of `INDUSTRY_ALIGNMENT`, `SPECIALTY_MATCH` and `LOCATION_FIT`? Name their keys, one per line. Name nothing else: no near-misses, no workings.",
+      "min_baseline_turns": 7,
+      "pilot_fingerprint": "d537f1d9e69f595b"
+    }
+  ],
+  "pilot": {
+    "run": "20260910T232303Z-pilot-association",
+    "min_turns": 5,
+    "dropped": [],
+    "rounds": [
+      {
+        "run": "20260910T232133Z-pilot-association",
+        "tasks": [
+          1
+        ],
+        "dropped_under_the_floor": []
+      },
+      {
+        "run": "20260910T232303Z-pilot-association",
+        "tasks": [
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20
+        ],
+        "dropped_under_the_floor": []
+      }
+    ]
+  }
+}

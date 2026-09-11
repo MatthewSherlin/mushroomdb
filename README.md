@@ -201,8 +201,8 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
-**Nine task tools** answer a question about the repository in one call. They are what the skill
-reaches for, and what `tools/list` shows first:
+**Fourteen task tools** answer a question in prose in one call. They are what the skill reaches for,
+and what `tools/list` shows first:
 
 | Tool | Purpose |
 |---|---|
@@ -212,19 +212,26 @@ reaches for, and what `tools/list` shows first:
 | `impact` | What changing these files reaches: partners with scores, importers, symbols other files call, owner. Defaults to the working tree's diff |
 | `owners` | Top author and share, who else knows the file, last touch, the split by quarter |
 | `why` | Every rule edge between two nodes with its evidence, or the shortest path when there is none |
+| `explain_association` | Why two entities are associated: every rule-derived edge between them, with the rule, the score, the predicate it matched, and the values the two actually share |
+| `node_edges` | Every edge on one node, grouped by edge type, with the rule and score behind each. `all_of: [types]` answers with the partners linked by every one of them, as keys; `edge_type`, `label`, `direction` and `limit` narrow it further |
+| `neighborhood` | At depth 1 the same grouped listing; above 1 the breadth-first `(key, label, depth)` table |
+| `edges_at` | The edges a node had at one 0-based WAL commit — the graph as it was, not as it is — with the same `all_of` / `edge_type` / `label` / `direction` filters |
+| `what_if` | The derived edges a property change would lose and gain, computed without writing anything. `edge_type` prints both sides as partner keys |
 | `recall` | One pointer per hit — `path:line symbol — first doc line` — for the identifiers in a topic |
 | `remember` | Write a note into the graph and return its key |
 | `sync` | Bring the store up to date: commits since the last sync, then the dirty working tree |
 
-Each of the nine also takes `json: true`, which answers with the raw report instead of the
-rendered digest.
+Each of the fourteen also takes `json: true`, which answers with the raw report instead of
+the rendered digest.
 
-**The sixteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
+**The thirteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
 in `tools/list`, so an assistant knows which surface is the front door. The default listing follows
 the store: a store built by `ingest-git` lists three tools in all — `explore`, `query` and `stats` —
-and any other store lists eleven, the eight task tools other than `explore` plus `query`,
-`ingest_json` and `stats`. All 25 stay served either way — the listing decides what a session can
-call, not what the server answers — and `mushroomdb mcp <db> --all-tools` lists the whole set:
+and any other store lists fifteen, the association surface: `query` (with an optional `role`),
+`explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `edges_at`,
+`what_if`, `node_history`, `edge_history`, `find_similar`, `hybrid_search`, `remember`, `recall`
+and `stats`. All 27 stay served either way — the listing decides what a session can call, not what
+the server answers — and `mushroomdb mcp <db> --all-tools` lists the whole set:
 
 | Tool | Purpose |
 |---|---|
@@ -233,12 +240,9 @@ call, not what the server answers — and `mushroomdb mcp <db> --all-tools` list
 | `create_rule` | Declare a derivation rule; backfills existing nodes immediately |
 | `find_similar` | Find similar nodes by query vector (HNSW) or by derived edge traversal |
 | `hybrid_search` | RRF over fulltext + vector results |
-| `explain_association` | Show rules and scores that link two nodes |
-| `explain` | Alias for `explain_association` |
-| `query` | Cypher query (read or write); pass `mask` for ACL-scoped read |
-| `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter |
+| `explain` | The rules and scores that link two nodes, as JSON — `explain_association` above answers the same question in prose |
+| `query` | Cypher query (read or write); pass `mask` for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` |
 | `node_info` | Return a node's key, label, and properties |
-| `node_edges` | Return all edges incident on a node |
 | `stats` | Live node, edge, and rule counts |
 | `node_history` | WAL change history for a node (archives included; a `snapshot --truncate` ends the reach) |
 | `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
@@ -292,7 +296,7 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 
 | Command | What it does |
 |---|---|
-| `mushroomdb install [--platform claude-code\|cursor\|codex\|all] [--project\|--user] [--db <path>] [--command <path>] [--delivery cli\|mcp\|both] [--no-git-hooks] [--intercept-grep] [--no-prewarm]` | Write the `/mushroom` skill + MCP server entry + the `SessionStart`, `UserPromptSubmit` and `PostToolUse` hooks + git hooks. Auto-detects platform and scope. `--delivery cli` writes no server entry: the skill teaches the binary instead |
+| `mushroomdb install [--platform claude-code\|cursor\|codex\|all] [--project\|--user] [--db <path>] [--command <path>] [--delivery cli\|mcp\|both] [--no-git-hooks] [--intercept-grep] [--impact-before-edit] [--enrich-grep] [--always-load\|--no-always-load] [--no-prewarm]` | Write the `/mushroom` skill + MCP server entry + the `SessionStart`, `UserPromptSubmit` and `PostToolUse` hooks + git hooks. Auto-detects platform and scope. `--delivery cli` writes no server entry: the skill teaches the binary instead. The three experimental hooks — grep redirect, blast radius before an edit, symbol facts after a search — are off by default; `alwaysLoad` on the server entry is on by default for an install that pins a store with `--db` |
 | `mushroomdb uninstall [--platform …] [--project] [--db <path>]` | Remove exactly what `install` wrote (manifest-driven; leaves user files) |
 | `mushroomdb disable [--platform …] [--project\|--user]` | Turn an install off without removing it: strips the MCP entry, the hooks and the git hook blocks. The skill, the store and `.gitignore` stay |
 | `mushroomdb enable [--platform …] [--project\|--user]` | Turn a disabled install back on, re-resolving the command instead of replaying what `disable` removed |
@@ -395,6 +399,15 @@ Full methodology and honesty notes:
   retraction semantics — drift = 0 is a property of that, not of hand-rolling in general.
   [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-vs-rules.md)
 
+**Agent benchmarks** are separate and less flattering. `benchmarks/agent-tasks/` runs real
+`claude -p` sessions against executable truth. The association suite (`--suite association`) asks
+twenty relationship questions of one generated world written three ways — as JSON files, as a
+single relational file, and as a mushroomdb store — and its first committed run
+[**failed its gate**](benchmarks/agent-tasks/results/20260911T005749Z/summary.md): the graph arm
+scored 0.795 against the relational baseline's 0.987, at four times the cost. The v0.6.3 CHANGELOG
+entry reports it in full, and [`docs/site/association-bench.md`](docs/site/association-bench.md)
+describes the suite and how to rebuild the world.
+
 ---
 
 ## Architecture
@@ -445,7 +458,7 @@ Phases 1–4 and Plan 18 all landed. What remains:
 
 - [Quickstart](docs/site/quickstart.md) · [Rules](docs/site/rules.md) · [Cypher reference](docs/site/query.md) · [HTTP + MCP API](docs/site/api.md)
 - [The live code graph](docs/site/code-graph.md) · [Concurrency](docs/site/concurrency.md) · [Codebase graph](docs/site/ingest-git.md)
-- [Install, plugin and hooks](docs/site/skill.md) · [MCP tools](docs/site/mcp.md)
+- [Install, plugin and hooks](docs/site/skill.md) · [MCP tools](docs/site/mcp.md) · [Association benchmark](docs/site/association-bench.md)
 - [Time travel](docs/site/timetravel.md) · [Subscriptions](docs/site/subscriptions.md) · [Views](docs/site/views.md) · [Rule suggestions](docs/site/suggest.md)
 - [Masks and access control](docs/site/masks.md) · [Full-text search](docs/site/fulltext.md) · [Property indexes](docs/site/indexes.md) · [Graph algorithms](docs/site/algorithms.md)
 - [Durability and recovery](docs/site/durability.md) · [Panic policy](docs/site/panic-policy.md) · [Testing](docs/site/testing.md) · [Format stability](docs/format-stability.md)

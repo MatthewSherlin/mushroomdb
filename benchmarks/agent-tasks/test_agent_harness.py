@@ -4,6 +4,16 @@ from __future__ import annotations
 import json, sys
 from pathlib import Path
 
+
+def _binary() -> Path:
+    """The binary the world builder spawns; a checkout without one skips
+    those tests instead of failing on a missing file (set `MUSHROOMDB`)."""
+    import pytest
+    from subjects import MUSHROOMDB
+    if not MUSHROOMDB.exists():
+        pytest.skip(f"no mushroomdb binary at {MUSHROOMDB}; build it or set MUSHROOMDB")
+    return MUSHROOMDB
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
@@ -105,6 +115,39 @@ def test_cell_command_arm_f_has_no_mcp():
     assert cmd[cmd.index("--mcp-config") + 1] == str(EMPTY_MCP)
 
 
+def test_cell_command_arm_l_has_mcp_and_no_prefix():
+    from run import cell_command
+    from subjects import MCP_TOOL, SUBJECT_L
+    cmd, cwd = cell_command("L", "q", 30, None)
+    assert cwd == SUBJECT_L
+    assert cmd[2] == "q"
+    tools = cmd[cmd.index("--allowedTools") + 1]
+    assert MCP_TOOL in tools
+    assert cmd[cmd.index("--mcp-config") + 1] == ".mcp.json"
+
+
+def test_cell_command_arm_j_has_mcp_and_no_prefix():
+    from run import cell_command
+    from subjects import MCP_TOOL, SUBJECT_J
+    cmd, cwd = cell_command("J", "q", 30, None)
+    assert cwd == SUBJECT_J
+    assert cmd[2] == "q"
+    tools = cmd[cmd.index("--allowedTools") + 1]
+    assert MCP_TOOL in tools
+    assert cmd[cmd.index("--mcp-config") + 1] == ".mcp.json"
+
+
+def test_cell_command_arm_h_has_mcp_and_no_prefix():
+    from run import cell_command
+    from subjects import MCP_TOOL, SUBJECT_H
+    cmd, cwd = cell_command("H", "q", 30, None)
+    assert cwd == SUBJECT_H
+    assert cmd[2] == "q"
+    tools = cmd[cmd.index("--allowedTools") + 1]
+    assert MCP_TOOL in tools
+    assert cmd[cmd.index("--mcp-config") + 1] == ".mcp.json"
+
+
 def test_mcp_arms_matches_what_the_cells_are_actually_given():
     """`MCP_ARMS` is what a summary says; `cell_command` is what ran."""
     from run import cell_command
@@ -113,6 +156,32 @@ def test_mcp_arms_matches_what_the_cells_are_actually_given():
         cmd, _ = cell_command(arm, "q", 30, None)
         given = MCP_TOOL in cmd[cmd.index("--allowedTools") + 1]
         assert given == (arm in MCP_ARMS), arm
+
+
+def test_cell_command_emits_disallowed_tools_only_when_non_empty(monkeypatch):
+    """`--disallowedTools` is the removal mechanism; `--allowedTools` alone
+    does not take a tool away (the 0.6.2 finding)."""
+    from run import cell_command
+    import subjects
+    monkeypatch.setitem(subjects.ARM_DISALLOWED, "A", ["Grep"])
+    cmd, _ = cell_command("A", "q", 30, None)
+    assert "--disallowedTools" in cmd
+    assert cmd[cmd.index("--disallowedTools") + 1] == "Grep"
+
+    monkeypatch.setitem(subjects.ARM_DISALLOWED, "B", [])
+    cmd2, _ = cell_command("B", "q", 30, None)
+    assert "--disallowedTools" not in cmd2
+
+
+def test_arm_disallowed_is_empty_for_every_current_arm():
+    from subjects import ARM_DISALLOWED, ARM_LABEL
+    for arm in ARM_LABEL:
+        assert ARM_DISALLOWED.get(arm, []) == [], arm
+
+
+def test_code_suite_default_arms_unchanged():
+    from subjects import SUITES
+    assert SUITES["code"]["arms"] == ["A", "B", "C", "D"]
 
 
 # --- grading -------------------------------------------------------------
@@ -144,6 +213,44 @@ def test_grade_text_task_unchanged():
     from ground_truth import grade
     task = {"kind": "navigate", "checks": [{"kind": "text", "value": "src/x.rs"}], "truth": {}}
     assert grade(task, "it is in src/x.rs", None, None)["score"] == 1.0
+
+
+def test_grade_set_check_scores_the_fraction_it_names():
+    """A `set` check is graded as recall over the truth set, minus a penalty
+    for each near-miss the answer names. Floor is zero: a wrong answer scores
+    nothing, it never scores negative."""
+    from ground_truth import grade
+    task = {"kind": "why", "truth": {}, "extras": {"kind": "none"},
+            "checks": [{"kind": "set",
+                        "values": ["company-000001", "company-000002",
+                                   "company-000003", "company-000004"],
+                        "forbid": ["company-000900", "company-000901"]}]}
+    everything = "\n".join(f"company-00000{i}" for i in (1, 2, 3, 4))
+    assert grade(task, everything)["score"] == 1.0
+    assert grade(task, everything)["wrong_extra"] == 0
+
+    half = "company-000001\ncompany-000002"
+    assert grade(task, half)["score"] == 0.5
+
+    penalised = grade(task, half + "\ncompany-000900")
+    assert penalised["score"] == 0.25            # 0.5 - one 0.25 penalty
+    assert penalised["wrong_extra"] == 1
+
+    floored = grade(task, "company-000900\ncompany-000901")
+    assert floored["score"] == 0.0               # 0.0 - 0.5, floored
+    assert floored["wrong_extra"] == 2
+
+
+def test_grade_set_check_unit_passes_only_on_a_clean_sweep():
+    from ground_truth import grade, unit_passed
+    task = {"kind": "why", "truth": {}, "extras": {"kind": "none"},
+            "checks": [{"kind": "set", "values": ["a-1", "a-2"],
+                        "forbid": ["b-9"]}]}
+    clean = grade(task, "a-1 a-2")["units"]
+    dirty = grade(task, "a-1 a-2 b-9")["units"]
+    assert len(clean) == len(dirty) == 1        # the check produced a unit
+    assert unit_passed(clean[0])
+    assert not unit_passed(dirty[0])
 
 
 # --- statistics and the gate --------------------------------------------
@@ -192,7 +299,7 @@ def test_gate_fails_on_low_adoption():
 def test_gate_without_a_stock_arm_cannot_pass():
     from report import gate_verdict
     v = gate_verdict([_row("C", 1, 1.0, 0.0, True)])
-    assert not v["passed"] and v["reasons"] == ["no stock arm"]
+    assert not v["passed"] and v["reasons"] == ["no baseline arm A"]
 
 
 # --- summary -------------------------------------------------------------
@@ -223,7 +330,7 @@ def test_write_summary_reports_the_gate_deltas_and_the_new_columns(tmp_path):
                           graph_calls=2, mcp_calls=2, tool_search_calls=1,
                           cache_hit_ratio=0.9))
     text = write_summary(tmp_path, rows, {"head_short": "abc1234"}).read_text()
-    assert "## Gate" in text and "## Deltas vs stock" in text
+    assert "## Gate" in text and "## Deltas vs arm A" in text
     assert "PASSED" in text
     assert "cache hit" in text and "graph calls" in text
     assert "tool search" in text and "adoption" in text
@@ -301,8 +408,53 @@ def test_rerender_rewrites_a_summary_without_moving_a_number(tmp_path):
     # the summary that was there is put back untouched.
     rows[1]["score"] = 0.25
     (tmp_path / "cells.json").write_text(json.dumps(rows, indent=2) + "\n")
-    with pytest.raises(SystemExit, match="would change a number"):
+    with pytest.raises(SystemExit, match="would change or drop a number"):
         rerender(tmp_path)
+    assert (tmp_path / "summary.md").read_text() == before
+
+
+def test_rerender_may_add_a_number_but_never_move_one():
+    """A newer `report.py` that reports a gate leg it used to leave silent adds
+    numbers to the page; that is allowed, and changing or dropping one is not.
+    """
+    from rescore import is_subsequence
+
+    assert is_subsequence(["1", "2"], ["1", "2"]) is None
+    assert is_subsequence(["1", "2"], ["1", "0.5", "2"]) is None, "added"
+    assert is_subsequence(["1", "2"], ["1", "3"]) == 1, "changed"
+    assert is_subsequence(["1", "2"], ["1"]) == 1, "dropped"
+    assert is_subsequence(["2", "1"], ["1", "2"]) == 1, "reordered"
+
+
+def test_rerender_reproduces_an_association_summarys_own_gate(tmp_path):
+    """An association summary re-renders under the association gate.
+
+    Read back off the page — its suite, its baseline arm, its world digest and
+    the arms it gated — because rendering it under the `code` defaults would
+    describe a gate the run was never judged against and compute a verdict
+    from it.
+    """
+    import json
+    from report import write_summary
+    from rescore import rerender, summary_meta
+
+    rows = [_cell("Q", 1, score=1.0, cost_usd=0.1),
+            _cell("P", 1, score=1.0, cost_usd=0.1),
+            _cell("R", 1, score=0.5, cost_usd=0.5, mcp_calls=1, adopted=True)]
+    meta = {"suite": "association", "baseline": "Q", "graph_arms": ["R"],
+            "world_digest": "f2b689ba52c80241", "max_turns": 30,
+            "cost_ci": True, "adoption_gate": False}
+    write_summary(tmp_path, rows, meta)
+    (tmp_path / "cells.json").write_text(json.dumps(rows, indent=2) + "\n")
+    before = (tmp_path / "summary.md").read_text()
+
+    recovered = summary_meta(before)
+    assert recovered["suite"] == "association"
+    assert recovered["baseline"] == "Q"
+    assert recovered["world_digest"] == "f2b689ba52c80241"
+    assert recovered["graph_arms"] == ["R"]
+
+    rerender(tmp_path)
     assert (tmp_path / "summary.md").read_text() == before
 
 
@@ -393,6 +545,16 @@ def test_no_prompt_points_the_agent_at_the_graph():
         assert not any(b in low for b in banned), (t["key"], low)
         if t["repo"] == "R2":
             assert "mushroom" not in low, t["key"]
+
+    # The association suite has no repository at all, so nothing there may
+    # name the engine, its store, its tools or the shape of its data.
+    assoc = json.loads((HERE / "association" / "tasks.json").read_text())["tasks"]
+    assoc_banned = banned + ("mushroom", "graph", "store", "explain_association",
+                             "was_linked", "node_history", "edge_history",
+                             "commit", "days.json", "cypher")
+    for t in assoc:
+        low = t["full_prompt"].lower()
+        assert not any(b in low for b in assoc_banned), (t["id"], low)
 
 
 # --- change-task plumbing ------------------------------------------------
@@ -495,3 +657,1044 @@ def test_run_verify_grades_a_missing_command_rather_than_crashing(tmp_path):
     task = {"repo": "R1", "verify": {"cmd": ["definitely-not-a-real-binary", "-x"]}}
     assert run_verify(task, tmp_path, log) == VERIFY_MISSING_RC
     assert "definitely-not-a-real-binary" in log.read_text()
+
+
+# --------------------------------------------------------------------------
+# association suite: one world, three forms
+# --------------------------------------------------------------------------
+
+
+def test_world_is_deterministic_and_the_expected_shape():
+    from association.build import world
+    a, b = world(seed=7, scale=200), world(seed=7, scale=200)
+    assert a["nodes"] == b["nodes"] and a["changes"] == b["changes"]
+    assert len(a["nodes"]) == 200 and len(a["changes"]) == 300 and a["changes"][-1]["day"] <= 89
+    assert {r["name"] for r in a["roles"]} == {"recruiter", "client"}
+
+
+def test_a_changelog_never_touches_a_key_twice_a_day_or_after_deleting_it():
+    """The two invariants the truth script leans on: replaying a day is
+    order-independent within that day, and a delete is final."""
+    from association.build import world
+    w = world(seed=7, scale=200)
+    seen: set[tuple[int, str]] = set()
+    deleted: dict[str, int] = {}
+    for seq, change in enumerate(w["changes"]):
+        day_key = (change["day"], change["key"])
+        assert day_key not in seen, f"{change['key']} changed twice on day {change['day']}"
+        seen.add(day_key)
+        assert change["key"] not in deleted, (
+            f"change {seq} refers to {change['key']}, deleted by change "
+            f"{deleted[change['key']]}")
+        if change["op"] == "delete_node":
+            deleted[change["key"]] = seq
+    assert deleted, "a 300-change history with no deletion tests nothing"
+
+
+def test_the_three_forms_carry_the_same_base_facts(tmp_path):
+    from association.build import (SQLITE_NAME, equivalent, world, write_files,
+                                   write_sqlite, write_store)
+    MUSHROOMDB = _binary()
+    w = world(seed=7, scale=200)
+    sqlite_path = tmp_path / "sqlite" / SQLITE_NAME
+    write_files(w, tmp_path / "files")
+    write_sqlite(w, sqlite_path)
+    days = write_store(w, tmp_path / "graph", MUSHROOMDB)
+    assert equivalent(tmp_path / "files", sqlite_path, tmp_path / "graph")
+    assert days[0] >= 0 and days[89] > days[0]
+
+
+def test_the_built_store_is_never_snapshotted(tmp_path):
+    """The WAL is the history every time-travel task asks about; a snapshot
+    truncates it. `snapshot.bin` must not exist in a built store."""
+    from association.build import SNAPSHOT_FILES, STORE_NAME, world, write_store
+    MUSHROOMDB = _binary()
+    w = world(seed=7, scale=200)
+    write_store(w, tmp_path / "graph", MUSHROOMDB)
+    present = {p.name for p in (tmp_path / "graph" / STORE_NAME).iterdir()}
+    assert present.isdisjoint(SNAPSHOT_FILES), f"store was snapshotted: {present}"
+    assert "wal.bin" in present, f"store has no WAL: {present}"
+    assert {p.name for p in (tmp_path / "graph").iterdir()} == {
+        STORE_NAME, "README.md", "days.json", "schema.json"}
+
+
+def test_a_deleted_key_is_absent_later_and_present_earlier(tmp_path):
+    """Time travel is the point of the graph form: the store must still be
+    able to show a node the changelog removed, at a commit before the removal."""
+    from association.build import world, write_store
+    MUSHROOMDB = _binary()
+    from mushroomdb import GraphDb
+    w = world(seed=7, scale=200)
+    days = write_store(w, tmp_path / "graph", MUSHROOMDB)
+    gone = next(c for c in w["changes"] if c["op"] == "delete_node")
+    before, after = days[gone["day"] - 1], days[89]
+    db = GraphDb.open(str(tmp_path / "graph" / "world.mushroomdb"), read_only=True)
+    try:
+        was = {r["n"] for r in db.query_at(before, "MATCH (n) RETURN n")}
+        now = {r["n"] for r in db.query_at(after, "MATCH (n) RETURN n")}
+    finally:
+        db.close()
+    assert gone["key"] in was
+    assert gone["key"] not in now
+
+
+# --------------------------------------------------------------------------
+# association suite: the truth script
+# --------------------------------------------------------------------------
+
+
+def _node(key, label, **props):
+    return {"key": key, "label": label, "props": props}
+
+
+def _rule(name, src, dst, predicate, edge_type):
+    return {"name": name, "src_label": src, "dst_label": dst,
+            "predicate": predicate, "edge_type": edge_type,
+            "weight_prop": "score", "max_edges": None}
+
+
+def test_predicate_holds_is_the_engines_definition_not_a_guess():
+    """The four predicates, read off `crates/core-rules/src/def.rs`.
+
+    `Overlap` is the one worth pinning: the denominator is the **union**, so
+    the score is the Jaccard index, and a non-empty intersection is required
+    on top of the threshold.
+    """
+    from association.truth import predicate_holds
+
+    def holds(pred, a, b, field="f"):
+        return predicate_holds({"predicate": pred},
+                               _node("a", "Talent", **{field: a}),
+                               _node("b", "Company", **{field: b}))
+
+    eq = {"FieldEqual": {"field": "f"}}
+    assert holds(eq, "architecture", "architecture")
+    assert not holds(eq, "architecture", "interior-design")
+    assert not holds(eq, None, None)             # a missing field never matches
+    assert not holds(eq, ["x"], ["x"])           # a list has no ValueKey
+
+    # Jaccard, not overlap-over-the-smaller-list: {a,b} vs {a,b,c,d} is
+    # 2/4 = 0.5, which clears 0.5 and fails 0.6. Over the smaller list it
+    # would be 2/2 = 1.0 and clear both — that is the guess this pins down.
+    half = {"Overlap": {"field": "f", "min": 0.5}}
+    steep = {"Overlap": {"field": "f", "min": 0.6}}
+    assert holds(half, ["a", "b"], ["a", "b", "c", "d"])
+    assert not holds(steep, ["a", "b"], ["a", "b", "c", "d"])
+    assert not holds({"Overlap": {"field": "f", "min": 0.0001}}, ["a"], ["b"])
+    assert not holds(half, ["a", "b"], [])       # empty union, no match
+    assert not holds(half, "a", "a")             # non-list, no tokens
+    assert holds(half, ["a", "a", "b"], ["a", "b"])   # duplicates collapse
+
+    # Haversine on the WGS-84 authalic mean radius. NYC to Philadelphia is
+    # ~130 km; NYC to Boston ~306 km.
+    nyc, philly, boston = [40.7128, -74.0060], [39.9526, -75.1652], [42.3601, -71.0589]
+    near = {"GeoRadius": {"field": "f", "km": 160.9}}
+    assert holds(near, nyc, philly)
+    assert not holds(near, nyc, boston)
+    assert holds({"GeoRadius": {"field": "f", "km": 306.5}}, nyc, boston)
+    assert not holds(near, nyc, [40.7128])       # not a lat/lon pair
+    assert not holds(near, nyc, [999.0, 0.0])    # out of range
+
+    loose = {"NumericWithin": {"field": "f", "tolerance": 1.0}}
+    strict = {"NumericWithin": {"field": "f", "tolerance": 0.0}}
+    assert holds(loose, 2, 3) and holds(loose, 3, 2) and holds(loose, 2, 2)
+    assert not holds(loose, 2, 4)
+    assert holds(strict, 3, 3)
+    assert not holds(strict, 3, 4)
+    assert not holds(strict, 3, None)
+
+
+def test_derived_edges_on_a_six_node_world_is_the_hand_computed_set():
+    from association.truth import derived_edges
+    nyc, la = [40.7128, -74.0060], [34.0522, -118.2437]
+    nodes = [
+        _node("t1", "Talent", industry="architecture", specialties=["a", "b"],
+              location=nyc, size_bucket=2),
+        _node("t2", "Talent", industry="interior-design", specialties=["b", "c"],
+              location=la, size_bucket=3),
+        _node("t3", "Talent", industry="architecture", specialties=["a", "b"],
+              location=[40.8, -74.0], size_bucket=3),
+        _node("c1", "Company", industry="architecture", specialties=["a", "b"],
+              location=[40.75, -74.0], size_bucket=2),
+        _node("c2", "Company", industry="interior-design", specialties=["c", "d"],
+              location=[34.05, -118.2], size_bucket=3),
+        _node("j1", "Job", industry="architecture", specialties=["a"],
+              location=[40.7, -74.0], size_bucket=3),
+    ]
+    rules = [
+        _rule("ind", "Talent", "Company", {"FieldEqual": {"field": "industry"}},
+              "INDUSTRY_ALIGNMENT"),
+        _rule("spec", "Talent", "Company",
+              {"Overlap": {"field": "specialties", "min": 0.5}}, "SPECIALTY_MATCH"),
+        _rule("loc", "Talent", "Company",
+              {"GeoRadius": {"field": "location", "km": 160.9}}, "LOCATION_FIT"),
+        _rule("size", "Talent", "Job",
+              {"NumericWithin": {"field": "size_bucket", "tolerance": 0.0}},
+              "SIMILAR_SIZE_STRICT"),
+    ]
+    assert derived_edges(nodes, rules) == {
+        ("INDUSTRY_ALIGNMENT", "t1", "c1"),
+        ("INDUSTRY_ALIGNMENT", "t2", "c2"),
+        ("INDUSTRY_ALIGNMENT", "t3", "c1"),
+        ("SPECIALTY_MATCH", "t1", "c1"),
+        ("SPECIALTY_MATCH", "t3", "c1"),
+        ("LOCATION_FIT", "t1", "c1"),
+        ("LOCATION_FIT", "t2", "c2"),
+        ("LOCATION_FIT", "t3", "c1"),
+        ("SIMILAR_SIZE_STRICT", "t2", "j1"),
+        ("SIMILAR_SIZE_STRICT", "t3", "j1"),
+    }
+
+
+def _tiny_world():
+    """Three talents, two companies, one job, four rules — the same shape the
+    hand-computed edge set above covers, wrapped as a world so the
+    history-and-role helpers can be exercised on it."""
+    nyc, la = [40.7128, -74.0060], [34.0522, -118.2437]
+    nodes = [
+        _node("t1", "Talent", industry="architecture", specialties=["a", "b"],
+              location=nyc, size_bucket=2),
+        _node("t2", "Talent", industry="interior-design", specialties=["b", "c"],
+              location=la, size_bucket=3),
+        _node("t3", "Talent", industry="architecture", specialties=["a", "b"],
+              location=[40.8, -74.0], size_bucket=3),
+        _node("c1", "Company", industry="architecture", specialties=["a", "b"],
+              location=[40.75, -74.0], size_bucket=2),
+        _node("c2", "Company", industry="interior-design", specialties=["c", "d"],
+              location=[34.05, -118.2], size_bucket=3),
+        _node("j1", "Job", industry="architecture", specialties=["a"],
+              location=[40.7, -74.0], size_bucket=3),
+    ]
+    rules = [
+        _rule("ind", "Talent", "Company", {"FieldEqual": {"field": "industry"}},
+              "INDUSTRY_ALIGNMENT"),
+        _rule("spec", "Talent", "Company",
+              {"Overlap": {"field": "specialties", "min": 0.5}}, "SPECIALTY_MATCH"),
+        _rule("loc", "Talent", "Company",
+              {"GeoRadius": {"field": "location", "km": 160.9}}, "LOCATION_FIT"),
+        _rule("size", "Talent", "Job",
+              {"NumericWithin": {"field": "size_bucket", "tolerance": 0.0}},
+              "SIMILAR_SIZE_STRICT"),
+    ]
+    return {"nodes": nodes, "rules": rules, "changes": [],
+            "roles": [{"name": "recruiter", "labels": ["Talent", "Job"]},
+                      {"name": "client", "labels": ["Company", "Job"]}],
+            "days": ["2026-06-01"]}
+
+
+def test_why_partners_and_multihop_read_the_same_edges():
+    from association.truth import derived_edges, multihop, partners, why
+    w = _tiny_world()
+    assert why(w, 0, "t1", "c1") == [
+        ("INDUSTRY_ALIGNMENT", "ind"), ("LOCATION_FIT", "loc"),
+        ("SPECIALTY_MATCH", "spec")]
+    assert why(w, 0, "c1", "t1") == why(w, 0, "t1", "c1")   # either way round
+    assert why(w, 0, "t2", "c1") == []
+
+    edges = derived_edges(w["nodes"], w["rules"])
+    assert partners(edges, "c1") == {"t1", "t3"}
+    assert partners(edges, "c1", ["INDUSTRY_ALIGNMENT", "SPECIALTY_MATCH"]) == {
+        "t1", "t3"}
+    assert partners(edges, "c2", ["SPECIALTY_MATCH"]) == set()
+
+    tri = ["INDUSTRY_ALIGNMENT", "SPECIALTY_MATCH", "LOCATION_FIT"]
+    assert multihop(w["nodes"], edges, dst_label="Company", edge_types=tri,
+                    min_sources=2) == {"c1"}
+    assert multihop(w["nodes"], edges, dst_label="Company", edge_types=tri,
+                    min_sources=3) == set()
+    # t1 and t3 both reach c1 by all three; only t1 is in bucket 2, so the
+    # filter takes the second source away and the bar of two stops being met.
+    bucket2 = lambda n: n["props"]["size_bucket"] == 2         # noqa: E731
+    assert multihop(w["nodes"], edges, dst_label="Company", edge_types=tri,
+                    min_sources=1, src_filter=bucket2) == {"c1"}
+    assert multihop(w["nodes"], edges, dst_label="Company", edge_types=tri,
+                    min_sources=2, src_filter=bucket2) == set()
+
+
+def test_retraction_names_only_the_edges_a_counterfactual_costs():
+    from association.truth import retraction
+    w = _tiny_world()
+    # c1's specialties no longer overlap either talent's, so both specialty
+    # edges go — and nothing else does.
+    assert retraction(w, 0, "c1", "specialties", ["x", "y"]) == {
+        ("SPECIALTY_MATCH", "t1", "c1"), ("SPECIALTY_MATCH", "t3", "c1")}
+    # Moving c1 across the country costs it the location edges instead.
+    assert retraction(w, 0, "c1", "location", [34.05, -118.2]) == {
+        ("LOCATION_FIT", "t1", "c1"), ("LOCATION_FIT", "t3", "c1")}
+    # A change that changes nothing retracts nothing.
+    assert retraction(w, 0, "c1", "size_bucket", 4) == set()
+
+
+def test_a_role_sees_a_relationship_only_when_it_sees_both_ends():
+    from association.truth import derived_edges, visible
+    w = _tiny_world()
+    edges = derived_edges(w["nodes"], w["rules"])
+    keys = {n["key"] for n in w["nodes"]}
+    assert visible(w, "recruiter", keys, w["nodes"]) == {"t1", "t2", "t3", "j1"}
+    assert visible(w, "client", keys, w["nodes"]) == {"c1", "c2", "j1"}
+    # A recruiter sees Talent and Job, so the Talent-Company edges are hidden
+    # however strongly they match, and the Talent-Job ones are not.
+    seen = visible(w, "recruiter", edges, w["nodes"])
+    assert seen == {("SIMILAR_SIZE_STRICT", "t2", "j1"),
+                    ("SIMILAR_SIZE_STRICT", "t3", "j1")}
+    # A client sees Company and Job, and no rule joins those two: it sees no
+    # derived relationship at all.
+    assert visible(w, "client", edges, w["nodes"]) == set()
+
+
+def test_state_at_replays_a_set_prop_and_a_delete():
+    from association.build import world
+    from association.truth import state_at
+    w = world(seed=7, scale=200)
+
+    edit = next(c for c in w["changes"] if c["op"] == "set_prop")
+    before = state_at(w, edit["day"] - 1)
+    after = state_at(w, edit["day"])
+    assert after[edit["key"]]["props"][edit["field"]] == edit["value"]
+    assert before[edit["key"]]["props"][edit["field"]] != edit["value"]
+
+    gone = next(c for c in w["changes"] if c["op"] == "delete_node")
+    assert gone["key"] in state_at(w, gone["day"] - 1)
+    assert gone["key"] not in state_at(w, gone["day"])
+
+    born = next(c for c in w["changes"] if c["op"] == "insert_node")
+    assert born["key"] not in state_at(w, born["day"] - 1)
+    assert born["key"] in state_at(w, born["day"])
+
+    # Day 0 is the base state: nothing has happened yet.
+    assert len(state_at(w, 0)) == len(w["nodes"])
+
+
+def test_the_truth_script_and_the_engine_agree_on_a_small_world(tmp_path):
+    """The cross-check the suite's credibility rests on: brute force in
+    Python and the engine's own derivation must name the same relationships,
+    live and at a past commit.
+
+    Nothing is excused any more: the one disagreement this ever filed was an
+    engine bug and it is fixed, so every line the cross-check returns is a bug
+    in one of the two truths and fails here.
+    """
+    from association.build import world, write_store
+    from association.truth import cross_check
+    MUSHROOMDB = _binary()
+    w = world(seed=7, scale=200)
+    write_store(w, tmp_path / "graph", MUSHROOMDB)
+    problems = cross_check(w, tmp_path / "graph", seed=7,
+                           live_pairs=60, time_probes=6, history_probes=6)
+    assert problems == [], problems
+    # And the history probe is not passing vacuously: the keys it picks are
+    # keys the changelog deleted after editing — the shape that used to fail.
+    import random
+    from association.truth import _history_keys
+    picked = _history_keys(random.Random("k"), w, 6)
+    edited_then_deleted = {c["key"] for c in w["changes"] if c["op"] == "set_prop"} \
+        & {c["key"] for c in w["changes"] if c["op"] == "delete_node"}
+    assert set(picked) & edited_then_deleted, picked
+
+
+def test_a_negative_time_probe_always_asks_about_a_derivable_type():
+    """A `was_linked` probe that expects False proves nothing if no rule could
+    ever have derived that type for that pair of labels — `SIMILAR_SIZE`
+    between a Talent and a Job is False whatever the engine does."""
+    import random
+    from association.build import world
+    from association.truth import (
+        _label_pair_is_possible, _pick_time_probe, state_at,
+    )
+    w = world(seed=7, scale=200)
+    rules = w["rules"]
+    edge_types = sorted({r["edge_type"] for r in rules})
+    commit_of = {d: d for d in range(90)}
+    rng = random.Random(11)
+    negatives = 0
+    for _ in range(12):
+        probe = _pick_time_probe(rng, w, rules, edge_types, commit_of,
+                                 want_linked=False)
+        assert probe is not None
+        day, a, b, edge_type, expected = probe
+        assert expected is False
+        nodes = state_at(w, day)
+        assert _label_pair_is_possible(nodes, rules, a, b, [edge_type]), (
+            f"{edge_type} is not derivable between {nodes[a]['label']} and "
+            f"{nodes[b]['label']}; the probe proves nothing")
+        negatives += 1
+    assert negatives == 12
+
+
+def test_an_insert_contributes_no_prop_set_records(tmp_path):
+    """What the changelog calls one `insert_node` the engine records as one
+    InsertNode frame carrying the whole record — not a prop_set per field. The
+    history cross-check counts on it, so it is measured rather than assumed."""
+    from association.truth import INSERT_PROP_SET_RECORDS
+    from mushroomdb import GraphDb
+    db = GraphDb.open(str(tmp_path / "insert.mushroomdb"))
+    try:
+        db.insert_node("Talent", "t1", {"industry": "architecture",
+                                        "size_bucket": 2, "status": "published"})
+        kinds = [e["kind"] for e in db.node_history("t1")]
+        assert kinds.count("prop_set") == 3 * INSERT_PROP_SET_RECORDS == 0
+        db.set_prop("t1", "status", "draft")
+        assert [e["kind"] for e in db.node_history("t1")].count("prop_set") == 1
+    finally:
+        db.close()
+
+
+def test_a_deleted_nodes_property_history_survives_the_tombstone(tmp_path):
+    """The disagreement this suite once filed, reduced to three calls.
+
+    `node_history` used to keep a deleted node's insert and its delete but
+    drop every `prop_set` in between: `db.rs`'s `SetPropId` branch resolved the
+    id with `key_of`, which is `None` for a tombstoned id. It resolves it the
+    way the other branches do now, so the property history outlives the
+    tombstone and the cross-check has no known gap left to excuse.
+    """
+    from association import truth
+    from mushroomdb import GraphDb
+    assert not hasattr(truth, "KNOWN_GAPS"), "the filed gap is fixed; drop it"
+    db = GraphDb.open(str(tmp_path / "gap.mushroomdb"))
+    try:
+        db.insert_node("Talent", "t1", {"industry": "architecture"})
+        db.set_prop("t1", "industry", "interior-design")
+        assert [e["kind"] for e in db.node_history("t1")] == [
+            "node_inserted", "prop_set"]
+        db.delete_node("t1")
+        assert [e["kind"] for e in db.node_history("t1")] == [
+            "node_inserted", "prop_set", "node_deleted"]
+    finally:
+        db.close()
+
+
+# --------------------------------------------------------------------------
+# association suite: the task set
+# --------------------------------------------------------------------------
+
+ASSOC_KINDS = ("why", "multihop", "retraction", "timetravel", "visibility")
+
+
+def test_association_task_set_is_twenty_tasks_four_per_kind():
+    data = json.loads((HERE / "association" / "tasks.json").read_text())
+    tasks = data["tasks"]
+    assert len(tasks) == 20
+    assert len({t["id"] for t in tasks}) == 20
+    mix = {}
+    for t in tasks:
+        mix[t["kind"]] = mix.get(t["kind"], 0) + 1
+    assert mix == {k: 4 for k in ASSOC_KINDS}, mix
+    assert data["prefix"].startswith("Answer using only the data")
+    for t in tasks:
+        assert t["suite"] == "association"
+        assert t["verify"] is None
+        assert t["extras"] == {"kind": "none"}
+        assert t["full_prompt"].endswith(t["prompt"])
+        assert data["prefix"] in t["full_prompt"]
+
+
+def test_every_association_task_is_a_bounded_set_question():
+    """Brute force has to be real work, and the answer has to be checkable:
+    every task is graded by one `set` check whose values are the truth and
+    whose forbidden values are near-misses the truth excludes."""
+    data = json.loads((HERE / "association" / "tasks.json").read_text())
+    for t in data["tasks"]:
+        assert len(t["checks"]) == 1, t["id"]
+        check = t["checks"][0]
+        assert check["kind"] == "set", t["id"]
+        assert check["values"], t["id"]
+        assert t["truth"]["size"] == len(check["values"]), t["id"]
+        assert not set(check["values"]) & set(check["forbid"]), t["id"]
+        assert len(set(check["values"])) == len(check["values"]), t["id"]
+        assert len(check["forbid"]) == 5, (t["id"], len(check["forbid"]))
+        if t["kind"] != "why":
+            assert 3 <= t["truth"]["size"] <= 40, (t["id"], t["truth"]["size"])
+        # Every value the answer must name has to appear in the answer as a
+        # whole token; a value that is a substring of another would be graded
+        # by accident.
+        for a in check["values"] + check["forbid"]:
+            others = [b for b in check["values"] + check["forbid"] if b != a]
+            assert not any(a.lower() in b.lower() for b in others), (t["id"], a)
+        # And the question must not contain its own answer or its own traps:
+        # an agent that quotes the prompt back would be scored for it.
+        low = t["full_prompt"].lower()
+        echoed = [v for v in check["values"] + check["forbid"] if v.lower() in low]
+        assert not echoed, (t["id"], echoed)
+
+
+def test_no_association_task_penalises_an_arm_for_its_own_data():
+    """`SEMANTIC_MATCH` is derived from a vector only the graph form carries.
+    Forbidding it would cost that arm for reading its own store and cost no
+    other arm anything, so no task may name it — as truth or as a near-miss."""
+    data = json.loads((HERE / "association" / "tasks.json").read_text())
+    for t in data["tasks"]:
+        check = t["checks"][0]
+        assert "SEMANTIC_MATCH" not in check["values"] + check["forbid"], t["id"]
+        assert "SEMANTIC_MATCH" not in t["full_prompt"], t["id"]
+
+
+def test_every_engine_checkable_task_records_what_the_engine_was_asked():
+    """Four kinds carry a claim `verify_against_store` can put to the engine;
+    each one has to carry the fields that verification reads."""
+    data = json.loads((HERE / "association" / "tasks.json").read_text())
+    for t in data["tasks"]:
+        truth = t["truth"]
+        if t["kind"] == "why":
+            assert len(truth["target"]) == 2 and truth["types"], t["id"]
+        elif t["kind"] == "visibility":
+            assert truth["target"] and truth["edge_types"], t["id"]
+        elif t["kind"] == "retraction":
+            # The neighbourhood before the counterfactual is what `explain`
+            # can be asked about, so it is recorded, not just counted.
+            assert truth["base"], t["id"]
+            assert len(truth["base"]) == truth["linked_before"], t["id"]
+            assert set(truth["answer"]) <= set(truth["base"]), t["id"]
+            assert set(truth["forbid"]) <= set(truth["base"]), t["id"]
+        elif t["kind"] == "timetravel":
+            assert isinstance(truth["day"], int) and truth["edge_types"], t["id"]
+        else:
+            assert t["kind"] == "multihop", t["id"]
+
+
+def test_every_association_task_survived_the_pilot_turn_floor():
+    """§3.2: a task the SQLite arm answers in four turns or fewer cannot show
+    a graph win, so it is replaced. What ships carries the measurement that
+    says it was not one of those — earned by `run.py --suite association
+    --pilot`, at the prompt it still has."""
+    from run import SUITES, already_sized
+    field = SUITES["association"]["turns_field"]
+    floor = SUITES["association"]["pilot_floor"]
+    tasks = json.loads((HERE / "association" / "tasks.json").read_text())["tasks"]
+    unsized = [t["key"] for t in tasks if t.get(field) is None]
+    assert not unsized, (f"never piloted: {unsized} (run `run.py --suite "
+                         f"association --pilot`)")
+    too_easy = {t["key"]: t[field] for t in tasks if t[field] < floor}
+    assert not too_easy, f"under the {floor}-turn floor: {too_easy}"
+    stale = [t["key"] for t in tasks if not already_sized(t, field)]
+    assert not stale, f"prompt or truth changed since the pilot sized it: {stale}"
+
+
+# --------------------------------------------------------------------------
+# association suite: the harness — arms P/Q/R, the suite switch, the gate
+# --------------------------------------------------------------------------
+
+
+def test_cell_command_arm_p_is_the_files_subject_without_mcp():
+    from run import cell_command
+    from subjects import EMPTY_MCP, MCP_TOOL, SUBJECT_P
+    cmd, cwd = cell_command("P", "who matches whom?", 30, None)
+    assert cwd == SUBJECT_P
+    assert cmd[2] == "who matches whom?"
+    assert cmd[cmd.index("--mcp-config") + 1] == str(EMPTY_MCP)
+    tools = cmd[cmd.index("--allowedTools") + 1]
+    assert MCP_TOOL not in tools
+    assert tools == "Read,Grep,Glob,Bash,Edit,Write"
+
+
+def test_cell_command_arm_q_is_the_sqlite_subject_without_mcp():
+    from run import cell_command
+    from subjects import EMPTY_MCP, MCP_TOOL, SUBJECT_Q
+    cmd, cwd = cell_command("Q", "q", 30, None)
+    assert cwd == SUBJECT_Q
+    assert cmd[2] == "q"
+    assert cmd[cmd.index("--mcp-config") + 1] == str(EMPTY_MCP)
+    assert MCP_TOOL not in cmd[cmd.index("--allowedTools") + 1]
+
+
+def test_cell_command_arm_r_is_the_graph_subject_with_mcp():
+    from run import cell_command
+    from subjects import MCP_TOOL, SUBJECT_R
+    cmd, cwd = cell_command("R", "q", 30, None)
+    assert cwd == SUBJECT_R
+    assert cwd.name == "graph"
+    assert cmd[2] == "q"                          # plain prompt, no prefix
+    assert cmd[cmd.index("--mcp-config") + 1] == ".mcp.json"
+    assert MCP_TOOL in cmd[cmd.index("--allowedTools") + 1]
+
+
+def test_the_three_association_subjects_are_the_three_built_forms():
+    from association.build import STORE_NAME, form_paths
+    from subjects import (ASSOC_BUILD, ASSOC_STORE_NAME, SUBJECT_P, SUBJECT_Q,
+                          SUBJECT_R)
+    where = form_paths(ASSOC_BUILD)
+    assert (SUBJECT_P, SUBJECT_Q, SUBJECT_R) == (
+        where["files"], where["sqlite"], where["graph"])
+    assert ASSOC_STORE_NAME == STORE_NAME
+
+
+def test_reprovision_removes_the_install_and_keeps_the_world(tmp_path):
+    """`install_association_graph` skips whenever `.mcp.json` is there, so a
+    subject provisioned by an older binary keeps that binary's skill and hooks
+    for ever. `--reprovision` takes the install off; it must not take the world
+    with it, which costs six minutes to rebuild and would move the truth."""
+    from subjects import ASSOC_STORE_NAME, reprovision_association
+    graph = tmp_path / "graph"
+    (graph / ".claude" / "skills" / "mushroom").mkdir(parents=True)
+    (graph / ".claude" / "skills" / "mushroom" / "SKILL.md").write_text("0.6.2")
+    (graph / ".mcp.json").write_text("{}\n")
+    (graph / ASSOC_STORE_NAME).mkdir()
+    (graph / ASSOC_STORE_NAME / "wal.bin").write_text("the world")
+    (graph / "days.json").write_text("[]\n")
+
+    assert sorted(reprovision_association(graph)) == [".claude", ".mcp.json"]
+    assert not (graph / ".mcp.json").exists()
+    assert not (graph / ".claude").exists()
+    assert (graph / ASSOC_STORE_NAME / "wal.bin").read_text() == "the world"
+    assert (graph / "days.json").exists()
+    # Idempotent: a second pass has nothing to take.
+    assert reprovision_association(graph) == []
+
+
+def test_load_tasks_reads_the_suites_own_file():
+    from run import load_tasks
+    code = load_tasks("code")
+    assert len(code["tasks"]) == 20 and code["tasks"][0]["repo"] in ("R1", "R2")
+    assoc = load_tasks("association")
+    assert assoc["suite"] == "association" and len(assoc["tasks"]) == 20
+    assert all(t["suite"] == "association" for t in assoc["tasks"])
+
+
+def test_suites_pin_the_arms_baseline_and_gate_of_each_suite():
+    import run
+    import subjects
+    from run import PILOT_MIN_TURNS, SUITES
+    # One table, read by the runner and by the report: `report.py` renders a
+    # suite's gate legs from it and cannot import `run.py`.
+    assert SUITES is subjects.SUITES
+    assert run.PILOT_MIN_TURNS == SUITES["code"]["pilot_floor"] == PILOT_MIN_TURNS
+
+    code, assoc = SUITES["code"], SUITES["association"]
+    assert code["arms"] == ["A", "B", "C", "D"] and code["baseline"] == "A"
+    assert code["gate"] == {"cost_ci": False, "adoption_gate": True}
+    assert code["graph_arms"] is None            # every arm but A is gated
+    assert code["pilot_floor"] == 6 and code["pilot_arm"] == "A"
+    assert code["turns_field"] == "min_stock_turns"
+    assert code["tasks"].name == "tasks.json"
+
+    assert assoc["arms"] == ["P", "Q", "R"] and assoc["baseline"] == "Q"
+    assert assoc["gate"] == {"cost_ci": True, "adoption_gate": False}
+    assert assoc["graph_arms"] == ["R"]          # P is the second baseline
+    assert assoc["pilot_floor"] == 5 and assoc["pilot_arm"] == "Q"
+    assert assoc["turns_field"] == "min_baseline_turns"
+    assert assoc["tasks"].parent.name == "association"
+
+
+def test_paired_deltas_measures_against_the_baseline_it_is_given():
+    from report import paired_deltas
+    rows = [_row("Q", 1, 0.4, 0.1, False), _row("R", 1, 0.9, 0.1, True),
+            _row("P", 1, 0.2, 0.1, False),
+            _row("Q", 2, 0.5, 0.1, False), _row("R", 2, 0.8, 0.1, True),
+            _row("P", 2, 0.1, 0.1, False)]
+    approx = lambda ds: [round(d, 6) for d in ds]                    # noqa: E731
+    assert approx(paired_deltas(rows, "R", "score", baseline="Q")) == [0.5, 0.3]
+    assert approx(paired_deltas(rows, "R", "score", baseline="P")) == [0.7, 0.7]
+    # No baseline cells for that arm means no differences at all, not zeros.
+    assert paired_deltas(rows, "R", "score", baseline="A") == []
+
+
+def _assoc_rows(r_scores, p_scores=None, q_score=1.0, r_costs=0.05,
+                q_cost=0.10, adopted=True):
+    """One rep per task for arms P, Q and R.
+
+    Defaults model what the pilot actually measured: the SQLite baseline
+    answers every task (1.00), so the gate turns on cost. `r_costs` takes
+    either one number or one per task.
+    """
+    p_scores = p_scores if p_scores is not None else [q_score] * len(r_scores)
+    if not isinstance(r_costs, (list, tuple)):
+        r_costs = [r_costs] * len(r_scores)
+    rows = []
+    for t, (rs, ps, rc) in enumerate(zip(r_scores, p_scores, r_costs), start=1):
+        rows += [_row("Q", t, q_score, q_cost, False),
+                 _row("P", t, ps, q_cost, False),
+                 _row("R", t, rs, rc, adopted)]
+    return rows
+
+
+ASSOC_GATE = {"baseline": "Q", "cost_ci": True, "adoption_gate": False,
+              "graph_arms": ["R"]}
+
+
+def test_association_gate_passes_on_a_score_tie_and_a_real_cost_win():
+    """§1 as amended: correctness is saturated, so a tie on score passes and
+    cost — mean and interval — is what the gate turns on."""
+    from report import gate_verdict
+    rows = _assoc_rows([1.0] * 6)                  # every arm scores 1.00
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert v["passed"] and v["best_arm"] == "R", v["reasons"]
+    assert v["arms"]["R"]["paired_score"] == 0.0   # a tie, and it passed
+
+
+def test_association_gate_fails_when_the_cost_interval_includes_zero():
+    """Cheaper on the mean is not enough: the paired cost difference has to be
+    consistent across tasks, or the win is noise."""
+    from report import gate_verdict
+    # Mean cost 0.095 < 0.10, but the per-task difference swings either way.
+    rows = _assoc_rows([1.0] * 6,
+                       r_costs=[0.02, 0.18, 0.02, 0.18, 0.02, 0.15])
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert not v["passed"]
+    assert any("cost interval" in r for r in v["reasons"]), v["reasons"]
+    # ... and no correctness complaint: the scores tie.
+    assert not any("correctness" in r for r in v["reasons"]), v["reasons"]
+
+
+def test_association_gate_fails_when_the_cost_interval_sits_above_zero():
+    """An interval entirely above zero is the graph reliably costing *more*.
+    That is the strongest cost failure there is, and the interval leg has to
+    say so rather than waving it through for not containing zero."""
+    from report import gate_verdict
+    rows = _assoc_rows([1.0] * 6, r_costs=0.12)     # dearer on every task
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert not v["passed"]
+    assert any("cost interval" in r and "below zero" in r
+               for r in v["reasons"]), v["reasons"]
+
+
+def test_association_gate_passes_when_the_cost_interval_sits_below_zero():
+    """The only interval that passes: every resample cheaper than baseline."""
+    from report import gate_verdict
+    rows = _assoc_rows([1.0] * 6,
+                       r_costs=[0.04, 0.05, 0.06, 0.04, 0.05, 0.06])
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert v["passed"], v["reasons"]
+
+
+def test_association_gate_fails_when_another_arm_is_more_correct():
+    """A tie passes; being *below* another arm does not. P winning is never
+    itself a pass — it is the second baseline, not a contender."""
+    from report import gate_verdict
+    rows = _assoc_rows([0.9] * 6, p_scores=[0.95] * 6, q_score=0.9)
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert not v["passed"] and v["best_arm"] == "R"
+    assert sorted(v["arms"]) == ["R"]
+    assert any("P" in r and "correctness" in r for r in v["reasons"]), v["reasons"]
+
+
+def test_association_gate_fails_when_the_graph_is_below_the_baseline():
+    from report import gate_verdict
+    rows = _assoc_rows([0.6] * 6, p_scores=[0.6] * 6, q_score=1.0)
+    reasons = gate_verdict(rows, **ASSOC_GATE)["reasons"]
+    assert any("correctness" in r and "arm Q" in r for r in reasons), reasons
+
+
+def test_association_gate_records_adoption_without_gating_it():
+    """In arm R the store is the only data path, so adoption is not a leg."""
+    from report import gate_verdict
+    rows = _assoc_rows([1.0] * 6, adopted=False)
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert v["passed"], v["reasons"]
+    assert v["arms"]["R"]["adoption"] == 0.0      # recorded all the same
+    # ... and the same rows fail the code suite's gate, which does gate on it.
+    assert not gate_verdict(rows, baseline="Q")["passed"]
+
+
+def test_association_gate_still_fails_on_cost_and_on_max_turns():
+    from report import gate_verdict
+    dear = _assoc_rows([1.0] * 6, r_costs=0.20)
+    assert any("cost 0.2" in r for r in gate_verdict(dear, **ASSOC_GATE)["reasons"])
+    rows = _assoc_rows([1.0] * 6)
+    rows[2]["result_subtype"] = "error_max_turns"
+    reasons = gate_verdict(rows, **ASSOC_GATE)["reasons"]
+    assert any("max-turns" in r for r in reasons), reasons
+
+
+def test_the_code_suite_gate_is_untouched_by_the_amendment():
+    """The 0.6.2 gate still has no interval leg and still gates on adoption:
+    the same rows that pass it would fail the association variant on cost."""
+    from report import gate_verdict
+    rows = []
+    for t in range(1, 5):
+        rows += [_row("A", t, 0.8, 0.10, False), _row("C", t, 0.9, 0.10, True)]
+    assert gate_verdict(rows)["passed"]                 # cost equal, no CI leg
+    v = gate_verdict(rows, baseline="A", cost_ci=True, graph_arms=["C"])
+    assert not v["passed"]
+    assert any("cost interval" in r for r in v["reasons"]), v["reasons"]
+
+
+def test_write_summary_names_the_suite_and_the_baseline_arm(tmp_path):
+    from report import write_summary
+    rows = []
+    for t in (1, 2, 3, 4, 5, 6):
+        rows.append(_cell("Q", t, score=1.0, cost_usd=0.10))
+        rows.append(_cell("P", t, score=1.0, cost_usd=0.10))
+        rows.append(_cell("R", t, score=1.0, cost_usd=0.05, adopted=True,
+                          mcp_calls=3, graph_calls=3))
+    # No gate keys in the meta: the variant is looked up from `SUITES`.
+    text = write_summary(tmp_path, rows, {
+        "suite": "association", "baseline": "Q", "graph_arms": ["R"],
+        "world_digest": "abc123def456", "max_turns": 30}).read_text()
+    assert "- suite: association" in text
+    assert "- baseline arm: Q" in text
+    assert "abc123def456" in text
+    assert "## Deltas vs arm Q" in text
+    from subjects import ARM_PROVENANCE
+    for arm in ("P", "Q", "R"):
+        assert f"- arm {arm} (" in text and ARM_PROVENANCE[arm] in text
+    # The code suite's own footnotes describe a run this one did not do.
+    assert "DEVIATION" not in text and "R2 subject" not in text
+    # The amended legs, in words: a score tie passes, the cost interval is the
+    # discriminator, adoption is recorded rather than gated.
+    assert "at or above every other arm's paired mean (a tie passes)" in text
+    assert "the 95% cost interval vs arm Q lies entirely below zero" in text
+    assert "adoption >=" not in text
+    assert "Adoption is recorded below, not gated" in text
+    assert "amended 2026-09-11" in text
+    assert "PASSED" in text
+
+
+def test_write_summary_keeps_the_code_suites_own_provenance(tmp_path):
+    from report import GATE_ADOPTION, write_summary
+    rows = [_cell("A", 1, score=0.5, cost_usd=0.2),
+            _cell("B", 1, score=0.6, cost_usd=0.1, adopted=True, mcp_calls=1)]
+    text = write_summary(tmp_path, rows, {"head_short": "abc1234"}).read_text()
+    assert "- suite: code" in text and "- baseline arm: A" in text
+    assert "DEVIATION" in text and "R2 subject" in text
+    assert "## Deltas vs arm A" in text
+    # The 0.6.2 legs, unchanged by the association amendment.
+    assert f"adoption >= {GATE_ADOPTION:.0%}" in text
+    assert "cost interval" not in text and "a tie passes" not in text
+
+
+def test_the_graph_subject_holds_the_store_the_install_and_nothing_else(tmp_path):
+    """§5: the install goes into an otherwise empty directory, and what it
+    leaves behind is the whole of arm R's world. A stray `.gitignore` (the
+    install writes one) or a leftover build artefact would be data the other
+    two arms do not have."""
+    from association.build import world, write_store
+    from subjects import ASSOC_GRAPH_CONTENTS, install_association_graph
+    MUSHROOMDB = _binary()
+    w = world(seed=7, scale=200)
+    graph = tmp_path / "graph"
+    write_store(w, graph, MUSHROOMDB)
+    install_association_graph(graph)                 # raises if doctor fails
+    assert {p.name for p in graph.iterdir()} == set(ASSOC_GRAPH_CONTENTS)
+    assert (graph / ".mcp.json").is_file() and (graph / ".claude").is_dir()
+    assert not (graph / ".gitignore").exists()
+    # Idempotent: setup runs it on every invocation, not only the first.
+    install_association_graph(graph)
+    assert {p.name for p in graph.iterdir()} == set(ASSOC_GRAPH_CONTENTS)
+
+    # And a cell copy of that real install must name its own store everywhere
+    # the install wrote a path — `.mcp.json`, all three hooks, the manifest —
+    # and the subject nowhere. This is the whole of arm R's isolation.
+    from subjects import ASSOC_STORE_NAME, make_cell_copy
+    cell = make_cell_copy(graph, tmp_path / "cells" / "assoc-R")
+    subject_store = str((graph / ASSOC_STORE_NAME).resolve())
+    cell_store = str((cell / ASSOC_STORE_NAME).resolve())
+    wrote_a_path = []
+    for path in [cell / ".mcp.json", *sorted((cell / ".claude").rglob("*"))]:
+        if not path.is_file():
+            continue
+        body = path.read_text(errors="replace")
+        assert subject_store not in body, path
+        assert str(graph.resolve()) not in body, path
+        if cell_store in body:
+            wrote_a_path.append(path.name)
+    assert ".mcp.json" in wrote_a_path
+    assert "settings.json" in wrote_a_path
+    assert ".install-manifest.json" in wrote_a_path
+
+    mcp = json.loads((cell / ".mcp.json").read_text())
+    assert mcp["mcpServers"]["mushroomdb"]["args"][-1] == cell_store
+    hooks = json.loads((cell / ".claude" / "settings.json").read_text())["hooks"]
+    assert set(hooks) == {"UserPromptSubmit", "PostToolUse", "SessionStart"}
+    for entries in hooks.values():
+        for entry in entries:
+            for hook in entry["hooks"]:
+                assert cell_store in hook["command"], hook["command"]
+
+
+def _assoc_task(i, prompt, target=None, kind="why"):
+    return {"id": i, "key": f"assoc-{kind}-{i}", "kind": kind,
+            "full_prompt": prompt, "verify": None,
+            "truth": {"size": i, **({"target": target} if target else {})}}
+
+
+def test_replace_dropped_tasks_rebuilds_in_place_and_accumulates_avoid(
+        tmp_path, monkeypatch):
+    """The replacement loop, without paying `build_tasks.py` to run: a canned
+    rebuild stands in for it, and what is asserted is what this function owns —
+    the avoid list it passes, the file it rewrites, and the stamps it carries.
+    """
+    import subprocess
+    import run
+
+    out = tmp_path / "tasks.json"
+    canned: list[dict] = []
+    seen_avoid: list[str] = []
+
+    def fake_run(cmd, **kw):
+        seen_avoid.append(cmd[cmd.index("--avoid") + 1])
+        dest = Path(cmd[cmd.index("--out") + 1])
+        dest.write_text(json.dumps({"suite": "association", "seed": 1,
+                                    "tasks": canned.pop(0)}) + "\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    # The function imports `subprocess` itself at call time, so patching the
+    # module's own attribute is what it will see.
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    # Round 1: three tasks, two of them sized; task 2 was under the floor.
+    kept_a = _assoc_task(1, "why a?", ["talent-1", "company-1"])
+    kept_b = _assoc_task(3, "why c?", ["talent-3", "company-3"])
+    dropped = _assoc_task(2, "why b?", ["talent-2", "company-2"])
+    data = {"tasks": [kept_a, kept_b], "pilot": {"run": "round-1"}}
+    for t in data["tasks"]:
+        t["min_baseline_turns"] = 9
+        t["pilot_fingerprint"] = run.task_fingerprint(t)
+
+    # The rebuild reproduces 1 and 3 and puts a new task in 2's place.
+    canned.append([dict(kept_a), _assoc_task(2, "why d?", ["talent-9"]),
+                   dict(kept_b)])
+    fresh = run.replace_dropped_association_tasks(
+        data, [dropped], tmp_path / "build", out=out)
+
+    assert seen_avoid == ["company-2,talent-2"]
+    assert json.loads(out.read_text()) == fresh          # rewritten in place
+    stamped = {t["key"]: t.get("min_baseline_turns") for t in fresh["tasks"]}
+    assert stamped == {"assoc-why-1": 9, "assoc-why-2": None, "assoc-why-3": 9}
+    assert fresh["dropped_targets"] == ["company-2", "talent-2"]
+    assert fresh["pilot"] == {"run": "round-1"}          # provenance survives
+
+    # Round 2: the replacement is itself too easy. The avoid list accumulates —
+    # a rebuild that forgot round 1 would hand back the task it just replaced.
+    canned.append([dict(kept_a), _assoc_task(2, "why e?", ["talent-8"]),
+                   dict(kept_b)])
+    fresh2 = run.replace_dropped_association_tasks(
+        fresh, [fresh["tasks"][1]], tmp_path / "build", out=out)
+    assert seen_avoid[-1] == "company-2,talent-2,talent-9"
+    assert fresh2["dropped_targets"] == ["company-2", "talent-2", "talent-9"]
+    assert [t["full_prompt"] for t in fresh2["tasks"]] == [
+        "why a?", "why e?", "why c?"]
+
+
+def test_replace_dropped_tasks_refuses_a_task_it_cannot_avoid(tmp_path):
+    """A multihop truth names no target, so `--avoid` cannot exclude it and a
+    rebuild would reproduce it — the pilot would drop it again for ever. Say
+    so instead of looping."""
+    import pytest
+    import run
+    multihop = _assoc_task(5, "which companies?", kind="multihop")
+    assert "target" not in multihop["truth"]
+    with pytest.raises(SystemExit, match="names no target"):
+        run.replace_dropped_association_tasks(
+            {"tasks": []}, [multihop], tmp_path / "build",
+            out=tmp_path / "tasks.json")
+
+
+def test_an_empty_build_directory_is_not_a_built_world(tmp_path, monkeypatch):
+    """Three empty directories are what an interrupted build leaves. Skipping
+    on the directories alone would hand a run three subjects with no data."""
+    import subjects
+    monkeypatch.setattr(subjects, "ASSOC_BUILD", tmp_path / "assoc-build")
+    monkeypatch.setattr(subjects, "ensure_binary", lambda: None)
+    rebuilt = []
+    monkeypatch.setattr(subjects, "sh",
+                        lambda cmd, **kw: rebuilt.append(cmd) or "")
+    for form in ("files", "sqlite", "graph"):
+        (tmp_path / "assoc-build" / form).mkdir(parents=True)
+
+    subjects.build_association_world()
+    assert len(rebuilt) == 1, "an empty build directory was accepted as built"
+    assert str(tmp_path / "assoc-build") in rebuilt[0]
+
+    # It also cleared the incomplete tree rather than building on top of it.
+    assert not (tmp_path / "assoc-build").exists()
+
+    # With the three markers present it is left alone.
+    for form in ("files", "sqlite", "graph"):
+        (tmp_path / "assoc-build" / form).mkdir(parents=True)
+    (tmp_path / "assoc-build" / "files" / "entities").mkdir()
+    (tmp_path / "assoc-build" / "sqlite" / "world.sqlite").write_text("x")
+    (tmp_path / "assoc-build" / "graph" / "world.mushroomdb").mkdir()
+    subjects.build_association_world()
+    assert len(rebuilt) == 1, "a complete world was rebuilt anyway"
+
+
+def test_a_copy_that_repoints_nothing_is_an_error(tmp_path):
+    """`repoint_install` returning zero on a tree that carries an install
+    means the paths did not match what was expected — the cell would run
+    against the subject's store and nothing would say so."""
+    import pytest
+    from subjects import make_cell_copy
+    subject = tmp_path / "graph"
+    subject.mkdir()
+    # An install whose `.mcp.json` names no path under the subject at all.
+    (subject / ".mcp.json").write_text('{"mcpServers": {"x": {"args": []}}}')
+    with pytest.raises(SystemExit, match="repointed nothing"):
+        make_cell_copy(subject, tmp_path / "cells" / "assoc-R")
+
+
+def test_a_rebuilt_association_set_keeps_the_measurements_it_earned():
+    """Replacing one task must not re-pilot the nineteen that did not move,
+    and must not stamp a replacement with the turn count of the task it
+    replaced."""
+    from run import apply_pilot, carry_pilot_stamps
+    def task(i, prompt):
+        return {"id": i, "key": f"assoc-{i}", "full_prompt": prompt,
+                "truth": {"size": i}, "verify": None}
+    old = [task(1, "why a?"), task(2, "why b?"), task(3, "why c?")]
+    old, _turns, dropped = apply_pilot(
+        {"tasks": old},
+        [{"task": 1, "num_turns": 9}, {"task": 2, "num_turns": 7},
+         {"task": 3, "num_turns": 2}],
+        30, "round-1", floor=5, field="min_baseline_turns")
+    assert dropped == [("assoc-3", 2)]
+
+    # The rebuild reproduces 1 and 2 word for word and puts a new task in
+    # place of 3; 2's own prompt is then edited by hand.
+    fresh = [task(1, "why a?"), {**task(2, "why b, restated?")},
+             task(3, "why d?")]
+    merged, carried = carry_pilot_stamps(old["tasks"], fresh,
+                                         "min_baseline_turns")
+    assert carried == 1
+    assert merged[0]["min_baseline_turns"] == 9
+    assert "min_baseline_turns" not in merged[1]     # the prompt moved
+    assert "min_baseline_turns" not in merged[2]     # the replacement
+
+
+def test_an_association_cell_is_a_fresh_copy_of_its_subject(tmp_path):
+    """P/Q/R cells are copies, not worktrees: the subjects are not git repos,
+    and a cell that writes scratch files must not hand them to the next one."""
+    from subjects import assoc_cell_dir, make_cell_copy
+    subject = tmp_path / "subject"
+    (subject / "sub").mkdir(parents=True)
+    (subject / "README.md").write_text("one")
+    (subject / "sub" / "b.json").write_text("two")
+
+    dest = tmp_path / "cells" / "assoc-Q"
+    make_cell_copy(subject, dest)
+    assert (dest / "README.md").read_text() == "one"
+    assert (dest / "sub" / "b.json").read_text() == "two"
+
+    (dest / "scratch.txt").write_text("the agent's leftovers")
+    make_cell_copy(subject, dest)
+    assert not (dest / "scratch.txt").exists()
+    assert not (subject / "scratch.txt").exists()
+
+    assert assoc_cell_dir("R").name == "assoc-R"
+
+
+def test_a_copied_cell_reaches_its_own_store_not_the_subjects(tmp_path):
+    """`install` writes the store's absolute path into `.mcp.json` and into
+    every hook. Copied verbatim, arm R's cell would open the subject's store
+    over MCP — the copy would isolate nothing and one cell's writes would
+    reach the next one's data."""
+    import json as _json
+    from subjects import make_cell_copy
+    subject = (tmp_path / "graph").resolve()
+    (subject / ".claude" / "skills" / "mushroom").mkdir(parents=True)
+    (subject / "world.mushroomdb").mkdir()
+    store = subject / "world.mushroomdb"
+    (subject / ".mcp.json").write_text(_json.dumps(
+        {"mcpServers": {"mushroomdb": {"command": "/bin/mushroomdb",
+                                       "args": ["mcp", str(store)]}}}))
+    (subject / ".claude" / "settings.json").write_text(_json.dumps(
+        {"hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": f"'/bin/mushroomdb' brief '{store}'"}]}]}}))
+
+    dest = (tmp_path / "cells" / "assoc-R").resolve()
+    make_cell_copy(subject, dest)
+    mcp = _json.loads((dest / ".mcp.json").read_text())
+    assert mcp["mcpServers"]["mushroomdb"]["args"][1] == str(dest / "world.mushroomdb")
+    settings = (dest / ".claude" / "settings.json").read_text()
+    assert str(subject) not in settings and str(dest / "world.mushroomdb") in settings
+    # The binary is not under the subject, so it is untouched.
+    assert mcp["mcpServers"]["mushroomdb"]["command"] == "/bin/mushroomdb"

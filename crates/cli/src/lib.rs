@@ -4,7 +4,10 @@
 //! prints what the lib functions return.
 
 pub mod doctor;
+pub mod enrich;
 pub mod export;
+pub(crate) mod hook;
+pub mod impact_hook;
 pub mod ingest_git;
 pub mod install;
 pub mod intercept;
@@ -222,9 +225,9 @@ pub enum Command {
         /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
         db_dir: Option<PathBuf>,
         auto: bool,
-        /// `--all-tools`: advertise all twenty-five tools in `tools/list`
+        /// `--all-tools`: advertise all twenty-seven tools in `tools/list`
         /// rather than the surface the store chose — three on a store
-        /// `ingest-git` built, eleven on any other. The rest are callable
+        /// `ingest-git` built, fifteen on any other. The rest are callable
         /// either way; the flag decides what is listed, and what every session
         /// pays for before its first turn.
         all_tools: bool,
@@ -354,6 +357,22 @@ pub enum Command {
         db_dir: Option<PathBuf>,
         auto: bool,
     },
+    /// Body of the optional `PreToolUse` hook on the editing tools: reads the
+    /// tool call on stdin and prints the edited file's blast radius as
+    /// `additionalContext`, so the model knows what the change reaches before
+    /// it makes it. Off unless `install --impact-before-edit` wired it.
+    ImpactHook {
+        db_dir: Option<PathBuf>,
+        auto: bool,
+    },
+    /// Body of the optional `PostToolUse` hook on `Grep`: reads the finished
+    /// tool call on stdin and prints what the graph knows about the symbols it
+    /// matched as `additionalContext`. Off unless `install --enrich-grep`
+    /// wired it.
+    Enrich {
+        db_dir: Option<PathBuf>,
+        auto: bool,
+    },
     /// Re-extract named files only. Body of the PostToolUse hook, which reads
     /// the paths off a payload on stdin when none are given on the command line.
     Touch {
@@ -452,11 +471,21 @@ Usage:
   mushroomdb install [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
                      [--command <path>] [--no-git-hooks] [--no-prewarm]
                      [--delivery cli|mcp|both] [--intercept-grep]
+                     [--impact-before-edit] [--enrich-grep]
+                     [--always-load|--no-always-load]
                      --delivery cli writes the skill and the hooks and registers no MCP
                      server: the skill teaches `mushroomdb <command>` instead (claude-code
                      only; cursor and codex are always registered as MCP servers)
                      --intercept-grep adds an experimental PreToolUse hook (matcher Grep)
                      that redirects a search for a known symbol name to `explore`
+                     --impact-before-edit adds an experimental PreToolUse hook (matcher
+                     Edit|Write|MultiEdit) that injects the file's blast radius before the edit
+                     --enrich-grep adds an experimental PostToolUse hook (matcher Grep) that
+                     appends what the graph knows about the symbols the search matched
+                     --always-load marks the registered MCP server alwaysLoad, so the host
+                     keeps its tools in context instead of deferring them; already the
+                     default when --db names a store and a server is registered
+                     (--delivery mcp|both) — --no-always-load opts out
   mushroomdb uninstall [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
   mushroomdb disable [--platform claude-code|cursor|codex|all] [--project|--user]
                      turn an install off without removing it: hooks, MCP entry and git hook
@@ -468,8 +497,8 @@ Usage:
                      stdio handshake with the configured MCP command; exits 1 on any `fail`
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
   mushroomdb mcp <db-dir>|--auto [--all-tools]
-                     --all-tools lists all 25 tools; the default follows the store — 3 on a
-                     store `ingest-git` built (explore, query, stats), 11 on any other
+                     --all-tools lists all 27 tools; the default follows the store — 3 on a
+                     store `ingest-git` built (explore, query, stats), 15 on any other
                      (the rest stay callable, just unlisted)
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
@@ -505,6 +534,12 @@ Usage:
                                    hook body: reads a PreToolUse Grep payload on stdin; exits 2
                                    with a one-line pointer to `explore` when the pattern names a
                                    symbol the graph holds, else exits 0 in silence
+  mushroomdb impact-hook <db-dir>|--auto
+                                   hook body: reads a PreToolUse edit payload on stdin; prints the
+                                   edited file's blast radius as additionalContext, else nothing
+  mushroomdb enrich <db-dir>|--auto
+                                   hook body: reads a PostToolUse Grep payload on stdin; prints what
+                                   the graph knows about the symbols it matched, else nothing
   mushroomdb suggest <db-dir>
   mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
   mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
@@ -564,6 +599,11 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
     let mut prewarm = true;
     let mut delivery = install::Delivery::default();
     let mut intercept_grep = false;
+    let mut impact_before_edit = false;
+    let mut enrich_grep = false;
+    // Tri-state on purpose: `None` is "the user said nothing", which is the
+    // only case the default below is allowed to decide.
+    let mut always_load: Option<bool> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -606,6 +646,18 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
         } else if a == "--intercept-grep" {
             intercept_grep = true;
             i += 1;
+        } else if a == "--impact-before-edit" {
+            impact_before_edit = true;
+            i += 1;
+        } else if a == "--enrich-grep" {
+            enrich_grep = true;
+            i += 1;
+        } else if a == "--always-load" {
+            always_load = Some(true);
+            i += 1;
+        } else if a == "--no-always-load" {
+            always_load = Some(false);
+            i += 1;
         } else if a == "--no-prewarm" {
             prewarm = false;
             i += 1;
@@ -635,6 +687,19 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
             return Err(format!("unexpected argument: {a}"));
         }
     }
+    // An install that named its store with `--db` and registers a server is
+    // an entity-store install: the session is being pointed at a graph it
+    // could not otherwise find, and the first association run showed what a
+    // deferred tool list costs it — turns spent searching for the tools
+    // before the first question. So `alwaysLoad` is the default there, and
+    // `--no-always-load` is the way out.
+    //
+    // An install with no `--db` takes whatever store the working directory
+    // resolves to, which is usually the code graph: three tools, a skill that
+    // teaches them, and no discovery problem worth pinning context for. That
+    // one stays opt-in through `--always-load`.
+    let always_load =
+        always_load.unwrap_or(db.is_some() && !matches!(delivery, install::Delivery::Cli));
     Ok(install::InstallOpts {
         platform,
         scope,
@@ -644,6 +709,9 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
         prewarm,
         delivery,
         intercept_grep,
+        impact_before_edit,
+        enrich_grep,
+        always_load,
     })
 }
 
@@ -838,6 +906,10 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
             .map(|(db_dir, auto)| Command::Brief { db_dir, auto }),
         "intercept" => parse_dir_or_auto("intercept", &args[1..])
             .map(|(db_dir, auto)| Command::Intercept { db_dir, auto }),
+        "impact-hook" => parse_dir_or_auto("impact-hook", &args[1..])
+            .map(|(db_dir, auto)| Command::ImpactHook { db_dir, auto }),
+        "enrich" => parse_dir_or_auto("enrich", &args[1..])
+            .map(|(db_dir, auto)| Command::Enrich { db_dir, auto }),
         "sync" => parse_sync(&args[1..]),
         "map" => parse_dir_with_json("map", &args[1..])
             .map(|(db_dir, json)| Command::Map { db_dir, json }),
@@ -1700,12 +1772,11 @@ pub fn run_map(db_dir: &Path, json: bool) -> Result<String, CliError> {
 pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
     let db = open_for_reading(db_dir)?;
     let report = repograph::brief(&db, &repograph::BriefOptions::default());
-    let tool = if db.has_node(ingest_git::SYNC_KEY) {
-        "explore"
-    } else {
-        "context"
-    };
-    Ok(repograph::render_brief(&report, &reach_line(db_dir, tool)))
+    let code_graph = db.has_node(ingest_git::SYNC_KEY);
+    Ok(repograph::render_brief(
+        &report,
+        &reach_line(db_dir, code_graph),
+    ))
 }
 
 /// The brief's last line: how to reach the graph from this session.
@@ -1716,23 +1787,40 @@ pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
 /// hooks themselves were written with, and it names the store, because both
 /// tools take one.
 ///
-/// `tool` is the door this store actually has: a store a repository was
-/// ingested into serves `explore`, which is the only tool its MCP surface
-/// advertises, and any other store serves `context`. Naming a tool the session
+/// **Every MCP name here has to be one the store's surface actually lists.**
+/// A session can only call what its client was shown, so naming a tool it
 /// cannot see would be worse than naming none — which is also why a `cli`
-/// install, which registers no server at all, gets the shell form alone.
-fn reach_line(db_dir: &Path, tool: &str) -> String {
-    let shell = format!(
-        "{} {tool} {} <target>",
-        install::detect_mcp_command(None).shell(),
-        install::sh_quote(&db_dir.to_string_lossy())
-    );
+/// install, registering no server at all, gets the shell form alone. The two
+/// surfaces are [`server::CODE_GRAPH_TOOLS`] and [`server::ASSOCIATION_TOOLS`]:
+/// a store a repository was ingested into is reached through `explore`, and
+/// any other store through `explain_association` and `query`, which is where
+/// its entities are. `the_reach_line_names_only_tools_its_surface_lists` holds
+/// this line and those two lists in step.
+///
+/// The shell half names `query` on a memory store rather than the MCP pair:
+/// `explain_association` has no CLI subcommand, and `query` — which does —
+/// answers the same question a Cypher read away.
+fn reach_line(db_dir: &Path, code_graph: bool) -> String {
+    let bin = install::detect_mcp_command(None).shell();
+    let db = install::sh_quote(&db_dir.to_string_lossy());
+    let (tools, shell) = if code_graph {
+        (
+            format!("explore <target> (MCP tool){}or:", repograph::render::SEP),
+            format!("{bin} explore {db} <target>"),
+        )
+    } else {
+        (
+            format!(
+                "explain_association <a> <b>{sep}query '<cypher>' (MCP tools; add role: <name> \
+                 to see as a role){sep}or:",
+                sep = repograph::render::SEP
+            ),
+            format!("{bin} query {db} '<cypher>'"),
+        )
+    };
     match install::delivery_for_store(db_dir) {
         install::Delivery::Cli => shell,
-        _ => format!(
-            "{tool} <target> (MCP tool){}or: {shell}",
-            repograph::render::SEP
-        ),
+        _ => format!("{tools} {shell}"),
     }
 }
 
@@ -3097,11 +3185,111 @@ mod tests {
                 },
             },
             Case {
-                // The experiment is off unless it is asked for by name.
+                args: &[
+                    "install",
+                    "--impact-before-edit",
+                    "--enrich-grep",
+                    "--always-load",
+                ],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => {
+                        assert!(opts.impact_before_edit);
+                        assert!(opts.enrich_grep);
+                        assert!(opts.always_load);
+                    }
+                    other => panic!("install with the code-door flags, got {other:?}"),
+                },
+            },
+            Case {
+                // An install that names its store and registers a server is
+                // an entity-store install: `alwaysLoad` without asking, so a
+                // session meets the tools rather than searching for them.
+                args: &["install", "--delivery", "mcp", "--db", "./mem"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(opts.always_load),
+                    other => panic!("install --delivery mcp --db, got {other:?}"),
+                },
+            },
+            Case {
+                // `both` registers a server too, so it defaults the same way.
+                args: &["install", "--delivery", "both", "--db=./mem"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(opts.always_load),
+                    other => panic!("install --delivery both --db, got {other:?}"),
+                },
+            },
+            Case {
+                // …and `--no-always-load` is the way out of it.
+                args: &[
+                    "install",
+                    "--delivery",
+                    "mcp",
+                    "--db",
+                    "./mem",
+                    "--no-always-load",
+                ],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(!opts.always_load),
+                    other => panic!("install --no-always-load, got {other:?}"),
+                },
+            },
+            Case {
+                // A `--delivery cli` install registers no server, so there is
+                // no entry for the key to go on: naming a store cannot turn
+                // it on.
+                args: &["install", "--delivery", "cli", "--db", "./mem"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(!opts.always_load),
+                    other => panic!("install --delivery cli --db, got {other:?}"),
+                },
+            },
+            Case {
+                // An install with no `--db` resolves whatever store the
+                // directory has — usually the code graph — and stays opt-in.
+                // `--always-load` still forces it.
+                args: &["install", "--always-load"],
+                check: |r| match r {
+                    Ok(Command::Install(opts)) => assert!(opts.always_load),
+                    other => panic!("install --always-load, got {other:?}"),
+                },
+            },
+            Case {
+                // Every experiment is off unless it is asked for by name.
                 args: &["install"],
                 check: |r| match r {
-                    Ok(Command::Install(opts)) => assert!(!opts.intercept_grep),
+                    Ok(Command::Install(opts)) => {
+                        assert!(!opts.intercept_grep);
+                        assert!(!opts.impact_before_edit);
+                        assert!(!opts.enrich_grep);
+                        assert!(!opts.always_load);
+                    }
                     other => panic!("install, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["impact-hook", "--auto"],
+                check: |r| match r {
+                    Ok(Command::ImpactHook { db_dir, auto }) => {
+                        assert!(db_dir.is_none() && auto);
+                    }
+                    other => panic!("impact-hook --auto, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["enrich", "/tmp/db"],
+                check: |r| match r {
+                    Ok(Command::Enrich { db_dir, auto }) => {
+                        assert_eq!(db_dir.as_deref(), Some(Path::new("/tmp/db")));
+                        assert!(!auto);
+                    }
+                    other => panic!("enrich /tmp/db, got {other:?}"),
+                },
+            },
+            Case {
+                args: &["enrich"],
+                check: |r| match r {
+                    Err(e) => assert!(e.contains("enrich requires <db-dir> or --auto"), "{e}"),
+                    other => panic!("enrich with no store, got {other:?}"),
                 },
             },
             Case {
