@@ -8518,6 +8518,143 @@ LIMIT 10";
         );
     }
 
+    // ── Task 17 fix round 2 ─────────────────────────────────────────────
+    //
+    // `WITH … WHERE …` filters *after* the projection, so an alias the WITH
+    // introduces is in scope for it. The executor always did that; the
+    // planner's pre-flight check scoped the WHERE to the pre-WITH variables
+    // and rejected every such query before it ran.
+
+    /// An alias a non-aggregate `WITH` introduces is visible to its `WHERE`.
+    #[test]
+    fn a_with_alias_is_visible_to_its_where() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent) WITH t, t.years_of_experience AS x WHERE x > 11 \
+             RETURN key(t), x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["key(t)", "x"]);
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("t1")), Some(i(12))]]);
+    }
+
+    /// …and to its `ORDER BY`, in the same clause.
+    #[test]
+    fn a_with_alias_is_visible_to_where_and_order_by_together() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent) WITH t, t.years_of_experience AS x WHERE x > 3 \
+             ORDER BY x DESC RETURN key(t), x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["key(t)", "x"]);
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("t1")), Some(i(12))],
+                vec![Some(s("t2")), Some(i(11))],
+            ]
+        );
+    }
+
+    /// A `WITH` that carries only the variable, with no alias at all, filters
+    /// on the node's own properties. This always worked; it is pinned so the
+    /// scoping change cannot quietly take it away.
+    #[test]
+    fn a_with_carrying_only_a_variable_still_filters_on_it() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent) WHERE t.status = 'published' \
+             WITH t WHERE t.years_of_experience > 11 RETURN key(t)",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["key(t)"]);
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("t1"))]]);
+    }
+
+    /// A `WITH` alias with no `WHERE` projects under its new name. Also
+    /// always worked; pinned alongside the two above.
+    #[test]
+    fn a_with_alias_projects_under_its_new_name() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (c:Company) WITH c, c.name AS nm RETURN nm",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["nm"]);
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("Acme Design Works"))],
+                vec![Some(s("Beta Studio"))],
+                vec![Some(s("Gamma Works"))],
+            ]
+        );
+    }
+
+    /// Every alias shape a WITH can introduce is in scope for its WHERE: a
+    /// property, an arithmetic expression, a subscript, a renamed node, and
+    /// an alias that drops the node it came from.
+    #[test]
+    fn every_with_alias_shape_is_in_scope_for_the_where() {
+        let fx = assoc_graph();
+        let p = BTreeMap::new();
+        for (q, want) in [
+            (
+                "MATCH (t:Talent) WITH t, t.years_of_experience + 1 AS x WHERE x > 12 \
+                 RETURN key(t)",
+                vec!["t1"],
+            ),
+            (
+                "MATCH (t:Talent) WITH t, t.location[0] AS lat WHERE lat > 41.0 RETURN key(t)",
+                vec!["t2"],
+            ),
+            (
+                "MATCH (t:Talent) WITH t AS u WHERE u.years_of_experience > 11 RETURN key(u)",
+                vec!["t1"],
+            ),
+            (
+                "MATCH (t:Talent) WITH t.key AS k WHERE k = 't2' RETURN k",
+                vec!["t2"],
+            ),
+        ] {
+            let rs = run(&fx.view(), q, &p).unwrap_or_else(|e| panic!("{q}: {e}"));
+            let got: Vec<String> = (0..rs.len())
+                .map(|r| match rs.row(r)[0].clone() {
+                    Some(Value::Str(k)) => k,
+                    other => panic!("{q}: {other:?}"),
+                })
+                .collect();
+            assert_eq!(got, want, "{q}");
+        }
+    }
+
+    /// A name that is neither in scope before the WITH nor introduced by it
+    /// is still a named error — the scope widened, it did not disappear.
+    #[test]
+    fn an_unknown_name_in_a_with_where_is_still_an_error() {
+        let err = plan(
+            &parse(
+                &lex(
+                    "MATCH (t:Talent) WITH t, t.years_of_experience AS x WHERE nope > 1 \
+                     RETURN key(t)",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .expect_err("must not plan");
+        assert_eq!(err, "unbound variable `nope` in WHERE");
+    }
+
     /// Comma-separated patterns with no shared variable are a cartesian
     /// product, the openCypher meaning.
     #[test]
