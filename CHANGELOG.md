@@ -98,6 +98,9 @@ about agent performance.
 - **`mushroomdb asof` reported the wrong total** on any store with WAL archives; it counted only
   live `wal.bin` frames, so an eleven-commit store printed `of 1`. It now prints the real total and
   names the horizon floor.
+- **The open adopts a snapshot's persisted vector index before scanning nodes**, so an embedding the
+  scan sees but the index predates is added to the index rather than dropped. On 0.6.5 as shipped the
+  case was masked by the write hook re-filing the node; the ordering is now correct on its own.
 - **Opening a store with an approximate vector rule no longer rebuilds the HNSW index the snapshot
   already holds.** The open path built every approximate rule's graph from scratch and then replaced
   it wholesale with the persisted blob; it now loads the blob and skips the build. A rebuild is the
