@@ -13,7 +13,9 @@ pub use engine::{
 };
 pub use hnsw::HnswIndex;
 #[cfg(any(test, feature = "test-hooks"))]
-pub use hnsw::{hnsw_insert_count, hnsw_insert_count_reset};
+pub use hnsw::{
+    hnsw_insert_count, hnsw_insert_count_reset, hnsw_remove_scanned, hnsw_remove_scanned_reset,
+};
 pub use index::{
     candidate_spec, with_ivf_drift_rebuild, CandidateSpec, RuleIndex, SideIndex, IVF_DRIFT_REBUILD,
 };
