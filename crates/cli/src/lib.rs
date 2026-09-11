@@ -1169,10 +1169,21 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
 
 /// Execute an as-of query at the given commit and print results.
 pub fn run_asof(db_dir: &Path, commit: u64, query: Option<&str>) -> Result<String, CliError> {
-    let total = wal_commit_count_at(db_dir)?;
+    // Counts come off the opened handle: it knows the archives the live WAL no
+    // longer holds, and where history now starts.
     let db = GraphDb::open_at(db_dir, commit)?;
+    let total = db.wal_total_commits()?;
+    let floor = db.wal_horizon_floor();
     let mut out = String::new();
-    let _ = writeln!(out, "as-of commit {} of {}", commit, total);
+    if floor == 0 {
+        let _ = writeln!(out, "as-of commit {} of {}", commit, total);
+    } else {
+        let _ = writeln!(
+            out,
+            "as-of commit {} of {} (history reaches back to commit {})",
+            commit, total, floor
+        );
+    }
     if let Some(cypher) = query {
         let params = BTreeMap::new();
         let rs = db.query(cypher, &params)?;
@@ -2280,6 +2291,15 @@ pub fn format_stats(stats: &Stats) -> String {
         stats.nodes_live, stats.nodes_tombstoned
     );
     let _ = writeln!(out, "edges: {}", stats.edges);
+    if stats.history_floor == 0 {
+        let _ = writeln!(out, "history: complete (nothing pruned)");
+    } else {
+        let _ = writeln!(
+            out,
+            "history: reaches back to commit {}",
+            stats.history_floor
+        );
+    }
     let _ = writeln!(out, "rules: {}", stats.rules.len());
     for r in &stats.rules {
         let _ = writeln!(
@@ -3928,6 +3948,100 @@ mod tests {
         let db = GraphDb::open(&dir).expect("reopen");
         assert!(db.has_node("bob"), "query_write must persist CREATE");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The as-of header says how far back history reaches, and counts every
+    /// commit the store still holds — including the archived ones the live
+    /// WAL no longer carries.
+    #[test]
+    fn asof_header_names_the_horizon() {
+        let dir = tmp("asof-horizon");
+        // Ten rounds of "write, then snapshot": the retention bound prunes the
+        // oldest archives and the floor advances past 0.
+        for i in 0..10 {
+            {
+                let mut db = GraphDb::open(&dir).expect("open");
+                db.insert_node("Person", &format!("p{i}"), vec![])
+                    .expect("insert");
+            }
+            let shared = SharedDb::open(&dir).expect("open shared");
+            snapshot_shared(&shared).expect("snapshot");
+        }
+        // One more write after the last snapshot: that commit lives in the live
+        // WAL, which is what `asof` can still reconstruct on a pruned store.
+        {
+            let mut db = GraphDb::open(&dir).expect("open");
+            db.insert_node("Person", "after", vec![]).expect("insert");
+        }
+        let (floor, total) = {
+            let db = GraphDb::open(&dir).expect("reopen");
+            (
+                db.wal_horizon_floor(),
+                db.wal_total_commits().expect("total"),
+            )
+        };
+        assert!(floor > 0, "the retention must have pruned something");
+
+        let out = run_asof(&dir, total - 1, None).expect("asof");
+        assert_eq!(
+            out.trim(),
+            format!(
+                "as-of commit {} of {total} (history reaches back to commit {floor})",
+                total - 1
+            ),
+            "the header must name the horizon it can reach"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A store that has pruned nothing reads exactly as it always did.
+        let clean = tmp("asof-clean");
+        {
+            let mut db = GraphDb::open(&clean).expect("open");
+            db.insert_node("Person", "a", vec![]).expect("insert");
+        }
+        assert_eq!(
+            run_asof(&clean, 0, None).expect("asof").trim(),
+            "as-of commit 0 of 1"
+        );
+        let _ = std::fs::remove_dir_all(&clean);
+    }
+
+    /// `stats` says whether history is complete, and where it starts when it
+    /// is not.
+    #[test]
+    fn format_stats_says_how_far_back_history_reaches() {
+        let dir = tmp("stats-horizon");
+        {
+            let mut db = GraphDb::open(&dir).expect("open");
+            db.insert_node("Person", "a", vec![]).expect("insert");
+        }
+        let text = format_stats(&read_stats(&dir).expect("stats"));
+        assert!(
+            text.contains("history: complete (nothing pruned)"),
+            "an unpruned store says so, got:\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let pruned = tmp("stats-horizon-pruned");
+        for i in 0..10 {
+            {
+                let mut db = GraphDb::open(&pruned).expect("open");
+                db.insert_node("Person", &format!("p{i}"), vec![])
+                    .expect("insert");
+            }
+            let shared = SharedDb::open(&pruned).expect("open shared");
+            snapshot_shared(&shared).expect("snapshot");
+        }
+        let stats = read_stats(&pruned).expect("stats");
+        assert!(stats.history_floor > 0, "the retention must have pruned");
+        assert!(
+            format_stats(&stats).contains(&format!(
+                "history: reaches back to commit {}",
+                stats.history_floor
+            )),
+            "a pruned store names its floor"
+        );
+        let _ = std::fs::remove_dir_all(&pruned);
     }
 
     #[test]

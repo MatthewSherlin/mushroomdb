@@ -618,14 +618,18 @@ fn check_store_and_lock(db_dir: &Path) -> Vec<Check> {
         Ok(db) => {
             let stats = db.stats();
             let stale = db.is_stale().unwrap_or(false);
+            let floor = db.wal_horizon_floor();
+            let total = db.wal_total_commits().unwrap_or(floor);
             out.push(Check::ok(
                 "store",
                 format!(
-                    "{} — {} nodes live ({} tombstoned), {} edges{}",
+                    "{} — {} nodes live ({} tombstoned), {} edges, history from commit {} of {}{}",
                     db_dir.display(),
                     stats.nodes_live,
                     stats.nodes_tombstoned,
                     stats.edges,
+                    floor,
+                    total,
                     if stale {
                         ", stale (newer commits pending refresh)"
                     } else {
