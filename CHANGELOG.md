@@ -21,8 +21,8 @@ and 20 questions over five kinds (why, multihop, retraction, timetravel, visibil
 The arms are **P** (files + grep), **Q** (the relational file, and the baseline), **R** (the store,
 reached only through the MCP server). Every arm gets `Read,Grep,Glob,Bash,Edit,Write`; R also gets
 `mcp__mushroomdb`. The §1 gate: correctness at or above arm Q paired by task, at or above every
-other arm's paired mean, cost at or below arm Q, the 95% cost interval against Q excluding zero,
-and no max-turns failure on a task Q finished. Correctness carries no interval requirement —
+other arm's paired mean, cost at or below arm Q, the 95% interval of the paired cost difference
+against Q lying entirely below zero, and no max-turns failure on a task Q finished. Correctness carries no interval requirement —
 Q saturated it in the pilot — so cost is the discriminator. Adoption is recorded, not gated: in
 arm R the store is the only data path.
 
@@ -42,6 +42,7 @@ Why it failed:
 - R: correctness -0.191 vs arm Q, paired over 20 task(s)
 - R: correctness -0.191 is below arm(s) P (+0.013)
 - R: cost 0.5089 > arm Q 0.1257
+- R: cost interval [+0.2522, +0.5253] vs arm Q is not entirely below zero
 - R: max-turns on tasks [5, 8, 14, 15, 16] where arm Q succeeded
 
 | metric | P (files + grep) | Q (relational) | R (graph) |

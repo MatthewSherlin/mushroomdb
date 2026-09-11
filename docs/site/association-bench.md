@@ -116,7 +116,8 @@ An arm passes when all of these hold:
 1. correctness at or above arm Q, paired by task (a tie passes),
 2. correctness at or above every other arm's paired mean,
 3. cost at or below arm Q,
-4. the 95% cost interval against arm Q **excludes zero**,
+4. the 95% interval of the paired cost difference against arm Q lies
+   **entirely below zero**,
 5. no max-turns failure on a task arm Q finished.
 
 Correctness carries no interval requirement, because arm Q saturated it in the

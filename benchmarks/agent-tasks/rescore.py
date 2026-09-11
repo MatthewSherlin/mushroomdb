@@ -37,6 +37,9 @@ NAME_RE = re.compile(r"task(\d+)_rep(\d+)_arm([A-Z])\.stream\.jsonl$")
 
 TITLE_RE = re.compile(r"^# Agent benchmark run(.*)$", re.M)
 HEAD_RE = re.compile(r"^- subject HEAD: `([^`]+)`", re.M)
+SUITE_RE = re.compile(r"^- suite: (\S+)$", re.M)
+BASELINE_RE = re.compile(r"^- baseline arm: ([A-Z])\b", re.M)
+DIGEST_RE = re.compile(r"^- world digest: `([^`]+)`", re.M)
 TURNS_RE = re.compile(r"^- model: .*max-turns (\d+)", re.M)
 NUM_RE = re.compile(r"\d+(?:\.\d+)?")
 
@@ -47,14 +50,44 @@ def summary_meta(md: str) -> dict:
     Read back off the summary itself rather than out of `tasks.json`, which
     has moved on since: a re-render must reproduce the run that happened, not
     the run the current task set would describe.
+
+    The suite and the baseline arm are read back too, and they decide the gate
+    variant `write_summary` describes: rendering an `association` summary under
+    the `code` defaults would print the wrong gate and compute the wrong
+    verdict, which is the one thing a re-render must not do. Whichever of the
+    provenance lines a suite carries — `subject HEAD` for `code`, `world
+    digest` for `association` — is the one required.
     """
     title = TITLE_RE.search(md)
-    head = HEAD_RE.search(md)
     turns = TURNS_RE.search(md)
-    if not (title and head and turns):
-        raise SystemExit("rerender: summary.md is missing its title, HEAD or "
+    suite = SUITE_RE.search(md)
+    baseline = BASELINE_RE.search(md)
+    if not (title and turns):
+        raise SystemExit("rerender: summary.md is missing its title or "
                          "max-turns line — cannot reproduce its meta")
-    meta = {"head_short": head.group(1), "max_turns": int(turns.group(1))}
+    meta: dict = {"max_turns": int(turns.group(1))}
+    if suite:
+        meta["suite"] = suite.group(1)
+    if baseline:
+        meta["baseline"] = baseline.group(1)
+    if meta.get("suite") == "association":
+        digest = DIGEST_RE.search(md)
+        if not digest:
+            raise SystemExit("rerender: an association summary.md is missing "
+                             "its world-digest line")
+        meta["world_digest"] = digest.group(1)
+        # `graph_arms` is not on the page in words, but "arms under the gate"
+        # is: a re-render gates exactly the arms the run gated.
+        gated = re.search(r"^\| arms under the gate \| (.+?) \|$", md, re.M)
+        if gated and gated.group(1).strip() != "-":
+            meta["graph_arms"] = [a.strip() for a in
+                                  gated.group(1).split(",")]
+    else:
+        head = HEAD_RE.search(md)
+        if not head:
+            raise SystemExit("rerender: summary.md is missing its HEAD line — "
+                             "cannot reproduce its meta")
+        meta["head_short"] = head.group(1)
     if title.group(1):
         meta["title_suffix"] = title.group(1)
     # Anything between the title and the provenance block is the run's note,
@@ -84,6 +117,22 @@ def numbers(md: str) -> list[str]:
     return out
 
 
+def is_subsequence(small: list[str], large: list[str]) -> int | None:
+    """`None` when every element of `small` appears in `large` in order,
+    else the index in `small` of the first one that does not.
+
+    A re-render may *add* numbers — a gate leg that used to go unreported now
+    prints its interval — but it may never change or drop one, because every
+    number outside the provenance block came out of a cell that nothing
+    re-ran.
+    """
+    it = iter(large)
+    for i, want in enumerate(small):
+        if not any(got == want for got in it):
+            return i
+    return None
+
+
 def rerender(run_dir: Path) -> Path:
     """Rewrite `run_dir/summary.md` from `run_dir/cells.json`, numbers intact."""
     path = run_dir / "summary.md"
@@ -92,14 +141,13 @@ def rerender(run_dir: Path) -> Path:
     write_summary(run_dir, rows, summary_meta(before), filename="summary.md")
     after = path.read_text()
     old, new = numbers(before), numbers(after)
-    if old != new:
+    first = is_subsequence(old, new)
+    if first is not None:
         path.write_text(before)          # leave the committed file as it was
-        first = next((i for i, (a, b) in enumerate(zip(old, new)) if a != b),
-                     min(len(old), len(new)))
         raise SystemExit(
-            f"rerender: {path} would change a number "
-            f"({len(old)} before, {len(new)} after; first difference at "
-            f"{first}: {old[first:first + 3]} -> {new[first:first + 3]}) — "
+            f"rerender: {path} would change or drop a number "
+            f"({len(old)} before, {len(new)} after; first unmatched at "
+            f"{first}: {old[first:first + 3]}) — "
             "re-render aborted and the file restored")
     return path
 

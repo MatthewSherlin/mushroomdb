@@ -14,7 +14,7 @@
 
 ## Gate
 
-The pre-registered §1 gate: correctness >= arm Q (paired by task), at or above every other arm's paired mean (a tie passes), cost <= arm Q, the 95% cost interval vs arm Q excludes zero, no max-turns failure on a task arm Q finished.
+The pre-registered §1 gate: correctness >= arm Q (paired by task), at or above every other arm's paired mean (a tie passes), cost <= arm Q, the 95% cost interval vs arm Q lies entirely below zero, no max-turns failure on a task arm Q finished.
 
 Correctness carries no interval requirement: the baseline arm Q saturated it in the pilot (1.00 on every task), so cost is the discriminator (§1, amended 2026-09-11).
 
@@ -32,6 +32,7 @@ Why it failed:
 - R: correctness -0.191 vs arm Q, paired over 20 task(s)
 - R: correctness -0.191 is below arm(s) P (+0.013)
 - R: cost 0.5089 > arm Q 0.1257
+- R: cost interval [+0.2522, +0.5253] vs arm Q is not entirely below zero
 - R: max-turns on tasks [5, 8, 14, 15, 16] where arm Q succeeded
 
 ## Per cell

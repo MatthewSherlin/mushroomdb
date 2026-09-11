@@ -398,8 +398,53 @@ def test_rerender_rewrites_a_summary_without_moving_a_number(tmp_path):
     # the summary that was there is put back untouched.
     rows[1]["score"] = 0.25
     (tmp_path / "cells.json").write_text(json.dumps(rows, indent=2) + "\n")
-    with pytest.raises(SystemExit, match="would change a number"):
+    with pytest.raises(SystemExit, match="would change or drop a number"):
         rerender(tmp_path)
+    assert (tmp_path / "summary.md").read_text() == before
+
+
+def test_rerender_may_add_a_number_but_never_move_one():
+    """A newer `report.py` that reports a gate leg it used to leave silent adds
+    numbers to the page; that is allowed, and changing or dropping one is not.
+    """
+    from rescore import is_subsequence
+
+    assert is_subsequence(["1", "2"], ["1", "2"]) is None
+    assert is_subsequence(["1", "2"], ["1", "0.5", "2"]) is None, "added"
+    assert is_subsequence(["1", "2"], ["1", "3"]) == 1, "changed"
+    assert is_subsequence(["1", "2"], ["1"]) == 1, "dropped"
+    assert is_subsequence(["2", "1"], ["1", "2"]) == 1, "reordered"
+
+
+def test_rerender_reproduces_an_association_summarys_own_gate(tmp_path):
+    """An association summary re-renders under the association gate.
+
+    Read back off the page — its suite, its baseline arm, its world digest and
+    the arms it gated — because rendering it under the `code` defaults would
+    describe a gate the run was never judged against and compute a verdict
+    from it.
+    """
+    import json
+    from report import write_summary
+    from rescore import rerender, summary_meta
+
+    rows = [_cell("Q", 1, score=1.0, cost_usd=0.1),
+            _cell("P", 1, score=1.0, cost_usd=0.1),
+            _cell("R", 1, score=0.5, cost_usd=0.5, mcp_calls=1, adopted=True)]
+    meta = {"suite": "association", "baseline": "Q", "graph_arms": ["R"],
+            "world_digest": "f2b689ba52c80241", "max_turns": 30,
+            "cost_ci": True, "adoption_gate": False}
+    write_summary(tmp_path, rows, meta)
+    (tmp_path / "cells.json").write_text(json.dumps(rows, indent=2) + "\n")
+    before = (tmp_path / "summary.md").read_text()
+
+    recovered = summary_meta(before)
+    assert recovered["suite"] == "association"
+    assert recovered["baseline"] == "Q"
+    assert recovered["world_digest"] == "f2b689ba52c80241"
+    assert recovered["graph_arms"] == ["R"]
+
+    rerender(tmp_path)
     assert (tmp_path / "summary.md").read_text() == before
 
 
