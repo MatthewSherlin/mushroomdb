@@ -50,6 +50,7 @@ fn decode_ivf_bytes_to_export(bytes: &[u8]) -> BTreeMap<String, RuleIvfExport> {
         .collect()
 }
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
 
 /// A single derived-edge fire or retract captured during a commit.
@@ -306,6 +307,15 @@ pub struct RuleEngine {
     /// instead of at open time to avoid the ~544 MiB bincode overhead.
     /// Wrapped in Mutex so `store_snapshot_state` can take `&self`.
     retained_ivf_bytes: Mutex<Option<Vec<u8>>>,
+    /// How many id slots the snapshot held, recorded by `store_snapshot_state`.
+    ///
+    /// Ids are dense and never reused, so every node created since the snapshot
+    /// has an id at or above this. That is what lets `reindex_all_load_state`
+    /// tell "the persisted graph was cut short mid-build" (a vector missing
+    /// *below* the line) from "this is simply a newer node" (missing at or
+    /// above it) — including the node whose own `apply` is what tripped the
+    /// lazy index build in the first place.
+    retained_node_count: AtomicU32,
     /// Raw rkyv bytes of the provenance section retained from the last snapshot.
     ///
     /// Wrapped in `Mutex` so the `&self` read path (`ensure_provenance_loaded`)
@@ -2081,6 +2091,7 @@ impl RuleEngine {
             indexes_populated: false,
             retained_hnsw_blobs: Mutex::new(BTreeMap::new()),
             retained_ivf_bytes: Mutex::new(None),
+            retained_node_count: AtomicU32::new(0),
             retained_provenance_bytes: Mutex::new(None),
             lazy_provenance: OnceLock::new(),
             lazy_hnsw: OnceLock::new(),
@@ -2157,15 +2168,16 @@ impl RuleEngine {
 
     /// Advance every pending build by one slice.
     ///
-    /// Returns the names that finished, in rule order. The caller **must**
-    /// backfill each of them through `RebuildRule`: the rule derives nothing
-    /// until it does, and it has already vanished from
+    /// Returns the builds that finished, in rule order, carrying their final
+    /// `indexed`/`total` so a caller can report what it just completed. The
+    /// caller **must** backfill each of them through `RebuildRule`: the rule
+    /// derives nothing until it does, and it has already vanished from
     /// [`RuleEngine::builds_in_progress`].
     ///
     /// Does at most [`crate::HNSW_BUILD_BATCH`] vector inserts per pending
     /// rule, so a caller can drive a large build to completion without holding
     /// a write lock for more than a slice at a time.
-    pub fn pump_index_build(&mut self, g: &mut GraphMut<'_>) -> Vec<String> {
+    pub fn pump_index_build(&mut self, g: &mut GraphMut<'_>) -> Vec<BuildProgress> {
         // A clean-open handle that has never written reaches this with empty
         // indexes and a rule set restored from the snapshot. Populating them is
         // also what re-derives a pending build that a mid-build snapshot left
@@ -2176,7 +2188,7 @@ impl RuleEngine {
         }
         let batch = self.build_batch();
         let names: Vec<String> = self.pending_builds.keys().cloned().collect();
-        let mut finished = Vec::new();
+        let mut finished: Vec<BuildProgress> = Vec::new();
         for name in names {
             let Some(pb) = self.pending_builds.get(&name).cloned() else {
                 continue;
@@ -2192,7 +2204,7 @@ impl RuleEngine {
                 .pending_builds
                 .get_mut(&name)
                 .expect("pending build removed mid-slice");
-            entry.indexed = entry.indexed.saturating_add(inserted);
+            entry.indexed = entry.indexed.saturating_add(inserted).min(entry.total);
             entry.cursor = cursor;
             if cursor >= pb.limit {
                 // The graph is whole: fit the legacy IVF fallback exactly where
@@ -2202,11 +2214,18 @@ impl RuleEngine {
                     idx.src_side.fit_ivf_clusters(&name);
                     idx.dst_side.fit_ivf_clusters(&name);
                 }
-                self.pending_builds.remove(&name);
+                let done = self
+                    .pending_builds
+                    .remove(&name)
+                    .expect("pending build vanished mid-slice");
                 // Tells the `RebuildRule` this name is about to trigger that the
                 // graph is already built and must be carried, not rebuilt.
                 self.builds_awaiting_backfill.insert(name.clone());
-                finished.push(name);
+                finished.push(BuildProgress {
+                    rule: name,
+                    indexed: done.indexed,
+                    total: done.total,
+                });
             }
         }
         finished
@@ -2366,6 +2385,7 @@ impl RuleEngine {
             }
         }
         self.indexes_populated = true;
+        self.release_lazy_hnsw();
     }
 
     /// Like `reindex_all` but LOADS persisted IVF state for approximate rules
@@ -2471,13 +2491,20 @@ impl RuleEngine {
 
         // Re-derive the pending builds a mid-build snapshot left behind.
         //
-        // `pending_builds` is never persisted, so the only evidence that a
-        // build was unfinished is that the scan had to supply vectors the
-        // adopted graph did not carry. A store snapshotted after a *complete*
-        // build has a graph covering every vector, so this fires for nothing
-        // else. The scan has already finished the graph — what is still owed is
-        // the backfill, so the entry is registered complete and the next pump
-        // turns it into one `RebuildRule`.
+        // `pending_builds` is never persisted, so the evidence that a build was
+        // unfinished is that the scan had to supply a vector for a node the
+        // snapshot already held and the adopted graph did not carry. The
+        // qualifier is the whole of it: this runs from `ensure_indexes_populated`
+        // too, which fires *inside* the apply of the first write after a clean
+        // reopen, with that write's node already labelled and propped. Comparing
+        // raw graph sizes made every completed rule look interrupted on that
+        // write and cost a full `RebuildRule`. Ids are dense and never reused,
+        // so "the snapshot already held it" is exactly "id < retained_node_count".
+        //
+        // The scan has already finished the graph; what is still owed is the
+        // backfill, so the entry is registered complete and the next pump turns
+        // it into one `RebuildRule`.
+        let snapshot_ids = self.retained_node_count.load(AtomicOrdering::Relaxed);
         for (name, (src_ids, dst_ids)) in &adopted {
             if src_ids.is_empty() && dst_ids.is_empty() {
                 continue; // nothing was adopted: this was a plain rebuild
@@ -2485,12 +2512,21 @@ impl RuleEngine {
             let Some(idx) = self.indexes.get(name) else {
                 continue;
             };
-            let src_now = idx.src_side.hnsw_ref().map_or(0, |h| h.len());
-            let dst_now = idx.dst_side.hnsw_ref().map_or(0, |h| h.len());
-            if src_now <= src_ids.len() && dst_now <= dst_ids.len() {
+            let src_now = idx.src_side.hnsw_ref().map(|h| h.node_ids());
+            let dst_now = idx.dst_side.hnsw_ref().map(|h| h.node_ids());
+            let cut_short = |now: &Option<BTreeSet<u32>>, adopted: &BTreeSet<u32>| {
+                now.as_ref().is_some_and(|now| {
+                    now.iter()
+                        .take_while(|id| **id < snapshot_ids)
+                        .any(|id| !adopted.contains(id))
+                })
+            };
+            if !cut_short(&src_now, src_ids) && !cut_short(&dst_now, dst_ids) {
                 continue; // the persisted graph was whole
             }
-            let total = src_now.max(dst_now) as u64;
+            let total = src_now
+                .map_or(0, |s| s.len())
+                .max(dst_now.map_or(0, |s| s.len())) as u64;
             self.pending_builds.insert(
                 name.clone(),
                 PendingBuild {
@@ -2524,6 +2560,7 @@ impl RuleEngine {
             }
         }
         self.indexes_populated = true;
+        self.release_lazy_hnsw();
     }
 
     /// Store HNSW blobs and raw IVF bytes from a snapshot **without deserializing**.
@@ -2533,11 +2570,19 @@ impl RuleEngine {
     ///   - `consume_retained_state_eager` (WAL-present open, before WAL replay)
     ///   - The mutation-hook lazy-init guard (clean open, first-write cost)
     ///   - `ensure_hnsw_loaded` (first ANN query on a clean open)
+    ///
+    /// `node_count` is the number of id slots the snapshot holds. It is the
+    /// line between "the snapshot had this node" and "this node is newer",
+    /// which `reindex_all_load_state` needs to recognise an interrupted build
+    /// without mistaking an in-flight write for one.
     pub fn store_snapshot_state(
         &self,
         hnsw_blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
         ivf_bytes: Vec<u8>,
+        node_count: u32,
     ) {
+        self.retained_node_count
+            .store(node_count, AtomicOrdering::Relaxed);
         *self
             .retained_hnsw_blobs
             .lock()
@@ -2655,7 +2700,6 @@ impl RuleEngine {
         // the scan skips the build for every side that has one, because the
         // load used to overwrite that build wholesale.
         self.reindex_all_load_state(ids, syms, labels, props, ivf, hnsw);
-        self.release_lazy_hnsw();
     }
 
     /// Deserialize retained HNSW blobs into `lazy_hnsw` for the clean-open ANN
@@ -2705,9 +2749,10 @@ impl RuleEngine {
 
     /// Drop the lazily-decoded HNSW graphs.
     ///
-    /// Called from both paths that install the persisted graphs into
-    /// `self.indexes` (`consume_retained_state_eager` and
-    /// `ensure_indexes_populated`). Two things go wrong if they are kept:
+    /// Called at every site that sets `indexes_populated` — the two reindex
+    /// entry points and both arms of `create_rule` — so the lazy copies never
+    /// outlive the live indexes taking over. Two things go wrong if they are
+    /// kept:
     ///
     /// * **Memory.** A handle that served one ANN query and then wrote holds
     ///   the graph twice — once decoded here, once in the live index — for the
@@ -2949,7 +2994,6 @@ impl RuleEngine {
             .unwrap_or_default();
         let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
         self.reindex_all_load_state(g.ids, g.syms, g.labels, g.props, ivf, hnsw);
-        self.release_lazy_hnsw();
     }
 
     /// Register a rule and backfill existing nodes.
@@ -3038,6 +3082,7 @@ impl RuleEngine {
             // above and this rule's non-vector legs are whole, so the flag is as
             // true here as it is on the one-commit path.
             self.indexes_populated = true;
+            self.release_lazy_hnsw();
             self.end_chain(scope, g);
             return Ok(());
         }
@@ -3119,6 +3164,7 @@ impl RuleEngine {
         // already populated (or there are no other rules) mark the whole engine
         // as ready; otherwise a later reindex_all call will set the flag.
         self.indexes_populated = true;
+        self.release_lazy_hnsw();
 
         self.end_chain(scope, g);
         Ok(())
@@ -3275,6 +3321,18 @@ impl RuleEngine {
                         let spec = candidate_spec_for(&def);
                         idx.dst_side.insert(&spec, n, &cur_getter);
                     }
+                }
+
+                // A rule whose vector index is still being built derives
+                // nothing. The write above has gone into the index and will be
+                // there when the build completes; deriving from a half-built
+                // graph here would put a partial, wrong edge set on the store
+                // for the duration, and the backfill that runs when the build
+                // finishes derives the whole set anyway. The drift counter is
+                // left alone too: a rebuild queued now would throw the sliced
+                // build away and redo it in one commit.
+                if self.pending_builds.contains_key(&rule_name) {
+                    continue;
                 }
 
                 self.maybe_queue_ivf_rebuild(&rule_name, &def);
@@ -3724,6 +3782,11 @@ impl RuleEngine {
                 }
             }
 
+            // A rule that is still building owns no edges to retract, and a
+            // drift rebuild queued now would discard its sliced graph.
+            if self.pending_builds.contains_key(&rule_name) {
+                continue;
+            }
             self.maybe_queue_ivf_rebuild(&rule_name, &def);
         }
 

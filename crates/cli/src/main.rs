@@ -623,6 +623,15 @@ fn run_serve(
                 let mut last: Vec<(String, u64)> = Vec::new();
                 loop {
                     interval.tick().await;
+                    // Under the *read* lock first: a store with nothing
+                    // building must not pay a write lock once a second, and an
+                    // idle server must not force the first-write index scan
+                    // just because it has been running for a second. A build a
+                    // reopen has to recognise is registered by the first
+                    // write's index population, or by `mushroomdb build-index`.
+                    if db_build.read().builds_in_progress().is_empty() {
+                        continue;
+                    }
                     let db_build = db_build.clone();
                     let pumped =
                         tokio::task::spawn_blocking(move || db_build.write().pump_index_build())

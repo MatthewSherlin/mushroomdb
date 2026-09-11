@@ -909,7 +909,7 @@ Sixteen tools:
 |---|---|
 | `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `role?` (answer as one of the store's roles), `as_of?` (0-based commit index — answer from the graph as it was then; composes with `role` or with `mask`, not both, since the tool refuses `role` + `mask` together; writes and `stub_hidden` refused), `stub_hidden?` (bool; see below) |
 | `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?` |
-| `create_rule` | Declare a linking rule; params: `RuleDef` fields |
+| `create_rule` | Declare a linking rule; params: `RuleDef` fields. Over ~2,048 vectors the reply carries `building: {indexed, total}` and a note: the rule is installed but derives no edges until its vector index is built (see [POST /rules](#post-rules)) |
 | `explain` | Explain edges; params: `a`, `b` |
 | `stats` | Database statistics (no params) |
 | `neighborhood` | Typed neighborhood; params: `key`, `depth?`, `dir?` |

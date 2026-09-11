@@ -2428,8 +2428,12 @@ impl<F: Fs> GraphDb<F> {
             bincode::serialize(&state.ivf_state).expect("IVF state serialize cannot fail")
         };
         // Store blobs without eagerly deserializing them.
+        // `self.ids` is the snapshot's id table at this point — WAL replay has
+        // not run — so its length is the line an interrupted build is detected
+        // against.
+        let snapshot_ids = self.ids.len() as u32;
         self.engine
-            .store_snapshot_state(state.hnsw_state, ivf_bytes);
+            .store_snapshot_state(state.hnsw_state, ivf_bytes, snapshot_ids);
         // Restore view defs from snapshot (V5).
         // The ColumnStore already contains view values from the snapshot;
         // use restore_view (no collision check, no backfill) so the store
@@ -2621,7 +2625,11 @@ impl<F: Fs> GraphDb<F> {
                 .unwrap_or_default();
             // IVF: raw bincode bytes; deserialized on first mutation/query.
             let ivf_bytes = base.ivf_bytes().map(|b| b.to_vec()).unwrap_or_default();
-            self.engine.store_snapshot_state(hnsw_state, ivf_bytes);
+            // Called before WAL replay on a WAL-present open (`open_with`) and
+            // before any write on a clean one, so this is the snapshot's count.
+            let snapshot_ids = self.ids.len() as u32;
+            self.engine
+                .store_snapshot_state(hnsw_state, ivf_bytes, snapshot_ids);
         }
         self.v8_sections_loaded.store(true, Ordering::Release);
         if std::env::var("MUSHROOMDB_TRACE_OPEN").is_ok() {
@@ -4379,7 +4387,7 @@ impl<F: Fs> GraphDb<F> {
             if !matches!(&rec, WalRecord::CreateRule { .. })
                 && !self.engine.builds_in_progress().is_empty()
             {
-                rebuilds.extend(self.pump_one_slice());
+                rebuilds.extend(self.pump_one_slice().into_iter().map(|b| b.rule));
             }
             let mut failed = Vec::new();
             for name in rebuilds {
@@ -5694,17 +5702,36 @@ impl<F: Fs> GraphDb<F> {
     /// hook in `log_then_apply_with`), so this is for quiescent stores and for
     /// operators who want the build finished before traffic arrives.
     pub fn pump_index_build(&mut self) -> Result<Vec<BuildProgress>> {
+        Ok(self.pump_index_build_reporting()?.1)
+    }
+
+    /// [`GraphDb::pump_index_build`], also reporting the builds that **this**
+    /// call finished, so a progress display can say so.
+    ///
+    /// A build can be registered and completed inside a single call — that is
+    /// what a mid-build snapshot looks like on reopen, where the index scan
+    /// finishes the graph and only the backfill is outstanding — and the
+    /// outstanding list alone cannot show that anything happened.
+    pub fn pump_index_build_reporting(
+        &mut self,
+    ) -> Result<(Vec<BuildProgress>, Vec<BuildProgress>)> {
+        // A read-only handle cannot issue the `RebuildRule` a finished build
+        // needs, so it would advance the index and then silently fail to
+        // produce the edges. Refusing is the honest answer.
         if self.read_only {
-            return Ok(self.engine.builds_in_progress());
+            return Err(GraphError::ReadOnly);
         }
-        for name in self.pump_one_slice() {
+        let finished = self.pump_one_slice();
+        for done in &finished {
             // The index is whole but the rule still owns no edges. A failed
             // second commit must leave the rule re-pumpable rather than
             // silently edge-less, so the error is surfaced here — unlike the
             // post-commit hook, this call is not riding someone else's commit.
-            self.log_then_apply(WalRecord::RebuildRule { name })?;
+            self.log_then_apply(WalRecord::RebuildRule {
+                name: done.rule.clone(),
+            })?;
         }
-        Ok(self.engine.builds_in_progress())
+        Ok((finished, self.engine.builds_in_progress()))
     }
 
     /// One slice of build work for every pending rule. Returns the rules whose
@@ -5713,7 +5740,13 @@ impl<F: Fs> GraphDb<F> {
     /// Goes through the engine even with nothing pending when the indexes have
     /// not been populated yet: that call is what re-derives a build a mid-build
     /// snapshot left behind, and a fresh handle has no other way to learn of it.
-    fn pump_one_slice(&mut self) -> Vec<String> {
+    fn pump_one_slice(&mut self) -> Vec<BuildProgress> {
+        // The retained snapshot blobs — and the id count an interrupted build
+        // is recognised against — arrive with the V8 base sections, which a
+        // clean open reads lazily. Without this a freshly opened handle pumps
+        // against empty retained state and concludes there is nothing to do,
+        // which is precisely the store `build-index` exists for.
+        self.ensure_v8_base_sections_loaded();
         let mut eng = std::mem::take(&mut self.engine);
         let finished = {
             let mut gm = make_graph_mut(

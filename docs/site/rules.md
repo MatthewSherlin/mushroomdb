@@ -317,12 +317,17 @@ While a rule is in that state:
      quiescent server finishes too.
   3. **`mushroomdb build-index <db-dir> [--rule <name>]`.** Drives it to
      completion now, one progress line per slice, for an operator who wants the
-     build done before traffic arrives. `GraphDb::pump_index_build` is the Rust
-     equivalent: one write lock and at most one slice per pending rule per call.
+     build done before traffic arrives. `--rule` narrows the report, not the
+     work — pending builds share one write lock. `GraphDb::pump_index_build` is
+     the Rust equivalent: one write lock and at most one slice per pending rule
+     per call, and `Err(ReadOnly)` on a read-only handle (it could advance the
+     index but not commit the backfill).
 
 A store killed mid-build reopens with the rule present and its index partly
 built; the snapshot's graph covers what it carried, the open-time scan covers
-the rest, and the next pump issues the backfill.
+the rest, and the next pump issues the backfill. Node ids are dense and never
+reused, so "the snapshot held this node but its graph did not" is decided
+exactly, and an ordinary write after a clean reopen is never mistaken for one.
 
 **Breaking change in 0.6.6:** code that created an approximate rule over more
 than 2,048 vectors and immediately asserted an edge count must now pump first.

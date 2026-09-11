@@ -1929,3 +1929,163 @@ fn an_interrupted_build_resumes_on_reopen() {
         "the resumed build derives the same edges"
     );
 }
+
+/// The first embedded write after a clean reopen must not look like an
+/// interrupted build.
+///
+/// `ensure_indexes_populated` runs *inside* the apply of that write, with the
+/// in-flight node already labelled and propped, so comparing the rebuilt graph
+/// against the adopted one by size alone made every completed rule look
+/// mid-build — one full `RebuildRule` (every node re-scanned, every edge
+/// re-derived) on the first embedded write after every reopen.
+#[test]
+fn a_reopened_complete_store_does_not_rebuild_on_the_first_write() {
+    let dir = tmp("slice-reopen-complete");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for i in 0..300 {
+            db.insert_node("V", &format!("v{i}"), vec![("emb".into(), slice_vec(i))])
+                .unwrap();
+        }
+        db.create_rule(slice_rule()).unwrap();
+        assert!(
+            db.stats().rules[0].building.is_none(),
+            "built in one commit"
+        );
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    let fires_before = db.stats().rules[0].fires;
+    let wal_before = std::fs::metadata(dir.join("wal.bin")).map_or(0, |m| m.len());
+
+    db.insert_node("V", "late", vec![("emb".into(), slice_vec(3))])
+        .unwrap();
+
+    let wal = std::fs::read(dir.join("wal.bin")).unwrap();
+    let (tail, _) = decode_all(&wal[wal_before as usize..]);
+    assert!(
+        !tail
+            .iter()
+            .any(|r| matches!(r, WalRecord::RebuildRule { .. })),
+        "the first write after a reopen must not trigger a rebuild; WAL tail: {tail:?}"
+    );
+
+    assert!(
+        db.stats().rules[0].building.is_none(),
+        "a completed rule must not be reported as building after a reopen"
+    );
+    assert_eq!(
+        db.stats().rules[0].fires - fires_before,
+        1,
+        "one write must evaluate the rule once, not once per node: a full \
+         RebuildRule ran"
+    );
+    assert!(
+        db.neighbors("late", "SIM", Direction::Out)
+            .unwrap()
+            .contains(&"v0".to_string()),
+        "the write still derives its own edges"
+    );
+}
+
+/// A rule that is still building derives nothing, including for writes that
+/// land while it builds; the backfill then derives the whole set.
+#[test]
+fn a_write_during_a_pending_build_derives_no_edges() {
+    let want = {
+        let (_d, mut db) = store_with_vectors("slice-noedge-want", 300);
+        db.create_rule(slice_rule()).unwrap();
+        db.insert_node("V", "late", vec![("emb".into(), slice_vec(3))])
+            .unwrap();
+        edge_set(&db, "SIM", 300)
+    };
+
+    let (_d, mut db) = store_with_vectors("slice-noedge", 300);
+    db.set_hnsw_build_batch(Some(64));
+    db.create_rule(slice_rule()).unwrap();
+    db.insert_node("V", "late", vec![("emb".into(), slice_vec(3))])
+        .unwrap();
+    assert!(
+        building_of(&db, "sim").is_some(),
+        "one write does not finish a 300/64 build"
+    );
+    assert_eq!(
+        edges_of(&db, "sim"),
+        0,
+        "a rule that is still building must derive nothing, not a partial set"
+    );
+    assert_eq!(
+        db.neighbors("late", "SIM", Direction::Out).unwrap(),
+        Vec::<String>::new()
+    );
+
+    while !db.pump_index_build().unwrap().is_empty() {}
+    assert!(building_of(&db, "sim").is_none());
+    assert_eq!(
+        edge_set(&db, "SIM", 300),
+        want,
+        "the backfill derives the whole set, the write included"
+    );
+    assert!(db
+        .neighbors("late", "SIM", Direction::Out)
+        .unwrap()
+        .contains(&"v0".to_string()));
+}
+
+/// A store killed between `CreateRule` and the `RebuildRule` that finishes it
+/// reopens resumable: the replayed `CreateRule` re-derives the build, and a
+/// pump completes it to the one-shot edge set.
+#[test]
+fn a_truncated_wal_replay_leaves_the_build_resumable() {
+    let want = {
+        let (_d, mut db) = store_with_vectors("slice-truncwal-want", 300);
+        db.create_rule(slice_rule()).unwrap();
+        edge_set(&db, "SIM", 300)
+    };
+
+    let dir = tmp("slice-truncwal");
+    {
+        // No snapshot: the WAL holds InsertNode ×300 + CreateRule and nothing
+        // else, because the build never finished.
+        let mut db = GraphDb::open(&dir).unwrap();
+        for i in 0..300 {
+            db.insert_node("V", &format!("v{i}"), vec![("emb".into(), slice_vec(i))])
+                .unwrap();
+        }
+        db.set_hnsw_build_batch(Some(64));
+        db.create_rule(slice_rule()).unwrap();
+        assert_eq!(edges_of(&db, "sim"), 0);
+    }
+
+    // Replay re-runs `create_rule`, which defers again at the production slice
+    // size only if the corpus warrants it; at 300 vectors it does not, so the
+    // replay builds it whole. Either way the store must be consistent.
+    let mut db = GraphDb::open(&dir).unwrap();
+    while !db.pump_index_build().unwrap().is_empty() {}
+    assert!(building_of(&db, "sim").is_none());
+    assert_eq!(
+        edge_set(&db, "SIM", 300),
+        want,
+        "a replayed unfinished build lands on the one-shot edge set"
+    );
+}
+
+/// A read-only handle cannot commit the backfill a finished build needs, so it
+/// says so rather than advancing the index and losing the edges.
+#[test]
+fn pump_index_build_is_refused_read_only() {
+    let dir = tmp("slice-readonly");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("V", "v0", vec![("emb".into(), slice_vec(0))])
+            .unwrap();
+        db.snapshot().unwrap();
+    }
+    let opts = core_api::OpenOptions {
+        read_only: true,
+        ..Default::default()
+    };
+    let mut db = GraphDb::open_with_options(&dir, opts).unwrap();
+    assert!(matches!(db.pump_index_build(), Err(GraphError::ReadOnly)));
+}

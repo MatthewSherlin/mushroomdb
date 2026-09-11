@@ -448,9 +448,32 @@ fn tool_create_rule(db: &SharedDb, args: &Js) -> CallOutcome {
         let mut g = db.write();
         g.create_rule(def)
     };
-    match res {
-        Ok(()) => CallOutcome::ToolOk(json!({"ok": true, "name": name})),
-        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+    if let Err(e) = res {
+        return CallOutcome::ToolErr(graph_err_msg(e));
+    }
+    // A rule over a corpus too large to index in one commit is installed but
+    // derives nothing yet. Saying "ok" there would tell the caller to go and
+    // query edges that do not exist, so report the build instead — `stats`
+    // carries the same progress under each rule's `building`.
+    let building = db
+        .read()
+        .builds_in_progress()
+        .into_iter()
+        .find(|b| b.rule == name);
+    match building {
+        Some(b) => CallOutcome::ToolOk(json!({
+            "ok": true,
+            "name": name,
+            "building": {"indexed": b.indexed, "total": b.total},
+            "note": format!(
+                "the vector index for {name:?} is still being built ({}/{} vectors); \
+                 this rule derives no edges until it finishes. Every write advances it, \
+                 and `mushroomdb build-index <db-dir>` finishes it now. Poll `stats` — \
+                 the rule's `building` field disappears when its edges are in.",
+                b.indexed, b.total
+            ),
+        })),
+        None => CallOutcome::ToolOk(json!({"ok": true, "name": name})),
     }
 }
 
@@ -1605,6 +1628,80 @@ mod tests {
         assert!(!is_error(&resp));
         let result = tool_text(&resp);
         assert_eq!(result["nodes_live"], 2);
+    }
+
+    /// A rule whose corpus is too large to index in one commit must not come
+    /// back as a bare "ok": the caller would go straight to querying edges that
+    /// do not exist yet.
+    #[test]
+    fn create_rule_reports_a_build_it_could_not_finish() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            for i in 0..300usize {
+                const D: usize = 32;
+                let axis = (i / 10) % D;
+                let mut xs = vec![0.0f64; D];
+                xs[axis] = 1.0;
+                xs[(axis + 1) % D] = (i % 10) as f64 * 0.001;
+                g.insert_node(
+                    "V",
+                    &format!("v{i}"),
+                    vec![(
+                        "emb".into(),
+                        Value::List(xs.into_iter().map(Value::Float).collect()),
+                    )],
+                )
+                .expect("insert");
+            }
+            g.set_hnsw_build_batch(Some(64));
+        }
+        let args = json!({
+            "name": "sim",
+            "src_label": "V",
+            "dst_label": "V",
+            "predicate": {"VectorSimilar": {"field": "emb", "min": 0.9}},
+            "edge_type": "SIM",
+            "weight_prop": null,
+            "max_edges": null,
+            "approximate": true
+        });
+        let resp = tool_call(&db, 1, "create_rule", args);
+        assert!(!is_error(&resp), "{resp}");
+        let result = tool_text(&resp);
+        assert_eq!(result["name"], json!("sim"));
+        assert_eq!(result["building"], json!({"indexed": 64, "total": 300}));
+        let note = result["note"].as_str().expect("a note explaining the wait");
+        assert!(
+            note.contains("derives no edges until it finishes") && note.contains("build-index"),
+            "the note must say the edges are not there yet and how to finish: {note}"
+        );
+
+        // `stats` carries the same progress.
+        let stats = tool_text(&tool_call(&db, 2, "stats", json!({})));
+        let rule = stats["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|r| r["name"] == "sim")
+            .expect("the rule is installed while it builds");
+        assert_eq!(rule["edges"], json!(0));
+        assert_eq!(
+            rule["building"],
+            json!({"rule": "sim", "indexed": 64, "total": 300})
+        );
+
+        // Finished, the report is the plain one again.
+        while !db.write().pump_index_build().expect("pump").is_empty() {}
+        let stats = tool_text(&tool_call(&db, 3, "stats", json!({})));
+        let rule = stats["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|r| r["name"] == "sim")
+            .expect("rule");
+        assert!(rule.get("building").is_none(), "{rule}");
+        assert!(rule["edges"].as_u64().expect("edges") > 0);
     }
 
     #[test]

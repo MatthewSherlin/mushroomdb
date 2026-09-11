@@ -1526,47 +1526,36 @@ pub fn build_index_on(db: &mut GraphDb<RealFs>, rule: Option<&str>) -> Result<St
     let mut out = String::new();
     let interesting = |name: &str| rule.is_none_or(|r| r == name);
 
-    let start = db.builds_in_progress();
-    if !start.iter().any(|b| interesting(&b.rule)) {
-        match rule {
-            Some(r) => out.push_str(&format!(
-                "nothing to build for rule {r:?}
-"
-            )),
-            None => out.push_str(
-                "nothing to build
-",
-            ),
-        }
-        return Ok(out);
-    }
-
-    let mut outstanding = start;
+    // Pump before looking. A freshly opened handle holds no pending build until
+    // its indexes are populated, and populating them is what recognises a build
+    // a mid-build snapshot cut short — so asking `builds_in_progress()` first
+    // would answer "nothing to build" on exactly the store this command is for.
     loop {
-        let before = outstanding.clone();
-        outstanding = db.pump_index_build()?;
+        let (finished, outstanding) = db.pump_index_build_reporting()?;
         for b in &outstanding {
             if interesting(&b.rule) {
-                out.push_str(&format!(
-                    "building {}: {}/{}
-",
-                    b.rule, b.indexed, b.total
-                ));
+                out.push_str(&format!("building {}: {}/{}\n", b.rule, b.indexed, b.total));
             }
         }
-        for b in &before {
-            if interesting(&b.rule) && !outstanding.iter().any(|o| o.rule == b.rule) {
-                out.push_str(&format!(
-                    "built {}: {} vectors
-",
-                    b.rule, b.total
-                ));
+        // Reported from the pump rather than inferred from a shrinking
+        // outstanding list: a resumed build is registered and finished inside a
+        // single call, so it never appears in that list at all.
+        for b in &finished {
+            if interesting(&b.rule) {
+                out.push_str(&format!("built {}: {} vectors\n", b.rule, b.total));
             }
         }
         if outstanding.is_empty() {
-            return Ok(out);
+            break;
         }
     }
+    if out.is_empty() {
+        match rule {
+            Some(r) => out.push_str(&format!("nothing to build for rule {r:?}\n")),
+            None => out.push_str("nothing to build\n"),
+        }
+    }
+    Ok(out)
 }
 
 fn parse_schema(args: &[&str]) -> Result<Command, String> {
