@@ -2741,9 +2741,27 @@ fn execute_aggregate(
 
 /// The value a `DISTINCT` aggregate argument takes on one row.
 ///
-/// A node variable is identified by its key, a scalar alias by its value, and
-/// a property by the property's value. `DISTINCT *` is rejected at parse
-/// time, so `Star` is unreachable and yields `None` defensively.
+/// A node variable is identified by its key, a relationship variable by the
+/// edge it is bound to, a scalar alias by its value, and a property by the
+/// property's value. `DISTINCT *` is rejected at parse time, so `Star` is
+/// unreachable and yields `None` defensively.
+///
+/// # A relationship is keyed on the edge, not dropped
+///
+/// A relationship cell has no key of its own, so this used to answer `None`
+/// for one — and `None` means "contributes to no aggregate", so
+/// `count(DISTINCT r)` counted nothing at all and returned `0` on a graph
+/// full of edges. An edge *is* identified, by the triple the executor binds:
+/// its type and its two endpoints. That is what is keyed here, so
+/// `count(DISTINCT r)` equals `count(r)` on a graph where no pair is joined
+/// twice by one type, and is smaller exactly where an alternation matched the
+/// same edge through more than one pattern.
+///
+/// The key is only ever compared against other keys from this same function
+/// within one `DISTINCT` gate, and an aggregate argument is one variable, so
+/// a relationship's key never meets a node key or a property string: the
+/// separator is there to keep the three ids apart, not to fence off a
+/// collision that the grammar can produce.
 fn distinct_value(
     view: &GraphView,
     vars: &VarTable,
@@ -2760,7 +2778,10 @@ fn distinct_value(
                 Some(Cell::Node(id)) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
                 Some(Cell::Scalar(val)) => Some(val.clone()),
                 Some(Cell::Path(hops)) => Some(Value::Int(*hops as i64)),
-                Some(Cell::Rel(_)) | None => None,
+                Some(Cell::Rel(e)) => {
+                    Some(Value::Str(format!("{}\u{1}{}\u{1}{}", e.etype, e.src, e.dst)))
+                }
+                None => None,
             })
         }
         AggArg::Prop { var, field } => resolve_prop(view, vars, row, var, field),
@@ -8262,6 +8283,46 @@ LIMIT 10";
                 vec![Some(s("c3")), Some(i(2)), Some(i(1))],
             ]
         );
+    }
+
+    /// `count(DISTINCT r)` on a **relationship** variable counts edges, not
+    /// nothing.
+    ///
+    /// A relationship cell has no key, and the DISTINCT gate used to read
+    /// that as "no value", which drops the row: the answer was `0` on a graph
+    /// full of edges, and silently — no error, no null, a number that looks
+    /// like an answer. An edge is identified by its type and its two
+    /// endpoints, so on a graph where no pair is joined twice by one type
+    /// `count(DISTINCT r)` is `count(r)`.
+    #[test]
+    fn count_distinct_on_a_relationship_counts_edges() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (a)-[r]->(b) RETURN count(r) AS raw, count(DISTINCT r) AS uniq",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let row = &rows_of(&rs)[0];
+        assert_eq!(row[0], row[1], "no pair is joined twice by one type: {row:?}");
+        assert_ne!(row[1], Some(i(0)), "a graph full of edges counts them");
+    }
+
+    /// And the same alternation that multiplies rows for a node variable
+    /// still yields one key per edge, so `DISTINCT` over `r` is the edge
+    /// count of the two types rather than the row count.
+    #[test]
+    fn count_distinct_on_a_relationship_survives_an_alternation() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent)-[r:INDUSTRY_ALIGNMENT|:SPECIALTY_MATCH]->(c:Company) \
+             RETURN count(r) AS raw, count(DISTINCT r) AS uniq",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let row = &rows_of(&rs)[0];
+        assert_eq!(row[0], row[1], "every row bound a different edge: {row:?}");
     }
 
     /// `collect(DISTINCT …)` dedupes the same way.
