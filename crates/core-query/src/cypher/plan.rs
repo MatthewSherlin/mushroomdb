@@ -639,17 +639,25 @@ fn compile_with_stage(
         // Non-aggregate WITH → validate items and emit PlanOp::With.
         check_return_bound(&stage.items, bound, rel_bound)?;
 
-        // Optional WHERE filter on the current (pre-WITH) rows.
-        // This also handles bare-variable operands (Operand::Var) referencing
-        // scalar aliases produced by earlier stages.
+        // `WITH … WHERE …` filters *after* the projection — the executor
+        // projects each row through the WITH items and only then runs the
+        // filter, exactly so that `WITH t, t.age AS age WHERE age > 30`
+        // works. The pre-flight check has to scope the same way: against the
+        // variables that survive the WITH as well as those already in scope.
+        // Checking the pre-WITH set alone rejected every alias a
+        // non-aggregate WITH introduced (`unbound variable `age` in WHERE`)
+        // even though the plan it would have produced ran correctly, while
+        // the aggregate branch above has always scoped its HAVING clause to
+        // the group's output columns.
+        let with_col_names: BTreeSet<String> = stage.items.iter().map(column_name).collect();
+        let with_scope: BTreeSet<String> = bound.union(&with_col_names).cloned().collect();
         if let Some(expr) = &stage.where_expr {
-            check_expr_bound(expr, bound)?;
+            check_expr_bound(expr, &with_scope)?;
         }
         // ORDER BY items reference either var names or prop paths — no rewrite needed
         // here; exec_order_by_rows handles raw row ordering.
         // ORDER BY may reference the WITH output columns (aliases) in addition to
         // variables already in scope before the WITH.
-        let with_col_names: BTreeSet<String> = stage.items.iter().map(column_name).collect();
         for item in &stage.order_by {
             match &item.target {
                 OrderTarget::Prop { var, .. } | OrderTarget::Var(var) => {
