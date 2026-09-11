@@ -17,10 +17,11 @@ pub use algo::{
 pub use core_query::{CmpOp, Dir, Filter, ResultSet};
 pub use core_rules::suggest::DEFAULT_SEED as SUGGEST_DEFAULT_SEED;
 pub use core_rules::{
-    default_max_edges, is_keymatch_rooted, AggFn, Predicate, RuleDef, RuleSuggestion,
-    SuggestConfig, SuggestReport, ViewDef, ViewSource, ViewStore, DEFAULT_KEYMATCH_TOP_K,
-    DEFAULT_SCORED_TOP_K, MAX_CHAIN_DEPTH,
+    default_max_edges, is_keymatch_rooted, AggFn, BuildProgress, Predicate, RuleDef,
+    RuleSuggestion, SuggestConfig, SuggestReport, ViewDef, ViewSource, ViewStore,
+    DEFAULT_KEYMATCH_TOP_K, DEFAULT_SCORED_TOP_K, HNSW_BUILD_BATCH, MAX_CHAIN_DEPTH,
 };
+pub use core_storage::fs::RealFs;
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
 pub use db::{

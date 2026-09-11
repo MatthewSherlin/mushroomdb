@@ -11,8 +11,8 @@ use core_query::cypher::{
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
-    decode_rule_def, evaluate, EngineEdgeDelta, GraphMut, NodeView, Predicate, RuleDef, RuleEngine,
-    ViewDef, ViewStore,
+    decode_rule_def, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView, Predicate,
+    RuleDef, RuleEngine, ViewDef, ViewStore,
 };
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
@@ -297,6 +297,15 @@ pub struct RuleStats {
     pub fires: u64,
     /// Whether this rule uses the approximate IVF-Flat candidate path.
     pub approximate: bool,
+    /// `Some` while this rule's vector index is still being built.
+    ///
+    /// The rule derives **no** edges until it is `None`: the backfill is one
+    /// commit that runs after the index is whole, so a caller never sees a
+    /// partial edge set. Absent from the JSON when the rule is not building,
+    /// which is every rule created over a corpus at or below
+    /// [`core_rules::HNSW_BUILD_BATCH`] vectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub building: Option<BuildProgress>,
 }
 
 /// One entry in the slow-query ring buffer.
@@ -4354,8 +4363,18 @@ impl<F: Fs> GraphDb<F> {
         // Skip when `rec` is itself RebuildRule: rebuild resets drift, so a
         // retrigger loop is impossible if the fit succeeded, but we still
         // drain the flag so a leftover cannot re-enter.
-        let rebuilds = self.engine.take_rebuild_needed();
+        // One slice of any outstanding vector-index build rides here too, so a
+        // store that is being written to finishes its build without anyone
+        // calling `pump_index_build`. A rule that becomes whole joins the same
+        // RebuildRule loop below.
+        let mut rebuilds = self.engine.take_rebuild_needed();
         if !matches!(&rec, WalRecord::RebuildRule { .. }) {
+            // Not after `CreateRule`: that record's own apply already did the
+            // rule's first slice, and pumping again here would make one
+            // `create_rule` call do two slices' work under one lock.
+            if !matches!(&rec, WalRecord::CreateRule { .. }) {
+                rebuilds.extend(self.pump_one_slice());
+            }
             let mut failed = Vec::new();
             for name in rebuilds {
                 if self.engine.rules().any(|r| r.name == name) {
@@ -5633,6 +5652,76 @@ impl<F: Fs> GraphDb<F> {
             detail: format!("serialize rule: {e}"),
         })?;
         self.log_then_apply(WalRecord::CreateRule { def_bytes })
+    }
+
+    /// Override this handle's HNSW build-slice size, or `None` to restore
+    /// [`core_rules::HNSW_BUILD_BATCH`].
+    ///
+    /// Exposed for tests that need a small slice without a large corpus; not
+    /// part of the stable surface.
+    #[doc(hidden)]
+    pub fn set_hnsw_build_batch(&mut self, batch: Option<usize>) {
+        self.engine.set_hnsw_build_batch(batch);
+    }
+
+    /// Rules whose vector index is still being built, in name order.
+    ///
+    /// The same list [`GraphDb::stats`] reports per rule in `building`.
+    pub fn builds_in_progress(&self) -> Vec<BuildProgress> {
+        self.engine.builds_in_progress()
+    }
+
+    /// Advance any vector index still building and backfill each rule that
+    /// finishes. Returns what is still outstanding.
+    ///
+    /// A map lookup when nothing is pending, so it is cheap to call on a timer.
+    /// One write lock and at most [`core_rules::HNSW_BUILD_BATCH`] vector
+    /// inserts per pending rule per call, so a caller can drive a large build
+    /// to completion without ever holding the lock for more than a slice.
+    ///
+    /// A rule that finishes here is backfilled through the same
+    /// `WalRecord::RebuildRule` second commit that IVF drift already uses, so
+    /// its derived edges are produced by [`GraphDb::rebuild_rule`]'s code path
+    /// and appear all at once.
+    ///
+    /// Every ordinary write pumps one slice on its own (see the post-commit
+    /// hook in `log_then_apply_with`), so this is for quiescent stores and for
+    /// operators who want the build finished before traffic arrives.
+    pub fn pump_index_build(&mut self) -> Result<Vec<BuildProgress>> {
+        if self.read_only {
+            return Ok(self.engine.builds_in_progress());
+        }
+        for name in self.pump_one_slice() {
+            // The index is whole but the rule still owns no edges. A failed
+            // second commit must leave the rule re-pumpable rather than
+            // silently edge-less, so the error is surfaced here — unlike the
+            // post-commit hook, this call is not riding someone else's commit.
+            self.log_then_apply(WalRecord::RebuildRule { name })?;
+        }
+        Ok(self.engine.builds_in_progress())
+    }
+
+    /// One slice of build work for every pending rule. Returns the rules whose
+    /// index just became whole, which the caller must `RebuildRule`.
+    fn pump_one_slice(&mut self) -> Vec<String> {
+        if self.engine.builds_in_progress().is_empty() && self.engine.indexes_populated() {
+            return Vec::new();
+        }
+        let mut eng = std::mem::take(&mut self.engine);
+        let finished = {
+            let mut gm = make_graph_mut(
+                &self.ids,
+                &mut self.syms,
+                &self.labels,
+                build_props_view(&self.props, &self.base),
+                &mut self.topo,
+                &self.base,
+                &mut self.edge_props,
+            );
+            eng.pump_index_build(&mut gm)
+        };
+        self.engine = eng;
+        finished
     }
 
     /// WAL-log rule deletion. Returns RuleNotFound if the rule does not exist.
@@ -10121,6 +10210,7 @@ impl<F: Fs> GraphDb<F> {
     /// and fire counter (includes rebuild evaluations). Rules are sorted by name.
     pub fn stats(&self) -> Stats {
         self.ensure_v8_base_sections_loaded();
+        let building = self.engine.builds_in_progress();
         let rules: Vec<RuleStats> = self
             .engine
             .rules()
@@ -10135,6 +10225,7 @@ impl<F: Fs> GraphDb<F> {
                 tripped: self.engine.is_tripped(&r.name),
                 fires: self.engine.fire_count(&r.name),
                 approximate: r.approximate,
+                building: building.iter().find(|b| b.rule == r.name).cloned(),
             })
             .collect();
         Stats {

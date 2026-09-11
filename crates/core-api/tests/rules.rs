@@ -1717,3 +1717,215 @@ fn reopening_does_not_rebuild_the_vector_index() {
          {N} are adopted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Sliced HNSW builds (v0.6.6 §4)
+// ---------------------------------------------------------------------------
+
+/// Dimensionality of the sliced-build fixture. One axis per cluster, so
+/// clusters are mutually orthogonal and the rule's edge set is exactly the
+/// within-cluster pairs.
+const SLICE_DIM: usize = 32;
+
+/// Node `i` sits in cluster `i / 10`, on that cluster's axis, nudged along the
+/// next axis so no two vectors are literally equal. Cosine within a cluster is
+/// ~1.0 and between clusters ~0.0, which puts the 0.9 threshold nowhere near a
+/// tie — the derived edge set is the same set whichever path builds the graph.
+fn slice_vec(i: usize) -> Value {
+    let axis = (i / 10) % SLICE_DIM;
+    let mut xs = vec![0.0f64; SLICE_DIM];
+    xs[axis] = 1.0;
+    xs[(axis + 1) % SLICE_DIM] = (i % 10) as f64 * 0.001;
+    emb(&xs)
+}
+
+fn store_with_vectors(name: &str, n: usize) -> (std::path::PathBuf, GraphDb<RealFs>) {
+    let dir = tmp(name);
+    let mut db = GraphDb::open(&dir).unwrap();
+    for i in 0..n {
+        db.insert_node("V", &format!("v{i}"), vec![("emb".into(), slice_vec(i))])
+            .unwrap();
+    }
+    (dir, db)
+}
+
+fn slice_rule() -> RuleDef {
+    RuleDef {
+        name: "sim".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.9,
+        },
+        edge_type: "SIM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+        via_label: None,
+        via_dir: None,
+        via_edge: None,
+    }
+}
+
+/// Every derived edge of `et`, as a sorted flat list, so two runs compare
+/// exactly.
+fn edge_set(db: &GraphDb<RealFs>, et: &str, n: usize) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for i in 0..n {
+        let k = format!("v{i}");
+        for d in db.neighbors(&k, et, Direction::Out).unwrap_or_default() {
+            out.push((k.clone(), d));
+        }
+    }
+    out.sort();
+    out
+}
+
+fn building_of(db: &GraphDb<RealFs>, rule: &str) -> Option<core_api::BuildProgress> {
+    db.stats()
+        .rules
+        .iter()
+        .find(|r| r.name == rule)
+        .and_then(|r| r.building.clone())
+}
+
+fn edges_of(db: &GraphDb<RealFs>, rule: &str) -> u64 {
+    db.stats()
+        .rules
+        .iter()
+        .find(|r| r.name == rule)
+        .map(|r| r.edges)
+        .unwrap_or(0)
+}
+
+/// A corpus that fits in one slice behaves exactly as it did before 0.6.6:
+/// one commit, edges present the moment `create_rule` returns.
+#[test]
+fn create_rule_under_the_slice_is_one_commit() {
+    let (_dir, mut db) = store_with_vectors("slice-small", 100);
+    db.create_rule(slice_rule()).unwrap();
+    assert!(
+        db.stats().rules.iter().all(|r| r.building.is_none()),
+        "a 100-vector corpus must not defer anything"
+    );
+    assert!(
+        edges_of(&db, "sim") > 0,
+        "edges exist the moment create_rule returns"
+    );
+    assert!(
+        db.pump_index_build().unwrap().is_empty(),
+        "pumping a store with nothing pending must be a no-op"
+    );
+}
+
+/// Above the slice the rule is installed, derives nothing yet, reports its
+/// progress, and — once pumped — produces exactly the set the one-commit path
+/// produces. Deferring must not change the answer.
+#[test]
+fn create_rule_over_the_slice_defers_then_matches() {
+    let want = {
+        let (_d, mut db) = store_with_vectors("slice-want", 300);
+        db.create_rule(slice_rule()).unwrap();
+        assert!(db.stats().rules[0].building.is_none());
+        edge_set(&db, "SIM", 300)
+    };
+    assert!(!want.is_empty(), "the fixture must derive some edges");
+
+    let (_d, mut db) = store_with_vectors("slice-defer", 300);
+    core_rules::with_hnsw_build_batch(64, || {
+        db.create_rule(slice_rule()).unwrap();
+        let p = building_of(&db, "sim").expect("must report a build in progress");
+        assert_eq!(p.indexed, 64, "create_rule does exactly one slice inline");
+        assert_eq!(p.total, 300);
+        assert_eq!(edges_of(&db, "sim"), 0, "no partial edge set, ever");
+        assert_eq!(
+            db.neighbors("v0", "SIM", Direction::Out).unwrap(),
+            Vec::<String>::new()
+        );
+        while !db.pump_index_build().unwrap().is_empty() {}
+    });
+    assert!(building_of(&db, "sim").is_none());
+    assert_eq!(
+        edge_set(&db, "SIM", 300),
+        want,
+        "the deferred build derives the same edges"
+    );
+}
+
+/// An ordinary write advances a pending build without anyone calling pump, and
+/// the nodes those writes add are indexed like any other.
+#[test]
+fn a_write_pumps_the_build() {
+    let want = {
+        let (_d, mut db) = store_with_vectors("slice-write-want", 300);
+        db.create_rule(slice_rule()).unwrap();
+        edge_set(&db, "SIM", 300)
+    };
+
+    let (_d, mut db) = store_with_vectors("slice-write", 300);
+    core_rules::with_hnsw_build_batch(64, || {
+        db.create_rule(slice_rule()).unwrap();
+        assert!(building_of(&db, "sim").is_some());
+        let mut writes = 0;
+        while building_of(&db, "sim").is_some() {
+            db.insert_node(
+                "Other",
+                &format!("o{writes}"),
+                vec![("v".into(), Value::Int(1))],
+            )
+            .unwrap();
+            writes += 1;
+            assert!(writes < 100, "the build never finished under plain writes");
+        }
+        assert!(writes >= 3, "a 64-vector slice should need several writes");
+    });
+    assert_eq!(
+        edge_set(&db, "SIM", 300),
+        want,
+        "the write-driven build derives the same edges"
+    );
+
+    // A vector written while the build was outstanding is in the finished index.
+    core_rules::with_hnsw_build_batch(64, || {
+        db.insert_node("V", "late", vec![("emb".into(), slice_vec(3))])
+            .unwrap();
+        while !db.pump_index_build().unwrap().is_empty() {}
+    });
+    let late: Vec<String> = db.neighbors("late", "SIM", Direction::Out).unwrap();
+    assert!(
+        late.contains(&"v0".to_string()),
+        "a node written during/after the build must link to its cluster; got {late:?}"
+    );
+}
+
+/// A build interrupted by a snapshot + reopen resumes rather than restarting,
+/// and still lands on the same edge set.
+#[test]
+fn an_interrupted_build_resumes_on_reopen() {
+    let want = {
+        let (_d, mut db) = store_with_vectors("slice-resume-want", 300);
+        db.create_rule(slice_rule()).unwrap();
+        edge_set(&db, "SIM", 300)
+    };
+
+    let (dir, mut db) = store_with_vectors("slice-resume", 300);
+    core_rules::with_hnsw_build_batch(64, || {
+        db.create_rule(slice_rule()).unwrap();
+        db.pump_index_build().unwrap();
+        let p = building_of(&db, "sim").expect("still building");
+        assert_eq!(p.indexed, 128, "two slices in");
+        db.snapshot().unwrap();
+    });
+    drop(db);
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(edges_of(&db, "sim"), 0, "the partial build derived nothing");
+    core_rules::with_hnsw_build_batch(64, || while !db.pump_index_build().unwrap().is_empty() {});
+    assert!(building_of(&db, "sim").is_none());
+    assert_eq!(
+        edge_set(&db, "SIM", 300),
+        want,
+        "the resumed build derives the same edges"
+    );
+}

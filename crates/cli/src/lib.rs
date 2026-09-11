@@ -18,8 +18,8 @@ use core_api::repograph;
 use core_api::schema::Schema;
 use core_api::{
     default_max_edges, is_write_query, AlgoDir, BackupReport, DegreeConfig, Explanation, GraphDb,
-    IngestOptions, LouvainConfig, PageRankConfig, Predicate, ResultSet, RuleDef, RuleSuggestion,
-    SharedDb, SnapshotOptions, Stats, Value, WccConfig, WriteGuard,
+    IngestOptions, LouvainConfig, PageRankConfig, Predicate, RealFs, ResultSet, RuleDef,
+    RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig, WriteGuard,
 };
 use export::ExportFormat;
 use std::collections::{BTreeMap, BTreeSet};
@@ -284,6 +284,12 @@ pub enum Command {
         /// Keep the newest N archives; prune oldest at snapshot time.
         /// None = unlimited. Applies only when the WAL is archived.
         retention: Option<u32>,
+    },
+    /// Drive any outstanding vector-index build to completion.
+    BuildIndex {
+        db_dir: PathBuf,
+        /// Build only this rule; `None` builds every pending one.
+        rule: Option<String>,
     },
     /// Apply a JSON schema file idempotently (`schema apply <db-dir> <schema.json>`).
     SchemaApply {
@@ -561,6 +567,10 @@ Usage:
                      folds the WAL into snapshot.bin and archives it as wal.<N>.archive,
                      so node_history, edge_history, was_linked and asof keep reaching it;
                      --truncate discards it instead, --keep-wal leaves wal.bin whole
+  mushroomdb build-index <db-dir> [--rule <name>]
+                     drives a rule's vector index to completion a slice at a time, for an
+                     operator who wants the build finished before traffic arrives; a rule
+                     created over a large corpus derives no edges until its index is whole
   mushroomdb migrate <db-dir>
   mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
   mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
@@ -909,6 +919,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "algo" => parse_algo(&args[1..]),
         "query" => parse_query(&args[1..]),
         "snapshot" => parse_snapshot(&args[1..]),
+        "build-index" => parse_build_index(&args[1..]),
         "schema" => parse_schema(&args[1..]),
         "migrate" => parse_one_dir("migrate", &args[1..]).map(|db_dir| Command::Migrate { db_dir }),
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
@@ -1460,6 +1471,102 @@ pub fn run_snapshot(
         "snapshot written: {}\n",
         db_dir.join("snapshot.bin").display()
     ))
+}
+
+fn parse_build_index(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir: Option<PathBuf> = None;
+    let mut rule: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if let Some(v) = a.strip_prefix("--rule=") {
+            if v.is_empty() {
+                return Err("--rule requires a value".to_string());
+            }
+            rule = Some(v.to_string());
+            i += 1;
+        } else if a == "--rule" {
+            i += 1;
+            let v = args
+                .get(i)
+                .ok_or_else(|| "--rule requires a value".to_string())?;
+            rule = Some((*v).to_string());
+            i += 1;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else if db_dir.is_none() {
+            db_dir = Some(PathBuf::from(a));
+            i += 1;
+        } else {
+            return Err(format!("unexpected extra argument: {a}"));
+        }
+    }
+    let db_dir = db_dir.ok_or_else(|| "build-index requires <db-dir>".to_string())?;
+    Ok(Command::BuildIndex { db_dir, rule })
+}
+
+/// Pump every outstanding vector-index build to completion, one slice per
+/// call, printing a line per slice.
+///
+/// `rule` narrows the report to one rule; the pump itself always advances every
+/// pending build, because they share one write lock and splitting them would
+/// only mean holding it more often.
+pub fn run_build_index(db_dir: &Path, rule: Option<&str>) -> Result<String, CliError> {
+    let mut db = GraphDb::open(db_dir)?;
+    build_index_on(&mut db, rule)
+}
+
+/// [`run_build_index`] against an already-open handle.
+///
+/// Whether a build is outstanding at all is decided when the rule is created,
+/// so a test that wants one has to hold the handle that created it; opening the
+/// store again would replay `CreateRule` at the production slice size and find
+/// nothing left to do.
+pub fn build_index_on(db: &mut GraphDb<RealFs>, rule: Option<&str>) -> Result<String, CliError> {
+    let mut out = String::new();
+    let interesting = |name: &str| rule.is_none_or(|r| r == name);
+
+    let start = db.builds_in_progress();
+    if !start.iter().any(|b| interesting(&b.rule)) {
+        match rule {
+            Some(r) => out.push_str(&format!(
+                "nothing to build for rule {r:?}
+"
+            )),
+            None => out.push_str(
+                "nothing to build
+",
+            ),
+        }
+        return Ok(out);
+    }
+
+    let mut outstanding = start;
+    loop {
+        let before = outstanding.clone();
+        outstanding = db.pump_index_build()?;
+        for b in &outstanding {
+            if interesting(&b.rule) {
+                out.push_str(&format!(
+                    "building {}: {}/{}
+",
+                    b.rule, b.indexed, b.total
+                ));
+            }
+        }
+        for b in &before {
+            if interesting(&b.rule) && !outstanding.iter().any(|o| o.rule == b.rule) {
+                out.push_str(&format!(
+                    "built {}: {} vectors
+",
+                    b.rule, b.total
+                ));
+            }
+        }
+        if outstanding.is_empty() {
+            return Ok(out);
+        }
+    }
 }
 
 fn parse_schema(args: &[&str]) -> Result<Command, String> {
@@ -3664,6 +3771,42 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_build_index_both_forms_and_a_missing_value() {
+        match parse_args(&["build-index", "/tmp/db"]).unwrap() {
+            Command::BuildIndex { db_dir, rule } => {
+                assert_eq!(db_dir, PathBuf::from("/tmp/db"));
+                assert_eq!(rule, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        for args in [
+            vec!["build-index", "/tmp/db", "--rule", "sim"],
+            vec!["build-index", "/tmp/db", "--rule=sim"],
+        ] {
+            match parse_args(&args).unwrap() {
+                Command::BuildIndex { db_dir, rule } => {
+                    assert_eq!(db_dir, PathBuf::from("/tmp/db"));
+                    assert_eq!(rule.as_deref(), Some("sim"), "{args:?}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(
+            parse_args(&["build-index", "/tmp/db", "--rule"]).unwrap_err(),
+            "--rule requires a value"
+        );
+        assert_eq!(
+            parse_args(&["build-index", "/tmp/db", "--rule="]).unwrap_err(),
+            "--rule requires a value"
+        );
+        assert_eq!(
+            parse_args(&["build-index"]).unwrap_err(),
+            "build-index requires <db-dir>"
+        );
+        assert!(usage().contains("mushroomdb build-index <db-dir> [--rule <name>]"));
     }
 
     #[test]

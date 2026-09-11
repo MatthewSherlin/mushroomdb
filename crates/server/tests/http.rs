@@ -500,6 +500,7 @@ async fn stats_round_trips_serialize() {
             tripped: true,
             fires: 5,
             approximate: false,
+            building: None,
         }],
     };
     let encoded = serde_json::to_value(&live).expect("Stats: Serialize");
@@ -1231,6 +1232,7 @@ fn wire_types_serialize() {
         tripped: false,
         fires: 0,
         approximate: false,
+        building: None,
     })
     .unwrap();
     serde_json::to_value(&IngestReport {
@@ -4897,4 +4899,94 @@ async fn role_token_was_linked_honours_visible_where() {
         v["error"].as_str().is_some_and(|s| s.contains("d2")),
         "404 body must name the hidden key: {v}"
     );
+}
+
+/// `POST /rules` on a corpus that fits in one slice keeps the exact body it has
+/// always returned.
+#[tokio::test]
+async fn create_rule_http_small_corpus_is_unchanged() {
+    let (app, db) = open("rules-slice-small");
+    for i in 0..20 {
+        db.write()
+            .insert_node("V", &format!("v{i}"), vec![("emb".into(), slice_emb(i))])
+            .unwrap();
+    }
+    let (status, body, _) = send(app, json_req("POST", "/rules", slice_rule_json())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&body), json!({"ok": true, "name": "sim"}));
+}
+
+/// Above the slice the route reports the build instead of claiming the rule is
+/// ready, and `GET /stats` says the same thing.
+#[tokio::test]
+async fn create_rule_http_large_corpus_is_accepted_and_building() {
+    let (app, db) = open("rules-slice-large");
+    for i in 0..300 {
+        db.write()
+            .insert_node("V", &format!("v{i}"), vec![("emb".into(), slice_emb(i))])
+            .unwrap();
+    }
+    db.write().set_hnsw_build_batch(Some(64));
+
+    let (status, body, _) = send(app.clone(), json_req("POST", "/rules", slice_rule_json())).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        parse_json(&body),
+        json!({"rule": "sim", "building": {"indexed": 64, "total": 300}})
+    );
+
+    let (status, body, _) = send(app.clone(), get("/stats")).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    let rule = v["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "sim")
+        .expect("the rule is installed while it builds");
+    assert_eq!(rule["edges"], json!(0), "no partial edge set on the wire");
+    assert_eq!(
+        rule["building"],
+        json!({"rule": "sim", "indexed": 64, "total": 300})
+    );
+
+    // Drive it to completion and the field disappears.
+    while !db.write().pump_index_build().unwrap().is_empty() {}
+    let (_, body, _) = send(app, get("/stats")).await;
+    let v = parse_json(&body);
+    let rule = v["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "sim")
+        .unwrap();
+    assert!(
+        rule.get("building").is_none(),
+        "a finished build must not be reported: {rule}"
+    );
+    assert!(rule["edges"].as_u64().unwrap() > 0, "the backfill ran");
+}
+
+/// One tight cluster of ten vectors per axis — see `slice_vec` in
+/// `core-api/tests/rules.rs`.
+fn slice_emb(i: usize) -> Value {
+    const D: usize = 32;
+    let axis = (i / 10) % D;
+    let mut xs = vec![0.0f64; D];
+    xs[axis] = 1.0;
+    xs[(axis + 1) % D] = (i % 10) as f64 * 0.001;
+    Value::List(xs.into_iter().map(Value::Float).collect())
+}
+
+fn slice_rule_json() -> Json {
+    json!({
+        "name": "sim",
+        "src_label": "V",
+        "dst_label": "V",
+        "predicate": {"VectorSimilar": {"field": "emb", "min": 0.9}},
+        "edge_type": "SIM",
+        "weight_prop": null,
+        "max_edges": null,
+        "approximate": true
+    })
 }

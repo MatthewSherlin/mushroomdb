@@ -2,8 +2,9 @@
 
 use cli::{
     format_backup, format_demo, format_stats, format_suggest, install, maybe_run_demo_if_empty,
-    parse_args, read_stats, run_algo, run_asof, run_backup, run_demo, run_export, run_migrate,
-    run_query, run_schema_apply, run_snapshot, run_suggest, run_verify, usage, Command, ServeUi,
+    parse_args, read_stats, run_algo, run_asof, run_backup, run_build_index, run_demo, run_export,
+    run_migrate, run_query, run_schema_apply, run_snapshot, run_suggest, run_verify, usage,
+    Command, ServeUi,
 };
 use core_api::{GraphError, SharedDb};
 use std::collections::HashMap;
@@ -332,6 +333,15 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
+        Ok(Command::BuildIndex { db_dir, rule }) => {
+            match run_build_index(&db_dir, rule.as_deref()) {
+                Ok(out) => {
+                    print!("{out}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e.to_string()),
+            }
+        }
         Ok(Command::SchemaApply {
             db_dir,
             schema_file,
@@ -598,6 +608,48 @@ fn run_serve(
                         Ok(Err(e)) => eprintln!("snapshot-every failed: {e}"),
                         Err(e) => eprintln!("snapshot-every task panicked: {e}"),
                     }
+                }
+            });
+        }
+        // A quiescent server still finishes a vector-index build it was handed:
+        // one slice a second, and the rule's edges appear when it completes.
+        // Cheap when nothing is pending — a map lookup under the write lock.
+        {
+            let db_build = db.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                interval.tick().await; // skip immediate fire
+                let mut last: Vec<(String, u64)> = Vec::new();
+                loop {
+                    interval.tick().await;
+                    let db_build = db_build.clone();
+                    let pumped =
+                        tokio::task::spawn_blocking(move || db_build.write().pump_index_build())
+                            .await;
+                    let now = match pumped {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(GraphError::Busy { .. })) => continue,
+                        Ok(Err(e)) => {
+                            eprintln!("build-index failed: {e}");
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("build-index task panicked: {e}");
+                            continue;
+                        }
+                    };
+                    for (rule, total) in &last {
+                        if !now.iter().any(|b| &b.rule == rule) {
+                            eprintln!("built {rule}: {total} vectors");
+                        }
+                    }
+                    for b in &now {
+                        if last.iter().any(|(r, _)| r == &b.rule) {
+                            eprintln!("building {}: {}/{}", b.rule, b.indexed, b.total);
+                        }
+                    }
+                    last = now.into_iter().map(|b| (b.rule, b.total)).collect();
                 }
             });
         }

@@ -49,6 +49,72 @@ pub fn with_ivf_drift_rebuild<R>(threshold: u64, f: impl FnOnce() -> R) -> R {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Sliced HNSW build (v0.6.6 T2)
+// ---------------------------------------------------------------------------
+
+/// Vectors inserted into one rule's HNSW graph per build slice. `create_rule`
+/// does one slice inline; `pump_index_build` does one slice per pending rule
+/// per call. A corpus at or below this size is built in a single commit and
+/// behaves exactly as it did before 0.6.6.
+pub const HNSW_BUILD_BATCH: usize = 2_048;
+
+thread_local! {
+    static HNSW_BUILD_BATCH_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn hnsw_build_batch() -> usize {
+    HNSW_BUILD_BATCH_OVERRIDE
+        .with(|c| c.get().unwrap_or(HNSW_BUILD_BATCH))
+        .max(1)
+}
+
+/// Run `f` with a temporary build-slice size. Test hook, in the shape of
+/// [`with_ivf_drift_rebuild`]. Restores the previous override (including
+/// across panics).
+///
+/// The override is thread-local, so `f` must do its `create_rule` **and** its
+/// pumping on the calling thread.
+pub fn with_hnsw_build_batch<R>(batch: usize, f: impl FnOnce() -> R) -> R {
+    HNSW_BUILD_BATCH_OVERRIDE.with(|c| {
+        let prev = c.replace(Some(batch));
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
+}
+
+/// What an insert does with the `Hnsw` leg of a candidate spec. Every variant
+/// records `hnsw_tracked` — that set is the fallback candidate list and has to
+/// cover the whole side regardless of who fills the graph.
+enum HnswLeg<'a> {
+    /// Insert the vector into the graph. The ordinary write path.
+    All,
+    /// Skip ids the adopted graph already holds. The open-time scan.
+    Skip(&'a BTreeSet<u32>),
+    /// Leave the graph alone; a build slice supplies the vector later.
+    Defer,
+}
+
+/// Whether `spec` would put at least one vector of `node`'s props into an HNSW
+/// graph — the predicate a sliced build counts with, so that the total it
+/// reports and the progress it makes are decided by the same rule.
+pub fn hnsw_vector_present(spec: &CandidateSpec, get: &dyn Fn(&str) -> Option<Value>) -> bool {
+    match spec {
+        CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) => {
+            specs.iter().any(|s| hnsw_vector_present(s, get))
+        }
+        CandidateSpec::Hnsw { field, .. } => {
+            get(field).as_ref().and_then(as_numeric_list).is_some()
+        }
+        _ => false,
+    }
+}
+
 /// k = ceil(sqrt(n)) clamped to [IVF_K_MIN, IVF_K_MAX].
 pub fn cluster_k(n: usize) -> usize {
     if n == 0 {
@@ -766,7 +832,7 @@ impl SideIndex {
     }
 
     pub fn insert(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
-        self.insert_skipping(spec, node, &BTreeSet::new(), get);
+        self.insert_with(spec, node, &HnswLeg::All, get);
     }
 
     /// `insert`, but skip the HNSW graph for ids in `already` — the open-time
@@ -782,11 +848,71 @@ impl SideIndex {
         already: &BTreeSet<u32>,
         get: &dyn Fn(&str) -> Option<Value>,
     ) {
+        self.insert_with(spec, node, &HnswLeg::Skip(already), get);
+    }
+
+    /// `insert`, but the HNSW graph is left untouched — the sliced-build
+    /// version, where [`SideIndex::insert_hnsw_only`] supplies the vectors a
+    /// slice at a time.
+    ///
+    /// Every other leg of `spec` (by-key buckets, IVF, `ScanAll` metadata) is
+    /// filed exactly as `insert` files it, and `hnsw_tracked` is still
+    /// recorded, so the rule's non-vector state is whole from the moment it is
+    /// created.
+    pub fn insert_deferring_hnsw(
+        &mut self,
+        spec: &CandidateSpec,
+        node: u32,
+        get: &dyn Fn(&str) -> Option<Value>,
+    ) {
+        self.insert_with(spec, node, &HnswLeg::Defer, get);
+    }
+
+    /// Insert `node` into the HNSW graph only, leaving every other leg of
+    /// `spec` alone — the second half of [`SideIndex::insert_deferring_hnsw`].
+    ///
+    /// Returns `true` when a vector actually went into a graph, which is how a
+    /// build slice counts what it has done.
+    pub fn insert_hnsw_only(
+        &mut self,
+        spec: &CandidateSpec,
+        node: u32,
+        get: &dyn Fn(&str) -> Option<Value>,
+    ) -> bool {
+        match spec {
+            CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) => {
+                let mut any = false;
+                for s in specs {
+                    any |= self.insert_hnsw_only(s, node, get);
+                }
+                any
+            }
+            CandidateSpec::Hnsw { field, .. } => {
+                let Some(xs) = get(field).as_ref().and_then(as_numeric_list) else {
+                    return false;
+                };
+                self.hnsw_tracked.insert(node);
+                if let Some(h) = &mut self.hnsw {
+                    h.insert(node, &xs);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn insert_with(
+        &mut self,
+        spec: &CandidateSpec,
+        node: u32,
+        leg: &HnswLeg<'_>,
+        get: &dyn Fn(&str) -> Option<Value>,
+    ) {
         // Union / Intersect: recurse into each child spec. insert() is
         // idempotent for ScanAll metadata (same-value overwrite).
         if let CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) = spec {
             for s in specs {
-                self.insert_skipping(s, node, already, get);
+                self.insert_with(s, node, leg, get);
             }
             return;
         }
@@ -794,8 +920,12 @@ impl SideIndex {
         if let CandidateSpec::Hnsw { field, .. } = spec {
             if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
                 self.hnsw_tracked.insert(node);
-                if already.contains(&node) {
-                    return; // the adopted graph already holds this vector
+                match leg {
+                    // The adopted graph already holds this vector, or the build
+                    // is sliced and a later slice will supply it.
+                    HnswLeg::Skip(already) if already.contains(&node) => return,
+                    HnswLeg::Defer => return,
+                    _ => {}
                 }
                 if let Some(h) = &mut self.hnsw {
                     h.insert(node, &xs);
@@ -1325,6 +1455,15 @@ impl SideIndex {
     /// Borrow the HNSW index, if initialized.
     pub fn hnsw_ref(&self) -> Option<&HnswIndex> {
         self.hnsw.as_ref()
+    }
+
+    /// Remove and return this side's HNSW graph, leaving the side without one.
+    ///
+    /// Lets a caller that is about to reset the whole `SideIndex` carry the
+    /// graph across — the graph is the expensive part and is not always worth
+    /// rebuilding.
+    pub fn take_hnsw(&mut self) -> Option<HnswIndex> {
+        self.hnsw.take()
     }
 }
 

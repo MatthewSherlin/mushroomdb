@@ -9,7 +9,8 @@ pub use def::{
     DEFAULT_KEYMATCH_TOP_K, DEFAULT_SCORED_TOP_K, MAX_KEYMATCH_LIST,
 };
 pub use engine::{
-    EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport, MAX_CHAIN_DEPTH,
+    BuildProgress, EngineEdgeDelta, GraphMut, RuleEngine, RuleIvfExport, SideIvfExport,
+    MAX_CHAIN_DEPTH,
 };
 pub use hnsw::HnswIndex;
 #[doc(hidden)]
@@ -19,7 +20,8 @@ pub use hnsw::{
     hnsw_search_count, hnsw_search_count_reset,
 };
 pub use index::{
-    candidate_spec, with_ivf_drift_rebuild, CandidateSpec, RuleIndex, SideIndex, IVF_DRIFT_REBUILD,
+    candidate_spec, hnsw_vector_present, with_hnsw_build_batch, with_ivf_drift_rebuild,
+    CandidateSpec, RuleIndex, SideIndex, HNSW_BUILD_BATCH, IVF_DRIFT_REBUILD,
 };
 pub use suggest::{
     RuleSuggestion, SuggestConfig, SuggestReport, DEFAULT_SEED as SUGGEST_DEFAULT_SEED,

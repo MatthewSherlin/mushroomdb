@@ -1214,9 +1214,25 @@ async fn create_rule(
     };
     let name = def.name.clone();
     let db = state.db.clone();
-    match blocking_write(move || db.write().create_rule(def)).await {
-        Ok(()) => json_ok(json!({"ok": true, "name": name})),
-        Err(resp) => resp,
+    if let Err(resp) = blocking_write(move || db.write().create_rule(def)).await {
+        return resp;
+    }
+    // A corpus too large to index in one commit leaves the rule installed but
+    // deriving nothing, so the route says "accepted", not "done", and hands
+    // back the progress the caller can poll on `GET /stats`.
+    let building = state
+        .db
+        .read()
+        .builds_in_progress()
+        .into_iter()
+        .find(|b| b.rule == name);
+    match building {
+        Some(b) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"rule": name, "building": {"indexed": b.indexed, "total": b.total}})),
+        )
+            .into_response(),
+        None => json_ok(json!({"ok": true, "name": name})),
     }
 }
 
