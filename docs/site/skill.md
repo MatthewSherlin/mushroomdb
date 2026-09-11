@@ -69,7 +69,7 @@ call, before answering:
 | Anything cross-file — before `Grep` | `explore` with one `target` and one `depth`: `context` (default), `impact` (before you edit), `history`, or `all` |
 | The user states a decision or durable fact | `remember`, and say the `note:` key it returns. A `--delivery cli` install has no such subcommand, so its copy of the skill says to write the note through `query` instead |
 | Commits have landed, or the brief reports an old sync | `sync` |
-| **On a memory store** — entities, no repository | Rows 1–3 do not apply. One named call per question kind (below), copied from the six worked calls the brief printed against the store's own keys |
+| **On a memory store** — entities, no repository | Rows 1–3 do not apply. One named call per question kind (below), copied from the worked calls the brief printed — one per kind — against the store's own keys |
 
 **Row 4 — the memory-store recipes.** One call per question, not a search:
 
@@ -81,6 +81,7 @@ call, before answering:
 | what changes if | `what_if a <field> <value>` — lost and gained, nothing written |
 | who may see | `query` with a `role` from the store's `roles.json` |
 | how many | a counting Cypher over the labels the brief listed |
+| linked by all of | `node_edges a all_of: [T1, T2]` for the partners carrying every named type, or one `MATCH` with comma-separated patterns and `count(DISTINCT …)` — the form the brief renders |
 
 Since when is `node_history` / `edge_history` / `was_linked`; around it is
 `neighborhood` / `node_info`; like it is `find_similar` / `hybrid_search`.

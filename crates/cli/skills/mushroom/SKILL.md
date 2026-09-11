@@ -46,15 +46,15 @@ The first row that matches the turn is what to call, before you answer.
    There is no `remember` subcommand.
 <!-- /cli -->
 3. **Commits have landed, or the brief reports an old sync** → `sync`: commits since the last sync, then files that differ from HEAD. On a code-graph store that is the git `post-commit` hook's job, not a listed tool.
-4. **On a memory store** — entities, no repository — rows 1–3 do not apply. The brief prints six worked calls against your own keys — copy them, do not probe Cypher for the schema.
+4. **On a memory store** — entities, no repository — rows 1–3 do not apply. The brief prints one worked call per question kind against your own keys — copy them, do not probe Cypher for the schema.
 <!-- mcp -->
-   Fifteen tools are listed; the six are one call each: **why** → `explain_association a b`; **relationships** → `node_edges a` (type, rule, score per edge); **as of** → `edges_at a <commit>`; **what if** → `what_if a <field> <value>`; **who may see** → `query` with a `role` from `roles.json`; **how many** → a counting Cypher over the brief's labels. Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `hybrid_search`.
+   Fifteen tools are listed, one call each: **why** → `explain_association a b`; **relationships** → `node_edges a` (type, rule, score); **linked by all of** → `node_edges a all_of: [T, U]`; **as of** → `edges_at a <commit>`; **what if** → `what_if a <field> <value>`; **who may see** → `query` with a `role` from `roles.json`; **how many** → a counting Cypher. Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `hybrid_search`.
 <!-- /mcp -->
 <!-- cli -->
    Those have no subcommand — `explain_association`, `node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked`, `neighborhood` — and none is wired here: `why <a> <b>`, `asof --commit N --query`, `query` (no `role`). The rest need `--delivery mcp`.
 <!-- /cli -->
 
-`explore` composes `context`, `impact` (bare, it reads the current diff) and `owners`; those, `why` (what links two keys, with evidence), `recall`, `map` and the rest stay served — `--all-tools` lists them.
+`explore` composes `context`, `impact` (bare, it reads the diff) and `owners`; those, `why` (what links two keys, with evidence), `recall`, `map` and the rest stay served — `--all-tools` lists them.
 
 ### What runs without you
 
@@ -62,14 +62,14 @@ The first row that matches the turn is what to call, before you answer.
 
 ## Learn
 
-The `learn` pass — `/mushroom learn <path>` — turns prose (docs, ADRs) into `Concept` nodes: ≤ 20 documents a run, ≤ 5 concepts each, one row apiece (`id` `concept:<kebab-case-name>`, `name`, `summary` ≤ 300 characters, `source_files` verified with `query` and sorted, `source_hashes` in that order, `extracted_by`, `extracted_at`), written with `ingest_json`.
+The `learn` pass — `/mushroom learn <path>` — turns prose (docs, ADRs) into `Concept` nodes: ≤ 20 documents a run, ≤ 5 concepts each, one row apiece (`id` `concept:<kebab-case-name>`, `name`, `summary` ≤ 300 chars, `source_files` verified with `query` and sorted, `source_hashes` in that order, `extracted_by`, `extracted_at`), written with `ingest_json`.
 
 The `concept_sources` rule links each concept to its sources with `DESCRIBED_IN`; when a source's hash stops matching the concept is stale and the prompt hook says so. **Re-learn only those.**
 
 ## Advanced
 <!-- mcp -->
 
-`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the fifteen of row 4. All are served either way; `{{BIN}} mcp <db> --all-tools` lists the rest with their schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
+`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the fifteen of row 4. All are served either way; `{{BIN}} mcp <db> --all-tools` lists the rest with schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
 <!-- /mcp -->
 
 Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`{{BIN}} serve '{{DB_PATH}}'`), and `doctor` checks the install.
