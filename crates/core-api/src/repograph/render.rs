@@ -5,7 +5,7 @@
 //! shortening, and — above all — [`sanitize`], which every string that came
 //! out of the graph must pass through before it reaches a rendered line.
 
-use crate::repograph::brief::BriefReport;
+use crate::repograph::brief::{BriefReport, SchemaBrief};
 use crate::repograph::context::{ContextReport, Target};
 use crate::repograph::explore::ExploreReport;
 use crate::repograph::impact::{FileImpact, ImpactReport, Partner};
@@ -418,6 +418,13 @@ pub const EMPTY_BRIEF: &str =
 /// Headings the two listings sit under.
 const BRIEF_FILES_HEADING: &str = "key files (by centrality):\n";
 const BRIEF_SYMBOLS_HEADING: &str = "key symbols (most called):\n";
+/// Headings a memory store's schema sits under.
+const BRIEF_LABELS_HEADING: &str = "labels:\n";
+const BRIEF_EDGE_TYPES_HEADING: &str = "edge types:\n";
+/// The heading over the worked calls. Named for what a reader wants out of
+/// it — one call, not a search — because the failure it exists to stop is a
+/// session probing the store for its schema before asking anything.
+const BRIEF_RECIPES_HEADING: &str = "ask in one call:\n";
 
 /// Render a [`BriefReport`] as the block a session opens with: at most
 /// [`MAX_BRIEF_BYTES`] bytes, byte-identical for the same report.
@@ -444,11 +451,15 @@ const BRIEF_SYMBOLS_HEADING: &str = "key symbols (most called):\n";
 /// a list was cut reads a partial ranking as a complete one.
 #[must_use]
 pub fn render_brief(b: &BriefReport, reach: &str) -> String {
-    if b.files == 0 && b.symbols == 0 && b.edges == 0 {
+    let nodes = b.schema.as_ref().map_or(b.files + b.symbols, |s| s.nodes);
+    if nodes == 0 && b.edges == 0 {
         return EMPTY_BRIEF.to_string();
     }
     let tail = format!("reach the graph: {}\n", sanitize(reach));
     let budget = MAX_BRIEF_BYTES.saturating_sub(tail.len());
+    if let Some(schema) = &b.schema {
+        return render_memory_brief(b, schema, budget) + &tail;
+    }
 
     // The header: what this repository is, how big, and which commit it is at.
     // No age — see [`BriefReport::last_sync`]. A store no repository was
@@ -508,6 +519,136 @@ fn brief_body(header: &str, files: &[String], symbols: &[String], dropped: usize
         let _ = writeln!(out, "  … and {dropped} more");
     }
     out
+}
+
+/// A memory store's brief, above its `reach` line: the schema, then one
+/// worked call per question kind.
+///
+/// The order is the argument. A session that has just been handed the
+/// association surface and an unfamiliar store asks two questions before its
+/// own — *what is in here* and *how do I ask* — and the first association run
+/// showed it answering both by probing Cypher, one guess at a time. So the
+/// labels and the edge types come first, complete enough to write a query
+/// against, and the worked calls come last, where a reader who skimmed the
+/// schema still lands on them.
+///
+/// **The calls never come off.** When the budget is short, entries drop from
+/// the listings above — edge types first, then labels, since a label with no
+/// edge type is still a thing to query and an edge type with no labels is
+/// not — and the cut is counted in the same `… and N more` every other digest
+/// uses. Dropping a recipe instead would save a line and cost the session the
+/// round trip the whole section exists to remove.
+fn render_memory_brief(b: &BriefReport, s: &SchemaBrief, budget: usize) -> String {
+    let header = format!(
+        "{UNTRUSTED_FRAMING}mushroomdb brief — {}\n",
+        [
+            plural(s.nodes, "node"),
+            plural(b.edges, "edge"),
+            plural(s.labels.len(), "label"),
+        ]
+        .join(SEP)
+    );
+
+    let mut labels: Vec<String> = s
+        .labels
+        .iter()
+        .map(|l| {
+            let mut line = format!("  {} ({})", sanitize(&l.label), thousands(l.nodes));
+            if !l.props.is_empty() {
+                let _ = write!(line, " — {}", l.props.join(", "));
+            }
+            if l.hidden_props > 0 {
+                let _ = write!(line, ", … +{}", l.hidden_props);
+            }
+            line.push('\n');
+            line
+        })
+        .collect();
+    let mut edge_types: Vec<String> = s
+        .edge_types
+        .iter()
+        .map(|t| {
+            let mut line = format!("  {} ({})", sanitize(&t.edge_type), thousands(t.edges));
+            if let Some(rule) = &t.rule {
+                let _ = write!(line, " — rule {}", sanitize(rule));
+            }
+            let _ = writeln!(line, " — {} → {}", ends(&t.src), ends(&t.dst));
+            line
+        })
+        .collect();
+
+    // The part that never gives way: how deep the history runs, who may read
+    // it, and the calls.
+    let mut fixed = format!("history: {} commits\n", s.commits);
+    if !s.roles.is_empty() {
+        let roles: Vec<String> = s
+            .roles
+            .iter()
+            .map(|(name, labels)| {
+                if labels.is_empty() {
+                    sanitize(name)
+                } else {
+                    format!("{} ({})", sanitize(name), labels.join(", "))
+                }
+            })
+            .collect();
+        let _ = writeln!(fixed, "roles: {}", roles.join(SEP));
+    }
+    fixed.push_str(BRIEF_RECIPES_HEADING);
+    for r in &s.recipes {
+        let _ = writeln!(fixed, "  {}: {}", sanitize(&r.question), sanitize(&r.call));
+    }
+
+    let mut dropped = 0;
+    loop {
+        let body = memory_body(&header, &labels, &edge_types, &fixed, dropped);
+        if body.len() <= budget || (labels.is_empty() && edge_types.is_empty()) {
+            return body;
+        }
+        if edge_types.pop().is_none() {
+            labels.pop();
+        }
+        dropped += 1;
+    }
+}
+
+/// A memory store's brief above its `reach` line, for one candidate schema.
+fn memory_body(
+    header: &str,
+    labels: &[String],
+    edge_types: &[String],
+    fixed: &str,
+    dropped: usize,
+) -> String {
+    let mut out = String::from(header);
+    if !labels.is_empty() {
+        out.push_str(BRIEF_LABELS_HEADING);
+        out.extend(labels.iter().map(String::as_str));
+    }
+    if !edge_types.is_empty() {
+        out.push_str(BRIEF_EDGE_TYPES_HEADING);
+        out.extend(edge_types.iter().map(String::as_str));
+    }
+    if dropped > 0 {
+        let _ = writeln!(out, "  … and {dropped} more");
+    }
+    out.push_str(fixed);
+    out
+}
+
+/// The labels on one end of an edge type, as one phrase. An edge type seen
+/// between nodes of no known label — every endpoint tombstoned — says `?`
+/// rather than leaving the arrow with nothing on one side.
+fn ends(labels: &[String]) -> String {
+    if labels.is_empty() {
+        "?".to_string()
+    } else {
+        labels
+            .iter()
+            .map(|l| sanitize(l))
+            .collect::<Vec<_>>()
+            .join("|")
+    }
 }
 
 /// What a listing line adds after its key, when the graph had anything to add.

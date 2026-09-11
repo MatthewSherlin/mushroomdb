@@ -53,7 +53,7 @@ pub mod render;
 pub mod rules;
 mod why;
 
-pub use brief::{brief, BriefOptions, BriefReport};
+pub use brief::{brief, BriefOptions, BriefReport, EdgeTypeBrief, LabelBrief, Recipe, SchemaBrief};
 pub use concepts::stale_concepts;
 pub use context::{
     context, context_with, named_symbols, CallSites, ContextOptions, ContextReport, Target,
