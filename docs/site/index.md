@@ -1,6 +1,9 @@
 # mushroomdb
 
-An embedded Rust property-graph database with native incremental linking rules.
+mushroomdb is the data layer for agents that reason over entities. It is an embedded Rust graph
+database in which a relationship is a schema declaration: write a rule once, and every write
+derives, maintains and **retracts** the matching edges, each one carrying the rule, the score and
+the values that produced it.
 
 ---
 
@@ -37,6 +40,15 @@ disk, with no network round-trip and no server to start. The optional `serve`
 command adds an HTTP API and a bundled graph explorer when you want them, and
 several processes can share one store — see [Concurrency](concurrency.md).
 
+`ingest-git` stays supported as a **data source**: commits, pull requests, files and authors become
+entities with rule-derived relationships, which is what makes a ticket↔commit link a rule rather
+than a script.
+
+**Deprecated in 0.6.4:** the code-graph door — the `explore`, `map`, `context`, `impact`, `owners`,
+`why` and `sync` tools, the three grep/edit hooks, and the plugin's coding-assistant positioning. It
+still works and is still tested; it is **removed in 0.7**. See
+[Deprecations](../../README.md#deprecations).
+
 The roadmap and the benchmark numbers are in [README.md](../../README.md). The
 full design spec is at [docs/design.md](../design.md).
 
@@ -62,13 +74,13 @@ Docker, `install.sh`, and the build-from-source path are in
 ## Pages in this section
 
 - [Quickstart](quickstart.md) — two commands to a running graph explorer, two more to a graphed repository
-- [The live code graph](code-graph.md) — what the repository graph guarantees, measured, and what it does not do
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
 - [Codebase graph](ingest-git.md) — `ingest-git`, its rules, submodules, pull requests, incremental sync
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
 - [MCP tools](mcp.md) — the fourteen task tools, the thirteen graph tools, and the listing each store gets
 - [The association benchmark](association-bench.md) — one world in three forms, the twenty questions, and the gate
+- [The live code graph](code-graph.md) — **deprecated in 0.6.4, removed in 0.7**: what the repository graph guarantees, measured
 - [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
 - [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error
