@@ -1537,6 +1537,335 @@ fn explain_association_answers_with_text_and_json_on_request() {
     assert_eq!(report[0]["edge_type"], json!("WORKS_AT"));
 }
 
+/// A store whose talent and company overlap on a list, agree on a field, sit
+/// a known distance apart, and carry a numeric field within tolerance — one
+/// rule per predicate kind, so one `explain_association` call exercises all
+/// four evidence shapes at once.
+fn evidence_store(name: &str) -> SharedDb {
+    let db = open(name);
+    {
+        let mut w = db.write();
+        w.insert_node(
+            "Talent",
+            "t1",
+            vec![
+                ("id".into(), Value::Str("t1".into())),
+                ("industry".into(), Value::Str("Architecture".into())),
+                (
+                    "specialties".into(),
+                    Value::List(vec![
+                        Value::Str("hospitality".into()),
+                        Value::Str("residential".into()),
+                        Value::Str("retail".into()),
+                    ]),
+                ),
+                (
+                    "location".into(),
+                    Value::List(vec![Value::Float(40.7128), Value::Float(-74.006)]),
+                ),
+                ("size_bucket".into(), Value::Int(4)),
+            ],
+        )
+        .unwrap();
+        w.insert_node(
+            "Company",
+            "c1",
+            vec![
+                ("id".into(), Value::Str("c1".into())),
+                ("industry".into(), Value::Str("Architecture".into())),
+                (
+                    "specialties".into(),
+                    Value::List(vec![
+                        Value::Str("commercial".into()),
+                        Value::Str("hospitality".into()),
+                        Value::Str("residential".into()),
+                        Value::Str("single-family".into()),
+                    ]),
+                ),
+                (
+                    "location".into(),
+                    Value::List(vec![Value::Float(40.73061), Value::Float(-73.8)]),
+                ),
+                ("size_bucket".into(), Value::Int(5)),
+            ],
+        )
+        .unwrap();
+        let rule =
+            |name: &str, edge_type: &str, predicate: core_api::Predicate| core_api::RuleDef {
+                name: name.into(),
+                src_label: "Talent".into(),
+                dst_label: "Company".into(),
+                predicate,
+                edge_type: edge_type.into(),
+                weight_prop: None,
+                max_edges: None,
+                approximate: false,
+                via_label: None,
+                via_edge: None,
+                via_dir: None,
+            };
+        w.create_rule(rule(
+            "specialty_match",
+            "SPECIALTY_MATCH",
+            core_api::Predicate::Overlap {
+                field: "specialties".into(),
+                min: 0.2,
+            },
+        ))
+        .unwrap();
+        w.create_rule(rule(
+            "industry_alignment",
+            "INDUSTRY_ALIGNMENT",
+            core_api::Predicate::FieldEqual {
+                field: "industry".into(),
+            },
+        ))
+        .unwrap();
+        w.create_rule(rule(
+            "location_fit",
+            "LOCATION_FIT",
+            core_api::Predicate::GeoRadius {
+                field: "location".into(),
+                km: 50.0,
+            },
+        ))
+        .unwrap();
+        w.create_rule(rule(
+            "size_fit",
+            "SIZE_FIT",
+            core_api::Predicate::NumericWithin {
+                field: "size_bucket".into(),
+                tolerance: 2.0,
+            },
+        ))
+        .unwrap();
+    }
+    db
+}
+
+/// Binding: every explained edge names the values the two nodes actually
+/// share, not just the rule and the threshold.
+///
+/// This is the whole point of the tool. Without these values the agent that
+/// asked "which specialties do they have in common" calls `node_info` on both
+/// nodes and reads out every specialty either one holds — `retail` and
+/// `commercial` and `single-family` included, none of which is shared.
+#[test]
+fn explain_association_names_the_values_the_two_share() {
+    let db = evidence_store("explain-evidence");
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "explain_association",
+        json!({"a": "t1", "b": "c1"}),
+    ));
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[0], "mushroomdb explain — t1 ↔ c1: 4 relationship(s)",
+        "{text}"
+    );
+    // Edges are listed by edge type, the order `explain` returns them in.
+    assert_eq!(
+        lines[1],
+        "  INDUSTRY_ALIGNMENT via rule industry_alignment (score 1.00) — field_equal on industry \
+         [industry: Architecture]",
+        "{text}"
+    );
+    assert_eq!(
+        lines[2],
+        "  LOCATION_FIT via rule location_fit (score 0.65) — geo_radius on location within 50 km \
+         [location: 40.7128,-74.0060 vs 40.7306,-73.8000, 17.47 km apart]",
+        "{text}"
+    );
+    assert_eq!(
+        lines[3],
+        "  SIZE_FIT via rule size_fit (score 0.50) — numeric_within on size_bucket +/- 2 \
+         [size_bucket: 4 vs 5]",
+        "{text}"
+    );
+    assert_eq!(
+        lines[4],
+        "  SPECIALTY_MATCH via rule specialty_match (score 0.40) — overlap on specialties >= 0.2 \
+         [specialties: hospitality, residential]",
+        "{text}"
+    );
+
+    // The forbidden half of the answer: a value only one of the two holds
+    // must never appear in the reply.
+    for unshared in ["retail", "commercial", "single-family"] {
+        assert!(
+            !text.contains(unshared),
+            "`{unshared}` is held by one node only and must not be named: {text}"
+        );
+    }
+
+    // A why reply stays a screen, not a dump.
+    assert!(
+        text.len() < 600,
+        "a four-relationship reply must stay compact, was {} bytes: {text}",
+        text.len()
+    );
+}
+
+/// Binding: the `json: true` shape gains an `evidence` object per
+/// relationship, one shape per predicate kind.
+#[test]
+fn explain_association_report_carries_an_evidence_object_per_relationship() {
+    let db = evidence_store("explain-evidence-json");
+    let report = task_report(db, "explain_association", json!({"a": "t1", "b": "c1"}));
+    let rows = report.as_array().expect("array");
+    assert_eq!(rows.len(), 4, "{report}");
+    let by_type = |t: &str| {
+        rows.iter()
+            .find(|r| r["edge_type"] == json!(t))
+            .unwrap_or_else(|| panic!("no {t} edge: {report}"))["evidence"]
+            .clone()
+    };
+    assert_eq!(
+        by_type("SPECIALTY_MATCH"),
+        json!({"field": "specialties", "shared": ["hospitality", "residential"]})
+    );
+    assert_eq!(
+        by_type("INDUSTRY_ALIGNMENT"),
+        json!({"field": "industry", "value": "Architecture"})
+    );
+    assert_eq!(
+        by_type("LOCATION_FIT"),
+        json!({
+            "field": "location",
+            "a": "40.7128,-74.0060",
+            "b": "40.7306,-73.8000",
+            "km": 17.47
+        })
+    );
+    assert_eq!(
+        by_type("SIZE_FIT"),
+        json!({"field": "size_bucket", "a": 4, "b": 5})
+    );
+    // Nothing else about the report moved.
+    assert_eq!(
+        by_type_field(rows, "SPECIALTY_MATCH", "rule"),
+        json!("specialty_match")
+    );
+    assert_eq!(
+        by_type_field(rows, "SPECIALTY_MATCH", "src_key"),
+        json!("t1")
+    );
+    assert_eq!(
+        by_type_field(rows, "SPECIALTY_MATCH", "dst_key"),
+        json!("c1")
+    );
+}
+
+fn by_type_field(rows: &[Js], edge_type: &str, field: &str) -> Js {
+    rows.iter()
+        .find(|r| r["edge_type"] == json!(edge_type))
+        .expect("edge")[field]
+        .clone()
+}
+
+/// Binding: a composed predicate reports one clause of evidence per branch
+/// that matched, on the one line.
+#[test]
+fn composed_predicate_evidence_lists_every_branch() {
+    let db = open("explain-evidence-all");
+    {
+        let mut w = db.write();
+        w.insert_node(
+            "Talent",
+            "t1",
+            vec![
+                ("id".into(), Value::Str("t1".into())),
+                ("industry".into(), Value::Str("Architecture".into())),
+                (
+                    "specialties".into(),
+                    Value::List(vec![
+                        Value::Str("hospitality".into()),
+                        Value::Str("retail".into()),
+                    ]),
+                ),
+            ],
+        )
+        .unwrap();
+        w.insert_node(
+            "Company",
+            "c1",
+            vec![
+                ("id".into(), Value::Str("c1".into())),
+                ("industry".into(), Value::Str("Architecture".into())),
+                (
+                    "specialties".into(),
+                    Value::List(vec![
+                        Value::Str("civic".into()),
+                        Value::Str("hospitality".into()),
+                    ]),
+                ),
+            ],
+        )
+        .unwrap();
+        w.create_rule(core_api::RuleDef {
+            name: "fit".into(),
+            src_label: "Talent".into(),
+            dst_label: "Company".into(),
+            predicate: core_api::Predicate::All(vec![
+                core_api::Predicate::FieldEqual {
+                    field: "industry".into(),
+                },
+                core_api::Predicate::Overlap {
+                    field: "specialties".into(),
+                    min: 0.2,
+                },
+            ]),
+            edge_type: "FIT".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })
+        .unwrap();
+    }
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "explain_association",
+        json!({"a": "t1", "b": "c1"}),
+    ));
+    assert!(
+        text.contains("[industry: Architecture; specialties: hospitality]"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("retail") && !text.contains("civic"),
+        "{text}"
+    );
+
+    let report = task_report(db, "explain_association", json!({"a": "t1", "b": "c1"}));
+    assert_eq!(
+        report[0]["evidence"],
+        json!({"parts": [
+            {"field": "industry", "value": "Architecture"},
+            {"field": "specialties", "shared": ["hospitality"]}
+        ]})
+    );
+}
+
+/// Binding: a key-match rule's shared value is the destination's own key.
+#[test]
+fn key_match_evidence_names_the_destination_key() {
+    let db = association_store("explain-evidence-keymatch");
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "explain_association",
+        json!({"a": "p1", "b": "acme"}),
+    ));
+    assert!(text.contains("[org_id: acme]"), "{text}");
+    let report = task_report(db, "explain_association", json!({"a": "p1", "b": "acme"}));
+    assert_eq!(
+        report[0]["evidence"],
+        json!({"field": "org_id", "value": "acme"})
+    );
+}
+
 /// Binding: two keys the graph holds with no rule edge between them are an
 /// answer, not a failure.
 #[test]

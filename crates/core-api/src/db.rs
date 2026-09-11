@@ -665,6 +665,10 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
                 operand_node_vars(d, out);
             }
         }
+        Operand::Index { base, index } => {
+            operand_node_vars(base, out);
+            operand_node_vars(index, out);
+        }
         Operand::Lit(_) | Operand::Param(_) => {}
     }
 }
@@ -747,6 +751,7 @@ fn ret_column_name(item: &RetItem) -> String {
                     Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                     Operand::BinArith { .. } => "<arith>".to_string(),
                     Operand::Case { .. } => "<case>".to_string(),
+                    Operand::Index { .. } => "<index>".to_string(),
                 })
                 .collect();
             format!("{name}({})", arg_strs.join(", "))
@@ -797,6 +802,13 @@ fn eval_set_return_operand<F: Fs>(
         Operand::Case { .. } => Err(GraphError::QueryError {
             detail: "CASE is not supported in a write-statement RETURN projection; \
                      use a read query"
+                .into(),
+        }),
+        // Same as CASE: a list subscript is supported in a read-query RETURN
+        // but not yet in a write-statement RETURN projection.
+        Operand::Index { .. } => Err(GraphError::QueryError {
+            detail: "a list subscript is not supported in a write-statement RETURN \
+                     projection; use a read query"
                 .into(),
         }),
     }

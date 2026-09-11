@@ -1212,6 +1212,10 @@ fn check_operand_bound(
             check_operand_bound(left, bound, clause)?;
             check_operand_bound(right, bound, clause)
         }
+        Operand::Index { base, index } => {
+            check_operand_bound(base, bound, clause)?;
+            check_operand_bound(index, bound, clause)
+        }
         Operand::FuncCall { args, .. } => {
             for arg in args {
                 check_operand_bound(arg, bound, clause)?;
@@ -1272,15 +1276,7 @@ fn check_return_bound(
             RetVal::Prop { var, .. } => {
                 require_bound(var, bound, "RETURN")?;
             }
-            RetVal::Agg { arg, .. } => match arg {
-                AggArg::Star => {}
-                AggArg::Var(v) => {
-                    require_bound(v, bound, "RETURN")?;
-                }
-                AggArg::Prop { var, .. } => {
-                    require_bound(var, bound, "RETURN")?;
-                }
-            },
+            RetVal::Agg { arg, .. } => check_agg_arg_bound(arg, bound)?,
             RetVal::FuncCall { args, .. } => {
                 for arg in args {
                     check_operand_bound(arg, bound, "RETURN")?;
@@ -1338,6 +1334,7 @@ fn column_name(item: &RetItem) -> String {
                     Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                     Operand::BinArith { .. } => "<arith>".to_string(),
                     Operand::Case { .. } => "<case>".to_string(),
+                    Operand::Index { .. } => "<index>".to_string(),
                 })
                 .collect();
             format!("{name}({})", arg_strs.join(", "))
@@ -1346,16 +1343,31 @@ fn column_name(item: &RetItem) -> String {
     }
 }
 
+/// Every variable an aggregate argument reads must be bound, through any
+/// `DISTINCT` wrapper.
+fn check_agg_arg_bound(arg: &AggArg, bound: &BTreeSet<String>) -> Result<(), String> {
+    match arg {
+        AggArg::Star => Ok(()),
+        AggArg::Var(v) => require_bound(v, bound, "RETURN"),
+        AggArg::Prop { var, .. } => require_bound(var, bound, "RETURN"),
+        AggArg::Distinct(inner) => check_agg_arg_bound(inner, bound),
+    }
+}
+
 /// Canonical string for an aggregate without an alias, e.g. `COUNT(*)`,
-/// `SUM(n.age)`.
+/// `SUM(n.age)`, `COUNT(DISTINCT t)`.
 fn agg_column_name(func: &AggFunc, arg: &AggArg) -> String {
     let f = func_name(func);
-    let a = match arg {
+    format!("{f}({})", agg_arg_name(arg))
+}
+
+fn agg_arg_name(arg: &AggArg) -> String {
+    match arg {
         AggArg::Star => "*".to_string(),
         AggArg::Var(v) => v.clone(),
         AggArg::Prop { var, field } => format!("{var}.{field}"),
-    };
-    format!("{f}({a})")
+        AggArg::Distinct(inner) => format!("DISTINCT {}", agg_arg_name(inner)),
+    }
 }
 
 fn func_name(func: &AggFunc) -> &'static str {

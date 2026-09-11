@@ -73,7 +73,9 @@ use core_api::repograph::{
     self, ContextOptions, ImpactOptions, MapOptions, RememberInput, DEFAULT_EXCLUDES,
     MAX_OUTPUT_BYTES, NOTE_KINDS, UNTRUSTED_FRAMING,
 };
-use core_api::{json_to_value, Dir, Explanation, GraphError, PredicateSummary, SharedDb};
+use core_api::{
+    json_to_value, Dir, Explanation, GraphError, NodeInfo, PredicateSummary, SharedDb, Value,
+};
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -587,14 +589,280 @@ fn tool_explain_association(db: &SharedDb, args: &Js, json_out: bool) -> CallOut
     // looks at a single edge, and that is the engine's answer to give.
     let report = {
         let g = db.read();
-        match g.explain(&a, &b) {
+        let found = match g.explain(&a, &b) {
             Ok(v) => v,
             Err(e) => return CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
-        }
+        };
+        // The matched values are read here, under the same read guard the
+        // edges came from, so the evidence cannot describe a graph that has
+        // since moved.
+        found
+            .into_iter()
+            .map(|e| {
+                // A via-hop rule evaluates its predicate between the *via*
+                // node and the destination, not between the two keys the
+                // caller asked about, so there is no pair of nodes here whose
+                // values would be the evidence — the line still names the hop.
+                let evidence = if e.via_edge.is_some() {
+                    None
+                } else {
+                    match (g.node_info(&e.src_key), g.node_info(&e.dst_key)) {
+                        (Some(src), Some(dst)) => {
+                            predicate_evidence(&e.predicate, &src, &dst, e.weight)
+                        }
+                        _ => None,
+                    }
+                };
+                ExplainedEdge { edge: e, evidence }
+            })
+            .collect::<Vec<_>>()
     };
     ok(json_out, &report, |found| {
         render_explanations(&a, &b, found)
     })
+}
+
+/// One explained edge, with the values that made the predicate true.
+///
+/// The `Explanation` fields are flattened, so `json: true` hands back the
+/// array it always did with one `evidence` object added per relationship.
+#[derive(serde::Serialize)]
+struct ExplainedEdge {
+    #[serde(flatten)]
+    edge: Explanation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<Evidence>,
+}
+
+/// What the two nodes actually had in common, per predicate kind.
+///
+/// Naming the rule and the threshold was never the answer to "why are these
+/// two related" — the shared values are. Without them an assistant fetches
+/// both nodes' raw property lists and reads them out, which names every
+/// value either node holds rather than the ones they share.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum Evidence {
+    /// `overlap` — the intersection of the two lists, sorted.
+    Shared { field: String, shared: Vec<Js> },
+    /// `field_equal` / `key_match` — the one value both carry.
+    Value { field: String, value: Js },
+    /// `geo_radius` — both points and the distance between them.
+    Geo {
+        field: String,
+        a: Js,
+        b: Js,
+        km: f64,
+    },
+    /// `numeric_within` / `vector_similar` — the two sides. For
+    /// `vector_similar` the vectors themselves are useless to read, so `a`
+    /// and `b` are omitted and only the score stands.
+    Pair {
+        field: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        a: Option<Js>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        b: Option<Js>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        similarity: Option<f64>,
+    },
+    /// `all` / `any` — one entry per branch that contributed.
+    Parts { parts: Vec<Evidence> },
+}
+
+/// Mean Earth radius, as the rules engine uses for `geo_radius`.
+const EARTH_RADIUS_KM: f64 = 6371.0088;
+
+/// Evidence for one predicate, recursing through `all` / `any`.
+///
+/// `score` is the edge's weight and is passed only at the top level: `all`
+/// takes the minimum of its branches and `any` the maximum, so a branch's own
+/// score is not recoverable from the edge and a nested `vector_similar` has
+/// no similarity to report.
+fn predicate_evidence(
+    p: &PredicateSummary,
+    src: &NodeInfo,
+    dst: &NodeInfo,
+    score: Option<f64>,
+) -> Option<Evidence> {
+    if let Some(parts) = &p.parts {
+        let parts: Vec<Evidence> = parts
+            .iter()
+            .filter_map(|q| predicate_evidence(q, src, dst, None))
+            .collect();
+        return (!parts.is_empty()).then_some(Evidence::Parts { parts });
+    }
+    let field = p.fields.first()?.clone();
+    match p.kind.as_str() {
+        "overlap" => {
+            let (Some(Value::List(a)), Some(Value::List(b))) =
+                (src.props.get(&field), dst.props.get(&field))
+            else {
+                return None;
+            };
+            // Compared as the rules engine compares them: only a scalar
+            // element is a token, and its type is part of its identity, so a
+            // `1` and a `1.0` in two lists are not an overlap.
+            let right: BTreeSet<(u8, String)> = b.iter().filter_map(scalar_token).collect();
+            let mut shared: Vec<String> = a
+                .iter()
+                .filter_map(scalar_token)
+                .filter(|t| right.contains(t))
+                .map(|(_, text)| text)
+                .collect();
+            shared.sort();
+            shared.dedup();
+            (!shared.is_empty()).then(|| Evidence::Shared {
+                field,
+                shared: shared.into_iter().map(Js::String).collect(),
+            })
+        }
+        "field_equal" => {
+            let v = src.props.get(&field)?;
+            (dst.props.get(&field) == Some(v)).then(|| Evidence::Value {
+                field,
+                value: crate::json::value_to_json(v),
+            })
+        }
+        // A key-match rule reads a foreign key off the source; the value they
+        // share is the destination's own key.
+        "key_match" => Some(Evidence::Value {
+            field,
+            value: Js::String(dst.key.clone()),
+        }),
+        "numeric_within" => {
+            let (a, b) = (src.props.get(&field)?, dst.props.get(&field)?);
+            Some(Evidence::Pair {
+                field,
+                a: Some(crate::json::value_to_json(a)),
+                b: Some(crate::json::value_to_json(b)),
+                similarity: None,
+            })
+        }
+        "geo_radius" => {
+            let (alat, alon) = lat_lon(src.props.get(&field)?)?;
+            let (blat, blon) = lat_lon(dst.props.get(&field)?)?;
+            Some(Evidence::Geo {
+                field,
+                a: Js::String(format_lat_lon(alat, alon)),
+                b: Js::String(format_lat_lon(blat, blon)),
+                km: round2(haversine_km(alat, alon, blat, blon)),
+            })
+        }
+        // The two vectors say nothing a reader can use; the cosine the rule
+        // scored does, and that is the edge's weight.
+        "vector_similar" => score.map(|sim| Evidence::Pair {
+            field,
+            a: None,
+            b: None,
+            similarity: Some(sim),
+        }),
+        _ => None,
+    }
+}
+
+/// The comparable token of one list element, as `(type tag, text)`.
+///
+/// Mirrors `ValueKey::from_value`: a nested list or map is not a token and
+/// cannot overlap, and two tokens of different types never match however
+/// alike they read.
+fn scalar_token(v: &Value) -> Option<(u8, String)> {
+    match v {
+        Value::Str(s) => Some((0, s.clone())),
+        Value::Int(i) => Some((1, i.to_string())),
+        Value::Float(f) => Some((2, format!("{f}"))),
+        Value::Bool(b) => Some((3, b.to_string())),
+        Value::List(_) | Value::Map(_) => None,
+    }
+}
+
+/// A `[lat, lon]` pair, as `geo_radius` reads it.
+fn lat_lon(v: &Value) -> Option<(f64, f64)> {
+    let Value::List(items) = v else {
+        return None;
+    };
+    if items.len() != 2 {
+        return None;
+    }
+    let num = |x: &Value| match x {
+        Value::Int(i) => Some(*i as f64),
+        Value::Float(f) if f.is_finite() => Some(*f),
+        _ => None,
+    };
+    Some((num(&items[0])?, num(&items[1])?))
+}
+
+fn format_lat_lon(lat: f64, lon: f64) -> String {
+    format!("{:.4},{:.4}", lat, lon)
+}
+
+fn round2(km: f64) -> f64 {
+    (km * 100.0).round() / 100.0
+}
+
+/// Great-circle distance in km — the same formula `geo_radius` scores with,
+/// so the printed distance and the edge's score agree.
+fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let phi1 = lat1.to_radians();
+    let phi2 = lat2.to_radians();
+    let dphi = (lat2 - lat1).to_radians();
+    let dlam = (lon2 - lon1).to_radians();
+    let a = ((dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlam / 2.0).sin().powi(2))
+        .clamp(0.0, 1.0);
+    EARTH_RADIUS_KM * 2.0 * a.sqrt().atan2((1.0 - a).sqrt())
+}
+
+/// One evidence clause, rendered for the digest line.
+fn evidence_summary(e: &Evidence) -> String {
+    match e {
+        Evidence::Shared { field, shared } => {
+            let vals: Vec<String> = shared.iter().map(json_scalar_text).collect();
+            format!("{}: {}", repograph::sanitize(field), vals.join(", "))
+        }
+        Evidence::Value { field, value } => format!(
+            "{}: {}",
+            repograph::sanitize(field),
+            json_scalar_text(value)
+        ),
+        Evidence::Geo { field, a, b, km } => format!(
+            "{}: {} vs {}, {km} km apart",
+            repograph::sanitize(field),
+            json_scalar_text(a),
+            json_scalar_text(b)
+        ),
+        Evidence::Pair {
+            field,
+            a: Some(a),
+            b: Some(b),
+            ..
+        } => format!(
+            "{}: {} vs {}",
+            repograph::sanitize(field),
+            json_scalar_text(a),
+            json_scalar_text(b)
+        ),
+        Evidence::Pair {
+            field,
+            similarity: Some(sim),
+            ..
+        } => format!("{}: similarity {sim:.2}", repograph::sanitize(field)),
+        Evidence::Pair { field, .. } => repograph::sanitize(field),
+        Evidence::Parts { parts } => parts
+            .iter()
+            .map(evidence_summary)
+            .collect::<Vec<_>>()
+            .join("; "),
+    }
+}
+
+/// A JSON scalar as the digest prints it: a string without its quotes,
+/// anything else as-is. Property values are graph content, so every string
+/// goes through [`repograph::sanitize`].
+fn json_scalar_text(v: &Js) -> String {
+    match v {
+        Js::String(s) => repograph::sanitize(s),
+        other => other.to_string(),
+    }
 }
 
 /// One header, then one line per rule-derived edge, capped like every other
@@ -603,7 +871,7 @@ fn tool_explain_association(db: &SharedDb, args: &Js, json_out: bool) -> CallOut
 /// Rule names, edge types and predicate fields are all graph content — a rule
 /// is named by whoever created it — so each goes through
 /// [`repograph::sanitize`] before it reaches a line-structured digest.
-fn render_explanations(a: &str, b: &str, found: &[Explanation]) -> String {
+fn render_explanations(a: &str, b: &str, found: &[ExplainedEdge]) -> String {
     let mut out = format!(
         "mushroomdb explain — {} ↔ {}: {} relationship(s)\n",
         repograph::sanitize(a),
@@ -614,7 +882,7 @@ fn render_explanations(a: &str, b: &str, found: &[Explanation]) -> String {
         out.push_str("  none\n");
         return out;
     }
-    for e in found {
+    for ExplainedEdge { edge: e, evidence } in found {
         out.push_str(&format!(
             "  {} via rule {}",
             repograph::sanitize(&e.edge_type),
@@ -626,7 +894,15 @@ fn render_explanations(a: &str, b: &str, found: &[Explanation]) -> String {
         if let Some(via) = &e.via_edge {
             out.push_str(&format!(" via {}", repograph::sanitize(via)));
         }
-        out.push_str(&format!(" — {}\n", predicate_summary(&e.predicate)));
+        out.push_str(&format!(" — {}", predicate_summary(&e.predicate)));
+        // The matched values, in brackets, after the threshold that admitted
+        // them: "overlap on specialties >= 0.2 [specialties: hospitality,
+        // residential]". This is the line that stops an assistant fetching
+        // both nodes' raw lists and reading out everything either one holds.
+        if let Some(ev) = evidence {
+            out.push_str(&format!(" [{}]", evidence_summary(ev)));
+        }
+        out.push('\n');
     }
     repograph::cap_lines(&out, repograph::MAX_TOOL_LINES)
 }
@@ -1630,7 +1906,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "explain_association",
-            "description": "Why are A and B related — every relationship between the two keys and its evidence: the rule that derived it, its edge type, the match score, and the predicate it matched on. Both keys must already exist.",
+            "description": "Why are A and B related — every relationship between the two keys and its evidence: the rule that derived it, its edge type, the match score, the predicate it matched on, and the values the two actually share (which specialties overlapped, which field was equal, how far apart they are). Answer from those shared values; the nodes' full property lists name everything either one holds, not what they have in common. Both keys must already exist.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2004,22 +2280,27 @@ mod tests {
     /// produces.
     #[test]
     fn an_explanation_line_names_the_score_the_hop_and_the_predicate() {
-        let one = |rule: &str, via: Option<&str>| Explanation {
-            rule: rule.to_string(),
-            edge_type: "SIMILAR".to_string(),
-            src_key: "a".to_string(),
-            dst_key: "b".to_string(),
-            weight: Some(0.9625),
-            predicate: PredicateSummary {
-                kind: "vector_similar".to_string(),
-                fields: vec!["emb".to_string()],
-                min: Some(0.85),
-                tolerance: None,
-                km: None,
-                parts: None,
-                approximate: false,
+        let one = |rule: &str, via: Option<&str>| ExplainedEdge {
+            edge: Explanation {
+                rule: rule.to_string(),
+                edge_type: "SIMILAR".to_string(),
+                src_key: "a".to_string(),
+                dst_key: "b".to_string(),
+                weight: Some(0.9625),
+                predicate: PredicateSummary {
+                    kind: "vector_similar".to_string(),
+                    fields: vec!["emb".to_string()],
+                    min: Some(0.85),
+                    tolerance: None,
+                    km: None,
+                    parts: None,
+                    approximate: false,
+                },
+                via_edge: via.map(str::to_string),
             },
-            via_edge: via.map(str::to_string),
+            // A via-hop rule matched between the via node and the
+            // destination, so there is no pair here to show evidence from.
+            evidence: None,
         };
 
         let text = render_explanations("a", "b", &[one("close", Some("WORKS_AT"))]);
@@ -2029,7 +2310,7 @@ mod tests {
              via WORKS_AT — vector_similar on emb >= 0.85\n"
         );
 
-        let many: Vec<Explanation> = (0..40).map(|i| one(&format!("r{i}"), None)).collect();
+        let many: Vec<ExplainedEdge> = (0..40).map(|i| one(&format!("r{i}"), None)).collect();
         let capped = render_explanations("a", "b", &many);
         assert_eq!(
             capped.lines().count(),
