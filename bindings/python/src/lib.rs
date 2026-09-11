@@ -1,6 +1,6 @@
 use core_api::{
-    default_max_edges, Direction, Explanation, GraphDb as CoreDb, GraphError, HistoryChange,
-    HistoryEntry, NodeInfo, NodeMask, PredicateSummary, ResultSet, RuleDef, Value,
+    default_max_edges, Direction, EdgeAt, Explanation, GraphDb as CoreDb, GraphError,
+    HistoryChange, HistoryEntry, NodeInfo, NodeMask, PredicateSummary, ResultSet, RuleDef, Value,
 };
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -627,6 +627,65 @@ impl GraphDb {
         Ok(out.unbind())
     }
 
+    /// Every edge incident on `key` at WAL commit `commit`, from one WAL scan.
+    ///
+    /// The bulk form of `was_linked`: one call answers "what did this node's
+    /// relationships look like then", instead of one `edge_history` per
+    /// candidate partner.
+    ///
+    /// Returns a list of `{edge_type, src, dst, derived, rule}` dicts sorted by
+    /// `(edge_type, src, dst)`; `rule` is the deriving rule's name for a
+    /// rule-owned edge and `None` for a manually written one. Endpoint keys are
+    /// reported under the name each node carries today.
+    ///
+    /// `commit` outside `[0, wal_total_commits())` raises `RuntimeError`. An
+    /// unknown key is not an error — it simply had no edges.
+    #[pyo3(text_signature = "($self, key, commit)")]
+    fn edges_at(&self, py: Python<'_>, key: &str, commit: u64) -> PyResult<Vec<Py<PyDict>>> {
+        let edges = self.with_ref(|db| db.edges_at(key, commit))?;
+        edges.iter().map(|e| edge_at_to_py(py, e)).collect()
+    }
+
+    /// The derived edges that would be retracted and derived if `key.field`
+    /// were set to `value` — nothing is written and the store is unchanged.
+    ///
+    /// Returns `{"lost": [...], "gained": [...]}` where each entry has the same
+    /// shape as `edges_at` (`{edge_type, src, dst, derived, rule}`). A change
+    /// with no effect returns two empty lists.
+    ///
+    /// Raises `RuntimeError` for an unknown key or a view-owned field. `value`
+    /// must not be `None`.
+    #[pyo3(text_signature = "($self, key, field, value)")]
+    fn what_if_set_prop(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        field: &str,
+        value: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyDict>> {
+        if value.is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "what_if_set_prop value must not be None",
+            ));
+        }
+        let v = py_to_value(&value)?;
+        let wi = self.with_ref(|db| db.what_if_set_prop(key, field, v))?;
+        let lost = wi
+            .lost
+            .iter()
+            .map(|e| edge_at_to_py(py, e))
+            .collect::<PyResult<Vec<Py<PyDict>>>>()?;
+        let gained = wi
+            .gained
+            .iter()
+            .map(|e| edge_at_to_py(py, e))
+            .collect::<PyResult<Vec<Py<PyDict>>>>()?;
+        let out = PyDict::new(py);
+        out.set_item("lost", lost)?;
+        out.set_item("gained", gained)?;
+        Ok(out.unbind())
+    }
+
     /// Atomically ingest `nodes` (each `{key, label, props}`) and optional
     /// `edges` (each `{edge_type, src, dst}`) in a single WAL commit.
     ///
@@ -1204,6 +1263,19 @@ fn node_info_to_py(py: Python<'_>, info: &NodeInfo) -> PyResult<Py<PyDict>> {
     d.set_item("key", &info.key)?;
     d.set_item("label", &info.label)?;
     d.set_item("props", props)?;
+    Ok(d.unbind())
+}
+
+/// `{edge_type, src, dst, derived, rule}` — the shape `edges_at` and
+/// `what_if_set_prop` return. `src`/`dst` (not `src_key`/`dst_key`) so a row
+/// reads the same way as an `ingest_json` edge.
+fn edge_at_to_py(py: Python<'_>, e: &EdgeAt) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("edge_type", &e.edge_type)?;
+    d.set_item("src", &e.src_key)?;
+    d.set_item("dst", &e.dst_key)?;
+    d.set_item("derived", e.derived)?;
+    d.set_item("rule", e.rule.as_deref())?;
     Ok(d.unbind())
 }
 

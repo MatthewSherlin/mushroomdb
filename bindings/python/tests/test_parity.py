@@ -481,6 +481,8 @@ _DOCUMENTED = [
     "wal_total_commits",
     "edge_history",
     "was_linked",
+    "edges_at",
+    "what_if_set_prop",
     "enable_index",
     "disable_index",
     "is_index_enabled",
