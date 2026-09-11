@@ -95,6 +95,9 @@ fn base_opts() -> InstallOpts {
         prewarm: false,
         delivery: Delivery::Both,
         intercept_grep: false,
+        impact_before_edit: false,
+        enrich_grep: false,
+        always_load: false,
     }
 }
 
@@ -3235,9 +3238,22 @@ fn reinstalling_as_cli_removes_the_server_the_earlier_install_registered() {
 // Test: --intercept-grep adds a fourth hook, and nothing else does
 // ---------------------------------------------------------------------------
 
-/// The experiment is opt-in, so the default install must leave `PreToolUse`
-/// entirely absent — not present and empty, which would still be a hook array
-/// the user did not ask for.
+/// Every hook group under `event` whose `matcher` is exactly `matcher`.
+fn groups_matching<'a>(
+    s: &'a serde_json::Value,
+    event: &str,
+    matcher: &str,
+) -> Vec<&'a serde_json::Value> {
+    s["hooks"][event]
+        .as_array()
+        .map(|gs| gs.iter().filter(|g| g["matcher"] == matcher).collect())
+        .unwrap_or_default()
+}
+
+/// All three experiments are opt-in, so the default install must leave
+/// `PreToolUse` entirely absent — not present and empty, which would still be
+/// a hook array the user did not ask for — and must add no `Grep`-matched
+/// `PostToolUse` group beside the `touch` one it always writes.
 #[test]
 fn default_install_writes_no_pretooluse_hook() {
     let root = temp_dir("no-intercept");
@@ -3258,7 +3274,18 @@ fn default_install_writes_no_pretooluse_hook() {
     let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
     assert!(
         s["hooks"].get("PreToolUse").is_none(),
-        "an install nobody asked for the redirect wrote one: {s}"
+        "an install nobody asked for the redirect or the impact hook wrote one: {s}"
+    );
+    // `touch` is a PostToolUse hook on the editing tools and must survive; the
+    // grep enrichment would be a second group, matched to `Grep`.
+    assert_eq!(
+        groups_matching(&s, "PostToolUse", "Edit|Write|MultiEdit").len(),
+        1,
+        "the touch hook is not the only editing-tool PostToolUse group: {s}"
+    );
+    assert!(
+        groups_matching(&s, "PostToolUse", "Grep").is_empty(),
+        "an install nobody asked for the enrichment wrote one: {s}"
     );
     let manifest: serde_json::Value = serde_json::from_str(&read(
         &root,
@@ -3266,6 +3293,15 @@ fn default_install_writes_no_pretooluse_hook() {
     ))
     .unwrap();
     assert_eq!(manifest["intercept_grep"], false, "{manifest}");
+    assert_eq!(manifest["impact_before_edit"], false, "{manifest}");
+    assert_eq!(manifest["enrich_grep"], false, "{manifest}");
+    assert_eq!(manifest["always_load"], false, "{manifest}");
+    // And nothing marks the server entry as always loaded.
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert!(
+        mcp["mcpServers"]["mushroomdb"].get("alwaysLoad").is_none(),
+        "an install nobody asked for always-load wrote the key: {mcp}"
+    );
 }
 
 #[test]
@@ -3358,5 +3394,263 @@ fn reinstalling_without_the_flag_removes_the_redirect() {
             .iter()
             .any(|h| h["event"] == "PreToolUse"),
         "the manifest still owns a hook that is gone: {manifest}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: the three code-door flags — --impact-before-edit, --enrich-grep,
+//       --always-load
+// ---------------------------------------------------------------------------
+
+/// Opts for a Claude Code project install with every code-door flag off.
+fn door_opts() -> InstallOpts {
+    InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    }
+}
+
+#[test]
+fn impact_before_edit_writes_an_edit_matched_pretooluse_hook() {
+    let root = temp_dir("impact-hook");
+    let home = temp_dir("impact-hook-home");
+    git_repo(&root);
+    let opts = InstallOpts {
+        impact_before_edit: true,
+        ..door_opts()
+    };
+
+    let out = install_on_path(&root, &home, &opts).expect("install failed");
+    assert!(out.contains("added  PreToolUse hook"), "{out}");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    let groups = groups_matching(&s, "PreToolUse", "Edit|Write|MultiEdit");
+    assert_eq!(groups.len(), 1, "{s}");
+    let hook = &groups[0]["hooks"][0];
+    assert_eq!(hook["command"], "mushroomdb impact-hook --auto");
+    assert_eq!(hook["timeout"], 5);
+    assert!(
+        hook.get("async").is_none(),
+        "the context has to be there before the edit: {hook}"
+    );
+    // The redirect was not asked for, so `Grep` gets no PreToolUse group.
+    assert!(groups_matching(&s, "PreToolUse", "Grep").is_empty(), "{s}");
+
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["impact_before_edit"], true, "{manifest}");
+
+    run_uninstall(&root, &home, &opts).expect("uninstall failed");
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        s["hooks"].get("PreToolUse").is_none(),
+        "the impact hook survived uninstall: {s}"
+    );
+}
+
+#[test]
+fn enrich_grep_writes_a_grep_matched_posttooluse_hook() {
+    let root = temp_dir("enrich");
+    let home = temp_dir("enrich-home");
+    git_repo(&root);
+    let opts = InstallOpts {
+        enrich_grep: true,
+        ..door_opts()
+    };
+
+    install_on_path(&root, &home, &opts).expect("install failed");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    let groups = groups_matching(&s, "PostToolUse", "Grep");
+    assert_eq!(groups.len(), 1, "{s}");
+    let hook = &groups[0]["hooks"][0];
+    assert_eq!(hook["command"], "mushroomdb enrich --auto");
+    assert_eq!(hook["timeout"], 5);
+    assert!(
+        hook.get("async").is_none(),
+        "the facts have to reach the transcript with the result: {hook}"
+    );
+    // The `touch` hook is the other PostToolUse group and is untouched.
+    let touch = groups_matching(&s, "PostToolUse", "Edit|Write|MultiEdit");
+    assert_eq!(touch.len(), 1, "{s}");
+    assert_eq!(touch[0]["hooks"][0]["command"], "mushroomdb touch --auto");
+    assert_eq!(touch[0]["hooks"][0]["async"], true, "{s}");
+
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["enrich_grep"], true, "{manifest}");
+
+    run_uninstall(&root, &home, &opts).expect("uninstall failed");
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        groups_matching(&s, "PostToolUse", "Grep").is_empty(),
+        "the enrichment survived uninstall: {s}"
+    );
+}
+
+/// Re-installing without a flag turns that experiment off — the hook goes and
+/// the manifest stops claiming it — and turning one off must not disturb
+/// another that shares its event.
+#[test]
+fn reinstalling_without_a_door_flag_removes_only_that_hook() {
+    let root = temp_dir("door-off");
+    let home = temp_dir("door-off-home");
+    git_repo(&root);
+    let both = InstallOpts {
+        intercept_grep: true,
+        impact_before_edit: true,
+        enrich_grep: true,
+        ..door_opts()
+    };
+    install_on_path(&root, &home, &both).expect("install with every door");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2, "{s}");
+
+    install_on_path(
+        &root,
+        &home,
+        &InstallOpts {
+            impact_before_edit: false,
+            ..both
+        },
+    )
+    .expect("install without the impact hook");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert!(
+        groups_matching(&s, "PreToolUse", "Edit|Write|MultiEdit").is_empty(),
+        "the impact hook survived an install that did not ask for it: {s}"
+    );
+    assert_eq!(
+        groups_matching(&s, "PreToolUse", "Grep").len(),
+        1,
+        "turning the impact hook off took the redirect with it: {s}"
+    );
+    assert_eq!(
+        groups_matching(&s, "PostToolUse", "Grep").len(),
+        1,
+        "turning the impact hook off took the enrichment with it: {s}"
+    );
+
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["impact_before_edit"], false, "{manifest}");
+    assert_eq!(manifest["intercept_grep"], true, "{manifest}");
+    assert_eq!(manifest["enrich_grep"], true, "{manifest}");
+    let events: Vec<&str> = manifest["hooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["command"].as_str().unwrap())
+        .collect();
+    assert!(
+        !events.iter().any(|c| c.contains("impact-hook")),
+        "the manifest still owns a hook that is gone: {manifest}"
+    );
+    assert!(
+        events.iter().any(|c| c.contains(" intercept ")),
+        "the manifest dropped the redirect it still owns: {manifest}"
+    );
+}
+
+#[test]
+fn always_load_marks_the_server_entry_and_re_install_clears_it() {
+    let root = temp_dir("always-load");
+    let home = temp_dir("always-load-home");
+    git_repo(&root);
+    let on = InstallOpts {
+        always_load: true,
+        ..door_opts()
+    };
+
+    install_on_path(&root, &home, &on).expect("install failed");
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    let entry = &mcp["mcpServers"]["mushroomdb"];
+    assert_eq!(entry["alwaysLoad"], true, "{mcp}");
+    assert_eq!(entry["command"], "mushroomdb", "{mcp}");
+    assert_eq!(
+        entry["args"],
+        serde_json::json!(["mcp", "--auto"]),
+        "the flag must not disturb the invocation: {mcp}"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["always_load"], true, "{manifest}");
+
+    // Off again: the key goes, the entry stays.
+    install_on_path(
+        &root,
+        &home,
+        &InstallOpts {
+            always_load: false,
+            ..on
+        },
+    )
+    .expect("re-install failed");
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert!(
+        mcp["mcpServers"]["mushroomdb"].get("alwaysLoad").is_none(),
+        "always-load survived an install that did not ask for it: {mcp}"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(manifest["always_load"], false, "{manifest}");
+}
+
+/// `disable` then `enable` rebuilds the install that was turned off, not a
+/// different one: the three flags survive the round trip.
+#[test]
+fn disable_then_enable_preserves_the_door_flags() {
+    let root = temp_dir("door-toggle");
+    let home = temp_dir("door-toggle-home");
+    git_repo(&root);
+    let opts = InstallOpts {
+        impact_before_edit: true,
+        enrich_grep: true,
+        always_load: true,
+        ..door_opts()
+    };
+    install_on_path(&root, &home, &opts).expect("install failed");
+
+    let toggle = cli::install::ToggleOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+    };
+    cli::install::run_disable_with(&root, &home, &toggle, &no_externals()).expect("disable failed");
+    cli::install::run_enable_with(&root, &home, &toggle, &McpCommand::OnPath, &no_externals())
+        .expect("enable failed");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        groups_matching(&s, "PreToolUse", "Edit|Write|MultiEdit").len(),
+        1,
+        "enable dropped the impact hook: {s}"
+    );
+    assert_eq!(
+        groups_matching(&s, "PostToolUse", "Grep").len(),
+        1,
+        "enable dropped the enrichment: {s}"
+    );
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(
+        mcp["mcpServers"]["mushroomdb"]["alwaysLoad"], true,
+        "enable dropped always-load: {mcp}"
     );
 }

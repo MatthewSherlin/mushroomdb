@@ -76,6 +76,9 @@ fn base_opts() -> InstallOpts {
         prewarm: false,
         delivery: Delivery::Both,
         intercept_grep: false,
+        impact_before_edit: false,
+        enrich_grep: false,
+        always_load: false,
     }
 }
 

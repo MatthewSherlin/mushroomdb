@@ -41,7 +41,7 @@ const DB_PATH_PLACEHOLDER: &str = "{{DB_PATH}}";
 const BIN_PLACEHOLDER: &str = "{{BIN}}";
 
 /// The MCP server name we write. Must not be changed without a migration.
-const SERVER_NAME: &str = "mushroomdb";
+pub(crate) const SERVER_NAME: &str = "mushroomdb";
 
 /// The binary name looked up on PATH and used as the bare MCP command.
 const BIN_NAME: &str = "mushroomdb";
@@ -519,6 +519,17 @@ pub struct InstallOpts {
     /// redirects a `Grep` for a known symbol name to `explore`. Off by
     /// default — it is the one hook of ours that can block a tool call.
     pub intercept_grep: bool,
+    /// `--impact-before-edit`: also write the experimental `PreToolUse` hook
+    /// that puts a file's blast radius in front of an edit. Off by default.
+    pub impact_before_edit: bool,
+    /// `--enrich-grep`: also write the experimental `PostToolUse` hook that
+    /// appends what the graph knows about the symbols a `Grep` matched. Off by
+    /// default.
+    pub enrich_grep: bool,
+    /// `--always-load`: mark the registered server `alwaysLoad` so the host
+    /// keeps its tools in context rather than deferring them. Off by default,
+    /// and meaningless on a `--delivery cli` install, which registers none.
+    pub always_load: bool,
 }
 
 /// Options parsed from `mushroomdb enable [flags]` or `mushroomdb disable [flags]`.
@@ -994,6 +1005,19 @@ struct Manifest {
     /// false, which is what every manifest written before it existed means.
     #[serde(default)]
     intercept_grep: bool,
+    /// Whether this install asked for the pre-edit impact hook. Read for the
+    /// same three reasons as `intercept_grep`, and defaulted the same way.
+    #[serde(default)]
+    impact_before_edit: bool,
+    /// Whether this install asked for the grep enrichment hook.
+    #[serde(default)]
+    enrich_grep: bool,
+    /// Whether the registered server entry carries `alwaysLoad`. The key lives
+    /// in the MCP JSON, which `uninstall` removes whole, so nothing needs this
+    /// to undo it; `enable` reads it to put the same entry back, and `doctor`
+    /// to report it.
+    #[serde(default)]
+    always_load: bool,
 }
 
 impl Manifest {
@@ -1136,6 +1160,36 @@ pub(crate) const INTERCEPT_EVENT: &str = "PreToolUse";
 /// redirected: the graph has no better answer to those.
 const INTERCEPT_MATCHER: &str = "Grep";
 
+/// The optional fifth hook: the blast radius of a file, in front of the edit
+/// that is about to change it.
+///
+/// Written only for `install --impact-before-edit`. It shares `PreToolUse`
+/// with the redirect but is a different group, matched to the editing tools
+/// rather than to `Grep`, so the two are independent: each is recognised by
+/// its own subcommand word (see [`is_our_hook_command`]) and turning one off
+/// leaves the other alone. It never blocks — it prints one
+/// `hookSpecificOutput` object with `additionalContext` and exits 0 — but it
+/// is awaited, because context that arrives after the edit is context nobody
+/// read.
+pub(crate) const IMPACT_EVENT: &str = "PreToolUse";
+
+/// The tools it fires for: the ones that change a file, the same set
+/// [`TOUCH_MATCHER`] names.
+const IMPACT_MATCHER: &str = TOUCH_MATCHER;
+
+/// The optional sixth hook: what the graph knows about the symbols a `Grep`
+/// just matched, appended to the result.
+///
+/// Written only for `install --enrich-grep`. It shares `PostToolUse` with the
+/// `touch` re-extraction and, like the impact hook, is a separate group with
+/// its own matcher and its own subcommand word. Awaited on the short budget:
+/// the facts have to reach the transcript with the tool result, and an `async`
+/// hook's output arrives too late to be part of it.
+pub(crate) const ENRICH_EVENT: &str = "PostToolUse";
+
+/// The one tool it fires for.
+const ENRICH_MATCHER: &str = "Grep";
+
 /// Single-quote `s` for embedding in a POSIX shell command line, escaping
 /// embedded single quotes as `'\''`. Claude Code runs a `type: "command"`
 /// hook through a shell, so an unquoted path containing whitespace or shell
@@ -1167,6 +1221,16 @@ fn intercept_hook_command(shell: &str, store: &StoreRef) -> String {
     format!("{shell} intercept {}", store.shell_arg())
 }
 
+/// The exact command string written into the pre-edit impact hook entry.
+fn impact_hook_command(shell: &str, store: &StoreRef) -> String {
+    format!("{shell} impact-hook {}", store.shell_arg())
+}
+
+/// The exact command string written into the grep-enrichment hook entry.
+fn enrich_hook_command(shell: &str, store: &StoreRef) -> String {
+    format!("{shell} enrich {}", store.shell_arg())
+}
+
 /// One `hooks.<event>` array entry in Claude Code's settings.json shape.
 fn hook_entry(command: &str) -> serde_json::Value {
     serde_json::json!({ "hooks": [ { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS } ] })
@@ -1191,6 +1255,32 @@ fn touch_hook_entry(command: &str) -> serde_json::Value {
 fn intercept_hook_entry(command: &str) -> serde_json::Value {
     serde_json::json!({
         "matcher": INTERCEPT_MATCHER,
+        "hooks": [ {
+            "type": "command",
+            "command": command,
+            "timeout": HOOK_TIMEOUT_SECS
+        } ]
+    })
+}
+
+/// The `PreToolUse` entry for the impact hook: matched to the editing tools,
+/// and awaited, so the blast radius is in the transcript before the edit is.
+fn impact_hook_entry(command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "matcher": IMPACT_MATCHER,
+        "hooks": [ {
+            "type": "command",
+            "command": command,
+            "timeout": HOOK_TIMEOUT_SECS
+        } ]
+    })
+}
+
+/// The `PostToolUse` entry for the grep enrichment: matched to `Grep`, and
+/// awaited, so the facts land with the result rather than after it.
+fn enrich_hook_entry(command: &str) -> serde_json::Value {
+    serde_json::json!({
+        "matcher": ENRICH_MATCHER,
         "hooks": [ {
             "type": "command",
             "command": command,
@@ -1317,6 +1407,18 @@ pub(crate) fn is_our_hook_command(command: &str, sub: &str, store: &StoreRef) ->
         .any(|tail| command.ends_with(tail))
 }
 
+/// Which of our subcommands a recorded hook command runs, judged without a
+/// [`StoreRef`].
+///
+/// [`is_our_hook_command`] is the test for a command found on disk, where the
+/// store still has to be matched — a hook naming a different store is not ours
+/// to touch. A command read back out of our own manifest is already known to
+/// be ours and to name our store; all that is left to ask is which hook it is,
+/// and the answer is the word between the binary and the store argument.
+fn hook_command_runs(command: &str, sub: &str) -> bool {
+    command.contains(&format!(" {sub} "))
+}
+
 /// The same identity test for a line that does not *end* with the invocation:
 /// a git hook block backgrounds it and redirects its output, so the store
 /// argument sits in the middle of the line rather than at the end of it.
@@ -1438,6 +1540,16 @@ struct Ctx<'a> {
     /// Whether to write the experimental grep redirect. Claude Code only —
     /// it is a Claude Code hook.
     intercept_grep: bool,
+    /// Whether to write the experimental pre-edit impact hook. Claude Code
+    /// only, for the same reason.
+    impact_before_edit: bool,
+    /// Whether to write the experimental grep enrichment hook. Claude Code
+    /// only, for the same reason.
+    enrich_grep: bool,
+    /// Whether the server entry this install writes carries `alwaysLoad`.
+    /// Claude Code's `.mcp.json` only: it is a Claude Code key, and a Cursor
+    /// or Codex registration has no equivalent to set.
+    always_load: bool,
 }
 
 /// Anchor a user-supplied path to `base` when it is relative, and drop any
@@ -1569,6 +1681,9 @@ pub fn run_install_with(
         prewarm: opts.prewarm && !package_fetched,
         delivery: opts.delivery,
         intercept_grep: opts.intercept_grep,
+        impact_before_edit: opts.impact_before_edit,
+        enrich_grep: opts.enrich_grep,
+        always_load: opts.always_load,
     };
 
     let manifest_path = manifest_path(project_root, home, scope, &platforms);
@@ -1583,14 +1698,21 @@ pub fn run_install_with(
     // other drift, so the only extra step is clearing the flag once that
     // write lands, and saying so in the summary.
     let was_disabled = existing.disabled;
-    // Turning the redirect off writes nothing new, so the manifest would
-    // otherwise go on claiming a hook this run just removed.
-    let intercept_changed = existing.intercept_grep != opts.intercept_grep;
+    // Turning an experiment off writes nothing new, so the manifest would
+    // otherwise go on claiming a hook — or an `alwaysLoad` key — this run just
+    // removed.
+    let doors_changed = existing.intercept_grep != opts.intercept_grep
+        || existing.impact_before_edit != opts.impact_before_edit
+        || existing.enrich_grep != opts.enrich_grep
+        || existing.always_load != opts.always_load;
 
     let mut manifest = Manifest {
         requested_cmd,
         delivery: opts.delivery,
         intercept_grep: opts.intercept_grep,
+        impact_before_edit: opts.impact_before_edit,
+        enrich_grep: opts.enrich_grep,
+        always_load: opts.always_load,
         ..Manifest::default()
     };
     let mut notes: Vec<String> = Vec::new();
@@ -1612,7 +1734,7 @@ pub fn run_install_with(
     }
 
     let anything_written = !manifest.is_empty();
-    if anything_written || was_disabled || intercept_changed {
+    if anything_written || was_disabled || doors_changed {
         // Union this-run entries with the existing manifest (dedup by path/key).
         let mut merged = if anything_written {
             union_manifests(existing, &manifest)
@@ -1629,11 +1751,22 @@ pub fn run_install_with(
         if !opts.delivery.wires_mcp() {
             merged.mcp_keys.retain(|k| has_our_server(&k.file));
         }
-        // Same for the redirect: an install without the flag has just taken
-        // the hook off disk, so the manifest must stop owning it.
+        // Same for each experiment: an install without the flag has just taken
+        // that hook off disk, so the manifest must stop owning it. The three
+        // opt-in hooks share two events between them and with `touch`, so the
+        // entry is matched on its subcommand word rather than on its event.
         merged.intercept_grep = opts.intercept_grep;
-        if !opts.intercept_grep {
-            merged.hooks.retain(|h| h.event != INTERCEPT_EVENT);
+        merged.impact_before_edit = opts.impact_before_edit;
+        merged.enrich_grep = opts.enrich_grep;
+        merged.always_load = opts.always_load;
+        for (on, sub) in [
+            (opts.intercept_grep, "intercept"),
+            (opts.impact_before_edit, "impact-hook"),
+            (opts.enrich_grep, "enrich"),
+        ] {
+            if !on {
+                merged.hooks.retain(|h| !hook_command_runs(&h.command, sub));
+            }
         }
         write_manifest(&manifest_path, &merged)?;
     }
@@ -2254,9 +2387,12 @@ pub fn run_enable_with(
         // `cli` install has no server to put back, and its skill is the one
         // that teaches the binary.
         delivery: manifest.delivery,
-        // Likewise the redirect: `enable` never adds an experiment the
-        // install it is restoring never had.
+        // Likewise the experiments: `enable` never adds one the install it is
+        // restoring never had, and never drops one it did.
         intercept_grep: manifest.intercept_grep,
+        impact_before_edit: manifest.impact_before_edit,
+        enrich_grep: manifest.enrich_grep,
+        always_load: manifest.always_load,
     };
 
     let mut fresh = Manifest::default();
@@ -2675,7 +2811,7 @@ fn install_claude_code(
     // binary talking to the session, not the session talking to a server.
     let mcp_file = claude_mcp_file(ctx.project_root, ctx.home, ctx.scope);
     if ctx.delivery.wires_mcp() {
-        merge_mcp_entry(&mcp_file, ctx, store, manifest, notes)?;
+        merge_mcp_entry(&mcp_file, ctx, store, ctx.always_load, manifest, notes)?;
     } else if remove_mcp_key(&mcp_file, SERVER_NAME)? {
         // Switching an existing install to `cli` has to take the server it
         // already registered back out, or the door this delivery exists to
@@ -2760,6 +2896,51 @@ fn install_claude_code(
         ));
     }
 
+    // The fifth and sixth are opt-in the same way, and each shares its event
+    // with a hook that is not it: the impact hook sits beside the redirect
+    // under `PreToolUse`, the enrichment beside `touch` under `PostToolUse`.
+    // The subcommand word keeps them apart, so turning one off leaves its
+    // neighbour exactly where it was.
+    let impact = impact_hook_command(&shell, store);
+    if ctx.impact_before_edit {
+        if remove_stale_hooks(&settings_file, IMPACT_EVENT, "impact-hook", store, &impact)? {
+            notes.push(format!("replaced stale {IMPACT_EVENT} impact hook"));
+        }
+        merge_hook_entry(
+            &settings_file,
+            IMPACT_EVENT,
+            &impact,
+            impact_hook_entry(&impact),
+            manifest,
+        )?;
+    } else if drop_hooks(&settings_file, IMPACT_EVENT, |c| {
+        is_our_hook_command(c, "impact-hook", store)
+    })? {
+        notes.push(format!(
+            "removed {IMPACT_EVENT} impact hook — no --impact-before-edit"
+        ));
+    }
+
+    let enrich = enrich_hook_command(&shell, store);
+    if ctx.enrich_grep {
+        if remove_stale_hooks(&settings_file, ENRICH_EVENT, "enrich", store, &enrich)? {
+            notes.push(format!("replaced stale {ENRICH_EVENT} enrichment hook"));
+        }
+        merge_hook_entry(
+            &settings_file,
+            ENRICH_EVENT,
+            &enrich,
+            enrich_hook_entry(&enrich),
+            manifest,
+        )?;
+    } else if drop_hooks(&settings_file, ENRICH_EVENT, |c| {
+        is_our_hook_command(c, "enrich", store)
+    })? {
+        notes.push(format!(
+            "removed {ENRICH_EVENT} enrichment hook — no --enrich-grep"
+        ));
+    }
+
     Ok(())
 }
 
@@ -2794,7 +2975,7 @@ fn install_cursor(
     }
 
     let mcp_file = cursor_mcp_file(ctx.project_root, ctx.home, ctx.scope);
-    merge_mcp_entry(&mcp_file, ctx, store, manifest, notes)?;
+    merge_mcp_entry(&mcp_file, ctx, store, false, manifest, notes)?;
 
     Ok(())
 }
@@ -3077,10 +3258,17 @@ fn prewarm(ctx: &Ctx<'_>) -> Option<String> {
 /// absent. No-op if the entry already matches (idempotent). An entry that is
 /// present but different is an upgrade: it is rewritten, and the summary says
 /// so, because a stale command is exactly the failure this replaces.
+///
+/// `always_load` adds the `alwaysLoad` key to the entry. It is a parameter
+/// rather than a read of `ctx` because it belongs to one platform: the key is
+/// Claude Code's, and the Cursor writer passes `false` whatever the flag said.
+/// Comparing the whole entry is also what takes the key back off on a
+/// re-install without the flag — the desired entry simply no longer has it.
 fn merge_mcp_entry(
     mcp_file: &Path,
     ctx: &Ctx<'_>,
     store: &StoreRef,
+    always_load: bool,
     manifest: &mut Manifest,
     notes: &mut Vec<String>,
 ) -> Result<(), CliError> {
@@ -3098,7 +3286,10 @@ fn merge_mcp_entry(
         root["mcpServers"] = serde_json::json!({});
     }
 
-    let desired = ctx.cmd.json_entry("mcp", &store.arg());
+    let mut desired = ctx.cmd.json_entry("mcp", &store.arg());
+    if always_load {
+        desired["alwaysLoad"] = serde_json::Value::Bool(true);
+    }
     let existing = &root["mcpServers"][SERVER_NAME];
 
     if existing == &desired {
@@ -3259,16 +3450,33 @@ pub(crate) fn is_disabled(
     load_manifest(&manifest_path(project_root, home, scope, platforms)).disabled
 }
 
-/// Whether an install at this scope asked for the experimental grep redirect.
-/// `false` for a scope with no manifest, and for every manifest written before
-/// the flag existed — `doctor` reports the hook only where one was asked for.
-pub(crate) fn intercept_installed(
+/// Which of the four opt-in experiments an install asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OptIns {
+    pub(crate) intercept_grep: bool,
+    pub(crate) impact_before_edit: bool,
+    pub(crate) enrich_grep: bool,
+    pub(crate) always_load: bool,
+}
+
+/// What an install at this scope opted into. Every field is `false` for a
+/// scope with no manifest, and for a manifest written before the flag existed
+/// — `doctor` reports each of these only where one was asked for, because a
+/// line about an experiment nobody enabled says something about every install
+/// that is true of none.
+pub(crate) fn opt_ins(
     project_root: &Path,
     home: &Path,
     scope: Scope,
     platforms: &[Platform],
-) -> bool {
-    load_manifest(&manifest_path(project_root, home, scope, platforms)).intercept_grep
+) -> OptIns {
+    let m = load_manifest(&manifest_path(project_root, home, scope, platforms));
+    OptIns {
+        intercept_grep: m.intercept_grep,
+        impact_before_edit: m.impact_before_edit,
+        enrich_grep: m.enrich_grep,
+        always_load: m.always_load,
+    }
 }
 
 /// Union `existing` with `this_run`, deduplicating by path (files, git hooks),
@@ -3313,9 +3521,12 @@ fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
     // is how a user changes it, and the manifest has to describe what is on
     // disk now, not what an earlier run put there.
     existing.delivery = this_run.delivery;
-    // Same rule for the redirect (and `run_install_with` prunes the hook entry
-    // when the latest run turned it off).
+    // Same rule for the three experiments (and `run_install_with` prunes the
+    // hook entries when the latest run turned one off).
     existing.intercept_grep = this_run.intercept_grep;
+    existing.impact_before_edit = this_run.impact_before_edit;
+    existing.enrich_grep = this_run.enrich_grep;
+    existing.always_load = this_run.always_load;
     existing
 }
 

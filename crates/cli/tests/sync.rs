@@ -903,6 +903,9 @@ fn install_from_a_worktree_writes_hooks_to_the_common_dir() {
         prewarm: false,
         delivery: Delivery::Both,
         intercept_grep: false,
+        impact_before_edit: false,
+        enrich_grep: false,
+        always_load: false,
     };
     let summary = run_install_with(
         &wt,
@@ -1047,6 +1050,9 @@ fn install_in_a_submodule_keeps_the_submodule_hooks() {
             prewarm: false,
             delivery: Delivery::Both,
             intercept_grep: false,
+            impact_before_edit: false,
+            enrich_grep: false,
+            always_load: false,
         },
         &McpCommand::Explicit(bin),
         &Externals::with_path(None),

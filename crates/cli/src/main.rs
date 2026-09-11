@@ -71,6 +71,25 @@ fn main() -> ExitCode {
                 None => ExitCode::SUCCESS,
             }
         }
+        Ok(Command::ImpactHook { db_dir, auto }) => {
+            // Claude Code reads one `hookSpecificOutput` object on stdout as
+            // context to add to the turn; exit 0 lets the edit proceed either
+            // way. Nothing to say is nothing written, like every other hook
+            // this binary provides.
+            let mut raw = String::new();
+            let _ = io::stdin().read_to_string(&mut raw);
+            let text =
+                silently(|| cli::impact_hook::run(&resolve_db(db_dir, auto), &raw)).flatten();
+            print_hook_context("PreToolUse", text.as_deref());
+            ExitCode::SUCCESS
+        }
+        Ok(Command::Enrich { db_dir, auto }) => {
+            let mut raw = String::new();
+            let _ = io::stdin().read_to_string(&mut raw);
+            let text = silently(|| cli::enrich::run(&resolve_db(db_dir, auto), &raw)).flatten();
+            print_hook_context("PostToolUse", text.as_deref());
+            ExitCode::SUCCESS
+        }
         Ok(Command::Map { db_dir, json }) => match cli::run_map(&db_dir, json) {
             Ok(out) => {
                 print!("{out}");
@@ -475,6 +494,31 @@ fn silent_touch(db_dir: Option<PathBuf>, auto: bool, files: &[PathBuf], payload:
         let db = resolve_db(db_dir, auto);
         cli::ingest_git::run_touch(&db, files, payload)
     });
+}
+
+/// Print one hook result object on stdout, or nothing at all for `None`.
+///
+/// The shape is Claude Code's documented `hookSpecificOutput`: an object
+/// carrying the event's own name and `additionalContext`, the field both
+/// `PreToolUse` and `PostToolUse` read as "add this to the turn". Nothing else
+/// goes in it — no `permissionDecision`, no `decision` — because neither of
+/// these hooks has an opinion about whether the tool call should happen.
+///
+/// Not `print!`: that panics on EPIPE (exit 101) if the hook runner closes the
+/// pipe, and a hook body must never be why anything fails.
+fn print_hook_context(event: &str, text: Option<&str>) {
+    let Some(text) = text.filter(|t| !t.is_empty()) else {
+        return;
+    };
+    let out = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": event,
+            "additionalContext": text,
+        }
+    });
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(out.to_string().as_bytes());
+    let _ = stdout.flush();
 }
 
 /// The database a `<db-dir>`-or-`--auto` command should use.

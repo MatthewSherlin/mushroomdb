@@ -41,7 +41,11 @@ const MIN_PATTERN_LEN: usize = 3;
 /// — still one name, still something the graph can be asked about — and it is
 /// not a regex metacharacter, so a pattern containing it is no more likely to
 /// be a search than a plain name is.
-fn is_identifier(pattern: &str) -> bool {
+///
+/// Shared with [`crate::enrich`], which asks the same question of the tokens in
+/// a search result: the floor that makes a pattern worth a lookup is the floor
+/// that makes a matched word worth one.
+pub(crate) fn is_identifier(pattern: &str) -> bool {
     if pattern.len() < MIN_PATTERN_LEN {
         return false;
     }

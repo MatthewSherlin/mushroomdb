@@ -67,6 +67,9 @@ fn install_opts(scope: Scope, db: &Path, command: &Path) -> InstallOpts {
         prewarm: false,
         delivery: Delivery::Both,
         intercept_grep: false,
+        impact_before_edit: false,
+        enrich_grep: false,
+        always_load: false,
     }
 }
 
@@ -202,6 +205,9 @@ fn doctor_understands_auto_entries() {
         prewarm: false,
         delivery: Delivery::Both,
         intercept_grep: false,
+        impact_before_edit: false,
+        enrich_grep: false,
+        always_load: false,
     };
     run_install_with(
         &root,
