@@ -2606,6 +2606,38 @@ and it **failed**: the graph arm scored 0.795 against arm Q's 0.987 and cost
 $0.5089 against $0.1257. The v0.6.3 CHANGELOG entry reports it in full, and the
 association tools in [`mcp.md`](mcp.md) are what that run's failures turned into.
 
+The run after those fixes is committed at
+[`benchmarks/agent-tasks/results/20260911T065400Z/summary.md`](../../benchmarks/agent-tasks/results/20260911T065400Z/summary.md).
+It still **failed**, on two of the five legs:
+
+| | |
+|---|---|
+| verdict | **FAILED** |
+| best arm | R |
+| arms under the gate | R |
+| cells with no cost recorded | 0 of 180 |
+
+Why it failed:
+
+- R: correctness -0.007 vs arm Q, paired over 20 task(s)
+- R: correctness -0.007 is below arm(s) P (+0.026)
+- R: cost interval [-0.0581, +0.0115] vs arm Q is not entirely below zero
+
+Arm R against arm Q, paired by task:
+
+| metric | arm mean | arm Q mean | delta | 95% CI | tasks |
+|---|---|---|---|---|---|
+| score | 0.967 | 0.974 | -0.0070 | [-0.0711, 0.0483] | 20 |
+| cost $ | 0.0923 | 0.1158 | -0.02355 | [-0.05815, 0.01148] | 20 |
+| total tokens | 186215 | 221063 | -34848.5 | [-96315.1, 33715.3] | 20 |
+| turns | 5.07 | 7.38 | -2.317 | [-4.000, -0.483] | 20 |
+| cache hit ratio | 0.945 | 0.955 | -0.0096 | [-0.0275, 0.0056] | 20 |
+
+The graph arm moved from 0.795 to 0.967 on correctness and from $0.5089 to
+$0.0923 on cost, with its eight max-turns cells gone — a tie with the relational
+baseline on correctness and cheaper in mean cost, turns and wall time, but not
+the gate, which wants the cost interval entirely below zero.
+
 ---
 
 ## Reading a summary

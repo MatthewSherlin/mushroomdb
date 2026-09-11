@@ -69,6 +69,53 @@ The **code-door arms L, J and H** — arm B's install plus `--impact-before-edit
 but **carry no measurement**: no run of them is committed, so nothing here claims anything about
 what those three hooks are worth.
 
+#### Measured after the fixes
+
+The same suite, the same world digest `f2b689ba52c80241`, the same three arms × 3 reps × 20 tasks,
+180 cells:
+[`benchmarks/agent-tasks/results/20260911T065400Z/summary.md`](benchmarks/agent-tasks/results/20260911T065400Z/summary.md).
+
+| | |
+|---|---|
+| verdict | **FAILED** |
+| best arm | R |
+| arms under the gate | R |
+| cells with no cost recorded | 0 of 180 |
+
+Why it failed:
+
+- R: correctness -0.007 vs arm Q, paired over 20 task(s)
+- R: correctness -0.007 is below arm(s) P (+0.026)
+- R: cost interval [-0.0581, +0.0115] vs arm Q is not entirely below zero
+
+| metric | P (files + grep) | Q (relational) | R (graph) |
+|---|---|---|---|
+| score | 1.000 | 0.974 | 0.967 |
+| cost $ | 0.0949 | 0.1158 | 0.0923 |
+| total tokens | 200034 | 221063 | 186215 |
+| tool calls | 5.90 | 6.38 | 4.00 |
+| turns | 6.90 | 7.38 | 5.07 |
+| seconds | 29.1 | 35.2 | 21.7 |
+| adoption | 0.00 | 0.00 | 1.00 |
+
+Paired by task, with a 95% percentile bootstrap over the per-task differences (2,000 resamples,
+seeded), arm R against arm Q: score `-0.0070 [-0.0711, 0.0483]`, cost `-0.02355 [-0.05815,
+0.01148]`, total tokens `-34848.5 [-96315.1, 33715.3]`, turns `-2.317 [-4.000, -0.483]`. Arm P
+against arm Q: score `0.0264 [0.0040, 0.0639]`, cost `-0.02094 [-0.02861, -0.01260]`, total tokens
+`-21029.5 [-38685.4, -2746.6]`, turns `-0.483 [-0.933, 0.017]`.
+
+The run measured commit `bbaa919`. The commits after it up to the release commit are docs, the
+version bump, the gate wording, the brief's hard byte cap and its as-of note, `count(DISTINCT r)`,
+and the `listed`/`label`/`neighborhood`/unknown-type fixes — none of them changes a tool this run
+exercised, except the brief's as-of note. Against the "before" run the graph arm moved from score
+0.795 to 0.967, cost $0.509 to $0.092, turns 25.6 to 5.1, max-turns cells 8 to 0, and errors 8 to 0.
+Read plainly: the graph arm now ties the relational baseline on correctness and is cheaper in mean
+cost, turns and wall time — but the pre-registered gate is still not met, because two rep-1
+time-travel cells scored 0 (the agent chose a wrong commit for the date; see
+[`classification.md`](benchmarks/agent-tasks/results/20260911T065400Z/classification.md)) and the
+cost interval's upper end sits just above zero. The files + grep arm remains the cheapest and most
+correct way to answer these twenty questions on this 2,000-node world.
+
 #### The association surface — fifteen tools on a memory store
 
 - **A store that was not built by `ingest-git` now lists the association surface.** Fifteen tools:
