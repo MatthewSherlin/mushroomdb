@@ -269,10 +269,9 @@ mod tests {
             }],
         };
         let bytes = rkyv::api::high::to_bytes::<rkyv::rancor::Error>(&legacy).expect("rkyv encode");
-        let archived = rkyv::access::<crate::v8::layout::ArchivedColumnsData, rkyv::rancor::Error>(
-            &bytes,
-        )
-        .expect("rkyv access");
+        let archived =
+            rkyv::access::<crate::v8::layout::ArchivedColumnsData, rkyv::rancor::Error>(&bytes)
+                .expect("rkyv access");
 
         let overlay = ColumnStore::new();
         // `with_base` leaves `strings: None` — the pre-V9 case.

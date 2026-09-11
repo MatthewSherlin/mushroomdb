@@ -199,7 +199,11 @@ fn v8_store_auto_migrates_to_v9_with_bak() {
             2,
             "V8 store must have 2 nodes after migrate"
         );
-        assert_eq!(db.edge_count(), 1, "V8 store must have 1 edge after migrate");
+        assert_eq!(
+            db.edge_count(),
+            1,
+            "V8 store must have 1 edge after migrate"
+        );
     }
     // On-disk snapshot is now V9; .bak holds the original V8 bytes.
     assert_eq!(
