@@ -1138,10 +1138,13 @@ fn v6_snapshot_roundtrip() {
     assert_eq!(db.node_count(), 3);
     assert_eq!(db.edge_count(), 1);
     assert_eq!(db.get_prop("a", "v"), Some(Value::Int(7)));
-    // Verify the snapshot file actually uses V8 container.
+    // Verify the snapshot file actually uses the current mmap-able container.
     let snap = std::fs::read(dir.join("snapshot.bin")).unwrap();
     assert_eq!(&snap[0..4], b"GDB1");
-    assert_eq!(u16::from_le_bytes([snap[4], snap[5]]), 8);
+    assert_eq!(
+        u16::from_le_bytes([snap[4], snap[5]]),
+        core_storage::snapshot::VERSION
+    );
 }
 
 /// V4-refuse is unchanged by V6: a V4-stamped snapshot must still be rejected.
@@ -2892,5 +2895,124 @@ fn open_after_snapshot_is_not_slower_than_wal_replay() {
         snapshot.as_secs_f64() <= replay.as_secs_f64() * 3.0,
         "opening the snapshot took {snapshot:?} against {replay:?} of WAL replay; \
          a snapshot must not cost more than the log it replaces"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// V9: one shared string table per snapshot
+// ---------------------------------------------------------------------------
+
+/// The string table is written once per snapshot, not once per string column.
+#[test]
+fn shared_string_table_is_written_once() {
+    const MARKER: &str = "mushroom-marker-42";
+    let dir = tmp("shared-string-table");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for n in 0..200u32 {
+            let props: Vec<(String, Value)> = (0..8)
+                .map(|f| {
+                    (
+                        format!("f{f}"),
+                        Value::Str(if n % 8 == f {
+                            MARKER.to_string()
+                        } else {
+                            format!("v{}", n % 13)
+                        }),
+                    )
+                })
+                .collect();
+            db.insert_node("D", &format!("d{n}"), props).unwrap();
+        }
+        db.snapshot().unwrap();
+    }
+    let bytes = std::fs::read(dir.join("snapshot.bin")).unwrap();
+    let hits = bytes
+        .windows(MARKER.len())
+        .filter(|w| *w == MARKER.as_bytes())
+        .count();
+    assert_eq!(
+        hits, 1,
+        "the marker must appear once, in the shared table; got {hits} copies"
+    );
+
+    let db = GraphDb::open(&dir).unwrap();
+    for n in 0..200u32 {
+        for f in 0..8u32 {
+            let want = if n % 8 == f {
+                MARKER.to_string()
+            } else {
+                format!("v{}", n % 13)
+            };
+            assert_eq!(
+                db.get_prop(&format!("d{n}"), &format!("f{f}")),
+                Some(Value::Str(want)),
+                "d{n}.f{f} must survive the shared table"
+            );
+        }
+    }
+}
+
+/// A pre-V9 snapshot has no shared section and its per-column tables still answer.
+#[test]
+fn a_v8_snapshot_still_reads_its_strings() {
+    let dir = tmp("v8-strings-compat");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("snapshot.bin"),
+        include_bytes!("fixtures/golden_v8.bin"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("wal.bin"), b"").unwrap();
+    // Read-only so the auto-migrate rewrite does not turn it into V9 under us.
+    let db = GraphDb::open_with_options(
+        &dir,
+        core_api::OpenOptions {
+            read_only: true,
+            ..core_api::OpenOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.node_count(), 2);
+    assert_eq!(db.get_prop("a", "v"), Some(Value::Int(42)));
+}
+
+/// ~3.8 MB of string properties across 8 columns must not cost a 9x snapshot.
+/// Pre-0.6.5 this store wrote 8 copies of the whole intern table and landed near 8x.
+///
+/// The vocabulary is one distinct value per (node, field) on purpose: the cost
+/// of the old per-column copy is `columns x table`, so a small vocabulary hides
+/// the bug however many property bytes are written. Measured on this store:
+/// 36,784,616 B (9.82x) before the shared section, 5,200,624 B (1.39x) after.
+#[test]
+#[ignore = "slow: 12k nodes; run in the format-compat job"]
+fn snapshot_size_is_near_the_property_payload() {
+    let dir = tmp("snapshot-size");
+    let vocab: Vec<String> = (0..96_000)
+        .map(|i| format!("value-{i:05}-{}", "x".repeat(27)))
+        .collect();
+    let mut payload = 0usize;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for n in 0..12_000u32 {
+            let props: Vec<(String, Value)> = (0..8u32)
+                .map(|f| {
+                    let v = &vocab[((n * 8 + f) as usize) % vocab.len()];
+                    payload += v.len();
+                    (format!("f{f}"), Value::Str(v.clone()))
+                })
+                .collect();
+            db.insert_node("D", &format!("d{n}"), props).unwrap();
+        }
+        db.snapshot().unwrap();
+    }
+    let size = std::fs::metadata(dir.join("snapshot.bin")).unwrap().len() as usize;
+    println!(
+        "property payload {payload} B, snapshot.bin {size} B, ratio {:.2}x",
+        size as f64 / payload as f64
+    );
+    assert!(
+        size < payload * 2,
+        "snapshot.bin {size} B must be under 2x the {payload} B of properties"
     );
 }
