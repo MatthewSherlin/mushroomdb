@@ -1077,7 +1077,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "stats",
-                "description": "How big is this store — live node, edge and rule counts.",
+                "description": "How big is this store — live node, edge and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}

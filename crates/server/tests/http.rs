@@ -6,7 +6,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use core_api::{
     json_to_value, schema::Schema, Explanation, FkSkip, IngestReport, Predicate, PredicateSummary,
-    RoleDef, RuleDef, RuleStats, SharedDb, Stats, Value, WriteScope,
+    RoleDef, RuleDef, RuleStats, SharedDb, SnapshotOptions, Stats, Value, WriteScope,
 };
 use serde_json::{json, Value as Json};
 #[cfg(feature = "embed-ui")]
@@ -2542,6 +2542,70 @@ async fn history_bodies_carry_the_horizon() {
             .is_some_and(|s| s.contains("valid range is")),
         "the 400 must name the range it accepts: {v}"
     );
+}
+
+/// On a store whose oldest archives were pruned, the horizon the wire reports
+/// is the store's own floor — not a constant, and not zero.
+#[tokio::test]
+async fn a_pruned_store_reports_its_real_floor() {
+    let db = SharedDb::open(&tmp("hist-pruned-floor")).unwrap();
+    db.write().set_wal_archive_retention(Some(1));
+    for i in 0..6 {
+        db.write()
+            .insert_node("Person", &format!("p{i}"), vec![])
+            .unwrap();
+        db.write()
+            .snapshot_with(SnapshotOptions {
+                keep_wal: false,
+                archive_wal: true,
+            })
+            .unwrap();
+    }
+    let (floor, total) = {
+        let g = db.read();
+        (g.wal_horizon_floor(), g.wal_total_commits().unwrap())
+    };
+    assert!(floor > 0, "the retention must have advanced the floor");
+    let app = router(db.clone());
+
+    let (status, body, _) = send(app.clone(), get("/node/p5/history")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        parse_json(&body)["horizon"].as_u64(),
+        Some(floor),
+        "node history must report the store's floor"
+    );
+
+    let (status, body, _) = send(app.clone(), get("/history/edge?a=p4&b=p5")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        parse_json(&body)["horizon"].as_u64(),
+        Some(floor),
+        "edge history must report the store's floor"
+    );
+
+    let (status, body, _) = send(app.clone(), get("/stats")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(parse_json(&body)["history_floor"].as_u64(), Some(floor));
+
+    let (status, body, _) = send(
+        app,
+        get(&format!(
+            "/history/was_linked?a=p0&b=p1&edge_type=LINK&at_commit={}",
+            floor - 1
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err = parse_json(&body)["error"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        err.contains(&format!("valid range is {floor}..{total}")),
+        "the 400 must name the retained range: {err}"
+    );
+    assert!(err.contains("not retained"), "{err}");
 }
 
 #[tokio::test]
