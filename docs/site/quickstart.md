@@ -370,6 +370,7 @@ Output after the demo:
 ```text
 nodes: 60 live, 0 tombstoned
 edges: 334
+history: complete (nothing pruned)
 rules: 7
   auto_fk_person_org_id        edges=30  tripped=false
   auto_fk_person_project_id    edges=30  tripped=false

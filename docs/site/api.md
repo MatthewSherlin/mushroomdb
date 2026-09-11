@@ -274,6 +274,7 @@ without `LIMIT` still error at 1,000,000 intermediate rows.
   "nodes_live": 60,
   "nodes_tombstoned": 0,
   "edges": 334,
+  "history_floor": 0,
   "rules": [
     {"name": "skill_fit", "edges": 90, "tripped": false, "fires": 90, "approximate": false},
     ...
@@ -690,12 +691,15 @@ Response:
     { "commit": 1, "change": { "type": "PropSet", "field": "age", "value": 30 } },
     { "commit": 2, "change": { "type": "EdgeAdded", "edge_type": "KNOWS", "other": "bob", "outgoing": true } }
   ],
-  "total_commits": 3
+  "total_commits": 3,
+  "horizon": 0
 }
 ```
 
 `total_commits` is the horizon upper bound (exclusive) — the number of WAL frames
-visible in the current window. History before the last WAL-truncating snapshot is not
+visible in the current window. `horizon` is the oldest commit still retained; it is `0`
+until archives are pruned, and when it is greater than `0` the events before it were
+pruned and are not in `history`. History before the last WAL-truncating snapshot is not
 visible. See [Horizon contract](#horizon-contract) below.
 
 Role tokens: if the requested key is outside the role's visibility mask, the response
@@ -716,12 +720,15 @@ Response:
     { "edge_type": "KNOWS", "commit": 2, "event": "Added", "rule": null },
     { "edge_type": "SIMILAR", "commit": 3, "event": "Added", "rule": "sim_emb" }
   ],
-  "total_commits": 4
+  "total_commits": 4,
+  "horizon": 0
 }
 ```
 
 `event` is `"Added"` or `"Retracted"`. `rule` is the rule name for derived edges,
-`null` for manually written edges. `total_commits` is the horizon upper bound.
+`null` for manually written edges. `total_commits` is the horizon upper bound, and
+`horizon` is the oldest commit still retained — events before it were pruned and are not
+in `events`.
 
 Role tokens: BOTH `a` AND `b` must be visible in the role mask. If either is hidden,
 the response is 404 for that key (no existence oracle).
@@ -738,21 +745,30 @@ Response:
 { "a": "alice", "b": "bob", "edge_type": "KNOWS", "at_commit": 2, "linked": true }
 ```
 
-Returns 400 (not 500) when `at_commit` is outside the visible horizon:
+Returns 400 (not 500) when `at_commit` is outside the retained horizon. The body carries
+the range it will accept, and on a pruned store says what is gone:
 ```json
-{ "error": "commit 999 is out of range" }
+{ "error": "commit 3 is out of range; valid range is 12..40 — events before commit 12 are not retained" }
 ```
+
+On a store that has pruned nothing the floor is `0` and the message is
+`commit 999 is out of range; valid range is 0..40`.
 
 Role tokens: BOTH `a` AND `b` must be visible (same-as-absent rule applies).
 
 #### Horizon contract
 
-All three history endpoints include `total_commits` in their response. This is the
-exclusive upper bound for valid commit indices (`0..total_commits`). When the WAL is
-empty (after a truncating snapshot and before any new writes), `total_commits` is 0.
-Pre-snapshot commits are not visible — history restarts from the first WAL frame after
-the snapshot. Use `snapshot_with(SnapshotOptions { keep_wal: true })` to preserve
-deep history across snapshots.
+Valid commit indices are `floor..total_commits`. `total_commits` is the exclusive upper
+bound; `floor` is the oldest commit still retained, `0` until archive pruning advances it.
+`GET /node/{key}/history` and `GET /history/edge` report that floor as `horizon` in their
+response body; `GET /history/was_linked` names both bounds in the 400 it returns for a
+commit outside the range. `GET /stats` reports the same floor as `history_floor`.
+
+When the WAL is empty (after a truncating snapshot and before any new writes),
+`total_commits` is 0. Pre-snapshot commits are not visible — history restarts from the
+first WAL frame after the snapshot. Use
+`snapshot_with(SnapshotOptions { keep_wal: true })` to preserve deep history across
+snapshots, or `archive_wal: true` to keep it in archives.
 
 ---
 
