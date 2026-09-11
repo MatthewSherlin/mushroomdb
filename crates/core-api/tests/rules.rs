@@ -1617,3 +1617,103 @@ fn any_of_keymatch_derives_when_the_destination_is_the_one_written() {
         "inserting the named destination must derive the KeyMatch branch"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Opening a store adopts the persisted vector index instead of rebuilding it
+// ---------------------------------------------------------------------------
+
+/// A deterministic 8-d unit vector for `i`, spread over the sphere by
+/// splitmix64 so no two are near-duplicates.
+fn unit_vec_8_raw(i: u32) -> Vec<f64> {
+    let mut s = 0x9E37_79B9_7F4A_7C15u64 ^ (i as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    let mut out = Vec::with_capacity(8);
+    for _ in 0..8 {
+        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut x = s;
+        x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        x ^= x >> 31;
+        out.push((x as i64 as f64) / (i64::MAX as f64));
+    }
+    let n = out.iter().map(|x| x * x).sum::<f64>().sqrt();
+    out.iter().map(|x| x / n).collect()
+}
+
+fn unit_vec_8(i: u32) -> Value {
+    emb(&unit_vec_8_raw(i))
+}
+
+fn tight_vec_rule() -> RuleDef {
+    RuleDef {
+        name: "sim".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.9,
+        },
+        edge_type: "SIM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    }
+}
+
+/// Opening a store must adopt the persisted vector index, not rebuild one and
+/// throw it away. Before 0.6.5/0.6.6 the open scan built the whole graph and
+/// `load_hnsw_state` replaced it.
+///
+/// The rule's src and dst labels are both `V`, so `index_node_for_rule` offers
+/// each node to *both* sides: one node is two `HnswIndex::insert` calls.
+#[test]
+fn reopening_does_not_rebuild_the_vector_index() {
+    const N: u32 = 400;
+    let dir = tmp("no-rebuild-on-open");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for i in 0..N {
+            db.insert_node("V", &format!("v{i}"), vec![("emb".into(), unit_vec_8(i))])
+                .unwrap();
+        }
+        db.create_rule(tight_vec_rule()).unwrap();
+        db.snapshot().unwrap();
+    }
+
+    // Clean open (the snapshot truncated the WAL): `ensure_indexes_populated`
+    // is the path, tripped by the first mutation.
+    core_rules::hnsw_insert_count_reset();
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert!(
+        !db.find_similar_vector("emb", Some("V"), &unit_vec_8_raw(7), 3, 0.0)
+            .is_empty(),
+        "force the index path so the count is meaningful"
+    );
+    db.insert_node("Other", "o", vec![("v".into(), Value::Int(1))])
+        .unwrap();
+    assert_eq!(
+        core_rules::hnsw_insert_count(),
+        0,
+        "opening a store must not insert a single vector into the HNSW graph"
+    );
+    drop(db);
+
+    // WAL-present open: `consume_retained_state_eager` is the path, and the one
+    // post-snapshot node arrives through replay.
+    {
+        let mut w = GraphDb::open(&dir).unwrap();
+        w.insert_node("V", "extra", vec![("emb".into(), unit_vec_8(9_999))])
+            .unwrap();
+    }
+    core_rules::hnsw_insert_count_reset();
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(db.has_node("extra"));
+    assert_eq!(
+        core_rules::hnsw_insert_count(),
+        2,
+        "only the post-snapshot node is inserted (once per rule side); the other \
+         {N} are adopted"
+    );
+}

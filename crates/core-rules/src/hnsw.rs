@@ -44,6 +44,41 @@ pub const EF_CONSTRUCTION: usize = 400;
 pub const EF_SEARCH: usize = 400;
 
 // ---------------------------------------------------------------------------
+// Test hooks
+// ---------------------------------------------------------------------------
+//
+// A thread-local count of vectors pushed into any `HnswIndex` on this thread,
+// in the shape `with_ivf_drift_rebuild` (`index.rs:29-50`) already uses. It
+// exists so an integration test can assert that opening a store inserts
+// *nothing* — the persisted graph is adopted, not rebuilt. Gated on
+// `test-hooks` because `#[cfg(test)]` items in this crate are invisible to
+// `mushroomdb`'s integration tests.
+
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    static HNSW_INSERT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one `HnswIndex::insert` call. Compiles away without `test-hooks`.
+#[inline]
+fn note_insert() {
+    #[cfg(any(test, feature = "test-hooks"))]
+    HNSW_INSERT_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Vectors inserted into any `HnswIndex` on this thread since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_insert_count() -> u64 {
+    HNSW_INSERT_COUNT.with(|c| c.get())
+}
+
+/// Reset this thread's `HnswIndex::insert` counter to zero.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_insert_count_reset() {
+    HNSW_INSERT_COUNT.with(|c| c.set(0));
+}
+
+// ---------------------------------------------------------------------------
 // PRNG helpers
 // ---------------------------------------------------------------------------
 
@@ -273,6 +308,7 @@ impl HnswIndex {
     /// Zero vectors are silently skipped (cosine is undefined for them).
     /// If `id` already exists it is replaced (remove + re-insert semantics).
     pub fn insert(&mut self, id: u32, v: &[f64]) {
+        note_insert();
         let Some(unit) = l2_normalize(v) else {
             return; // zero vector — skip
         };

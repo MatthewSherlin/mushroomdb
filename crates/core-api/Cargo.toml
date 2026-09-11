@@ -35,6 +35,12 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.4" }
+# `test-hooks` exposes `core_rules::hnsw_insert_count`, which
+# `tests/rules.rs::reopening_does_not_rebuild_the_vector_index` uses to assert
+# that an open adopts the persisted graph instead of inserting into a new one.
+core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.6.4", features = [
+    "test-hooks",
+] }
 # Path-only (no version): sim-harness is publish=false; a version key makes
 # `cargo publish -p mushroomdb` try to resolve it on the index and fail.
 sim-harness = { path = "../sim-harness" }
