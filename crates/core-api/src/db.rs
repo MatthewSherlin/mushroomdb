@@ -2027,7 +2027,7 @@ impl<F: Fs> GraphDb<F> {
         }
         // WAL-present path: build indexes eagerly BEFORE replay so that the
         // first replayed record does not trigger the lazy-init guard (which
-        // would call reindex_all_load_ivf on an empty graph, defeating the
+        // would call reindex_all_load_state on an empty graph, defeating the
         // point of restoring IVF/HNSW blobs from the snapshot).
         if !records.is_empty() {
             db.ensure_v8_base_sections_loaded();

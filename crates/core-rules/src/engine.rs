@@ -34,7 +34,7 @@ fn deserialize_hnsw_blob(rule: &str, side: &str, blob: &[u8]) -> Option<HnswInde
 }
 
 /// Decode raw IVF section bytes into the `RuleIvfExport` format consumed by
-/// `reindex_all_load_ivf`.  Returns an empty map when `bytes` is empty.
+/// `reindex_all_load_state`.  Returns an empty map when `bytes` is empty.
 fn decode_ivf_bytes_to_export(bytes: &[u8]) -> BTreeMap<String, RuleIvfExport> {
     decode_ivf_bytes(bytes)
         .into_iter()
@@ -235,7 +235,7 @@ pub struct RuleEngine {
     rebuild_needed: BTreeSet<String>,
     /// Whether candidate indexes have been populated.  Starts `false` after a
     /// snapshot restore that defers index building.  Set to `true` by
-    /// `reindex_all`, `reindex_all_load_ivf`, and `create_rule`.  On the first
+    /// `reindex_all`, `reindex_all_load_state`, and `create_rule`.  On the first
     /// mutation call when this is `false`, the full O(n) scan runs (first-write
     /// cost), consuming and replacing `retained_hnsw_blobs`.
     indexes_populated: bool,
@@ -2011,6 +2011,10 @@ impl RuleEngine {
     /// Zero after an open that restored every graph from the snapshot; non-zero
     /// when a rule was created, or when a graph had to be rebuilt because no
     /// blob was persisted for it or the blob failed to load.
+    ///
+    /// Test observability, not stable surface: never persisted, and counted
+    /// per engine instance rather than per store.
+    #[doc(hidden)]
     pub fn hnsw_build_count(&self) -> u64 {
         self.hnsw_builds
     }
@@ -2094,9 +2098,12 @@ impl RuleEngine {
     /// For approximate rules absent from `ivf_state` (e.g. a rule added
     /// after the snapshot), falls back to `fit_ivf_clusters`.
     ///
-    /// Rebuilds every HNSW graph from scratch.  Callers that hold persisted
-    /// HNSW blobs should use [`RuleEngine::reindex_all_load_state`] instead,
-    /// which loads them and skips the build.
+    /// **Always rebuilds every approximate rule's HNSW graph from scratch**, at
+    /// a cost superlinear in the number of embeddings.  Nothing in this
+    /// repository calls it; it is retained only because it is published API.
+    /// Any caller holding persisted HNSW blobs — every open path does — must
+    /// use [`RuleEngine::reindex_all_load_state`], which installs those graphs
+    /// and skips the build instead of doing it and throwing it away.
     pub fn reindex_all_load_ivf(
         &mut self,
         ids: &IdMap,
@@ -2461,8 +2468,13 @@ impl RuleEngine {
             .clone()
     }
 
-    /// Restore HNSW graphs from bincoded blobs (overrides any incrementally built
-    /// graphs produced during `reindex_all_load_ivf`).
+    /// Restore HNSW graphs from bincoded blobs (overrides any graphs the node
+    /// scan built).
+    ///
+    /// The open paths no longer need this: `reindex_all_load_state` installs the
+    /// persisted graphs itself and skips the build for every side it can supply.
+    /// It is still used for blobs naming a rule this engine does not hold as
+    /// approximate.
     ///
     /// Called from `restore_snapshot_state` in db.rs after reindex.
     pub fn load_hnsw_state(&mut self, blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>) {

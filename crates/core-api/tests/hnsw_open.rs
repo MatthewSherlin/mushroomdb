@@ -75,6 +75,18 @@ fn edge_map(db: &Db) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
+/// `edge_map` plus the post-snapshot node. A deleted key yields an empty list
+/// on both sides of the comparison, so it stays in the map harmlessly.
+fn edge_map_with_late(db: &Db) -> Vec<(String, Vec<String>)> {
+    let mut out = edge_map(db);
+    out.push((
+        "late".into(),
+        db.neighbors("late", "SIM", Direction::Out)
+            .unwrap_or_default(),
+    ));
+    out
+}
+
 /// Clean open (snapshot truncates the WAL): the first mutation populates the
 /// indexes through `ensure_indexes_populated`, which must load the persisted
 /// graphs rather than build new ones.
@@ -151,6 +163,140 @@ fn wal_replayed_embeddings_are_searchable_after_open() {
     assert!(
         keys.contains(&"d0"),
         "pre-snapshot embedding must still be searchable; got {keys:?}"
+    );
+}
+
+/// Post-snapshot writes of every shape the index has to absorb: an INSERT, an
+/// embedding UPDATE that moves a node between clusters, and a DELETE.
+///
+/// `d2` leaves the +y cluster for the +x cluster; `d1` (a +x node) is removed;
+/// `late` joins +x.
+fn post_snapshot_writes(db: &mut Db) {
+    db.set_prop("d2", "emb", emb(&[0.99, 0.14])).unwrap();
+    db.delete_node("d1").unwrap();
+    db.insert_node("Doc", "late", vec![("emb".into(), emb(&[0.995, 0.1]))])
+        .unwrap();
+}
+
+fn keys_of(hits: &[(String, f64)]) -> Vec<String> {
+    hits.iter().map(|(k, _)| k.clone()).collect()
+}
+
+/// The adopted index must absorb an UPDATE and a DELETE replayed from the WAL,
+/// not just an insert: the loaded graph is only correct if `on_node_changed`
+/// and `on_node_removed` reach it during replay.
+#[test]
+fn wal_replayed_update_and_delete_are_reflected_after_open() {
+    let dir = tmp("hnsw-open-wal-upd-del");
+    let live_hits;
+    let live_edges;
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+        post_snapshot_writes(&mut db);
+        live_hits = keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.5));
+        live_edges = edge_map_with_late(&db);
+    }
+
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.hnsw_build_count(), 0, "reopen rebuilt a persisted graph");
+
+    let after = keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.5));
+    assert!(
+        !after.iter().any(|k| k == "d1"),
+        "the replayed DELETE must remove d1 from the adopted index; got {after:?}"
+    );
+    assert!(
+        after.iter().any(|k| k == "d2"),
+        "the replayed UPDATE must make d2 findable at its NEW vector; got {after:?}"
+    );
+    assert!(
+        after.iter().any(|k| k == "late"),
+        "the replayed INSERT must be in the index; got {after:?}"
+    );
+    assert_eq!(
+        live_hits, after,
+        "ANN results diverged between the live writes and the reopen"
+    );
+    assert_eq!(
+        live_edges,
+        edge_map_with_late(&db),
+        "derived edge set diverged between the live writes and the reopen"
+    );
+
+    // The old position of the updated vector must no longer lead to d2 first:
+    // a stale entry at [0,1] would still be top-1 there.
+    let old_spot = db.find_similar_vector("emb", Some("Doc"), &[0.0, 1.0], 1, 0.99);
+    assert!(
+        !old_spot.iter().any(|(k, _)| k == "d2"),
+        "d2 is still indexed at its pre-update vector; got {old_spot:?}"
+    );
+}
+
+/// A discriminating check that the replayed DELETE actually left the adopted
+/// graph rather than merely being filtered out downstream: query `k = 1` at the
+/// deleted node's exact vector. A stale id still in the graph would win that
+/// search and then be dropped when resolved to a key, yielding no hit at all.
+#[test]
+fn deleted_node_is_gone_from_the_adopted_index() {
+    let dir = tmp("hnsw-open-wal-del");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+        db.delete_node("d1").unwrap();
+    }
+
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.hnsw_build_count(), 0, "reopen rebuilt a persisted graph");
+
+    // d1's exact vector.
+    let hits = db.find_similar_vector("emb", Some("Doc"), &[0.98, 0.2], 1, 0.0);
+    assert_eq!(
+        hits.len(),
+        1,
+        "top-1 at the deleted node's vector came back empty: its id is still in \
+         the HNSW graph"
+    );
+    assert_ne!(hits[0].0, "d1", "the deleted node was returned by a query");
+}
+
+/// Same writes, but snapshotted again afterwards, so the reopen takes the
+/// clean-open path (`ensure_indexes_populated`) rather than WAL replay. The
+/// persisted graph must already carry the update and the delete.
+#[test]
+fn clean_open_after_update_and_delete() {
+    let dir = tmp("hnsw-open-clean-upd-del");
+    let live_hits;
+    let live_edges;
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+        post_snapshot_writes(&mut db);
+        db.snapshot().unwrap();
+        live_hits = keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.5));
+        live_edges = edge_map_with_late(&db);
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.5)),
+        live_hits,
+        "ANN results diverged across the clean reopen"
+    );
+
+    // Trip the lazy guard so the mutation-path indexes materialize too.
+    db.insert_node("Other", "o", vec![("v".into(), Value::Int(1))])
+        .unwrap();
+    assert_eq!(db.hnsw_build_count(), 0, "clean open rebuilt a graph");
+    assert_eq!(
+        keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.5)),
+        live_hits,
+        "ANN results diverged after the lazy guard populated the indexes"
+    );
+    assert_eq!(
+        live_edges,
+        edge_map_with_late(&db),
+        "derived edge set diverged across the clean reopen"
     );
 }
 
