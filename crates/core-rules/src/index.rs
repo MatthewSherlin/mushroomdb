@@ -1257,10 +1257,18 @@ impl SideIndex {
             return;
         }
         if let Ok(h) = bincode::deserialize::<HnswIndex>(blob) {
-            // Repopulate hnsw_tracked from the loaded graph.
-            self.hnsw_tracked = h.node_ids();
-            self.hnsw = Some(h);
+            self.adopt_hnsw(h);
         }
+    }
+
+    /// Install an already-deserialized HNSW graph, replacing any existing one.
+    ///
+    /// `hnsw_tracked` is repopulated from the graph's node ids so candidates
+    /// and removal work against the installed graph rather than whatever the
+    /// preceding node scan happened to record.
+    pub fn adopt_hnsw(&mut self, h: HnswIndex) {
+        self.hnsw_tracked = h.node_ids();
+        self.hnsw = Some(h);
     }
 
     /// True when the HNSW graph has been initialized and contains at least one node.
