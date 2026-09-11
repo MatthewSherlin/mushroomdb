@@ -25,7 +25,7 @@ use serde_json::{json, Value as Js};
 use server::run_mcp_stdio;
 use std::collections::BTreeSet;
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn tmp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-mcp-{}-{}", name, std::process::id()));
@@ -192,7 +192,7 @@ fn tools_list_returns_all_tools_with_schemas() {
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 25);
+    assert_eq!(tools.len(), 27);
 
     let by_name = |n: &str| {
         tools
@@ -252,7 +252,20 @@ fn tools_list_returns_all_tools_with_schemas() {
     let edges = by_name("node_edges");
     assert_eq!(edges["inputSchema"]["type"], "object");
     assert!(edges["inputSchema"]["properties"].get("key").is_some());
+    assert!(edges["inputSchema"]["properties"]
+        .get("edge_type")
+        .is_some());
+    assert!(edges["inputSchema"]["properties"].get("limit").is_some());
     assert_eq!(edges["inputSchema"]["required"], json!(["key"]));
+
+    let at = by_name("edges_at");
+    assert_eq!(at["inputSchema"]["required"], json!(["key", "at"]));
+
+    let what_if = by_name("what_if");
+    assert_eq!(
+        what_if["inputSchema"]["required"],
+        json!(["key", "field", "value"])
+    );
 
     let cr = by_name("create_rule");
     assert_eq!(cr["inputSchema"]["type"], "object");
@@ -323,7 +336,7 @@ fn tools_call_happy_path_for_each_tool() {
             "neighborhood",
             json!({
                 "key": "p1",
-                "depth": 1,
+                "depth": 2,
                 "edge_types": ["KNOWS"],
                 "direction": "out"
             }),
@@ -390,7 +403,9 @@ fn query_create_is_a_write() {
     assert_eq!(db.read().stats().nodes_live, 1);
 }
 
-/// Binding: node_info / node_edges MCP payloads match the HTTP wire shapes.
+/// Binding: `node_info` still answers in the HTTP wire shape, and `node_edges`
+/// answers with the grouped listing — every edge under its type, the derived
+/// one carrying the rule that wrote it.
 #[test]
 fn node_info_and_edges_tool_parity() {
     let db = open("node-tools");
@@ -429,7 +444,7 @@ fn node_info_and_edges_tool_parity() {
     let stdin = format!(
         "{}{}{}",
         call(1, "node_info", json!({"key": "p1"})),
-        call(2, "node_edges", json!({"key": "p1"})),
+        call(2, "node_edges", json!({"key": "p1", "json": true})),
         call(3, "node_info", json!({"key": "ghost"})),
     );
     let (res, out) = exchange(db, &stdin);
@@ -447,18 +462,36 @@ fn node_info_and_edges_tool_parity() {
     assert_eq!(
         edges,
         json!({
-            "edges": [
+            "key": "p1",
+            "total": 2,
+            "types": [
                 {
                     "edge_type": "KNOWS",
-                    "src_key": "p1",
-                    "dst_key": "p2",
-                    "derived": false
+                    "count": 1,
+                    "listed": 1,
+                    "edges": [{
+                        "edge_type": "KNOWS",
+                        "other": "p2",
+                        "direction": "out",
+                        "derived": false,
+                        "rule": null,
+                        "score": null,
+                        "predicate": null
+                    }]
                 },
                 {
                     "edge_type": "WORKS_AT",
-                    "src_key": "p1",
-                    "dst_key": "acme",
-                    "derived": true
+                    "count": 1,
+                    "listed": 1,
+                    "edges": [{
+                        "edge_type": "WORKS_AT",
+                        "other": "acme",
+                        "direction": "out",
+                        "derived": true,
+                        "rule": "works_at",
+                        "score": 1.0,
+                        "predicate": "key_match on org_id"
+                    }]
                 }
             ]
         })
@@ -1003,7 +1036,7 @@ fn hybrid_search_text_only_and_missing_field_errors() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The ten task tools, in the order `tools/list` must list them.
-const TASK_TOOLS: [&str; 10] = [
+const TASK_TOOLS: [&str; 14] = [
     "explore",
     "map",
     "context",
@@ -1011,21 +1044,23 @@ const TASK_TOOLS: [&str; 10] = [
     "owners",
     "why",
     "explain_association",
+    "node_edges",
+    "neighborhood",
+    "edges_at",
+    "what_if",
     "recall",
     "remember",
     "sync",
 ];
 
-/// The fifteen graph tools, in their established order, after the task tools.
-const ADVANCED_TOOLS: [&str; 15] = [
+/// The thirteen graph tools, in their established order, after the task tools.
+const ADVANCED_TOOLS: [&str; 13] = [
     "query",
     "ingest_json",
     "create_rule",
     "explain",
     "stats",
-    "neighborhood",
     "node_info",
-    "node_edges",
     "upsert_entity",
     "find_similar",
     "hybrid_search",
@@ -1388,15 +1423,17 @@ fn one_task_call(db: SharedDb, name: &str, args: Js) -> Js {
     parse_lines(&out).remove(0)
 }
 
-/// The thirteen a memory store lists, in the order it lists them: the entity
+/// The fifteen a memory store lists, in the order it lists them: the entity
 /// questions first, the store's own counts last.
-const ASSOCIATION_TOOLS: [&str; 13] = [
+const ASSOCIATION_TOOLS: [&str; 15] = [
     "query",
     "explain_association",
     "neighborhood",
     "node_info",
     "node_edges",
     "was_linked",
+    "edges_at",
+    "what_if",
     "node_history",
     "edge_history",
     "find_similar",
@@ -1407,7 +1444,7 @@ const ASSOCIATION_TOOLS: [&str; 13] = [
 ];
 
 /// Binding: a store no repository was ingested into lists the association
-/// surface — the thirteen tools that answer a question about an entity graph,
+/// surface — the fifteen tools that answer a question about an entity graph,
 /// in that order — and none of the code-door task tools.
 #[test]
 fn a_memory_store_lists_the_association_surface() {
@@ -1424,7 +1461,7 @@ fn a_memory_store_lists_the_association_surface() {
         ASSOCIATION_TOOLS.to_vec(),
         "default tools/list on a memory store"
     );
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 15);
     for hidden in [
         "explore", "map", "context", "impact", "owners", "why", "sync",
     ] {
@@ -1516,6 +1553,428 @@ fn explain_association_says_none_when_nothing_links_the_two() {
         "{text}"
     );
     assert!(text.contains("\n  none"), "{text}");
+}
+
+// ── node_edges / neighborhood ────────────────────────────────────────────────
+
+/// Binding: `node_edges` answers in prose, grouped by edge type with a count,
+/// and every derived edge carries its direction, rule, score and predicate —
+/// the evidence that used to cost a second `explain` call.
+#[test]
+fn node_edges_groups_by_type_and_names_the_rule_behind_each_edge() {
+    let db = association_store("edges-grouped");
+    db.write()
+        .insert_node("Person", "p2", vec![("id".into(), Value::Str("p2".into()))])
+        .unwrap();
+    db.write().insert_edge("KNOWS", "p2", "p1").unwrap();
+
+    let (text, report) = task_both(db, "node_edges", json!({"key": "p1"}));
+    assert_eq!(
+        text,
+        "mushroomdb edges — p1: 2 edge(s) over 2 type(s)\n\
+         KNOWS (1)\n\
+         \x20 ← p2\n\
+         WORKS_AT (1)\n\
+         \x20 → acme  rule works_at  score 1.00 — key_match on org_id\n",
+        "{text}"
+    );
+
+    assert_eq!(report["key"], json!("p1"));
+    assert_eq!(report["total"], json!(2));
+    let works_at = &report["types"][1];
+    assert_eq!(works_at["edge_type"], json!("WORKS_AT"));
+    assert_eq!(works_at["edges"][0]["rule"], json!("works_at"));
+    assert_eq!(works_at["edges"][0]["direction"], json!("out"));
+    assert_eq!(
+        works_at["edges"][0]["predicate"],
+        json!("key_match on org_id")
+    );
+    // A manual edge was written by a caller, not matched by a predicate, so it
+    // has nothing to explain and claims no rule.
+    assert_eq!(report["types"][0]["edges"][0]["rule"], json!(null));
+}
+
+/// A store where one `Person` is joined to `n` `Org`s by the same rule, which
+/// is the shape a listing has to cap.
+fn wide_store(name: &str, n: usize) -> SharedDb {
+    let db = open(name);
+    {
+        let mut w = db.write();
+        for i in 0..n {
+            w.insert_node(
+                "Org",
+                &format!("org{i:02}"),
+                vec![("id".into(), Value::Str(format!("org{i:02}")))],
+            )
+            .unwrap();
+        }
+        w.create_rule(core_api::RuleDef {
+            name: "any_org".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: core_api::Predicate::FieldEqual {
+                field: "sector".into(),
+            },
+            edge_type: "IN_SECTOR".into(),
+            weight_prop: None,
+            max_edges: Some(1000),
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })
+        .unwrap();
+        for i in 0..n {
+            w.set_prop(&format!("org{i:02}"), "sector", Value::Str("tech".into()))
+                .unwrap();
+        }
+        w.insert_node(
+            "Person",
+            "p1",
+            vec![
+                ("id".into(), Value::Str("p1".into())),
+                ("sector".into(), Value::Str("tech".into())),
+            ],
+        )
+        .unwrap();
+    }
+    db
+}
+
+/// Binding: a type with more edges than the limit lists the limit and counts
+/// the rest, and the header still says how many there are in total.
+#[test]
+fn node_edges_caps_each_type_and_counts_what_it_did_not_list() {
+    let db = wide_store("edges-wide", 25);
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "node_edges",
+        json!({"key": "p1"}),
+    ));
+    assert!(
+        text.starts_with("mushroomdb edges — p1: 25 edge(s) over 1 type(s)\nIN_SECTOR (25)\n"),
+        "the header counts every edge, listed or not: {text}"
+    );
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("  →")).count(),
+        10,
+        "ten edges listed by default: {text}"
+    );
+    assert!(text.contains("  … and 15 more\n"), "{text}");
+
+    // And an explicit limit moves both numbers.
+    let report = task_report(db, "node_edges", json!({"key": "p1", "limit": 3}));
+    assert_eq!(report["types"][0]["count"], json!(25));
+    assert_eq!(report["types"][0]["listed"], json!(3));
+    assert_eq!(
+        report["types"][0]["edges"].as_array().map(Vec::len),
+        Some(3)
+    );
+}
+
+/// Binding: `edge_type` narrows the listing to one type, and a limit outside
+/// the schema's range is a tool error rather than a silent clamp to nothing.
+#[test]
+fn node_edges_filters_by_type_and_refuses_a_zero_limit() {
+    let db = association_store("edges-filter");
+    db.write()
+        .insert_node("Person", "p2", vec![("id".into(), Value::Str("p2".into()))])
+        .unwrap();
+    db.write().insert_edge("KNOWS", "p2", "p1").unwrap();
+
+    let report = task_report(
+        db.clone(),
+        "node_edges",
+        json!({"key": "p1", "edge_type": "WORKS_AT"}),
+    );
+    assert_eq!(report["total"], json!(1));
+    assert_eq!(report["types"].as_array().map(Vec::len), Some(1));
+    assert_eq!(report["types"][0]["edge_type"], json!("WORKS_AT"));
+
+    let reply = one_task_call(db.clone(), "node_edges", json!({"key": "p1", "limit": 0}));
+    assert!(error_text(&reply).contains("positive integer"), "{reply}");
+
+    let reply = one_task_call(db, "node_edges", json!({"key": "ghost"}));
+    assert!(error_text(&reply).contains("ghost"), "{reply}");
+}
+
+/// Binding: a depth-1 `neighborhood` is the edge listing with its evidence;
+/// past one hop it is still the breadth-first table, because no single rule
+/// accounts for a two-hop row.
+#[test]
+fn neighborhood_answers_one_hop_with_edges_and_deeper_with_the_table() {
+    let db = association_store("nb-depth");
+    db.write()
+        .insert_node("Person", "p2", vec![("id".into(), Value::Str("p2".into()))])
+        .unwrap();
+    db.write().insert_edge("KNOWS", "p1", "p2").unwrap();
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "neighborhood",
+        json!({"key": "p1"}),
+    ));
+    assert!(
+        text.starts_with("mushroomdb edges — p1: 2 edge(s) over 2 type(s)"),
+        "{text}"
+    );
+    assert!(text.contains("rule works_at"), "{text}");
+
+    // The filters still apply at depth 1.
+    let report = task_report(
+        db.clone(),
+        "neighborhood",
+        json!({"key": "p1", "edge_types": ["KNOWS"], "direction": "out"}),
+    );
+    assert_eq!(report["total"], json!(1));
+    assert_eq!(report["types"][0]["edge_type"], json!("KNOWS"));
+
+    let reply = one_task_call(db, "neighborhood", json!({"key": "p1", "depth": 2}));
+    let table = content_json(&reply);
+    assert_eq!(table["columns"], json!(["key", "label", "depth"]));
+}
+
+// ── edges_at ─────────────────────────────────────────────────────────────────
+
+/// Binding: `edges_at` checks its arguments and then says plainly that this
+/// build cannot answer, rather than guessing from the live edges.
+#[test]
+fn edges_at_checks_its_arguments_then_says_it_is_unavailable() {
+    let db = association_store("edges-at");
+    let reply = one_task_call(db.clone(), "edges_at", json!({"at": 0}));
+    assert!(error_text(&reply).contains("missing key"), "{reply}");
+
+    let reply = one_task_call(db.clone(), "edges_at", json!({"key": "p1"}));
+    assert!(error_text(&reply).contains("missing at"), "{reply}");
+
+    let reply = one_task_call(db, "edges_at", json!({"key": "p1", "at": 0}));
+    assert_eq!(
+        error_text(&reply),
+        "edges_at is not available in this build"
+    );
+}
+
+// ── what_if ──────────────────────────────────────────────────────────────────
+
+/// A memory store on a known directory, holding two `Org`s, one `Person` at
+/// the first of them, and the rule that puts them together.
+fn what_if_store(name: &str) -> (SharedDb, PathBuf) {
+    let dir = tmp(name);
+    let db = SharedDb::open(&dir).unwrap();
+    {
+        let mut w = db.write();
+        for org in ["acme", "globex"] {
+            w.insert_node("Org", org, vec![("id".into(), Value::Str(org.into()))])
+                .unwrap();
+        }
+        w.create_rule(core_api::RuleDef {
+            name: "works_at".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: core_api::Predicate::KeyMatch {
+                field: "org_id".into(),
+            },
+            edge_type: "WORKS_AT".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })
+        .unwrap();
+        w.insert_node(
+            "Person",
+            "p1",
+            vec![
+                ("id".into(), Value::Str("p1".into())),
+                ("org_id".into(), Value::Str("acme".into())),
+            ],
+        )
+        .unwrap();
+    }
+    (db, dir)
+}
+
+fn what_if_call(db: SharedDb, dir: &Path, args: Js) -> Js {
+    let (res, out) = exchange_at(db, Some(dir.to_path_buf()), &call(1, "what_if", args));
+    assert!(res.is_ok(), "{res:?}");
+    parse_lines(&out).remove(0)
+}
+
+/// Binding: `what_if` names the edges a change would lose and gain, with the
+/// rule behind each — and the live store is untouched afterwards.
+#[test]
+fn what_if_lists_the_edges_a_change_would_lose_and_gain() {
+    let (db, dir) = what_if_store("what-if-flip");
+
+    let reply = what_if_call(
+        db.clone(),
+        &dir,
+        json!({"key": "p1", "field": "org_id", "value": "globex"}),
+    );
+    let text = task_reply(&reply);
+    assert_eq!(
+        text,
+        "mushroomdb what_if — p1.org_id = \"globex\": 1 lost, 1 gained\n\
+         lost (1)\n\
+         \x20 → WORKS_AT acme  rule works_at  score 1.00\n\
+         gained (1)\n\
+         \x20 → WORKS_AT globex  rule works_at  score 1.00\n",
+        "{text}"
+    );
+
+    let reply = what_if_call(
+        db.clone(),
+        &dir,
+        json!({"key": "p1", "field": "org_id", "value": "globex", "json": true}),
+    );
+    let report: Js = serde_json::from_str(
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
+    assert_eq!(report["lost"][0]["other"], json!("acme"));
+    assert_eq!(report["lost"][0]["rule"], json!("works_at"));
+    assert_eq!(report["gained"][0]["other"], json!("globex"));
+    assert_eq!(report["gained"][0]["rule"], json!("works_at"));
+
+    // Nothing was written here: the change happened on a copy that is gone.
+    let live = task_report(db.clone(), "node_edges", json!({"key": "p1"}));
+    assert_eq!(live["types"][0]["edges"][0]["other"], json!("acme"));
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Binding: a change that moves nothing says so, rather than printing two
+/// empty headings with no count.
+#[test]
+fn what_if_says_nothing_changes_when_nothing_does() {
+    let (db, dir) = what_if_store("what-if-still");
+    let reply = what_if_call(
+        db.clone(),
+        &dir,
+        json!({"key": "p1", "field": "nickname", "value": "pip"}),
+    );
+    let text = task_reply(&reply);
+    assert!(
+        text.starts_with("mushroomdb what_if — p1.nickname = \"pip\": 0 lost, 0 gained"),
+        "{text}"
+    );
+    assert_eq!(text.matches("  none\n").count(), 2, "{text}");
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Binding: the three ways to call `what_if` wrong are tool errors, and the
+/// unknown key is refused before a byte of the store is copied.
+#[test]
+fn what_if_refuses_an_unknown_key_and_an_unsupported_value() {
+    let (db, dir) = what_if_store("what-if-bad");
+
+    let reply = what_if_call(
+        db.clone(),
+        &dir,
+        json!({"key": "ghost", "field": "org_id", "value": "globex"}),
+    );
+    assert!(error_text(&reply).contains("ghost"), "{reply}");
+
+    let reply = what_if_call(
+        db.clone(),
+        &dir,
+        // A list holding a null has no value the store can hold, which is the
+        // one shape `json_to_value` refuses outright.
+        json!({"key": "p1", "field": "org_id", "value": [null]}),
+    );
+    assert!(
+        error_text(&reply).contains("not a supported value type"),
+        "{reply}"
+    );
+
+    let reply = what_if_call(db.clone(), &dir, json!({"key": "p1", "field": "org_id"}));
+    assert!(error_text(&reply).contains("missing value"), "{reply}");
+
+    // Without the store path there is nothing to copy, and the tool says so.
+    let reply = one_task_call(
+        db.clone(),
+        "what_if",
+        json!({"key": "p1", "field": "org_id", "value": "globex"}),
+    );
+    assert!(error_text(&reply).contains("store path unknown"), "{reply}");
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── descriptions ─────────────────────────────────────────────────────────────
+
+/// Binding: every tool a memory store advertises opens its description with
+/// the question it answers.
+///
+/// The listing is what a host ranks tools by, and the first association run
+/// paid thirty-four `ToolSearch` turns discovering names whose descriptions
+/// said what they *returned* rather than what they were *for*.
+#[test]
+fn every_association_tool_description_opens_with_its_question() {
+    const OPENERS: [(&str, &str); 15] = [
+        ("query", "Who may see this"),
+        ("explain_association", "Why are A and B related"),
+        ("neighborhood", "What is around K"),
+        ("node_info", "What is K —"),
+        ("node_edges", "What is K related to"),
+        ("was_linked", "Were A and B linked at commit C"),
+        (
+            "edges_at",
+            "What did K's relationships look like at commit C",
+        ),
+        ("what_if", "What changes if K's FIELD became VALUE"),
+        ("node_history", "What has happened to K"),
+        ("edge_history", "When did A and B become linked"),
+        ("find_similar", "What is most like this"),
+        ("hybrid_search", "What matches these words and this vector"),
+        ("remember", "Remember this for next time"),
+        ("recall", "What do I already know about this"),
+        ("stats", "How big is this store"),
+    ];
+
+    let (res, out) = exchange(open("descriptions"), &req(json!(1), "tools/list", None));
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    let tools = replies[0]["result"]["tools"].as_array().expect("tools");
+    let described = |name: &str| -> String {
+        let d = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not listed"))["description"]
+            .as_str()
+            .expect("description")
+            .to_string();
+        // The graph tools carry the ranking prefix; the question is what
+        // follows it.
+        d.strip_prefix("Advanced: ").unwrap_or(&d).to_string()
+    };
+
+    for (name, opener) in OPENERS {
+        let d = described(name);
+        assert!(
+            d.starts_with(opener),
+            "{name} must open with the question it answers, got {d:?}"
+        );
+    }
+    assert_eq!(
+        OPENERS.map(|(n, _)| n).to_vec(),
+        ASSOCIATION_TOOLS.to_vec(),
+        "the openers cover the whole surface, in its order"
+    );
+
+    // `query` is the one tool whose argument a session has to be told about:
+    // the dialect it speaks and the restriction it can answer under.
+    let q = described("query");
+    assert!(q.contains("Cypher"), "{q}");
+    assert!(q.contains("'role'"), "{q}");
 }
 
 /// Binding: a key the graph does not hold is a tool error that names the key,
@@ -1681,10 +2140,10 @@ fn an_unlisted_graph_tool_is_still_callable() {
     );
 }
 
-/// Binding: `--all-tools` lists 25, task tools first in their fixed order, and
-/// every one of the fifteen graph tools carries the `Advanced:` prefix.
+/// Binding: `--all-tools` lists 27, task tools first in their fixed order, and
+/// every one of the thirteen graph tools carries the `Advanced:` prefix.
 #[test]
-fn tools_list_has_25_tools_task_tools_first_and_advanced_prefix() {
+fn tools_list_has_27_tools_task_tools_first_and_advanced_prefix() {
     let (res, out) = exchange_all_tools(open("list-order"), &req(json!(1), "tools/list", None));
     assert!(res.is_ok(), "{res:?}");
     let replies = parse_lines(&out);
@@ -1700,7 +2159,7 @@ fn tools_list_has_25_tools_task_tools_first_and_advanced_prefix() {
         .copied()
         .collect();
     assert_eq!(names, expected, "tools/list order");
-    assert_eq!(tools.len(), 25);
+    assert_eq!(tools.len(), 27);
 
     for t in tools.iter().take(TASK_TOOLS.len()) {
         let d = t["description"].as_str().expect("description");
@@ -1720,7 +2179,7 @@ fn tools_list_has_25_tools_task_tools_first_and_advanced_prefix() {
         );
     }
 
-    // The schemas the plan fixes. `json` is the one argument all eight share:
+    // The schemas the plan fixes. `json` is the one argument they all share:
     // it is what a program asks for the report with, now that no reply carries
     // one by default.
     let by_name = |n: &str| tools.iter().find(|t| t["name"] == n).expect("tool");
@@ -2305,8 +2764,9 @@ fn sync_with_db_dir_reports_the_child_failure() {
 /// Binding: every task tool stamps its text with the untrusted-data framing
 /// line, exactly once, before any repository content.
 ///
-/// `task_reply` asserts this on each tool's own test too; this one sweeps all
-/// nine in one place so a tenth tool cannot be added without a framed answer.
+/// `task_reply` asserts this on each tool's own test too; this one sweeps the
+/// whole list in one place so another tool cannot be added without a framed
+/// answer.
 #[test]
 fn every_task_tool_frames_its_text_as_untrusted() {
     let db = code_store("framing");
@@ -2317,13 +2777,17 @@ fn every_task_tool_frames_its_text_as_untrusted() {
         "why" | "explain_association" => json!({"a": "src/core.rs", "b": "src/web.rs"}),
         "recall" => json!({"topic": "src/core.rs"}),
         "remember" => json!({"text": "framing check", "about": ["src/core.rs"]}),
+        "node_edges" | "neighborhood" => json!({"key": "src/core.rs"}),
+        "edges_at" => json!({"key": "src/core.rs", "at": 0}),
+        "what_if" => json!({"key": "src/core.rs", "field": "lines", "value": 2}),
         _ => json!({}),
     };
     for tool in TASK_TOOLS {
-        // `sync` has no store path here, so it is the one tool that answers with
-        // an error; a tool error is a message to the caller, not graph content,
-        // and carries no framing by design.
-        if tool == "sync" {
+        // Three answer with an error here: `sync` and `what_if` need the store
+        // path this transcript does not pass, and `edges_at` waits on the
+        // engine call. A tool error is a message to the caller, not graph
+        // content, and carries no framing by design.
+        if matches!(tool, "sync" | "what_if" | "edges_at") {
             let reply = one_task_call(db.clone(), tool, args(tool));
             assert!(
                 !error_text(&reply).starts_with(UNTRUSTED_FRAMING),

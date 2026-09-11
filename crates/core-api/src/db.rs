@@ -478,6 +478,35 @@ pub struct EdgeInfo {
     pub derived: bool,
 }
 
+/// One directed edge incident on a node at a point in WAL history, with the
+/// rule that derived it when it is rule-owned.
+///
+/// Returned by [`GraphDb::edges_at`] (sorted by `(edge_type, src_key, dst_key)`)
+/// and by [`GraphDb::what_if_set_prop`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct EdgeAt {
+    pub edge_type: String,
+    pub src_key: String,
+    pub dst_key: String,
+    /// `true` when a rule wrote the edge (`DerivedEdgeAdded` in the WAL, or a
+    /// live provenance entry).
+    pub derived: bool,
+    /// The rule that derived the edge. `None` for a manual edge.
+    pub rule: Option<String>,
+}
+
+/// The derived edges a hypothetical property change would retract and derive.
+///
+/// Returned by [`GraphDb::what_if_set_prop`]. Both lists are sorted by
+/// `(edge_type, src_key, dst_key)` and every entry is rule-derived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WhatIf {
+    /// Derived edges that exist now and would be retracted.
+    pub lost: Vec<EdgeAt>,
+    /// Derived edges that do not exist now and would be derived.
+    pub gained: Vec<EdgeAt>,
+}
+
 /// An edge with mask-aware endpoint visibility.
 ///
 /// Returned by [`GraphDb::node_edges_masked`] in [`crate::mask::MaskMode::Stub`]
@@ -9413,6 +9442,368 @@ impl<F: Fs> GraphDb<F> {
         }
 
         Ok(active.iter().any(|(et, _, _)| et == edge_type))
+    }
+
+    /// Every edge incident to `key` — either endpoint — that existed at WAL
+    /// commit `commit`, from ONE scan of the WAL.
+    ///
+    /// This is the bulk form of [`was_linked`](GraphDb::was_linked): answering
+    /// "what did K's relationships look like at commit C" with one call instead
+    /// of one [`edge_history`](GraphDb::edge_history) per candidate partner.
+    /// The two agree edge for edge.
+    ///
+    /// Results are sorted by `(edge_type, src_key, dst_key)`.
+    ///
+    /// ## Horizon
+    ///
+    /// Valid commit indices are `wal_horizon_floor()..wal_total_commits()`;
+    /// anything outside is [`GraphError::CommitOutOfRange`], exactly like
+    /// `was_linked`. An unknown key is not an error — it simply had no edges.
+    ///
+    /// ## Derived edges
+    ///
+    /// `DerivedEdgeAdded` / `DerivedEdgeRetracted` markers carry rule
+    /// attribution, so a rule-owned edge comes back with `derived: true` and
+    /// `rule: Some(name)`.
+    ///
+    /// ## Renames
+    ///
+    /// `key` is matched through the same commit-bounded alias intervals
+    /// `edge_history` uses, so querying a node's *current* key surfaces edges
+    /// written under an earlier name. Endpoint keys in the result are reported
+    /// under the name the node carries today, so they can be fed straight back
+    /// into `node_info`, `explain` or another `edges_at`.
+    ///
+    /// ## Masks
+    ///
+    /// Like `edge_history` and `node_history`, this reads the WAL regardless of
+    /// any role mask. Apply masking at the caller level.
+    pub fn edges_at(&self, key: &str, commit: u64) -> Result<Vec<EdgeAt>> {
+        use core_storage::wal::WalRecord;
+
+        let (frames, _) = self.all_frames()?;
+        let total_commits = self.wal_horizon_floor + frames.len() as u64;
+
+        // Horizon floor: commits in pruned archives are unreachable.
+        if commit < self.wal_horizon_floor || commit >= total_commits {
+            return Err(GraphError::CommitOutOfRange {
+                commit,
+                total: total_commits,
+            });
+        }
+
+        // Commit-bounded historical names of `key` (handles RenameNode).
+        let alias = self.build_key_alias_intervals(&frames, key);
+
+        // Forward rename chain, for reporting endpoints under their current
+        // names: old key → [(commit, new key)] in ascending commit order.
+        // Built over the whole WAL, not just the prefix up to `commit`, because
+        // a rename after `commit` still changes what the node is called today.
+        let mut renames: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+        for (local_i, frame) in frames.iter().enumerate() {
+            let c = self.wal_horizon_floor + local_i as u64;
+            let records: &[WalRecord] = match frame {
+                WalRecord::Batch(inner) => inner.as_slice(),
+                single => std::slice::from_ref(single),
+            };
+            for rec in records {
+                if let WalRecord::RenameNode { old_key, new_key } = rec {
+                    renames
+                        .entry(old_key.clone())
+                        .or_default()
+                        .push((c, new_key.clone()));
+                }
+            }
+        }
+
+        // The name a node written as `k` at commit `from` carries today.
+        // Follows the first rename at or after `from`, then keeps going. The
+        // iteration cap bounds a rename cycle inside a single batch.
+        let canon = |k: &str, from: u64| -> String {
+            if renames.is_empty() {
+                return k.to_string();
+            }
+            let mut cur = k.to_string();
+            let mut at = from;
+            for _ in 0..64 {
+                match renames
+                    .get(&cur)
+                    .and_then(|v| v.iter().find(|(c, _)| *c >= at))
+                {
+                    Some((c, new)) => {
+                        at = *c;
+                        cur = new.clone();
+                    }
+                    None => break,
+                }
+            }
+            cur
+        };
+
+        let local_commit = commit - self.wal_horizon_floor;
+        // (edge_type, src_key, dst_key) → (derived, rule)
+        let mut active: BTreeMap<(String, String, String), (bool, Option<String>)> =
+            BTreeMap::new();
+
+        for (local_i, frame) in frames.iter().enumerate().take((local_commit + 1) as usize) {
+            let c = self.wal_horizon_floor + local_i as u64;
+            let records: &[WalRecord] = match frame {
+                WalRecord::Batch(inner) => inner.as_slice(),
+                single => std::slice::from_ref(single),
+            };
+
+            for rec in records {
+                match rec {
+                    WalRecord::InsertEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        if Self::aliases_match(&alias, src_key, c)
+                            || Self::aliases_match(&alias, dst_key, c)
+                        {
+                            active.insert(
+                                (edge_type.clone(), canon(src_key, c), canon(dst_key, c)),
+                                (false, None),
+                            );
+                        }
+                    }
+                    WalRecord::InsertEdgeId { etype, src, dst } => {
+                        let Some(etype_str) = self.syms.resolve(*etype) else {
+                            continue;
+                        };
+                        // `key_of_historical` resolves tombstoned ids too, and
+                        // already returns the node's current key — no rename
+                        // canonicalisation needed on this arm.
+                        let (Some(src_key), Some(dst_key)) = (
+                            self.ids.key_of_historical(*src),
+                            self.ids.key_of_historical(*dst),
+                        ) else {
+                            continue;
+                        };
+                        if src_key == key || dst_key == key {
+                            active.insert(
+                                (
+                                    etype_str.to_string(),
+                                    src_key.to_string(),
+                                    dst_key.to_string(),
+                                ),
+                                (false, None),
+                            );
+                        }
+                    }
+                    WalRecord::DeleteEdge {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        if Self::aliases_match(&alias, src_key, c)
+                            || Self::aliases_match(&alias, dst_key, c)
+                        {
+                            active.remove(&(
+                                edge_type.clone(),
+                                canon(src_key, c),
+                                canon(dst_key, c),
+                            ));
+                        }
+                    }
+                    WalRecord::DeleteNode { key: k } => {
+                        if active.is_empty() {
+                            continue;
+                        }
+                        if Self::aliases_match(&alias, k, c) {
+                            // Our node is gone; every incident edge goes with it.
+                            active.clear();
+                        } else {
+                            // A partner is gone; its edges to us go with it.
+                            let ck = canon(k, c);
+                            active.retain(|(_, s, d), _| *s != ck && *d != ck);
+                        }
+                    }
+                    WalRecord::DerivedEdgeAdded {
+                        rule,
+                        edge_type,
+                        src_key,
+                        dst_key,
+                    } => {
+                        if Self::aliases_match(&alias, src_key, c)
+                            || Self::aliases_match(&alias, dst_key, c)
+                        {
+                            active.insert(
+                                (edge_type.clone(), canon(src_key, c), canon(dst_key, c)),
+                                (true, Some(rule.clone())),
+                            );
+                        }
+                    }
+                    WalRecord::DerivedEdgeRetracted {
+                        edge_type,
+                        src_key,
+                        dst_key,
+                        ..
+                    } => {
+                        if Self::aliases_match(&alias, src_key, c)
+                            || Self::aliases_match(&alias, dst_key, c)
+                        {
+                            active.remove(&(
+                                edge_type.clone(),
+                                canon(src_key, c),
+                                canon(dst_key, c),
+                            ));
+                        }
+                    }
+                    // InsertNode, SetProp, CreateRule, … do not move edges.
+                    _ => {}
+                }
+            }
+        }
+
+        // BTreeMap iteration is already (edge_type, src, dst) order.
+        Ok(active
+            .into_iter()
+            .map(|((edge_type, src_key, dst_key), (derived, rule))| EdgeAt {
+                edge_type,
+                src_key,
+                dst_key,
+                derived,
+                rule,
+            })
+            .collect())
+    }
+
+    /// The derived edges that would be retracted and derived if `key.field`
+    /// were set to `value` — computed WITHOUT writing anything.
+    ///
+    /// Nothing is committed and nothing on `self` is mutated: the rule engine's
+    /// provenance, its candidate indexes, the topology and the property columns
+    /// are all cloned first, the change is applied to the clone, and the real
+    /// per-node re-derivation (`RuleEngine::on_node_changed` — the same call
+    /// `set_prop` makes during apply) runs against it. The derived-edge deltas
+    /// it emits are the answer, so rule semantics — predicates, top-k,
+    /// via-hops, chaining, weights — are the engine's, not a re-implementation.
+    ///
+    /// Works on a read-only handle.
+    ///
+    /// Returns `Err(KeyNotFound)` for an unknown or tombstoned key and
+    /// `Err(ViewPropReadOnly)` for a field a view owns — matching
+    /// [`set_prop`](GraphDb::set_prop)'s validation. A change with no effect
+    /// (the node already holds `value`, or no rule watches `field`) returns
+    /// empty lists.
+    ///
+    /// ## Cost
+    ///
+    /// One clone of the property columns, the topology overlay, the symbol
+    /// interner, the edge properties and the provenance map, plus one candidate
+    /// re-index (O(nodes × rules)). That is much cheaper than copying the store
+    /// directory, but it is not free — this is an interactive "what if", not a
+    /// hot path.
+    pub fn what_if_set_prop(&self, key: &str, field: &str, value: Value) -> Result<WhatIf> {
+        let empty = WhatIf {
+            lost: Vec::new(),
+            gained: Vec::new(),
+        };
+
+        if let Some(view_name) = self.view_store.view_for_prop(field) {
+            return Err(GraphError::ViewPropReadOnly {
+                view_name: view_name.to_string(),
+            });
+        }
+        MutPreview::new(self).check_live_key(key)?;
+        let id = self
+            .ids
+            .get(key)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+
+        let rules: Vec<RuleDef> = self.engine.rules().cloned().collect();
+        if rules.is_empty() {
+            return Ok(empty);
+        }
+
+        // No rule watches this field → no derivation can change.
+        if !rules.iter().any(|r| r.watched_fields().contains(field)) {
+            return Ok(empty);
+        }
+
+        let old_value = build_props_view(&self.props, &self.base)
+            .get(id, field)
+            .map(|vr| vr.into_value());
+        if old_value.as_ref() == Some(&value) {
+            return Ok(empty);
+        }
+
+        // --- Clone every piece of state the re-derivation writes to. ---
+        let mut props = self.props.clone();
+        let mut topo = self.topo.clone();
+        let mut syms = self.syms.clone();
+        let mut edge_props = self.edge_props.clone();
+
+        let mut tripped: BTreeMap<String, bool> = BTreeMap::new();
+        let mut fires: BTreeMap<String, u64> = BTreeMap::new();
+        for r in &rules {
+            tripped.insert(r.name.clone(), self.engine.is_tripped(&r.name));
+            fires.insert(r.name.clone(), self.engine.fire_count(&r.name));
+        }
+        // `provenance()` decodes retained snapshot bytes on first use; the
+        // engine clone needs the real map, not an empty one.
+        let provenance = self.engine.provenance().clone();
+        let mut engine = core_rules::RuleEngine::from_persist(rules, provenance, tripped, fires);
+
+        // Build the candidate indexes from the state BEFORE the change, exactly
+        // as apply() sees them: `on_node_changed` withdraws the node under its
+        // old value and refiles it under the new one, so the index must not
+        // already reflect the change.
+        engine.reindex_all_load_ivf(
+            &self.ids,
+            &syms,
+            &self.labels,
+            build_props_view(&self.props, &self.base),
+            self.engine.export_ivf_state(),
+        );
+        engine.load_hnsw_state(self.engine.export_hnsw_state_passthrough());
+        engine.set_emit_deltas(true);
+
+        // --- Apply the hypothetical change and re-derive. ---
+        props.set(id, field, value);
+        {
+            let mut gm = make_graph_mut(
+                &self.ids,
+                &mut syms,
+                &self.labels,
+                build_props_view(&props, &self.base),
+                &mut topo,
+                &self.base,
+                &mut edge_props,
+            );
+            engine.on_node_changed(id, Some((field, old_value)), &mut gm);
+        }
+
+        let mut lost: BTreeSet<EdgeAt> = BTreeSet::new();
+        let mut gained: BTreeSet<EdgeAt> = BTreeSet::new();
+        for d in engine.drain_deltas() {
+            let edge = EdgeAt {
+                edge_type: d.edge_type,
+                src_key: d.src_key,
+                dst_key: d.dst_key,
+                derived: true,
+                rule: Some(d.rule),
+            };
+            if d.fired {
+                gained.insert(edge);
+            } else {
+                lost.insert(edge);
+            }
+        }
+        // An edge retracted and re-derived within the same re-derivation (top-k
+        // churn) is not a change the caller would see.
+        let churn: Vec<EdgeAt> = lost.intersection(&gained).cloned().collect();
+        for e in churn {
+            lost.remove(&e);
+            gained.remove(&e);
+        }
+
+        Ok(WhatIf {
+            lost: lost.into_iter().collect(),
+            gained: gained.into_iter().collect(),
+        })
     }
 
     pub fn edge_count(&self) -> u64 {

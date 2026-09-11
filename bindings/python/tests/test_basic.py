@@ -698,3 +698,88 @@ def test_query_at_time_travel(tmp_path):
     assert len(db.query_at(2, "MATCH (n:N) RETURN n")) == 3
     assert len(db.query("MATCH (n:N) RETURN n")) == 3  # live unaffected
     db.close()
+
+
+def _teammates_rule():
+    return {
+        "name": "teammates",
+        "src_label": "Person",
+        "dst_label": "Person",
+        "predicate": {"FieldEqual": {"field": "team"}},
+        "edge_type": "TEAMMATE",
+    }
+
+
+def test_edges_at_returns_incident_edges_with_rule_attribution(tmp_path):
+    """edges_at answers 'what did K's edges look like at commit C' in one call."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Person", "a", {"team": "red"})
+    db.insert_node("Person", "b", {"team": "red"})
+    db.insert_node("Person", "c", {"team": "blue"})
+    db.insert_edge("KNOWS", "a", "c")
+    db.create_rule(_teammates_rule())
+    last = db.wal_total_commits() - 1
+
+    rows = db.edges_at("a", last)
+    assert rows == sorted(rows, key=lambda r: (r["edge_type"], r["src"], r["dst"]))
+    by_type = {r["edge_type"]: r for r in rows}
+    assert by_type["KNOWS"]["derived"] is False
+    assert by_type["KNOWS"]["rule"] is None
+    assert by_type["KNOWS"]["src"] == "a"
+    assert by_type["KNOWS"]["dst"] == "c"
+    assert by_type["TEAMMATE"]["derived"] is True
+    assert by_type["TEAMMATE"]["rule"] == "teammates"
+
+    # Agrees with was_linked, which is the per-pair form of the same question.
+    for other in ("b", "c"):
+        for etype in ("KNOWS", "TEAMMATE"):
+            want = db.was_linked("a", other, etype, last)
+            got = any(
+                r["edge_type"] == etype and other in (r["src"], r["dst"]) for r in rows
+            )
+            assert got == want, (other, etype, rows)
+
+    # Before the edge existed there is nothing to report.
+    assert db.edges_at("a", 0) == []
+
+    with pytest.raises(RuntimeError, match="out of range"):
+        db.edges_at("a", 999)
+    db.close()
+
+
+def test_what_if_set_prop_previews_without_writing(tmp_path):
+    """what_if_set_prop reports lost/gained derived edges and writes nothing."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Person", "a", {"team": "red"})
+    db.insert_node("Person", "b", {"team": "red"})
+    db.insert_node("Person", "c", {"team": "blue"})
+    db.create_rule(_teammates_rule())
+
+    commits_before = db.wal_total_commits()
+    preview = db.what_if_set_prop("a", "team", "blue")
+    assert set(preview) == {"lost", "gained"}
+    lost = {(r["src"], r["dst"]) for r in preview["lost"]}
+    gained = {(r["src"], r["dst"]) for r in preview["gained"]}
+    assert lost == {("a", "b"), ("b", "a")}
+    assert gained == {("a", "c"), ("c", "a")}
+    for r in preview["lost"] + preview["gained"]:
+        assert r["derived"] is True
+        assert r["rule"] == "teammates"
+        assert r["edge_type"] == "TEAMMATE"
+
+    # Nothing was committed.
+    assert db.wal_total_commits() == commits_before
+    still = {(r["src"], r["dst"]) for r in db.edges_at("a", commits_before - 1)}
+    assert still == {("a", "b"), ("b", "a")}
+
+    # The real write matches the preview.
+    db.set_prop("a", "team", "blue")
+    after = {(r["src_key"], r["dst_key"]) for r in db.node_edges("a") if r["derived"]}
+    assert after == {("a", "c"), ("c", "a")}
+
+    # A change with no effect is two empty lists.
+    assert db.what_if_set_prop("a", "team", "blue") == {"lost": [], "gained": []}
+
+    with pytest.raises(RuntimeError, match="not found"):
+        db.what_if_set_prop("nope", "team", "red")
+    db.close()
