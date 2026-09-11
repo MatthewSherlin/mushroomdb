@@ -378,19 +378,18 @@ scans are unaffected.
 
 ### How far back history reaches
 
-Automatic snapshots (`serve`, git ingest) keep only the newest **8** WAL
-archives by default (`AUTO_SNAPSHOT_RETENTION`, `crates/cli/src/lib.rs`),
-pruning the rest on every run. Every read says where the remaining history
-starts. Below that horizon (`commit < wal_horizon_floor`): `was_linked`,
-`edges_at`, and `open_at`/`query_at` return `GraphError::CommitOutOfRange`,
-whose message names the range it will accept and says that events before the
-floor are not retained. `node_history` and `edge_history` take no commit bound,
-so they return the events that survive together with `horizon` — the oldest
-commit still retained; anything before it was pruned.
-
-To keep everything, don't rely on the automatic path: take an explicit
-`mushroomdb snapshot <db-dir>` with no `--retention` (keeps every archive),
-or add `--keep-wal` to never truncate the WAL.
+Automatic snapshots (`serve`, git ingest) keep **every** WAL archive by
+default (`AUTO_SNAPSHOT_RETENTION`, `crates/cli/src/lib.rs`, is `None`
+unless configured): nothing is pruned unless a caller asks for it. Retention
+is opt-in — `mushroomdb snapshot <db-dir> --retention N` is how to bound the
+archives, and every read says where the remaining history starts once that
+bound has pruned something. Below that horizon (`commit < wal_horizon_floor`):
+`was_linked`, `edges_at`, and `open_at`/`query_at` return
+`GraphError::CommitOutOfRange`, whose message names the range it will accept
+and says that events before the floor are not retained. `node_history` and
+`edge_history` take no commit bound, so they return the events that survive
+together with `horizon` — the oldest commit still retained; anything before
+it was pruned.
 
 ---
 

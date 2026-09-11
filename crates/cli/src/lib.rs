@@ -44,34 +44,35 @@ pub const AUTOMATIC_SNAPSHOT: SnapshotOptions = SnapshotOptions {
 };
 
 /// How many WAL archives a snapshot mushroomdb takes *on its own* keeps.
+/// `None` = all of them. Retention is configured, never defaulted: deleting
+/// history nobody asked to delete is not a default worth having.
 ///
 /// Archiving moves the WAL aside rather than deleting it, so without a bound
 /// every automatic snapshot leaves one more file behind and nothing ever
 /// reclaims them. On a dogfooded repository that is a new archive per
-/// [`SNAPSHOT_WAL_BYTES`] of churn, for as long as the store exists.
+/// [`SNAPSHOT_WAL_BYTES`] of churn, for as long as the store exists — and that
+/// growth is the argument for the default, not against it: the reach archives
+/// exist to preserve — `node_history`, `edge_history`, `was_linked` — is
+/// exactly what pruning costs, so an automatic snapshot never volunteers to
+/// pay it. `mushroomdb stats` and `mushroomdb doctor` both print where history
+/// currently starts, and `mushroomdb snapshot <db> --retention N` is how a
+/// caller bounds the directory once they have decided the trade is worth it.
 ///
-/// Eight is the compromise. The reach archives exist to preserve —
-/// `node_history`, `edge_history`, `was_linked` — is what the bound costs, and
-/// eight archives is eight snapshot intervals of it, which on the 4 MiB
-/// threshold is tens of megabytes of history and weeks of ordinary commit
-/// traffic. Beyond that the disk is a worse trade than the reach.
+/// One consequence is worth stating plainly for whoever does set a bound,
+/// because it is not proportional. The first prune breaks the genesis chain,
+/// and `open_at` refuses any commit it cannot reconstruct from a complete
+/// prefix — so from that point it answers for commits past the last snapshot
+/// and no further, even though the retained archives still answer
+/// `node_history` and `was_linked` over their own window. Time travel to a
+/// point-in-time state is therefore bounded by the last snapshot once a store
+/// has churned this far; the history reads are bounded by the retention.
 ///
-/// One consequence is worth stating plainly, because it is not proportional.
-/// The first prune breaks the genesis chain, and `open_at` refuses any commit
-/// it cannot reconstruct from a complete prefix — so from that point it
-/// answers for commits past the last snapshot and no further, even though the
-/// eight retained archives still answer `node_history` and `was_linked` over
-/// their own window. Time travel to a point-in-time state is therefore bounded
-/// by the last snapshot once a store has churned this far; the history reads
-/// are bounded by the retention.
-///
-/// Only the automatic path is bounded. `mushroomdb snapshot` is a thing the
-/// user asked for, and `--retention N` is theirs to set: an explicit snapshot
-/// with no `--retention` still keeps every archive, because deleting history
-/// nobody asked to delete is not a default worth having.
+/// Only the automatic path takes this default. `mushroomdb snapshot` is a
+/// thing the user asked for, and `--retention N` is theirs to set: an
+/// explicit snapshot with no `--retention` still keeps every archive.
 ///
 /// [`SNAPSHOT_WAL_BYTES`]: crate::ingest_git::SNAPSHOT_WAL_BYTES
-pub const AUTO_SNAPSHOT_RETENTION: u32 = 8;
+pub const AUTO_SNAPSHOT_RETENTION: Option<u32> = None;
 
 /// Take [`AUTOMATIC_SNAPSHOT`] under a held write lock, keeping
 /// [`AUTO_SNAPSHOT_RETENTION`] archives.
@@ -83,7 +84,7 @@ pub const AUTO_SNAPSHOT_RETENTION: u32 = 8;
 ///
 /// Whatever writing the snapshot returned.
 pub fn snapshot_automatically(db: &mut WriteGuard<'_>) -> Result<(), core_api::GraphError> {
-    db.set_wal_archive_retention(Some(AUTO_SNAPSHOT_RETENTION));
+    db.set_wal_archive_retention(AUTO_SNAPSHOT_RETENTION);
     db.snapshot_with(AUTOMATIC_SNAPSHOT)
 }
 
@@ -3840,15 +3841,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Automatic snapshots keep a bounded number of archives, and the window
-    /// they keep is still reachable.
-    ///
-    /// Archiving moves the WAL aside rather than deleting it, so a store that
-    /// snapshots on every sync would otherwise leave one more file behind for
-    /// every threshold's worth of churn, forever. The bound is the only thing
-    /// that ever reclaims them, and it must not cost the recent past.
+    /// Automatic snapshots keep every archive: history is the thing archives
+    /// exist for, and nothing deletes it unless a caller asks with
+    /// `--retention`.
     #[test]
-    fn automatic_snapshots_keep_a_bounded_number_of_archives() {
+    fn automatic_snapshots_keep_every_archive() {
         let dir = tmp("snapshot-retention");
         let archives = |d: &Path| {
             std::fs::read_dir(d)
@@ -3873,40 +3870,25 @@ mod tests {
 
         assert_eq!(
             archives(&dir),
-            AUTO_SNAPSHOT_RETENTION as usize,
-            "{rounds} automatic snapshots must not leave {rounds} archives"
+            rounds,
+            "an automatic snapshot must not delete an archive"
         );
 
-        // The bound costs the oldest history, never the data and never the
-        // window it kept.
         let db = GraphDb::open(&dir).expect("reopen");
+        assert_eq!(
+            db.wal_horizon_floor(),
+            0,
+            "nothing was pruned, so the floor stays at 0"
+        );
         for i in 0..rounds {
-            assert!(db.has_node(&format!("p{i}")), "p{i} survived the pruning");
+            assert!(db.has_node(&format!("p{i}")), "p{i} survived");
         }
-        // What the bound costs is the oldest history and only that: the two
-        // frames below the floor are gone, and everything the retained
-        // archives still hold is still explainable.
         assert!(
-            db.node_history("p0").expect("history").items.is_empty(),
-            "the pruned archives take their history with them"
+            !db.node_history("p0").expect("history").items.is_empty(),
+            "the oldest history is still there: that is the point of the default"
         );
-        assert!(
-            !db.node_history("p9").expect("history").items.is_empty(),
-            "the retained window is still explainable"
-        );
+        assert_eq!(db.node_history("p0").expect("history").horizon, 0);
         drop(db);
-
-        // Pruning breaks the genesis chain, so `open_at` reaches what it can
-        // reconstruct from the snapshot forward: the live WAL.
-        {
-            let mut db = GraphDb::open(&dir).expect("open");
-            db.insert_node("Person", "after", vec![]).expect("insert");
-        }
-        let latest = GraphDb::open(&dir).expect("reopen").commit_seq();
-        assert!(
-            GraphDb::open_at(&dir, latest - 1).is_ok(),
-            "asof still reaches commits past the last snapshot"
-        );
 
         // The explicit command is the user's, and keeps everything unless the
         // user says otherwise.
@@ -3927,6 +3909,28 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&manual);
+    }
+
+    /// `--retention N` still bounds the archives when a caller asks for it —
+    /// the automatic default changed, not the escape hatch.
+    #[test]
+    fn retention_is_still_available_when_configured() {
+        let dir = tmp("retention-configured");
+        for i in 0..5 {
+            {
+                let mut db = GraphDb::open(&dir).unwrap();
+                db.insert_node("Person", &format!("p{i}"), vec![]).unwrap();
+            }
+            run_snapshot(&dir, WalDisposition::Archive, Some(2)).unwrap();
+        }
+        let archives = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".archive"))
+            .count();
+        assert_eq!(archives, 2, "--retention 2 still prunes to two");
+        assert!(GraphDb::open(&dir).unwrap().wal_horizon_floor() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3956,16 +3960,17 @@ mod tests {
     #[test]
     fn asof_header_names_the_horizon() {
         let dir = tmp("asof-horizon");
-        // Ten rounds of "write, then snapshot": the retention bound prunes the
-        // oldest archives and the floor advances past 0.
+        // Ten rounds of "write, then snapshot with an explicit retention": the
+        // bound prunes the oldest archives and the floor advances past 0. The
+        // automatic path no longer prunes on its own, so the horizon here is
+        // built with `--retention` rather than the automatic default.
         for i in 0..10 {
             {
                 let mut db = GraphDb::open(&dir).expect("open");
                 db.insert_node("Person", &format!("p{i}"), vec![])
                     .expect("insert");
             }
-            let shared = SharedDb::open(&dir).expect("open shared");
-            snapshot_shared(&shared).expect("snapshot");
+            run_snapshot(&dir, WalDisposition::Archive, Some(2)).expect("snapshot");
         }
         // One more write after the last snapshot: that commit lives in the live
         // WAL, which is what `asof` can still reconstruct on a pruned store.
@@ -4029,8 +4034,7 @@ mod tests {
                 db.insert_node("Person", &format!("p{i}"), vec![])
                     .expect("insert");
             }
-            let shared = SharedDb::open(&pruned).expect("open shared");
-            snapshot_shared(&shared).expect("snapshot");
+            run_snapshot(&pruned, WalDisposition::Archive, Some(2)).expect("snapshot");
         }
         let stats = read_stats(&pruned).expect("stats");
         assert!(stats.history_floor > 0, "the retention must have pruned");
