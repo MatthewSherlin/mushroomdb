@@ -8,7 +8,10 @@
 //! - pending_delta_count == 0 after open_at (mirror of T1's post-loop assert)
 //! - Commit out of range returns CommitOutOfRange
 
-use core_api::{Direction, GraphDb, GraphError, IngestOptions, Predicate, RuleDef, Value};
+use core_api::{
+    AsOfScope, Direction, GraphDb, GraphError, IngestOptions, Predicate, ResultSet, RoleDef,
+    RuleDef, Schema, Value,
+};
 use core_storage::wal::wal_commits;
 use std::path::PathBuf;
 
@@ -583,4 +586,106 @@ fn read_ops_work_on_as_of_instance() {
     // node_edges
     let edges = db.node_edges("a").unwrap();
     assert!(!edges.is_empty(), "commit 2: a has edges");
+}
+
+// ── As-of composed with a role or a key allow-list (v0.6.5 §6) ───────────────
+
+/// Node keys of a `RETURN n` result set, in row order.
+fn keys_of(rs: &ResultSet) -> Vec<String> {
+    (0..rs.len())
+        .filter_map(|i| match rs.row(i)[0].as_ref() {
+            Some(Value::Str(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A role mask resolved on an as-of view sees the graph as it was then.
+#[test]
+fn query_at_scoped_masks_at_the_requested_commit() {
+    let dir = tmp("asof-scoped");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Public", "p1", vec![]).unwrap(); // commit 0
+    db.apply_schema(&Schema {
+        roles: vec![RoleDef {
+            name: "reader".into(),
+            keys: vec![],
+            labels: vec!["Public".into()],
+            write: None,
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    let at_one = db.wal_total_commits().unwrap() - 1;
+    db.insert_node("Public", "p2", vec![]).unwrap(); // later
+    db.insert_node("Secret", "s1", vec![]).unwrap();
+
+    let params = std::collections::BTreeMap::new();
+    let now = db
+        .query_at_scoped(
+            db.wal_total_commits().unwrap() - 1,
+            "MATCH (n) RETURN n",
+            &params,
+            AsOfScope::Role("reader"),
+        )
+        .unwrap();
+    assert_eq!(
+        keys_of(&now),
+        vec!["p1", "p2"],
+        "Secret is never visible to reader"
+    );
+
+    let then = db
+        .query_at_scoped(
+            at_one,
+            "MATCH (n) RETURN n",
+            &params,
+            AsOfScope::Role("reader"),
+        )
+        .unwrap();
+    assert_eq!(
+        keys_of(&then),
+        vec!["p1"],
+        "p2 did not exist at that commit"
+    );
+
+    // Writes stay refused, exactly as query_at refuses them.
+    assert!(db
+        .query_at_scoped(
+            at_one,
+            "CREATE (x:Public {id:'z'})",
+            &params,
+            AsOfScope::Role("reader")
+        )
+        .is_err());
+
+    // A key allow-list resolves against the as-of graph too.
+    let ks = vec!["p1".to_string(), "p2".to_string()];
+    let scoped = db
+        .query_at_scoped(at_one, "MATCH (n) RETURN n", &params, AsOfScope::Keys(&ks))
+        .unwrap();
+    assert_eq!(keys_of(&scoped), vec!["p1"]);
+
+    // A role intersected with a client allow-list never widens the role.
+    let wide = vec!["p1".to_string(), "s1".to_string()];
+    let both = db
+        .query_at_scoped(
+            db.wal_total_commits().unwrap() - 1,
+            "MATCH (n) RETURN n",
+            &params,
+            AsOfScope::RoleAndKeys("reader", &wide),
+        )
+        .unwrap();
+    assert_eq!(keys_of(&both), vec!["p1"], "s1 is outside the role");
+
+    // An out-of-range commit carries the retained range.
+    match db.query_at_scoped(
+        9_999,
+        "MATCH (n) RETURN n",
+        &params,
+        AsOfScope::Role("reader"),
+    ) {
+        Err(GraphError::CommitOutOfRange { commit, .. }) => assert_eq!(commit, 9_999),
+        other => panic!("expected CommitOutOfRange, got {other:?}"),
+    }
 }

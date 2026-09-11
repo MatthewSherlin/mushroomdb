@@ -23,9 +23,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use core_api::{
-    is_write_query, json_to_rows, json_to_value, AutoFk, BackupReport, BatchOp, DegreeConfig, Dir,
-    GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig, ResultSet, SharedDb,
-    SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
+    is_write_query, json_to_rows, json_to_value, AsOfScope, AutoFk, BackupReport, BatchOp,
+    DegreeConfig, Dir, GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig, ResultSet,
+    SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -810,12 +810,15 @@ async fn query(
         Some(_) => return err_response("mask must be an array of strings"),
     };
 
-    // Time-travel is currently supported only on the full-token, unmasked read
-    // path (temporal + RBAC-mask composition is a follow-on).
-    if as_of.is_some() && (matches!(identity, AuthIdentity::Role(_)) || mask_keys.is_some()) {
-        return err_response(
-            "as_of (time-travel) is not yet supported with role tokens or a client mask",
-        );
+    // Stub mode discloses node existence, which is exactly the question an
+    // as-of read is asking. The two do not compose.
+    if as_of.is_some()
+        && body
+            .get("stub_hidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        return err_response("as_of (time-travel) does not compose with stub_hidden");
     }
 
     // Role token: write Cypher routes to query_write_authz (scope + mask
@@ -826,6 +829,9 @@ async fn query(
             Ok(b) => b,
             Err(e) => return err_response(e),
         };
+        if as_of.is_some() && is_write {
+            return err_response("as_of (time-travel) queries are read-only");
+        }
         if is_write {
             let role = role_name.clone();
             let cypher_c = cypher.clone();
@@ -838,6 +844,24 @@ async fn query(
             {
                 Ok(rs) => format_query_result(rs, format),
                 Err(resp) => resp,
+            };
+        }
+        // Time travel: the role's keys and labels are resolved against the
+        // graph as it was at `commit`, and a client mask intersects them
+        // there.  The role *definition* is the current one — `roles.json` is a
+        // sidecar and is never a WAL record, so it has no past version.
+        if let Some(commit) = as_of {
+            let scope = match mask_keys {
+                Some(ref keys) => AsOfScope::RoleAndKeys(role_name, keys),
+                None => AsOfScope::Role(role_name),
+            };
+            return match state
+                .db
+                .read()
+                .query_at_scoped(commit, &cypher, &params, scope)
+            {
+                Ok(rs) => format_query_result(rs, format),
+                Err(e) => role_mask_err(e),
             };
         }
         let snap = state.db.reader();
@@ -873,6 +897,19 @@ async fn query(
     // behaviour is identical in both modes (hidden nodes are excluded from
     // query results regardless of mode).
     if let Some(ref keys) = mask_keys {
+        // Time travel: the allow-list resolves against the as-of graph, so a
+        // key that did not exist at `commit` resolves to nothing.
+        if let Some(commit) = as_of {
+            return match state.db.read().query_at_scoped(
+                commit,
+                &cypher,
+                &params,
+                AsOfScope::Keys(keys),
+            ) {
+                Ok(rs) => format_query_result(rs, format),
+                Err(e) => graph_err(e),
+            };
+        }
         let stub_hidden = body
             .get("stub_hidden")
             .and_then(|v| v.as_bool())

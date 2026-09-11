@@ -205,6 +205,11 @@ fn tools_list_returns_all_tools_with_schemas() {
     assert_eq!(query["inputSchema"]["type"], "object");
     assert!(query["inputSchema"]["properties"].get("cypher").is_some());
     assert!(query["inputSchema"]["properties"].get("params").is_some());
+    // A host defers the schema, so `as_of` has to be findable in it.
+    assert_eq!(
+        query["inputSchema"]["properties"]["as_of"]["type"],
+        json!("integer")
+    );
     assert_eq!(query["inputSchema"]["required"], json!(["cypher"]));
 
     let ingest = by_name("ingest_json");
@@ -3412,6 +3417,7 @@ fn every_association_tool_description_opens_with_its_question() {
     let q = described("query");
     assert!(q.contains("Cypher"), "{q}");
     assert!(q.contains("'role'"), "{q}");
+    assert!(q.contains("'as_of'"), "{q}");
 }
 
 /// Binding: a key the graph does not hold is a tool error that names the key,
@@ -3514,6 +3520,89 @@ fn query_with_a_role_sees_only_that_roles_labels() {
         both.contains("role") && both.contains("mask"),
         "one restriction or the other, never both: {both}"
     );
+}
+
+/// Binding: `query` takes `as_of` — a past commit — and it composes with
+/// `role` and with `mask`.  Both restrictions are resolved against the graph
+/// as it was at that commit, and a write at a past commit is a tool error.
+#[test]
+fn query_as_of_composes_with_a_role_and_a_mask() {
+    let db = open("query-asof-role");
+    let at_one = {
+        let mut w = db.write();
+        w.insert_node("Public", "p1", vec![]).unwrap();
+        let at = w.wal_total_commits().unwrap() - 1;
+        w.insert_node("Public", "p2", vec![]).unwrap();
+        w.insert_node("Secret", "s1", vec![]).unwrap();
+        w.apply_schema(&core_api::Schema {
+            roles: vec![core_api::RoleDef {
+                name: "reader".into(),
+                keys: vec![],
+                labels: vec!["Public".into()],
+                write: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        at
+    };
+
+    // A role at a past commit sees only what it could see then.
+    let then = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "role": "reader", "as_of": at_one}),
+    ));
+    assert_eq!(then["rows"], json!([["p1"]]));
+
+    // The same role now sees both Public nodes and never the Secret one.
+    let now = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "role": "reader"}),
+    ));
+    assert_eq!(now["rows"], json!([["p1"], ["p2"]]));
+
+    // `as_of` alone time-travels, unrestricted.
+    let plain = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": at_one}),
+    ));
+    assert_eq!(plain["rows"], json!([["p1"]]));
+
+    // `as_of` with a mask resolves the allow-list against the as-of graph.
+    let masked = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "mask": ["p1", "p2"], "as_of": at_one}),
+    ));
+    assert_eq!(masked["rows"], json!([["p1"]]));
+
+    // A write at a past commit is a tool error, not a write.
+    let write = error_text(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "CREATE (x:Public {id:'z'})", "as_of": at_one}),
+    ));
+    assert!(write.contains("read-only"), "{write}");
+    assert!(!db.read().has_node("z"), "the write must not have landed");
+
+    // A non-integer `as_of` names what it wants.
+    let bad = error_text(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": "yesterday"}),
+    ));
+    assert!(bad.contains("as_of"), "{bad}");
+
+    // An out-of-range commit carries the retained range.
+    let far = error_text(&one_task_call(
+        db,
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "role": "reader", "as_of": 9_999}),
+    ));
+    assert!(far.contains("out of range"), "{far}");
 }
 
 /// Binding: a store carrying the `GitSync` marker — a repository was ingested

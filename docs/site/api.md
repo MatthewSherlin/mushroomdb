@@ -211,6 +211,25 @@ affects the node-info, edges, and neighborhood endpoints.
 Role tokens: `stub_hidden` is silently ignored. Hidden nodes are always fully omitted
 for role-token requests.
 
+`as_of` (optional): a 0-based WAL commit index. The query is answered from the
+graph as it existed at that commit, read-only — a write statement with `as_of`
+is a 400. It composes with a role token and with a client `mask`, both of which
+are resolved against the graph as it was then; a role token plus a client mask
+still intersects, never widens. The role *definition* itself is the current one
+(`roles.json` is a sidecar and is never a WAL record). A commit outside the
+retained range is a 400 naming the range, e.g.
+`commit 9999 is out of range; valid range is 12..40 — events before commit 12 are not retained`.
+`as_of` and `stub_hidden` do not compose: the pair is a 400. See
+[timetravel.md](timetravel.md) and [masks.md](masks.md).
+
+```json
+{
+  "cypher": "MATCH (n) RETURN n",
+  "as_of": 12,
+  "mask": ["ada", "bob"]
+}
+```
+
 Default response: Arrow IPC stream (`application/vnd.apache.arrow.stream`).
 
 Add `?format=json` for a JSON response:

@@ -222,6 +222,31 @@ remain trustworthy across restarts.
 (inclusive) into a fresh in-memory graph, then marks the instance read-only.
 Every mutation method on the returned instance returns `GraphError::ReadOnly`.
 
+### As-of with a role or a mask
+
+`GraphDb::query_at_scoped(commit, cypher, params, scope)` runs a read-only
+query at `commit` under a restriction. `AsOfScope` says which one:
+
+| Scope | Restriction |
+|---|---|
+| `AsOfScope::Role("reader")` | everything that role may see |
+| `AsOfScope::Keys(&keys)` | an explicit node-key allow-list |
+| `AsOfScope::RoleAndKeys("reader", &keys)` | the role ∩ the allow-list — a client list can only narrow a role, never widen it |
+
+Over HTTP this is `as_of` on `POST /query`: it composes with a role token and
+with a client `mask`. Over MCP it is the `query` tool's `as_of` argument,
+which composes with `role` and with `mask`. Writes are refused at any commit.
+
+**The one semantic to get right:** the **graph** is historical, the **role
+definition** is current. `roles.json` is a sidecar — it is never written as a
+WAL record, so it has no past version to read. What time-travels is which
+nodes the role's `keys` and `labels` resolve to: a role that may see the
+`Public` label sees exactly the `Public` nodes that existed at `commit`. If
+you rename a role's labels today, an as-of read from last week answers with
+today's label list against last week's graph.
+
+`stub_hidden` does not compose with `as_of`; see [masks.md](masks.md).
+
 ### WAL retention and snapshot interaction
 
 Every write appends a frame to the WAL. Commits are numbered 0-based: commit 0

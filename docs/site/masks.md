@@ -141,3 +141,25 @@ Summary of what each caller class sees:
 | Full-access token, no mask | all nodes |
 | Full-access token + client mask | client mask |
 | Role token | role mask ∩ client mask (if any) |
+
+### Composing with `as_of`
+
+A mask composes with time travel. `POST /query` accepts `as_of` alongside a
+role token or a client `mask`, and the MCP `query` tool accepts `as_of`
+alongside `role` or `mask`. Every key and label is resolved against the graph
+**as it was at that commit**, so a key that did not exist yet resolves to
+nothing and a role that may see a label sees exactly the nodes that carried it
+then. The intersection rule is unchanged: a client mask can only narrow a
+role, never widen it. Writes are refused at any commit.
+
+The graph is historical; the role *definition* is not. `roles.json` is a
+sidecar and is never a WAL record, so there is no past version of it to read —
+an as-of read applies today's role definition to the graph as it was then. See
+[timetravel.md](timetravel.md).
+
+**`stub_hidden` does not compose with `as_of`** — the pair is rejected with
+`as_of (time-travel) does not compose with stub_hidden`. Stub mode exists to
+disclose that a hidden node *exists*, and node existence at a past commit is
+exactly the question an as-of read is asking; answering it through a stub
+would leak the historical shape of the graph outside the mask. Drop
+`stub_hidden` or drop `as_of`.
