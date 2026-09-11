@@ -27,6 +27,9 @@ SUBJECT_B = SCRATCH / "subject-mdb"
 SUBJECT_D = SCRATCH / "subject-cli"      # install --delivery cli, no MCP server
 SUBJECT_E = SCRATCH / "subject-mdb-i"    # B's install, plus --intercept-grep
 SUBJECT_F = SCRATCH / "subject-cli-i"    # D's install, plus --intercept-grep
+SUBJECT_L = SCRATCH / "subject-mdb-l"    # B's install, plus --impact-before-edit
+SUBJECT_J = SCRATCH / "subject-mdb-j"    # B's install, plus --enrich-grep
+SUBJECT_H = SCRATCH / "subject-mdb-h"    # B's install, plus --always-load
 EMPTY_MCP = SCRATCH / "empty-mcp.json"
 
 # R2: the second subject repository (see truth_r2.py). One local clone at the
@@ -37,6 +40,9 @@ SUBJECT2_B = SCRATCH / "subject2-mdb"
 SUBJECT2_D = SCRATCH / "subject2-cli"
 SUBJECT2_E = SCRATCH / "subject2-mdb-i"
 SUBJECT2_F = SCRATCH / "subject2-cli-i"
+SUBJECT2_L = SCRATCH / "subject2-mdb-l"
+SUBJECT2_J = SCRATCH / "subject2-mdb-j"
+SUBJECT2_H = SCRATCH / "subject2-mdb-h"
 R2_VENV = SCRATCH / "venv-r2"            # what `python` means in an R2 verify
 
 # The association suite (v0.6.3 §3): one built world in three forms, each its
@@ -65,9 +71,13 @@ SUBJECTS = {
     ("A", "R1"): SUBJECT_A, ("B", "R1"): SUBJECT_B,
     ("C", "R1"): SUBJECT_B, ("D", "R1"): SUBJECT_D,
     ("E", "R1"): SUBJECT_E, ("F", "R1"): SUBJECT_F,
+    ("L", "R1"): SUBJECT_L, ("J", "R1"): SUBJECT_J,
+    ("H", "R1"): SUBJECT_H,
     ("A", "R2"): SUBJECT2_A, ("B", "R2"): SUBJECT2_B,
     ("C", "R2"): SUBJECT2_B, ("D", "R2"): SUBJECT2_D,
     ("E", "R2"): SUBJECT2_E, ("F", "R2"): SUBJECT2_F,
+    ("L", "R2"): SUBJECT2_L, ("J", "R2"): SUBJECT2_J,
+    ("H", "R2"): SUBJECT2_H,
 }
 
 # One target directory for every cargo invocation of a run — the agent's own
@@ -90,6 +100,9 @@ ARM_LABEL = {
     "D": "mushroomdb, cli delivery (no MCP)",
     "E": "mushroomdb installed + grep redirect",
     "F": "mushroomdb cli delivery + grep redirect",
+    "L": "mushroomdb installed + impact-before-edit hook",
+    "J": "mushroomdb installed + enrich-grep hook",
+    "H": "mushroomdb installed + always-load",
     "P": "files + grep",
     "Q": "sqlite",
     "R": "graph",
@@ -111,6 +124,15 @@ ARM_PROVENANCE = {
          "PreToolUse redirect from `Grep` to `explore`; plain prompt",
     "F": "`mushroomdb install --delivery cli --intercept-grep` — arm D's "
          "install plus that redirect; plain prompt",
+    "L": "arm B's install plus `--impact-before-edit` — a `PreToolUse` hook, "
+         "awaited, that prints a file's blast radius in front of the `Edit`/"
+         "`Write` call about to change it; plain prompt",
+    "J": "arm B's install plus `--enrich-grep` — a `PostToolUse` hook, "
+         "awaited, that appends what the graph knows about the symbols a "
+         "`Grep` just matched to that tool's result; plain prompt",
+    "H": "arm B's install plus `--always-load` — the registered MCP server "
+         "is marked `alwaysLoad`, so the host keeps its tools in context "
+         "instead of deferring them behind ToolSearch; plain prompt",
     "P": "the world as `entities/*.json`, `changes.jsonl`, `roles.json` and a "
          "README describing the rules; no MCP server; plain prompt",
     "Q": "the same world as `world.sqlite` (`sqlite3` on PATH) with the same "
@@ -122,7 +144,19 @@ ARM_PROVENANCE = {
 
 # The arms whose session is given the MCP tool. Kept beside the arms rather
 # than read off `cell_command`, which lives in `run.py` and imports this file.
-MCP_ARMS = frozenset({"B", "C", "E", "R"})
+MCP_ARMS = frozenset({"B", "C", "E", "R", "L", "J", "H"})
+
+# Per-arm tools to strip from the session with `--disallowedTools`, which
+# actually removes a tool from what the model is offered — unlike
+# `--allowedTools`, which only grants permission and leaves the tool visible
+# (the 0.6.2 finding: an arm meant to go Grep-less by permission alone still
+# had Grep in its tool list). Empty for every arm above; the mechanism exists
+# for a future arm whose point is that a tool is gone, not merely disallowed.
+ARM_DISALLOWED: dict[str, list[str]] = {
+    "A": [], "B": [], "C": [], "D": [], "E": [], "F": [],
+    "L": [], "J": [], "H": [],
+    "P": [], "Q": [], "R": [],
+}
 
 # Both arms get exactly these tools. `Bash` is unqualified on purpose: the
 # per-command form `Bash(git:*)` denies every pipeline (`git log ... | sort |
@@ -439,6 +473,9 @@ def setup_code(force: bool = False, arms: set[str] | None = None) -> set[str]:
         print("arm F: this binary's install has no --delivery flag; "
               "skipping its subjects")
         want_f = False
+    want_l = "L" in arms
+    want_j = "J" in arms
+    want_h = "H" in arms
 
     tasks_path = HERE / "tasks.json"
     pinned = json.loads(tasks_path.read_text()) if tasks_path.exists() else None
@@ -455,6 +492,12 @@ def setup_code(force: bool = False, arms: set[str] | None = None) -> set[str]:
             dirs += [SUBJECT_E, SUBJECT2_E]
         if want_f:
             dirs += [SUBJECT_F, SUBJECT2_F]
+        if want_l:
+            dirs += [SUBJECT_L, SUBJECT2_L]
+        if want_j:
+            dirs += [SUBJECT_J, SUBJECT2_J]
+        if want_h:
+            dirs += [SUBJECT_H, SUBJECT2_H]
         for d in dirs:
             shutil.rmtree(d, ignore_errors=True)
     shutil.rmtree(CELLS, ignore_errors=True)
@@ -473,6 +516,12 @@ def setup_code(force: bool = False, arms: set[str] | None = None) -> set[str]:
     if want_f:
         install_subject(SUBJECT_F, ["--delivery", "cli", "--intercept-grep"],
                         REPO, r1_sha)
+    if want_l:
+        install_subject(SUBJECT_L, ["--impact-before-edit"], REPO, r1_sha)
+    if want_j:
+        install_subject(SUBJECT_J, ["--enrich-grep"], REPO, r1_sha)
+    if want_h:
+        install_subject(SUBJECT_H, ["--always-load"], REPO, r1_sha)
 
     # R2: one pinned clone feeds the arms' clones, and the venv the change
     # tasks test in.
@@ -489,6 +538,12 @@ def setup_code(force: bool = False, arms: set[str] | None = None) -> set[str]:
     if want_f:
         install_subject(SUBJECT2_F, ["--delivery", "cli", "--intercept-grep"],
                         R2_SRC, r2_sha)
+    if want_l:
+        install_subject(SUBJECT2_L, ["--impact-before-edit"], R2_SRC, r2_sha)
+    if want_j:
+        install_subject(SUBJECT2_J, ["--enrich-grep"], R2_SRC, r2_sha)
+    if want_h:
+        install_subject(SUBJECT2_H, ["--always-load"], R2_SRC, r2_sha)
     ensure_r2_venv()
 
     if rebuild:

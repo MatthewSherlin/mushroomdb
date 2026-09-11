@@ -105,6 +105,39 @@ def test_cell_command_arm_f_has_no_mcp():
     assert cmd[cmd.index("--mcp-config") + 1] == str(EMPTY_MCP)
 
 
+def test_cell_command_arm_l_has_mcp_and_no_prefix():
+    from run import cell_command
+    from subjects import MCP_TOOL, SUBJECT_L
+    cmd, cwd = cell_command("L", "q", 30, None)
+    assert cwd == SUBJECT_L
+    assert cmd[2] == "q"
+    tools = cmd[cmd.index("--allowedTools") + 1]
+    assert MCP_TOOL in tools
+    assert cmd[cmd.index("--mcp-config") + 1] == ".mcp.json"
+
+
+def test_cell_command_arm_j_has_mcp_and_no_prefix():
+    from run import cell_command
+    from subjects import MCP_TOOL, SUBJECT_J
+    cmd, cwd = cell_command("J", "q", 30, None)
+    assert cwd == SUBJECT_J
+    assert cmd[2] == "q"
+    tools = cmd[cmd.index("--allowedTools") + 1]
+    assert MCP_TOOL in tools
+    assert cmd[cmd.index("--mcp-config") + 1] == ".mcp.json"
+
+
+def test_cell_command_arm_h_has_mcp_and_no_prefix():
+    from run import cell_command
+    from subjects import MCP_TOOL, SUBJECT_H
+    cmd, cwd = cell_command("H", "q", 30, None)
+    assert cwd == SUBJECT_H
+    assert cmd[2] == "q"
+    tools = cmd[cmd.index("--allowedTools") + 1]
+    assert MCP_TOOL in tools
+    assert cmd[cmd.index("--mcp-config") + 1] == ".mcp.json"
+
+
 def test_mcp_arms_matches_what_the_cells_are_actually_given():
     """`MCP_ARMS` is what a summary says; `cell_command` is what ran."""
     from run import cell_command
@@ -113,6 +146,32 @@ def test_mcp_arms_matches_what_the_cells_are_actually_given():
         cmd, _ = cell_command(arm, "q", 30, None)
         given = MCP_TOOL in cmd[cmd.index("--allowedTools") + 1]
         assert given == (arm in MCP_ARMS), arm
+
+
+def test_cell_command_emits_disallowed_tools_only_when_non_empty(monkeypatch):
+    """`--disallowedTools` is the removal mechanism; `--allowedTools` alone
+    does not take a tool away (the 0.6.2 finding)."""
+    from run import cell_command
+    import subjects
+    monkeypatch.setitem(subjects.ARM_DISALLOWED, "A", ["Grep"])
+    cmd, _ = cell_command("A", "q", 30, None)
+    assert "--disallowedTools" in cmd
+    assert cmd[cmd.index("--disallowedTools") + 1] == "Grep"
+
+    monkeypatch.setitem(subjects.ARM_DISALLOWED, "B", [])
+    cmd2, _ = cell_command("B", "q", 30, None)
+    assert "--disallowedTools" not in cmd2
+
+
+def test_arm_disallowed_is_empty_for_every_current_arm():
+    from subjects import ARM_DISALLOWED, ARM_LABEL
+    for arm in ARM_LABEL:
+        assert ARM_DISALLOWED.get(arm, []) == [], arm
+
+
+def test_code_suite_default_arms_unchanged():
+    from subjects import SUITES
+    assert SUITES["code"]["arms"] == ["A", "B", "C", "D"]
 
 
 # --- grading -------------------------------------------------------------

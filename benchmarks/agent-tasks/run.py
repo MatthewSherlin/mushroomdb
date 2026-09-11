@@ -42,10 +42,11 @@ sys.path.insert(0, str(HERE))
 
 from ground_truth import grade, unit_passed                      # noqa: E402
 from report import write_summary                                 # noqa: E402
-from subjects import (ASSOC_ARMS, ASSOC_SUBJECTS, BASE_TOOLS,    # noqa: E402
-                      CELL_TIMEOUT_S,
+from subjects import (ARM_DISALLOWED, ASSOC_ARMS, ASSOC_SUBJECTS,  # noqa: E402
+                      BASE_TOOLS, CELL_TIMEOUT_S,
                       DEFAULT_MAX_TURNS, EMPTY_MCP, MCP_TOOL, SUBJECT_A,
-                      SUBJECT_B, SUBJECT_D, SUBJECT_E, SUBJECT_F, SUITES,
+                      SUBJECT_B, SUBJECT_D, SUBJECT_E, SUBJECT_F, SUBJECT_H,
+                      SUBJECT_J, SUBJECT_L, SUITES,
                       assoc_cell_dir, cell_worktree, changed_files,
                       child_env, drop_worktree, make_cell_copy, make_worktree,
                       restore_subject, setup, subject_root)
@@ -94,6 +95,15 @@ def cell_command(arm: str, prompt: str, max_turns: int = DEFAULT_MAX_TURNS,
     elif arm == "E":
         # B's install plus --intercept-grep: MCP present, plain prompt.
         cwd, mcp_config, tools = SUBJECT_E, ".mcp.json", list(BASE_TOOLS) + [MCP_TOOL]
+    elif arm == "L":
+        # B's install plus --impact-before-edit: MCP present, plain prompt.
+        cwd, mcp_config, tools = SUBJECT_L, ".mcp.json", list(BASE_TOOLS) + [MCP_TOOL]
+    elif arm == "J":
+        # B's install plus --enrich-grep: MCP present, plain prompt.
+        cwd, mcp_config, tools = SUBJECT_J, ".mcp.json", list(BASE_TOOLS) + [MCP_TOOL]
+    elif arm == "H":
+        # B's install plus --always-load: MCP present, plain prompt.
+        cwd, mcp_config, tools = SUBJECT_H, ".mcp.json", list(BASE_TOOLS) + [MCP_TOOL]
     else:
         # B and C share the arm B clone; C differs only by invoking the
         # project skill with its own trigger.
@@ -113,6 +123,15 @@ def cell_command(arm: str, prompt: str, max_turns: int = DEFAULT_MAX_TURNS,
         "--setting-sources", "project",
         "--allowedTools", ",".join(tools),
     ]
+    # `--allowedTools` only grants permission; a tool it omits is still on the
+    # model's tool list, just denied when called (the 0.6.2 finding — an arm
+    # meant to go Grep-less by permission alone still had Grep offered).
+    # `--disallowedTools` is the actual removal mechanism, for a future arm
+    # whose point is that a tool is gone. `ARM_DISALLOWED` is empty for every
+    # current arm, so this is a no-op today.
+    disallowed = ARM_DISALLOWED.get(arm, [])
+    if disallowed:
+        cmd += ["--disallowedTools", ",".join(disallowed)]
     return cmd, cwd
 
 
