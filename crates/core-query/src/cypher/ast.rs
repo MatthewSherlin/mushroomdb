@@ -245,6 +245,64 @@ pub enum Operand {
     },
 }
 
+/// The column name an operand gets in a RETURN or WITH item that has no
+/// `AS` alias.
+///
+/// There are three copies of the column-naming rule — the planner's
+/// duplicate-column check, the executor's projection, and core-api's
+/// write-statement RETURN — and they have to agree exactly or a `WITH` alias
+/// stops resolving. This is the one place the operand half of that rule
+/// lives.
+///
+/// A composite operand renders as a placeholder (`<arith>`, `<case>`)
+/// because it has no natural spelling; a subscript does have one, so
+/// `n.location[0]` names itself and two subscripts of the same list are two
+/// distinct columns rather than a duplicate-column error.
+pub fn operand_label(op: &Operand) -> String {
+    match op {
+        Operand::Var(v) => v.clone(),
+        Operand::Prop { var, field } => format!("{var}.{field}"),
+        Operand::Lit(_) => "<lit>".to_string(),
+        Operand::Param(p) => format!("${p}"),
+        Operand::FuncCall { name, .. } => format!("{name}(...)"),
+        Operand::BinArith { .. } => "<arith>".to_string(),
+        Operand::Case { .. } => "<case>".to_string(),
+        Operand::Index { base, index } => {
+            format!("{}[{}]", operand_label(base), subscript_label(index))
+        }
+    }
+}
+
+/// The index half of a subscript's column name. A literal integer prints as
+/// itself — `<lit>` would make every subscript of one list the same column.
+fn subscript_label(op: &Operand) -> String {
+    match op {
+        Operand::Lit(Value::Int(n)) => n.to_string(),
+        other => operand_label(other),
+    }
+}
+
+/// The column name a RETURN item takes when it has no `AS` alias, for the
+/// item kinds whose name does not depend on the planner.
+///
+/// `RetVal::Agg` is not here: an aggregate's column is computed by the
+/// planner and stored on the plan op, and the three callers disagree about
+/// what to do with it.
+pub fn ret_val_label(value: &RetVal) -> Option<String> {
+    match value {
+        RetVal::Var(v) => Some(v.clone()),
+        RetVal::Prop { var, field } => Some(format!("{var}.{field}")),
+        RetVal::FuncCall { name, args } => {
+            let arg_strs: Vec<String> = args.iter().map(operand_label).collect();
+            Some(format!("{name}({})", arg_strs.join(", ")))
+        }
+        // A subscript names itself; every other scalar expression is `<expr>`.
+        RetVal::ScalarExpr(op @ Operand::Index { .. }) => Some(operand_label(op)),
+        RetVal::ScalarExpr(_) => Some("<expr>".to_string()),
+        RetVal::Agg { .. } => None,
+    }
+}
+
 /// Arithmetic operators for `Operand::BinArith`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ArithOp {
