@@ -245,12 +245,16 @@ break in an agent's context.
 | `owners` | `path` | Top author and share, authors who know the file, the last commit to touch it, and the split by quarter. |
 | `why` | `a`, `b` | Every rule edge between two nodes with its score and evidence, or the shortest path between them when there is no direct link. |
 | `explain_association` | `a`, `b` | Every rule-derived edge between two node keys, one line each: the edge type, the rule that wrote it, the score, and the predicate it matched on. Both keys must already exist. `json: true` returns the array of explanations instead. |
+| `node_edges` | `key` | Every edge incident on one node, grouped by edge type, with the rule and score behind each derived edge and the partner's label. |
+| `neighborhood` | `key`, `hops?`, `edge_type?` | Everything within N hops of a node, optionally restricted to one edge type. |
+| `edges_at` | `key`, `commit` | The edges the node had at one commit — the graph as it was then, replayed from the WAL and its archives. Renames are followed, so a node's current key finds edges written under an earlier name. |
+| `what_if` | `key`, `field`, `value` | The derived edges a property change would retract and derive, computed without writing anything: the rule engine runs the same re-derivation a real `set_prop` would, against a clone. |
 | `recall` | `topic` | One pointer per hit — `path:line symbol — first doc line` — for the identifiers a topic names: a path, a `mod::name`, a snake_case word, or any word in backticks. |
 | `remember` | `text`, `about?`, `kind?` | Writes a note into the graph and returns its key. Every key in `about` must already exist. |
 | `sync` | — | Brings the store up to date with the repository it was built from: the commits since the last sync, then the files that differ from `HEAD`. |
 
-Each of the ten also accepts `json` (boolean, default false), which swaps the
-rendered digest for the report.
+Each of the fourteen also accepts `json` (boolean, default false), which swaps
+the rendered digest for the report.
 
 `context` and `impact` are the two that read anything outside the graph.
 `context` reads it only when asked: with `full: true` it quotes source from the
@@ -268,7 +272,7 @@ re-invoking the binary the server is running from.
 
 ## Tool reference
 
-The fifteen tools below are the graph API itself. Their `tools/list`
+The thirteen tools below are the graph API itself. Their `tools/list`
 descriptions all begin `Advanced:`, which marks them as the lower-level surface
 beneath the repository tools above.
 
@@ -279,16 +283,16 @@ serves both kinds and neither has to be configured for:
 | Store | Default listing |
 |---|---|
 | Built by `ingest-git` (a code graph) | **three** — `explore`, `query`, `stats` |
-| Anything else (a memory store) | **thirteen** — the association surface: `query`, `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `node_history`, `edge_history`, `find_similar`, `hybrid_search`, `remember`, `recall`, `stats` |
+| Anything else (a memory store) | **fifteen** — the association surface: `query`, `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `edges_at`, `what_if`, `node_history`, `edge_history`, `find_similar`, `hybrid_search`, `remember`, `recall`, `stats` |
 
-All 25 stay served on either surface: the surface decides what is listed, not
+All 27 stay served on either surface: the surface decides what is listed, not
 what the server answers. A session can only call what its client was shown,
 though — on a code-graph store that is `explore`, `query` and `stats`, so a
 note is written with `query` and the sync is the git `post-commit` hook's job.
 `mushroomdb mcp <db> --all-tools` lists the whole set with their schemas on
-either store. The default listing a session pays for before its first turn is
-1,670 bytes on a code-graph store against 8,442 on a memory store; the full 25
-are 14,681.
+either store. The default listing a session pays for before its first turn — the
+`tools` array of the `tools/list` reply, as compact JSON — is 1,942 bytes on a
+code-graph store against 11,963 on a memory store; the full 27 are 18,557.
 
 `ingest_json` is deliberately not on the code-graph surface: a store built by
 `ingest-git` is written by `sync` and `touch`, not by an assistant bulk-loading
@@ -303,9 +307,7 @@ rows into it.
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain` | The rules and scores that produced the edges between two nodes, as JSON. `explain_association` above is the same question answered in prose. |
 | `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels resolved to that same allow-list. Pass one or the other, never both. See [Trust model](#trust-model) below. |
-| `neighborhood` | Multi-hop neighborhood traversal with optional edge-type filter. |
 | `node_info` | Return a node's key, label, and all properties. |
-| `node_edges` | Return all edges incident on a node. |
 | `stats` | Return live node, edge, and rule counts. |
 | `node_history` | Every property change for a node since the last truncating snapshot. |
 | `edge_history` | Add/retract lifecycle for all edges between two nodes, with the rule behind each event. |
