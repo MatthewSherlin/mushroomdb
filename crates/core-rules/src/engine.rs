@@ -11,28 +11,6 @@ use core_storage::v8::encode::{decode_ivf_bytes, decode_provenance_bytes};
 use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::{EdgeProps, IdMap, Interner, Topology, Value};
 
-/// Deserialize one side's persisted HNSW blob.
-///
-/// `None` means "no usable persisted graph, rebuild this side": either the blob
-/// is empty (the side had no graph when the snapshot was written) or it failed
-/// to deserialize, in which case the reason is reported on stderr — a corrupt
-/// blob costs a rebuild, never a silently empty index.
-fn deserialize_hnsw_blob(rule: &str, side: &str, blob: &[u8]) -> Option<HnswIndex> {
-    if blob.is_empty() {
-        return None;
-    }
-    match bincode::deserialize::<HnswIndex>(blob) {
-        Ok(h) => Some(h),
-        Err(e) => {
-            eprintln!(
-                "[mushroomdb] rule {rule:?}: persisted {side}-side HNSW index failed to load \
-                 ({e}); rebuilding it from the node scan"
-            );
-            None
-        }
-    }
-}
-
 /// Decode raw IVF section bytes into the `RuleIvfExport` format consumed by
 /// `reindex_all_load_state`.  Returns an empty map when `bytes` is empty.
 fn decode_ivf_bytes_to_export(bytes: &[u8]) -> BTreeMap<String, RuleIvfExport> {
@@ -1615,14 +1593,30 @@ fn index_node_for_rule(
     syms: &Interner,
     props: ColumnsView<'_>,
 ) {
+    const NONE: (BTreeSet<u32>, BTreeSet<u32>) = (BTreeSet::new(), BTreeSet::new());
+    index_node_for_rule_skipping(id, label_sym, def, index, syms, props, &NONE);
+}
+
+/// `index_node_for_rule`, but the open-time scan's version: `skip` holds the
+/// `(src, dst)` node ids the adopted HNSW graphs already contain, so the scan
+/// only inserts vectors the persisted graphs did not carry.
+fn index_node_for_rule_skipping(
+    id: u32,
+    label_sym: u32,
+    def: &RuleDef,
+    index: &mut RuleIndex,
+    syms: &Interner,
+    props: ColumnsView<'_>,
+    skip: &(BTreeSet<u32>, BTreeSet<u32>),
+) {
     let get = |f: &str| props.get(id, f).map(|vr| vr.into_value());
     if syms.get(&def.src_label) == Some(label_sym) {
         let spec = src_lookup_spec_for(def);
-        index.src_side.insert(&spec, id, &get);
+        index.src_side.insert_skipping(&spec, id, &skip.0, &get);
     }
     if syms.get(&def.dst_label) == Some(label_sym) {
         let spec = candidate_spec_for(def);
-        index.dst_side.insert(&spec, id, &get);
+        index.dst_side.insert_skipping(&spec, id, &skip.1, &get);
     }
 }
 
@@ -2121,12 +2115,14 @@ impl RuleEngine {
     /// `hnsw_state`: map from rule name to `(src_blob, dst_blob)` as produced
     /// by `export_hnsw_state` / stored in the snapshot.
     ///
-    /// A side whose blob deserializes is left without an HNSW graph for the
-    /// duration of the node scan: `SideIndex::insert` then records only
-    /// `hnsw_tracked` and skips the graph insert.  That is the whole point —
-    /// building the graph during the scan is superlinear in the number of
-    /// embeddings, and the persisted graph installed afterwards replaced it
-    /// wholesale anyway, so the build was pure waste on every open.
+    /// The persisted graph is adopted **before** the node scan, and the scan is
+    /// told which ids it already holds so it inserts only what the snapshot did
+    /// not carry.  That is the whole point — building the graph during the scan
+    /// is superlinear in the number of embeddings, and the persisted graph
+    /// replaced it wholesale anyway, so the build was pure waste on every open.
+    /// Adopting first also means a node the scan *does* see but the graph does
+    /// not — a rule whose blob predates a write — is inserted rather than
+    /// dropped.
     ///
     /// A side falls back to the full rebuild when:
     ///   * `hnsw_state` has no entry for the rule — a store written before HNSW
@@ -2151,38 +2147,29 @@ impl RuleEngine {
         }
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
 
-        // Deserialize persisted graphs up front, before the node scan, so the
-        // scan knows which sides it must build and which it must leave alone.
-        // Sides with no usable blob get `init_hnsw` and are filled by the scan.
+        // Adopt the persisted graphs up front, before the node scan, and keep
+        // the ids each one already holds so the scan can skip them.  Sides with
+        // no usable blob get `init_hnsw` and are filled by the scan.
         let mut leftover_blobs = hnsw_state;
-        let mut restored: BTreeMap<String, (Option<HnswIndex>, Option<HnswIndex>)> =
-            BTreeMap::new();
+        let mut adopted: BTreeMap<String, (BTreeSet<u32>, BTreeSet<u32>)> = BTreeMap::new();
         for name in &rule_names {
             if !self.rules[name].approximate {
                 continue;
             }
-            let blobs = leftover_blobs.remove(name);
-            let (src, dst) = match &blobs {
-                Some((s, d)) => (
-                    deserialize_hnsw_blob(name, "src", s),
-                    deserialize_hnsw_blob(name, "dst", d),
-                ),
-                None => (None, None),
-            };
+            let (src_blob, dst_blob) = leftover_blobs.remove(name).unwrap_or_default();
             let idx = self.indexes.get_mut(name).unwrap();
-            if src.is_none() {
-                idx.src_side.init_hnsw(name);
+            let (src_ids, src_adopted) = idx.src_side.init_or_adopt_hnsw(name, &src_blob);
+            let (dst_ids, dst_adopted) = idx.dst_side.init_or_adopt_hnsw(name, &dst_blob);
+            if !src_adopted {
                 self.hnsw_builds += 1;
             }
-            if dst.is_none() {
-                idx.dst_side.init_hnsw(name);
+            if !dst_adopted {
                 self.hnsw_builds += 1;
             }
-            if src.is_some() || dst.is_some() {
-                restored.insert(name.clone(), (src, dst));
-            }
+            adopted.insert(name.clone(), (src_ids, dst_ids));
         }
 
+        let empty: (BTreeSet<u32>, BTreeSet<u32>) = (BTreeSet::new(), BTreeSet::new());
         for id in 0..ids.len() as u32 {
             let label_sym = match labels.get(id as usize).copied() {
                 Some(s) if s != u32::MAX => s,
@@ -2190,26 +2177,12 @@ impl RuleEngine {
             };
             for name in &rule_names {
                 let def = self.rules[name].clone();
+                let skip = adopted.get(name).unwrap_or(&empty);
                 let idx = self.indexes.get_mut(name).unwrap();
-                index_node_for_rule(id, label_sym, &def, idx, syms, props);
+                index_node_for_rule_skipping(id, label_sym, &def, idx, syms, props, skip);
             }
         }
 
-        // Install the persisted graphs now that the scan is done.  The scan
-        // recorded `hnsw_tracked` for these sides; adopting the graph resets it
-        // to the graph's own node ids, which is what the old
-        // build-then-overwrite order produced too.
-        for (name, (src, dst)) in restored {
-            let Some(idx) = self.indexes.get_mut(&name) else {
-                continue;
-            };
-            if let Some(h) = src {
-                idx.src_side.adopt_hnsw(h);
-            }
-            if let Some(h) = dst {
-                idx.dst_side.adopt_hnsw(h);
-            }
-        }
         // Any blob naming a rule that is not approximate here (or not a rule at
         // all) is applied exactly as the old `load_hnsw_state` call site did.
         if !leftover_blobs.is_empty() {
@@ -3747,6 +3720,34 @@ mod tests {
             eng2.hnsw_search_dst("emb", "V", &[1.0, 0.0], 4),
             before,
             "the rebuilt graph must answer as the original did"
+        );
+    }
+
+    /// A node the scan sees but the blob predates must be inserted, not
+    /// dropped. Adopting *before* the scan is what makes the load incremental:
+    /// the persisted graph is the base, the newer nodes are the delta.
+    #[test]
+    fn reindex_inserts_nodes_the_blob_predates() {
+        let (mut fx, eng) = approx_fixture();
+        let hnsw = eng.export_hnsw_state();
+        let ivf = eng.export_ivf_state();
+
+        // A node written after that blob was taken.
+        fx.add("V", "late", vec![("emb", emb(&[0.999, 0.045]))]);
+
+        let eng2 = reopened(&fx, ivf, hnsw);
+        assert_eq!(
+            eng2.hnsw_build_count(),
+            0,
+            "adopting the blob must still skip both builds"
+        );
+        let late_id = fx.ids.len() as u32 - 1;
+        let hits = eng2
+            .hnsw_search_dst("emb", "V", &[1.0, 0.0], 8)
+            .expect("the dst side must have a graph");
+        assert!(
+            hits.iter().any(|&(id, _)| id == late_id),
+            "a node the blob predates must be inserted by the scan; got {hits:?}"
         );
     }
 
