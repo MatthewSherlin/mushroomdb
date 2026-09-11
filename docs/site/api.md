@@ -41,14 +41,16 @@ A role may carry a `visible_where` predicate beside its labels:
 {
   "name": "reader",
   "labels": ["Document"],
-  "visible_where": { "field": "status", "in": [{ "Str": "published" }] }
+  "visible_where": { "field": "status", "in": ["published", "archived"] }
 }
 ```
 
 `visible = keys ∪ { n : label(n) ∈ labels ∧ predicate(n) }` — the predicate
 narrows the labels leg only, never `keys`, and a node missing the property fails
 it. Only `eq` (one value) and `in` (a list) exist, exactly one per predicate, and
-a predicate on a role with no labels is refused. See
+a predicate on a role with no labels is refused. Values may be written as plain
+JSON scalars, as above, or in the graph's tagged encoding (`{"Str": "published"}`)
+— both are accepted, and the tagged form is what the server writes back. See
 [masks.md](masks.md#narrowing-a-role-by-a-property).
 
 Role-token behavior per endpoint:

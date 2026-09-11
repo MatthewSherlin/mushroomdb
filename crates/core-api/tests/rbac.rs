@@ -1350,11 +1350,12 @@ fn roles_json_version_3_round_trips() {
         3,
         "a role carrying visible_where lifts the sidecar to version 3"
     );
-    // The on-disk shape docs/site/masks.md documents, asserted so it stays true.
+    // Serialization is always the tagged form, whichever spelling was typed —
+    // the shape docs/site/masks.md calls "what the server writes back".
     assert_eq!(
         parsed["roles"][0]["visible_where"],
         serde_json::json!({"field": "status", "in": [{"Str": "published"}]}),
-        "the predicate's on-disk shape is the one masks.md shows"
+        "the predicate is written back in the graph's tagged value encoding"
     );
 
     let db = GraphDb::open(&dir).unwrap();
@@ -1490,16 +1491,35 @@ fn reader_snapshot_honours_the_predicate() {
         vec![("status".into(), Value::Str("draft".into()))],
     )
     .unwrap();
-    db.apply_schema(&roles_schema(vec![reader_role(Some(published()), vec![])]))
-        .unwrap();
+    db.insert_node("Document", "bare", vec![]).unwrap(); // no status at all
+    db.apply_schema(&roles_schema(vec![reader_role(
+        Some(published()),
+        vec!["draft".into()],
+    )]))
+    .unwrap();
 
+    // The reader-side resolver is the live one's twin: `pub` passes, `bare` has
+    // no status and absent is not a match, and the `draft` key is granted
+    // administratively and never narrowed.
     let snap = db.reader();
     let mask = snap.mask_for_role("reader").unwrap();
-    assert_eq!(mask.len(), 1, "reader snapshot applies the predicate too");
+    assert_eq!(mask.len(), 2, "reader snapshot applies the predicate too");
     let rs = snap
-        .query_masked("MATCH (n) RETURN n.id", &no_params(), &mask)
+        .query_masked("MATCH (n) RETURN n", &no_params(), &mask)
         .unwrap();
-    assert_eq!(rs.len(), 1);
+    let mut seen: Vec<String> = (0..rs.len())
+        .filter_map(|i| match rs.row(i)[0].as_ref() {
+            Some(Value::Str(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(seen, vec!["draft", "pub"]);
+    assert_eq!(
+        seen,
+        mask_keys(&db, "reader"),
+        "the snapshot and the live handle resolve the same role identically"
+    );
 
     // A snapshot taken after a write sees the new node; the memo is per-commit.
     db.insert_node(
@@ -1509,9 +1529,63 @@ fn reader_snapshot_honours_the_predicate() {
     )
     .unwrap();
     let snap2 = db.reader();
-    assert_eq!(snap2.mask_for_role("reader").unwrap().len(), 2);
+    assert_eq!(snap2.mask_for_role("reader").unwrap().len(), 3);
     // The old snapshot still answers for the state it froze.
-    assert_eq!(snap.mask_for_role("reader").unwrap().len(), 1);
+    assert_eq!(snap.mask_for_role("reader").unwrap().len(), 2);
+}
+
+/// A role edit is not a commit, so the memo's version key cannot see it. The
+/// live handle takes a fresh cache, which leaves a snapshot frozen against the
+/// old definitions unable to publish its now-wrong mask into it.
+#[test]
+fn a_stale_snapshot_cannot_publish_its_mask_after_a_role_edit() {
+    let dir = tmp("mask-memo-role-edit");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    db.insert_node(
+        "Document",
+        "pub",
+        vec![("status".into(), Value::Str("published".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Document",
+        "draft",
+        vec![("status".into(), Value::Str("draft".into()))],
+    )
+    .unwrap();
+    db.apply_schema(&roles_schema(vec![reader_role(None, vec![])]))
+        .unwrap();
+
+    // Frozen while the role is still the wide one.
+    let stale = db.reader();
+    let before = db.commit_seq();
+
+    // Narrow the role. Rewriting the sidecar is not a commit.
+    db.apply_schema(&roles_schema(vec![reader_role(Some(published()), vec![])]))
+        .unwrap();
+    assert_eq!(
+        db.commit_seq(),
+        before,
+        "a role edit must not move commit_seq — that is exactly why the memo \
+         cannot rely on it here"
+    );
+
+    // The stale snapshot resolves FIRST, against the definitions it froze. If it
+    // shared the live memo it would seed the wide mask under the current version.
+    assert_eq!(
+        stale.mask_for_role("reader").unwrap().len(),
+        2,
+        "the snapshot answers for the role definition it froze"
+    );
+
+    // The live handle must still be narrowed.
+    assert_eq!(
+        mask_keys(&db, "reader"),
+        vec!["pub"],
+        "a stale snapshot must not be able to widen the live handle's answer"
+    );
 }
 
 /// An as-of read applies the current predicate to the historical graph.
@@ -1551,7 +1625,7 @@ fn visible_where_applies_to_an_as_of_read() {
         .unwrap();
     assert_eq!(rs.len(), 2, "both documents are published at commit 2");
 
-    // At commit 2 `draft` was still a draft — the predicate evaluates against
+    // At commit 1 `draft` was still a draft — the predicate evaluates against
     // the property values AT the commit being read.
     let rs = db
         .query_at_scoped(
@@ -1631,4 +1705,164 @@ fn mask_memo_cost_before_and_after() {
         warm,
         warm / reps,
     );
+}
+
+/// A predicate value may be written as a plain JSON scalar, not only in the
+/// graph's tagged `Value` form. A hand-written `roles.json` is the normal case,
+/// and getting it wrong poisons every role in the store.
+#[test]
+fn visible_where_accepts_plain_json_scalars() {
+    let dir = tmp("predicate-untagged");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Written by hand, in the shape the spec and the docs show.
+    std::fs::write(
+        dir.join("roles.json"),
+        br#"{"version":3,"roles":[
+             {"name":"reader","keys":[],"labels":["Document"],
+              "visible_where":{"field":"status","in":["published","archived"]}},
+             {"name":"core","keys":[],"labels":["Document"],
+              "visible_where":{"field":"kind","eq":"core"}},
+             {"name":"tier","keys":[],"labels":["Document"],
+              "visible_where":{"field":"tier","in":[2,{"Int":3}]}},
+             {"name":"flagged","keys":[],"labels":["Document"],
+              "visible_where":{"field":"flag","eq":true}}
+           ]}"#,
+    )
+    .unwrap();
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert!(
+        !db.roles().is_empty(),
+        "an untagged predicate must parse, not poison the sidecar"
+    );
+
+    db.insert_node(
+        "Document",
+        "a",
+        vec![
+            ("status".into(), Value::Str("published".into())),
+            ("kind".into(), Value::Str("core".into())),
+            ("tier".into(), Value::Int(2)),
+            ("flag".into(), Value::Bool(true)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "Document",
+        "b",
+        vec![
+            ("status".into(), Value::Str("archived".into())),
+            ("kind".into(), Value::Str("extra".into())),
+            ("tier".into(), Value::Int(3)),
+            ("flag".into(), Value::Bool(false)),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "Document",
+        "c",
+        vec![("status".into(), Value::Str("draft".into()))],
+    )
+    .unwrap();
+
+    // Untagged strings in an `in` list evaluate as the tagged ones would.
+    assert_eq!(mask_keys(&db, "reader"), vec!["a", "b"]);
+    // Untagged `eq` string.
+    assert_eq!(mask_keys(&db, "core"), vec!["a"]);
+    // One list, both spellings: 2 plain, {"Int": 3} tagged.
+    assert_eq!(mask_keys(&db, "tier"), vec!["a", "b"]);
+    // Untagged boolean.
+    assert_eq!(mask_keys(&db, "flagged"), vec!["a"]);
+
+    // The parsed predicate is the same value either way.
+    let roles = db.roles();
+    let reader = roles.iter().find(|r| r.name == "reader").unwrap();
+    assert_eq!(
+        reader.visible_where.as_ref().unwrap(),
+        &PropPredicate {
+            field: "status".into(),
+            eq: None,
+            in_: Some(vec![
+                Value::Str("published".into()),
+                Value::Str("archived".into())
+            ]),
+        }
+    );
+
+    // Re-applying rewrites the sidecar in the tagged form, and it still resolves
+    // identically — the two spellings are one predicate.
+    db.apply_schema(&roles_schema(vec![reader.clone()]))
+        .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["a", "b"]);
+}
+
+/// A predicate value that is neither a scalar nor a tagged value is refused,
+/// and refusing means poisoning — never silently dropping the narrowing.
+#[test]
+fn visible_where_refuses_a_value_it_cannot_read() {
+    let dir = tmp("predicate-bad-value");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("roles.json"),
+        br#"{"version":3,"roles":[{"name":"reader","keys":[],"labels":["Document"],
+             "visible_where":{"field":"status","eq":{"not":"a value"}}}]}"#,
+    )
+    .unwrap();
+
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(
+        db.mask_for_role("reader").is_err(),
+        "an unreadable predicate value must poison, not resolve to the whole label"
+    );
+}
+
+/// The spec's own schema JSON applies as written — it is what a user copies.
+#[test]
+fn the_spec_schema_snippet_applies_as_written() {
+    let dir = tmp("predicate-spec-snippet");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    let schema: Schema = serde_json::from_str(
+        r#"{ "roles": [
+              { "name": "reader",
+                "labels": ["Document", "Note"],
+                "visible_where": { "field": "status", "in": ["published", "archived"] } },
+              { "name": "editor",
+                "labels": ["Document"],
+                "visible_where": { "field": "workspace", "eq": "core" } }
+            ] }"#,
+    )
+    .expect("the spec's schema JSON must deserialize");
+    db.apply_schema(&schema).expect("and apply");
+
+    db.insert_node(
+        "Document",
+        "d1",
+        vec![
+            ("status".into(), Value::Str("published".into())),
+            ("workspace".into(), Value::Str("core".into())),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "Note",
+        "n1",
+        vec![("status".into(), Value::Str("archived".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Document",
+        "d2",
+        vec![
+            ("status".into(), Value::Str("draft".into())),
+            ("workspace".into(), Value::Str("side".into())),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(mask_keys(&db, "reader"), vec!["d1", "n1"]);
+    assert_eq!(mask_keys(&db, "editor"), vec!["d1"]);
 }

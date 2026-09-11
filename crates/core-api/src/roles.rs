@@ -76,17 +76,85 @@ pub struct WriteScope {
 /// be obviously correct.
 ///
 /// Exactly one of `eq` and `in` is set; `validate` enforces it.
+///
+/// # Value shapes accepted on the way in
+///
+/// A predicate is usually hand-written, so both spellings of a value parse:
+/// the plain JSON scalar (`"published"`, `3`, `true`) and the tagged form the
+/// graph's own [`Value`] serializes as (`{"Str": "published"}`, `{"Int": 3}`).
+/// They mean the same thing. Serialization always writes the tagged form, so a
+/// sidecar this binary rewrote is unambiguous no matter which one was typed.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct PropPredicate {
     /// The property to test. Never empty.
     pub field: String,
     /// Single-value form: the property must equal this value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "de_value_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub eq: Option<Value>,
     /// Membership form: the property must equal one of these values. An empty
     /// list matches nothing — it is a valid, fully-closed predicate.
-    #[serde(default, rename = "in", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "in",
+        deserialize_with = "de_value_vec_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub in_: Option<Vec<Value>>,
+}
+
+/// Read one predicate value, accepting the tagged form or a plain JSON scalar.
+///
+/// The tagged form is tried first, so `{"Str": "x"}` never falls through to the
+/// scalar branch and is never mistaken for a map-valued property.
+fn value_from_json(j: serde_json::Value) -> std::result::Result<Value, String> {
+    if let Ok(v) = serde_json::from_value::<Value>(j.clone()) {
+        return Ok(v);
+    }
+    match j {
+        serde_json::Value::String(s) => Ok(Value::Str(s)),
+        serde_json::Value::Bool(b) => Ok(Value::Bool(b)),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(Value::Int)
+            .or_else(|| n.as_f64().map(Value::Float))
+            .ok_or_else(|| format!("visible_where: {n} is not a representable number")),
+        other => Err(format!(
+            "visible_where: {other} is not a value — use a string, number or boolean, \
+             or the tagged form such as {{\"Str\": \"published\"}}"
+        )),
+    }
+}
+
+fn de_value_opt<'de, D>(d: D) -> std::result::Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(d)? {
+        None => Ok(None),
+        Some(j) => value_from_json(j)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+fn de_value_vec_opt<'de, D>(d: D) -> std::result::Result<Option<Vec<Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<Vec<serde_json::Value>>::deserialize(d)? {
+        None => Ok(None),
+        // Element-wise, so one list may mix the two spellings.
+        Some(items) => items
+            .into_iter()
+            .map(value_from_json)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 impl PropPredicate {

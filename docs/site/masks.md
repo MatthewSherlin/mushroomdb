@@ -44,7 +44,7 @@ beside its labels:
       "name": "reader",
       "keys": [],
       "labels": ["Document"],
-      "visible_where": { "field": "status", "in": [{ "Str": "published" }] },
+      "visible_where": { "field": "status", "in": ["published", "archived"] },
       "write": null
     }
   ]
@@ -65,9 +65,13 @@ visible = keys ∪ { n : label(n) ∈ labels ∧ predicate(n) }
 - Resolution stays live. A node whose `status` changes to `published` is visible on
   the next read; one edited out of the predicate is gone on the next read. No
   re-apply of the schema is needed either way.
-- Property values are written in the graph's own value encoding, so a string is
-  `{"Str": "published"}`, an integer `{"Int": 3}`, a boolean `{"Bool": true}`.
-  Comparison is by value, not by rendering.
+- Write values as plain JSON scalars — `"published"`, `3`, `true`. The graph's own
+  tagged encoding (`{"Str": "published"}`, `{"Int": 3}`, `{"Bool": true}`) is accepted
+  too, including mixed within one `in` list, and means exactly the same thing; it is
+  what the server writes back when it rewrites the sidecar. Comparison is by value,
+  not by rendering.
+- A value that is neither — an object that is not a tagged value, say — is refused at
+  load, which poisons the roles state rather than dropping the narrowing.
 
 Only two operators exist:
 
