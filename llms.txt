@@ -253,7 +253,7 @@ Claude Desktop config (Claude Code and Cursor should use the plugin or
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.6.2", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.6.3", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -470,6 +470,7 @@ https://github.com/MatthewSherlin/mushroomdb
 - Rules: docs/site/rules.md
 - Cypher reference: docs/site/query.md
 - MCP / agent memory: docs/site/mcp.md
+- Association benchmark (one world in three forms, the gate): docs/site/association-bench.md
 - HTTP API: docs/site/api.md
 - Subscriptions: docs/site/subscriptions.md
 - Time travel: docs/site/timetravel.md

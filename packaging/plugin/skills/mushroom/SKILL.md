@@ -14,7 +14,7 @@ A live graph of this repository at `./mushroom-memory`: files, symbols, imports,
 **1. If `./mushroom-memory` does not exist yet, build it once:**
 
 ```
-npx -y mushroomdb@0.6.2 ingest-git './mushroom-memory' . --prs --ensure-gitignore
+npx -y mushroomdb@0.6.3 ingest-git './mushroom-memory' . --prs --ensure-gitignore
 ```
 
 `CO_CHANGED` / `IMPORTS` / `CALLS` edges are derived by rule; the store joins `.gitignore`.
@@ -49,8 +49,8 @@ The `concept_sources` rule links each concept to its sources with `DESCRIBED_IN`
 
 ## Advanced
 
-`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the fifteen of row 4. All are served either way; `npx -y mushroomdb@0.6.2 mcp <db> --all-tools` lists the rest with their schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
+`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the fifteen of row 4. All are served either way; `npx -y mushroomdb@0.6.3 mcp <db> --all-tools` lists the rest with their schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
 
-Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`npx -y mushroomdb@0.6.2 serve './mushroom-memory'`), and `doctor` checks the install.
+Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`npx -y mushroomdb@0.6.3 serve './mushroom-memory'`), and `doctor` checks the install.
 
 More: [docs](https://github.com/MatthewSherlin/mushroomdb/tree/main/docs/site)
