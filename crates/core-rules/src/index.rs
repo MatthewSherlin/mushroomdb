@@ -766,11 +766,27 @@ impl SideIndex {
     }
 
     pub fn insert(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
+        self.insert_skipping(spec, node, &BTreeSet::new(), get);
+    }
+
+    /// `insert`, but skip the HNSW graph for ids in `already` — the open-time
+    /// scan's version, where the adopted graph is the base and the scan only
+    /// has to supply what the snapshot did not carry.
+    ///
+    /// `hnsw_tracked` is still recorded for every node, adopted or not: it is
+    /// the fallback candidate set and must cover the whole side.
+    pub fn insert_skipping(
+        &mut self,
+        spec: &CandidateSpec,
+        node: u32,
+        already: &BTreeSet<u32>,
+        get: &dyn Fn(&str) -> Option<Value>,
+    ) {
         // Union / Intersect: recurse into each child spec. insert() is
         // idempotent for ScanAll metadata (same-value overwrite).
         if let CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) = spec {
             for s in specs {
-                self.insert(s, node, get);
+                self.insert_skipping(s, node, already, get);
             }
             return;
         }
@@ -778,6 +794,9 @@ impl SideIndex {
         if let CandidateSpec::Hnsw { field, .. } = spec {
             if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
                 self.hnsw_tracked.insert(node);
+                if already.contains(&node) {
+                    return; // the adopted graph already holds this vector
+                }
                 if let Some(h) = &mut self.hnsw {
                     h.insert(node, &xs);
                 }
@@ -1237,13 +1256,13 @@ impl SideIndex {
         self.hnsw_tracked.clone()
     }
 
-    /// Export the HNSW graph as an opaque bincoded blob.
+    /// Export the HNSW graph as an opaque versioned blob.
     ///
     /// Returns an empty `Vec` when the HNSW is not initialized.
     pub fn export_hnsw_blob(&self) -> Vec<u8> {
         self.hnsw
             .as_ref()
-            .and_then(|h| bincode::serialize(h).ok())
+            .and_then(crate::hnsw::encode_hnsw_blob)
             .unwrap_or_default()
     }
 
@@ -1251,13 +1270,40 @@ impl SideIndex {
     ///
     /// The `hnsw_tracked` set is populated from the restored graph's node ids
     /// so candidates/remove work correctly after restore.
-    /// Silently ignores empty or corrupt blobs (HNSW stays uninitialized).
+    /// Silently ignores empty, corrupt, or unknown-version blobs (the HNSW
+    /// stays uninitialized and the side keeps its full-scan fallback).
     pub fn load_hnsw_blob(&mut self, blob: &[u8]) {
-        if blob.is_empty() {
-            return;
-        }
-        if let Ok(h) = bincode::deserialize::<HnswIndex>(blob) {
+        if let Ok(h) = crate::hnsw::decode_hnsw_blob(blob) {
             self.adopt_hnsw(h);
+        }
+    }
+
+    /// Initialise this side's HNSW graph, adopting `blob` when it holds one.
+    ///
+    /// Returns the node ids the adopted graph already contains, so an open-time
+    /// scan can skip re-inserting them. An empty, corrupt, or unknown-version
+    /// blob yields an empty graph and an empty set — exactly what `init_hnsw`
+    /// gives today — and the scan then builds the graph as it always did.
+    ///
+    /// `true` in the second slot means "this side was adopted, not built", which
+    /// is what the caller counts as a skipped build.
+    pub fn init_or_adopt_hnsw(&mut self, rule_name: &str, blob: &[u8]) -> (BTreeSet<u32>, bool) {
+        self.hnsw = None;
+        if !blob.is_empty() {
+            match crate::hnsw::decode_hnsw_blob(blob) {
+                Ok(h) => self.adopt_hnsw(h),
+                Err(e) => eprintln!(
+                    "[mushroomdb] rule {rule_name:?}: a persisted HNSW index failed to load \
+                     ({e}); rebuilding it from the node scan"
+                ),
+            }
+        }
+        match &self.hnsw {
+            Some(h) => (h.node_ids(), true),
+            None => {
+                self.init_hnsw(rule_name);
+                (BTreeSet::new(), false)
+            }
         }
     }
 
@@ -1948,6 +1994,103 @@ mod tests {
             "ckpts[7] should be norm of last segment; got {} vs {}",
             ckpts[7],
             expected_last
+        );
+    }
+    // -----------------------------------------------------------------------
+    // init_or_adopt_hnsw
+    // -----------------------------------------------------------------------
+
+    /// A side seeded with three vectors, plus the `Hnsw` spec that indexes them.
+    fn hnsw_side() -> (SideIndex, CandidateSpec<'static>) {
+        let spec = CandidateSpec::Hnsw { field: "emb", k: 8 };
+        let mut side = SideIndex::default();
+        side.init_hnsw("sim");
+        for (id, xs) in [
+            (1u32, vec![1.0, 0.0]),
+            (2, vec![0.0, 1.0]),
+            (3, vec![0.7, 0.7]),
+        ] {
+            side.insert(&spec, id, &getter(&emb(&xs)));
+        }
+        (side, spec)
+    }
+
+    /// A usable blob is adopted before any scan, and its node ids come back so
+    /// the scan can skip them.
+    #[test]
+    fn init_or_adopt_hnsw_adopts_a_usable_blob() {
+        let (side, spec) = hnsw_side();
+        let blob = side.export_hnsw_blob();
+
+        let mut fresh = SideIndex::default();
+        let (ids, adopted) = fresh.init_or_adopt_hnsw("sim", &blob);
+        assert!(adopted, "a usable blob must be adopted, not rebuilt");
+        assert_eq!(ids, BTreeSet::from([1, 2, 3]));
+        assert!(fresh.has_hnsw());
+        assert_eq!(
+            fresh.candidates(&spec, &getter(&emb(&[1.0, 0.0]))),
+            side.candidates(&spec, &getter(&emb(&[1.0, 0.0]))),
+            "the adopted graph must answer as the original did"
+        );
+    }
+
+    /// A blob whose version this build does not know is treated exactly as a
+    /// corrupt one: an empty graph, an empty skip set, and the caller's node
+    /// scan rebuilds. Until it does, the side answers from `hnsw_tracked`.
+    #[test]
+    fn an_unknown_version_leaves_the_graph_empty() {
+        let (side, spec) = hnsw_side();
+        let mut blob = side.export_hnsw_blob();
+        blob[4] = 99; // the version's low byte
+
+        let mut fresh = SideIndex::default();
+        let (ids, adopted) = fresh.init_or_adopt_hnsw("sim", &blob);
+        assert!(!adopted, "an unreadable blob must not count as adopted");
+        assert!(ids.is_empty(), "nothing may be skipped by the scan");
+        assert!(!fresh.has_hnsw(), "the graph must be empty");
+
+        // The scan then fills it, and the full-scan fallback covers the gap.
+        for (id, xs) in [
+            (1u32, vec![1.0, 0.0]),
+            (2, vec![0.0, 1.0]),
+            (3, vec![0.7, 0.7]),
+        ] {
+            fresh.insert_skipping(&spec, id, &ids, &getter(&emb(&xs)));
+        }
+        assert!(fresh.has_hnsw());
+        assert_eq!(
+            fresh.candidates(&spec, &getter(&emb(&[1.0, 0.0]))),
+            BTreeSet::from([1, 2, 3])
+        );
+    }
+
+    /// `insert_skipping` still tracks a skipped node for the fallback scan; it
+    /// only declines to insert it into the graph a second time.
+    #[test]
+    fn insert_skipping_tracks_but_does_not_reinsert() {
+        let (side, spec) = hnsw_side();
+        let blob = side.export_hnsw_blob();
+
+        let mut fresh = SideIndex::default();
+        let (already, _) = fresh.init_or_adopt_hnsw("sim", &blob);
+        let before = fresh.hnsw_ref().map(|h| h.len());
+
+        // Node 3 is adopted; node 4 is not.
+        fresh.insert_skipping(&spec, 3, &already, &getter(&emb(&[0.7, 0.7])));
+        assert_eq!(
+            fresh.hnsw_ref().map(|h| h.len()),
+            before,
+            "an adopted id must not be re-inserted"
+        );
+        fresh.insert_skipping(&spec, 4, &already, &getter(&emb(&[-1.0, 0.0])));
+        assert_eq!(
+            fresh.hnsw_ref().map(|h| h.len()),
+            before.map(|n| n + 1),
+            "a post-snapshot id must be inserted"
+        );
+        assert_eq!(
+            fresh.candidates(&spec, &getter(&emb(&[1.0, 0.0]))),
+            BTreeSet::from([1, 2, 3, 4])
         );
     }
 }
