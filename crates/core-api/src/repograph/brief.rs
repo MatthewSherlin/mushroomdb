@@ -601,9 +601,12 @@ fn recipes(
     // about what its relationships would become. [`HIDDEN_PROPS`] goes with
     // them: `what_if key embedding <value>` asks the session to type out a
     // vector.
-    let field = nodes
-        .iter()
-        .find(|n| n.key == key)
+    //
+    // The node itself is kept as `key_node` rather than looked up twice: the
+    // intersection below reads its label, the same node the field is read
+    // from.
+    let key_node = nodes.iter().find(|n| n.key == key);
+    let field = key_node
         .and_then(|n| {
             let watched = rule_fields.get(&n.label);
             let mut usable = n.props.keys().filter(|f| {
@@ -615,6 +618,15 @@ fn recipes(
                 .or_else(|| usable.next())
         })
         .map_or_else(|| "<field>".to_string(), |f| sanitize(f));
+    // The same intersection `linked_by_all_recipe` runs for the store's
+    // busiest source label, run here for the label of the key already
+    // picked above — up to [`LINKED_BY_ALL_MAX_TYPES`] edge types shared
+    // between that label and the one target label they most often reach
+    // together. `edges_at`, `node_edges` and `what_if` all accept `all_of` /
+    // `edge_type`, so the same selection teaches the one-call intersection
+    // form on every recipe that names this key, not only on the one recipe
+    // that happens to demonstrate a `MATCH`.
+    let intersection = key_node.and_then(|n| types_from(&n.label, edge_types));
     // The role and the label it probes have to be chosen *together*. Picked
     // independently — the first role, the most populous label — the
     // association store rendered `MATCH (n:Talent) … role: client`, and
@@ -667,19 +679,19 @@ fn recipes(
         },
         Recipe {
             question: "relationships".to_string(),
-            call: format!("node_edges {key}"),
+            call: relationships_call(&key, &intersection),
         },
     ];
     if let Some(at) = latest_commit {
         out.push(Recipe {
             question: "as of".to_string(),
-            call: format!("edges_at {key} {at}"),
+            call: as_of_call(&key, at, &intersection),
         });
     }
     out.extend([
         Recipe {
             question: "what if".to_string(),
-            call: format!("what_if {key} {field} <value>"),
+            call: what_if_call(&key, &field, &intersection),
         },
         Recipe {
             question: "who may see".to_string(),
@@ -733,29 +745,9 @@ fn linked_by_all_recipe(labels: &[LabelBrief], edge_types: &[EdgeTypeBrief]) -> 
         .iter()
         .find(|l| edge_types.iter().any(|t| t.src.contains(&l.label)))?
         .label;
+    let (types, dst) = types_from(src, edge_types)?;
 
-    let mut by_dst: BTreeMap<&str, usize> = BTreeMap::new();
-    for t in edge_types.iter().filter(|t| t.src.contains(src)) {
-        for dst in &t.dst {
-            *by_dst.entry(dst.as_str()).or_default() += t.edges;
-        }
-    }
-    let (dst, _) = by_dst
-        .into_iter()
-        .max_by_key(|(name, n)| (*n, std::cmp::Reverse(*name)))?;
-
-    // `edge_types` is already sorted most-numerous-first, ties on the name,
-    // so filtering it keeps that order — "most populous first" among the
-    // types that actually connect this pair.
-    let types: Vec<&str> = edge_types
-        .iter()
-        .filter(|t| t.src.contains(src) && t.dst.iter().any(|d| d.as_str() == dst))
-        .take(LINKED_BY_ALL_MAX_TYPES)
-        .map(|t| t.edge_type.as_str())
-        .collect();
-    let first = *types.first()?;
-
-    let mut pattern = format!("(a:{src})-[:{first}]->(b:{dst})");
+    let mut pattern = format!("(a:{src})-[:{}]->(b:{dst})", types[0]);
     for t in &types[1..] {
         pattern.push_str(&format!(", (a)-[:{t}]->(b)"));
     }
@@ -769,6 +761,92 @@ fn linked_by_all_recipe(labels: &[LabelBrief], edge_types: &[EdgeTypeBrief]) -> 
              separate MATCHes do not"
         ),
     })
+}
+
+/// Up to [`LINKED_BY_ALL_MAX_TYPES`] edge types running from `src`, and the
+/// one destination label they most often reach together — the selection
+/// [`linked_by_all_recipe`] runs for the store's own busiest source label,
+/// factored out so [`recipes`] can run the identical census-based pick for
+/// the source label of whatever key it has already chosen.
+///
+/// Weighted by how many edges each type carries, ties on the destination
+/// label's name; `edge_types` is already sorted most-numerous-first, ties on
+/// the name, so filtering it keeps that order — "most populous first" among
+/// the types that actually connect `src` to the label picked.
+///
+/// `None` when `src` is never a source at all — the only way for there to be
+/// no destination label to weigh.
+fn types_from(src: &str, edge_types: &[EdgeTypeBrief]) -> Option<(Vec<String>, String)> {
+    let mut by_dst: BTreeMap<&str, usize> = BTreeMap::new();
+    for t in edge_types.iter().filter(|t| t.src.iter().any(|s| s == src)) {
+        for dst in &t.dst {
+            *by_dst.entry(dst.as_str()).or_default() += t.edges;
+        }
+    }
+    let (dst, _) = by_dst
+        .into_iter()
+        .max_by_key(|(name, n)| (*n, std::cmp::Reverse(*name)))?;
+
+    let types: Vec<String> = edge_types
+        .iter()
+        .filter(|t| t.src.iter().any(|s| s == src) && t.dst.iter().any(|d| d.as_str() == dst))
+        .take(LINKED_BY_ALL_MAX_TYPES)
+        .map(|t| t.edge_type.clone())
+        .collect();
+    (!types.is_empty()).then(|| (types, dst.to_string()))
+}
+
+/// The `relationships` recipe: `node_edges` with the intersection the key's
+/// own source label supports, when there is one.
+///
+/// `all_of` even for a single type — the reply is the same partner-keys
+/// shape either way, and the note names the `edge_type` shortcut rather than
+/// the call switching form for it. Falls back to the plain call when the key
+/// has no [`types_from`] selection at all (a key that is never a source, or
+/// a store with no edge types).
+fn relationships_call(key: &str, intersection: &Option<(Vec<String>, String)>) -> String {
+    match intersection {
+        Some((types, dst)) => format!(
+            "node_edges {key} all_of: [{}] label: {dst} — or edge_type: {} for one \
+             type's partner keys",
+            types.join(", "),
+            types[0]
+        ),
+        None => format!("node_edges {key}"),
+    }
+}
+
+/// The `as of` recipe: `edges_at` with the same intersection, at commit `at`.
+///
+/// Unlike [`relationships_call`], a single type switches the call itself to
+/// `edge_type` rather than an `all_of` of one — this recipe's note is about
+/// the grouped view, not the `edge_type` shortcut, so nothing else names it
+/// when only one type is on offer.
+fn as_of_call(key: &str, at: u64, intersection: &Option<(Vec<String>, String)>) -> String {
+    let note =
+        "— partners linked by every listed type, keys only; omit all_of for the grouped view";
+    match intersection {
+        Some((types, dst)) if types.len() >= 2 => format!(
+            "edges_at {key} {at} all_of: [{}] label: {dst} {note}",
+            types.join(", ")
+        ),
+        Some((types, _)) => format!("edges_at {key} {at} edge_type: {} {note}", types[0]),
+        None => format!("edges_at {key} {at}"),
+    }
+}
+
+/// The `what if` recipe: `what_if` with the busiest type from the same
+/// intersection, so the shown call also demonstrates narrowing to one type's
+/// partner keys.
+fn what_if_call(key: &str, field: &str, intersection: &Option<(Vec<String>, String)>) -> String {
+    match intersection {
+        Some((types, _)) => format!(
+            "what_if {key} {field} <value> edge_type: {} — the partners that would be \
+             lost or gained under that type",
+            types[0]
+        ),
+        None => format!("what_if {key} {field} <value>"),
+    }
 }
 
 /// Every file the graph records a [`DEPENDENCY_EDGES`] edge for, in either
