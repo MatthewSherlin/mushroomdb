@@ -1004,7 +1004,7 @@ fn graph_tools() -> Vec<Js> {
     let Js::Array(tools) = json!([
             {
                 "name": "query",
-                "description": "Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'.",
+                "description": "Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2066,7 +2066,8 @@ mod tests {
 
     /// Binding: `explain_association` now answers in prose, and the report
     /// behind it — what `json: true` returns — is still `explain`'s array,
-    /// unchanged.
+    /// with one `evidence` object added per relationship and every other
+    /// field unchanged.
     #[test]
     fn test_explain_association_same_as_explain() {
         let db = demo_db();
@@ -2082,7 +2083,20 @@ mod tests {
             "explain_association",
             json!({ "a": "alice", "b": "bob", "json": true }),
         ));
-        assert_eq!(explain, assoc);
+        let explain: Vec<Js> = serde_json::from_value(explain).expect("explain array");
+        let mut assoc: Vec<Js> = serde_json::from_value(assoc).expect("assoc array");
+        for row in &mut assoc {
+            let ev = row
+                .as_object_mut()
+                .expect("object")
+                .remove("evidence")
+                .expect("every derived edge carries its evidence");
+            assert!(
+                ev["similarity"].is_number(),
+                "a vector_similar edge reports the cosine it scored: {ev}"
+            );
+        }
+        assert_eq!(explain, assoc, "evidence is the only addition");
 
         let prose = tool_call(
             &db,
