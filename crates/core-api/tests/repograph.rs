@@ -973,7 +973,12 @@ fn brief_on_a_memory_store_works_one_call_per_question_kind() {
     assert_eq!(
         got,
         vec![
-            ("why", "explain_association person:ada project:apollo"),
+            (
+                "why",
+                "explain_association person:ada project:apollo — returns each \
+                 relationship's rule and the values the two share, so there is no \
+                 need to fetch raw lists to compare by hand",
+            ),
             ("relationships", "node_edges person:ada"),
             // The newest commit `edges_at` accepts, which is one below the
             // count on a store nothing has pruned — the off-by-one that made
@@ -998,6 +1003,18 @@ fn brief_on_a_memory_store_works_one_call_per_question_kind() {
                 "how many",
                 "MATCH (a:Person)-[:ASSIGNED_TO]->(b:Project) WITH key(b) AS b_key, \
                  count(a) AS n WHERE n >= 3 RETURN b_key, n",
+            ),
+            // The seventh recipe: Person is the only label that is ever a
+            // source, and its edges land on Project (3) more than on Person
+            // itself (2, via KNOWS) — so the pair is (Person, Project), and
+            // only ASSIGNED_TO runs between them.
+            (
+                "linked by all of",
+                "MATCH (a:Person)-[:ASSIGNED_TO]->(b:Project) WITH b, count(DISTINCT a) \
+                 AS n WHERE n >= 1 RETURN key(b), n ORDER BY n DESC LIMIT 20 — add \
+                 `WHERE a.<field> = …` before WITH to filter the source side; one \
+                 MATCH with comma-separated patterns intersects, separate MATCHes \
+                 do not",
             ),
         ],
         "every placeholder the store can fill is filled"
@@ -1275,6 +1292,46 @@ fn a_wide_memory_schema_is_counted_off_and_keeps_every_worked_call() {
         text.ends_with("reach the graph: query '<cypher>'\n"),
         "{text}"
     );
+    // Exactly one edge type — `KNOWS` — runs in this whole store, so there is
+    // nothing for `linked by all of` to intersect and the recipe is omitted.
+    assert!(
+        !text.contains("linked by all of"),
+        "a single edge type has nothing to intersect:\n{text}"
+    );
+}
+
+/// Binding: a store with only one edge type in it altogether has nothing to
+/// intersect, so `linked by all of` is not one of the recipes — a recipe of
+/// a single pattern would demonstrate the wrong thing (that shape already
+/// exists: it is the `how many` recipe).
+#[test]
+fn a_store_with_a_single_edge_type_omits_the_linked_by_all_of_recipe() {
+    use core_api::Value;
+
+    let dir = tmp("brief-memory-single-edge-type");
+    let mut db = open(&dir);
+    for (key, name) in [("person:ada", "Ada"), ("person:bob", "Bob")] {
+        db.insert_node(
+            "Person",
+            key,
+            vec![("name".into(), Value::Str(name.to_string()))],
+        )
+        .expect("person");
+    }
+    db.insert_edge("KNOWS", "person:ada", "person:bob")
+        .expect("edge");
+
+    let b = brief(&db, &BriefOptions::default());
+    let s = b.schema.as_ref().expect("a memory store has a schema");
+    assert_eq!(s.edge_types.len(), 1, "one edge type in the whole store");
+    assert!(
+        !s.recipes.iter().any(|r| r.question == "linked by all of"),
+        "a single edge type has nothing to intersect: {:?}",
+        s.recipes
+    );
+
+    let text = render_brief(&b, "query '<cypher>'");
+    assert!(!text.contains("linked by all of"), "{text}");
 }
 
 /// A memory store whose busiest label is one the first role cannot see —
@@ -1370,7 +1427,10 @@ fn run_recipe_cypher(
         let (cypher, tail) = rest.split_once('\'').expect("a closed quote");
         (cypher, tail.strip_prefix(" role: "))
     } else if call.starts_with("MATCH ") {
-        (call, None)
+        // The `linked by all of` recipe appends a one-line note after its
+        // query, separated by " — "; every other `MATCH` call has no such
+        // suffix, so this is a no-op for them.
+        (call.split(" — ").next().unwrap_or(call), None)
     } else {
         return None;
     };
@@ -1439,7 +1499,7 @@ fn every_cypher_recipe_answers_on_the_store_it_came_from() {
                 );
             }
         }
-        assert_eq!(ran, 2, "the brief renders two Cypher recipes");
+        assert_eq!(ran, 3, "the brief renders three Cypher recipes");
     }
 }
 
