@@ -4818,9 +4818,10 @@ can still reach pre-snapshot commits. The WAL replay over the snapshot is
 idempotent — no manual recovery is needed. The WAL grows until an explicit
 `snapshot()` (with default `keep_wal: false`) truncates it.
 
-**V8 snapshot format:** mmap-able rkyv sections (12 total); zero-copy open via
-mmap; no heap allocation for section data. V5/V6/V7 stores are auto-migrated to
-V8 on open. See [`docs/format-stability.md`](../format-stability.md) for the
+**V9 snapshot format:** mmap-able rkyv sections (13 total); zero-copy open via
+mmap; no heap allocation for section data. V5–V8 stores are auto-migrated to
+V9 on open; a V9 snapshot cannot be opened by a pre-0.6.5 binary, which refuses
+it with `snapshot: unsupported version 9`. See [`docs/format-stability.md`](../format-stability.md) for the
 full section table and migration notes. 100k nodes (v0.2, ~10M derived edges):
 V8 snapshot open 0.02 s / 31–41 MiB RSS (warm file cache, cold process,
 2026-08-28, Apple M4 Pro).
