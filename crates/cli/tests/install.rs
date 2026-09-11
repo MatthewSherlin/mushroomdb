@@ -3654,3 +3654,71 @@ fn disable_then_enable_preserves_the_door_flags() {
         "enable dropped always-load: {mcp}"
     );
 }
+
+/// The manifest prune matches the whole ` <sub> <store>` tail, not the bare
+/// subcommand word, so a store path that happens to read ` enrich ` cannot
+/// make turning the enrichment off take every other hook with it.
+#[test]
+fn a_store_path_naming_a_subcommand_does_not_confuse_the_prune() {
+    let root = temp_dir("prune-path");
+    let home = temp_dir("prune-path-home");
+    git_repo(&root);
+    // The store lives outside the project, so `--auto` is not written and the
+    // hook commands carry this path verbatim.
+    let db = temp_dir("my enrich impact-hook intercept tools").join("memory");
+    let on = InstallOpts {
+        db: Some(db.clone()),
+        intercept_grep: true,
+        impact_before_edit: true,
+        enrich_grep: true,
+        ..door_opts()
+    };
+    install_on_path(&root, &home, &on).expect("install with every door");
+
+    install_on_path(
+        &root,
+        &home,
+        &InstallOpts {
+            enrich_grep: false,
+            ..on
+        },
+    )
+    .expect("install without the enrichment");
+
+    let manifest: serde_json::Value = serde_json::from_str(&read(
+        &root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    let commands: Vec<&str> = manifest["hooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["command"].as_str().unwrap())
+        .collect();
+    let runs = |sub: &str| {
+        commands
+            .iter()
+            .any(|c| c.ends_with(&format!(" {sub} '{}'", db.display())))
+    };
+    assert!(runs("recall"), "{commands:?}");
+    assert!(runs("touch"), "{commands:?}");
+    assert!(runs("brief"), "{commands:?}");
+    assert!(runs("intercept"), "{commands:?}");
+    assert!(runs("impact-hook"), "{commands:?}");
+    assert!(
+        !runs("enrich"),
+        "the pruned hook is still owned: {commands:?}"
+    );
+    assert_eq!(commands.len(), 5, "{commands:?}");
+
+    // And on disk: the `touch` hook still stands beside the removed one.
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    assert_eq!(
+        groups_matching(&s, "PostToolUse", "Edit|Write|MultiEdit").len(),
+        1,
+        "{s}"
+    );
+    assert!(groups_matching(&s, "PostToolUse", "Grep").is_empty(), "{s}");
+    assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2, "{s}");
+}

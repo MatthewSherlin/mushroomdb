@@ -288,15 +288,8 @@ pub fn run_doctor_with(
                     ));
                 }
             }
-            // `alwaysLoad` is not a hook: the manifest recording it and the
-            // `.mcp.json` entry are written in the same breath, and `config`
-            // above has already checked that entry, so there is nothing left
-            // to verify — only to say.
             if opted.always_load {
-                checks.push(Check::ok(
-                    "always-load",
-                    format!("mcpServers.{SERVER_NAME} is marked alwaysLoad"),
-                ));
+                checks.push(check_always_load(project_root, home, scope));
             }
         }
     }
@@ -710,6 +703,36 @@ fn check_hooks(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef)
                 settings_file.display()
             ),
             Some("mushroomdb install --platform claude-code".to_string()),
+        )
+    }
+}
+
+/// `alwaysLoad` on the registered server, for an install whose manifest asked
+/// for it.
+///
+/// Reads the file rather than trusting the flag. The two can disagree for
+/// ordinary reasons — the entry hand-edited, a `--delivery cli` install that
+/// records the flag but registers no server for it to sit on, another tool
+/// rewriting `.mcp.json` — and in every one of them the manifest says the
+/// experiment is on while the host is deferring the server exactly as before.
+/// That is the failure a benchmark arm would silently record as "no effect",
+/// so it is a `warn` naming the file, not an `ok`.
+fn check_always_load(project_root: &Path, home: &Path, scope: Scope) -> Check {
+    let mcp_file = claude_mcp_file(project_root, home, scope);
+    let entry = read_json(&mcp_file).unwrap_or(Js::Null);
+    if entry["mcpServers"][SERVER_NAME]["alwaysLoad"] == Js::Bool(true) {
+        Check::ok(
+            "always-load",
+            format!(
+                "mcpServers.{SERVER_NAME} is marked alwaysLoad in {}",
+                mcp_file.display()
+            ),
+        )
+    } else {
+        Check::warn(
+            "always-load",
+            format!("manifest records it but {} does not", mcp_file.display()),
+            Some("mushroomdb install --platform claude-code --always-load".to_string()),
         )
     }
 }

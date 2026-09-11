@@ -1199,94 +1199,57 @@ pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The exact command string written into the hook entry. Both halves arrive
-/// already quoted where quoting is needed.
-fn recall_hook_command(shell: &str, store: &StoreRef) -> String {
-    format!("{shell} recall {}", store.shell_arg())
+/// The exact command string written into a hook entry: the resolved binary,
+/// the subcommand that is that hook's body, and the store. Both outer halves
+/// arrive already quoted where quoting is needed.
+///
+/// One function for all six hooks, because the shape is the thing every other
+/// part of the installer depends on: [`is_our_hook_command`] recognises a hook
+/// of ours by exactly this tail, and a second spelling of the same line would
+/// be a hook nothing could later find to replace or remove.
+fn hook_command(shell: &str, sub: &str, store: &StoreRef) -> String {
+    format!("{shell} {sub} {}", store.shell_arg())
 }
 
-/// The exact command string written into the post-edit hook entry. `touch` in
-/// hook mode prints nothing and exits 0 whatever it is handed.
-fn touch_hook_command(shell: &str, store: &StoreRef) -> String {
-    format!("{shell} touch {}", store.shell_arg())
-}
-
-/// The exact command string written into the session-start hook entry.
-fn brief_hook_command(shell: &str, store: &StoreRef) -> String {
-    format!("{shell} brief {}", store.shell_arg())
-}
-
-/// The exact command string written into the grep-redirect hook entry.
-fn intercept_hook_command(shell: &str, store: &StoreRef) -> String {
-    format!("{shell} intercept {}", store.shell_arg())
-}
-
-/// The exact command string written into the pre-edit impact hook entry.
-fn impact_hook_command(shell: &str, store: &StoreRef) -> String {
-    format!("{shell} impact-hook {}", store.shell_arg())
-}
-
-/// The exact command string written into the grep-enrichment hook entry.
-fn enrich_hook_command(shell: &str, store: &StoreRef) -> String {
-    format!("{shell} enrich {}", store.shell_arg())
-}
-
-/// One `hooks.<event>` array entry in Claude Code's settings.json shape.
+/// One `hooks.<event>` array entry in Claude Code's settings.json shape, for a
+/// hook that fires on every occurrence of its event.
+///
+/// `SessionStart` and `UserPromptSubmit` are not tool calls, so there is
+/// nothing to match on and the key is left out entirely — an empty `matcher`
+/// is not the same as no matcher.
 fn hook_entry(command: &str) -> serde_json::Value {
     serde_json::json!({ "hooks": [ { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS } ] })
 }
 
-/// The `PostToolUse` entry: matched to the file-editing tools, and `async` so
-/// the assistant's tool call returns without waiting for the re-extraction.
-fn touch_hook_entry(command: &str) -> serde_json::Value {
-    serde_json::json!({
-        "matcher": TOUCH_MATCHER,
-        "hooks": [ {
-            "type": "command",
-            "command": command,
-            "timeout": TOUCH_TIMEOUT_SECS,
-            "async": true
-        } ]
-    })
-}
-
-/// The `PreToolUse` entry: matched to `Grep` alone, and awaited — an `async`
-/// hook has already let the tool call through by the time it decides.
-fn intercept_hook_entry(command: &str) -> serde_json::Value {
-    serde_json::json!({
-        "matcher": INTERCEPT_MATCHER,
-        "hooks": [ {
-            "type": "command",
-            "command": command,
-            "timeout": HOOK_TIMEOUT_SECS
-        } ]
-    })
-}
-
-/// The `PreToolUse` entry for the impact hook: matched to the editing tools,
-/// and awaited, so the blast radius is in the transcript before the edit is.
-fn impact_hook_entry(command: &str) -> serde_json::Value {
-    serde_json::json!({
-        "matcher": IMPACT_MATCHER,
-        "hooks": [ {
-            "type": "command",
-            "command": command,
-            "timeout": HOOK_TIMEOUT_SECS
-        } ]
-    })
-}
-
-/// The `PostToolUse` entry for the grep enrichment: matched to `Grep`, and
-/// awaited, so the facts land with the result rather than after it.
-fn enrich_hook_entry(command: &str) -> serde_json::Value {
-    serde_json::json!({
-        "matcher": ENRICH_MATCHER,
-        "hooks": [ {
-            "type": "command",
-            "command": command,
-            "timeout": HOOK_TIMEOUT_SECS
-        } ]
-    })
+/// One `hooks.<event>` array entry matched to a set of tools.
+///
+/// Four of our hooks are this shape and differ only in three values, so they
+/// share one builder: two events hold two hooks of ours each (`PreToolUse` has
+/// the redirect and the impact hook, `PostToolUse` has `touch` and the grep
+/// enrichment), and what keeps each pair apart on disk is the matcher plus the
+/// subcommand inside `command`.
+///
+/// `async` is written only when asked for, because the key's *absence* is what
+/// makes a hook awaited, and every hook here but `touch` has to be: a hook
+/// that decides after the tool call has gone through has decided nothing, and
+/// context that arrives after the edit is context nobody read. `touch` is the
+/// exception — nothing waits on a re-extraction — and pays for it with the
+/// longer [`TOUCH_TIMEOUT_SECS`] budget.
+fn matched_hook_entry(
+    matcher: &str,
+    command: &str,
+    timeout: u64,
+    run_async: bool,
+) -> serde_json::Value {
+    let mut hook = serde_json::json!({
+        "type": "command",
+        "command": command,
+        "timeout": timeout,
+    });
+    if run_async {
+        hook["async"] = serde_json::Value::Bool(true);
+    }
+    serde_json::json!({ "matcher": matcher, "hooks": [hook] })
 }
 
 /// True if any hook group under `event` contains a command hook equal to `command`.
@@ -1405,18 +1368,6 @@ pub(crate) fn is_our_hook_command(command: &str, sub: &str, store: &StoreRef) ->
         .hook_tails(sub)
         .iter()
         .any(|tail| command.ends_with(tail))
-}
-
-/// Which of our subcommands a recorded hook command runs, judged without a
-/// [`StoreRef`].
-///
-/// [`is_our_hook_command`] is the test for a command found on disk, where the
-/// store still has to be matched — a hook naming a different store is not ours
-/// to touch. A command read back out of our own manifest is already known to
-/// be ours and to name our store; all that is left to ask is which hook it is,
-/// and the answer is the word between the binary and the store argument.
-fn hook_command_runs(command: &str, sub: &str) -> bool {
-    command.contains(&format!(" {sub} "))
 }
 
 /// The same identity test for a line that does not *end* with the invocation:
@@ -1752,9 +1703,15 @@ pub fn run_install_with(
             merged.mcp_keys.retain(|k| has_our_server(&k.file));
         }
         // Same for each experiment: an install without the flag has just taken
-        // that hook off disk, so the manifest must stop owning it. The three
-        // opt-in hooks share two events between them and with `touch`, so the
-        // entry is matched on its subcommand word rather than on its event.
+        // that hook off disk, so the manifest must stop owning it.
+        //
+        // Matched with [`is_our_hook_command`], the same predicate the removal
+        // itself used — not on the event, because the three opt-in hooks share
+        // two events between them and with `touch`, and not on the subcommand
+        // word alone, because a `--db` or `--command` path may contain it (a
+        // store at `~/my enrich tools/memory` would otherwise make the prune
+        // drop every hook it owns). Matching the whole ` <sub> <store>` tail
+        // can only ever be true of the hook that is actually going away.
         merged.intercept_grep = opts.intercept_grep;
         merged.impact_before_edit = opts.impact_before_edit;
         merged.enrich_grep = opts.enrich_grep;
@@ -1765,7 +1722,11 @@ pub fn run_install_with(
             (opts.enrich_grep, "enrich"),
         ] {
             if !on {
-                merged.hooks.retain(|h| !hook_command_runs(&h.command, sub));
+                merged.hooks.retain(|h| {
+                    !stores
+                        .iter()
+                        .any(|(_, store)| is_our_hook_command(&h.command, sub, store))
+                });
             }
         }
         write_manifest(&manifest_path, &merged)?;
@@ -2833,7 +2794,7 @@ fn install_claude_code(
     // An earlier install of ours for this same store is replaced, not joined:
     // its command names a binary this version no longer writes, and leaving it
     // would run both on every prompt.
-    let recall = recall_hook_command(&shell, store);
+    let recall = hook_command(&shell, "recall", store);
     if remove_stale_hooks(&settings_file, HOOK_EVENT, "recall", store, &recall)? {
         notes.push(format!("replaced stale {HOOK_EVENT} hook"));
     }
@@ -2844,7 +2805,7 @@ fn install_claude_code(
         hook_entry(&recall),
         manifest,
     )?;
-    let touch = touch_hook_command(&shell, store);
+    let touch = hook_command(&shell, "touch", store);
     if remove_stale_hooks(&settings_file, TOUCH_EVENT, "touch", store, &touch)? {
         notes.push(format!("replaced stale {TOUCH_EVENT} hook"));
     }
@@ -2852,10 +2813,10 @@ fn install_claude_code(
         &settings_file,
         TOUCH_EVENT,
         &touch,
-        touch_hook_entry(&touch),
+        matched_hook_entry(TOUCH_MATCHER, &touch, TOUCH_TIMEOUT_SECS, true),
         manifest,
     )?;
-    let brief = brief_hook_command(&shell, store);
+    let brief = hook_command(&shell, "brief", store);
     if remove_stale_hooks(&settings_file, BRIEF_EVENT, "brief", store, &brief)? {
         notes.push(format!("replaced stale {BRIEF_EVENT} hook"));
     }
@@ -2870,7 +2831,7 @@ fn install_claude_code(
     // The fourth hook is opt-in, and an install that does not ask for it takes
     // back any earlier one of ours for this store — otherwise the experiment
     // could only ever be turned on.
-    let intercept = intercept_hook_command(&shell, store);
+    let intercept = hook_command(&shell, "intercept", store);
     if ctx.intercept_grep {
         if remove_stale_hooks(
             &settings_file,
@@ -2885,7 +2846,7 @@ fn install_claude_code(
             &settings_file,
             INTERCEPT_EVENT,
             &intercept,
-            intercept_hook_entry(&intercept),
+            matched_hook_entry(INTERCEPT_MATCHER, &intercept, HOOK_TIMEOUT_SECS, false),
             manifest,
         )?;
     } else if drop_hooks(&settings_file, INTERCEPT_EVENT, |c| {
@@ -2901,7 +2862,7 @@ fn install_claude_code(
     // under `PreToolUse`, the enrichment beside `touch` under `PostToolUse`.
     // The subcommand word keeps them apart, so turning one off leaves its
     // neighbour exactly where it was.
-    let impact = impact_hook_command(&shell, store);
+    let impact = hook_command(&shell, "impact-hook", store);
     if ctx.impact_before_edit {
         if remove_stale_hooks(&settings_file, IMPACT_EVENT, "impact-hook", store, &impact)? {
             notes.push(format!("replaced stale {IMPACT_EVENT} impact hook"));
@@ -2910,7 +2871,7 @@ fn install_claude_code(
             &settings_file,
             IMPACT_EVENT,
             &impact,
-            impact_hook_entry(&impact),
+            matched_hook_entry(IMPACT_MATCHER, &impact, HOOK_TIMEOUT_SECS, false),
             manifest,
         )?;
     } else if drop_hooks(&settings_file, IMPACT_EVENT, |c| {
@@ -2921,7 +2882,7 @@ fn install_claude_code(
         ));
     }
 
-    let enrich = enrich_hook_command(&shell, store);
+    let enrich = hook_command(&shell, "enrich", store);
     if ctx.enrich_grep {
         if remove_stale_hooks(&settings_file, ENRICH_EVENT, "enrich", store, &enrich)? {
             notes.push(format!("replaced stale {ENRICH_EVENT} enrichment hook"));
@@ -2930,7 +2891,7 @@ fn install_claude_code(
             &settings_file,
             ENRICH_EVENT,
             &enrich,
-            enrich_hook_entry(&enrich),
+            matched_hook_entry(ENRICH_MATCHER, &enrich, HOOK_TIMEOUT_SECS, false),
             manifest,
         )?;
     } else if drop_hooks(&settings_file, ENRICH_EVENT, |c| {

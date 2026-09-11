@@ -6,6 +6,7 @@
 pub mod doctor;
 pub mod enrich;
 pub mod export;
+pub(crate) mod hook;
 pub mod impact_hook;
 pub mod ingest_git;
 pub mod install;

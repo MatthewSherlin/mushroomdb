@@ -19,6 +19,7 @@
 //! missing or busy, a path the graph has no `File` for. Silence here means the
 //! edit proceeds exactly as it would with no hook installed.
 
+use crate::hook::{cut_to, open_for_hook};
 use core_api::repograph::{impact, ImpactOptions, ImpactReport};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -83,6 +84,24 @@ fn recorded_repo(db: &crate::structure::Db) -> Option<PathBuf> {
 /// a leading `./` is dropped either way. An absolute path *outside* the
 /// recorded repository belongs to some other checkout and resolves to nothing:
 /// answering about a same-named file in this one would be worse than silence.
+///
+/// # It is lexical, deliberately
+///
+/// Nothing here touches the filesystem: no `canonicalize`, no `metadata`, no
+/// symlink resolution. Two consequences a caller should know about, both of
+/// which end in silence rather than in a wrong answer:
+///
+/// - `..` components are **dropped**, not resolved. `a/../b/x.rs` becomes
+///   `a/b/x.rs`, which is very unlikely to be a key the graph holds, so such a
+///   path simply finds nothing.
+/// - A path that reaches the repository by a **different spelling** than the
+///   recorded root — through a symlink, or macOS's `/var` → `/private/var` —
+///   does not match the prefix and finds nothing either.
+///
+/// Resolving either would mean `stat`-ing paths inside a hook that runs before
+/// every edit, to rescue cases a host does not produce: Claude Code sends the
+/// path it opened the file at, and the marker records the root `git rev-parse`
+/// printed. Silence on the odd one out is the cheaper trade.
 fn repo_relative(path: &str, repo: Option<&Path>) -> Option<String> {
     let p = Path::new(path);
     let rel = if p.is_absolute() {
@@ -136,13 +155,18 @@ fn render(report: &ImpactReport) -> Option<String> {
 
     let mut sections: Vec<String> = Vec::new();
     if !callers.is_empty() {
-        // The count is every importer the graph named, including the ones the
-        // list cap and the test split left out: a reader has to be able to
-        // tell a short list from a truncated one.
+        // `(N)` counts what this line is about — the non-test importers — so a
+        // reader can tell a three-name list that is complete from one the
+        // display cap shortened. It is deliberately *not* the file's fan-in:
+        // `impact` stops at `ImpactOptions::max_importers`, so when its list
+        // came back full the true count is unknown and the line says `+more`
+        // rather than reporting the cap as if it were the answer.
+        let truncated = file.importers.len() >= ImpactOptions::default().max_importers;
         sections.push(format!(
-            "callers {} ({})",
+            "callers {} ({}{})",
             join_capped(&callers),
-            file.importers.len()
+            callers.len(),
+            if truncated { "+more" } else { "" }
         ));
     }
     if !partners.is_empty() {
@@ -165,7 +189,7 @@ fn render(report: &ImpactReport) -> Option<String> {
         }
         out.push_str(s);
     }
-    Some(cut(out))
+    Some(cut_to(out, MAX_CONTEXT_BYTES))
 }
 
 /// At most [`MAX_NAMED`] paths, comma-separated, with `…` where the rest were.
@@ -178,21 +202,6 @@ fn join_capped(paths: &[&str]) -> String {
     out
 }
 
-/// `s` cut to [`MAX_CONTEXT_BYTES`] on a character boundary, with an ellipsis
-/// marking the cut. Unchanged when it already fits.
-fn cut(s: String) -> String {
-    if s.len() <= MAX_CONTEXT_BYTES {
-        return s;
-    }
-    // One byte of the budget goes to the ellipsis, which is three bytes of
-    // UTF-8, so the cut point leaves room for it.
-    let mut end = MAX_CONTEXT_BYTES - '…'.len_utf8();
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", s[..end].trim_end())
-}
-
 /// The whole hook body: parse the payload, open the store, render the radius.
 ///
 /// `None` for every failure as well as for every file the graph has nothing to
@@ -202,23 +211,7 @@ fn cut(s: String) -> String {
 pub fn run(db_dir: &Path, payload: &str) -> Option<String> {
     let input: serde_json::Value = serde_json::from_str(payload).ok()?;
     let path = edited_path(&input)?;
-    // Guard the open, as `run_intercept` does: `RealFs::new` runs
-    // `create_dir_all`, so a hook left behind by an uninstall — or pointed at
-    // a typo'd path — would otherwise create an empty store before every edit.
-    if !db_dir.exists() {
-        return None;
-    }
-    // Read-only, no migration, no WAL repair: a hook in front of a tool call
-    // has no business writing to the store, and must never wait on a lock.
-    let db = core_api::GraphDb::open_with_options(
-        db_dir,
-        core_api::OpenOptions {
-            auto_migrate: false,
-            repair_wal: false,
-            read_only: true,
-        },
-    )
-    .ok()?;
+    let db = open_for_hook(db_dir)?;
     let key = repo_relative(path, recorded_repo(&db).as_deref())?;
     let report = impact(&db, &[key], &BTreeSet::new(), &ImpactOptions::default());
     render(&report)
@@ -226,7 +219,7 @@ pub fn run(db_dir: &Path, payload: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cut, looks_like_test, repo_relative, MAX_CONTEXT_BYTES};
+    use super::{looks_like_test, repo_relative};
     use std::path::Path;
 
     #[test]
@@ -267,10 +260,12 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_holds_on_a_multibyte_cut() {
-        let long = format!("impact of editing a: {}", "é".repeat(MAX_CONTEXT_BYTES));
-        let out = cut(long);
-        assert!(out.len() <= MAX_CONTEXT_BYTES, "{} bytes", out.len());
-        assert!(out.ends_with('…'), "{out}");
+    fn a_dot_dot_path_is_flattened_rather_than_resolved() {
+        let repo = Path::new("/home/me/proj");
+        assert_eq!(
+            repo_relative("/home/me/proj/src/../src/lib.rs", Some(repo)).as_deref(),
+            Some("src/src/lib.rs"),
+            "lexical only: `..` is dropped, so the key simply does not match"
+        );
     }
 }

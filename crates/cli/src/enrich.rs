@@ -21,9 +21,31 @@
 //! Everything else — a store that will not open, a payload that will not
 //! parse, a pattern that names nothing — is silence, like every other hook
 //! this binary writes.
+//!
+//! # Where the facts land
+//!
+//! The text goes out as `additionalContext` on a `hookSpecificOutput` object,
+//! which puts it in the turn *beside* the tool result — not inside it. Claude
+//! Code also documents `updatedToolOutput` for `PostToolUse`, which would
+//! rewrite the result itself, but the reference's list of the tools that
+//! support it could not be retrieved when this was written, and a key the host
+//! ignores is a hook that silently does nothing. Anyone reading the grep-
+//! enrichment arm's numbers should read them as "the facts arrived in the same
+//! turn, adjacent to the matches", not "the matches came back annotated".
+//!
+//! # Cost
+//!
+//! One pass over the `Symbol` nodes builds the name index ([`name_index`]),
+//! and every candidate is answered out of it. Asking the graph per candidate
+//! instead would be up to [`MAX_CANDIDATES`] full scans of the symbol table on
+//! every single `Grep`, which is the whole budget spent on names that mostly
+//! turn out to be ordinary words.
 
+use crate::hook::{cut_to, open_for_hook};
 use crate::intercept::is_identifier;
-use core_api::repograph::{context_with, named_symbols, ContextOptions};
+use core_api::repograph::{context_with, sanitize, ContextOptions};
+use core_api::Value;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -119,6 +141,25 @@ fn candidates(texts: &[String]) -> Vec<String> {
     out
 }
 
+/// Every `Symbol` the store holds, by the bare `name` prop, from one scan.
+///
+/// The values are the keys sharing that name, sorted, which is exactly what
+/// [`core_api::repograph::named_symbols`] returns for a single name — this is
+/// that answer for every name at once, so a hook with dozens of candidates
+/// pays for one pass rather than dozens.
+fn name_index(db: &crate::structure::Db) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for node in db.nodes_with_label("Symbol") {
+        if let Some(Value::Str(name)) = node.prop("name") {
+            out.entry(name).or_default().push(sanitize(node.key()));
+        }
+    }
+    for keys in out.values_mut() {
+        keys.sort();
+    }
+    out
+}
+
 /// One symbol's line: where it is, how many files call it, who owns its file.
 ///
 /// Named by its key rather than by the bare name that found it, because a key
@@ -160,32 +201,16 @@ pub fn run(db_dir: &Path, payload: &str) -> Option<String> {
     if tokens.is_empty() {
         return None;
     }
-    // Guard the open, as `run_intercept` does: `RealFs::new` runs
-    // `create_dir_all`, so a hook left behind by an uninstall would otherwise
-    // create an empty store after every `Grep` and answer out of it.
-    if !db_dir.exists() {
-        return None;
-    }
-    // Read-only, no migration, no WAL repair: a hook beside a tool call has no
-    // business writing to the store, and must never wait on a lock.
-    let db = core_api::GraphDb::open_with_options(
-        db_dir,
-        core_api::OpenOptions {
-            auto_migrate: false,
-            repair_wal: false,
-            read_only: true,
-        },
-    )
-    .ok()?;
+    let db = open_for_hook(db_dir)?;
 
-    let mut keys: Vec<String> = Vec::new();
+    let by_name = name_index(&db);
+    let mut keys: Vec<&str> = Vec::new();
     for token in &tokens {
         // A name several symbols share is ambiguous, and picking one of them
-        // would be inventing an answer; the first key is taken only where the
-        // name resolves to exactly one symbol.
-        let found = named_symbols(&db, token);
-        if let [key] = found.as_slice() {
-            keys.push(key.clone());
+        // would be inventing an answer; a token earns a line only where it
+        // resolves to exactly one symbol.
+        if let Some([key]) = by_name.get(token).map(Vec::as_slice) {
+            keys.push(key);
         }
         if keys.len() >= MAX_SYMBOLS {
             break;
@@ -211,7 +236,10 @@ pub fn run(db_dir: &Path, payload: &str) -> Option<String> {
     if out.ends_with(": ") {
         return None;
     }
-    Some(out)
+    // The per-line check above already holds the budget; `cut_to` is the
+    // backstop that makes the cap true by construction rather than by
+    // argument.
+    Some(cut_to(out, MAX_CONTEXT_BYTES))
 }
 
 #[cfg(test)]

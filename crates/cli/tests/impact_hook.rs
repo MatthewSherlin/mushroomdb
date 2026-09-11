@@ -94,9 +94,47 @@ fn a_known_file_gets_its_blast_radius() {
         text.starts_with("impact of editing src/install.rs:"),
         "{text}"
     );
-    assert!(text.contains("callers src/main.rs (2)"), "{text}");
+    // `(1)` counts the non-test importers this line names, not the file's
+    // fan-in: `tests/install.rs` is the other importer and is reported as a
+    // test. No `+more`, because the graph's importer list came back short of
+    // its cap, so the count is complete.
+    assert!(text.contains("callers src/main.rs (1)"), "{text}");
+    assert!(!text.contains("+more"), "{text}");
     assert!(text.contains("changes with src/doctor.rs"), "{text}");
     assert!(text.contains("tests tests/install.rs"), "{text}");
+    assert!(text.len() <= MAX_CONTEXT_BYTES, "{} bytes", text.len());
+}
+
+/// When `impact` returns a full importer list the true fan-in is unknown — the
+/// engine stopped at its cap — so the line says so rather than reporting the
+/// cap as if it were the answer.
+#[test]
+fn a_truncated_importer_list_is_marked_rather_than_counted() {
+    let repo = tmp("repo-cap");
+    std::fs::create_dir_all(&repo).unwrap();
+    let dir = tmp("cap");
+    let mut db = GraphDb::open(&dir).expect("open store");
+    db.insert_node(
+        "GitSync",
+        "__mushroomdb_git_sync__",
+        vec![(
+            "repo".to_string(),
+            Value::Str(repo.to_string_lossy().into_owned()),
+        )],
+    )
+    .expect("insert marker");
+    db.insert_node("File", "src/install.rs", vec![]).unwrap();
+    // Nine importers: more than `ImpactOptions::default().max_importers` (6),
+    // so the report comes back capped.
+    for i in 0..9 {
+        let path = format!("src/importer{i}.rs");
+        db.insert_node("File", &path, vec![]).unwrap();
+        db.insert_edge("IMPORTS", &path, "src/install.rs").unwrap();
+    }
+    drop(db);
+
+    let text = impact_hook::run(&dir, &payload("src/install.rs")).expect("importers are reported");
+    assert!(text.contains("(6+more)"), "{text}");
     assert!(text.len() <= MAX_CONTEXT_BYTES, "{} bytes", text.len());
 }
 

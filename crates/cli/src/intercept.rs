@@ -27,6 +27,7 @@
 //! a missing field — is silence and exit 0, like every other hook this binary
 //! writes.
 
+use crate::hook::open_for_hook;
 use crate::structure::Db;
 use core_api::repograph;
 use std::path::Path;
@@ -96,24 +97,7 @@ pub fn decide(db: &Db, input: &serde_json::Value) -> Option<String> {
 pub fn run_intercept(db_dir: &Path, payload: &str) -> Option<String> {
     let input: serde_json::Value = serde_json::from_str(payload).ok()?;
     redirectable_pattern(&input)?;
-    // Guard the open, as `run_recall` does: `RealFs::new` runs
-    // `create_dir_all`, so a hook left behind by an uninstall — or pointed at
-    // a typo'd path — would otherwise create an empty store before every
-    // `Grep` and answer out of it.
-    if !db_dir.exists() {
-        return None;
-    }
-    // Read-only, no migration, no WAL repair: a hook in front of a tool call
-    // has no business writing to the store, and must never wait on a lock.
-    let db = core_api::GraphDb::open_with_options(
-        db_dir,
-        core_api::OpenOptions {
-            auto_migrate: false,
-            repair_wal: false,
-            read_only: true,
-        },
-    )
-    .ok()?;
+    let db = open_for_hook(db_dir)?;
     decide(&db, &input)
 }
 
