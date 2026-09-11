@@ -589,10 +589,13 @@ fn render_memory_brief(b: &BriefReport, s: &SchemaBrief, budget: usize) -> Strin
         s.labels
             .iter()
             .map(|l| {
-                let mut line = format!("  {} ({})", cap_name(&sanitize(&l.label), cap), at_least(l.nodes));
+                let mut line = format!(
+                    "  {} ({})",
+                    cap_name(&sanitize(&l.label), cap),
+                    at_least(l.nodes)
+                );
                 if !l.props.is_empty() {
-                    let props: Vec<String> =
-                        l.props.iter().map(|p| cap_name(p, cap)).collect();
+                    let props: Vec<String> = l.props.iter().map(|p| cap_name(p, cap)).collect();
                     let _ = write!(line, " — {}", props.join(", "));
                 }
                 if l.hidden_props > 0 {
@@ -699,11 +702,13 @@ fn render_memory_brief(b: &BriefReport, s: &SchemaBrief, budget: usize) -> Strin
     // Measure three: the worked calls, from the end, and a line that says the
     // brief was cut — without it a session reads a truncated set of recipes as
     // the whole set.
-    let truncated = format!("(brief truncated at {} bytes)\n", thousands(MAX_BRIEF_BYTES));
+    let truncated = format!(
+        "(brief truncated at {} bytes)\n",
+        thousands(MAX_BRIEF_BYTES)
+    );
     let mut kept = recipes.len();
     loop {
-        let body =
-            memory_body(&header, &[], &[], &with_recipes(kept), dropped) + &truncated;
+        let body = memory_body(&header, &[], &[], &with_recipes(kept), dropped) + &truncated;
         if body.len() <= budget {
             return body;
         }

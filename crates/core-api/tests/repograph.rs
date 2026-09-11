@@ -1475,7 +1475,12 @@ fn a_brief_of_very_long_names_is_still_capped_at_four_thousand_bytes() {
         text.contains("(brief truncated at 4,000 bytes)\n"),
         "a brief that lost recipes says so:\n{text}"
     );
-    let all = b.schema.as_ref().expect("a memory store has a schema").recipes.len();
+    let all = b
+        .schema
+        .as_ref()
+        .expect("a memory store has a schema")
+        .recipes
+        .len();
     let printed = text
         .lines()
         .filter(|l| {

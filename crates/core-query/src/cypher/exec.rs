@@ -2778,9 +2778,10 @@ fn distinct_value(
                 Some(Cell::Node(id)) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
                 Some(Cell::Scalar(val)) => Some(val.clone()),
                 Some(Cell::Path(hops)) => Some(Value::Int(*hops as i64)),
-                Some(Cell::Rel(e)) => {
-                    Some(Value::Str(format!("{}\u{1}{}\u{1}{}", e.etype, e.src, e.dst)))
-                }
+                Some(Cell::Rel(e)) => Some(Value::Str(format!(
+                    "{}\u{1}{}\u{1}{}",
+                    e.etype, e.src, e.dst
+                ))),
                 None => None,
             })
         }
@@ -8304,7 +8305,10 @@ LIMIT 10";
         )
         .unwrap();
         let row = &rows_of(&rs)[0];
-        assert_eq!(row[0], row[1], "no pair is joined twice by one type: {row:?}");
+        assert_eq!(
+            row[0], row[1],
+            "no pair is joined twice by one type: {row:?}"
+        );
         assert_ne!(row[1], Some(i(0)), "a graph full of edges counts them");
     }
 
