@@ -98,6 +98,10 @@ about agent performance.
 - **`mushroomdb asof` reported the wrong total** on any store with WAL archives; it counted only
   live `wal.bin` frames, so an eleven-commit store printed `of 1`. It now prints the real total and
   names the horizon floor.
+- **A clean-open store answers approximate vector queries from its persisted index before the first
+  write**, instead of scanning every embedding (results were already exact either way; every earlier
+  release brute-forced here). The first write then releases the read path's copy of that index
+  instead of holding it for the life of the handle.
 - **The open adopts a snapshot's persisted vector index before scanning nodes**, so an embedding the
   scan sees but the index predates is added to the index rather than dropped. On 0.6.5 as shipped the
   case was masked by the write hook re-filing the node; the ordering is now correct on its own.
