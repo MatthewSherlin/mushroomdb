@@ -4,6 +4,16 @@ from __future__ import annotations
 import json, sys
 from pathlib import Path
 
+
+def _binary() -> Path:
+    """The binary the world builder spawns; a checkout without one skips
+    those tests instead of failing on a missing file (set `MUSHROOMDB`)."""
+    import pytest
+    from subjects import MUSHROOMDB
+    if not MUSHROOMDB.exists():
+        pytest.skip(f"no mushroomdb binary at {MUSHROOMDB}; build it or set MUSHROOMDB")
+    return MUSHROOMDB
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
@@ -684,7 +694,7 @@ def test_a_changelog_never_touches_a_key_twice_a_day_or_after_deleting_it():
 def test_the_three_forms_carry_the_same_base_facts(tmp_path):
     from association.build import (SQLITE_NAME, equivalent, world, write_files,
                                    write_sqlite, write_store)
-    from subjects import MUSHROOMDB
+    MUSHROOMDB = _binary()
     w = world(seed=7, scale=200)
     sqlite_path = tmp_path / "sqlite" / SQLITE_NAME
     write_files(w, tmp_path / "files")
@@ -698,7 +708,7 @@ def test_the_built_store_is_never_snapshotted(tmp_path):
     """The WAL is the history every time-travel task asks about; a snapshot
     truncates it. `snapshot.bin` must not exist in a built store."""
     from association.build import SNAPSHOT_FILES, STORE_NAME, world, write_store
-    from subjects import MUSHROOMDB
+    MUSHROOMDB = _binary()
     w = world(seed=7, scale=200)
     write_store(w, tmp_path / "graph", MUSHROOMDB)
     present = {p.name for p in (tmp_path / "graph" / STORE_NAME).iterdir()}
@@ -712,7 +722,7 @@ def test_a_deleted_key_is_absent_later_and_present_earlier(tmp_path):
     """Time travel is the point of the graph form: the store must still be
     able to show a node the changelog removed, at a commit before the removal."""
     from association.build import world, write_store
-    from subjects import MUSHROOMDB
+    MUSHROOMDB = _binary()
     from mushroomdb import GraphDb
     w = world(seed=7, scale=200)
     days = write_store(w, tmp_path / "graph", MUSHROOMDB)
@@ -966,7 +976,7 @@ def test_the_truth_script_and_the_engine_agree_on_a_small_world(tmp_path):
     """
     from association.build import world, write_store
     from association.truth import cross_check
-    from subjects import MUSHROOMDB
+    MUSHROOMDB = _binary()
     w = world(seed=7, scale=200)
     write_store(w, tmp_path / "graph", MUSHROOMDB)
     problems = cross_check(w, tmp_path / "graph", seed=7,
@@ -1448,8 +1458,8 @@ def test_the_graph_subject_holds_the_store_the_install_and_nothing_else(tmp_path
     install writes one) or a leftover build artefact would be data the other
     two arms do not have."""
     from association.build import world, write_store
-    from subjects import (ASSOC_GRAPH_CONTENTS, MUSHROOMDB,
-                          install_association_graph)
+    from subjects import ASSOC_GRAPH_CONTENTS, install_association_graph
+    MUSHROOMDB = _binary()
     w = world(seed=7, scale=200)
     graph = tmp_path / "graph"
     write_store(w, graph, MUSHROOMDB)

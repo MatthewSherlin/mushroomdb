@@ -20,7 +20,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
-MUSHROOMDB = REPO / "target" / "release" / "mushroomdb"
+# `MUSHROOMDB=<path>` points every subprocess at another binary (CI builds debug).
+MUSHROOMDB = Path(os.environ["MUSHROOMDB"]) if os.environ.get("MUSHROOMDB") else REPO / "target" / "release" / "mushroomdb"
 SCRATCH = Path(os.environ.get("TMPDIR", "/tmp")) / "agent-bench"
 SUBJECT_A = SCRATCH / "subject"
 SUBJECT_B = SCRATCH / "subject-mdb"

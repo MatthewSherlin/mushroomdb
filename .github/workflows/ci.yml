@@ -144,7 +144,13 @@ jobs:
       - run: .venv/bin/maturin develop
       - run: .venv/bin/pytest
       - run: .venv/bin/python -m pytest ../../dogfood -q
+      # The harness's world-builder tests spawn the binary; a debug build is
+      # enough for a 200-node world, and `MUSHROOMDB` points them at it.
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb
+        working-directory: .
       - run: .venv/bin/python -m pytest ../../benchmarks/agent-tasks/test_agent_harness.py -q
+        env:
+          MUSHROOMDB: ${{ github.workspace }}/target/debug/mushroomdb
       - run: .venv/bin/python -m pytest ../../benchmarks/test_harness.py -v -q
       - run: .venv/bin/python -m pytest ../../benchmarks/ci/test_compare.py -v -q
 
@@ -237,6 +243,7 @@ jobs:
             --threshold 0.15
 
   # SDK-level MCP handshake: speaks to a real `mushroomdb mcp <db>` process
+  # on an empty store — a memory store, so the fifteen association tools —
   # over stdio using the official @modelcontextprotocol/sdk client, not a
   # hand-rolled JSON-RPC probe, so a break in the wire protocol or the tool
   # list fails the same way it would for a real assistant host.
@@ -259,7 +266,7 @@ jobs:
             --command ../../target/debug/mushroomdb \
             --db "$(mktemp -d)" \
             --expect-version "$(cargo pkgid -p mushroomdb-cli | sed 's/.*[#@]//')" \
-            --expect-tools map,context,impact,owners,why,recall,remember,sync
+            --expect-tools query,explain_association,neighborhood,node_info,node_edges,was_linked,edges_at,what_if,node_history,edge_history,find_similar,hybrid_search,remember,recall,stats
         working-directory: scripts/mcp-handshake
 
   # The v0.6 code-graph acceptance run: ingest, map, determinism, freshness,
