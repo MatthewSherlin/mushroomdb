@@ -1,5 +1,9 @@
 # Deployment
 
+This page is about reaching the server: TLS, reverse proxies, and the loopback
+default. For keeping the store alive across restarts — the volume, backups, and
+`serve --restore-from` — see [Running it as a service](service.md).
+
 ---
 
 ## Terminating TLS at a reverse proxy (recommended)

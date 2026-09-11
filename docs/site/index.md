@@ -83,4 +83,5 @@ Docker, `install.sh`, and the build-from-source path are in
 - [The live code graph](code-graph.md) — **deprecated in 0.6.4, removed in 0.7**: what the repository graph guarantees, measured
 - [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
+- [Running it as a service](service.md) — the volume, the snapshot interval, backup, restore, and what a restart costs
 - [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error

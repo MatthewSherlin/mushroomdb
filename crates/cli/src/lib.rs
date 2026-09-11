@@ -217,6 +217,9 @@ pub enum Command {
         role_tokens: Vec<(String, String)>,
         /// Periodic snapshot cadence. `None` = off (default).
         snapshot_every: Option<Duration>,
+        /// Seed an empty `db_dir` from the newest backup under this directory
+        /// before opening it. See [`restore_if_empty`]. `None` = off (default).
+        restore_from: Option<PathBuf>,
         /// Path to PEM certificate for native TLS (`--tls-cert`). Requires `--tls-key`.
         tls_cert: Option<PathBuf>,
         /// Path to PEM private key for native TLS (`--tls-key`). Requires `--tls-cert`.
@@ -499,7 +502,9 @@ Usage:
   mushroomdb doctor [--project|--user] [--platform claude-code|cursor|codex|all]
                      verify an install: config entry, store, hooks, git hooks, and a real
                      stdio handshake with the configured MCP command; exits 1 on any `fail`
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>]
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>]
+                     --restore-from seeds an empty <db-dir> from the newest backup under <dir>
+                     (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
   mushroomdb mcp <db-dir>|--auto [--all-tools]
                      --all-tools lists all 27 tools; the default follows the store — 3 on a
                      store `ingest-git` built (explore, query, stats), 15 on any other
@@ -962,6 +967,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
     let mut token = None;
     let mut role_tokens: Vec<(String, String)> = Vec::new();
     let mut snapshot_every = None;
+    let mut restore_from: Option<PathBuf> = None;
     let mut tls_cert: Option<PathBuf> = None;
     let mut tls_key: Option<PathBuf> = None;
     let mut i = 0;
@@ -1028,6 +1034,16 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--snapshot-every=") {
             snapshot_every = Some(parse_snapshot_every(val)?);
             i += 1;
+        } else if a == "--restore-from" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --restore-from".to_string())?;
+            restore_from = Some(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--restore-from=") {
+            restore_from = Some(PathBuf::from(val));
+            i += 1;
         } else if a == "--tls-cert" {
             let val = args
                 .get(i + 1)
@@ -1074,6 +1090,7 @@ fn parse_serve(args: &[&str]) -> Result<Command, String> {
         token,
         role_tokens,
         snapshot_every,
+        restore_from,
         tls_cert,
         tls_key,
     })
@@ -1576,6 +1593,170 @@ fn parse_export(args: &[&str]) -> Result<Command, String> {
 pub fn run_backup(db_dir: &Path, dest: &Path) -> Result<BackupReport, CliError> {
     let db = GraphDb::open(db_dir)?;
     Ok(db.backup_to(dest)?)
+}
+
+/// What [`restore_if_empty`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// `db_dir` already holds a store; nothing was copied.
+    AlreadyPresent,
+    /// Seeded from `from`.
+    Restored {
+        from: PathBuf,
+        files: Vec<String>,
+        bytes: u64,
+    },
+    /// `from` held no backup: nothing under it looks like a store.
+    Empty,
+}
+
+/// Every file `GraphDb::backup_to` copies that is not a WAL archive.
+///
+/// Kept in the same order, so a restore writes them the way a backup wrote
+/// them. Archives are found by name at copy time, since their count varies.
+const RESTORE_FILES: [&str; 6] = [
+    "snapshot.bin",
+    "snapshot.bin.bak",
+    "wal.bin",
+    "wal.floor",
+    "wal.genesis",
+    "roles.json",
+];
+
+/// Is there a store in `dir` already?
+///
+/// A store is "present" when `dir` holds `snapshot.bin` or a non-empty
+/// `wal.bin`. An empty `wal.bin` is what a crashed first boot leaves behind,
+/// and seeding over it is the whole point of `--restore-from`.
+fn holds_a_store(dir: &Path) -> bool {
+    if dir.join("snapshot.bin").is_file() {
+        return true;
+    }
+    std::fs::metadata(dir.join("wal.bin"))
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// How recently a backup directory was written: the newest mtime among the
+/// files that make it a store.
+///
+/// `snapshot.bin` alone is not enough to rank by, because a store that has
+/// never snapshotted backs up as `wal.bin` and nothing else — which is exactly
+/// what `mushroomdb demo` then `mushroomdb backup` produces.
+fn backup_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    ["snapshot.bin", "wal.bin"]
+        .iter()
+        .filter_map(|n| {
+            std::fs::metadata(dir.join(n))
+                .and_then(|m| m.modified())
+                .ok()
+        })
+        .max()
+}
+
+/// Pick the backup under `from`, if there is one.
+///
+/// `from` is either a backup directory itself (it holds a store) or a
+/// directory of them, in which case the immediate subdirectory named `latest`
+/// wins outright if it holds one — so a symlink or a rolling copy can name
+/// itself — and otherwise the newest by mtime wins.
+///
+/// "Holds a store" is [`holds_a_store`], the same predicate that decides
+/// whether `db_dir` needs seeding. A backup of a never-snapshotted store is
+/// `wal.bin` and nothing else, and it carries every commit; ranking on
+/// `snapshot.bin` alone would skip it and start empty.
+fn choose_backup(from: &Path) -> Option<PathBuf> {
+    if holds_a_store(from) {
+        return Some(from.to_path_buf());
+    }
+    let entries = std::fs::read_dir(from).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !holds_a_store(&dir) {
+            continue;
+        }
+        if dir.file_name().map(|n| n == "latest").unwrap_or(false) {
+            return Some(dir);
+        }
+        let Some(mtime) = backup_mtime(&dir) else {
+            continue;
+        };
+        // Ties break on the path, so a vault of same-second backups still
+        // picks the same one on every boot.
+        let better = match &best {
+            None => true,
+            Some((best_mtime, best_dir)) => (mtime, &dir) > (*best_mtime, best_dir),
+        };
+        if better {
+            best = Some((mtime, dir));
+        }
+    }
+    best.map(|(_, dir)| dir)
+}
+
+/// Seed `db_dir` from the newest backup under `from`, if `db_dir` has no store.
+///
+/// A store is "present" when `db_dir` holds `snapshot.bin` or a non-empty
+/// `wal.bin`. `from` is either a backup directory itself (it holds a store by
+/// that same test) or a directory of them, in which case the immediate
+/// subdirectory named `latest` wins if it holds one, else the newest by mtime.
+/// The copy is opened before `serve` proceeds; a copy that does not open is an
+/// error naming the path, never a silent empty start.
+///
+/// # Errors
+///
+/// Whatever creating `db_dir`, copying a file, or opening the copy returned.
+pub fn restore_if_empty(db_dir: &Path, from: &Path) -> Result<RestoreOutcome, CliError> {
+    if holds_a_store(db_dir) {
+        return Ok(RestoreOutcome::AlreadyPresent);
+    }
+    let Some(backup) = choose_backup(from) else {
+        return Ok(RestoreOutcome::Empty);
+    };
+
+    std::fs::create_dir_all(db_dir)
+        .map_err(|e| CliError(format!("restore into {}: {e}", db_dir.display())))?;
+
+    let mut names: Vec<String> = RESTORE_FILES.iter().map(|n| n.to_string()).collect();
+    let mut archives: Vec<String> = std::fs::read_dir(&backup)
+        .map_err(|e| CliError(format!("restore from {}: {e}", backup.display())))?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("wal.") && n.ends_with(".archive"))
+        .collect();
+    archives.sort();
+    names.extend(archives);
+
+    let mut files = Vec::new();
+    let mut bytes = 0u64;
+    for name in names {
+        let src = backup.join(&name);
+        if !src.is_file() {
+            continue;
+        }
+        let n = std::fs::copy(&src, db_dir.join(&name))
+            .map_err(|e| CliError(format!("restore {} from {}: {e}", name, backup.display())))?;
+        bytes += n;
+        files.push(name);
+    }
+
+    // Prove the copy opens before `serve` gets it: the same CRC and replay
+    // checks any open runs. A copy that does not open is a hard failure, not a
+    // silent empty start.
+    GraphDb::open(db_dir).map_err(|e| {
+        CliError(format!(
+            "restored {} from {} but it does not open: {e}",
+            db_dir.display(),
+            backup.display()
+        ))
+    })?;
+
+    Ok(RestoreOutcome::Restored {
+        from: backup,
+        files,
+        bytes,
+    })
 }
 
 /// Format a [`BackupReport`] for display.
@@ -2855,6 +3036,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        restore_from,
                         tls_cert,
                         tls_key,
                     }) => {
@@ -2865,6 +3047,7 @@ mod tests {
                         assert_eq!(token, None);
                         assert!(role_tokens.is_empty());
                         assert_eq!(snapshot_every, None);
+                        assert_eq!(restore_from, None);
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
                     }
@@ -2882,6 +3065,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        restore_from,
                         tls_cert,
                         tls_key,
                     }) => {
@@ -2895,6 +3079,7 @@ mod tests {
                         assert_eq!(token, None);
                         assert!(role_tokens.is_empty());
                         assert_eq!(snapshot_every, None);
+                        assert_eq!(restore_from, None);
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
                     }
@@ -2912,6 +3097,7 @@ mod tests {
                         token,
                         role_tokens,
                         snapshot_every,
+                        restore_from,
                         tls_cert,
                         tls_key,
                     }) => {
@@ -2925,6 +3111,7 @@ mod tests {
                         assert_eq!(token, None);
                         let _ = role_tokens; // empty, not asserted
                         assert_eq!(snapshot_every, None);
+                        assert_eq!(restore_from, None);
                         assert_eq!(tls_cert, None);
                         assert_eq!(tls_key, None);
                     }
@@ -4141,6 +4328,239 @@ mod tests {
         assert!(report.bytes > 0);
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// Build a one-node store at `dir` and snapshot it, so `backup_to` has a
+    /// `snapshot.bin` to copy.
+    fn seed_store(dir: &Path, key: &str) {
+        let mut db = GraphDb::open(dir).expect("open seed store");
+        db.insert_node("N", key, vec![]).expect("insert seed node");
+        db.snapshot().expect("snapshot seed store");
+    }
+
+    #[test]
+    fn restore_from_seeds_an_empty_dir() {
+        let src = tmp("restore-src");
+        seed_store(&src, "a");
+        let vault = tmp("restore-vault");
+        run_backup(&src, &vault.join("2026-09-10T00-00Z")).expect("backup");
+
+        let fresh = tmp("restore-fresh");
+        match restore_if_empty(&fresh, &vault).expect("restore_if_empty") {
+            RestoreOutcome::Restored { files, bytes, .. } => {
+                assert!(
+                    files.contains(&"snapshot.bin".to_string()),
+                    "expected snapshot.bin among {files:?}"
+                );
+                assert!(bytes > 0, "expected a non-zero byte count");
+            }
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert!(GraphDb::open(&fresh).expect("open restored").has_node("a"));
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&vault);
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    #[test]
+    fn restore_from_a_backup_dir_itself() {
+        let src = tmp("restore-direct-src");
+        seed_store(&src, "a");
+        let backup = tmp("restore-direct-backup");
+        run_backup(&src, &backup).expect("backup");
+
+        let fresh = tmp("restore-direct-fresh");
+        match restore_if_empty(&fresh, &backup).expect("restore_if_empty") {
+            RestoreOutcome::Restored { from, .. } => assert_eq!(from, backup),
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert!(GraphDb::open(&fresh).expect("open restored").has_node("a"));
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&backup);
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    /// A store that has never snapshotted backs up as `wal.bin` and nothing
+    /// else — `mushroomdb demo` then `mushroomdb backup` is exactly that — and
+    /// it carries every commit. Ranking on `snapshot.bin` alone would skip it
+    /// and start the server empty, which is the failure the flag exists to
+    /// prevent.
+    #[test]
+    fn restore_from_a_wal_only_backup() {
+        let src = tmp("restore-walonly-src");
+        {
+            let mut db = GraphDb::open(&src).expect("open src");
+            db.insert_node("N", "a", vec![]).expect("insert");
+        }
+        assert!(
+            !src.join("snapshot.bin").exists(),
+            "test setup: src must not have snapshotted"
+        );
+        let vault = tmp("restore-walonly-vault");
+        run_backup(&src, &vault.join("2026-09-10T00-00Z")).expect("backup");
+
+        let fresh = tmp("restore-walonly-fresh");
+        match restore_if_empty(&fresh, &vault).expect("restore_if_empty") {
+            RestoreOutcome::Restored { files, .. } => assert!(
+                files.contains(&"wal.bin".to_string()),
+                "expected wal.bin among {files:?}"
+            ),
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert!(GraphDb::open(&fresh).expect("open restored").has_node("a"));
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&vault);
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    #[test]
+    fn restore_from_picks_latest_then_newest() {
+        let older_src = tmp("restore-rank-old-src");
+        seed_store(&older_src, "old");
+        let newer_src = tmp("restore-rank-new-src");
+        seed_store(&newer_src, "new");
+        let latest_src = tmp("restore-rank-latest-src");
+        seed_store(&latest_src, "named-latest");
+
+        // Newest by mtime, with no `latest/` present.
+        let vault = tmp("restore-rank-vault");
+        run_backup(&older_src, &vault.join("2026-09-01")).expect("backup old");
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        run_backup(&newer_src, &vault.join("2026-09-02")).expect("backup new");
+
+        let fresh = tmp("restore-rank-fresh");
+        match restore_if_empty(&fresh, &vault).expect("restore by mtime") {
+            RestoreOutcome::Restored { from, .. } => assert_eq!(from, vault.join("2026-09-02")),
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert!(GraphDb::open(&fresh)
+            .expect("open restored")
+            .has_node("new"));
+
+        // `latest/` wins outright, even though it is older than 2026-09-02.
+        run_backup(&latest_src, &vault.join("latest")).expect("backup latest");
+        let older_than_latest = std::fs::metadata(vault.join("2026-09-02").join("snapshot.bin"))
+            .expect("stat newest")
+            .modified()
+            .expect("mtime");
+        let latest_mtime = std::fs::metadata(vault.join("latest").join("snapshot.bin"))
+            .expect("stat latest")
+            .modified()
+            .expect("mtime");
+        assert!(
+            latest_mtime >= older_than_latest,
+            "test setup: latest/ should not be older here"
+        );
+
+        let fresh2 = tmp("restore-rank-fresh2");
+        match restore_if_empty(&fresh2, &vault).expect("restore by name") {
+            RestoreOutcome::Restored { from, .. } => assert_eq!(from, vault.join("latest")),
+            other => panic!("expected Restored, got {other:?}"),
+        }
+        assert!(GraphDb::open(&fresh2)
+            .expect("open restored")
+            .has_node("named-latest"));
+
+        for d in [&older_src, &newer_src, &latest_src, &vault, &fresh, &fresh2] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn restore_from_is_a_no_op_when_a_store_exists() {
+        let src = tmp("restore-noop-src");
+        seed_store(&src, "a");
+        let vault = tmp("restore-noop-vault");
+        run_backup(&src, &vault.join("2026-09-10T00-00Z")).expect("backup");
+
+        let existing = tmp("restore-noop-existing");
+        seed_store(&existing, "b");
+
+        assert_eq!(
+            restore_if_empty(&existing, &vault).expect("restore_if_empty"),
+            RestoreOutcome::AlreadyPresent
+        );
+        let db = GraphDb::open(&existing).expect("open existing");
+        assert!(db.has_node("b"), "the existing store must survive");
+        assert!(!db.has_node("a"), "the backup must not have been copied in");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&vault);
+        let _ = std::fs::remove_dir_all(&existing);
+    }
+
+    #[test]
+    fn restore_from_an_empty_vault_is_not_an_error() {
+        let vault = tmp("restore-empty-vault");
+        std::fs::create_dir_all(&vault).expect("mkdir vault");
+        let fresh = tmp("restore-empty-fresh");
+        assert_eq!(
+            restore_if_empty(&fresh, &vault).expect("restore_if_empty"),
+            RestoreOutcome::Empty
+        );
+        // A missing `from` is the same warning: a first boot with no volume yet.
+        assert_eq!(
+            restore_if_empty(&fresh, &vault.join("nope")).expect("restore_if_empty"),
+            RestoreOutcome::Empty
+        );
+
+        let _ = std::fs::remove_dir_all(&vault);
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    #[test]
+    fn restore_from_a_corrupt_backup_fails_loudly() {
+        let src = tmp("restore-corrupt-src");
+        seed_store(&src, "a");
+        let vault = tmp("restore-corrupt-vault");
+        let backup = vault.join("2026-09-10T00-00Z");
+        run_backup(&src, &backup).expect("backup");
+
+        // Truncate the copied snapshot: the CRC check on open must reject it.
+        let snap = backup.join("snapshot.bin");
+        let bytes = std::fs::read(&snap).expect("read snapshot");
+        std::fs::write(&snap, &bytes[..bytes.len() / 2]).expect("truncate snapshot");
+
+        let fresh = tmp("restore-corrupt-fresh");
+        let err = restore_if_empty(&fresh, &vault).expect_err("expected a hard failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&fresh.display().to_string()),
+            "error must name the restored dir, got: {msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&vault);
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    #[test]
+    fn serve_parses_restore_from() {
+        match parse_args(&["serve", "/tmp/db", "--restore-from", "/vol/backups"]) {
+            Ok(Command::Serve { restore_from, .. }) => {
+                assert_eq!(restore_from, Some(PathBuf::from("/vol/backups")))
+            }
+            other => panic!("--restore-from parse, got {other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db", "--restore-from=/vol/backups"]) {
+            Ok(Command::Serve { restore_from, .. }) => {
+                assert_eq!(restore_from, Some(PathBuf::from("/vol/backups")))
+            }
+            other => panic!("--restore-from= parse, got {other:?}"),
+        }
+        match parse_args(&["serve", "/tmp/db"]) {
+            Ok(Command::Serve { restore_from, .. }) => assert_eq!(restore_from, None),
+            other => panic!("default restore_from, got {other:?}"),
+        }
+        let err = parse_args(&["serve", "/tmp/db", "--restore-from"])
+            .expect_err("missing value must be an error");
+        assert!(
+            err.contains("--restore-from"),
+            "error must name the flag, got: {err}"
+        );
     }
 
     #[test]

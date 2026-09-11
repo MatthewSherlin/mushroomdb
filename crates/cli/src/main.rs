@@ -173,6 +173,7 @@ fn main() -> ExitCode {
             token,
             role_tokens,
             snapshot_every,
+            restore_from,
             tls_cert,
             tls_key,
         }) => {
@@ -206,6 +207,27 @@ fn main() -> ExitCode {
             }
             for (tok, role) in role_tokens {
                 all_role_tokens.insert(tok, role);
+            }
+            // Before the demo, so a restored store is never overwritten by it.
+            if let Some(from) = restore_from {
+                match cli::restore_if_empty(&db_dir, &from) {
+                    Ok(cli::RestoreOutcome::Restored { from, files, bytes }) => println!(
+                        "restored from {}: {} files, {} bytes",
+                        from.display(),
+                        files.len(),
+                        bytes
+                    ),
+                    Ok(cli::RestoreOutcome::AlreadyPresent) => eprintln!(
+                        "restore-from: {} already holds a store; not restoring",
+                        db_dir.display()
+                    ),
+                    // A warning, not an error: a first boot with an empty
+                    // backup volume must still start.
+                    Ok(cli::RestoreOutcome::Empty) => {
+                        eprintln!("restore-from: no backup found under {}", from.display())
+                    }
+                    Err(e) => return fail(&e.to_string()),
+                }
             }
             if demo_if_empty {
                 match maybe_run_demo_if_empty(&db_dir) {
