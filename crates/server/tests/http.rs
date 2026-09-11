@@ -4470,6 +4470,128 @@ async fn concurrent_role_writers_fifo_serialize() {
     assert!(db.read().has_node("conc-2"), "conc-2 must exist");
 }
 
+/// `as_of` composes with a role token and with a client mask; it did not
+/// before 0.6.5.  Both restrictions are resolved against the graph as it was
+/// at the requested commit.
+#[tokio::test]
+async fn http_query_as_of_composes_with_a_role() {
+    let (app, db) = open_rbac(
+        "asof-role-compose",
+        &[("reader", &["Public"], &[])],
+        Some("adm"),
+        &[("rt", "reader")],
+    );
+    db.write().insert_node("Public", "p1", vec![]).unwrap();
+    let at_one = db.read().wal_total_commits().unwrap() - 1;
+    db.write().insert_node("Public", "p2", vec![]).unwrap();
+    db.write().insert_node("Secret", "s1", vec![]).unwrap();
+
+    /// Node keys of a `RETURN n` JSON result body.
+    fn keys(body: &[u8]) -> Vec<String> {
+        parse_json(body)["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[0].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    // Role token + as_of: the role mask resolved at that commit.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "rt",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": at_one}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "as_of + role must no longer be refused: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(keys(&body), vec!["p1".to_string()]);
+
+    // Role token, no as_of: the role still sees both Public nodes now.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "rt",
+        json!({"cypher": "MATCH (n) RETURN n"}),
+    );
+    let (_, body, _) = send(app.clone(), req).await;
+    assert_eq!(keys(&body), vec!["p1".to_string(), "p2".to_string()]);
+
+    // Role token + as_of + client mask: intersection, never widened.  At the
+    // newest commit the role sees p1+p2 and the client list is p1+s1, so only
+    // p1 survives — s1 is outside the role, p2 outside the client list.
+    let latest = db.read().wal_total_commits().unwrap() - 1;
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "rt",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": latest, "mask": ["p1", "s1"]}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        keys(&body),
+        vec!["p1".to_string()],
+        "s1 is outside the role, p2 outside the client list"
+    );
+
+    // Full token + as_of + client mask.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "adm",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": at_one, "mask": ["p1", "p2"]}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(keys(&body), vec!["p1".to_string()]);
+
+    // as_of + a write is still refused …
+    let req = authed_json_req(
+        "POST",
+        "/query",
+        "rt",
+        json!({"cypher": "CREATE (x:Public {id:'z'})", "as_of": 0}),
+    );
+    let (status, _, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // … and so is as_of + stub_hidden, naming the flag.
+    let req = authed_json_req(
+        "POST",
+        "/query",
+        "adm",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": 0, "mask": ["p1"], "stub_hidden": true}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("stub_hidden"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // An out-of-range as_of on the role path is a 400 carrying the range.
+    let req = authed_json_req(
+        "POST",
+        "/query",
+        "rt",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": 9_999}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(
+        text.contains("out of range") && text.contains("valid range"),
+        "{text}"
+    );
+}
+
 /// POST /query with `as_of` runs a time-travel read; the current state is
 /// unaffected and a write + as_of is rejected.
 #[tokio::test]

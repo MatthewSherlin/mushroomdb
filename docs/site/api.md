@@ -208,8 +208,42 @@ mask appear as `{"key": "…", "restricted": true}` rather than being omitted. S
 omit-only** — `stub_hidden` has no effect on which rows the query returns; it only
 affects the node-info, edges, and neighborhood endpoints.
 
-Role tokens: `stub_hidden` is silently ignored. Hidden nodes are always fully omitted
-for role-token requests.
+Role tokens: `stub_hidden` is silently ignored — except with `as_of`, where it is
+refused (`as_of (time-travel) does not compose with stub_hidden`). Hidden nodes are
+always fully omitted for role-token requests.
+
+`as_of` (optional): a 0-based WAL commit index. The query is answered from the
+graph as it existed at that commit, read-only — a write statement with `as_of`
+is a 400. It composes with a role token and with a client `mask`, both of which
+are resolved against the graph as it was then; a role token plus a client mask
+still intersects, never widens. The role *definition* itself is the current one
+(`roles.json` is a sidecar and is never a WAL record). A commit outside the
+retained range is a 400 naming the range, e.g.
+`commit 9999 is out of range; valid range is 12..40 — events before commit 12 are not retained`.
+`as_of` and `stub_hidden` do not compose: the pair is a 400. See
+[timetravel.md](timetravel.md) and [masks.md](masks.md).
+
+```json
+{
+  "cypher": "MATCH (n) RETURN n",
+  "as_of": 12,
+  "mask": ["ada", "bob"]
+}
+```
+
+**Deletion is not retroactive, and keys are not identities.** A role reads a
+now-deleted node at a commit where it was live, and a role's `keys` resolve to
+whichever node held that key at the commit asked for (renaming frees a key for
+reuse). To revoke history, prune archives or narrow the role. See
+[masks.md](masks.md).
+
+**Cost.** An `as_of` read — role-token reads included — replays the WAL under
+the store's read guard for the duration of the query; it does not use the
+lock-free epoch snapshot that a plain read uses. Replay cost grows with the
+number of commits since the last truncating snapshot, so on a large store take
+snapshots (see the horizon and retention sections in
+[timetravel.md](timetravel.md)) and rate-limit role tokens that are allowed to
+send `as_of`.
 
 Default response: Arrow IPC stream (`application/vnd.apache.arrow.stream`).
 
@@ -824,7 +858,7 @@ Sixteen tools:
 
 | Tool | Description |
 |---|---|
-| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `stub_hidden?` (bool; see below) |
+| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `role?` (answer as one of the store's roles), `as_of?` (0-based commit index — answer from the graph as it was then; composes with `role` or with `mask`, not both, since the tool refuses `role` + `mask` together; writes and `stub_hidden` refused), `stub_hidden?` (bool; see below) |
 | `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?` |
 | `create_rule` | Declare a linking rule; params: `RuleDef` fields |
 | `explain` | Explain edges; params: `a`, `b` |

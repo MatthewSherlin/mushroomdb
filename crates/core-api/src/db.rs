@@ -1563,6 +1563,25 @@ fn extract_scan_label(ops: &[PlanOp], syms: &mut Interner) -> Option<u32> {
     None
 }
 
+/// How an as-of read is restricted — the argument to
+/// [`GraphDb::query_at_scoped`].
+///
+/// Every variant is resolved against the graph **as it was at the requested
+/// commit**, not against the current graph.
+#[derive(Debug, Clone, Copy)]
+pub enum AsOfScope<'a> {
+    /// Everything the named role may see. The role *definition* is the current
+    /// one — `roles.json` is a sidecar and has no past version — but its
+    /// `keys` and `labels` are resolved against the as-of graph.
+    Role(&'a str),
+    /// An explicit node-key allow-list. Keys that did not exist at that commit
+    /// resolve to nothing.
+    Keys(&'a [String]),
+    /// A role intersected with a client-supplied allow-list. The intersection
+    /// is the never-widen rule: a client mask can only narrow a role.
+    RoleAndKeys(&'a str, &'a [String]),
+}
+
 impl GraphDb<RealFs> {
     /// Open the database at `dir` with default options.
     ///
@@ -1699,6 +1718,63 @@ impl GraphDb<RealFs> {
         cypher: &str,
         params: &std::collections::BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        let temporal = self.open_at_for_read(commit, cypher)?;
+        temporal.query(cypher, params)
+    }
+
+    /// Run a **read-only** Cypher query at `commit`, restricted by `scope`.
+    ///
+    /// The **graph** is as of `commit`; the **role definition** is as it is
+    /// now, because `roles.json` is a sidecar and is never a WAL record — it
+    /// has no past version to read. A role's `keys` and `labels` are resolved
+    /// against the commit-`commit` graph, so a role that may see a label sees
+    /// exactly the nodes that carried it then, and an explicit key that did
+    /// not exist yet resolves to nothing.
+    ///
+    /// [`AsOfScope::RoleAndKeys`] intersects the two: a client allow-list can
+    /// only narrow what a role may see, never widen it.
+    ///
+    /// Write statements are rejected, exactly as [`GraphDb::query_at`] rejects
+    /// them.
+    ///
+    /// # Errors
+    /// - [`GraphError::CommitOutOfRange`] if `commit` is outside the retained
+    ///   range; the error carries that range.
+    /// - [`GraphError::KeyNotFound`] with a `role:` prefix for an unknown role,
+    ///   or [`GraphError::Corrupt`] when `roles.json` was corrupt at open.
+    /// - A query error for a malformed or write query.
+    pub fn query_at_scoped(
+        &self,
+        commit: u64,
+        cypher: &str,
+        params: &std::collections::BTreeMap<String, Value>,
+        scope: AsOfScope<'_>,
+    ) -> Result<ResultSet> {
+        let temporal = self.open_at_for_read(commit, cypher)?;
+        // One resolver answers "what may this role see" — `mask_for_role` — and
+        // it runs against the temporal handle, so the answer is the as-of one.
+        let mask = match scope {
+            AsOfScope::Role(role) => temporal.mask_for_role(role)?,
+            AsOfScope::Keys(keys) => {
+                crate::mask::NodeMask::from_keys(&temporal, keys.iter().map(String::as_str))
+            }
+            AsOfScope::RoleAndKeys(role, keys) => {
+                temporal
+                    .mask_for_role(role)?
+                    .intersect(&crate::mask::NodeMask::from_keys(
+                        &temporal,
+                        keys.iter().map(String::as_str),
+                    ))
+            }
+        };
+        temporal.query_masked(cypher, params, &mask)
+    }
+
+    /// Open the temporal view for a time-travel read and refuse write Cypher.
+    ///
+    /// Shared by [`GraphDb::query_at`] and [`GraphDb::query_at_scoped`] so both
+    /// resolve the commit and reject writes identically.
+    fn open_at_for_read(&self, commit: u64, cypher: &str) -> Result<Self> {
         let dir = self.fs.dir().to_path_buf();
         let temporal = Self::open_at(&dir, commit)?;
         if is_write_tokens(&lex(cypher).map_err(|e| GraphError::QueryError {
@@ -1710,7 +1786,7 @@ impl GraphDb<RealFs> {
                     .into(),
             });
         }
-        temporal.query(cypher, params)
+        Ok(temporal)
     }
 }
 
