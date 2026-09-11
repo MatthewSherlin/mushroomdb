@@ -17,9 +17,9 @@ pub mod structure;
 use core_api::repograph;
 use core_api::schema::Schema;
 use core_api::{
-    default_max_edges, is_write_query, wal_commit_count_at, AlgoDir, BackupReport, DegreeConfig,
-    Explanation, GraphDb, IngestOptions, LouvainConfig, PageRankConfig, Predicate, ResultSet,
-    RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig, WriteGuard,
+    default_max_edges, is_write_query, AlgoDir, BackupReport, DegreeConfig, Explanation, GraphDb,
+    IngestOptions, LouvainConfig, PageRankConfig, Predicate, ResultSet, RuleDef, RuleSuggestion,
+    SharedDb, SnapshotOptions, Stats, Value, WccConfig, WriteGuard,
 };
 use export::ExportFormat;
 use std::collections::{BTreeMap, BTreeSet};
@@ -3791,7 +3791,7 @@ mod tests {
             let mut db = GraphDb::open(&dir).expect("open");
             db.insert_node("Person", "alice", vec![]).expect("insert");
         }
-        let before = wal_commit_count_at(&dir).expect("count");
+        let before = core_api::wal_commit_count_at(&dir).expect("count");
         assert!(before > 0, "the insert is a commit");
 
         // Exactly the call `serve` makes on a tick and on shutdown.

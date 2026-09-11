@@ -820,8 +820,8 @@ Sixteen tools:
 | `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?`; (2) edge traversal — `key`, `edge_type?`, `limit?` |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
-| `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits}` |
-| `edge_history` | Add/retract lifecycle for edges between two nodes; params: `a`, `b`. Returns `{a, b, events, total_commits}` |
+| `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits, horizon}` |
+| `edge_history` | Add/retract lifecycle for edges between two nodes; params: `a`, `b`. Returns `{a, b, events, total_commits, horizon}` |
 | `was_linked` | Point-in-time edge check; params: `a`, `b`, `edge_type`, `at_commit`. Returns `{linked}` or error when outside horizon |
 | `rename_node` | Rename a node's key; params: `old_key`, `new_key`. Errors if old key absent or new key already exists. |
 
