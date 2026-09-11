@@ -2430,6 +2430,11 @@ fn all_of_lists_at_most_limit_partners_and_counts_the_rest() {
     assert!(text.contains("… and 21 more\n"), "{text}");
     assert_eq!(report["total"], json!(25));
     assert_eq!(
+        report["listed"],
+        json!(4),
+        "a cut report says what it listed"
+    );
+    assert_eq!(
         report["partners"].as_array().map(Vec::len),
         Some(4),
         "{report}"
@@ -2966,6 +2971,153 @@ fn what_if_accepts_a_list_valued_change() {
 
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Binding: `direction` narrows the grouped `edges_at` view the same way it
+/// narrows `node_edges` — counts and listing both — rather than being parsed
+/// and then ignored on the path that does not take `edge_type`/`all_of`.
+#[test]
+fn edges_at_grouped_view_honours_direction() {
+    let db = all_of_store("edges-at-direction");
+    let at = db.read().wal_total_commits().unwrap() - 1;
+
+    // hub has seven edges at `at`: A and B to o1/o2/o3 outgoing, C to o1
+    // outgoing, and C from o2 incoming.
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "edges_at",
+        json!({"key": "hub", "at": at}),
+    ));
+    assert!(text.contains(&format!("commit {at}: 8 edge(s)")), "{text}");
+
+    let (text, report) = task_both(
+        db.clone(),
+        "edges_at",
+        json!({"key": "hub", "at": at, "direction": "out"}),
+    );
+    assert!(
+        text.contains(&format!("commit {at}: 7 edge(s)")),
+        "the incoming C edge is out of the count: {text}"
+    );
+    assert!(text.contains("C (1)"), "{text}");
+    assert!(!text.contains("← o2"), "{text}");
+    assert_eq!(report["total"], json!(7), "{report}");
+
+    let (text, report) = task_both(
+        db,
+        "edges_at",
+        json!({"key": "hub", "at": at, "direction": "in"}),
+    );
+    assert!(text.contains(&format!("commit {at}: 1 edge(s)")), "{text}");
+    assert!(text.contains("← o2"), "{text}");
+    assert_eq!(report["total"], json!(1), "{report}");
+    assert_eq!(
+        report["edges"].as_array().map(Vec::len),
+        Some(1),
+        "{report}"
+    );
+}
+
+/// Binding: `all_of` and `edge_type` together are an argument error, not a
+/// silent win for one of them — they answer two different questions.
+#[test]
+fn all_of_and_edge_type_together_are_refused() {
+    let db = all_of_store("edges-both-filters");
+    let at = db.read().wal_total_commits().unwrap() - 1;
+
+    let reply = one_task_call(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A"], "edge_type": "B"}),
+    );
+    assert!(
+        error_text(&reply).contains("pass one of all_of or edge_type"),
+        "{reply}"
+    );
+
+    let reply = one_task_call(
+        db,
+        "edges_at",
+        json!({"key": "hub", "at": at, "all_of": ["A"], "edge_type": "B"}),
+    );
+    assert!(
+        error_text(&reply).contains("pass one of all_of or edge_type"),
+        "{reply}"
+    );
+}
+
+/// Binding: the grouped `what_if` reply never loses a section to a line
+/// budget. `limit` is the only cap, so fifty lost edges do not delete the
+/// `gained` heading and the three edges under it.
+#[test]
+fn what_if_grouped_view_never_truncates_away_the_gained_section() {
+    let db = open("what-if-no-truncation");
+    {
+        let mut w = db.write();
+        for i in 0..50 {
+            let k = format!("old{i:02}");
+            w.insert_node(
+                "Org",
+                &k,
+                vec![("sector".into(), Value::Str("tech".into()))],
+            )
+            .unwrap();
+        }
+        for i in 0..3 {
+            let k = format!("new{i:02}");
+            w.insert_node(
+                "Org",
+                &k,
+                vec![("sector".into(), Value::Str("finance".into()))],
+            )
+            .unwrap();
+        }
+        w.create_rule(core_api::RuleDef {
+            name: "any_org".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: core_api::Predicate::FieldEqual {
+                field: "sector".into(),
+            },
+            edge_type: "IN_SECTOR".into(),
+            weight_prop: None,
+            max_edges: Some(1000),
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })
+        .unwrap();
+        w.insert_node(
+            "Person",
+            "p1",
+            vec![
+                ("id".into(), Value::Str("p1".into())),
+                ("sector".into(), Value::Str("tech".into())),
+            ],
+        )
+        .unwrap();
+    }
+
+    let text = task_reply(&one_task_call(
+        db,
+        "what_if",
+        json!({"key": "p1", "field": "sector", "value": "finance", "limit": 50}),
+    ));
+    assert!(text.contains("would lose 50, would gain 3"), "{text}");
+    assert_eq!(
+        text.matches("→ old").count(),
+        50,
+        "every lost edge the limit allows is listed: {text}"
+    );
+    assert!(
+        text.contains("gained\n  IN_SECTOR (3)\n"),
+        "the gained section survives a full lost section: {text}"
+    );
+    for i in 0..3 {
+        assert!(text.contains(&format!("→ new{i:02}")), "{text}");
+    }
+    assert!(!text.contains("… and"), "nothing was cut at all: {text}");
 }
 
 /// Binding: `what_if` with an `edge_type` answers about that type alone —

@@ -1004,6 +1004,23 @@ const MAX_EDGE_LIMIT: usize = 100;
 /// printed, so a capped digest still says how much it is not showing.
 const MAX_EDGE_LINES: usize = repograph::MAX_MAP_LINES;
 
+/// Cap a grouped digest at [`MAX_EDGE_LINES`], saying so when it cuts.
+///
+/// A listing over many edge types runs past the line budget even under a
+/// small `limit`, and a budget that cut silently looked exactly like a
+/// complete reply — the caller could not tell. The compact forms are the way
+/// past it, so the marker names them.
+fn cap_grouped(out: &str) -> String {
+    if out.lines().count() <= MAX_EDGE_LINES {
+        return out.to_string();
+    }
+    let mut capped = repograph::cap_lines(out, MAX_EDGE_LINES);
+    capped.push_str(&format!(
+        "… listing capped at {MAX_EDGE_LINES} lines; pass edge_type or all_of for the whole set\n"
+    ));
+    capped
+}
+
 /// One incident edge, with whatever the rules say about it.
 ///
 /// `rule`, `score` and `predicate` are `Some` only for a derived edge that
@@ -1192,7 +1209,7 @@ fn render_edge_groups(key: &str, total: usize, groups: &[EdgeGroup]) -> String {
             out.push_str(&format!("  … and {} more\n", g.count - g.listed.len()));
         }
     }
-    repograph::cap_lines(&out, MAX_EDGE_LINES)
+    cap_grouped(&out)
 }
 
 /// The same grouping as a document, for `json: true`.
@@ -1253,6 +1270,12 @@ const DEFAULT_PARTNER_LIMIT: usize = 200;
 /// The largest `limit` a keys-only view honours. A partner set this wide is
 /// still only tens of kilobytes, and it is what the caller asked for by name.
 const MAX_PARTNER_LIMIT: usize = 2000;
+
+/// Refusing the one pair of arguments that cannot both be honoured: the
+/// answer is either an intersection over several types or a listing of one,
+/// and silently letting either win would be a reply about a question the
+/// caller did not ask.
+const ONE_OF_ALL_OF_OR_EDGE_TYPE: &str = "pass one of all_of or edge_type, not both";
 
 /// Columns a wrapped key list fills before it breaks to the next line.
 const KEY_WRAP_COLUMNS: usize = 100;
@@ -1490,6 +1513,7 @@ fn partners_json(
         "key": key,
         "all_of": all_of,
         "partners": &partners[..partners.len().min(limit)],
+        "listed": partners.len().min(limit),
         "total": partners.len(),
     });
     if let Some(a) = at {
@@ -1543,6 +1567,7 @@ fn type_partners_json(
         "rule": rule,
         "edges": edges,
         "partners": &partners[..partners.len().min(limit)],
+        "listed": partners.len().min(limit),
         "total": partners.len(),
     });
     if let Some(a) = at {
@@ -1580,6 +1605,10 @@ fn tool_node_edges(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Ok(l) => l,
         Err(e) => return CallOutcome::ToolErr(e),
     };
+
+    if !all_of.is_empty() && edge_type.is_some() {
+        return CallOutcome::ToolErr(ONE_OF_ALL_OF_OR_EDGE_TYPE.into());
+    }
 
     if !all_of.is_empty() || edge_type.is_some() {
         let limit = match limit_arg(args, DEFAULT_PARTNER_LIMIT, MAX_PARTNER_LIMIT) {
@@ -1831,7 +1860,7 @@ fn render_edges_at(key: &str, at: u64, total: usize, groups: &[EdgeAtGroup]) -> 
             out.push_str(&format!("  … and {} more\n", g.count - g.listed.len()));
         }
     }
-    repograph::cap_lines(&out, MAX_EDGE_LINES)
+    cap_grouped(&out)
 }
 
 /// The node's canonical current key, recovered from `edges` — every one of
@@ -1902,6 +1931,9 @@ fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Ok(l) => l,
         Err(e) => return CallOutcome::ToolErr(e),
     };
+    if !all_of.is_empty() && edge_type.is_some() {
+        return CallOutcome::ToolErr(ONE_OF_ALL_OF_OR_EDGE_TYPE.into());
+    }
     let keys_only = !all_of.is_empty() || edge_type.is_some();
     let limit = match if keys_only {
         limit_arg(args, DEFAULT_PARTNER_LIMIT, MAX_PARTNER_LIMIT)
@@ -1963,18 +1995,22 @@ fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         });
     }
 
-    // The grouped view, narrowed to the partners carrying `label` if one was
-    // named — counts included, so the header says what the filter left.
+    // The grouped view, narrowed by `direction` and by the partners carrying
+    // `label` if one was named — counts included, so the header says what the
+    // filters left. Both apply here exactly as they do on `node_edges`: an
+    // argument the tool accepts has to mean the same thing in every form of
+    // its reply.
     let mut filter = LabelFilter::new(db, label);
     let edges: Vec<core_api::EdgeAt> = edges
         .into_iter()
         .filter(|e| {
-            let other = if e.src_key == self_key {
-                &e.dst_key
-            } else {
-                &e.src_key
-            };
-            filter.keeps(other)
+            let outgoing = e.src_key == self_key;
+            let other = if outgoing { &e.dst_key } else { &e.src_key };
+            match dir {
+                Dir::Out if !outgoing => false,
+                Dir::In if outgoing => false,
+                _ => filter.keeps(other),
+            }
         })
         .collect();
 
@@ -2109,7 +2145,13 @@ fn render_what_if(
     render_what_if_groups(&mut out, lost, limit);
     out.push_str("gained\n");
     render_what_if_groups(&mut out, gained, limit);
-    repograph::cap_lines(&out, MAX_EDGE_LINES)
+    // No line budget on top of `limit`. This reply has two sections, and a
+    // budget that ran out inside the first one deleted the second without
+    // saying so: at `limit: 50` with fifty lost edges, the whole `gained`
+    // section — heading included — fell off the end of a reply that had just
+    // said how many there were. `limit` is the cap here, and every group that
+    // it cuts says `… and N more` itself.
+    out
 }
 
 fn what_if_header(
@@ -2584,7 +2626,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "node_edges",
-            "description": "What is K related to — every relationship of one node, grouped by edge type with a count, each listed edge carrying its direction, the rule that derived it, its score and the predicate it matched on. Answers 'why is this here' in the same call that lists it, so no follow-up explain is needed. Which partners are linked by all of these types? pass all_of and the reply is just their keys; pass one edge_type for that type's partner keys with the rule named once. label narrows partners.",
+            "description": "What is K related to — every relationship of one node, grouped by edge type with a count, each listed edge carrying its direction, the rule that derived it, its score and the predicate it matched on. Answers 'why is this here' in the same call that lists it, so no follow-up explain is needed. Which partners are linked by all of these types? pass all_of and the reply is just their keys; pass one edge_type for that type's partner keys with the rule named once. label narrows partners. With json:true the report carries `listed` and `total`, so a reply that was cut still says how much there was.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2614,7 +2656,7 @@ fn task_tool_schemas() -> Vec<Js> {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 2000,
-                        "description": "Edges listed per edge type (default 10), or partner keys listed under edge_type/all_of (default 200, max 2000). The rest are counted as '… and N more'."
+                        "description": "Edges listed per edge type (default 10, max 100), or partner keys listed under edge_type/all_of (default 200, max 2000). The rest are counted as '… and N more'."
                     }
                 },
                 "required": ["key"]
@@ -2654,7 +2696,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "edges_at",
-            "description": "What did K's relationships look like at commit C — the edges that were live at one point in the store's history, with the rule that had derived each. `at` is a 0-based WAL commit index; use node_history or edge_history first to find the commit you want, then read this instead of replaying either by hand. Which partners were linked by all of these types on that day? pass all_of and the reply is just their keys; pass one edge_type for that type's partner keys with the rule named once. label narrows partners.",
+            "description": "What did K's relationships look like at commit C — the edges that were live at one point in the store's history, with the rule that had derived each. `at` is a 0-based WAL commit index; use node_history or edge_history first to find the commit you want, then read this instead of replaying either by hand. Which partners were linked by all of these types on that day? pass all_of and the reply is just their keys; pass one edge_type for that type's partner keys with the rule named once. label narrows partners. With json:true the report carries `listed` and `total`, so a reply that was cut still says how much there was.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
