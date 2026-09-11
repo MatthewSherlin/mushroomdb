@@ -1,14 +1,25 @@
-//! The ten MCP tools that answer a question in prose rather than in JSON.
+//! The fourteen MCP tools that answer a question in prose rather than in JSON.
 //!
 //! `explore`, `map`, `context`, `impact`, `owners`, `why`, `recall`,
-//! `remember` and `sync` sit in front of the fifteen graph tools in
+//! `remember` and `sync` sit in front of the thirteen graph tools in
 //! `mcp::tools_list`, because they are what an assistant working in a checkout
 //! actually reaches for: find me this thing, what is this repository, what is
 //! this symbol, what does my diff touch, who wrote this, why are these two
 //! linked, what do I already know, remember this, and bring the store up to
-//! date. `explain_association` is the tenth, and the one that answers on a
-//! store with no repository in it: why these two entities are associated, with
-//! the rule that derived each edge.
+//! date. `explain_association` answers on a store with no repository in it:
+//! why these two entities are associated, with the rule that derived each
+//! edge.
+//!
+//! Four more answer the rest of the entity graph's questions, and they are the
+//! ones the first association benchmark run showed an assistant failing to
+//! find. `node_edges` and `neighborhood` used to hand back a JSON array of
+//! `{edge_type, src_key, dst_key, derived}` — a listing with no rule, no score
+//! and no evidence, which is why a run spent 195 `query` calls and 66
+//! `edge_history` calls reconstructing what one reply could have said. Both
+//! now answer in prose, grouped by edge type, each listed edge carrying the
+//! rule that derived it, its score, and the predicate it matched on.
+//! `edges_at` answers the same question at a past commit, and `what_if`
+//! answers it about a change that has not been made.
 //!
 //! `explore` is the composition of `context`, `impact` and `owners` behind one
 //! name, and on a store a repository was ingested into it is the *only* task
@@ -62,9 +73,9 @@ use core_api::repograph::{
     self, ContextOptions, ImpactOptions, MapOptions, RememberInput, DEFAULT_EXCLUDES,
     MAX_OUTPUT_BYTES, NOTE_KINDS, UNTRUSTED_FRAMING,
 };
-use core_api::{Explanation, GraphError, PredicateSummary, SharedDb};
+use core_api::{json_to_value, Dir, Explanation, GraphError, PredicateSummary, SharedDb};
 use serde_json::{json, Value as Js};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -79,16 +90,19 @@ const SYNC_REPO_PROP: &str = "repo";
 /// The host's project directory: the checkout an assistant is working in.
 const PROJECT_DIR_VAR: &str = "CLAUDE_PROJECT_DIR";
 
-/// The ten names this module answers to. Listed once, so the `json` argument
-/// below is read for exactly the tools that declare it.
+/// The fourteen names this module answers to. Listed once, so the `json`
+/// argument below is read for exactly the tools that declare it.
 ///
 /// `explore` comes first because it is the whole default surface of a
 /// code-graph store: the one tool a session finds, composed from the three
 /// beneath it. `explain_association` sits beside `why` because they are the
 /// same question asked of the two doors: what links these two, with the
 /// evidence — `why` from a code graph, `explain_association` from the rules
-/// that derived the edge.
-pub(crate) const TASK_TOOLS: [&str; 10] = [
+/// that derived the edge. The four entity tools follow it, because they are
+/// the same question widened: every relationship of one node rather than of
+/// one pair, that listing at a past commit, and that listing under a change
+/// that has not been made.
+pub(crate) const TASK_TOOLS: [&str; 14] = [
     "explore",
     "map",
     "context",
@@ -96,12 +110,16 @@ pub(crate) const TASK_TOOLS: [&str; 10] = [
     "owners",
     "why",
     "explain_association",
+    "node_edges",
+    "neighborhood",
+    "edges_at",
+    "what_if",
     "recall",
     "remember",
     "sync",
 ];
 
-/// Route a task tool. `None` when `name` is not one of the ten.
+/// Route a task tool. `None` when `name` is not one of the fourteen.
 pub(crate) fn dispatch(
     db: &SharedDb,
     db_dir: Option<&Path>,
@@ -135,10 +153,14 @@ pub(crate) fn dispatch(
         "owners" => tool_owners(db, args, json_out),
         "why" => tool_why(db, args, json_out),
         "explain_association" => tool_explain_association(db, args, json_out),
+        "node_edges" => tool_node_edges(db, args, json_out),
+        "neighborhood" => tool_neighborhood(db, args, json_out),
+        "edges_at" => tool_edges_at(db, args, json_out),
+        "what_if" => tool_what_if(db, db_dir, args, json_out),
         "recall" => tool_recall(db, db_dir, args, json_out),
         "remember" => tool_remember(db, args, json_out),
         "sync" => tool_sync(db_dir, json_out),
-        _ => unreachable!("TASK_TOOLS and this match list the same ten names"),
+        _ => unreachable!("TASK_TOOLS and this match list the same fourteen names"),
     })
 }
 
@@ -239,6 +261,19 @@ fn str_arg<'a>(args: &'a Js, name: &str) -> Result<&'a str, String> {
         .and_then(Js::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("missing {name}"))
+}
+
+/// An optional string argument. `Err` when present but not a non-empty string.
+///
+/// An empty string is a filter that matches nothing, which no caller means —
+/// they mean "no filter" — so it is refused rather than answered with zero
+/// edges.
+fn opt_str_arg<'a>(args: &'a Js, name: &str) -> Result<Option<&'a str>, String> {
+    match args.get(name) {
+        None | Some(Js::Null) => Ok(None),
+        Some(Js::String(s)) if !s.is_empty() => Ok(Some(s.as_str())),
+        Some(_) => Err(format!("{name} must be a non-empty string")),
+    }
 }
 
 /// An optional array-of-strings argument. `Err` when present but wrong-typed.
@@ -623,6 +658,662 @@ fn predicate_summary(p: &PredicateSummary) -> String {
     out
 }
 
+// ── node_edges / neighborhood ────────────────────────────────────────────────
+
+/// Edges listed per edge type when the caller names no `limit`, and the
+/// number of `explain` calls one type may cost.
+const DEFAULT_EDGE_LIMIT: usize = 10;
+
+/// The largest `limit` a caller may ask for.
+///
+/// The cost of this reply is one `explain` call per listed partner that is
+/// joined by a derived edge — about a millisecond each — so the cap on what is
+/// listed is also the cap on what the call costs. A hub node has thousands of
+/// partners; a reply is a screen, not a dump.
+const MAX_EDGE_LIMIT: usize = 100;
+
+/// Longest edge digest, in lines. Wider than [`repograph::MAX_TOOL_LINES`]
+/// because this listing is the reply an assistant reads instead of calling
+/// `query` twenty times, and a default `limit` over four edge types already
+/// runs past twenty-five lines. The header counts every edge whatever is
+/// printed, so a capped digest still says how much it is not showing.
+const MAX_EDGE_LINES: usize = repograph::MAX_MAP_LINES;
+
+/// One incident edge, with whatever the rules say about it.
+///
+/// `rule`, `score` and `predicate` are `Some` only for a derived edge that
+/// `explain` accounted for: a manual edge was written by a caller, not
+/// matched by a predicate, and has nothing to explain.
+struct EdgeLine {
+    edge_type: String,
+    /// The node at the other end. For a self-loop, the node itself.
+    other: String,
+    /// `true` when the edge runs out of the node asked about.
+    outgoing: bool,
+    derived: bool,
+    rule: Option<String>,
+    score: Option<f64>,
+    predicate: Option<String>,
+}
+
+/// Every edge of one type incident on the node, and the slice of them listed.
+struct EdgeGroup {
+    edge_type: String,
+    /// How many edges of this type the node has, before the `limit`.
+    count: usize,
+    listed: Vec<EdgeLine>,
+}
+
+/// The edges incident on `key`, grouped by edge type, with each listed edge
+/// attributed to the rule that derived it.
+///
+/// `types` and `dir` are the `neighborhood` filters; `node_edges` passes its
+/// single `edge_type` as a one-element list and [`Dir::Both`].
+///
+/// # What this costs
+///
+/// One `explain(key, other)` call per **distinct partner** among the listed
+/// edges that carries a derived edge, memoised across types so a partner
+/// joined by three rules costs one call rather than three. Nothing outside the
+/// listed slice is explained, so the bound is `limit` partners per edge type.
+///
+/// That bound is also the one honest limit on the ordering: a score is only
+/// known for an edge that was explained, so a type with more than `limit`
+/// edges lists the first `limit` the engine returns and orders **those** by
+/// score. Ordering all of them by score would mean explaining all of them,
+/// which is the cost this cap exists to refuse.
+fn node_edge_groups(
+    db: &SharedDb,
+    key: &str,
+    types: Option<&[String]>,
+    dir: Dir,
+    limit: usize,
+) -> Result<(usize, Vec<EdgeGroup>), GraphError> {
+    let edges = {
+        let g = db.read();
+        g.node_edges(key)?
+    };
+
+    let mut by_type: BTreeMap<String, Vec<(String, bool, bool)>> = BTreeMap::new();
+    let mut total = 0usize;
+    for e in edges {
+        if let Some(wanted) = types {
+            if !wanted.iter().any(|t| t == &e.edge_type) {
+                continue;
+            }
+        }
+        let outgoing = e.src_key == key;
+        match dir {
+            Dir::Out if !outgoing => continue,
+            Dir::In if outgoing => continue,
+            _ => {}
+        }
+        let other = if outgoing {
+            e.dst_key.clone()
+        } else {
+            e.src_key.clone()
+        };
+        total += 1;
+        by_type
+            .entry(e.edge_type.clone())
+            .or_default()
+            .push((other, outgoing, e.derived));
+    }
+
+    // Memoised per partner, not per edge: `explain` answers for every rule
+    // edge between the pair at once, whatever its type.
+    let mut explained: BTreeMap<String, Vec<Explanation>> = BTreeMap::new();
+    let mut groups = Vec::with_capacity(by_type.len());
+    for (edge_type, rows) in by_type {
+        let count = rows.len();
+        let mut listed: Vec<EdgeLine> = Vec::with_capacity(count.min(limit));
+        for (other, outgoing, derived) in rows.into_iter().take(limit) {
+            let mut line = EdgeLine {
+                edge_type: edge_type.clone(),
+                other,
+                outgoing,
+                derived,
+                rule: None,
+                score: None,
+                predicate: None,
+            };
+            if derived {
+                if !explained.contains_key(&line.other) {
+                    let found = {
+                        let g = db.read();
+                        g.explain(key, &line.other).unwrap_or_default()
+                    };
+                    explained.insert(line.other.clone(), found);
+                }
+                let found = explained.get(&line.other).map(Vec::as_slice).unwrap_or(&[]);
+                if let Some(e) = found.iter().find(|e| {
+                    e.edge_type == edge_type
+                        && if outgoing {
+                            e.src_key == key && e.dst_key == line.other
+                        } else {
+                            e.src_key == line.other && e.dst_key == key
+                        }
+                }) {
+                    line.rule = Some(e.rule.clone());
+                    line.score = e.weight;
+                    line.predicate = Some(predicate_summary(&e.predicate));
+                }
+            }
+            listed.push(line);
+        }
+        // Strongest first. An edge with no score — a manual one, or a rule
+        // that declares no `weight_prop` — sorts last rather than pretending
+        // to a score of zero, and ties break on the partner key so the reply
+        // is byte-stable.
+        listed.sort_by(|a, b| {
+            let sa = a.score.unwrap_or(f64::NEG_INFINITY);
+            let sb = b.score.unwrap_or(f64::NEG_INFINITY);
+            sb.partial_cmp(&sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.other.cmp(&b.other))
+        });
+        groups.push(EdgeGroup {
+            edge_type,
+            count,
+            listed,
+        });
+    }
+    Ok((total, groups))
+}
+
+/// One header, then one block per edge type: its name, how many edges the node
+/// has of it, and the listed ones with their direction, rule, score and
+/// predicate.
+///
+/// Edge types, partner keys, rule names and predicate fields are all graph
+/// content, so every one of them goes through [`repograph::sanitize`] before
+/// it reaches a line-structured digest.
+fn render_edge_groups(key: &str, total: usize, groups: &[EdgeGroup]) -> String {
+    let mut out = format!(
+        "mushroomdb edges — {}: {total} edge(s) over {} type(s)\n",
+        repograph::sanitize(key),
+        groups.len()
+    );
+    if groups.is_empty() {
+        out.push_str("  none\n");
+        return out;
+    }
+    for g in groups {
+        out.push_str(&format!(
+            "{} ({})\n",
+            repograph::sanitize(&g.edge_type),
+            g.count
+        ));
+        for e in &g.listed {
+            let arrow = if e.outgoing { "→" } else { "←" };
+            out.push_str(&format!("  {arrow} {}", repograph::sanitize(&e.other)));
+            if let Some(rule) = &e.rule {
+                out.push_str(&format!("  rule {}", repograph::sanitize(rule)));
+            }
+            if let Some(score) = e.score {
+                out.push_str(&format!("  score {score:.2}"));
+            }
+            if let Some(predicate) = &e.predicate {
+                out.push_str(&format!(" — {predicate}"));
+            }
+            out.push('\n');
+        }
+        if g.count > g.listed.len() {
+            out.push_str(&format!("  … and {} more\n", g.count - g.listed.len()));
+        }
+    }
+    repograph::cap_lines(&out, MAX_EDGE_LINES)
+}
+
+/// The same grouping as a document, for `json: true`.
+fn edge_groups_json(key: &str, total: usize, groups: &[EdgeGroup]) -> Js {
+    json!({
+        "key": key,
+        "total": total,
+        "types": groups.iter().map(|g| json!({
+            "edge_type": g.edge_type,
+            "count": g.count,
+            "listed": g.listed.len(),
+            "edges": g.listed.iter().map(edge_line_json).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn edge_line_json(e: &EdgeLine) -> Js {
+    json!({
+        "edge_type": e.edge_type,
+        "other": e.other,
+        "direction": if e.outgoing { "out" } else { "in" },
+        "derived": e.derived,
+        "rule": e.rule,
+        "score": e.score,
+        "predicate": e.predicate,
+    })
+}
+
+/// The `limit` argument: how many edges of each type to list.
+fn edge_limit_arg(args: &Js) -> Result<usize, String> {
+    match args.get("limit") {
+        None | Some(Js::Null) => Ok(DEFAULT_EDGE_LIMIT),
+        Some(v) => match v.as_u64() {
+            // Zero is a reply with counts and no edges, which no caller means.
+            Some(0) | None => Err("limit must be a positive integer".into()),
+            Some(n) => Ok(usize::try_from(n)
+                .unwrap_or(MAX_EDGE_LIMIT)
+                .min(MAX_EDGE_LIMIT)),
+        },
+    }
+}
+
+fn tool_node_edges(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
+    let key = match str_arg(args, "key") {
+        Ok(k) => k,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let edge_type = match opt_str_arg(args, "edge_type") {
+        Ok(t) => t,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let limit = match edge_limit_arg(args) {
+        Ok(n) => n,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let filter = edge_type.map(|t| vec![t.to_string()]);
+    edge_reply(db, key, filter.as_deref(), Dir::Both, limit, json_out)
+}
+
+/// Group, render and answer — the tail both `node_edges` and a depth-1
+/// `neighborhood` share.
+fn edge_reply(
+    db: &SharedDb,
+    key: &str,
+    types: Option<&[String]>,
+    dir: Dir,
+    limit: usize,
+    json_out: bool,
+) -> CallOutcome {
+    match node_edge_groups(db, key, types, dir, limit) {
+        Ok((total, groups)) => ok(json_out, &edge_groups_json(key, total, &groups), |_| {
+            render_edge_groups(key, total, &groups)
+        }),
+        Err(e) => CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
+    }
+}
+
+/// One hop is the edge listing; further than that is still the BFS table.
+///
+/// Depth 1 is the question this tool is nearly always asked — what is this
+/// node joined to — and a table of `(key, label, depth)` answers it without
+/// saying *why* any row is there. Past one hop there is no single rule behind
+/// a row, so the table is still the honest shape and is returned unchanged.
+fn tool_neighborhood(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
+    let key = match str_arg(args, "key") {
+        Ok(k) => k,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let depth = match args.get("depth") {
+        None | Some(Js::Null) => 1u32,
+        Some(v) => match v.as_u64().and_then(|n| u32::try_from(n).ok()) {
+            Some(d) => d,
+            None => return CallOutcome::ToolErr("depth must be an integer".into()),
+        },
+    };
+    let dir = match args.get("direction") {
+        None | Some(Js::Null) => Dir::Both,
+        Some(v) => match v.as_str() {
+            Some(s) if s.eq_ignore_ascii_case("out") => Dir::Out,
+            Some(s) if s.eq_ignore_ascii_case("in") => Dir::In,
+            Some(s) if s.eq_ignore_ascii_case("both") => Dir::Both,
+            Some(other) => return CallOutcome::ToolErr(format!("unknown direction: {other}")),
+            None => return CallOutcome::ToolErr("direction must be a string".into()),
+        },
+    };
+    let edge_types = match str_list_arg(args, "edge_types") {
+        Ok(t) => t,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let filter = (!edge_types.is_empty()).then_some(edge_types.as_slice());
+
+    if depth <= 1 {
+        let limit = match edge_limit_arg(args) {
+            Ok(n) => n,
+            Err(e) => return CallOutcome::ToolErr(e),
+        };
+        return edge_reply(db, key, filter, dir, limit, json_out);
+    }
+
+    let etype_refs: Option<Vec<&str>> = filter.map(|v| v.iter().map(String::as_str).collect());
+    let rs = {
+        let g = db.read();
+        match g.node_ref(key) {
+            Some(n) => Ok(n.neighborhood(depth, etype_refs.as_deref(), dir)),
+            None => Err(GraphError::KeyNotFound {
+                key: key.to_string(),
+            }),
+        }
+    };
+    match rs {
+        Ok(rs) => CallOutcome::ToolOk(crate::json::result_set_json(&rs)),
+        Err(e) => CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
+    }
+}
+
+// ── edges_at ─────────────────────────────────────────────────────────────────
+
+fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
+    let key = match str_arg(args, "key") {
+        Ok(k) => k,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let at = match args.get("at") {
+        None | Some(Js::Null) => return CallOutcome::ToolErr("missing at".into()),
+        Some(v) => match v.as_u64() {
+            Some(n) => n,
+            None => return CallOutcome::ToolErr("at must be a non-negative integer".into()),
+        },
+    };
+    engine_edges_at(db, key, at, json_out)
+}
+
+/// The point-in-time edge listing.
+///
+/// The engine call this needs is being added on another branch, so the
+/// dispatch arm, the schema and the argument checks above are in place and the
+/// answer is not: a caller is told the build cannot serve it rather than being
+/// handed a listing from the wrong commit.
+// wired to GraphDb::edges_at when the engine stream merges
+fn engine_edges_at(_db: &SharedDb, _key: &str, _at: u64, _json_out: bool) -> CallOutcome {
+    CallOutcome::ToolErr("edges_at is not available in this build".into())
+}
+
+// ── what_if ──────────────────────────────────────────────────────────────────
+
+/// One edge the change would lose or gain.
+struct DiffEdge {
+    edge_type: String,
+    other: String,
+    outgoing: bool,
+    derived: bool,
+    rule: Option<String>,
+    score: Option<f64>,
+}
+
+/// The identity of an incident edge: type, partner, direction. Two edges with
+/// the same triple are the same edge, so this is what a diff compares.
+type EdgeId = (String, String, bool);
+
+/// What a change to one property would do to one node's relationships.
+///
+/// The change is never applied to the live store. The store directory is
+/// copied to a fresh temp directory, the copy is opened read-write, the
+/// property is set there, and the node's edges before and after are diffed;
+/// the copy is deleted whichever way that goes. A copy of 166 MiB takes about
+/// 0.2 s, which is the price of answering "what would happen" without it
+/// having happened.
+///
+/// The rules behind the **gained** edges are read from the copy, which is the
+/// only place they exist. The rules behind the **lost** ones are read from the
+/// live store, whose state is the copy's "before" — asked for after the diff
+/// is known, so only the partners that actually changed cost a call.
+fn tool_what_if(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) -> CallOutcome {
+    let key = match str_arg(args, "key") {
+        Ok(k) => k.to_string(),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let field = match str_arg(args, "field") {
+        Ok(f) => f.to_string(),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let Some(raw) = args.get("value").filter(|v| !v.is_null()) else {
+        return CallOutcome::ToolErr("missing value".into());
+    };
+    let Some(value) = json_to_value(raw.clone()) else {
+        return CallOutcome::ToolErr(format!(
+            "value is not a supported value type: {}",
+            repograph::sanitize(&raw.to_string())
+        ));
+    };
+    let Some(db_dir) = db_dir else {
+        return CallOutcome::ToolErr(
+            "store path unknown: what_if needs the directory this server was started on".into(),
+        );
+    };
+    // Checked before a byte is copied: a mistyped key is the likeliest way to
+    // call this, and it is not worth 0.2 s to find out.
+    {
+        let g = db.read();
+        if !g.has_node(&key) {
+            return CallOutcome::ToolErr(crate::mcp::graph_err_msg(GraphError::KeyNotFound {
+                key: key.clone(),
+            }));
+        }
+    }
+
+    let copy_dir = what_if_dir();
+    let diffed = what_if_on_copy(db_dir, &copy_dir, &key, &field, value);
+    let _ = std::fs::remove_dir_all(&copy_dir);
+    let (lost_ids, gained) = match diffed {
+        Ok(v) => v,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+
+    // The live store still holds the state the copy started from, so it is
+    // what says which rule wrote an edge the change would remove.
+    let mut lost: Vec<DiffEdge> = Vec::with_capacity(lost_ids.len());
+    let mut explained: BTreeMap<String, Vec<Explanation>> = BTreeMap::new();
+    for ((edge_type, other, outgoing), derived) in lost_ids {
+        let mut edge = DiffEdge {
+            edge_type,
+            other,
+            outgoing,
+            derived,
+            rule: None,
+            score: None,
+        };
+        if derived {
+            if !explained.contains_key(&edge.other) {
+                let found = {
+                    let g = db.read();
+                    g.explain(&key, &edge.other).unwrap_or_default()
+                };
+                explained.insert(edge.other.clone(), found);
+            }
+            let found = explained.get(&edge.other).map(Vec::as_slice).unwrap_or(&[]);
+            if let Some(e) = found
+                .iter()
+                .find(|e| e.edge_type == edge.edge_type && endpoints_match(e, &key, &edge))
+            {
+                edge.rule = Some(e.rule.clone());
+                edge.score = e.weight;
+            }
+        }
+        lost.push(edge);
+    }
+
+    let report = json!({
+        "key": key,
+        "field": field,
+        "value": raw.clone(),
+        "lost": lost.iter().map(diff_edge_json).collect::<Vec<_>>(),
+        "gained": gained.iter().map(diff_edge_json).collect::<Vec<_>>(),
+    });
+    ok(json_out, &report, |_| {
+        render_what_if(&key, &field, raw, &lost, &gained)
+    })
+}
+
+fn endpoints_match(e: &Explanation, key: &str, edge: &DiffEdge) -> bool {
+    if edge.outgoing {
+        e.src_key == key && e.dst_key == edge.other
+    } else {
+        e.src_key == edge.other && e.dst_key == key
+    }
+}
+
+/// A fresh directory for one `what_if` copy: this process, this call.
+fn what_if_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("mushroomdb-what-if-{}-{n}", std::process::id()))
+}
+
+/// Copy, open, set, diff. Returns the lost edges as identities (their rules
+/// are read from the live store afterwards) and the gained ones already
+/// attributed, since the copy is the only place their rules exist.
+#[allow(clippy::type_complexity)]
+fn what_if_on_copy(
+    src: &Path,
+    copy_dir: &Path,
+    key: &str,
+    field: &str,
+    value: core_api::Value,
+) -> Result<(Vec<(EdgeId, bool)>, Vec<DiffEdge>), String> {
+    copy_dir_all(src, copy_dir).map_err(|e| format!("what_if could not copy the store: {e}"))?;
+    let copy = SharedDb::open(copy_dir).map_err(|e| {
+        format!(
+            "what_if could not open the copy: {}",
+            crate::mcp::graph_err_msg(e)
+        )
+    })?;
+
+    let before = incident_edges(&copy, key)?;
+    {
+        let mut g = copy.write();
+        g.set_prop(key, field, value)
+            .map_err(crate::mcp::graph_err_msg)?;
+    }
+    let after = incident_edges(&copy, key)?;
+
+    let lost: Vec<(EdgeId, bool)> = before
+        .iter()
+        .filter(|(id, _)| !after.contains_key(*id))
+        .map(|(id, derived)| (id.clone(), *derived))
+        .collect();
+
+    let mut gained: Vec<DiffEdge> = Vec::new();
+    let mut explained: BTreeMap<String, Vec<Explanation>> = BTreeMap::new();
+    for ((edge_type, other, outgoing), derived) in &after {
+        if before.contains_key(&(edge_type.clone(), other.clone(), *outgoing)) {
+            continue;
+        }
+        let mut edge = DiffEdge {
+            edge_type: edge_type.clone(),
+            other: other.clone(),
+            outgoing: *outgoing,
+            derived: *derived,
+            rule: None,
+            score: None,
+        };
+        if *derived {
+            if !explained.contains_key(other) {
+                let found = {
+                    let g = copy.read();
+                    g.explain(key, other).unwrap_or_default()
+                };
+                explained.insert(other.clone(), found);
+            }
+            let found = explained.get(other).map(Vec::as_slice).unwrap_or(&[]);
+            if let Some(e) = found
+                .iter()
+                .find(|e| &e.edge_type == edge_type && endpoints_match(e, key, &edge))
+            {
+                edge.rule = Some(e.rule.clone());
+                edge.score = e.weight;
+            }
+        }
+        gained.push(edge);
+    }
+
+    // The handle owns a drain thread and the copy's files; it has to be gone
+    // before the caller deletes the directory under it.
+    drop(copy);
+    Ok((lost, gained))
+}
+
+/// Every edge incident on `key`, keyed by identity, with its derived flag.
+fn incident_edges(db: &SharedDb, key: &str) -> Result<BTreeMap<EdgeId, bool>, String> {
+    let edges = {
+        let g = db.read();
+        g.node_edges(key).map_err(crate::mcp::graph_err_msg)?
+    };
+    let mut out = BTreeMap::new();
+    for e in edges {
+        let outgoing = e.src_key == key;
+        let other = if outgoing { e.dst_key } else { e.src_key };
+        out.insert((e.edge_type, other, outgoing), e.derived);
+    }
+    Ok(out)
+}
+
+/// Copy a directory tree. Symlinks are skipped: a store is a directory of
+/// plain files, and following one would copy something outside it.
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else if ty.is_file() {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn diff_edge_json(e: &DiffEdge) -> Js {
+    json!({
+        "edge_type": e.edge_type,
+        "other": e.other,
+        "direction": if e.outgoing { "out" } else { "in" },
+        "derived": e.derived,
+        "rule": e.rule,
+        "score": e.score,
+    })
+}
+
+fn render_what_if(
+    key: &str,
+    field: &str,
+    value: &Js,
+    lost: &[DiffEdge],
+    gained: &[DiffEdge],
+) -> String {
+    let mut out = format!(
+        "mushroomdb what_if — {}.{} = {}: {} lost, {} gained\n",
+        repograph::sanitize(key),
+        repograph::sanitize(field),
+        repograph::sanitize(&value.to_string()),
+        lost.len(),
+        gained.len()
+    );
+    for (heading, edges) in [("lost", lost), ("gained", gained)] {
+        out.push_str(&format!("{heading} ({})\n", edges.len()));
+        if edges.is_empty() {
+            out.push_str("  none\n");
+            continue;
+        }
+        for e in edges {
+            let arrow = if e.outgoing { "→" } else { "←" };
+            out.push_str(&format!(
+                "  {arrow} {} {}",
+                repograph::sanitize(&e.edge_type),
+                repograph::sanitize(&e.other)
+            ));
+            if let Some(rule) = &e.rule {
+                out.push_str(&format!("  rule {}", repograph::sanitize(rule)));
+            }
+            if let Some(score) = e.score {
+                out.push_str(&format!("  score {score:.2}"));
+            }
+            out.push('\n');
+        }
+    }
+    repograph::cap_lines(&out, MAX_EDGE_LINES)
+}
+
 // ── recall ───────────────────────────────────────────────────────────────────
 
 fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) -> CallOutcome {
@@ -917,7 +1608,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "explain_association",
-            "description": "Why two entities are associated: every rule-derived edge between the two keys, with the rule that wrote it, its edge type, the match score, and the predicate it matched on. Both keys must already exist.",
+            "description": "Why are A and B related — every relationship between the two keys and its evidence: the rule that derived it, its edge type, the match score, and the predicate it matched on. Both keys must already exist.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -928,8 +1619,93 @@ fn task_tool_schemas() -> Vec<Js> {
             }
         }),
         json!({
+            "name": "node_edges",
+            "description": "What is K related to — every relationship of one node, grouped by edge type with a count, each listed edge carrying its direction, the rule that derived it, its score and the predicate it matched on. Answers 'why is this here' in the same call that lists it, so no follow-up explain is needed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "minLength": 1, "description": "Node key." },
+                    "edge_type": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "List only edges of this type. Omit for every type."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Edges listed per edge type (default 10). The rest are counted as '… and N more'."
+                    }
+                },
+                "required": ["key"]
+            }
+        }),
+        json!({
+            "name": "neighborhood",
+            "description": "What is around K — one hop out, as the same grouped relationship listing node_edges gives, with the rule and score behind each edge. With depth above 1 it is the breadth-first table of (key, label, depth) instead, because past one hop no single rule accounts for a row.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "minLength": 1, "description": "Node key to start from." },
+                    "depth": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Hops to traverse (default 1). 1 gives the relationship listing; above 1 gives the traversal table."
+                    },
+                    "edge_types": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Only follow these edge types. Omit for every type."
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["out", "in", "both"],
+                        "description": "Edge direction to follow (default both)."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "At depth 1, edges listed per edge type (default 10)."
+                    }
+                },
+                "required": ["key"]
+            }
+        }),
+        json!({
+            "name": "edges_at",
+            "description": "What did K's relationships look like at commit C — the edges that were live at one point in the store's history, with the rule that had derived each. Use this instead of replaying node_history or edge_history by hand.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "minLength": 1, "description": "Node key." },
+                    "at": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "0-based WAL commit index to read the edges at."
+                    }
+                },
+                "required": ["key", "at"]
+            }
+        }),
+        json!({
+            "name": "what_if",
+            "description": "What changes if K's FIELD became VALUE — the relationships lost and gained, with the rule behind each. Nothing is written: the store is copied, the change is made on the copy, the copy is diffed and deleted.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "minLength": 1, "description": "Node key to change." },
+                    "field": { "type": "string", "minLength": 1, "description": "Property name to set." },
+                    "value": {
+                        "description": "The value it would take: a string, number, boolean, or a list or map of those. Not null."
+                    }
+                },
+                "required": ["key", "field", "value"]
+            }
+        }),
+        json!({
             "name": "recall",
-            "description": "Where the graph says a topic lives: one pointer per hit — path:line, the symbol, and the first line of its doc — across notes, concepts, files, symbols and people.",
+            "description": "What do I already know about this — where the graph says a topic lives: one pointer per hit, path:line, the symbol, and the first line of its doc, across notes, concepts, files, symbols and people.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -944,7 +1720,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "remember",
-            "description": "Write a note into the graph and return its key. Keys listed in 'about' are linked to the note, and every one of them must already exist.",
+            "description": "Remember this for next time — write a note into the graph and return its key. Keys listed in 'about' are linked to the note, and every one of them must already exist.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

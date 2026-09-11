@@ -11,11 +11,11 @@
 //! - `notifications/initialized` — ignored
 //! - `tools/list` — the default listing follows the store the server opened
 //!   (see [`Surface`]): a store a repository was ingested into lists three —
-//!   `explore`, `query`, `stats` — and any other store lists the thirteen of
+//!   `explore`, `query`, `stats` — and any other store lists the fifteen of
 //!   [`ASSOCIATION_TOOLS`], the tools that answer a question about an entity
 //!   graph, in that order. Graph-tool descriptions carry the
 //!   prefix `Advanced: ` so a host ranking tools by description puts the task
-//!   tools in front. `mushroomdb mcp --all-tools` lists all twenty-five; the
+//!   tools in front. `mushroomdb mcp --all-tools` lists all twenty-seven; the
 //!   rest are callable either way, just not advertised
 //! - `tools/call` — dispatch; success for a graph tool is
 //!   `{content:[{type:"text", text:<json string>}]}`, and for a task tool one
@@ -49,12 +49,12 @@
 //! EOF on `reader` returns `Ok(())`. Read/write I/O errors propagate.
 
 use crate::json::{
-    edge_history_result_json, node_edges_json, node_history_json, node_info_json, params_from_json,
+    edge_history_result_json, node_history_json, node_info_json, params_from_json,
     parse_ingest_edges, result_set_json, rule_def_from_json,
 };
 use core_api::{
-    json_to_rows, json_to_value, AutoFk, Dir, GraphError, IngestOptions, MaskMode, NodeMask,
-    SharedDb, Value,
+    json_to_rows, json_to_value, AutoFk, GraphError, IngestOptions, MaskMode, NodeMask, SharedDb,
+    Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -79,7 +79,7 @@ pub fn run_mcp_stdio(
 /// [`run_mcp_stdio`], with the tool list chosen by the caller.
 ///
 /// `all_tools` false lists what the store's [`Surface`] names — three on a
-/// code graph, thirteen on a memory store; true lists all twenty-five. Either
+/// code graph, fifteen on a memory store; true lists all twenty-seven. Either
 /// way every tool remains callable — the flag decides what is advertised, not
 /// what is served.
 ///
@@ -224,9 +224,7 @@ fn dispatch_call(db: &SharedDb, db_dir: Option<&Path>, params: Option<&Js>) -> C
         "create_rule" => tool_create_rule(db, args),
         "explain" => tool_explain(db, args),
         "stats" => tool_stats(db),
-        "neighborhood" => tool_neighborhood(db, args),
         "node_info" => tool_node_info(db, args),
-        "node_edges" => tool_node_edges(db, args),
         "upsert_entity" => tool_upsert_entity(db, args),
         "find_similar" => tool_find_similar(db, args),
         "hybrid_search" => tool_hybrid_search(db, args),
@@ -441,65 +439,6 @@ fn tool_stats(db: &SharedDb) -> CallOutcome {
     }
 }
 
-fn tool_neighborhood(db: &SharedDb, args: &Js) -> CallOutcome {
-    let Some(key) = args.get("key").and_then(Js::as_str) else {
-        return CallOutcome::ToolErr("missing key".into());
-    };
-    let depth = match args.get("depth") {
-        None => 1u32,
-        Some(v) => match v.as_u64().and_then(|n| u32::try_from(n).ok()) {
-            Some(d) => d,
-            None => return CallOutcome::ToolErr("depth must be an integer".into()),
-        },
-    };
-    let dir = match args.get("direction") {
-        None => Dir::Both,
-        Some(v) => match v.as_str() {
-            Some(s) if s.eq_ignore_ascii_case("out") => Dir::Out,
-            Some(s) if s.eq_ignore_ascii_case("in") => Dir::In,
-            Some(s) if s.eq_ignore_ascii_case("both") => Dir::Both,
-            Some(other) => return CallOutcome::ToolErr(format!("unknown direction: {other}")),
-            None => return CallOutcome::ToolErr("direction must be a string".into()),
-        },
-    };
-    let edge_type_names: Option<Vec<String>> = match args.get("edge_types") {
-        None => None,
-        Some(v) => {
-            let Some(arr) = v.as_array() else {
-                return CallOutcome::ToolErr("edge_types must be an array of strings".into());
-            };
-            let mut names = Vec::with_capacity(arr.len());
-            for item in arr {
-                match item.as_str() {
-                    Some(s) => names.push(s.to_string()),
-                    None => {
-                        return CallOutcome::ToolErr(
-                            "edge_types must be an array of strings".into(),
-                        )
-                    }
-                }
-            }
-            Some(names)
-        }
-    };
-    let etype_refs: Option<Vec<&str>> = edge_type_names
-        .as_ref()
-        .map(|v| v.iter().map(String::as_str).collect());
-    let rs = {
-        let g = db.read();
-        match g.node_ref(key) {
-            Some(n) => Ok(n.neighborhood(depth, etype_refs.as_deref(), dir)),
-            None => Err(GraphError::KeyNotFound {
-                key: key.to_string(),
-            }),
-        }
-    };
-    match rs {
-        Ok(rs) => CallOutcome::ToolOk(result_set_json(&rs)),
-        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
-    }
-}
-
 fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
     let Some(key) = args.get("key").and_then(Js::as_str) else {
         return CallOutcome::ToolErr("missing key".into());
@@ -513,20 +452,6 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
         None => CallOutcome::ToolErr(graph_err_msg(GraphError::KeyNotFound {
             key: key.to_string(),
         })),
-    }
-}
-
-fn tool_node_edges(db: &SharedDb, args: &Js) -> CallOutcome {
-    let Some(key) = args.get("key").and_then(Js::as_str) else {
-        return CallOutcome::ToolErr("missing key".into());
-    };
-    let out = {
-        let g = db.read();
-        g.node_edges(key)
-    };
-    match out {
-        Ok(edges) => CallOutcome::ToolOk(node_edges_json(&edges)),
-        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
     }
 }
 
@@ -947,7 +872,7 @@ const ADVANCED_PREFIX: &str = "Advanced: ";
 /// listing.
 pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 
-/// The thirteen a memory store advertises, in the order it lists them.
+/// The fifteen a memory store advertises, in the order it lists them.
 ///
 /// A store with no repository in it used to be handed the code door's own task
 /// tools — `map`, `context`, `impact`, `owners`, `why`, `sync` — which answer
@@ -962,16 +887,24 @@ pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 /// Listing order is ranking: a host that defers schemas shows this list in
 /// order, so the two questions this door exists for come first.
 ///
+/// `edges_at` and `what_if` are the two the first association benchmark run
+/// showed missing: a run asked what a node's relationships were at a past
+/// commit and spent twenty to sixty-seven turns replaying `edge_history` for
+/// it, and had no way at all to ask what a change would do. They sit after
+/// `was_linked`, which is the narrowest form of the same time question.
+///
 /// The code task tools stay served on a memory store, as these stay served on
 /// a code-graph one — [`tools_list`] decides what is *advertised*, never what
 /// is answered.
-pub const ASSOCIATION_TOOLS: [&str; 13] = [
+pub const ASSOCIATION_TOOLS: [&str; 15] = [
     "query",
     "explain_association",
     "neighborhood",
     "node_info",
     "node_edges",
     "was_linked",
+    "edges_at",
+    "what_if",
     "node_history",
     "edge_history",
     "find_similar",
@@ -991,7 +924,7 @@ pub(crate) enum Surface {
     /// A repository was ingested into this store: the `GitSync` marker is
     /// there, and `explore` has a code graph to explore.
     CodeGraph,
-    /// Any other store, including an empty one: the thirteen-tool association
+    /// Any other store, including an empty one: the fifteen-tool association
     /// surface, where `explore` would have nothing to answer from.
     Memory,
 }
@@ -1021,17 +954,17 @@ fn surface_of(db: &SharedDb) -> Surface {
     }
 }
 
-/// The tools `tools/list` advertises: the ten repository task tools, then the
+/// The tools `tools/list` advertises: the fourteen task tools, then the
 /// graph tools with their descriptions prefixed.
 ///
 /// `all` false — the default — lists what `surface` names, **in the order that
-/// surface names it**: three on a code graph, thirteen on a memory store. The
+/// surface names it**: three on a code graph, fifteen on a memory store. The
 /// order is the point. A host that defers tool schemas makes a model search
 /// for them, and the list it searches is read top-down, so each surface ranks
 /// its own tools rather than inheriting the task-tools-then-graph-tools order
 /// that only the code door has a reason for.
 ///
-/// `all` true lists all twenty-five in that established order whichever store
+/// `all` true lists all twenty-seven in that established order whichever store
 /// this is, which is what `mushroomdb mcp --all-tools` runs and what the
 /// published server card documents: a caller that asked for everything asked
 /// for the whole surface, not for one door's ranking of it.
@@ -1065,13 +998,13 @@ fn tools_list(all: bool, surface: Surface) -> Js {
     json!({ "tools": tools })
 }
 
-/// The fifteen graph tools, in the order they have always been listed, with
+/// The thirteen graph tools, in the order they have always been listed, with
 /// their descriptions unprefixed. [`tools_list`] adds the prefix.
 fn graph_tools() -> Vec<Js> {
     let Js::Array(tools) = json!([
             {
                 "name": "query",
-                "description": "Run a Cypher query (read or write) against the graph. When 'mask' is provided, only the listed node keys are visible (read-only).",
+                "description": "Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1116,7 +1049,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "create_rule",
-                "description": "Create a derivation rule (RuleDef JSON).",
+                "description": "How should this kind of relationship be derived from now on — declare a rule (RuleDef JSON) and the engine maintains its edges as the data changes. Propose it and show the edges it would derive before creating one.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1136,7 +1069,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "explain",
-                "description": "Explain rule-derived edges between two node keys.",
+                "description": "Why are A and B related, as a raw array — the same rule-derived edges explain_association renders, for a caller that wants the JSON without asking.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1148,46 +1081,15 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "stats",
-                "description": "Return live node, edge, and rule statistics.",
+                "description": "How big is this store — live node, edge and rule counts.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
                 }
             },
             {
-                "name": "neighborhood",
-                "description": "Traverse the neighborhood of a node key.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "key": { "type": "string" },
-                        "depth": { "type": "integer" },
-                        "edge_types": {
-                            "type": "array",
-                            "items": { "type": "string" }
-                        },
-                        "direction": {
-                            "type": "string",
-                            "enum": ["out", "in", "both"]
-                        }
-                    },
-                    "required": ["key"]
-                }
-            },
-            {
                 "name": "node_info",
-                "description": "Return a node's key, label, and properties.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "key": { "type": "string" }
-                    },
-                    "required": ["key"]
-                }
-            },
-            {
-                "name": "node_edges",
-                "description": "Return all edges incident on a node key.",
+                "description": "What is K — its label and every property it holds.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1198,7 +1100,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "upsert_entity",
-                "description": "Insert or update a node by key. If the key exists, updates the supplied properties. If not, creates a new node with the given label and properties. Useful for agent memory: store or refresh an entity without checking existence first.",
+                "description": "Record what is now true about K — insert or update a node by key. If the key exists, updates the supplied properties. If not, creates a new node with the given label and properties. Useful for agent memory: store or refresh an entity without checking existence first.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1214,7 +1116,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "find_similar",
-                "description": "Two modes: (1) Vector search — provide `vector` (and optionally `field`, `label`, `k`, `min`) to find the k most similar nodes by cosine similarity using the HNSW index when available, brute-force otherwise. (2) Edge traversal — provide `key` (and optionally `edge_type`, `limit`) to return neighbors previously connected by a derived rule edge. Results from mode 2 come only from edges already derived by a VectorSimilar rule. In both modes, the optional `mask` array limits visibility: hidden nodes never appear in results, and a hidden query key in edge mode behaves identically to a nonexistent key.",
+                "description": "What is most like this — two modes: (1) Vector search — provide `vector` (and optionally `field`, `label`, `k`, `min`) to find the k most similar nodes by cosine similarity using the HNSW index when available, brute-force otherwise. (2) Edge traversal — provide `key` (and optionally `edge_type`, `limit`) to return neighbors previously connected by a derived rule edge. Results from mode 2 come only from edges already derived by a VectorSimilar rule. In both modes, the optional `mask` array limits visibility: hidden nodes never appear in results, and a hidden query key in edge mode behaves identically to a nonexistent key.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1240,7 +1142,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "hybrid_search",
-                "description": "Reciprocal Rank Fusion (RRF) over fulltext + vector results. Provide `query_text` and `text_field` for the fulltext leg. Optionally provide `vector` (embedding array) and `vector_field` (default: embedding) for the vector leg; omitting `vector` gives text-only ranking through the same RRF path. `label` restricts the vector search to nodes with that label (required for brute-force; omit to rely on HNSW rules). `k` controls result count (default: 10). RRF constant is fixed at 60; scores are 1/(60+rank) summed over lists a node appears in.",
+                "description": "What matches these words and this vector at once — Reciprocal Rank Fusion (RRF) over fulltext + vector results. Provide `query_text` and `text_field` for the fulltext leg. Optionally provide `vector` (embedding array) and `vector_field` (default: embedding) for the vector leg; omitting `vector` gives text-only ranking through the same RRF path. `label` restricts the vector search to nodes with that label (required for brute-force; omit to rely on HNSW rules). `k` controls result count (default: 10). RRF constant is fixed at 60; scores are 1/(60+rank) summed over lists a node appears in.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1260,7 +1162,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "node_history",
-                "description": "Return the WAL change history for a node. Events include NodeInserted, PropSet, PropRemoved, EdgeAdded, EdgeRemoved, and NodeDeleted. The response includes `total_commits` (the horizon upper bound). History is WAL-scoped — pre-snapshot commits are not visible.",
+                "description": "What has happened to K — every recorded change to one node, newest last. Events include NodeInserted, PropSet, PropRemoved, EdgeAdded, EdgeRemoved, and NodeDeleted. The response includes `total_commits` (the horizon upper bound). History is WAL-scoped — pre-snapshot commits are not visible.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1271,7 +1173,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "edge_history",
-                "description": "Return the full add/retract lifecycle for edges between nodes `a` and `b`. Includes derived (rule-attributed) edges via DerivedEdgeAdded/DerivedEdgeRetracted WAL markers. The response includes `total_commits` (the horizon upper bound).",
+                "description": "When did A and B become linked, and when did it break — the full add/retract lifecycle for every edge between the two keys. Includes derived (rule-attributed) edges via DerivedEdgeAdded/DerivedEdgeRetracted WAL markers. The response includes `total_commits` (the horizon upper bound).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1283,7 +1185,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "was_linked",
-                "description": "Return whether an edge of `edge_type` existed between nodes `a` and `b` (either direction) at WAL commit `at_commit`. Returns an error when `at_commit` is outside the visible horizon (`0..total_commits`).",
+                "description": "Were A and B linked at commit C — whether an edge of `edge_type` existed between the two keys (either direction) at that WAL commit. Returns an error when `at_commit` is outside the visible horizon (`0..total_commits`).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1297,7 +1199,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "rename_node",
-                "description": "Rename a node's key. The dense id and all edges/properties remain stable. Returns 404 if `old_key` does not exist, 409 if `new_key` is already taken.",
+                "description": "Rename K — the key changes and nothing else does. The dense id and all edges/properties remain stable. Returns 404 if `old_key` does not exist, 409 if `new_key` is already taken.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1510,7 +1412,7 @@ mod tests {
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
         for expected in &[
-            // The ten task tools, first and in order.
+            // The fourteen task tools, first and in order.
             "explore",
             "map",
             "context",
@@ -1518,18 +1420,20 @@ mod tests {
             "owners",
             "why",
             "explain_association",
+            "node_edges",
+            "neighborhood",
+            "edges_at",
+            "what_if",
             "recall",
             "remember",
             "sync",
-            // The fifteen graph tools.
+            // The thirteen graph tools.
             "query",
             "ingest_json",
             "create_rule",
             "explain",
             "stats",
-            "neighborhood",
             "node_info",
-            "node_edges",
             "upsert_entity",
             "find_similar",
             "hybrid_search",
@@ -1542,12 +1446,12 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            25,
-            "expected exactly 25 tools, got {}",
+            27,
+            "expected exactly 27 tools, got {}",
             names.len()
         );
         assert_eq!(
-            &names[..10],
+            &names[..14],
             [
                 "explore",
                 "map",
@@ -1556,20 +1460,24 @@ mod tests {
                 "owners",
                 "why",
                 "explain_association",
+                "node_edges",
+                "neighborhood",
+                "edges_at",
+                "what_if",
                 "recall",
                 "remember",
                 "sync"
             ],
             "the task tools come first, in order"
         );
-        assert_eq!(names[10], "query", "the graph tools follow them");
+        assert_eq!(names[14], "query", "the graph tools follow them");
     }
 
     /// Binding: on a store no repository was ingested into, the default
-    /// listing is the thirteen association tools, in [`ASSOCIATION_TOOLS`]
+    /// listing is the fifteen association tools, in [`ASSOCIATION_TOOLS`]
     /// order, and nothing else.
     #[test]
-    fn tools_list_defaults_to_thirteen_on_a_memory_store() {
+    fn tools_list_defaults_to_fifteen_on_a_memory_store() {
         let db = demo_db();
         let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let names: Vec<&str> = resp["result"]["tools"]
@@ -1715,24 +1623,55 @@ mod tests {
         assert_eq!(result["props"]["name"], "Alice");
     }
 
+    /// Binding: `node_edges` groups by edge type and names the rule and score
+    /// behind each derived edge, in the report as in the digest.
     #[test]
     fn test_node_edges_returns_edges() {
         let db = demo_db();
-        let resp = tool_call(&db, 1, "node_edges", json!({ "key": "alice" }));
+        let resp = tool_call(
+            &db,
+            1,
+            "node_edges",
+            json!({ "key": "alice", "json": true }),
+        );
         assert!(!is_error(&resp));
         let result = tool_text(&resp);
-        let edges = result["edges"].as_array().expect("edges");
+        assert_eq!(result["key"], "alice");
+        let types = result["types"].as_array().expect("types");
         assert!(
-            !edges.is_empty(),
-            "alice should have at least one derived edge"
+            !types.is_empty(),
+            "alice should have at least one edge type"
         );
-        // All edges touch alice.
-        for e in edges {
-            let touches = e["src_key"] == "alice" || e["dst_key"] == "alice";
-            assert!(touches, "edge does not touch alice: {e}");
+        let similar = types
+            .iter()
+            .find(|t| t["edge_type"] == "SIMILAR")
+            .expect("the rule's edge type");
+        // A symmetric rule derives the edge both ways, and both are listed
+        // with the direction that tells them apart.
+        assert_eq!(similar["count"], json!(2));
+        let edges = similar["edges"].as_array().expect("edges");
+        let dirs: Vec<&str> = edges
+            .iter()
+            .map(|e| e["direction"].as_str().expect("direction"))
+            .collect();
+        assert!(dirs.contains(&"out") && dirs.contains(&"in"), "{similar}");
+        for edge in edges {
+            assert_eq!(edge["other"], json!("bob"));
+            assert_eq!(edge["derived"], json!(true));
+            assert_eq!(edge["rule"], json!("sim_emb"));
+            assert_eq!(edge["score"], json!(1.0));
+            assert!(
+                edge["predicate"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("vector_similar"),
+                "the predicate travels with the edge: {edge}"
+            );
         }
     }
 
+    /// Binding: a depth-1 `neighborhood` is the same relationship listing, and
+    /// anything deeper is still the traversal table.
     #[test]
     fn test_neighborhood_traverses_one_hop() {
         let db = demo_db();
@@ -1740,11 +1679,23 @@ mod tests {
             &db,
             1,
             "neighborhood",
-            json!({ "key": "alice", "depth": 1 }),
+            json!({ "key": "alice", "depth": 1, "json": true }),
         );
         assert!(!is_error(&resp));
         let result = tool_text(&resp);
-        assert!(result["rows"].as_array().is_some());
+        assert_eq!(result["key"], "alice");
+        assert!(result["types"].as_array().is_some(), "{result}");
+
+        let deep = tool_call(
+            &db,
+            2,
+            "neighborhood",
+            json!({ "key": "alice", "depth": 2 }),
+        );
+        assert!(!is_error(&deep));
+        let table = tool_text(&deep);
+        assert_eq!(table["columns"], json!(["key", "label", "depth"]));
+        assert!(table["rows"].as_array().is_some());
     }
 
     #[test]
@@ -1801,11 +1752,11 @@ mod tests {
         let result = tool_text(&resp);
         assert_eq!(result["ok"], true);
         // Derived edges should now exist.
-        let edges_resp = tool_call(&db, 2, "node_edges", json!({ "key": "x" }));
+        let edges_resp = tool_call(&db, 2, "node_edges", json!({ "key": "x", "json": true }));
         let edges_result = tool_text(&edges_resp);
-        let edges = edges_result["edges"].as_array().expect("edges");
+        let types = edges_result["types"].as_array().expect("types");
         assert!(
-            edges.iter().any(|e| e["edge_type"] == "SAME_TAG"),
+            types.iter().any(|t| t["edge_type"] == "SAME_TAG"),
             "SAME_TAG edge not found after create_rule"
         );
     }
