@@ -31,6 +31,7 @@ answer those twenty questions on a 2,000-entity world
 - The Claude Code plugin's description leads with graph memory.
 - Every "faster coding" / "fewer tokens" claim is removed from README, the docs site, `llms.txt`,
   `llms-full.txt` and the plugin description, and `scripts/check-claims.sh` keeps them out in CI.
+- The publish smoke expects the entity surface.
 
 #### Deprecated — still working, still tested, removed in 0.7
 
