@@ -2496,6 +2496,54 @@ async fn was_linked_full_token_happy_path() {
     assert_eq!(v["edge_type"], "LINK");
 }
 
+/// Every history body says where history starts, and the refusal names the
+/// range it will accept — a reader must never have to guess what was pruned.
+#[tokio::test]
+async fn history_bodies_carry_the_horizon() {
+    let (app, _db) = open_history_db("hist-horizon");
+
+    let (status, body, _) = send(app.clone(), get("/node/alice/history")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(
+        v["horizon"].as_u64(),
+        Some(0),
+        "node history must carry horizon: {v}"
+    );
+
+    let (status, body, _) = send(app.clone(), get("/stats")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(
+        v["history_floor"].as_u64(),
+        Some(0),
+        "/stats must say how far back history reaches: {v}"
+    );
+
+    let (status, body, _) = send(app.clone(), get("/history/edge?a=alice&b=bob")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(
+        v["horizon"].as_u64(),
+        Some(0),
+        "edge history must carry horizon: {v}"
+    );
+
+    let (status, body, _) = send(
+        app,
+        get("/history/was_linked?a=alice&b=bob&edge_type=LINK&at_commit=99999"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v = parse_json(&body);
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("valid range is")),
+        "the 400 must name the range it accepts: {v}"
+    );
+}
+
 #[tokio::test]
 async fn was_linked_out_of_horizon_is_400_not_500() {
     let (app, _db) = open_history_db("hist-wl-oob");

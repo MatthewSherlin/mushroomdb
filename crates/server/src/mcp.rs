@@ -761,15 +761,11 @@ fn tool_node_history(db: &SharedDb, args: &Js) -> CallOutcome {
         return CallOutcome::ToolErr("missing key".into());
     };
     let g = db.read();
-    let entries = match g.node_history(key) {
+    let result = match g.node_history(key) {
         Ok(e) => e,
         Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
     };
-    let total_commits = match g.wal_total_commits() {
-        Ok(n) => n,
-        Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
-    };
-    CallOutcome::ToolOk(node_history_json(key, &entries.items, total_commits))
+    CallOutcome::ToolOk(node_history_json(key, &result))
 }
 
 fn tool_edge_history(db: &SharedDb, args: &Js) -> CallOutcome {
@@ -1162,7 +1158,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "node_history",
-                "description": "What has happened to K — every recorded change to one node, newest last. Events include NodeInserted, PropSet, PropRemoved, EdgeAdded, EdgeRemoved, and NodeDeleted. The response includes `total_commits` (the horizon upper bound). History is WAL-scoped — pre-snapshot commits are not visible.",
+                "description": "What has happened to K — every recorded change to one node, newest last. Events include NodeInserted, PropSet, PropRemoved, EdgeAdded, EdgeRemoved, and NodeDeleted. The response includes `total_commits` (the horizon upper bound) and `horizon`, the oldest commit still retained; events before it are gone. History is WAL-scoped — pre-snapshot commits are not visible.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1173,7 +1169,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "edge_history",
-                "description": "When did A and B become linked, and when did it break — the full add/retract lifecycle for every edge between the two keys. Includes derived (rule-attributed) edges via DerivedEdgeAdded/DerivedEdgeRetracted WAL markers. The response includes `total_commits` (the horizon upper bound).",
+                "description": "When did A and B become linked, and when did it break — the full add/retract lifecycle for every edge between the two keys. Includes derived (rule-attributed) edges via DerivedEdgeAdded/DerivedEdgeRetracted WAL markers. The response includes `total_commits` (the horizon upper bound) and `horizon`, the oldest commit still retained; events before it are gone.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1185,7 +1181,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "was_linked",
-                "description": "Were A and B linked at commit C — whether an edge of `edge_type` existed between the two keys (either direction) at that WAL commit. Returns an error when `at_commit` is outside the visible horizon (`0..total_commits`).",
+                "description": "Were A and B linked at commit C — whether an edge of `edge_type` existed between the two keys (either direction) at that WAL commit. Returns an error when `at_commit` is outside the retained horizon (`horizon..total_commits`).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

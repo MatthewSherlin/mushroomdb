@@ -1867,7 +1867,9 @@ async fn set_node_prop(
 
 /// `GET /node/{key}/history` — return the WAL change history for `key`.
 ///
-/// Response: `{ key, history: [{commit, change}], total_commits }`.
+/// Response: `{ key, history: [{commit, change}], total_commits, horizon }`.
+/// `horizon` is the oldest commit history still reaches; events before it were
+/// pruned and are not in `history`.
 /// Role tokens: if `key` is hidden by the role mask, responds with 404
 /// (same shape as querying an absent key — no existence oracle).
 async fn node_history_handler(
@@ -1885,28 +1887,30 @@ async fn node_history_handler(
         if !role_mask.contains_node(&*g, &key) {
             return key_not_found(key);
         }
-        let entries = match g.node_history(&key) {
+        let result = match g.node_history(&key) {
             Ok(e) => e,
-            Err(e) => return graph_err(e),
-        };
-        let total_commits = match g.wal_total_commits() {
-            Ok(n) => n,
             Err(e) => return graph_err(e),
         };
         // Filter EdgeAdded/EdgeRemoved entries whose `other` endpoint is hidden.
         // A role token must not learn about hidden nodes via edge history events —
         // mirrors the same protection in `node_edges` (http.rs ~978-989).
         use core_api::HistoryChange;
-        let visible: Vec<_> = entries
-            .items
-            .into_iter()
-            .filter(|entry| match &entry.change {
-                HistoryChange::EdgeAdded { other, .. }
-                | HistoryChange::EdgeRemoved { other, .. } => role_mask.contains_node(&*g, other),
-                _ => true,
-            })
-            .collect();
-        return json_ok(node_history_json(&key, &visible, total_commits));
+        let visible = core_api::HistoryResult {
+            total_commits: result.total_commits,
+            horizon: result.horizon,
+            items: result
+                .items
+                .into_iter()
+                .filter(|entry| match &entry.change {
+                    HistoryChange::EdgeAdded { other, .. }
+                    | HistoryChange::EdgeRemoved { other, .. } => {
+                        role_mask.contains_node(&*g, other)
+                    }
+                    _ => true,
+                })
+                .collect(),
+        };
+        return json_ok(node_history_json(&key, &visible));
     }
     // Full identity: no masking. Return 404 for absent keys (consistent with
     // GET /node/{key} and the Role branch above).
@@ -1914,20 +1918,18 @@ async fn node_history_handler(
     if !g.has_node(&key) {
         return key_not_found(key);
     }
-    let entries = match g.node_history(&key) {
+    let result = match g.node_history(&key) {
         Ok(e) => e,
         Err(e) => return graph_err(e),
     };
-    let total_commits = match g.wal_total_commits() {
-        Ok(n) => n,
-        Err(e) => return graph_err(e),
-    };
-    json_ok(node_history_json(&key, &entries.items, total_commits))
+    json_ok(node_history_json(&key, &result))
 }
 
 /// `GET /history/edge?a=&b=` — return the edge lifecycle between two nodes.
 ///
-/// Response: `{ a, b, events: [{edge_type, commit, event, rule}], total_commits }`.
+/// Response: `{ a, b, events: [{edge_type, commit, event, rule}], total_commits, horizon }`.
+/// `horizon` is the oldest commit history still reaches; events before it were
+/// pruned and are not in `events`.
 /// Role tokens: BOTH `a` AND `b` must be visible in the role mask, otherwise
 /// responds with 404 for the first invisible key (no existence oracle).
 async fn edge_history_handler(
@@ -2018,9 +2020,9 @@ async fn was_linked_handler(
                 "a": a, "b": b, "edge_type": edge_type,
                 "at_commit": at_commit, "linked": linked,
             })),
-            Err(GraphError::CommitOutOfRange { .. }) => (
+            Err(e @ GraphError::CommitOutOfRange { .. }) => (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("commit {at_commit} is out of range")})),
+                Json(json!({"error": e.to_string()})),
             )
                 .into_response(),
             Err(e) => graph_err(e),
@@ -2034,9 +2036,9 @@ async fn was_linked_handler(
             "a": a, "b": b, "edge_type": edge_type,
             "at_commit": at_commit, "linked": linked,
         })),
-        Err(GraphError::CommitOutOfRange { .. }) => (
+        Err(e @ GraphError::CommitOutOfRange { .. }) => (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("commit {at_commit} is out of range")})),
+            Json(json!({"error": e.to_string()})),
         )
             .into_response(),
         Err(e) => graph_err(e),

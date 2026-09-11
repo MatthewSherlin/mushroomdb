@@ -4371,3 +4371,39 @@ fn recall_is_framed_once_not_twice() {
         "recall's own digest already opens with the framing line"
     );
 }
+
+/// Binding: every history reply says where history starts, and `was_linked`
+/// refuses an unreachable commit by naming the range it accepts.
+#[test]
+fn history_replies_carry_the_horizon() {
+    let db = open("mcp-horizon");
+    seed_person(&db, "alice");
+    seed_person(&db, "bob");
+    db.write().insert_edge("LINK", "alice", "bob").unwrap();
+
+    let stdin = format!(
+        "{}{}{}",
+        call(1, "node_history", json!({"key": "alice"})),
+        call(2, "edge_history", json!({"a": "alice", "b": "bob"})),
+        call(
+            3,
+            "was_linked",
+            json!({"a": "alice", "b": "bob", "edge_type": "LINK", "at_commit": 99999})
+        ),
+    );
+    let (res, out) = exchange(db, &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+
+    let nh = content_json(&replies[0]);
+    assert_eq!(nh["horizon"], json!(0), "node_history must report it: {nh}");
+    assert!(nh["history"].is_array(), "{nh}");
+    let eh = content_json(&replies[1]);
+    assert_eq!(eh["horizon"], json!(0), "edge_history must report it: {eh}");
+
+    let err = error_text(&replies[2]);
+    assert!(
+        err.contains("valid range is"),
+        "the refusal must name the range it accepts: {err}"
+    );
+}
