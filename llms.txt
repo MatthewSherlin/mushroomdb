@@ -211,7 +211,7 @@ Task tools, in the order `tools/list` serves them (all callable on any store):
 graph; `explain_association`, `node_edges`, `neighborhood`, `edges_at` and
 `what_if` read an entity graph; `recall` and `remember` answer on either. Each
 returns the rendered digest as its text content; `json: true` swaps in the report
-instead. See the live-code-graph section above.
+instead. See the "Repository as a data source (deprecated door)" section above.
 
 The 13 graph tools below are the graph API itself; their `tools/list`
 descriptions are prefixed `Advanced:`.
@@ -494,7 +494,7 @@ https://github.com/MatthewSherlin/mushroomdb
 
 ## Docs
 
-- Live code graph (the five properties, measured, and the scope boundaries): docs/site/code-graph.md
+- Live code graph (the five properties, measured, and the scope boundaries) (deprecated in 0.6.4, removed in 0.7): docs/site/code-graph.md
 - Codebase graph (ingest-git reference): docs/site/ingest-git.md
 - Concurrency across processes: docs/site/concurrency.md
 - Install, plugin, hooks and doctor: docs/site/skill.md
