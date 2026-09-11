@@ -1566,6 +1566,47 @@ fn a_partial_schema_renders_its_counts_as_lower_bounds() {
     );
 }
 
+/// Binding: the vector payload is not a schema property a session should
+/// query. It is hundreds of floats, it is never what a question is about, and
+/// a brief that names it invites a `RETURN n.embedding` that returns a wall of
+/// numbers.
+#[test]
+fn the_brief_hides_the_embedding_prop() {
+    use core_api::Value;
+
+    let dir = tmp("brief-embedding");
+    let mut db = open(&dir);
+    for key in ["doc:one", "doc:two"] {
+        db.insert_node(
+            "Doc",
+            key,
+            vec![
+                ("title".into(), Value::Str(key.to_string())),
+                (
+                    "embedding".into(),
+                    Value::List(vec![Value::Float(0.1), Value::Float(0.2)]),
+                ),
+            ],
+        )
+        .expect("doc");
+    }
+
+    let b = brief(&db, &BriefOptions::default());
+    let s = b.schema.as_ref().expect("a memory store has a schema");
+    assert_eq!(
+        s.labels[0].props,
+        vec!["title".to_string()],
+        "the vector payload is not listed"
+    );
+    assert_eq!(
+        s.labels[0].hidden_props, 0,
+        "and it is not counted off either — it is hidden, not deferred"
+    );
+
+    let text = render_brief(&b, "query '<cypher>'");
+    assert!(!text.contains("embedding"), "{text}");
+}
+
 /// Binding: the role recipe names a label the role it names can actually see.
 #[test]
 fn the_role_recipe_probes_a_label_that_role_can_see() {

@@ -53,6 +53,12 @@ const HOW_MANY_MIN: usize = 3;
 /// what a `what_if` is about. `id` is the identity prop Cypher `CREATE`
 /// writes; `key` is what the store calls the same thing.
 const IDENTITY_PROPS: [&str; 2] = ["id", "key"];
+/// Property names the schema listing does not print. `embedding` is the vector
+/// payload `hybrid_search` and `find_similar` read: hundreds of floats, never
+/// a question target, and naming it in a schema a session is meant to write
+/// queries from invites a query that returns a wall of numbers. The tools that
+/// use it do not need to be told it is there.
+const HIDDEN_PROPS: [&str; 1] = ["embedding"];
 
 /// Characters of the synced sha the brief prints — the usual abbreviation,
 /// and the same width [`render_map`](super::render_map) uses.
@@ -357,7 +363,12 @@ fn memory_schema<F: Fs>(db: &GraphDb<F>, deadline: Option<Instant>) -> SchemaBri
         counted += 1;
         let entry = by_label.entry(n.label.clone()).or_default();
         entry.0 += 1;
-        entry.1.extend(n.props.keys().cloned());
+        entry.1.extend(
+            n.props
+                .keys()
+                .filter(|p| !HIDDEN_PROPS.contains(&p.as_str()))
+                .cloned(),
+        );
     }
 
     // Pass two: the per-type census, keyed for the recipes to read back.
@@ -582,16 +593,17 @@ fn recipes(
     //
     // `id` and `key` are skipped either way: both name the node rather than
     // describe it, and changing a node's name is `rename_node`, not a question
-    // about what its relationships would become.
+    // about what its relationships would become. [`HIDDEN_PROPS`] goes with
+    // them: `what_if key embedding <value>` asks the session to type out a
+    // vector.
     let field = nodes
         .iter()
         .find(|n| n.key == key)
         .and_then(|n| {
             let watched = rule_fields.get(&n.label);
-            let mut usable = n
-                .props
-                .keys()
-                .filter(|f| !IDENTITY_PROPS.contains(&f.as_str()));
+            let mut usable = n.props.keys().filter(|f| {
+                !IDENTITY_PROPS.contains(&f.as_str()) && !HIDDEN_PROPS.contains(&f.as_str())
+            });
             usable
                 .clone()
                 .find(|f| watched.is_some_and(|w| w.contains(*f)))
