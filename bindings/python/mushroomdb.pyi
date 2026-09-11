@@ -113,6 +113,20 @@ class GraphDb:
     def was_linked(self, a: str, b: str, edge_type: str, at_commit: int) -> bool:
         """Whether `a` and `b` were linked by `edge_type` at or before `at_commit`."""
 
+    def edges_at(self, key: str, commit: int) -> list[Row]:
+        """Every edge incident on `key` at WAL `commit`, from one WAL scan.
+
+        Returns `{edge_type, src, dst, derived, rule}` dicts sorted by
+        `(edge_type, src, dst)`. Raises for a commit outside the horizon.
+        """
+
+    def what_if_set_prop(self, key: str, field: str, value: Any) -> dict[str, list[Row]]:
+        """Derived edges a `set_prop(key, field, value)` would change.
+
+        Returns `{"lost": [...], "gained": [...]}`, each entry shaped like an
+        `edges_at` row. Writes nothing.
+        """
+
     def enable_index(self, label: str, field: str) -> None:
         """Enable an equality index on `(label, field)`."""
 
