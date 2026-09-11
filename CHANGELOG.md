@@ -128,6 +128,17 @@ what those three hooks are worth.
   or all_of for the whole set`.
 - `all_of` together with `edge_type` is a tool error — `pass one of all_of or edge_type, not
   both` — rather than one of them silently winning.
+- **An edge type that is nowhere in the store is a tool error naming it and the types the store
+  does have**, capped at twenty names, rather than the "0 edges" / "0 partners" a misspelling used
+  to answer — which reads as a fact about the graph and is indistinguishable from the right answer
+  for a type this node genuinely has none of. The census only runs when the answer came back empty.
+- **`neighborhood` takes `label` too**, and applies it: at depth 1 it narrows the partners and the
+  counts exactly as `node_edges` does, and past one hop it keeps the traversal rows of that label.
+  It used to be accepted and silently ignored. The walk itself is never narrowed — a hop through
+  another label is how a two-hop question reaches the label it asked about.
+- **The grouped `json: true` report carries a top-level `listed`** — the edges actually in the
+  document, the sum of the per-type counts — and echoes the `label` it was narrowed by, which the
+  other shapes of the reply already did.
 
 #### New: `edges_at` and `what_if`
 
@@ -170,7 +181,8 @@ benchmark's multihop cells burned their turns on.
 - **`count(DISTINCT …)` and `collect(DISTINCT …)`.** This is what makes an intersection correct:
   three edge types between one pair yield three rows per source under an alternation, and only
   `DISTINCT` counts it once. `count(DISTINCT *)` is a named parse error, and a variable actually
-  named `distinct` still parses.
+  named `distinct` still parses. On a **relationship** variable `count(DISTINCT r)` counts distinct
+  edges, keyed on `(edge type, source, destination)`; it used to answer `0` on a graph full of them.
 - **A non-aggregate `WITH … WHERE <alias>` resolves the alias.** `WITH t, t.x AS x WHERE x > 11`
   was a planner-only false rejection — the plan it refused to build would have run correctly.
 - **An aggregate `WITH` with no `WHERE` now projects its `RETURN`.** `WITH c, count(t) AS n RETURN
@@ -185,14 +197,18 @@ benchmark's multihop cells burned their turns on.
   property names and node count, each edge type with the rule behind it, its source and
   destination labels and its count, the roles, the total commit count — and then one worked call
   per question kind, built from that store's own labels and edge types, so the calls are runnable
-  as printed. It is capped at 4,000 bytes and byte-stable between runs; a store too large to read
+  as printed. The 4,000 bytes is a ceiling and not a line count: schema entries drop first, then
+  every name is cut to 60 characters, and only then do the worked calls come off from the end
+  under a final `(brief truncated at 4,000 bytes)` line. It is byte-stable between runs; a store too large to read
   inside the 3-second budget renders **partially** rather than late. The `embedding` field is
   hidden from the schema listing — 1,536 floats is not a property worth naming.
 - **The recipes teach the one-call forms.** `why` names `explain_association` and says the reply
   carries the shared values; `relationships` and `as of` render the `all_of:` / `label:` form of
   `node_edges` and `edges_at` over edge types that actually run between the two busiest labels;
   `what if` appends the `edge_type:` narrowing; and a `linked by all of` recipe renders the
-  comma-pattern, `count(DISTINCT …)` Cypher for the intersection question.
+  comma-pattern, `count(DISTINCT …)` Cypher for the intersection question. The `as of` note says
+  where its `at` comes from — no commit carries a date, so a date is turned into a commit number
+  through `node_history` / `edge_history`, never guessed from the end of the WAL.
 - **The skill carries a recipe per question kind**, and the `--delivery cli` variant names the CLI
   equivalent of each.
 
@@ -259,6 +275,15 @@ benchmark's multihop cells burned their turns on.
   limit up to 2,000 for the whole set.
 - **`what_if {json: true}` respects `limit`** (default 10) and gains `lost_total` / `gained_total`,
   where it used to return every edge.
+- **The grouped `edges_at` view honours `direction`.** `out`, `in` and `any` were parsed and then
+  ignored on that path, so every caller got the undirected answer; a call that passed a direction
+  now gets the edges it asked for, and the counts in the header narrow with them.
+- **`all_of` together with `edge_type` is a tool error** — `pass one of all_of or edge_type, not
+  both` — on `node_edges` and `edges_at`, where one of the two used to win silently.
+- **`alwaysLoad: true` is the default for an entity-store MCP install.** `install --delivery mcp`
+  or `both` with an explicit `--db` writes it on the `mcpServers.mushroomdb` entry, so a re-run of
+  `install` rewrites an existing `.mcp.json` that did not have it. `--no-always-load` opts out; an
+  install that named no store is unchanged.
 - **`WITH c, count(t) AS n RETURN key(c), n` now returns the columns it projects.** A query that
   was reading the columns named `c` and `n` out of that shape, or relying on a dropped computed
   projection, sees the projected names and values instead.
