@@ -11,7 +11,7 @@ use crate::traverse::{expand, Dir, EdgeRef};
 use crate::value_ops::{cmp_optional, values_equal};
 use crate::view::GraphView;
 use core_storage::{Value, ValueKey};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Test-only counter incremented each time the fused ScanLabel+Filter arm
 /// executes.  Lets property tests assert the fast path actually fires for
@@ -501,6 +501,13 @@ fn execute_inner(
             PlanOp::GroupAggregate { keys, aggs } => {
                 let mut grp_groups: HashMap<GroupKey, GroupEntry> = HashMap::new();
                 let mut grp_key_order: Vec<GroupKey> = Vec::new();
+                // A grouping key that is a bare node variable stays a node
+                // downstream: `WITH c, count(*) AS n WHERE n >= 2 RETURN c.key`
+                // reads `c` as a node after the group, not as the key string a
+                // display value would flatten it to. Without this the whole
+                // pipeline after an aggregate loses node identity, and both
+                // `c.key` and `key(c)` stop working.
+                let mut grp_cells: HashMap<GroupKey, Vec<Option<Cell>>> = HashMap::new();
                 for row in &rows {
                     let mut gk: GroupKey = Vec::with_capacity(keys.len());
                     let mut display_vals: Vec<Option<Value>> = Vec::with_capacity(keys.len());
@@ -514,11 +521,12 @@ fn execute_inner(
                             return Err(group_cap_err());
                         }
                         grp_key_order.push(gk.clone());
+                        grp_cells.insert(gk.clone(), key_source_cells(&vars, row, keys));
                         grp_groups.insert(
                             gk.clone(),
                             (
                                 display_vals,
-                                aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+                                aggs.iter().map(|(f, a, _)| AggAcc::for_arg(f, a)).collect(),
                             ),
                         );
                     }
@@ -536,14 +544,21 @@ fn execute_inner(
                         empty_key,
                         (
                             vec![],
-                            aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+                            aggs.iter().map(|(f, a, _)| AggAcc::for_arg(f, a)).collect(),
                         ),
                     );
                 }
                 if is_pipeline {
                     // Pipeline mode: convert group results to raw rows with Cell::Scalar
                     // so that subsequent WITH / RETURN stages can consume them.
-                    rows = group_result_to_rows(keys, aggs, grp_key_order, &mut grp_groups, &vars);
+                    rows = group_result_to_rows(
+                        keys,
+                        aggs,
+                        grp_key_order,
+                        &mut grp_groups,
+                        &mut grp_cells,
+                        &vars,
+                    );
                     projected = None;
                     // Record column order so the staged executor can build the final
                     // ResultSet from `rows` if no Project op follows.
@@ -693,7 +708,7 @@ fn execute_inner(
                     func,
                     arg,
                 };
-                let mut acc = AggAcc::new(func);
+                let mut acc = AggAcc::for_arg(func, arg);
                 for row in &rows {
                     // agg_stream with empty ops hits the terminal branch (accumulate).
                     agg_stream(&ctx, &[], row, &mut acc)?;
@@ -893,6 +908,7 @@ fn collect_params_from_ops(
                         AggArg::Star => {}
                         AggArg::Var(_) => {}
                         AggArg::Prop { .. } => {}
+                        AggArg::Distinct(_) => {}
                     }
                 }
             }
@@ -1064,15 +1080,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                     }
                 }
             }
-            PlanOp::Aggregate { arg, .. } => match arg {
-                AggArg::Star => {}
-                AggArg::Var(v) => {
-                    vars.intern(v);
-                }
-                AggArg::Prop { var, .. } => {
-                    vars.intern(var);
-                }
-            },
+            PlanOp::Aggregate { arg, .. } => intern_agg_arg(&mut vars, arg),
             PlanOp::GroupAggregate { keys, aggs } => {
                 // Intern input variable names (for the producer pass).
                 for (col, item) in keys {
@@ -1094,15 +1102,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                     vars.intern(col);
                 }
                 for (_, arg, col) in aggs {
-                    match arg {
-                        AggArg::Star => {}
-                        AggArg::Var(v) => {
-                            vars.intern(v);
-                        }
-                        AggArg::Prop { var, .. } => {
-                            vars.intern(var);
-                        }
-                    }
+                    intern_agg_arg(&mut vars, arg);
                     // Intern output column name.
                     vars.intern(col);
                 }
@@ -1156,6 +1156,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                                         Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                                         Operand::BinArith { .. } => "<arith>".to_string(),
                                         Operand::Case { .. } => "<case>".to_string(),
+                                        Operand::Index { .. } => "<index>".to_string(),
                                     })
                                     .collect();
                                 let col = format!("{name}({})", arg_strs.join(", "));
@@ -1269,6 +1270,34 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
                 intern_operand(vars, d);
             }
         }
+        Operand::Index { base, index } => {
+            intern_operand(vars, base);
+            intern_operand(vars, index);
+        }
+    }
+}
+
+/// Intern the variables an aggregate argument reads, through any `DISTINCT`.
+fn intern_agg_arg(vars: &mut VarTable, arg: &AggArg) {
+    match arg {
+        AggArg::Star => {}
+        AggArg::Var(v) => {
+            vars.intern(v);
+        }
+        AggArg::Prop { var, .. } => {
+            vars.intern(var);
+        }
+        AggArg::Distinct(inner) => intern_agg_arg(vars, inner),
+    }
+}
+
+/// Render an aggregate argument the way it was written, for a column name.
+fn agg_arg_label(arg: &AggArg) -> String {
+    match arg {
+        AggArg::Star => "*".to_string(),
+        AggArg::Var(v) => v.clone(),
+        AggArg::Prop { var, field } => format!("{var}.{field}"),
+        AggArg::Distinct(inner) => format!("DISTINCT {}", agg_arg_label(inner)),
     }
 }
 
@@ -1626,6 +1655,7 @@ const SCALAR_FUNCS: &[&str] = &[
     "toString",
     "decay",
     "key",
+    "labels",
 ];
 
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
@@ -1770,6 +1800,39 @@ fn eval_func(
                 )),
                 Some(Cell::Scalar(_) | Cell::Path(_)) => {
                     Err(format!("key() argument `{var_name}` is not a node"))
+                }
+                None => Ok(None), // null binding → null (optional match scenario)
+            }
+        }
+        "labels" => {
+            if args.len() != 1 {
+                return Err(format!(
+                    "labels() requires exactly 1 argument, got {}",
+                    args.len()
+                ));
+            }
+            // openCypher returns a list because a node may carry several
+            // labels; this store gives a node exactly one, so the list holds
+            // one element. `n.label` is the scalar spelling of the same thing.
+            let Operand::Var(var_name) = &args[0] else {
+                return Err(
+                    "labels() argument must be a node variable (e.g. labels(n))".to_string()
+                );
+            };
+            let slot = vars
+                .slot(var_name)
+                .ok_or_else(|| format!("unbound variable `{var_name}` in labels()"))?;
+            match row.get(slot).and_then(|c| c.as_ref()) {
+                Some(Cell::Node(id)) => Ok(Some(Value::List(
+                    view.label_of(*id)
+                        .map(|l| vec![Value::Str(l.to_owned())])
+                        .unwrap_or_default(),
+                ))),
+                Some(Cell::Rel(_)) => Err(format!(
+                    "labels() argument `{var_name}` is a relationship, not a node"
+                )),
+                Some(Cell::Scalar(_) | Cell::Path(_)) => {
+                    Err(format!("labels() argument `{var_name}` is not a node"))
                 }
                 None => Ok(None), // null binding → null (optional match scenario)
             }
@@ -1974,6 +2037,11 @@ fn resolve_operand(
             }
         }
         Operand::FuncCall { name, args } => eval_func(name, args, view, vars, row, params),
+        Operand::Index { base, index } => {
+            let base_val = resolve_operand(view, vars, row, base, params)?;
+            let idx_val = resolve_operand(view, vars, row, index, params)?;
+            Ok(index_list(base_val, idx_val))
+        }
         Operand::Case { branches, default } => {
             for (cond, value) in branches {
                 if eval_expr(view, vars, row, cond, params, 0)? {
@@ -2034,6 +2102,48 @@ fn resolve_operand(
     }
 }
 
+/// One element of a list value, openCypher subscript semantics.
+///
+/// A negative index counts from the end. A non-list base, a non-integer
+/// index, or an out-of-range index all give null — a subscript reads like a
+/// property that is not there, never an error.
+fn index_list(base: Option<Value>, index: Option<Value>) -> Option<Value> {
+    let (Some(Value::List(items)), Some(idx)) = (base, index) else {
+        return None;
+    };
+    let i = match idx {
+        Value::Int(n) => n,
+        Value::Float(f) if f.fract() == 0.0 && f.is_finite() => f as i64,
+        _ => return None,
+    };
+    let len = i64::try_from(items.len()).ok()?;
+    let pos = if i < 0 { len.checked_add(i)? } else { i };
+    if pos < 0 || pos >= len {
+        return None;
+    }
+    items.into_iter().nth(pos as usize)
+}
+
+/// True for the two field names that read node identity rather than a stored
+/// property. See [`node_identity_prop`].
+fn is_identity_field(field: &str) -> bool {
+    field == "key" || field == "label"
+}
+
+/// Node identity exposed as a property: `n.key` and `n.label`.
+///
+/// Neither is stored in the column store — the key lives in the id map and
+/// the label in the interner — so `n.key` used to read as null while
+/// `key(n)` worked. A property of the same name always wins, so a graph that
+/// really does store a `key` field keeps it.
+fn node_identity_prop(view: &GraphView, id: u32, field: &str) -> Option<Value> {
+    match field {
+        "key" => view.ids.key_of(id).map(|k| Value::Str(k.to_owned())),
+        "label" => view.label_of(id).map(|l| Value::Str(l.to_owned())),
+        _ => None,
+    }
+}
+
 fn resolve_prop(
     view: &GraphView,
     vars: &VarTable,
@@ -2052,7 +2162,10 @@ fn resolve_prop(
         None => return Ok(None),
     };
     match cell {
-        Cell::Node(id) => Ok(view.prop(*id, field).map(|vr| vr.into_value())),
+        Cell::Node(id) => Ok(view
+            .prop(*id, field)
+            .map(|vr| vr.into_value())
+            .or_else(|| node_identity_prop(view, *id, field))),
         Cell::Rel(e) => Ok(view.edge_props.get(e.etype, e.src, e.dst, field)),
         // Virtual path cell: only `length` is exposed.
         Cell::Path(hops) => {
@@ -2086,8 +2199,12 @@ fn node_matches(
         let Some(expected) = resolve_operand(view, vars, row, operand, params)? else {
             return Ok(false);
         };
-        match view.prop(id, field) {
-            Some(got) if values_equal(got.as_value(), &expected) => {}
+        let got = view
+            .prop(id, field)
+            .map(|vr| vr.into_value())
+            .or_else(|| node_identity_prop(view, id, field));
+        match got {
+            Some(got) if values_equal(&got, &expected) => {}
             _ => return Ok(false),
         }
     }
@@ -2503,14 +2620,38 @@ fn execute_pull(
 /// Running state for a single aggregate accumulation.
 enum AggAcc {
     Count(u64),
-    Sum { val: f64, has_value: bool },
-    Avg { sum: f64, n: u64 },
+    Sum {
+        val: f64,
+        has_value: bool,
+    },
+    Avg {
+        sum: f64,
+        n: u64,
+    },
     Min(Option<Value>),
     Max(Option<Value>),
     Collect(Vec<Value>),
+    /// `DISTINCT` wrapper: forwards to `inner` the first time a value is
+    /// seen in this group and drops every repeat.
+    Distinct {
+        seen: HashSet<Option<ValueKey>>,
+        inner: Box<AggAcc>,
+    },
 }
 
 impl AggAcc {
+    /// The accumulator an aggregate needs given the argument it was written
+    /// with — a `DISTINCT` argument adds the seen-set around the plain one.
+    fn for_arg(func: &AggFunc, arg: &AggArg) -> Self {
+        match arg {
+            AggArg::Distinct(_) => AggAcc::Distinct {
+                seen: HashSet::new(),
+                inner: Box::new(AggAcc::new(func)),
+            },
+            _ => AggAcc::new(func),
+        }
+    }
+
     fn new(func: &AggFunc) -> Self {
         match func {
             AggFunc::Count => AggAcc::Count(0),
@@ -2550,6 +2691,7 @@ impl AggAcc {
             AggAcc::Max(v) => v,
             // Empty collect() yields an empty list (never null), matching openCypher.
             AggAcc::Collect(items) => Some(Value::List(items)),
+            AggAcc::Distinct { inner, .. } => inner.finish(),
         }
     }
 }
@@ -2603,13 +2745,43 @@ fn execute_aggregate(
         arg,
     };
     let initial_row: Row = vec![None; vars.names.len()];
-    let mut acc = AggAcc::new(func);
+    let mut acc = AggAcc::for_arg(func, arg);
     agg_stream(&ctx, producers, &initial_row, &mut acc)?;
 
     let value = acc.finish();
     let mut rs = ResultSet::new(vec![column.clone()]);
     rs.push_row(vec![value]);
     Ok(rs)
+}
+
+/// The value a `DISTINCT` aggregate argument takes on one row.
+///
+/// A node variable is identified by its key, a scalar alias by its value, and
+/// a property by the property's value. `DISTINCT *` is rejected at parse
+/// time, so `Star` is unreachable and yields `None` defensively.
+fn distinct_value(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    arg: &AggArg,
+) -> Result<Option<Value>, String> {
+    match arg {
+        AggArg::Star => Ok(None),
+        AggArg::Var(v) => {
+            let Some(slot) = vars.slot(v) else {
+                return Ok(None);
+            };
+            Ok(match row.get(slot).and_then(|c| c.as_ref()) {
+                Some(Cell::Node(id)) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                Some(Cell::Scalar(val)) => Some(val.clone()),
+                Some(Cell::Path(hops)) => Some(Value::Int(*hops as i64)),
+                Some(Cell::Rel(_)) | None => None,
+            })
+        }
+        AggArg::Prop { var, field } => resolve_prop(view, vars, row, var, field),
+        // The parser never nests DISTINCT; treat a nested one as its inner arg.
+        AggArg::Distinct(inner) => distinct_value(view, vars, row, inner),
+    }
 }
 
 /// Update a single accumulator for one matched row.
@@ -2625,6 +2797,24 @@ fn update_acc(
     arg: &AggArg,
     acc: &mut AggAcc,
 ) -> Result<(), String> {
+    // DISTINCT gate: resolve the row's value for the inner argument, drop the
+    // row when this group has already seen it, and otherwise forward to the
+    // plain accumulator underneath.
+    if let AggArg::Distinct(inner_arg) = arg {
+        let AggAcc::Distinct { seen, inner } = acc else {
+            return Ok(());
+        };
+        let val = distinct_value(view, vars, row, inner_arg)?;
+        // An unbound / null argument contributes to no aggregate, DISTINCT or
+        // not: `count(DISTINCT x)` counts distinct non-null values.
+        let Some(val) = val else {
+            return Ok(());
+        };
+        if !seen.insert(group_key_normalize(&val)) {
+            return Ok(());
+        }
+        return update_acc(view, vars, row, func, inner_arg, inner);
+    }
     match (func, arg) {
         (AggFunc::Count, AggArg::Star) => {
             if let AggAcc::Count(n) = acc {
@@ -3076,21 +3266,40 @@ fn build_group_projected(
 /// (i.e., `is_pipeline = true`).  Each group becomes one `Row` with `Cell::Scalar`
 /// values for key and aggregate columns.  Column names are interned in `vars` so
 /// that subsequent pipeline stages can look them up by slot.
+/// The original cell behind each grouping key that is a bare variable.
+///
+/// Only `RetVal::Var` keys carry a cell through: a computed key (`c.city`,
+/// `toLower(c.name)`) has no node behind it and stays a scalar.
+fn key_source_cells(vars: &VarTable, row: &Row, keys: &[(String, RetItem)]) -> Vec<Option<Cell>> {
+    keys.iter()
+        .map(|(_, item)| match &item.value {
+            RetVal::Var(v) => vars
+                .slot(v)
+                .and_then(|s| row.get(s))
+                .and_then(|c| c.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn group_result_to_rows(
     keys: &[(String, RetItem)],
     aggs: &[(AggFunc, AggArg, String)],
     key_order: Vec<GroupKey>,
     groups: &mut HashMap<GroupKey, GroupEntry>,
+    key_cells: &mut HashMap<GroupKey, Vec<Option<Cell>>>,
     vars: &VarTable,
 ) -> Vec<Row> {
     let row_len = vars.names.len();
     let mut out: Vec<Row> = Vec::with_capacity(key_order.len());
     for gk in key_order {
         let (display_keys, accs) = groups.remove(&gk).unwrap_or_default();
+        let mut cells = key_cells.remove(&gk).unwrap_or_default();
+        cells.resize(keys.len(), None);
         let mut row: Row = vec![None; row_len];
-        for ((col, _), val) in keys.iter().zip(display_keys) {
+        for (((col, _), val), cell) in keys.iter().zip(display_keys).zip(cells) {
             if let Some(slot) = vars.slot(col) {
-                row[slot] = val.map(Cell::Scalar);
+                row[slot] = cell.or_else(|| val.map(Cell::Scalar));
             }
         }
         for ((_, _, col), acc) in aggs.iter().zip(accs) {
@@ -3132,7 +3341,10 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
                     .and_then(|s| row.get(s))
                     .and_then(|c| c.as_ref())
                     .and_then(|c| match c {
-                        Cell::Node(id) => view.prop(*id, field).map(|vr| vr.into_value()),
+                        Cell::Node(id) => view
+                            .prop(*id, field)
+                            .map(|vr| vr.into_value())
+                            .or_else(|| node_identity_prop(view, *id, field)),
                         Cell::Rel(e) => view.edge_props.get(e.etype, e.src, e.dst, field),
                         _ => None,
                     }),
@@ -3202,7 +3414,7 @@ fn execute_group_aggregate(
             empty_key,
             (
                 vec![],
-                aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect(),
+                aggs.iter().map(|(f, a, _)| AggAcc::for_arg(f, a)).collect(),
             ),
         );
     }
@@ -3255,7 +3467,11 @@ fn group_stream(
                     return Err(group_cap_err());
                 }
                 key_order.push(gk.clone());
-                let init: Vec<AggAcc> = ctx.aggs.iter().map(|(f, _, _)| AggAcc::new(f)).collect();
+                let init: Vec<AggAcc> = ctx
+                    .aggs
+                    .iter()
+                    .map(|(f, a, _)| AggAcc::for_arg(f, a))
+                    .collect();
                 groups.insert(gk.clone(), (display_vals, init));
             }
             let (_, accs) = groups.get_mut(&gk).unwrap();
@@ -3603,6 +3819,10 @@ fn pull_rows(
                 None
             });
 
+            // `n.key` / `n.label` are not columns, so the fused path would
+            // see an empty column and drop every row. Fall through to the
+            // generic path, which goes through `resolve_prop`.
+            let fused_filter = fused_filter.filter(|(f, _, _)| !is_identity_field(f));
             if let Some((field, cmp_op_ref, lit)) = fused_filter {
                 // Fused scan+filter: column resolved once, comparison done
                 // inline — no recursive call into pull_rows for the Filter arm.
@@ -4032,7 +4252,6 @@ fn column_name(item: &RetItem) -> String {
         // Agg column names are computed by the planner and stored in Aggregate.column;
         // this branch is unreachable for well-formed plans but needed for exhaustiveness.
         RetVal::Agg { func, arg } => {
-            use crate::cypher::ast::AggArg;
             let f = match func {
                 AggFunc::Count => "COUNT",
                 AggFunc::Sum => "SUM",
@@ -4041,12 +4260,7 @@ fn column_name(item: &RetItem) -> String {
                 AggFunc::Max => "MAX",
                 AggFunc::Collect => "COLLECT",
             };
-            let a = match arg {
-                AggArg::Star => "*".to_string(),
-                AggArg::Var(v) => v.clone(),
-                AggArg::Prop { var, field } => format!("{var}.{field}"),
-            };
-            format!("{f}({a})")
+            format!("{f}({})", agg_arg_label(arg))
         }
         RetVal::FuncCall { name, args } => {
             let arg_strs: Vec<String> = args
@@ -4059,6 +4273,7 @@ fn column_name(item: &RetItem) -> String {
                     Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
                     Operand::BinArith { .. } => "<arith>".to_string(),
                     Operand::Case { .. } => "<case>".to_string(),
+                    Operand::Index { .. } => "<index>".to_string(),
                 })
                 .collect();
             format!("{name}({})", arg_strs.join(", "))
@@ -7781,6 +7996,410 @@ LIMIT 10";
             rows_of(&fallback),
             rows_of(&indexed),
             "fallback must return identical rows"
+        );
+    }
+    // ── Task 17: the Cypher an assistant assumes exists ──────────────────────
+    //
+    // Every query below came out of a benchmark transcript where the agent
+    // wrote it, got null or a parse error, and spent its turn budget
+    // recovering. The fixtures are the association store's shape: talents
+    // joined to companies by three rule-derived edge types.
+
+    /// Talents and companies joined by three edge types.
+    ///
+    /// `c1` is reached by all three from both published talents; `c2` by only
+    /// two from `t1`; `c3` by all three but from a talent below the
+    /// experience floor. An intersection query must return `c1` alone.
+    fn assoc_graph() -> Fx {
+        let mut fx = Fx::new();
+        let t1 = fx.add(
+            "Talent",
+            "t1",
+            vec![
+                ("status", s("published")),
+                ("years_of_experience", i(12)),
+                (
+                    "specialties",
+                    Value::List(vec![s("hospitality"), s("retail")]),
+                ),
+                ("location", Value::List(vec![f(40.71), f(-74.01)])),
+            ],
+        );
+        let t2 = fx.add(
+            "Talent",
+            "t2",
+            vec![
+                ("status", s("published")),
+                ("years_of_experience", i(11)),
+                ("location", Value::List(vec![f(41.88), f(-87.63)])),
+            ],
+        );
+        let t3 = fx.add(
+            "Talent",
+            "t3",
+            vec![("status", s("published")), ("years_of_experience", i(3))],
+        );
+        let c1 = fx.add("Company", "c1", vec![("name", s("Acme Design Works"))]);
+        let c2 = fx.add("Company", "c2", vec![("name", s("Beta Studio"))]);
+        let c3 = fx.add("Company", "c3", vec![("name", s("Gamma Works"))]);
+        for (t, c) in [(t1, c1), (t2, c1), (t3, c3)] {
+            fx.edge("INDUSTRY_ALIGNMENT", t, c, vec![]);
+            fx.edge("SPECIALTY_MATCH", t, c, vec![]);
+            fx.edge("LOCATION_FIT", t, c, vec![]);
+        }
+        // c2 is joined by two of the three types only.
+        fx.edge("INDUSTRY_ALIGNMENT", t1, c2, vec![]);
+        fx.edge("SPECIALTY_MATCH", t1, c2, vec![]);
+        fx
+    }
+
+    /// `n.key` is the node's key after a plain MATCH — it used to be null,
+    /// and `RETURN c.key` is what every agent writes.
+    #[test]
+    fn node_key_reads_as_a_property() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:Company) RETURN n.key",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("c1"))],
+                vec![Some(s("c2"))],
+                vec![Some(s("c3"))]
+            ]
+        );
+    }
+
+    /// The same after a WITH aggregation with a HAVING filter — the shape the
+    /// benchmark's multihop cells died on, where the grouping key used to be
+    /// flattened to a scalar and both `c.key` and `key(c)` stopped working.
+    #[test]
+    fn node_key_survives_a_with_aggregation() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company) \
+             WITH c, count(*) AS n WHERE n >= 1 RETURN c.key, key(c), n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("c1")), Some(s("c1")), Some(i(2))],
+                vec![Some(s("c2")), Some(s("c2")), Some(i(1))],
+                vec![Some(s("c3")), Some(s("c3")), Some(i(1))],
+            ]
+        );
+    }
+
+    /// A stored property named `key` wins over the node's identity.
+    #[test]
+    fn stored_key_property_wins_over_node_key() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("key", s("stored"))]);
+        let rs = run(&fx.view(), "MATCH (n:N) RETURN n.key", &BTreeMap::new()).unwrap();
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("stored"))]]);
+    }
+
+    /// `labels(n)` returns the node's label list; `n.label` is the scalar
+    /// spelling. `labels()` used to be an unknown function.
+    #[test]
+    fn labels_and_label_read_the_node_label() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:Company) RETURN labels(n), n.label LIMIT 1",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&rs),
+            vec![vec![
+                Some(Value::List(vec![s("Company")])),
+                Some(s("Company"))
+            ]]
+        );
+    }
+
+    /// An unknown function names itself in the error rather than reading null.
+    #[test]
+    fn unknown_function_is_a_named_error() {
+        let fx = assoc_graph();
+        let err = run(
+            &fx.view(),
+            "MATCH (n:Company) RETURN nodes(n)",
+            &BTreeMap::new(),
+        )
+        .expect_err("unknown function must error");
+        assert!(err.contains("unknown function `nodes`"), "{err}");
+        assert!(
+            err.contains("labels"),
+            "error must list what is supported: {err}"
+        );
+    }
+
+    /// Infix `STARTS WITH` / `ENDS WITH` / `CONTAINS` — all three were parse
+    /// errors, and each cost a round trip in the benchmark.
+    #[test]
+    fn infix_string_predicates_filter() {
+        let fx = assoc_graph();
+        let p = BTreeMap::new();
+        for (q, want) in [
+            (
+                "MATCH (c:Company) WHERE c.name STARTS WITH 'Acme' RETURN c.key",
+                vec!["c1"],
+            ),
+            (
+                "MATCH (c:Company) WHERE c.name ENDS WITH 'Works' RETURN c.key",
+                vec!["c1", "c3"],
+            ),
+            (
+                "MATCH (c:Company) WHERE c.name CONTAINS 'Studio' RETURN c.key",
+                vec!["c2"],
+            ),
+            (
+                "MATCH (c:Company) WHERE NOT c.name CONTAINS 'Works' RETURN c.key",
+                vec!["c2"],
+            ),
+        ] {
+            let rs = run(&fx.view(), q, &p).unwrap_or_else(|e| panic!("{q}: {e}"));
+            let got: Vec<String> = (0..rs.len())
+                .map(|r| match rs.row(r)[0].clone() {
+                    Some(Value::Str(k)) => k,
+                    other => panic!("{q}: {other:?}"),
+                })
+                .collect();
+            assert_eq!(got, want, "{q}");
+        }
+    }
+
+    /// A missing or non-string property makes an infix predicate false, not
+    /// an error — same null handling as the `startsWith(a, b)` spelling.
+    #[test]
+    fn infix_string_predicate_on_missing_property_is_false() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent) WHERE t.name STARTS WITH 'x' RETURN t.key",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rows_of(&rs), Vec::<Vec<Option<Value>>>::new());
+    }
+
+    /// `STARTS` without `WITH` is a named parse error, not a silent
+    /// reinterpretation of the word as a variable.
+    #[test]
+    fn starts_without_with_is_a_named_error() {
+        let err = parse(&lex("MATCH (c:Company) WHERE c.name STARTS 'Acme' RETURN c").unwrap())
+            .expect_err("must not parse");
+        assert!(err.contains("expected WITH after STARTS"), "{err}");
+    }
+
+    /// `n.location[0]` — bracket indexing was a parse error, which forced the
+    /// benchmark's geo cells to page the whole table and filter by hand.
+    #[test]
+    fn list_subscript_reads_one_element() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent) WHERE t.key = 't1' \
+             RETURN t.location[0] AS lat, t.location[1] AS lon, \
+                    t.location[-1] AS last, t.location[7] AS oob, t.status[0] AS notalist",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&rs),
+            vec![vec![
+                Some(f(40.71)),
+                Some(f(-74.01)),
+                Some(f(-74.01)),
+                None,
+                None
+            ]]
+        );
+    }
+
+    /// `n.key` filters, orders and matches — not only projects. Each of
+    /// these goes down a different path in the executor (index-scan fallback,
+    /// bounded pull scan, raw-row ORDER BY, inline pattern property).
+    #[test]
+    fn node_key_works_in_every_position() {
+        let fx = assoc_graph();
+        let p = BTreeMap::new();
+        for (q, want) in [
+            (
+                "MATCH (c:Company) WHERE c.key = 'c2' RETURN c.key",
+                vec!["c2"],
+            ),
+            (
+                "MATCH (c:Company) WHERE c.key <> 'c1' RETURN c.key LIMIT 1",
+                vec!["c2"],
+            ),
+            (
+                "MATCH (c:Company) WITH c ORDER BY c.key DESC RETURN c.key LIMIT 1",
+                vec!["c3"],
+            ),
+            ("MATCH (c:Company {key: 'c3'}) RETURN c.key", vec!["c3"]),
+            (
+                "MATCH (c:Company) WHERE c.label = 'Company' RETURN c.key LIMIT 1",
+                vec!["c1"],
+            ),
+        ] {
+            let rs = run(&fx.view(), q, &p).unwrap_or_else(|e| panic!("{q}: {e}"));
+            let got: Vec<String> = (0..rs.len())
+                .map(|r| match rs.row(r)[0].clone() {
+                    Some(Value::Str(k)) => k,
+                    other => panic!("{q}: {other:?}"),
+                })
+                .collect();
+            assert_eq!(got, want, "{q}");
+        }
+    }
+
+    /// A subscript is usable in WHERE, not only in RETURN.
+    #[test]
+    fn list_subscript_filters() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent) WHERE t.location[0] > 41.0 RETURN t.key",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("t2"))]]);
+    }
+
+    /// `count(DISTINCT t)` counts each talent once however many rows it
+    /// produced. Without it, an alternation or a multi-pattern match
+    /// multiplies the count by the number of matching edge types.
+    #[test]
+    fn count_distinct_counts_each_binding_once() {
+        let fx = assoc_graph();
+        let q = "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT|:SPECIALTY_MATCH]->(c:Company) \
+                 WITH c, count(t) AS raw, count(DISTINCT t) AS uniq WHERE raw >= 1 \
+                 RETURN c.key, raw, uniq";
+        let rs = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("c1")), Some(i(4)), Some(i(2))],
+                vec![Some(s("c2")), Some(i(2)), Some(i(1))],
+                vec![Some(s("c3")), Some(i(2)), Some(i(1))],
+            ]
+        );
+    }
+
+    /// `collect(DISTINCT …)` dedupes the same way.
+    #[test]
+    fn collect_distinct_dedupes() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT|:SPECIALTY_MATCH]->(c:Company) \
+             WHERE c.key = 'c1' WITH collect(DISTINCT t.status) AS st RETURN st",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&rs),
+            vec![vec![Some(Value::List(vec![s("published")]))]]
+        );
+    }
+
+    /// `DISTINCT *` is rejected at parse time rather than silently ignored.
+    #[test]
+    fn count_distinct_star_is_rejected() {
+        let err =
+            parse(&lex("MATCH (n) RETURN count(DISTINCT *)").unwrap()).expect_err("must not parse");
+        assert!(
+            err.contains("DISTINCT * is not a valid aggregate argument"),
+            "{err}"
+        );
+    }
+
+    /// A variable actually named `distinct` still parses as an argument.
+    #[test]
+    fn distinct_is_still_usable_as_a_variable_name() {
+        let q = parse(&lex("MATCH (distinct) RETURN count(distinct)").unwrap()).unwrap();
+        assert_eq!(
+            q.returns[0].value,
+            RetVal::Agg {
+                func: crate::cypher::ast::AggFunc::Count,
+                arg: crate::cypher::ast::AggArg::Var("distinct".into()),
+            }
+        );
+    }
+
+    /// Comma-separated patterns in one MATCH bind the same variables across
+    /// every pattern — the intersection shape every multihop question needs.
+    /// A company joined by only two of the three types must not survive.
+    #[test]
+    fn comma_patterns_intersect_on_shared_variables() {
+        let fx = assoc_graph();
+        let q = "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company), \
+                       (t)-[:SPECIALTY_MATCH]->(c), \
+                       (t)-[:LOCATION_FIT]->(c) \
+                 WHERE t.status = 'published' AND t.years_of_experience >= 10 \
+                 WITH c, count(DISTINCT t) AS n WHERE n >= 2 \
+                 RETURN c.key, n ORDER BY n DESC";
+        let rs = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("c1")), Some(i(2))]]);
+    }
+
+    /// The same query with the threshold dropped lists every company joined
+    /// by all three types, and only those: `c2` (two types) is absent, `c3`
+    /// (three types, under-experienced talent) is filtered by the WHERE.
+    #[test]
+    fn comma_patterns_exclude_partial_matches() {
+        let fx = assoc_graph();
+        let q = "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company), \
+                       (t)-[:SPECIALTY_MATCH]->(c), \
+                       (t)-[:LOCATION_FIT]->(c) \
+                 WHERE t.years_of_experience >= 10 \
+                 WITH c, count(DISTINCT t) AS n RETURN c.key, n";
+        let rs = run(&fx.view(), q, &BTreeMap::new()).unwrap();
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("c1")), Some(i(2))]]);
+    }
+
+    /// Comma-separated patterns and a run of separate MATCH clauses parse to
+    /// the same query.
+    #[test]
+    fn comma_patterns_equal_separate_match_clauses() {
+        let commas =
+            parse(&lex("MATCH (a:A)-[:X]->(b:B), (a)-[:Y]->(b) RETURN a.key").unwrap()).unwrap();
+        let clauses =
+            parse(&lex("MATCH (a:A)-[:X]->(b:B) MATCH (a)-[:Y]->(b) RETURN a.key").unwrap())
+                .unwrap();
+        assert_eq!(commas.matches, clauses.matches);
+    }
+
+    /// Comma-separated patterns with no shared variable are a cartesian
+    /// product, the openCypher meaning.
+    #[test]
+    fn comma_patterns_without_shared_vars_are_a_product() {
+        let mut fx = Fx::new();
+        fx.add("A", "a1", vec![]);
+        fx.add("A", "a2", vec![]);
+        fx.add("B", "b1", vec![]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (a:A), (b:B) RETURN a.key, b.key",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("a1")), Some(s("b1"))],
+                vec![Some(s("a2")), Some(s("b1"))],
+            ]
         );
     }
 }

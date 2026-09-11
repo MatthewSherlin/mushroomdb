@@ -115,6 +115,16 @@ pub enum AggArg {
     Var(String),
     /// `SUM(var.field)`, `AVG(var.field)`, etc.
     Prop { var: String, field: String },
+    /// `COUNT(DISTINCT var)` / `COLLECT(DISTINCT var.field)` — the inner
+    /// argument is fed to the accumulator at most once per distinct value
+    /// within a group.
+    ///
+    /// This is what makes an N-way relation intersection expressible: a
+    /// company reached by three edge types yields three rows per talent, and
+    /// only `count(DISTINCT t)` counts the talent once. The parser rejects
+    /// `DISTINCT *` and nested `DISTINCT`, so the inner argument is always
+    /// `Star`-free and one level deep.
+    Distinct(Box<AggArg>),
 }
 
 /// Hop-count range for variable-length relationship patterns (`*min..max`).
@@ -214,6 +224,17 @@ pub enum Operand {
         op: ArithOp,
         left: Box<Operand>,
         right: Box<Operand>,
+    },
+    /// List subscript: `n.tags[0]`, `n.location[1]`, `$list[$i]`.
+    ///
+    /// Evaluates `base`, which must be a `Value::List`, and returns the
+    /// element at `index`. A negative index counts from the end
+    /// (openCypher §3.4.4). An out-of-range index, a non-list base, or a
+    /// non-integer index all evaluate to null rather than erroring, so a
+    /// subscript behaves like a missing property.
+    Index {
+        base: Box<Operand>,
+        index: Box<Operand>,
     },
     /// Generic `CASE WHEN <cond> THEN <value> [WHEN …] [ELSE <value>] END`.
     /// Evaluates each branch's condition in order, returning the first matching
