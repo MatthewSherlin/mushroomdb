@@ -338,6 +338,18 @@ without `LIMIT` still error at 1,000,000 intermediate rows.
 }
 ```
 
+A rule whose vector index is still being built carries an extra `building`
+object and derives no edges until it disappears:
+
+```json
+{"name": "sim", "edges": 0, "tripped": false, "fires": 0, "approximate": true,
+ "building": {"rule": "sim", "indexed": 2048, "total": 120000}}
+```
+
+The field is absent for every rule that is not building. See
+[POST /rules](#post-rules) for what starts a build and
+`mushroomdb build-index` for finishing one on a quiet store.
+
 ---
 
 ### GET /metrics
@@ -448,6 +460,21 @@ creates edges in both directions. An undirected Cypher pattern
 
 Returns 400 with `{"error": "..."}` on validation failure (unknown field
 type, missing required field, duplicate rule name).
+
+**202 while the index builds.** An approximate VectorSimilar rule over more
+than 2,048 vectors cannot index its corpus in one commit, so the route installs
+the rule, indexes the first slice, and returns `202 Accepted` with the progress
+instead of `200`:
+
+```json
+{"rule": "sim", "building": {"indexed": 2048, "total": 120000}}
+```
+
+The rule derives **no** edges until the build finishes — never a partial set —
+and `GET /stats` reports the same progress under `building`. Every write
+advances the build by one slice, `mushroomdb serve` advances it once a second,
+and `mushroomdb build-index <db-dir>` drives it to completion. At or below
+2,048 vectors nothing changes: one commit, `200`, edges present on return.
 
 Predicate JSON shapes:
 

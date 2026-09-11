@@ -291,6 +291,44 @@ graph closure, compliance checks).
 The `explain` endpoint marks approximate edges with `"approximate": true`
 in the predicate summary.
 
+### Creating a rule over a large corpus
+
+Building an HNSW graph is superlinear in the number of vectors, and
+`create_rule` holds the write lock for the whole of it. Above **2,048 vectors**
+(`core_rules::HNSW_BUILD_BATCH`) the build is therefore sliced: `create_rule`
+installs the rule, files every non-vector index leg, indexes the first 2,048
+vectors, and **returns before its edges exist**.
+
+```text
+create_rule ──▶ rule installed, 2048/120000 indexed, 0 edges
+   pump ──▶ 4096/120000 ─▶ … ─▶ 120000/120000 ─▶ backfill (one commit) ─▶ edges
+```
+
+While a rule is in that state:
+
+- `GET /stats` (and `GraphDb::stats`) reports it under `building`
+  (`{"rule", "indexed", "total"}`), and `POST /rules` answered `202 Accepted`.
+- It derives **no** edges. Never a partial set: the backfill is a single commit
+  that runs after the index is whole, through the same path `rebuild_rule` uses.
+- Three things advance it, and any one of them is enough:
+  1. **Any write.** Every durable commit does one slice on its way out, so a
+     store that is being written to finishes on its own.
+  2. **`mushroomdb serve`.** A 1-second ticker calls `pump_index_build`, so a
+     quiescent server finishes too.
+  3. **`mushroomdb build-index <db-dir> [--rule <name>]`.** Drives it to
+     completion now, one progress line per slice, for an operator who wants the
+     build done before traffic arrives. `GraphDb::pump_index_build` is the Rust
+     equivalent: one write lock and at most one slice per pending rule per call.
+
+A store killed mid-build reopens with the rule present and its index partly
+built; the snapshot's graph covers what it carried, the open-time scan covers
+the rest, and the next pump issues the backfill.
+
+**Breaking change in 0.6.6:** code that created an approximate rule over more
+than 2,048 vectors and immediately asserted an edge count must now pump first.
+At or below 2,048 vectors nothing changed — one commit, edges present the
+moment `create_rule` returns.
+
 ---
 
 ## Provenance and explain
