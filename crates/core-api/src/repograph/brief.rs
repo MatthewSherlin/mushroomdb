@@ -462,6 +462,17 @@ fn ends(labels: &[String]) -> Vec<String> {
 /// value in a `what_if` — stays an angle-bracketed placeholder rather than an
 /// invention.
 ///
+/// # The keys come back through `key(n)`
+///
+/// A node's key is not a property, so `RETURN n.key` parses, runs, and answers
+/// a column of nulls. `key(n)` is the function that returns it. Same failure
+/// mode as the commit below: a line that reads like a call and answers
+/// nothing.
+///
+/// In the counting recipe the key is taken in the `WITH` rather than the
+/// `RETURN`, because after a grouping `WITH` the variable is a projected
+/// scalar and no longer a node: `key(b)` in the `RETURN` errors there.
+///
 /// # The commit is a commit, not a count
 ///
 /// `history: N commits` counts; `edges_at`'s `at` is a zero-based WAL index
@@ -523,12 +534,34 @@ fn recipes(
                 .or_else(|| usable.next())
         })
         .map_or_else(|| "<field>".to_string(), |f| sanitize(f));
-    let role = roles
-        .first()
-        .map_or_else(|| "<name>".to_string(), |(n, _)| n.clone());
-    let probe_label = labels
-        .first()
-        .map_or_else(|| "<label>".to_string(), |l| l.label.clone());
+    // The role and the label it probes have to be chosen *together*. Picked
+    // independently — the first role, the most populous label — the
+    // association store rendered `MATCH (n:Talent) … role: client`, and
+    // `client` reads only `Company` and `Job`: zero rows, and the session that
+    // copies the line learns the tool is broken. So walk the roles in the
+    // order they are printed and take the first that can see any label at all,
+    // probing the busiest label it can see (`labels` is already sorted most
+    // populous first). A store whose roles name no label the brief lists —
+    // roles scoped to individual keys, or no roles at all — falls back to the
+    // first role and the busiest label, which is as much as can be said.
+    let (role, probe_label) = roles
+        .iter()
+        .find_map(|(name, visible)| {
+            labels
+                .iter()
+                .find(|l| visible.iter().any(|v| *v == l.label))
+                .map(|l| (name.clone(), l.label.clone()))
+        })
+        .unwrap_or_else(|| {
+            (
+                roles
+                    .first()
+                    .map_or_else(|| "<name>".to_string(), |(n, _)| n.clone()),
+                labels
+                    .first()
+                    .map_or_else(|| "<label>".to_string(), |l| l.label.clone()),
+            )
+        });
     // The counting template. The busiest edge type, with the labels it was
     // actually seen between.
     let (l1, etype, l2) = edge_types.first().map_or_else(
@@ -566,14 +599,14 @@ fn recipes(
         Recipe {
             question: "who may see".to_string(),
             call: format!(
-                "query 'MATCH (n:{probe_label}) RETURN n.key LIMIT {ROLE_PROBE_ROWS}' role: {role}"
+                "query 'MATCH (n:{probe_label}) RETURN key(n) LIMIT {ROLE_PROBE_ROWS}' role: {role}"
             ),
         },
         Recipe {
             question: "how many".to_string(),
             call: format!(
-                "MATCH (a:{l1})-[:{etype}]->(b:{l2}) WITH b, count(a) AS n \
-                 WHERE n >= {HOW_MANY_MIN} RETURN b.key, n"
+                "MATCH (a:{l1})-[:{etype}]->(b:{l2}) WITH key(b) AS b_key, count(a) AS n \
+                 WHERE n >= {HOW_MANY_MIN} RETURN b_key, n"
             ),
         },
     ]);

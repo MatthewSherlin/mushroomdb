@@ -854,10 +854,14 @@ fn seeded_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::RealFs
         )
         .expect("project");
     }
+    // All three on one project, so the `how many` recipe — which filters on
+    // `n >= HOW_MANY_MIN`, three — has an answer on the store it was rendered
+    // from. A fixture whose own worked call returns nothing cannot pin that
+    // the call works.
     for (key, name, team, project) in [
         ("person:ada", "Ada", "core", "project:apollo"),
         ("person:bob", "Bob", "core", "project:apollo"),
-        ("person:cy", "Cy", "web", "project:borealis"),
+        ("person:cy", "Cy", "web", "project:apollo"),
     ] {
         db.insert_node(
             "Person",
@@ -975,14 +979,17 @@ fn brief_on_a_memory_store_works_one_call_per_question_kind() {
             // reads, so the call shown is one that would really lose and gain
             // an edge. Only the new value stays a placeholder.
             ("what if", "what_if person:ada project_id <value>"),
+            // `key(n)`, not `n.key`: a node's key is not a property, so
+            // `n.key` renders a column of nulls. Pinned by
+            // `every_cypher_recipe_answers_on_the_store_it_came_from`.
             (
                 "who may see",
-                "query 'MATCH (n:Person) RETURN n.key LIMIT 20' role: analyst",
+                "query 'MATCH (n:Person) RETURN key(n) LIMIT 20' role: analyst",
             ),
             (
                 "how many",
-                "MATCH (a:Person)-[:ASSIGNED_TO]->(b:Project) WITH b, count(a) AS n \
-                 WHERE n >= 3 RETURN b.key, n",
+                "MATCH (a:Person)-[:ASSIGNED_TO]->(b:Project) WITH key(b) AS b_key, \
+                 count(a) AS n WHERE n >= 3 RETURN b_key, n",
             ),
         ],
         "every placeholder the store can fill is filled"
@@ -1259,6 +1266,211 @@ fn a_wide_memory_schema_is_counted_off_and_keeps_every_worked_call() {
     assert!(
         text.ends_with("reach the graph: query '<cypher>'\n"),
         "{text}"
+    );
+}
+
+/// A memory store whose busiest label is one the first role cannot see —
+/// the shape of the real association store, where `client` reads only
+/// `Company` and `Job` while `Talent` is the most populous label.
+///
+/// Picking the role and the probe label independently rendered
+/// `MATCH (n:Talent) … role: client`, which answers zero rows.
+fn role_scoped_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::RealFs> {
+    use core_api::schema::Schema;
+    use core_api::{Predicate, RoleDef, RuleDef, Value};
+
+    let dir = tmp(name);
+    let mut db = open(&dir);
+    db.apply_schema(&Schema {
+        fulltext: vec![],
+        indexes: vec![],
+        rules: vec![RuleDef {
+            name: "works_at".into(),
+            src_label: "Talent".into(),
+            dst_label: "Company".into(),
+            predicate: Predicate::KeyMatch {
+                field: "company_id".into(),
+            },
+            edge_type: "WORKS_AT".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        }],
+        views: vec![],
+        roles: vec![
+            // Sorts first, and sees neither the busiest label nor the label
+            // the busiest edge type starts at.
+            RoleDef {
+                name: "client".into(),
+                keys: vec![],
+                labels: vec!["Company".into(), "Job".into()],
+                write: None,
+            },
+            RoleDef {
+                name: "recruiter".into(),
+                keys: vec![],
+                labels: vec!["Company".into(), "Job".into(), "Talent".into()],
+                write: None,
+            },
+        ],
+    })
+    .expect("schema");
+
+    for key in ["company:acme", "company:globex"] {
+        db.insert_node("Company", key, vec![]).expect("company");
+    }
+    for (key, company) in [
+        ("job:backend", "company:acme"),
+        ("job:frontend", "company:acme"),
+        ("job:sre", "company:globex"),
+    ] {
+        db.insert_node("Job", key, vec![]).expect("job");
+        db.insert_edge("POSTED", company, key).expect("posted");
+    }
+    // Three at acme, so the `how many` recipe's `n >= 3` filter has an answer.
+    for (key, company) in [
+        ("talent:ada", "company:acme"),
+        ("talent:bob", "company:acme"),
+        ("talent:cy", "company:acme"),
+        ("talent:di", "company:globex"),
+        ("talent:eve", "company:globex"),
+    ] {
+        db.insert_node(
+            "Talent",
+            key,
+            vec![("company_id".into(), Value::Str(company.to_string()))],
+        )
+        .expect("talent");
+    }
+    db
+}
+
+/// Run one recipe's call if it is Cypher, and say how many rows it answered.
+///
+/// `None` for a recipe that is a tool call rather than a query. A role, where
+/// the recipe names one, is resolved to its mask and the query runs under it —
+/// which is what the session copying the line will experience.
+fn run_recipe_cypher(
+    db: &core_api::GraphDb<core_storage::fs::RealFs>,
+    call: &str,
+) -> Option<core_query::ResultSet> {
+    let params = std::collections::BTreeMap::new();
+    let (cypher, role) = if let Some(rest) = call.strip_prefix("query '") {
+        let (cypher, tail) = rest.split_once('\'').expect("a closed quote");
+        (cypher, tail.strip_prefix(" role: "))
+    } else if call.starts_with("MATCH ") {
+        (call, None)
+    } else {
+        return None;
+    };
+    let rs = match role {
+        Some(role) => {
+            let mask = db
+                .mask_for_role(role)
+                .unwrap_or_else(|e| panic!("the recipe names a role the store has: {role}: {e}"));
+            db.query_masked(cypher, &params, &mask)
+        }
+        None => db.query(cypher, &params),
+    }
+    .unwrap_or_else(|e| panic!("the brief's own worked call must run: {call:?}: {e}"));
+    Some(rs)
+}
+
+/// Binding: every Cypher recipe the brief renders answers on the very store it
+/// was computed from — at least one row, and no null cell in it.
+///
+/// Two ways a recipe can read like a call and answer nothing, both of which
+/// shipped:
+///
+/// - `RETURN n.key`. A node's key is not a property, so the query runs, returns
+///   the right number of rows, and every cell is null.
+/// - a role and a label chosen independently. On the association store that
+///   rendered `MATCH (n:Talent) … role: client`, and `client` sees only
+///   `Company` and `Job` — zero rows.
+///
+/// So the test does not read the recipes: it runs them, under the role each
+/// names, and looks at the cells.
+#[test]
+fn every_cypher_recipe_answers_on_the_store_it_came_from() {
+    for db in [
+        seeded_memory_store("brief-recipes-run"),
+        role_scoped_memory_store("brief-recipes-roles"),
+    ] {
+        let b = brief(&db, &BriefOptions::default());
+        let s = b.schema.as_ref().expect("a memory store has a schema");
+        let text = render_brief(&b, "query '<cypher>'");
+        let mut ran = 0;
+        for r in &s.recipes {
+            assert!(
+                text.lines()
+                    .any(|l| l == format!("  {}: {}", r.question, r.call)),
+                "the brief must print {:?}:\n{text}",
+                r.question
+            );
+            let Some(rs) = run_recipe_cypher(&db, &r.call) else {
+                continue;
+            };
+            ran += 1;
+            assert!(
+                !rs.is_empty(),
+                "the {:?} recipe answers no rows: {}",
+                r.question,
+                r.call
+            );
+            for i in 0..rs.len() {
+                assert!(
+                    rs.row(i).iter().all(Option::is_some),
+                    "the {:?} recipe answers a null cell — a column that is not \
+                     a property: {} → {:?}",
+                    r.question,
+                    r.call,
+                    rs.row(i)
+                );
+            }
+        }
+        assert_eq!(ran, 2, "the brief renders two Cypher recipes");
+    }
+}
+
+/// Binding: the role recipe names a label the role it names can actually see.
+#[test]
+fn the_role_recipe_probes_a_label_that_role_can_see() {
+    let db = role_scoped_memory_store("brief-role-visible");
+    let b = brief(&db, &BriefOptions::default());
+    let s = b.schema.as_ref().expect("a memory store has a schema");
+
+    assert_eq!(
+        s.labels[0].label, "Talent",
+        "the busiest label is the one no role sorted first can see"
+    );
+    let call = &s
+        .recipes
+        .iter()
+        .find(|r| r.question == "who may see")
+        .expect("a store with roles shows the role recipe")
+        .call;
+
+    let role = call
+        .rsplit(" role: ")
+        .next()
+        .expect("the recipe names a role");
+    let visible: &[String] = &s
+        .roles
+        .iter()
+        .find(|(n, _)| n == role)
+        .expect("a real role")
+        .1;
+    let label = call
+        .split_once("MATCH (n:")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .expect("the recipe probes a label")
+        .0;
+    assert!(
+        visible.iter().any(|l| l == label),
+        "role {role} cannot see {label}: {call}"
     );
 }
 
