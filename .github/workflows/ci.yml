@@ -320,3 +320,7 @@ jobs:
       - run: npm i -g @anthropic-ai/claude-code@2
       - run: claude plugin validate packaging/plugin --strict
       - run: bash scripts/render-plugin.sh --check
+      # The v0.6.4 claim scrub: no "faster coding" / "fewer tokens" claim in a
+      # product-facing file, and no skill telling an agent to call the graph
+      # ahead of a search. See scripts/check-claims.sh for why.
+      - run: bash scripts/check-claims.sh
