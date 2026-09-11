@@ -43,12 +43,26 @@ jobs:
         with: { toolchain: "1.92.0" }
       # hnsw_5k_1536_recall: 5k vectors × 1536-D HNSW; asserts min recall@10 ≥ 0.90, mean ≥ 0.95.
       - run: cargo test --release -p mushroomdb-rules -- hnsw_5k_1536_recall --ignored --nocapture
+      # clustered_recall_survives_clusters_wider_than_m0: 40 clusters of 120 × 128-D, so a
+      # cluster is wider than m0=64 — the case the §3.5 heuristic replaced M₀=128 for.
+      # Asserts min recall@10 ≥ 0.70, mean ≥ 0.95.
+      - run: cargo test --release -p mushroomdb-rules -- clustered_recall_survives_clusters_wider_than_m0 --ignored --nocapture
+      # recall_survives_insert_remove_churn: the same 5k × 1536-D corpus put through an
+      # insert/remove/re-insert sequence, then scored against brute force over the
+      # survivors. Asserts min recall@10 ≥ 0.90, mean ≥ 0.95 — a graph that heals badly
+      # answers from the wrong neighbourhood, and nothing else in CI would notice.
+      - run: cargo test --release -p mushroomdb-rules -- recall_survives_insert_remove_churn --ignored --nocapture
       # approximate_recall_above_floor_1536dim_1k: 1024-node HNSW × 1536-D; asserts recall ≥ 0.90.
       - run: cargo test --release -p sim-harness -- approximate_recall_above_floor_1536dim_1k --ignored --nocapture
-      # approximate_recall_5k_timing: 5k-node HNSW × 1536-D; asserts recall ≥ 0.90 at M₀=128.
-      # Measured: recall 1.0000 (approx=495000 exact=495000) at M₀=128/k=128/ef=400.
+      # approximate_recall_5k_timing: 5k-node HNSW × 1536-D; asserts recall ≥ 0.90.
       # Note: this test takes ~4.5 min (HNSW backfill 227 s + exact O(n²) ground truth ~43 s).
+      # The M₀=128/ef=400 measurement this comment used to quote is superseded: the index
+      # shape is now HnswParams::default() (see docs/site/rules.md).
       - run: cargo test --release -p sim-harness -- approximate_recall_5k_timing --ignored --nocapture
+      # exact_vector_rule_recall_5k: an exact VectorSimilar rule over the same
+      # 5k × 1536-D corpus; asserts recall >= 0.98 against the same O(n^2)
+      # ground truth the approximate gate uses.
+      - run: cargo test --release -p sim-harness -- exact_vector_rule_recall_5k --ignored --nocapture
 
   # Every historical snapshot format (V5..V9) must open, migrate, and preserve
   # data, forever. Naming this job separately means a regression says

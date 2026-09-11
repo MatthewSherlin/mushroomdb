@@ -329,6 +329,87 @@ than 2,048 vectors and immediately asserted an edge count must now pump first.
 At or below 2,048 vectors nothing changed — one commit, edges present the
 moment `create_rule` returns.
 
+### Vector index parameters
+
+The HNSW graph has one shape, store-wide — not per rule. Nothing in it is
+persisted: the parameters bound how a graph is *built*, never how a built graph
+is *read*, so a snapshot written under one shape opens correctly under any
+other.
+
+| Parameter | Default | Was (0.6.5) | Raising it buys | Raising it costs |
+|---|---|---|---|---|
+| `m` | 16 | 32 | Denser upper layers, so the descent needs fewer restarts | Build time and memory on every layer above 0 |
+| `m0` | 64 | 128 | Denser layer 0, the layer every query finishes in | Memory per vector, and build time quadratically — the prune scores every candidate against every neighbour already kept |
+| `ef_construction` | 200 | 400 | A better candidate pool at insert time, so better neighbours | Build time, linearly |
+| `ef_search` | 400 | 400 | Recall per query | Query latency, linearly. It is a *floor* under the query's own `k`: asking for more than 400 neighbours widens the beam to match |
+
+Since 0.6.6 the prune is the HNSW paper's §3.5 diverse-neighbour heuristic
+(Algorithm 4): a candidate is kept only when it is closer to the node than to
+every neighbour already kept, because a candidate sitting behind an existing
+neighbour is already reachable through it. `m0` was 128 before 0.6.6 purely to
+compensate for not having that heuristic, and halves now that it exists.
+
+`ef_search` did **not** fall with the rest. At 1,536 dimensions the
+nearest-neighbour distribution is flat enough that recall is a beam-width
+problem before it is a graph-shape problem, and `hnsw_5k_1536_recall` rejects
+every narrower beam: at `ef_search` = 128 its min recall@10 is 0.30 at
+`m0` = 32 and 0.70 at `m0` = 64, against a floor of 0.90.
+
+**Overriding them.** Set `MUSHROOMDB_HNSW_PARAMS` to
+`m,m0,ef_construction,ef_search`:
+
+```sh
+MUSHROOMDB_HNSW_PARAMS=16,64,300,256 mushroomdb serve ./db
+```
+
+It is read once per process, before the first insert. Unset, malformed, or
+carrying a zero in any field, it falls back to the defaults above — a zero `m0`
+is a graph with no edges. It is for benchmarking and for an operator who has
+measured their own corpus; there is no per-rule knob.
+
+**Memory per indexed vector**, as arithmetic rather than as a measured total:
+`m0 × 4` bytes of layer-0 adjacency plus `dim × 8` bytes of vector, so 256 B +
+12,288 B at the defaults with a 1,536-D embedding. Layers above 0 add `m × 4`
+bytes for the minority of nodes that have them, and the reverse-adjacency index
+that makes a removal O(in-degree) holds one more `u32` per link — so the
+adjacency figure roughly doubles in practice. Halving `m0` halves all of it.
+
+**The recall these defaults are held to**, by tests that run in CI's
+`recall-gates` job:
+
+| Test | Corpus | Floor |
+|---|---|---|
+| `hnsw_5k_1536_recall` (`crates/core-rules/src/hnsw.rs`) | 5,000 × 1,536-D, 50 queries | min recall@10 ≥ 0.90, mean ≥ 0.95 |
+| `recall_survives_insert_remove_churn` (same file) | 5,000 × 1,536-D, then an insert/remove/re-insert sequence | min recall@10 ≥ 0.90, mean ≥ 0.95 against brute force over the survivors |
+| `clustered_recall_survives_clusters_wider_than_m0` (same file) | 40 clusters of 120 × 128-D — clusters wider than `m0` | min recall@10 ≥ 0.70, mean ≥ 0.95 |
+| `approximate_recall_above_floor_1536dim_1k` (`crates/sim-harness/tests/oracle_equivalence.rs`) | 1,024 × 1,536-D derived edge set | recall ≥ 0.90 |
+| `approximate_recall_5k_timing` (same file) | 5,000 × 1,536-D derived edge set | recall ≥ 0.90 |
+| `exact_vector_rule_recall_5k` (same file) | the same corpus, `approximate: false` | recall ≥ 0.98 |
+
+A parameter set that cannot pass those is not shipped.
+
+**Measuring a change to them.** `crates/core-rules/tests/hnsw_scale.rs` builds
+2k / 10k / 50k indexes at 1,536-D and asserts the build stays sub-quadratic, the
+50k case finishes, and re-embedding one node costs the same at 50k as at 2k. It
+is a wall-clock measurement, so it is not in CI:
+
+```sh
+MUSHROOMDB_BENCH_HNSW=1 cargo test --release -p mushroomdb-rules \
+  --test hnsw_scale -- --ignored --nocapture
+```
+
+Its sibling `hnsw_memory_per_node_5k_1536` prints bytes per indexed vector, and
+honours `MUSHROOMDB_HNSW_PARAMS`, so a proposed shape can be compared against
+the default before it is adopted.
+
+**Its growth assertions do not pass today.** Measured at the defaults, the build
+is 49.60 s at 2,000 vectors and 730.84 s at 10,000 — 14.73× for 5× the vectors,
+against a ceiling of 8×, so the 50,000 case is hours rather than the five
+minutes the benchmark allows it. Building a large vector index is therefore
+still something to do once, ahead of traffic (see *Creating a rule over a large
+corpus* above), not something to absorb inline. The benchmark is committed
+failing on purpose: it is the gate that will say when that changes.
+
 ---
 
 ## Provenance and explain
