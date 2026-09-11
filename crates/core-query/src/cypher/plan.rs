@@ -5,8 +5,8 @@
 //! *start* node of a MATCH whose variable is already bound.
 
 use super::ast::{
-    AggArg, AggFunc, Expr, LimitSkip, NodePat, Operand, OptionalClause, OrderItem, OrderTarget,
-    Pattern, Query, RelDir, RelPat, RetItem, RetVal, UnwindExpr, WithStage,
+    ret_val_label, AggArg, AggFunc, Expr, LimitSkip, NodePat, Operand, OptionalClause, OrderItem,
+    OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, UnwindExpr, WithStage,
 };
 use crate::filter::CmpOp;
 use std::collections::BTreeSet;
@@ -1319,28 +1319,10 @@ fn column_name(item: &RetItem) -> String {
     if let Some(alias) = &item.alias {
         return alias.clone();
     }
-    match &item.value {
-        RetVal::Var(v) => v.clone(),
-        RetVal::Prop { var, field } => format!("{var}.{field}"),
+    ret_val_label(&item.value).unwrap_or_else(|| match &item.value {
         RetVal::Agg { func, arg } => agg_column_name(func, arg),
-        RetVal::FuncCall { name, args } => {
-            let arg_strs: Vec<String> = args
-                .iter()
-                .map(|a| match a {
-                    Operand::Var(v) => v.clone(),
-                    Operand::Prop { var, field } => format!("{var}.{field}"),
-                    Operand::Lit(_) => "<lit>".to_string(),
-                    Operand::Param(p) => format!("${p}"),
-                    Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
-                    Operand::BinArith { .. } => "<arith>".to_string(),
-                    Operand::Case { .. } => "<case>".to_string(),
-                    Operand::Index { .. } => "<index>".to_string(),
-                })
-                .collect();
-            format!("{name}({})", arg_strs.join(", "))
-        }
-        RetVal::ScalarExpr(_) => "<expr>".to_string(),
-    }
+        _ => unreachable!("ret_val_label names every non-aggregate item"),
+    })
 }
 
 /// Every variable an aggregate argument reads must be bound, through any

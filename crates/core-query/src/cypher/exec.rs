@@ -1,7 +1,8 @@
 //! Cypher executor: `PlanOp` sequence → `ResultSet` over a binding table.
 
 use crate::cypher::ast::{
-    AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem, OrderTarget, RetItem, RetVal, UnwindExpr,
+    ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem, OrderTarget, RetItem,
+    RetVal, UnwindExpr,
 };
 use crate::cypher::plan::PlanOp;
 use crate::cypher::RelDir;
@@ -326,9 +327,20 @@ fn execute_inner(
 
     // Pipeline plans (WITH / UNWIND / LeftOuterApply) always use the staged
     // path so that intermediate rows are correctly sequenced.
-    // A GroupAggregate followed by a Filter means aggregate-WITH with a HAVING
-    // clause — route through staged path so the Filter evaluates against
-    // Cell::Scalar rows produced by group_result_to_rows.
+    //
+    // So does a `GroupAggregate` followed by a `Filter` or a `Project`. Both
+    // mean an aggregate `WITH` with something after it — a HAVING clause, or
+    // a RETURN that projects the groups — and both have to see the
+    // `Cell::Scalar`/`Cell::Node` rows `group_result_to_rows` produces. The
+    // streaming `execute_group_aggregate` path emits the group table itself
+    // and ignores every op after the aggregate except ORDER BY / SKIP /
+    // LIMIT, so a `Project` there was silently dropped: `WITH c, count(t) AS
+    // n RETURN c.name, n * 2 AS dbl` came back as columns `c` and `n`
+    // carrying the group key and the raw count.
+    //
+    // A plain aggregate with no `WITH` (`RETURN c.name, count(*)`) has its
+    // columns in the `GroupAggregate` op itself and no `Project` after it, so
+    // it keeps the streaming path.
     let is_pipeline = plan.iter().any(|op| {
         matches!(
             op,
@@ -341,7 +353,7 @@ fn execute_inner(
                 saw_gagg = true;
                 false
             } else {
-                saw_gagg && matches!(op, PlanOp::Filter { .. })
+                saw_gagg && matches!(op, PlanOp::Filter { .. } | PlanOp::Project { .. })
             }
         })
     };
@@ -1128,41 +1140,14 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                             intern_operand(&mut vars, op);
                         }
                     }
-                    // Intern output column name (alias or derived).
+                    // Intern output column name (alias or derived). The
+                    // derived name must be the one `column_name` gives the
+                    // same item, or the slot a later stage looks the alias up
+                    // in does not exist.
                     if let Some(alias) = &item.alias {
                         vars.intern(alias);
-                    } else {
-                        match &item.value {
-                            RetVal::Var(name) => {
-                                vars.intern(name);
-                            }
-                            RetVal::Prop { var, field } => {
-                                let col = format!("{var}.{field}");
-                                vars.intern(&col);
-                            }
-                            RetVal::Agg { .. } => {}
-                            RetVal::ScalarExpr(_) => {
-                                vars.intern("<expr>");
-                            }
-                            RetVal::FuncCall { name, args } => {
-                                // Compute canonical column name inline.
-                                let arg_strs: Vec<String> = args
-                                    .iter()
-                                    .map(|a| match a {
-                                        Operand::Var(v) => v.clone(),
-                                        Operand::Prop { var, field } => format!("{var}.{field}"),
-                                        Operand::Lit(_) => "<lit>".to_string(),
-                                        Operand::Param(p) => format!("${p}"),
-                                        Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
-                                        Operand::BinArith { .. } => "<arith>".to_string(),
-                                        Operand::Case { .. } => "<case>".to_string(),
-                                        Operand::Index { .. } => "<index>".to_string(),
-                                    })
-                                    .collect();
-                                let col = format!("{name}({})", arg_strs.join(", "));
-                                vars.intern(&col);
-                            }
-                        }
+                    } else if let Some(col) = ret_val_label(&item.value) {
+                        vars.intern(&col);
                     }
                 }
                 if let Some(expr) = where_expr {
@@ -4246,11 +4231,10 @@ fn column_name(item: &RetItem) -> String {
     if let Some(alias) = &item.alias {
         return alias.clone();
     }
-    match &item.value {
-        RetVal::Var(v) => v.clone(),
-        RetVal::Prop { var, field } => format!("{var}.{field}"),
-        // Agg column names are computed by the planner and stored in Aggregate.column;
-        // this branch is unreachable for well-formed plans but needed for exhaustiveness.
+    // Agg column names are computed by the planner and stored on the plan op;
+    // this branch is unreachable for well-formed plans but needed for
+    // exhaustiveness.
+    ret_val_label(&item.value).unwrap_or_else(|| match &item.value {
         RetVal::Agg { func, arg } => {
             let f = match func {
                 AggFunc::Count => "COUNT",
@@ -4262,24 +4246,8 @@ fn column_name(item: &RetItem) -> String {
             };
             format!("{f}({})", agg_arg_label(arg))
         }
-        RetVal::FuncCall { name, args } => {
-            let arg_strs: Vec<String> = args
-                .iter()
-                .map(|a| match a {
-                    Operand::Var(v) => v.clone(),
-                    Operand::Prop { var, field } => format!("{var}.{field}"),
-                    Operand::Lit(_) => "<lit>".to_string(),
-                    Operand::Param(p) => format!("${p}"),
-                    Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
-                    Operand::BinArith { .. } => "<arith>".to_string(),
-                    Operand::Case { .. } => "<case>".to_string(),
-                    Operand::Index { .. } => "<index>".to_string(),
-                })
-                .collect();
-            format!("{name}({})", arg_strs.join(", "))
-        }
-        RetVal::ScalarExpr(_) => "<expr>".to_string(),
-    }
+        _ => unreachable!("ret_val_label names every non-aggregate item"),
+    })
 }
 
 fn exec_project(
@@ -8378,6 +8346,176 @@ LIMIT 10";
             parse(&lex("MATCH (a:A)-[:X]->(b:B) MATCH (a)-[:Y]->(b) RETURN a.key").unwrap())
                 .unwrap();
         assert_eq!(commas.matches, clauses.matches);
+    }
+
+    // ── Task 17 fix round 1 ──────────────────────────────────────────────
+
+    /// An aggregate `WITH` with no `WHERE` after it still projects what the
+    /// RETURN asked for.
+    ///
+    /// The streaming group-aggregate path emits the group table itself and
+    /// ignores every op after the aggregate but ORDER BY / SKIP / LIMIT, so a
+    /// `Project` was silently dropped: this query came back as columns `c`
+    /// and `n` carrying the group key and the raw count, with `n * 2` never
+    /// evaluated. Adding a `WHERE` after the `WITH` routed it elsewhere and
+    /// was correct, which is what made it look like a query-shape problem.
+    #[test]
+    fn aggregate_with_projects_without_a_having_clause() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company) \
+             WITH c, count(t) AS n RETURN c.name, n * 2 AS dbl",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["c.name", "dbl"]);
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("Acme Design Works")), Some(i(4))],
+                vec![Some(s("Beta Studio")), Some(i(2))],
+                vec![Some(s("Gamma Works")), Some(i(2))],
+            ]
+        );
+    }
+
+    /// The same, projecting `key(c)` — the columns are named for what was
+    /// asked, not for the grouping variable.
+    #[test]
+    fn aggregate_with_names_its_projected_columns() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company) \
+             WITH c, count(t) AS n RETURN key(c), n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["key(c)", "n"]);
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("c1")), Some(i(2))],
+                vec![Some(s("c2")), Some(i(1))],
+                vec![Some(s("c3")), Some(i(1))],
+            ]
+        );
+    }
+
+    /// `RETURN c` after an aggregate `WITH` still returns the key string, and
+    /// only that column.
+    #[test]
+    fn aggregate_with_returning_the_bare_node_keeps_the_key() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company) \
+             WITH c, count(t) AS n RETURN c",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["c"]);
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("c1"))],
+                vec![Some(s("c2"))],
+                vec![Some(s("c3"))]
+            ]
+        );
+    }
+
+    /// A plain aggregate with no `WITH` keeps the streaming path and its
+    /// column names — the fix must not move it.
+    #[test]
+    fn a_plain_aggregate_is_unchanged() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (c:Company) RETURN c.name, count(*)",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["c.name", "COUNT(*)"]);
+        assert_eq!(rs.len(), 3);
+    }
+
+    /// Two unaliased subscripts of the same list are two columns, each named
+    /// for what it reads. They used to collide on `<expr>` and fail the
+    /// planner's duplicate-column check before the query ever ran.
+    #[test]
+    fn two_subscripts_of_one_list_are_two_named_columns() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent) RETURN t.location[0], t.location[1]",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["t.location[0]", "t.location[1]"]);
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(f(40.71)), Some(f(-74.01))],
+                vec![Some(f(41.88)), Some(f(-87.63))],
+                // t3 has no location at all.
+                vec![None, None],
+            ]
+        );
+    }
+
+    /// A subscript carries through a `WITH` stage — the case that breaks if
+    /// the name the executor projects and the one `collect_vars` interns ever
+    /// disagree, both aliased and left to name itself.
+    #[test]
+    fn a_subscript_carries_through_a_with_stage() {
+        let fx = assoc_graph();
+        let rs = run(
+            &fx.view(),
+            "MATCH (t:Talent) WHERE t.location[0] > 41.0 \
+             WITH t, t.location[0] AS lat, t.location[1] \
+             RETURN key(t), lat, t.location[1]",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["key(t)", "lat", "t.location[1]"]);
+        assert_eq!(
+            rows_of(&rs),
+            vec![vec![Some(s("t2")), Some(f(41.88)), Some(f(-87.63))]]
+        );
+    }
+
+    /// A subscript inside a function call is named the same way, and a
+    /// non-literal index falls back to the operand's own label.
+    #[test]
+    fn subscript_column_names_cover_nested_and_computed_forms() {
+        use crate::cypher::ast::operand_label;
+        let prop = || Operand::Prop {
+            var: "t".into(),
+            field: "location".into(),
+        };
+        let at = |idx: Operand| Operand::Index {
+            base: Box::new(prop()),
+            index: Box::new(idx),
+        };
+        assert_eq!(operand_label(&at(Operand::Lit(i(0)))), "t.location[0]");
+        assert_eq!(operand_label(&at(Operand::Lit(i(-1)))), "t.location[-1]");
+        assert_eq!(
+            operand_label(&at(Operand::Param("k".into()))),
+            "t.location[$k]"
+        );
+        assert_eq!(
+            operand_label(&at(Operand::Var("j".into()))),
+            "t.location[j]"
+        );
+        assert_eq!(
+            operand_label(&Operand::Index {
+                base: Box::new(at(Operand::Lit(i(0)))),
+                index: Box::new(Operand::Lit(i(1))),
+            }),
+            "t.location[0][1]"
+        );
     }
 
     /// Comma-separated patterns with no shared variable are a cartesian

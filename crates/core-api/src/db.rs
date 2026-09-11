@@ -3,7 +3,7 @@ use crate::roles::{RoleDef, RolesFile, WriteScope};
 use crate::subscription::{
     event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
 };
-use core_query::cypher::ast::ArithOp;
+use core_query::cypher::ast::{ret_val_label, ArithOp};
 use core_query::cypher::{
     execute, execute_union, is_subscribable, is_write_tokens, lex, parse, parse_read, parse_write,
     plan, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem, RetVal,
@@ -737,28 +737,11 @@ fn ret_column_name(item: &RetItem) -> String {
     if let Some(alias) = &item.alias {
         return alias.clone();
     }
-    match &item.value {
-        RetVal::Var(v) => v.clone(),
-        RetVal::Prop { var, field } => format!("{var}.{field}"),
-        RetVal::FuncCall { name, args } => {
-            let arg_strs: Vec<String> = args
-                .iter()
-                .map(|a| match a {
-                    Operand::Var(v) => v.clone(),
-                    Operand::Prop { var, field } => format!("{var}.{field}"),
-                    Operand::Lit(_) => "<lit>".to_string(),
-                    Operand::Param(p) => format!("${p}"),
-                    Operand::FuncCall { name: n, .. } => format!("{n}(...)"),
-                    Operand::BinArith { .. } => "<arith>".to_string(),
-                    Operand::Case { .. } => "<case>".to_string(),
-                    Operand::Index { .. } => "<index>".to_string(),
-                })
-                .collect();
-            format!("{name}({})", arg_strs.join(", "))
-        }
-        RetVal::ScalarExpr(_) => "<expr>".to_string(),
-        RetVal::Agg { .. } => "<agg>".to_string(),
-    }
+    // The same naming rule the planner and the executor use, so a
+    // write-statement RETURN names its columns exactly as a read query does.
+    // An aggregate is not legal in a write-statement RETURN; it keeps the
+    // placeholder it always had.
+    ret_val_label(&item.value).unwrap_or_else(|| "<agg>".to_string())
 }
 
 fn eval_set_return_operand<F: Fs>(
