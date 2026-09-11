@@ -1062,7 +1062,7 @@ fn graph_tools() -> Vec<Js> {
                         },
                         "role": {
                             "type": "string",
-                            "description": "Answer as this role from the store's roles: only the nodes it may see."
+                            "description": "Answer as this role from the store's roles: only the nodes it may see. A role may also be narrowed by one property test (`status in [...]`), declared in the store's roles."
                         },
                         "as_of": {
                             "type": "integer",

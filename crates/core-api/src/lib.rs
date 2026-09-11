@@ -40,9 +40,9 @@ pub use history::{EdgeEvent, EdgeHistoryEvent, HistoryChange, HistoryEntry, Hist
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
-pub use mask::{MaskMode, NodeMask};
+pub use mask::{MaskMode, NodeMask, RoleMaskCache};
 pub use reader::{CommitDelta, FrozenOverlay, ReaderSnapshot, FOLD_EVERY_K};
-pub use roles::{RoleDef, WriteScope};
+pub use roles::{PropPredicate, RoleDef, WriteScope};
 pub use schema::{Schema, SchemaDiff};
 pub use shared::{SharedDb, WriteGuard};
 pub use subscription::{DbEvent, Subscription, DEFAULT_SUB_CAPACITY};

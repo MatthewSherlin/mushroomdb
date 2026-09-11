@@ -611,6 +611,7 @@ fn query_at_scoped_masks_at_the_requested_commit() {
             name: "reader".into(),
             keys: vec![],
             labels: vec!["Public".into()],
+            visible_where: None,
             write: None,
         }],
         ..Default::default()
@@ -718,12 +719,14 @@ fn query_at_scoped_deletion_is_not_retroactive() {
                 name: "by_label".into(),
                 keys: vec![],
                 labels: vec!["Public".into()],
+                visible_where: None,
                 write: None,
             },
             RoleDef {
                 name: "by_key".into(),
                 keys: vec!["p1".into()],
                 labels: vec![],
+                visible_where: None,
                 write: None,
             },
         ],
@@ -818,6 +821,7 @@ fn query_at_scoped_keys_follow_the_commit_not_todays_owner() {
             name: "by_key".into(),
             keys: vec!["alice".into()],
             labels: vec![],
+            visible_where: None,
             write: None,
         }],
         ..Default::default()
@@ -884,6 +888,7 @@ fn query_at_scoped_edges_match_a_hand_built_mask_at_the_same_commit() {
             name: "reader".into(),
             keys: vec![],
             labels: vec!["Public".into()],
+            visible_where: None,
             write: None,
         }],
         ..Default::default()
