@@ -264,7 +264,7 @@ key files (by centrality):
 key symbols (most called):
   crates/core-api/tests/algo.rs#insert_node — fn insert_node(db: &mut GraphDb<core_storage::fs::RealFs>, label: &str, key: &str)
   crates/core-api/tests/algo.rs#insert_edge — fn insert_edge(db: &mut GraphDb<core_storage::fs::RealFs>, etype: &str, src: &str, dst: &str)
-reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.2 explore './mushroom-memory' <target>
+reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.3 explore './mushroom-memory' <target>
 ```
 
 The first line is the untrusted-data marker every digest rendered out of a store
@@ -410,14 +410,46 @@ install to `cli` removes the entry it registered, and `doctor` reports the
 config and handshake checks as `skip … delivery: cli` while still checking the
 store, the lock and the hooks.
 
-One more door is off by default. `install --intercept-grep` adds a fourth Claude
-Code hook — `PreToolUse`, matched to `Grep` — that exits 2 when the search
-pattern is a bare identifier of three characters or more that the graph holds as
-a symbol, handing the model one line pointing at `explore("<name>")` instead of
-a list of matching lines. Anything that looks like a regex, any name the graph
-does not hold, and any store that will not open pass straight through, and the
-identifier test runs before the store is opened so a regex search costs nothing.
-It is an experiment: leave it off unless you are measuring it.
+Whichever door is opened, three hooks are written: `SessionStart` runs `brief`,
+`UserPromptSubmit` runs `recall`, and `PostToolUse` on `Edit|Write|MultiEdit`
+runs `touch` so an edited file reaches the graph without the tool call waiting.
+
+### The three experimental hooks
+
+Three more are off by default, one flag each. All three are Claude Code only,
+all three are recorded in the install manifest — so `disable`, `enable` and
+`uninstall` handle them like any other hook, and re-running `install` without
+the flag removes them — and all three are reported by `doctor`.
+
+| Flag | Hook | What it does |
+|---|---|---|
+| `--intercept-grep` | `PreToolUse`, matched to `Grep` | Exits 2 when the search pattern is a bare identifier of three characters or more that the graph holds as a symbol, handing the model one line pointing at `explore("<name>")` instead of a list of matching lines. Anything regex-shaped, any name the graph does not hold, and any store that will not open pass straight through, and the identifier test runs *before* the store is opened, so a regex search costs nothing |
+| `--impact-before-edit` | `PreToolUse`, matched to `Edit\|Write\|MultiEdit` | Before an edit lands, at most 600 bytes of the file's blast radius — the files that import it, the files that usually change with it, the tests that cover it. It never blocks: exit 0 always, and a file the graph has no `File` for, a store that will not open and a payload that will not parse each print nothing |
+| `--enrich-grep` | `PostToolUse`, matched to `Grep` | After a search returns, at most 800 bytes about the first five identifiers that name exactly one symbol the graph holds — definition site, caller count, the file's owner. Nothing resolving is nothing printed |
+
+The last two **emit `hookSpecificOutput.additionalContext`**, which is the shape
+Claude Code adds to the model's context rather than showing to the user; the
+first communicates by exit code, because blocking is the point. Each hook is its
+own group with its own matcher, so two sharing an event (`--intercept-grep` and
+`--impact-before-edit`, or `--enrich-grep` and `touch`) leave each other alone.
+
+They are experiments. No committed benchmark run measures any of them; leave
+them off unless you are measuring them yourself.
+
+### `alwaysLoad` — showing the tools before the first question
+
+A registered MCP server's tool schemas are normally deferred until something
+asks for them. `"alwaysLoad": true` on the `mcpServers.mushroomdb` entry tells
+the host to keep them in context instead. `install` writes it **by default for
+an entity-store install** — `--delivery mcp` or `both` together with an explicit
+`--db` — because a session that cannot see the tools spends turns finding them,
+and an install that pins a store is one whose tools a session needs before its
+first question. `--always-load` forces it on an install that named no store
+(where the resolved store is usually the code graph, whose three tools need no
+pinning); `--no-always-load` opts out. It is Claude Code's `.mcp.json` only — a
+Cursor or Codex registration has no equivalent — and it was verified honoured
+for a stdio server by Claude Code 2.1.258. Re-running `install` with a different
+answer rewrites the key; `disable` and `enable` preserve it.
 
 ---
 

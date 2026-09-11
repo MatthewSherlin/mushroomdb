@@ -1,5 +1,267 @@
 # Changelog
 
+## v0.6.3 — the association release
+
+A release about the question the graph is supposed to be best at: *why are these two things
+related, and what did that look like on some other day.* A new benchmark suite asks it — one
+generated world written three ways, twenty relationship questions, graded against executable
+truth — and the first run of it **failed its gate**, badly. Everything below is what that run
+exposed, fixed: an `explain_association` that names the values two nodes actually share, a
+`node_edges` that answers "why" in the call that lists the edges, two new tools (`edges_at`,
+`what_if`) that answer a whole question in one call instead of twenty, and the Cypher spellings
+an agent assumes exist and used to discover by parse error. The "before" measurement is reported
+here as it came out. No format change.
+
+#### Measured on the association suite (before the fixes)
+
+The suite is `benchmarks/agent-tasks/` run with `--suite association`: one deterministic world
+(seed `20260910`, scale 2000, a 90-day window and 300 changes) written three ways — `files/` as
+`entities/*.json` + `changes.jsonl`, `sqlite/` as `world.sqlite`, `graph/` as a mushroomdb store —
+and 20 questions over five kinds (why, multihop, retraction, timetravel, visibility), four each.
+The arms are **P** (files + grep), **Q** (the relational file, and the baseline), **R** (the store,
+reached only through the MCP server). Every arm gets `Read,Grep,Glob,Bash,Edit,Write`; R also gets
+`mcp__mushroomdb`. The §1 gate: correctness at or above arm Q paired by task, at or above every
+other arm's paired mean, cost at or below arm Q, the 95% cost interval against Q excluding zero,
+and no max-turns failure on a task Q finished. Correctness carries no interval requirement —
+Q saturated it in the pilot — so cost is the discriminator. Adoption is recorded, not gated: in
+arm R the store is the only data path.
+
+The verdict of the "before" run,
+[`benchmarks/agent-tasks/results/20260911T005749Z/summary.md`](benchmarks/agent-tasks/results/20260911T005749Z/summary.md)
+— arms P, Q, R × 3 reps × 20 tasks, 180 cells, world digest `f2b689ba52c80241`:
+
+| | |
+|---|---|
+| verdict | **FAILED** |
+| best arm | R |
+| arms under the gate | R |
+| cells with no cost recorded | 0 of 180 |
+
+Why it failed:
+
+- R: correctness -0.191 vs arm Q, paired over 20 task(s)
+- R: correctness -0.191 is below arm(s) P (+0.013)
+- R: cost 0.5089 > arm Q 0.1257
+- R: max-turns on tasks [5, 8, 14, 15, 16] where arm Q succeeded
+
+| metric | P (files + grep) | Q (relational) | R (graph) |
+|---|---|---|---|
+| score | 1.000 | 0.987 | 0.795 |
+| cost $ | 0.1050 | 0.1257 | 0.5089 |
+| total tokens | 202216 | 226711 | 935776 |
+| tool calls | 5.88 | 6.52 | 25.17 |
+| turns | 6.88 | 7.52 | 25.55 |
+| seconds | 45.7 | 60.3 | 159.1 |
+| adoption | 0.00 | 0.00 | 1.00 |
+
+Paired by task, with a 95% percentile bootstrap over the per-task differences (2,000 resamples,
+seeded), arm R against arm Q: score `-0.1914 [-0.3420, -0.0699]`, cost `0.38314 [0.25218,
+0.52528]`, total tokens `709065.6 [498965.9, 914119.2]`, turns `18.033 [11.483, 25.667]`. Read
+plainly: the graph arm was **worse and four times more expensive** than a single relational file,
+and five tasks ran out of turns that Q finished. Adoption was 100% by construction, so nothing here
+is a question of whether the agent reached for the graph — it reached for it 1,178 times and still
+lost. The tool calls that dominated were `query` ×612 and `edge_history` ×222: an agent
+replaying history event by event because no call answered the question whole.
+
+The **code-door arms L, J and H** — arm B's install plus `--impact-before-edit`, plus
+`--enrich-grep`, plus `--always-load` respectively — are wired into the harness in this release
+but **carry no measurement**: no run of them is committed, so nothing here claims anything about
+what those three hooks are worth.
+
+#### The association surface — fifteen tools on a memory store
+
+- **A store that was not built by `ingest-git` now lists the association surface.** Fifteen tools:
+  `query`, `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`,
+  `edges_at`, `what_if`, `node_history`, `edge_history`, `find_similar`, `hybrid_search`,
+  `remember`, `recall`, `stats`. A code-graph store still lists three (`explore`, `query`,
+  `stats`). All **27** stay served on either surface — the listing decides what a session can
+  call, not what the server answers — and `mushroomdb mcp <db> --all-tools` lists the whole set
+  with schemas. The server decides once, at startup, from the store it opened, so one `.mcp.json`
+  serves both kinds.
+- **`query` takes a `role`.** Pass `role: "<name>"` to answer as one role from the store's
+  `roles.json`: its label and key selectors resolve to the same allow-list `mask` takes. Pass one
+  or the other, never both. Like `mask`, it is cooperative and never a security boundary.
+
+#### `explain_association` answers with the evidence
+
+- **The reply is text first, and it names the values the two nodes share.** Each relationship is
+  one line — edge type, rule, score, the predicate it matched — followed by a bracketed clause
+  carrying the evidence: `overlap` prints the shared list items, `field_equal` the equal value,
+  `key_match` the destination key the field named, `geo_radius` both coordinates and the distance,
+  `numeric_within` the two numbers, `vector_similar` the cosine the rule scored. A composed
+  `all`/`any` prints one clause per branch. On the real association store the whole reply is 562
+  bytes, and the values only one node holds never appear in it — which is the point: the old reply
+  named a predicate and left the agent to fetch both property lists and diff them by hand.
+- **Each predicate's own threshold is applied before anything is reported.** `overlap` must clear
+  its `min` as a Jaccard ratio, `numeric_within` its tolerance, `geo_radius` its radius, and
+  `key_match` only reports when the source field actually names the destination. Under `any`, only
+  the satisfied branches print.
+- **`json: true` gains an `evidence` object per relationship** — `{field, shared:[…]}`,
+  `{field, value}`, `{field, a, b, km}`, `{field, a, b}`, `{field, similarity}` or `{parts:[…]}`.
+  Every other field of the array is byte-identical to before.
+- Two deliberate silences: a via-hop rule reports no evidence (its predicate was evaluated between
+  the via node and the destination, not between the two keys asked about), and a `vector_similar`
+  nested inside `all`/`any` reports no similarity, because a branch's own score is not recoverable
+  from a min or a max.
+
+#### Relationships in one call — `node_edges` and `neighborhood`
+
+- **Both are text first, grouped by edge type with a count, each listed edge carrying its
+  direction, the rule that derived it, its score and the predicate it matched.** "Why is this
+  here" is answered in the same call that lists it, so no follow-up explain is needed. `json: true`
+  returns `{key, total, listed, types: [{edge_type, count, listed, edges: […]}]}`.
+- **`all_of: [types]` answers the intersection question in partner keys.** Only the partners linked
+  to `key` by *every* one of the listed types, sorted, comma-separated, wrapped at 100 columns.
+  On the benchmark's own hub node this is 302 bytes and one call against 114 KB of JSON or ~280
+  pairwise probes. `json: true` → `{key, all_of, partners, listed, total}`.
+- **`edge_type: T` gives one type's partner keys with the rule named once** rather than repeated
+  per line; `json: true` → `{key, edge_type, rule, edges, partners, listed, total}`.
+- **`label: L` narrows the partners** — and the counts, not only the listings — in every form, so
+  "which *companies*" is one call rather than a key-prefix filter afterwards.
+- **`direction: out | in | any`** (default `any`; `both` is a synonym) filters the edges the
+  grouped view groups and the intersection is taken over. It was previously parsed and ignored by
+  the grouped `edges_at` path.
+- **`limit`** is 10 per edge type in the grouped view (max 100) and 200 partner keys under
+  `edge_type`/`all_of` (max 2,000); the remainder is always stated as `… and N more`. The grouped
+  listings still stop at 40 lines, and now say so: `… listing capped at 40 lines; pass edge_type
+  or all_of for the whole set`.
+- `all_of` together with `edge_type` is a tool error — `pass one of all_of or edge_type, not
+  both` — rather than one of them silently winning.
+
+#### New: `edges_at` and `what_if`
+
+- **`edges_at(key, at, …)` is the graph as it was.** One WAL scan returns the edges a node had at
+  commit `at` (0-based), each with the rule that had derived it. Renames are followed, so a node's
+  current key finds edges written under an earlier name; a label is resolved against the live
+  graph, which is the same answer at any commit because a label is fixed at insert. It takes the
+  same `edge_type` / `all_of` / `label` / `direction` / `limit` arguments as `node_edges`, so "who
+  was linked by all three of these on day 41" is one call.
+- **`what_if(key, field, value, …)` answers before the change.** The rule engine runs the same
+  re-derivation a real `set_prop` would, against a clone, and reports the derived edges that would
+  be lost and gained with the rule behind each. **Nothing is written**: nothing on disk is copied,
+  and the live graph answers the same way before and after. `edge_type` narrows counts as well as
+  listings and prints both sides as partner keys; `label` narrows partners; `limit` (default 10,
+  max 2,000) now applies to the grouped text too, and `json: true` carries `lost_total` /
+  `gained_total` so a truncated report still says how much there was.
+- **Engine**: `GraphDb::edges_at`, `GraphDb::what_if_set_prop`, `GraphDb::edge_type_census` and
+  `GraphDb::wal_total_commits`.
+- **Python**: `edges_at(key, commit)`, `what_if_set_prop(key, field, value)`, `edge_history(a, b)`
+  and `wal_total_commits()`.
+
+#### Cypher — the spellings an agent assumes exist
+
+Every one of these used to be a parse error or a silent `null`, which is most of what the
+benchmark's multihop cells burned their turns on.
+
+- **`n.key` and `n.label` read as properties**, and `labels(n)` returns a one-element list. A
+  stored property of either name still wins; this is only the fallback. They work in `WHERE`, in
+  `ORDER BY`, in an inline pattern filter (`MATCH (c {key: 'c3'})`) and after a grouping `WITH` —
+  the last of which was the deeper bug: `WITH c, count(*) AS n` used to flatten `c` to a scalar, so
+  `c.key` read null and `key(c)` failed outright.
+- **`STARTS WITH` / `ENDS WITH` / `CONTAINS`** as infix operators, desugaring to the scalar
+  functions of the same meaning, so null and non-string handling is shared with the call spelling.
+- **List subscripts** — `n.location[0]`, `[-1]` counting from the end. Out of range, a non-list
+  base and a non-integer index are all `null`, never an error. Two unaliased subscripts of one list
+  are now two named columns (`t.location[0]`, `t.location[1]`) instead of a duplicate-column error.
+- **Comma-separated patterns in one `MATCH`** — `MATCH (t)-[:A]->(c), (t)-[:B]->(c)` — producing
+  exactly what a run of separate `MATCH` clauses produces, so both spellings plan and execute
+  identically. Patterns sharing no variable are a cartesian product, as openCypher says.
+- **`count(DISTINCT …)` and `collect(DISTINCT …)`.** This is what makes an intersection correct:
+  three edge types between one pair yield three rows per source under an alternation, and only
+  `DISTINCT` counts it once. `count(DISTINCT *)` is a named parse error, and a variable actually
+  named `distinct` still parses.
+- **A non-aggregate `WITH … WHERE <alias>` resolves the alias.** `WITH t, t.x AS x WHERE x > 11`
+  was a planner-only false rejection — the plan it refused to build would have run correctly.
+- **An aggregate `WITH` with no `WHERE` now projects its `RETURN`.** `WITH c, count(t) AS n RETURN
+  key(c), n` used to come back with columns named `c` and `n`, and a computed projection like
+  `RETURN n * 2` was silently dropped.
+- **An unknown function names itself** — the error quotes the name it did not know and lists the
+  functions it does, instead of failing anonymously.
+
+#### A memory store opens with its schema — `SessionStart`
+
+- **`mushroomdb brief <db>` on a memory store prints the store's shape**: each label with its
+  property names and node count, each edge type with the rule behind it, its source and
+  destination labels and its count, the roles, the total commit count — and then one worked call
+  per question kind, built from that store's own labels and edge types, so the calls are runnable
+  as printed. It is capped at 4,000 bytes and byte-stable between runs; a store too large to read
+  inside the 3-second budget renders **partially** rather than late. The `embedding` field is
+  hidden from the schema listing — 1,536 floats is not a property worth naming.
+- **The recipes teach the one-call forms.** `why` names `explain_association` and says the reply
+  carries the shared values; `relationships` and `as of` render the `all_of:` / `label:` form of
+  `node_edges` and `edges_at` over edge types that actually run between the two busiest labels;
+  `what if` appends the `edge_type:` narrowing; and a `linked by all of` recipe renders the
+  comma-pattern, `count(DISTINCT …)` Cypher for the intersection question.
+- **The skill carries a recipe per question kind**, and the `--delivery cli` variant names the CLI
+  equivalent of each.
+
+#### `install` — three more experiments, and always-load by default
+
+- **`--impact-before-edit`** (off by default) adds a `PreToolUse` hook matched to
+  `Edit|Write|MultiEdit`: before an edit lands it prints at most 600 bytes of the file's blast
+  radius — importers, co-change partners, covering tests. It never blocks; exit 0 always.
+- **`--enrich-grep`** (off by default) adds a `PostToolUse` hook matched to `Grep`: after a search
+  returns it prints at most 800 bytes about the first five identifiers that name exactly one symbol
+  the graph holds — definition site, caller count, the file's owner. Nothing resolving is nothing
+  printed.
+- **Both emit `hookSpecificOutput.additionalContext`** rather than bare stdout, which is the shape
+  Claude Code adds to the model's context instead of showing to the user.
+- **`--always-load` / `--no-always-load`.** `alwaysLoad: true` on the `mcpServers.mushroomdb`
+  entry is now the **default for an entity-store install** — `--delivery mcp` or `both` with an
+  explicit `--db` — because a session that cannot see the tools spends turns finding them. It is
+  Claude Code's `.mcp.json` only, and it was verified honoured for a stdio server by Claude Code
+  2.1.258. `--no-always-load` opts out; an install that named no store is unchanged.
+- **`doctor` reports all of them**, and the install manifest records which are on, so `disable`,
+  `enable` and `uninstall` handle them like every other hook.
+
+#### The benchmark harness
+
+- **`--suite association`** — the world builder (`association/build.py`, one generator and three
+  writers that `equivalent()` checks agree), the truth module, 20 tasks over five kinds, arms P/Q/R,
+  a paired percentile bootstrap, and a gate variant that requires the cost interval to exclude
+  zero and does not gate on adoption.
+- **`run.py --suite association --setup-only`** builds the three forms once (5–6 minutes) under the
+  scratch directory; **`--reprovision`** takes the install off the graph subject so the next setup
+  writes it again with the current binary, skill and brief, without touching the six-minute world
+  or the digest `tasks.json` was written against.
+- **Code-door arms L, J and H** (arm B's install plus `--impact-before-edit`, plus `--enrich-grep`,
+  plus `--always-load`) and a real **`--disallowedTools`** switch, which removes a tool from what
+  the model is offered — unlike `--allowedTools`, which only grants permission and leaves the tool
+  in the list.
+
+#### Fixed
+
+- **`node_history` keeps the property events of a deleted node.** A node removed since the last
+  truncating snapshot used to lose the history the WAL still held.
+- **`what_if_set_prop` loads the base sections on a cold snapshot open** before cloning provenance,
+  instead of reading an unpopulated clone.
+- **`edges_at` resolves its key to the node's canonical current name**, so a renamed node's history
+  is reachable by the key it has now.
+
+#### BREAKING
+
+- **The default MCP tool listing on a memory store is the fifteen-tool association surface.** Any
+  store not built by `ingest-git` used to list a different set; a programmatic caller that
+  discovers tools by listing rather than by name sees a different list. All 27 remain served and
+  `--all-tools` lists them all.
+- **`explain_association` replies with text, not JSON.** The rendered digest is the text content
+  now; pass `json: true` for the array, which itself gains an `evidence` object per relationship.
+- **`node_edges` and `neighborhood` reply with text, not JSON**, grouped by edge type with the rule
+  and score per edge. `json: true` returns the grouped report.
+- **`node_edges {key, edge_type, json: true}` changed shape.** It used to return the grouped
+  `types[]` document; with `edge_type` it now returns the partner document
+  (`{key, edge_type, rule, edges, partners, listed, total}`). Drop `edge_type` to keep the grouped
+  shape. The HTTP `/node/{key}/edges` endpoint is untouched.
+- **`edges_at {json: true}` lists at most `limit` edges per edge type** (default 10, max 100 in
+  that form) and carries `listed` and `total` alongside `edges`, where it used to dump everything —
+  114,092 bytes on the measured hub call against 7,266 now. Pass `edge_type` or `all_of` with a
+  limit up to 2,000 for the whole set.
+- **`what_if {json: true}` respects `limit`** (default 10) and gains `lost_total` / `gained_total`,
+  where it used to return every edge.
+- **`WITH c, count(t) AS n RETURN key(c), n` now returns the columns it projects.** A query that
+  was reading the columns named `c` and `n` out of that shape, or relying on a dropped computed
+  projection, sees the projected names and values instead.
+
 ## v0.6.2 — the proof release
 
 The delivery changes in this release were measured on a rebuilt agent benchmark before it shipped —

@@ -22,6 +22,7 @@ SITE_DOCS=(
     concurrency.md
     rules.md
     mcp.md
+    association-bench.md
     query.md
     api.md
     subscriptions.md

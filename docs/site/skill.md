@@ -69,6 +69,27 @@ call, before answering:
 | Anything cross-file — before `Grep` | `explore` with one `target` and one `depth`: `context` (default), `impact` (before you edit), `history`, or `all` |
 | The user states a decision or durable fact | `remember`, and say the `note:` key it returns. A `--delivery cli` install has no such subcommand, so its copy of the skill says to write the note through `query` instead |
 | Commits have landed, or the brief reports an old sync | `sync` |
+| **On a memory store** — entities, no repository | Rows 1–3 do not apply. One named call per question kind (below), copied from the six worked calls the brief printed against the store's own keys |
+
+**Row 4 — the memory-store recipes.** One call per question, not a search:
+
+| The question | The call |
+|---|---|
+| why are these two related | `explain_association a b` — the rule, the score and the values the two share |
+| what is it related to | `node_edges a` — grouped by type, rule and score per edge; `all_of: [T1, T2]` for the partners linked by every one of them, `label:` to narrow them |
+| what did it look like then | `edges_at a <commit>` — the same views at a past commit |
+| what changes if | `what_if a <field> <value>` — lost and gained, nothing written |
+| who may see | `query` with a `role` from the store's `roles.json` |
+| how many | a counting Cypher over the labels the brief listed |
+
+Since when is `node_history` / `edge_history` / `was_linked`; around it is
+`neighborhood` / `node_info`; like it is `find_similar` / `hybrid_search`.
+
+The **`--delivery cli` variant of the skill names the CLI equivalents** instead,
+and says plainly which of them have none: `why <a> <b>` and `asof --commit N
+--query` are wired, `query` takes no `role`, and `explain_association`,
+`node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked` and
+`neighborhood` need `--delivery mcp`.
 
 A paragraph after the table names what `explore` composes — `context`, `impact`
 and `owners` — and says that those, `why`, `recall`, `map` and the rest stay
