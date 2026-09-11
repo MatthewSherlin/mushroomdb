@@ -5405,8 +5405,11 @@ Summary:
 
 | Operation | Live WAL commits | Archive commits (intact genesis chain) | Archive commits (pruned/incomplete) |
 |---|---|---|---|
-| `node_history` / `edge_history` / `was_linked` | Always reachable | Always reachable | Always reachable |
-| `open_at` (as-of) | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
+| `node_history` / `edge_history` | Always reachable | Always reachable | Reachable, but pruned events are silently omitted |
+| `was_linked` / `edges_at` | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
+| `open_at` / `query_at` (as-of) | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
+
+`node_history`/`edge_history` take no commit bound and just scan whatever WAL/archives remain, so a pruned commit's events are missing with no error, while `was_linked`, `edges_at`, and `open_at`/`query_at` all check the horizon floor explicitly and refuse instead.
 
 ### Retention and pruning
 
