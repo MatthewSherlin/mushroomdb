@@ -134,12 +134,12 @@ fn wal_preserved_by_auto_migrate() {
     );
 }
 
-/// A V7 store opens, migrates to V8, leaves a .bak of the original V7 bytes;
-/// a second clean open at V8 deletes the .bak.
+/// A V7 store opens, migrates to the current version, leaves a .bak of the
+/// original V7 bytes; a second clean open at that version deletes the .bak.
 ///
 /// V7 fixture content: 2 nodes ("a", "b"), 1 edge (E: a→b), prop v=42 on "a".
 #[test]
-fn v7_store_auto_migrates_to_v8_with_bak() {
+fn v7_store_auto_migrates_to_v9_with_bak() {
     let dir = store_from_fixture("v7", include_bytes!("fixtures/golden_v7.bin"));
     {
         let db = GraphDb::open(&dir).unwrap();
@@ -154,11 +154,11 @@ fn v7_store_auto_migrates_to_v8_with_bak() {
             "V7 store must have 1 edge after migrate"
         );
     }
-    // On-disk snapshot is now V8; .bak holds the original V7 bytes.
+    // On-disk snapshot is now V9; .bak holds the original V7 bytes.
     assert_eq!(
         core_api::snapshot_version_at(&dir).unwrap(),
         Some(core_storage::snapshot::VERSION),
-        "snapshot must be rewritten to V8 after migration"
+        "snapshot must be rewritten to V9 after migration"
     );
     let bak = std::fs::read(dir.join("snapshot.bin.bak")).unwrap();
     assert_eq!(
@@ -171,17 +171,17 @@ fn v7_store_auto_migrates_to_v8_with_bak() {
     assert_eq!(
         db.get_prop("a", "v"),
         Some(Value::Int(42)),
-        "property v=42 on node 'a' must survive V7→V8 migration"
+        "property v=42 on node 'a' must survive V7→V9 migration"
     );
     assert_eq!(
         db.neighbors("a", "E", Direction::Out).unwrap(),
         vec!["b"],
-        "edge a→b must survive V7→V8 migration"
+        "edge a→b must survive V7→V9 migration"
     );
-    // Second clean open at V8 must remove .bak.
+    // Second clean open at V9 must remove .bak.
     assert!(
         !dir.join("snapshot.bin.bak").exists(),
-        "second clean open at V8 must delete the .bak"
+        "second clean open at V9 must delete the .bak"
     );
 }
 

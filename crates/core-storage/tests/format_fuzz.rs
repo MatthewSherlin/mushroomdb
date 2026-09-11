@@ -19,6 +19,12 @@
 //!       called; neither may panic.  Random seed (proptest default);
 //!       deterministic hardcoded mutations (u32::MAX / 1 / arbitrary) provide
 //!       the coverage floor regardless of seed.
+//!   (f) bit-flips inside the V9 shared string table (section 12), with both
+//!       the section CRC and the header CRC recomputed so the mutation is
+//!       reached rather than rejected as a checksum failure.  `snapshot::decode`
+//!       must return `Ok` or `Err(Corrupt)` — never panic, never resolve a
+//!       corrupted relative pointer out of bounds.  A deterministic companion
+//!       test smashes the root relative pointer directly and asserts `Corrupt`.
 
 use core_storage::snapshot::{self, SnapshotState};
 use core_storage::v8::MappedBase;
@@ -118,6 +124,11 @@ fn valid_snapshot_bytes() -> Vec<u8> {
 
     let mut props = ColumnStore::new();
     props.set(0, "age", Value::Int(30));
+    // A string property so section 12 (the shared string table) is non-empty:
+    // an empty table's rkyv root has no relative pointer to corrupt, and block
+    // (f) needs one.
+    props.set(0, "name", Value::Str("alice".into()));
+    props.set(1, "name", Value::Str("bob".into()));
 
     let mut provenance = BTreeMap::new();
     let mut edges = BTreeSet::new();
@@ -411,7 +422,7 @@ proptest! {
     })]
     #[test]
     fn v8_section_directory_corruption_never_panics(
-        section_idx in 0usize..12usize,
+        section_idx in 0usize..13usize,
         mutation in 0u8..3u8,
         len_val in any::<u32>(),
     ) {
@@ -434,6 +445,167 @@ proptest! {
             );
             // Path 2: full snapshot::decode — must also not panic.
             check_snap_decode(&bytes)?;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block (f): V9 shared string table (section 12) corruption
+// ---------------------------------------------------------------------------
+
+/// Locate `(offset, len)` of the directory entry for `section_id`.
+fn v8_section_span(v8: &[u8], section_id: u8) -> Option<(usize, usize)> {
+    if v8.len() < 12 {
+        return None;
+    }
+    let section_count = u16::from_le_bytes([v8[6], v8[7]]) as usize;
+    for i in 0..section_count {
+        let base = 8 + i * 16;
+        if base + 16 > v8.len() {
+            return None;
+        }
+        if v8[base] == section_id {
+            let off = u32::from_le_bytes(v8[base + 4..base + 8].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(v8[base + 8..base + 12].try_into().unwrap()) as usize;
+            return Some((off, len));
+        }
+    }
+    None
+}
+
+/// XOR `mask` into the byte at `byte_idx` of section `section_id`, then
+/// recompute that section's CRC32 and the whole-header CRC32 so the mutation
+/// survives both checksum gates and is actually decoded.
+fn corrupt_v8_section_payload(
+    v8: &[u8],
+    section_id: u8,
+    byte_idx: usize,
+    mask: u8,
+) -> Option<Vec<u8>> {
+    let (off, len) = v8_section_span(v8, section_id)?;
+    if len == 0 || off + len > v8.len() {
+        return None;
+    }
+    let mut out = v8.to_vec();
+    out[off + byte_idx % len] ^= if mask == 0 { 0xff } else { mask };
+
+    let section_count = u16::from_le_bytes([out[6], out[7]]) as usize;
+    let dir_end = 8 + section_count * 16;
+    for i in 0..section_count {
+        let base = 8 + i * 16;
+        if out[base] == section_id {
+            let crc = crc32fast::hash(&out[off..off + len]);
+            out[base + 12..base + 16].copy_from_slice(&crc.to_le_bytes());
+            break;
+        }
+    }
+    let header_crc = crc32fast::hash(&out[0..dir_end]);
+    out[dir_end..dir_end + 4].copy_from_slice(&header_crc.to_le_bytes());
+    Some(out)
+}
+
+/// The fixture must actually carry a shared string table, or block (f) would
+/// silently test nothing.
+#[test]
+fn fixture_snapshot_carries_a_shared_string_table() {
+    let v9 = valid_snapshot_bytes();
+    assert_eq!(
+        u16::from_le_bytes([v9[4], v9[5]]),
+        snapshot::VERSION_9,
+        "the fixture must be a V9 snapshot"
+    );
+    let (_, len) = v8_section_span(&v9, core_storage::v8::SECTION_STRINGS)
+        .expect("a V9 snapshot must carry section 12");
+    assert!(
+        len > 16,
+        "section 12 must hold a real table (got {len} bytes), else there is no \
+         relative pointer to corrupt"
+    );
+}
+
+/// A smashed relative pointer in the shared string table must surface as
+/// `Corrupt` from the validated decode path, not as a panic or an OOB read.
+///
+/// The rkyv root of `StringTableData` sits in the last `size_of::<Archived>()`
+/// bytes of the payload and begins with the `ArchivedVec` relative pointer, so
+/// the final 8 bytes are where the pointer and length live.
+#[test]
+fn a_smashed_string_table_pointer_decodes_as_corrupt() {
+    let v9 = valid_snapshot_bytes();
+    let (off, len) = v8_section_span(&v9, core_storage::v8::SECTION_STRINGS)
+        .expect("a V9 snapshot must carry section 12");
+    let mut any_detected = false;
+    for byte in (len - 8)..len {
+        let Some(bytes) =
+            corrupt_v8_section_payload(&v9, core_storage::v8::SECTION_STRINGS, byte, 0xff)
+        else {
+            continue;
+        };
+        let outcome = catch_unwind(AssertUnwindSafe(|| snapshot::decode(&bytes)));
+        let decoded = match outcome {
+            Ok(r) => r,
+            Err(panic) => panic!(
+                "snapshot::decode panicked on a corrupted string-table pointer \
+                 (section offset {off}, byte {byte}): {}",
+                panic_message(panic)
+            ),
+        };
+        match decoded {
+            Err(core_storage::GraphError::Corrupt { detail }) => {
+                // Pins *which* layer caught it: the validated `rkyv::access` on
+                // the strings section, not a CRC or a bounds check upstream.
+                assert!(
+                    detail.contains("strings"),
+                    "a corrupted section 12 must be reported by the strings \
+                     structural check; got: {detail}"
+                );
+                any_detected = true;
+            }
+            Err(other) => panic!("expected Corrupt, got {other:?}"),
+            // A flip inside the length field can still describe a structurally
+            // valid (if wrong) archive; that is not a safety failure.
+            Ok(_) => {}
+        }
+    }
+    assert!(
+        any_detected,
+        "smashing the string-table root pointer must be reported as Corrupt by \
+         at least one of the eight root bytes"
+    );
+}
+
+// Block (f): arbitrary bit-flips anywhere in section 12, CRCs recomputed.
+// `snapshot::decode` must never panic and must never read out of bounds.
+// 256 cases.
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 256,
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
+    #[test]
+    fn v9_string_table_corruption_never_panics(
+        byte_idx in 0usize..4096usize,
+        mask in any::<u8>(),
+    ) {
+        let v9 = valid_snapshot_bytes();
+        if let Some(bytes) =
+            corrupt_v8_section_payload(&v9, core_storage::v8::SECTION_STRINGS, byte_idx, mask)
+        {
+            // Path 1: the validated decode path.
+            check_snap_decode(&bytes)?;
+            // Path 2: `mushroomdb verify`'s structural pass over section 12.
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                if let Ok(base) = MappedBase::from_bytes(bytes.clone()) {
+                    let _ = base.validate_section_bounds();
+                    let _ = base.validate_hot_sections();
+                }
+            }));
+            prop_assert!(
+                outcome.is_ok(),
+                "validate_hot_sections panicked on a corrupted section 12 \
+                 (byte_idx={byte_idx} mask={mask})"
+            );
         }
     }
 }

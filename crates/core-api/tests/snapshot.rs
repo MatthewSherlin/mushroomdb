@@ -2523,6 +2523,77 @@ fn verify_snapshot_structural_pass_and_corruption_detection() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `verify` must structurally validate the shared string table (section 12),
+/// not merely CRC it.
+///
+/// Section 12 is a large section, so `section_bytes` skips its per-touch CRC
+/// and `verify_integrity` reports a checksum mismatch as an `Ok` row rather
+/// than an error. An `Err` out of `verify_snapshot` can therefore only come
+/// from the bounds check or the rkyv structural pass, and the assertion on the
+/// message pins it to the latter. The CRC-recomputing variant — which proves a
+/// repaired checksum does not get a crafted snapshot past `verify` — lives in
+/// `core-storage` as `verify_rejects_a_structurally_corrupt_string_table`.
+#[test]
+fn verify_rejects_a_corrupted_string_table() {
+    let dir = tmp("verify-strings");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for n in 0..32u32 {
+            db.insert_node(
+                "N",
+                &format!("n{n}"),
+                vec![("tag".into(), Value::Str(format!("tag-value-{n}")))],
+            )
+            .unwrap();
+        }
+        db.snapshot().unwrap();
+    }
+    let path = dir.join("snapshot.bin");
+    let healthy = std::fs::read(&path).unwrap();
+    assert_eq!(
+        u16::from_le_bytes([healthy[4], healthy[5]]),
+        core_storage::snapshot::VERSION,
+        "the store must be at the current version before corrupting it"
+    );
+    core_api::verify_snapshot(&dir).expect("a healthy V9 snapshot must verify");
+
+    // Locate section 12 in the directory.
+    let section_count = u16::from_le_bytes([healthy[6], healthy[7]]) as usize;
+    let mut entry = None;
+    for i in 0..section_count {
+        let base = 8 + i * 16;
+        if healthy[base] == 12 {
+            let off = u32::from_le_bytes(healthy[base + 4..base + 8].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(healthy[base + 8..base + 12].try_into().unwrap()) as usize;
+            entry = Some((off, len));
+            break;
+        }
+    }
+    let (off, len) = entry.expect("a V9 snapshot must carry section 12");
+    assert!(len > 16, "section 12 must hold a real table, got {len} B");
+
+    // Smash the root relative pointer — the last 8 bytes of the payload.
+    let mut detected_any = false;
+    for byte in (len - 8)..len {
+        let mut bytes = healthy.clone();
+        bytes[off + byte] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        if let Err(e) = core_api::verify_snapshot(&dir) {
+            assert!(
+                format!("{e:?}").contains("strings"),
+                "the strings structural pass must be what rejects it; got {e:?}"
+            );
+            detected_any = true;
+        }
+    }
+    assert!(
+        detected_any,
+        "verify must reject a structurally corrupt section 12"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // V6/V7 richer-content round-trips (format-compat)
 // ---------------------------------------------------------------------------
@@ -3013,7 +3084,7 @@ fn a_v8_snapshot_still_reads_its_strings() {
 }
 
 /// ~3.8 MB of string properties across 8 columns must not cost a 9x snapshot.
-/// Pre-0.6.5 this store wrote 8 copies of the whole intern table and landed near 8x.
+/// Pre-0.6.5 this store wrote 8 copies of the whole intern table and landed at 9.82x.
 ///
 /// The vocabulary is one distinct value per (node, field) on purpose: the cost
 /// of the old per-column copy is `columns x table`, so a small vocabulary hides

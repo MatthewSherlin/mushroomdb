@@ -346,7 +346,7 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
 | `mushroomdb snapshot <dir> [--keep-wal\|--truncate] [--retention N]` | Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole |
-| `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch |
+| `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 13 sections plus an rkyv structural pass over the mmap'd ones, exit 2 on any mismatch |
 | `mushroomdb migrate <dir>` | Migrate an older store format in place |
 | `mushroomdb backup <dir> <dest>` | Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores |
 | `mushroomdb export <dir> <dest> [--format jsonl\|parquet\|graphml]` | Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools |
@@ -460,11 +460,13 @@ Dependency rule (inward only):
 `bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
 
 Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy`), plus mmap-able
-V8 rkyv snapshots (12 sections: CSR topology, columnar properties, HNSW blobs, provenance, IVF
-state, per-node last-change index, and more — zero-copy, no heap allocation on open). V5/V6/V7
-stores are auto-migrated to V8 on `GraphDb::open`. Derived edges are not WAL-logged; they are
-restored directly from the mmap'd sections. See [`docs/format-stability.md`](docs/format-stability.md)
-for the format evolution contract.
+V9 rkyv snapshots (13 sections: CSR topology, columnar properties, one shared string table for every
+string column, HNSW blobs, provenance, IVF state, per-node last-change index, and more — zero-copy,
+no heap allocation on open). V5–V8 stores are auto-migrated to V9 on `GraphDb::open`, keeping the
+original beside the new one as `snapshot.bin.bak` until the next clean open. The upgrade is one-way:
+an earlier binary refuses a V9 snapshot with `snapshot: unsupported version 9` rather than reading it
+wrongly. Derived edges are not WAL-logged; they are restored directly from the mmap'd sections. See
+[`docs/format-stability.md`](docs/format-stability.md) for the format evolution contract.
 
 ---
 

@@ -280,9 +280,10 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
 /// hot production path in `db.rs` does NOT call this — it uses zero-copy
 /// seam views backed by `MappedBase::topology()` (unchecked) directly.
 ///
-/// This function uses `rkyv::access` (validated) for all large sections so
-/// that corrupt bytes return `GraphError::Corrupt` rather than UB.  Small
-/// sections (IDS, SYMS, RULES_META, VIEWS) already CRC-check on first touch.
+/// This function uses `rkyv::access` (validated) for all large sections — the
+/// shared string table (12) included — so that corrupt bytes return
+/// `GraphError::Corrupt` rather than UB.  Small sections (IDS, SYMS,
+/// RULES_META, VIEWS) already CRC-check on first touch.
 pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<SnapshotState>> {
     use crate::v8::encode::{
         archived_edge_props_to_owned, archived_hnsw_to_owned, archived_provenance_to_owned,
@@ -291,7 +292,8 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
         decode_meta,
     };
     use crate::v8::{
-        SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_PROVENANCE, SECTION_TOPOLOGY,
+        SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_PROVENANCE, SECTION_STRINGS,
+        SECTION_TOPOLOGY,
     };
 
     // Large sections: use validated rkyv::access so corrupt bytes return
@@ -313,10 +315,28 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
         .map_err(|e| GraphError::Corrupt {
             detail: format!("v8: columns rkyv access: {e}"),
         })?;
-    // `None` for a pre-V9 snapshot: its columns carry their own tables.  An
-    // error is propagated rather than swallowed — treating an unreadable
-    // section-12 as absent would silently drop every string in a V9 snapshot.
-    let shared_strings = mapped.string_table().transpose()?;
+    // Shared string table (section 12).  `None` only when the directory has no
+    // entry — a pre-V9 snapshot, whose columns carry their own tables.  An
+    // unreadable section is an error, never "absent": treating it as absent
+    // would hand back the empty per-column tables a V9 snapshot writes and
+    // silently drop every string property.
+    //
+    // Validated `rkyv::access`, not the `access_unchecked` that
+    // `MappedBase::string_table()` uses: this is the fuzz-safe decode path, and
+    // its contract is that corrupt bytes return `GraphError::Corrupt` rather
+    // than resolving a bad relative pointer into UB.
+    let shared_strings = if mapped.has_section(SECTION_STRINGS) {
+        Some(
+            rkyv::access::<crate::v8::layout::ArchivedStringTableData, rkyv::rancor::Error>(
+                mapped.section_bytes(SECTION_STRINGS)?,
+            )
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: strings rkyv access: {e}"),
+            })?,
+        )
+    } else {
+        None
+    };
     let props = archived_to_columnstore(archived_cols, shared_strings);
 
     let archived_ids = mapped.ids()?;

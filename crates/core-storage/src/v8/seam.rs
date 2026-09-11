@@ -542,10 +542,17 @@ pub struct BaseColumns<'a> {
 /// **Column handle**: `ColumnsView::column()` returns an overlay-backed
 /// `ColumnHandle`.  Base values are NOT visible through the column handle —
 /// only through the `get()` path.  This is acceptable because:
-///   (a) base is `None` for V5–V7 stores and for V8 stores before Task 3
-///       wires the persistent mmap (overlay starts empty after snapshot open);
+///   (a) base is `None` for V5–V7 stores, which have no mmap'd section at all
+///       (their whole snapshot is materialised into the overlay at open);
 ///   (b) callers that need a fused-scan path with base values should use
 ///       `get()` directly.
+///
+/// **String columns come in two shapes.** In a V5–V8 base every
+/// `ArchivedColumnData::Str` carries its own full copy of the string table and
+/// `strings` below is `None`. From V9 on the table is written once as section
+/// 12, every column's own copy is empty, and `strings` holds it. `get()`
+/// resolves with one rule: if the shared table is present it is the table;
+/// otherwise the column's own is.
 #[derive(Copy, Clone)]
 pub struct ColumnsView<'a> {
     pub overlay: &'a ColumnStore,
