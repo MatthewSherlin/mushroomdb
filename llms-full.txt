@@ -2633,7 +2633,7 @@ rows into it.
 | `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity using HNSW when available; (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). |
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain` | The rules and scores that produced the edges between two nodes, as JSON. `explain_association` above is the same question answered in prose. |
-| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels resolved to that same allow-list. Pass one or the other, never both. See [Trust model](#trust-model) below. The dialect: `n.key` / `n.label` / `key(n)` / `labels(n)`, `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `IN`, list subscripts (`n.location[0]`), comma-separated patterns sharing variables in one `MATCH`, and `count(DISTINCT …)` after a `WITH`. Full reference: [`query.md`](query.md). |
+| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels resolved to that same allow-list. Pass one or the other, never both. Pass `as_of` — a 0-based WAL commit index — to answer from the graph as it was at that commit; it composes with `role` or with `mask` (not both, since the tool refuses that pair), and both are resolved against the graph as it was then. Writes and `stub_hidden` are refused with `as_of`. Deleting a node does not remove it from a role's past, and a role's `keys` resolve to whichever node held the key at that commit — see [masks.md](masks.md). See [Trust model](#trust-model) below. The dialect: `n.key` / `n.label` / `key(n)` / `labels(n)`, `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `IN`, list subscripts (`n.location[0]`), comma-separated patterns sharing variables in one `MATCH`, and `count(DISTINCT …)` after a `WITH`. Full reference: [`query.md`](query.md). |
 | `node_info` | Return a node's key, label, and all properties. |
 | `stats` | Return live node, edge, and rule counts. |
 | `node_history` | Every property change for a node since the last truncating snapshot. |
@@ -3853,8 +3853,9 @@ mask appear as `{"key": "…", "restricted": true}` rather than being omitted. S
 omit-only** — `stub_hidden` has no effect on which rows the query returns; it only
 affects the node-info, edges, and neighborhood endpoints.
 
-Role tokens: `stub_hidden` is silently ignored. Hidden nodes are always fully omitted
-for role-token requests.
+Role tokens: `stub_hidden` is silently ignored — except with `as_of`, where it is
+refused (`as_of (time-travel) does not compose with stub_hidden`). Hidden nodes are
+always fully omitted for role-token requests.
 
 `as_of` (optional): a 0-based WAL commit index. The query is answered from the
 graph as it existed at that commit, read-only — a write statement with `as_of`
@@ -3874,6 +3875,20 @@ retained range is a 400 naming the range, e.g.
   "mask": ["ada", "bob"]
 }
 ```
+
+**Deletion is not retroactive, and keys are not identities.** A role reads a
+now-deleted node at a commit where it was live, and a role's `keys` resolve to
+whichever node held that key at the commit asked for (renaming frees a key for
+reuse). To revoke history, prune archives or narrow the role. See
+[masks.md](masks.md).
+
+**Cost.** An `as_of` read — role-token reads included — replays the WAL under
+the store's read guard for the duration of the query; it does not use the
+lock-free epoch snapshot that a plain read uses. Replay cost grows with the
+number of commits since the last truncating snapshot, so on a large store take
+snapshots (see the horizon and retention sections in
+[timetravel.md](timetravel.md)) and rate-limit role tokens that are allowed to
+send `as_of`.
 
 Default response: Arrow IPC stream (`application/vnd.apache.arrow.stream`).
 
@@ -4488,7 +4503,7 @@ Sixteen tools:
 
 | Tool | Description |
 |---|---|
-| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `stub_hidden?` (bool; see below) |
+| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `role?` (answer as one of the store's roles), `as_of?` (0-based commit index — answer from the graph as it was then; composes with `role` or with `mask`, not both, since the tool refuses `role` + `mask` together; writes and `stub_hidden` refused), `stub_hidden?` (bool; see below) |
 | `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?` |
 | `create_rule` | Declare a linking rule; params: `RuleDef` fields |
 | `explain` | Explain edges; params: `a`, `b` |
@@ -5330,8 +5345,9 @@ query at `commit` under a restriction. `AsOfScope` says which one:
 | `AsOfScope::RoleAndKeys("reader", &keys)` | the role ∩ the allow-list — a client list can only narrow a role, never widen it |
 
 Over HTTP this is `as_of` on `POST /query`: it composes with a role token and
-with a client `mask`. Over MCP it is the `query` tool's `as_of` argument,
-which composes with `role` and with `mask`. Writes are refused at any commit.
+with a client `mask`. Over MCP it is the `query` tool's `as_of` argument, which
+composes with `role` **or** with `mask` — that tool refuses the two together,
+with or without `as_of`. Writes are refused at any commit.
 
 **The one semantic to get right:** the **graph** is historical, the **role
 definition** is current. `roles.json` is a sidecar — it is never written as a
@@ -5340,6 +5356,19 @@ nodes the role's `keys` and `labels` resolve to: a role that may see the
 `Public` label sees exactly the `Public` nodes that existed at `commit`. If
 you rename a role's labels today, an as-of read from last week answers with
 today's label list against last week's graph.
+
+**Deletion is not retroactive.** Deleting a node does not remove it from a
+role's past: a role that may see `Public` reads a now-deleted `Public` node,
+and its edges, at any retained commit where it was live, and a role with
+`keys: ["k"]` reads `k` after `k` is gone. `DELETE` changes the present, not
+the WAL. To revoke history, prune the archives (below) or narrow the role —
+narrowing takes effect at every commit at once, because the role definition is
+always the current one.
+
+**Keys are not identities.** A role's `keys` resolve to whichever node held
+that key at the commit asked for. Renaming a node frees its key for reuse, so
+`keys: ["alice"]` read at an old commit sees the node that was `alice` then,
+not the one called `alice` now.
 
 `stub_hidden` does not compose with `as_of`; see [masks.md](masks.md).
 

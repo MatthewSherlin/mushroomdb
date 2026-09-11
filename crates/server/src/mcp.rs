@@ -1046,7 +1046,7 @@ fn graph_tools() -> Vec<Js> {
     let Js::Array(tools) = json!([
             {
                 "name": "query",
-                "description": "Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Pass 'as_of' to answer from a past commit; it composes with 'role' and 'mask'. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range, the property is not a list, or the index is not an integer, so a subscript never errors and never matches.",
+                "description": "Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Pass 'as_of' to answer from a past commit; it composes with 'role' or with 'mask'. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range, the property is not a list, or the index is not an integer, so a subscript never errors and never matches.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1067,7 +1067,7 @@ fn graph_tools() -> Vec<Js> {
                         "as_of": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "0-based WAL commit index: answer from the graph as it was at that commit. Composes with 'role' and with 'mask', which are resolved against the graph as it was then. Writes are refused."
+                            "description": "0-based WAL commit index: answer from the graph as it was at that commit. Composes with 'role' or with 'mask' — never both, which is refused as it is without 'as_of' — and whichever is passed is resolved against the graph as it was then. Deleting a node does not remove it from a role's past, and a role's 'keys' resolve to whichever node held the key at that commit. Writes are refused."
                         }
                     },
                     "required": ["cypher"]

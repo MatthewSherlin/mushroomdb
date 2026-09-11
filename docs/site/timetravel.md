@@ -234,8 +234,9 @@ query at `commit` under a restriction. `AsOfScope` says which one:
 | `AsOfScope::RoleAndKeys("reader", &keys)` | the role ∩ the allow-list — a client list can only narrow a role, never widen it |
 
 Over HTTP this is `as_of` on `POST /query`: it composes with a role token and
-with a client `mask`. Over MCP it is the `query` tool's `as_of` argument,
-which composes with `role` and with `mask`. Writes are refused at any commit.
+with a client `mask`. Over MCP it is the `query` tool's `as_of` argument, which
+composes with `role` **or** with `mask` — that tool refuses the two together,
+with or without `as_of`. Writes are refused at any commit.
 
 **The one semantic to get right:** the **graph** is historical, the **role
 definition** is current. `roles.json` is a sidecar — it is never written as a
@@ -244,6 +245,19 @@ nodes the role's `keys` and `labels` resolve to: a role that may see the
 `Public` label sees exactly the `Public` nodes that existed at `commit`. If
 you rename a role's labels today, an as-of read from last week answers with
 today's label list against last week's graph.
+
+**Deletion is not retroactive.** Deleting a node does not remove it from a
+role's past: a role that may see `Public` reads a now-deleted `Public` node,
+and its edges, at any retained commit where it was live, and a role with
+`keys: ["k"]` reads `k` after `k` is gone. `DELETE` changes the present, not
+the WAL. To revoke history, prune the archives (below) or narrow the role —
+narrowing takes effect at every commit at once, because the role definition is
+always the current one.
+
+**Keys are not identities.** A role's `keys` resolve to whichever node held
+that key at the commit asked for. Renaming a node frees its key for reuse, so
+`keys: ["alice"]` read at an old commit sees the node that was `alice` then,
+not the one called `alice` now.
 
 `stub_hidden` does not compose with `as_of`; see [masks.md](masks.md).
 
