@@ -301,6 +301,9 @@ same answer at any commit because a label is fixed when a node is inserted — w
 one consequence: a node deleted since `at` carries no label and drops out of a
 labelled historical answer.
 
+`edges_at` errors below the retention horizon; `node_history` instead just omits
+what's been pruned — see [How far back history reaches](timetravel.md#how-far-back-history-reaches).
+
 `json: true` without a filter → `{key, at, edges, listed, total}`, listing at most
 `limit` edges **per edge type** (default 10, max 100 in that form).
 

@@ -364,6 +364,20 @@ being persisted first.
 prune, `open_at` for pruned-archive commits returns `CommitOutOfRange`. History
 scans are unaffected.
 
+### How far back history reaches
+
+Automatic snapshots (`serve`, git ingest) keep only the newest **8** WAL
+archives by default (`AUTO_SNAPSHOT_RETENTION`, `crates/cli/src/lib.rs`),
+pruning the rest on every run. Below that horizon (`commit <
+wal_horizon_floor`): `was_linked`, `edges_at`, and `open_at`/`query_at` check
+the floor and return `GraphError::CommitOutOfRange`, while `node_history` and
+`edge_history` take no commit bound and just omit the pruned events — no
+error, no notice.
+
+To keep everything, don't rely on the automatic path: take an explicit
+`mushroomdb snapshot <db-dir>` with no `--retention` (keeps every archive),
+or add `--keep-wal` to never truncate the WAL.
+
 ---
 
 ## Error reference
