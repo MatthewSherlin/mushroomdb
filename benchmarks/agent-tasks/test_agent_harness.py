@@ -1257,6 +1257,27 @@ def test_association_gate_fails_when_the_cost_interval_includes_zero():
     assert not any("correctness" in r for r in v["reasons"]), v["reasons"]
 
 
+def test_association_gate_fails_when_the_cost_interval_sits_above_zero():
+    """An interval entirely above zero is the graph reliably costing *more*.
+    That is the strongest cost failure there is, and the interval leg has to
+    say so rather than waving it through for not containing zero."""
+    from report import gate_verdict
+    rows = _assoc_rows([1.0] * 6, r_costs=0.12)     # dearer on every task
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert not v["passed"]
+    assert any("cost interval" in r and "below zero" in r
+               for r in v["reasons"]), v["reasons"]
+
+
+def test_association_gate_passes_when_the_cost_interval_sits_below_zero():
+    """The only interval that passes: every resample cheaper than baseline."""
+    from report import gate_verdict
+    rows = _assoc_rows([1.0] * 6,
+                       r_costs=[0.04, 0.05, 0.06, 0.04, 0.05, 0.06])
+    v = gate_verdict(rows, **ASSOC_GATE)
+    assert v["passed"], v["reasons"]
+
+
 def test_association_gate_fails_when_another_arm_is_more_correct():
     """A tie passes; being *below* another arm does not. P winning is never
     itself a pass — it is the second baseline, not a contender."""
@@ -1333,7 +1354,7 @@ def test_write_summary_names_the_suite_and_the_baseline_arm(tmp_path):
     # The amended legs, in words: a score tie passes, the cost interval is the
     # discriminator, adoption is recorded rather than gated.
     assert "at or above every other arm's paired mean (a tie passes)" in text
-    assert "the 95% cost interval vs arm Q excludes zero" in text
+    assert "the 95% cost interval vs arm Q lies entirely below zero" in text
     assert "adoption >=" not in text
     assert "Adoption is recorded below, not gated" in text
     assert "amended 2026-09-11" in text

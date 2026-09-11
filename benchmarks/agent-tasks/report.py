@@ -106,7 +106,9 @@ def gate_verdict(rows: list[dict], baseline: str = "A",
       interval requirement on score, because the SQLite pilot scored 1.00 on
       all twenty tasks and correctness is saturated. Cost is the discriminator
       instead: mean cost at or below the baseline **and** the 95% bootstrap
-      interval of the paired cost differences excluding zero. Max-turns is
+      interval of the paired cost differences lying entirely below zero — an
+      interval straddling zero is noise, one above it is the graph reliably
+      costing more, and neither is a win. Max-turns is
       unchanged. Adoption is recorded but not gated: in arm R the store is the
       agent's only data path, so it measures nothing.
 
@@ -164,9 +166,12 @@ def gate_verdict(rows: list[dict], baseline: str = "A",
         if cost_ci:
             cost_diffs = paired_deltas(rows, arm, "cost_usd", baseline)
             lo, hi = bootstrap_ci(cost_diffs)
-            if not cost_diffs or lo <= 0 <= hi:
+            # Only an interval entirely below zero is a cost win. One that
+            # straddles zero is noise; one entirely above zero is the graph
+            # reliably costing more, which is a failure, not a pass.
+            if not cost_diffs or hi >= 0:
                 reasons.append(f"{arm}: cost interval [{lo:+.4f}, {hi:+.4f}] "
-                               f"vs arm {baseline} includes zero")
+                               f"vs arm {baseline} is not entirely below zero")
         adoption = sum(1 for r in rs if r["adopted"]) / len(rs)
         if adoption_gate and adoption < GATE_ADOPTION:
             reasons.append(f"{arm}: adoption {adoption:.0%} < {GATE_ADOPTION:.0%}")
@@ -258,7 +263,8 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
         legs.append("at or above every other arm's paired mean (a tie passes)")
     legs.append(f"cost <= arm {baseline}")
     if cost_ci:
-        legs.append(f"the 95% cost interval vs arm {baseline} excludes zero")
+        legs.append(f"the 95% cost interval vs arm {baseline} lies entirely "
+                    "below zero")
     if adoption_gate:
         legs.append(f"adoption >= {GATE_ADOPTION:.0%}")
     legs.append(f"no max-turns failure on a task arm {baseline} finished")
