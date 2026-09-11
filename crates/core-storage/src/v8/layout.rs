@@ -120,6 +120,25 @@ pub struct InternerData {
 }
 
 // ---------------------------------------------------------------------------
+// Shared string table (section 12)
+// ---------------------------------------------------------------------------
+
+/// The one string table a V9 snapshot carries for *every* `ColumnData::Str` in
+/// the columns section: `ids[node]` indexes into `strings`.
+///
+/// Up to V8 each string column carried its own `strings: Vec<String>` copy of
+/// the whole intern table, so a snapshot with K string columns paid for K
+/// copies.  V9 writes the table once here and leaves every column's own
+/// `strings` empty.  The resolution rule, in `seam.rs`'s `Str` arm and in
+/// `encode::archived_to_columnstore`, is one sentence: if the shared table is
+/// present it is the table, otherwise the column's own `strings` is — which is
+/// what keeps a pre-V9 snapshot, whose directory has no section 12, readable.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct StringTableData {
+    pub strings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Edge props (section 5)
 // ---------------------------------------------------------------------------
 
@@ -240,3 +259,4 @@ pub type ArchivedHnsw = ArchivedHnswSectionData;
 pub type ArchivedProvenance = ArchivedProvenanceSectionData;
 pub type ArchivedRulesMeta = ArchivedRulesMetaData;
 pub type ArchivedViews = ArchivedViewsSectionData;
+pub type ArchivedStringTable = ArchivedStringTableData;

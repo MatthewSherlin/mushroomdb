@@ -3,8 +3,8 @@
 //! Wire layout (all integers LE):
 //! ```text
 //! [0..4]   MAGIC "GDB1"
-//! [4..6]   VERSION = 8 (u16 LE)
-//! [6..8]   section_count (u16 LE) — currently 11
+//! [4..6]   VERSION = 8 or 9 (u16 LE) — same container, V9 adds section 12
+//! [6..8]   section_count (u16 LE) — currently 13
 //! [8..8+16*N] SectionEntry * N  -- {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}
 //! [8+16*N..8+16*N+4]  whole-header CRC32
 //! [..4096]  zero-pad
@@ -23,6 +23,8 @@
 //!   8 = RULES_META (rkyv RulesMetaData)
 //!   9 = VIEWS (rkyv ViewsSectionData)
 //!  10 = IVF_STATE (bincode BTreeMap<String,PerRuleIvfState>; retained as undecoded bytes at open)
+//!  11 = LAST_CHANGE (bincode HashMap<u32,u64>)
+//!  12 = STRINGS (rkyv StringTableData — the one table every Str column indexes; V9 only)
 
 pub mod encode;
 pub mod layout;
@@ -31,7 +33,7 @@ pub mod seam;
 use crate::types::{GraphError, Result};
 use crate::v8::layout::{
     ArchivedColumns, ArchivedCsr, ArchivedEdgeProps, ArchivedHnsw, ArchivedIdMap, ArchivedInterner,
-    ArchivedRulesMeta, ArchivedViews,
+    ArchivedRulesMeta, ArchivedStringTable, ArchivedViews,
 };
 use memmap2::MmapOptions;
 use std::path::Path;
@@ -83,10 +85,15 @@ pub const SECTION_IVF_STATE: u8 = 10;
 /// Small section (8-16 bytes/node); loaded eagerly at open.  Missing in pre-Task-3 snapshots
 /// (treated as absent; the live map is rebuilt from WAL replay only).
 pub const SECTION_LAST_CHANGE: u8 = 11;
+/// Shared string table for every `ColumnData::Str` in the columns section:
+/// rkyv `StringTableData`.  Written from V9 on; absent in V5–V8 snapshots,
+/// where each string column carries its own copy and that copy is authoritative.
+pub const SECTION_STRINGS: u8 = 12;
 
 /// Total number of canonical section slots (used for atomic check_state array).
-/// Extended from 11 (Task 5: +ivf_state) to 12 (Task 3: +last_change).
-pub const V8_MAGIC_SECTION_COUNT: usize = 12;
+/// Extended from 11 (Task 5: +ivf_state) to 12 (Task 3: +last_change) to 13
+/// (v0.6.5: +strings).
+pub const V8_MAGIC_SECTION_COUNT: usize = 13;
 
 /// Returns `true` for sections whose content is large enough that a
 /// full-section CRC at first touch would cost tens or hundreds of
@@ -105,6 +112,7 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_HNSW
             | SECTION_PROVENANCE
             | SECTION_IVF_STATE
+            | SECTION_STRINGS
     )
 }
 
@@ -258,6 +266,7 @@ impl MappedBase {
             SECTION_VIEWS => "views",
             SECTION_IVF_STATE => "ivf_state",
             SECTION_LAST_CHANGE => "last_change",
+            SECTION_STRINGS => "strings",
             _ => "unknown",
         };
         self.dir
@@ -443,6 +452,37 @@ impl MappedBase {
         Ok(unsafe { rkyv::access_unchecked::<crate::v8::layout::ArchivedColumnsData>(bytes) })
     }
 
+    /// Zero-copy access to the shared string table (section 12).
+    ///
+    /// `None` when the snapshot predates the shared section (pre-V9): every
+    /// `ColumnData::Str` carries its own copy and that copy is authoritative.
+    /// `Some(Err(..))` only when the section is present but unreadable, which
+    /// must not be silently treated as "absent" — that would hand the caller
+    /// the empty per-column tables a V9 snapshot writes and lose every string.
+    ///
+    /// Uses `rkyv::access_unchecked`; see `topology()` for the full safety
+    /// rationale.  Reads in `ColumnsView`/`archived_to_columnstore` are
+    /// bounds-checked against the returned slice.
+    pub fn string_table(&self) -> Option<Result<&ArchivedStringTable>> {
+        if self.dir.iter().all(|e| e.id != SECTION_STRINGS) {
+            return None;
+        }
+        Some((|| {
+            let bytes = self.section_bytes(SECTION_STRINGS)?;
+            if bytes.len() < std::mem::size_of::<crate::v8::layout::ArchivedStringTableData>() {
+                return Err(GraphError::Corrupt {
+                    detail: "v8: strings section too short for rkyv root".to_string(),
+                });
+            }
+            // SAFETY: Minimum length checked above; encoder writes self-contained
+            // sections with all relative pointers within-section.  Same rationale
+            // and same mitigation (`mushroomdb verify`) as `columns()`.
+            Ok(unsafe {
+                rkyv::access_unchecked::<crate::v8::layout::ArchivedStringTableData>(bytes)
+            })
+        })())
+    }
+
     /// Zero-copy access to the archived id map.
     pub fn ids(&self) -> Result<&ArchivedIdMap> {
         let bytes = self.section_bytes(SECTION_IDS)?;
@@ -622,12 +662,14 @@ impl MappedBase {
 fn min_rkyv_root_size(section_id: u8) -> Option<usize> {
     use crate::v8::layout::{
         ArchivedColumnsData, ArchivedCsrData, ArchivedEdgePropsData, ArchivedHnswSectionData,
+        ArchivedStringTableData,
     };
     match section_id {
         SECTION_TOPOLOGY => Some(std::mem::size_of::<ArchivedCsrData>()),
         SECTION_COLUMNS => Some(std::mem::size_of::<ArchivedColumnsData>()),
         SECTION_EDGE_PROPS => Some(std::mem::size_of::<ArchivedEdgePropsData>()),
         SECTION_HNSW => Some(std::mem::size_of::<ArchivedHnswSectionData>()),
+        SECTION_STRINGS => Some(std::mem::size_of::<ArchivedStringTableData>()),
         _ => None,
     }
 }
@@ -651,10 +693,14 @@ fn parse_header(mmap: &[u8]) -> Result<Vec<SectionEntry>> {
         });
     }
     // Infallible: `mmap.len() >= HEADER_SIZE` checked above; slices are exactly 2 bytes each.
+    // V8 and V9 share this container byte-for-byte: same magic, same 4 KB
+    // header page, same 16-byte directory entries, same per-section CRC.  V9
+    // only adds section 12 and empties the per-column string tables, so one
+    // parser serves both and `string_table()` is what tells them apart.
     let version = u16::from_le_bytes(mmap[4..6].try_into().unwrap());
-    if version != 8 {
+    if version != crate::snapshot::VERSION_8 && version != crate::snapshot::VERSION_9 {
         return Err(GraphError::Corrupt {
-            detail: format!("v8: expected version 8, got {version}"),
+            detail: format!("v8: expected version 8 or 9, got {version}"),
         });
     }
     let section_count = u16::from_le_bytes(mmap[6..8].try_into().unwrap()) as usize;
@@ -746,7 +792,7 @@ mod tests {
         let meta = tiny_v8_meta();
         let mut out = Vec::new();
         encode_v8(
-            None, None, None, None, &topo, &props, &ids, &syms, &meta, &mut out,
+            None, None, None, None, None, &topo, &props, &ids, &syms, &meta, &mut out,
         )
         .expect("encode_v8");
         out
