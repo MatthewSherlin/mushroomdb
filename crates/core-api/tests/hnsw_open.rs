@@ -444,3 +444,65 @@ fn query_results_identical_across_snapshot_and_reopen() {
         "derived edge set must be identical across snapshot + reopen"
     );
 }
+
+/// Exact k-NN over `DOCS`, computed here rather than by the database: the
+/// reference the approximate path has to reproduce.
+fn brute_force(q: &[f64; 2], k: usize, min: f64) -> Vec<String> {
+    let qn = (q[0] * q[0] + q[1] * q[1]).sqrt();
+    let mut scored: Vec<(String, f64)> = DOCS
+        .iter()
+        .map(|(key, v)| {
+            let vn = (v[0] * v[0] + v[1] * v[1]).sqrt();
+            (key.to_string(), (q[0] * v[0] + q[1] * v[1]) / (qn * vn))
+        })
+        .filter(|&(_, sim)| sim >= min)
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    scored.truncate(k);
+    scored.into_iter().map(|(key, _)| key).collect()
+}
+
+/// Clean open, **before any mutation**: the first approximate query must be
+/// answered by the persisted graph, not by the brute-force fallback.
+///
+/// This is the `ensure_hnsw_loaded` path (`engine.rs`), which decodes the
+/// retained blobs on the read side under a shared lock. It is separate from
+/// `ensure_indexes_populated`, and its failure is silent: the results are
+/// still correct — brute force gets the same answer — so only a counter can
+/// tell the two apart. Two things used to break it on a clean open: the
+/// retained blobs were never read out of the snapshot before the `OnceLock`
+/// latched (so it latched an empty map for the handle's life), and the
+/// label-less entry point could not reach the lazily decoded graphs at all.
+#[test]
+fn clean_open_first_query_is_served_by_the_index() {
+    let dir = tmp("hnsw-open-lazy");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+    }
+
+    let db = GraphDb::open(&dir).unwrap();
+    let q = [1.0, 0.0];
+    let expected = brute_force(&q, 2, 0.0);
+
+    core_rules::hnsw_search_count_reset();
+    let hits = db.find_similar_vector("emb", Some("Doc"), &q, 2, 0.0);
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "the first query on a clean open fell back to a full scan: the retained \
+         HNSW blob was never decoded"
+    );
+    assert_eq!(keys_of(&hits), expected, "index disagrees with brute force");
+
+    // Same for the cross-label entry point used by hybrid search.
+    core_rules::hnsw_search_count_reset();
+    let any = db.find_similar_vector("emb", None, &q, 2, 0.0);
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "the label-less query fell back to a full scan"
+    );
+    assert_eq!(keys_of(&any), expected, "index disagrees with brute force");
+
+    // Still no mutation has happened: the read path must not have built one.
+    assert_eq!(db.hnsw_build_count(), 0, "clean open rebuilt a graph");
+}

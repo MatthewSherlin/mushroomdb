@@ -43,6 +43,33 @@ pub const EF_CONSTRUCTION: usize = 400;
 /// Beam width for search.
 pub const EF_SEARCH: usize = 400;
 
+thread_local! {
+    static HNSW_SEARCH_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count one query answered by the graph itself (past the empty-index guards).
+/// Compiles away without `test-hooks`.
+#[inline]
+fn note_search() {
+    #[cfg(any(test, feature = "test-hooks"))]
+    HNSW_SEARCH_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Queries answered by an `HnswIndex` graph on this thread since the last
+/// reset. Zero means every approximate query fell back to a full scan.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_search_count() -> u64 {
+    HNSW_SEARCH_COUNT.with(|c| c.get())
+}
+
+/// Reset this thread's graph-query counter to zero.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_search_count_reset() {
+    HNSW_SEARCH_COUNT.with(|c| c.set(0));
+}
+
 // ---------------------------------------------------------------------------
 // PRNG helpers
 // ---------------------------------------------------------------------------
@@ -463,6 +490,7 @@ impl HnswIndex {
             return vec![];
         }
 
+        note_search();
         let ef = k.max(EF_SEARCH);
         let mut curr_ep = ep;
 
