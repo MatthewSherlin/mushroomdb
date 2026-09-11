@@ -50,7 +50,7 @@ Write the batch with `ingest_json`, `label` `Concept`, `rows_json` the array of 
 
 ## Advanced
 
-`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the fifteen above. All 27 are served either way; `{{BIN}} mcp <db> --all-tools` lists the rest with the schemas documenting their arguments: `map`, `context`, `impact`, `owners`, `why`, `recall`, `remember`, `sync`, `ingest_json`, `create_rule`, `explain`, `upsert_entity`, `rename_node`.
+`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the fifteen above. All are served either way; `{{BIN}} mcp <db> --all-tools` lists the rest with the schemas documenting their arguments: `map`, `context`, `impact`, `owners`, `why`, `recall`, `remember`, `sync`, `ingest_json`, `create_rule`, `explain`, `upsert_entity`, `rename_node`.
 
 **Never create a rule silently.** *Propose* `create_rule` — show the predicate and the edges it would derive — and wait for explicit approval. When `ingest_json` skips an auto-FK field with `ambiguous target labels`, its values point at two labels: declare one `create_rule` KeyMatch rule per target label instead.
 

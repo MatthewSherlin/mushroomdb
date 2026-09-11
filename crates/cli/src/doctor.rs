@@ -1028,7 +1028,7 @@ fn self_handshake(command: &str, args: &[String]) -> Result<HandshakeOk, String>
 ///
 /// Either is enough, because which one is listed follows the store: a store
 /// `ingest-git` built advertises `explore` and hides the rest, and any other
-/// store advertises `explain_association` among its thirteen. Requiring one
+/// store advertises `explain_association` among its fifteen. Requiring one
 /// particular name would fail `doctor` on exactly the stores the other surface
 /// exists for.
 const TASK_PATH_TOOLS: [&str; 2] = ["explore", "explain_association"];
