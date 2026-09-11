@@ -3063,8 +3063,16 @@ fn shared_string_table_is_written_once() {
 }
 
 /// A pre-V9 snapshot has no shared section and its per-column tables still answer.
+///
+/// `golden_v8.bin` holds only an Int property, so this checks that a real V8
+/// file still opens and reads correctly — not string resolution specifically.
+/// The pre-V9 string-table fallback itself is covered by
+/// `a_pre_v9_column_resolves_through_its_own_table` in
+/// `crates/core-storage/src/v8/seam.rs`, and by
+/// `v8_string_props_survive_the_migration_to_v9` in
+/// `crates/core-api/tests/migrate.rs`.
 #[test]
-fn a_v8_snapshot_still_reads_its_strings() {
+fn a_v8_snapshot_still_reads_its_properties() {
     let dir = tmp("v8-strings-compat");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(

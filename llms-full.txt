@@ -1982,7 +1982,7 @@ destination-side vectors (cosine similarity, in-tree implementation — no
 external ANN dependency). Each node insertion incrementally updates the HNSW
 graph. On each lookup, the HNSW index returns the approximate k nearest
 neighbors. IVF-Flat centroids are also maintained as a fallback; the primary
-candidate path is HNSW. The HNSW graph is persisted in V7 snapshots alongside
+candidate path is HNSW. The HNSW graph is persisted in the snapshot alongside
 IVF centroids so WAL replay and snapshot open avoid full re-fitting. Opening a
 store whose snapshot holds that graph loads it directly and never rebuilds it;
 the rebuild is the fallback for a rule with no persisted graph, or one whose
@@ -2641,8 +2641,8 @@ rows into it.
 | `explain` | The rules and scores that produced the edges between two nodes, as JSON. `explain_association` above is the same question answered in prose. |
 | `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels, narrowed by its `visible_where` property test if it declares one, resolved to that same allow-list. Pass one or the other, never both. Pass `as_of` — a 0-based WAL commit index — to answer from the graph as it was at that commit; it composes with `role` or with `mask` (not both, since the tool refuses that pair), and both are resolved against the graph as it was then. Writes and `stub_hidden` are refused with `as_of`. Deleting a node does not remove it from a role's past, and a role's `keys` resolve to whichever node held the key at that commit — see [masks.md](masks.md). See [Trust model](#trust-model) below. The dialect: `n.key` / `n.label` / `key(n)` / `labels(n)`, `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `IN`, list subscripts (`n.location[0]`), comma-separated patterns sharing variables in one `MATCH`, and `count(DISTINCT …)` after a `WITH`. Full reference: [`query.md`](query.md). |
 | `node_info` | Return a node's key, label, and all properties. |
-| `stats` | Return live node, edge, and rule counts. |
-| `node_history` | Every property change for a node since the last truncating snapshot. |
+| `stats` | Return live node, edge, and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned). |
+| `node_history` | Every recorded change to one node, newest last, plus `total_commits` (the horizon upper bound) and `horizon`, the oldest commit still retained. |
 | `edge_history` | Add/retract lifecycle for all edges between two nodes, with the rule behind each event. |
 | `was_linked` | Point-in-time check: was an edge of this type active at this commit? |
 | `rename_node` | Rename a node's key, preserving all its edges. |
@@ -5397,7 +5397,10 @@ always the current one.
 **Keys are not identities.** A role's `keys` resolve to whichever node held
 that key at the commit asked for. Renaming a node frees its key for reuse, so
 `keys: ["alice"]` read at an old commit sees the node that was `alice` then,
-not the one called `alice` now.
+not the one called `alice` now. The same caveat reaches `GET
+/node/{key}/history` under a role token: its edge-endpoint filter resolves the
+other endpoint's key against today's ids, not the ids as of the historical
+event, so a recycled key is judged by who holds it now, not who held it then.
 
 `stub_hidden` does not compose with `as_of`; see [masks.md](masks.md).
 

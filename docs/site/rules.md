@@ -265,7 +265,7 @@ destination-side vectors (cosine similarity, in-tree implementation — no
 external ANN dependency). Each node insertion incrementally updates the HNSW
 graph. On each lookup, the HNSW index returns the approximate k nearest
 neighbors. IVF-Flat centroids are also maintained as a fallback; the primary
-candidate path is HNSW. The HNSW graph is persisted in V7 snapshots alongside
+candidate path is HNSW. The HNSW graph is persisted in the snapshot alongside
 IVF centroids so WAL replay and snapshot open avoid full re-fitting. Opening a
 store whose snapshot holds that graph loads it directly and never rebuilds it;
 the rebuild is the fallback for a rule with no persisted graph, or one whose

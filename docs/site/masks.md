@@ -255,3 +255,10 @@ Renaming a node frees its key, and a later node may take it. A role with
 `keys: ["alice"]` that reads at an old commit sees the node that was called
 `alice` *then* — not the one called `alice` now. Grant by label, or by a key
 you do not recycle, when that distinction matters.
+
+The same caveat reaches the history endpoints. `GET /node/{key}/history` under
+a role token filters out `EdgeAdded`/`EdgeRemoved` entries whose other
+endpoint the role cannot see — but that filter resolves the other endpoint's
+key against **today's** ids, not the ids as of the historical event. A key
+that was reused since the event can be let through, or held back, on the
+strength of who holds it now rather than who held it then.

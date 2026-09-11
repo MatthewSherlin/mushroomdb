@@ -1705,10 +1705,16 @@ fn choose_backup(from: &Path) -> Option<PathBuf> {
 /// The restore is all-or-nothing. The backup is copied into a staging
 /// directory **inside** `db_dir` and opened there — the same CRC and replay
 /// checks any open runs — and only a copy that opened is moved into place. Any
-/// failure removes the staging directory and leaves `db_dir` exactly as it was,
-/// so the error names the paths, the operator can fix the backup, and the next
+/// *error* removes the staging directory (or, once files have started moving,
+/// undoes the moves already made) and leaves `db_dir` exactly as it was, so
+/// the error names the paths, the operator can fix the backup, and the next
 /// boot restores rather than reporting [`RestoreOutcome::AlreadyPresent`] over
-/// a half-written store.
+/// a half-written store. That unwind is process-local: a crash between the
+/// two renames that install the staged files (not a returned error, but the
+/// process dying) can leave `db_dir` holding one file but not the other. The
+/// next boot sees that partial store as already present and reports
+/// [`RestoreOutcome::AlreadyPresent`] rather than restoring over it — clear
+/// the directory and restore again.
 ///
 /// Staging lives inside `db_dir` on purpose: `db_dir` is typically the mount
 /// point, so a sibling directory could land on another filesystem and turn the

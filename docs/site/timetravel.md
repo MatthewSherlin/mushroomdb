@@ -257,7 +257,10 @@ always the current one.
 **Keys are not identities.** A role's `keys` resolve to whichever node held
 that key at the commit asked for. Renaming a node frees its key for reuse, so
 `keys: ["alice"]` read at an old commit sees the node that was `alice` then,
-not the one called `alice` now.
+not the one called `alice` now. The same caveat reaches `GET
+/node/{key}/history` under a role token: its edge-endpoint filter resolves the
+other endpoint's key against today's ids, not the ids as of the historical
+event, so a recycled key is judged by who holds it now, not who held it then.
 
 `stub_hidden` does not compose with `as_of`; see [masks.md](masks.md).
 

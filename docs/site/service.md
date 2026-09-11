@@ -147,7 +147,13 @@ Four rules make it safe to leave in a container command line forever:
    moved in once it has opened, a corrupt or truncated backup leaves the store
    directory exactly as it was — empty. Fix the backup, or point at a different
    one, and the next boot restores; there is no half-written store to clear out
-   first, and no run that silently reports a store is already present.
+   first, and no run that silently reports a store is already present. That
+   guarantee covers errors the restore itself detects; a crash between the two
+   renames that install the staged files (not a returned error, but the
+   process dying mid-restore) can still leave the directory holding one file
+   but not the other. The next boot sees that partial store as already
+   present and reports it rather than restoring over it — clear the directory
+   and restore again.
 4. **It runs before `--demo-if-empty`.** A restored store is never overwritten
    by the demo seed, whichever order the flags appear in.
 

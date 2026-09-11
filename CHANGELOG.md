@@ -19,7 +19,10 @@ about agent performance.
 - **Snapshot format V9 — one shared string table.** A snapshot carries the string table once, in a
   new section, instead of a full copy inside every string column. Measured by
   `snapshot_size_is_near_the_property_payload` (12,000 nodes × 8 string fields, 3.7 MB of property
-  bytes): **36.8 MB → 5.2 MB** on disk, 9.82× the payload down to 1.39×. Upgrading is automatic and
+  bytes): **36.8 MB → 5.2 MB** on disk, 9.82× the payload down to 1.39× (the 36.8 MB / 9.82× "before"
+  figure is a pre-change measurement recorded beside the test, taken against the old per-column
+  layout the V8 encoder wrote; the 5.2 MB / 1.39× "after" figure is what the committed test asserts,
+  as `size < payload * 2`). Upgrading is automatic and
   in place — the first read-write open of a V5–V8 store rewrites its snapshot at V9 and keeps the
   old one as `snapshot.bin.bak` until the next clean open. **A store snapshotted by 0.6.5 cannot be
   opened by 0.6.4 or earlier**: an older binary refuses it with `snapshot: unsupported version 9`
@@ -43,6 +46,12 @@ about agent performance.
 - **`as_of` together with `stub_hidden` is refused** on `POST /query` and on the MCP `query` tool
   (400 / tool error, `as_of (time-travel) does not compose with stub_hidden`). The combination was
   previously accepted with the flag silently inert.
+- **`RoleDef` gains a public field `visible_where`.** Rust callers building a `RoleDef` with a
+  struct literal add the field (or `..`).
+- **`Stats` gains a public field `history_floor`.** Rust callers building a `Stats` with a struct
+  literal add the field (or `..`).
+- **`AUTO_SNAPSHOT_RETENTION` changes type from `u32` to `Option<u32>`.** `None` is the new
+  keep-everything default; a Rust caller reading the constant matches the new type.
 
 #### Added
 
