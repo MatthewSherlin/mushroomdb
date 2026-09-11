@@ -357,7 +357,11 @@ where there is no intersection to take.
 
 ---
 
-## Repository tools
+## Repository tools (deprecated in v0.6.4, removed in 0.7)
+
+These nine answer from a repository the store was built from with `ingest-git`.
+They still ship and are still tested; they are no longer promoted, and 0.7
+removes them. The five association tools above answer on any store.
 
 Fourteen task tools answer a question in one call rather than exposing the graph
 API. Nine of them are about a repository the store was built from with

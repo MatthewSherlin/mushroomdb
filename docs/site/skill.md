@@ -61,30 +61,28 @@ search, and call `explore <target>` on the first file or symbol the task names
 before any `Grep`, file read or plan. On a memory store, where `explore` is
 unlisted, `map` opens instead.
 
-**Three task rules**, in order — the first that matches the turn is the tool to
-call, before answering:
-
-| The turn | The tool |
-|---|---|
-| Anything cross-file — before `Grep` | `explore` with one `target` and one `depth`: `context` (default), `impact` (before you edit), `history`, or `all` |
-| The user states a decision or durable fact | `remember`, and say the `note:` key it returns. A `--delivery cli` install has no such subcommand, so its copy of the skill says to write the note through `query` instead |
-| Commits have landed, or the brief reports an old sync | `sync` |
-| **On a memory store** — entities, no repository | Rows 1–3 do not apply. One named call per question kind (below), copied from the worked calls the brief printed — one per kind — against the store's own keys |
-
-**Row 4 — the memory-store recipes.** One call per question, not a search:
+**Task rules.** One call per question kind, on the store's own keys — not a
+search. The `SessionStart` brief prints one worked call per kind; copy those
+rather than probing Cypher for the schema:
 
 | The question | The call |
 |---|---|
 | why are these two related | `explain_association a b` — the rule, the score and the values the two share |
-| what is it related to | `node_edges a` — grouped by type, rule and score per edge; `all_of: [T1, T2]` for the partners linked by every one of them, `label:` to narrow them |
-| what did it look like then | `edges_at a <commit>` — the same views at a past commit |
-| what changes if | `what_if a <field> <value>` — lost and gained, nothing written |
+| what is it related to | `node_edges a` — grouped by type, rule and score; `all_of: [T, U]` for the partners carrying every named type; `label:` narrows them |
+| what did it look like then | `edges_at a <commit>` |
+| what would this change do | `what_if a <field> <value>` — lost and gained, nothing written |
 | who may see | `query` with a `role` from the store's `roles.json` |
 | how many | a counting Cypher over the labels the brief listed |
-| linked by all of | `node_edges a all_of: [T1, T2]` for the partners carrying every named type, or one `MATCH` with comma-separated patterns and `count(DISTINCT …)` — the form the brief renders |
+| a durable fact | `remember` — the `text` and the existing keys it is `about`; say the `note:` key back |
 
 Since when is `node_history` / `edge_history` / `was_linked`; around it is
 `neighborhood` / `node_info`; like it is `find_similar` / `hybrid_search`.
+
+**Deprecated, removed in 0.7.** A store built by `ingest-git` is a repository
+as entities — commits, pull requests, files, authors — and lists `explore`,
+`query` and `stats` instead. The code tools `map`, `context`, `impact`,
+`owners`, `why` and `sync` stay served behind `--all-tools`. The skill treats
+`ingest-git` as a data source, not as the tool to reach for ahead of a search.
 
 The **`--delivery cli` variant of the skill names the CLI equivalents** instead,
 and says plainly which of them have none: `why <a> <b>` and `asof --commit N
@@ -134,9 +132,9 @@ Cursor gets the same content as an always-apply rules file
 | `--command <path>` | Invoke this binary instead of `npx`. Use it for a local build or a pinned install. A relative path is fine to type: it is anchored to the current directory before anything is written, because the assistant spawns the server from a directory of its own. `--db` is anchored the same way. A bare name with no separator (`--command mushroomdb`) means a `PATH` lookup and is written exactly as given. |
 | `--delivery cli\|mcp\|both` | Which door the install opens. Default `both`: the MCP server entry **and** a skill that also teaches the shell form. `mcp` writes the server entry alone. `cli` writes no server entry at all — the skill teaches `mushroomdb explore <store> <target>` through `Bash`, so a session loads no tool schemas before its first turn; re-installing as `cli` removes an entry an earlier run registered. Claude Code only: a Cursor or Codex install is always the server, and `install` prints a note saying so rather than dropping the flag. |
 | `--no-git-hooks` | Skip the `post-commit` / `post-checkout` / `post-merge` sync hooks. |
-| `--intercept-grep` | **Experimental, off by default.** Adds a fourth Claude Code hook: `hooks.PreToolUse`, matched to `Grep`, running `<bin> intercept <store>` (5 s timeout). When the search pattern is a bare identifier of three characters or more that the graph holds as a symbol, the hook exits 2 with one line pointing at `explore("<name>")` — Claude Code blocks the search and hands the model that message, so a question the graph answers exactly (definition, callers, callees) is not answered by a list of matching lines. Anything that looks like a regex, any name the graph does not hold, and any store that will not open passes straight through. Leave it off unless you are measuring it; `disable`, `enable` and `uninstall` handle it like every other hook, and re-running `install` without the flag removes it. |
-| `--impact-before-edit` | **Experimental, off by default.** Adds a Claude Code hook: `hooks.PreToolUse`, matched to `Edit\|Write\|MultiEdit`, running `<bin> impact-hook <store>` (5 s timeout, awaited). Before an edit lands, it prints at most 600 bytes of the file's blast radius — the files that import it, the files that usually change with it, the tests that cover it — as `additionalContext` on stdout, so the model knows what the change reaches before making it. It never blocks: exit 0 always, and a file the graph has no `File` for, a store that will not open and a payload that will not parse each print nothing at all. Independent of `--intercept-grep`, which shares its event: each hook is its own group with its own matcher, and turning one off leaves the other alone. |
-| `--enrich-grep` | **Experimental, off by default.** Adds a Claude Code hook: `hooks.PostToolUse`, matched to `Grep`, running `<bin> enrich <store>` (5 s timeout, awaited). After a search returns, it looks up the pattern and the identifiers in the matches, and prints at most 800 bytes about the first five that name exactly one symbol the graph holds — definition site, caller count, the file's owner — as `additionalContext`. Nothing resolving is nothing printed. Independent of the `touch` hook, which shares its event. |
+| `--intercept-grep` | **Deprecated in v0.6.4, removed in 0.7.** **Experimental, off by default.** Adds a fourth Claude Code hook: `hooks.PreToolUse`, matched to `Grep`, running `<bin> intercept <store>` (5 s timeout). When the search pattern is a bare identifier of three characters or more that the graph holds as a symbol, the hook exits 2 with one line pointing at `explore("<name>")` — Claude Code blocks the search and hands the model that message, so a question the graph answers exactly (definition, callers, callees) is not answered by a list of matching lines. Anything that looks like a regex, any name the graph does not hold, and any store that will not open passes straight through. Leave it off unless you are measuring it; `disable`, `enable` and `uninstall` handle it like every other hook, and re-running `install` without the flag removes it. |
+| `--impact-before-edit` | **Deprecated in v0.6.4, removed in 0.7.** **Experimental, off by default.** Adds a Claude Code hook: `hooks.PreToolUse`, matched to `Edit\|Write\|MultiEdit`, running `<bin> impact-hook <store>` (5 s timeout, awaited). Before an edit lands, it prints at most 600 bytes of the file's blast radius — the files that import it, the files that usually change with it, the tests that cover it — as `additionalContext` on stdout, so the model knows what the change reaches before making it. It never blocks: exit 0 always, and a file the graph has no `File` for, a store that will not open and a payload that will not parse each print nothing at all. Independent of `--intercept-grep`, which shares its event: each hook is its own group with its own matcher, and turning one off leaves the other alone. |
+| `--enrich-grep` | **Deprecated in v0.6.4, removed in 0.7.** **Experimental, off by default.** Adds a Claude Code hook: `hooks.PostToolUse`, matched to `Grep`, running `<bin> enrich <store>` (5 s timeout, awaited). After a search returns, it looks up the pattern and the identifiers in the matches, and prints at most 800 bytes about the first five that name exactly one symbol the graph holds — definition site, caller count, the file's owner — as `additionalContext`. Nothing resolving is nothing printed. Independent of the `touch` hook, which shares its event. |
 | `--always-load` | Writes `"alwaysLoad": true` on the `mcpServers.mushroomdb` entry, so the host keeps the server's tools in context instead of deferring them until something asks. **Already the default when `--db` names a store and a server is registered** (`--delivery mcp` or `both`): an install that pins a store is an entity-store install, whose tools a session has to be shown before it can ask its first question — the alternative is turns spent searching for them. Use the flag to force it on an install that named no store, where the resolved store is usually the code graph and its three tools need no pinning. Claude Code's `.mcp.json` only — a Cursor or Codex registration has no equivalent. Re-running `install` with a different answer rewrites the key; `disable` and `enable` preserve it. |
 | `--no-always-load` | Opts out of the `alwaysLoad` default above: the server entry is written without the key, and the host defers its tool schemas as before. Meaningless with `--delivery cli`, which registers no entry at all. |
 | `--no-prewarm` | No network and no resolution during the install: neither the one-off package fetch nor locating the package's binary. Every hook keeps the slower `npx` form. |

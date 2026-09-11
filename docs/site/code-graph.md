@@ -1,5 +1,16 @@
 # The live code graph
 
+> **Deprecated in v0.6.4 — removed in 0.7.** Everything on this page still works, is still tested,
+> and still ships. `ingest-git` is a supported **data source**, and `explore`, `map`, `context`,
+> `impact`, `owners`, `why` and `sync` stay served — listed on a store `ingest-git` built, and
+> reachable anywhere through `mushroomdb mcp <db> --all-tools`. It is simply no longer what
+> mushroomdb leads with. Measured reason: across 240 benchmark cells a coding agent with this door
+> was no more correct than a stock session, cost about 20% more when it used the graph, and made no
+> graph call at all in 120 unprompted sessions
+> ([`results/20260910T000418Z`](../../benchmarks/agent-tasks/results/20260910T000418Z/summary.md)).
+> If you rely on these tools, pin `mushroomdb@0.6.x`; nothing on the entity surface replaces them.
+> What mushroomdb is for now: [MCP tools](mcp.md).
+
 `mushroomdb ingest-git` turns a git repository into a graph: authors, commits,
 files, symbols, imports, calls, merged pull requests, and the notes an assistant
 writes into it. `explore` reads that graph back as text an assistant can quote,
@@ -415,6 +426,8 @@ Whichever door is opened, three hooks are written: `SessionStart` runs `brief`,
 runs `touch` so an edited file reaches the graph without the tool call waiting.
 
 ### The three experimental hooks
+
+**Deprecated in v0.6.4, removed in 0.7.** All three still install and still work; `install` prints a deprecation line for each.
 
 Three more are off by default, one flag each. All three are Claude Code only,
 all three are recorded in the install manifest — so `disable`, `enable` and
