@@ -2606,13 +2606,19 @@ const CODE_TOOL_MENTIONS: &[&str] = &[
 /// memory store with no instruction to call any of these, which is the whole
 /// failure the thirteen-tool listing exists to fix.
 const ASSOCIATION_TOOL_MENTIONS: &[&str] = &[
-    "`explain_association`",
+    "`explain_association",
     "`node_history`",
     "`was_linked`",
     "`neighborhood`",
     "`role`",
     "`remember`",
     "`recall`",
+    // The two task tools the first association run showed an assistant never
+    // finding: it probed Cypher for a node's relationships and for what they
+    // were at an older commit, because nothing told it either question had a
+    // tool. Naming them here is what keeps a rewrite from dropping them.
+    "`edges_at",
+    "`what_if",
 ];
 
 #[test]
@@ -3562,6 +3568,83 @@ fn reinstalling_without_a_door_flag_removes_only_that_hook() {
         events.iter().any(|c| c.contains(" intercept ")),
         "the manifest dropped the redirect it still owns: {manifest}"
     );
+}
+
+/// Binding: the command line an entity-store install is typed as — a `--db`
+/// that names a store, and a delivery that registers a server — writes
+/// `alwaysLoad` without the flag, `--no-always-load` writes an entry without
+/// it, and `--always-load` still forces it on an install that named no store.
+///
+/// The default is a command-line decision, so it is read off the command
+/// line: `parse_args` is the layer that owns it, and the install below proves
+/// the decision reaches `.mcp.json` rather than stopping at a struct field.
+///
+/// Why it is the default at all: the first association run watched a session
+/// spend turns searching for tools its host had deferred before it could ask
+/// the store anything. A store the user named by path is one they mean to be
+/// asked; keeping its tools in context is what makes the first question the
+/// first question.
+#[test]
+fn an_entity_store_install_defaults_to_always_load_from_the_command_line() {
+    fn always_load_of(argv: &[&str]) -> bool {
+        match cli::parse_args(argv).expect("parse") {
+            cli::Command::Install(opts) => opts.always_load,
+            other => panic!("{argv:?} did not parse as an install: {other:?}"),
+        }
+    }
+
+    assert!(
+        always_load_of(&["install", "--delivery", "mcp", "--db", "./mushroom-memory"]),
+        "an entity-store install pins its tools without being asked"
+    );
+    assert!(
+        always_load_of(&["install", "--delivery", "both", "--db", "./mushroom-memory"]),
+        "`both` registers a server too"
+    );
+    assert!(
+        !always_load_of(&[
+            "install",
+            "--delivery",
+            "mcp",
+            "--db",
+            "./mushroom-memory",
+            "--no-always-load",
+        ]),
+        "--no-always-load is the way out"
+    );
+    assert!(
+        !always_load_of(&["install", "--delivery", "mcp"]),
+        "an install that named no store resolves whatever is there: opt-in"
+    );
+    assert!(
+        always_load_of(&["install", "--always-load"]),
+        "--always-load still forces it on an auto install"
+    );
+
+    // And the decision reaches the file the host reads.
+    let root = temp_dir("always-load-default");
+    let home = temp_dir("always-load-default-home");
+    git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let opts = match cli::parse_args(&[
+        "install",
+        "--platform",
+        "claude-code",
+        "--project",
+        "--delivery",
+        "mcp",
+        "--db",
+        &db.to_string_lossy(),
+        "--no-prewarm",
+    ])
+    .expect("parse")
+    {
+        cli::Command::Install(opts) => opts,
+        other => panic!("not an install: {other:?}"),
+    };
+    install_on_path(&root, &home, &opts).expect("install failed");
+    let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
+    assert_eq!(mcp["mcpServers"]["mushroomdb"]["alwaysLoad"], true, "{mcp}");
 }
 
 #[test]
