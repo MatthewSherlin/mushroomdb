@@ -7745,6 +7745,14 @@ impl<F: Fs> GraphDb<F> {
         self.engine.hnsw_build_count()
     }
 
+    /// Rules whose vector graphs the clean-open read path still holds a second
+    /// copy of. Zero before the first ANN query and again after the first
+    /// write. Exposed for tests; not part of the stable surface.
+    #[doc(hidden)]
+    pub fn lazy_hnsw_len(&self) -> usize {
+        self.engine.lazy_hnsw_len()
+    }
+
     /// Find nodes whose `field` vector is most similar to `q` (cosine
     /// similarity), returning up to `k` results with similarity ≥ `min`,
     /// sorted descending.

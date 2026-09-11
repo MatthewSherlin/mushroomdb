@@ -255,8 +255,10 @@ pub struct RuleEngine {
     ///
     /// Populated once by `ensure_hnsw_loaded` on the first ANN query after a
     /// snapshot open with no WAL.  `OnceLock` guarantees exactly-once init
-    /// even under concurrent shared-read access.  After the first mutation the
-    /// mutation-path HNSW in `indexes` takes over; this field is never cleared.
+    /// even under concurrent shared-read access.  Released by
+    /// `mark_indexes_populated` the moment the live indexes take over, so the
+    /// handle never carries two copies of a graph and never answers from the
+    /// snapshot's picture of a side the live index has since emptied.
     lazy_hnsw: OnceLock<LazyHnswMap>,
     /// Current chaining level. `0` while a top-level hook runs; `1..=MAX_CHAIN_DEPTH`
     /// while [`RuleEngine::chain_from`] re-enters `on_edge_changed`. Non-zero
@@ -2013,6 +2015,36 @@ impl RuleEngine {
         self.hnsw_builds
     }
 
+    /// Number of rules whose graphs the clean-open read path still holds in
+    /// `lazy_hnsw`.
+    ///
+    /// Zero once the live indexes are populated: `mark_indexes_populated`
+    /// releases the lazy copies at that moment. Test observability, not stable
+    /// surface.
+    #[doc(hidden)]
+    pub fn lazy_hnsw_len(&self) -> usize {
+        self.lazy_hnsw.get().map_or(0, |m| m.len())
+    }
+
+    /// Declare the live per-rule indexes authoritative and release the
+    /// read-path copies.
+    ///
+    /// `lazy_hnsw` holds a second, full copy of every approximate rule's graph,
+    /// decoded by `ensure_hnsw_loaded` for queries that arrive before the first
+    /// write. Once the live indexes exist that copy is both redundant — double
+    /// the resident memory for every approximate rule — and *stale*: it is a
+    /// picture of the snapshot, so a side whose live graph has since been
+    /// emptied would fall through to it and answer with deleted nodes.
+    ///
+    /// Resetting the `OnceLock` rather than clearing the map matters: a later
+    /// `ensure_hnsw_loaded` then re-runs `get_or_init` against the
+    /// already-drained `retained_hnsw_blobs` and latches an empty map, so the
+    /// copies never come back.
+    fn mark_indexes_populated(&mut self) {
+        self.indexes_populated = true;
+        self.lazy_hnsw = OnceLock::new();
+    }
+
     /// Export IVF state for all approximate rules.  Passed to `snapshot()` in
     /// `core-api` and stored in the V4 snapshot so `open()` can restore cluster
     /// assignments without re-fitting k-means.
@@ -2079,7 +2111,7 @@ impl RuleEngine {
                 idx.dst_side.fit_ivf_clusters(name);
             }
         }
-        self.indexes_populated = true;
+        self.mark_indexes_populated();
     }
 
     /// Like `reindex_all` but LOADS persisted IVF state for approximate rules
@@ -2204,7 +2236,7 @@ impl RuleEngine {
                 idx.dst_side.fit_ivf_clusters(name);
             }
         }
-        self.indexes_populated = true;
+        self.mark_indexes_populated();
     }
 
     /// Store HNSW blobs and raw IVF bytes from a snapshot **without deserializing**.
@@ -2734,7 +2766,7 @@ impl RuleEngine {
         // This rule's index is now populated. If prior rules' indexes were
         // already populated (or there are no other rules) mark the whole engine
         // as ready; otherwise a later reindex_all call will set the flag.
-        self.indexes_populated = true;
+        self.mark_indexes_populated();
 
         self.end_chain(scope, g);
         Ok(())
