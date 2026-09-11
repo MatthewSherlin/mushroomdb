@@ -101,14 +101,18 @@ class GraphDb:
     def node_edges(self, key: str) -> list[Row]:
         """Edges incident on `key`; raises for an unknown key."""
 
-    def node_history(self, key: str) -> list[Row]:
-        """Per-node change history since the last truncating snapshot."""
+    def node_history(self, key: str) -> Row:
+        """Per-node change history: `{key, history, total_commits, horizon}`.
+
+        `horizon` is the oldest commit still retained; events before it were
+        pruned and are not in `history`.
+        """
 
     def wal_total_commits(self) -> int:
         """Total number of committed WAL frames visible in the current horizon."""
 
     def edge_history(self, a: str, b: str) -> Row:
-        """Per-edge change history between `a` and `b`: `{a, b, events, total_commits}`."""
+        """Per-edge change history: `{a, b, events, total_commits, horizon}`."""
 
     def was_linked(self, a: str, b: str, edge_type: str, at_commit: int) -> bool:
         """Whether `a` and `b` were linked by `edge_type` at or before `at_commit`."""
@@ -181,7 +185,7 @@ class GraphDb:
         """Atomically apply edge inserts and deletes in a single WAL commit."""
 
     def stats(self) -> dict[str, Any]:
-        """Node/edge counts plus per-rule provenance size, latch, and fires."""
+        """Node/edge counts, `history_floor`, and per-rule size, latch, and fires."""
 
     def snapshot(self) -> None:
         """Write a durable snapshot and truncate the WAL tail."""
