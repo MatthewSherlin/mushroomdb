@@ -49,6 +49,11 @@ const ROLE_PROBE_ROWS: usize = 20;
 /// The threshold the `how many` recipe filters on. Three is the smallest
 /// count that reads as a pattern rather than a coincidence.
 const HOW_MANY_MIN: usize = 3;
+/// Edge types the `linked by all of` recipe intersects in one `MATCH`. Three
+/// is enough to demonstrate the shape — a fourth pattern would not teach a
+/// reader anything a third has not already shown, and every one past the
+/// first costs a `, (a)-[:TYPE]->(b)` the byte budget pays for.
+const LINKED_BY_ALL_MAX_TYPES: usize = 3;
 /// Property names that name a node rather than describe it, and so are never
 /// what a `what_if` is about. `id` is the identity prop Cypher `CREATE`
 /// writes; `key` is what the store calls the same thing.
@@ -654,7 +659,11 @@ fn recipes(
     let mut out = vec![
         Recipe {
             question: "why".to_string(),
-            call: format!("explain_association {a} {b}"),
+            call: format!(
+                "explain_association {a} {b} — returns each relationship's rule and \
+                 the values the two share, so there is no need to fetch raw lists to \
+                 compare by hand"
+            ),
         },
         Recipe {
             question: "relationships".to_string(),
@@ -686,7 +695,80 @@ fn recipes(
             ),
         },
     ]);
+    // The seventh recipe: "linked by all of" — the multi-hop intersection a
+    // benchmark showed agents fail, chaining one `MATCH` per relation with
+    // fresh variables and so counting each relation independently instead of
+    // requiring all of them at once. One `MATCH` with comma-separated
+    // patterns sharing `a` and `b` is the shape that actually intersects.
+    //
+    // Omitted on a store with only one edge type in it altogether: there is
+    // nothing to intersect, and a recipe of one pattern would demonstrate the
+    // wrong thing.
+    if edge_types.len() > 1 {
+        if let Some(recipe) = linked_by_all_recipe(labels, edge_types) {
+            out.push(recipe);
+        }
+    }
     out
+}
+
+/// The "linked by all of" recipe: up to [`LINKED_BY_ALL_MAX_TYPES`] edge
+/// types run between the store's own busiest source label and the
+/// destination label it most commonly reaches, intersected in one `MATCH`
+/// rather than chained across several.
+///
+/// The pair is picked from the store's own schema, not asked for: the most
+/// populous label that is ever a source (`labels` is already sorted most
+/// populous first), then the destination label its edges most often land on,
+/// weighted by how many edges each type carries. With fewer than
+/// [`LINKED_BY_ALL_MAX_TYPES`] edge types actually running between that
+/// pair, the recipe still renders — one pattern is still a worked call, even
+/// though there is nothing yet to intersect it against.
+///
+/// `None` only when no label is ever a source, which does not happen once
+/// `edge_types` is non-empty — every edge type's `src` came from a real
+/// source label — but the search stays an `Option` rather than assume it.
+fn linked_by_all_recipe(labels: &[LabelBrief], edge_types: &[EdgeTypeBrief]) -> Option<Recipe> {
+    let src = &labels
+        .iter()
+        .find(|l| edge_types.iter().any(|t| t.src.contains(&l.label)))?
+        .label;
+
+    let mut by_dst: BTreeMap<&str, usize> = BTreeMap::new();
+    for t in edge_types.iter().filter(|t| t.src.contains(src)) {
+        for dst in &t.dst {
+            *by_dst.entry(dst.as_str()).or_default() += t.edges;
+        }
+    }
+    let (dst, _) = by_dst
+        .into_iter()
+        .max_by_key(|(name, n)| (*n, std::cmp::Reverse(*name)))?;
+
+    // `edge_types` is already sorted most-numerous-first, ties on the name,
+    // so filtering it keeps that order — "most populous first" among the
+    // types that actually connect this pair.
+    let types: Vec<&str> = edge_types
+        .iter()
+        .filter(|t| t.src.contains(src) && t.dst.iter().any(|d| d.as_str() == dst))
+        .take(LINKED_BY_ALL_MAX_TYPES)
+        .map(|t| t.edge_type.as_str())
+        .collect();
+    let first = *types.first()?;
+
+    let mut pattern = format!("(a:{src})-[:{first}]->(b:{dst})");
+    for t in &types[1..] {
+        pattern.push_str(&format!(", (a)-[:{t}]->(b)"));
+    }
+
+    Some(Recipe {
+        question: "linked by all of".to_string(),
+        call: format!(
+            "MATCH {pattern} WITH b, count(DISTINCT a) AS n WHERE n >= 1 RETURN key(b), n \
+             ORDER BY n DESC LIMIT 20 — add `WHERE a.<field> = …` before WITH to filter \
+             the source side; one MATCH with comma-separated patterns intersects, \
+             separate MATCHes do not"
+        ),
+    })
 }
 
 /// Every file the graph records a [`DEPENDENCY_EDGES`] edge for, in either
