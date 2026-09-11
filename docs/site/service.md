@@ -47,7 +47,8 @@ normally, which is why no backup carries one.
 mushroomdb serve /data --snapshot-every 300
 ```
 
-`--snapshot-every <secs>` (`crates/cli/src/lib.rs:505`) bounds one thing: how
+`--snapshot-every <secs>` (in `mushroomdb serve`'s usage text, `crates/cli/src/lib.rs`)
+bounds one thing: how
 much WAL a **hard** crash leaves to replay on the next open. Without it, a store
 that has never snapshotted replays from genesis, which re-derives every rule's
 edges and rebuilds the ANN index for any `VectorSimilar` rule — minutes on a
@@ -60,11 +61,11 @@ Three properties worth knowing:
   insurance against the ungraceful case.
 - **A tick is skipped, never queued.** A snapshot replaces `wal.bin`, so it needs
   the store's cross-process write lock; the timer waits `SNAPSHOT_LOCK_WAIT`
-  (500 ms, `crates/cli/src/lib.rs:91-111`) and, if a peer holds it, drops that
+  (`SNAPSHOT_LOCK_WAIT`, 500 ms, `crates/cli/src/lib.rs`) and, if a peer holds it, drops that
   tick rather than piling up behind it. The next one is only a period away, and
   a missed snapshot costs a longer replay, never data.
 - **Automatic snapshots keep every archive.** `AUTO_SNAPSHOT_RETENTION` is
-  `None` (`crates/cli/src/lib.rs:75`), so a `--snapshot-every` tick archives the
+  `None` (`crates/cli/src/lib.rs`), so a `--snapshot-every` tick archives the
   folded WAL as `wal.<N>.archive` and prunes nothing. History is what the
   archives exist for. The consequence is disk: one new archive per snapshot that
   had WAL to fold, indefinitely. `mushroomdb stats <db-dir>` prints a `history:`
@@ -120,10 +121,11 @@ opens it:
 - Otherwise `<dir>` is a directory *of* backups. An immediate subdirectory named
   `latest` holding a store wins outright — so a symlink or a rolling copy can
   name itself — and failing that, the newest by mtime wins.
-- The chosen backup's files are copied in and the store is opened once to prove
-  it works, which runs the same CRC and replay checks any open runs. A copy that
-  does not open is a hard failure naming the path, and `serve` exits non-zero
-  rather than starting empty.
+- The chosen backup's files are copied into a staging directory inside the store
+  directory and opened there, which runs the same CRC and replay checks any open
+  runs. Only a copy that opened is moved into place. A copy that does not open is
+  a hard failure naming both paths, and `serve` exits non-zero rather than
+  starting empty.
 
 It prints one line:
 
@@ -131,7 +133,7 @@ It prints one line:
 restored from /backups/latest: 4 files, 2097152 bytes
 ```
 
-Three rules make it safe to leave in a container command line forever:
+Four rules make it safe to leave in a container command line forever:
 
 1. **It never overwrites a store.** If the directory already holds a store — by
    the same `snapshot.bin`-or-non-empty-`wal.bin` test — it does nothing and says
@@ -141,7 +143,12 @@ Three rules make it safe to leave in a container command line forever:
 2. **An empty vault is a warning, not an error.** A first boot against a backup
    volume with nothing in it yet prints `restore-from: no backup found under
    <path>` and starts empty, which is the only sensible behaviour for day one.
-3. **It runs before `--demo-if-empty`.** A restored store is never overwritten
+3. **A failed restore changes nothing.** Because the copy is staged and only
+   moved in once it has opened, a corrupt or truncated backup leaves the store
+   directory exactly as it was — empty. Fix the backup, or point at a different
+   one, and the next boot restores; there is no half-written store to clear out
+   first, and no run that silently reports a store is already present.
+4. **It runs before `--demo-if-empty`.** A restored store is never overwritten
    by the demo seed, whichever order the flags appear in.
 
 The manual equivalent is exactly what the flag automates: with the server

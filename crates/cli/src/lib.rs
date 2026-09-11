@@ -1701,12 +1701,23 @@ fn choose_backup(from: &Path) -> Option<PathBuf> {
 /// `wal.bin`. `from` is either a backup directory itself (it holds a store by
 /// that same test) or a directory of them, in which case the immediate
 /// subdirectory named `latest` wins if it holds one, else the newest by mtime.
-/// The copy is opened before `serve` proceeds; a copy that does not open is an
-/// error naming the path, never a silent empty start.
+///
+/// The restore is all-or-nothing. The backup is copied into a staging
+/// directory **inside** `db_dir` and opened there — the same CRC and replay
+/// checks any open runs — and only a copy that opened is moved into place. Any
+/// failure removes the staging directory and leaves `db_dir` exactly as it was,
+/// so the error names the paths, the operator can fix the backup, and the next
+/// boot restores rather than reporting [`RestoreOutcome::AlreadyPresent`] over
+/// a half-written store.
+///
+/// Staging lives inside `db_dir` on purpose: `db_dir` is typically the mount
+/// point, so a sibling directory could land on another filesystem and turn the
+/// final moves into cross-device copies.
 ///
 /// # Errors
 ///
-/// Whatever creating `db_dir`, copying a file, or opening the copy returned.
+/// Whatever creating `db_dir`, copying a file, opening the staged copy, or
+/// moving it into place returned.
 pub fn restore_if_empty(db_dir: &Path, from: &Path) -> Result<RestoreOutcome, CliError> {
     if holds_a_store(db_dir) {
         return Ok(RestoreOutcome::AlreadyPresent);
@@ -1718,8 +1729,32 @@ pub fn restore_if_empty(db_dir: &Path, from: &Path) -> Result<RestoreOutcome, Cl
     std::fs::create_dir_all(db_dir)
         .map_err(|e| CliError(format!("restore into {}: {e}", db_dir.display())))?;
 
+    // Named for this process, so two `serve` processes racing onto one fresh
+    // volume stage into separate directories rather than over each other.
+    let staging = db_dir.join(format!(".restore-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging); // a previous run that was killed
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| CliError(format!("restore into {}: {e}", staging.display())))?;
+
+    let outcome = stage_and_install(db_dir, &staging, &backup);
+    // Whether it worked or not: the staging directory never outlives the call.
+    // On success it holds only what opening the copy created (`LOCK`), since
+    // the restored files were moved out of it.
+    let _ = std::fs::remove_dir_all(&staging);
+    outcome
+}
+
+/// Copy `backup` into `staging`, prove it opens, then move it into `db_dir`.
+///
+/// Split out of [`restore_if_empty`] so every early return runs through one
+/// cleanup of `staging` at the call site.
+fn stage_and_install(
+    db_dir: &Path,
+    staging: &Path,
+    backup: &Path,
+) -> Result<RestoreOutcome, CliError> {
     let mut names: Vec<String> = RESTORE_FILES.iter().map(|n| n.to_string()).collect();
-    let mut archives: Vec<String> = std::fs::read_dir(&backup)
+    let mut archives: Vec<String> = std::fs::read_dir(backup)
         .map_err(|e| CliError(format!("restore from {}: {e}", backup.display())))?
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
@@ -1735,25 +1770,43 @@ pub fn restore_if_empty(db_dir: &Path, from: &Path) -> Result<RestoreOutcome, Cl
         if !src.is_file() {
             continue;
         }
-        let n = std::fs::copy(&src, db_dir.join(&name))
+        let n = std::fs::copy(&src, staging.join(&name))
             .map_err(|e| CliError(format!("restore {} from {}: {e}", name, backup.display())))?;
         bytes += n;
         files.push(name);
     }
 
-    // Prove the copy opens before `serve` gets it: the same CRC and replay
-    // checks any open runs. A copy that does not open is a hard failure, not a
-    // silent empty start.
-    GraphDb::open(db_dir).map_err(|e| {
+    // Prove the copy opens before `serve` gets it. A copy that does not open is
+    // a hard failure, not a silent empty start — and because it opened in
+    // staging, nothing of it reaches `db_dir`.
+    GraphDb::open(staging).map_err(|e| {
         CliError(format!(
-            "restored {} from {} but it does not open: {e}",
+            "restore into {} from {} failed: the copy does not open: {e}",
             db_dir.display(),
             backup.display()
         ))
     })?;
 
+    // The copy is good. Move it in. A rename within one directory tree is the
+    // closest thing to atomic the filesystem offers; if one still fails, undo
+    // the moves already made so `db_dir` is left as it was found.
+    let mut moved: Vec<&String> = Vec::new();
+    for name in &files {
+        if let Err(e) = std::fs::rename(staging.join(name), db_dir.join(name)) {
+            for done in &moved {
+                let _ = std::fs::remove_file(db_dir.join(done));
+            }
+            return Err(CliError(format!(
+                "restore into {} from {}: installing {name}: {e}",
+                db_dir.display(),
+                backup.display()
+            )));
+        }
+        moved.push(name);
+    }
+
     Ok(RestoreOutcome::Restored {
-        from: backup,
+        from: backup.to_path_buf(),
         files,
         bytes,
     })
@@ -4531,10 +4584,95 @@ mod tests {
             msg.contains(&fresh.display().to_string()),
             "error must name the restored dir, got: {msg}"
         );
+        assert!(
+            msg.contains(&backup.display().to_string()),
+            "error must name the backup, got: {msg}"
+        );
 
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&vault);
         let _ = std::fs::remove_dir_all(&fresh);
+    }
+
+    /// A failed restore is all-or-nothing: nothing of the bad copy reaches
+    /// `db_dir`, so the next boot restores rather than reporting
+    /// `AlreadyPresent` over a half-written store.
+    #[test]
+    fn a_failed_restore_leaves_the_db_dir_untouched() {
+        let src = tmp("restore-atomic-src");
+        seed_store(&src, "a");
+
+        let bad_vault = tmp("restore-atomic-bad-vault");
+        let bad = bad_vault.join("2026-09-10T00-00Z");
+        run_backup(&src, &bad).expect("backup the bad one");
+        let snap = bad.join("snapshot.bin");
+        let bytes = std::fs::read(&snap).expect("read snapshot");
+        std::fs::write(&snap, &bytes[..bytes.len() / 2]).expect("truncate snapshot");
+
+        let good_vault = tmp("restore-atomic-good-vault");
+        run_backup(&src, &good_vault.join("2026-09-11T00-00Z")).expect("backup the good one");
+
+        let fresh = tmp("restore-atomic-fresh");
+        let err = restore_if_empty(&fresh, &bad_vault).expect_err("expected a hard failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&fresh.display().to_string()) && msg.contains(&bad.display().to_string()),
+            "error must name both paths, got: {msg}"
+        );
+
+        // Nothing was left behind — not the copied files, not the staging dir.
+        let leftovers: Vec<String> = std::fs::read_dir(&fresh)
+            .expect("read fresh")
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed restore must leave nothing behind, found: {leftovers:?}"
+        );
+        assert!(!holds_a_store(&fresh), "the dir must not hold a store");
+
+        // So the retry against a good backup restores, rather than deciding a
+        // store is already there.
+        match restore_if_empty(&fresh, &good_vault).expect("retry must restore") {
+            RestoreOutcome::Restored { from, .. } => {
+                assert_eq!(from, good_vault.join("2026-09-11T00-00Z"))
+            }
+            other => panic!("expected Restored on retry, got {other:?}"),
+        }
+        assert!(GraphDb::open(&fresh).expect("open restored").has_node("a"));
+
+        for d in [&src, &bad_vault, &good_vault, &fresh] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// The staging directory never outlives a successful restore either — a
+    /// served store directory holds the store and nothing else.
+    #[test]
+    fn a_successful_restore_leaves_no_staging_dir() {
+        let src = tmp("restore-staging-src");
+        seed_store(&src, "a");
+        let vault = tmp("restore-staging-vault");
+        run_backup(&src, &vault.join("2026-09-11T00-00Z")).expect("backup");
+
+        let fresh = tmp("restore-staging-fresh");
+        restore_if_empty(&fresh, &vault).expect("restore");
+
+        let stray: Vec<String> = std::fs::read_dir(&fresh)
+            .expect("read fresh")
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with(".restore-"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "staging dir must be gone, found: {stray:?}"
+        );
+
+        for d in [&src, &vault, &fresh] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]
