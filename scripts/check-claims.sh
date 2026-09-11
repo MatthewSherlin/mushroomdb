@@ -12,12 +12,24 @@
 #      instead of a search. That instruction is what the benchmark measured and
 #      it is not worth what it cost.
 #
+# The claim scan covers every product-facing surface: the README, the llms
+# files, the plugin manifests and their templates, every page under docs/site
+# (the Markdown pages and the published index.html), and the three skill files.
+# The grep-redirect scan covers the skill files alone, because only a skill can
+# instruct an agent.
+#
 # Exits 1 printing file:line for every hit. Run by the plugin-validate CI job.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 fail=0
+
+GREP_FILES=(
+  crates/cli/skills/mushroom/SKILL.md
+  crates/cli/skills/mushroom/cursor-rules.mdc
+  packaging/plugin/skills/mushroom/SKILL.md
+)
 
 CLAIM_FILES=(
   README.md
@@ -28,8 +40,13 @@ CLAIM_FILES=(
   .claude-plugin/marketplace.json
   scripts/plugin-templates/plugin.json.tmpl
   scripts/plugin-templates/marketplace.json.tmpl
+  docs/site/index.html
 )
 while IFS= read -r f; do CLAIM_FILES+=("$f"); done < <(ls docs/site/*.md)
+# The skill files carry product-facing copy too — a retired claim reads the same
+# in a skill as it does in the README — so they take both scans, not just the
+# grep-redirect one below.
+CLAIM_FILES+=("${GREP_FILES[@]}")
 
 CLAIM_PATTERNS=(
   '(code|coding|ship|shipping|develop|work)(s|ing)?[[:space:]]+faster'
@@ -41,11 +58,6 @@ CLAIM_PATTERNS=(
   '(beats|outperforms)[[:space:]]+(a[[:space:]]+)?stock'
 )
 
-GREP_FILES=(
-  crates/cli/skills/mushroom/SKILL.md
-  crates/cli/skills/mushroom/cursor-rules.mdc
-  packaging/plugin/skills/mushroom/SKILL.md
-)
 GREP_PATTERNS=(
   'before[[:space:]]+(any[[:space:]]+)?`?Grep'
   'instead[[:space:]]+of[[:space:]]+`?[Gg]rep'

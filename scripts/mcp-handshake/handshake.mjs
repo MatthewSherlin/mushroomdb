@@ -135,12 +135,14 @@ async function main() {
       }
     }
 
-    // Every handshake calls `map` on the target store (the CI job points it
+    // Every handshake calls `stats` on the target store (the CI job points it
     // at an empty one) so a break in the tool-call path — not just tools/list
-    // — fails the same way a real client would see it.
-    const mapResult = await client.callTool({ name: "map", arguments: {} });
-    if (mapResult.isError) {
-      throw new Error(`map tool call returned an error: ${JSON.stringify(mapResult.content)}`);
+    // — fails the same way a real client would see it. `stats` is served on
+    // every store, entity or repository, so the probe survives 0.7 dropping
+    // the code-graph tools. `--call` still overrides what else gets called.
+    const probeResult = await client.callTool({ name: "stats", arguments: {} });
+    if (probeResult.isError) {
+      throw new Error(`stats tool call returned an error: ${JSON.stringify(probeResult.content)}`);
     }
 
     if (opts.call) {
