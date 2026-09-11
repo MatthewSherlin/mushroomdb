@@ -246,6 +246,52 @@ mod tests {
     use crate::v8::MappedBase;
     use std::collections::BTreeMap;
 
+    /// A pre-V9 base carries its table inside each `Str` column and no shared
+    /// section; the resolution rule must fall back to that copy.
+    ///
+    /// The encoder cannot write a V8 snapshot any more, so the legacy shape is
+    /// built directly: this is the only place the pre-V9 read path is exercised
+    /// with real strings (`golden_v8.bin` holds a single Int property).
+    #[test]
+    fn a_pre_v9_column_resolves_through_its_own_table() {
+        use crate::v8::layout::{ColumnData, ColumnsData, FieldEntry};
+
+        let legacy = ColumnsData {
+            fields: vec![FieldEntry {
+                name: "tag".to_string(),
+                col: ColumnData::Str {
+                    ids: vec![2, 0, 1],
+                    present: vec![0b111],
+                    // The whole table, copied into the column: exactly what
+                    // every V5-V8 snapshot wrote for every string column.
+                    strings: vec!["alpha".into(), "beta".into(), "gamma".into()],
+                },
+            }],
+        };
+        let bytes = rkyv::api::high::to_bytes::<rkyv::rancor::Error>(&legacy).expect("rkyv encode");
+        let archived = rkyv::access::<crate::v8::layout::ArchivedColumnsData, rkyv::rancor::Error>(
+            &bytes,
+        )
+        .expect("rkyv access");
+
+        let overlay = ColumnStore::new();
+        // `with_base` leaves `strings: None` — the pre-V9 case.
+        let view = ColumnsView::with_base(&overlay, archived);
+        assert!(view.strings.is_none(), "a pre-V9 base has no shared table");
+        for (id, want) in [(0u32, "gamma"), (1, "alpha"), (2, "beta")] {
+            match view.get(id, "tag") {
+                Some(ValueRef::Owned(Value::Str(got))) => assert_eq!(got, want, "node {id}"),
+                other => panic!("node {id}: expected Str({want}), got {other:?}"),
+            }
+        }
+
+        // The materialising path resolves the same way with `shared: None`.
+        let store = crate::v8::encode::archived_to_columnstore(archived, None);
+        assert_eq!(store.get(0, "tag"), Some(&Value::Str("gamma".into())));
+        assert_eq!(store.get(1, "tag"), Some(&Value::Str("alpha".into())));
+        assert_eq!(store.get(2, "tag"), Some(&Value::Str("beta".into())));
+    }
+
     fn tiny_meta() -> V8Meta {
         use std::collections::HashMap;
         V8Meta {

@@ -1521,6 +1521,41 @@ fn golden_v8_pin() {
     assert_eq!(db.neighbors("a", "E", Direction::Out).unwrap(), vec!["b"]);
 }
 
+/// Golden V9 fixture pin: `snapshot()` writes VERSION=9 — the V8 container with
+/// one shared string table (section 12) instead of a copy inside every string
+/// column. Decoding the committed fixture verifies the V9 wire format is stable.
+/// V5-V8 snapshots are still decoded by their own paths, unedited, beside this.
+///
+/// To regenerate (only for an intentional VERSION bump):
+/// `cargo run -p mushroomdb --example gen_golden_fixture -- crates/core-api/tests/fixtures/golden_v9.bin`
+#[test]
+fn golden_v9_pin() {
+    let snap_bytes = include_bytes!("fixtures/golden_v9.bin");
+    assert_eq!(
+        &snap_bytes[0..4],
+        b"GDB1",
+        "V9 fixture must start with GDB1 magic"
+    );
+    assert_eq!(
+        u16::from_le_bytes([snap_bytes[4], snap_bytes[5]]),
+        9,
+        "V9 fixture version field must be 9"
+    );
+    let dir = tmp("golden-v9-pin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("snapshot.bin"), snap_bytes).unwrap();
+    std::fs::write(dir.join("wal.bin"), b"").unwrap();
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.node_count(), 2, "V9 fixture must decode to 2 nodes");
+    assert_eq!(db.edge_count(), 1, "V9 fixture must decode to 1 edge");
+    assert_eq!(
+        db.get_prop("a", "v"),
+        Some(Value::Int(42)),
+        "V9 fixture must preserve prop v=42 on node 'a'"
+    );
+    assert_eq!(db.neighbors("a", "E", Direction::Out).unwrap(), vec!["b"]);
+}
+
 /// V8 encode/decode equivalence: encode a graph as V8, decode back, assert all
 /// observable state matches the original. This exercises the full V8 round-trip
 /// path through `MappedBase::from_bytes` → `decode_v8_from_mapped` →

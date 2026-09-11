@@ -184,3 +184,112 @@ fn v7_store_auto_migrates_to_v8_with_bak() {
         "second clean open at V8 must delete the .bak"
     );
 }
+
+/// A V8 store opens, migrates to V9 (one shared string table), leaves a .bak of
+/// the original V8 bytes; a second clean open at V9 deletes the .bak.
+///
+/// V8 fixture content: 2 nodes ("a", "b"), 1 edge (E: a→b), prop v=42 on "a".
+#[test]
+fn v8_store_auto_migrates_to_v9_with_bak() {
+    let dir = store_from_fixture("v8", include_bytes!("fixtures/golden_v8.bin"));
+    {
+        let db = GraphDb::open(&dir).unwrap();
+        assert_eq!(
+            db.node_count(),
+            2,
+            "V8 store must have 2 nodes after migrate"
+        );
+        assert_eq!(db.edge_count(), 1, "V8 store must have 1 edge after migrate");
+    }
+    // On-disk snapshot is now V9; .bak holds the original V8 bytes.
+    assert_eq!(
+        core_api::snapshot_version_at(&dir).unwrap(),
+        Some(core_storage::snapshot::VERSION),
+        "snapshot must be rewritten to V9 after migration"
+    );
+    let bak = std::fs::read(dir.join("snapshot.bin.bak")).unwrap();
+    assert_eq!(
+        u16::from_le_bytes([bak[4], bak[5]]),
+        8,
+        ".bak must contain the original V8 bytes"
+    );
+    // Data must survive the migration: the V8 per-column tables are read, and
+    // the rewrite collapses them into the one shared section.
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.get_prop("a", "v"),
+        Some(Value::Int(42)),
+        "property v=42 on node 'a' must survive V8→V9 migration"
+    );
+    assert_eq!(
+        db.neighbors("a", "E", Direction::Out).unwrap(),
+        vec!["b"],
+        "edge a→b must survive V8→V9 migration"
+    );
+    // Second clean open at V9 must remove .bak.
+    assert!(
+        !dir.join("snapshot.bin.bak").exists(),
+        "second clean open at V9 must delete the .bak"
+    );
+}
+
+/// A V8 store's *string* properties survive the migration and come back through
+/// the shared table after the rewrite — the property-preservation half of the
+/// V8→V9 auto-migrate, which the tiny golden fixture (v=42, an Int) cannot show.
+#[test]
+fn v8_string_props_survive_the_migration_to_v9() {
+    // Build a V8 store by hand: snapshot with a V8-era encoder is gone, so take
+    // the committed V8 fixture's container and write strings through the WAL,
+    // then let the migrating open rewrite the whole store at V9.
+    let dir = store_from_fixture("v8-strings", include_bytes!("fixtures/golden_v8.bin"));
+    let words: Vec<String> = (0..64).map(|i| format!("word-{i:03}")).collect();
+    {
+        // auto_migrate=false so these land in the WAL over an untouched V8 base.
+        let mut db = GraphDb::open_with_options(
+            &dir,
+            OpenOptions {
+                auto_migrate: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (n, w) in words.iter().enumerate() {
+            db.insert_node(
+                "N",
+                &format!("s{n}"),
+                (0..4)
+                    .map(|f| (format!("f{f}"), Value::Str(w.clone())))
+                    .collect(),
+            )
+            .unwrap();
+        }
+    }
+    assert_eq!(
+        core_api::snapshot_version_at(&dir).unwrap(),
+        Some(8),
+        "the store must still be V8 before the migrating open"
+    );
+    // Migrating open rewrites the snapshot at V9.
+    drop(GraphDb::open(&dir).unwrap());
+    assert_eq!(
+        core_api::snapshot_version_at(&dir).unwrap(),
+        Some(core_storage::snapshot::VERSION),
+        "the migrating open must rewrite the snapshot at V9"
+    );
+    // Reopen and compare every property.
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.get_prop("a", "v"),
+        Some(Value::Int(42)),
+        "the V8 base's own property must survive"
+    );
+    for (n, w) in words.iter().enumerate() {
+        for f in 0..4 {
+            assert_eq!(
+                db.get_prop(&format!("s{n}"), &format!("f{f}")),
+                Some(Value::Str(w.clone())),
+                "s{n}.f{f} must survive the V8→V9 rewrite"
+            );
+        }
+    }
+}
