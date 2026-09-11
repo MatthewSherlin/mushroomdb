@@ -357,17 +357,18 @@ where there is no intersection to take.
 
 ---
 
-## Repository tools (deprecated in v0.6.4, removed in 0.7)
+## Repository tools
 
-These nine answer from a repository the store was built from with `ingest-git`.
-They still ship and are still tested; they are no longer promoted, and 0.7
-removes them. The five association tools above answer on any store.
+> **Deprecated in 0.6.4:** the code-graph door — the `explore`, `map`, `context`, `impact`,
+> `owners`, `why` and `sync` tools, the three grep/edit hooks, and the plugin's coding-assistant
+> positioning. It still works and is still tested; it is **removed in 0.7**. See
+> [Deprecations](../../README.md#deprecations).
+> Of the fourteen task tools, those seven answer from a repository the store was built from with
+> `ingest-git`; the other seven answer on any store.
 
 Fourteen task tools answer a question in one call rather than exposing the graph
-API. Nine of them are about a repository the store was built from with
-`mushroomdb ingest-git`; the five association tools above answer on any store.
-They are listed first in `tools/list`, and each returns a short rendered digest
-as its text content — one text block, and nothing else.
+API. They are listed first in `tools/list`, and each returns a short rendered
+digest as its text content — one text block, and nothing else.
 
 Every one of them also takes an optional `json` boolean. With `json: true` the
 reply is the serialised report *as* the text content, with no rendered digest:

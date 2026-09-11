@@ -17,17 +17,13 @@ A live graph at `{{DB_PATH}}`: entities, the edges rules derive between them, an
 
 **3. Answer from the store, and quote what it prints.** One named call per question kind — the table below — against the store's own keys.
 <!-- cli -->
-
-Or through `Bash`, store first; `query` runs any Cypher, read or write:
-
-```
-{{BIN}} query '{{DB_PATH}}' '<cypher>'
-```
+Every command runs through `Bash`, store first; the forms are below.
 <!-- /cli -->
 
 ## Task rules
 
 One call per question, on the store's own keys. The `SessionStart` brief printed one worked call per kind — copy those rather than probing Cypher for the schema.
+<!-- mcp -->
 
 | The question | The call |
 |---|---|
@@ -40,6 +36,17 @@ One call per question, on the store's own keys. The `SessionStart` brief printed
 | a durable fact | `remember` — the `text` and the existing keys it is `about`; say the `note:` key back |
 
 Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `hybrid_search`.
+<!-- /mcp -->
+<!-- cli -->
+
+| The question | The command |
+|---|---|
+| why are these two related | `{{BIN}} why '{{DB_PATH}}' <a> <b>` — what links two keys, with the evidence |
+| what did it look like then | `{{BIN}} asof '{{DB_PATH}}' --commit N --query '<cypher>'` |
+| anything else, including a durable fact | `{{BIN}} query '{{DB_PATH}}' '<cypher>'` — any Cypher, read or write; a fact is a `CREATE (n:Note {id: "note:…", text: "…"})`, and say the key back |
+
+`explain_association`, `node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked` and `neighborhood` have no subcommand here, `query` takes no `role`, and there is no `remember` subcommand. The rest need `--delivery mcp`.
+<!-- /cli -->
 
 **Deprecated, removed in 0.7.** A store built by `{{BIN}} ingest-git '{{DB_PATH}}' . --prs --ensure-gitignore` is a repository as entities — commits, pull requests, files, authors — and lists `explore`, `query` and `stats` instead. The code tools `map`, `context`, `impact`, `owners`, `why` and `sync` stay served behind `--all-tools`. Use the repository as a data source; do not reach for it ahead of a search.
 <!-- cli -->

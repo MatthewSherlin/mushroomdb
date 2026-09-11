@@ -6,6 +6,13 @@ project or your home directory and also wires the git hooks.
 
 > **Alpha.** Local only. No data leaves your machine.
 
+> **Deprecated in 0.6.4:** the code-graph door — the `explore`, `map`, `context`, `impact`,
+> `owners`, `why` and `sync` tools, the three grep/edit hooks, and the plugin's coding-assistant
+> positioning. It still works and is still tested; it is **removed in 0.7**. See
+> [Deprecations](../../README.md#deprecations).
+> In the skill that means the task rules lead with the entity surface, and name the code tools only
+> under a deprecation paragraph.
+
 ---
 
 ## Route 1 — the Claude Code plugin
@@ -85,9 +92,14 @@ as entities — commits, pull requests, files, authors — and lists `explore`,
 `owners`, `why` and `sync` stay served behind `--all-tools`. The skill treats
 `ingest-git` as a data source, not as the tool to reach for ahead of a search.
 
-The **`--delivery cli` variant of the skill adds the shell forms**: `query` for
-any Cypher, read or write, and — under the deprecation paragraph, while it
-lasts — `explore` with its `--depth`.
+That table is the MCP variant's. The **`--delivery cli` variant carries its own
+table of shell forms** — `mushroomdb why <a> <b>`, `asof --commit N --query`,
+and `query` for any Cypher, read or write, a durable fact included — and says
+plainly which tools have no subcommand there: `explain_association`,
+`node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked` and
+`neighborhood`, with no `role` on `query` and no `remember`. Those need
+`--delivery mcp`. The deprecated `explore` keeps its shell form under the
+deprecation paragraph while it lasts.
 
 **The `learn` pass** turns prose — design docs, ADRs, READMEs — into `Concept`
 nodes carrying the source files and their hashes. When a source file's hash
@@ -127,9 +139,9 @@ Cursor gets the same content as an always-apply rules file
 | `--command <path>` | Invoke this binary instead of `npx`. Use it for a local build or a pinned install. A relative path is fine to type: it is anchored to the current directory before anything is written, because the assistant spawns the server from a directory of its own. `--db` is anchored the same way. A bare name with no separator (`--command mushroomdb`) means a `PATH` lookup and is written exactly as given. |
 | `--delivery cli\|mcp\|both` | Which door the install opens. Default `both`: the MCP server entry **and** a skill that also teaches the shell form. `mcp` writes the server entry alone. `cli` writes no server entry at all — the skill teaches `mushroomdb explore <store> <target>` through `Bash`, so a session loads no tool schemas before its first turn; re-installing as `cli` removes an entry an earlier run registered. Claude Code only: a Cursor or Codex install is always the server, and `install` prints a note saying so rather than dropping the flag. |
 | `--no-git-hooks` | Skip the `post-commit` / `post-checkout` / `post-merge` sync hooks. |
-| `--intercept-grep` | **Deprecated in v0.6.4, removed in 0.7.** **Experimental, off by default.** Adds a fourth Claude Code hook: `hooks.PreToolUse`, matched to `Grep`, running `<bin> intercept <store>` (5 s timeout). When the search pattern is a bare identifier of three characters or more that the graph holds as a symbol, the hook exits 2 with one line pointing at `explore("<name>")` — Claude Code blocks the search and hands the model that message, so a question the graph answers exactly (definition, callers, callees) is not answered by a list of matching lines. Anything that looks like a regex, any name the graph does not hold, and any store that will not open passes straight through. Leave it off unless you are measuring it; `disable`, `enable` and `uninstall` handle it like every other hook, and re-running `install` without the flag removes it. |
-| `--impact-before-edit` | **Deprecated in v0.6.4, removed in 0.7.** **Experimental, off by default.** Adds a Claude Code hook: `hooks.PreToolUse`, matched to `Edit\|Write\|MultiEdit`, running `<bin> impact-hook <store>` (5 s timeout, awaited). Before an edit lands, it prints at most 600 bytes of the file's blast radius — the files that import it, the files that usually change with it, the tests that cover it — as `additionalContext` on stdout, so the model knows what the change reaches before making it. It never blocks: exit 0 always, and a file the graph has no `File` for, a store that will not open and a payload that will not parse each print nothing at all. Independent of `--intercept-grep`, which shares its event: each hook is its own group with its own matcher, and turning one off leaves the other alone. |
-| `--enrich-grep` | **Deprecated in v0.6.4, removed in 0.7.** **Experimental, off by default.** Adds a Claude Code hook: `hooks.PostToolUse`, matched to `Grep`, running `<bin> enrich <store>` (5 s timeout, awaited). After a search returns, it looks up the pattern and the identifiers in the matches, and prints at most 800 bytes about the first five that name exactly one symbol the graph holds — definition site, caller count, the file's owner — as `additionalContext`. Nothing resolving is nothing printed. Independent of the `touch` hook, which shares its event. |
+| `--intercept-grep` | **Deprecated in 0.6.4, removed in 0.7.** **Experimental, off by default.** Adds a fourth Claude Code hook: `hooks.PreToolUse`, matched to `Grep`, running `<bin> intercept <store>` (5 s timeout). When the search pattern is a bare identifier of three characters or more that the graph holds as a symbol, the hook exits 2 with one line pointing at `explore("<name>")` — Claude Code blocks the search and hands the model that message, so a question the graph answers exactly (definition, callers, callees) is not answered by a list of matching lines. Anything that looks like a regex, any name the graph does not hold, and any store that will not open passes straight through. Leave it off unless you are measuring it; `disable`, `enable` and `uninstall` handle it like every other hook, and re-running `install` without the flag removes it. |
+| `--impact-before-edit` | **Deprecated in 0.6.4, removed in 0.7.** **Experimental, off by default.** Adds a Claude Code hook: `hooks.PreToolUse`, matched to `Edit\|Write\|MultiEdit`, running `<bin> impact-hook <store>` (5 s timeout, awaited). Before an edit lands, it prints at most 600 bytes of the file's blast radius — the files that import it, the files that usually change with it, the tests that cover it — as `additionalContext` on stdout, so the model knows what the change reaches before making it. It never blocks: exit 0 always, and a file the graph has no `File` for, a store that will not open and a payload that will not parse each print nothing at all. Independent of `--intercept-grep`, which shares its event: each hook is its own group with its own matcher, and turning one off leaves the other alone. |
+| `--enrich-grep` | **Deprecated in 0.6.4, removed in 0.7.** **Experimental, off by default.** Adds a Claude Code hook: `hooks.PostToolUse`, matched to `Grep`, running `<bin> enrich <store>` (5 s timeout, awaited). After a search returns, it looks up the pattern and the identifiers in the matches, and prints at most 800 bytes about the first five that name exactly one symbol the graph holds — definition site, caller count, the file's owner — as `additionalContext`. Nothing resolving is nothing printed. Independent of the `touch` hook, which shares its event. |
 | `--always-load` | Writes `"alwaysLoad": true` on the `mcpServers.mushroomdb` entry, so the host keeps the server's tools in context instead of deferring them until something asks. **Already the default when `--db` names a store and a server is registered** (`--delivery mcp` or `both`): an install that pins a store is an entity-store install, whose tools a session has to be shown before it can ask its first question — the alternative is turns spent searching for them. Use the flag to force it on an install that named no store, where the resolved store is usually the code graph and its three tools need no pinning. Claude Code's `.mcp.json` only — a Cursor or Codex registration has no equivalent. Re-running `install` with a different answer rewrites the key; `disable` and `enable` preserve it. |
 | `--no-always-load` | Opts out of the `alwaysLoad` default above: the server entry is written without the key, and the host defers its tool schemas as before. Meaningless with `--delivery cli`, which registers no entry at all. |
 | `--no-prewarm` | No network and no resolution during the install: neither the one-off package fetch nor locating the package's binary. Every hook keeps the slower `npx` form. |

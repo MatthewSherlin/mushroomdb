@@ -78,7 +78,8 @@ Full tool reference: [`docs/site/mcp.md`](docs/site/mcp.md).
   number of readers, and every handle picks up a peer's commits by `refresh()` rather than
   reopening — so a running `serve`, an editor hook, a git hook and a CLI command can share one
   store. [`docs/site/concurrency.md`](docs/site/concurrency.md)
-- Local-first: your data stays on disk, no cloud service, no LLM in the write path.
+- Local-first: your data stays on disk, no cloud service, no model call in the write path unless
+  you enable embeddings.
 
 **What it isn't**
 
@@ -214,9 +215,9 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
-**Fourteen task tools** — seven answer on any store, seven are the deprecated code door — answer a
-question in prose in one call. They are what the skill reaches for,
-and what `tools/list` shows first:
+**Fourteen task tools** answer a question in prose in one call. Seven answer on any store; seven
+are the deprecated code door. They are what the skill reaches for, and what `tools/list` shows
+first:
 
 | Tool | Purpose |
 |---|---|

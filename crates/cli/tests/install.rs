@@ -2809,6 +2809,25 @@ fn every_delivery_variant_names_every_tool_and_fits_the_budget() {
                 "{label}: {tool} is never named — the assistant has no cue to call it"
             );
         }
+        // A `--delivery cli` install registers no server, so an MCP-only call
+        // written as a call there sends the session after a subcommand that
+        // does not exist. Naming the tools is fine — and required above, so an
+        // assistant knows what the other delivery holds — but a call form is
+        // not. This is the 0.6.3 finding, kept fixed.
+        if matches!(delivery, Delivery::Cli) {
+            for banned in [
+                "explain_association(",
+                "explain_association a",
+                "edges_at ",
+                "node_edges a",
+                "what_if a",
+            ] {
+                assert!(
+                    !skill.contains(banned),
+                    "{label}: an MCP-only call leaked into the shell variant: {banned}\n{skill}"
+                );
+            }
+        }
         assert!(
             !skill.contains("<!--"),
             "{label}: a delivery marker leaked into the rendered skill:\n{skill}"
