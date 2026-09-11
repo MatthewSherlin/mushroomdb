@@ -414,7 +414,40 @@ def install_association_graph(graph: Path) -> None:
         raise SystemExit(f"doctor failed in {graph}:\n{p.stdout}\n{p.stderr}")
 
 
-def setup_association(force: bool = False) -> set[str]:
+def reprovision_association(graph: Path = SUBJECT_R) -> list[str]:
+    """Take the install off the graph subject, so the next setup writes it again.
+
+    `install_association_graph` is a no-op once `.mcp.json` is there, which is
+    right for a re-run and wrong after the binary moved: the subject keeps the
+    skill and the hooks of whatever version provisioned it, and the run then
+    measures an old skill under the new version's name.
+
+    The world is never touched. `INSTALL_ARTIFACTS` names `mushroom-memory`,
+    which is the code suite's store and not this one — the association store is
+    `ASSOC_STORE_NAME` — so the six-minute build and the digest `tasks.json`
+    was written against both survive.
+
+    Returns what it removed, so a caller can say whether there was anything to
+    remove. Idempotent.
+    """
+    graph = Path(graph)
+    removed = []
+    for name in INSTALL_ARTIFACTS:
+        target = graph / name
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+        else:
+            continue
+        removed.append(name)
+    if removed:
+        print(f"reprovision: removed {', '.join(sorted(removed))} from {graph}")
+    return removed
+
+
+def setup_association(force: bool = False,
+                      reprovision: bool = False) -> set[str]:
     """Provision arms P, Q and R. Returns the arms it got.
 
     No clones, no worktrees, no ground-truth regeneration: the three forms are
@@ -426,6 +459,8 @@ def setup_association(force: bool = False) -> set[str]:
     EMPTY_MCP.write_text('{"mcpServers":{}}\n')
     shutil.rmtree(CELLS, ignore_errors=True)
     build_association_world(force)
+    if reprovision:
+        reprovision_association(SUBJECT_R)
     install_association_graph(SUBJECT_R)
     for arm, subject in sorted(ASSOC_SUBJECTS.items()):
         if not subject.exists():
@@ -436,14 +471,14 @@ def setup_association(force: bool = False) -> set[str]:
 
 
 def setup(force: bool = False, arms: set[str] | None = None,
-          suite: str = "code") -> set[str]:
+          suite: str = "code", reprovision: bool = False) -> set[str]:
     """Provision what the requested arms of this suite need.
 
     The association suite has its own provisioning entirely — see
     `setup_association`.
     """
     if suite == "association":
-        return setup_association(force)
+        return setup_association(force, reprovision)
     return setup_code(force, arms)
 
 

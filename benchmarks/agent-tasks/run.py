@@ -596,6 +596,10 @@ def main() -> int:
     ap.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     ap.add_argument("--setup-only", action="store_true")
     ap.add_argument("--force-setup", action="store_true")
+    ap.add_argument("--reprovision", action="store_true",
+                    help="association suite: remove the graph subject's "
+                         "install before setup, so the current binary writes "
+                         "the skill and hooks again (the world is kept)")
     ap.add_argument("--pilot", action="store_true",
                     help="the baseline arm only, one rep, to size the tasks "
                          "(§3.2)")
@@ -606,7 +610,7 @@ def main() -> int:
              if a.arms else list(cfg["arms"]))
     provisioned = setup(force=a.force_setup,
                         arms={cfg["pilot_arm"]} if a.pilot else set(asked),
-                        suite=a.suite)
+                        suite=a.suite, reprovision=a.reprovision)
     if a.setup_only:
         return 0
     if a.pilot:

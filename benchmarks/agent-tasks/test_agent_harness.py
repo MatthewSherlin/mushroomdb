@@ -1163,6 +1163,29 @@ def test_the_three_association_subjects_are_the_three_built_forms():
     assert ASSOC_STORE_NAME == STORE_NAME
 
 
+def test_reprovision_removes_the_install_and_keeps_the_world(tmp_path):
+    """`install_association_graph` skips whenever `.mcp.json` is there, so a
+    subject provisioned by an older binary keeps that binary's skill and hooks
+    for ever. `--reprovision` takes the install off; it must not take the world
+    with it, which costs six minutes to rebuild and would move the truth."""
+    from subjects import ASSOC_STORE_NAME, reprovision_association
+    graph = tmp_path / "graph"
+    (graph / ".claude" / "skills" / "mushroom").mkdir(parents=True)
+    (graph / ".claude" / "skills" / "mushroom" / "SKILL.md").write_text("0.6.2")
+    (graph / ".mcp.json").write_text("{}\n")
+    (graph / ASSOC_STORE_NAME).mkdir()
+    (graph / ASSOC_STORE_NAME / "wal.bin").write_text("the world")
+    (graph / "days.json").write_text("[]\n")
+
+    assert sorted(reprovision_association(graph)) == [".claude", ".mcp.json"]
+    assert not (graph / ".mcp.json").exists()
+    assert not (graph / ".claude").exists()
+    assert (graph / ASSOC_STORE_NAME / "wal.bin").read_text() == "the world"
+    assert (graph / "days.json").exists()
+    # Idempotent: a second pass has nothing to take.
+    assert reprovision_association(graph) == []
+
+
 def test_load_tasks_reads_the_suites_own_file():
     from run import load_tasks
     code = load_tasks("code")
