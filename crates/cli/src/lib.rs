@@ -509,26 +509,31 @@ Usage:
   mushroomdb brief <db-dir>|--auto    hook body: the repository in one block — size, synced sha, the most
                                       central files and the most called symbols; byte-stable, so a
                                       session host caches it once
-  mushroomdb sync <db-dir>|--auto [--json]
+  mushroomdb sync <db-dir>|--auto [--json]   (deprecated, removed in 0.7)
                                    re-sync the repo the store was built from: new commits, then the
                                    dirty working tree (git hook body)
-  mushroomdb map <db-dir> [--json] summarise the graphed repository: clusters, key files, owners, hot files
+  mushroomdb map <db-dir> [--json] (deprecated, removed in 0.7)
+                                   summarise the graphed repository: clusters, key files, owners, hot files
                                    --json prints the computed map instead of the rendered digest
   mushroomdb explore <db-dir> <target> [--depth context|impact|history|all] [--full]
+                                   (deprecated, removed in 0.7)
                                    one target from as many sides as asked for: the definition and
                                    its callers (context), the blast radius (impact), the owner and
                                    what it changes with (history), or all three
                                    <target> is a file path, a symbol key, or a bare symbol name
                                    --full also quotes the body from the working tree
-  mushroomdb context <db-dir> <target> [--full]
+  mushroomdb context <db-dir> <target> [--full]   (deprecated, removed in 0.7)
                                    one file or symbol from every side: where it is, signature, callers,
                                    callees, importers, co-change partners, commits, notes
                                    <target> is a file path, a symbol key, or a bare symbol name
                                    --full also quotes the body from the working tree
-  mushroomdb impact <db-dir> <file>...   what changing these files reaches: partners, importers,
+  mushroomdb impact <db-dir> <file>...   (deprecated, removed in 0.7)
+                                   what changing these files reaches: partners, importers,
                                    and the symbols other files call
-  mushroomdb owners <db-dir> <path>      top author and share, who else knows it, last touch, last 4 quarters
-  mushroomdb why <db-dir> <a> <b>        every rule edge between two nodes with its evidence, or the
+  mushroomdb owners <db-dir> <path>      (deprecated, removed in 0.7)
+                                   top author and share, who else knows it, last touch, last 4 quarters
+  mushroomdb why <db-dir> <a> <b>        (deprecated, removed in 0.7)
+                                   every rule edge between two nodes with its evidence, or the
                                    shortest path between them
   mushroomdb touch <db-dir>|--auto [<file>...]
                                    re-extract just these files; with no <file> reads them from a
@@ -4750,6 +4755,34 @@ mod tests {
             "mushroomdb why <db-dir> <a> <b>",
         ] {
             assert!(usage().contains(line), "usage is missing {line:?}");
+        }
+    }
+
+    /// The seven code-graph subcommands are deprecated in 0.6.4 and removed in
+    /// 0.7, and `--help` has to say so — the same marker the three hook flags
+    /// carry. Each entry below is the usage line's prefix; the marker must
+    /// appear inside that command's block, before the next one starts.
+    #[test]
+    fn usage_marks_the_deprecated_subcommands() {
+        let text = usage();
+        for prefix in [
+            "mushroomdb explore <db-dir> <target>",
+            "mushroomdb map <db-dir> [--json]",
+            "mushroomdb context <db-dir> <target>",
+            "mushroomdb impact <db-dir> <file>...",
+            "mushroomdb owners <db-dir> <path>",
+            "mushroomdb why <db-dir> <a> <b>",
+            "mushroomdb sync <db-dir>|--auto",
+        ] {
+            let start = text
+                .find(prefix)
+                .unwrap_or_else(|| panic!("usage is missing {prefix:?}"));
+            let rest = &text[start..];
+            let block_end = rest.find("\n  mushroomdb ").unwrap_or(rest.len());
+            assert!(
+                rest[..block_end].contains("(deprecated, removed in 0.7)"),
+                "usage does not mark {prefix:?} deprecated"
+            );
         }
     }
 
