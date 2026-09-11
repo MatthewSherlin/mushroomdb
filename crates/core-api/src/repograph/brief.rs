@@ -27,7 +27,7 @@
 
 use crate::db::{EdgeTypeCensus, GraphDb};
 use crate::repograph::facts::str_prop;
-use crate::repograph::map::{file_pagerank, SYNC_KEY};
+use crate::repograph::map::{file_pagerank, spent, SYNC_KEY};
 use crate::repograph::render::{basename, dir_components, sanitize, top_tokens};
 use core_storage::fs::Fs;
 use core_storage::Value;
@@ -59,10 +59,15 @@ const IDENTITY_PROPS: [&str; 2] = ["id", "key"];
 const SHORT_SHA: usize = 7;
 /// Subdirectory names a file's role may be built from.
 const ROLE_TOKENS: usize = 2;
-/// What the ranking may spend. The `SessionStart` hook has five seconds, and
-/// a store too large to rank inside three of them yields the partial ranking
-/// the iteration had reached — still a valid ordering, and a partial brief is
-/// worth more at the start of a session than none.
+/// What the brief may spend. The `SessionStart` hook has five seconds, and a
+/// store too large to describe inside three of them yields what it had reached
+/// — a partial ranking is still a valid ordering, partial counts are still
+/// lower bounds, and a partial brief is worth more at the start of a session
+/// than none.
+///
+/// Both surfaces are budgeted, and the memory one needs it more: its work is
+/// [`GraphDb::wal_total_commits`], which re-reads the WAL — seconds on a store
+/// nobody has snapshotted — plus two passes whose length is the store's.
 const RANK_BUDGET: Duration = Duration::from_secs(3);
 /// The edge types that make a file a candidate for the key-files list: the
 /// *structural* two of the three [`file_pagerank`] ranks over.
@@ -76,13 +81,18 @@ const RANK_BUDGET: Duration = Duration::from_secs(3);
 /// `context`, `impact` and `why`, which are the tools that ask about it.
 const DEPENDENCY_EDGES: [&str; 2] = ["IMPORTS", "CALLS"];
 
-/// How much of each ranking the brief lists.
+/// How much of each ranking the brief lists, and how long it may take.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BriefOptions {
     /// Files listed, most central first.
     pub max_files: usize,
     /// Symbols listed, most called first.
     pub max_symbols: usize,
+    /// Wall-clock the whole brief may spend, [`RANK_BUDGET`] by default.
+    /// [`Duration::ZERO`] is a budget already spent — every count comes back
+    /// as the lower bound reached, which is what the tests use. A budget too
+    /// large to add to the clock is no budget at all.
+    pub budget: Duration,
 }
 
 impl Default for BriefOptions {
@@ -90,6 +100,7 @@ impl Default for BriefOptions {
         Self {
             max_files: 25,
             max_symbols: 25,
+            budget: RANK_BUDGET,
         }
     }
 }
@@ -155,13 +166,23 @@ pub struct SchemaBrief {
     /// How many commits of history are still reachable — `total` above the
     /// horizon floor. A *count*, not an index: the newest commit `edges_at`,
     /// `node_history` and `was_linked` accept is one below it, which is what
-    /// the `as of` recipe names. Zero on a store whose WAL was truncated and
-    /// whose archives are gone, and then there is no `as of` recipe at all.
-    pub commits: u64,
+    /// the `as of` recipe names. `Some(0)` on a store whose WAL was truncated
+    /// and whose archives are gone, and then there is no `as of` recipe at all.
+    ///
+    /// `None` when the budget ran out before it could be counted: the scan
+    /// that answers it re-reads the WAL, so it is the first thing a spent
+    /// budget drops. Unknown and zero are different answers, which is why this
+    /// is an `Option` and not a zero.
+    pub commits: Option<u64>,
     /// `(role name, the labels it may see)`, sorted by name.
     pub roles: Vec<(String, Vec<String>)>,
     /// One worked call per question kind, in a fixed order.
     pub recipes: Vec<Recipe>,
+    /// The budget ran out while counting: every count above is a *lower
+    /// bound*, the listings may be short of entries, and `commits` is
+    /// `None`. Rendered, so a reader never mistakes a partial count for a
+    /// complete one.
+    pub partial: bool,
 }
 
 /// The repository, as a session starts.
@@ -205,6 +226,10 @@ pub struct BriefReport {
 /// session from probing for them.
 #[must_use]
 pub fn brief<F: Fs>(db: &GraphDb<F>, opts: &BriefOptions) -> BriefReport {
+    // One deadline for the whole brief, taken before the first read, so the
+    // two surfaces cannot each spend the budget in turn.
+    let deadline = Instant::now().checked_add(opts.budget);
+
     let mut file_keys: Vec<String> = db
         .nodes_with_label("File")
         .iter()
@@ -221,7 +246,7 @@ pub fn brief<F: Fs>(db: &GraphDb<F>, opts: &BriefOptions) -> BriefReport {
             last_sync: None,
             key_files: Vec::new(),
             key_symbols: Vec::new(),
-            schema: Some(memory_schema(db)),
+            schema: Some(memory_schema(db, deadline)),
         };
     }
 
@@ -230,7 +255,7 @@ pub fn brief<F: Fs>(db: &GraphDb<F>, opts: &BriefOptions) -> BriefReport {
     // Cut short by the budget it is a partial ranking, which is still an
     // ordering; the brief has no "(truncated)" to report and does not pretend
     // otherwise.
-    let (ranked, _truncated) = file_pagerank(db, &file_keys, Some(Instant::now() + RANK_BUDGET));
+    let (ranked, _truncated) = file_pagerank(db, &file_keys, deadline);
 
     // The ranking alone fills the list with a repository's assets. A file
     // nothing imports has no rank of its own, so PageRank leaves it on the
@@ -307,24 +332,47 @@ pub fn brief<F: Fs>(db: &GraphDb<F>, opts: &BriefOptions) -> BriefReport {
 /// Both come back sorted, and the census's sample edge is the first of its
 /// type in the store's own id order, so the worked calls name the same keys on
 /// every run.
-fn memory_schema<F: Fs>(db: &GraphDb<F>) -> SchemaBrief {
+///
+/// # The budget
+///
+/// Neither pass is bounded by anything but the store, and the history count
+/// after them re-reads the WAL. `deadline` is checked inside both loops and
+/// before the WAL scan, so what a spent budget costs is *completeness*, not
+/// the brief: the counts reached become lower bounds, the history goes
+/// uncounted, and the `as of` recipe — which needs a commit index the scan
+/// would have supplied — is not shown at all rather than shown wrong.
+fn memory_schema<F: Fs>(db: &GraphDb<F>, deadline: Option<Instant>) -> SchemaBrief {
     let nodes = db.all_nodes_for_export();
+    let mut partial = false;
 
     // Pass one: label → how many nodes, and every property name any of them
     // has. `props` is a `BTreeMap`, so the union arrives sorted.
     let mut by_label: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
+    let mut counted = 0usize;
     for n in &nodes {
+        if spent(deadline) {
+            partial = true;
+            break;
+        }
+        counted += 1;
         let entry = by_label.entry(n.label.clone()).or_default();
         entry.0 += 1;
         entry.1.extend(n.props.keys().cloned());
     }
 
     // Pass two: the per-type census, keyed for the recipes to read back.
-    let by_type: BTreeMap<String, EdgeTypeCensus> = db
-        .edge_type_census()
-        .into_iter()
-        .map(|c| (c.edge_type.clone(), c))
-        .collect();
+    let mut by_type: BTreeMap<String, EdgeTypeCensus> = BTreeMap::new();
+    if spent(deadline) {
+        partial = true;
+    } else {
+        for c in db.edge_type_census() {
+            if spent(deadline) {
+                partial = true;
+                break;
+            }
+            by_type.insert(c.edge_type.clone(), c);
+        }
+    }
 
     let mut labels: Vec<LabelBrief> = by_label
         .iter()
@@ -399,10 +447,23 @@ fn memory_schema<F: Fs>(db: &GraphDb<F>) -> SchemaBrief {
     // every commit index out of it. There is no `as of` call to show, so the
     // brief shows none — a recipe that cannot answer is worse than a missing
     // one, since the session that copies it learns the tool is broken.
-    let floor = db.wal_horizon_floor();
-    let total = db.wal_total_commits().unwrap_or(floor);
-    let commits = total.saturating_sub(floor);
-    let latest_commit = (total > floor).then(|| total - 1);
+    //
+    // And it is the first thing the budget drops: on a store nobody has
+    // snapshotted the scan is seconds on its own, which is the whole of the
+    // hook's five. Uncounted history renders as `unknown` and takes the `as
+    // of` recipe with it — a recipe whose commit index was guessed is the one
+    // failure a recipe must not have.
+    let (commits, latest_commit) = if spent(deadline) {
+        partial = true;
+        (None, None)
+    } else {
+        let floor = db.wal_horizon_floor();
+        let total = db.wal_total_commits().unwrap_or(floor);
+        (
+            Some(total.saturating_sub(floor)),
+            (total > floor).then(|| total - 1),
+        )
+    };
     let recipes = recipes(
         &nodes,
         &by_type,
@@ -414,12 +475,15 @@ fn memory_schema<F: Fs>(db: &GraphDb<F>) -> SchemaBrief {
     );
 
     SchemaBrief {
-        nodes: nodes.len(),
+        // What was actually counted, so the number the brief prints is a
+        // lower bound the pass reached rather than a total it never read.
+        nodes: counted,
         labels,
         edge_types,
         commits,
         roles,
         recipes,
+        partial,
     }
 }
 
@@ -549,7 +613,7 @@ fn recipes(
         .find_map(|(name, visible)| {
             labels
                 .iter()
-                .find(|l| visible.iter().any(|v| *v == l.label))
+                .find(|l| visible.contains(&l.label))
                 .map(|l| (name.clone(), l.label.clone()))
         })
         .unwrap_or_else(|| {

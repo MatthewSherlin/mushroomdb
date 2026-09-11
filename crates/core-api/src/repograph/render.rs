@@ -539,21 +539,37 @@ fn brief_body(header: &str, files: &[String], symbols: &[String], dropped: usize
 /// uses. Dropping a recipe instead would save a line and cost the session the
 /// round trip the whole section exists to remove.
 fn render_memory_brief(b: &BriefReport, s: &SchemaBrief, budget: usize) -> String {
+    // A partial schema counts what it reached, so every count it produced is
+    // a lower bound. Marked once in the header rather than on each line — the
+    // budget the marker is charged against is the same one the counts came
+    // short of.
+    let at_least = |n: usize| {
+        if s.partial {
+            format!("≥ {}", thousands(n))
+        } else {
+            thousands(n)
+        }
+    };
     let header = format!(
-        "{UNTRUSTED_FRAMING}mushroomdb brief — {}\n",
+        "{UNTRUSTED_FRAMING}mushroomdb brief — {}{}\n",
         [
-            plural(s.nodes, "node"),
+            if s.partial {
+                format!("≥ {}", plural(s.nodes, "node"))
+            } else {
+                plural(s.nodes, "node")
+            },
             plural(b.edges, "edge"),
             plural(s.labels.len(), "label"),
         ]
-        .join(SEP)
+        .join(SEP),
+        if s.partial { " (partial)" } else { "" }
     );
 
     let mut labels: Vec<String> = s
         .labels
         .iter()
         .map(|l| {
-            let mut line = format!("  {} ({})", sanitize(&l.label), thousands(l.nodes));
+            let mut line = format!("  {} ({})", sanitize(&l.label), at_least(l.nodes));
             if !l.props.is_empty() {
                 let _ = write!(line, " — {}", l.props.join(", "));
             }
@@ -568,7 +584,7 @@ fn render_memory_brief(b: &BriefReport, s: &SchemaBrief, budget: usize) -> Strin
         .edge_types
         .iter()
         .map(|t| {
-            let mut line = format!("  {} ({})", sanitize(&t.edge_type), thousands(t.edges));
+            let mut line = format!("  {} ({})", sanitize(&t.edge_type), at_least(t.edges));
             if let Some(rule) = &t.rule {
                 let _ = write!(line, " — rule {}", sanitize(rule));
                 if t.hidden_rules > 0 {
@@ -582,7 +598,12 @@ fn render_memory_brief(b: &BriefReport, s: &SchemaBrief, budget: usize) -> Strin
 
     // The part that never gives way: how deep the history runs, who may read
     // it, and the calls.
-    let mut fixed = format!("history: {} commits\n", s.commits);
+    // `unknown`, not `0`: a history the budget never counted is not a history
+    // that is not there, and the two lead a reader to opposite conclusions.
+    let mut fixed = match s.commits {
+        Some(n) => format!("history: {n} commits\n"),
+        None => "history: unknown\n".to_string(),
+    };
     if !s.roles.is_empty() {
         let roles: Vec<String> = s
             .roles

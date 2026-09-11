@@ -536,6 +536,7 @@ fn a_long_brief_is_capped_by_whole_lines_and_keeps_the_reach_line() {
         &BriefOptions {
             max_files: 30,
             max_symbols: 12,
+            ..BriefOptions::default()
         },
     );
     // A reach line long enough that the budget cannot hold the whole listing.
@@ -689,6 +690,7 @@ fn brief_lists_only_files_something_imports_or_calls() {
         &BriefOptions {
             max_files: 100,
             max_symbols: 25,
+            ..BriefOptions::default()
         },
     );
     assert_eq!(
@@ -936,7 +938,7 @@ fn brief_on_a_memory_store_prints_the_schema() {
         "edge types:",
         "  ASSIGNED_TO (3) — rule assigned_to — Person → Project",
         "  KNOWS (2) — Person → Person",
-        &format!("history: {} commits", s.commits),
+        &format!("history: {} commits", s.commits.expect("counted")),
         "roles: analyst (Person) · auditor (Person, Project)",
     ] {
         assert!(
@@ -944,7 +946,10 @@ fn brief_on_a_memory_store_prints_the_schema() {
             "the schema must print {line:?}:\n{text}"
         );
     }
-    assert!(s.commits > 0, "a store that was written to has a history");
+    assert!(
+        s.commits.is_some_and(|c| c > 0),
+        "a store that was written to has a history"
+    );
     assert!(
         text.ends_with("reach the graph: query '<cypher>'\n"),
         "{text}"
@@ -974,7 +979,10 @@ fn brief_on_a_memory_store_works_one_call_per_question_kind() {
             // count on a store nothing has pruned — the off-by-one that made
             // this recipe `CommitOutOfRange` is pinned by
             // `the_as_of_recipe_names_a_commit_edges_at_accepts`.
-            ("as of", &*format!("edges_at person:ada {}", s.commits - 1),),
+            (
+                "as of",
+                &*format!("edges_at person:ada {}", s.commits.expect("counted") - 1),
+            ),
             // `project_id`, not `name`: the field the `assigned_to` rule
             // reads, so the call shown is one that would really lose and gain
             // an edge. Only the new value stays a placeholder.
@@ -1074,7 +1082,7 @@ fn a_store_with_no_reachable_history_shows_no_as_of_recipe() {
     assert!(!s.labels.is_empty() && !s.edge_types.is_empty());
 
     let text = render_brief(&b, "query '<cypher>'");
-    if s.commits == 0 {
+    if s.commits == Some(0) {
         assert!(
             !questions.contains(&"as of"),
             "no history means no `as of` call to show: {questions:?}"
@@ -1433,6 +1441,129 @@ fn every_cypher_recipe_answers_on_the_store_it_came_from() {
         }
         assert_eq!(ran, 2, "the brief renders two Cypher recipes");
     }
+}
+
+/// Binding: the memory-store brief runs under the same budget the two
+/// rankings do, and an exhausted one costs counts and history rather than the
+/// brief.
+///
+/// The hook that renders this has five seconds. Nothing in the memory path was
+/// watching a clock: the node pass, the edge-type census and `wal_total_commits`
+/// each ran to completion however long they took, and the last of those
+/// re-reads the whole WAL. A brief that arrives late is a brief the session
+/// never sees.
+#[test]
+fn a_memory_brief_out_of_budget_is_partial_rather_than_late() {
+    let db = seeded_memory_store("brief-memory-budget");
+
+    let full = brief(&db, &BriefOptions::default());
+    let fs = full.schema.as_ref().expect("a memory store has a schema");
+    assert!(!fs.partial, "the default budget is ample for five nodes");
+    assert!(fs.commits.is_some(), "and the history is counted");
+
+    let b = brief(
+        &db,
+        &BriefOptions {
+            budget: std::time::Duration::ZERO,
+            ..BriefOptions::default()
+        },
+    );
+    let s = b.schema.as_ref().expect("still a memory store");
+    assert!(s.partial, "a spent budget is reported, never hidden");
+    assert_eq!(
+        s.commits, None,
+        "wal_total_commits re-reads the WAL — not on a spent budget"
+    );
+    assert!(
+        !s.recipes.iter().any(|r| r.question == "as of"),
+        "no commit index is known, so there is no `as of` call to show: {:?}",
+        s.recipes
+    );
+
+    let text = render_brief(&b, "query '<cypher>'");
+    assert!(text.starts_with(UNTRUSTED_FRAMING), "{text}");
+    assert!(
+        text.lines().next_back() == Some("reach the graph: query '<cypher>'"),
+        "the reach line survives a spent budget:\n{text}"
+    );
+    assert!(
+        text.lines().any(|l| l == "history: unknown"),
+        "an uncounted history says so rather than reading as zero:\n{text}"
+    );
+    assert!(
+        text.lines().next().is_some() && text.contains("(partial)"),
+        "the header marks a partial brief:\n{text}"
+    );
+    assert!(text.contains("ask in one call:"), "{text}");
+}
+
+/// Binding: a partial schema's counts render as lower bounds.
+///
+/// Built by hand rather than timed, so the assertion is about the rendering
+/// and not about how fast the machine running the tests happens to be.
+#[test]
+fn a_partial_schema_renders_its_counts_as_lower_bounds() {
+    use core_api::repograph::{BriefReport, EdgeTypeBrief, LabelBrief, Recipe, SchemaBrief};
+
+    let schema = SchemaBrief {
+        nodes: 7,
+        labels: vec![LabelBrief {
+            label: "Person".into(),
+            nodes: 7,
+            props: vec!["name".into()],
+            hidden_props: 0,
+        }],
+        edge_types: vec![EdgeTypeBrief {
+            edge_type: "KNOWS".into(),
+            rule: None,
+            hidden_rules: 0,
+            src: vec!["Person".into()],
+            dst: vec!["Person".into()],
+            edges: 9,
+        }],
+        commits: None,
+        roles: Vec::new(),
+        recipes: vec![Recipe {
+            question: "relationships".into(),
+            call: "node_edges person:ada".into(),
+        }],
+        partial: true,
+    };
+    let text = render_brief(
+        &BriefReport {
+            repo: String::new(),
+            files: 0,
+            symbols: 0,
+            edges: 9,
+            last_sync: None,
+            key_files: Vec::new(),
+            key_symbols: Vec::new(),
+            schema: Some(schema),
+        },
+        "query '<cypher>'",
+    );
+
+    assert!(
+        text.lines()
+            .next_back()
+            .is_some_and(|l| l.contains("reach the graph")),
+        "{text}"
+    );
+    for line in [
+        "  Person (≥ 7) — name",
+        "  KNOWS (≥ 9) — Person → Person",
+        "history: unknown",
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "a partial brief must print {line:?}:\n{text}"
+        );
+    }
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("mushroomdb brief — ") && l.ends_with("(partial)")),
+        "{text}"
+    );
 }
 
 /// Binding: the role recipe names a label the role it names can actually see.
