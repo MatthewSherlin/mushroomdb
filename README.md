@@ -475,7 +475,7 @@ Phases 1–4 and Plan 18 all landed. What remains:
 ## Docs
 
 - [Quickstart](docs/site/quickstart.md) · [Rules](docs/site/rules.md) · [Cypher reference](docs/site/query.md) · [HTTP + MCP API](docs/site/api.md)
-- [The live code graph](docs/site/code-graph.md) · [Concurrency](docs/site/concurrency.md) · [Codebase graph](docs/site/ingest-git.md)
+- [The live code graph](docs/site/code-graph.md) (deprecated in 0.6.4, removed in 0.7) · [Concurrency](docs/site/concurrency.md) · [Codebase graph](docs/site/ingest-git.md)
 - [Install, plugin and hooks](docs/site/skill.md) · [MCP tools](docs/site/mcp.md) · [Association benchmark](docs/site/association-bench.md)
 - [Time travel](docs/site/timetravel.md) · [Subscriptions](docs/site/subscriptions.md) · [Views](docs/site/views.md) · [Rule suggestions](docs/site/suggest.md)
 - [Masks and access control](docs/site/masks.md) · [Full-text search](docs/site/fulltext.md) · [Property indexes](docs/site/indexes.md) · [Graph algorithms](docs/site/algorithms.md)

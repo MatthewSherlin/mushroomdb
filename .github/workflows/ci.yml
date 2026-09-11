@@ -269,7 +269,7 @@ jobs:
             --expect-tools query,explain_association,neighborhood,node_info,node_edges,was_linked,edges_at,what_if,node_history,edge_history,find_similar,hybrid_search,remember,recall,stats
         working-directory: scripts/mcp-handshake
 
-  # DEPRECATED DOOR, STILL GATED. The code graph is deprecated in v0.6.4 and removed in 0.7;
+  # DEPRECATED DOOR, STILL GATED. The code graph is deprecated in 0.6.4 and removed in 0.7;
   # this job keeps running until then, because a deprecated feature that still ships is a
   # feature that still has to work.
   # The v0.6 code-graph acceptance run: ingest, map, determinism, freshness,

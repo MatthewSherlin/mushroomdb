@@ -17,7 +17,7 @@ python3 benchmarks/agent-tasks/run.py --suite association --reps 3
 ## `--suite code` — retired
 
 The code suite asked twenty repository questions of a stock session and of sessions carrying the
-code-graph door. **It is retired as of v0.6.4.** It still runs — nothing was deleted — but no
+code-graph door. **It is retired as of 0.6.4.** It still runs — nothing was deleted — but no
 further runs will be committed, because the question it asks has been answered:
 
 | run | what it measured | result |

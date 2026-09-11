@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # acceptance-0.6.sh — the v0.6 code-graph acceptance run.
-# DEPRECATED DOOR, STILL GATED. The code graph is deprecated in v0.6.4 and removed in 0.7;
+# DEPRECATED DOOR, STILL GATED. The code graph is deprecated in 0.6.4 and removed in 0.7;
 # this job keeps running until then, because a deprecated feature that still ships is a
 # feature that still has to work.
 #

@@ -59,7 +59,7 @@ The 13 graph tools below are prefixed `Advanced:`.
 
 `ingest-git` is supported as a data source. The tools that read a repository
 graph — `explore`, `map`, `context`, `impact`, `owners`, `why`, `sync` — are
-**deprecated in v0.6.4 and removed in 0.7**; they still ship and are still
+**deprecated in 0.6.4 and removed in 0.7**; they still ship and are still
 tested.
 
 ```sh

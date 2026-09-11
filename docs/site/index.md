@@ -73,7 +73,7 @@ Docker, `install.sh`, and the build-from-source path are in
 
 ## Pages in this section
 
-- [Quickstart](quickstart.md) — two commands to a running graph explorer, two more to a graphed repository
+- [Quickstart](quickstart.md) — a store, an assistant wired to it, and the four questions with one worked call each
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
 - [Codebase graph](ingest-git.md) — `ingest-git`, its rules, submodules, pull requests, incremental sync
