@@ -769,7 +769,7 @@ fn tool_node_history(db: &SharedDb, args: &Js) -> CallOutcome {
         Ok(n) => n,
         Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
     };
-    CallOutcome::ToolOk(node_history_json(key, &entries, total_commits))
+    CallOutcome::ToolOk(node_history_json(key, &entries.items, total_commits))
 }
 
 fn tool_edge_history(db: &SharedDb, args: &Js) -> CallOutcome {

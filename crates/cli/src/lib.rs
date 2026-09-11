@@ -3796,7 +3796,7 @@ mod tests {
             let db = GraphDb::open(&dir).expect("reopen");
             assert!(db.has_node("alice"));
             assert!(
-                !db.node_history("alice").expect("history").is_empty(),
+                !db.node_history("alice").expect("history").items.is_empty(),
                 "the insert is still explainable"
             );
         }
@@ -3867,11 +3867,11 @@ mod tests {
         // frames below the floor are gone, and everything the retained
         // archives still hold is still explainable.
         assert!(
-            db.node_history("p0").expect("history").is_empty(),
+            db.node_history("p0").expect("history").items.is_empty(),
             "the pruned archives take their history with them"
         );
         assert!(
-            !db.node_history("p9").expect("history").is_empty(),
+            !db.node_history("p9").expect("history").items.is_empty(),
             "the retained window is still explainable"
         );
         drop(db);

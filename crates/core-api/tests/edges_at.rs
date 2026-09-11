@@ -214,7 +214,11 @@ fn edges_at_commit_out_of_range_errors() {
     let total = db.wal_total_commits().unwrap();
 
     match db.edges_at("a", total) {
-        Err(GraphError::CommitOutOfRange { commit, total: t }) => {
+        Err(GraphError::CommitOutOfRange {
+            commit,
+            total: t,
+            floor: 0,
+        }) => {
             assert_eq!(commit, total);
             assert_eq!(t, total);
         }

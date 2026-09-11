@@ -2,18 +2,22 @@ use core_storage::Value;
 
 // ── Edge history types ────────────────────────────────────────────────────────
 
-/// Result wrapper for history queries. Carries the event list and the total
-/// number of WAL commits visible in the current horizon window.
+/// Result wrapper for history queries. Carries the event list, the total
+/// number of WAL commits, and the oldest commit still reachable.
 ///
-/// Valid commit indices for `was_linked` are `0..total_commits`. Any index
-/// `>= total_commits` is outside the horizon and `was_linked` will return
+/// Valid commit indices for `was_linked` are `horizon..total_commits`. Any index
+/// outside that range is unreachable and `was_linked` will return
 /// `CommitOutOfRange`.
 #[derive(Debug)]
 pub struct HistoryResult<T> {
     pub items: Vec<T>,
-    /// Exclusive upper bound for valid commit indices (`frames.len()`).
-    /// The horizon window is `[0, total_commits)`.
+    /// Exclusive upper bound for valid commit indices.
+    /// The horizon window is `[horizon, total_commits)`.
     pub total_commits: u64,
+    /// The oldest commit index still reachable (the WAL horizon floor). `0`
+    /// when nothing has been pruned; when `> 0`, events before this commit
+    /// were pruned and are not part of `items`.
+    pub horizon: u64,
 }
 
 /// A single add-or-retract event for an edge between two nodes.

@@ -1898,6 +1898,7 @@ async fn node_history_handler(
         // mirrors the same protection in `node_edges` (http.rs ~978-989).
         use core_api::HistoryChange;
         let visible: Vec<_> = entries
+            .items
             .into_iter()
             .filter(|entry| match &entry.change {
                 HistoryChange::EdgeAdded { other, .. }
@@ -1921,7 +1922,7 @@ async fn node_history_handler(
         Ok(n) => n,
         Err(e) => return graph_err(e),
     };
-    json_ok(node_history_json(&key, &entries, total_commits))
+    json_ok(node_history_json(&key, &entries.items, total_commits))
 }
 
 /// `GET /history/edge?a=&b=` — return the edge lifecycle between two nodes.

@@ -760,6 +760,7 @@ fn stats_live_and_tombstoned_after_delete_node() {
             edges: 1,
             rules: vec![],
             chain_truncations: 0,
+            history_floor: 0,
         }
     );
     db.delete_node("a").unwrap();

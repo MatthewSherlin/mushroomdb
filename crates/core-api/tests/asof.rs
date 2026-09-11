@@ -308,6 +308,7 @@ fn open_at_out_of_range_returns_error() {
         GraphError::CommitOutOfRange {
             commit: 7,
             total: 7,
+            floor: 0,
         } => {}
         other => panic!("expected CommitOutOfRange{{7,7}}, got {other:?}"),
     }
@@ -320,6 +321,7 @@ fn open_at_out_of_range_returns_error() {
         GraphError::CommitOutOfRange {
             commit: 0,
             total: 0,
+            floor: 0,
         } => {}
         other => panic!("expected CommitOutOfRange{{0,0}} for empty WAL, got {other:?}"),
     }
@@ -380,6 +382,7 @@ fn torn_tail_open_at_sees_fewer_commits() {
         GraphError::CommitOutOfRange {
             commit: 2,
             total: 2,
+            floor: 0,
         } => {}
         other => panic!("expected CommitOutOfRange{{2,2}}, got {other:?}"),
     }

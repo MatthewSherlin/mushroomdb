@@ -623,7 +623,7 @@ fn unchanged_files_are_not_rewritten() {
     run_ingest_git(&db_dir, &opts(&repo)).unwrap();
     let before_file = {
         let db = GraphDb::open(&db_dir).unwrap();
-        db.node_history("src/util.rs").unwrap().len()
+        db.node_history("src/util.rs").unwrap().items.len()
     };
     let before_commits = core_api::wal_commit_count_at(&db_dir).unwrap();
 
@@ -643,7 +643,7 @@ fn unchanged_files_are_not_rewritten() {
     );
     let db = GraphDb::open(&db_dir).unwrap();
     assert_eq!(
-        db.node_history("src/util.rs").unwrap().len(),
+        db.node_history("src/util.rs").unwrap().items.len(),
         before_file,
         "an unchanged file must produce no write on a re-scan"
     );
@@ -662,6 +662,7 @@ fn the_sync_marker_is_written_after_the_structure_pass() {
     let newest = |key: &str| {
         db.node_history(key)
             .unwrap()
+            .items
             .iter()
             .map(|e| e.commit)
             .max()

@@ -275,6 +275,11 @@ pub struct Stats {
     /// rule chain or shorten it. Never persisted, so it resets on reopen.
     #[serde(default)]
     pub chain_truncations: u64,
+    /// The oldest commit index history still reaches (the WAL horizon floor).
+    /// `0` means nothing has been pruned and history is complete; a non-zero
+    /// value means events before that commit were pruned and are gone.
+    #[serde(default)]
+    pub history_floor: u64,
 }
 
 /// One rule's provenance size, trip latch, and fire counter.
@@ -2595,10 +2600,18 @@ impl<F: Fs> GraphDb<F> {
 
         // Horizon and range check.
         if commit < db.wal_horizon_floor {
-            return Err(GraphError::CommitOutOfRange { commit, total });
+            return Err(GraphError::CommitOutOfRange {
+                commit,
+                total,
+                floor: db.wal_horizon_floor,
+            });
         }
         if commit >= total {
-            return Err(GraphError::CommitOutOfRange { commit, total });
+            return Err(GraphError::CommitOutOfRange {
+                commit,
+                total,
+                floor: db.wal_horizon_floor,
+            });
         }
 
         // Local index into surviving frames (0 = first frame of oldest archive).
@@ -2613,7 +2626,11 @@ impl<F: Fs> GraphDb<F> {
             // If either condition is violated the prefix needed to reconstruct
             // the requested state is gone; refuse rather than return wrong data.
             if db.wal_horizon_floor > 0 || !db.archive_genesis_chain {
-                return Err(GraphError::CommitOutOfRange { commit, total });
+                return Err(GraphError::CommitOutOfRange {
+                    commit,
+                    total,
+                    floor: db.wal_horizon_floor,
+                });
             }
             // Replay all archive frames up to and including the target commit
             // from an empty database state.  Archives must be replayed in order
@@ -9029,11 +9046,24 @@ impl<F: Fs> GraphDb<F> {
             .any(|(k, vf, vu)| k == record_key && commit >= *vf && vu.is_none_or(|u| commit < u))
     }
 
-    pub fn node_history(&self, key: &str) -> Result<Vec<crate::history::HistoryEntry>> {
-        use crate::history::{HistoryChange, HistoryEntry};
+    /// Return the change history of node `key` by scanning the on-disk WAL.
+    ///
+    /// ## Horizon
+    ///
+    /// History reaches back only as far as the retained WAL. The returned
+    /// [`HistoryResult`](crate::history::HistoryResult) carries `total_commits`
+    /// (the exclusive upper bound for valid commit indices) and `horizon` (the
+    /// oldest commit still reachable). When `horizon > 0`, older events were
+    /// pruned and are not in `items`.
+    pub fn node_history(
+        &self,
+        key: &str,
+    ) -> Result<crate::history::HistoryResult<crate::history::HistoryEntry>> {
+        use crate::history::{HistoryChange, HistoryEntry, HistoryResult};
         use core_storage::wal::WalRecord;
 
         let (frames, _) = self.all_frames()?;
+        let total_commits = self.wal_horizon_floor + frames.len() as u64;
 
         // Resolve commit-bounded alias intervals for `key` (handles renames in the WAL).
         let alias_intervals = self.build_key_alias_intervals(&frames, key);
@@ -9199,7 +9229,11 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        Ok(out)
+        Ok(HistoryResult {
+            items: out,
+            total_commits,
+            horizon: self.wal_horizon_floor,
+        })
     }
 
     /// Return the per-edge change history between nodes `a` and `b` by scanning
@@ -9417,6 +9451,7 @@ impl<F: Fs> GraphDb<F> {
         Ok(HistoryResult {
             items: out,
             total_commits,
+            horizon: self.wal_horizon_floor,
         })
     }
 
@@ -9446,12 +9481,14 @@ impl<F: Fs> GraphDb<F> {
             return Err(GraphError::CommitOutOfRange {
                 commit: at_commit,
                 total: total_commits,
+                floor: self.wal_horizon_floor,
             });
         }
         if at_commit >= total_commits {
             return Err(GraphError::CommitOutOfRange {
                 commit: at_commit,
                 total: total_commits,
+                floor: self.wal_horizon_floor,
             });
         }
 
@@ -9607,6 +9644,7 @@ impl<F: Fs> GraphDb<F> {
             return Err(GraphError::CommitOutOfRange {
                 commit,
                 total: total_commits,
+                floor: self.wal_horizon_floor,
             });
         }
 
@@ -9960,6 +9998,7 @@ impl<F: Fs> GraphDb<F> {
             edges: self.topo_view().edge_count(),
             rules,
             chain_truncations: self.engine.chain_truncations(),
+            history_floor: self.wal_horizon_floor,
         }
     }
 

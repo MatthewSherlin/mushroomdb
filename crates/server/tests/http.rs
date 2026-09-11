@@ -493,6 +493,7 @@ async fn stats_round_trips_serialize() {
         nodes_tombstoned: 2,
         edges: 3,
         chain_truncations: 0,
+        history_floor: 0,
         rules: vec![RuleStats {
             name: "r".into(),
             edges: 4,
@@ -1221,6 +1222,7 @@ fn wire_types_serialize() {
         edges: 0,
         rules: vec![],
         chain_truncations: 0,
+        history_floor: 0,
     };
     serde_json::to_value(&stats).unwrap();
     serde_json::to_value(&RuleStats {
