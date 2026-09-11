@@ -2040,7 +2040,7 @@ impl<F: Fs> GraphDb<F> {
         }
         // WAL-present path: build indexes eagerly BEFORE replay so that the
         // first replayed record does not trigger the lazy-init guard (which
-        // would call reindex_all_load_ivf on an empty graph, defeating the
+        // would call reindex_all_load_state on an empty graph, defeating the
         // point of restoring IVF/HNSW blobs from the snapshot).
         if !records.is_empty() {
             db.ensure_v8_base_sections_loaded();
@@ -2409,7 +2409,8 @@ impl<F: Fs> GraphDb<F> {
         // snapshot are retained without deserializing so that:
         //   - clean-open (empty WAL): indexes stay empty; blobs load on first
         //     ANN query via ensure_hnsw_loaded, or on first mutation via the
-        //     lazy-init guard which calls reindex_all_load_ivf + load_hnsw_state.
+        //     lazy-init guard which calls reindex_all_load_state (the scan
+        //     skips the HNSW build for every side the blob supplies).
         //   - WAL-present: open_with calls consume_retained_state_eager before
         //     replay so HNSW/IVF are live before any record fires the hooks.
         let ivf_bytes = if state.ivf_state.is_empty() {
@@ -7733,6 +7734,17 @@ impl<F: Fs> GraphDb<F> {
         self.engine.hnsw_has_rule(field)
     }
 
+    /// How many HNSW graphs this handle has built from scratch since it was
+    /// opened (one per side of an approximate rule).
+    ///
+    /// An open that restored every graph from the snapshot reports `0`.
+    /// Exposed for tests that assert the open path reuses the persisted index
+    /// rather than rebuilding it; not part of the stable surface.
+    #[doc(hidden)]
+    pub fn hnsw_build_count(&self) -> u64 {
+        self.engine.hnsw_build_count()
+    }
+
     /// Find nodes whose `field` vector is most similar to `q` (cosine
     /// similarity), returning up to `k` results with similarity ≥ `min`,
     /// sorted descending.
@@ -10028,14 +10040,14 @@ impl<F: Fs> GraphDb<F> {
         // as apply() sees them: `on_node_changed` withdraws the node under its
         // old value and refiles it under the new one, so the index must not
         // already reflect the change.
-        engine.reindex_all_load_ivf(
+        engine.reindex_all_load_state(
             &self.ids,
             &syms,
             &self.labels,
             build_props_view(&self.props, &self.base),
             self.engine.export_ivf_state(),
+            self.engine.export_hnsw_state_passthrough(),
         );
-        engine.load_hnsw_state(self.engine.export_hnsw_state_passthrough());
         engine.set_emit_deltas(true);
 
         // --- Apply the hypothetical change and re-derive. ---

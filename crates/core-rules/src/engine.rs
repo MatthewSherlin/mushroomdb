@@ -11,8 +11,30 @@ use core_storage::v8::encode::{decode_ivf_bytes, decode_provenance_bytes};
 use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::{EdgeProps, IdMap, Interner, Topology, Value};
 
+/// Deserialize one side's persisted HNSW blob.
+///
+/// `None` means "no usable persisted graph, rebuild this side": either the blob
+/// is empty (the side had no graph when the snapshot was written) or it failed
+/// to deserialize, in which case the reason is reported on stderr — a corrupt
+/// blob costs a rebuild, never a silently empty index.
+fn deserialize_hnsw_blob(rule: &str, side: &str, blob: &[u8]) -> Option<HnswIndex> {
+    if blob.is_empty() {
+        return None;
+    }
+    match bincode::deserialize::<HnswIndex>(blob) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!(
+                "[mushroomdb] rule {rule:?}: persisted {side}-side HNSW index failed to load \
+                 ({e}); rebuilding it from the node scan"
+            );
+            None
+        }
+    }
+}
+
 /// Decode raw IVF section bytes into the `RuleIvfExport` format consumed by
-/// `reindex_all_load_ivf`.  Returns an empty map when `bytes` is empty.
+/// `reindex_all_load_state`.  Returns an empty map when `bytes` is empty.
 fn decode_ivf_bytes_to_export(bytes: &[u8]) -> BTreeMap<String, RuleIvfExport> {
     decode_ivf_bytes(bytes)
         .into_iter()
@@ -213,7 +235,7 @@ pub struct RuleEngine {
     rebuild_needed: BTreeSet<String>,
     /// Whether candidate indexes have been populated.  Starts `false` after a
     /// snapshot restore that defers index building.  Set to `true` by
-    /// `reindex_all`, `reindex_all_load_ivf`, and `create_rule`.  On the first
+    /// `reindex_all`, `reindex_all_load_state`, and `create_rule`.  On the first
     /// mutation call when this is `false`, the full O(n) scan runs (first-write
     /// cost), consuming and replacing `retained_hnsw_blobs`.
     indexes_populated: bool,
@@ -280,6 +302,14 @@ pub struct RuleEngine {
     /// How many times a write hit [`MAX_CHAIN_DEPTH`] with work still pending.
     /// Never persisted; counts from engine construction. Surfaced in `Stats`.
     chain_truncations: u64,
+    /// How many HNSW graphs this engine has built from scratch — one per side
+    /// of an approximate rule, counted where `init_hnsw` hands the following
+    /// node scan an empty graph to fill.
+    ///
+    /// Never persisted; counts from engine construction. A graph restored from
+    /// a persisted blob is *not* a build and does not count, which is what
+    /// makes "this open reused the persisted index" observable to a test.
+    hnsw_builds: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1930,6 +1960,7 @@ impl RuleEngine {
             chain_fired: BTreeSet::new(),
             doomed: None,
             chain_truncations: 0,
+            hnsw_builds: 0,
         }
     }
 
@@ -1974,6 +2005,20 @@ impl RuleEngine {
         }
     }
 
+    /// How many HNSW graphs this engine instance has built from scratch since
+    /// it was constructed (one per side of an approximate rule).
+    ///
+    /// Zero after an open that restored every graph from the snapshot; non-zero
+    /// when a rule was created, or when a graph had to be rebuilt because no
+    /// blob was persisted for it or the blob failed to load.
+    ///
+    /// Test observability, not stable surface: never persisted, and counted
+    /// per engine instance rather than per store.
+    #[doc(hidden)]
+    pub fn hnsw_build_count(&self) -> u64 {
+        self.hnsw_builds
+    }
+
     /// Export IVF state for all approximate rules.  Passed to `snapshot()` in
     /// `core-api` and stored in the V4 snapshot so `open()` can restore cluster
     /// assignments without re-fitting k-means.
@@ -2016,6 +2061,7 @@ impl RuleEngine {
                 let idx = self.indexes.get_mut(name).unwrap();
                 idx.src_side.init_hnsw(name);
                 idx.dst_side.init_hnsw(name);
+                self.hnsw_builds += 2;
             }
         }
 
@@ -2051,6 +2097,13 @@ impl RuleEngine {
     ///
     /// For approximate rules absent from `ivf_state` (e.g. a rule added
     /// after the snapshot), falls back to `fit_ivf_clusters`.
+    ///
+    /// **Always rebuilds every approximate rule's HNSW graph from scratch**, at
+    /// a cost superlinear in the number of embeddings.  Nothing in this
+    /// repository calls it; it is retained only because it is published API.
+    /// Any caller holding persisted HNSW blobs — every open path does — must
+    /// use [`RuleEngine::reindex_all_load_state`], which installs those graphs
+    /// and skips the build instead of doing it and throwing it away.
     pub fn reindex_all_load_ivf(
         &mut self,
         ids: &IdMap,
@@ -2059,18 +2112,74 @@ impl RuleEngine {
         props: ColumnsView<'_>,
         ivf_state: BTreeMap<String, RuleIvfExport>,
     ) {
+        self.reindex_all_load_state(ids, syms, labels, props, ivf_state, BTreeMap::new());
+    }
+
+    /// Like `reindex_all_load_ivf`, but also restores the persisted HNSW graphs
+    /// **instead of rebuilding them**.
+    ///
+    /// `hnsw_state`: map from rule name to `(src_blob, dst_blob)` as produced
+    /// by `export_hnsw_state` / stored in the snapshot.
+    ///
+    /// A side whose blob deserializes is left without an HNSW graph for the
+    /// duration of the node scan: `SideIndex::insert` then records only
+    /// `hnsw_tracked` and skips the graph insert.  That is the whole point —
+    /// building the graph during the scan is superlinear in the number of
+    /// embeddings, and the persisted graph installed afterwards replaced it
+    /// wholesale anyway, so the build was pure waste on every open.
+    ///
+    /// A side falls back to the full rebuild when:
+    ///   * `hnsw_state` has no entry for the rule — a store written before HNSW
+    ///     persistence existed, or a rule created since the last snapshot;
+    ///   * the blob for that side is empty — the side had no graph to export;
+    ///   * the blob fails to deserialize — the reason is logged to stderr and
+    ///     the scan rebuilds the graph.
+    ///
+    /// Entries naming a rule this engine does not treat as approximate are left
+    /// for `load_hnsw_state` after the scan, exactly as before.
+    pub fn reindex_all_load_state(
+        &mut self,
+        ids: &IdMap,
+        syms: &Interner,
+        labels: &[u32],
+        props: ColumnsView<'_>,
+        ivf_state: BTreeMap<String, RuleIvfExport>,
+        hnsw_state: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
+    ) {
         for idx in self.indexes.values_mut() {
             *idx = RuleIndex::default();
         }
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
 
-        // Init HNSW for approximate rules before inserting nodes so each
-        // insert also populates the HNSW graph incrementally.
+        // Deserialize persisted graphs up front, before the node scan, so the
+        // scan knows which sides it must build and which it must leave alone.
+        // Sides with no usable blob get `init_hnsw` and are filled by the scan.
+        let mut leftover_blobs = hnsw_state;
+        let mut restored: BTreeMap<String, (Option<HnswIndex>, Option<HnswIndex>)> =
+            BTreeMap::new();
         for name in &rule_names {
-            if self.rules[name].approximate {
-                let idx = self.indexes.get_mut(name).unwrap();
+            if !self.rules[name].approximate {
+                continue;
+            }
+            let blobs = leftover_blobs.remove(name);
+            let (src, dst) = match &blobs {
+                Some((s, d)) => (
+                    deserialize_hnsw_blob(name, "src", s),
+                    deserialize_hnsw_blob(name, "dst", d),
+                ),
+                None => (None, None),
+            };
+            let idx = self.indexes.get_mut(name).unwrap();
+            if src.is_none() {
                 idx.src_side.init_hnsw(name);
+                self.hnsw_builds += 1;
+            }
+            if dst.is_none() {
                 idx.dst_side.init_hnsw(name);
+                self.hnsw_builds += 1;
+            }
+            if src.is_some() || dst.is_some() {
+                restored.insert(name.clone(), (src, dst));
             }
         }
 
@@ -2085,9 +2194,29 @@ impl RuleEngine {
                 index_node_for_rule(id, label_sym, &def, idx, syms, props);
             }
         }
+
+        // Install the persisted graphs now that the scan is done.  The scan
+        // recorded `hnsw_tracked` for these sides; adopting the graph resets it
+        // to the graph's own node ids, which is what the old
+        // build-then-overwrite order produced too.
+        for (name, (src, dst)) in restored {
+            let Some(idx) = self.indexes.get_mut(&name) else {
+                continue;
+            };
+            if let Some(h) = src {
+                idx.src_side.adopt_hnsw(h);
+            }
+            if let Some(h) = dst {
+                idx.dst_side.adopt_hnsw(h);
+            }
+        }
+        // Any blob naming a rule that is not approximate here (or not a rule at
+        // all) is applied exactly as the old `load_hnsw_state` call site did.
+        if !leftover_blobs.is_empty() {
+            self.load_hnsw_state(leftover_blobs);
+        }
+
         // For approximate rules: restore persisted IVF state (no re-fit).
-        // HNSW was built incrementally; it will be replaced by `load_hnsw_state`
-        // in `restore_snapshot_state` when a snapshot blob is available.
         for name in &rule_names {
             if !self.rules[name].approximate {
                 continue;
@@ -2230,9 +2359,10 @@ impl RuleEngine {
             .take()
             .unwrap_or_default();
         let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
-        self.reindex_all_load_ivf(ids, syms, labels, props, ivf);
-        // Override the incrementally-built HNSW with the persisted blob (better).
-        self.load_hnsw_state(hnsw);
+        // The persisted HNSW graphs go in as part of the reindex, not after it:
+        // the scan skips the build for every side that has one, because the
+        // load used to overwrite that build wholesale.
+        self.reindex_all_load_state(ids, syms, labels, props, ivf, hnsw);
     }
 
     /// Deserialize retained HNSW blobs into `lazy_hnsw` for the clean-open ANN
@@ -2338,8 +2468,13 @@ impl RuleEngine {
             .clone()
     }
 
-    /// Restore HNSW graphs from bincoded blobs (overrides any incrementally built
-    /// graphs produced during `reindex_all_load_ivf`).
+    /// Restore HNSW graphs from bincoded blobs (overrides any graphs the node
+    /// scan built).
+    ///
+    /// The open paths no longer need this: `reindex_all_load_state` installs the
+    /// persisted graphs itself and skips the build for every side it can supply.
+    /// It is still used for blobs naming a rule this engine does not hold as
+    /// approximate.
     ///
     /// Called from `restore_snapshot_state` in db.rs after reindex.
     pub fn load_hnsw_state(&mut self, blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>) {
@@ -2505,8 +2640,7 @@ impl RuleEngine {
             .take()
             .unwrap_or_default();
         let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
-        self.reindex_all_load_ivf(g.ids, g.syms, g.labels, g.props, ivf);
-        self.load_hnsw_state(hnsw);
+        self.reindex_all_load_state(g.ids, g.syms, g.labels, g.props, ivf, hnsw);
     }
 
     /// Register a rule and backfill existing nodes.
@@ -2543,6 +2677,7 @@ impl RuleEngine {
             let idx = self.indexes.get_mut(&name).unwrap();
             idx.src_side.init_hnsw(&name);
             idx.dst_side.init_hnsw(&name);
+            self.hnsw_builds += 2;
         }
 
         for id in 0..n_total {
@@ -3344,6 +3479,7 @@ impl RuleEngine {
             let idx = self.indexes.get_mut(name).unwrap();
             idx.src_side.init_hnsw(name);
             idx.dst_side.init_hnsw(name);
+            self.hnsw_builds += 2;
         }
 
         let n_total = g.ids.len() as u32;
@@ -3500,6 +3636,134 @@ mod tests {
             via_edge: None,
             via_dir: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // reindex_all_load_state: reuse the persisted HNSW graph, never rebuild it
+    // -----------------------------------------------------------------------
+
+    /// A populated engine plus the fixture that built it, ready to be reindexed
+    /// into a fresh engine the way an open would.
+    fn approx_fixture() -> (Fx, RuleEngine) {
+        let mut fx = Fx::new();
+        for i in 0..8 {
+            let t = i as f64 * std::f64::consts::FRAC_PI_4;
+            fx.add(
+                "V",
+                &format!("v{i}"),
+                vec![("emb", emb(&[t.cos(), t.sin()]))],
+            );
+        }
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(approx_vec_rule(), &mut g).unwrap();
+        }
+        (fx, eng)
+    }
+
+    fn reopened(
+        fx: &Fx,
+        ivf: BTreeMap<String, RuleIvfExport>,
+        hnsw: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
+    ) -> RuleEngine {
+        let mut eng = RuleEngine::from_persist(
+            vec![approx_vec_rule()],
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        );
+        eng.reindex_all_load_state(
+            &fx.ids,
+            &fx.syms,
+            &fx.labels,
+            ColumnsView::owned(&fx.props),
+            ivf,
+            hnsw,
+        );
+        eng
+    }
+
+    /// The open path must install the persisted graph rather than build one the
+    /// install would immediately throw away.
+    #[test]
+    fn reindex_with_persisted_hnsw_skips_the_build() {
+        let (fx, eng) = approx_fixture();
+        assert!(
+            eng.hnsw_build_count() > 0,
+            "create_rule builds the graph for the first time"
+        );
+        let before = eng.hnsw_search_dst("emb", "V", &[1.0, 0.0], 4);
+        assert!(before.is_some(), "fixture must have a populated HNSW");
+
+        let eng2 = reopened(&fx, eng.export_ivf_state(), eng.export_hnsw_state());
+        assert_eq!(
+            eng2.hnsw_build_count(),
+            0,
+            "no HNSW graph may be built when the snapshot persisted one"
+        );
+        assert_eq!(
+            eng2.hnsw_search_dst("emb", "V", &[1.0, 0.0], 4),
+            before,
+            "the restored graph must answer exactly as the built one did"
+        );
+    }
+
+    /// No persisted state — a store written before HNSW persistence, or a rule
+    /// created since the last snapshot — still gets a full rebuild.
+    #[test]
+    fn reindex_without_persisted_hnsw_rebuilds() {
+        let (fx, eng) = approx_fixture();
+        let before = eng.hnsw_search_dst("emb", "V", &[1.0, 0.0], 4);
+
+        let eng2 = reopened(&fx, eng.export_ivf_state(), BTreeMap::new());
+        assert_eq!(
+            eng2.hnsw_build_count(),
+            2,
+            "both sides of the rule must be rebuilt when no blob is persisted"
+        );
+        assert_eq!(eng2.hnsw_search_dst("emb", "V", &[1.0, 0.0], 4), before);
+    }
+
+    /// A blob that fails to deserialize falls back to the rebuild rather than
+    /// leaving the rule with an empty index.
+    #[test]
+    fn reindex_with_corrupt_hnsw_blob_rebuilds() {
+        let (fx, eng) = approx_fixture();
+        let before = eng.hnsw_search_dst("emb", "V", &[1.0, 0.0], 4);
+
+        let mut hnsw = eng.export_hnsw_state();
+        for (src, dst) in hnsw.values_mut() {
+            src.truncate(src.len() / 2);
+            dst.truncate(dst.len() / 2);
+        }
+        let eng2 = reopened(&fx, eng.export_ivf_state(), hnsw);
+        assert_eq!(
+            eng2.hnsw_build_count(),
+            2,
+            "a corrupt blob must cost a rebuild, not an empty index"
+        );
+        assert_eq!(
+            eng2.hnsw_search_dst("emb", "V", &[1.0, 0.0], 4),
+            before,
+            "the rebuilt graph must answer as the original did"
+        );
+    }
+
+    /// One side persisted, the other not: only the missing side is rebuilt.
+    #[test]
+    fn reindex_rebuilds_only_the_side_without_a_blob() {
+        let (fx, eng) = approx_fixture();
+        let mut hnsw = eng.export_hnsw_state();
+        for (src, _) in hnsw.values_mut() {
+            src.clear();
+        }
+        let eng2 = reopened(&fx, eng.export_ivf_state(), hnsw);
+        assert_eq!(eng2.hnsw_build_count(), 1);
+        assert_eq!(
+            eng2.hnsw_search_dst("emb", "V", &[1.0, 0.0], 4),
+            eng.hnsw_search_dst("emb", "V", &[1.0, 0.0], 4)
+        );
     }
 
     #[test]
