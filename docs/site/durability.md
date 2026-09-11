@@ -94,8 +94,12 @@ breaks the `wal.genesis` chain, `asof` from then on answers for commits after
 the last snapshot rather than replaying into the archives.
 
 The other added cost is one `snapshot.bin`, which is rewritten in place rather
-than accumulated — 37 MB for an 8 MB WAL on a 435-file repository, since a
-snapshot is an expanded image rather than a log.
+than accumulated. A snapshot is an expanded image rather than a log, so it is
+sized by the data it holds and not by the WAL it replaces: a store of 3.7 MB of
+string properties spread over eight columns snapshots to 5.2 MB, 1.39× its
+property payload. A snapshot carries **one** string table, not one per column —
+before 0.6.5 the same store wrote eight copies of the table and came to 36.8 MB,
+9.82×. That change moves the format to V9; see **Recovery vs. refresh** below.
 
 ## Recovery vs. refresh
 
@@ -106,6 +110,13 @@ replayed on top of it. A torn trailing frame — the signature of a crash mid-
 append — is dropped, and with `repair_wal` on (the default) the valid prefix is
 written back over it. That truncation is correct crash recovery: the frame was
 never fsynced, so no caller was ever told it committed.
+
+Recovery is also where the snapshot format is upgraded, and that upgrade is
+one-way: a store snapshotted by 0.6.5 is format V9, and an earlier binary cannot
+open it — it refuses with `snapshot: unsupported version 9` rather than reading
+it wrongly. The first read-write open of a V5–V8 store rewrites `snapshot.bin`
+at V9 and keeps the original beside it as `snapshot.bin.bak` until the next
+clean open, so the way back is to restore that file with the older binary.
 
 **Refresh** happens while the store is open, and it is not recovery. A handle
 tracks how much of the WAL it has applied and, on `refresh()`, decodes only what
