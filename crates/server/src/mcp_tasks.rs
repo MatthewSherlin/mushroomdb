@@ -1213,17 +1213,29 @@ fn render_edge_groups(key: &str, total: usize, groups: &[EdgeGroup]) -> String {
 }
 
 /// The same grouping as a document, for `json: true`.
-fn edge_groups_json(key: &str, total: usize, groups: &[EdgeGroup]) -> Js {
-    json!({
+///
+/// `listed` is the top-level count of edges actually in `types[].edges`, the
+/// sum of the per-type `listed`. It is what the tool description and the docs
+/// promise — "the report carries `listed` and `total`, so a reply that was cut
+/// still says how much there was" — and without it a caller had to add the
+/// per-type counts up itself to learn whether the reply was whole.
+///
+/// `label` is echoed when the reply was narrowed by one, the way every other
+/// shape of this reply echoes it: a document that does not say what it was
+/// filtered by reads as the unfiltered answer.
+fn edge_groups_json(key: &str, total: usize, groups: &[EdgeGroup], label: Option<&str>) -> Js {
+    let doc = json!({
         "key": key,
         "total": total,
+        "listed": groups.iter().map(|g| g.listed.len()).sum::<usize>(),
         "types": groups.iter().map(|g| json!({
             "edge_type": g.edge_type,
             "count": g.count,
             "listed": g.listed.len(),
             "edges": g.listed.iter().map(edge_line_json).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
-    })
+    });
+    with_label(doc, label)
 }
 
 fn edge_line_json(e: &EdgeLine) -> Js {
@@ -1279,6 +1291,62 @@ const ONE_OF_ALL_OF_OR_EDGE_TYPE: &str = "pass one of all_of or edge_type, not b
 
 /// Columns a wrapped key list fills before it breaks to the next line.
 const KEY_WRAP_COLUMNS: usize = 100;
+
+/// Edge type names an "no such edge type" error lists before it counts the
+/// rest off. Twenty is enough to recognise the one that was meant on any
+/// schema a person designed, and short enough that the error is still an
+/// error rather than a schema dump.
+const MAX_KNOWN_EDGE_TYPES: usize = 20;
+
+/// The error a keys-only view answers when the type it was asked about is not
+/// in the store at all.
+///
+/// "0 partners" is the *right* answer for a type that exists and this node has
+/// none of, and the wrong one for a typo — and the caller cannot tell the two
+/// apart, so a misspelling reads as a fact about the graph. The census is the
+/// store's own list of edge types, so the reply both names what went wrong and
+/// carries what to ask instead.
+///
+/// `known` is only walked when the answer came back empty: a type that matched
+/// something is a type that exists, and the census costs a pass over the
+/// topology.
+fn unknown_edge_type(db: &SharedDb, named: &[String]) -> Option<String> {
+    let known: Vec<String> = {
+        let g = db.read();
+        g.edge_type_census()
+            .into_iter()
+            .map(|c| c.edge_type)
+            .collect()
+    };
+    let missing: Vec<&String> = named.iter().filter(|t| !known.contains(t)).collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = known
+        .iter()
+        .take(MAX_KNOWN_EDGE_TYPES)
+        .map(|t| repograph::sanitize(t))
+        .collect();
+    let rest = known.len().saturating_sub(listed.len());
+    let more = if rest > 0 {
+        format!(", … and {rest} more")
+    } else {
+        String::new()
+    };
+    let names = missing
+        .iter()
+        .map(|t| repograph::sanitize(t))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(if known.is_empty() {
+        format!("no edge type named {names}; this store has no edges yet")
+    } else {
+        format!(
+            "no edge type named {names}; this store has: {}{more}",
+            listed.join(", ")
+        )
+    })
+}
 
 /// Keeps only the partners carrying one label.
 ///
@@ -1629,6 +1697,13 @@ fn tool_node_edges(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         LabelFilter::new(db, label).retain(&mut rows);
         if !all_of.is_empty() {
             let partners = partners_linked_by_all(&rows, &all_of, dir);
+            // An empty answer is where a typo and a fact look the same; only
+            // there is the census worth a pass.
+            if partners.is_empty() {
+                if let Some(e) = unknown_edge_type(db, &all_of) {
+                    return CallOutcome::ToolErr(e);
+                }
+            }
             let report = partners_json(key, None, &all_of, label, &partners, limit);
             return ok(json_out, &report, |_| {
                 render_all_of("edges", key, None, &all_of, &partners, limit)
@@ -1636,6 +1711,11 @@ fn tool_node_edges(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         }
         let edge_type = edge_type.unwrap_or_default();
         let (count, partners) = partners_of_type(&rows, edge_type, dir);
+        if count == 0 {
+            if let Some(e) = unknown_edge_type(db, &[edge_type.to_string()]) {
+                return CallOutcome::ToolErr(e);
+            }
+        }
         let rule = live_rule_for_type(db, key, edge_type, partners.first());
         let report = with_label(
             type_partners_json(
@@ -1697,9 +1777,11 @@ fn edge_reply(
     json_out: bool,
 ) -> CallOutcome {
     match node_edge_groups(db, key, types, dir, limit, label) {
-        Ok((total, groups)) => ok(json_out, &edge_groups_json(key, total, &groups), |_| {
-            render_edge_groups(key, total, &groups)
-        }),
+        Ok((total, groups)) => ok(
+            json_out,
+            &edge_groups_json(key, total, &groups, label),
+            |_| render_edge_groups(key, total, &groups),
+        ),
         Err(e) => CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
     }
 }
@@ -1736,6 +1818,10 @@ fn tool_neighborhood(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Ok(t) => t,
         Err(e) => return CallOutcome::ToolErr(e),
     };
+    let label = match opt_str_arg(args, "label") {
+        Ok(l) => l,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
     let filter = (!edge_types.is_empty()).then_some(edge_types.as_slice());
 
     if depth <= 1 {
@@ -1743,7 +1829,7 @@ fn tool_neighborhood(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             Ok(n) => n,
             Err(e) => return CallOutcome::ToolErr(e),
         };
-        return edge_reply(db, key, filter, dir, limit, None, json_out);
+        return edge_reply(db, key, filter, dir, limit, label, json_out);
     }
 
     let etype_refs: Option<Vec<&str>> = filter.map(|v| v.iter().map(String::as_str).collect());
@@ -1757,9 +1843,30 @@ fn tool_neighborhood(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         }
     };
     match rs {
-        Ok(rs) => CallOutcome::ToolOk(crate::json::result_set_json(&rs)),
+        Ok(rs) => CallOutcome::ToolOk(crate::json::result_set_json(&keeping_label(rs, label))),
         Err(e) => CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
     }
+}
+
+/// A traversal table narrowed to the rows carrying `label`.
+///
+/// Past one hop the reply is the BFS table, and the table already carries a
+/// `label` column — so narrowing it is a filter on rows rather than on the
+/// walk. Deliberately not a filter on the *traversal*: a hop through a node of
+/// another label is how a two-hop question reaches the label it asked about,
+/// and refusing to walk through it would answer a different question. So the
+/// walk is whole and the answer is the nodes of that label it reached.
+fn keeping_label(rs: core_api::ResultSet, label: Option<&str>) -> core_api::ResultSet {
+    let Some(label) = label else {
+        return rs;
+    };
+    let mut out = core_api::ResultSet::new(rs.columns().to_vec());
+    for i in 0..rs.len() {
+        if rs.get(i, "label") == Some(&Value::Str(label.to_string())) {
+            out.push_row(rs.row(i).to_vec());
+        }
+    }
+    out
 }
 
 // ── edges_at / what_if shared rendering ─────────────────────────────────────
@@ -2664,7 +2771,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "neighborhood",
-            "description": "What is around K — one hop out, as the same grouped relationship listing node_edges gives, with the rule and score behind each edge. With depth above 1 it is the breadth-first table of (key, label, depth) instead, because past one hop no single rule accounts for a row.",
+            "description": "What is around K — one hop out, as the same grouped relationship listing node_edges gives, with the rule and score behind each edge. With depth above 1 it is the breadth-first table of (key, label, depth) instead, because past one hop no single rule accounts for a row. label narrows the reply to nodes carrying it, at either depth.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2678,6 +2785,11 @@ fn task_tool_schemas() -> Vec<Js> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Only follow these edge types. Omit for every type."
+                    },
+                    "label": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Only nodes carrying this label: at depth 1 the partners, counts included; above it the rows of the traversal table. The walk itself is never narrowed — a hop through another label is how the label you asked about is reached."
                     },
                     "direction": {
                         "type": "string",

@@ -464,6 +464,7 @@ fn node_info_and_edges_tool_parity() {
         json!({
             "key": "p1",
             "total": 2,
+            "listed": 2,
             "types": [
                 {
                     "edge_type": "KNOWS",
@@ -2116,6 +2117,158 @@ fn node_edges_filters_by_type_and_refuses_a_zero_limit() {
 
     let reply = one_task_call(db, "node_edges", json!({"key": "ghost"}));
     assert!(error_text(&reply).contains("ghost"), "{reply}");
+}
+
+/// Binding: the grouped report carries the top-level `listed` the docs and the
+/// tool description promise, and echoes the `label` it was narrowed by.
+///
+/// `listed` is the sum of the per-type counts — how many edges are actually in
+/// the document — so a caller can tell a whole reply from a cut one without
+/// adding the types up itself. And a report that was narrowed by a label and
+/// does not say so reads as the unnarrowed answer: every other shape of this
+/// reply echoes it, and the grouped one used to be the exception.
+#[test]
+fn the_grouped_edge_report_counts_what_it_listed_and_echoes_its_label() {
+    let db = wide_store("edges-grouped-listed", 25);
+
+    let report = task_report(db.clone(), "node_edges", json!({"key": "p1", "limit": 4}));
+    assert_eq!(report["total"], json!(25));
+    assert_eq!(report["listed"], json!(4), "{report}");
+    assert_eq!(report["types"][0]["listed"], json!(4));
+    assert_eq!(
+        report["label"],
+        json!(null),
+        "a call that named no label says nothing about one"
+    );
+
+    let report = task_report(
+        db.clone(),
+        "node_edges",
+        json!({"key": "p1", "label": "Org", "limit": 4}),
+    );
+    assert_eq!(report["label"], json!("Org"), "{report}");
+    assert_eq!(report["listed"], json!(4));
+    assert_eq!(report["total"], json!(25));
+
+    // A label nothing carries narrows the counts, not just the listings.
+    let report = task_report(db, "node_edges", json!({"key": "p1", "label": "Nobody"}));
+    assert_eq!(report["label"], json!("Nobody"));
+    assert_eq!(report["total"], json!(0));
+    assert_eq!(report["listed"], json!(0));
+}
+
+/// Binding: `neighborhood` honours `label` rather than accepting and ignoring
+/// it — at depth 1, where it shares `node_edges`' grouped renderer, and past
+/// it, where the reply is the traversal table.
+///
+/// The walk itself is never narrowed: a hop through a node of another label is
+/// how a two-hop question reaches the label it asked about.
+#[test]
+fn neighborhood_narrows_by_label_at_both_depths() {
+    let db = all_of_store("neighborhood-label");
+    // A second hop off `o1`, of a label the hub itself has none of.
+    {
+        let mut w = db.write();
+        w.insert_node("Note", "n1", vec![("id".into(), Value::Str("n1".into()))])
+            .unwrap();
+        w.insert_edge("A", "o1", "n1").unwrap();
+    }
+
+    // Depth 1: the grouped listing, counts included. `o2` is a `Job`, so a
+    // `Company` filter keeps o1 and o3 and drops it.
+    let report = task_report(
+        db.clone(),
+        "neighborhood",
+        json!({"key": "hub", "label": "Company"}),
+    );
+    assert_eq!(report["label"], json!("Company"), "{report}");
+    assert_eq!(
+        report["total"],
+        json!(5),
+        "o1 and o3 over A and B, plus hub→o1 by C; o2's three edges gone: {report}"
+    );
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "neighborhood",
+        json!({"key": "hub", "label": "Company"}),
+    ));
+    assert!(
+        !text.contains("o2"),
+        "the Job partner is filtered out: {text}"
+    );
+    assert!(text.contains("o1") && text.contains("o3"), "{text}");
+
+    // Depth 2: the traversal table, narrowed to the rows of that label — and
+    // the walk still went through `o1` (a Company) to reach `n1`.
+    let reply = one_task_call(
+        db.clone(),
+        "neighborhood",
+        json!({"key": "hub", "depth": 2, "label": "Note"}),
+    );
+    let table = |reply: &Js| -> Vec<String> {
+        let text = reply["result"]["content"][0]["text"]
+            .as_str()
+            .expect("a text content");
+        let doc: Js = serde_json::from_str(text).expect("a result set");
+        doc["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r[0].as_str().expect("key").to_string())
+            .collect()
+    };
+    assert_eq!(table(&reply), vec!["n1".to_string()], "{reply}");
+
+    // Without the label the same walk reports every node it reached.
+    let reply = one_task_call(db, "neighborhood", json!({"key": "hub", "depth": 2}));
+    assert!(table(&reply).len() > 1, "{reply}");
+}
+
+/// Binding: an edge type that is nowhere in the store is a tool error naming
+/// it and the types the store does have — not "0 edges", which is the right
+/// answer for a type that exists and this node has none of.
+///
+/// A caller cannot tell those two apart from a count, so a misspelling used to
+/// read as a fact about the graph: the association benchmark's own failure
+/// mode, an agent concluding a node had no partners of a type it had
+/// mistyped.
+#[test]
+fn a_misspelled_edge_type_names_itself_and_the_ones_that_exist() {
+    let db = all_of_store("edges-misspelled");
+
+    let reply = one_task_call(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "edge_type": "AA"}),
+    );
+    let err = error_text(&reply);
+    assert!(err.contains("no edge type named AA"), "{err}");
+    assert!(
+        err.contains("A") && err.contains("B") && err.contains("C"),
+        "the error carries what to ask instead: {err}"
+    );
+
+    let reply = one_task_call(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A", "NOPE"]}),
+    );
+    let err = error_text(&reply);
+    assert!(err.contains("no edge type named NOPE"), "{err}");
+
+    // A type that exists and this node has none of in that direction is still
+    // an answer, never an error.
+    let report = task_report(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A", "B", "C"], "direction": "in"}),
+    );
+    assert_eq!(report["total"], json!(0));
+
+    // And a node with no edges of a real type answers zero, not an error.
+    let report = task_report(db, "node_edges", json!({"key": "o4", "edge_type": "A"}));
+    assert_eq!(report["total"], json!(0), "{report}");
 }
 
 /// Binding: one `edge_type` prints the partners as keys, on wrapped lines,
