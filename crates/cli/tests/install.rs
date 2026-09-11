@@ -2577,6 +2577,56 @@ fn uninstall_leaves_mixed_hook_group_with_user_hook_intact() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: turning on one of the experimental code-graph hooks says, in the
+//       summary the user is already reading, that the hook is on its way out.
+// ---------------------------------------------------------------------------
+
+/// Each of the three experimental hooks is deprecated in 0.6.4 and removed in
+/// 0.7. A user who turns one on has to be told by the thing they ran, not only
+/// by a docs page they may never open.
+#[test]
+fn each_deprecated_hook_flag_prints_a_deprecation_line() {
+    for (flag, set) in [
+        ("--intercept-grep", 0usize),
+        ("--impact-before-edit", 1),
+        ("--enrich-grep", 2),
+    ] {
+        let root = temp_dir(&format!("deprecated{set}"));
+        let home = temp_dir(&format!("deprecated{set}-home"));
+        git_repo(&root);
+        let opts = InstallOpts {
+            platform: Some(Platform::ClaudeCode),
+            scope: Some(Scope::Project),
+            intercept_grep: set == 0,
+            impact_before_edit: set == 1,
+            enrich_grep: set == 2,
+            ..base_opts()
+        };
+        let out = install_on_path(&root, &home, &opts).expect("install failed");
+        let want = format!(
+            "deprecated  {flag} — the code-graph hooks are deprecated and are removed in 0.7"
+        );
+        assert!(out.contains(&want), "{flag}: expected {want:?} in:\n{out}");
+    }
+}
+
+/// …and a default install says nothing about deprecation: the line is a
+/// consequence of asking for the hook, not noise every install pays for.
+#[test]
+fn a_default_install_prints_no_deprecation_line() {
+    let root = temp_dir("no-deprecation");
+    let home = temp_dir("no-deprecation-home");
+    git_repo(&root);
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+    let out = install_on_path(&root, &home, &opts).expect("install failed");
+    assert!(!out.contains("deprecated"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
 // Test: the rendered skill states mask semantics correctly (allow-list),
 //       documents the arguments the MCP server actually accepts, and names
 //       every task tool an assistant is expected to reach for. The task tools
@@ -2584,21 +2634,18 @@ fn uninstall_leaves_mixed_hook_group_with_user_hook_intact() {
 //       the assistant with no instruction to call it.
 // ---------------------------------------------------------------------------
 
-/// The code door's task tools plus the two entry points the skill has to name,
-/// written the way the text writes them so a bare word inside another word
-/// cannot pass.
-const CODE_TOOL_MENTIONS: &[&str] = &[
+/// The code door's task tools, written the way the text writes them so a bare
+/// word inside another word cannot pass. They are deprecated in 0.6.4 and
+/// removed in 0.7, and the skill still has to name them — an assistant on a
+/// code-graph store needs to know what it is looking at.
+const DEPRECATED_TOOL_MENTIONS: &[&str] = &[
     "`explore`",
     "`map`",
     "`context`",
     "`impact`",
     "`owners`",
     "`why`",
-    "`recall`",
-    "`remember`",
     "`sync`",
-    "`learn`",
-    "`serve`",
 ];
 
 /// The association surface: what a store with no repository in it answers
@@ -2675,10 +2722,23 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
             text.contains("ingest-git"),
             "{name}: ingest-git bootstrap undocumented"
         );
-        for tool in CODE_TOOL_MENTIONS.iter().chain(ASSOCIATION_TOOL_MENTIONS) {
+        for tool in DEPRECATED_TOOL_MENTIONS
+            .iter()
+            .chain(ASSOCIATION_TOOL_MENTIONS)
+        {
             assert!(
                 text.contains(tool),
                 "{name}: {tool} is never named — the assistant has no cue to call it"
+            );
+        }
+        assert!(
+            text.contains("removed in 0.7"),
+            "{name}: the deprecated code tools must be named as deprecated, not as the first thing to call"
+        );
+        for banned in ["before `Grep`", "before any `Grep`", "instead of `Grep`"] {
+            assert!(
+                !text.contains(banned),
+                "{name}: still tells an agent to reach for the graph ahead of a search: {banned}"
             );
         }
     }
@@ -2740,7 +2800,10 @@ fn every_delivery_variant_names_every_tool_and_fits_the_budget() {
             delivery,
         )
         .expect("the committed template's regions are well formed");
-        for tool in CODE_TOOL_MENTIONS.iter().chain(ASSOCIATION_TOOL_MENTIONS) {
+        for tool in DEPRECATED_TOOL_MENTIONS
+            .iter()
+            .chain(ASSOCIATION_TOOL_MENTIONS)
+        {
             assert!(
                 skill.contains(tool),
                 "{label}: {tool} is never named — the assistant has no cue to call it"

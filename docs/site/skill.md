@@ -44,9 +44,10 @@ mushroomdb install --platform claude-code --project
 Then open Claude Code in the same directory and type **`/mushroom`**. A skill
 installed into `.claude/skills/` is not namespaced, so it is invoked bare.
 
-The skill's first minute builds the store from the repository itself —
-`ingest-git` over the git history and the working tree — rather than a demo
-graph. See [`docs/site/ingest-git.md`](ingest-git.md).
+The skill's first minute is the entity store: if it is empty the assistant says
+so and offers `ingest_json` or `upsert_entity`. A repository store built with
+`ingest-git` is one data source among them — see
+[`docs/site/ingest-git.md`](ingest-git.md).
 
 ---
 
@@ -55,11 +56,11 @@ graph. See [`docs/site/ingest-git.md`](ingest-git.md).
 The file is task-first: it names a tool for each kind of turn, and it is
 explicit that the tool output *is* the answer.
 
-**The first minute.** Build the store if it does not exist, take the session's
-bearings from the `SessionStart` brief already in context rather than from a
-search, and call `explore <target>` on the first file or symbol the task names
-before any `Grep`, file read or plan. On a memory store, where `explore` is
-unlisted, `map` opens instead.
+**The first minute.** Say so if the store is empty and offer `ingest_json` or
+`upsert_entity`, take the session's bearings from the `SessionStart` brief
+already in context rather than from a search, then answer from the store and
+quote what it prints — one named call per question kind, against the store's
+own keys.
 
 **Task rules.** One call per question kind, on the store's own keys — not a
 search. The `SessionStart` brief prints one worked call per kind; copy those
@@ -84,15 +85,9 @@ as entities — commits, pull requests, files, authors — and lists `explore`,
 `owners`, `why` and `sync` stay served behind `--all-tools`. The skill treats
 `ingest-git` as a data source, not as the tool to reach for ahead of a search.
 
-The **`--delivery cli` variant of the skill names the CLI equivalents** instead,
-and says plainly which of them have none: `why <a> <b>` and `asof --commit N
---query` are wired, `query` takes no `role`, and `explain_association`,
-`node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked` and
-`neighborhood` need `--delivery mcp`.
-
-A paragraph after the table names what `explore` composes — `context`, `impact`
-and `owners` — and says that those, `why`, `recall`, `map` and the rest stay
-callable by name.
+The **`--delivery cli` variant of the skill adds the shell forms**: `query` for
+any Cypher, read or write, and — under the deprecation paragraph, while it
+lasts — `explore` with its `--depth`.
 
 **The `learn` pass** turns prose — design docs, ADRs, READMEs — into `Concept`
 nodes carrying the source files and their hashes. When a source file's hash

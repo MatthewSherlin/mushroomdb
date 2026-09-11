@@ -476,12 +476,15 @@ Usage:
                      --delivery cli writes the skill and the hooks and registers no MCP
                      server: the skill teaches `mushroomdb <command>` instead (claude-code
                      only; cursor and codex are always registered as MCP servers)
-                     --intercept-grep adds an experimental PreToolUse hook (matcher Grep)
-                     that redirects a search for a known symbol name to `explore`
-                     --impact-before-edit adds an experimental PreToolUse hook (matcher
-                     Edit|Write|MultiEdit) that injects the file's blast radius before the edit
-                     --enrich-grep adds an experimental PostToolUse hook (matcher Grep) that
-                     appends what the graph knows about the symbols the search matched
+                     --intercept-grep (deprecated, removed in 0.7) adds an experimental
+                     PreToolUse hook (matcher Grep) that redirects a search for a known
+                     symbol name to `explore`
+                     --impact-before-edit (deprecated, removed in 0.7) adds an experimental
+                     PreToolUse hook (matcher Edit|Write|MultiEdit) that injects the file's
+                     blast radius before the edit
+                     --enrich-grep (deprecated, removed in 0.7) adds an experimental
+                     PostToolUse hook (matcher Grep) that appends what the graph knows
+                     about the symbols the search matched
                      --always-load marks the registered MCP server alwaysLoad, so the host
                      keeps its tools in context instead of deferring them; already the
                      default when --db names a store and a server is registered
