@@ -569,7 +569,7 @@ full design spec is at [docs/design.md](../design.md).
 Pre-1.0 alpha — APIs and formats may change between minor versions. Single
 writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
 
-v0.6.4 is the current release. The shortest way in is the Claude Code plugin —
+v0.6.5 is the current release. The shortest way in is the Claude Code plugin —
 `claude marketplace add MatthewSherlin/mushroomdb` then `claude plugin install
 mushroom@mushroomdb`, and type `/mushroom:mushroom` in a repository. Or run
 `npx mushroomdb install`, which writes the `/mushroom` skill, the MCP server
@@ -1315,7 +1315,7 @@ key files (by centrality):
 key symbols (most called):
   crates/core-api/tests/algo.rs#insert_node — fn insert_node(db: &mut GraphDb<core_storage::fs::RealFs>, label: &str, key: &str)
   crates/core-api/tests/algo.rs#insert_edge — fn insert_edge(db: &mut GraphDb<core_storage::fs::RealFs>, etype: &str, src: &str, dst: &str)
-reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.4 explore './mushroom-memory' <target>
+reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.5 explore './mushroom-memory' <target>
 ```
 
 The first line is the untrusted-data marker every digest rendered out of a store
@@ -2200,7 +2200,7 @@ Claude Desktop has no installer path, so add mushroomdb by hand in
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.6.4", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.6.5", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -4520,7 +4520,7 @@ Response:
   "result": {
     "capabilities": {"tools": {}},
     "protocolVersion": "2024-11-05",
-    "serverInfo": {"name": "mushroomdb", "version": "0.6.4"}
+    "serverInfo": {"name": "mushroomdb", "version": "0.6.5"}
   }
 }
 ```
