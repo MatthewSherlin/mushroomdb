@@ -1849,6 +1849,94 @@ fn composed_predicate_evidence_lists_every_branch() {
     );
 }
 
+/// Binding: an `any` predicate reports only the branches that actually
+/// matched — the unsatisfied ones are the reasons the engine *rejected*, and
+/// printing them stated a falsehood about why the two are related.
+#[test]
+fn any_predicate_evidence_lists_only_the_satisfied_branches() {
+    let db = open("explain-evidence-any");
+    {
+        let mut w = db.write();
+        let node = |industry: &str, bucket: i64, specialties: Vec<&str>| {
+            vec![
+                ("industry".into(), Value::Str(industry.into())),
+                ("size_bucket".into(), Value::Int(bucket)),
+                (
+                    "specialties".into(),
+                    Value::List(
+                        specialties
+                            .into_iter()
+                            .map(|s| Value::Str(s.into()))
+                            .collect(),
+                    ),
+                ),
+            ]
+        };
+        w.insert_node(
+            "Talent",
+            "t1",
+            node("Architecture", 1, vec!["a", "b", "c", "d"]),
+        )
+        .unwrap();
+        // Same industry (the branch that matches), a size bucket eight apart
+        // on a ±2 tolerance, and a specialties overlap of 1/7 under a 0.5 min
+        // — two branches the engine rejected.
+        w.insert_node(
+            "Company",
+            "c1",
+            node("Architecture", 9, vec!["d", "e", "f", "g"]),
+        )
+        .unwrap();
+        w.create_rule(core_api::RuleDef {
+            name: "fit_any".into(),
+            src_label: "Talent".into(),
+            dst_label: "Company".into(),
+            predicate: core_api::Predicate::Any(vec![
+                core_api::Predicate::FieldEqual {
+                    field: "industry".into(),
+                },
+                core_api::Predicate::NumericWithin {
+                    field: "size_bucket".into(),
+                    tolerance: 2.0,
+                },
+                core_api::Predicate::Overlap {
+                    field: "specialties".into(),
+                    min: 0.5,
+                },
+            ]),
+            edge_type: "FIT".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+        })
+        .unwrap();
+    }
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "explain_association",
+        json!({"a": "t1", "b": "c1"}),
+    ));
+    assert!(text.contains("[industry: Architecture]"), "{text}");
+    assert!(
+        !text.contains("1 vs 9"),
+        "an out-of-tolerance branch is not evidence: {text}"
+    );
+    assert!(
+        !text.contains("specialties: d"),
+        "an overlap under the rule's min is not evidence: {text}"
+    );
+
+    let report = task_report(db, "explain_association", json!({"a": "t1", "b": "c1"}));
+    assert_eq!(
+        report[0]["evidence"],
+        json!({"parts": [{"field": "industry", "value": "Architecture"}]})
+    );
+}
+
 /// Binding: a key-match rule's shared value is the destination's own key.
 #[test]
 fn key_match_evidence_names_the_destination_key() {
@@ -2001,8 +2089,9 @@ fn node_edges_caps_each_type_and_counts_what_it_did_not_list() {
     );
 }
 
-/// Binding: `edge_type` narrows the listing to one type, and a limit outside
-/// the schema's range is a tool error rather than a silent clamp to nothing.
+/// Binding: `edge_type` narrows the reply to one type's partner keys, and a
+/// limit outside the schema's range is a tool error rather than a silent
+/// clamp to nothing.
 #[test]
 fn node_edges_filters_by_type_and_refuses_a_zero_limit() {
     let db = association_store("edges-filter");
@@ -2016,15 +2105,335 @@ fn node_edges_filters_by_type_and_refuses_a_zero_limit() {
         "node_edges",
         json!({"key": "p1", "edge_type": "WORKS_AT"}),
     );
+    assert_eq!(report["edge_type"], json!("WORKS_AT"));
+    assert_eq!(report["edges"], json!(1));
     assert_eq!(report["total"], json!(1));
-    assert_eq!(report["types"].as_array().map(Vec::len), Some(1));
-    assert_eq!(report["types"][0]["edge_type"], json!("WORKS_AT"));
+    assert_eq!(report["rule"], json!("works_at"));
+    assert_eq!(report["partners"], json!(["acme"]));
 
     let reply = one_task_call(db.clone(), "node_edges", json!({"key": "p1", "limit": 0}));
     assert!(error_text(&reply).contains("positive integer"), "{reply}");
 
     let reply = one_task_call(db, "node_edges", json!({"key": "ghost"}));
     assert!(error_text(&reply).contains("ghost"), "{reply}");
+}
+
+/// Binding: one `edge_type` prints the partners as keys, on wrapped lines,
+/// with the rule named once in the header rather than once per partner — and
+/// `limit` cuts the list and says what it cut.
+#[test]
+fn node_edges_with_one_type_prints_partner_keys_and_the_rule_once() {
+    let db = wide_store("edges-keys-only", 25);
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "node_edges",
+        json!({"key": "p1", "edge_type": "IN_SECTOR"}),
+    ));
+    assert!(
+        text.contains("mushroomdb edges — p1: 25 edge(s) over 1 type(s)\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("IN_SECTOR (25, rule any_org): org00,"),
+        "the rule is named once, in the header: {text}"
+    );
+    assert_eq!(
+        text.matches("rule any_org").count(),
+        1,
+        "the rule is not repeated per partner: {text}"
+    );
+    assert!(text.contains("org24"), "every partner is listed: {text}");
+    // Wrapped, not one enormous line, and no line runs away.
+    let widest = text.lines().map(str::len).max().unwrap_or(0);
+    assert!(widest <= 120, "line of {widest} bytes: {text}");
+    assert!(
+        text.lines().filter(|l| l.contains("org")).count() >= 2,
+        "the key list wraps: {text}"
+    );
+
+    let text = task_reply(&one_task_call(
+        db,
+        "node_edges",
+        json!({"key": "p1", "edge_type": "IN_SECTOR", "limit": 3}),
+    ));
+    assert!(
+        text.contains("IN_SECTOR (25, rule any_org): org00, org01, org02\n"),
+        "{text}"
+    );
+    assert!(text.contains("… and 22 more\n"), "{text}");
+}
+
+/// A hub joined to four partners by three edge types, arranged so that the
+/// intersection over the types is a smaller set than any one of them:
+///
+/// - `A` and `B`: hub → o1, o2, o3
+/// - `C`: hub → o1, and o2 → hub (incoming, so direction tells them apart)
+///
+/// o4 is joined by nothing and must never appear.
+fn all_of_store(name: &str) -> SharedDb {
+    let db = open(name);
+    {
+        let mut w = db.write();
+        // o2 is the odd one out by label as well as by direction, so a
+        // `label` filter and a `direction` filter cut the set differently.
+        for (k, label) in [
+            ("hub", "Talent"),
+            ("o1", "Company"),
+            ("o2", "Job"),
+            ("o3", "Company"),
+            ("o4", "Company"),
+        ] {
+            w.insert_node(label, k, vec![("id".into(), Value::Str(k.into()))])
+                .unwrap();
+        }
+        for partner in ["o1", "o2", "o3"] {
+            w.insert_edge("A", "hub", partner).unwrap();
+            w.insert_edge("B", "hub", partner).unwrap();
+        }
+        w.insert_edge("C", "hub", "o1").unwrap();
+        w.insert_edge("C", "o2", "hub").unwrap();
+    }
+    db
+}
+
+/// Binding: `all_of` answers with the partners carrying EVERY named type —
+/// a partner with two of three is not one of them — and `direction` decides
+/// which edges count toward that.
+#[test]
+fn node_edges_all_of_is_the_intersection_over_the_types() {
+    let db = all_of_store("edges-all-of");
+
+    let (text, report) = task_both(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A", "B", "C"]}),
+    );
+    assert_eq!(
+        text, "mushroomdb edges — hub — partners linked by all of A, B, C: 2\no1, o2\n",
+        "{text}"
+    );
+    assert_eq!(report["key"], json!("hub"));
+    assert_eq!(report["all_of"], json!(["A", "B", "C"]));
+    assert_eq!(report["partners"], json!(["o1", "o2"]));
+    assert_eq!(report["total"], json!(2));
+    assert_eq!(report["at"], json!(null), "a live call names no commit");
+
+    // Two of three is not all of three.
+    let report = task_report(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A", "B"]}),
+    );
+    assert_eq!(report["partners"], json!(["o1", "o2", "o3"]));
+
+    // Direction filters the edges the intersection is taken over: o2's only
+    // `C` edge points at the hub, so it is out of the outgoing answer.
+    let report = task_report(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A", "B", "C"], "direction": "out"}),
+    );
+    assert_eq!(report["partners"], json!(["o1"]));
+
+    let report = task_report(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A", "B", "C"], "direction": "in"}),
+    );
+    assert_eq!(report["partners"], json!([]));
+    assert_eq!(report["total"], json!(0));
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A", "B", "C"], "direction": "in"}),
+    ));
+    assert!(text.contains("all of A, B, C: 0\n  none\n"), "{text}");
+
+    // An empty `all_of` is a call that means nothing, and an unknown
+    // direction is refused rather than quietly read as "any".
+    let reply = one_task_call(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": []}),
+    );
+    assert!(
+        error_text(&reply).contains("at least one edge type"),
+        "{reply}"
+    );
+    let reply = one_task_call(
+        db,
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A"], "direction": "sideways"}),
+    );
+    assert!(error_text(&reply).contains("sideways"), "{reply}");
+}
+
+/// Binding: `label` narrows the partners in every form — the intersection,
+/// the one-type listing and the grouped view — counts included, which is what
+/// makes "which *companies* was T linked to" one call rather than a filter
+/// applied by hand afterwards.
+#[test]
+fn label_narrows_the_partners_in_every_form() {
+    let db = all_of_store("edges-label");
+
+    // The intersection, then the same intersection restricted by label.
+    let report = task_report(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A", "B", "C"]}),
+    );
+    assert_eq!(report["partners"], json!(["o1", "o2"]));
+
+    let (text, report) = task_both(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A", "B", "C"], "label": "Company"}),
+    );
+    assert_eq!(report["partners"], json!(["o1"]), "o2 is a Job: {report}");
+    assert_eq!(report["total"], json!(1), "the count is narrowed too");
+    assert_eq!(report["label"], json!("Company"));
+    assert!(
+        text.contains("partners linked by all of A, B, C: 1\no1\n"),
+        "{text}"
+    );
+
+    // Two types, both companies.
+    let report = task_report(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A", "B"], "label": "Company"}),
+    );
+    assert_eq!(report["partners"], json!(["o1", "o3"]));
+
+    // One `edge_type`: three partners, two of them companies.
+    let report = task_report(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "edge_type": "A"}),
+    );
+    assert_eq!(report["partners"], json!(["o1", "o2", "o3"]));
+    let (text, report) = task_both(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "edge_type": "A", "label": "Company"}),
+    );
+    assert_eq!(report["partners"], json!(["o1", "o3"]));
+    assert_eq!(report["edges"], json!(2), "the edge count is narrowed too");
+    assert!(text.contains("A (2): o1, o3\n"), "{text}");
+
+    // And the grouped view, where the header's totals move with the filter.
+    let (text, report) = task_both(
+        db.clone(),
+        "node_edges",
+        json!({"key": "hub", "label": "Company"}),
+    );
+    assert_eq!(
+        report["total"],
+        json!(5),
+        "A+B for o1/o3, C for o1: {report}"
+    );
+    assert!(
+        text.starts_with("mushroomdb edges — hub: 5 edge(s) over 3 type(s)\n"),
+        "{text}"
+    );
+    assert!(!text.contains("o2"), "a Job is not a Company: {text}");
+
+    // A label nothing carries is an empty answer, not an error.
+    let report = task_report(
+        db,
+        "node_edges",
+        json!({"key": "hub", "all_of": ["A"], "label": "Ghost"}),
+    );
+    assert_eq!(report["partners"], json!([]));
+    assert_eq!(report["total"], json!(0));
+}
+
+/// Binding: `edges_at` takes the same `label`, at a past commit.
+#[test]
+fn edges_at_label_narrows_the_partners_at_a_past_commit() {
+    let db = all_of_store("edges-at-label");
+    let at = db.read().wal_total_commits().unwrap() - 1;
+
+    let (text, report) = task_both(
+        db.clone(),
+        "edges_at",
+        json!({"key": "hub", "at": at, "all_of": ["A", "B", "C"], "label": "Company"}),
+    );
+    assert_eq!(report["partners"], json!(["o1"]));
+    assert_eq!(report["total"], json!(1));
+    assert_eq!(report["label"], json!("Company"));
+    assert!(
+        text.contains(&format!(
+            "hub as of commit {at} — partners linked by all of A, B, C: 1\no1\n"
+        )),
+        "{text}"
+    );
+
+    let (text, report) = task_both(
+        db,
+        "edges_at",
+        json!({"key": "hub", "at": at, "edge_type": "A", "label": "Company"}),
+    );
+    assert_eq!(report["partners"], json!(["o1", "o3"]));
+    assert_eq!(report["edges"], json!(2));
+    assert!(text.contains("A (2): o1, o3\n"), "{text}");
+}
+
+/// Binding: `what_if` takes the same `label`, and it narrows the counts the
+/// header states, not just the keys under them.
+#[test]
+fn what_if_label_narrows_both_sides() {
+    let (db, dir) = what_if_store("what-if-label");
+
+    let text = task_reply(&what_if_call(
+        db.clone(),
+        &dir,
+        json!({"key": "p1", "field": "org_id", "value": "globex", "label": "Org"}),
+    ));
+    assert!(text.contains("would lose 1, would gain 1"), "{text}");
+
+    let reply = what_if_call(
+        db.clone(),
+        &dir,
+        json!({"key": "p1", "field": "org_id", "value": "globex", "label": "Person", "json": true}),
+    );
+    let report: Js = serde_json::from_str(
+        reply["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text"),
+    )
+    .expect("json");
+    assert_eq!(report["lost_total"], json!(0), "acme is an Org: {report}");
+    assert_eq!(report["gained_total"], json!(0));
+    assert_eq!(report["label"], json!("Person"));
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Binding: the keys-only listing honours `limit` and counts what it cut.
+#[test]
+fn all_of_lists_at_most_limit_partners_and_counts_the_rest() {
+    let db = wide_store("all-of-limit", 25);
+    let (text, report) = task_both(
+        db,
+        "node_edges",
+        json!({"key": "p1", "all_of": ["IN_SECTOR"], "limit": 4}),
+    );
+    assert!(
+        text.starts_with("mushroomdb edges — p1 — partners linked by all of IN_SECTOR: 25\n"),
+        "the header counts the whole set: {text}"
+    );
+    assert!(text.contains("org00, org01, org02, org03\n"), "{text}");
+    assert!(text.contains("… and 21 more\n"), "{text}");
+    assert_eq!(report["total"], json!(25));
+    assert_eq!(
+        report["partners"].as_array().map(Vec::len),
+        Some(4),
+        "{report}"
+    );
 }
 
 /// Binding: a depth-1 `neighborhood` is the edge listing with its evidence;
@@ -2256,14 +2665,96 @@ fn edges_at_caps_each_type_and_counts_what_it_did_not_list() {
     );
     assert!(text.contains("… and 2 more"), "{text}");
 
-    // A caller-specified limit is honored too.
+    // A caller-specified limit is honored too — both under the default and
+    // above it, which is what a caller reaching for the whole set asks for.
     let text = task_reply(&one_task_call(
-        db,
+        db.clone(),
         "edges_at",
         json!({"key": "hub", "at": at, "limit": 3}),
     ));
     assert_eq!(text.matches("→ p").count(), 3, "{text}");
     assert!(text.contains("… and 9 more"), "{text}");
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "edges_at",
+        json!({"key": "hub", "at": at, "limit": 12}),
+    ));
+    assert_eq!(
+        text.matches("→ p").count(),
+        12,
+        "a limit above the default lists more: {text}"
+    );
+    assert!(!text.contains("… and"), "nothing was cut: {text}");
+
+    // `json: true` lists what the text lists — at most `limit` per edge type —
+    // and says how many there are, so no call silently returns every edge of
+    // a hub node.
+    let report = task_report(db.clone(), "edges_at", json!({"key": "hub", "at": at}));
+    assert_eq!(
+        report["edges"].as_array().map(Vec::len),
+        Some(10),
+        "{report}"
+    );
+    assert_eq!(report["listed"], json!(10));
+    assert_eq!(report["total"], json!(12));
+
+    let report = task_report(db, "edges_at", json!({"key": "hub", "at": at, "limit": 12}));
+    assert_eq!(
+        report["edges"].as_array().map(Vec::len),
+        Some(12),
+        "{report}"
+    );
+    assert_eq!(report["total"], json!(12));
+}
+
+/// Binding: `edges_at` answers the intersection question at a past commit —
+/// the same keys-only shape `node_edges` gives, with the commit in the header
+/// and in the report.
+#[test]
+fn edges_at_all_of_answers_with_partner_keys_at_a_past_commit() {
+    let db = all_of_store("edges-at-all-of");
+    let at = db.read().wal_total_commits().unwrap() - 1;
+
+    let (text, report) = task_both(
+        db.clone(),
+        "edges_at",
+        json!({"key": "hub", "at": at, "all_of": ["A", "B", "C"]}),
+    );
+    assert_eq!(
+        text,
+        format!(
+            "mushroomdb edges_at — hub as of commit {at} — \
+             partners linked by all of A, B, C: 2\no1, o2\n"
+        ),
+        "{text}"
+    );
+    assert_eq!(report["at"], json!(at));
+    assert_eq!(report["partners"], json!(["o1", "o2"]));
+    assert_eq!(report["total"], json!(2));
+
+    let report = task_report(
+        db.clone(),
+        "edges_at",
+        json!({"key": "hub", "at": at, "all_of": ["A", "B", "C"], "direction": "out"}),
+    );
+    assert_eq!(report["partners"], json!(["o1"]));
+
+    // And one `edge_type` is the same compact listing for a single type.
+    let (text, report) = task_both(
+        db,
+        "edges_at",
+        json!({"key": "hub", "at": at, "edge_type": "A"}),
+    );
+    assert_eq!(
+        text,
+        format!("mushroomdb edges_at — hub as of commit {at}: 3 edge(s)\nA (3): o1, o2, o3\n"),
+        "{text}"
+    );
+    assert_eq!(report["edge_type"], json!("A"));
+    assert_eq!(report["edges"], json!(3));
+    assert_eq!(report["partners"], json!(["o1", "o2", "o3"]));
+    assert_eq!(report["rule"], json!(null), "a manual edge claims no rule");
 }
 
 // ── what_if ──────────────────────────────────────────────────────────────────
@@ -2475,6 +2966,79 @@ fn what_if_accepts_a_list_valued_change() {
 
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Binding: `what_if` with an `edge_type` answers about that type alone —
+/// counts included — as two lists of partner keys with the rule named once,
+/// and `limit` cuts each list and says what it cut.
+#[test]
+fn what_if_with_an_edge_type_answers_in_partner_keys() {
+    let db = wide_store("what-if-keys", 25);
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "what_if",
+        json!({"key": "p1", "field": "sector", "value": "finance", "edge_type": "IN_SECTOR", "limit": 3}),
+    ));
+    assert!(
+        text.starts_with(
+            "mushroomdb what_if — p1.sector = \"finance\": would lose 25, would gain 0\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("lost\nIN_SECTOR (25, rule any_org): org00, org01, org02\n"),
+        "{text}"
+    );
+    assert!(text.contains("… and 22 more\n"), "{text}");
+    assert!(text.contains("gained\n  none\n"), "{text}");
+
+    // A type the change does not touch is a reply about that type: zero, zero.
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "what_if",
+        json!({"key": "p1", "field": "sector", "value": "finance", "edge_type": "NOPE"}),
+    ));
+    assert!(text.contains("would lose 0, would gain 0"), "{text}");
+    assert_eq!(text.matches("  none\n").count(), 2, "{text}");
+
+    // `json: true` obeys the same limit, and still says how many there are.
+    let report = task_report(
+        db.clone(),
+        "what_if",
+        json!({"key": "p1", "field": "sector", "value": "finance", "edge_type": "IN_SECTOR", "limit": 2}),
+    );
+    assert_eq!(report["edge_type"], json!("IN_SECTOR"));
+    assert_eq!(report["lost"].as_array().map(Vec::len), Some(2), "{report}");
+    assert_eq!(report["lost_total"], json!(25));
+    assert_eq!(report["gained"], json!([]));
+    assert_eq!(report["gained_total"], json!(0));
+
+    // Without an `edge_type` the grouped view is still the reply, and the
+    // default limit of ten now caps it instead of printing all twenty-five.
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "what_if",
+        json!({"key": "p1", "field": "sector", "value": "finance"}),
+    ));
+    assert_eq!(
+        text.matches("→ org").count(),
+        10,
+        "ten listed by default: {text}"
+    );
+    assert!(text.contains("    … and 15 more\n"), "{text}");
+
+    let report = task_report(
+        db,
+        "what_if",
+        json!({"key": "p1", "field": "sector", "value": "finance"}),
+    );
+    assert_eq!(
+        report["lost"].as_array().map(Vec::len),
+        Some(10),
+        "{report}"
+    );
+    assert_eq!(report["lost_total"], json!(25));
 }
 
 // ── descriptions ─────────────────────────────────────────────────────────────

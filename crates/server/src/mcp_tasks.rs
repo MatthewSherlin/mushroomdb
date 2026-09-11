@@ -679,6 +679,17 @@ const EARTH_RADIUS_KM: f64 = 6371.0088;
 /// takes the minimum of its branches and `any` the maximum, so a branch's own
 /// score is not recoverable from the edge and a nested `vector_similar` has
 /// no similarity to report.
+///
+/// # Only what matched
+///
+/// A branch reports evidence **only when that branch is itself satisfied**,
+/// thresholds applied: an `overlap` under its `min`, a `numeric_within` past
+/// its `tolerance`, a `geo_radius` past its `km`, a `key_match` whose field
+/// does not name the other node. Under `any` that is the whole point — one
+/// branch carries the edge and the others did not — and printing an unmatched
+/// branch stated a reason the engine had rejected (`size_bucket: 1 vs 9` on a
+/// `±2` tolerance). Under `all` every branch matched by construction, so the
+/// checks change nothing there.
 fn predicate_evidence(
     p: &PredicateSummary,
     src: &NodeInfo,
@@ -703,16 +714,26 @@ fn predicate_evidence(
             // Compared as the rules engine compares them: only a scalar
             // element is a token, and its type is part of its identity, so a
             // `1` and a `1.0` in two lists are not an overlap.
+            let left: BTreeSet<(u8, String)> = a.iter().filter_map(scalar_token).collect();
             let right: BTreeSet<(u8, String)> = b.iter().filter_map(scalar_token).collect();
-            let mut shared: Vec<String> = a
-                .iter()
-                .filter_map(scalar_token)
-                .filter(|t| right.contains(t))
-                .map(|(_, text)| text)
+            let union = left.union(&right).count();
+            let mut shared: Vec<String> = left
+                .intersection(&right)
+                .map(|(_, text)| text.clone())
                 .collect();
             shared.sort();
             shared.dedup();
-            (!shared.is_empty()).then(|| Evidence::Shared {
+            if shared.is_empty() || union == 0 {
+                return None;
+            }
+            // The rule's own test: the Jaccard ratio, against the `min` the
+            // predicate declares. Inside an `any`, a list that overlaps but
+            // not enough is a branch the engine rejected.
+            let jaccard = shared.len() as f64 / union as f64;
+            if p.min.is_some_and(|min| jaccard < min) {
+                return None;
+            }
+            Some(Evidence::Shared {
                 field,
                 shared: shared.into_iter().map(Js::String).collect(),
             })
@@ -725,14 +746,32 @@ fn predicate_evidence(
             })
         }
         // A key-match rule reads a foreign key off the source; the value they
-        // share is the destination's own key.
-        "key_match" => Some(Evidence::Value {
-            field,
-            value: Js::String(dst.key.clone()),
-        }),
+        // share is the destination's own key — when the field really does name
+        // it, directly or as one element of a list of foreign keys.
+        "key_match" => {
+            let names_dst = match src.props.get(&field)? {
+                Value::Str(s) => s == &dst.key,
+                Value::List(items) => items
+                    .iter()
+                    .any(|v| matches!(v, Value::Str(s) if s == &dst.key)),
+                _ => false,
+            };
+            names_dst.then(|| Evidence::Value {
+                field,
+                value: Js::String(dst.key.clone()),
+            })
+        }
         "numeric_within" => {
             let (a, b) = (src.props.get(&field)?, dst.props.get(&field)?);
-            Some(Evidence::Pair {
+            let (x, y) = (numeric(a)?, numeric(b)?);
+            let delta = (x - y).abs();
+            // The rule's own test. A zero tolerance asks for equality.
+            let within = match p.tolerance {
+                Some(0.0) => delta == 0.0,
+                Some(t) => delta <= t,
+                None => true,
+            };
+            within.then(|| Evidence::Pair {
                 field,
                 a: Some(crate::json::value_to_json(a)),
                 b: Some(crate::json::value_to_json(b)),
@@ -742,11 +781,15 @@ fn predicate_evidence(
         "geo_radius" => {
             let (alat, alon) = lat_lon(src.props.get(&field)?)?;
             let (blat, blon) = lat_lon(dst.props.get(&field)?)?;
+            let km = haversine_km(alat, alon, blat, blon);
+            if p.km.is_some_and(|radius| km > radius) {
+                return None;
+            }
             Some(Evidence::Geo {
                 field,
                 a: Js::String(format_lat_lon(alat, alon)),
                 b: Js::String(format_lat_lon(blat, blon)),
-                km: round2(haversine_km(alat, alon, blat, blon)),
+                km: round2(km),
             })
         }
         // The two vectors say nothing a reader can use; the cosine the rule
@@ -784,12 +827,18 @@ fn lat_lon(v: &Value) -> Option<(f64, f64)> {
     if items.len() != 2 {
         return None;
     }
-    let num = |x: &Value| match x {
+    Some((numeric(&items[0])?, numeric(&items[1])?))
+}
+
+/// A finite number, as the rules engine reads one: an integer or a finite
+/// float, and nothing else.
+fn numeric(v: &Value) -> Option<f64> {
+    match v {
+        #[allow(clippy::cast_precision_loss)]
         Value::Int(i) => Some(*i as f64),
         Value::Float(f) if f.is_finite() => Some(*f),
         _ => None,
-    };
-    Some((num(&items[0])?, num(&items[1])?))
+    }
 }
 
 fn format_lat_lon(lat: f64, lon: f64) -> String {
@@ -1004,11 +1053,13 @@ fn node_edge_groups(
     types: Option<&[String]>,
     dir: Dir,
     limit: usize,
+    label: Option<&str>,
 ) -> Result<(usize, Vec<EdgeGroup>), GraphError> {
     let edges = {
         let g = db.read();
         g.node_edges(key)?
     };
+    let mut wanted_label = LabelFilter::new(db, label);
 
     let mut by_type: BTreeMap<String, Vec<(String, bool, bool)>> = BTreeMap::new();
     let mut total = 0usize;
@@ -1029,6 +1080,9 @@ fn node_edge_groups(
         } else {
             e.src_key.clone()
         };
+        if !wanted_label.keeps(&other) {
+            continue;
+        }
         total += 1;
         by_type
             .entry(e.edge_type.clone())
@@ -1167,18 +1221,342 @@ fn edge_line_json(e: &EdgeLine) -> Js {
     })
 }
 
-/// The `limit` argument: how many edges of each type to list.
-fn edge_limit_arg(args: &Js) -> Result<usize, String> {
+/// The `limit` argument, defaulted and clamped.
+///
+/// A `limit` past `max` is clamped rather than refused — the schema already
+/// names the ceiling, and a caller who asks for more means "all of it" — but
+/// a zero is a reply with counts and no rows, which no caller means.
+fn limit_arg(args: &Js, default: usize, max: usize) -> Result<usize, String> {
     match args.get("limit") {
-        None | Some(Js::Null) => Ok(DEFAULT_EDGE_LIMIT),
+        None | Some(Js::Null) => Ok(default),
         Some(v) => match v.as_u64() {
-            // Zero is a reply with counts and no edges, which no caller means.
             Some(0) | None => Err("limit must be a positive integer".into()),
-            Some(n) => Ok(usize::try_from(n)
-                .unwrap_or(MAX_EDGE_LIMIT)
-                .min(MAX_EDGE_LIMIT)),
+            Some(n) => Ok(usize::try_from(n).unwrap_or(max).min(max)),
         },
     }
+}
+
+/// The `limit` argument: how many edges of each type to list.
+fn edge_limit_arg(args: &Js) -> Result<usize, String> {
+    limit_arg(args, DEFAULT_EDGE_LIMIT, MAX_EDGE_LIMIT)
+}
+
+// ── keys-only partner views ─────────────────────────────────────────────────
+
+/// Partners listed by a keys-only view when the caller names no `limit`.
+///
+/// Twenty times the grouped view's default: a key is a few bytes where an
+/// attributed edge line is a sentence, and the question these views answer —
+/// *which* partners — is not answered by a tenth of the set.
+const DEFAULT_PARTNER_LIMIT: usize = 200;
+
+/// The largest `limit` a keys-only view honours. A partner set this wide is
+/// still only tens of kilobytes, and it is what the caller asked for by name.
+const MAX_PARTNER_LIMIT: usize = 2000;
+
+/// Columns a wrapped key list fills before it breaks to the next line.
+const KEY_WRAP_COLUMNS: usize = 100;
+
+/// Keeps only the partners carrying one label.
+///
+/// The label is resolved per partner key and memoised, so a node joined by
+/// four rules is looked up once rather than four times, and a filter with no
+/// label answers `true` without touching the store at all. The label is the
+/// one the node carries **now**, including when the edges being filtered come
+/// from a past commit: a node's label is fixed when it is inserted.
+struct LabelFilter<'a> {
+    db: &'a SharedDb,
+    label: Option<String>,
+    seen: BTreeMap<String, bool>,
+}
+
+impl<'a> LabelFilter<'a> {
+    fn new(db: &'a SharedDb, label: Option<&str>) -> Self {
+        LabelFilter {
+            db,
+            label: label.map(str::to_string),
+            seen: BTreeMap::new(),
+        }
+    }
+
+    fn keeps(&mut self, key: &str) -> bool {
+        let Some(label) = &self.label else {
+            return true;
+        };
+        if let Some(hit) = self.seen.get(key) {
+            return *hit;
+        }
+        let ok = {
+            let g = self.db.read();
+            g.node_ref(key).is_some_and(|n| n.label() == label)
+        };
+        self.seen.insert(key.to_string(), ok);
+        ok
+    }
+
+    /// Drop every row whose partner does not carry the label.
+    fn retain(&mut self, rows: &mut Vec<PartnerEdge>) {
+        if self.label.is_none() {
+            return;
+        }
+        rows.retain(|r| self.keeps(&r.other));
+    }
+}
+
+/// One incident edge reduced to what a keys-only view needs: who is at the
+/// other end, by what type, and in which direction.
+struct PartnerEdge {
+    other: String,
+    edge_type: String,
+    outgoing: bool,
+}
+
+impl PartnerEdge {
+    /// `key` must be the node's canonical key — see [`canonical_self`].
+    fn of(src_key: &str, dst_key: &str, edge_type: &str, key: &str) -> Self {
+        let outgoing = src_key == key;
+        PartnerEdge {
+            other: if outgoing {
+                dst_key.to_string()
+            } else {
+                src_key.to_string()
+            },
+            edge_type: edge_type.to_string(),
+            outgoing,
+        }
+    }
+
+    fn kept(&self, dir: Dir) -> bool {
+        match dir {
+            Dir::Out => self.outgoing,
+            Dir::In => !self.outgoing,
+            Dir::Both => true,
+        }
+    }
+}
+
+/// The `direction` argument of a keys-only view: `out`, `in`, or `any`
+/// (the default). `both` is accepted as a synonym of `any`, because that is
+/// what `neighborhood` calls the same thing.
+fn partner_dir_arg(args: &Js) -> Result<Dir, String> {
+    match args.get("direction") {
+        None | Some(Js::Null) => Ok(Dir::Both),
+        Some(v) => match v.as_str() {
+            Some(s) if s.eq_ignore_ascii_case("out") => Ok(Dir::Out),
+            Some(s) if s.eq_ignore_ascii_case("in") => Ok(Dir::In),
+            Some(s) if s.eq_ignore_ascii_case("any") || s.eq_ignore_ascii_case("both") => {
+                Ok(Dir::Both)
+            }
+            Some(other) => Err(format!("unknown direction: {}", repograph::sanitize(other))),
+            None => Err("direction must be a string".into()),
+        },
+    }
+}
+
+/// The `all_of` argument: the edge types a partner must carry *every* one of.
+fn all_of_arg(args: &Js) -> Result<Vec<String>, String> {
+    let types = str_list_arg(args, "all_of")?;
+    if args.get("all_of").is_some_and(|v| !v.is_null()) && types.is_empty() {
+        return Err("all_of must name at least one edge type".into());
+    }
+    Ok(types)
+}
+
+/// The partners joined to the node by **every** type in `all_of`, sorted.
+///
+/// The intersection is over partners, not edges: a partner carrying two of
+/// three named types is not in the answer, however many edges of those two it
+/// has. Direction filters the edges considered, so `direction: "out"` asks
+/// which partners the node points at by all of the types.
+fn partners_linked_by_all(rows: &[PartnerEdge], all_of: &[String], dir: Dir) -> Vec<String> {
+    let mut by_partner: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for r in rows {
+        if !r.kept(dir) {
+            continue;
+        }
+        by_partner
+            .entry(r.other.as_str())
+            .or_default()
+            .insert(r.edge_type.as_str());
+    }
+    by_partner
+        .into_iter()
+        .filter(|(_, types)| all_of.iter().all(|t| types.contains(t.as_str())))
+        .map(|(k, _)| k.to_string())
+        .collect()
+}
+
+/// The distinct partners joined by one edge type, sorted, and how many edges
+/// of that type there are — the two are equal unless a pair is joined twice.
+fn partners_of_type(rows: &[PartnerEdge], edge_type: &str, dir: Dir) -> (usize, Vec<String>) {
+    let mut edges = 0usize;
+    let mut partners: BTreeSet<&str> = BTreeSet::new();
+    for r in rows {
+        if r.edge_type != edge_type || !r.kept(dir) {
+            continue;
+        }
+        edges += 1;
+        partners.insert(r.other.as_str());
+    }
+    (
+        edges,
+        partners.into_iter().map(str::to_string).collect::<Vec<_>>(),
+    )
+}
+
+/// Append `keys` as `a, b, c`, continuing `lead` and wrapping at
+/// [`KEY_WRAP_COLUMNS`].
+///
+/// Every key goes through [`repograph::sanitize`] — a key is graph content,
+/// and these lines are line-structured digests like any other.
+fn push_key_list(out: &mut String, lead: &str, keys: &[String]) {
+    let mut line = lead.to_string();
+    let mut empty = line.is_empty();
+    for (i, k) in keys.iter().enumerate() {
+        let k = repograph::sanitize(k);
+        let comma = usize::from(i + 1 < keys.len());
+        if !empty && line.len() + 1 + k.len() + comma > KEY_WRAP_COLUMNS {
+            out.push_str(&line);
+            out.push('\n');
+            line.clear();
+            empty = true;
+        }
+        if !empty {
+            line.push(' ');
+        }
+        line.push_str(&k);
+        if comma == 1 {
+            line.push(',');
+        }
+        empty = false;
+    }
+    if !line.is_empty() {
+        out.push_str(&line);
+        out.push('\n');
+    }
+}
+
+/// `lead: k, k, k` plus the `… and N more` the `limit` cut off.
+fn push_partner_block(out: &mut String, lead: &str, partners: &[String], limit: usize) {
+    let listed = &partners[..partners.len().min(limit)];
+    push_key_list(out, lead, listed);
+    if partners.len() > listed.len() {
+        out.push_str(&format!("… and {} more\n", partners.len() - listed.len()));
+    }
+}
+
+/// The keys-only answer to "which partners are linked by all of these types".
+///
+/// Nothing here is capped by line count: `limit` is the cap, the trailing
+/// `… and N more` says what it cut, and a capped digest that swallowed that
+/// line would be the one shape a caller could not tell from a complete answer.
+fn render_all_of(
+    tool: &str,
+    key: &str,
+    at: Option<u64>,
+    all_of: &[String],
+    partners: &[String],
+    limit: usize,
+) -> String {
+    let types = all_of
+        .iter()
+        .map(|t| repograph::sanitize(t))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let when = at.map_or_else(String::new, |a| format!(" as of commit {a}"));
+    let mut out = format!(
+        "mushroomdb {tool} — {}{when} — partners linked by all of {types}: {}\n",
+        repograph::sanitize(key),
+        partners.len()
+    );
+    if partners.is_empty() {
+        out.push_str("  none\n");
+        return out;
+    }
+    push_partner_block(&mut out, "", partners, limit);
+    out
+}
+
+/// The `json: true` shape of a keys-only partner answer.
+fn partners_json(
+    key: &str,
+    at: Option<u64>,
+    all_of: &[String],
+    label: Option<&str>,
+    partners: &[String],
+    limit: usize,
+) -> Js {
+    let mut doc = json!({
+        "key": key,
+        "all_of": all_of,
+        "partners": &partners[..partners.len().min(limit)],
+        "total": partners.len(),
+    });
+    if let Some(a) = at {
+        doc["at"] = json!(a);
+    }
+    if let Some(l) = label {
+        doc["label"] = json!(l);
+    }
+    doc
+}
+
+/// The keys-only answer to "which partners does one edge type join".
+///
+/// The rule is printed once, in the type's header: every edge of a type comes
+/// from the rule that declares that type, so repeating it per line said the
+/// same words as many times as there were partners.
+fn render_type_partners(
+    header: String,
+    edge_type: &str,
+    edges: usize,
+    rule: Option<&str>,
+    partners: &[String],
+    limit: usize,
+) -> String {
+    let mut out = header;
+    if partners.is_empty() {
+        out.push_str("  none\n");
+        return out;
+    }
+    let rule = rule.map_or_else(String::new, |r| {
+        format!(", rule {}", repograph::sanitize(r))
+    });
+    let lead = format!("{} ({edges}{rule}):", repograph::sanitize(edge_type));
+    push_partner_block(&mut out, &lead, partners, limit);
+    out
+}
+
+/// The `json: true` shape of a one-type keys-only answer.
+fn type_partners_json(
+    key: &str,
+    at: Option<u64>,
+    edge_type: &str,
+    rule: Option<&str>,
+    edges: usize,
+    partners: &[String],
+    limit: usize,
+) -> Js {
+    let mut doc = json!({
+        "key": key,
+        "edge_type": edge_type,
+        "rule": rule,
+        "edges": edges,
+        "partners": &partners[..partners.len().min(limit)],
+        "total": partners.len(),
+    });
+    if let Some(a) = at {
+        doc["at"] = json!(a);
+    }
+    doc
+}
+
+/// Record the `label` a reply was narrowed by, when it was narrowed at all.
+fn with_label(mut doc: Js, label: Option<&str>) -> Js {
+    if let Some(l) = label {
+        doc["label"] = json!(l);
+    }
+    doc
 }
 
 fn tool_node_edges(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
@@ -1190,12 +1568,92 @@ fn tool_node_edges(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Ok(t) => t,
         Err(e) => return CallOutcome::ToolErr(e),
     };
+    let all_of = match all_of_arg(args) {
+        Ok(t) => t,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let dir = match partner_dir_arg(args) {
+        Ok(d) => d,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let label = match opt_str_arg(args, "label") {
+        Ok(l) => l,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+
+    if !all_of.is_empty() || edge_type.is_some() {
+        let limit = match limit_arg(args, DEFAULT_PARTNER_LIMIT, MAX_PARTNER_LIMIT) {
+            Ok(n) => n,
+            Err(e) => return CallOutcome::ToolErr(e),
+        };
+        let edges = {
+            let g = db.read();
+            match g.node_edges(key) {
+                Ok(v) => v,
+                Err(e) => return CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
+            }
+        };
+        let mut rows: Vec<PartnerEdge> = edges
+            .iter()
+            .map(|e| PartnerEdge::of(&e.src_key, &e.dst_key, &e.edge_type, key))
+            .collect();
+        LabelFilter::new(db, label).retain(&mut rows);
+        if !all_of.is_empty() {
+            let partners = partners_linked_by_all(&rows, &all_of, dir);
+            let report = partners_json(key, None, &all_of, label, &partners, limit);
+            return ok(json_out, &report, |_| {
+                render_all_of("edges", key, None, &all_of, &partners, limit)
+            });
+        }
+        let edge_type = edge_type.unwrap_or_default();
+        let (count, partners) = partners_of_type(&rows, edge_type, dir);
+        let rule = live_rule_for_type(db, key, edge_type, partners.first());
+        let report = with_label(
+            type_partners_json(
+                key,
+                None,
+                edge_type,
+                rule.as_deref(),
+                count,
+                &partners,
+                limit,
+            ),
+            label,
+        );
+        return ok(json_out, &report, |_| {
+            let header = format!(
+                "mushroomdb edges — {}: {count} edge(s) over {} type(s)\n",
+                repograph::sanitize(key),
+                usize::from(count > 0)
+            );
+            render_type_partners(header, edge_type, count, rule.as_deref(), &partners, limit)
+        });
+    }
+
     let limit = match edge_limit_arg(args) {
         Ok(n) => n,
         Err(e) => return CallOutcome::ToolErr(e),
     };
-    let filter = edge_type.map(|t| vec![t.to_string()]);
-    edge_reply(db, key, filter.as_deref(), Dir::Both, limit, json_out)
+    edge_reply(db, key, None, dir, limit, label, json_out)
+}
+
+/// The rule behind one edge type on a live node, from a single `explain` call
+/// on one partner — every edge of a type is written by the one rule that
+/// declares it, so one pair answers for the whole type. `None` for a manual
+/// edge, which no rule derived and which has nothing to name.
+fn live_rule_for_type(
+    db: &SharedDb,
+    key: &str,
+    edge_type: &str,
+    partner: Option<&String>,
+) -> Option<String> {
+    let partner = partner?;
+    let g = db.read();
+    g.explain(key, partner)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|e| e.edge_type == edge_type)
+        .map(|e| e.rule)
 }
 
 /// Group, render and answer — the tail both `node_edges` and a depth-1
@@ -1206,9 +1664,10 @@ fn edge_reply(
     types: Option<&[String]>,
     dir: Dir,
     limit: usize,
+    label: Option<&str>,
     json_out: bool,
 ) -> CallOutcome {
-    match node_edge_groups(db, key, types, dir, limit) {
+    match node_edge_groups(db, key, types, dir, limit, label) {
         Ok((total, groups)) => ok(json_out, &edge_groups_json(key, total, &groups), |_| {
             render_edge_groups(key, total, &groups)
         }),
@@ -1255,7 +1714,7 @@ fn tool_neighborhood(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             Ok(n) => n,
             Err(e) => return CallOutcome::ToolErr(e),
         };
-        return edge_reply(db, key, filter, dir, limit, json_out);
+        return edge_reply(db, key, filter, dir, limit, None, json_out);
     }
 
     let etype_refs: Option<Vec<&str>> = filter.map(|v| v.iter().map(String::as_str).collect());
@@ -1427,7 +1886,28 @@ fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             None => return CallOutcome::ToolErr("at must be a non-negative integer".into()),
         },
     };
-    let limit = match edge_limit_arg(args) {
+    let edge_type = match opt_str_arg(args, "edge_type") {
+        Ok(t) => t,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let all_of = match all_of_arg(args) {
+        Ok(t) => t,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let dir = match partner_dir_arg(args) {
+        Ok(d) => d,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let label = match opt_str_arg(args, "label") {
+        Ok(l) => l,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let keys_only = !all_of.is_empty() || edge_type.is_some();
+    let limit = match if keys_only {
+        limit_arg(args, DEFAULT_PARTNER_LIMIT, MAX_PARTNER_LIMIT)
+    } else {
+        edge_limit_arg(args)
+    } {
         Ok(n) => n,
         Err(e) => return CallOutcome::ToolErr(e),
     };
@@ -1440,11 +1920,87 @@ fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         }
     };
     let self_key = canonical_self(&edges, key);
-    let report = json!({
-        "key": self_key,
-        "at": at,
-        "edges": edges.iter().map(edge_at_json).collect::<Vec<_>>(),
-    });
+
+    if keys_only {
+        let mut rows: Vec<PartnerEdge> = edges
+            .iter()
+            .map(|e| PartnerEdge::of(&e.src_key, &e.dst_key, &e.edge_type, &self_key))
+            .collect();
+        LabelFilter::new(db, label).retain(&mut rows);
+        if !all_of.is_empty() {
+            let partners = partners_linked_by_all(&rows, &all_of, dir);
+            let report = partners_json(&self_key, Some(at), &all_of, label, &partners, limit);
+            return ok(json_out, &report, |_| {
+                render_all_of("edges_at", &self_key, Some(at), &all_of, &partners, limit)
+            });
+        }
+        let edge_type = edge_type.unwrap_or_default();
+        let (count, partners) = partners_of_type(&rows, edge_type, dir);
+        // The rule as it stood at `at`, off the edges themselves — every edge
+        // of a type carries the same one, so the first is the type's.
+        let rule = edges
+            .iter()
+            .find(|e| e.edge_type == edge_type && e.rule.is_some())
+            .and_then(|e| e.rule.clone());
+        let report = with_label(
+            type_partners_json(
+                &self_key,
+                Some(at),
+                edge_type,
+                rule.as_deref(),
+                count,
+                &partners,
+                limit,
+            ),
+            label,
+        );
+        return ok(json_out, &report, |_| {
+            let header = format!(
+                "mushroomdb edges_at — {} as of commit {at}: {count} edge(s)\n",
+                repograph::sanitize(&self_key)
+            );
+            render_type_partners(header, edge_type, count, rule.as_deref(), &partners, limit)
+        });
+    }
+
+    // The grouped view, narrowed to the partners carrying `label` if one was
+    // named — counts included, so the header says what the filter left.
+    let mut filter = LabelFilter::new(db, label);
+    let edges: Vec<core_api::EdgeAt> = edges
+        .into_iter()
+        .filter(|e| {
+            let other = if e.src_key == self_key {
+                &e.dst_key
+            } else {
+                &e.src_key
+            };
+            filter.keeps(other)
+        })
+        .collect();
+
+    // The report lists what the text lists: at most `limit` per edge type,
+    // the engine's own order. Without this an edges_at report of a hub node
+    // was a hundred kilobytes of JSON no caller had asked for.
+    let mut per_type: BTreeMap<&str, usize> = BTreeMap::new();
+    let listed: Vec<Js> = edges
+        .iter()
+        .filter(|e| {
+            let n = per_type.entry(e.edge_type.as_str()).or_default();
+            *n += 1;
+            *n <= limit
+        })
+        .map(edge_at_json)
+        .collect();
+    let report = with_label(
+        json!({
+            "key": self_key,
+            "at": at,
+            "edges": listed,
+            "listed": listed.len(),
+            "total": edges.len(),
+        }),
+        label,
+    );
     let (total, groups) = edges_at_groups(edges, &self_key, limit);
     ok(json_out, &report, |_| {
         render_edges_at(&self_key, at, total, &groups)
@@ -1505,7 +2061,7 @@ fn what_if_groups(edges: &[core_api::EdgeAt], key: &str) -> Vec<WhatIfGroup> {
     groups
 }
 
-fn render_what_if_groups(out: &mut String, groups: &[WhatIfGroup]) {
+fn render_what_if_groups(out: &mut String, groups: &[WhatIfGroup], limit: usize) {
     if groups.is_empty() {
         out.push_str("  none\n");
         return;
@@ -1516,7 +2072,7 @@ fn render_what_if_groups(out: &mut String, groups: &[WhatIfGroup]) {
             repograph::sanitize(&g.edge_type),
             g.count
         ));
-        for l in &g.lines {
+        for l in g.lines.iter().take(limit) {
             if l.incident {
                 let arrow = if l.outgoing { "→" } else { "←" };
                 let other = if l.outgoing { &l.dst } else { &l.src };
@@ -1533,6 +2089,9 @@ fn render_what_if_groups(out: &mut String, groups: &[WhatIfGroup]) {
             }
             out.push('\n');
         }
+        if g.count > limit {
+            out.push_str(&format!("    … and {} more\n", g.count - limit));
+        }
     }
 }
 
@@ -1540,22 +2099,83 @@ fn render_what_if(
     key: &str,
     field: &str,
     value: &Js,
-    lost_total: usize,
-    gained_total: usize,
     lost: &[WhatIfGroup],
     gained: &[WhatIfGroup],
+    limit: usize,
 ) -> String {
-    let mut out = format!(
+    let edges = |gs: &[WhatIfGroup]| gs.iter().map(|g| g.count).sum::<usize>();
+    let mut out = what_if_header(key, field, value, edges(lost), edges(gained));
+    out.push_str("lost\n");
+    render_what_if_groups(&mut out, lost, limit);
+    out.push_str("gained\n");
+    render_what_if_groups(&mut out, gained, limit);
+    repograph::cap_lines(&out, MAX_EDGE_LINES)
+}
+
+fn what_if_header(
+    key: &str,
+    field: &str,
+    value: &Js,
+    lost_total: usize,
+    gained_total: usize,
+) -> String {
+    format!(
         "mushroomdb what_if — {}.{} = {}: would lose {lost_total}, would gain {gained_total}\n",
         repograph::sanitize(key),
         repograph::sanitize(field),
         repograph::sanitize(&value.to_string()),
-    );
-    out.push_str("lost\n");
-    render_what_if_groups(&mut out, lost);
-    out.push_str("gained\n");
-    render_what_if_groups(&mut out, gained);
-    repograph::cap_lines(&out, MAX_EDGE_LINES)
+    )
+}
+
+/// The distinct nodes one side of a `what_if` touches, sorted.
+///
+/// An edge incident on the changed node is named by its partner — the answer
+/// to "which partners does this cost me". An edge the change churns elsewhere
+/// in the graph has no partner to name, so it is written out as the pair it
+/// is, rather than being dropped from a reply that counts it.
+fn what_if_partners(edges: &[core_api::EdgeAt], key: &str) -> Vec<String> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for e in edges {
+        if e.src_key == key {
+            set.insert(e.dst_key.clone());
+        } else if e.dst_key == key {
+            set.insert(e.src_key.clone());
+        } else {
+            set.insert(format!("{} → {}", e.src_key, e.dst_key));
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// The keys-only `what_if` reply: one edge type, so one rule, so two lists of
+/// keys under `lost` and `gained`.
+fn render_what_if_keys_only(
+    key: &str,
+    field: &str,
+    value: &Js,
+    edge_type: &str,
+    lost: &[core_api::EdgeAt],
+    gained: &[core_api::EdgeAt],
+    limit: usize,
+) -> String {
+    let mut out = what_if_header(key, field, value, lost.len(), gained.len());
+    for (heading, side) in [("lost\n", lost), ("gained\n", gained)] {
+        out.push_str(heading);
+        let partners = what_if_partners(side, key);
+        if partners.is_empty() {
+            out.push_str("  none\n");
+            continue;
+        }
+        let rule = side
+            .iter()
+            .find_map(|e| e.rule.as_deref())
+            .map_or_else(String::new, |r| {
+                format!(", rule {}", repograph::sanitize(r))
+            });
+        let lead = format!("{} ({}{rule}):", repograph::sanitize(edge_type), side.len());
+        push_partner_block(&mut out, &lead, &partners, limit);
+    }
+    out
 }
 
 /// What changes if `key.field` became `value` — computed directly by the
@@ -1581,6 +2201,19 @@ fn tool_what_if(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         ));
     };
 
+    let edge_type = match opt_str_arg(args, "edge_type") {
+        Ok(t) => t,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let label = match opt_str_arg(args, "label") {
+        Ok(l) => l,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let limit = match limit_arg(args, DEFAULT_EDGE_LIMIT, MAX_PARTNER_LIMIT) {
+        Ok(n) => n,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+
     let wi = {
         let g = db.read();
         g.what_if_set_prop(key, field, value)
@@ -1590,25 +2223,58 @@ fn tool_what_if(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Err(e) => return CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
     };
 
-    let report = json!({
-        "key": key,
-        "field": field,
-        "value": raw,
-        "lost": wi.lost.iter().map(edge_at_json).collect::<Vec<_>>(),
-        "gained": wi.gained.iter().map(edge_at_json).collect::<Vec<_>>(),
-    });
-    let lost_groups = what_if_groups(&wi.lost, key);
-    let gained_groups = what_if_groups(&wi.gained, key);
+    // `edge_type` and `label` narrow what is counted as well as what is
+    // listed: the reply is then about that type, or those partners, totals
+    // included. An edge the change churns elsewhere in the graph has no
+    // partner to carry a label, so a labelled call leaves it out.
+    let mut filter = LabelFilter::new(db, label);
+    let mut pick = |edges: &'_ [core_api::EdgeAt]| -> Vec<core_api::EdgeAt> {
+        edges
+            .iter()
+            .filter(|e| edge_type.is_none_or(|t| e.edge_type == t))
+            .filter(|e| match (e.src_key == key, e.dst_key == key) {
+                (true, _) => filter.keeps(&e.dst_key),
+                (_, true) => filter.keeps(&e.src_key),
+                _ => label.is_none(),
+            })
+            .cloned()
+            .collect()
+    };
+    let lost = pick(&wi.lost);
+    let gained = pick(&wi.gained);
+
+    let doc = |edges: &[core_api::EdgeAt]| -> Vec<Js> {
+        edges
+            .iter()
+            .take(limit)
+            .map(edge_at_json)
+            .collect::<Vec<_>>()
+    };
+    let mut report = with_label(
+        json!({
+            "key": key,
+            "field": field,
+            "value": raw,
+            "lost": doc(&lost),
+            "lost_total": lost.len(),
+            "gained": doc(&gained),
+            "gained_total": gained.len(),
+        }),
+        label,
+    );
+    if let Some(t) = edge_type {
+        report["edge_type"] = json!(t);
+    }
+
+    if let Some(t) = edge_type {
+        return ok(json_out, &report, |_| {
+            render_what_if_keys_only(key, field, raw, t, &lost, &gained, limit)
+        });
+    }
+    let lost_groups = what_if_groups(&lost, key);
+    let gained_groups = what_if_groups(&gained, key);
     ok(json_out, &report, |_| {
-        render_what_if(
-            key,
-            field,
-            raw,
-            wi.lost.len(),
-            wi.gained.len(),
-            &lost_groups,
-            &gained_groups,
-        )
+        render_what_if(key, field, raw, &lost_groups, &gained_groups, limit)
     })
 }
 
@@ -1918,7 +2584,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "node_edges",
-            "description": "What is K related to — every relationship of one node, grouped by edge type with a count, each listed edge carrying its direction, the rule that derived it, its score and the predicate it matched on. Answers 'why is this here' in the same call that lists it, so no follow-up explain is needed.",
+            "description": "What is K related to — every relationship of one node, grouped by edge type with a count, each listed edge carrying its direction, the rule that derived it, its score and the predicate it matched on. Answers 'why is this here' in the same call that lists it, so no follow-up explain is needed. Which partners are linked by all of these types? pass all_of and the reply is just their keys; pass one edge_type for that type's partner keys with the rule named once. label narrows partners.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1926,13 +2592,29 @@ fn task_tool_schemas() -> Vec<Js> {
                     "edge_type": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "List only edges of this type. Omit for every type."
+                        "description": "Only this type: the reply is that type's partner keys, compactly. Omit for the grouped listing over every type."
+                    },
+                    "all_of": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Only the partners linked by EVERY one of these types — the intersection, as keys."
+                    },
+                    "label": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Only partners carrying this node label, counts included."
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["out", "in", "any"],
+                        "description": "Which edges count (default any)."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 100,
-                        "description": "Edges listed per edge type (default 10). The rest are counted as '… and N more'."
+                        "maximum": 2000,
+                        "description": "Edges listed per edge type (default 10), or partner keys listed under edge_type/all_of (default 200, max 2000). The rest are counted as '… and N more'."
                     }
                 },
                 "required": ["key"]
@@ -1972,7 +2654,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "edges_at",
-            "description": "What did K's relationships look like at commit C — the edges that were live at one point in the store's history, with the rule that had derived each. `at` is a 0-based WAL commit index; use node_history or edge_history first to find the commit you want, then read this instead of replaying either by hand.",
+            "description": "What did K's relationships look like at commit C — the edges that were live at one point in the store's history, with the rule that had derived each. `at` is a 0-based WAL commit index; use node_history or edge_history first to find the commit you want, then read this instead of replaying either by hand. Which partners were linked by all of these types on that day? pass all_of and the reply is just their keys; pass one edge_type for that type's partner keys with the rule named once. label narrows partners.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1982,11 +2664,32 @@ fn task_tool_schemas() -> Vec<Js> {
                         "minimum": 0,
                         "description": "0-based WAL commit index to read the edges at."
                     },
+                    "edge_type": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Only this type: the reply is that type's partner keys, compactly. Omit for the grouped listing over every type."
+                    },
+                    "all_of": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Only the partners linked by EVERY one of these types at that commit — the intersection, as keys."
+                    },
+                    "label": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Only partners carrying this node label, counts included."
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["out", "in", "any"],
+                        "description": "Which edges count (default any)."
+                    },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 100,
-                        "description": "Edges listed per edge type (default 10). The rest are counted as '… and N more'."
+                        "maximum": 2000,
+                        "description": "Edges listed per edge type (default 10, max 100), or partner keys listed under edge_type/all_of (default 200, max 2000). The rest are counted as '… and N more'."
                     }
                 },
                 "required": ["key", "at"]
@@ -1994,7 +2697,7 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "what_if",
-            "description": "What changes if K's FIELD became VALUE — the relationships lost and gained, with the rule behind each. Does not change the store: nothing is written, nothing on disk is copied, and the live graph answers the same way before and after the call.",
+            "description": "What changes if K's FIELD became VALUE — the relationships lost and gained, with the rule behind each. Does not change the store: nothing is written, nothing on disk is copied, and the live graph answers the same way before and after the call. Which partners of one type would it cost? pass edge_type and the lost and gained lists are just their keys, with the rule named once. label narrows partners.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2002,6 +2705,22 @@ fn task_tool_schemas() -> Vec<Js> {
                     "field": { "type": "string", "minLength": 1, "description": "Property name to set." },
                     "value": {
                         "description": "The value it would take: a string, number, boolean, or a list or map of those. Not null."
+                    },
+                    "edge_type": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Only this type, counts included: the reply is the partner keys lost and gained, compactly."
+                    },
+                    "label": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Only partners carrying this node label, counts included."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 2000,
+                        "description": "Edges (or partner keys) listed per side (default 10). The rest are counted as '… and N more'."
                     }
                 },
                 "required": ["key", "field", "value"]
