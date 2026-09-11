@@ -25,7 +25,7 @@
 //! Sharing `map`'s ranking is the point: two tools that disagreed about which
 //! files matter would each be wrong half the time.
 
-use crate::db::GraphDb;
+use crate::db::{EdgeTypeCensus, GraphDb};
 use crate::repograph::facts::str_prop;
 use crate::repograph::map::{file_pagerank, SYNC_KEY};
 use crate::repograph::render::{basename, dir_components, sanitize, top_tokens};
@@ -111,9 +111,13 @@ pub struct LabelBrief {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EdgeTypeBrief {
     pub edge_type: String,
-    /// The rule that derives it, when any of its edges is derived. `None` for
-    /// an edge type written by hand.
+    /// The first rule that declares it, sorted. `None` for an edge type
+    /// written by hand.
     pub rule: Option<String>,
+    /// How many further rules also derive it — two rules deriving one type is
+    /// normal, and naming one while implying it is the only one would be a
+    /// half-truth.
+    pub hidden_rules: usize,
     /// The labels seen on each end, sorted, cut at [`MAX_END_LABELS`].
     pub src: Vec<String>,
     pub dst: Vec<String>,
@@ -148,8 +152,11 @@ pub struct SchemaBrief {
     pub labels: Vec<LabelBrief>,
     /// Edge types, most numerous first, ties on the name.
     pub edge_types: Vec<EdgeTypeBrief>,
-    /// Commits the store has replayed — the upper end of what `edges_at`,
-    /// `node_history` and `was_linked` can be asked about.
+    /// How many commits of history are still reachable — `total` above the
+    /// horizon floor. A *count*, not an index: the newest commit `edges_at`,
+    /// `node_history` and `was_linked` accept is one below it, which is what
+    /// the `as of` recipe names. Zero on a store whose WAL was truncated and
+    /// whose archives are gone, and then there is no `as of` recipe at all.
     pub commits: u64,
     /// `(role name, the labels it may see)`, sorted by name.
     pub roles: Vec<(String, Vec<String>)>,
@@ -281,56 +288,43 @@ pub fn brief<F: Fs>(db: &GraphDb<F>, opts: &BriefOptions) -> BriefReport {
 
 /// What a memory store is, in two passes and no more.
 ///
-/// # Why two passes and not one per edge
+/// # Why neither pass is per edge
 ///
-/// The counts here are per *edge type*, and the cheap way to get them wrong is
-/// to ask the store about each edge in turn — `explain` per edge is a rule
-/// evaluation per edge, and a store with ten thousand edges would spend the
-/// whole `SessionStart` budget describing itself. [`GraphDb::all_edges_for_export`]
-/// already resolves the rule provenance for every edge in one sweep, so the
-/// rule names, the end labels and the counts all fall out of a single walk.
-/// Nodes are the same: one walk gives every label its count and the union of
-/// its property names.
+/// The counts here are per *label* and per *edge type*, and there are two ways
+/// to get them expensively. One is to ask the store about each edge in turn —
+/// `explain` per edge is a rule evaluation per edge. The other is to
+/// materialise every edge first: [`GraphDb::all_edges_for_export`] gives the
+/// rule names, the ends and the counts in one sweep, but it pays three
+/// `String`s and a provenance entry per edge to do it, which on the 1.3 M-edge
+/// association store is seven seconds and hundreds of megabytes spent to print
+/// nine lines.
 ///
-/// Both sweeps come back sorted by key, so the first key seen under a label —
-/// and the first edge seen under a type — is the same one on every run, which
-/// is what makes the worked calls byte-stable.
+/// So edges go through [`GraphDb::edge_type_census`], which walks the topology
+/// and sums neighbour slice lengths without building a record per edge, and
+/// nodes through [`GraphDb::all_nodes_for_export`], which is one record per
+/// node — on a memory store there are thousands of those, not millions.
+///
+/// Both come back sorted, and the census's sample edge is the first of its
+/// type in the store's own id order, so the worked calls name the same keys on
+/// every run.
 fn memory_schema<F: Fs>(db: &GraphDb<F>) -> SchemaBrief {
     let nodes = db.all_nodes_for_export();
 
     // Pass one: label → how many nodes, and every property name any of them
     // has. `props` is a `BTreeMap`, so the union arrives sorted.
     let mut by_label: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
-    let mut label_of: BTreeMap<&str, &str> = BTreeMap::new();
     for n in &nodes {
         let entry = by_label.entry(n.label.clone()).or_default();
         entry.0 += 1;
         entry.1.extend(n.props.keys().cloned());
-        label_of.insert(n.key.as_str(), n.label.as_str());
     }
 
-    // Pass two: edge type → the rule that derives it, the labels on each end,
-    // how many, and the first pair in the store's own sort order.
-    let mut by_type: BTreeMap<String, EdgeAgg> = BTreeMap::new();
-    for e in db.all_edges_for_export() {
-        let agg = by_type.entry(e.edge_type.clone()).or_default();
-        agg.edges += 1;
-        if agg.rule.is_none() {
-            agg.rule.clone_from(&e.rule);
-        }
-        if let Some(l) = label_of.get(e.src.as_str()) {
-            agg.src.insert((*l).to_string());
-        }
-        if let Some(l) = label_of.get(e.dst.as_str()) {
-            agg.dst.insert((*l).to_string());
-        }
-        if agg.first.is_none() {
-            agg.first = Some((e.src.clone(), e.dst.clone()));
-        }
-        if agg.derived_first.is_none() && e.derived {
-            agg.derived_first = Some((e.src, e.dst));
-        }
-    }
+    // Pass two: the per-type census, keyed for the recipes to read back.
+    let by_type: BTreeMap<String, EdgeTypeCensus> = db
+        .edge_type_census()
+        .into_iter()
+        .map(|c| (c.edge_type.clone(), c))
+        .collect();
 
     let mut labels: Vec<LabelBrief> = by_label
         .iter()
@@ -348,13 +342,14 @@ fn memory_schema<F: Fs>(db: &GraphDb<F>) -> SchemaBrief {
     labels.sort_by(|a, b| b.nodes.cmp(&a.nodes).then(a.label.cmp(&b.label)));
 
     let mut edge_types: Vec<EdgeTypeBrief> = by_type
-        .iter()
-        .map(|(edge_type, agg)| EdgeTypeBrief {
-            edge_type: sanitize(edge_type),
-            rule: agg.rule.as_deref().map(sanitize),
-            src: ends(&agg.src),
-            dst: ends(&agg.dst),
-            edges: agg.edges,
+        .values()
+        .map(|c| EdgeTypeBrief {
+            edge_type: sanitize(&c.edge_type),
+            rule: c.rules.first().map(|r| sanitize(r)),
+            hidden_rules: c.rules.len().saturating_sub(1),
+            src: ends(&c.src_labels),
+            dst: ends(&c.dst_labels),
+            edges: usize::try_from(c.edges).unwrap_or(usize::MAX),
         })
         .collect();
     edge_types.sort_by(|a, b| b.edges.cmp(&a.edges).then(a.edge_type.cmp(&b.edge_type)));
@@ -387,7 +382,27 @@ fn memory_schema<F: Fs>(db: &GraphDb<F>) -> SchemaBrief {
         }
     }
 
-    let commits = db.commit_seq();
+    // Two different numbers, and the difference is the whole point. The
+    // history line reports how many commits the store has replayed, which is
+    // what a reader wants to know about its depth. The `edges_at` recipe needs
+    // an *index*, and `wal_total_commits` is the only thing that knows the top
+    // of that range — `commit_seq` counts replayed frames and is seeded from
+    // the snapshot's sequence numbers, so it is neither the count nor the
+    // index on a store that has ever been snapshotted.
+    //
+    // `wal_total_commits` re-reads the WAL, which is not free; it is bought
+    // once here rather than paid for by a session that copies a broken call.
+    // `edges_at` itself pays the same scan, so a brief that can afford to name
+    // the call can afford to have checked it.
+    // A WAL-truncating snapshot that has outlived its archives leaves a store
+    // with no reachable history at all: `floor == total`, an empty range, and
+    // every commit index out of it. There is no `as of` call to show, so the
+    // brief shows none — a recipe that cannot answer is worse than a missing
+    // one, since the session that copies it learns the tool is broken.
+    let floor = db.wal_horizon_floor();
+    let total = db.wal_total_commits().unwrap_or(floor);
+    let commits = total.saturating_sub(floor);
+    let latest_commit = (total > floor).then(|| total - 1);
     let recipes = recipes(
         &nodes,
         &by_type,
@@ -395,7 +410,7 @@ fn memory_schema<F: Fs>(db: &GraphDb<F>) -> SchemaBrief {
         &edge_types,
         &roles,
         &rule_fields,
-        commits,
+        latest_commit,
     );
 
     SchemaBrief {
@@ -406,20 +421,6 @@ fn memory_schema<F: Fs>(db: &GraphDb<F>) -> SchemaBrief {
         roles,
         recipes,
     }
-}
-
-/// What one edge type's edges add up to, built during the single sweep.
-#[derive(Default)]
-struct EdgeAgg {
-    rule: Option<String>,
-    src: BTreeSet<String>,
-    dst: BTreeSet<String>,
-    edges: usize,
-    /// The first `(src, dst)` in the sweep's `(type, src, dst)` order.
-    first: Option<(String, String)>,
-    /// The first pair a rule derived — the pair `explain_association` has
-    /// something to say about.
-    derived_first: Option<(String, String)>,
 }
 
 /// Every property name a predicate reads, its branches included.
@@ -443,7 +444,7 @@ fn predicate_fields(p: &core_rules::Predicate, out: &mut BTreeSet<String>) {
 }
 
 /// The labels on one end of an edge type, cut at [`MAX_END_LABELS`].
-fn ends(labels: &BTreeSet<String>) -> Vec<String> {
+fn ends(labels: &[String]) -> Vec<String> {
     labels
         .iter()
         .take(MAX_END_LABELS)
@@ -455,35 +456,38 @@ fn ends(labels: &BTreeSet<String>) -> Vec<String> {
 ///
 /// Every placeholder the store can fill is filled: a pair a rule actually
 /// derived for `explain_association`, a key that has edges for `node_edges`,
-/// the latest commit for `edges_at`, a property that key really carries for
+/// a commit `edges_at` accepts, a property that key really carries for
 /// `what_if`, a role out of `roles.json`, and the store's own labels and edge
 /// type in the counting template. What the store cannot supply — the *new*
 /// value in a `what_if` — stays an angle-bracketed placeholder rather than an
 /// invention.
+///
+/// # The commit is a commit, not a count
+///
+/// `history: N commits` counts; `edges_at`'s `at` is a zero-based WAL index
+/// whose range is `wal_horizon_floor..total_commits`. Substituting the count
+/// names one past the end, and the worked example answers `CommitOutOfRange`
+/// on every store there has ever been — the worst thing a recipe can do, since
+/// a session that copies it learns the tool is broken. So the recipe gets
+/// `latest_commit`, the newest index the store will accept.
 fn recipes(
     nodes: &[crate::db::NodeInfo],
-    by_type: &BTreeMap<String, EdgeAgg>,
+    by_type: &BTreeMap<String, EdgeTypeCensus>,
     labels: &[LabelBrief],
     edge_types: &[EdgeTypeBrief],
     roles: &[(String, Vec<String>)],
     rule_fields: &BTreeMap<String, BTreeSet<String>>,
-    commits: u64,
+    latest_commit: Option<u64>,
 ) -> Vec<Recipe> {
-    // The pair to explain: prefer one a rule derived, since that is the pair
-    // `explain_association` can name a predicate for. `edge_types` is already
-    // sorted most-numerous-first, so this is the busiest such type.
+    // The pair to explain: prefer a type some rule derives, since that is the
+    // pair `explain_association` can name a predicate for. `edge_types` is
+    // already sorted most-numerous-first, so this is the busiest such type.
+    let sample_of = |t: &EdgeTypeBrief| by_type.get(&t.edge_type).and_then(|c| c.sample.clone());
     let pair = edge_types
         .iter()
-        .find_map(|t| {
-            by_type
-                .get(&t.edge_type)
-                .and_then(|a| a.derived_first.clone())
-        })
-        .or_else(|| {
-            edge_types
-                .iter()
-                .find_map(|t| by_type.get(&t.edge_type).and_then(|a| a.first.clone()))
-        });
+        .filter(|t| t.rule.is_some())
+        .find_map(sample_of)
+        .or_else(|| edge_types.iter().find_map(sample_of));
     let (a, b) = match &pair {
         Some((a, b)) => (sanitize(a), sanitize(b)),
         None => ("<a>".to_string(), "<b>".to_string()),
@@ -538,7 +542,7 @@ fn recipes(
         },
     );
 
-    vec![
+    let mut out = vec![
         Recipe {
             question: "why".to_string(),
             call: format!("explain_association {a} {b}"),
@@ -547,10 +551,14 @@ fn recipes(
             question: "relationships".to_string(),
             call: format!("node_edges {key}"),
         },
-        Recipe {
+    ];
+    if let Some(at) = latest_commit {
+        out.push(Recipe {
             question: "as of".to_string(),
-            call: format!("edges_at {key} {commits}"),
-        },
+            call: format!("edges_at {key} {at}"),
+        });
+    }
+    out.extend([
         Recipe {
             question: "what if".to_string(),
             call: format!("what_if {key} {field} <value>"),
@@ -568,7 +576,8 @@ fn recipes(
                  WHERE n >= {HOW_MANY_MIN} RETURN b.key, n"
             ),
         },
-    ]
+    ]);
+    out
 }
 
 /// Every file the graph records a [`DEPENDENCY_EDGES`] edge for, in either

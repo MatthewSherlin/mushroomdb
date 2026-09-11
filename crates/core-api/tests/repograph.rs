@@ -966,7 +966,11 @@ fn brief_on_a_memory_store_works_one_call_per_question_kind() {
         vec![
             ("why", "explain_association person:ada project:apollo"),
             ("relationships", "node_edges person:ada"),
-            ("as of", &*format!("edges_at person:ada {}", s.commits),),
+            // The newest commit `edges_at` accepts, which is one below the
+            // count on a store nothing has pruned — the off-by-one that made
+            // this recipe `CommitOutOfRange` is pinned by
+            // `the_as_of_recipe_names_a_commit_edges_at_accepts`.
+            ("as of", &*format!("edges_at person:ada {}", s.commits - 1),),
             // `project_id`, not `name`: the field the `assigned_to` rule
             // reads, so the call shown is one that would really lose and gain
             // an edge. Only the new value stays a placeholder.
@@ -997,6 +1001,183 @@ fn brief_on_a_memory_store_works_one_call_per_question_kind() {
     assert!(
         text.contains("edges_at ") && text.contains("what_if "),
         "{text}"
+    );
+}
+
+/// Binding: the `as of` recipe is a call that *works*, not a line that reads
+/// like one — the commit it names is inside `edges_at`'s accepted range.
+///
+/// `history: N commits` counts commits; `edges_at`'s `at` is a zero-based WAL
+/// index whose valid range is `wal_horizon_floor..total_commits`. The count
+/// and the last index are off by one, so substituting the count produced a
+/// worked example that answered `CommitOutOfRange` on every store there has
+/// ever been — the one failure mode a recipe must not have, since a session
+/// that copies it learns the tool is broken and goes back to probing Cypher.
+///
+/// So the test does not read the recipe: it *runs* it. The commit argument is
+/// parsed back out of the rendered brief — the bytes a session actually sees —
+/// and handed to the engine.
+#[test]
+fn the_as_of_recipe_names_a_commit_edges_at_accepts() {
+    let db = seeded_memory_store("brief-memory-as-of");
+    let text = render_brief(&brief(&db, &BriefOptions::default()), "query '<cypher>'");
+
+    let line = text
+        .lines()
+        .find_map(|l| l.strip_prefix("  as of: edges_at "))
+        .expect("the brief prints an `as of` recipe");
+    let (key, at) = line.split_once(' ').expect("edges_at <key> <commit>");
+    let at: u64 = at.parse().expect("the commit argument is a number");
+
+    let edges = db
+        .edges_at(key, at)
+        .unwrap_or_else(|e| panic!("the brief's own worked call must answer: {e}"));
+    assert!(
+        !edges.is_empty(),
+        "the recipe names a key with edges at that commit, or it teaches nothing"
+    );
+
+    // And it is the *latest* commit: one past it is out of range, which is
+    // what pins the off-by-one rather than merely stepping back far enough to
+    // stop failing.
+    assert!(
+        db.edges_at(key, at + 1).is_err(),
+        "the recipe must name the newest commit edges_at accepts, got {at}"
+    );
+}
+
+/// Binding: a store whose history is gone prints no `as of` recipe at all.
+///
+/// A WAL-truncating snapshot leaves `wal_horizon_floor == total_commits` — an
+/// empty range, in which *every* commit index is out of range. Measured on the
+/// association store: `mushroomdb snapshot --truncate` takes the brief from 95
+/// s to 0.66 s, so this is the shape a large store will actually be in, not a
+/// corner. The five remaining calls still work; a sixth that could not would
+/// teach the session the tool is broken.
+#[test]
+fn a_store_with_no_reachable_history_shows_no_as_of_recipe() {
+    let mut db = seeded_memory_store("brief-memory-truncated");
+    db.snapshot().expect("fold the WAL into a snapshot");
+
+    let b = brief(&db, &BriefOptions::default());
+    let s = b.schema.as_ref().expect("still a memory store");
+    let questions: Vec<&str> = s.recipes.iter().map(|r| r.question.as_str()).collect();
+
+    // The schema itself is untouched — truncation costs history, not shape.
+    assert!(!s.labels.is_empty() && !s.edge_types.is_empty());
+
+    let text = render_brief(&b, "query '<cypher>'");
+    if s.commits == 0 {
+        assert!(
+            !questions.contains(&"as of"),
+            "no history means no `as of` call to show: {questions:?}"
+        );
+        assert!(!text.contains("edges_at "), "{text}");
+        assert!(text.contains("history: 0 commits"), "{text}");
+    } else {
+        // Archives survived, so history did: then the recipe must still be
+        // callable, which is the same invariant the test above pins.
+        let line = text
+            .lines()
+            .find_map(|l| l.strip_prefix("  as of: edges_at "))
+            .expect("history means an `as of` recipe");
+        let (key, at) = line.split_once(' ').expect("edges_at <key> <commit>");
+        let at: u64 = at.parse().expect("a commit number");
+        db.edges_at(key, at)
+            .unwrap_or_else(|e| panic!("the brief's own worked call must answer: {e}"));
+    }
+    // Whatever happened to the history, the other five calls are still there.
+    for question in ["why", "relationships", "what if", "who may see", "how many"] {
+        assert!(
+            questions.contains(&question),
+            "{question:?} does not depend on history: {questions:?}"
+        );
+    }
+}
+
+/// Timing probe for the memory-store brief on a real store. Ignored by
+/// default; point `MUSHROOMDB_BENCH_STORE` at a store directory and run with
+/// `--ignored`, the same contract `tests/edges_at.rs` uses.
+///
+/// The number that matters is the *delta* over opening the store, which every
+/// hook pays whatever it then asks. `brief` was walking every edge through
+/// `all_edges_for_export` — three `String`s and a provenance entry apiece —
+/// which on the association store's 1.29 M derived edges cost seven seconds in
+/// debug on top of the open. `edge_type_census` replaced that walk; this
+/// reports what the replacement costs, so a regression has a number to fail
+/// against rather than a feeling.
+#[test]
+#[ignore]
+fn memory_brief_bench_on_large_store() {
+    let Ok(path) = std::env::var("MUSHROOMDB_BENCH_STORE") else {
+        eprintln!("MUSHROOMDB_BENCH_STORE unset — skipping");
+        return;
+    };
+
+    let t0 = std::time::Instant::now();
+    let db = core_api::GraphDb::open_with_options(
+        std::path::Path::new(&path),
+        core_api::OpenOptions {
+            auto_migrate: false,
+            repair_wal: false,
+            read_only: true,
+        },
+    )
+    .expect("open the bench store read-only");
+    let opened = t0.elapsed();
+    eprintln!("open (read-only):      {opened:?}");
+
+    let t1 = std::time::Instant::now();
+    let census = db.edge_type_census();
+    let census_took = t1.elapsed();
+    eprintln!("edge_type_census:      {census_took:?}");
+
+    let t2 = std::time::Instant::now();
+    let total = db.wal_total_commits().expect("wal commits");
+    eprintln!("wal_total_commits:     {:?}", t2.elapsed());
+
+    let t3 = std::time::Instant::now();
+    let b = brief(&db, &BriefOptions::default());
+    let built = t3.elapsed();
+    eprintln!("brief (whole):         {built:?}");
+
+    let text = render_brief(&b, "query '<cypher>'");
+    let s = b
+        .schema
+        .as_ref()
+        .expect("the bench store is a memory store");
+    eprintln!(
+        "{} nodes, {} labels, {} edge types, {} edges, {total} wal commits, brief {} B",
+        s.nodes,
+        s.labels.len(),
+        census.len(),
+        b.edges,
+        text.len()
+    );
+    assert!(text.len() <= core_api::repograph::MAX_BRIEF_BYTES);
+    // Two budgets, because the brief's time is spent on two different things.
+    //
+    // The census is what this change owns — the walk that used to be
+    // `all_edges_for_export` — and on 1.29 M edges it is a tenth of a second
+    // in debug. That is the number a regression would blow, so it gets the
+    // tight budget.
+    //
+    // The rest is `wal_total_commits`, which re-reads the WAL to learn the
+    // commit the `as of` recipe may name. On this store — 166 MiB of WAL and
+    // no snapshot — that is ~2.3 s, and it is also why opening the store costs
+    // ninety. On a store anyone has ever snapshotted the WAL is empty and the
+    // scan is free: `mushroomdb snapshot --truncate` takes the whole
+    // `mushroomdb brief` on this store from 95 s to 0.7 s. So the whole-brief
+    // budget is the hook's five seconds, measured in debug, which is three to
+    // five times slower than the binary the hook runs.
+    assert!(
+        census_took < std::time::Duration::from_secs(1),
+        "the edge-type census took {census_took:?} on {} edges",
+        b.edges
+    );
+    assert!(
+        built < std::time::Duration::from_secs(5),
+        "describing the store took {built:?} (open was {opened:?})"
     );
 }
 

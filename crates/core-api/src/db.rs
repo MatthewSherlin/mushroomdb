@@ -592,6 +592,28 @@ pub struct ExportEdge {
     pub weight: Option<f64>,
 }
 
+/// One edge type's shape, as [`GraphDb::edge_type_census`] counts it.
+///
+/// Deliberately per *type* and not per edge: everything here is a summary a
+/// caller can print in one line, and none of it costs a record per edge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeTypeCensus {
+    pub edge_type: String,
+    /// Directed edges of this type. Counted the way
+    /// [`GraphDb::edge_count`] counts: each edge once, from its source.
+    pub edges: u64,
+    /// Every label seen on a source of this type, sorted.
+    pub src_labels: Vec<String>,
+    /// Every label seen on a destination of this type, sorted.
+    pub dst_labels: Vec<String>,
+    /// The rules that declare this `edge_type`, sorted. Empty for a type
+    /// written by hand.
+    pub rules: Vec<String>,
+    /// `(src key, dst key)` of the first edge of this type in the store's own
+    /// id order — a real pair to quote in an example.
+    pub sample: Option<(String, String)>,
+}
+
 /// Construct the standard write-query result set (columns: created, properties_set, deleted).
 fn write_result_set() -> ResultSet {
     ResultSet::new(vec![
@@ -7402,6 +7424,107 @@ impl<F: Fs> GraphDb<F> {
                 .then(a.dst.cmp(&b.dst))
         });
         edges
+    }
+
+    /// What each edge type *is*, without building one record per edge.
+    ///
+    /// [`all_edges_for_export`](Self::all_edges_for_export) answers the same
+    /// question by materialising every edge — three `String`s apiece, a
+    /// provenance `HashMap` over every derived edge, and a final sort. That is
+    /// the right shape for an export, and the wrong one for a summary: on a
+    /// store with 1.3 M derived edges it allocates hundreds of megabytes to
+    /// produce nine lines. This walks the topology instead, summing neighbour
+    /// slice lengths and collecting *label symbols* rather than label strings,
+    /// so the per-edge cost is an integer add and a set insert on a set with
+    /// as many members as the store has labels.
+    ///
+    /// The rule names come off the rule *definitions*, which each declare the
+    /// `edge_type` they derive, so naming them costs one pass over the rules
+    /// rather than one provenance lookup per edge. That is also why `rules`
+    /// is a list: two rules may derive the same type — the association store
+    /// derives `INDUSTRY_ALIGNMENT` from both a talent→company and a
+    /// talent→job rule — and naming only one of them would be a half-truth.
+    /// A type with no rules is one written by hand.
+    ///
+    /// `sample` is the first edge of the type in the store's own id order,
+    /// which is insertion order: deterministic for a given store, and not the
+    /// same as key order, which cannot be had without resolving a key per
+    /// edge. Sorted by `edge_type`.
+    pub fn edge_type_census(&self) -> Vec<EdgeTypeCensus> {
+        self.ensure_v8_base_sections_loaded();
+
+        let mut rules_by_type: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for r in self.engine.rules() {
+            rules_by_type
+                .entry(r.edge_type.as_str())
+                .or_default()
+                .insert(r.name.as_str());
+        }
+
+        let tv = self.topo_view();
+        let node_count = self.ids.len() as u32;
+        let mut out = Vec::new();
+        for etype_sym in tv.etypes() {
+            // An etype the interner cannot resolve means a corrupt TOPOLOGY
+            // section; skip it rather than name it, as `all_edges_for_export`
+            // does for the same reason.
+            let Some(edge_type) = self.syms.resolve(etype_sym) else {
+                continue;
+            };
+            let mut edges: u64 = 0;
+            let mut src_syms: BTreeSet<u32> = BTreeSet::new();
+            let mut dst_syms: BTreeSet<u32> = BTreeSet::new();
+            let mut sample: Option<(u32, u32)> = None;
+            for id in 0..node_count {
+                let Some(&lsym) = self.labels.get(id as usize) else {
+                    continue;
+                };
+                if lsym == u32::MAX {
+                    continue; // tombstoned
+                }
+                let nbrs = tv.neighbors(etype_sym, Direction::Out, id);
+                let nbrs = nbrs.as_ref();
+                if nbrs.is_empty() {
+                    continue;
+                }
+                edges += nbrs.len() as u64;
+                src_syms.insert(lsym);
+                for &nbr in nbrs {
+                    if let Some(&dsym) = self.labels.get(nbr as usize) {
+                        if dsym != u32::MAX {
+                            dst_syms.insert(dsym);
+                        }
+                    }
+                }
+                if sample.is_none() {
+                    sample = Some((id, nbrs[0]));
+                }
+            }
+            let resolve = |syms: &BTreeSet<u32>| -> Vec<String> {
+                syms.iter()
+                    .filter_map(|&s| self.syms.resolve(s))
+                    .map(ToString::to_string)
+                    .collect()
+            };
+            out.push(EdgeTypeCensus {
+                edge_type: edge_type.to_string(),
+                edges,
+                src_labels: resolve(&src_syms),
+                dst_labels: resolve(&dst_syms),
+                rules: rules_by_type
+                    .get(edge_type)
+                    .map(|rs| rs.iter().map(ToString::to_string).collect())
+                    .unwrap_or_default(),
+                sample: sample.and_then(|(s, d)| {
+                    Some((
+                        self.ids.key_of(s)?.to_string(),
+                        self.ids.key_of(d)?.to_string(),
+                    ))
+                }),
+            });
+        }
+        out.sort_by(|a, b| a.edge_type.cmp(&b.edge_type));
+        out
     }
 
     /// All directed edges of `edge_type`, with the raw value of `weight_prop`

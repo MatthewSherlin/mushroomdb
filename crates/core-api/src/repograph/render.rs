@@ -571,6 +571,9 @@ fn render_memory_brief(b: &BriefReport, s: &SchemaBrief, budget: usize) -> Strin
             let mut line = format!("  {} ({})", sanitize(&t.edge_type), thousands(t.edges));
             if let Some(rule) = &t.rule {
                 let _ = write!(line, " — rule {}", sanitize(rule));
+                if t.hidden_rules > 0 {
+                    let _ = write!(line, " +{}", t.hidden_rules);
+                }
             }
             let _ = writeln!(line, " — {} → {}", ends(&t.src), ends(&t.dst));
             line
