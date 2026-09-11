@@ -18,7 +18,7 @@ fn node_history_insert_prop_edge_sequence() {
     db.remove_prop("a", "color").unwrap();
     db.delete_edge("Knows", "a", "b").unwrap();
 
-    let history_a = db.node_history("a").unwrap();
+    let history_a = db.node_history("a").unwrap().items;
 
     // Exactly 5 entries in strict commit order.
     assert_eq!(history_a.len(), 5, "history_a: {history_a:?}");
@@ -63,7 +63,7 @@ fn node_history_insert_prop_edge_sequence() {
     );
 
     // history("b") sees NodeInserted + EdgeAdded{outgoing:false} + EdgeRemoved{outgoing:false}
-    let history_b = db.node_history("b").unwrap();
+    let history_b = db.node_history("b").unwrap().items;
     assert_eq!(history_b.len(), 3, "history_b: {history_b:?}");
 
     // Commits are strictly increasing for b too.
@@ -103,7 +103,7 @@ fn node_history_delete_node() {
     db.insert_node("Thing", "x", vec![]).unwrap();
     db.delete_node("x").unwrap();
 
-    let history = db.node_history("x").unwrap();
+    let history = db.node_history("x").unwrap().items;
 
     // NodeInserted then NodeDeleted; no props set here, kept minimal on purpose.
     // See node_history_delete_node_keeps_prop_set_events for dense-id (SetPropId)
@@ -141,7 +141,7 @@ fn node_history_delete_node_keeps_prop_set_events() {
     db.set_prop("x", "count", Value::Int(2)).unwrap();
     db.delete_node("x").unwrap();
 
-    let history = db.node_history("x").unwrap();
+    let history = db.node_history("x").unwrap().items;
 
     assert_eq!(history.len(), 4, "history: {history:?}");
 
@@ -191,7 +191,7 @@ fn node_history_delete_node_keeps_edge_added_event() {
     db.insert_edge("Knows", "a", "b").unwrap();
     db.delete_node("a").unwrap();
 
-    let history = db.node_history("a").unwrap();
+    let history = db.node_history("a").unwrap().items;
 
     assert_eq!(history.len(), 3, "history: {history:?}");
     assert!(
@@ -227,7 +227,7 @@ fn node_history_horizon_after_snapshot() {
     // Post-snapshot mutation — the only thing in the new WAL.
     db.set_prop("a", "v", Value::Int(2)).unwrap();
 
-    let history = db.node_history("a").unwrap();
+    let history = db.node_history("a").unwrap().items;
 
     // Only the post-snapshot PropSet should appear — pre-snapshot history is beyond the horizon.
     assert_eq!(history.len(), 1, "history after snapshot: {history:?}");
@@ -244,7 +244,7 @@ fn node_history_unknown_key_returns_empty() {
     let dir = tmp("empty");
     let mut db = GraphDb::open(&dir).unwrap();
     db.insert_node("X", "exists", vec![]).unwrap();
-    let history = db.node_history("no_such_key").unwrap();
+    let history = db.node_history("no_such_key").unwrap().items;
     assert!(history.is_empty());
 }
 
@@ -372,6 +372,7 @@ fn was_linked_commit_out_of_range_errors() {
         Err(GraphError::CommitOutOfRange {
             commit: 3,
             total: 3,
+            floor: 0,
         }) => {}
         other => panic!("expected CommitOutOfRange{{3,3}}, got {other:?}"),
     }
@@ -380,6 +381,7 @@ fn was_linked_commit_out_of_range_errors() {
         Err(GraphError::CommitOutOfRange {
             commit: 999,
             total: 3,
+            floor: 0,
         }) => {}
         other => panic!("expected CommitOutOfRange{{999,3}}, got {other:?}"),
     }
@@ -394,6 +396,7 @@ fn was_linked_empty_wal_always_out_of_range() {
         Err(GraphError::CommitOutOfRange {
             commit: 0,
             total: 0,
+            floor: 0,
         }) => {}
         other => panic!("expected CommitOutOfRange{{0,0}} for empty WAL, got {other:?}"),
     }

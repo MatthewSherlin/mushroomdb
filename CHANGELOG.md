@@ -1,5 +1,132 @@
 # Changelog
 
+## v0.6.5 — the knowledge-base release
+
+A team running mushroomdb as a sidecar graph beside a document knowledge base wrote down what
+stopped it becoming the primary store, and this release is that list, fixed. History expired
+silently — automatic snapshots kept the newest eight WAL archives, and past that horizon a history
+read answered as if nothing had happened. A snapshot cost roughly nine times the data it held,
+because every string column carried its own copy of the string table. The two things the product
+sells — time travel and per-caller visibility — refused to compose. Durability was self-managed,
+with no page telling an operator what to mount or how to restore. And the 0.5.x data-loss bug
+class — via-hop rules retracting all their edges after a snapshot — was still covered by
+dogfooding rather than by a test. Each item is small, each has its own test, and every number
+below comes from a test this release commits. There is no benchmark gate: nothing here is a claim
+about agent performance.
+
+#### BREAKING
+
+- **Snapshot format V9 — one shared string table.** A snapshot carries the string table once, in a
+  new section, instead of a full copy inside every string column. Measured by
+  `snapshot_size_is_near_the_property_payload` (12,000 nodes × 8 string fields, 3.7 MB of property
+  bytes): **36.8 MB → 5.2 MB** on disk, 9.82× the payload down to 1.39× (the 36.8 MB / 9.82× "before"
+  figure is a pre-change measurement recorded beside the test, taken against the old per-column
+  layout the V8 encoder wrote; the 5.2 MB / 1.39× "after" figure is what the committed test asserts,
+  as `size < payload * 2`). Upgrading is automatic and
+  in place — the first read-write open of a V5–V8 store rewrites its snapshot at V9 and keeps the
+  old one as `snapshot.bin.bak` until the next clean open. **A store snapshotted by 0.6.5 cannot be
+  opened by 0.6.4 or earlier**: an older binary refuses it with `snapshot: unsupported version 9`
+  rather than reading it wrongly. The `.bak` is the only way back, so take a backup before
+  upgrading a store you may need to downgrade.
+- **`GraphError::CommitOutOfRange` gains `floor`.** The error names the range it will actually
+  accept (`floor..total`) instead of claiming `0..total` on a store whose early commits have been
+  pruned, and appends `— events before commit {floor} are not retained` when the floor is above
+  zero. Rust callers matching the variant exhaustively add `floor` or `..`.
+- **`GraphDb::node_history` returns `HistoryResult`**, matching `edge_history`:
+  `{ items, total_commits, horizon }` instead of a bare `Vec`. `edge_history`'s result gains
+  `horizon` in the same shape. Python's `db.node_history(key)` likewise returns a dict — migrate
+  with `db.node_history(k)["history"]`.
+- **Automatic snapshots keep every archive by default.** The eight-archive bound is gone: retention
+  is something you configure (`mushroomdb snapshot <db> --retention N`), never something that
+  happens to you. The consequence is that a store directory now **grows with churn until you prune
+  it**; `mushroomdb stats` and `mushroomdb doctor` both print where history starts.
+- **`roles.json` version 3** is written when any role carries `visible_where`. An older binary
+  refuses a version-3 file and **denies every role**, which is the safe direction but is a hard
+  stop — roll roles forward only once every reader is on 0.6.5.
+- **`as_of` together with `stub_hidden` is refused** on `POST /query` and on the MCP `query` tool
+  (400 / tool error, `as_of (time-travel) does not compose with stub_hidden`). The combination was
+  previously accepted with the flag silently inert.
+- **`RoleDef` gains a public field `visible_where`.** Rust callers building a `RoleDef` with a
+  struct literal add the field (or `..`).
+- **`Stats` gains a public field `history_floor`.** Rust callers building a `Stats` with a struct
+  literal add the field (or `..`).
+- **`AUTO_SNAPSHOT_RETENTION` changes type from `u32` to `Option<u32>`.** `None` is the new
+  keep-everything default; a Rust caller reading the constant matches the new type.
+
+#### Added
+
+- **Time travel composes with roles and masks.** `POST /query` with `as_of` and a role token or a
+  client mask is no longer refused, and the MCP `query` tool takes `as_of`. The engine surface is
+  `GraphDb::query_at_scoped(commit, cypher, params, scope)` with
+  `AsOfScope::{Role, Keys, RoleAndKeys}`; both masks are resolved on the temporal handle, so a role
+  and a client allow-list intersect at the commit being read and neither can widen the other. Three
+  semantics are worth knowing: the **graph is historical but the role definition is current**,
+  because `roles.json` is a sidecar with no past version, so narrowing a role today changes the
+  answer to yesterday's question; **deletion is not retroactive** — a role reads a now-deleted node,
+  and its edges, at any retained commit where it was live, so revoking history means pruning
+  archives or narrowing the role, not `DELETE`; and **keys resolve by string at the commit being
+  read**, so a key reused after a rename names whichever node held it then.
+- **Predicate masks.** A role may carry `visible_where: {field, eq | in}` beside `labels`, so "this
+  reader sees published documents" is a role rather than a key list. Equality and membership only;
+  a missing property fails the predicate; `keys` grants are never narrowed by it; a predicate
+  without at least one label is refused. Values may be written as plain JSON scalars
+  (`"in": ["published", "archived"]`) or in the graph's tagged form, mixed within one list; the
+  server writes the tagged form back. A resolved mask is memoised per commit sequence, so a scoped
+  reader pays for it once per write rather than once per call, and a role edit installs a fresh
+  memo rather than clearing the old one.
+- **`mushroomdb serve --restore-from <dir>`** seeds an empty store directory from the newest backup
+  under `<dir>` (an immediate `latest/` subdirectory wins outright, otherwise newest by mtime), and
+  does nothing when the directory already holds a store — safe to leave in a container command line
+  forever. The copy is staged inside the target directory and opened before anything is installed,
+  so **a failed restore changes nothing**: a corrupt backup leaves the store directory exactly as it
+  was found, and the next boot restores rather than reporting a half-written store. New page:
+  [Running it as a service](docs/site/service.md) — what to mount, how often to snapshot, how to
+  back up, how to restore, and what a restart without a volume costs.
+- **A snapshot round trip per rule kind** — ten cases covering every predicate (`KeyMatch`,
+  `FieldEqual`, `Overlap`, `NumericWithin`, `GeoRadius`, `VectorSimilar`, `All`, `Any`) plus the
+  via-hop and two-rule-chain shapes, each asserting that derived edges survive a reopen *and* that a
+  write after the reopen retracts exactly the right subset and no more. This is the class of bug
+  0.5.x shipped; reverting the 0.6.0 fix makes the two via-hop-shaped cases fail.
+
+#### Fixed
+
+- **Every history read reports the horizon.** `node_history` and `edge_history` carry `horizon`, the
+  oldest commit still retained, on the Rust, HTTP, MCP and Python surfaces; `was_linked`, `edges_at`,
+  `asof` and `query_at` name the valid range in their error. `Stats` gains `history_floor`, and
+  `mushroomdb stats` prints a `history:` line — `complete (nothing pruned)` or `reaches back to
+  commit N`. No read answers "nothing happened" when the answer is "that is no longer retained".
+- **`mushroomdb asof` reported the wrong total** on any store with WAL archives; it counted only
+  live `wal.bin` frames, so an eleven-commit store printed `of 1`. It now prints the real total and
+  names the horizon floor.
+- **A clean-open store answers approximate vector queries from its persisted index before the first
+  write**, instead of scanning every embedding (results were already exact either way; every earlier
+  release brute-forced here). The first write then releases the read path's copy of that index
+  instead of holding it for the life of the handle.
+- **The open adopts a snapshot's persisted vector index before scanning nodes**, so an embedding the
+  scan sees but the index predates is added to the index rather than dropped. On 0.6.5 as shipped the
+  case was masked by the write hook re-filing the node; the ordering is now correct on its own.
+- **Opening a store with an approximate vector rule no longer rebuilds the HNSW index the snapshot
+  already holds.** The open path built every approximate rule's graph from scratch and then replaced
+  it wholesale with the persisted blob; it now loads the blob and skips the build. A rebuild is the
+  fallback for a rule with no persisted index or one whose persisted index fails to load, and a
+  failed load says so on stderr rather than leaving an empty index. The same build-then-discard
+  shape was removed from every `what_if` call.
+- **The shared string table is validated, not trusted.** The fuzz-safe decode path reaches the new
+  section through checked `rkyv` access, the structural pass behind `mushroomdb verify` covers it,
+  and a smashed pointer inside it decodes as `Corrupt` instead of resolving out of bounds.
+
+#### Known limits
+
+- **Role-token `as_of` replays the WAL under the store's read guard.** `query_at_scoped` reopens
+  from disk on every call, exactly as `query_at` already did, but the surface is now reachable by a
+  role token — so a role-token client can drive repeated replays. There is no rate limit.
+- **`docs/site/masks.md` is not in the LLM bundle.** `scripts/gen-llms-full.sh` links the masks page
+  rather than concatenating it, so the predicate-mask and as-of-composition sections do not reach
+  `llms-full.txt`. The same statements do reach it through `api.md` and `timetravel.md`.
+- **A cold predicate resolve is linear in the allowed labels.** Resolving a narrowed role scans every
+  node of every allowed label and reads one property each; no property index is consulted. The memo
+  hides this between writes, so a write-heavy store with a large label set pays it once per commit.
+
 ## v0.6.4 — the data-layer release
 
 No engine change, no tool added or removed, no format change. This release is the product saying

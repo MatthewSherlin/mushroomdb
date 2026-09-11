@@ -575,7 +575,10 @@ fn topk_field_equal_cap_per_source_and_stats_survive_recovery() {
         let s = db.stats();
         assert_eq!(s.nodes_live, 5);
         assert_eq!(s.edges, 10, "5 nodes × top-2 each = 10 edges");
-        assert_eq!(GraphDb::<core_storage::fs::RealFs>::format_version(), 8);
+        assert_eq!(
+            GraphDb::<core_storage::fs::RealFs>::format_version(),
+            core_storage::snapshot::VERSION
+        );
         assert_eq!(s.rules.len(), 1);
         assert_eq!(s.rules[0].name, "eq");
         assert_eq!(s.rules[0].edges, 10);
@@ -760,6 +763,7 @@ fn stats_live_and_tombstoned_after_delete_node() {
             edges: 1,
             rules: vec![],
             chain_truncations: 0,
+            history_floor: 0,
         }
     );
     db.delete_node("a").unwrap();

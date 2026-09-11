@@ -30,6 +30,71 @@ itself or any other party that was not already visible before the write. A role 
 may only mutate nodes that are currently in its read mask. Hidden nodes are treated
 as non-existent in all write responses — no existence oracle.
 
+### Narrowing a role by a property
+
+A label is often too coarse: every document is a `Document`, but a reviewer should
+see only the published ones. A role may carry one **property test**, `visible_where`,
+beside its labels:
+
+```json
+{
+  "version": 3,
+  "roles": [
+    {
+      "name": "reader",
+      "keys": [],
+      "labels": ["Document"],
+      "visible_where": { "field": "status", "in": ["published", "archived"] },
+      "write": null
+    }
+  ]
+}
+```
+
+The resolved mask is:
+
+```
+visible = keys ∪ { n : label(n) ∈ labels ∧ predicate(n) }
+```
+
+- The predicate narrows the **labels leg only**. `keys` is an administrative grant
+  and is never narrowed by it.
+- **A missing property fails the predicate.** A `Document` with no `status` at all
+  is not visible to the role above. Absent is not a match — that is the deny-side
+  answer, and it is the one a narrowed role wants.
+- Resolution stays live. A node whose `status` changes to `published` is visible on
+  the next read; one edited out of the predicate is gone on the next read. No
+  re-apply of the schema is needed either way.
+- Write values as plain JSON scalars — `"published"`, `3`, `true`. The graph's own
+  tagged encoding (`{"Str": "published"}`, `{"Int": 3}`, `{"Bool": true}`) is accepted
+  too, including mixed within one `in` list, and means exactly the same thing; it is
+  what the server writes back when it rewrites the sidecar. Comparison is by value,
+  not by rendering.
+- A value that is neither — an object that is not a tagged value, say — is refused at
+  load, which poisons the roles state rather than dropping the narrowing.
+
+Only two operators exist:
+
+| Form | Meaning |
+|---|---|
+| `"eq": <value>` | the property equals this value |
+| `"in": [<value>, …]` | the property equals one of these values — an empty list matches nothing |
+
+Exactly one of the two must be set, and `field` must not be empty; `apply_schema`
+refuses anything else. There are no ranges, no negation, and no nesting, and that is
+deliberate: a mask that can express arbitrary predicates is a query language with a
+security boundary attached, and every operator added is another shape the resolver
+has to be right about, on the deny side, forever. A `visible_where` on a role that
+declares no labels is also refused — it would narrow nothing, and a name that reads
+like a restriction should never be one.
+
+**Version 3 is refused by an older binary.** A sidecar carrying a predicate is written
+as `{"version": 3, …}`, and a binary that predates predicates does not recognise the
+version, so it poisons its roles state and denies every role instead of loading the
+file and resolving the role to its whole label set. Denying is the safe direction;
+silently ignoring a narrowing is not. (Versions 1 and 2 still load, and a role without
+`visible_where` behaves exactly as it did before version 3 existed.)
+
 ---
 
 ## Client node masks
@@ -108,8 +173,10 @@ endpoint is visible.
 ### Role tokens never use stub mode
 
 Role paths always use `MaskMode::Omit`. The `stub_hidden` parameter is silently
-ignored on any request authenticated with a role token. A role caller never receives
-stub responses — hidden nodes are fully omitted.
+ignored on any request authenticated with a role token — except with `as_of`, where
+it is refused rather than ignored (`as_of (time-travel) does not compose with
+stub_hidden`; see [Composing with `as_of`](#composing-with-as_of)). A role caller
+never receives stub responses — hidden nodes are fully omitted.
 
 ### MCP trust boundary
 
@@ -119,8 +186,8 @@ enforcement. The `stub_hidden` arg on the MCP `query` tool applies the client ma
 in stub mode, but there is no role layer enforcing minimum visibility.
 
 The MCP `query` tool also takes a `role`, which resolves a name from `roles.json`
-to the same node mask the HTTP role path would compute and applies it as a client
-mask. It is a convenience for asking "what would this role see", not a credential:
+to the same node mask the HTTP role path would compute — `visible_where` included —
+and applies it as a client mask. It is a convenience for asking "what would this role see", not a credential:
 any caller may name any role, and passing both `role` and `mask` is rejected. Real
 enforcement is the HTTP server's role tokens (`serve --role-token`).
 
@@ -141,3 +208,57 @@ Summary of what each caller class sees:
 | Full-access token, no mask | all nodes |
 | Full-access token + client mask | client mask |
 | Role token | role mask ∩ client mask (if any) |
+
+### Composing with `as_of`
+
+A mask composes with time travel. `POST /query` accepts `as_of` alongside a
+role token or a client `mask`, and the MCP `query` tool accepts `as_of`
+alongside `role` or `mask`. Every key and label is resolved against the graph
+**as it was at that commit**, so a key that did not exist yet resolves to
+nothing and a role that may see a label sees exactly the nodes that carried it
+then. The intersection rule is unchanged: a client mask can only narrow a
+role, never widen it. Writes are refused at any commit.
+
+The graph is historical; the role *definition* is not. `roles.json` is a
+sidecar and is never a WAL record, so there is no past version of it to read —
+an as-of read applies today's role definition to the graph as it was then. See
+[timetravel.md](timetravel.md).
+
+A `visible_where` predicate follows the same rule and is evaluated against the
+**property values at the commit being read**. A document that was a draft then
+and is published now is outside a `status in ["published"]` role at that past
+commit, and inside it today. Narrowing a role therefore takes effect at every
+commit at once, which is what makes it a revocation.
+
+**`stub_hidden` does not compose with `as_of`** — the pair is rejected with
+`as_of (time-travel) does not compose with stub_hidden`. Stub mode exists to
+disclose that a hidden node *exists*, and node existence at a past commit is
+exactly the question an as-of read is asking; answering it through a stub
+would leak the historical shape of the graph outside the mask. Drop
+`stub_hidden` or drop `as_of`.
+
+#### Deletion is not retroactive
+
+**Deleting a node does not remove it from a role's past.** A role that may see
+the `Public` label reads a now-deleted `Public` node — and the edges it had —
+at any retained commit where it was live. A role with `keys: ["k"]` reads `k`
+at a past commit even though `k` is gone today. `DELETE` changes the present;
+it does not rewrite the WAL. **To revoke history, prune the archives** (see
+[timetravel.md](timetravel.md) — WAL archives and retention) **or narrow the
+role**, which takes effect at every commit at once because the role definition
+is always the current one.
+
+#### Keys are not identities
+
+A role's `keys` name **whichever node held that key at the commit asked for**.
+Renaming a node frees its key, and a later node may take it. A role with
+`keys: ["alice"]` that reads at an old commit sees the node that was called
+`alice` *then* — not the one called `alice` now. Grant by label, or by a key
+you do not recycle, when that distinction matters.
+
+The same caveat reaches the history endpoints. `GET /node/{key}/history` under
+a role token filters out `EdgeAdded`/`EdgeRemoved` entries whose other
+endpoint the role cannot see — but that filter resolves the other endpoint's
+key against **today's** ids, not the ids as of the historical event. A key
+that was reused since the event can be let through, or held back, on the
+strength of who holds it now rather than who held it then.

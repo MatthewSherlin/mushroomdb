@@ -246,6 +246,51 @@ mod tests {
     use crate::v8::MappedBase;
     use std::collections::BTreeMap;
 
+    /// A pre-V9 base carries its table inside each `Str` column and no shared
+    /// section; the resolution rule must fall back to that copy.
+    ///
+    /// The encoder cannot write a V8 snapshot any more, so the legacy shape is
+    /// built directly: this is the only place the pre-V9 read path is exercised
+    /// with real strings (`golden_v8.bin` holds a single Int property).
+    #[test]
+    fn a_pre_v9_column_resolves_through_its_own_table() {
+        use crate::v8::layout::{ColumnData, ColumnsData, FieldEntry};
+
+        let legacy = ColumnsData {
+            fields: vec![FieldEntry {
+                name: "tag".to_string(),
+                col: ColumnData::Str {
+                    ids: vec![2, 0, 1],
+                    present: vec![0b111],
+                    // The whole table, copied into the column: exactly what
+                    // every V5-V8 snapshot wrote for every string column.
+                    strings: vec!["alpha".into(), "beta".into(), "gamma".into()],
+                },
+            }],
+        };
+        let bytes = rkyv::api::high::to_bytes::<rkyv::rancor::Error>(&legacy).expect("rkyv encode");
+        let archived =
+            rkyv::access::<crate::v8::layout::ArchivedColumnsData, rkyv::rancor::Error>(&bytes)
+                .expect("rkyv access");
+
+        let overlay = ColumnStore::new();
+        // `with_base` leaves `strings: None` — the pre-V9 case.
+        let view = ColumnsView::with_base(&overlay, archived);
+        assert!(view.strings.is_none(), "a pre-V9 base has no shared table");
+        for (id, want) in [(0u32, "gamma"), (1, "alpha"), (2, "beta")] {
+            match view.get(id, "tag") {
+                Some(ValueRef::Owned(Value::Str(got))) => assert_eq!(got, want, "node {id}"),
+                other => panic!("node {id}: expected Str({want}), got {other:?}"),
+            }
+        }
+
+        // The materialising path resolves the same way with `shared: None`.
+        let store = crate::v8::encode::archived_to_columnstore(archived, None);
+        assert_eq!(store.get(0, "tag"), Some(&Value::Str("gamma".into())));
+        assert_eq!(store.get(1, "tag"), Some(&Value::Str("alpha".into())));
+        assert_eq!(store.get(2, "tag"), Some(&Value::Str("beta".into())));
+    }
+
     fn tiny_meta() -> V8Meta {
         use std::collections::HashMap;
         V8Meta {
@@ -284,6 +329,7 @@ mod tests {
         let meta = tiny_meta();
         let mut snap_bytes = Vec::new();
         encode_v8(
+            None,
             None,
             None,
             None,
@@ -342,6 +388,7 @@ mod tests {
         ids2.get_or_insert("B");
         ids2.get_or_insert("C");
         encode_v8(
+            None,
             None,
             None,
             None,
@@ -473,6 +520,19 @@ impl MixedCache {
     }
 }
 
+/// A base snapshot's columns section together with the shared string table
+/// that resolves its string ids.
+///
+/// The two travel as a pair because from V9 on neither is complete alone: the
+/// columns hold `sid` indices and only the table holds the vocabulary.
+/// `strings` is `None` for a pre-V9 base, whose columns still carry their own
+/// copies.
+#[derive(Copy, Clone)]
+pub struct BaseColumns<'a> {
+    pub cols: &'a ArchivedColumns,
+    pub strings: Option<&'a crate::v8::layout::ArchivedStringTable>,
+}
+
 /// Overlay-over-base column store view.
 ///
 /// Reads consult the owned overlay `ColumnStore` first; if the field/node is
@@ -482,10 +542,17 @@ impl MixedCache {
 /// **Column handle**: `ColumnsView::column()` returns an overlay-backed
 /// `ColumnHandle`.  Base values are NOT visible through the column handle —
 /// only through the `get()` path.  This is acceptable because:
-///   (a) base is `None` for V5–V7 stores and for V8 stores before Task 3
-///       wires the persistent mmap (overlay starts empty after snapshot open);
+///   (a) base is `None` for V5–V7 stores, which have no mmap'd section at all
+///       (their whole snapshot is materialised into the overlay at open);
 ///   (b) callers that need a fused-scan path with base values should use
 ///       `get()` directly.
+///
+/// **String columns come in two shapes.** In a V5–V8 base every
+/// `ArchivedColumnData::Str` carries its own full copy of the string table and
+/// `strings` below is `None`. From V9 on the table is written once as section
+/// 12, every column's own copy is empty, and `strings` holds it. `get()`
+/// resolves with one rule: if the shared table is present it is the table;
+/// otherwise the column's own is.
 #[derive(Copy, Clone)]
 pub struct ColumnsView<'a> {
     pub overlay: &'a ColumnStore,
@@ -493,6 +560,9 @@ pub struct ColumnsView<'a> {
     /// Memo for `Mixed` base columns; see [`MixedCache`].  `None` means every
     /// `Mixed` read decodes the whole column, which is correct but O(column).
     pub mixed: Option<&'a MixedCache>,
+    /// The snapshot's one shared string table (section 12).  `None` for a
+    /// pre-V9 snapshot, where the column's own `strings` is authoritative.
+    pub strings: Option<&'a crate::v8::layout::ArchivedStringTable>,
 }
 
 impl<'a> ColumnsView<'a> {
@@ -502,6 +572,7 @@ impl<'a> ColumnsView<'a> {
             overlay,
             base: None,
             mixed: None,
+            strings: None,
         }
     }
 
@@ -519,6 +590,7 @@ impl<'a> ColumnsView<'a> {
             overlay,
             base: Some(base),
             mixed: None,
+            strings: None,
         }
     }
 
@@ -533,7 +605,23 @@ impl<'a> ColumnsView<'a> {
             overlay,
             base: Some(base),
             mixed: Some(mixed),
+            strings: None,
         }
+    }
+
+    /// Attach the snapshot's shared string table (V9 section 12).
+    ///
+    /// Pass `None` for a pre-V9 base: every `ColumnData::Str` there carries its
+    /// own copy of the table and that copy stays authoritative.  Pass the table
+    /// from the same [`MappedBase`](crate::v8::MappedBase) the `base` columns
+    /// came from — a table from a different snapshot would resolve string ids
+    /// against the wrong vocabulary.
+    pub fn with_shared_strings(
+        mut self,
+        strings: Option<&'a crate::v8::layout::ArchivedStringTable>,
+    ) -> Self {
+        self.strings = strings;
+        self
     }
 
     /// Look up a property value for `(id, field)`: overlay first, then base.
@@ -597,12 +685,16 @@ impl<'a> ColumnsView<'a> {
                     return None;
                 }
                 let sid = u32::from(ids[idx]) as usize;
-                if sid >= strings.len() {
+                // The resolution rule: if the shared table is present it is the
+                // table; otherwise the column's own `strings` is.
+                let table = match self.strings {
+                    Some(shared) => &shared.strings,
+                    None => strings,
+                };
+                if sid >= table.len() {
                     return None;
                 }
-                Some(ValueRef::Owned(Value::Str(
-                    strings[sid].as_str().to_string(),
-                )))
+                Some(ValueRef::Owned(Value::Str(table[sid].as_str().to_string())))
             }
             ArchivedColumnData::Mixed(blob) => match self.mixed {
                 // One decode per field for the life of the mapping. The value

@@ -59,7 +59,7 @@ full design spec is at [docs/design.md](../design.md).
 Pre-1.0 alpha — APIs and formats may change between minor versions. Single
 writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
 
-v0.6.4 is the current release. The shortest way in is the Claude Code plugin —
+v0.6.5 is the current release. The shortest way in is the Claude Code plugin —
 `claude marketplace add MatthewSherlin/mushroomdb` then `claude plugin install
 mushroom@mushroomdb`, and type `/mushroom:mushroom` in a repository. Or run
 `npx mushroomdb install`, which writes the `/mushroom` skill, the MCP server
@@ -83,4 +83,5 @@ Docker, `install.sh`, and the build-from-source path are in
 - [The live code graph](code-graph.md) — **deprecated in 0.6.4, removed in 0.7**: what the repository graph guarantees, measured
 - [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
+- [Running it as a service](service.md) — the volume, the snapshot interval, backup, restore, and what a restart costs
 - [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error

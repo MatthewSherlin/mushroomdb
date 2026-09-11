@@ -1,5 +1,7 @@
 use core_storage::fs::Fs;
-use std::collections::HashSet;
+use core_storage::Result;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use crate::db::GraphDb;
 
@@ -126,5 +128,123 @@ impl NodeMask {
         db.ids()
             .get(key)
             .is_some_and(|id| self.visible.contains(&id))
+    }
+}
+
+// ── Role → mask memo ──────────────────────────────────────────────────────────
+
+/// Role → resolved mask, valid for exactly one commit sequence.
+///
+/// Resolving a role is a full scan of the label vector, and with a
+/// [`visible_where`](crate::roles::RoleDef::visible_where) predicate it is also
+/// a property read per candidate node. A scoped reader pays that on every
+/// request, and between two writes the answer cannot have changed — so it is
+/// paid once and remembered.
+///
+/// **Never stale**: an entry records the store's `commit_seq` at the moment it
+/// was built and is served only when that is still the current one. Any write
+/// bumps `commit_seq` and the entry simply stops matching. The cache can be
+/// cold, but it cannot be wrong.
+///
+/// `commit_seq` does not move when a role *definition* changes — `roles.json`
+/// is a sidecar, not a WAL record — so the owner of the cache installs a fresh
+/// one whenever roles are rewritten or the store is reloaded. That also leaves
+/// any reader snapshot holding the old `Arc` with a private cache, so a
+/// snapshot frozen against the old definitions can never publish an answer the
+/// live handle would read back.
+#[derive(Default)]
+pub struct RoleMaskCache {
+    entries: Mutex<HashMap<String, (u64, Arc<NodeMask>)>>,
+}
+
+impl RoleMaskCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the memoised mask for `role` at `version`, building it if the
+    /// entry is absent or was built against a different commit sequence.
+    ///
+    /// `build` runs outside the lock: it reads the store, and the cache must
+    /// never be a lock ordering between two readers.
+    pub fn get_or_build(
+        &self,
+        role: &str,
+        version: u64,
+        build: impl FnOnce() -> Result<NodeMask>,
+    ) -> Result<Arc<NodeMask>> {
+        if let Ok(entries) = self.entries.lock() {
+            if let Some((v, mask)) = entries.get(role) {
+                if *v == version {
+                    return Ok(Arc::clone(mask));
+                }
+            }
+        }
+        let mask = Arc::new(build()?);
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.insert(role.to_string(), (version, Arc::clone(&mask)));
+        }
+        Ok(mask)
+    }
+
+    /// Drop every entry. Correctness never depends on this — a mismatched
+    /// version is already ignored — but the owner calls it when the role
+    /// definitions themselves change, which `commit_seq` does not record.
+    pub fn clear(&self) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_version_change_rebuilds_and_clear_empties() {
+        let cache = RoleMaskCache::new();
+        let built = std::cell::Cell::new(0u32);
+        let build = |ids: Vec<u32>| {
+            built.set(built.get() + 1);
+            Ok(NodeMask::from_ids(ids))
+        };
+
+        let m = cache.get_or_build("r", 1, || build(vec![1])).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(built.get(), 1);
+
+        // Same version → memo hit, `build` never runs.
+        let m = cache.get_or_build("r", 1, || build(vec![1, 2])).unwrap();
+        assert_eq!(m.len(), 1, "the memoised mask is returned unchanged");
+        assert_eq!(built.get(), 1);
+
+        // New version → rebuild.
+        let m = cache.get_or_build("r", 2, || build(vec![1, 2])).unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(built.get(), 2);
+
+        // A different role is a different entry.
+        let m = cache.get_or_build("other", 2, || build(vec![9])).unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!(built.get(), 3);
+
+        cache.clear();
+        let _ = cache.get_or_build("r", 2, || build(vec![1, 2])).unwrap();
+        assert_eq!(built.get(), 4, "clear drops the entry, so it rebuilds");
+    }
+
+    #[test]
+    fn a_failed_build_is_not_cached() {
+        let cache = RoleMaskCache::new();
+        assert!(cache
+            .get_or_build("r", 1, || Err(core_storage::GraphError::KeyNotFound {
+                key: "role:r".into()
+            }))
+            .is_err());
+        let m = cache
+            .get_or_build("r", 1, || Ok(NodeMask::from_ids(vec![7])))
+            .unwrap();
+        assert_eq!(m.len(), 1);
     }
 }

@@ -346,7 +346,7 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
 | `mushroomdb snapshot <dir> [--keep-wal\|--truncate] [--retention N]` | Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole |
-| `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 12 sections, exit 2 on any mismatch |
+| `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 13 sections plus an rkyv structural pass over the mmap'd ones, exit 2 on any mismatch |
 | `mushroomdb migrate <dir>` | Migrate an older store format in place |
 | `mushroomdb backup <dir> <dest>` | Copy store files to `<dest>` and CRC-verify the copy. WARNING: unsafe against a running `serve` — use `POST /backup` for live-served stores |
 | `mushroomdb export <dir> <dest> [--format jsonl\|parquet\|graphml]` | Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools |
@@ -460,11 +460,13 @@ Dependency rule (inward only):
 `bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
 
 Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy`), plus mmap-able
-V8 rkyv snapshots (12 sections: CSR topology, columnar properties, HNSW blobs, provenance, IVF
-state, per-node last-change index, and more — zero-copy, no heap allocation on open). V5/V6/V7
-stores are auto-migrated to V8 on `GraphDb::open`. Derived edges are not WAL-logged; they are
-restored directly from the mmap'd sections. See [`docs/format-stability.md`](docs/format-stability.md)
-for the format evolution contract.
+V9 rkyv snapshots (13 sections: CSR topology, columnar properties, one shared string table for every
+string column, HNSW blobs, provenance, IVF state, per-node last-change index, and more — zero-copy,
+no heap allocation on open). V5–V8 stores are auto-migrated to V9 on `GraphDb::open`, keeping the
+original beside the new one as `snapshot.bin.bak` until the next clean open. The upgrade is one-way:
+an earlier binary refuses a V9 snapshot with `snapshot: unsupported version 9` rather than reading it
+wrongly. Derived edges are not WAL-logged; they are restored directly from the mmap'd sections. See
+[`docs/format-stability.md`](docs/format-stability.md) for the format evolution contract.
 
 ---
 
@@ -488,7 +490,7 @@ Phases 1–4 and Plan 18 all landed. What remains:
 - [Install, plugin and hooks](docs/site/skill.md) · [MCP tools](docs/site/mcp.md) · [Association benchmark](docs/site/association-bench.md)
 - [Time travel](docs/site/timetravel.md) · [Subscriptions](docs/site/subscriptions.md) · [Views](docs/site/views.md) · [Rule suggestions](docs/site/suggest.md)
 - [Masks and access control](docs/site/masks.md) · [Full-text search](docs/site/fulltext.md) · [Property indexes](docs/site/indexes.md) · [Graph algorithms](docs/site/algorithms.md)
-- [Durability and recovery](docs/site/durability.md) · [Panic policy](docs/site/panic-policy.md) · [Testing](docs/site/testing.md) · [Format stability](docs/format-stability.md)
+- [Durability and recovery](docs/site/durability.md) · [Running it as a service](docs/site/service.md) · [Panic policy](docs/site/panic-policy.md) · [Testing](docs/site/testing.md) · [Format stability](docs/format-stability.md)
 - [Design spec](docs/design.md) · [Moat roadmap](docs/site/roadmap-moat.md) · [Case study](docs/dogfood-report.md)
 
 Building from source, Docker, packaging, and the test gates are in
@@ -567,7 +569,7 @@ full design spec is at [docs/design.md](../design.md).
 Pre-1.0 alpha — APIs and formats may change between minor versions. Single
 writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
 
-v0.6.4 is the current release. The shortest way in is the Claude Code plugin —
+v0.6.5 is the current release. The shortest way in is the Claude Code plugin —
 `claude marketplace add MatthewSherlin/mushroomdb` then `claude plugin install
 mushroom@mushroomdb`, and type `/mushroom:mushroom` in a repository. Or run
 `npx mushroomdb install`, which writes the `/mushroom` skill, the MCP server
@@ -591,6 +593,7 @@ Docker, `install.sh`, and the build-from-source path are in
 - [The live code graph](code-graph.md) — **deprecated in 0.6.4, removed in 0.7**: what the repository graph guarantees, measured
 - [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
+- [Running it as a service](service.md) — the volume, the snapshot interval, backup, restore, and what a restart costs
 - [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error
 
 ---
@@ -969,6 +972,7 @@ Output after the demo:
 ```text
 nodes: 60 live, 0 tombstoned
 edges: 334
+history: complete (nothing pruned)
 rules: 7
   auto_fk_person_org_id        edges=30  tripped=false
   auto_fk_person_project_id    edges=30  tripped=false
@@ -1311,7 +1315,7 @@ key files (by centrality):
 key symbols (most called):
   crates/core-api/tests/algo.rs#insert_node — fn insert_node(db: &mut GraphDb<core_storage::fs::RealFs>, label: &str, key: &str)
   crates/core-api/tests/algo.rs#insert_edge — fn insert_edge(db: &mut GraphDb<core_storage::fs::RealFs>, etype: &str, src: &str, dst: &str)
-reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.4 explore './mushroom-memory' <target>
+reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.5 explore './mushroom-memory' <target>
 ```
 
 The first line is the untrusted-data marker every digest rendered out of a store
@@ -1978,8 +1982,11 @@ destination-side vectors (cosine similarity, in-tree implementation — no
 external ANN dependency). Each node insertion incrementally updates the HNSW
 graph. On each lookup, the HNSW index returns the approximate k nearest
 neighbors. IVF-Flat centroids are also maintained as a fallback; the primary
-candidate path is HNSW. The HNSW graph is persisted in V7 snapshots alongside
-IVF centroids so WAL replay and snapshot open avoid full re-fitting.
+candidate path is HNSW. The HNSW graph is persisted in the snapshot alongside
+IVF centroids so WAL replay and snapshot open avoid full re-fitting. Opening a
+store whose snapshot holds that graph loads it directly and never rebuilds it;
+the rebuild is the fallback for a rule with no persisted graph, or one whose
+persisted graph fails to load (the reason is logged).
 
 **Trade-offs:**
 
@@ -1988,7 +1995,7 @@ IVF centroids so WAL replay and snapshot open avoid full re-fitting.
 | Candidates | All vectors with the right label | HNSW approximate k-NN |
 | Per-query edge recall | 1.00 (exact) | min 0.90, mean 0.998 (5k/dim 1536, fixed-seed probe) |
 | Determinism | Yes | Yes — same rule + data → same graph |
-| WAL replay | Identical | Identical (HNSW rebuilt on replay) |
+| WAL replay | Identical | Identical (replayed writes update the loaded HNSW) |
 
 Measured at 5k nodes, dim 1536: exact ~12 min backfill. Approximate
 backfill time is substantially faster — the IVF-Flat-era measurement was
@@ -2193,7 +2200,7 @@ Claude Desktop has no installer path, so add mushroomdb by hand in
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.6.4", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.6.5", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -2467,8 +2474,9 @@ same answer at any commit because a label is fixed when a node is inserted — w
 one consequence: a node deleted since `at` carries no label and drops out of a
 labelled historical answer.
 
-`edges_at` errors below the retention horizon; `node_history` instead just omits
-what's been pruned — see [How far back history reaches](timetravel.md#how-far-back-history-reaches).
+`edges_at` errors below the retention horizon, naming the range it accepts;
+`node_history` and `edge_history` return what survives plus `horizon`, the oldest
+commit still retained — see [How far back history reaches](timetravel.md#how-far-back-history-reaches).
 
 `json: true` without a filter → `{key, at, edges, listed, total}`, listing at most
 `limit` edges **per edge type** (default 10, max 100 in that form).
@@ -2631,10 +2639,10 @@ rows into it.
 | `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity using HNSW when available; (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). |
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain` | The rules and scores that produced the edges between two nodes, as JSON. `explain_association` above is the same question answered in prose. |
-| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels resolved to that same allow-list. Pass one or the other, never both. See [Trust model](#trust-model) below. The dialect: `n.key` / `n.label` / `key(n)` / `labels(n)`, `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `IN`, list subscripts (`n.location[0]`), comma-separated patterns sharing variables in one `MATCH`, and `count(DISTINCT …)` after a `WITH`. Full reference: [`query.md`](query.md). |
+| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels, narrowed by its `visible_where` property test if it declares one, resolved to that same allow-list. Pass one or the other, never both. Pass `as_of` — a 0-based WAL commit index — to answer from the graph as it was at that commit; it composes with `role` or with `mask` (not both, since the tool refuses that pair), and both are resolved against the graph as it was then. Writes and `stub_hidden` are refused with `as_of`. Deleting a node does not remove it from a role's past, and a role's `keys` resolve to whichever node held the key at that commit — see [masks.md](masks.md). See [Trust model](#trust-model) below. The dialect: `n.key` / `n.label` / `key(n)` / `labels(n)`, `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `IN`, list subscripts (`n.location[0]`), comma-separated patterns sharing variables in one `MATCH`, and `count(DISTINCT …)` after a `WITH`. Full reference: [`query.md`](query.md). |
 | `node_info` | Return a node's key, label, and all properties. |
-| `stats` | Return live node, edge, and rule counts. |
-| `node_history` | Every property change for a node since the last truncating snapshot. |
+| `stats` | Return live node, edge, and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned). |
+| `node_history` | Every recorded change to one node, newest last, plus `total_commits` (the horizon upper bound) and `horizon`, the oldest commit still retained. |
 | `edge_history` | Add/retract lifecycle for all edges between two nodes, with the rule behind each event. |
 | `was_linked` | Point-in-time check: was an edge of this type active at this commit? |
 | `rename_node` | Rename a node's key, preserving all its edges. |
@@ -3672,9 +3680,29 @@ query param. Grants access to all endpoints.
 
 **Role-bound tokens** (`--role-token TOKEN:ROLE` / `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`):
 bearer-only. A role token receives a node-visibility mask derived from the
-named role's label selectors (defined in `schema.json` or `roles.json`). The
-mask is resolved live at request time against the same DB snapshot used for
-the query — one read-lock acquisition.
+named role's label selectors (defined in `schema.json` or `roles.json`), and
+optionally narrowed by one property test on those labels. The mask is resolved
+live at request time against the same DB snapshot used for the query — one
+read-lock acquisition, memoised per commit so a scoped reader between two writes
+resolves its role once.
+
+A role may carry a `visible_where` predicate beside its labels:
+
+```json
+{
+  "name": "reader",
+  "labels": ["Document"],
+  "visible_where": { "field": "status", "in": ["published", "archived"] }
+}
+```
+
+`visible = keys ∪ { n : label(n) ∈ labels ∧ predicate(n) }` — the predicate
+narrows the labels leg only, never `keys`, and a node missing the property fails
+it. Only `eq` (one value) and `in` (a list) exist, exactly one per predicate, and
+a predicate on a role with no labels is refused. Values may be written as plain
+JSON scalars, as above, or in the graph's tagged encoding (`{"Str": "published"}`)
+— both are accepted, and the tagged form is what the server writes back. See
+[masks.md](masks.md#narrowing-a-role-by-a-property).
 
 Role-token behavior per endpoint:
 
@@ -3711,7 +3739,9 @@ write endpoints — exactly the v1 read-only behavior.
 present in `roles.json` at open time → 401; corrupt `roles.json` → 500 for
 role tokens (full-access token unaffected); empty role → sees zero nodes.
 Role sidecar is stored in `<db-dir>/roles.json` (v1 for read-only roles, v2 when
-any role carries a write scope).
+any role carries a write scope, v3 when any role carries a `visible_where`
+predicate). A version this binary does not recognise poisons the roles state
+rather than loading it — denying beats over-granting.
 
 ---
 
@@ -3851,8 +3881,42 @@ mask appear as `{"key": "…", "restricted": true}` rather than being omitted. S
 omit-only** — `stub_hidden` has no effect on which rows the query returns; it only
 affects the node-info, edges, and neighborhood endpoints.
 
-Role tokens: `stub_hidden` is silently ignored. Hidden nodes are always fully omitted
-for role-token requests.
+Role tokens: `stub_hidden` is silently ignored — except with `as_of`, where it is
+refused (`as_of (time-travel) does not compose with stub_hidden`). Hidden nodes are
+always fully omitted for role-token requests.
+
+`as_of` (optional): a 0-based WAL commit index. The query is answered from the
+graph as it existed at that commit, read-only — a write statement with `as_of`
+is a 400. It composes with a role token and with a client `mask`, both of which
+are resolved against the graph as it was then; a role token plus a client mask
+still intersects, never widens. The role *definition* itself is the current one
+(`roles.json` is a sidecar and is never a WAL record). A commit outside the
+retained range is a 400 naming the range, e.g.
+`commit 9999 is out of range; valid range is 12..40 — events before commit 12 are not retained`.
+`as_of` and `stub_hidden` do not compose: the pair is a 400. See
+[timetravel.md](timetravel.md) and [masks.md](masks.md).
+
+```json
+{
+  "cypher": "MATCH (n) RETURN n",
+  "as_of": 12,
+  "mask": ["ada", "bob"]
+}
+```
+
+**Deletion is not retroactive, and keys are not identities.** A role reads a
+now-deleted node at a commit where it was live, and a role's `keys` resolve to
+whichever node held that key at the commit asked for (renaming frees a key for
+reuse). To revoke history, prune archives or narrow the role. See
+[masks.md](masks.md).
+
+**Cost.** An `as_of` read — role-token reads included — replays the WAL under
+the store's read guard for the duration of the query; it does not use the
+lock-free epoch snapshot that a plain read uses. Replay cost grows with the
+number of commits since the last truncating snapshot, so on a large store take
+snapshots (see the horizon and retention sections in
+[timetravel.md](timetravel.md)) and rate-limit role tokens that are allowed to
+send `as_of`.
 
 Default response: Arrow IPC stream (`application/vnd.apache.arrow.stream`).
 
@@ -3917,6 +3981,7 @@ without `LIMIT` still error at 1,000,000 intermediate rows.
   "nodes_live": 60,
   "nodes_tombstoned": 0,
   "edges": 334,
+  "history_floor": 0,
   "rules": [
     {"name": "skill_fit", "edges": 90, "tripped": false, "fires": 90, "approximate": false},
     ...
@@ -4333,12 +4398,15 @@ Response:
     { "commit": 1, "change": { "type": "PropSet", "field": "age", "value": 30 } },
     { "commit": 2, "change": { "type": "EdgeAdded", "edge_type": "KNOWS", "other": "bob", "outgoing": true } }
   ],
-  "total_commits": 3
+  "total_commits": 3,
+  "horizon": 0
 }
 ```
 
 `total_commits` is the horizon upper bound (exclusive) — the number of WAL frames
-visible in the current window. History before the last WAL-truncating snapshot is not
+visible in the current window. `horizon` is the oldest commit still retained; it is `0`
+until archives are pruned, and when it is greater than `0` the events before it were
+pruned and are not in `history`. History before the last WAL-truncating snapshot is not
 visible. See [Horizon contract](#horizon-contract) below.
 
 Role tokens: if the requested key is outside the role's visibility mask, the response
@@ -4359,12 +4427,15 @@ Response:
     { "edge_type": "KNOWS", "commit": 2, "event": "Added", "rule": null },
     { "edge_type": "SIMILAR", "commit": 3, "event": "Added", "rule": "sim_emb" }
   ],
-  "total_commits": 4
+  "total_commits": 4,
+  "horizon": 0
 }
 ```
 
 `event` is `"Added"` or `"Retracted"`. `rule` is the rule name for derived edges,
-`null` for manually written edges. `total_commits` is the horizon upper bound.
+`null` for manually written edges. `total_commits` is the horizon upper bound, and
+`horizon` is the oldest commit still retained — events before it were pruned and are not
+in `events`.
 
 Role tokens: BOTH `a` AND `b` must be visible in the role mask. If either is hidden,
 the response is 404 for that key (no existence oracle).
@@ -4381,21 +4452,30 @@ Response:
 { "a": "alice", "b": "bob", "edge_type": "KNOWS", "at_commit": 2, "linked": true }
 ```
 
-Returns 400 (not 500) when `at_commit` is outside the visible horizon:
+Returns 400 (not 500) when `at_commit` is outside the retained horizon. The body carries
+the range it will accept, and on a pruned store says what is gone:
 ```json
-{ "error": "commit 999 is out of range" }
+{ "error": "commit 3 is out of range; valid range is 12..40 — events before commit 12 are not retained" }
 ```
+
+On a store that has pruned nothing the floor is `0` and the message is
+`commit 999 is out of range; valid range is 0..40`.
 
 Role tokens: BOTH `a` AND `b` must be visible (same-as-absent rule applies).
 
 #### Horizon contract
 
-All three history endpoints include `total_commits` in their response. This is the
-exclusive upper bound for valid commit indices (`0..total_commits`). When the WAL is
-empty (after a truncating snapshot and before any new writes), `total_commits` is 0.
-Pre-snapshot commits are not visible — history restarts from the first WAL frame after
-the snapshot. Use `snapshot_with(SnapshotOptions { keep_wal: true })` to preserve
-deep history across snapshots.
+Valid commit indices are `floor..total_commits`. `total_commits` is the exclusive upper
+bound; `floor` is the oldest commit still retained, `0` until archive pruning advances it.
+`GET /node/{key}/history` and `GET /history/edge` report that floor as `horizon` in their
+response body; `GET /history/was_linked` names both bounds in the 400 it returns for a
+commit outside the range. `GET /stats` reports the same floor as `history_floor`.
+
+When the WAL is empty (after a truncating snapshot and before any new writes),
+`total_commits` is 0. Pre-snapshot commits are not visible — history restarts from the
+first WAL frame after the snapshot. Use
+`snapshot_with(SnapshotOptions { keep_wal: true })` to preserve deep history across
+snapshots, or `archive_wal: true` to keep it in archives.
 
 ---
 
@@ -4440,7 +4520,7 @@ Response:
   "result": {
     "capabilities": {"tools": {}},
     "protocolVersion": "2024-11-05",
-    "serverInfo": {"name": "mushroomdb", "version": "0.6.4"}
+    "serverInfo": {"name": "mushroomdb", "version": "0.6.5"}
   }
 }
 ```
@@ -4451,7 +4531,7 @@ Sixteen tools:
 
 | Tool | Description |
 |---|---|
-| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `stub_hidden?` (bool; see below) |
+| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `role?` (answer as one of the store's roles), `as_of?` (0-based commit index — answer from the graph as it was then; composes with `role` or with `mask`, not both, since the tool refuses `role` + `mask` together; writes and `stub_hidden` refused), `stub_hidden?` (bool; see below) |
 | `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?` |
 | `create_rule` | Declare a linking rule; params: `RuleDef` fields |
 | `explain` | Explain edges; params: `a`, `b` |
@@ -4463,8 +4543,8 @@ Sixteen tools:
 | `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?`; (2) edge traversal — `key`, `edge_type?`, `limit?` |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
-| `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits}` |
-| `edge_history` | Add/retract lifecycle for edges between two nodes; params: `a`, `b`. Returns `{a, b, events, total_commits}` |
+| `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits, horizon}` |
+| `edge_history` | Add/retract lifecycle for edges between two nodes; params: `a`, `b`. Returns `{a, b, events, total_commits, horizon}` |
 | `was_linked` | Point-in-time edge check; params: `a`, `b`, `edge_type`, `at_commit`. Returns `{linked}` or error when outside horizon |
 | `rename_node` | Rename a node's key; params: `old_key`, `new_key`. Errors if old key absent or new key already exists. |
 
@@ -4799,9 +4879,10 @@ can still reach pre-snapshot commits. The WAL replay over the snapshot is
 idempotent — no manual recovery is needed. The WAL grows until an explicit
 `snapshot()` (with default `keep_wal: false`) truncates it.
 
-**V8 snapshot format:** mmap-able rkyv sections (12 total); zero-copy open via
-mmap; no heap allocation for section data. V5/V6/V7 stores are auto-migrated to
-V8 on open. See [`docs/format-stability.md`](../format-stability.md) for the
+**V9 snapshot format:** mmap-able rkyv sections (13 total); zero-copy open via
+mmap; no heap allocation for section data. V5–V8 stores are auto-migrated to
+V9 on open; a V9 snapshot cannot be opened by a pre-0.6.5 binary, which refuses
+it with `snapshot: unsupported version 9`. See [`docs/format-stability.md`](../format-stability.md) for the
 full section table and migration notes. 100k nodes (v0.2, ~10M derived edges):
 V8 snapshot open 0.02 s / 31–41 MiB RSS (warm file cache, cold process,
 2026-08-28, Apple M4 Pro).
@@ -5078,7 +5159,7 @@ which portion of history is visible.
 Returns every WAL-visible change for a node since the last WAL-truncating
 snapshot.
 
-**MCP:** `node_history(key)` → `{key, history, total_commits}`
+**MCP:** `node_history(key)` → `{key, history, total_commits, horizon}`
 
 **HTTP:** `GET /node/{key}/history`
 
@@ -5090,7 +5171,8 @@ snapshot.
     { "commit": 1, "change": { "type": "PropSet", "field": "age", "value": 30 } },
     { "commit": 2, "change": { "type": "EdgeAdded", "edge_type": "KNOWS", "other": "bob", "outgoing": true } }
   ],
-  "total_commits": 3
+  "total_commits": 3,
+  "horizon": 0
 }
 ```
 
@@ -5101,7 +5183,7 @@ Change types: `NodeInserted`, `PropSet`, `PropRemoved`, `EdgeAdded`,
 
 Returns the full add/retract history for all edges between two nodes. Includes
 **derived edges** — those created by rules — with the rule name attributed via
-`rule`. This is the Zep-class differentiator: not just *what* was connected,
+`rule`. That is the point of the record: not just *what* was connected,
 but *why* (which rule fired) and *when* (at which commit).
 
 **How rule attribution works:** When the rule engine fires or retracts a
@@ -5112,7 +5194,7 @@ history — they are state no-ops on replay (derived edges are re-derived from
 rules deterministically). History scans read them as ground truth of when the
 edge was created or retracted and by which rule.
 
-**MCP:** `edge_history(a, b)` → `{a, b, events, total_commits}`
+**MCP:** `edge_history(a, b)` → `{a, b, events, total_commits, horizon}`
 
 **HTTP:** `GET /history/edge?a=&b=`
 
@@ -5125,7 +5207,8 @@ edge was created or retracted and by which rule.
     { "edge_type": "SIMILAR", "commit": 3, "event": "Added",     "rule": "sim_emb" },
     { "edge_type": "SIMILAR", "commit": 7, "event": "Retracted", "rule": "sim_emb" }
   ],
-  "total_commits": 10
+  "total_commits": 10,
+  "horizon": 4
 }
 ```
 
@@ -5153,22 +5236,29 @@ outside horizon
 { "a": "alice", "b": "bob", "edge_type": "SIMILAR", "at_commit": 4, "linked": true }
 ```
 
-Returns 400 (not 500) when `at_commit` is outside the visible horizon:
+Returns 400 (not 500) when `at_commit` is outside the retained horizon. The
+body carries the range it will accept, and says so when older events are gone:
 
 ```json
-{ "error": "commit 999 is out of range" }
+{ "error": "commit 999 is out of range; valid range is 4..10 — events before commit 4 are not retained" }
 ```
 
 ### Horizon contract
 
-All three history endpoints include `total_commits` in their response. This is
-the exclusive upper bound for valid commit indices (`0..total_commits`). When
-the WAL is empty (immediately after a WAL-truncating snapshot and before any
-new writes), `total_commits` is 0 and the history list is empty. Commits before
-the last truncating snapshot are not visible.
+All three history endpoints report the window they can answer over. Valid
+commit indices are `horizon..total_commits`: `total_commits` is the exclusive
+upper bound, and `horizon` is the oldest commit still retained — `0` when
+nothing has been pruned. `node_history` and `edge_history` carry both fields in
+their response; `was_linked`, `edges_at` and `open_at`/`query_at` name both in
+the `CommitOutOfRange` they return for a commit outside it. When the WAL is
+empty (immediately after a WAL-truncating snapshot and before any new writes),
+`total_commits` is 0 and the history list is empty. Commits before the last
+truncating snapshot are not visible.
 
-This field is the **honesty contract**: clients can always determine what
-portion of history is visible and whether their query covers the full timeline.
+These two fields are the **honesty contract**: a client can always tell what
+portion of history it is looking at, and a short answer is never silent. The
+same pair is reported by `mushroomdb stats` (`history_floor`), `/stats`, the
+MCP `stats` tool, `mushroomdb doctor`'s `store` line, and the `asof` header.
 
 ### Role-token masking
 
@@ -5271,6 +5361,48 @@ remain trustworthy across restarts.
 `GraphDb::open_at(dir, commit)` replays WAL frames 0 through `commit`
 (inclusive) into a fresh in-memory graph, then marks the instance read-only.
 Every mutation method on the returned instance returns `GraphError::ReadOnly`.
+
+### As-of with a role or a mask
+
+`GraphDb::query_at_scoped(commit, cypher, params, scope)` runs a read-only
+query at `commit` under a restriction. `AsOfScope` says which one:
+
+| Scope | Restriction |
+|---|---|
+| `AsOfScope::Role("reader")` | everything that role may see |
+| `AsOfScope::Keys(&keys)` | an explicit node-key allow-list |
+| `AsOfScope::RoleAndKeys("reader", &keys)` | the role ∩ the allow-list — a client list can only narrow a role, never widen it |
+
+Over HTTP this is `as_of` on `POST /query`: it composes with a role token and
+with a client `mask`. Over MCP it is the `query` tool's `as_of` argument, which
+composes with `role` **or** with `mask` — that tool refuses the two together,
+with or without `as_of`. Writes are refused at any commit.
+
+**The one semantic to get right:** the **graph** is historical, the **role
+definition** is current. `roles.json` is a sidecar — it is never written as a
+WAL record, so it has no past version to read. What time-travels is which
+nodes the role's `keys` and `labels` resolve to: a role that may see the
+`Public` label sees exactly the `Public` nodes that existed at `commit`. If
+you rename a role's labels today, an as-of read from last week answers with
+today's label list against last week's graph.
+
+**Deletion is not retroactive.** Deleting a node does not remove it from a
+role's past: a role that may see `Public` reads a now-deleted `Public` node,
+and its edges, at any retained commit where it was live, and a role with
+`keys: ["k"]` reads `k` after `k` is gone. `DELETE` changes the present, not
+the WAL. To revoke history, prune the archives (below) or narrow the role —
+narrowing takes effect at every commit at once, because the role definition is
+always the current one.
+
+**Keys are not identities.** A role's `keys` resolve to whichever node held
+that key at the commit asked for. Renaming a node frees its key for reuse, so
+`keys: ["alice"]` read at an old commit sees the node that was `alice` then,
+not the one called `alice` now. The same caveat reaches `GET
+/node/{key}/history` under a role token: its edge-endpoint filter resolves the
+other endpoint's key against today's ids, not the ids as of the historical
+event, so a recycled key is judged by who holds it now, not who held it then.
+
+`stub_hidden` does not compose with `as_of`; see [masks.md](masks.md).
 
 ### WAL retention and snapshot interaction
 
@@ -5405,11 +5537,11 @@ Summary:
 
 | Operation | Live WAL commits | Archive commits (intact genesis chain) | Archive commits (pruned/incomplete) |
 |---|---|---|---|
-| `node_history` / `edge_history` | Always reachable | Always reachable | Reachable, but pruned events are silently omitted |
+| `node_history` / `edge_history` | Always reachable | Always reachable | Reachable; `horizon` names what is not |
 | `was_linked` / `edges_at` | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
 | `open_at` / `query_at` (as-of) | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
 
-`node_history`/`edge_history` take no commit bound and just scan whatever WAL/archives remain, so a pruned commit's events are missing with no error, while `was_linked`, `edges_at`, and `open_at`/`query_at` all check the horizon floor explicitly and refuse instead.
+`node_history`/`edge_history` take no commit bound and scan whatever WAL/archives remain, so a pruned commit's events are not in the list — the `horizon` field in their response says so. `was_linked`, `edges_at`, and `open_at`/`query_at` check the horizon floor explicitly and refuse, naming the range they accept.
 
 ### Retention and pruning
 
@@ -5428,17 +5560,18 @@ scans are unaffected.
 
 ### How far back history reaches
 
-Automatic snapshots (`serve`, git ingest) keep only the newest **8** WAL
-archives by default (`AUTO_SNAPSHOT_RETENTION`, `crates/cli/src/lib.rs`),
-pruning the rest on every run. Below that horizon (`commit <
-wal_horizon_floor`): `was_linked`, `edges_at`, and `open_at`/`query_at` check
-the floor and return `GraphError::CommitOutOfRange`, while `node_history` and
-`edge_history` take no commit bound and just omit the pruned events — no
-error, no notice.
-
-To keep everything, don't rely on the automatic path: take an explicit
-`mushroomdb snapshot <db-dir>` with no `--retention` (keeps every archive),
-or add `--keep-wal` to never truncate the WAL.
+Automatic snapshots (`serve`, git ingest) keep **every** WAL archive by
+default (`AUTO_SNAPSHOT_RETENTION`, `crates/cli/src/lib.rs`, is `None`
+unless configured): nothing is pruned unless a caller asks for it. Retention
+is opt-in — `mushroomdb snapshot <db-dir> --retention N` is how to bound the
+archives, and every read says where the remaining history starts once that
+bound has pruned something. Below that horizon (`commit < wal_horizon_floor`):
+`was_linked`, `edges_at`, and `open_at`/`query_at` return
+`GraphError::CommitOutOfRange`, whose message names the range it will accept
+and says that events before the floor are not retained. `node_history` and
+`edge_history` take no commit bound, so they return the events that survive
+together with `horizon` — the oldest commit still retained; anything before
+it was pruned.
 
 ---
 
@@ -5447,7 +5580,7 @@ or add `--keep-wal` to never truncate the WAL.
 | Error | Meaning |
 |---|---|
 | `GraphError::ReadOnly` | Mutation attempted on an as-of instance. |
-| `GraphError::CommitOutOfRange { commit, total }` | `commit >= total`; valid range is `0..total`. Also returned for archive-resident commits when the genesis chain is pruned or incomplete. |
+| `GraphError::CommitOutOfRange { commit, total, floor }` | `commit` is outside `floor..total`. `floor` is the oldest commit still retained (`0` when nothing has been pruned); when it is non-zero the message adds *"events before commit `floor` are not retained"*. Also returned for archive-resident commits when the genesis chain is pruned or incomplete. |
 | `GraphError::CasConflict { key, expected, actual }` | A `Precondition` failed; the batch was not applied. |
 
 ---

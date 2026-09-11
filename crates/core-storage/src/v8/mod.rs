@@ -3,8 +3,8 @@
 //! Wire layout (all integers LE):
 //! ```text
 //! [0..4]   MAGIC "GDB1"
-//! [4..6]   VERSION = 8 (u16 LE)
-//! [6..8]   section_count (u16 LE) — currently 11
+//! [4..6]   VERSION = 8 or 9 (u16 LE) — same container, V9 adds section 12
+//! [6..8]   section_count (u16 LE) — currently 13
 //! [8..8+16*N] SectionEntry * N  -- {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}
 //! [8+16*N..8+16*N+4]  whole-header CRC32
 //! [..4096]  zero-pad
@@ -23,6 +23,8 @@
 //!   8 = RULES_META (rkyv RulesMetaData)
 //!   9 = VIEWS (rkyv ViewsSectionData)
 //!  10 = IVF_STATE (bincode BTreeMap<String,PerRuleIvfState>; retained as undecoded bytes at open)
+//!  11 = LAST_CHANGE (bincode HashMap<u32,u64>)
+//!  12 = STRINGS (rkyv StringTableData — the one table every Str column indexes; V9 only)
 
 pub mod encode;
 pub mod layout;
@@ -31,7 +33,7 @@ pub mod seam;
 use crate::types::{GraphError, Result};
 use crate::v8::layout::{
     ArchivedColumns, ArchivedCsr, ArchivedEdgeProps, ArchivedHnsw, ArchivedIdMap, ArchivedInterner,
-    ArchivedRulesMeta, ArchivedViews,
+    ArchivedRulesMeta, ArchivedStringTable, ArchivedViews,
 };
 use memmap2::MmapOptions;
 use std::path::Path;
@@ -83,10 +85,15 @@ pub const SECTION_IVF_STATE: u8 = 10;
 /// Small section (8-16 bytes/node); loaded eagerly at open.  Missing in pre-Task-3 snapshots
 /// (treated as absent; the live map is rebuilt from WAL replay only).
 pub const SECTION_LAST_CHANGE: u8 = 11;
+/// Shared string table for every `ColumnData::Str` in the columns section:
+/// rkyv `StringTableData`.  Written from V9 on; absent in V5–V8 snapshots,
+/// where each string column carries its own copy and that copy is authoritative.
+pub const SECTION_STRINGS: u8 = 12;
 
 /// Total number of canonical section slots (used for atomic check_state array).
-/// Extended from 11 (Task 5: +ivf_state) to 12 (Task 3: +last_change).
-pub const V8_MAGIC_SECTION_COUNT: usize = 12;
+/// Extended from 11 (Task 5: +ivf_state) to 12 (Task 3: +last_change) to 13
+/// (v0.6.5: +strings).
+pub const V8_MAGIC_SECTION_COUNT: usize = 13;
 
 /// Returns `true` for sections whose content is large enough that a
 /// full-section CRC at first touch would cost tens or hundreds of
@@ -105,6 +112,7 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_HNSW
             | SECTION_PROVENANCE
             | SECTION_IVF_STATE
+            | SECTION_STRINGS
     )
 }
 
@@ -258,6 +266,7 @@ impl MappedBase {
             SECTION_VIEWS => "views",
             SECTION_IVF_STATE => "ivf_state",
             SECTION_LAST_CHANGE => "last_change",
+            SECTION_STRINGS => "strings",
             _ => "unknown",
         };
         self.dir
@@ -311,6 +320,15 @@ impl MappedBase {
     /// Exposed as `pub(crate)` so that `snapshot::decode_v8_from_mapped` can
     /// call `rkyv::access` (validated) for hostile-byte safety while the
     /// production seam path uses the `access_unchecked` accessors above.
+    /// `true` when the directory carries an entry for `section_id`.
+    ///
+    /// The optional sections (IVF_STATE, LAST_CHANGE, STRINGS) are absent from
+    /// snapshots written before they existed; this is how a caller tells
+    /// "absent" from "present but unreadable" without swallowing the second.
+    pub(crate) fn has_section(&self, section_id: u8) -> bool {
+        self.dir.iter().any(|e| e.id == section_id)
+    }
+
     pub(crate) fn section_bytes(&self, section_id: u8) -> Result<&[u8]> {
         let entry = self
             .dir
@@ -443,6 +461,37 @@ impl MappedBase {
         Ok(unsafe { rkyv::access_unchecked::<crate::v8::layout::ArchivedColumnsData>(bytes) })
     }
 
+    /// Zero-copy access to the shared string table (section 12).
+    ///
+    /// `None` when the snapshot predates the shared section (pre-V9): every
+    /// `ColumnData::Str` carries its own copy and that copy is authoritative.
+    /// `Some(Err(..))` only when the section is present but unreadable, which
+    /// must not be silently treated as "absent" — that would hand the caller
+    /// the empty per-column tables a V9 snapshot writes and lose every string.
+    ///
+    /// Uses `rkyv::access_unchecked`; see `topology()` for the full safety
+    /// rationale.  Reads in `ColumnsView`/`archived_to_columnstore` are
+    /// bounds-checked against the returned slice.
+    pub fn string_table(&self) -> Option<Result<&ArchivedStringTable>> {
+        if !self.has_section(SECTION_STRINGS) {
+            return None;
+        }
+        Some((|| {
+            let bytes = self.section_bytes(SECTION_STRINGS)?;
+            if bytes.len() < std::mem::size_of::<crate::v8::layout::ArchivedStringTableData>() {
+                return Err(GraphError::Corrupt {
+                    detail: "v8: strings section too short for rkyv root".to_string(),
+                });
+            }
+            // SAFETY: Minimum length checked above; encoder writes self-contained
+            // sections with all relative pointers within-section.  Same rationale
+            // and same mitigation (`mushroomdb verify`) as `columns()`.
+            Ok(unsafe {
+                rkyv::access_unchecked::<crate::v8::layout::ArchivedStringTableData>(bytes)
+            })
+        })())
+    }
+
     /// Zero-copy access to the archived id map.
     pub fn ids(&self) -> Result<&ArchivedIdMap> {
         let bytes = self.section_bytes(SECTION_IDS)?;
@@ -511,8 +560,9 @@ impl MappedBase {
         Ok(unsafe { rkyv::access_unchecked::<crate::v8::layout::ArchivedHnswSectionData>(bytes) })
     }
 
-    /// Structurally validate the four sections that the hot path reads via
-    /// `access_unchecked` (topology, columns, edge_props, hnsw), using rkyv's
+    /// Structurally validate the sections that the hot path reads via
+    /// `access_unchecked` (topology, columns, edge_props, hnsw, and — from V9
+    /// on — the shared string table), using rkyv's
     /// checked access (`bytecheck`). This walks every relative pointer and
     /// rejects out-of-bounds / malformed archives — the defense the hot path
     /// deliberately skips for speed.
@@ -526,6 +576,7 @@ impl MappedBase {
     pub fn validate_hot_sections(&self) -> Result<()> {
         use crate::v8::layout::{
             ArchivedColumnsData, ArchivedCsrData, ArchivedEdgePropsData, ArchivedHnswSectionData,
+            ArchivedStringTableData,
         };
         let check = |bytes: &[u8], name: &str| -> Result<()> {
             match name {
@@ -541,6 +592,9 @@ impl MappedBase {
                 "hnsw" => {
                     rkyv::access::<ArchivedHnswSectionData, rkyv::rancor::Error>(bytes).map(|_| ())
                 }
+                "strings" => {
+                    rkyv::access::<ArchivedStringTableData, rkyv::rancor::Error>(bytes).map(|_| ())
+                }
                 _ => Ok(()),
             }
             .map_err(|e| GraphError::Corrupt {
@@ -551,6 +605,12 @@ impl MappedBase {
         check(self.section_bytes(SECTION_COLUMNS)?, "columns")?;
         check(self.section_bytes(SECTION_EDGE_PROPS)?, "edge_props")?;
         check(self.section_bytes(SECTION_HNSW)?, "hnsw")?;
+        // Absent in a pre-V9 snapshot; when present it is read through
+        // `access_unchecked` like the other large sections, so this is the pass
+        // that catches a crafted relative pointer in it.
+        if self.has_section(SECTION_STRINGS) {
+            check(self.section_bytes(SECTION_STRINGS)?, "strings")?;
+        }
         Ok(())
     }
 
@@ -622,12 +682,14 @@ impl MappedBase {
 fn min_rkyv_root_size(section_id: u8) -> Option<usize> {
     use crate::v8::layout::{
         ArchivedColumnsData, ArchivedCsrData, ArchivedEdgePropsData, ArchivedHnswSectionData,
+        ArchivedStringTableData,
     };
     match section_id {
         SECTION_TOPOLOGY => Some(std::mem::size_of::<ArchivedCsrData>()),
         SECTION_COLUMNS => Some(std::mem::size_of::<ArchivedColumnsData>()),
         SECTION_EDGE_PROPS => Some(std::mem::size_of::<ArchivedEdgePropsData>()),
         SECTION_HNSW => Some(std::mem::size_of::<ArchivedHnswSectionData>()),
+        SECTION_STRINGS => Some(std::mem::size_of::<ArchivedStringTableData>()),
         _ => None,
     }
 }
@@ -651,10 +713,14 @@ fn parse_header(mmap: &[u8]) -> Result<Vec<SectionEntry>> {
         });
     }
     // Infallible: `mmap.len() >= HEADER_SIZE` checked above; slices are exactly 2 bytes each.
+    // V8 and V9 share this container byte-for-byte: same magic, same 4 KB
+    // header page, same 16-byte directory entries, same per-section CRC.  V9
+    // only adds section 12 and empties the per-column string tables, so one
+    // parser serves both and `string_table()` is what tells them apart.
     let version = u16::from_le_bytes(mmap[4..6].try_into().unwrap());
-    if version != 8 {
+    if version != crate::snapshot::VERSION_8 && version != crate::snapshot::VERSION_9 {
         return Err(GraphError::Corrupt {
-            detail: format!("v8: expected version 8, got {version}"),
+            detail: format!("v8: expected version 8 or 9, got {version}"),
         });
     }
     let section_count = u16::from_le_bytes(mmap[6..8].try_into().unwrap()) as usize;
@@ -746,7 +812,7 @@ mod tests {
         let meta = tiny_v8_meta();
         let mut out = Vec::new();
         encode_v8(
-            None, None, None, None, &topo, &props, &ids, &syms, &meta, &mut out,
+            None, None, None, None, None, &topo, &props, &ids, &syms, &meta, &mut out,
         )
         .expect("encode_v8");
         out
@@ -908,6 +974,104 @@ mod tests {
             Err(other) => panic!("expected Corrupt, got {other:?}"),
             Ok(_) => panic!("expected Err(Corrupt) for tiny section len, got Ok"),
         }
+    }
+
+    /// `verify` must reject a structurally corrupt shared string table even
+    /// when every CRC has been repaired.
+    ///
+    /// Section 12 is a large section, so its CRC is skipped on the query path
+    /// and `verify_integrity` alone cannot be the defence: an attacker who
+    /// controls the bytes recomputes the checksum.  `validate_hot_sections` is
+    /// the pass that walks the relative pointers, and this asserts it catches a
+    /// smashed root with both the section CRC and the header CRC rebuilt.
+    #[test]
+    fn verify_rejects_a_structurally_corrupt_string_table() {
+        let healthy = encode_with_strings();
+        // Locate section 12.
+        let section_count = u16::from_le_bytes(healthy[6..8].try_into().unwrap()) as usize;
+        let dir_end = 8 + section_count * 16;
+        let mut found = None;
+        for i in 0..section_count {
+            let base = 8 + i * 16;
+            if healthy[base] == SECTION_STRINGS {
+                let off =
+                    u32::from_le_bytes(healthy[base + 4..base + 8].try_into().unwrap()) as usize;
+                let len =
+                    u32::from_le_bytes(healthy[base + 8..base + 12].try_into().unwrap()) as usize;
+                found = Some((base, off, len));
+                break;
+            }
+        }
+        let (entry_base, off, len) = found.expect("a V9 snapshot must carry section 12");
+        assert!(len > 16, "section 12 must hold a real table, got {len} B");
+
+        let mut detected_any = false;
+        for byte in (len - 8)..len {
+            let mut bytes = healthy.clone();
+            bytes[off + byte] ^= 0xff;
+            // Repair the section CRC, then the whole-header CRC.
+            let crc = crc32fast::hash(&bytes[off..off + len]);
+            bytes[entry_base + 12..entry_base + 16].copy_from_slice(&crc.to_le_bytes());
+            let header_crc = crc32fast::hash(&bytes[0..dir_end]);
+            bytes[dir_end..dir_end + 4].copy_from_slice(&header_crc.to_le_bytes());
+
+            let base = MappedBase::from_bytes(bytes).expect("header CRC is correct after repair");
+            base.validate_section_bounds()
+                .expect("bounds are untouched");
+            // Every CRC was rebuilt, so the checksum audit must report clean —
+            // which is exactly why it cannot be the defence here.
+            assert!(
+                base.verify_integrity().iter().all(|(_, _, _, r)| r.is_ok()),
+                "CRCs were recomputed; a mismatch means this test is wrong"
+            );
+            match base.validate_hot_sections() {
+                Err(GraphError::Corrupt { detail }) => {
+                    assert!(
+                        detail.contains("strings"),
+                        "the strings structural check must be what rejects it; got: {detail}"
+                    );
+                    detected_any = true;
+                }
+                Err(other) => panic!("expected Corrupt, got {other:?}"),
+                // A flip inside the length field can still describe a
+                // structurally valid (if wrong) archive; not a safety failure.
+                Ok(()) => {}
+            }
+        }
+        assert!(
+            detected_any,
+            "validate_hot_sections must reject a smashed string-table root even \
+             with every CRC repaired"
+        );
+    }
+
+    /// A snapshot whose columns carry string properties, so section 12 holds a
+    /// real table rather than an empty one.
+    fn encode_with_strings() -> Vec<u8> {
+        let mut ids = IdMap::new();
+        let mut props = ColumnStore::new();
+        for n in 0..32u32 {
+            ids.get_or_insert(&format!("n{n}"));
+            props.set(n, "tag", Value::Str(format!("tag-value-{n}")));
+        }
+        let mut meta = tiny_v8_meta();
+        meta.labels = vec![0; 32];
+        let mut out = Vec::new();
+        encode_v8(
+            None,
+            None,
+            None,
+            None,
+            None,
+            &Topology::new(),
+            &props,
+            &ids,
+            &Interner::new(),
+            &meta,
+            &mut out,
+        )
+        .expect("encode_v8");
+        out
     }
 
     /// RAII guard that removes the file on drop.

@@ -1,0 +1,595 @@
+//! The open path must reuse the HNSW graph the snapshot persisted instead of
+//! rebuilding it.
+//!
+//! Both open paths — `consume_retained_state_eager` (WAL present) and
+//! `ensure_indexes_populated` (clean open, first mutation) — used to run a full
+//! node scan into a freshly initialized HNSW graph and then immediately replace
+//! that graph with the persisted blob. The build is superlinear in the number
+//! of embeddings and its result was discarded every time.
+
+use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
+use core_storage::fs::RealFs;
+
+type Db = GraphDb<RealFs>;
+
+fn tmp(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("graphdb-{}-{}", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+fn emb(xs: &[f64]) -> Value {
+    Value::List(xs.iter().copied().map(Value::Float).collect())
+}
+
+fn sim_rule() -> RuleDef {
+    RuleDef {
+        name: "sim".into(),
+        src_label: "Doc".into(),
+        dst_label: "Doc".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: 0.9,
+        },
+        edge_type: "SIM".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: true,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    }
+}
+
+/// Eight 2-D unit vectors in four well-separated pairs, so the approximate
+/// rule's edge set is deterministic and cheap to compare.
+const DOCS: &[(&str, [f64; 2])] = &[
+    ("d0", [1.0, 0.0]),
+    ("d1", [0.98, 0.2]),
+    ("d2", [0.0, 1.0]),
+    ("d3", [-0.2, 0.98]),
+    ("d4", [-1.0, 0.0]),
+    ("d5", [-0.98, 0.2]),
+    ("d6", [0.0, -1.0]),
+    ("d7", [0.2, -0.98]),
+];
+
+fn seed(dir: &std::path::Path) -> Db {
+    let mut db = GraphDb::open(dir).unwrap();
+    for (k, v) in DOCS {
+        db.insert_node("Doc", k, vec![("emb".into(), emb(v))])
+            .unwrap();
+    }
+    db.create_rule(sim_rule()).unwrap();
+    db
+}
+
+fn edge_map(db: &Db) -> Vec<(String, Vec<String>)> {
+    DOCS.iter()
+        .map(|(k, _)| {
+            (
+                k.to_string(),
+                db.neighbors(k, "SIM", Direction::Out).unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// `edge_map` plus the post-snapshot node. A deleted key yields an empty list
+/// on both sides of the comparison, so it stays in the map harmlessly.
+fn edge_map_with_late(db: &Db) -> Vec<(String, Vec<String>)> {
+    let mut out = edge_map(db);
+    out.push((
+        "late".into(),
+        db.neighbors("late", "SIM", Direction::Out)
+            .unwrap_or_default(),
+    ));
+    out
+}
+
+/// Clean open (snapshot truncates the WAL): the first mutation populates the
+/// indexes through `ensure_indexes_populated`, which must load the persisted
+/// graphs rather than build new ones.
+#[test]
+fn clean_open_reuses_persisted_hnsw() {
+    let dir = tmp("hnsw-open-clean");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    // A mutation trips the lazy-init guard, the clean-open path into the
+    // reindex. Nothing about this node touches the vector rule's dst side.
+    db.insert_node("Other", "o", vec![("v".into(), Value::Int(1))])
+        .unwrap();
+    assert_eq!(
+        db.hnsw_build_count(),
+        0,
+        "clean open rebuilt an HNSW graph the snapshot already holds"
+    );
+
+    // The loaded graph still answers.
+    let hits = db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 2, 0.0);
+    assert!(
+        hits.iter().any(|(k, _)| k == "d0"),
+        "persisted HNSW must still find d0; got {hits:?}"
+    );
+}
+
+/// WAL-present open: `consume_retained_state_eager` runs before replay and
+/// must load the persisted graphs rather than build new ones.
+#[test]
+fn wal_present_open_reuses_persisted_hnsw() {
+    let dir = tmp("hnsw-open-wal");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+        // WAL tail: replayed on the next open.
+        db.insert_node("Doc", "tail", vec![("emb".into(), emb(&[0.99, 0.1]))])
+            .unwrap();
+    }
+
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        db.hnsw_build_count(),
+        0,
+        "WAL-present open rebuilt an HNSW graph the snapshot already holds"
+    );
+}
+
+/// Embeddings written after the last snapshot arrive through WAL replay, which
+/// runs `on_node_changed` against the already-loaded index. They must be
+/// searchable on the next open without any rebuild.
+#[test]
+fn wal_replayed_embeddings_are_searchable_after_open() {
+    let dir = tmp("hnsw-open-wal-search");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+        db.insert_node("Doc", "late", vec![("emb".into(), emb(&[0.995, 0.1]))])
+            .unwrap();
+    }
+
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.hnsw_build_count(), 0, "open rebuilt a persisted graph");
+
+    let hits = db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 3, 0.5);
+    let keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(
+        keys.contains(&"late"),
+        "embedding written after the snapshot must be searchable after reopen; got {keys:?}"
+    );
+    assert!(
+        keys.contains(&"d0"),
+        "pre-snapshot embedding must still be searchable; got {keys:?}"
+    );
+}
+
+/// The lazy populate path must not drop an embedding the persisted blob
+/// predates.
+///
+/// Clean open (the snapshot truncated the WAL), so the indexes populate through
+/// `ensure_indexes_populated` on the first write — and that first write is
+/// itself the post-snapshot embedding, so the node scan runs with `late`
+/// already in the graph while the blob only knows `d0..d7`.
+#[test]
+fn lazy_open_indexes_an_embedding_the_blob_predates() {
+    let dir = tmp("hnsw-open-lazy-late");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Doc", "late", vec![("emb".into(), emb(&[0.995, 0.1]))])
+        .unwrap();
+    assert_eq!(
+        db.hnsw_build_count(),
+        0,
+        "the lazy populate rebuilt a graph the snapshot already holds"
+    );
+
+    let keys = keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 3, 0.5));
+    assert!(
+        keys.iter().any(|k| k == "late"),
+        "the post-snapshot embedding must be in the adopted index; got {keys:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k == "d0"),
+        "a pre-snapshot embedding must still be in the adopted index; got {keys:?}"
+    );
+
+    // Discriminating: k = 1 at `late`'s exact vector. An id the scan tracked but
+    // never inserted into the graph cannot win this search at all.
+    let exact = db.find_similar_vector("emb", Some("Doc"), &[0.995, 0.1], 1, 0.0);
+    assert_eq!(
+        exact.len(),
+        1,
+        "top-1 at the post-snapshot vector came back empty; got {exact:?}"
+    );
+    assert_eq!(
+        exact[0].0, "late",
+        "top-1 at `late`'s own vector must be `late`; got {exact:?}"
+    );
+}
+
+/// Post-snapshot writes of every shape the index has to absorb: an INSERT, an
+/// embedding UPDATE that moves a node between clusters, and a DELETE.
+///
+/// `d2` leaves the +y cluster for the +x cluster; `d1` (a +x node) is removed;
+/// `late` joins +x.
+fn post_snapshot_writes(db: &mut Db) {
+    db.set_prop("d2", "emb", emb(&[0.99, 0.14])).unwrap();
+    db.delete_node("d1").unwrap();
+    db.insert_node("Doc", "late", vec![("emb".into(), emb(&[0.995, 0.1]))])
+        .unwrap();
+}
+
+fn keys_of(hits: &[(String, f64)]) -> Vec<String> {
+    hits.iter().map(|(k, _)| k.clone()).collect()
+}
+
+/// The adopted index must absorb an UPDATE and a DELETE replayed from the WAL,
+/// not just an insert: the loaded graph is only correct if `on_node_changed`
+/// and `on_node_removed` reach it during replay.
+#[test]
+fn wal_replayed_update_and_delete_are_reflected_after_open() {
+    let dir = tmp("hnsw-open-wal-upd-del");
+    let live_hits;
+    let live_edges;
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+        post_snapshot_writes(&mut db);
+        live_hits = keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.5));
+        live_edges = edge_map_with_late(&db);
+    }
+
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.hnsw_build_count(), 0, "reopen rebuilt a persisted graph");
+
+    let after = keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.5));
+    assert!(
+        !after.iter().any(|k| k == "d1"),
+        "the replayed DELETE must remove d1 from the adopted index; got {after:?}"
+    );
+    assert!(
+        after.iter().any(|k| k == "d2"),
+        "the replayed UPDATE must make d2 findable at its NEW vector; got {after:?}"
+    );
+    assert!(
+        after.iter().any(|k| k == "late"),
+        "the replayed INSERT must be in the index; got {after:?}"
+    );
+    assert_eq!(
+        live_hits, after,
+        "ANN results diverged between the live writes and the reopen"
+    );
+    assert_eq!(
+        live_edges,
+        edge_map_with_late(&db),
+        "derived edge set diverged between the live writes and the reopen"
+    );
+
+    // The old position of the updated vector must no longer lead to d2 first:
+    // a stale entry at [0,1] would still be top-1 there.
+    let old_spot = db.find_similar_vector("emb", Some("Doc"), &[0.0, 1.0], 1, 0.99);
+    assert!(
+        !old_spot.iter().any(|(k, _)| k == "d2"),
+        "d2 is still indexed at its pre-update vector; got {old_spot:?}"
+    );
+}
+
+/// A discriminating check that the replayed DELETE actually left the adopted
+/// graph rather than merely being filtered out downstream: query `k = 1` at the
+/// deleted node's exact vector. A stale id still in the graph would win that
+/// search and then be dropped when resolved to a key, yielding no hit at all.
+#[test]
+fn deleted_node_is_gone_from_the_adopted_index() {
+    let dir = tmp("hnsw-open-wal-del");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+        db.delete_node("d1").unwrap();
+    }
+
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.hnsw_build_count(), 0, "reopen rebuilt a persisted graph");
+
+    // d1's exact vector.
+    let hits = db.find_similar_vector("emb", Some("Doc"), &[0.98, 0.2], 1, 0.0);
+    assert_eq!(
+        hits.len(),
+        1,
+        "top-1 at the deleted node's vector came back empty: its id is still in \
+         the HNSW graph"
+    );
+    assert_ne!(hits[0].0, "d1", "the deleted node was returned by a query");
+}
+
+/// Same writes, but snapshotted again afterwards, so the reopen takes the
+/// clean-open path (`ensure_indexes_populated`) rather than WAL replay. The
+/// persisted graph must already carry the update and the delete.
+#[test]
+fn clean_open_after_update_and_delete() {
+    let dir = tmp("hnsw-open-clean-upd-del");
+    let live_hits;
+    let live_edges;
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+        post_snapshot_writes(&mut db);
+        db.snapshot().unwrap();
+        live_hits = keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.5));
+        live_edges = edge_map_with_late(&db);
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(
+        keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.5)),
+        live_hits,
+        "ANN results diverged across the clean reopen"
+    );
+
+    // Trip the lazy guard so the mutation-path indexes materialize too.
+    db.insert_node("Other", "o", vec![("v".into(), Value::Int(1))])
+        .unwrap();
+    assert_eq!(db.hnsw_build_count(), 0, "clean open rebuilt a graph");
+    assert_eq!(
+        keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.5)),
+        live_hits,
+        "ANN results diverged after the lazy guard populated the indexes"
+    );
+    assert_eq!(
+        live_edges,
+        edge_map_with_late(&db),
+        "derived edge set diverged across the clean reopen"
+    );
+}
+
+/// Open-time bench on a synthetic 2,000-embedding store.  Ignored by default
+/// and additionally gated on `MUSHROOM_BENCH_HNSW_OPEN=1`, because the build it
+/// times is exactly the superlinear cost this change removes.
+///
+/// Run with:
+/// `MUSHROOM_BENCH_HNSW_OPEN=1 cargo test -p mushroomdb --test hnsw_open -- --ignored --nocapture`
+#[test]
+#[ignore = "timing bench: set MUSHROOM_BENCH_HNSW_OPEN=1"]
+fn bench_open_2k_embeddings() {
+    if std::env::var("MUSHROOM_BENCH_HNSW_OPEN").is_err() {
+        return;
+    }
+    const N: usize = 2_000;
+    const D: usize = 64;
+
+    // Deterministic pseudo-random unit vectors (xorshift64*), so the bench
+    // measures the same graph on every run.
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut next = move || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    };
+
+    let dir = tmp("hnsw-open-bench");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for i in 0..N {
+            let xs: Vec<f64> = (0..D).map(|_| next()).collect();
+            let norm = xs.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let unit: Vec<f64> = xs.iter().map(|x| x / norm).collect();
+            db.insert_node("Doc", &format!("n{i}"), vec![("emb".into(), emb(&unit))])
+                .unwrap();
+        }
+        let t = std::time::Instant::now();
+        db.create_rule(sim_rule()).unwrap();
+        eprintln!("create_rule (full build, {N}x{D}): {:?}", t.elapsed());
+        db.snapshot().unwrap();
+        // WAL tail so the reopen takes the eager (consume_retained_state_eager)
+        // path rather than deferring to the first mutation.
+        db.insert_node("Doc", "tail", vec![("emb".into(), emb(&vec![0.0; D]))])
+            .unwrap();
+    }
+
+    let t = std::time::Instant::now();
+    let db = GraphDb::open(&dir).unwrap();
+    let open = t.elapsed();
+    eprintln!(
+        "open (WAL-present, {N} embeddings): {open:?}, hnsw builds = {}",
+        db.hnsw_build_count()
+    );
+}
+
+/// Correctness invariant: skipping the build must not change what the rule
+/// derives or what an ANN query returns.
+#[test]
+fn query_results_identical_across_snapshot_and_reopen() {
+    let dir = tmp("hnsw-open-equiv");
+    let edges_before;
+    let hits_before;
+    {
+        let mut db = seed(&dir);
+        edges_before = edge_map(&db);
+        hits_before = db.find_similar_vector("emb", Some("Doc"), &[0.9, 0.3], 4, 0.0);
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    let hits_after = db.find_similar_vector("emb", Some("Doc"), &[0.9, 0.3], 4, 0.0);
+    let keys_before: Vec<&str> = hits_before.iter().map(|(k, _)| k.as_str()).collect();
+    let keys_after: Vec<&str> = hits_after.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys_before, keys_after,
+        "top-k candidates must be identical across snapshot + reopen"
+    );
+    // Scores are recomputed from the stored vectors on each path, so they may
+    // differ by a ULP from summation order; they must not differ meaningfully.
+    for ((k, a), (_, b)) in hits_before.iter().zip(hits_after.iter()) {
+        assert!(
+            (a - b).abs() < 1e-12,
+            "score for {k} changed across reopen: {a} vs {b}"
+        );
+    }
+
+    // Force the mutation path to materialize the indexes, then compare the
+    // derived edge set the rule owns.
+    db.insert_node("Other", "o", vec![("v".into(), Value::Int(1))])
+        .unwrap();
+    assert_eq!(db.hnsw_build_count(), 0, "reopen rebuilt a persisted graph");
+    assert_eq!(
+        edges_before,
+        edge_map(&db),
+        "derived edge set must be identical across snapshot + reopen"
+    );
+}
+
+/// Exact k-NN over `DOCS`, computed here rather than by the database: the
+/// reference the approximate path has to reproduce.
+fn brute_force(q: &[f64; 2], k: usize, min: f64) -> Vec<String> {
+    let qn = (q[0] * q[0] + q[1] * q[1]).sqrt();
+    let mut scored: Vec<(String, f64)> = DOCS
+        .iter()
+        .map(|(key, v)| {
+            let vn = (v[0] * v[0] + v[1] * v[1]).sqrt();
+            (key.to_string(), (q[0] * v[0] + q[1] * v[1]) / (qn * vn))
+        })
+        .filter(|&(_, sim)| sim >= min)
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    scored.truncate(k);
+    scored.into_iter().map(|(key, _)| key).collect()
+}
+
+/// Clean open, **before any mutation**: the first approximate query must be
+/// answered by the persisted graph, not by the brute-force fallback.
+///
+/// This is the `ensure_hnsw_loaded` path (`engine.rs`), which decodes the
+/// retained blobs on the read side under a shared lock. It is separate from
+/// `ensure_indexes_populated`, and its failure is silent: the results are
+/// still correct — brute force gets the same answer — so only a counter can
+/// tell the two apart. Two things used to break it on a clean open: the
+/// retained blobs were never read out of the snapshot before the `OnceLock`
+/// latched (so it latched an empty map for the handle's life), and the
+/// label-less entry point could not reach the lazily decoded graphs at all.
+#[test]
+fn clean_open_first_query_is_served_by_the_index() {
+    let dir = tmp("hnsw-open-lazy");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+    }
+
+    let db = GraphDb::open(&dir).unwrap();
+    let q = [1.0, 0.0];
+    let expected = brute_force(&q, 2, 0.0);
+
+    core_rules::hnsw_search_count_reset();
+    let hits = db.find_similar_vector("emb", Some("Doc"), &q, 2, 0.0);
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "the first query on a clean open fell back to a full scan: the retained \
+         HNSW blob was never decoded"
+    );
+    assert_eq!(keys_of(&hits), expected, "index disagrees with brute force");
+
+    // Same for the cross-label entry point used by hybrid search.
+    core_rules::hnsw_search_count_reset();
+    let any = db.find_similar_vector("emb", None, &q, 2, 0.0);
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "the label-less query fell back to a full scan"
+    );
+    assert_eq!(keys_of(&any), expected, "index disagrees with brute force");
+
+    // Still no mutation has happened: the read path must not have built one.
+    assert_eq!(db.hnsw_build_count(), 0, "clean open rebuilt a graph");
+}
+
+/// The lazy copy is a *transient*: it exists only for the window between a
+/// clean open and the first write. Once the write has moved the persisted
+/// blobs into the live indexes, holding on to it would double the resident
+/// memory of every approximate rule for the life of the handle.
+#[test]
+fn the_first_write_releases_the_lazy_index_copy() {
+    let dir = tmp("hnsw-open-lazy-release");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.lazy_hnsw_len(), 0, "nothing is decoded before the query");
+
+    let q = [1.0, 0.0];
+    let before = db.find_similar_vector("emb", Some("Doc"), &q, 2, 0.0);
+    assert_eq!(db.lazy_hnsw_len(), 1, "the query did not decode the blob");
+
+    // The first write populates the live indexes from the same blobs.
+    db.insert_node("Other", "o", vec![("v".into(), Value::Int(1))])
+        .unwrap();
+    assert_eq!(
+        db.lazy_hnsw_len(),
+        0,
+        "the read-path copy outlived the live index it duplicates"
+    );
+
+    // And the live index — not a re-decoded copy — answers from here on.
+    core_rules::hnsw_search_count_reset();
+    let after = db.find_similar_vector("emb", Some("Doc"), &q, 2, 0.0);
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "the query after the first write fell back to a full scan"
+    );
+    assert_eq!(db.lazy_hnsw_len(), 0, "the copy came back");
+    assert_eq!(keys_of(&before), keys_of(&after));
+}
+
+/// Emptying a side must be believed. The lazy copy is a picture of the
+/// snapshot, so if it survives the write that empties the live graph, the
+/// fallthrough in `hnsw_search_dst` / `hnsw_search_any_dst` reaches it and the
+/// query is answered by a graph full of nodes that no longer exist.
+///
+/// The id map currently masks the damage at this level — `key_of` drops every
+/// stale id, so the caller sees an empty result either way — but the search
+/// counter shows whether the stale graph was walked at all, and nothing
+/// guarantees that masking holds if ids are ever recycled.
+#[test]
+fn deleting_every_embedding_on_a_side_consults_no_stale_graph() {
+    let dir = tmp("hnsw-open-lazy-stale");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    let q = [1.0, 0.0];
+    // Decode the blob on the read path first — this is the window the bug
+    // lived in.
+    assert!(!db
+        .find_similar_vector("emb", Some("Doc"), &q, 2, 0.0)
+        .is_empty());
+    assert_eq!(db.lazy_hnsw_len(), 1);
+
+    for (k, _) in DOCS {
+        db.delete_node(k).unwrap();
+    }
+
+    core_rules::hnsw_search_count_reset();
+    assert_eq!(
+        db.find_similar_vector("emb", Some("Doc"), &q, 8, 0.0),
+        vec![],
+        "a labelled query answered from the snapshot's copy of a deleted side"
+    );
+    assert_eq!(
+        db.find_similar_vector("emb", None, &q, 8, 0.0),
+        vec![],
+        "a label-less query answered from the snapshot's copy of a deleted side"
+    );
+    assert_eq!(
+        core_rules::hnsw_search_count(),
+        0,
+        "an emptied side still walked a graph: the stale copy is reachable"
+    );
+}

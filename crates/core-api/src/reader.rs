@@ -28,7 +28,7 @@ use core_storage::{
 };
 
 use crate::db::{EdgeInfo, NodeInfo};
-use crate::mask::NodeMask;
+use crate::mask::{NodeMask, RoleMaskCache};
 use crate::roles::RoleDef;
 
 /// Fold trigger: every K commits, the overlay is cloned into a new `FrozenOverlay`
@@ -75,6 +75,12 @@ pub struct ReaderSnapshot {
     pub base: Option<Arc<MappedBase>>,
     /// Commits since the last fold, in arrival order. Length ≤ `FOLD_EVERY_K − 1`.
     pub deltas: Vec<Arc<CommitDelta>>,
+    /// The store's `commit_seq` when this snapshot was taken — the version key
+    /// for the shared role-mask memo. The effective state (frozen + deltas) is
+    /// exactly the state the live handle had at this commit.
+    pub version: u64,
+    /// Role → mask memo, shared with the `GraphDb` this snapshot came from.
+    role_masks: Arc<RoleMaskCache>,
     /// Cached materialized overlay (frozen + deltas applied).
     ///
     /// Computed at most once per `ReaderSnapshot` on the first call to
@@ -104,7 +110,11 @@ fn build_cv<'a>(props: &'a ColumnStore, base: &'a Option<Arc<MappedBase>>) -> Co
             let cols = b
                 .columns()
                 .expect("base columns CRC already verified at open");
-            ColumnsView::with_base_cached(props, cols, b.mixed_cache())
+            let strings = b
+                .string_table()
+                .transpose()
+                .expect("base strings CRC already verified at open");
+            ColumnsView::with_base_cached(props, cols, b.mixed_cache()).with_shared_strings(strings)
         }
     }
 }
@@ -363,7 +373,17 @@ fn apply_one(
 
 // ── ReaderSnapshot ────────────────────────────────────────────────────────────
 
-fn mask_for_role_from(state: &FrozenOverlay, role: &str) -> Result<NodeMask> {
+/// Resolve `role` against a frozen overlay — the reader-side twin of
+/// [`crate::db::GraphDb::mask_for_role`], and kept identical to it.
+///
+/// Takes `base` because a role carrying a `visible_where` predicate has to read
+/// properties, and a node's property may live in the mmap'd base rather than
+/// the overlay.
+fn mask_for_role_from(
+    state: &FrozenOverlay,
+    base: &Option<Arc<MappedBase>>,
+    role: &str,
+) -> Result<NodeMask> {
     let roles = state.roles.as_ref().ok_or_else(|| GraphError::Corrupt {
         detail: "roles.json was corrupt at open; fix the file and re-open".into(),
     })?;
@@ -374,16 +394,33 @@ fn mask_for_role_from(state: &FrozenOverlay, role: &str) -> Result<NodeMask> {
             key: format!("role:{role}"),
         })?;
     let mut visible = HashSet::new();
+    // Key leg: an administrative grant, never narrowed by the predicate.
     for key in &def.keys {
         if let Some(id) = state.ids.get(key) {
             visible.insert(id);
         }
     }
+    let props = def
+        .visible_where
+        .as_ref()
+        .map(|_| build_cv(&state.props, base));
     for label_name in &def.labels {
         if let Some(sym) = state.syms.get(label_name) {
             for (i, &s) in state.labels.iter().enumerate() {
-                if s == sym {
-                    visible.insert(i as u32);
+                if s != sym {
+                    continue;
+                }
+                let id = i as u32;
+                match (&def.visible_where, &props) {
+                    (Some(pred), Some(view)) => {
+                        let value = view.get(id, &pred.field).map(|vr| vr.into_value());
+                        if pred.holds(value.as_ref()) {
+                            visible.insert(id);
+                        }
+                    }
+                    _ => {
+                        visible.insert(id);
+                    }
                 }
             }
         }
@@ -435,11 +472,15 @@ impl ReaderSnapshot {
         frozen: Arc<FrozenOverlay>,
         base: Option<Arc<MappedBase>>,
         deltas: Vec<Arc<CommitDelta>>,
+        version: u64,
+        role_masks: Arc<RoleMaskCache>,
     ) -> Self {
         Self {
             frozen,
             base,
             deltas,
+            version,
+            role_masks,
             cache: OnceLock::new(),
         }
     }
@@ -472,8 +513,16 @@ impl ReaderSnapshot {
     /// Coherent with [`Self::query_masked`]: both read from the same effective
     /// state (frozen or cached materialization), so the mask is never stale
     /// relative to the query data.
+    ///
+    /// Memoised per `(role, version)` in the cache shared with the originating
+    /// `GraphDb`, so a scoped reader taking snapshot after snapshot between two
+    /// writes resolves the role once.
     pub fn mask_for_role(&self, role: &str) -> Result<NodeMask> {
-        mask_for_role_from(self.effective()?, role)
+        self.role_masks
+            .get_or_build(role, self.version, || {
+                mask_for_role_from(self.effective()?, &self.base, role)
+            })
+            .map(|m| (*m).clone())
     }
 
     /// Resolve a node key to its dense id.

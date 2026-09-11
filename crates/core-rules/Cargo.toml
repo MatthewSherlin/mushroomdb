@@ -12,9 +12,14 @@ description = "Rule evaluation engine for mushroomdb: declarative predicates and
 [lib]
 name = "core_rules"
 
+[features]
+# Exposes counters an integration test in a *different* crate needs to observe
+# index work (`hnsw_search_count`). Never enabled by a normal build.
+test-hooks = []
+
 [dependencies]
 bincode = { workspace = true }
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.4" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.5" }
 serde = { workspace = true }
 
 [dev-dependencies]

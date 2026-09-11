@@ -27,7 +27,7 @@ Claude Desktop has no installer path, so add mushroomdb by hand in
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.6.4", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.6.5", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -301,8 +301,9 @@ same answer at any commit because a label is fixed when a node is inserted — w
 one consequence: a node deleted since `at` carries no label and drops out of a
 labelled historical answer.
 
-`edges_at` errors below the retention horizon; `node_history` instead just omits
-what's been pruned — see [How far back history reaches](timetravel.md#how-far-back-history-reaches).
+`edges_at` errors below the retention horizon, naming the range it accepts;
+`node_history` and `edge_history` return what survives plus `horizon`, the oldest
+commit still retained — see [How far back history reaches](timetravel.md#how-far-back-history-reaches).
 
 `json: true` without a filter → `{key, at, edges, listed, total}`, listing at most
 `limit` edges **per edge type** (default 10, max 100 in that form).
@@ -465,10 +466,10 @@ rows into it.
 | `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity using HNSW when available; (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). |
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain` | The rules and scores that produced the edges between two nodes, as JSON. `explain_association` above is the same question answered in prose. |
-| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels resolved to that same allow-list. Pass one or the other, never both. See [Trust model](#trust-model) below. The dialect: `n.key` / `n.label` / `key(n)` / `labels(n)`, `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `IN`, list subscripts (`n.location[0]`), comma-separated patterns sharing variables in one `MATCH`, and `count(DISTINCT …)` after a `WITH`. Full reference: [`query.md`](query.md). |
+| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels, narrowed by its `visible_where` property test if it declares one, resolved to that same allow-list. Pass one or the other, never both. Pass `as_of` — a 0-based WAL commit index — to answer from the graph as it was at that commit; it composes with `role` or with `mask` (not both, since the tool refuses that pair), and both are resolved against the graph as it was then. Writes and `stub_hidden` are refused with `as_of`. Deleting a node does not remove it from a role's past, and a role's `keys` resolve to whichever node held the key at that commit — see [masks.md](masks.md). See [Trust model](#trust-model) below. The dialect: `n.key` / `n.label` / `key(n)` / `labels(n)`, `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `IN`, list subscripts (`n.location[0]`), comma-separated patterns sharing variables in one `MATCH`, and `count(DISTINCT …)` after a `WITH`. Full reference: [`query.md`](query.md). |
 | `node_info` | Return a node's key, label, and all properties. |
-| `stats` | Return live node, edge, and rule counts. |
-| `node_history` | Every property change for a node since the last truncating snapshot. |
+| `stats` | Return live node, edge, and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned). |
+| `node_history` | Every recorded change to one node, newest last, plus `total_commits` (the horizon upper bound) and `horizon`, the oldest commit still retained. |
 | `edge_history` | Add/retract lifecycle for all edges between two nodes, with the rule behind each event. |
 | `was_linked` | Point-in-time check: was an edge of this type active at this commit? |
 | `rename_node` | Rename a node's key, preserving all its edges. |

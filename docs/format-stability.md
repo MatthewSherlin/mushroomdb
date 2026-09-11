@@ -22,17 +22,25 @@ document is the binding contract for how the snapshot and WAL formats evolve.
 | V5 | Uncompressed bincode payload with CRC32 header |
 | V6 | zstd-compressed V5 payload |
 | V7 | zstd(CRC32 + packed CSR topology + packed columnar properties + bincode meta) |
-| V8 (current) | mmap-able zero-copy rkyv sections; see wire description below |
+| V8 | mmap-able zero-copy rkyv sections; every string column carries a full copy of the string table |
+| V9 (current) | V8's container with one shared string table (section 12); every string column's own table is empty |
 
-The current encoder always writes **V8**. The decoder supports V5, V6, V7, and V8.
-V5–V7 stores are **automatically migrated** to V8 on `GraphDb::open` (see Automatic migration below).
+The current encoder always writes **V9**. The decoder supports V5, V6, V7, V8, and V9.
+V5–V8 stores are **automatically migrated** to V9 on `GraphDb::open` (see Automatic migration below).
 
-#### V8 wire description
+V8 and V9 are the *same container* — same magic, header page, directory entries
+and per-section CRC — and both decode through `MappedBase`. The version still
+moves because the change is not backward-safe in the other direction: a V8
+reader opening a V9 snapshot would find every string column's own table empty
+and silently drop every string property. It refuses with
+`snapshot: unsupported version 9` instead.
+
+#### V9 wire description
 
 ```text
 [0..4]         magic "GDB1"
-[4..6]         VERSION = 8 (u16 LE)
-[6..8]         section_count (u16 LE) — currently 12
+[4..6]         VERSION = 9 (u16 LE); V8 wrote 8 into the same container
+[6..8]         section_count (u16 LE) — currently 13
 [8..8+16*N]    section directory: N × { id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32 }
 [8+16*N..+4]   whole-header CRC32 (covers bytes [0..8+16*N])
 [..4096]       zero-pad to complete the 4 KB header page
@@ -55,6 +63,11 @@ Section ids (fixed):
 | 9  | VIEWS      | rkyv `ViewsSectionData` (view definition bincode blobs) |
 | 10 | IVF_STATE  | bincode `BTreeMap<String, PerRuleIvfState>` (IVF centroid + cluster state per approximate rule) |
 | 11 | LAST_CHANGE | bincode `HashMap<u32, u64>` (per-node-id → last-commit-seq; used for CAS precondition checks) |
+| 12 | STRINGS    | rkyv `StringTableData` — the one table every `ColumnData::Str` in section 1 indexes (V9+; absent in V5–V8, where each column carries its own copy) |
+
+Resolution rule for string columns, in one sentence: **if the shared table is
+present it is the table; otherwise the column's own `strings` is.** That is what
+keeps a pre-V9 snapshot, whose directory has no section 12, readable unchanged.
 
 CRC coverage: each section payload `[offset..offset+len]` is covered by its directory `crc32`.
 Alignment padding bytes between sections are written as zeros and are NOT covered by any CRC.
@@ -66,7 +79,7 @@ Small sections (IDS=2, SYMS=3, META=4, RULES_META=8, VIEWS=9) validate their CRC
 on first access.
 
 Large sections (TOPOLOGY=0, COLUMNS=1, EDGE_PROPS=5, HNSW=6, PROVENANCE=7,
-IVF_STATE=10) **skip** the per-touch CRC on the normal query path. A full-section
+IVF_STATE=10, STRINGS=12) **skip** the per-touch CRC on the normal query path. A full-section
 hash of hundreds of MiB costs 50–200 ms per section. Section bounds are validated
 at open time; rkyv archived data on the hot path uses `access_unchecked` (O(1)
 root-pointer lookup, no pointer-walk). This is sound for encoder-produced

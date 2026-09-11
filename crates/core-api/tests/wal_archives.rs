@@ -109,7 +109,7 @@ fn node_history_spans_two_archive_boundaries() {
         );
 
         // node_history for "a" must include: NodeInserted (commit 0) + PropSet (commit 5)
-        let hist = db.node_history("a").unwrap();
+        let hist = db.node_history("a").unwrap().items;
         assert!(
             hist.len() >= 2,
             "expected at least 2 history entries for 'a', got {:?}",
@@ -638,7 +638,7 @@ fn cross_session_truncate_then_archive() {
     // History scan via node_history: "d" was inserted in the archived WAL slice
     // (frame record present) → must appear in node_history despite no genesis chain.
     let db = GraphDb::open(&dir).unwrap();
-    let hist = db.node_history("d").unwrap();
+    let hist = db.node_history("d").unwrap().items;
     assert!(
         !hist.is_empty(),
         "node 'd' inserted in archived WAL must appear in node_history (scan-based, not state-replay)"
@@ -773,9 +773,9 @@ fn cross_session_archive_names_monotonic() {
 
     // History scan: all 3 nodes appear in correct temporal order.
     let db = GraphDb::open(&dir).unwrap();
-    let ha = db.node_history("a").unwrap();
-    let hb = db.node_history("b").unwrap();
-    let hc = db.node_history("c").unwrap();
+    let ha = db.node_history("a").unwrap().items;
+    let hb = db.node_history("b").unwrap().items;
+    let hc = db.node_history("c").unwrap().items;
     assert!(!ha.is_empty() && !hb.is_empty() && !hc.is_empty());
     assert!(
         ha[0].commit < hb[0].commit && hb[0].commit < hc[0].commit,
@@ -840,6 +840,64 @@ fn crash_window_prune_op_sweep() {
             }
         }
     }
+}
+
+// ── Horizon honesty: every history read reports where history starts ───────
+
+/// Every history read must say where history starts. Below the floor the error
+/// names the valid range; the two reads that take no commit carry `horizon`.
+#[test]
+fn horizon_is_reported_by_every_history_read() {
+    let dir = tmp("horizon-honesty");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.set_wal_archive_retention(Some(1)); // keep one archive: the floor must advance
+    for i in 0..6 {
+        db.insert_node("N", &format!("n{i}"), vec![]).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: true,
+        })
+        .unwrap();
+    }
+    let floor = db.wal_horizon_floor();
+    let total = db.wal_total_commits().unwrap();
+    assert!(
+        floor > 0,
+        "the retention must have advanced the floor; got {floor}"
+    );
+
+    // (a) The two commit-less reads carry the floor.
+    assert_eq!(db.node_history("n5").unwrap().horizon, floor);
+    assert_eq!(db.edge_history("n4", "n5").unwrap().horizon, floor);
+
+    // (b) The three commit-taking reads name the range they refuse.
+    let want = format!("valid range is {floor}..{total}");
+    for msg in [
+        db.was_linked("n0", "n1", "E", floor - 1)
+            .unwrap_err()
+            .to_string(),
+        db.edges_at("n0", floor - 1).unwrap_err().to_string(),
+        GraphDb::open_at(&dir, floor - 1)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string(),
+    ] {
+        assert!(msg.contains(&want), "{msg:?} must contain {want:?}");
+        assert!(
+            msg.contains("not retained"),
+            "{msg:?} must say what is gone"
+        );
+    }
+
+    // (c) An unpruned store reads exactly as it did before.
+    let clean = tmp("horizon-clean");
+    let mut c = GraphDb::open(&clean).unwrap();
+    c.insert_node("N", "a", vec![]).unwrap();
+    assert_eq!(c.node_history("a").unwrap().horizon, 0);
+    assert_eq!(
+        c.was_linked("a", "a", "E", 99).unwrap_err().to_string(),
+        "commit 99 is out of range; valid range is 0..1"
+    );
 }
 
 /// Minimal workload that exercises the archive_wal snapshot path.

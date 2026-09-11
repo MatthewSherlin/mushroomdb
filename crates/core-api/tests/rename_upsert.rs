@@ -162,7 +162,7 @@ fn rename_node_history_follows_by_id() {
     db.insert_edge("KNOWS", "alice", "bob").unwrap();
     db.rename_node("alice", "alice2").unwrap();
     // node_history on the new key should include the prior edge event
-    let hist = db.node_history("alice2").unwrap();
+    let hist = db.node_history("alice2").unwrap().items;
     assert!(
         hist.iter().any(|e| {
             matches!(
@@ -376,7 +376,10 @@ fn node_history_shows_insert_through_rename() {
     db.insert_node("Person", "alice", vec![]).unwrap();
     db.rename_node("alice", "alice2").unwrap();
 
-    let history = db.node_history("alice2").expect("history must succeed");
+    let history = db
+        .node_history("alice2")
+        .expect("history must succeed")
+        .items;
     let has_inserted = history
         .iter()
         .any(|e| matches!(&e.change, HistoryChange::NodeInserted { label } if label == "Person"));
@@ -484,7 +487,7 @@ fn node_history_alias_excludes_recycled_key_events() {
     // commit 3: set a prop on the new "a" — must NOT appear in history("b")
     db.set_prop("a", "extra", Value::Int(99)).unwrap();
 
-    let hist = db.node_history("b").unwrap();
+    let hist = db.node_history("b").unwrap().items;
     // history("b") must NOT contain the new "a"'s extra prop
     let has_recycled_set_prop = hist
         .iter()
@@ -495,7 +498,7 @@ fn node_history_alias_excludes_recycled_key_events() {
     );
 
     // Sanity: history("a") must include the recycled node's prop
-    let hist_a = db.node_history("a").unwrap();
+    let hist_a = db.node_history("a").unwrap().items;
     let has_new_a_prop = hist_a
         .iter()
         .any(|e| matches!(&e.change, HistoryChange::PropSet { field, .. } if field == "extra"));
@@ -525,7 +528,7 @@ fn node_history_alias_multi_hop_reuse() {
     // Rename: "a" → "c"
     db.rename_node("a", "c").unwrap();
 
-    let hist = db.node_history("c").unwrap();
+    let hist = db.node_history("c").unwrap().items;
 
     // Must see phase=2 (second identity)
     let has_phase2 = hist.iter().any(|e| {

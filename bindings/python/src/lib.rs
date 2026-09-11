@@ -576,16 +576,25 @@ impl GraphDb {
         result_set_to_rows(py, &rs)
     }
 
-    /// Per-node change history since the last truncating snapshot. Returns a
-    /// list of `{commit, kind, ...}` dicts (kind is one of node_inserted,
-    /// prop_set, prop_removed, edge_added, edge_removed, node_deleted).
+    /// Per-node change history. Returns `{key, history, total_commits,
+    /// horizon}`; `history` is a list of `{commit, kind, ...}` dicts (kind is
+    /// one of node_inserted, prop_set, prop_removed, edge_added, edge_removed,
+    /// node_deleted) and `horizon` is the oldest commit still retained —
+    /// events before it were pruned and are not in `history`.
     #[pyo3(text_signature = "($self, key)")]
-    fn node_history(&self, py: Python<'_>, key: &str) -> PyResult<Vec<Py<PyDict>>> {
-        let entries = self.with_ref(|db| db.node_history(key))?;
-        entries
+    fn node_history(&self, py: Python<'_>, key: &str) -> PyResult<Py<PyDict>> {
+        let result = self.with_ref(|db| db.node_history(key))?;
+        let history = result
+            .items
             .iter()
             .map(|e| history_entry_to_dict(py, e))
-            .collect()
+            .collect::<PyResult<Vec<Py<PyDict>>>>()?;
+        let out = PyDict::new(py);
+        out.set_item("key", key)?;
+        out.set_item("history", history)?;
+        out.set_item("total_commits", result.total_commits)?;
+        out.set_item("horizon", result.horizon)?;
+        Ok(out.unbind())
     }
 
     /// Total number of committed WAL frames visible in the current horizon
@@ -596,10 +605,11 @@ impl GraphDb {
         self.with_ref(|db| db.wal_total_commits())
     }
 
-    /// Per-edge change history between `a` and `b` since the last truncating
-    /// snapshot. Returns `{a, b, events: [{edge_type, commit, event, rule}],
-    /// total_commits}`; `event` is `"Added"` or `"Retracted"`, `rule` is the
-    /// rule name for derived edges and `None` for manually written ones.
+    /// Per-edge change history between `a` and `b`. Returns `{a, b, events:
+    /// [{edge_type, commit, event, rule}], total_commits, horizon}`; `event` is
+    /// `"Added"` or `"Retracted"`, `rule` is the rule name for derived edges
+    /// and `None` for manually written ones, and `horizon` is the oldest commit
+    /// still retained — events before it were pruned and are not in `events`.
     #[pyo3(text_signature = "($self, a, b)")]
     fn edge_history(&self, py: Python<'_>, a: &str, b: &str) -> PyResult<Py<PyDict>> {
         let result = self.with_ref(|db| db.edge_history(a, b))?;
@@ -624,6 +634,7 @@ impl GraphDb {
         out.set_item("b", b)?;
         out.set_item("events", events)?;
         out.set_item("total_commits", result.total_commits)?;
+        out.set_item("horizon", result.horizon)?;
         Ok(out.unbind())
     }
 
@@ -860,6 +871,7 @@ impl GraphDb {
         d.set_item("nodes_live", s.nodes_live)?;
         d.set_item("nodes_tombstoned", s.nodes_tombstoned)?;
         d.set_item("edges", s.edges)?;
+        d.set_item("history_floor", s.history_floor)?;
         let rules_list = PyList::empty(py);
         for r in &s.rules {
             let rd = PyDict::new(py);

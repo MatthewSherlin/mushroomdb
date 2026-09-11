@@ -6,7 +6,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use core_api::{
     json_to_value, schema::Schema, Explanation, FkSkip, IngestReport, Predicate, PredicateSummary,
-    RoleDef, RuleDef, RuleStats, SharedDb, Stats, Value, WriteScope,
+    RoleDef, RuleDef, RuleStats, SharedDb, SnapshotOptions, Stats, Value, WriteScope,
 };
 use serde_json::{json, Value as Json};
 #[cfg(feature = "embed-ui")]
@@ -493,6 +493,7 @@ async fn stats_round_trips_serialize() {
         nodes_tombstoned: 2,
         edges: 3,
         chain_truncations: 0,
+        history_floor: 0,
         rules: vec![RuleStats {
             name: "r".into(),
             edges: 4,
@@ -1221,6 +1222,7 @@ fn wire_types_serialize() {
         edges: 0,
         rules: vec![],
         chain_truncations: 0,
+        history_floor: 0,
     };
     serde_json::to_value(&stats).unwrap();
     serde_json::to_value(&RuleStats {
@@ -1494,6 +1496,7 @@ fn open_rbac(
                 name: rname.to_string(),
                 labels: labels.iter().map(|s| s.to_string()).collect(),
                 keys: keys.iter().map(|s| s.to_string()).collect(),
+                visible_where: None,
                 write: None,
             })
             .collect(),
@@ -2494,6 +2497,118 @@ async fn was_linked_full_token_happy_path() {
     assert_eq!(v["edge_type"], "LINK");
 }
 
+/// Every history body says where history starts, and the refusal names the
+/// range it will accept — a reader must never have to guess what was pruned.
+#[tokio::test]
+async fn history_bodies_carry_the_horizon() {
+    let (app, _db) = open_history_db("hist-horizon");
+
+    let (status, body, _) = send(app.clone(), get("/node/alice/history")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(
+        v["horizon"].as_u64(),
+        Some(0),
+        "node history must carry horizon: {v}"
+    );
+
+    let (status, body, _) = send(app.clone(), get("/stats")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(
+        v["history_floor"].as_u64(),
+        Some(0),
+        "/stats must say how far back history reaches: {v}"
+    );
+
+    let (status, body, _) = send(app.clone(), get("/history/edge?a=alice&b=bob")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(
+        v["horizon"].as_u64(),
+        Some(0),
+        "edge history must carry horizon: {v}"
+    );
+
+    let (status, body, _) = send(
+        app,
+        get("/history/was_linked?a=alice&b=bob&edge_type=LINK&at_commit=99999"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v = parse_json(&body);
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("valid range is")),
+        "the 400 must name the range it accepts: {v}"
+    );
+}
+
+/// On a store whose oldest archives were pruned, the horizon the wire reports
+/// is the store's own floor — not a constant, and not zero.
+#[tokio::test]
+async fn a_pruned_store_reports_its_real_floor() {
+    let db = SharedDb::open(&tmp("hist-pruned-floor")).unwrap();
+    db.write().set_wal_archive_retention(Some(1));
+    for i in 0..6 {
+        db.write()
+            .insert_node("Person", &format!("p{i}"), vec![])
+            .unwrap();
+        db.write()
+            .snapshot_with(SnapshotOptions {
+                keep_wal: false,
+                archive_wal: true,
+            })
+            .unwrap();
+    }
+    let (floor, total) = {
+        let g = db.read();
+        (g.wal_horizon_floor(), g.wal_total_commits().unwrap())
+    };
+    assert!(floor > 0, "the retention must have advanced the floor");
+    let app = router(db.clone());
+
+    let (status, body, _) = send(app.clone(), get("/node/p5/history")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        parse_json(&body)["horizon"].as_u64(),
+        Some(floor),
+        "node history must report the store's floor"
+    );
+
+    let (status, body, _) = send(app.clone(), get("/history/edge?a=p4&b=p5")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        parse_json(&body)["horizon"].as_u64(),
+        Some(floor),
+        "edge history must report the store's floor"
+    );
+
+    let (status, body, _) = send(app.clone(), get("/stats")).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(parse_json(&body)["history_floor"].as_u64(), Some(floor));
+
+    let (status, body, _) = send(
+        app,
+        get(&format!(
+            "/history/was_linked?a=p0&b=p1&edge_type=LINK&at_commit={}",
+            floor - 1
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let err = parse_json(&body)["error"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        err.contains(&format!("valid range is {floor}..{total}")),
+        "the 400 must name the retained range: {err}"
+    );
+    assert!(err.contains("not retained"), "{err}");
+}
+
 #[tokio::test]
 async fn was_linked_out_of_horizon_is_400_not_500() {
     let (app, _db) = open_history_db("hist-wl-oob");
@@ -3313,6 +3428,7 @@ fn open_rbac_write(
                 name: rname.to_string(),
                 labels: labels.iter().map(|s| s.to_string()).collect(),
                 keys: vec![],
+                visible_where: None,
                 write: write.clone(),
             })
             .collect(),
@@ -4319,6 +4435,7 @@ async fn concurrent_role_writers_fifo_serialize() {
             name: "agent".into(),
             labels: vec!["AgentNote".into()],
             keys: vec![],
+            visible_where: None,
             write: Some(agent_write_scope()),
         }],
         ..Default::default()
@@ -4354,6 +4471,128 @@ async fn concurrent_role_writers_fifo_serialize() {
     assert!(r2.is_ok(), "concurrent write 2 must succeed: {r2:?}");
     assert!(db.read().has_node("conc-1"), "conc-1 must exist");
     assert!(db.read().has_node("conc-2"), "conc-2 must exist");
+}
+
+/// `as_of` composes with a role token and with a client mask; it did not
+/// before 0.6.5.  Both restrictions are resolved against the graph as it was
+/// at the requested commit.
+#[tokio::test]
+async fn http_query_as_of_composes_with_a_role() {
+    let (app, db) = open_rbac(
+        "asof-role-compose",
+        &[("reader", &["Public"], &[])],
+        Some("adm"),
+        &[("rt", "reader")],
+    );
+    db.write().insert_node("Public", "p1", vec![]).unwrap();
+    let at_one = db.read().wal_total_commits().unwrap() - 1;
+    db.write().insert_node("Public", "p2", vec![]).unwrap();
+    db.write().insert_node("Secret", "s1", vec![]).unwrap();
+
+    /// Node keys of a `RETURN n` JSON result body.
+    fn keys(body: &[u8]) -> Vec<String> {
+        parse_json(body)["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[0].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    // Role token + as_of: the role mask resolved at that commit.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "rt",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": at_one}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "as_of + role must no longer be refused: {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(keys(&body), vec!["p1".to_string()]);
+
+    // Role token, no as_of: the role still sees both Public nodes now.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "rt",
+        json!({"cypher": "MATCH (n) RETURN n"}),
+    );
+    let (_, body, _) = send(app.clone(), req).await;
+    assert_eq!(keys(&body), vec!["p1".to_string(), "p2".to_string()]);
+
+    // Role token + as_of + client mask: intersection, never widened.  At the
+    // newest commit the role sees p1+p2 and the client list is p1+s1, so only
+    // p1 survives — s1 is outside the role, p2 outside the client list.
+    let latest = db.read().wal_total_commits().unwrap() - 1;
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "rt",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": latest, "mask": ["p1", "s1"]}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        keys(&body),
+        vec!["p1".to_string()],
+        "s1 is outside the role, p2 outside the client list"
+    );
+
+    // Full token + as_of + client mask.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "adm",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": at_one, "mask": ["p1", "p2"]}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(keys(&body), vec!["p1".to_string()]);
+
+    // as_of + a write is still refused …
+    let req = authed_json_req(
+        "POST",
+        "/query",
+        "rt",
+        json!({"cypher": "CREATE (x:Public {id:'z'})", "as_of": 0}),
+    );
+    let (status, _, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // … and so is as_of + stub_hidden, naming the flag.
+    let req = authed_json_req(
+        "POST",
+        "/query",
+        "adm",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": 0, "mask": ["p1"], "stub_hidden": true}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&body).contains("stub_hidden"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // An out-of-range as_of on the role path is a 400 carrying the range.
+    let req = authed_json_req(
+        "POST",
+        "/query",
+        "rt",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": 9_999}),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(
+        text.contains("out of range") && text.contains("valid range"),
+        "{text}"
+    );
 }
 
 /// POST /query with `as_of` runs a time-travel read; the current state is
@@ -4537,4 +4776,125 @@ async fn busy_write_is_503_with_retry_after() {
     );
 
     drop(peer);
+}
+
+// ── 18. A role narrowed by `visible_where` on every read path ────────────────
+
+/// A store with one `Doc` label, three documents, and a `publisher` role that
+/// may see only the published ones.
+fn open_predicate_rbac(name: &str) -> (Router, SharedDb) {
+    let db = SharedDb::open(&tmp(name)).unwrap();
+    {
+        let mut w = db.write();
+        w.insert_node(
+            "Doc",
+            "d1",
+            vec![("status".into(), Value::Str("published".into()))],
+        )
+        .unwrap();
+        w.insert_node(
+            "Doc",
+            "d2",
+            vec![("status".into(), Value::Str("draft".into()))],
+        )
+        .unwrap();
+        w.insert_node(
+            "Doc",
+            "d3",
+            vec![("status".into(), Value::Str("published".into()))],
+        )
+        .unwrap();
+        w.insert_edge("LINKS", "d1", "d2").unwrap();
+        w.insert_edge("LINKS", "d1", "d3").unwrap();
+        w.apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "publisher".into(),
+                keys: vec![],
+                labels: vec!["Doc".into()],
+                visible_where: Some(core_api::PropPredicate {
+                    field: "status".into(),
+                    eq: None,
+                    in_: Some(vec![Value::Str("published".into())]),
+                }),
+                write: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    let rtoks = [("pub-tok".to_string(), "publisher".to_string())]
+        .into_iter()
+        .collect();
+    let app = router_with_role_tokens(db.clone(), Some("admin".to_string()), rtoks);
+    (app, db)
+}
+
+#[tokio::test]
+async fn role_token_query_honours_visible_where() {
+    let (app, _db) = open_predicate_rbac("rbac-predicate-query");
+
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "pub-tok",
+        json!({"cypher": "MATCH (n) RETURN n.id"}),
+    );
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(
+        v["rows"].as_array().unwrap().len(),
+        2,
+        "the role sees the two published docs and not the draft, got {v}"
+    );
+
+    // The draft is hidden exactly like an absent key — no existence oracle.
+    let (status, _, _) = send(app.clone(), authed_get("/node/d2", "pub-tok")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = send(app.clone(), authed_get("/node/d1", "pub-tok")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Full token still sees all three.
+    let req = authed_json_req(
+        "POST",
+        "/query?format=json",
+        "admin",
+        json!({"cypher": "MATCH (n) RETURN n.id"}),
+    );
+    let (_, body, _) = send(app, req).await;
+    assert_eq!(parse_json(&body)["rows"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn role_token_was_linked_honours_visible_where() {
+    let (app, db) = open_predicate_rbac("rbac-predicate-was-linked");
+    let at = db.read().wal_total_commits().unwrap() - 1;
+
+    // Both endpoints pass the predicate → the check answers.
+    let (status, body, _) = send(
+        app.clone(),
+        authed_get(
+            &format!("/history/was_linked?a=d1&b=d3&edge_type=LINKS&at_commit={at}"),
+            "pub-tok",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(parse_json(&body)["linked"], json!(true));
+
+    // The draft endpoint fails the predicate → same-as-absent, named in the body.
+    let (status, body, _) = send(
+        app,
+        authed_get(
+            &format!("/history/was_linked?a=d1&b=d2&edge_type=LINKS&at_commit={at}"),
+            "pub-tok",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let v = parse_json(&body);
+    assert!(
+        v["error"].as_str().is_some_and(|s| s.contains("d2")),
+        "404 body must name the hidden key: {v}"
+    );
 }

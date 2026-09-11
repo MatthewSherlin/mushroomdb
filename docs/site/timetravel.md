@@ -19,7 +19,7 @@ which portion of history is visible.
 Returns every WAL-visible change for a node since the last WAL-truncating
 snapshot.
 
-**MCP:** `node_history(key)` → `{key, history, total_commits}`
+**MCP:** `node_history(key)` → `{key, history, total_commits, horizon}`
 
 **HTTP:** `GET /node/{key}/history`
 
@@ -31,7 +31,8 @@ snapshot.
     { "commit": 1, "change": { "type": "PropSet", "field": "age", "value": 30 } },
     { "commit": 2, "change": { "type": "EdgeAdded", "edge_type": "KNOWS", "other": "bob", "outgoing": true } }
   ],
-  "total_commits": 3
+  "total_commits": 3,
+  "horizon": 0
 }
 ```
 
@@ -42,7 +43,7 @@ Change types: `NodeInserted`, `PropSet`, `PropRemoved`, `EdgeAdded`,
 
 Returns the full add/retract history for all edges between two nodes. Includes
 **derived edges** — those created by rules — with the rule name attributed via
-`rule`. This is the Zep-class differentiator: not just *what* was connected,
+`rule`. That is the point of the record: not just *what* was connected,
 but *why* (which rule fired) and *when* (at which commit).
 
 **How rule attribution works:** When the rule engine fires or retracts a
@@ -53,7 +54,7 @@ history — they are state no-ops on replay (derived edges are re-derived from
 rules deterministically). History scans read them as ground truth of when the
 edge was created or retracted and by which rule.
 
-**MCP:** `edge_history(a, b)` → `{a, b, events, total_commits}`
+**MCP:** `edge_history(a, b)` → `{a, b, events, total_commits, horizon}`
 
 **HTTP:** `GET /history/edge?a=&b=`
 
@@ -66,7 +67,8 @@ edge was created or retracted and by which rule.
     { "edge_type": "SIMILAR", "commit": 3, "event": "Added",     "rule": "sim_emb" },
     { "edge_type": "SIMILAR", "commit": 7, "event": "Retracted", "rule": "sim_emb" }
   ],
-  "total_commits": 10
+  "total_commits": 10,
+  "horizon": 4
 }
 ```
 
@@ -94,22 +96,29 @@ outside horizon
 { "a": "alice", "b": "bob", "edge_type": "SIMILAR", "at_commit": 4, "linked": true }
 ```
 
-Returns 400 (not 500) when `at_commit` is outside the visible horizon:
+Returns 400 (not 500) when `at_commit` is outside the retained horizon. The
+body carries the range it will accept, and says so when older events are gone:
 
 ```json
-{ "error": "commit 999 is out of range" }
+{ "error": "commit 999 is out of range; valid range is 4..10 — events before commit 4 are not retained" }
 ```
 
 ### Horizon contract
 
-All three history endpoints include `total_commits` in their response. This is
-the exclusive upper bound for valid commit indices (`0..total_commits`). When
-the WAL is empty (immediately after a WAL-truncating snapshot and before any
-new writes), `total_commits` is 0 and the history list is empty. Commits before
-the last truncating snapshot are not visible.
+All three history endpoints report the window they can answer over. Valid
+commit indices are `horizon..total_commits`: `total_commits` is the exclusive
+upper bound, and `horizon` is the oldest commit still retained — `0` when
+nothing has been pruned. `node_history` and `edge_history` carry both fields in
+their response; `was_linked`, `edges_at` and `open_at`/`query_at` name both in
+the `CommitOutOfRange` they return for a commit outside it. When the WAL is
+empty (immediately after a WAL-truncating snapshot and before any new writes),
+`total_commits` is 0 and the history list is empty. Commits before the last
+truncating snapshot are not visible.
 
-This field is the **honesty contract**: clients can always determine what
-portion of history is visible and whether their query covers the full timeline.
+These two fields are the **honesty contract**: a client can always tell what
+portion of history it is looking at, and a short answer is never silent. The
+same pair is reported by `mushroomdb stats` (`history_floor`), `/stats`, the
+MCP `stats` tool, `mushroomdb doctor`'s `store` line, and the `asof` header.
 
 ### Role-token masking
 
@@ -212,6 +221,48 @@ remain trustworthy across restarts.
 `GraphDb::open_at(dir, commit)` replays WAL frames 0 through `commit`
 (inclusive) into a fresh in-memory graph, then marks the instance read-only.
 Every mutation method on the returned instance returns `GraphError::ReadOnly`.
+
+### As-of with a role or a mask
+
+`GraphDb::query_at_scoped(commit, cypher, params, scope)` runs a read-only
+query at `commit` under a restriction. `AsOfScope` says which one:
+
+| Scope | Restriction |
+|---|---|
+| `AsOfScope::Role("reader")` | everything that role may see |
+| `AsOfScope::Keys(&keys)` | an explicit node-key allow-list |
+| `AsOfScope::RoleAndKeys("reader", &keys)` | the role ∩ the allow-list — a client list can only narrow a role, never widen it |
+
+Over HTTP this is `as_of` on `POST /query`: it composes with a role token and
+with a client `mask`. Over MCP it is the `query` tool's `as_of` argument, which
+composes with `role` **or** with `mask` — that tool refuses the two together,
+with or without `as_of`. Writes are refused at any commit.
+
+**The one semantic to get right:** the **graph** is historical, the **role
+definition** is current. `roles.json` is a sidecar — it is never written as a
+WAL record, so it has no past version to read. What time-travels is which
+nodes the role's `keys` and `labels` resolve to: a role that may see the
+`Public` label sees exactly the `Public` nodes that existed at `commit`. If
+you rename a role's labels today, an as-of read from last week answers with
+today's label list against last week's graph.
+
+**Deletion is not retroactive.** Deleting a node does not remove it from a
+role's past: a role that may see `Public` reads a now-deleted `Public` node,
+and its edges, at any retained commit where it was live, and a role with
+`keys: ["k"]` reads `k` after `k` is gone. `DELETE` changes the present, not
+the WAL. To revoke history, prune the archives (below) or narrow the role —
+narrowing takes effect at every commit at once, because the role definition is
+always the current one.
+
+**Keys are not identities.** A role's `keys` resolve to whichever node held
+that key at the commit asked for. Renaming a node frees its key for reuse, so
+`keys: ["alice"]` read at an old commit sees the node that was `alice` then,
+not the one called `alice` now. The same caveat reaches `GET
+/node/{key}/history` under a role token: its edge-endpoint filter resolves the
+other endpoint's key against today's ids, not the ids as of the historical
+event, so a recycled key is judged by who holds it now, not who held it then.
+
+`stub_hidden` does not compose with `as_of`; see [masks.md](masks.md).
 
 ### WAL retention and snapshot interaction
 
@@ -346,11 +397,11 @@ Summary:
 
 | Operation | Live WAL commits | Archive commits (intact genesis chain) | Archive commits (pruned/incomplete) |
 |---|---|---|---|
-| `node_history` / `edge_history` | Always reachable | Always reachable | Reachable, but pruned events are silently omitted |
+| `node_history` / `edge_history` | Always reachable | Always reachable | Reachable; `horizon` names what is not |
 | `was_linked` / `edges_at` | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
 | `open_at` / `query_at` (as-of) | Always reachable | Reachable | `CommitOutOfRange` (safe refusal) |
 
-`node_history`/`edge_history` take no commit bound and just scan whatever WAL/archives remain, so a pruned commit's events are missing with no error, while `was_linked`, `edges_at`, and `open_at`/`query_at` all check the horizon floor explicitly and refuse instead.
+`node_history`/`edge_history` take no commit bound and scan whatever WAL/archives remain, so a pruned commit's events are not in the list — the `horizon` field in their response says so. `was_linked`, `edges_at`, and `open_at`/`query_at` check the horizon floor explicitly and refuse, naming the range they accept.
 
 ### Retention and pruning
 
@@ -369,17 +420,18 @@ scans are unaffected.
 
 ### How far back history reaches
 
-Automatic snapshots (`serve`, git ingest) keep only the newest **8** WAL
-archives by default (`AUTO_SNAPSHOT_RETENTION`, `crates/cli/src/lib.rs`),
-pruning the rest on every run. Below that horizon (`commit <
-wal_horizon_floor`): `was_linked`, `edges_at`, and `open_at`/`query_at` check
-the floor and return `GraphError::CommitOutOfRange`, while `node_history` and
-`edge_history` take no commit bound and just omit the pruned events — no
-error, no notice.
-
-To keep everything, don't rely on the automatic path: take an explicit
-`mushroomdb snapshot <db-dir>` with no `--retention` (keeps every archive),
-or add `--keep-wal` to never truncate the WAL.
+Automatic snapshots (`serve`, git ingest) keep **every** WAL archive by
+default (`AUTO_SNAPSHOT_RETENTION`, `crates/cli/src/lib.rs`, is `None`
+unless configured): nothing is pruned unless a caller asks for it. Retention
+is opt-in — `mushroomdb snapshot <db-dir> --retention N` is how to bound the
+archives, and every read says where the remaining history starts once that
+bound has pruned something. Below that horizon (`commit < wal_horizon_floor`):
+`was_linked`, `edges_at`, and `open_at`/`query_at` return
+`GraphError::CommitOutOfRange`, whose message names the range it will accept
+and says that events before the floor are not retained. `node_history` and
+`edge_history` take no commit bound, so they return the events that survive
+together with `horizon` — the oldest commit still retained; anything before
+it was pruned.
 
 ---
 
@@ -388,5 +440,5 @@ or add `--keep-wal` to never truncate the WAL.
 | Error | Meaning |
 |---|---|
 | `GraphError::ReadOnly` | Mutation attempted on an as-of instance. |
-| `GraphError::CommitOutOfRange { commit, total }` | `commit >= total`; valid range is `0..total`. Also returned for archive-resident commits when the genesis chain is pruned or incomplete. |
+| `GraphError::CommitOutOfRange { commit, total, floor }` | `commit` is outside `floor..total`. `floor` is the oldest commit still retained (`0` when nothing has been pruned); when it is non-zero the message adds *"events before commit `floor` are not retained"*. Also returned for archive-resident commits when the genesis chain is pruned or incomplete. |
 | `GraphError::CasConflict { key, expected, actual }` | A `Precondition` failed; the batch was not applied. |

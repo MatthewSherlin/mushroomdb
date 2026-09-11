@@ -661,7 +661,7 @@ def test_node_history_and_was_linked(tmp_path):
     db.insert_node("A", "x", {"n": 1})
     db.insert_node("A", "y", {})
     db.set_prop("x", "n", 2)
-    hist = db.node_history("x")
+    hist = db.node_history("x")["history"]
     kinds = [e["kind"] for e in hist]
     assert "node_inserted" in kinds
     assert "prop_set" in kinds
@@ -669,6 +669,28 @@ def test_node_history_and_was_linked(tmp_path):
     # (documented behaviour — binding does not clamp out-of-range commits to False).
     with pytest.raises(RuntimeError, match="out of range"):
         db.was_linked("x", "y", "KNOWS", 999)
+    db.close()
+
+
+def test_history_reads_report_the_horizon(tmp_path):
+    """Every history read says where history starts, so a short answer is visible."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("A", "a", {})
+    db.insert_node("A", "b", {})
+    db.insert_edge("LINKS", "a", "b")
+
+    nh = db.node_history("a")
+    assert "history" in nh
+    assert nh["key"] == "a"
+    assert nh["horizon"] == 0
+    assert nh["total_commits"] == db.wal_total_commits()
+    assert any(e["kind"] == "node_inserted" for e in nh["history"])
+
+    assert db.edge_history("a", "b")["horizon"] == 0
+    assert db.stats()["history_floor"] == 0
+
+    with pytest.raises(RuntimeError, match="valid range is"):
+        db.was_linked("a", "b", "LINKS", 999)
     db.close()
 
 

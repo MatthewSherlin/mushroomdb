@@ -1081,9 +1081,11 @@ fn snapshot_due(db_dir: &Path, full: bool) -> bool {
 /// Write a snapshot if one is due, after the run's own writes are committed.
 ///
 /// The WAL is archived rather than dropped — see [`AUTOMATIC_SNAPSHOT`], which
-/// every snapshot mushroomdb takes on its own shares — and the archives are
-/// bounded by [`AUTO_SNAPSHOT_RETENTION`], so a store that syncs on every
-/// commit does not grow an archive per 4 MiB of churn forever.
+/// every snapshot mushroomdb takes on its own shares — and every archive is
+/// kept: [`AUTO_SNAPSHOT_RETENTION`] is `None` by default, so a store that
+/// syncs on every commit grows an archive per 4 MiB of churn rather than
+/// losing any of its history. `mushroomdb snapshot <db> --retention N` is how
+/// a caller bounds that growth once they have decided the trade is worth it.
 ///
 /// [`AUTOMATIC_SNAPSHOT`]: crate::AUTOMATIC_SNAPSHOT
 /// [`AUTO_SNAPSHOT_RETENTION`]: crate::AUTO_SNAPSHOT_RETENTION

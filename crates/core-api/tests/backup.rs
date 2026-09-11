@@ -84,6 +84,7 @@ fn build_store_with_archives(dir: &std::path::Path) -> usize {
             name: "reader".into(),
             keys: vec![],
             labels: vec!["Person".into()],
+            visible_where: None,
             write: None,
         }],
     };

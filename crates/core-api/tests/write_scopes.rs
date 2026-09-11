@@ -117,6 +117,7 @@ fn writer_role() -> RoleDef {
         name: "writer".into(),
         keys: vec![],
         labels: vec!["MyLabel".into(), "Visible".into()],
+        visible_where: None,
         write: Some(WriteScope {
             create_labels: vec!["MyLabel".into()],
             update_labels: vec!["MyLabel".into(), "Visible".into()],
@@ -292,6 +293,7 @@ fn test_update_scope_denied() {
             name: "reader_writer".into(),
             keys: vec![],
             labels: vec!["MyLabel".into(), "ReadOnly".into()],
+            visible_where: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec!["MyLabel".into()], // ReadOnly NOT in update_labels
@@ -644,6 +646,7 @@ fn test_merge_update_only_hidden_eq_absent() {
             name: "updater".into(),
             keys: vec![],
             labels: vec!["MyLabel".into()],
+            visible_where: None,
             write: Some(WriteScope {
                 create_labels: vec![], // no create scope
                 update_labels: vec!["MyLabel".into()],
@@ -715,6 +718,7 @@ fn test_merge_create_only_disclosure_pinned() {
             name: "creator".into(),
             keys: vec![],
             labels: vec!["MyLabel".into()],
+            visible_where: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec![],
@@ -793,6 +797,7 @@ fn test_merge_on_create_set_with_role_authz() {
             name: "creator".into(),
             keys: vec![],
             labels: vec!["MyLabel".into()],
+            visible_where: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec![], // empty — no update scope
@@ -1173,6 +1178,7 @@ fn test_delete_recreate_setprop_respects_update_labels() {
             name: "delcreate".into(),
             keys: vec![],
             labels: vec!["MyLabel".into()],
+            visible_where: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec![], // intentionally empty
@@ -1380,5 +1386,90 @@ fn test_detach_delete_cascades_hidden_edges() {
     assert!(
         !c_in.contains(&"del_a".to_string()),
         "edge del_a→hidden_c must be cascade-deleted regardless of mask; c_in={c_in:?}"
+    );
+}
+
+// ── Predicate masks × write scopes ───────────────────────────────────────────
+
+/// A `visible_where` predicate narrows what a write-scoped role may mutate:
+/// a node of an allowed label that fails the predicate is hidden, and hidden
+/// is exactly as unwritable as absent.
+#[test]
+fn test_predicate_narrows_the_write_target_set() {
+    let dir = tmp("predicate-write-scope");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node(
+        "MyLabel",
+        "open",
+        vec![("status".into(), Value::Str("published".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "MyLabel",
+        "closed",
+        vec![("status".into(), Value::Str("draft".into()))],
+    )
+    .unwrap();
+    db.apply_schema(&Schema {
+        roles: vec![RoleDef {
+            visible_where: Some(core_api::PropPredicate {
+                field: "status".into(),
+                eq: None,
+                in_: Some(vec![Value::Str("published".into())]),
+            }),
+            ..writer_role()
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let authz = {
+        let roles = db.roles();
+        let def = roles.iter().find(|r| r.name == "writer").unwrap();
+        core_api::WriteAuthz {
+            role: "writer".into(),
+            scope: def.write.clone().unwrap(),
+            mask: db.mask_for_role("writer").unwrap(),
+        }
+    };
+    assert_eq!(authz.mask.len(), 1, "only the published node is in scope");
+
+    // The published node is writable.
+    db.write_batch_authz(
+        Some(&authz),
+        vec![BatchOp::SetProp {
+            key: "open".into(),
+            field: "note".into(),
+            value: Value::Str("ok".into()),
+        }],
+    )
+    .expect("a visible node of an update label is writable");
+
+    // The draft is not — and is refused exactly as an absent key is.
+    let hidden = db
+        .write_batch_authz(
+            Some(&authz),
+            vec![BatchOp::SetProp {
+                key: "closed".into(),
+                field: "note".into(),
+                value: Value::Str("no".into()),
+            }],
+        )
+        .expect_err("a node failing the predicate must not be writable");
+    let absent = db
+        .write_batch_authz(
+            Some(&authz),
+            vec![BatchOp::SetProp {
+                key: "never-existed".into(),
+                field: "note".into(),
+                value: Value::Str("no".into()),
+            }],
+        )
+        .expect_err("an absent key must not be writable either");
+    assert!(is_role_write_denied(&hidden));
+    assert_eq!(
+        denied_reason(&hidden),
+        denied_reason(&absent),
+        "hidden-by-predicate must be byte-equal to absent — no existence oracle"
     );
 }

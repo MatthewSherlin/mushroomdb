@@ -336,7 +336,7 @@ fn full_ingest_writes_a_snapshot() {
     assert!(db.has_node("src/net.rs"), "the graph survived the snapshot");
     assert_eq!(out(&db, "src/net.rs", "IMPORTS"), vec!["src/util.rs"]);
     assert!(
-        !db.node_history("src/net.rs").unwrap().is_empty(),
+        !db.node_history("src/net.rs").unwrap().items.is_empty(),
         "the snapshot kept the history readable"
     );
     assert!(
