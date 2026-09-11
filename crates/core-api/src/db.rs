@@ -4372,7 +4372,13 @@ impl<F: Fs> GraphDb<F> {
             // Not after `CreateRule`: that record's own apply already did the
             // rule's first slice, and pumping again here would make one
             // `create_rule` call do two slices' work under one lock.
-            if !matches!(&rec, WalRecord::CreateRule { .. }) {
+            // Nothing pending is the overwhelmingly common case and must cost
+            // a map lookup, not an engine swap: a store being written to has
+            // long since populated its indexes, so the `pump_index_build`
+            // entry point owns the not-yet-populated case on its own.
+            if !matches!(&rec, WalRecord::CreateRule { .. })
+                && !self.engine.builds_in_progress().is_empty()
+            {
                 rebuilds.extend(self.pump_one_slice());
             }
             let mut failed = Vec::new();
@@ -5703,10 +5709,11 @@ impl<F: Fs> GraphDb<F> {
 
     /// One slice of build work for every pending rule. Returns the rules whose
     /// index just became whole, which the caller must `RebuildRule`.
+    ///
+    /// Goes through the engine even with nothing pending when the indexes have
+    /// not been populated yet: that call is what re-derives a build a mid-build
+    /// snapshot left behind, and a fresh handle has no other way to learn of it.
     fn pump_one_slice(&mut self) -> Vec<String> {
-        if self.engine.builds_in_progress().is_empty() && self.engine.indexes_populated() {
-            return Vec::new();
-        }
         let mut eng = std::mem::take(&mut self.engine);
         let finished = {
             let mut gm = make_graph_mut(

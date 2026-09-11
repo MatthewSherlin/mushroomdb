@@ -3137,6 +3137,10 @@ impl RuleEngine {
         self.indexes.remove(name);
         self.tripped.remove(name);
         self.fires.remove(name);
+        // A rule that is gone is not building: its slice state would otherwise
+        // keep it in `builds_in_progress` until the next pump noticed.
+        self.pending_builds.remove(name);
+        self.builds_awaiting_backfill.remove(name);
         let mut leftover = self.provenance.remove(name).unwrap_or_default();
         // intern so the symbol exists; edge_type was already interned at create time.
         let _et = g.syms.intern(&def.edge_type);
