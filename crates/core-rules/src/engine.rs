@@ -2534,31 +2534,27 @@ impl RuleEngine {
             if !predicate_covers_field(&def.predicate, field) {
                 continue;
             }
-            let hits: Option<Vec<(u32, f64)>> = if let Some(idx) = self.indexes.get(name) {
-                if let Some(h) = idx.dst_side.hnsw_ref() {
-                    if !h.is_empty() {
-                        found_index = true;
-                        Some(h.search(q, k))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else if let Some(lazy) = self.lazy_hnsw.get() {
-                if let Some((_, Some(h))) = lazy.get(name) {
-                    if !h.is_empty() {
-                        found_index = true;
-                        Some(h.search(q, k))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+            // The live index first, then the blobs `ensure_hnsw_loaded`
+            // decoded on the read path — the same order `hnsw_search_dst`
+            // uses, and it must be a fallthrough rather than an `else`.  On a
+            // clean open `self.indexes` holds an entry for every rule with no
+            // HNSW graph in it, so an `else if` here made the decoded blob
+            // unreachable and every label-less query ran brute force.
+            let live = self
+                .indexes
+                .get(name)
+                .and_then(|idx| idx.dst_side.hnsw_ref())
+                .filter(|h| !h.is_empty());
+            let lazy = self
+                .lazy_hnsw
+                .get()
+                .and_then(|lazy| lazy.get(name))
+                .and_then(|(_, dst)| dst.as_ref())
+                .filter(|h| !h.is_empty());
+            let hits: Option<Vec<(u32, f64)>> = live.or(lazy).map(|h| {
+                found_index = true;
+                h.search(q, k)
+            });
 
             if let Some(hits) = hits {
                 for (id, score) in hits {
