@@ -436,3 +436,79 @@ fn clean_open_first_query_is_served_by_the_index() {
     );
     assert!(any.iter().any(|(k, _)| k == "d0"), "got {any:?}");
 }
+
+/// The lazily-decoded blobs are a *bridge* from the open to the first write,
+/// not a second copy of the index. Once `ensure_indexes_populated` (or the
+/// eager consume on a WAL-present open) has moved the persisted graphs into
+/// the live indexes, the lazy map must be dropped: a handle that served one
+/// ANN query and then wrote otherwise holds two copies of every approximate
+/// rule's graph for the rest of its life.
+#[test]
+fn the_lazy_graphs_are_released_once_the_live_index_owns_them() {
+    let dir = tmp("hnsw-open-lazy-release");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    // The ANN read path decodes the blobs into the lazy map.
+    let _ = db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 2, 0.0);
+    assert!(
+        db.lazy_hnsw_len() > 0,
+        "the clean-open read path did not decode any blob, so this test proves nothing"
+    );
+
+    // The first write installs the same graphs into `self.indexes`.
+    db.insert_node("Other", "o", vec![("v".into(), Value::Int(1))])
+        .unwrap();
+    assert_eq!(
+        db.lazy_hnsw_len(),
+        0,
+        "the lazy graphs survived the write that moved them into the live index: \
+         every approximate rule's graph is held twice"
+    );
+}
+
+/// A live graph emptied by deletes is the truth, not a reason to consult the
+/// snapshot. `live.or(lazy)` made an emptied index claim it had an answer,
+/// which suppressed the brute-force scan that would have found the vectors no
+/// rule covers.
+#[test]
+fn deleting_every_embedded_node_leaves_nothing_to_find() {
+    let dir = tmp("hnsw-open-lazy-stale");
+    {
+        let mut db = seed(&dir);
+        // Carries `emb` but no approximate rule covers its label, so only the
+        // brute-force path can ever return it.
+        db.insert_node("Note", "note", vec![("emb".into(), emb(&[1.0, 0.0]))])
+            .unwrap();
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    // Decode the blobs first, so the stale copy exists when the deletes land.
+    let before = db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.0);
+    assert!(!before.is_empty(), "the seeded store must answer at all");
+
+    for (k, _) in DOCS {
+        db.delete_node(k).unwrap();
+    }
+
+    assert_eq!(
+        db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.0),
+        Vec::<(String, f64)>::new(),
+        "the emptied index fell back to the snapshot's graph"
+    );
+    let any: Vec<String> = db
+        .find_similar_vector("emb", None, &[1.0, 0.0], 8, 0.0)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        any,
+        vec!["note".to_string()],
+        "the emptied index answered for the whole store out of the snapshot's \
+         graph, hiding the vector no rule indexes"
+    );
+}

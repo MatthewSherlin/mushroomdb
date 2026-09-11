@@ -7745,6 +7745,16 @@ impl<F: Fs> GraphDb<F> {
         self.engine.hnsw_build_count()
     }
 
+    /// How many rules this handle still holds a lazily-decoded HNSW graph for.
+    ///
+    /// See [`core_rules::RuleEngine::lazy_hnsw_len`]. Exposed for tests that
+    /// assert the lazy copies are released once the live indexes own them; not
+    /// part of the stable surface.
+    #[doc(hidden)]
+    pub fn lazy_hnsw_len(&self) -> usize {
+        self.engine.lazy_hnsw_len()
+    }
+
     /// Find nodes whose `field` vector is most similar to `q` (cosine
     /// similarity), returning up to `k` results with similarity ≥ `min`,
     /// sorted descending.

@@ -276,8 +276,10 @@ pub struct RuleEngine {
     ///
     /// Populated once by `ensure_hnsw_loaded` on the first ANN query after a
     /// snapshot open with no WAL.  `OnceLock` guarantees exactly-once init
-    /// even under concurrent shared-read access.  After the first mutation the
-    /// mutation-path HNSW in `indexes` takes over; this field is never cleared.
+    /// even under concurrent shared-read access.  It is a bridge from the open
+    /// to the first write, not a second copy: whichever path installs the
+    /// persisted graphs into `indexes` (`consume_retained_state_eager` or
+    /// `ensure_indexes_populated`) drops it again via `release_lazy_hnsw`.
     lazy_hnsw: OnceLock<LazyHnswMap>,
     /// Current chaining level. `0` while a top-level hook runs; `1..=MAX_CHAIN_DEPTH`
     /// while [`RuleEngine::chain_from`] re-enters `on_edge_changed`. Non-zero
@@ -2034,6 +2036,19 @@ impl RuleEngine {
         self.hnsw_builds
     }
 
+    /// How many rules currently hold a lazily-decoded HNSW graph pair.
+    ///
+    /// Zero before the first ANN query on a clean open, and zero again once a
+    /// write has moved the persisted graphs into the live indexes. A non-zero
+    /// count after a write means the handle is holding two copies of every
+    /// approximate rule's graph.
+    ///
+    /// Test observability, not stable surface.
+    #[doc(hidden)]
+    pub fn lazy_hnsw_len(&self) -> usize {
+        self.lazy_hnsw.get().map_or(0, |m| m.len())
+    }
+
     /// Export IVF state for all approximate rules.  Passed to `snapshot()` in
     /// `core-api` and stored in the V4 snapshot so `open()` can restore cluster
     /// assignments without re-fitting k-means.
@@ -2357,6 +2372,7 @@ impl RuleEngine {
         // the scan skips the build for every side that has one, because the
         // load used to overwrite that build wholesale.
         self.reindex_all_load_state(ids, syms, labels, props, ivf, hnsw);
+        self.release_lazy_hnsw();
     }
 
     /// Deserialize retained HNSW blobs into `lazy_hnsw` for the clean-open ANN
@@ -2402,6 +2418,27 @@ impl RuleEngine {
                 })
                 .collect()
         });
+    }
+
+    /// Drop the lazily-decoded HNSW graphs.
+    ///
+    /// Called from both paths that install the persisted graphs into
+    /// `self.indexes` (`consume_retained_state_eager` and
+    /// `ensure_indexes_populated`). Two things go wrong if they are kept:
+    ///
+    /// * **Memory.** A handle that served one ANN query and then wrote holds
+    ///   the graph twice — once decoded here, once in the live index — for the
+    ///   rest of its life, and the snapshot copy is never consulted again.
+    /// * **Staleness.** The ANN read paths chain `live.or(lazy)`, and `live`
+    ///   is filtered on `!is_empty()`. A live graph legitimately emptied by
+    ///   deletes would therefore fall through to the graph the store held at
+    ///   snapshot time, which suppresses the brute-force scan.
+    ///
+    /// Safe to call unconditionally: `ensure_hnsw_loaded` re-initializes the
+    /// `OnceLock` on demand, and by this point the retained blobs have been
+    /// taken, so it re-initializes to an empty map.
+    fn release_lazy_hnsw(&mut self) {
+        self.lazy_hnsw = OnceLock::new();
     }
 
     /// Returns `true` if candidate indexes have been built (either eagerly or
@@ -2629,6 +2666,7 @@ impl RuleEngine {
             .unwrap_or_default();
         let ivf = decode_ivf_bytes_to_export(&ivf_bytes);
         self.reindex_all_load_state(g.ids, g.syms, g.labels, g.props, ivf, hnsw);
+        self.release_lazy_hnsw();
     }
 
     /// Register a rule and backfill existing nodes.
