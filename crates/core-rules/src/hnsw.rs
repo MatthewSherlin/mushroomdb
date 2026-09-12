@@ -665,8 +665,10 @@ pub struct HnswIndex {
     /// and the parked vector is re-inserted — and [`Self::can_answer`] is what
     /// makes the gap safe while it lasts.
     ///
-    /// Bounded by construction: a re-election needs the index to hold at most one
-    /// vector, so this cannot grow with the corpus. Never persisted, and holding
+    /// Bounded by the number of distinct dimensions ever elected, not by the
+    /// corpus: a re-election needs the index to hold at most one vector, and a
+    /// stream that changes dimension on every insert parks one entry per
+    /// change. Every insert and remove pays an `O(parked)` scan. Never persisted, and holding
     /// an `f64` copy of a vector the index is not indexing, which
     /// [`Self::memory_stats`] does not count.
     #[serde(skip)]
@@ -777,7 +779,7 @@ impl HnswIndex {
     /// `q_len` dimensions *completely* — meaning a caller may use its answer
     /// instead of an exhaustive scan.
     ///
-    /// Three things have to hold, and each of them is a way the index can be
+    /// Four things have to hold, and each of them is a way the index can be
     /// useless rather than wrong:
     ///
     /// * It holds something. An empty index answers nothing.
@@ -1266,13 +1268,14 @@ impl HnswIndex {
     /// record of; an eviction keeps it, so the index can say precisely what it is
     /// missing and stop claiming only that.
     pub fn insert(&mut self, id: u32, v: &[f64]) {
+        // An explicit insert supersedes any parked copy of the same node: the
+        // caller is telling us this node's vector, and a stale parked one must
+        // never be revived over it — including when the new vector is the zero
+        // vector the index will not hold.
+        self.parked.retain(|(pid, _)| *pid != id);
         let Some(unit) = l2_normalize(v) else {
             return; // zero vector — skip, and do not count it as indexed
         };
-        // An explicit insert supersedes any parked copy of the same node: the
-        // caller is telling us this node's vector, and a stale parked one must
-        // never be revived over it.
-        self.parked.retain(|(pid, _)| *pid != id);
         if self.slab.dim != 0 && unit.len() != self.slab.dim {
             // At most one vector in, so the stride was elected on a sample of
             // one — or on a node that has since been removed, leaving a stride
