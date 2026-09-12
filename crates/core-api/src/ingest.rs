@@ -347,6 +347,7 @@ fn infer_auto_fk<F: Fs>(
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 });
             }
             _ => {

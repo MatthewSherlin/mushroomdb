@@ -74,6 +74,7 @@ fn imports_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -242,6 +243,7 @@ fn scalar_behaviour_is_unchanged() {
                 via_label: None,
                 via_edge: None,
                 via_dir: None,
+                namespace: None,
             },
             &mut g,
         )

@@ -28,6 +28,7 @@ fn rule(name: &str, pred: Predicate, weight_prop: Option<&str>) -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -158,6 +159,7 @@ fn via_rule(weight_prop: Option<&str>) -> RuleDef {
         via_label: Some("Org".into()),
         via_edge: Some("WORKS_AT".into()),
         via_dir: None,
+        namespace: None,
     }
 }
 

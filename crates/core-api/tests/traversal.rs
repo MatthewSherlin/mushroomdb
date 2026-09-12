@@ -37,6 +37,7 @@ fn open_fixture(name: &str) -> GraphDb<core_storage::fs::RealFs> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.insert_node(

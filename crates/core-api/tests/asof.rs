@@ -64,6 +64,7 @@ fn build_known_history(dir: &std::path::Path) {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // commit 2 — rule fires (a and b share tag="x"); commit 3 = DerivedEdgeAdded markers
@@ -212,6 +213,7 @@ fn build_equivalence_history(dir: &std::path::Path) {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.insert_node("T", "y", vec![("tag".into(), Value::Str("hello".into()))])
@@ -475,6 +477,7 @@ fn mutation_refusal_sweep() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap_err();
     assert!(
@@ -612,6 +615,7 @@ fn query_at_scoped_masks_at_the_requested_commit() {
             keys: vec![],
             labels: vec!["Public".into()],
             visible_where: None,
+            namespaces: None,
             write: None,
         }],
         ..Default::default()
@@ -720,6 +724,7 @@ fn query_at_scoped_deletion_is_not_retroactive() {
                 keys: vec![],
                 labels: vec!["Public".into()],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             },
             RoleDef {
@@ -727,6 +732,7 @@ fn query_at_scoped_deletion_is_not_retroactive() {
                 keys: vec!["p1".into()],
                 labels: vec![],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             },
         ],
@@ -822,6 +828,7 @@ fn query_at_scoped_keys_follow_the_commit_not_todays_owner() {
             keys: vec!["alice".into()],
             labels: vec![],
             visible_where: None,
+            namespaces: None,
             write: None,
         }],
         ..Default::default()
@@ -889,6 +896,7 @@ fn query_at_scoped_edges_match_a_hand_built_mask_at_the_same_commit() {
             keys: vec![],
             labels: vec!["Public".into()],
             visible_where: None,
+            namespaces: None,
             write: None,
         }],
         ..Default::default()
@@ -944,4 +952,97 @@ fn query_at_scoped_edges_match_a_hand_built_mask_at_the_same_commit() {
         !got.iter().any(|(a, b)| a == "p4" || b == "p4"),
         "nothing after the commit leaks in: {got:?}"
     );
+}
+
+// ── As-of composed with a namespace (v0.6.6 §7.6) ────────────────────────────
+
+/// The graph is historical and the role definition is current, so a role bound
+/// to a namespace resolves that binding against the commit being read. A node's
+/// namespace cannot have changed — it is immutable — so there is no second case.
+#[test]
+fn query_at_scoped_honours_namespaces() {
+    let dir = tmp("asof-ns");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let ns = |n: &str| ("ns".to_string(), Value::Str(n.to_string()));
+
+    db.insert_node("Public", "x1", vec![ns("x")]).unwrap(); // commit 0
+    db.insert_node("Public", "y1", vec![ns("y")]).unwrap(); // commit 1
+    let at_c = db.wal_total_commits().unwrap() - 1;
+    db.insert_node("Public", "x2", vec![ns("x")]).unwrap(); // after c
+
+    db.apply_schema(&Schema {
+        roles: vec![
+            RoleDef {
+                name: "in-x".into(),
+                keys: vec![],
+                labels: vec!["Public".into()],
+                visible_where: None,
+                namespaces: Some(vec!["x".into()]),
+                write: None,
+            },
+            RoleDef {
+                name: "in-y".into(),
+                keys: vec![],
+                labels: vec!["Public".into()],
+                visible_where: None,
+                namespaces: Some(vec!["y".into()]),
+                write: None,
+            },
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+
+    let params = std::collections::BTreeMap::new();
+    let latest = db.wal_total_commits().unwrap() - 1;
+    let q = "MATCH (n) RETURN n";
+
+    // A node created in `x` after commit c is invisible to an as-of c read.
+    assert_eq!(
+        keys_of(
+            &db.query_at_scoped(at_c, q, &params, AsOfScope::Role("in-x"))
+                .unwrap()
+        ),
+        vec!["x1"],
+        "x2 did not exist at commit c"
+    );
+    assert_eq!(
+        keys_of(
+            &db.query_at_scoped(latest, q, &params, AsOfScope::Role("in-x"))
+                .unwrap()
+        ),
+        vec!["x1", "x2"]
+    );
+    // The y-bound role never sees it, at any commit.
+    for commit in [at_c, latest] {
+        let got = keys_of(
+            &db.query_at_scoped(commit, q, &params, AsOfScope::Role("in-y"))
+                .unwrap(),
+        );
+        assert_eq!(got, vec!["y1"], "in-y sees only y, at commit {commit}");
+    }
+
+    // `AsOfScope::Namespace` agrees with a hand-built mask: the unrestricted
+    // as-of answer, filtered to the nodes that were in `x` then.
+    for commit in [at_c, latest] {
+        let all = keys_of(&db.query_at(commit, q, &params).unwrap());
+        let expected: Vec<String> = all.into_iter().filter(|k| k.starts_with('x')).collect();
+        let got = keys_of(
+            &db.query_at_scoped(commit, q, &params, AsOfScope::Namespace("x"))
+                .unwrap(),
+        );
+        assert_eq!(got, expected, "namespace scope at commit {commit}");
+    }
+    // An unused namespace resolves to nothing, never to everything.
+    assert!(keys_of(
+        &db.query_at_scoped(latest, q, &params, AsOfScope::Namespace("nobody"))
+            .unwrap()
+    )
+    .is_empty());
+    // And the default namespace is a namespace like any other.
+    assert!(keys_of(
+        &db.query_at_scoped(latest, q, &params, AsOfScope::Namespace("default"))
+            .unwrap()
+    )
+    .is_empty());
 }

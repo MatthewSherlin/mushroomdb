@@ -494,6 +494,7 @@ async fn stats_round_trips_serialize() {
         edges: 3,
         chain_truncations: 0,
         history_floor: 0,
+        namespaces: vec![],
         rules: vec![RuleStats {
             name: "r".into(),
             edges: 4,
@@ -613,6 +614,7 @@ async fn explain_happy_path() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         w.insert_node(
@@ -681,6 +683,7 @@ async fn explain_predicate_all_json_shape() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         w.insert_node(
@@ -870,6 +873,7 @@ async fn node_edges_json_shape_user_and_derived() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         w.insert_node(
@@ -1224,6 +1228,7 @@ fn wire_types_serialize() {
         rules: vec![],
         chain_truncations: 0,
         history_floor: 0,
+        namespaces: vec![],
     };
     serde_json::to_value(&stats).unwrap();
     serde_json::to_value(&RuleStats {
@@ -1499,6 +1504,7 @@ fn open_rbac(
                 labels: labels.iter().map(|s| s.to_string()).collect(),
                 keys: keys.iter().map(|s| s.to_string()).collect(),
                 visible_where: None,
+                namespaces: None,
                 write: None,
             })
             .collect(),
@@ -3431,6 +3437,7 @@ fn open_rbac_write(
                 labels: labels.iter().map(|s| s.to_string()).collect(),
                 keys: vec![],
                 visible_where: None,
+                namespaces: None,
                 write: write.clone(),
             })
             .collect(),
@@ -4438,6 +4445,7 @@ async fn concurrent_role_writers_fifo_serialize() {
             labels: vec!["AgentNote".into()],
             keys: vec![],
             visible_where: None,
+            namespaces: None,
             write: Some(agent_write_scope()),
         }],
         ..Default::default()
@@ -4818,6 +4826,7 @@ fn open_predicate_rbac(name: &str) -> (Router, SharedDb) {
                     eq: None,
                     in_: Some(vec![Value::Str("published".into())]),
                 }),
+                namespaces: None,
                 write: None,
             }],
             ..Default::default()

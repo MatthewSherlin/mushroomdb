@@ -12,6 +12,33 @@ use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::{EdgeProps, IdMap, Interner, Topology, Value};
 use serde::{Deserialize, Serialize};
 
+/// Whether `def` may see node `id` — the namespace scoping check (v0.6.6 §7.4).
+///
+/// A global rule (`def.namespace == None`) sees every node and takes no column
+/// read at all, so every rule written before namespaces existed runs exactly the
+/// code it ran before. A scoped rule sees only nodes in its namespace, which is
+/// what makes every edge it derives intra-namespace: the check is applied to
+/// each side where candidates are enumerated, so no pair-level check exists.
+fn rule_sees_node(def: &RuleDef, id: u32, props: &ColumnsView<'_>) -> bool {
+    match &def.namespace {
+        None => true,
+        Some(ns) => {
+            let value = props
+                .get(id, core_storage::NS_PROP)
+                .map(|vr| vr.into_value());
+            core_storage::namespace_of_value(value.as_ref()) == ns.as_str()
+        }
+    }
+}
+
+/// [`rule_sees_node`] against the graph handle a hook already holds.
+fn rule_sees(def: &RuleDef, id: u32, g: &GraphMut<'_>) -> bool {
+    if def.namespace.is_none() {
+        return true;
+    }
+    rule_sees_node(def, id, &g.props)
+}
+
 /// Decode one side's retained HNSW blob for the lazy clean-open read path.
 ///
 /// Empty means "this side had no graph"; a decode failure is reported once on
@@ -464,6 +491,10 @@ fn compute_desired(
     if g.labels.get(n as usize).copied() != Some(my_sym) {
         return BTreeMap::new();
     }
+    // Namespace scoping: a scoped rule sees neither side outside its namespace.
+    if !rule_sees(def, n, g) {
+        return BTreeMap::new();
+    }
     let other_sym = g.syms.get(other_label);
 
     let n_key = match g.ids.key_of(n) {
@@ -569,6 +600,9 @@ fn compute_desired(
         }
         if g.labels.get(m as usize).copied() != other_sym {
             continue; // label filter
+        }
+        if !rule_sees(def, m, g) {
+            continue; // namespace filter — the other side of the pair
         }
         let m_key = match g.ids.key_of(m) {
             Some(k) => k,
@@ -729,7 +763,8 @@ fn compute_desired_via(
             if Some(src_id) == doomed {
                 return BTreeMap::new();
             }
-            if g.labels.get(src_id as usize).copied() == Some(src_sym) {
+            if g.labels.get(src_id as usize).copied() == Some(src_sym) && rule_sees(def, src_id, g)
+            {
                 vec![src_id]
             } else {
                 return BTreeMap::new();
@@ -744,6 +779,7 @@ fn compute_desired_via(
                             g.labels.get(id as usize).copied(),
                             Some(s) if s != u32::MAX && s == src_sym
                         )
+                        && rule_sees(def, id, g)
                 })
                 .collect()
         }
@@ -755,7 +791,8 @@ fn compute_desired_via(
             if Some(dst_id) == doomed {
                 return BTreeMap::new();
             }
-            if g.labels.get(dst_id as usize).copied() == Some(dst_sym) {
+            if g.labels.get(dst_id as usize).copied() == Some(dst_sym) && rule_sees(def, dst_id, g)
+            {
                 Some(dst_id)
             } else {
                 return BTreeMap::new();
@@ -781,7 +818,13 @@ fn compute_desired_via(
             .neighbors(via_etype, via_dir, src)
             .iter()
             .copied()
-            .filter(|&v| Some(v) != doomed && g.labels.get(v as usize).copied() == Some(via_sym))
+            .filter(|&v| {
+                Some(v) != doomed
+                    && g.labels.get(v as usize).copied() == Some(via_sym)
+                    // The via node is a node: a scoped rule does not hop through
+                    // one in another namespace.
+                    && rule_sees(def, v, g)
+            })
             .collect();
 
         if via_neighbors.is_empty() {
@@ -819,6 +862,7 @@ fn compute_desired_via(
                             g.labels.get(id as usize).copied(),
                             Some(s) if s != u32::MAX && s == dst_sym
                         )
+                        && rule_sees(def, id, g)
                 })
                 .collect()
         } else {
@@ -830,6 +874,7 @@ fn compute_desired_via(
                             g.labels.get(id as usize).copied(),
                             Some(s) if s != u32::MAX && s == dst_sym
                         )
+                        && rule_sees(def, id, g)
                 })
                 .collect()
         };
@@ -1289,6 +1334,11 @@ fn pair_still_desired(def: &RuleDef, s: u32, d: u32, g: &GraphMut<'_>) -> bool {
     if g.labels.get(d as usize).copied() != Some(dst_sym) {
         return false;
     }
+    // A scoped rule desires no pair with an endpoint outside its namespace, so
+    // the retract pass withdraws an edge whose endpoint moved out of reach.
+    if !rule_sees(def, s, g) || !rule_sees(def, d, g) {
+        return false;
+    }
     let s_key = match g.ids.key_of(s) {
         Some(k) => k,
         None => return false,
@@ -1662,7 +1712,7 @@ fn bump_fires_for_participants(def: &RuleDef, g: &GraphMut<'_>, fires: &mut u64)
             Some(s) if s != u32::MAX => s,
             _ => continue,
         };
-        if src_sym == Some(label_sym) || dst_sym == Some(label_sym) {
+        if (src_sym == Some(label_sym) || dst_sym == Some(label_sym)) && rule_sees(def, id, g) {
             *fires += 1;
         }
     }
@@ -1692,6 +1742,9 @@ fn index_node_for_rule_deferring_hnsw(
     syms: &Interner,
     props: ColumnsView<'_>,
 ) {
+    if !rule_sees_node(def, id, &props) {
+        return;
+    }
     let get = |f: &str| props.get(id, f).map(|vr| vr.into_value());
     if syms.get(&def.src_label) == Some(label_sym) {
         let spec = src_lookup_spec_for(def);
@@ -1728,6 +1781,11 @@ fn hnsw_build_total(def: &RuleDef, g: &GraphMut<'_>) -> u64 {
         if src_sym != Some(label_sym) && dst_sym != Some(label_sym) {
             continue;
         }
+        // A scoped rule files no vector for a node outside its namespace, so it
+        // must not count one either or the build never reports complete.
+        if !rule_sees(def, id, g) {
+            continue;
+        }
         let get = |f: &str| g.props.get(id, f).map(|vr| vr.into_value());
         let hit = (src_sym == Some(label_sym) && hnsw_vector_present(&src_spec, &get))
             || (dst_sym == Some(label_sym) && hnsw_vector_present(&dst_spec, &get));
@@ -1750,6 +1808,11 @@ fn index_node_for_rule_skipping(
     props: ColumnsView<'_>,
     skip: &(BTreeSet<u32>, BTreeSet<u32>),
 ) {
+    // Namespace scoping: a scoped rule's candidate index holds only its own
+    // namespace, so a probe can never offer a candidate across the boundary.
+    if !rule_sees_node(def, id, &props) {
+        return;
+    }
     let get = |f: &str| props.get(id, f).map(|vr| vr.into_value());
     if syms.get(&def.src_label) == Some(label_sym) {
         let spec = src_lookup_spec_for(def);
@@ -3300,6 +3363,13 @@ impl RuleEngine {
         for rule_name in rule_names {
             let def = self.rules[&rule_name].clone();
 
+            // Namespace scoping (v0.6.6 §7.4): a scoped rule does not see this
+            // node at all, so neither its candidate index nor its derived edges
+            // can reach across the boundary. A global rule takes no read here.
+            if !rule_sees(&def, n, g) {
+                continue;
+            }
+
             if def.via_label.is_some() {
                 // --- Via-hop rule path ---
                 self.on_node_changed_via(&rule_name, &def, n, n_label, changed.clone(), g);
@@ -4102,6 +4172,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -4125,6 +4196,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -4407,6 +4479,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 },
                 &mut g,
             )
@@ -4454,6 +4527,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 },
                 &mut g,
             )
@@ -4520,6 +4594,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 },
                 &mut g,
             )
@@ -4626,6 +4701,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 },
                 &mut g,
             )
@@ -4647,6 +4723,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 },
                 &mut g,
             )
@@ -4710,6 +4787,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -4785,6 +4863,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         let mut eng = RuleEngine::new();
         {
@@ -4839,6 +4918,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         let mut eng = RuleEngine::new();
 
@@ -5023,6 +5103,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -5042,6 +5123,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -5061,6 +5143,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -5175,6 +5258,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -5314,6 +5398,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         {
             let mut g = fx.g();
@@ -5595,6 +5680,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 };
 
                 let build = || {
@@ -5646,6 +5732,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 };
 
                 let build = || {
@@ -5695,6 +5782,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 };
 
                 let build = || {
@@ -5755,6 +5843,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 };
 
                 let build = || {
@@ -5875,6 +5964,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
 
         // Baseline: RSS before any create_rule allocation.
@@ -5984,6 +6074,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
 
         // Build three identical fixtures (independent topo state, same data).
@@ -6090,6 +6181,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
 
         let mut eng = RuleEngine::new();
@@ -6203,6 +6295,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
 
         // Three independent fixtures with the same razor pair.
@@ -6346,6 +6439,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 

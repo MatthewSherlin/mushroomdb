@@ -172,6 +172,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })?;
 
     // --- 6 L1 nodes ---
@@ -214,6 +215,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })?;
 
     // DUMMY rule created and immediately deleted.
@@ -229,6 +231,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })?;
     db.delete_rule("dummy")?;
 
@@ -255,6 +258,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })?;
     db.create_rule(RuleDef {
         name: "nz".into(),
@@ -271,6 +275,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })?;
 
     // Geo: Paris/London cross-cell; ±180 at lat 70 (antimeridian wrap); NYC far.
@@ -294,6 +299,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })?;
 
     // Vector: [1,0] vs near-threshold 0.95; orthogonal [0,1] does not match.
@@ -319,6 +325,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })?;
 
     // Approximate vector rule (vec_approx): 8 VA nodes in 4 pairs across quadrants.
@@ -353,6 +360,7 @@ fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })?;
 
     // Snapshot while km, ov, and Plan-7 rules are live (no dummy rule).
@@ -994,6 +1002,7 @@ fn delete_heavy_workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })?;
     db.create_rule(RuleDef {
         name: "dfe".into(),
@@ -1007,6 +1016,7 @@ fn delete_heavy_workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })?;
 
     // Insert 6 more nodes: d6..d11.
@@ -1192,6 +1202,7 @@ fn write_batch_large_frame_dst_byte_sweep() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })?;
         // 12-op write_batch: all-or-none atomicity gate
         db.write_batch(|b| {
@@ -1376,6 +1387,7 @@ fn write_batch_composition_sweep() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })?;
 
         // Phase 2: snapshot — captures nodes + rule + derived edges.
@@ -2053,6 +2065,7 @@ fn workload_with_v8_setprop_retract<F: Fs>(db: &mut GraphDb<F>) -> core_api::Res
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })?;
     // KM edge src→target is now derived (src.key == "target" == dst key).
     db.snapshot()?;

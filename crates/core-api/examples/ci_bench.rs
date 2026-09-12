@@ -77,6 +77,7 @@ fn main() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .expect("create score_near rule");
     db.create_rule(RuleDef {
@@ -91,6 +92,7 @@ fn main() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .expect("create tag_match rule");
     let rule_backfill_wall_s = t_backfill.elapsed().as_secs_f64();
@@ -153,6 +155,7 @@ fn main() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .expect("create field_equal rule");
     let backfill_field_equal_5k_wall_s = t_fe.elapsed().as_secs_f64();

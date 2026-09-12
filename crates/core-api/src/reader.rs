@@ -425,6 +425,18 @@ fn mask_for_role_from(
             }
         }
     }
+    // Namespace leg — the live resolver's retain, against the frozen overlay's
+    // own `ns` column (the reader has no derived `node_ns` array: its effective
+    // state is assembled per snapshot, and reading the column it would mirror is
+    // the same answer by construction). Intersects the key leg too; see
+    // `RoleDef::namespaces`.
+    if def.namespaces.is_some() {
+        let cv = build_cv(&state.props, base);
+        visible.retain(|&id| {
+            let value = cv.get(id, core_storage::NS_PROP).map(|vr| vr.into_value());
+            def.sees_namespace(core_storage::namespace_of_value(value.as_ref()))
+        });
+    }
     Ok(NodeMask::from_ids(visible))
 }
 

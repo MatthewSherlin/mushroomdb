@@ -43,6 +43,7 @@ fn approx_rule(src: &str, dst: &str, field: &str, edge: &str) -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 

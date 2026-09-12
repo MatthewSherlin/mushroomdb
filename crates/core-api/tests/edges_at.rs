@@ -59,6 +59,7 @@ fn seed(dir: &std::path::Path) -> GraphDb<core_storage::fs::RealFs> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 

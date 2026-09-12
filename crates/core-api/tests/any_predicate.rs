@@ -57,6 +57,7 @@ fn any_two_branch_overlap_or_numeric_derives_edges() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -158,6 +159,7 @@ fn any_nested_in_all_derives_edges() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -253,6 +255,7 @@ fn any_score_is_max_over_satisfied_branches() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -342,6 +345,7 @@ fn any_retraction_when_sole_branch_breaks() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -430,6 +434,7 @@ fn any_edge_retained_when_one_branch_holds() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -547,6 +552,7 @@ fn any_with_max_edges_score_change_causes_evict_backfill() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -650,6 +656,7 @@ fn any_snapshot_v4_roundtrip() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
 
@@ -734,6 +741,7 @@ fn any_bincode_roundtrip_and_old_records_still_decode() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     let bytes = bincode::serialize(&rule).unwrap();
     let decoded: RuleDef = bincode::deserialize(&bytes).unwrap();
@@ -755,6 +763,7 @@ fn any_bincode_roundtrip_and_old_records_still_decode() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     let old_bytes = bincode::serialize(&old).unwrap();
     let old_decoded: RuleDef = bincode::deserialize(&old_bytes).unwrap();

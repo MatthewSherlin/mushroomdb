@@ -75,6 +75,7 @@ fn snapshot_preserves_rules_provenance_and_scores() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         db.insert_node(
@@ -159,6 +160,7 @@ fn crash_between_snapshot_and_wal_truncation_recovers() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         db.insert_node(
@@ -207,6 +209,7 @@ fn crash_between_snapshot_and_wal_truncation_recovers() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         // first snapshot: rule "gone" in engine
@@ -318,6 +321,7 @@ fn v4_round_trip_exact_rule() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         // a↔b derived
@@ -389,6 +393,7 @@ fn v4_round_trip_approx_rule_edge_set_identical() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
 
@@ -480,6 +485,7 @@ fn v4_replay_identity_with_approx_rule() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
 
@@ -505,6 +511,7 @@ fn v4_replay_identity_with_approx_rule() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         db.snapshot().unwrap();
@@ -601,6 +608,7 @@ fn v4_crash_between_snapshot_and_wal_truncation_with_approx_rule() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
 
@@ -672,6 +680,7 @@ fn v6_torn_written_snapshot_with_ivf_state_is_rejected() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         // Approximate/IVF rule: a few vector nodes → IVF state in snapshot.
@@ -700,6 +709,7 @@ fn v6_torn_written_snapshot_with_ivf_state_is_rejected() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         // V5: create a view so view_defs region is populated in the snapshot.
@@ -772,6 +782,7 @@ fn v4_weight_prop_round_trip() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
 
     // Build reference db — never closed, never snapshotted.
@@ -871,6 +882,7 @@ fn v4_round_trip_topk_rule() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
 
     // Build the reference db — never snapshot; receives all ops.
@@ -1208,6 +1220,7 @@ fn v6_torn_snapshot_write_is_rejected() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         // Add a view so the snapshot payload covers the view_defs region.
@@ -2417,6 +2430,7 @@ fn clean_open_snapshot_preserves_approx_rule_ivf_hnsw() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         // Verify IVF produced edges before snapshotting.
@@ -2816,6 +2830,7 @@ fn seed_list_props(dir: &std::path::Path, nodes: u32, list_len: u32, snapshot: b
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     for id in 0..nodes {

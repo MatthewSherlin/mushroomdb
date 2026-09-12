@@ -315,6 +315,7 @@ fn tools_call_happy_path_for_each_tool() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
     }
@@ -431,6 +432,7 @@ fn node_info_and_edges_tool_parity() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         w.insert_node(
@@ -1132,6 +1134,7 @@ fn code_rules() -> Vec<core_api::RuleDef> {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
     let mut out = vec![
@@ -1178,6 +1181,7 @@ fn code_rules() -> Vec<core_api::RuleDef> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     });
     out.push(core_api::RuleDef {
         name: "knows".into(),
@@ -1191,6 +1195,7 @@ fn code_rules() -> Vec<core_api::RuleDef> {
         via_label: Some("File".into()),
         via_edge: Some("TOP_AUTHOR".into()),
         via_dir: Some(core_api::Direction::In),
+        namespace: None,
     });
     out
 }
@@ -1513,6 +1518,7 @@ fn association_store(name: &str) -> SharedDb {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
     }
@@ -1609,6 +1615,7 @@ fn evidence_store(name: &str) -> SharedDb {
                 via_label: None,
                 via_edge: None,
                 via_dir: None,
+                namespace: None,
             };
         w.create_rule(rule(
             "specialty_match",
@@ -1828,6 +1835,7 @@ fn composed_predicate_evidence_lists_every_branch() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
     }
@@ -1917,6 +1925,7 @@ fn any_predicate_evidence_lists_only_the_satisfied_branches() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
     }
@@ -2045,6 +2054,7 @@ fn wide_store(name: &str, n: usize) -> SharedDb {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         for i in 0..n {
@@ -2947,6 +2957,7 @@ fn what_if_store(name: &str) -> (SharedDb, PathBuf) {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         w.insert_node(
@@ -3244,6 +3255,7 @@ fn what_if_grouped_view_never_truncates_away_the_gained_section() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         w.insert_node(
@@ -3468,6 +3480,7 @@ fn roles_store(name: &str) -> SharedDb {
                 keys: vec![],
                 labels: vec!["Company".into()],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             }],
             ..Default::default()
@@ -3541,6 +3554,7 @@ fn query_as_of_composes_with_a_role_and_a_mask() {
                 keys: vec![],
                 labels: vec!["Public".into()],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             }],
             ..Default::default()
@@ -4538,6 +4552,7 @@ fn query_with_a_role_honours_a_visible_where_predicate() {
                     eq: None,
                     in_: Some(vec![Value::Str("published".into())]),
                 }),
+                namespaces: None,
                 write: None,
             }],
             ..Default::default()

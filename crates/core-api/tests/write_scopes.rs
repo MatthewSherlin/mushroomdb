@@ -118,6 +118,7 @@ fn writer_role() -> RoleDef {
         keys: vec![],
         labels: vec!["MyLabel".into(), "Visible".into()],
         visible_where: None,
+        namespaces: None,
         write: Some(WriteScope {
             create_labels: vec!["MyLabel".into()],
             update_labels: vec!["MyLabel".into(), "Visible".into()],
@@ -294,6 +295,7 @@ fn test_update_scope_denied() {
             keys: vec![],
             labels: vec!["MyLabel".into(), "ReadOnly".into()],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec!["MyLabel".into()], // ReadOnly NOT in update_labels
@@ -422,6 +424,7 @@ fn derived_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -647,6 +650,7 @@ fn test_merge_update_only_hidden_eq_absent() {
             keys: vec![],
             labels: vec!["MyLabel".into()],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec![], // no create scope
                 update_labels: vec!["MyLabel".into()],
@@ -719,6 +723,7 @@ fn test_merge_create_only_disclosure_pinned() {
             keys: vec![],
             labels: vec!["MyLabel".into()],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec![],
@@ -798,6 +803,7 @@ fn test_merge_on_create_set_with_role_authz() {
             keys: vec![],
             labels: vec!["MyLabel".into()],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec![], // empty — no update scope
@@ -1100,6 +1106,7 @@ fn test_create_rule_forbidden_for_role() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     let ops = vec![BatchOp::CreateRule(rule)];
     let err = db.write_batch_authz(Some(&authz), ops).unwrap_err();
@@ -1179,6 +1186,7 @@ fn test_delete_recreate_setprop_respects_update_labels() {
             keys: vec![],
             labels: vec!["MyLabel".into()],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec![], // intentionally empty

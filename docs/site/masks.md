@@ -97,6 +97,118 @@ silently ignoring a narrowing is not. (Versions 1 and 2 still load, and a role w
 
 ---
 
+## Namespaces
+
+A namespace is a **tenancy boundary**: a second visibility axis that crosses the
+label one. Where `labels` and `visible_where` answer "what kind of node, with what
+property", a namespace answers "whose data".
+
+A node's namespace is a reserved node property, `ns`:
+
+```json
+{ "label": "Document", "key": "d1", "props": { "ns": "tenant-a", "status": "published" } }
+```
+
+- **Absent `ns` means the namespace `default`.** Every node in a store that has
+  never named a namespace is in `default`, so nothing about an existing store
+  changes when this version is installed.
+- **Writing `ns: "default"` explicitly stores nothing.** A single-tenant store
+  carries no `ns` column at all and pays nothing for the feature.
+- **A name is 1–64 characters of `[A-Za-z0-9_.-]`.** `/` is excluded on purpose:
+  keys already contain it, and a namespace must never read as a key prefix. An
+  invalid name, or a non-string `ns`, is refused at insert.
+- **Keys do not change.** A namespace is not a key prefix — `key(n)`, every history
+  body, every mask entry and every `KeyMatch` target keeps the exact value it has.
+  Keys stay globally unique across namespaces.
+
+### Set at insert, immutable after
+
+`insert_node`, `/ingest`, Cypher `CREATE` and every other create path accept `ns`
+like any other property. Changing it afterwards is refused — `set_prop`, Cypher
+`SET`, `MERGE`'s property merge and every upsert that merges props:
+
+```
+node d1 is in namespace tenant-a; a namespace is set at insert and cannot be
+changed to tenant-b — delete and re-insert the node instead
+```
+
+Writing the namespace a node is already in is a no-op, not an error. `rename_node`
+changes the key, not the namespace. Moving a node between tenants is a deletion
+from one and a creation in the other, and saying so is more honest than a property
+edit that silently re-homes every edge the node carries.
+
+### A role binds to namespaces — `roles.json` version 4
+
+```json
+{
+  "version": 4,
+  "roles": [
+    {
+      "name": "tenant-a-reader",
+      "keys": [],
+      "labels": ["Document"],
+      "visible_where": { "field": "status", "in": ["published"] },
+      "namespaces": ["tenant-a"],
+      "write": null
+    }
+  ]
+}
+```
+
+The full resolution, all three legs:
+
+```
+visible = ( keys ∪ { n : label(n) ∈ labels ∧ visible_where(n) } )
+          ∩ { n : ns(n) ∈ namespaces }
+```
+
+- **Absent `namespaces` is unscoped** — exactly the behaviour every role had before
+  version 4, so no existing role changes meaning.
+- **The namespace leg intersects `keys` too**, unlike `visible_where`, which narrows
+  only the label leg. A namespace is a tenancy boundary, and an explicitly named key
+  in another tenant's namespace is a mistake rather than an administrative grant:
+  `apply_schema` refuses a role whose `keys` name a **live** node outside its
+  namespaces, naming both the key and its namespace. A key naming no live node is
+  still silently ignored, as it is today.
+- **`"namespaces": []` is refused.** A role that sees nothing is written by omitting
+  `keys` and `labels`, not by closing the namespace leg.
+- Resolution stays live, as the other two legs do: a node inserted into the role's
+  namespace is visible on the next read.
+
+**Version 4 is refused by an older binary**, for the same reason version 3 is: a
+binary that does not know `namespaces` would resolve a tenant-scoped role across
+every tenant. An unrecognised version poisons the roles state and denies every role.
+Versions 1–3 still load, and version 4 is written **only** when some role actually
+carries a `namespaces` binding — a store that uses no namespaces keeps the sidecar
+version it had.
+
+### No cross-namespace edges
+
+A user-written edge stays inside one namespace:
+
+```
+edge d1 → e1 crosses a namespace boundary (tenant-a → tenant-b);
+only a global rule may derive one
+```
+
+Every insert-edge path goes through the same check, single op or batch. Only a
+**global** rule — one with no `namespace` — may derive an edge across the boundary;
+see [rules.md](rules.md#namespace-scoping). On an existing store every node is in
+`default`, so nothing that works today stops working.
+
+### Time travel
+
+A role bound to a namespace resolves that binding against the commit being read, so
+an as-of read under a tenant-scoped role sees that tenant's nodes **as they were
+then**. The rule is the one as-of always follows: the graph is historical, the role
+definition is current. A node's namespace, unlike its label or its properties,
+cannot have changed — it is immutable — so there is no second case to explain.
+
+`stats` carries a `namespaces` list with the live node count per namespace, always
+including `default`.
+
+---
+
 ## Client node masks
 
 Full-access callers can supply a `mask` allow-list to any read path (query, node-info,

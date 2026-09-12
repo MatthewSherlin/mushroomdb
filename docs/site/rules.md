@@ -32,6 +32,7 @@ pub struct RuleDef {
     pub weight_prop: Option<String>, // if Some, score stored as this edge prop
     pub max_edges: Option<usize>,    // cap on derived edges per rule (recommended)
     pub approximate: bool,     // HNSW approximate mode (VectorSimilar only)
+    pub namespace: Option<String>,   // None = global; Some(ns) = scoped (see below)
 }
 ```
 
@@ -490,6 +491,51 @@ minutes the benchmark allows it. Building a large vector index is therefore
 still something to do once, ahead of traffic (see *Creating a rule over a large
 corpus* above), not something to absorb inline. The benchmark is committed
 failing on purpose: it is the gate that will say when that changes.
+
+---
+
+## Namespace scoping
+
+A rule is either **global** or **scoped to one namespace**. The `namespace` field
+decides which:
+
+| `namespace` | What the rule sees | What it may derive |
+|---|---|---|
+| `None` (default) | every node in the store | any pair, including one that crosses a namespace boundary |
+| `Some("tenant-a")` | only nodes whose `ns` is `tenant-a` — source, via hop and destination alike | only pairs inside `tenant-a`, by construction |
+
+```rust
+db.create_rule(RuleDef {
+    name: "tenant-a-similar".into(),
+    src_label: "Document".into(),
+    dst_label: "Document".into(),
+    predicate: Predicate::VectorSimilar { field: "emb".into(), min: 0.8 },
+    edge_type: "SIMILAR".into(),
+    namespace: Some("tenant-a".into()),
+    ..rule_defaults()
+})?;
+```
+
+- **Scoping is not a filter applied after derivation.** A scoped rule's candidate
+  index holds only its own namespace, and each side of every pair it considers is
+  checked, so no cross-namespace edge is ever written and then removed. There is no
+  pair-level check to get wrong.
+- **A global rule is unchanged code**: with `namespace: None` the engine takes no
+  namespace read at all, so every rule written before namespaces existed behaves
+  byte-identically and costs exactly what it did.
+- **A via-hop rule is scoped the same way.** The via node is a node, so a scoped rule
+  never hops through another namespace to reach a destination.
+- **A rule is the only way to get a cross-namespace edge**, and only a global one:
+  a user-written edge across a boundary is refused
+  ([masks.md](masks.md#no-cross-namespace-edges)).
+- A name that is not a valid namespace (1–64 of `[A-Za-z0-9_.-]`) is refused when the
+  rule is created.
+- A rule persisted before this field existed decodes as `namespace: None` — global,
+  which is the behaviour it had.
+
+Namespaces themselves — the reserved `ns` property, how a role binds to one, and the
+cross-namespace edge refusal — are documented in
+[masks.md](masks.md#namespaces).
 
 ---
 

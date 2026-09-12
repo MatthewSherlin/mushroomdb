@@ -62,6 +62,7 @@ fn main() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
     }

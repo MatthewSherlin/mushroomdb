@@ -46,6 +46,7 @@ fn analyst_role() -> RoleDef {
         keys: vec!["alice".into()],
         labels: vec!["Public".into()],
         visible_where: None,
+        namespaces: None,
         write: None,
     }
 }
@@ -196,6 +197,7 @@ fn mask_for_role_keys_and_labels_union() {
             keys: vec!["alice".into()],
             labels: vec!["Public".into()],
             visible_where: None,
+            namespaces: None,
             write: None,
         }],
     };
@@ -248,6 +250,7 @@ fn mask_for_role_label_resolves_live() {
             keys: vec![],
             labels: vec!["Public".into()],
             visible_where: None,
+            namespaces: None,
             write: None,
         }],
     };
@@ -309,6 +312,7 @@ fn empty_role_yields_empty_visibility() {
             keys: vec![],
             labels: vec![],
             visible_where: None,
+            namespaces: None,
             write: None,
         }],
     };
@@ -383,6 +387,7 @@ fn apply_schema_rejects_empty_role_name() {
             keys: vec![],
             labels: vec![],
             visible_where: None,
+            namespaces: None,
             write: None,
         }],
     };
@@ -409,6 +414,7 @@ fn apply_schema_rejects_duplicate_role_names() {
                 keys: vec![],
                 labels: vec![],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             },
             RoleDef {
@@ -416,6 +422,7 @@ fn apply_schema_rejects_duplicate_role_names() {
                 keys: vec!["alice".into()],
                 labels: vec![],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             },
         ],
@@ -575,6 +582,7 @@ fn v2_write_scope_round_trips() {
         keys: vec![],
         labels: vec!["AgentNote".into(), "AgentContext".into()],
         visible_where: None,
+        namespaces: None,
         write: Some(WriteScope {
             create_labels: vec!["AgentNote".into(), "AgentContext".into()],
             update_labels: vec!["AgentNote".into()],
@@ -625,6 +633,7 @@ fn version_written_is_v2_when_write_present() {
         keys: vec![],
         labels: vec!["AgentNote".into()],
         visible_where: None,
+        namespaces: None,
         write: Some(WriteScope {
             create_labels: vec!["AgentNote".into()],
             update_labels: vec![],
@@ -695,6 +704,7 @@ fn subset_violation_create_labels_not_in_read_labels_rejected() {
         keys: vec![],
         labels: vec!["AgentNote".into()],
         visible_where: None,
+        namespaces: None,
         write: Some(WriteScope {
             create_labels: vec!["AgentNote".into(), "Secret".into()],
             update_labels: vec![],
@@ -734,6 +744,7 @@ fn subset_violation_update_labels_not_in_read_labels_rejected() {
         keys: vec![],
         labels: vec!["Doc".into()],
         visible_where: None,
+        namespaces: None,
         write: Some(WriteScope {
             create_labels: vec!["Doc".into()],
             update_labels: vec!["Hidden".into()], // not in labels
@@ -773,6 +784,7 @@ fn subset_violation_delete_labels_not_in_read_labels_rejected() {
         keys: vec![],
         labels: vec!["Doc".into()],
         visible_where: None,
+        namespaces: None,
         write: Some(WriteScope {
             create_labels: vec![],
             update_labels: vec![],
@@ -813,6 +825,7 @@ fn edge_types_not_subset_validated() {
         keys: vec![],
         labels: vec!["Doc".into()],
         visible_where: None,
+        namespaces: None,
         write: Some(WriteScope {
             create_labels: vec![],
             update_labels: vec![],
@@ -853,6 +866,7 @@ fn write_scope_only_change_produces_updated_diff() {
             keys: vec![],
             labels: vec!["Doc".into()],
             visible_where: None,
+            namespaces: None,
             write: None,
         }],
     };
@@ -870,6 +884,7 @@ fn write_scope_only_change_produces_updated_diff() {
             keys: vec![],
             labels: vec!["Doc".into()],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec!["Doc".into()],
                 update_labels: vec![],
@@ -954,6 +969,7 @@ fn empty_write_scope_still_writes_v2_and_round_trips_as_some() {
         keys: vec![],
         labels: vec!["Doc".into()],
         visible_where: None,
+        namespaces: None,
         write: Some(WriteScope::default()), // all vecs empty, but Some(...)
     };
     let schema = Schema {
@@ -1012,6 +1028,7 @@ fn multi_role_v1_to_v2_transition_writeless_role_unchanged() {
                 keys: vec!["key1".into()],
                 labels: vec!["Public".into()],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             },
             RoleDef {
@@ -1019,6 +1036,7 @@ fn multi_role_v1_to_v2_transition_writeless_role_unchanged() {
                 keys: vec!["key2".into()],
                 labels: vec!["Admin".into()],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             },
         ],
@@ -1047,6 +1065,7 @@ fn multi_role_v1_to_v2_transition_writeless_role_unchanged() {
                 keys: vec!["key1".into()],
                 labels: vec!["Public".into()],
                 visible_where: None,
+                namespaces: None,
                 write: None, // unchanged
             },
             RoleDef {
@@ -1054,6 +1073,7 @@ fn multi_role_v1_to_v2_transition_writeless_role_unchanged() {
                 keys: vec!["key2".into()],
                 labels: vec!["Admin".into()],
                 visible_where: None,
+                namespaces: None,
                 write: Some(WriteScope {
                     create_labels: vec!["Admin".into()],
                     update_labels: vec![],
@@ -1145,6 +1165,7 @@ fn reader_role(vw: Option<PropPredicate>, keys: Vec<String>) -> RoleDef {
         keys,
         labels: vec!["Document".into()],
         visible_where: vw,
+        namespaces: None,
         write: None,
     }
 }
@@ -1285,6 +1306,7 @@ fn visible_where_narrows_the_label_leg() {
                 eq: Some(Value::Str("x".into())),
                 in_: None,
             }),
+            namespaces: None,
             write: None,
         }]))
         .is_err(),
@@ -1408,23 +1430,94 @@ fn roles_json_version_2_still_loads() {
     );
 }
 
-/// Version 4 and up still poisons — never-widen holds in the new direction too.
+/// Version 5 and up still poisons — never-widen holds in the new direction too.
+/// (Version 4 is namespaces, v0.6.6 §7.3, and loads.)
 #[test]
-fn roles_json_version_4_poisons() {
-    let dir = tmp("roles-v4-poison");
+fn roles_json_version_5_poisons() {
+    let dir = tmp("roles-v5-poison");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("roles.json"),
-        br#"{"version":4,"roles":[{"name":"reader","labels":["Document"]}]}"#,
+        br#"{"version":5,"roles":[{"name":"reader","labels":["Document"]}]}"#,
     )
     .unwrap();
 
     let db = GraphDb::open(&dir).unwrap();
     assert!(
         db.mask_for_role("reader").is_err(),
-        "version 4 must poison the roles state"
+        "version 5 must poison the roles state"
     );
+}
+
+/// A version-4 sidecar loads, and its namespace binding survives the round trip.
+#[test]
+fn roles_json_version_4_loads_with_its_namespaces() {
+    let dir = tmp("roles-v4-loads");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("roles.json"),
+        br#"{"version":4,"roles":[{"name":"reader","labels":["Document"],
+             "namespaces":["x"]}]}"#,
+    )
+    .unwrap();
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node(
+        "Document",
+        "inx",
+        vec![("ns".into(), Value::Str("x".into()))],
+    )
+    .unwrap();
+    db.insert_node(
+        "Document",
+        "iny",
+        vec![("ns".into(), Value::Str("y".into()))],
+    )
+    .unwrap();
+    assert_eq!(
+        db.roles()[0].namespaces.as_deref(),
+        Some(&["x".to_string()][..])
+    );
+    assert_eq!(mask_keys(&db, "reader"), vec!["inx"]);
+}
+
+/// The memo cannot serve a mask that predates a write into the role's namespace.
+#[test]
+fn mask_memo_sees_a_new_node_in_the_roles_namespace() {
+    let dir = tmp("mask-memo-ns");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Document", "a", vec![("ns".into(), Value::Str("x".into()))])
+        .unwrap();
+    db.apply_schema(&roles_schema(vec![RoleDef {
+        namespaces: Some(vec!["x".into()]),
+        ..reader_role(None, vec![])
+    }]))
+    .unwrap();
+
+    // Resolve once — the memo now holds a mask for this commit.
+    assert_eq!(mask_keys(&db, "reader"), vec!["a"]);
+
+    // A node in the role's namespace: the next resolve must see it.
+    db.insert_node("Document", "b", vec![("ns".into(), Value::Str("x".into()))])
+        .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["a", "b"]);
+
+    // And one outside it stays invisible, memo or no memo.
+    db.insert_node("Document", "c", vec![("ns".into(), Value::Str("y".into()))])
+        .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["a", "b"]);
+
+    // A role edit that changes only the namespace binding is not a commit, and
+    // must still be seen.
+    db.apply_schema(&roles_schema(vec![RoleDef {
+        namespaces: Some(vec!["y".into()]),
+        ..reader_role(None, vec![])
+    }]))
+    .unwrap();
+    assert_eq!(mask_keys(&db, "reader"), vec!["c"]);
 }
 
 /// The memo is keyed by commit sequence, so a write invalidates it.

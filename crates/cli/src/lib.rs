@@ -2699,6 +2699,7 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })?;
         let founded_within = Predicate::NumericWithin {
             field: "founded_year".into(),
@@ -2717,6 +2718,7 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })?;
         let nearby_office = Predicate::GeoRadius {
             field: "office".into(),
@@ -2735,6 +2737,7 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })?;
         let similar_interests = Predicate::VectorSimilar {
             field: "embedding".into(),
@@ -2753,6 +2756,7 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })?;
         // Name lookup for `mushroomdb recall`. Adds no nodes or edges.
         for (label, field) in [("Org", "name"), ("Project", "name"), ("Person", "name")] {

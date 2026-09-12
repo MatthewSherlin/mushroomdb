@@ -25,8 +25,15 @@ use core_storage::v8::seam::TopologyView;
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::EdgePropsView;
 use core_storage::{
-    ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result, Topology, Value,
+    namespace_of_value, ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result,
+    Topology, Value,
 };
+pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
+
+/// Index of [`NS_DEFAULT`] in `GraphDb::ns_names` — always zero, so the
+/// open-time pass over a store with no `ns` column fills `node_ns` with one
+/// constant and allocates no names.
+const NS_DEFAULT_IDX: u32 = 0;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -280,6 +287,19 @@ pub struct Stats {
     /// value means events before that commit were pruned and are gone.
     #[serde(default)]
     pub history_floor: u64,
+    /// Live node counts per namespace, in name order. Always carries
+    /// `default` — a store is at least its default namespace — so a
+    /// single-tenant store reads `[{"name":"default", …}]` and a reader can
+    /// tell "no namespaces in use" from one entry.
+    #[serde(default)]
+    pub namespaces: Vec<NamespaceStats>,
+}
+
+/// Live node count for one namespace; one entry of [`Stats::namespaces`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NamespaceStats {
+    pub name: String,
+    pub nodes_live: usize,
 }
 
 /// One rule's provenance size, trip latch, and fire counter.
@@ -1240,6 +1260,23 @@ pub struct GraphDb<F: Fs> {
     topo: Topology,
     props: ColumnStore,
     labels: Vec<u32>, // node id -> label symbol
+    /// Namespace names by index; index [`NS_DEFAULT_IDX`] is always
+    /// [`NS_DEFAULT`]. Derived beside [`Self::node_ns`], never persisted.
+    ///
+    /// A private table rather than the shared [`Interner`]: interning
+    /// `"default"` at open would add a symbol to the store's symbol table and
+    /// change the bytes of the next snapshot of a store that has no namespaces
+    /// at all.
+    ns_names: Vec<String>,
+    /// Namespace index per dense node id, into [`Self::ns_names`];
+    /// [`NS_DEFAULT_IDX`] for a node with no `ns` property.
+    ///
+    /// Derived: built by one pass over the `ns` column at open (which reads
+    /// nothing when the column does not exist) and maintained at every node
+    /// insert. Never written to a snapshot or the WAL, because the property it
+    /// mirrors already is. A namespace cannot change, so no other record shape
+    /// can move a node between namespaces.
+    node_ns: Vec<u32>,
     edge_props: EdgeProps,
     engine: RuleEngine,
     view_store: ViewStore,
@@ -1597,6 +1634,13 @@ pub enum AsOfScope<'a> {
     /// A role intersected with a client-supplied allow-list. The intersection
     /// is the never-widen rule: a client mask can only narrow a role.
     RoleAndKeys(&'a str, &'a [String]),
+    /// Every live node in one namespace, as the graph was at that commit.
+    ///
+    /// A namespace cannot change — it is set at insert and immutable — so the
+    /// answer is simply "the nodes that existed then and are in this
+    /// namespace". A name no node uses resolves to nothing, never to
+    /// everything.
+    Namespace(&'a str),
 }
 
 impl GraphDb<RealFs> {
@@ -1783,6 +1827,7 @@ impl GraphDb<RealFs> {
                         keys.iter().map(String::as_str),
                     ))
             }
+            AsOfScope::Namespace(namespace) => temporal.mask_for_namespace(namespace),
         };
         temporal.query_masked(cypher, params, &mask)
     }
@@ -1860,6 +1905,8 @@ impl<F: Fs> GraphDb<F> {
             topo: Topology::new(),
             props: ColumnStore::new(),
             labels: Vec::new(),
+            ns_names: vec![NS_DEFAULT.to_string()],
+            node_ns: Vec::new(),
             edge_props: EdgeProps::new(),
             engine: RuleEngine::new(),
             view_store: ViewStore::new(),
@@ -1920,6 +1967,8 @@ impl<F: Fs> GraphDb<F> {
         self.topo = Topology::new();
         self.props = ColumnStore::new();
         self.labels = Vec::new();
+        self.ns_names = vec![NS_DEFAULT.to_string()];
+        self.node_ns = Vec::new();
         self.edge_props = EdgeProps::new();
         self.engine = RuleEngine::new();
         self.view_store = ViewStore::new();
@@ -2088,6 +2137,11 @@ impl<F: Fs> GraphDb<F> {
             &db.syms,
             build_props_view(&db.props, &db.base),
         );
+        // Namespaces: one pass over the `ns` column, after the snapshot is
+        // restored and the WAL replayed. Replay maintains `node_ns` record by
+        // record as well; this pass is what makes a snapshot-only open right,
+        // and it reads nothing on a store with no `ns` column.
+        db.rebuild_node_ns();
         // Load roles sidecar. Missing file = no roles (Some(vec![])).
         // Corrupt/unparseable = poisoned (None); mask_for_role will fail-loud.
         db.roles = Self::load_roles_from_fs(&db.fs)?;
@@ -2854,6 +2908,9 @@ impl<F: Fs> GraphDb<F> {
             &db.syms,
             build_props_view(&db.props, &db.base),
         );
+        // Namespaces on the temporal handle, built by the same pass the live
+        // open uses, so an as-of mask narrows by the namespaces of that commit.
+        db.rebuild_node_ns();
         // Load roles sidecar (current roles, not point-in-time).
         db.roles = Self::load_roles_from_fs(&db.fs)?;
         db.read_only = true;
@@ -2937,9 +2994,14 @@ impl<F: Fs> GraphDb<F> {
                     self.labels.resize(id as usize + 1, u32::MAX);
                 }
                 self.labels[id as usize] = sym;
+                let mut ns_name = NS_DEFAULT.to_string();
                 for (field, value) in props {
+                    if field == NS_PROP {
+                        ns_name = namespace_of_value(Some(value)).to_string();
+                    }
                     self.props.set(id, field, value.clone());
                 }
+                self.set_node_ns(id, &ns_name);
                 // Initialize view values for the new node before the engine runs so
                 // delta-based increments start from a known zero baseline.
                 self.view_store
@@ -3186,6 +3248,7 @@ impl<F: Fs> GraphDb<F> {
                         detail: format!("wal InsertNodeId unknown label intern {label}"),
                     })?
                     .to_string();
+                let mut ns_name = NS_DEFAULT.to_string();
                 for (field_sym, value) in props {
                     let field =
                         self.syms
@@ -3195,8 +3258,12 @@ impl<F: Fs> GraphDb<F> {
                                     "wal InsertNodeId unknown field intern {field_sym}"
                                 ),
                             })?;
+                    if field == NS_PROP {
+                        ns_name = namespace_of_value(Some(value)).to_string();
+                    }
                     self.props.set(id, field, value.clone());
                 }
+                self.set_node_ns(id, &ns_name);
                 self.view_store
                     .init_node_views(id, &mut self.props, &self.syms, &self.labels);
                 let cursor = self.engine.pending_delta_count();
@@ -3989,6 +4056,11 @@ impl<F: Fs> GraphDb<F> {
         let mut out = Vec::with_capacity(recs.len());
         // Node ids allocated by later apply(InsertNodeId) in this same batch.
         let mut pending: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        // Namespace of each node inserted earlier in this same frame, so a SET
+        // on a node this frame created is measured against the namespace it was
+        // created in rather than against the store, where it does not exist yet.
+        let mut pending_ns: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         let mut interned = std::collections::HashSet::<u32>::new();
         let mut next = u32::try_from(self.ids.len()).map_err(|_| GraphError::Corrupt {
             detail: "id space exhausted".into(),
@@ -4000,6 +4072,12 @@ impl<F: Fs> GraphDb<F> {
         for rec in recs {
             match rec {
                 WalRecord::InsertNode { label, key, props } => {
+                    // Namespace validation and normalisation, on the one seam
+                    // every user-visible node insert passes through: insert_node,
+                    // a batch, ingest, Cypher CREATE and MERGE all arrive here
+                    // before the WAL append, and replay never does.
+                    let (props, ns_name) = Self::normalise_insert_ns(&key, props)?;
+                    pending_ns.insert(key.clone(), ns_name);
                     let (label_id, intern) = self.intern_wal(&label);
                     if interned.insert(label_id) {
                         out.push(intern);
@@ -4025,6 +4103,35 @@ impl<F: Fs> GraphDb<F> {
                     });
                 }
                 WalRecord::SetProp { key, field, value } => {
+                    // A namespace is set at insert and fixed after: the write is
+                    // refused when it would move the node, and dropped when it
+                    // names the namespace the node is already in. Checked here
+                    // so set_prop, a batch, Cypher SET/MERGE and every upsert
+                    // that merges props get the same answer.
+                    if field == NS_PROP {
+                        let Value::Str(ref to) = value else {
+                            return Err(GraphError::RuleInvalid {
+                                detail: format!(
+                                    "node {key}: {NS_PROP} must be a string naming a namespace, \
+                                     got {value:?}"
+                                ),
+                            });
+                        };
+                        let from = pending_ns
+                            .get(&key)
+                            .cloned()
+                            .or_else(|| self.namespace_of(&key))
+                            .unwrap_or_else(|| NS_DEFAULT.to_string());
+                        let to = to.clone();
+                        if to != from {
+                            return Err(GraphError::NamespaceImmutable {
+                                key: key.clone(),
+                                from,
+                                to,
+                            });
+                        }
+                        continue;
+                    }
                     let id =
                         lookup(&self.ids, &pending, &key).ok_or_else(|| GraphError::Corrupt {
                             detail: format!("dense WAL rewrite missing key {key}"),
@@ -5391,6 +5498,13 @@ impl<F: Fs> GraphDb<F> {
         // rewrite_wal_dense converts every InsertNode/InsertEdge into its
         // *Id form, so only the dense variants can appear in `recs` here.
         let recs = self.rewrite_wal_dense(recs)?;
+        // The rewrite can empty a non-empty batch: a `SET n.ns` naming the
+        // namespace the node is already in is a no-op and is dropped there. An
+        // empty `Batch` frame would still take a commit sequence and a WAL
+        // record, so a batch that turns out to be nothing writes nothing.
+        if recs.is_empty() {
+            return Ok((0, 0));
+        }
         let nodes_inserted = recs
             .iter()
             .filter(|r| matches!(r, WalRecord::InsertNodeId { .. }))
@@ -6552,6 +6666,213 @@ impl<F: Fs> GraphDb<F> {
     }
 
     // -----------------------------------------------------------------------
+    // Namespaces
+    // -----------------------------------------------------------------------
+
+    /// The index `name` already has in `ns_names`, if any.
+    fn ns_index_of(&self, name: &str) -> Option<u32> {
+        self.ns_names
+            .iter()
+            .position(|n| n == name)
+            .map(|i| i as u32)
+    }
+
+    /// The index for `name`, appending it to `ns_names` when it is new.
+    ///
+    /// The table holds one entry per distinct namespace in the store — a
+    /// tenant count, not a node count — so the linear scan is cheaper than a
+    /// map and keeps `namespaces()` allocation-free of a second index.
+    fn ns_index_for(&mut self, name: &str) -> u32 {
+        match self.ns_index_of(name) {
+            Some(i) => i,
+            None => {
+                self.ns_names.push(name.to_string());
+                (self.ns_names.len() - 1) as u32
+            }
+        }
+    }
+
+    /// The namespace name at `idx`, or [`NS_DEFAULT`] for an index this handle
+    /// does not know (unreachable; the default is the narrowing answer).
+    fn ns_name(&self, idx: u32) -> &str {
+        self.ns_names
+            .get(idx as usize)
+            .map(String::as_str)
+            .unwrap_or(NS_DEFAULT)
+    }
+
+    /// The namespace index of dense node `id`, defaulting for an id with no
+    /// entry (a node inserted before this handle rebuilt the array cannot
+    /// exist: every insert path maintains it).
+    fn node_ns_idx(&self, id: u32) -> u32 {
+        self.node_ns
+            .get(id as usize)
+            .copied()
+            .unwrap_or(NS_DEFAULT_IDX)
+    }
+
+    /// File node `id` under namespace `name`, growing `node_ns` as `labels`
+    /// grows. Called from `apply` for every node insert, live and replayed.
+    fn set_node_ns(&mut self, id: u32, name: &str) {
+        let idx = if name == NS_DEFAULT {
+            NS_DEFAULT_IDX
+        } else {
+            self.ns_index_for(name)
+        };
+        if self.node_ns.len() <= id as usize {
+            self.node_ns.resize(id as usize + 1, NS_DEFAULT_IDX);
+        }
+        self.node_ns[id as usize] = idx;
+    }
+
+    /// Rebuild `node_ns` from the `ns` column — one pass, at the end of an
+    /// open or a reload, after the snapshot is restored and the WAL replayed.
+    ///
+    /// A store with no `ns` column reads nothing: the column-name check fails
+    /// and the vector is filled with one constant.
+    fn rebuild_node_ns(&mut self) {
+        let total = self.ids.len();
+        self.ns_names.truncate(1);
+        self.node_ns.clear();
+        self.node_ns.resize(total, NS_DEFAULT_IDX);
+        let has_ns_column = {
+            let cv = self.props_view();
+            cv.field_names().iter().any(|f| f == NS_PROP)
+        };
+        if !has_ns_column {
+            return;
+        }
+        // Collected first so the props view is released before `ns_index_for`
+        // takes `&mut self`.
+        let named: Vec<(u32, String)> = {
+            let cv = self.props_view();
+            (0..total as u32)
+                .filter_map(|id| match cv.get(id, NS_PROP).map(|vr| vr.into_value()) {
+                    Some(Value::Str(s)) if s != NS_DEFAULT => Some((id, s)),
+                    _ => None,
+                })
+                .collect()
+        };
+        for (id, name) in named {
+            let idx = self.ns_index_for(&name);
+            self.node_ns[id as usize] = idx;
+        }
+    }
+
+    /// Every namespace with at least one live node, in name order.
+    ///
+    /// `["default"]` on any store that has never named a namespace, including
+    /// an empty one: a store is always at least its default namespace.
+    pub fn namespaces(&self) -> Vec<String> {
+        let mut out: BTreeSet<&str> = BTreeSet::new();
+        out.insert(NS_DEFAULT);
+        for (id, &idx) in self.node_ns.iter().enumerate() {
+            if idx == NS_DEFAULT_IDX || !self.is_live_node(id as u32) {
+                continue;
+            }
+            out.insert(self.ns_name(idx));
+        }
+        out.into_iter().map(str::to_string).collect()
+    }
+
+    /// The namespace of `key`, or `None` when the key names no live node.
+    pub fn namespace_of(&self, key: &str) -> Option<String> {
+        let id = self.ids.get(key)?;
+        if !self.is_live_node(id) {
+            return None;
+        }
+        Some(self.ns_name(self.node_ns_idx(id)).to_string())
+    }
+
+    /// Every live node in `namespace`, as a visibility mask.
+    ///
+    /// Built off `node_ns` on whichever handle this is, so on a temporal handle
+    /// it is the namespace's membership at that commit. A name no node uses
+    /// gives an empty mask — a namespace scope never widens.
+    pub fn mask_for_namespace(&self, namespace: &str) -> crate::mask::NodeMask {
+        let Some(idx) = self.ns_index_of(namespace) else {
+            return crate::mask::NodeMask::from_ids(std::collections::HashSet::new());
+        };
+        let visible: std::collections::HashSet<u32> = (0..self.ids.len() as u32)
+            .filter(|&id| self.node_ns_idx(id) == idx && self.is_live_node(id))
+            .collect();
+        crate::mask::NodeMask::from_ids(visible)
+    }
+
+    /// Live-node test used by the namespace accessors: a deleted node keeps its
+    /// dense id and its `node_ns` slot, and the label sentinel is what marks it
+    /// gone — the same test `mask_for_role`'s label leg applies implicitly.
+    fn is_live_node(&self, id: u32) -> bool {
+        self.labels
+            .get(id as usize)
+            .is_some_and(|&sym| sym != u32::MAX)
+            && self.ids.key_of(id).is_some()
+    }
+
+    /// Per-namespace live node counts for [`Stats`], in name order.
+    fn namespace_stats(&self) -> Vec<NamespaceStats> {
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        counts.insert(NS_DEFAULT, 0);
+        for id in 0..self.ids.len() as u32 {
+            if !self.is_live_node(id) {
+                continue;
+            }
+            *counts
+                .entry(self.ns_name(self.node_ns_idx(id)))
+                .or_insert(0) += 1;
+        }
+        counts
+            .into_iter()
+            .filter(|&(name, n)| n > 0 || name == NS_DEFAULT)
+            .map(|(name, nodes_live)| NamespaceStats {
+                name: name.to_string(),
+                nodes_live,
+            })
+            .collect()
+    }
+
+    /// Validate the `ns` entry of a node's props and drop an explicit default.
+    ///
+    /// Runs on the write path only (see `rewrite_wal_dense`), never on replay:
+    /// a record that reached the WAL was already accepted here.
+    fn normalise_insert_ns(
+        key: &str,
+        props: Vec<(String, Value)>,
+    ) -> Result<(Vec<(String, Value)>, String)> {
+        let mut name = NS_DEFAULT.to_string();
+        let mut out = Vec::with_capacity(props.len());
+        for (field, value) in props {
+            if field != NS_PROP {
+                out.push((field, value));
+                continue;
+            }
+            let Value::Str(ref s) = value else {
+                return Err(GraphError::RuleInvalid {
+                    detail: format!(
+                        "node {key}: {NS_PROP} must be a string naming a namespace, \
+                         got {value:?}"
+                    ),
+                });
+            };
+            if !valid_namespace(s) {
+                return Err(GraphError::RuleInvalid {
+                    detail: format!(
+                        "node {key}: {s:?} is not a valid namespace name — 1 to {NS_MAX_LEN} \
+                         characters of [A-Za-z0-9_.-]"
+                    ),
+                });
+            }
+            name = s.clone();
+            // An explicit default stores nothing, so a single-tenant store
+            // never grows an `ns` column.
+            if name != NS_DEFAULT {
+                out.push((field, value));
+            }
+        }
+        Ok((out, name))
+    }
+
+    // -----------------------------------------------------------------------
     // RBAC role resolution
     // -----------------------------------------------------------------------
 
@@ -6579,8 +6900,8 @@ impl<F: Fs> GraphDb<F> {
             return Ok(Some(vec![]));
         }
         match serde_json::from_slice::<RolesFile>(&bytes) {
-            Ok(f) if matches!(f.version, 1..=3) => Ok(Some(f.roles)),
-            // Corrupt or unrecognised version (>3): poison the roles state.
+            Ok(f) if matches!(f.version, 1..=4) => Ok(Some(f.roles)),
+            // Corrupt or unrecognised version (>4): poison the roles state.
             // Never widen: a version this binary does not know may carry a
             // narrowing this binary would not apply.
             _ => Ok(None),
@@ -6666,6 +6987,15 @@ impl<F: Fs> GraphDb<F> {
                     }
                 }
             }
+        }
+
+        // Namespace leg: an intersection over the whole union, the key leg
+        // included. A namespace is a tenancy boundary, so a key naming a node in
+        // another tenant's namespace is not an administrative grant — and
+        // `apply_schema` has already refused that role, so this only has to be
+        // right about the node that moved into existence afterwards.
+        if def.namespaces.is_some() {
+            visible.retain(|&id| def.sees_namespace(self.ns_name(self.node_ns_idx(id))));
         }
 
         Ok(crate::mask::NodeMask::from_ids(visible))
@@ -10322,6 +10652,7 @@ impl<F: Fs> GraphDb<F> {
             rules,
             chain_truncations: self.engine.chain_truncations(),
             history_floor: self.wal_horizon_floor,
+            namespaces: self.namespace_stats(),
         }
     }
 
@@ -11106,6 +11437,19 @@ impl<'a, F: Fs> MutPreview<'a, F> {
                 detail: format!("edge {edge_type} {src_key}→{dst_key} is rule-owned"),
             });
         }
+        // A user-written edge stays inside one namespace. Derived edges do not
+        // come through here — the engine adds them directly — and the rule
+        // scoping check is what keeps those pure.
+        let src_ns = self.namespace_in_batch(src_key);
+        let dst_ns = self.namespace_in_batch(dst_key);
+        if src_ns != dst_ns {
+            return Err(GraphError::CrossNamespace {
+                src: src_key.to_string(),
+                src_ns,
+                dst: dst_key.to_string(),
+                dst_ns,
+            });
+        }
         Ok(!self.has_edge(edge_type, src_key, dst_key))
     }
 
@@ -11195,6 +11539,12 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             return None;
         }
         self.db.syms.resolve(sym).map(str::to_string)
+    }
+
+    /// The namespace `key` is in as this batch sees it — including a node
+    /// inserted earlier in the same batch, which the store does not have yet.
+    fn namespace_in_batch(&self, key: &str) -> String {
+        namespace_of_value(self.prop_value(key, NS_PROP).as_ref()).to_string()
     }
 
     fn prop_value(&self, key: &str, field: &str) -> Option<Value> {
@@ -11667,6 +12017,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 

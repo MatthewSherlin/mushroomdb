@@ -161,6 +161,7 @@ fn key_rule(name: &str, src: &str, dst: &str, field: &str, edge: &str) -> RuleDe
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 

@@ -817,6 +817,7 @@ fn ingest_prs(
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })?;
         report.rules_created.push(PR_FK_RULE.to_string());
     }
@@ -1244,6 +1245,7 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })?;
         w.create_rule(RuleDef {
             name: "knows".into(),
@@ -1257,6 +1259,7 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
             via_label: Some("File".into()),
             via_edge: Some("TOP_AUTHOR".into()),
             via_dir: Some(Direction::In),
+            namespace: None,
         })?;
         report
             .rules_created

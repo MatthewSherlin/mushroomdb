@@ -71,6 +71,7 @@ fn seed(db: &mut Db) {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.create_rule(RuleDef {
@@ -88,6 +89,7 @@ fn seed(db: &mut Db) {
         via_label: Some("File".into()),
         via_edge: Some("TOP_AUTHOR".into()),
         via_dir: Some(Direction::In),
+        namespace: None,
     })
     .unwrap();
 }
@@ -195,6 +197,7 @@ fn cycle_is_rejected_at_create_rule_with_named_error() {
             via_label: Some("Author".into()),
             via_edge: Some("KNOWS".into()),
             via_dir: Some(Direction::In),
+            namespace: None,
         })
         .unwrap_err();
     match err {
@@ -220,6 +223,7 @@ fn cycle_is_rejected_at_create_rule_with_named_error() {
             via_label: Some("File".into()),
             via_edge: Some("SAME".into()),
             via_dir: Some(Direction::Out),
+            namespace: None,
         })
         .unwrap_err();
     match err2 {
@@ -262,6 +266,7 @@ fn depth_cap_terminates_long_chains() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     for lvl in 1..6 {
@@ -277,6 +282,7 @@ fn depth_cap_terminates_long_chains() {
             via_label: Some(format!("L{lvl}")),
             via_edge: Some(format!("E{}", lvl - 1)),
             via_dir: Some(Direction::Out),
+            namespace: None,
         })
         .unwrap();
     }
@@ -383,6 +389,7 @@ fn a_later_level_can_refire_a_rule_an_earlier_level_already_ran() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     // Rule iteration is BTree name order, so at level 0 the X delta is appended
     // before the Y delta. That is the order that exposes the bug.
@@ -403,6 +410,7 @@ fn a_later_level_can_refire_a_rule_an_earlier_level_already_ran() {
         via_label: Some("T".into()),
         via_edge: Some("Y".into()),
         via_dir: Some(Direction::Out),
+        namespace: None,
     })
     .unwrap();
     // Hops over X, writes Z. Its result depends on WHICH T nodes it reaches.
@@ -418,6 +426,7 @@ fn a_later_level_can_refire_a_rule_an_earlier_level_already_ran() {
         via_label: Some("T".into()),
         via_edge: Some("X".into()),
         via_dir: Some(Direction::Out),
+        namespace: None,
     })
     .unwrap();
     assert!(db.neighbors("s", "Z", Direction::Out).unwrap().is_empty());
@@ -529,6 +538,7 @@ fn a_batch_cannot_assemble_a_cycle_one_rule_at_a_time() {
         via_label: Some("B".into()),
         via_edge: Some(via.into()),
         via_dir: Some(Direction::Out),
+        namespace: None,
     };
     // Neither rule closes a cycle on its own; together they do.
     let err = db
@@ -572,6 +582,7 @@ fn a_rule_deleted_within_a_batch_stops_counting_towards_cycles() {
         via_label: Some("B".into()),
         via_edge: Some(via.into()),
         via_dir: Some(Direction::Out),
+        namespace: None,
     };
     db.batch()
         .create_rule(hop("first", "X", "Y"))
@@ -679,6 +690,7 @@ fn create_rule_backfill_chains_into_an_existing_via_hop_rule() {
         via_label: Some("File".into()),
         via_edge: Some("TOP_AUTHOR".into()),
         via_dir: Some(Direction::In),
+        namespace: None,
     })
     .unwrap();
     assert_eq!(knows(&db, "alice"), Vec::<String>::new(), "no hops yet");
@@ -697,6 +709,7 @@ fn create_rule_backfill_chains_into_an_existing_via_hop_rule() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     assert_eq!(
@@ -762,6 +775,7 @@ fn one_level_rules_are_unchanged() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.set_prop("p1", "industry", Value::Str("y".into()))

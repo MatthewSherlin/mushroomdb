@@ -41,6 +41,7 @@ fn knows_rule(max_edges: Option<u64>) -> RuleDef {
         via_label: Some("File".into()),
         via_edge: Some("TOP_AUTHOR".into()),
         via_dir: Some(Direction::In),
+        namespace: None,
     }
 }
 
@@ -85,6 +86,7 @@ fn seed(db: &mut Db, max_edges: Option<u64>, docs_owner: &str, docs_commits: &[&
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.create_rule(knows_rule(max_edges)).unwrap();
@@ -203,6 +205,7 @@ fn deleting_a_sibling_rule_rebuilds_the_via_rule_correctly() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     assert_eq!(knows(&db, "alice"), vec!["api", "model"]);
@@ -419,6 +422,7 @@ fn inert_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -472,6 +476,7 @@ fn creating_a_rule_does_not_strand_a_plain_rules_edges() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         assert_eq!(
@@ -573,6 +578,7 @@ fn seed_mixed_any(db: &mut Db) {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.create_rule(RuleDef {
@@ -594,6 +600,7 @@ fn seed_mixed_any(db: &mut Db) {
         via_label: Some("File".into()),
         via_edge: Some("TOP_AUTHOR".into()),
         via_dir: Some(Direction::In),
+        namespace: None,
     })
     .unwrap();
 }

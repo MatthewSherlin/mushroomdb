@@ -136,6 +136,7 @@ fn load_demo_equivalent(dir: &Path) -> SharedDb {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .expect("skill_fit");
     }

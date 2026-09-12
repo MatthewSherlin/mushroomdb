@@ -17,6 +17,9 @@ pub use fs::{sync_wal_at, truncate_wal_at, FileId, Fs, RealFs};
 pub use idmap::IdMap;
 pub use interner::Interner;
 pub use topology::{Direction, Topology};
-pub use types::{list_tokens, GraphError, Result, Value, ValueKey};
+pub use types::{
+    list_tokens, namespace_of_value, valid_namespace, GraphError, Result, Value, ValueKey,
+    NS_DEFAULT, NS_MAX_LEN, NS_PROP,
+};
 pub use v8::seam::EdgePropsView;
 pub use wal::{decode_all, encode_record, WalRecord};

@@ -362,6 +362,7 @@ fn already_ruled_pair_not_re_suggested() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 

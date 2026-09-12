@@ -29,6 +29,7 @@ fn fk_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -196,6 +197,7 @@ fn explain_reports_rule_provenance_and_weights() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.insert_node(
@@ -280,6 +282,7 @@ fn explain_predicate_summary_key_match_and_all() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.insert_node(
@@ -474,6 +477,7 @@ fn all_vector_then_field_equal_does_not_scan_all() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -537,6 +541,7 @@ fn approx_vec_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -795,6 +800,7 @@ fn via_hop_rule_fires_only_matching_industry() {
         via_label: Some("Org".into()),
         via_edge: Some("WORKS_AT".into()),
         via_dir: None, // defaults to Out
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -829,6 +835,7 @@ fn via_hop_validate_rejects_half_set() {
         via_label: Some("V".into()),
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     assert!(
         db.create_rule(bad_label_only).is_err(),
@@ -848,6 +855,7 @@ fn via_hop_validate_rejects_half_set() {
         via_label: None,
         via_edge: Some("VE".into()),
         via_dir: None,
+        namespace: None,
     };
     assert!(
         db.create_rule(bad_edge_only).is_err(),
@@ -889,6 +897,7 @@ fn via_hop_incremental_edge_insert() {
         via_label: Some("Org".into()),
         via_edge: Some("WORKS_AT".into()),
         via_dir: None,
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -948,6 +957,7 @@ fn via_hop_incremental_via_prop_change() {
         via_label: Some("Org".into()),
         via_edge: Some("WORKS_AT".into()),
         via_dir: None,
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -1060,6 +1070,7 @@ fn via_hop_via_dir_in() {
         via_label: Some("Org".into()),
         via_edge: Some("MEMBER_OF".into()),
         via_dir: Some(core_storage::Direction::In),
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -1116,6 +1127,7 @@ fn via_hop_survives_snapshot_and_wal_replay() {
             via_label: Some("Org".into()),
             via_edge: Some("WORKS_AT".into()),
             via_dir: None,
+            namespace: None,
         };
         db.create_rule(rule).unwrap();
 
@@ -1194,6 +1206,7 @@ fn via_hop_new_via_node_insert_after_rule_creation() {
         via_label: Some("Org".into()),
         via_edge: Some("WORKS_AT".into()),
         via_dir: None,
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -1269,6 +1282,7 @@ fn ingest_json_list_fk_plus_keymatch_rule_yields_edges() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // "ghost.rs" names no node; the other two do.
@@ -1375,6 +1389,7 @@ fn explain_reports_keymatch_for_list_edge() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.insert_node(
@@ -1429,6 +1444,7 @@ fn list_fk_fires_per_element_at_the_default_cap() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.insert_node(
@@ -1493,6 +1509,7 @@ fn list_fk_under_a_small_cap_keeps_the_lowest_destination_keys() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // Stored in descending key order, so stored order and key order disagree.
@@ -1550,6 +1567,7 @@ fn seed_any_keymatch(db: &mut GraphDb<RealFs>) {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // bob is named by alice's FK and shares no city; carol shares alice's city
@@ -1659,6 +1677,7 @@ fn tight_vec_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -1764,6 +1783,7 @@ fn slice_rule() -> RuleDef {
         approximate: true,
         via_label: None,
         via_dir: None,
+        namespace: None,
         via_edge: None,
     }
 }

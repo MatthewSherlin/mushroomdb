@@ -27,6 +27,7 @@ fn overlap_rule(name: &str, etype: &str) -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -531,6 +532,7 @@ fn topk_eq_rule(k: u64) -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -764,6 +766,10 @@ fn stats_live_and_tombstoned_after_delete_node() {
             rules: vec![],
             chain_truncations: 0,
             history_floor: 0,
+            namespaces: vec![core_api::NamespaceStats {
+                name: core_api::NS_DEFAULT.to_string(),
+                nodes_live: 2,
+            }],
         }
     );
     db.delete_node("a").unwrap();

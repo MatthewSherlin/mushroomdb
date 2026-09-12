@@ -690,6 +690,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -771,6 +772,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }));
         assert!(o.create_rule(RuleDef {
             name: "nz".into(),
@@ -787,6 +789,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }));
         let edges = o.all_edges();
         assert!(edges.contains(&("NW".into(), "a".into(), "b".into())));
@@ -818,6 +821,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }));
         let edges = o.all_edges();
         assert!(edges.contains(&("GEO".into(), "paris".into(), "london".into())));
@@ -850,6 +854,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }));
         let edges = o.all_edges();
         assert!(edges.contains(&("VEC".into(), "a".into(), "b".into())));

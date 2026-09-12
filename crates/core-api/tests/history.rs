@@ -434,6 +434,7 @@ fn fk_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 

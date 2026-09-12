@@ -60,6 +60,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         1 => RuleDef {
             name: "r_fe".into(),
@@ -73,6 +74,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         2 => RuleDef {
             name: "r_ov".into(),
@@ -89,6 +91,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         3 => RuleDef {
             name: "r_all".into(),
@@ -108,6 +111,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         // Template 4: shares edge_type "r_fe" with r_fe — exercises C1 (co-owned
         // edge type survival after rule deletion).  Different name and lower min
@@ -127,6 +131,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         5 => RuleDef {
             name: "r_nw".into(),
@@ -143,6 +148,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         6 => RuleDef {
             name: "r_nz".into(),
@@ -159,6 +165,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         7 => RuleDef {
             name: "r_geo".into(),
@@ -175,6 +182,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         8 => RuleDef {
             name: "r_vec".into(),
@@ -191,6 +199,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         // Template 9: via-hop rule. Semantics: L0 -[e0]-> L1, FieldEqual(f)
         // between L1(via) and L0(dst), fire r_via edge src→dst.
@@ -208,6 +217,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: Some("L1".into()),
             via_edge: Some("e0".into()),
             via_dir: None,
+            namespace: None,
         },
     }
 }
@@ -1415,6 +1425,7 @@ fn approximate_wal_replay_identity() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -1514,6 +1525,7 @@ fn approximate_recall_above_floor_quiesced() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -1623,6 +1635,7 @@ fn approximate_recall_above_floor_after_rebuild() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -1768,6 +1781,7 @@ fn approximate_recall_above_floor_1536dim_1k() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -1869,6 +1883,7 @@ fn approximate_recall_5k_timing() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // Since 0.6.6 a `create_rule` over more than `HNSW_BUILD_BATCH` vectors
@@ -2009,6 +2024,7 @@ fn exact_vector_rule_recall_5k() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     let create_ms = t0.elapsed().as_millis();
@@ -2139,6 +2155,7 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 

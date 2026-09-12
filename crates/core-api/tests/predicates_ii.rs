@@ -31,6 +31,7 @@ fn numeric_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -50,6 +51,7 @@ fn geo_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -69,6 +71,7 @@ fn vec_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -408,6 +411,7 @@ fn vector_topk_per_source_caps_and_not_frozen() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // 5 nodes all with emb=[1,0] → cosine sim=1.0 ≥ 0.9; top-2 per source.
@@ -478,6 +482,7 @@ fn delete_numeric_coetype_survivor_keeps_edges() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.create_rule(RuleDef {
@@ -494,6 +499,7 @@ fn delete_numeric_coetype_survivor_keeps_edges() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     assert_eq!(

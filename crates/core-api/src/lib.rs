@@ -25,11 +25,11 @@ pub use core_storage::fs::RealFs;
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
 pub use db::{
-    snapshot_version_at, write_snapshot_bak, AsOfScope, BackupReport, BatchBuilder, BatchOp,
-    DeleteReport, EdgeAt, EdgeInfo, Explanation, ExportEdge, FsyncPolicy, GraphDb, MaskedEdge,
-    MaskedNodeResult, MutationEvent, NodeInfo, NodeRef, OpenOptions, Precondition,
-    PredicateSummary, RuleStats, SlowQueryEntry, SlowQuerySnapshot, SnapshotOptions, Stats, WhatIf,
-    WriteAuthz, WRITE_LOCK_WAIT,
+    snapshot_version_at, valid_namespace, write_snapshot_bak, AsOfScope, BackupReport,
+    BatchBuilder, BatchOp, DeleteReport, EdgeAt, EdgeInfo, Explanation, ExportEdge, FsyncPolicy,
+    GraphDb, MaskedEdge, MaskedNodeResult, MutationEvent, NamespaceStats, NodeInfo, NodeRef,
+    OpenOptions, Precondition, PredicateSummary, RuleStats, SlowQueryEntry, SlowQuerySnapshot,
+    SnapshotOptions, Stats, WhatIf, WriteAuthz, NS_DEFAULT, NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
 };
 
 /// Current on-disk snapshot format version written by this build.
