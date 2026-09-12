@@ -949,3 +949,98 @@ fn a_view_may_not_write_the_namespace_property() {
         "{err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 14. The reader's namespace resolver is the live one's twin
+// ---------------------------------------------------------------------------
+
+/// Keys a namespace mask admits, read through whichever handle built it.
+fn mask_keys(rs: core_api::ResultSet) -> Vec<String> {
+    let mut keys: Vec<String> = (0..rs.len())
+        .filter_map(|i| match rs.row(i)[0].as_ref() {
+            Some(Value::Str(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+fn live_ns_keys(db: &GraphDb<core_api::RealFs>, namespace: &str) -> Vec<String> {
+    let mask = db.mask_for_namespace(namespace);
+    mask_keys(
+        db.query_masked("MATCH (n) RETURN n", &no_params(), &mask)
+            .unwrap(),
+    )
+}
+
+fn reader_ns_keys(db: &GraphDb<core_api::RealFs>, namespace: &str) -> Vec<String> {
+    let reader = db.reader();
+    let mask = reader.mask_for_namespace(namespace).unwrap();
+    mask_keys(
+        reader
+            .query_masked("MATCH (n) RETURN n", &no_params(), &mask)
+            .unwrap(),
+    )
+}
+
+/// Binding: `ReaderSnapshot::mask_for_namespace` answers exactly what
+/// `GraphDb::mask_for_namespace` answers — including across a fold boundary, for a
+/// node **deleted** since the last fold and a node **added** after it.
+///
+/// The two resolvers read different things by construction: the live one indexes
+/// the derived `node_ns` array, the reader reads the `ns` column off its effective
+/// state (frozen overlay plus the delta tail). That they agree is what lets the
+/// HTTP role-token read path resolve a namespace on the same snapshot its query
+/// runs against, so this asserts it on a state where the two could diverge.
+#[test]
+fn the_readers_namespace_resolver_is_the_live_ones_twin() {
+    let dir = tmp("reader-ns-twin");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Document", "x1", vec![ns("x")]).unwrap();
+    db.insert_node("Document", "x2", vec![ns("x")]).unwrap();
+    db.insert_node("Document", "y1", vec![ns("y")]).unwrap();
+    db.insert_node("Document", "plain", vec![]).unwrap();
+
+    for name in ["x", "y", "default", "never-used"] {
+        assert_eq!(live_ns_keys(&db, name), reader_ns_keys(&db, name), "{name}");
+    }
+    assert_eq!(live_ns_keys(&db, "x"), vec!["x1", "x2"]);
+    assert_eq!(live_ns_keys(&db, "default"), vec!["plain"]);
+    assert!(live_ns_keys(&db, "never-used").is_empty());
+
+    // Past the fold point (FOLD_EVERY_K is 64), so the overlay the reader starts
+    // from is a folded one and what follows is a genuine delta tail.
+    for i in 0..70 {
+        db.insert_node("Filler", &format!("f{i}"), vec![ns("x")])
+            .unwrap();
+    }
+    // A node deleted since that fold, and a node added after it.
+    db.delete_node("x1").unwrap();
+    db.insert_node("Document", "x3", vec![ns("x")]).unwrap();
+
+    for name in ["x", "y", "default", "never-used"] {
+        assert_eq!(
+            live_ns_keys(&db, name),
+            reader_ns_keys(&db, name),
+            "after a delete and an insert in the delta tail: {name}"
+        );
+    }
+    let x = live_ns_keys(&db, "x");
+    assert!(!x.contains(&"x1".to_string()), "the deleted node is gone");
+    assert!(x.contains(&"x3".to_string()), "the new node is there");
+    assert!(x.contains(&"f69".to_string()));
+
+    // And a reopen — which rebuilds `node_ns` from disk rather than maintaining
+    // it incrementally — still agrees with its own reader.
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    for name in ["x", "y", "default", "never-used"] {
+        assert_eq!(
+            live_ns_keys(&db, name),
+            reader_ns_keys(&db, name),
+            "after a reopen: {name}"
+        );
+    }
+    assert_eq!(live_ns_keys(&db, "x"), x);
+}

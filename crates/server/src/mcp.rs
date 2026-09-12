@@ -54,7 +54,7 @@ use crate::json::{
 };
 use core_api::{
     json_to_rows, json_to_value, AsOfScope, AutoFk, GraphError, IngestOptions, MaskMode, NodeMask,
-    SharedDb, Value,
+    SharedDb, Value, NS_PROP,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -560,10 +560,23 @@ fn tool_stats(db: &SharedDb, args: &Js) -> CallOutcome {
     let (snap, role_def) = {
         let g = db.read();
         let def = match &role {
-            Some(r) => match g.roles().into_iter().find(|d| &d.name == r) {
-                Some(def) => Some(def),
-                None => return CallOutcome::ToolErr(format!("unknown role '{r}'")),
-            },
+            Some(r) => {
+                // Resolve through the same resolver `query` uses, so a store
+                // whose `roles.json` was corrupt at open says so here too
+                // instead of reporting the role simply unknown — one answer per
+                // cause, the same one on both tools. The mask is memoised per
+                // (role, commit_seq), so asking costs nothing a `query` with the
+                // same role would not already have paid.
+                if let Err(e) = g.mask_for_role(r) {
+                    return match e {
+                        GraphError::KeyNotFound { .. } => {
+                            CallOutcome::ToolErr(format!("unknown role '{r}'"))
+                        }
+                        other => CallOutcome::ToolErr(graph_err_msg(other)),
+                    };
+                }
+                g.roles().into_iter().find(|d| &d.name == r)
+            }
             None => None,
         };
         (g.stats(), def)
@@ -607,7 +620,16 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
 /// node that already exists it is written like any other property, which is what
 /// makes naming the namespace the node is already in a no-op and naming another
 /// one the engine's `NamespaceImmutable` refusal — one rule, stated once, in the
-/// place that owns it.
+/// place that owns it. A no-op `ns` writes nothing and is not counted in
+/// `updated_fields`, because nothing was updated.
+///
+/// `id` in `props` is **dropped on both paths**: it is the node's key. The create
+/// path stores `id` from `key` (it ingests with `key_field: "id"`), and
+/// `rename_node` is the only way to change it. One row builder now serves the
+/// create and the update path, so the rule is the same on both — before v0.6.6 the
+/// update path wrote `props.id` straight through `set_prop`, which could leave a
+/// stored `id` disagreeing with the key the node is reached by, while the create
+/// path had always ignored it.
 ///
 /// Returns `{ok, key, created, updated_fields?}`.
 fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
@@ -655,6 +677,14 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
         let mut g = db.write();
         let mut count = 0usize;
         for (field, v) in &row {
+            // The namespace a node is already in is the engine's no-op: it
+            // writes no record and takes no commit, so counting it as an updated
+            // field would report an update that did not happen. Asking first
+            // also keeps the refusal for a *different* namespace coming from the
+            // engine rather than from a second rule stated here.
+            if field == NS_PROP && Some(v) == g.namespace_of(key).map(Value::Str).as_ref() {
+                continue;
+            }
             if let Err(e) = g.set_prop(key, field, v.clone()) {
                 return CallOutcome::ToolErr(graph_err_msg(e));
             }
@@ -1273,7 +1303,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "upsert_entity",
-                "description": "Record what is now true about K — insert or update a node by key. If the key exists, updates the supplied properties. If not, creates a new node with the given label and properties. Useful for agent memory: store or refresh an entity without checking existence first.",
+                "description": "Record what is now true about K — insert or update a node by key. If the key exists, updates the supplied properties. If not, creates a new node with the given label and properties. 'id' in 'props' is ignored on both paths: a created node stores 'id' as its key, and 'rename_node' is the only way to change it. Useful for agent memory: store or refresh an entity without checking existence first.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

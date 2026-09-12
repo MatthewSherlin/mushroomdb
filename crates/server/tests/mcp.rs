@@ -4977,7 +4977,13 @@ fn the_schemas_advertise_namespace() {
     assert!(res.is_ok(), "{res:?}");
     let reply = parse_lines(&out).remove(0);
     let tools = reply["result"]["tools"].as_array().expect("tools").clone();
-    for name in ["query", "upsert_entity", "ingest_json", "create_rule"] {
+    for name in [
+        "query",
+        "upsert_entity",
+        "ingest_json",
+        "create_rule",
+        "stats",
+    ] {
         let tool = tools
             .iter()
             .find(|t| t["name"] == json!(name))
@@ -4988,4 +4994,152 @@ fn the_schemas_advertise_namespace() {
             "{name} advertises a string `namespace`"
         );
     }
+
+    // `stats` narrows its roster by role as well, so it advertises both — a
+    // client that is shown only `namespace` cannot ask the question it is for.
+    let stats = tools
+        .iter()
+        .find(|t| t["name"] == json!("stats"))
+        .expect("stats is listed");
+    assert_eq!(
+        stats["inputSchema"]["properties"]["role"]["type"],
+        json!("string"),
+        "stats advertises a string `role`"
+    );
+    assert!(
+        stats["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("namespaces"),
+        "stats says the body carries namespaces: {}",
+        stats["description"]
+    );
+
+    // And `upsert_entity` says that `id` is the key, not a property it writes.
+    let upsert = tools
+        .iter()
+        .find(|t| t["name"] == json!("upsert_entity"))
+        .expect("upsert_entity is listed");
+    let desc = upsert["description"].as_str().unwrap_or_default();
+    assert!(
+        desc.contains("'id' in 'props' is ignored on both paths"),
+        "{desc}"
+    );
+}
+
+/// Binding: `upsert_entity` never takes `id` from `props` — on the update path
+/// either, which is where it used to. `id` is the node's key: the create path
+/// stores it from `key`, `rename_node` is the only way to change it, and a
+/// `props.id` naming anything else is dropped on both paths rather than leaving a
+/// stored `id` that disagrees with the key it was reached by.
+#[test]
+fn upsert_entity_never_takes_id_from_props() {
+    let db = open("upsert-id");
+
+    // Create: `props.id` has always been dropped here.
+    let created = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "alice", "label": "Person", "props": {"id": "not-alice", "team": "red"}}),
+    ));
+    assert_eq!(created["created"], json!(true));
+    let info = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "alice", "props": {"id": "not-alice"}}),
+    ));
+    assert_eq!(
+        info["updated_fields"],
+        json!(0),
+        "an update of nothing but `id` updates nothing: {info}"
+    );
+    assert_eq!(info["created"], json!(false));
+
+    let node = content_json(&one_task_call(
+        db.clone(),
+        "node_info",
+        json!({"key": "alice"}),
+    ));
+    assert_eq!(
+        node["props"]["id"],
+        json!("alice"),
+        "the stored `id` is the key the node was created under, never the \
+         `props.id` that disagreed with it: {node}"
+    );
+    assert_eq!(node["props"]["team"], json!("red"));
+
+    // And `id` beside a real prop is dropped while the real one is written.
+    let both = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "alice", "props": {"id": "not-alice", "team": "blue"}}),
+    ));
+    assert_eq!(both["updated_fields"], json!(1), "{both}");
+    let node = content_json(&one_task_call(db, "node_info", json!({"key": "alice"})));
+    assert_eq!(node["props"]["team"], json!("blue"));
+    assert_eq!(node["props"]["id"], json!("alice"), "still the key: {node}");
+}
+
+/// Binding: naming the namespace a node is already in writes nothing and counts
+/// nothing — the engine's no-op, reported as one.
+#[test]
+fn upsert_entity_does_not_count_a_no_op_namespace() {
+    let db = open("upsert-ns-noop");
+    let _ = one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "a1", "label": "Doc", "namespace": "tenant-a", "props": {"title": "t"}}),
+    );
+    let before = db.read().commit_seq();
+
+    let same = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "a1", "namespace": "tenant-a", "props": {}}),
+    ));
+    assert_eq!(
+        same["updated_fields"],
+        json!(0),
+        "the namespace it is already in is not an update: {same}"
+    );
+    assert_eq!(
+        db.read().commit_seq(),
+        before,
+        "and it takes no commit either"
+    );
+
+    // Beside a real prop, only the real one counts.
+    let one = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "a1", "namespace": "tenant-a", "props": {"title": "u"}}),
+    ));
+    assert_eq!(one["updated_fields"], json!(1), "{one}");
+    assert_eq!(db.read().namespace_of("a1").as_deref(), Some("tenant-a"));
+}
+
+/// Binding: `stats` with a `role` on a store whose `roles.json` was corrupt at
+/// open says what `query` with a `role` says — the cause, not "unknown role".
+#[test]
+fn stats_with_a_role_on_a_corrupt_roles_file_says_so() {
+    let dir = tmp("stats-corrupt-roles");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("roles.json"), b"not valid json at all!").unwrap();
+    let db = SharedDb::open(&dir).unwrap();
+    seed_person(&db, "alice");
+
+    let from_query = error_text(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "role": "anyone"}),
+    ));
+    let from_stats = error_text(&one_task_call(db, "stats", json!({"role": "anyone"})));
+    assert!(
+        from_query.contains("roles.json"),
+        "query names the cause: {from_query}"
+    );
+    assert_eq!(
+        from_stats, from_query,
+        "and `stats` says exactly the same thing"
+    );
 }

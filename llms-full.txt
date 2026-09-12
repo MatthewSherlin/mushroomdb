@@ -4135,11 +4135,13 @@ Request body:
 }
 ```
 
-`stub_hidden` (optional, default `false`): when `true`, hidden nodes in the client
-mask appear as `{"key": "…", "restricted": true}` rather than being omitted. See
-[masks.md](masks.md) for the full policy. Note: Cypher result rows are **always
-omit-only** — `stub_hidden` has no effect on which rows the query returns; it only
-affects the node-info, edges, and neighborhood endpoints.
+`stub_hidden` (optional, default `false`): when `true`, hidden nodes in the mask the
+request resolved to appear as `{"key": "…", "restricted": true}` rather than being
+omitted. That mask is whichever one applies — a client `mask`, a `namespace` alone, or
+the two intersected — so a `namespace`-only request honours `stub_hidden` exactly as a
+key allow-list does. See [masks.md](masks.md) for the full policy. Note: Cypher result
+rows are **always omit-only** — `stub_hidden` has no effect on which rows the query
+returns; it only affects the node-info, edges, and neighborhood endpoints.
 
 Role tokens: `stub_hidden` is silently ignored — except with `as_of`, where it is
 refused (`as_of (time-travel) does not compose with stub_hidden`). Hidden nodes are

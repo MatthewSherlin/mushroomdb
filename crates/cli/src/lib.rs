@@ -6070,6 +6070,27 @@ mod tests {
             "role ∩ namespace, never role ∪ namespace: {both}"
         );
 
+        // Either argument makes the query a read: a restricted write is refused
+        // and nothing lands.
+        for (role, namespace) in [
+            (None, Some("tenant-a")),
+            (Some("a-reader"), None),
+            (Some("a-reader"), Some("tenant-a")),
+        ] {
+            let write = run_query(&dir, "CREATE (n:Doc {id: 'z1'})", role, namespace);
+            assert!(
+                write
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| e.0.contains("read-only")),
+                "a restricted write must be refused, got {write:?}"
+            );
+            assert!(
+                !GraphDb::open(&dir).expect("reopen").has_node("z1"),
+                "the write must not have landed"
+            );
+        }
+
         let unknown = run_query(&dir, q, Some("nobody"), None);
         assert!(unknown.is_err(), "an unknown role is an error");
         let invalid = run_query(&dir, q, None, Some("no spaces"));

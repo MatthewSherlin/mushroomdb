@@ -637,6 +637,18 @@ def test_query_takes_a_role_and_a_namespace(tmp_path):
         db.query(q, role="nobody")
     with pytest.raises(ValueError):
         db.query(q, namespace="no spaces")
+
+    # Either argument makes the call a read: a restricted write is refused and
+    # nothing lands.
+    for kw in (
+        {"namespace": "tenant-a"},
+        {"role": "a-reader"},
+        {"role": "a-reader", "namespace": "tenant-a"},
+    ):
+        with pytest.raises(RuntimeError) as e:
+            db.query("CREATE (n:Doc {id: 'z1'})", **kw)
+        assert "read-only" in str(e.value), kw
+        assert db.node_info("z1") is None, kw
     db.close()
 
 
