@@ -413,8 +413,13 @@ Measured three ways, all at `m,ef_construction,ef_search` = `16,200,400`:
 | **64** | **`both` (default)** | **1.0000** | **180.5 s** | **519 B/node** |
 | 128 | `own` | 1.0000 | 269.4 s | 1 031 B/node |
 
-`own` is roughly 5× faster to build on a corpus of genuinely distinct vectors
-(45.8 s against 251 s for the raw 5 000-vector index, with identical
+Every build time in this section and the one above it was measured **before the
+distance kernel**, which cut all of them by about 4.5× without changing a single
+edge — the same 5 000 × 1 536-D index is 9.56 s at `own` and 43.34 s at `both`
+today. The comparisons between the rows stand; the absolute seconds are history.
+
+`own` is roughly 4.5× faster to build on a corpus of genuinely distinct vectors
+(9.56 s against 43.34 s for the raw 5 000-vector index, with identical
 `hnsw_5k_1536_recall` at min 1.0000 / mean 1.0000), which is why it exists. But
 the corpus that matters has **clusters wider than `m0`** — 100 members against
 an `m0` of 64 — and there the neighbour side is exactly where the long-range
@@ -448,11 +453,66 @@ zero `m0` is a graph with no edges. It is for benchmarking and for an operator
 who has measured their own corpus; there is no per-rule knob.
 
 **Memory per indexed vector**, as arithmetic rather than as a measured total:
-`m0 × 4` bytes of layer-0 adjacency plus `dim × 8` bytes of vector, so 256 B +
-12,288 B at the defaults with a 1,536-D embedding. Layers above 0 add `m × 4`
-bytes for the minority of nodes that have them, and the reverse-adjacency index
-that makes a removal O(in-degree) holds one more `u32` per link — so the
-adjacency figure roughly doubles in practice. Halving `m0` halves all of it.
+`m0 × 4` bytes of layer-0 adjacency plus `dim × 4` bytes for the index's own copy
+of the vector, so 256 B + 6,144 B at the defaults with a 1,536-D embedding.
+Layers above 0 add `m × 4` bytes for the minority of nodes that have them, and
+the reverse-adjacency index that makes a removal O(in-degree) holds one more
+`u32` per link — so the adjacency figure roughly doubles in practice. Halving
+`m0` halves all of it. Measured at 5,000 × 1,536-D: **6,663.2 B per node**
+(519.2 adjacency + 6,144 vector), against 12,807.2 before the index's copy became
+`f32` — a 48.0 % cut, and the persisted index blob halves with it.
+
+### The distance kernel
+
+The index keeps its own copy of every vector as **`f32`, in one contiguous slab**
+addressed by slot, and the store keeps the `f64` properties untouched. That is
+safe for a reason worth stating plainly: **the index's distances choose
+candidates and never report a score.** The similarity a graph search returns is
+discarded, and every weight a rule or a query reports is recomputed from the
+`f64` properties. An `f32` dot of two 1,536-D unit vectors is accurate to about
+2e-6, which is far below the granularity at which candidate order can change, and
+the recall gates below are measured on the `f32` path.
+
+The dot product itself is summed in **eight independent accumulators** over
+`chunks_exact(8)`. IEEE addition is not associative, so a single accumulator is a
+serial dependency chain as long as the vector: compiled for aarch64, the old
+`f64` loop vectorised its *multiplies* (`fmul.2d`) and then added them one at a
+time (`fadd d0, d0, …`), 1,536 links of 3–4 cycle latency each. Choosing the
+summation order in the source is what lets the compiler emit four-lane work for
+both halves — `ldp q, q` / `fmul.4s` / `fadd.4s`, eight lanes per iteration.
+(`std::simd` would say this declaratively and is nightly-only; the toolchain is
+pinned stable, and `-C target-cpu=native` is not available to a published crate,
+so NEON on aarch64 and SSE2 on x86-64 — four-wide, no FMA — are what this buys.
+Expect a smaller win on x86-64 than the figures below, which are aarch64.)
+
+What it cost in work per insert is nothing: the evaluation count at 1,000 and
+5,000 nodes is **identical** before and after, because the slab changed no
+decision the graph makes, and the adjacency it builds is byte-for-byte the same
+size. What it bought, at 5,000 × 1,536-D:
+
+| | before | after |
+|---|---|---|
+| build, `prune = both` (default) | 254 s | **43.34 s** |
+| build, `prune = own` | 45.8 s | **9.56 s** |
+| bytes per node | 12,807.2 | **6,663.2** |
+| blob version | 2 | **3** |
+
+**One fixed dimension per index.** A slab has one stride, so the first vector an
+index takes fixes its dimension, and an embedding of any other length is
+**skipped** — logged once per index, not indexed, not counted, not returned. A
+query of the wrong length produces no candidates at all, so an **approximate**
+rule derives no edges for such a node, where before 0.6.6 it could derive one
+from a distance silently truncated to the shorter of the two vectors. A rule with
+`approximate: false` does not use the index and is unaffected. Mixed dimensions
+were never meaningful; this is the version that says so. Re-embed a collection
+with one model rather than mixing two.
+
+**Blob version 3.** The persisted graph carries the slab, so its version is 3.
+Version 2 (0.6.6 before the kernel) and the bare 0.6.5 shape both still load,
+converting the vectors in memory with no vector re-inserted and no distance
+computed. A reader older than this one meeting a v3 blob fails its version check
+and leaves that rule on its full-scan fallback — slower, never wrong. The
+snapshot format does not move: it carries the index as opaque bytes.
 
 **The recall these defaults are held to**, by tests that run in CI's
 `recall-gates` job:
@@ -483,13 +543,35 @@ Its sibling `hnsw_memory_per_node_5k_1536` prints bytes per indexed vector, and
 honours `MUSHROOMDB_HNSW_PARAMS`, so a proposed shape can be compared against
 the default before it is adopted.
 
-**Its growth assertions do not pass today.** Measured at the defaults, the build
-is 49.81 s at 2,000 vectors and 763.77 s at 10,000 — 15.33× for 5× the vectors,
-against a ceiling of 8×, so the 50,000 case is hours rather than the five
-minutes the benchmark allows it. Building a large vector index is therefore
-still something to do once, ahead of traffic (see *Creating a rule over a large
-corpus* above), not something to absorb inline. The benchmark is committed
-failing on purpose: it is the gate that will say when that changes.
+**Measured at the defaults** (`prune = both`, 1,536-D, one core), before and
+after the distance kernel:
+
+| | 2,000 | 10,000 | 50,000 |
+|---|---|---|---|
+| build, before | 49.60 s | 730.84 s | not reached |
+| build, **after** | **8.53 s** | **132.12 s** | **1,018.05 s** |
+| per-insert, **after** | **4.267 ms** | **13.212 ms** | **20.361 ms** |
+| one re-embed, **after** | **2.412 ms** | **6.641 ms** | **14.280 ms** |
+| bytes per node, **after** | **6,657.3** | **6,662.6** | **6,663.0** |
+
+**Two of its assertions still do not pass, and the benchmark is committed failing
+on purpose.** The build grows **15.48×** from 2,000 to 10,000 vectors against a
+ceiling of 8×, and the 50,000 case takes **17 minutes** against a ceiling of
+five. What the 50,000 row adds is the reason: from 10,000 to 50,000 the same
+step costs only **7.71×**, which is inside the ceiling. The steep first step is a
+regime, not an asymptote — at 2,000 nodes a beam that may touch
+`ef_construction × m0` = 12,800 distinct nodes cannot touch more than 2,000, so
+the small point is measured where an insert is effectively exhaustive, and the
+§3.5 prune's candidate walk is still getting denser. Counted rather than timed:
+an insert evaluates 12,739 distances at 1,000 nodes and 23,901 at 5,000, a climb
+of 1.88× with no N in either formula, and `dist_evals_per_insert_is_bounded`
+gates exactly that count in CI.
+
+Closing the rest means cutting the *count* — `ef_construction`, or a budget that
+truncates the prune's walk — and both change the graph, so both are the recall
+table's business. Until then, building a large vector index is something to do
+once, ahead of traffic (see *Creating a rule over a large corpus* above), not
+something to absorb inline.
 
 ---
 

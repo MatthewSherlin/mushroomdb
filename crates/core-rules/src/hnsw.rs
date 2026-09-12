@@ -13,6 +13,15 @@
 //! All vectors are L2-normalized at insert time; cosine similarity reduces to
 //! dot product for unit vectors, which is faster and numerically stable.
 //!
+//! The index keeps its own copy of every vector as `f32` in one contiguous
+//! [`VecSlab`] addressed by slot — the store keeps the `f64`s — and the dot
+//! product is [`dot_f32`], summed in eight independent accumulators so the
+//! compiler can emit parallel lanes. The index's distances choose *candidates*;
+//! every score a caller sees is recomputed from the `f64` properties, so the
+//! narrower type costs a tie-break and nothing observable. One slab means one
+//! stride, which is why an embedding whose dimension differs from the first one
+//! indexed is skipped rather than truncated.
+//!
 //! **Determinism**, and its one sharp edge: the level assigned to each node is
 //! derived from a seeded PRNG (`splitmix64`) seeded with
 //! `FNV-1a(rule_name) XOR (node_id × PHI)`, so insertion order and seed fix the
@@ -218,6 +227,8 @@ thread_local! {
     static HNSW_INSERT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static HNSW_REMOVE_SCANNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static HNSW_SEARCH_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static HNSW_DIST_EVALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static HNSW_DIST_EVALS_PAIRWISE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Count one vector actually indexed. Called *after* the zero-vector early
@@ -237,6 +248,51 @@ fn note_remove_scanned(n: usize) {
     HNSW_REMOVE_SCANNED.with(|c| c.set(c.get().saturating_add(n as u64)));
     #[cfg(not(any(test, feature = "test-hooks")))]
     let _ = n;
+}
+
+/// Count one distance evaluation. Called from the two distance functions and
+/// nowhere else, so the count is "dot products the graph asked for".
+///
+/// One thread-local add per `dim` multiply-adds is under 0.1 % of the kernel at
+/// any dimension worth indexing, and a counter a benchmark cannot read is not a
+/// gate. Compiles away without `test-hooks`.
+#[inline]
+fn note_dist() {
+    #[cfg(any(test, feature = "test-hooks"))]
+    HNSW_DIST_EVALS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Count one distance evaluation between two *indexed* vectors — the §3.5
+/// prune's diversity test and the neighbour-side scoring loop. Always
+/// accompanied by a [`note_dist`], so pairwise is a subset of the total and
+/// `total − pairwise` is the beam plus the descent.
+#[inline]
+fn note_dist_pairwise() {
+    #[cfg(any(test, feature = "test-hooks"))]
+    HNSW_DIST_EVALS_PAIRWISE.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Distance evaluations on this thread since the last reset.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_dist_evals() -> u64 {
+    HNSW_DIST_EVALS.with(|c| c.get())
+}
+
+/// The subset of [`hnsw_dist_evals`] that compared two indexed vectors rather
+/// than a vector against a query.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_dist_evals_pairwise() -> u64 {
+    HNSW_DIST_EVALS_PAIRWISE.with(|c| c.get())
+}
+
+/// Reset both distance-evaluation counters to zero.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_dist_evals_reset() {
+    HNSW_DIST_EVALS.with(|c| c.set(0));
+    HNSW_DIST_EVALS_PAIRWISE.with(|c| c.set(0));
 }
 
 /// Count one query answered by the graph itself (past the empty-index guards).
@@ -343,15 +399,199 @@ impl Ord for OrdF64 {
 }
 
 // ---------------------------------------------------------------------------
+// The distance kernel
+// ---------------------------------------------------------------------------
+
+/// The index's own copy of every vector: one contiguous `f32` allocation, `dim`
+/// floats per slot, addressed by slot.
+///
+/// The store keeps `f64`. This copy exists only to **choose candidates** —
+/// `index.rs::hnsw_candidates` throws away the similarity a search returns and
+/// keeps the ids, and every score a rule or a query reports is recomputed from
+/// the `f64` properties. So `f32` here costs a tie-break at the 1e-7 level and
+/// nothing a caller can observe, and it buys half the bytes and twice the lanes.
+///
+/// One slab rather than one `Vec<f64>` per node also means a distance is a
+/// pointer offset into a known stride instead of a chase through an
+/// independently allocated 12 KB block, and that the pair-distance path needs no
+/// copy at all.
+///
+/// `dim` is 0 until the first vector arrives, and fixed from then on: a slab has
+/// one stride, so a vector of another length has nowhere to go (see
+/// [`HnswIndex::insert`]).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct VecSlab {
+    dim: usize,
+    data: Vec<f32>,
+}
+
+impl VecSlab {
+    /// The row for `slot`, or an empty slice when the slab has no row there.
+    /// Empty is unreachable for a live slot — every `alloc_slot` writes one —
+    /// and returning it rather than panicking keeps a corrupt blob from taking
+    /// the process down.
+    #[inline]
+    fn get(&self, slot: u32) -> &[f32] {
+        if self.dim == 0 {
+            return &[];
+        }
+        let start = slot as usize * self.dim;
+        self.data.get(start..start + self.dim).unwrap_or(&[])
+    }
+
+    /// Write `v` into `slot`'s row, converting from the caller's unit `f64`
+    /// vector. Fixes `dim` on the first call. `false` — nothing written — when
+    /// `v.len()` disagrees with an established `dim`.
+    fn put(&mut self, slot: u32, v: &[f64]) -> bool {
+        if self.dim == 0 {
+            self.dim = v.len();
+        }
+        if self.dim == 0 || v.len() != self.dim {
+            return false;
+        }
+        let start = slot as usize * self.dim;
+        let end = start + self.dim;
+        if self.data.len() < end {
+            self.data.resize(end, 0.0);
+        }
+        for (d, s) in self.data[start..end].iter_mut().zip(v) {
+            *d = *s as f32;
+        }
+        true
+    }
+
+    /// Floats the slab holds for `live` nodes — an element count, so the
+    /// caller decides what a float costs.
+    #[inline]
+    fn floats_for(&self, live: usize) -> usize {
+        live * self.dim
+    }
+}
+
+/// Dot product of two equal-length `f32` slices, summed in **eight independent
+/// accumulators**.
+///
+/// IEEE addition is not associative, so LLVM may not reassociate a single
+/// accumulator: `a.iter().zip(b).map(|(x, y)| x * y).sum()` is a serial chain of
+/// `dim` dependent multiply-adds, `dim` × the 3–4 cycle latency of one add. At
+/// 1,536 dimensions that is ~1.5 µs of a machine that could have done the work
+/// in a fraction of it. Choosing the summation order here — eight partial sums
+/// over `chunks_exact(8)`, which hands LLVM a known-length slice — is what lets
+/// it emit parallel FMAs (NEON is baseline on `aarch64`; SSE2 on x86-64, which
+/// is 4-wide multiply and add without FMA and so a smaller win).
+///
+/// `std::simd` would say this declaratively and is nightly-only; the toolchain
+/// is pinned stable, so this is the portable way to say it. No `unsafe`, no
+/// `cfg`, one code path.
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "a dot product needs equal lengths");
+    let mut acc = [0.0f32; 8];
+    let mut ca = a.chunks_exact(8);
+    let mut cb = b.chunks_exact(8);
+    for (x, y) in ca.by_ref().zip(cb.by_ref()) {
+        for i in 0..8 {
+            acc[i] += x[i] * y[i];
+        }
+    }
+    let tail: f32 = ca
+        .remainder()
+        .iter()
+        .zip(cb.remainder())
+        .map(|(x, y)| x * y)
+        .sum();
+    acc.iter().sum::<f32>() + tail
+}
+
+/// Cosine distance between the two vectors in `a` and `b` — the prune's
+/// diversity test and the neighbour-side scoring loop. Both are already unit, so
+/// this is `1 − dot`, clamped to [0, 2].
+///
+/// Replaces the 12 KB `nb_vec.clone()` the neighbour-side prune used to make
+/// once per over-connected neighbour per insert.
+#[inline]
+fn dist_slots(slab: &VecSlab, a: u32, b: u32) -> f64 {
+    note_dist();
+    note_dist_pairwise();
+    let dot = dot_f32(slab.get(a), slab.get(b)) as f64;
+    (1.0 - dot.clamp(-1.0, 1.0)).max(0.0)
+}
+
+/// Cosine distance from the vector in `slot` to the already-unit `f32` query
+/// `q`. Returns `1 - dot` clamped to [0, 2] (0 = identical, 2 = opposite).
+#[inline]
+fn dist_to(slab: &VecSlab, slot: u32, q: &[f32]) -> f64 {
+    note_dist();
+    let dot = dot_f32(slab.get(slot), q) as f64;
+    (1.0 - dot.clamp(-1.0, 1.0)).max(0.0)
+}
+
+/// Build a slab from vectors decoded out of an older blob, `vectors[slot]` being
+/// the vector for that slot.
+///
+/// The stride is the first non-empty vector's length — a freed slot decodes as an
+/// empty one, and so does a node a 0.6.5 writer left without a vector. A vector
+/// of some *other* non-zero length is a mixed-dimension index, which older
+/// builds accepted and whose distances they computed over the shorter of the two
+/// vectors; it is copied as far as it goes and zero-filled beyond, because the
+/// node is already in the graph and dropping it would leave adjacency naming a
+/// slot that is not there. One log line names how many.
+fn slab_of_decoded(vectors: &[Vec<f64>]) -> VecSlab {
+    let dim = vectors
+        .iter()
+        .map(|v| v.len())
+        .find(|&l| l != 0)
+        .unwrap_or(0);
+    let mut slab = VecSlab {
+        dim,
+        data: vec![0.0; vectors.len() * dim],
+    };
+    if dim == 0 {
+        return slab;
+    }
+    let mut odd = 0usize;
+    for (slot, v) in vectors.iter().enumerate() {
+        if v.len() == dim {
+            slab.put(slot as u32, v);
+            continue;
+        }
+        if v.is_empty() {
+            continue; // a freed slot: its row stays zero and nothing reads it
+        }
+        odd += 1;
+        let start = slot * dim;
+        for (d, s) in slab.data[start..start + dim].iter_mut().zip(v) {
+            *d = *s as f32;
+        }
+    }
+    if odd > 0 {
+        eprintln!(
+            "mushroomdb: HNSW loaded {odd} node(s) whose embedding is not {dim} \
+             dimensions; they were padded to the index's stride. Re-embed the \
+             collection with one model — their distances were already meaningless."
+        );
+    }
+    slab
+}
+
+/// The `f32` form of a unit `f64` vector — the query shape every search path
+/// uses, and bit-for-bit what [`VecSlab::put`] stored.
+#[inline]
+fn as_f32(v: &[f64]) -> Vec<f32> {
+    v.iter().map(|&x| x as f32).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Node storage
 // ---------------------------------------------------------------------------
 
+/// A node's place in the hierarchy. The vector lives in the index's [`VecSlab`],
+/// addressed by the same slot, which is why this struct has no vector field and
+/// why the blob is version 3.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct HnswNode {
     /// Assigned layer level (inclusive; node has layers 0..=level).
     level: usize,
-    /// L2-normalized unit vector.
-    vector: Vec<f64>,
     /// `layers[l]` = neighbor **slots** at layer `l`.
     ///
     /// Slots, not node ids: a distance is then a `Vec` index rather than a
@@ -385,6 +625,18 @@ pub struct HnswIndex {
     id_of: Vec<u32>,
     /// Freed slots, reused by the next insert (LIFO).
     free: Vec<u32>,
+    /// Every indexed vector, `f32`, addressed by the same slot as `slots`.
+    ///
+    /// A freed slot keeps its row until another node takes the slot over: the
+    /// bytes stay resident where a per-node `Vec` would have freed them. In
+    /// exchange the index loses one allocator header and one fragmentation risk
+    /// per node, and `memory_stats` counts live nodes only, so the figure it
+    /// reports stays a floor on resident size rather than a measurement of it.
+    slab: VecSlab,
+    /// Vectors refused because their dimension disagreed with the slab's.
+    /// Derived bookkeeping for one log line, never persisted.
+    #[serde(skip)]
+    dim_mismatches: u64,
     /// Reverse adjacency: slot → the slots that list it as a neighbour on *any*
     /// layer. Maintained in lockstep with `HnswNode::layers` by insert, remove
     /// and the prune. Turns removal from O(live nodes × M₀) into O(in-degree).
@@ -437,19 +689,21 @@ pub struct HnswMemoryStats {
     pub neighbour_slots: usize,
     /// Total entries in the reverse adjacency index.
     pub back_ref_entries: usize,
-    /// Total `f64`s stored across every live node's vector.
+    /// Total floats stored across every live node's vector. `f32`s since 0.6.6:
+    /// the index's own copy is the slab's, and the `f64`s stay in the store.
     pub vector_floats: usize,
 }
 
 impl HnswMemoryStats {
     /// Payload bytes per indexed vector: adjacency (4 B per entry, forward and
-    /// reverse) plus the vector itself (8 B per dimension). Zero for an empty
-    /// index.
+    /// reverse) plus the index's own copy of the vector (4 B per dimension — the
+    /// store's `f64` copy is not the index's business). Zero for an empty index.
     pub fn bytes_per_node(&self) -> f64 {
         if self.live_nodes == 0 {
             return 0.0;
         }
-        let bytes = (self.neighbour_slots + self.back_ref_entries) * 4 + self.vector_floats * 8;
+        let bytes = (self.neighbour_slots + self.back_ref_entries) * 4
+            + self.vector_floats * std::mem::size_of::<f32>();
         bytes as f64 / self.live_nodes as f64
     }
 
@@ -500,9 +754,12 @@ impl HnswIndex {
         id_of.get(slot as usize).is_some_and(|&i| i != DEAD)
     }
 
-    /// Bind `id` to a slot (reusing a freed one when available) and store
-    /// `node` there. The caller owns linking it into the graph.
-    fn alloc_slot(&mut self, id: u32, node: HnswNode) -> u32 {
+    /// Bind `id` to a slot (reusing a freed one when available), store `node`
+    /// there and write `unit` into the slab's row for it. The caller owns linking
+    /// it into the graph, and must already have checked that `unit` matches the
+    /// slab's dimension — `debug_assert`ed here, because a refused write would
+    /// leave a live slot pointing at another node's stale row.
+    fn alloc_slot(&mut self, id: u32, node: HnswNode, unit: &[f64]) -> u32 {
         let slot = match self.free.pop() {
             Some(s) => {
                 self.slots[s as usize] = node;
@@ -515,6 +772,8 @@ impl HnswIndex {
                 (self.slots.len() - 1) as u32
             }
         };
+        let written = self.slab.put(slot, unit);
+        debug_assert!(written, "alloc_slot was handed a vector the slab refused");
         self.slot_of.insert(id, slot);
         slot
     }
@@ -583,17 +842,20 @@ impl HnswIndex {
             .enumerate()
             .map(|(s, &id)| (id, s as u32))
             .collect();
+        let mut vectors: Vec<Vec<f64>> = Vec::with_capacity(id_of.len());
         let slots: Vec<HnswNode> = v1
             .nodes
             .into_values()
-            .map(|n| HnswNode {
-                level: n.level,
-                vector: n.vector,
-                layers: n
-                    .layers
-                    .into_iter()
-                    .map(|l| l.iter().filter_map(|id| slot_of.get(id).copied()).collect())
-                    .collect(),
+            .map(|n| {
+                vectors.push(n.vector);
+                HnswNode {
+                    level: n.level,
+                    layers: n
+                        .layers
+                        .into_iter()
+                        .map(|l| l.iter().filter_map(|id| slot_of.get(id).copied()).collect())
+                        .collect(),
+                }
             })
             .collect();
 
@@ -601,6 +863,7 @@ impl HnswIndex {
             base_seed: v1.base_seed,
             entry_point: v1.entry_point.and_then(|e| slot_of.get(&e).copied()),
             max_level: v1.max_level,
+            slab: slab_of_decoded(&vectors),
             slots,
             slot_of,
             id_of,
@@ -618,6 +881,38 @@ impl HnswIndex {
             out.entry_point = Some(ep);
             out.max_level = out.slots[ep as usize].level;
         }
+        out.rebuild_back_refs();
+        out
+    }
+
+    /// Adopt a decoded 0.6.6-pre-3b (blob v2) index: the slot layout is already
+    /// this one's, so only the vectors move — out of the per-node `Vec<f64>`s and
+    /// into the slab, converted and nothing else. No distance is computed and no
+    /// vector is re-inserted, so the graph is adopted exactly as it was built.
+    fn from_v2(v2: HnswIndexV2) -> Self {
+        let mut vectors: Vec<Vec<f64>> = Vec::with_capacity(v2.slots.len());
+        let slots: Vec<HnswNode> = v2
+            .slots
+            .into_iter()
+            .map(|n| {
+                vectors.push(n.vector);
+                HnswNode {
+                    level: n.level,
+                    layers: n.layers,
+                }
+            })
+            .collect();
+        let mut out = Self {
+            base_seed: v2.base_seed,
+            slab: slab_of_decoded(&vectors),
+            slots,
+            slot_of: v2.slot_of,
+            id_of: v2.id_of,
+            free: v2.free,
+            entry_point: v2.entry_point,
+            max_level: v2.max_level,
+            ..Self::default()
+        };
         out.rebuild_back_refs();
         out
     }
@@ -641,6 +936,10 @@ impl HnswIndex {
 
     /// Release `slot`. The caller must already have stripped every adjacency
     /// reference to it — a reused slot names a different node.
+    ///
+    /// The slab's row is left as it is: nothing reads a dead slot's vector
+    /// (`is_live` gates every search path), and the next occupant overwrites it.
+    /// The cost is that the row stays resident until then.
     fn free_slot(&mut self, slot: u32) {
         let id = std::mem::replace(&mut self.id_of[slot as usize], DEAD);
         self.slot_of.remove(&id);
@@ -652,16 +951,6 @@ impl HnswIndex {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Cosine distance from the node in `slot` to unit query `q`.
-    /// Returns `1 - dot(v_slot, q)` clamped to [0, 2] (0 = identical,
-    /// 2 = opposite).
-    #[inline]
-    fn dist_to(slots: &[HnswNode], slot: u32, q: &[f64]) -> f64 {
-        let v = &slots[slot as usize].vector;
-        let dot: f64 = v.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
-        (1.0 - dot.clamp(-1.0, 1.0)).max(0.0)
-    }
-
     /// Beam search on a single layer.
     ///
     /// Returns a list of `(slot, cosine_distance)` — the `ef` nearest
@@ -670,16 +959,24 @@ impl HnswIndex {
     fn beam_search(
         slots: &[HnswNode],
         id_of: &[u32],
-        q: &[f64],
+        slab: &VecSlab,
+        q: &[f32],
         ep: u32,
         layer: usize,
         ef: usize,
     ) -> Vec<(u32, f64)> {
-        // visited: avoid re-expanding a node
-        let mut visited = std::collections::BTreeSet::new();
-        visited.insert(ep);
+        // visited: avoid re-expanding a node. A `Vec<bool>` indexed by slot, not
+        // a `BTreeSet`: this is probed once per candidate edge — order 10⁴ times
+        // per insert — and each probe was an O(log V) chase through separately
+        // allocated tree nodes. One memset per call buys O(1) probes. It changes
+        // neither which nodes are expanded nor the order they are pushed in,
+        // which is what keeps the graph a function of the WAL.
+        let mut visited = vec![false; slots.len()];
+        if let Some(v) = visited.get_mut(ep as usize) {
+            *v = true;
+        }
 
-        let ep_dist = Self::dist_to(slots, ep, q);
+        let ep_dist = dist_to(slab, ep, q);
 
         // c_heap: min-heap of (dist, slot) — candidates to expand
         let mut c_heap: BinaryHeap<Reverse<(OrdF64, u32)>> = BinaryHeap::new();
@@ -704,15 +1001,15 @@ impl HnswIndex {
                 .unwrap_or_default();
 
             for &e in neighbors {
-                if visited.contains(&e) {
+                if visited.get(e as usize).copied().unwrap_or(true) {
                     continue;
                 }
                 if !Self::is_live(id_of, e) {
                     continue; // defensive: a freed slot is never a candidate
                 }
-                visited.insert(e);
+                visited[e as usize] = true;
 
-                let e_dist = Self::dist_to(slots, e, q);
+                let e_dist = dist_to(slab, e, q);
                 let f_dist = w_heap.peek().map(|(OrdF64(d), _)| *d).unwrap_or(f64::MAX);
                 if e_dist < f_dist || w_heap.len() < ef {
                     c_heap.push(Reverse((OrdF64(e_dist), e)));
@@ -780,7 +1077,7 @@ impl HnswIndex {
     /// rather than a bug to fix later. `docs/site/rules.md` carries the same
     /// table for operators.
     fn select_neighbors_first_rejection(
-        slots: &[HnswNode],
+        slab: &VecSlab,
         id_of: &[u32],
         candidates: &[(u32, f64)],
         m: usize,
@@ -806,11 +1103,8 @@ impl HnswIndex {
             if !Self::is_live(id_of, cand) {
                 continue;
             }
-            let cand_vec = &slots[cand as usize].vector;
             // Closer to the base than to anything already kept?
-            let diverse = kept
-                .iter()
-                .all(|&k| d_base < Self::dist_to(slots, k, cand_vec));
+            let diverse = kept.iter().all(|&k| d_base < dist_slots(slab, k, cand));
             if diverse {
                 kept.push(cand);
             }
@@ -824,9 +1118,16 @@ impl HnswIndex {
 
     /// Greedy 1-NN descent from `ep` at `layer`. Returns the nearest slot
     /// found (used for upper-layer descent during insert/search).
-    fn greedy_step(slots: &[HnswNode], id_of: &[u32], q: &[f64], ep: u32, layer: usize) -> u32 {
+    fn greedy_step(
+        slots: &[HnswNode],
+        id_of: &[u32],
+        slab: &VecSlab,
+        q: &[f32],
+        ep: u32,
+        layer: usize,
+    ) -> u32 {
         let mut curr = ep;
-        let mut curr_dist = Self::dist_to(slots, ep, q);
+        let mut curr_dist = dist_to(slab, ep, q);
         loop {
             let mut improved = false;
             let neighbors: &[u32] = slots
@@ -838,7 +1139,7 @@ impl HnswIndex {
                 if !Self::is_live(id_of, nb) {
                     continue;
                 }
-                let d = Self::dist_to(slots, nb, q);
+                let d = dist_to(slab, nb, q);
                 if d < curr_dist {
                     curr_dist = d;
                     curr = nb;
@@ -860,10 +1161,30 @@ impl HnswIndex {
     ///
     /// Zero vectors are silently skipped (cosine is undefined for them).
     /// If `id` already exists it is replaced (remove + re-insert semantics).
+    ///
+    /// A vector whose dimension differs from the first one this index took is
+    /// **skipped too**, and the first such skip is logged. The slab has one
+    /// stride, so there is nowhere to put it; before 0.6.6 the distance
+    /// `zip`-truncated to the shorter of the two vectors and produced a number
+    /// that meant nothing, which is a worse answer than no answer.
     pub fn insert(&mut self, id: u32, v: &[f64]) {
         let Some(unit) = l2_normalize(v) else {
             return; // zero vector — skip, and do not count it as indexed
         };
+        if self.slab.dim != 0 && unit.len() != self.slab.dim {
+            self.dim_mismatches += 1;
+            if self.dim_mismatches == 1 {
+                eprintln!(
+                    "mushroomdb: HNSW skipped node {id}: its embedding has {} dimensions \
+                     and this index holds {}. A mixed-dimension index cannot be \
+                     searched; re-embed the collection with one model. Further skips \
+                     on this index are silent.",
+                    unit.len(),
+                    self.slab.dim
+                );
+            }
+            return;
+        }
         note_insert();
 
         // Remove existing entry if any (handles update = remove + re-insert).
@@ -880,10 +1201,16 @@ impl HnswIndex {
             id,
             HnswNode {
                 level,
-                vector: unit.clone(),
                 layers: vec![vec![]; level + 1],
             },
+            &unit,
         );
+
+        // The query every distance on this insert path is taken against: the
+        // same `f32` values the slab now holds for `slot`, so a distance to the
+        // new node is exactly a distance between two slab rows. Owned rather
+        // than borrowed from the slab because the graph is mutated below.
+        let q = as_f32(&unit);
 
         let Some(ep) = self.entry_point else {
             // First node ever inserted.
@@ -899,7 +1226,7 @@ impl HnswIndex {
 
         // Phase 1: greedy descent from max_level to level+1 (ef=1).
         for lc in ((level + 1)..=max_level).rev() {
-            curr_ep = Self::greedy_step(&self.slots, &self.id_of, &unit, curr_ep, lc);
+            curr_ep = Self::greedy_step(&self.slots, &self.id_of, &self.slab, &q, curr_ep, lc);
         }
 
         // Phase 2: beam-search + connect at each layer from min(level, max_level)
@@ -911,7 +1238,8 @@ impl HnswIndex {
             let mut candidates = Self::beam_search(
                 &self.slots,
                 &self.id_of,
-                &unit,
+                &self.slab,
+                &q,
                 curr_ep,
                 lc,
                 params.ef_construction,
@@ -931,7 +1259,7 @@ impl HnswIndex {
             // every node in a dense cluster pointing back into the same
             // cluster, and the beam never crosses out of it.
             let neighbors =
-                Self::select_neighbors_first_rejection(&self.slots, &self.id_of, &candidates, m_lc);
+                Self::select_neighbors_first_rejection(&self.slab, &self.id_of, &candidates, m_lc);
             self.set_layer(slot, lc, neighbors.clone());
 
             // Add bidirectional links and prune over-connected neighbors.
@@ -950,12 +1278,15 @@ impl HnswIndex {
                 }
                 // Over-connected. `set_layer` keeps `back_refs` in step for
                 // every link the prune drops, whichever prune that is.
-                let nb_vec: Vec<f64> = self.slots[nb as usize].vector.clone();
+                //
+                // Scoring is two slab rows per candidate — where 0.6.5 cloned
+                // the neighbour's whole 12 KB vector first, once per
+                // over-connected neighbour and so up to `m0` times per insert.
                 let current: Vec<u32> = self.slots[nb as usize].layers[lc].clone();
                 let mut scored: Vec<(u32, f64)> = current
                     .iter()
                     .filter(|&&s| Self::is_live(&self.id_of, s))
-                    .map(|&s| (s, Self::dist_to(&self.slots, s, &nb_vec)))
+                    .map(|&s| (s, dist_slots(&self.slab, s, nb)))
                     .collect();
                 sort_by_distance(&mut scored);
                 let kept: Vec<u32> = match prune {
@@ -965,7 +1296,7 @@ impl HnswIndex {
                     // Re-decide the whole list by diversity: O(m₀²) distances,
                     // once per over-connected neighbour per insert.
                     Prune::Both => Self::select_neighbors_first_rejection(
-                        &self.slots,
+                        &self.slab,
                         &self.id_of,
                         &scored,
                         m_lc,
@@ -1049,11 +1380,22 @@ impl HnswIndex {
     /// Approximate k-nearest-neighbor search by cosine similarity.
     ///
     /// Returns up to `k` results as `(node_id, cosine_similarity)` pairs,
-    /// sorted descending by similarity. Zero-norm query vectors return empty.
+    /// sorted descending by similarity. Zero-norm query vectors return empty,
+    /// and so does a query whose dimension is not the indexed one: the index
+    /// cannot compare them, and the `hnsw_tracked` full scan is the caller's
+    /// fallback.
+    ///
+    /// The similarity is computed from the index's `f32` copies, so it is a
+    /// candidate-ordering number, accurate to ~1e-6, and not a score to report:
+    /// `index.rs::hnsw_candidates` discards it and every reported score is
+    /// recomputed from the `f64` store.
     pub fn search(&self, q: &[f64], k: usize) -> Vec<(u32, f64)> {
         let Some(unit_q) = l2_normalize(q) else {
             return vec![];
         };
+        if self.slab.dim == 0 || unit_q.len() != self.slab.dim {
+            return vec![];
+        }
         let Some(ep) = self.entry_point.filter(|&s| Self::is_live(&self.id_of, s)) else {
             // No entry point, or one left dangling by a bug: answer nothing
             // rather than walk from a freed slot and hand back a `u32::MAX` id.
@@ -1066,14 +1408,23 @@ impl HnswIndex {
         note_search();
         let ef = k.max(hnsw_params().ef_search);
         let mut curr_ep = ep;
+        let unit_q = as_f32(&unit_q);
 
         // Greedy descent from max_level to layer 1.
         for lc in (1..=self.max_level).rev() {
-            curr_ep = Self::greedy_step(&self.slots, &self.id_of, &unit_q, curr_ep, lc);
+            curr_ep = Self::greedy_step(&self.slots, &self.id_of, &self.slab, &unit_q, curr_ep, lc);
         }
 
         // Beam search at layer 0 with ef candidates.
-        let candidates = Self::beam_search(&self.slots, &self.id_of, &unit_q, curr_ep, 0, ef);
+        let candidates = Self::beam_search(
+            &self.slots,
+            &self.id_of,
+            &self.slab,
+            &unit_q,
+            curr_ep,
+            0,
+            ef,
+        );
 
         // Convert slots → node ids and distances → cosine similarities; sort
         // descending; take k.
@@ -1090,24 +1441,24 @@ impl HnswIndex {
     /// indexed vector instead of guessing at them.
     ///
     /// Counts payload only — the `u32`s in every adjacency list, the `u32`s in
-    /// the reverse index, and the `f64`s of every vector. Allocator headers and
-    /// the per-`Vec`/per-`BTreeSet` bookkeeping are not counted, so this is a
-    /// floor on resident size, not a measurement of it.
+    /// the reverse index, and the `f32`s of every live node's slab row.
+    /// Allocator headers and the per-`Vec`/per-`BTreeSet` bookkeeping are not
+    /// counted, and neither are the slab rows of freed slots, so this is a floor
+    /// on resident size, not a measurement of it.
     pub fn memory_stats(&self) -> HnswMemoryStats {
         let mut neighbour_slots = 0usize;
-        let mut vector_floats = 0usize;
         for (s, node) in self.slots.iter().enumerate() {
             if !Self::is_live(&self.id_of, s as u32) {
                 continue;
             }
             neighbour_slots += node.layers.iter().map(|l| l.len()).sum::<usize>();
-            vector_floats += node.vector.len();
         }
+        let live_nodes = self.slot_of.len();
         HnswMemoryStats {
-            live_nodes: self.slot_of.len(),
+            live_nodes,
             neighbour_slots,
             back_ref_entries: self.back_refs.values().map(|s| s.len()).sum(),
-            vector_floats,
+            vector_floats: self.slab.floats_for(live_nodes),
         }
     }
 
@@ -1155,10 +1506,23 @@ impl HnswIndex {
 // Persisted blob: magic + version
 // ---------------------------------------------------------------------------
 
-/// Magic bytes at the head of a v2 (0.6.6) HNSW blob.
+/// Magic bytes at the head of every versioned (0.6.6 and later) HNSW blob.
 pub const HNSW_BLOB_MAGIC: [u8; 4] = *b"MHNS";
 /// Highest blob version this build can read, and the one it writes.
-pub const HNSW_BLOB_VERSION: u16 = 2;
+///
+/// **3** since the distance kernel: the index no longer holds `f64` vectors per
+/// node, it holds one `f32` slab, so the serialized shape changed and the blob
+/// halved. Version 2 (0.6.6 before the kernel) and the bare 0.6.5 shape both
+/// still decode, with no vector re-inserted and no distance computed. A reader
+/// older than this one meeting a v3 blob fails its version check and leaves the
+/// side on its `hnsw_tracked` full scan — slower, never wrong.
+pub const HNSW_BLOB_VERSION: u16 = 3;
+
+/// Bytes of the wrapper's header: `magic` (4 raw bytes) then `version` (a
+/// little-endian `u16`) under bincode's fixed-int encoding. Read directly rather
+/// than through a deserialize, because the rest of the wrapper's shape depends on
+/// the version it carries.
+const HNSW_BLOB_HEADER_LEN: usize = 6;
 
 /// On-disk wrapper for a persisted HNSW graph.
 ///
@@ -1166,9 +1530,10 @@ pub const HNSW_BLOB_VERSION: u16 = 2;
 /// without bumping the snapshot format: section 6 carries the index as two
 /// opaque `Vec<u8>` per rule, so only the bytes inside change.
 ///
-/// The reverse direction is safe by construction: a 0.6.5 binary meeting one of
-/// these fails its `bincode::deserialize::<HnswIndex>` against the old id-keyed
-/// shape and falls back to the `hnsw_tracked` full scan — slower, never wrong.
+/// The reverse direction is safe by construction: an older binary meeting one of
+/// these either fails its version check or fails its
+/// `bincode::deserialize::<HnswIndex>` against the shape it knows, and falls
+/// back to the `hnsw_tracked` full scan — slower, never wrong.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HnswBlob {
     pub magic: [u8; 4],
@@ -1202,6 +1567,41 @@ struct HnswNodeV1 {
     layers: Vec<Vec<u32>>,
 }
 
+/// The blob-v2 shape — 0.6.6 before the distance kernel. Slot-keyed already, but
+/// with an `f64` vector inside every node instead of a slab beside them.
+/// Read-only: nothing writes it any more.
+///
+/// The field order is the v2 `HnswIndex`'s, and it must stay that way: bincode is
+/// positional, so this struct *is* the old format's definition.
+#[derive(Deserialize)]
+struct HnswIndexV2 {
+    base_seed: u64,
+    slots: Vec<HnswNodeV2>,
+    slot_of: BTreeMap<u32, u32>,
+    id_of: Vec<u32>,
+    free: Vec<u32>,
+    entry_point: Option<u32>,
+    max_level: usize,
+}
+
+#[derive(Deserialize)]
+struct HnswNodeV2 {
+    level: usize,
+    vector: Vec<f64>,
+    /// Neighbour **slots**, as in v3.
+    layers: Vec<Vec<u32>>,
+}
+
+/// The v2 wrapper: the same magic and version, a different index shape.
+#[derive(Deserialize)]
+struct HnswBlobV2 {
+    #[allow(dead_code)]
+    magic: [u8; 4],
+    #[allow(dead_code)]
+    version: u16,
+    index: HnswIndexV2,
+}
+
 /// Serialize `index` as a versioned blob. `None` only if bincode fails.
 pub fn encode_hnsw_blob(index: &HnswIndex) -> Option<Vec<u8>> {
     bincode::serialize(&HnswBlobRef {
@@ -1214,42 +1614,53 @@ pub fn encode_hnsw_blob(index: &HnswIndex) -> Option<Vec<u8>> {
 
 /// Decode a persisted HNSW blob.
 ///
-/// Accepts the v2 wrapper, and — for a store last written by 0.6.5 — a bare
-/// bincoded `HnswIndex` in the old id-keyed shape, which is up-converted in
-/// memory by remapping the decoded adjacency lists onto slots and deriving
-/// `back_refs` from them. No distance is computed and no vector is re-inserted.
+/// Accepts, in this order:
 ///
-/// A blob whose magic matches but whose version this build does not know is
-/// rejected exactly as a corrupt one is: the caller leaves the side on its
+/// * **v3** — this build's shape, slot-keyed with an `f32` slab.
+/// * **v2** — 0.6.6 before the distance kernel, slot-keyed with an `f64` vector
+///   per node. The vectors move into a slab and nothing else changes.
+/// * **v1** — a bare bincoded `HnswIndex` from 0.6.5, id-keyed, up-converted by
+///   remapping the decoded adjacency lists onto slots.
+///
+/// No distance is computed and no vector is re-inserted on any of those paths:
+/// the graph is adopted as it was built.
+///
+/// The version is read from the header rather than inferred from a successful
+/// deserialize, because v2 and v3 differ *inside* the wrapper: a v2 blob fed to
+/// v3's shape could in principle decode into nonsense rather than fail. A blob
+/// whose magic matches but whose version this build does not know is rejected
+/// exactly as a corrupt one is — the caller leaves the side on its
 /// `hnsw_tracked` full-scan fallback rather than risk misreading it.
 pub fn decode_hnsw_blob(blob: &[u8]) -> Result<HnswIndex, String> {
     if blob.is_empty() {
         return Err("empty blob".to_string());
     }
-    match bincode::deserialize::<HnswBlob>(blob) {
-        Ok(b) if b.magic == HNSW_BLOB_MAGIC => {
-            if b.version == 0 || b.version > HNSW_BLOB_VERSION {
-                return Err(format!(
-                    "HNSW blob version {} is not readable by this build (reads up to \
-                     {HNSW_BLOB_VERSION})",
-                    b.version
-                ));
-            }
-            let mut index = b.index;
-            index.rebuild_back_refs();
-            Ok(index)
-        }
-        // No v2 wrapper (or foreign magic): try the 0.6.5 shape.
-        other => match bincode::deserialize::<HnswIndexV1>(blob) {
-            Ok(v1) => Ok(HnswIndex::from_v1(v1)),
-            Err(v1_err) => Err(match other {
-                Ok(b) => format!(
-                    "unrecognised HNSW blob magic {:?}, and not a v1 index either ({v1_err})",
-                    b.magic
-                ),
-                Err(v2_err) => format!("not a v2 HNSW blob ({v2_err}) and not a v1 one ({v1_err})"),
-            }),
-        },
+    if blob.len() >= HNSW_BLOB_HEADER_LEN && blob[..4] == HNSW_BLOB_MAGIC {
+        let version = u16::from_le_bytes([blob[4], blob[5]]);
+        return match version {
+            3 => bincode::deserialize::<HnswBlob>(blob)
+                .map_err(|e| format!("HNSW v3 blob did not decode ({e})"))
+                .map(|b| {
+                    let mut index = b.index;
+                    index.rebuild_back_refs();
+                    index
+                }),
+            2 => bincode::deserialize::<HnswBlobV2>(blob)
+                .map_err(|e| format!("HNSW v2 blob did not decode ({e})"))
+                .map(|b| HnswIndex::from_v2(b.index)),
+            v => Err(format!(
+                "HNSW blob version {v} is not readable by this build (reads up to \
+                 {HNSW_BLOB_VERSION})"
+            )),
+        };
+    }
+    // No wrapper, or foreign magic: try the 0.6.5 shape.
+    match bincode::deserialize::<HnswIndexV1>(blob) {
+        Ok(v1) => Ok(HnswIndex::from_v1(v1)),
+        Err(v1_err) => Err(format!(
+            "not a versioned HNSW blob (magic {:?}) and not a v1 one ({v1_err})",
+            &blob[..4.min(blob.len())]
+        )),
     }
 }
 
@@ -1407,6 +1818,55 @@ mod tests {
         );
     }
 
+    /// The distance kernel is the insert path's whole cost, so the count of
+    /// evaluations is the measurement this task is judged on. A counter a test
+    /// cannot read is not a gate.
+    #[test]
+    fn a_single_insert_reports_its_distance_evaluations() {
+        let vecs = make_unit_vecs(201, 32, 0x0D15_7A17);
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"dist-evals"));
+        for (i, v) in vecs.iter().take(200).enumerate() {
+            idx.insert(i as u32, v);
+        }
+
+        hnsw_dist_evals_reset();
+        idx.insert(200, &vecs[200]);
+        let total = hnsw_dist_evals();
+        let pairwise = hnsw_dist_evals_pairwise();
+        assert!(
+            total > 0,
+            "an insert into a 200-node index must evaluate distances"
+        );
+        assert!(
+            pairwise > 0,
+            "the prune compares candidates against each other, so some \
+             evaluations must be pairwise"
+        );
+        assert!(
+            pairwise <= total,
+            "pairwise ({pairwise}) is a subset of total ({total})"
+        );
+
+        // A one-node index: the only node the beam can reach is the entry point,
+        // so a search scores it once per layer it descends through plus once in
+        // the beam, and none of those evaluations is pairwise.
+        let mut one = HnswIndex::new(7);
+        one.insert(0, &vecs[0]);
+        hnsw_dist_evals_reset();
+        assert_eq!(one.search(&vecs[1], 5).len(), 1);
+        assert_eq!(
+            hnsw_dist_evals(),
+            1 + one.max_level as u64,
+            "a search of a one-node graph scores the entry point once per \
+             descended layer and once in the beam"
+        );
+        assert_eq!(
+            hnsw_dist_evals_pairwise(),
+            0,
+            "a search compares the query against nodes, never two nodes"
+        );
+    }
+
     #[test]
     fn hnsw_empty_returns_empty() {
         let idx = HnswIndex::new(42);
@@ -1456,6 +1916,93 @@ mod tests {
         assert!(r[0].1 >= r[1].1);
         assert!(r[1].1 >= r[2].1);
         assert_eq!(r[0].0, 0, "node 0 must be nearest");
+    }
+
+    // -----------------------------------------------------------------------
+    // The slab and the kernel
+    // -----------------------------------------------------------------------
+
+    /// The index's own copy of a vector is one `f32` per dimension, in a slab
+    /// indexed by slot — half the bytes of the `f64` store and one contiguous
+    /// allocation rather than one per node. And because the slab has a single
+    /// stride, a vector of some other dimension cannot be stored in it at all:
+    /// it is skipped, where the `zip`-truncating distance of 0.6.5 would have
+    /// taken it and produced meaningless distances.
+    #[test]
+    fn the_index_holds_one_f32_per_dimension() {
+        const DIM: usize = 64;
+        let vecs = make_unit_vecs(300, DIM, 0x51AB_1234);
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"slab"));
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert(i as u32, v);
+        }
+
+        let mem = idx.memory_stats();
+        assert_eq!(mem.live_nodes, 300);
+        assert_eq!(
+            mem.vector_floats,
+            300 * DIM,
+            "the slab holds one float per dimension per live node"
+        );
+        let expected = mem.adjacency_bytes_per_node() + (DIM * 4) as f64;
+        assert!(
+            (mem.bytes_per_node() - expected).abs() < 1.0,
+            "bytes per node is {:.1}, expected {expected:.1} = adjacency + {DIM} f32s",
+            mem.bytes_per_node()
+        );
+
+        // A vector of another dimension cannot go in: the slab's stride is the
+        // dimension of the first vector indexed.
+        let odd = make_unit_vecs(1, DIM - 1, 0x0DD);
+        hnsw_insert_count_reset();
+        idx.insert(1_000, &odd[0]);
+        assert_eq!(idx.len(), 300, "a 63-D vector must not enter a 64-D index");
+        assert_eq!(
+            hnsw_insert_count(),
+            0,
+            "a skipped vector must not be counted as indexed"
+        );
+        assert!(
+            idx.search(&odd[0], 5).is_empty(),
+            "a query of the wrong dimension cannot be answered"
+        );
+
+        // ...and one of the right dimension still can.
+        let more = make_unit_vecs(1, DIM, 0xF00D);
+        idx.insert(1_001, &more[0]);
+        assert_eq!(idx.len(), 301, "a 64-D vector is still accepted");
+        assert_eq!(hnsw_insert_count(), 1);
+    }
+
+    /// The kernel sums in eight accumulators rather than one, which is a
+    /// different summation order and therefore a different answer. This bounds
+    /// how different: well inside the granularity at which candidate order can
+    /// change, at every dimension including the awkward ones either side of the
+    /// chunk width.
+    #[test]
+    fn the_dot_kernel_agrees_with_an_f64_reference() {
+        for dim in [1usize, 7, 8, 15, 64, 1_536] {
+            let vecs = make_unit_vecs(6, dim, 0x4047_0000 ^ dim as u64);
+            for i in 0..vecs.len() {
+                let a32: Vec<f32> = vecs[i].iter().map(|&x| x as f32).collect();
+                let self_dot = dot_f32(&a32, &a32);
+                assert!(
+                    (self_dot as f64 - 1.0).abs() < 1e-5,
+                    "dim {dim}: a unit vector dotted with itself is {self_dot}, not 1.0"
+                );
+                for j in 0..vecs.len() {
+                    let b32: Vec<f32> = vecs[j].iter().map(|&x| x as f32).collect();
+                    let reference: f64 =
+                        vecs[i].iter().zip(vecs[j].iter()).map(|(a, b)| a * b).sum();
+                    let got = dot_f32(&a32, &b32) as f64;
+                    assert!(
+                        (got - reference).abs() < 2e-5,
+                        "dim {dim}, pair ({i},{j}): kernel {got} against reference \
+                         {reference}"
+                    );
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1575,19 +2122,16 @@ mod tests {
     // The §3.5 diverse-neighbour heuristic
     // -----------------------------------------------------------------------
 
-    /// Build a throwaway index holding exactly `vecs`, with no edges, so a
-    /// heuristic call can be made against known geometry.
-    fn slots_of(vecs: &[Vec<f64>]) -> (Vec<HnswNode>, Vec<u32>) {
-        let slots = vecs
-            .iter()
-            .map(|v| HnswNode {
-                level: 0,
-                vector: l2_normalize(v).unwrap(),
-                layers: vec![vec![]],
-            })
-            .collect();
+    /// Build a throwaway slab holding exactly `vecs`, normalized, one per slot,
+    /// so a heuristic call can be made against known geometry. The prune reads
+    /// the slab and the liveness map and nothing else.
+    fn slab_of(vecs: &[Vec<f64>]) -> (VecSlab, Vec<u32>) {
+        let mut slab = VecSlab::default();
+        for (s, v) in vecs.iter().enumerate() {
+            assert!(slab.put(s as u32, &l2_normalize(v).unwrap()));
+        }
         let id_of = (0..vecs.len() as u32).collect();
-        (slots, id_of)
+        (slab, id_of)
     }
 
     /// The prune's whole point: given candidates at nearly the same distance,
@@ -1611,10 +2155,9 @@ mod tests {
             vec![0.70, 0.71, 0.0], // 4: direction B — diverse
             vec![0.60, 0.0, 0.80], // 5: far, behind 0
         ];
-        let (slots, id_of) = slots_of(&vecs);
-        let mut cands: Vec<(u32, f64)> = (0..6u32)
-            .map(|s| (s, HnswIndex::dist_to(&slots, s, &base)))
-            .collect();
+        let (slab, id_of) = slab_of(&vecs);
+        let base = as_f32(&base);
+        let mut cands: Vec<(u32, f64)> = (0..6u32).map(|s| (s, dist_to(&slab, s, &base))).collect();
         sort_by_distance(&mut cands);
         assert_eq!(
             cands.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
@@ -1622,7 +2165,7 @@ mod tests {
             "fixture: candidates must arrive in this nearest-first order"
         );
 
-        let kept = HnswIndex::select_neighbors_first_rejection(&slots, &id_of, &cands, 2);
+        let kept = HnswIndex::select_neighbors_first_rejection(&slab, &id_of, &cands, 2);
         assert_eq!(
             kept,
             vec![0, 4],
@@ -1646,10 +2189,9 @@ mod tests {
             vec![0.78, 0.0, 0.63], // 1: behind 0, near
             vec![0.55, 0.0, 0.84], // 2: behind 0, far
         ];
-        let (slots, id_of) = slots_of(&vecs);
-        let mut cands: Vec<(u32, f64)> = (0..3u32)
-            .map(|s| (s, HnswIndex::dist_to(&slots, s, &base)))
-            .collect();
+        let (slab, id_of) = slab_of(&vecs);
+        let base = as_f32(&base);
+        let mut cands: Vec<(u32, f64)> = (0..3u32).map(|s| (s, dist_to(&slab, s, &base))).collect();
         sort_by_distance(&mut cands);
         assert_eq!(
             cands.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
@@ -1657,7 +2199,7 @@ mod tests {
             "fixture: nearest-first order"
         );
 
-        let kept = HnswIndex::select_neighbors_first_rejection(&slots, &id_of, &cands, 2);
+        let kept = HnswIndex::select_neighbors_first_rejection(&slab, &id_of, &cands, 2);
         assert_eq!(
             kept,
             vec![0, 2],
@@ -1674,14 +2216,12 @@ mod tests {
     #[test]
     fn the_prune_never_keeps_a_freed_slot() {
         let vecs = make_unit_vecs(4, 8, 0x7EA0_1234);
-        let (slots, mut id_of) = slots_of(&vecs);
+        let (slab, mut id_of) = slab_of(&vecs);
         id_of[1] = DEAD;
-        let base = l2_normalize(&vecs[0]).unwrap();
-        let mut cands: Vec<(u32, f64)> = (0..4u32)
-            .map(|s| (s, HnswIndex::dist_to(&slots, s, &base)))
-            .collect();
+        let base = as_f32(&l2_normalize(&vecs[0]).unwrap());
+        let mut cands: Vec<(u32, f64)> = (0..4u32).map(|s| (s, dist_to(&slab, s, &base))).collect();
         sort_by_distance(&mut cands);
-        let kept = HnswIndex::select_neighbors_first_rejection(&slots, &id_of, &cands, 4);
+        let kept = HnswIndex::select_neighbors_first_rejection(&slab, &id_of, &cands, 4);
         assert!(
             !kept.contains(&1),
             "a freed slot must not become a neighbour"
@@ -1740,7 +2280,7 @@ mod tests {
             params.m0,
             params.m,
             mem.adjacency_bytes_per_node(),
-            (mem.vector_floats * 8) as f64 / mem.live_nodes as f64,
+            (mem.vector_floats * 4) as f64 / mem.live_nodes as f64,
         );
         assert_eq!(mem.live_nodes, 1_200);
         assert!(
@@ -1755,7 +2295,7 @@ mod tests {
              index shape grew",
             mem.adjacency_bytes_per_node()
         );
-        // 32 f64s per vector, exactly, or the fixture is not what it says.
+        // 32 f32s per vector, exactly, or the fixture is not what it says.
         assert_eq!(mem.vector_floats, 1_200 * 32);
     }
 
@@ -2236,6 +2776,40 @@ mod tests {
         max_level: usize,
     }
 
+    /// The blob-v2 on-disk shape, serialize side, so a test can write one.
+    #[derive(Serialize)]
+    struct V2Node {
+        level: usize,
+        vector: Vec<f64>,
+        layers: Vec<Vec<u32>>,
+    }
+
+    #[derive(Serialize)]
+    struct V2Index {
+        base_seed: u64,
+        slots: Vec<V2Node>,
+        slot_of: BTreeMap<u32, u32>,
+        id_of: Vec<u32>,
+        free: Vec<u32>,
+        entry_point: Option<u32>,
+        max_level: usize,
+    }
+
+    #[derive(Serialize)]
+    struct V2Blob {
+        magic: [u8; 4],
+        version: u16,
+        index: V2Index,
+    }
+
+    /// A slot's vector back in `f64`, as the older shapes stored it. An `f32`
+    /// widened to `f64` and narrowed again is bit-exact, so a round trip through
+    /// either older blob loses nothing — which is what lets the upgrade tests
+    /// compare `search` results exactly.
+    fn vector_of(idx: &HnswIndex, slot: u32) -> Vec<f64> {
+        idx.slab.get(slot).iter().map(|&x| x as f64).collect()
+    }
+
     /// Re-express a live index in the id-keyed 0.6.5 shape.
     fn as_v1_blob(idx: &HnswIndex) -> Vec<u8> {
         let nodes: BTreeMap<u32, V1Node> = idx
@@ -2247,7 +2821,7 @@ mod tests {
                     id,
                     V1Node {
                         level: n.level,
-                        vector: n.vector.clone(),
+                        vector: vector_of(idx, s),
                         layers: n
                             .layers
                             .iter()
@@ -2262,6 +2836,35 @@ mod tests {
             nodes,
             entry_point: idx.entry_point.map(|s| idx.id_of[s as usize]),
             max_level: idx.max_level,
+        })
+        .unwrap()
+    }
+
+    /// Re-express a live index in the slot-keyed blob-v2 shape — 0.6.6 before the
+    /// distance kernel, with an `f64` vector inside every node.
+    fn as_v2_blob(idx: &HnswIndex) -> Vec<u8> {
+        let slots: Vec<V2Node> = idx
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(s, n)| V2Node {
+                level: n.level,
+                vector: vector_of(idx, s as u32),
+                layers: n.layers.clone(),
+            })
+            .collect();
+        bincode::serialize(&V2Blob {
+            magic: HNSW_BLOB_MAGIC,
+            version: 2,
+            index: V2Index {
+                base_seed: idx.base_seed,
+                slots,
+                slot_of: idx.slot_of.clone(),
+                id_of: idx.id_of.clone(),
+                free: idx.free.clone(),
+                entry_point: idx.entry_point,
+                max_level: idx.max_level,
+            },
         })
         .unwrap()
     }
@@ -2308,9 +2911,9 @@ mod tests {
         assert_matches(&loaded, &idx, &vecs[3]);
     }
 
-    /// The 0.6.6 wrapper round-trips.
+    /// This build's wrapper round-trips, and it is version 3.
     #[test]
-    fn a_v2_blob_round_trips() {
+    fn a_v3_blob_round_trips() {
         let (vecs, idx) = blob_fixture();
         let blob = encode_hnsw_blob(&idx).expect("encode");
         assert_eq!(
@@ -2318,10 +2921,41 @@ mod tests {
             &HNSW_BLOB_MAGIC,
             "the blob must carry its magic"
         );
+        assert_eq!(
+            u16::from_le_bytes([blob[4], blob[5]]),
+            3,
+            "the slab shape is blob version 3"
+        );
 
         hnsw_insert_count_reset();
-        let loaded = decode_hnsw_blob(&blob).expect("a v2 blob must load");
+        let loaded = decode_hnsw_blob(&blob).expect("a v3 blob must load");
         assert_eq!(hnsw_insert_count(), 0, "a load must not re-insert vectors");
+        assert_matches(&loaded, &idx, &vecs[3]);
+        assert_eq!(
+            loaded.slab.dim, idx.slab.dim,
+            "the slab's stride must survive the round trip"
+        );
+    }
+
+    /// A blob written by 0.6.6 before the distance kernel — slot-keyed, with an
+    /// `f64` vector per node — loads into the slab shape with no vector
+    /// re-inserted and answers identically.
+    #[test]
+    fn a_v2_blob_upgrades_in_place() {
+        let (vecs, idx) = blob_fixture();
+        let blob = as_v2_blob(&idx);
+
+        hnsw_insert_count_reset();
+        let loaded = decode_hnsw_blob(&blob).expect("a v2 blob must still load");
+        assert_eq!(
+            hnsw_insert_count(),
+            0,
+            "up-converting a v2 blob must not re-insert a single vector"
+        );
+        assert_eq!(
+            loaded.slab.dim, idx.slab.dim,
+            "the slab's stride comes from the decoded vectors"
+        );
         assert_matches(&loaded, &idx, &vecs[3]);
     }
 
@@ -2352,11 +2986,11 @@ mod tests {
         );
     }
 
-    /// The downgrade direction: a 0.6.5 binary meeting a 0.6.6 blob fails its
+    /// The downgrade direction: a 0.6.5 binary meeting a v3 blob fails its
     /// `bincode::deserialize::<HnswIndex>` against the old shape rather than
     /// misreading it. `V1ReadIndex` is that old shape's read side.
     #[test]
-    fn a_v2_blob_is_not_readable_as_a_v1_index() {
+    fn a_v3_blob_is_not_readable_as_a_v1_index() {
         #[derive(Deserialize)]
         #[allow(dead_code)]
         struct V1ReadNode {
