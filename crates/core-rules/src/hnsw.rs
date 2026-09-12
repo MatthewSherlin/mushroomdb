@@ -47,6 +47,42 @@ pub struct HnswParams {
     pub ef_construction: usize,
     /// Beam width during search; the floor under a query's own `k`.
     pub ef_search: usize,
+    /// How far the §3.5 diverse-neighbour heuristic reaches.
+    pub prune: Prune,
+}
+
+/// Which side of a new link the §3.5 diverse-neighbour heuristic decides.
+///
+/// The heuristic always chooses the new node's **own** neighbours — that is
+/// where diversity is cheap, because the candidate list is built once per
+/// insert. Applying it a second time on the **neighbour** side, to re-decide
+/// each over-connected neighbour's list, is what costs: that call is O(m₀²)
+/// distance computations and it runs once per neighbour per insert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Prune {
+    /// Heuristic for the new node's own neighbours; keep-the-m-nearest on the
+    /// neighbour side. Roughly 5× faster to build, and **below the recall floor
+    /// on clustered corpora at the default `m0`**: it scores 0.8581 on
+    /// `approximate_recall_5k_timing`, whose floor is 0.90. Opt in only with a
+    /// raised `m0` or a corpus measured to tolerate it.
+    Own,
+    /// Heuristic on both sides — the paper's Algorithm 4 applied in full. The
+    /// default, because it is the cheapest shape that passes every committed
+    /// recall gate: see `docs/site/rules.md` for the three-way comparison
+    /// against `own` and against raising `m0` instead.
+    #[default]
+    Both,
+}
+
+impl Prune {
+    /// Parse the `prune` field of `MUSHROOMDB_HNSW_PARAMS`.
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "own" => Some(Self::Own),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
 }
 
 impl Default for HnswParams {
@@ -65,32 +101,53 @@ impl Default for HnswParams {
     /// `hnsw_5k_1536_recall` refused every narrower beam that was tried: at
     /// `ef_search` = 128 the min recall is 0.30 at `m0` = 32 and 0.70 at
     /// `m0` = 64, against a floor of 0.90.
+    ///
+    /// `prune` is [`Prune::Both`] because [`Prune::Own`], which builds roughly 5×
+    /// faster on uniform vectors, scores **0.8581** on
+    /// `approximate_recall_5k_timing` against a floor of 0.90 — that corpus's
+    /// clusters are 100 members wide against an `m0` of 64, and the neighbour
+    /// side is where those links get thrown away. The two ways to fix it are
+    /// this and `m0` = 128; this one is both faster end to end (180 s against
+    /// 269 s of backfill) and half the adjacency memory, so it is the default.
     fn default() -> Self {
         Self {
             m: 16,
             m0: 64,
             ef_construction: 200,
             ef_search: 400,
+            prune: Prune::Both,
         }
     }
 }
 
 impl HnswParams {
-    /// Parse `m,m0,ef_construction,ef_search`. `None` if the shape is wrong or
-    /// any field is absent, unparseable or zero — a zero would produce an index
-    /// with no edges or a search with no beam.
+    /// Parse `m,m0,ef_construction,ef_search[,prune]`. `None` if the shape is
+    /// wrong, or a numeric field is absent, unparseable or zero — a zero would
+    /// produce an index with no edges or a search with no beam. The `prune`
+    /// field is optional and defaults to [`Prune::Own`]; it is the one field
+    /// that is a word rather than a number, so it cannot be confused with the
+    /// four ahead of it.
     fn parse(s: &str) -> Option<Self> {
-        let mut it = s.split(',').map(|f| f.trim().parse::<usize>().ok());
-        let mut next = || it.next().flatten().filter(|&v| v > 0);
-        let (m, m0, ef_construction, ef_search) = (next()?, next()?, next()?, next()?);
-        if it.next().is_some() {
-            return None; // a fifth field means the caller meant something else
+        let fields: Vec<&str> = s.split(',').collect();
+        if fields.len() < 4 || fields.len() > 5 {
+            return None;
         }
+        let mut num = fields
+            .iter()
+            .take(4)
+            .map(|f| f.trim().parse::<usize>().ok().filter(|&v| v > 0));
+        let mut next = || num.next().flatten();
+        let (m, m0, ef_construction, ef_search) = (next()?, next()?, next()?, next()?);
+        let prune = match fields.get(4) {
+            Some(f) => Prune::parse(f)?,
+            None => Prune::default(),
+        };
         Some(Self {
             m,
             m0,
             ef_construction,
             ef_search,
+            prune,
         })
     }
 }
@@ -98,7 +155,8 @@ impl HnswParams {
 /// The index shape this process builds and searches with.
 ///
 /// Read once from `MUSHROOMDB_HNSW_PARAMS`, formatted
-/// `m,m0,ef_construction,ef_search`. Unset or unparseable →
+/// `m,m0,ef_construction,ef_search[,prune]`, where `prune` is `own` or `both`
+/// and defaults to `own`. Unset or unparseable →
 /// [`HnswParams::default`]. Read once rather than per call so a graph cannot be
 /// half-built under one shape and half under another, and so the value is a
 /// pointer chase on the insert path.
@@ -322,6 +380,16 @@ pub struct HnswIndex {
     /// Entry-point **slot**.
     entry_point: Option<u32>,
     max_level: usize,
+    /// Overrides [`hnsw_params`]'s `prune` for this index only.
+    ///
+    /// Exists because `hnsw_params()` reads the environment through a
+    /// `OnceLock`: one process gets one shape, so a test that wants to compare
+    /// both prune strategies cannot get there through the env. Never
+    /// serialized, so it cannot change a blob, and `None` in every index the
+    /// engine builds.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub prune_override_for_test: Option<Prune>,
 }
 
 /// A freed slot's id sentinel.
@@ -508,6 +576,7 @@ impl HnswIndex {
             id_of,
             free: Vec::new(),
             back_refs: BTreeMap::new(),
+            prune_override_for_test: None,
         };
         // A dangling entry point would have panicked the old `dist_to`; elect a
         // live one instead.
@@ -769,6 +838,7 @@ impl HnswIndex {
         };
 
         let params = hnsw_params();
+        let prune = self.prune_override_for_test.unwrap_or(params.prune);
         let max_level = self.max_level;
         let mut curr_ep = ep;
 
@@ -823,9 +893,8 @@ impl HnswIndex {
                 if self.slots[nb as usize].layers[lc].len() <= m_lc {
                     continue;
                 }
-                // Over-connected: the heuristic decides which links survive on
-                // the neighbour side. `set_layer` keeps `back_refs` in step for
-                // every link it drops.
+                // Over-connected. `set_layer` keeps `back_refs` in step for
+                // every link the prune drops, whichever prune that is.
                 let nb_vec: Vec<f64> = self.slots[nb as usize].vector.clone();
                 let current: Vec<u32> = self.slots[nb as usize].layers[lc].clone();
                 let mut scored: Vec<(u32, f64)> = current
@@ -834,8 +903,16 @@ impl HnswIndex {
                     .map(|&s| (s, Self::dist_to(&self.slots, s, &nb_vec)))
                     .collect();
                 sort_by_distance(&mut scored);
-                let kept =
-                    Self::select_neighbors_heuristic(&self.slots, &self.id_of, &scored, m_lc);
+                let kept: Vec<u32> = match prune {
+                    // Keep the m nearest. One distance per candidate, already
+                    // computed above.
+                    Prune::Own => scored.iter().take(m_lc).map(|(s, _)| *s).collect(),
+                    // Re-decide the whole list by diversity: O(m₀²) distances,
+                    // once per over-connected neighbour per insert.
+                    Prune::Both => {
+                        Self::select_neighbors_heuristic(&self.slots, &self.id_of, &scored, m_lc)
+                    }
+                };
                 self.set_layer(nb, lc, kept);
             }
         }
@@ -1356,15 +1433,31 @@ mod tests {
                 m: 8,
                 m0: 64,
                 ef_construction: 300,
-                ef_search: 96
+                ef_search: 96,
+                prune: Prune::Both
             }),
             "whitespace around a field must not defeat the override"
+        );
+        assert_eq!(
+            HnswParams::parse("16,64,200,400,both"),
+            Some(HnswParams::default()),
+            "the prune field is optional, and `both` is what omitting it means"
+        );
+        assert_eq!(
+            HnswParams::parse("16,64,200,400, own "),
+            Some(HnswParams {
+                prune: Prune::Own,
+                ..HnswParams::default()
+            }),
+            "`own` opts out of the neighbour-side heuristic"
         );
         for bad in [
             "",
             "16",
             "16,64,200",
             "16,64,200,400,64",
+            "16,64,200,400,neither",
+            "16,64,200,400,own,own",
             "16,64,200,x",
             "0,64,200,400",
             "16,0,200,400",
@@ -1373,6 +1466,50 @@ mod tests {
             "-16,64,200,400",
         ] {
             assert_eq!(HnswParams::parse(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    /// The prune strategy changes the graph, so it must change what the
+    /// neighbour-side prune does — and nothing else. Both shapes must respect
+    /// the degree bound and both must answer.
+    #[test]
+    fn both_prune_strategies_build_a_searchable_bounded_graph() {
+        let params = hnsw_params();
+        let vecs = make_unit_vecs(600, 24, 0x9121_5EED);
+        for prune in [Prune::Own, Prune::Both] {
+            let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"prune-shapes"));
+            idx.prune_override_for_test = Some(prune);
+            for (i, v) in vecs.iter().enumerate() {
+                idx.insert(i as u32, v);
+            }
+            assert_eq!(idx.len(), 600, "{prune:?} lost nodes");
+            for (s, node) in idx.slots.iter().enumerate() {
+                if !HnswIndex::is_live(&idx.id_of, s as u32) {
+                    continue;
+                }
+                for (lc, layer) in node.layers.iter().enumerate() {
+                    let allowed = if lc == 0 { params.m0 } else { params.m };
+                    assert!(
+                        layer.len() <= allowed,
+                        "{prune:?} slot {s} layer {lc} holds {} links for an allowance of \
+                         {allowed}",
+                        layer.len()
+                    );
+                }
+            }
+            let hits = idx.search(&vecs[42], 5);
+            assert_eq!(
+                hits.first().map(|&(id, _)| id),
+                Some(42),
+                "{prune:?} search"
+            );
+            for &id in idx.node_ids().iter() {
+                assert_eq!(
+                    idx.back_refs_for_test(id),
+                    idx.scan_back_refs_for_test(id),
+                    "{prune:?} back_refs[{id}] disagrees with a full scan"
+                );
+            }
         }
     }
 
@@ -1530,10 +1667,6 @@ mod tests {
         );
 
         let vecs = make_clustered_unit_vecs(CLUSTERS, PER_CLUSTER, DIM, 0xC1_05_7E_12_34_56_78_9A);
-        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"clustered-recall"));
-        for (i, v) in vecs.iter().enumerate() {
-            idx.insert(i as u32, v);
-        }
 
         // Queries: one member of each cluster, nudged. The true top-10 is then
         // that member and its nine nearest cluster-mates — a well-defined set,
@@ -1547,32 +1680,81 @@ mod tests {
                 q
             })
             .collect();
-        let mut recalls = Vec::with_capacity(queries.len());
-        for q in &queries {
-            let exact: BTreeSet<usize> = exact_knn(&vecs, q, K).into_iter().collect();
-            let found = idx
-                .search(q, K)
-                .into_iter()
-                .filter(|(id, _)| exact.contains(&(*id as usize)))
-                .count();
-            recalls.push(found as f64 / K as f64);
+        let exact: Vec<BTreeSet<usize>> = queries
+            .iter()
+            .map(|q| exact_knn(&vecs, q, K).into_iter().collect())
+            .collect();
+
+        // Both prune strategies, because this fixture is the only one that can
+        // tell them apart, and the difference is the whole reason `Prune::Both`
+        // exists as an option. Floors are per strategy: they are what was
+        // measured, and the gap between them is the trade-off `rules.md`
+        // documents.
+        let mut scored: Vec<(Prune, f64, f64)> = Vec::new();
+        for prune in [Prune::Own, Prune::Both] {
+            let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"clustered-recall"));
+            idx.prune_override_for_test = Some(prune);
+            for (i, v) in vecs.iter().enumerate() {
+                idx.insert(i as u32, v);
+            }
+            let recalls: Vec<f64> = queries
+                .iter()
+                .zip(exact.iter())
+                .map(|(q, truth)| {
+                    let found = idx
+                        .search(q, K)
+                        .into_iter()
+                        .filter(|(id, _)| truth.contains(&(*id as usize)))
+                        .count();
+                    found as f64 / K as f64
+                })
+                .collect();
+            let min = recalls.iter().cloned().fold(f64::MAX, f64::min);
+            let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
+            eprintln!(
+                "clustered recall@{K} ({CLUSTERS}x{PER_CLUSTER}, dim {DIM}, m0={}, \
+                 prune={prune:?}): min={min:.4} mean={mean:.4}",
+                hnsw_params().m0
+            );
+            scored.push((prune, min, mean));
         }
-        let min = recalls.iter().cloned().fold(f64::MAX, f64::min);
-        let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
-        eprintln!(
-            "clustered recall@{K} ({CLUSTERS}x{PER_CLUSTER}, dim {DIM}, m0={}): \
-             min={min:.4} mean={mean:.4}",
-            hnsw_params().m0
+
+        // Measured: Own min 0.5000 / mean 0.9350, Both min 0.8000 / mean 0.9950.
+        // A query here sits inside a 120-member cluster whose members are
+        // genuinely close together, so ranks 8 to 12 are separated by very
+        // little and the tail of the top-10 is the hardest thing this index is
+        // ever asked for. The mean says the beam reached the right cluster; the
+        // min says no single query got stuck in one member's neighbourhood.
+        for &(prune, min, mean) in &scored {
+            let (min_floor, mean_floor) = match prune {
+                Prune::Own => (0.40, 0.90),
+                Prune::Both => (0.70, 0.95),
+            };
+            assert!(
+                min >= min_floor,
+                "{prune:?} min clustered recall@{K} = {min:.4} < {min_floor}"
+            );
+            assert!(
+                mean >= mean_floor,
+                "{prune:?} mean clustered recall@{K} = {mean:.4} < {mean_floor}"
+            );
+        }
+
+        // The reason the option exists: on a corpus whose clusters are wider
+        // than `m0`, the full heuristic must actually be better. If this ever
+        // stops holding, `Prune::Both` is paying 5x the build time for nothing.
+        let own = scored[0];
+        let both = scored[1];
+        assert!(
+            both.1 >= own.1 && both.2 >= own.2,
+            "Prune::Both (min {:.4} mean {:.4}) is not better than Prune::Own \
+             (min {:.4} mean {:.4}) on clusters wider than m0 — the option has no \
+             justification left",
+            both.1,
+            both.2,
+            own.1,
+            own.2
         );
-        // Measured min 0.8000 / mean 0.9950. The min floor is lower than the
-        // uniform-corpus gate's because a query here sits inside a 120-member
-        // cluster whose members are genuinely close together: ranks 8 to 12 are
-        // separated by very little, so the tail of the top-10 is the hardest
-        // thing this index is ever asked for. The mean is what says the beam
-        // reached the right cluster; the min is what says no single query got
-        // stuck in one member's immediate neighbourhood.
-        assert!(min >= 0.70, "min clustered recall@{K} = {min:.4} < 0.70");
-        assert!(mean >= 0.95, "mean clustered recall@{K} = {mean:.4} < 0.95");
     }
 
     /// Recall after churn. Insert 5,000 1,536-D vectors, remove a fifth,

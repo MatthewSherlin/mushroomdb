@@ -1871,7 +1871,30 @@ fn approximate_recall_5k_timing() {
         via_dir: None,
     })
     .unwrap();
+    // Since 0.6.6 a `create_rule` over more than `HNSW_BUILD_BATCH` vectors
+    // installs the rule and returns *before* its edges exist, building the
+    // index a slice at a time instead. 5 000 vectors is well over that, so
+    // without this loop the rule derives nothing and the recall below is 0.0 —
+    // which is exactly how this gate went dark. Pumping to completion is what a
+    // quiescent store does on its own ticker; doing it inside the timed region
+    // keeps `hnsw_ms` meaning "what the whole index cost".
+    let mut pumps = 0u32;
+    loop {
+        let outstanding = db.pump_index_build().unwrap();
+        if outstanding.is_empty() {
+            break;
+        }
+        pumps += 1;
+        assert!(
+            pumps < 10_000,
+            "the build made no progress after {pumps} pumps: {outstanding:?}"
+        );
+    }
     let hnsw_ms = t0.elapsed().as_millis();
+    assert!(
+        db.builds_in_progress().is_empty(),
+        "the index must be whole before recall is measured"
+    );
 
     // Collect approximate edges.
     let approx_edges: BTreeSet<(String, String, String)> = {
