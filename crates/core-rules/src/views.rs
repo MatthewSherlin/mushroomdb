@@ -88,6 +88,18 @@ impl ViewDef {
         if self.view_prop.is_empty() {
             return Err("view_prop must not be empty".into());
         }
+        // `ns` is the reserved namespace property (v0.6.6 §7.2). A view owns its
+        // `view_prop` column and rewrites it on every relevant change, so a view
+        // over `ns` would move nodes between namespaces behind the immutability
+        // rule — and `set_prop` refusing the same write would read as a
+        // contradiction.
+        if self.view_prop == core_storage::NS_PROP {
+            return Err(format!(
+                "view_prop must not be {:?}: it is the reserved namespace property, \
+                 which is set at insert and never written again",
+                core_storage::NS_PROP
+            ));
+        }
         match &self.source {
             ViewSource::Degree { edge_type, .. } => {
                 if edge_type.is_empty() {

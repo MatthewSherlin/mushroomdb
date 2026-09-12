@@ -781,3 +781,171 @@ fn namespaces_survive_a_snapshot_and_a_delete() {
     assert!(role_keys(&db, "y-only").is_empty());
     assert!(reader_role_keys(&db, "y-only").is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// 11. Removing `ns` is changing it, and is refused the same way
+// ---------------------------------------------------------------------------
+
+/// `RemoveProp` needs no dense rewrite, so it does not pass the seam that
+/// refuses a namespace change — `prepare_remove_prop` has to say so itself.
+/// Without that, removing `ns` lands the node in `default` on the next open:
+/// the cross-namespace edge guard is defeated and a default-bound role reads a
+/// tenant's node.
+#[test]
+fn removing_the_ns_property_is_refused() {
+    let dir = tmp("remove-ns");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Doc", "a", vec![ns("x")]).unwrap();
+    db.insert_node("Doc", "plain", vec![]).unwrap();
+
+    // (a) remove_prop
+    match db.remove_prop("a", NS_PROP) {
+        Err(GraphError::NamespaceImmutable { key, from, to }) => assert_eq!(
+            (key.as_str(), from.as_str(), to.as_str()),
+            ("a", "x", NS_DEFAULT)
+        ),
+        other => panic!("expected NamespaceImmutable, got {other:?}"),
+    }
+
+    // (b) a batched RemoveProp, which refuses the whole batch
+    let mut batch = db.batch();
+    batch.remove_prop("a", NS_PROP);
+    match batch.commit() {
+        Err(GraphError::NamespaceImmutable { from, to, .. }) => {
+            assert_eq!((from.as_str(), to.as_str()), ("x", NS_DEFAULT));
+        }
+        other => panic!("expected NamespaceImmutable, got {other:?}"),
+    }
+
+    // (c) Cypher REMOVE, if the dialect reaches it, must not be a way round.
+    if let Ok(_rs) = db.query_write("MATCH (n:Doc) WHERE n.id = 'a' REMOVE n.ns", &no_params()) {
+        assert_eq!(
+            db.namespace_of("a").as_deref(),
+            Some("x"),
+            "no Cypher path may strip the namespace"
+        );
+    }
+
+    // The node is untouched, and stays untouched across a reopen — this is the
+    // assertion that would have caught the silent move to `default`.
+    assert_eq!(db.namespace_of("a").as_deref(), Some("x"));
+    assert_eq!(db.get_prop("a", NS_PROP), Some(Value::Str("x".into())));
+    drop(db);
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.namespace_of("a").as_deref(), Some("x"));
+    assert_eq!(
+        db.namespaces(),
+        vec![NS_DEFAULT.to_string(), "x".to_string()]
+    );
+    // And the edge guard still holds, which is what the refusal protects.
+    assert!(matches!(
+        db.insert_edge("LINKS", "a", "plain"),
+        Err(GraphError::CrossNamespace { .. })
+    ));
+
+    // Removing `ns` from a node already in the default namespace is the same
+    // no-op that setting it to `default` is — there is no namespace to change.
+    let before = db.commit_seq();
+    assert!(!db.remove_prop("plain", NS_PROP).unwrap());
+    assert_eq!(db.commit_seq(), before);
+    assert_eq!(db.namespace_of("plain").as_deref(), Some(NS_DEFAULT));
+}
+
+// ---------------------------------------------------------------------------
+// 12. A global rule's crossing edge is invisible to a namespaced role
+// ---------------------------------------------------------------------------
+
+/// A global rule may derive across a boundary. A role bound to one namespace
+/// must still never see the node on the other side of such an edge — role masks
+/// are Omit-mode, so the edge goes with it.
+#[test]
+fn a_global_rules_crossing_edge_is_invisible_to_a_namespaced_role() {
+    let dir = tmp("crossing-edge-masked");
+    let mut db = two_tenant_store(&dir);
+    db.create_rule(tag_rule("global", None)).unwrap();
+    // The rule really does cross: p1 (x) → o2 (y).
+    assert!(db
+        .neighbors("p1", "TAGGED", core_api::Direction::Out)
+        .unwrap()
+        .contains(&"o2".to_string()));
+
+    db.apply_schema(&Schema {
+        roles: vec![
+            role("x-only", &["Person", "Org"], Some(&["x"])),
+            role("unscoped", &["Person", "Org"], None),
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+
+    // Cypher: no row naming a node outside the role's namespace.
+    let mask = db.mask_for_role("x-only").unwrap();
+    let rs = db
+        .query_masked("MATCH (a)-[:TAGGED]->(b) RETURN a, b", &no_params(), &mask)
+        .unwrap();
+    let pairs: Vec<(String, String)> = (0..rs.len())
+        .filter_map(|i| {
+            let row = rs.row(i);
+            match (row[0].as_ref(), row[1].as_ref()) {
+                (Some(Value::Str(a)), Some(Value::Str(b))) => Some((a.clone(), b.clone())),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("p1".to_string(), "o1".to_string()),
+            ("p2".to_string(), "o1".to_string())
+        ],
+        "only the intra-x pairs survive: every crossing edge went with its \
+         hidden endpoint: {pairs:?}"
+    );
+
+    // node_edges under the mask: Omit, so no stub and no foreign key leaks.
+    let edges = db.node_edges_masked("p1", &mask).unwrap();
+    let dsts: Vec<String> = edges.iter().map(|e| e.dst_key.clone()).collect();
+    assert_eq!(dsts, vec!["o1".to_string()], "masked node_edges: {dsts:?}");
+    assert!(
+        edges.iter().all(|e| e.src_key == "p1" && e.derived),
+        "the surviving edge is the derived intra-namespace one"
+    );
+
+    // The unscoped role still sees the crossing edge — the rule is global.
+    let wide = db.mask_for_role("unscoped").unwrap();
+    let wide_dsts: Vec<String> = db
+        .node_edges_masked("p1", &wide)
+        .unwrap()
+        .iter()
+        .map(|e| e.dst_key.clone())
+        .collect();
+    assert!(
+        wide_dsts.contains(&"o2".to_string()),
+        "an unscoped role sees what the global rule derived: {wide_dsts:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 13. A view may not own the namespace column
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_view_may_not_write_the_namespace_property() {
+    let dir = tmp("view-ns");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let err = db
+        .create_view(core_api::ViewDef {
+            name: "ns-view".into(),
+            label: "Doc".into(),
+            view_prop: NS_PROP.into(),
+            source: core_api::ViewSource::Degree {
+                edge_type: "LINKS".into(),
+                direction: core_api::Direction::Out,
+            },
+        })
+        .expect_err("a view over the reserved namespace property must be refused");
+    assert!(
+        err.to_string().contains("reserved namespace property"),
+        "{err}"
+    );
+}

@@ -61,6 +61,21 @@ impl Oracle {
         self.nodes.get(key)?.get(field)
     }
 
+    /// Whether `rule` may see the node `key` — the namespace scoping of
+    /// v0.6.6 §7.4, mirrored here so the oracle derives the same edge set the
+    /// engine does. A global rule (`namespace: None`) sees every node, which is
+    /// every rule the generators emit today.
+    fn rule_sees(&self, rule: &RuleDef, key: &str) -> bool {
+        if rule.namespace.is_none() {
+            return true;
+        }
+        let ns = self
+            .nodes
+            .get(key)
+            .and_then(|p| p.get(core_storage::NS_PROP));
+        rule.sees_namespace(core_storage::namespace_of_value(ns))
+    }
+
     pub fn neighbors(&self, key: &str, etype: &str, dir: Direction) -> Vec<String> {
         let mut out: Vec<String> = self
             .edges
@@ -181,6 +196,9 @@ impl Oracle {
                 Some(p) => p,
                 None => return HashMap::new(),
             };
+            if !self.rule_sees(rule, src_key) {
+                return HashMap::new();
+            }
             let mut out = HashMap::new();
             for (dst_key, dst_props) in &self.nodes {
                 if dst_key == src_key {
@@ -188,6 +206,9 @@ impl Oracle {
                 }
                 let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
                 if dst_label != rule.dst_label {
+                    continue;
+                }
+                if !self.rule_sees(rule, dst_key) {
                     continue;
                 }
                 let sp = |f: &str| src_props.get(f).cloned();
@@ -221,6 +242,9 @@ impl Oracle {
             None => return HashMap::new(),
         };
         let via_dir_out = rule.via_dir.map(|d| d == Direction::Out).unwrap_or(true); // None treated as Out
+        if !self.rule_sees(rule, src_key) {
+            return HashMap::new();
+        }
 
         // Find via-nodes reachable from src via via_edge in via_dir.
         let via_nodes: Vec<&str> = self
@@ -243,8 +267,12 @@ impl Oracle {
                     }
                     edge_src.as_str()
                 };
-                // Filter by via_label.
+                // Filter by via_label — and by namespace: the via node is a
+                // node, so a scoped rule does not hop through another namespace.
                 if self.labels.get(via_key).map_or("", |l| l.as_str()) != via_label {
+                    return None;
+                }
+                if !self.rule_sees(rule, via_key) {
                     return None;
                 }
                 Some(via_key)
@@ -264,6 +292,9 @@ impl Oracle {
             }
             let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
             if dst_label != rule.dst_label {
+                continue;
+            }
+            if !self.rule_sees(rule, dst_key) {
                 continue;
             }
             let dp = |f: &str| dst_props.get(f).cloned();
@@ -336,12 +367,18 @@ impl Oracle {
                         Some(p) => p,
                         None => continue,
                     };
+                    if !self.rule_sees(rule, src_key) {
+                        continue;
+                    }
                     for (dst_key, dst_props) in &self.nodes {
                         if src_key == dst_key {
                             continue; // skip self-pairs
                         }
                         let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
                         if dst_label != rule.dst_label {
+                            continue;
+                        }
+                        if !self.rule_sees(rule, dst_key) {
                             continue;
                         }
                         let sp = |f: &str| src_props.get(f).cloned();
@@ -377,12 +414,18 @@ impl Oracle {
                 if src_label != rule.src_label {
                     continue;
                 }
+                if !self.rule_sees(rule, src_key) {
+                    continue;
+                }
                 for (dst_key, dst_props) in &self.nodes {
                     if src_key == dst_key {
                         continue;
                     }
                     let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
                     if dst_label != rule.dst_label {
+                        continue;
+                    }
+                    if !self.rule_sees(rule, dst_key) {
                         continue;
                     }
                     let sp = |f: &str| src_props.get(f).cloned();
@@ -638,6 +681,9 @@ impl Oracle {
             let dst_label = self.labels.get(dst_key).map_or("", |l| l.as_str());
             if dst_label != rule.dst_label {
                 continue;
+            }
+            if !self.rule_sees(rule, src_key) || !self.rule_sees(rule, dst_key) {
+                continue; // a scoped rule derives nothing outside its namespace
             }
             let Some(src_props) = self.nodes.get(src_key) else {
                 continue;

@@ -6831,6 +6831,21 @@ impl<F: Fs> GraphDb<F> {
             .collect()
     }
 
+    /// The namespace a create-class op would put its node in: the `ns` entry of
+    /// the props it carries, normalised, with absent meaning [`NS_DEFAULT`].
+    fn created_namespace(props: &[(String, Value)]) -> &str {
+        namespace_of_value(props.iter().find(|(f, _)| f == NS_PROP).map(|(_, v)| v))
+    }
+
+    /// The definition of the role a write authorisation names.
+    ///
+    /// `None` when `roles.json` was corrupt at open or the role has since been
+    /// removed — neither can reach a write, because the authorisation carries a
+    /// mask `mask_for_role` already resolved for that name.
+    fn role_def_for(&self, role: &str) -> Option<&RoleDef> {
+        self.roles.as_ref()?.iter().find(|r| r.name == role)
+    }
+
     /// Validate the `ns` entry of a node's props and drop an explicit default.
     ///
     /// Runs on the write path only (see `rewrite_wal_dense`), never on replay:
@@ -7266,7 +7281,7 @@ impl<F: Fs> GraphDb<F> {
             // create_labels BEFORE any key lookup.  This is the structural
             // closure of the §6.2 timing-oracle item — the denial fires even
             // when the store is EMPTY (see test_create_scope_denied_empty_store).
-            BatchOp::InsertNode { label, key, .. } => {
+            BatchOp::InsertNode { label, key, props } => {
                 if !authz.scope.create_labels.contains(label) {
                     return Err(GraphError::RoleWriteDenied {
                         reason: format!(
@@ -7274,6 +7289,24 @@ impl<F: Fs> GraphDb<F> {
                             label
                         ),
                     });
+                }
+                // A role bound to namespaces may only create inside them. The
+                // never-widen rule is about what a write makes visible to *any*
+                // party, not only to the writer: a node this role could never
+                // read back is a write into somebody else's tenancy. Also a
+                // scope check, so it runs before the key lookup — it discloses
+                // nothing about the store. Covers Cypher `CREATE` and the node
+                // `MERGE` creates, both of which arrive as this op.
+                if let Some(def) = self.role_def_for(&authz.role) {
+                    let target = Self::created_namespace(props);
+                    if !def.sees_namespace(target) {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: namespace '{target}' not in the role's \
+                                 namespaces"
+                            ),
+                        });
+                    }
                 }
                 // Row 2/3: key lookup.
                 match self.ids.get(key.as_str()) {
@@ -7468,6 +7501,25 @@ impl<F: Fs> GraphDb<F> {
                         return Err(GraphError::RoleWriteDenied {
                             reason: "role-bound token: edge endpoint not visible".into(),
                         });
+                    }
+                }
+                // A placeholder is created with no props, so it lands in the
+                // default namespace. A role that cannot read `default` must not
+                // create one there, for the same reason it may not create a node
+                // there outright.
+                if let Some(def) = self.role_def_for(&authz.role) {
+                    if !def.sees_namespace(NS_DEFAULT) {
+                        for ep_key in [src_key.as_str(), dst_key.as_str()] {
+                            if self.ids.get(ep_key).is_none() && !batch_created.contains_key(ep_key)
+                            {
+                                return Err(GraphError::RoleWriteDenied {
+                                    reason: format!(
+                                        "role-bound token: namespace '{NS_DEFAULT}' not in the \
+                                         role's namespaces"
+                                    ),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -11455,6 +11507,25 @@ impl<'a, F: Fs> MutPreview<'a, F> {
 
     fn prepare_remove_prop(&self, key: &str, field: &str) -> Result<bool> {
         self.check_live_key(key)?;
+        // Removing `ns` is changing the namespace — to `default`, the namespace
+        // an absent property names. It goes through this one choke-point and NOT
+        // through `rewrite_wal_dense` (a `RemoveProp` needs no dense rewrite), so
+        // the immutability rule has to be stated here as well. Without it the
+        // node silently lands in `default` on the next open: the cross-namespace
+        // edge guard is defeated and a default-bound role reads a tenant's node.
+        if field == NS_PROP {
+            let from = self.namespace_in_batch(key);
+            if from != NS_DEFAULT {
+                return Err(GraphError::NamespaceImmutable {
+                    key: key.to_string(),
+                    from,
+                    to: NS_DEFAULT.to_string(),
+                });
+            }
+            // Already in `default`: the removal changes no namespace. It is the
+            // no-op `set_prop` to the current namespace is, not an error.
+            return Ok(false);
+        }
         Ok(self.has_prop(key, field))
     }
 

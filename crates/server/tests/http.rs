@@ -4047,6 +4047,46 @@ async fn scoped_remove_prop_scope_denied() {
     );
 }
 
+/// `DELETE /node/{key}/prop/ns` must not strip a namespace. The route reaches
+/// `BatchOp::RemoveProp`, which skips the dense-rewrite seam that refuses a
+/// namespace change, so the refusal has to hold at the batch choke-point — and
+/// it has to hold over HTTP, where a role token with update rights can ask.
+#[tokio::test]
+async fn scoped_remove_ns_prop_refused() {
+    let (app, db) = open_rbac_write(
+        "t3-rp-ns",
+        &[("agent", &["AgentNote"], Some(agent_write_scope()))],
+        Some("admin"),
+        &[("role-tok", "agent")],
+    );
+    db.write()
+        .insert_node(
+            "AgentNote",
+            "n1",
+            vec![("ns".into(), Value::Str("tenant-a".into()))],
+        )
+        .unwrap();
+    let (status, body, _) = send(app, authed_delete("/node/n1/prop/ns", "role-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "removing ns must be refused: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v = parse_json(&body);
+    let msg = v["error"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("is in namespace tenant-a")
+            && msg.contains("a namespace is set at insert and cannot be changed to default"),
+        "body must carry the immutability text: {v}"
+    );
+    assert_eq!(
+        db.read().namespace_of("n1").as_deref(),
+        Some("tenant-a"),
+        "the node keeps its namespace"
+    );
+}
+
 // ── POST /query (write Cypher) ────────────────────────────────────────────────
 
 #[tokio::test]

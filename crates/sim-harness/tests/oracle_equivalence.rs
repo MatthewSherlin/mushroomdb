@@ -2258,3 +2258,150 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
         "drift counter must be > 0 after deleting a node from an IVF-indexed rule; got {drift_after}"
     );
 }
+
+/// Deterministic oracle comparison for a **namespace-scoped** rule (v0.6.6 §7.4).
+///
+/// The oracle derives by brute force with its own namespace filter, so this is
+/// the independent check that the engine's scoping — candidate index, pair
+/// loops, via hop — agrees with the obvious reading of the rule. Six nodes that
+/// all satisfy the predicate, three per namespace, so a rule that ignored the
+/// scoping would derive a visibly larger set.
+#[test]
+fn scoped_rule_matches_the_oracle() {
+    let scoped = RuleDef {
+        name: "r_ns".into(),
+        src_label: "L0".into(),
+        dst_label: "L1".into(),
+        predicate: Predicate::FieldEqual { field: "f".into() },
+        edge_type: "r_ns".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: Some("x".into()),
+    };
+
+    let collect = |db: &GraphDb<SimFs>| -> BTreeSet<(String, String, String)> {
+        let mut out = BTreeSet::new();
+        for key in ["sx1", "sx2", "sy1", "dx1", "dy1", "dy2"] {
+            for nb in db
+                .neighbors(key, "r_ns", Direction::Out)
+                .unwrap_or_default()
+            {
+                out.insert(("r_ns".to_string(), key.to_string(), nb));
+            }
+        }
+        out
+    };
+
+    let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+    let mut oracle = Oracle::new();
+    let props = |ns: &str| {
+        vec![
+            ("f".to_string(), Value::Str("same".into())),
+            ("ns".to_string(), Value::Str(ns.to_string())),
+        ]
+    };
+    for (label, key, ns) in [
+        ("L0", "sx1", "x"),
+        ("L0", "sx2", "x"),
+        ("L0", "sy1", "y"),
+        ("L1", "dx1", "x"),
+        ("L1", "dy1", "y"),
+        ("L1", "dy2", "y"),
+    ] {
+        let p = props(ns);
+        db.insert_node(label, key, p.clone()).unwrap();
+        oracle.insert_node(label, key, &p);
+    }
+
+    // Backfill.
+    db.create_rule(scoped.clone()).unwrap();
+    oracle.create_rule(scoped.clone());
+    let eng = collect(&db);
+    let orc: BTreeSet<_> = oracle
+        .all_edges()
+        .into_iter()
+        .filter(|(et, _, _)| et == "r_ns")
+        .collect();
+    assert_eq!(eng, orc, "backfill: engine and oracle must agree");
+    assert_eq!(
+        eng.len(),
+        2,
+        "non-vacuous: sx1→dx1 and sx2→dx1 only, never a y node: {eng:?}"
+    );
+
+    // Incremental: a node arriving in each namespace.
+    for (label, key, ns) in [("L1", "dx2", "x"), ("L0", "sy2", "y")] {
+        let p = props(ns);
+        db.insert_node(label, key, p.clone()).unwrap();
+        oracle.insert_node(label, key, &p);
+    }
+    let mut eng = BTreeSet::new();
+    for key in ["sx1", "sx2", "sy1", "sy2"] {
+        for nb in db
+            .neighbors(key, "r_ns", Direction::Out)
+            .unwrap_or_default()
+        {
+            eng.insert(("r_ns".to_string(), key.to_string(), nb));
+        }
+    }
+    let orc: BTreeSet<_> = oracle
+        .all_edges()
+        .into_iter()
+        .filter(|(et, _, _)| et == "r_ns")
+        .collect();
+    assert_eq!(eng, orc, "incremental: engine and oracle must agree");
+    assert_eq!(eng.len(), 4, "two x sources × two x destinations: {eng:?}");
+
+    // A prop change inside the namespace retracts, and the oracle says so too.
+    db.set_prop("sx1", "f", Value::Str("other".into())).unwrap();
+    oracle.set_prop("sx1", "f", Value::Str("other".into()));
+    let mut eng = BTreeSet::new();
+    for key in ["sx1", "sx2", "sy1", "sy2"] {
+        for nb in db
+            .neighbors(key, "r_ns", Direction::Out)
+            .unwrap_or_default()
+        {
+            eng.insert(("r_ns".to_string(), key.to_string(), nb));
+        }
+    }
+    let orc: BTreeSet<_> = oracle
+        .all_edges()
+        .into_iter()
+        .filter(|(et, _, _)| et == "r_ns")
+        .collect();
+    assert_eq!(eng, orc, "retraction: engine and oracle must agree");
+    assert_eq!(eng.len(), 2, "sx1 dropped out: {eng:?}");
+
+    // The same rule made global derives every pair, crossing ones included.
+    db.delete_rule("r_ns").unwrap();
+    oracle.delete_rule("r_ns");
+    let global = RuleDef {
+        namespace: None,
+        ..scoped
+    };
+    db.create_rule(global.clone()).unwrap();
+    oracle.create_rule(global);
+    let mut eng = BTreeSet::new();
+    for key in ["sx1", "sx2", "sy1", "sy2"] {
+        for nb in db
+            .neighbors(key, "r_ns", Direction::Out)
+            .unwrap_or_default()
+        {
+            eng.insert(("r_ns".to_string(), key.to_string(), nb));
+        }
+    }
+    let orc: BTreeSet<_> = oracle
+        .all_edges()
+        .into_iter()
+        .filter(|(et, _, _)| et == "r_ns")
+        .collect();
+    assert_eq!(eng, orc, "global: engine and oracle must agree");
+    assert!(
+        eng.contains(&("r_ns".to_string(), "sy1".to_string(), "dx1".to_string())),
+        "a global rule crosses the boundary: {eng:?}"
+    );
+}

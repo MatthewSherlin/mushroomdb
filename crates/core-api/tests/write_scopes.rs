@@ -1481,3 +1481,172 @@ fn test_predicate_narrows_the_write_target_set() {
         "hidden-by-predicate must be byte-equal to absent — no existence oracle"
     );
 }
+
+// ── Namespace binding on the create gate (v0.6.6 §7) ─────────────────────────
+
+/// `writer`, bound to namespace `x`, with the same write scope.
+fn tenant_writer_role() -> RoleDef {
+    RoleDef {
+        namespaces: Some(vec!["x".into()]),
+        ..writer_role()
+    }
+}
+
+fn open_with_tenant_writer(name: &str) -> (GraphDb<core_storage::fs::RealFs>, std::path::PathBuf) {
+    let dir = tmp(name);
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.apply_schema(&Schema {
+        roles: vec![tenant_writer_role()],
+        ..Default::default()
+    })
+    .unwrap();
+    (db, dir)
+}
+
+fn ns_prop(n: &str) -> (String, Value) {
+    (core_api::NS_PROP.to_string(), Value::Str(n.to_string()))
+}
+
+/// A role bound to a namespace may only create inside it. The never-widen rule
+/// is about what a write makes visible to *any* party: a node the writer could
+/// never read back is a write into somebody else's tenancy.
+#[test]
+fn test_create_outside_the_roles_namespace_denied() {
+    let (mut db, _dir) = open_with_tenant_writer("create-foreign-ns");
+    let authz = writer_authz(&mut db);
+
+    // Inside the role's namespace: allowed.
+    db.write_batch_authz(
+        Some(&authz),
+        vec![BatchOp::InsertNode {
+            label: "MyLabel".into(),
+            key: "mine".into(),
+            props: vec![ns_prop("x")],
+        }],
+    )
+    .unwrap();
+    assert_eq!(db.namespace_of("mine").as_deref(), Some("x"));
+
+    // Another tenant's namespace: denied, and nothing is written.
+    let authz = writer_authz(&mut db);
+    let err = db
+        .write_batch_authz(
+            Some(&authz),
+            vec![BatchOp::InsertNode {
+                label: "MyLabel".into(),
+                key: "theirs".into(),
+                props: vec![ns_prop("y")],
+            }],
+        )
+        .unwrap_err();
+    assert!(is_role_write_denied(&err), "got {err:?}");
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: namespace 'y' not in the role's namespaces"
+    );
+    assert!(!db.has_node("theirs"));
+
+    // The default namespace is a namespace like any other: an `ns`-less create
+    // by an x-bound role lands in `default` and is denied too.
+    let authz = writer_authz(&mut db);
+    let err = db
+        .write_batch_authz(
+            Some(&authz),
+            vec![BatchOp::InsertNode {
+                label: "MyLabel".into(),
+                key: "bare".into(),
+                props: vec![],
+            }],
+        )
+        .unwrap_err();
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: namespace 'default' not in the role's namespaces"
+    );
+    assert!(!db.has_node("bare"));
+
+    // An upsert-edge whose placeholder endpoint would be created lands in
+    // `default` too, so it is refused on the same ground.
+    let authz = writer_authz(&mut db);
+    let err = db
+        .write_batch_authz(
+            Some(&authz),
+            vec![BatchOp::InsertEdgeUpsert {
+                edge_type: "KNOWS".into(),
+                src_key: "mine".into(),
+                dst_key: "ghost".into(),
+                placeholder_label: "MyLabel".into(),
+            }],
+        )
+        .unwrap_err();
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: namespace 'default' not in the role's namespaces"
+    );
+    assert!(!db.has_node("ghost"));
+}
+
+/// The same gate on the Cypher path: `CREATE` and the node `MERGE` creates both
+/// arrive as `BatchOp::InsertNode`.
+#[test]
+fn test_cypher_create_outside_the_roles_namespace_denied() {
+    let (mut db, _dir) = open_with_tenant_writer("cypher-foreign-ns");
+
+    let err = db
+        .query_write_authz(
+            "writer",
+            "CREATE (n:MyLabel {id: 'theirs', ns: 'y'})",
+            &no_params(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: namespace 'y' not in the role's namespaces"
+    );
+    assert!(!db.has_node("theirs"));
+
+    // MERGE's create arm is the same op, so the same refusal.
+    let err = db
+        .query_write_authz("writer", "MERGE (n:MyLabel {id: 'merged'})", &no_params())
+        .unwrap_err();
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: namespace 'default' not in the role's namespaces"
+    );
+    assert!(!db.has_node("merged"));
+
+    // Inside the namespace the same statement succeeds.
+    db.query_write_authz(
+        "writer",
+        "CREATE (n:MyLabel {id: 'mine', ns: 'x'})",
+        &no_params(),
+    )
+    .unwrap();
+    assert_eq!(db.namespace_of("mine").as_deref(), Some("x"));
+}
+
+/// A role with no namespace binding is unchanged: it creates wherever it likes,
+/// exactly as it did before namespaces existed.
+#[test]
+fn test_unscoped_role_may_create_in_any_namespace() {
+    let (mut db, _dir) = open_with_writer("create-unscoped-ns");
+    let authz = writer_authz(&mut db);
+    db.write_batch_authz(
+        Some(&authz),
+        vec![
+            BatchOp::InsertNode {
+                label: "MyLabel".into(),
+                key: "bare".into(),
+                props: vec![],
+            },
+            BatchOp::InsertNode {
+                label: "MyLabel".into(),
+                key: "tenanted".into(),
+                props: vec![ns_prop("y")],
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(db.namespace_of("bare").as_deref(), Some("default"));
+    assert_eq!(db.namespace_of("tenanted").as_deref(), Some("y"));
+}

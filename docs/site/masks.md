@@ -132,10 +132,20 @@ node d1 is in namespace tenant-a; a namespace is set at insert and cannot be
 changed to tenant-b — delete and re-insert the node instead
 ```
 
-Writing the namespace a node is already in is a no-op, not an error. `rename_node`
-changes the key, not the namespace. Moving a node between tenants is a deletion
-from one and a creation in the other, and saying so is more honest than a property
-edit that silently re-homes every edge the node carries.
+**Removing `ns` is changing it**, to `default` — the namespace an absent property
+names — so it is refused with the same error: `remove_prop`, a batched
+`RemoveProp`, Cypher `REMOVE n.ns`, and `DELETE /node/{key}/prop/ns` all return it.
+
+Writing the namespace a node is already in is a no-op, not an error, and so is
+removing `ns` from a node already in `default`: neither changes a namespace, and
+neither takes a commit. `rename_node` changes the key, not the namespace. Moving a
+node between tenants is a deletion from one and a creation in the other, and saying
+so is more honest than a property edit that silently re-homes every edge the node
+carries.
+
+A materialized view may not own the `ns` column either: a `view_prop` of `"ns"` is
+refused when the view is created, because a view rewrites its column on every
+relevant change and that is exactly what immutability forbids.
 
 ### A role binds to namespaces — `roles.json` version 4
 
@@ -181,6 +191,26 @@ every tenant. An unrecognised version poisons the roles state and denies every r
 Versions 1–3 still load, and version 4 is written **only** when some role actually
 carries a `namespaces` binding — a store that uses no namespaces keeps the sidecar
 version it had.
+
+### A role writes only into its own namespaces
+
+A role bound to `namespaces` may only **create** a node inside them. The never-widen
+rule is about what a write makes visible to *any* party, not only to the writer: a
+node the role could never read back would be a write into somebody else's tenancy.
+The refusal is a 403 with
+
+```
+role-bound token: namespace '<ns>' not in the role's namespaces
+```
+
+and it covers `POST /nodes`, a batch, Cypher `CREATE`, the node `MERGE` creates, and
+the placeholder endpoints `POST /edges/upsert` would auto-create (those carry no
+props, so they land in `default`). A create without an `ns` is a create in `default`,
+so an `x`-bound role is refused there too. A role with no `namespaces` binding is
+unchanged: it writes wherever its label scope allows.
+
+Updates need no separate rule — a role can only mutate nodes already in its read
+mask, and the namespace leg has already narrowed that.
 
 ### No cross-namespace edges
 
