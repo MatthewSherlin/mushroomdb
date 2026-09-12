@@ -2569,3 +2569,144 @@ fn scoped_via_rule_matches_the_oracle() {
         both(&db)
     );
 }
+
+/// The via-hop namespace gate, reached through a hop that **crosses** the
+/// boundary (v0.6.6 §7.4).
+///
+/// A user edge cannot cross, so the only way a crossing hop exists is a global
+/// rule deriving one — which is exactly what this builds: a global rule writes
+/// `sx1 -HOP→ hy`, and a rule scoped to `x` then uses `HOP` as its `via_edge`.
+/// The foreign hub `hy` shares its tag with an **x** destination, so without the
+/// via-side gate the scoped rule would derive `sx1 → dx` *through another
+/// tenant's node*; the in-x hub `hx` deliberately does not match `dx`, so that
+/// edge can only come from the foreign hop.
+///
+/// The oracle expands via-hops over its own edge set, so it is told about the
+/// crossing edge the global rule derived (`insert_edge`) — the engine has it in
+/// its topology either way, and what is being compared is the *scoped* rule's
+/// edge type, never `HOP` itself.
+#[test]
+fn a_scoped_via_rule_ignores_a_derived_crossing_hop() {
+    // Global: Src → Hub on a shared `link`, deriving HOP edges that may cross.
+    let hop_rule = RuleDef {
+        name: "r_hop".into(),
+        src_label: "L0".into(),
+        dst_label: "L2".into(),
+        predicate: Predicate::FieldEqual {
+            field: "link".into(),
+        },
+        edge_type: "HOP".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    };
+    // Scoped to x: Src -[HOP]→ Hub, predicate between Hub and Doc.
+    let via_rule = |namespace: Option<&str>| RuleDef {
+        name: "r_vcross".into(),
+        src_label: "L0".into(),
+        dst_label: "L1".into(),
+        predicate: Predicate::FieldEqual {
+            field: "tag".into(),
+        },
+        edge_type: "VCROSS".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("L2".into()),
+        via_edge: Some("HOP".into()),
+        via_dir: None, // Out: src → via
+        namespace: namespace.map(str::to_string),
+    };
+
+    let collect = |db: &GraphDb<SimFs>| -> BTreeSet<(String, String, String)> {
+        let mut out = BTreeSet::new();
+        for key in ["sx1"] {
+            for nb in db
+                .neighbors(key, "VCROSS", Direction::Out)
+                .unwrap_or_default()
+            {
+                out.insert(("VCROSS".to_string(), key.to_string(), nb));
+            }
+        }
+        out
+    };
+    let orc = |oracle: &Oracle| -> BTreeSet<(String, String, String)> {
+        oracle
+            .all_edges()
+            .into_iter()
+            .filter(|(et, _, _)| et == "VCROSS")
+            .collect()
+    };
+
+    let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+    let mut oracle = Oracle::new();
+    // `hy` (namespace y) carries the tag of `dx` (namespace x): the trap.
+    // `hx` (namespace x) carries a tag only `dz` (namespace x) answers, so the
+    // rule has something legitimate to derive and the test is not vacuous.
+    for (label, key, ns, field, value) in [
+        ("L0", "sx1", "x", "link", "L"),
+        ("L2", "hx", "x", "tag", "T-HX"),
+        ("L2", "hy", "y", "tag", "T-DX"),
+        ("L1", "dx", "x", "tag", "T-DX"),
+        ("L1", "dz", "x", "tag", "T-HX"),
+    ] {
+        let mut props = vec![("ns".to_string(), Value::Str(ns.into()))];
+        props.push((field.to_string(), Value::Str(value.into())));
+        if label == "L2" {
+            // Both hubs are reachable from sx1, so the hop itself never decides
+            // which destination is in play — the namespace gate does.
+            props.push(("link".to_string(), Value::Str("L".into())));
+        }
+        db.insert_node(label, key, props.clone()).unwrap();
+        oracle.insert_node(label, key, &props);
+    }
+
+    // The global rule derives both hops, including the crossing one.
+    db.create_rule(hop_rule).unwrap();
+    let hops: BTreeSet<String> = db
+        .neighbors("sx1", "HOP", Direction::Out)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        hops,
+        BTreeSet::from(["hx".to_string(), "hy".to_string()]),
+        "a global rule may derive a crossing edge, and this test needs it to: {hops:?}"
+    );
+    // Tell the oracle the edges exist; it models via-hops over its edge set.
+    oracle.insert_edge("HOP", "sx1", "hx");
+    oracle.insert_edge("HOP", "sx1", "hy");
+
+    // Scoped to x: the foreign hub is not a hop this rule may take, so `dx` —
+    // reachable only through `hy` — is not derived. `dz` is, through `hx`.
+    db.create_rule(via_rule(Some("x"))).unwrap();
+    oracle.create_rule(via_rule(Some("x")));
+    let eng = collect(&db);
+    assert_eq!(eng, orc(&oracle), "scoped: engine and oracle must agree");
+    assert_eq!(
+        eng,
+        BTreeSet::from([("VCROSS".to_string(), "sx1".to_string(), "dz".to_string())]),
+        "only the hop inside x may be taken, so dx is unreachable: {eng:?}"
+    );
+
+    // Global: the same rule may hop through the other namespace, and then `dx`
+    // appears. That is the difference the gate makes, stated as an edge.
+    db.delete_rule("r_vcross").unwrap();
+    oracle.delete_rule("r_vcross");
+    db.create_rule(via_rule(None)).unwrap();
+    oracle.create_rule(via_rule(None));
+    let eng = collect(&db);
+    assert_eq!(eng, orc(&oracle), "global: engine and oracle must agree");
+    assert_eq!(
+        eng,
+        BTreeSet::from([
+            ("VCROSS".to_string(), "sx1".to_string(), "dx".to_string()),
+            ("VCROSS".to_string(), "sx1".to_string(), "dz".to_string()),
+        ]),
+        "a global via-hop rule may reach dx through hy: {eng:?}"
+    );
+}

@@ -1106,15 +1106,15 @@ fn a_duplicate_ns_property_is_refused() {
     assert!(err.to_string().contains("given more than once"), "{err}");
     assert!(!db.has_node("b"));
 
-    // (c) Cypher CREATE, if the dialect carries both entries through.
-    match db.query_write("CREATE (n:Doc {id: 'c', ns: 'x', ns: 'y'})", &no_params()) {
-        Err(e) => assert!(
-            e.to_string().contains("given more than once")
-                || matches!(e, GraphError::QueryError { .. }),
-            "a duplicate ns must be refused, not resolved: {e}"
-        ),
-        Ok(_) => panic!("Cypher CREATE with two ns entries must not succeed"),
-    }
+    // (c) Cypher CREATE carries both entries through to the props list, so what
+    // fires is this refusal and not a parse error.
+    let err = db
+        .query_write("CREATE (n:Doc {id: 'c', ns: 'x', ns: 'y'})", &no_params())
+        .expect_err("two ns entries must be refused");
+    assert!(
+        err.to_string().contains("given more than once"),
+        "the duplicate-ns refusal must be what fires: {err}"
+    );
     assert!(!db.has_node("c"));
 
     // One entry is unchanged, and so is none.
@@ -1168,4 +1168,193 @@ fn merge_creates_in_the_default_namespace_only() {
     .unwrap();
     assert_eq!(db.get_prop("existing", "seen"), Some(Value::Int(1)));
     assert_eq!(db.namespace_of("existing").as_deref(), Some("x"));
+}
+
+// ---------------------------------------------------------------------------
+// 17. The sliced vector-index build is namespace-scoped too
+// ---------------------------------------------------------------------------
+
+/// A rule whose vector corpus exceeds one build slice has its HNSW graph built
+/// by `pump_index_build`, a slice at a time, through a different code path from
+/// the one-commit build every other test here takes
+/// (`RuleEngine::run_build_slice`). That path files vectors itself, so it needs
+/// the same namespace gate — otherwise a scoped rule's graph holds the other
+/// tenant's vectors, the beam's floor proof is taken over a corpus the rule
+/// cannot see, and the progress it reports counts a different population from
+/// the one `hnsw_build_total` sized.
+///
+/// Twelve nodes, six per namespace, every vector mutually similar above `min`,
+/// and a slice of 2 so the build is genuinely sliced (6 > 2). Exact and
+/// approximate both defer from 0.6.6 — both take this path — so both are run.
+#[test]
+fn a_sliced_build_files_only_its_own_namespace() {
+    /// `i`-th vector: all mutually similar well above 0.9, all distinct.
+    fn vec_of(i: usize) -> Value {
+        Value::List(vec![
+            Value::Float(1.0),
+            Value::Float(i as f64 * 0.01),
+            Value::Float(0.0),
+        ])
+    }
+    fn cosine(a: &[f64], b: &[f64]) -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let nb: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+        dot / (na * nb)
+    }
+    fn raw(i: usize) -> Vec<f64> {
+        vec![1.0, i as f64 * 0.01, 0.0]
+    }
+
+    const MIN: f64 = 0.9;
+    // ids 0..6 are namespace x, 6..12 are namespace y.
+    let key_of = |i: usize| {
+        if i < 6 {
+            format!("x{i}")
+        } else {
+            format!("y{i}")
+        }
+    };
+
+    for approximate in [false, true] {
+        let label = if approximate { "approx" } else { "exact" };
+        let dir = tmp(&format!("sliced-ns-{label}"));
+        let mut db = GraphDb::open(&dir).unwrap();
+        for i in 0..12 {
+            let namespace = if i < 6 { "x" } else { "y" };
+            db.insert_node(
+                "Vec",
+                &key_of(i),
+                vec![("emb".into(), vec_of(i)), ns(namespace)],
+            )
+            .unwrap();
+        }
+
+        // A slice of 2 against a 6-vector population: the build must defer.
+        db.set_hnsw_build_batch(Some(2));
+        db.create_rule(RuleDef {
+            name: "sim".into(),
+            src_label: "Vec".into(),
+            dst_label: "Vec".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: MIN,
+            },
+            edge_type: "SIM".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: Some("x".into()),
+        })
+        .unwrap();
+
+        // The build is outstanding, and it is sized by the x population alone —
+        // this is the counting half of the gate. 12 here would mean the slice
+        // loop and `hnsw_build_total` disagree about whose vectors are in play.
+        let pending = db
+            .builds_in_progress()
+            .into_iter()
+            .find(|b| b.rule == "sim")
+            .unwrap_or_else(|| panic!("{label}: a 6-vector corpus at a slice of 2 must defer"));
+        assert_eq!(
+            pending.total, 6,
+            "{label}: the build covers namespace x only, not all twelve nodes"
+        );
+        assert_eq!(
+            db.stats()
+                .rules
+                .iter()
+                .find(|r| r.name == "sim")
+                .map(|r| r.edges),
+            Some(0),
+            "{label}: a rule that is still building derives nothing"
+        );
+
+        // Pump to completion, keeping the progress of the call that finished it.
+        let mut finished: Vec<core_api::BuildProgress> = Vec::new();
+        loop {
+            let (done, outstanding) = db.pump_index_build_reporting().unwrap();
+            finished.extend(done);
+            if outstanding.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            db.builds_in_progress().is_empty(),
+            "{label}: the build must drain"
+        );
+        let done = finished
+            .iter()
+            .find(|b| b.rule == "sim")
+            .unwrap_or_else(|| panic!("{label}: the finishing slice must report the rule"));
+        assert_eq!(
+            (done.indexed, done.total),
+            (6, 6),
+            "{label}: every x vector filed, and only those"
+        );
+
+        // Index purity, read through the public ANN path. `find_similar_vector`
+        // asks a rule's dst-side HNSW for candidates and then re-scores them, so
+        // with `min = 0.0` and a `k` larger than the whole store the answer is
+        // whatever the graph holds: six x keys if the slice loop honoured the
+        // namespace, twelve if it did not.
+        //
+        // Only reachable for the approximate rule: `hnsw_search_dst` and
+        // `hnsw_search_any_dst` consult `approximate` rules' graphs only, so an
+        // exact rule's graph is not addressable from a query and the probe would
+        // measure the brute-force fallback (all twelve) instead of the index. For
+        // the exact rule the counting assertion above and the derived set below
+        // are what hold the gate.
+        //
+        // This says something about the *index*, not about visibility: an ANN
+        // query is not namespace-scoped, and a role mask is what hides a node.
+        if approximate {
+            let q = raw(0);
+            for scope in [Some("Vec"), None] {
+                let hits = db.find_similar_vector("emb", scope, &q, 50, 0.0);
+                let keys: std::collections::BTreeSet<String> =
+                    hits.iter().map(|(k, _)| k.clone()).collect();
+                assert_eq!(
+                    keys.len(),
+                    6,
+                    "{label}: scope {scope:?} — the scoped rule's graph holds six \
+                     vectors: {keys:?}"
+                );
+                assert!(
+                    keys.iter().all(|k| k.starts_with('x')),
+                    "{label}: scope {scope:?} — no y vector may be in the index: {keys:?}"
+                );
+            }
+        }
+
+        // The derived set is the exact scan restricted to x.
+        let mut want: Vec<(String, String)> = Vec::new();
+        for i in 0..6 {
+            for j in 0..6 {
+                if i != j && cosine(&raw(i), &raw(j)) >= MIN {
+                    want.push((key_of(i), key_of(j)));
+                }
+            }
+        }
+        want.sort();
+        assert_eq!(want.len(), 30, "the fixture must be a full intra-x mesh");
+        let mut got: Vec<(String, String)> = Vec::new();
+        for i in 0..12 {
+            let k = key_of(i);
+            for d in db
+                .neighbors(&k, "SIM", core_api::Direction::Out)
+                .unwrap_or_default()
+            {
+                got.push((k.clone(), d));
+            }
+        }
+        got.sort();
+        assert_eq!(
+            got, want,
+            "{label}: the backfill derives the exact scan restricted to x"
+        );
+    }
 }
