@@ -817,14 +817,16 @@ fn removing_the_ns_property_is_refused() {
         other => panic!("expected NamespaceImmutable, got {other:?}"),
     }
 
-    // (c) Cypher REMOVE, if the dialect reaches it, must not be a way round.
-    if let Ok(_rs) = db.query_write("MATCH (n:Doc) WHERE n.id = 'a' REMOVE n.ns", &no_params()) {
-        assert_eq!(
-            db.namespace_of("a").as_deref(),
-            Some("x"),
-            "no Cypher path may strip the namespace"
-        );
-    }
+    // (c) There is no Cypher path to a property removal at all — the dialect has
+    // no REMOVE — so the statement is a query error, not a second way round the
+    // refusal. Pinned so that adding REMOVE has to decide about `ns` on purpose.
+    let err = db
+        .query_write("MATCH (n:Doc) WHERE n.id = 'a' REMOVE n.ns", &no_params())
+        .expect_err("the dialect has no REMOVE");
+    assert!(
+        matches!(err, GraphError::QueryError { .. }),
+        "expected a query error, got {err:?}"
+    );
 
     // The node is untouched, and stays untouched across a reopen — this is the
     // assertion that would have caught the silent move to `default`.
@@ -1069,4 +1071,101 @@ fn a_namespaced_vector_rule_never_pairs_across_namespaces() {
             "a global vector rule may cross the boundary"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 15. A props list names the namespace once, or not at all
+// ---------------------------------------------------------------------------
+
+/// Two `ns` entries in one props list is the shape where "the node's namespace"
+/// stops being a single fact: one reader takes the first entry and another the
+/// last, and a create checked against `x` lands in `y`. One entry or none.
+#[test]
+fn a_duplicate_ns_property_is_refused() {
+    let dir = tmp("dup-ns");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // (a) insert_node
+    let err = db
+        .insert_node(
+            "Doc",
+            "a",
+            vec![("id".into(), Value::Str("a".into())), ns("x"), ns("y")],
+        )
+        .expect_err("two ns entries must be refused");
+    assert!(
+        err.to_string().contains("given more than once"),
+        "message: {err}"
+    );
+    assert!(!db.has_node("a"), "nothing was written");
+
+    // (b) a batch
+    let mut batch = db.batch();
+    batch.insert_node("Doc", "b", vec![ns("x"), ns("y")]);
+    let err = batch.commit().expect_err("two ns entries must be refused");
+    assert!(err.to_string().contains("given more than once"), "{err}");
+    assert!(!db.has_node("b"));
+
+    // (c) Cypher CREATE, if the dialect carries both entries through.
+    match db.query_write("CREATE (n:Doc {id: 'c', ns: 'x', ns: 'y'})", &no_params()) {
+        Err(e) => assert!(
+            e.to_string().contains("given more than once")
+                || matches!(e, GraphError::QueryError { .. }),
+            "a duplicate ns must be refused, not resolved: {e}"
+        ),
+        Ok(_) => panic!("Cypher CREATE with two ns entries must not succeed"),
+    }
+    assert!(!db.has_node("c"));
+
+    // One entry is unchanged, and so is none.
+    db.insert_node("Doc", "one", vec![ns("x")]).unwrap();
+    db.insert_node("Doc", "none", vec![]).unwrap();
+    assert_eq!(db.namespace_of("one").as_deref(), Some("x"));
+    assert_eq!(db.namespace_of("none").as_deref(), Some(NS_DEFAULT));
+    db.query_write("CREATE (n:Doc {id: 'cy', ns: 'x'})", &no_params())
+        .unwrap();
+    assert_eq!(db.namespace_of("cy").as_deref(), Some("x"));
+}
+
+// ---------------------------------------------------------------------------
+// 16. MERGE creates in the default namespace, and says so
+// ---------------------------------------------------------------------------
+
+/// `MERGE` carries only its identifying property into the create, so it creates
+/// in the default namespace — for every caller. A role bound to a namespace
+/// therefore cannot MERGE-create, and `ON CREATE SET n.ns` cannot rescue it
+/// because that is a namespace change. The match arm is unaffected.
+#[test]
+fn merge_creates_in_the_default_namespace_only() {
+    let dir = tmp("merge-ns");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Doc", "existing", vec![ns("x")]).unwrap();
+
+    // A full-authority MERGE creates in `default`, even beside a namespaced node.
+    db.query_write("MERGE (n:Doc {id: 'plain'})", &no_params())
+        .unwrap();
+    assert_eq!(db.namespace_of("plain").as_deref(), Some(NS_DEFAULT));
+
+    // `ON CREATE SET n.ns` is a namespace change, and is refused as one — the
+    // node is created in `default` by the same batch, so the set cannot move it.
+    let err = db
+        .query_write(
+            "MERGE (n:Doc {id: 'moved'}) ON CREATE SET n.ns = 'x'",
+            &no_params(),
+        )
+        .expect_err("ON CREATE SET n.ns must be refused");
+    assert!(
+        matches!(err, GraphError::NamespaceImmutable { .. }),
+        "expected NamespaceImmutable, got {err:?}"
+    );
+    assert!(!db.has_node("moved"), "the whole statement was refused");
+
+    // The match arm of a MERGE on a namespaced node still works.
+    db.query_write(
+        "MERGE (n:Doc {id: 'existing'}) ON MATCH SET n.seen = 1",
+        &no_params(),
+    )
+    .unwrap();
+    assert_eq!(db.get_prop("existing", "seen"), Some(Value::Int(1)));
+    assert_eq!(db.namespace_of("existing").as_deref(), Some("x"));
 }

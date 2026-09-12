@@ -2420,3 +2420,152 @@ fn scoped_rule_matches_the_oracle() {
         "a global rule crosses the boundary: {eng:?}"
     );
 }
+
+/// The via-hop half of the same comparison: a scoped rule must not hop through
+/// another namespace to reach a destination, and the oracle — which expands the
+/// hop itself, with its own namespace filter — is the independent check.
+///
+/// `sx1 -[e0]→ hx (x)` and `sx1 -[e0]→ hy (y)`: the same source reaches a via
+/// node in each namespace, and each via node is the only route to one
+/// destination. A rule scoped to `x` must derive the `x` destination only.
+#[test]
+fn scoped_via_rule_matches_the_oracle() {
+    let rule = |namespace: Option<&str>| RuleDef {
+        name: "r_vns".into(),
+        src_label: "L0".into(),
+        dst_label: "L1".into(),
+        predicate: Predicate::FieldEqual { field: "f".into() },
+        edge_type: "r_vns".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("L2".into()),
+        via_edge: Some("e0".into()),
+        via_dir: None, // Out: src → via
+        namespace: namespace.map(str::to_string),
+    };
+    let srcs = ["sx1"];
+    let collect = |db: &GraphDb<SimFs>| -> BTreeSet<(String, String, String)> {
+        let mut out = BTreeSet::new();
+        for key in srcs {
+            for nb in db
+                .neighbors(key, "r_vns", Direction::Out)
+                .unwrap_or_default()
+            {
+                out.insert(("r_vns".to_string(), key.to_string(), nb));
+            }
+        }
+        out
+    };
+    let orc = |oracle: &Oracle| -> BTreeSet<(String, String, String)> {
+        oracle
+            .all_edges()
+            .into_iter()
+            .filter(|(et, _, _)| et == "r_vns")
+            .collect()
+    };
+
+    let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+    let mut oracle = Oracle::new();
+    // Each via node shares `f` with exactly one destination, so the hop decides
+    // which destination is reachable; both hops leave the same source.
+    for (label, key, ns, f) in [
+        ("L0", "sx1", "x", "anything"),
+        ("L2", "hx", "x", "in-x"),
+        ("L2", "hy", "y", "in-y"),
+        ("L1", "dx", "x", "in-x"),
+        ("L1", "dy", "y", "in-y"),
+    ] {
+        let props = vec![
+            ("f".to_string(), Value::Str(f.into())),
+            ("ns".to_string(), Value::Str(ns.into())),
+        ];
+        db.insert_node(label, key, props.clone()).unwrap();
+        oracle.insert_node(label, key, &props);
+    }
+    // `sx1 → hx` is the hop inside x. The hop into y, `sx1 → hy`, is exactly the
+    // edge the CrossNamespace guard refuses — a user edge cannot cross — which is
+    // worth pinning here because it bounds what a via-hop rule can ever see: a
+    // scoped rule's hop is intra-namespace by the time it is asked.
+    db.insert_edge("e0", "sx1", "hx").unwrap();
+    oracle.insert_edge("e0", "sx1", "hx");
+    assert!(
+        matches!(
+            db.insert_edge("e0", "sx1", "hy"),
+            Err(GraphError::CrossNamespace { .. })
+        ),
+        "a user edge may not cross a namespace boundary"
+    );
+
+    // Scoped to x: the one reachable destination is dx, through hx.
+    db.create_rule(rule(Some("x"))).unwrap();
+    oracle.create_rule(rule(Some("x")));
+    let eng = collect(&db);
+    assert_eq!(
+        eng,
+        orc(&oracle),
+        "scoped via: engine and oracle must agree"
+    );
+    assert_eq!(
+        eng,
+        BTreeSet::from([("r_vns".to_string(), "sx1".to_string(), "dx".to_string())]),
+        "non-vacuous: sx1 → dx through hx, and nothing else: {eng:?}"
+    );
+
+    // The same rule made global derives the same set here, because the only hop
+    // that exists is the intra-x one: the crossing hop was refused above, so a
+    // global via-hop rule has nothing extra to walk. Agreement with the oracle is
+    // the point — both arrive at the same answer by different routes.
+    db.delete_rule("r_vns").unwrap();
+    oracle.delete_rule("r_vns");
+    db.create_rule(rule(None)).unwrap();
+    oracle.create_rule(rule(None));
+    let eng = collect(&db);
+    assert_eq!(
+        eng,
+        orc(&oracle),
+        "global via: engine and oracle must agree"
+    );
+    assert_eq!(
+        eng,
+        BTreeSet::from([("r_vns".to_string(), "sx1".to_string(), "dx".to_string())]),
+        "the only hop that exists is sx1 → hx, so the answer is the same set: {eng:?}"
+    );
+
+    // A second source in y with its own hop: the scoped rule ignores it, the
+    // global one derives it.
+    let sy1_props = vec![
+        ("f".to_string(), Value::Str("anything".into())),
+        ("ns".to_string(), Value::Str("y".into())),
+    ];
+    db.insert_node("L0", "sy1", sy1_props.clone()).unwrap();
+    oracle.insert_node("L0", "sy1", &sy1_props);
+    db.insert_edge("e0", "sy1", "hy").unwrap();
+    oracle.insert_edge("e0", "sy1", "hy");
+    let both = |db: &GraphDb<SimFs>| -> BTreeSet<(String, String, String)> {
+        let mut out = BTreeSet::new();
+        for key in ["sx1", "sy1"] {
+            for nb in db
+                .neighbors(key, "r_vns", Direction::Out)
+                .unwrap_or_default()
+            {
+                out.insert(("r_vns".to_string(), key.to_string(), nb));
+            }
+        }
+        out
+    };
+    assert_eq!(both(&db), orc(&oracle), "global via, two sources");
+    assert_eq!(both(&db).len(), 2, "sx1 → dx and sy1 → dy: {:?}", both(&db));
+
+    db.delete_rule("r_vns").unwrap();
+    oracle.delete_rule("r_vns");
+    db.create_rule(rule(Some("x"))).unwrap();
+    oracle.create_rule(rule(Some("x")));
+    assert_eq!(both(&db), orc(&oracle), "scoped via, two sources");
+    assert_eq!(
+        both(&db),
+        BTreeSet::from([("r_vns".to_string(), "sx1".to_string(), "dx".to_string())]),
+        "the y source and its hop are invisible to the x-scoped rule: {:?}",
+        both(&db)
+    );
+}

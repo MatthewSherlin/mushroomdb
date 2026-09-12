@@ -6877,8 +6877,36 @@ impl<F: Fs> GraphDb<F> {
 
     /// The namespace a create-class op would put its node in: the `ns` entry of
     /// the props it carries, normalised, with absent meaning [`NS_DEFAULT`].
-    fn created_namespace(props: &[(String, Value)]) -> &str {
-        namespace_of_value(props.iter().find(|(f, _)| f == NS_PROP).map(|(_, v)| v))
+    fn created_namespace<'a>(key: &str, props: &'a [(String, Value)]) -> Result<&'a str> {
+        Ok(namespace_of_value(Self::sole_ns_entry(key, props)?))
+    }
+
+    /// The one `ns` entry in a node's props, or `None` when it carries none.
+    ///
+    /// A props list naming `ns` twice is refused. Without that refusal the
+    /// write path and the authorisation path can read the same list
+    /// differently — one taking the first entry, the other the last — and
+    /// `CREATE (n:L {ns: 'mine', ns: 'theirs'})` lands a node in a namespace
+    /// the role was checked against the other of. One entry is the only shape
+    /// where "the node's namespace" is a single fact, so it is the only shape
+    /// accepted, and every reader of it agrees by construction.
+    fn sole_ns_entry<'a>(key: &str, props: &'a [(String, Value)]) -> Result<Option<&'a Value>> {
+        let mut found: Option<&'a Value> = None;
+        for (field, value) in props {
+            if field != NS_PROP {
+                continue;
+            }
+            if found.is_some() {
+                return Err(GraphError::RuleInvalid {
+                    detail: format!(
+                        "node {key}: {NS_PROP} is given more than once; a node has exactly \
+                         one namespace"
+                    ),
+                });
+            }
+            found = Some(value);
+        }
+        Ok(found)
     }
 
     /// The definition of the role a write authorisation names.
@@ -6898,6 +6926,11 @@ impl<F: Fs> GraphDb<F> {
         key: &str,
         props: Vec<(String, Value)>,
     ) -> Result<(Vec<(String, Value)>, String)> {
+        // One `ns` or none: this is where that is enforced, so every later
+        // reader of the list — the authorisation gate, the two `apply` arms,
+        // `node_ns` — is looking at a single entry and cannot disagree about
+        // which one counts.
+        Self::sole_ns_entry(key, &props)?;
         let mut name = NS_DEFAULT.to_string();
         let mut out = Vec::with_capacity(props.len());
         for (field, value) in props {
@@ -7341,8 +7374,12 @@ impl<F: Fs> GraphDb<F> {
                 // scope check, so it runs before the key lookup — it discloses
                 // nothing about the store. Covers Cypher `CREATE` and the node
                 // `MERGE` creates, both of which arrive as this op.
+                // Resolved before the role lookup so a props list naming `ns`
+                // twice is refused for every role, scoped or not: it is the same
+                // malformed write the seam refuses, and leaving it to the seam
+                // would mean the gate had already read one of the two.
+                let target = Self::created_namespace(key, props)?;
                 if let Some(def) = self.role_def_for(&authz.role) {
-                    let target = Self::created_namespace(props);
                     if !def.sees_namespace(target) {
                         return Err(GraphError::RoleWriteDenied {
                             reason: format!(
@@ -7551,16 +7588,21 @@ impl<F: Fs> GraphDb<F> {
                 // default namespace. A role that cannot read `default` must not
                 // create one there, for the same reason it may not create a node
                 // there outright.
+                //
+                // The refusal is byte-identical to the hidden-endpoint one above,
+                // and deliberately so: this arm fires only for an endpoint that
+                // does **not** exist, and the one above only for an endpoint that
+                // does. Two different strings would make the pair an existence
+                // oracle — ask for an upsert and read off whether the key is
+                // taken. Hidden ≡ absent is the rule everywhere else in this
+                // table and it holds here too.
                 if let Some(def) = self.role_def_for(&authz.role) {
                     if !def.sees_namespace(NS_DEFAULT) {
                         for ep_key in [src_key.as_str(), dst_key.as_str()] {
                             if self.ids.get(ep_key).is_none() && !batch_created.contains_key(ep_key)
                             {
                                 return Err(GraphError::RoleWriteDenied {
-                                    reason: format!(
-                                        "role-bound token: namespace '{NS_DEFAULT}' not in the \
-                                         role's namespaces"
-                                    ),
+                                    reason: "role-bound token: edge endpoint not visible".into(),
                                 });
                             }
                         }

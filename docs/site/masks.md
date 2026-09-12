@@ -117,6 +117,10 @@ A node's namespace is a reserved node property, `ns`:
 - **A name is 1–64 characters of `[A-Za-z0-9_.-]`.** `/` is excluded on purpose:
   keys already contain it, and a namespace must never read as a key prefix. An
   invalid name, or a non-string `ns`, is refused at insert.
+- **A node's props name `ns` once, or not at all.** Two `ns` entries in one insert
+  are refused (`ns is given more than once; a node has exactly one namespace`):
+  with two, "the node's namespace" stops being a single fact, and a write checked
+  against one entry could land under the other.
 - **Keys do not change.** A namespace is not a key prefix — `key(n)`, every history
   body, every mask entry and every `KeyMatch` target keeps the exact value it has.
   Keys stay globally unique across namespaces.
@@ -211,6 +215,25 @@ unchanged: it writes wherever its label scope allows.
 
 Updates need no separate rule — a role can only mutate nodes already in its read
 mask, and the namespace leg has already narrowed that.
+
+**`MERGE` creates in the default namespace, for every caller.** A `MERGE` pattern
+carries exactly one identifying property (`MERGE (n:Doc {id: 'x'})`), and only that
+property reaches the node it creates, so there is no way to name a namespace in a
+`MERGE` — and `ON CREATE SET n.ns = …` cannot stand in for one, because that is a
+namespace change and is refused as one. The consequences, stated plainly:
+
+- A role bound to namespaces **cannot `MERGE`-create**: the node would land in
+  `default`, which it may not write. It gets the namespace refusal above.
+- Its `MERGE` **match** arm is unaffected — the node it matches is already in the
+  role's mask, and `ON MATCH SET` works as it always has.
+- To create a node in a namespace, use `CREATE (n:Doc {id: 'x', ns: 'tenant-a'})`,
+  `insert_node`, or `/ingest`, all of which take `ns` like any other property.
+
+This is deliberately the loud answer rather than the convenient one. A role bound to
+exactly one namespace *could* have its creates default into that namespace, but then
+the same statement would write different data under different tokens, and it would
+write a property the caller never named. If that default is wanted, it belongs
+alongside an explicit `namespace` argument on the write surfaces, decided once.
 
 ### No cross-namespace edges
 
