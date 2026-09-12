@@ -13,10 +13,19 @@
 //! All vectors are L2-normalized at insert time; cosine similarity reduces to
 //! dot product for unit vectors, which is faster and numerically stable.
 //!
-//! **Determinism**: the level assigned to each node is derived from a seeded
-//! PRNG (`splitmix64`) seeded with `FNV-1a(rule_name) XOR (node_id × PHI)`.
-//! Insertion order + seed fully determines the graph structure, so WAL replay
-//! produces an identical index.
+//! **Determinism**, and its one sharp edge: the level assigned to each node is
+//! derived from a seeded PRNG (`splitmix64`) seeded with
+//! `FNV-1a(rule_name) XOR (node_id × PHI)`, so insertion order and seed fix the
+//! levels. They do **not** fix the graph on their own — the edges also depend on
+//! [`HnswParams`], which [`hnsw_params`] reads from `MUSHROOMDB_HNSW_PARAMS`.
+//!
+//! So: one WAL replayed by two processes with different `MUSHROOMDB_HNSW_PARAMS`
+//! produces two *different* graphs. That is sound, because the graph is derived
+//! state — every edge it yields is recomputable and the blob is never compared
+//! byte-for-byte across replicas — but it does mean the variable belongs with
+//! the deployment's configuration, not with a single node's environment. Set it
+//! identically across replicas, or accept that their approximate answers differ
+//! (each still above the recall floor its own shape was gated at).
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -61,10 +70,17 @@ pub struct HnswParams {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Prune {
     /// Heuristic for the new node's own neighbours; keep-the-m-nearest on the
-    /// neighbour side. Roughly 5× faster to build, and **below the recall floor
-    /// on clustered corpora at the default `m0`**: it scores 0.8581 on
-    /// `approximate_recall_5k_timing`, whose floor is 0.90. Opt in only with a
-    /// raised `m0` or a corpus measured to tolerate it.
+    /// neighbour side.
+    ///
+    /// **Below the recall floor on clustered corpora at the default `m0`**: it
+    /// scores 0.8581 on `approximate_recall_5k_timing`, whose floor is 0.90. Opt
+    /// in only with a raised `m0` or a corpus measured to tolerate it.
+    ///
+    /// The speed-up depends entirely on the corpus, so quote both numbers: **5×**
+    /// on a raw 5,000 × 1,536-D index of uniformly random vectors (45.8 s against
+    /// 251 s), but only **1.5×** on the clustered corpus the rule engine actually
+    /// derives edges over (123.1 s against 180.5 s of backfill) — and that is the
+    /// corpus where it misses the floor.
     Own,
     /// Heuristic on both sides — the paper's Algorithm 4 applied in full. The
     /// default, because it is the cheapest shape that passes every committed
@@ -102,8 +118,8 @@ impl Default for HnswParams {
     /// `ef_search` = 128 the min recall is 0.30 at `m0` = 32 and 0.70 at
     /// `m0` = 64, against a floor of 0.90.
     ///
-    /// `prune` is [`Prune::Both`] because [`Prune::Own`], which builds roughly 5×
-    /// faster on uniform vectors, scores **0.8581** on
+    /// `prune` is [`Prune::Both`] because [`Prune::Own`], which builds 5× faster
+    /// on uniform vectors but only 1.5× faster on clustered ones, scores **0.8581** on
     /// `approximate_recall_5k_timing` against a floor of 0.90 — that corpus's
     /// clusters are 100 members wide against an `m0` of 64, and the neighbour
     /// side is where those links get thrown away. The two ways to fix it are
@@ -124,7 +140,7 @@ impl HnswParams {
     /// Parse `m,m0,ef_construction,ef_search[,prune]`. `None` if the shape is
     /// wrong, or a numeric field is absent, unparseable or zero — a zero would
     /// produce an index with no edges or a search with no beam. The `prune`
-    /// field is optional and defaults to [`Prune::Own`]; it is the one field
+    /// field is optional and defaults to [`Prune::Both`]; it is the one field
     /// that is a word rather than a number, so it cannot be confused with the
     /// four ahead of it.
     fn parse(s: &str) -> Option<Self> {
@@ -156,7 +172,7 @@ impl HnswParams {
 ///
 /// Read once from `MUSHROOMDB_HNSW_PARAMS`, formatted
 /// `m,m0,ef_construction,ef_search[,prune]`, where `prune` is `own` or `both`
-/// and defaults to `own`. Unset or unparseable →
+/// and defaults to `both`. Unset or unparseable →
 /// [`HnswParams::default`]. Read once rather than per call so a graph cannot be
 /// half-built under one shape and half under another, and so the value is a
 /// pointer chase on the insert path.
@@ -384,12 +400,26 @@ pub struct HnswIndex {
     ///
     /// Exists because `hnsw_params()` reads the environment through a
     /// `OnceLock`: one process gets one shape, so a test that wants to compare
-    /// both prune strategies cannot get there through the env. Never
-    /// serialized, so it cannot change a blob, and `None` in every index the
-    /// engine builds.
+    /// both prune strategies cannot get there through the env. Compiled out
+    /// entirely without `test-hooks`, and `#[serde(skip)]` regardless, so it can
+    /// reach neither a production build nor a blob.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[serde(skip)]
     pub prune_override_for_test: Option<Prune>,
+}
+
+impl HnswIndex {
+    /// The prune this index builds with: the per-index test override when one is
+    /// set, otherwise the process-wide shape.
+    #[inline]
+    fn resolved_prune(&self, params: &HnswParams) -> Prune {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(p) = self.prune_override_for_test {
+            return p;
+        }
+        params.prune
+    }
 }
 
 /// A freed slot's id sentinel.
@@ -575,8 +605,7 @@ impl HnswIndex {
             slot_of,
             id_of,
             free: Vec::new(),
-            back_refs: BTreeMap::new(),
-            prune_override_for_test: None,
+            ..Self::default()
         };
         // A dangling entry point would have panicked the old `dist_to`; elect a
         // live one instead.
@@ -698,40 +727,73 @@ impl HnswIndex {
         w_heap.into_iter().map(|(OrdF64(d), s)| (s, d)).collect()
     }
 
-    /// HNSW Algorithm 4 — the §3.5 diverse-neighbour heuristic.
+    /// The **first-rejection prune** — a short-cut of HNSW Algorithm 4, not
+    /// Algorithm 4 itself. Read this before changing it: the difference is
+    /// deliberate, measured, and visible in the graph.
     ///
-    /// `candidates` must be `(slot, distance-to-base)` sorted nearest-first —
-    /// the base vector itself is never needed again, only those distances.
-    /// Walks them in that order and keeps one only when it is closer to the
-    /// base than to every neighbour already kept: a candidate that sits behind
-    /// an already-kept neighbour is reachable *through* that neighbour, so the
-    /// link would spend a slot without adding a route. Keeping it is what M₀
-    /// = 128 was paying for.
+    /// `candidates` must be `(slot, distance-to-base)` sorted nearest-first; the
+    /// base vector itself is never needed again, only those distances. Walking
+    /// nearest-first, a candidate is **kept** when it is closer to the base than
+    /// to every neighbour already kept — a candidate sitting behind an
+    /// already-kept neighbour is reachable *through* it, so the link would spend
+    /// a slot without adding a route. That much is Algorithm 4's diversity test,
+    /// and it is what `m0` = 128 was paying for before 0.6.6.
     ///
-    /// The paper's `keepPrunedConnections` option is on: if diversity leaves
-    /// fewer than `m` links, the nearest rejected candidates backfill the rest.
-    /// Under-connecting a layer is how a node becomes an inbound-only leaf, and
-    /// a leaf is invisible to beam search.
-    fn select_neighbors_heuristic(
+    /// **Where it stops being Algorithm 4.** Once `rejections ≥ candidates.len()
+    /// − m`, every candidate still unseen is taken without testing it, and the
+    /// walk ends. Consequences, both real:
+    ///
+    /// * The tail it takes is the **farthest** candidates, untested. Algorithm 4
+    ///   would have gone on testing, and then filled any shortfall with the
+    ///   **nearest** rejects (`keepPrunedConnections`). Those are different sets,
+    ///   so this builds a different graph — it is a short-cut, not an
+    ///   optimisation.
+    /// * On the neighbour side the candidate list is always exactly `m + 1`
+    ///   long, so `candidates.len() − m` is 1 and the walk stops at the **first**
+    ///   rejection. That prune therefore performs exactly one diversity
+    ///   rejection and keeps the rest as it found them, rather than re-deciding
+    ///   the whole adjacency list.
+    /// * Because the walk only ever ends with `kept.len() ≥ m` (or with the tail
+    ///   taken), `keepPrunedConnections` would never fire. There is no backfill
+    ///   here; if you restore the full algorithm you must restore it too, or
+    ///   nodes will under-connect into inbound-only leaves that beam search
+    ///   cannot route through.
+    ///
+    /// **Why the short-cut ships, and it is not only speed.** Full Algorithm 4
+    /// was implemented and measured against this, both at `prune = both`,
+    /// `m0` = 64:
+    ///
+    /// | gate | full Algorithm 4 | this |
+    /// |---|---|---|
+    /// | `hnsw_5k_1536_recall` (5 000 × 1 536-D uniform) | 1.0000 / 1.0000 in **369 s** | 1.0000 / 1.0000 in **254 s** |
+    /// | `clustered_…_wider_than_m0` (40 × 120, 128-D) | min **0.5000** / mean 0.9725 | min **0.8000** / mean 0.9950 |
+    /// | `approximate_recall_5k_timing` (5 000 clustered) | 1.0000, backfill **226.6 s** | 1.0000, backfill **181.5 s** |
+    ///
+    /// So the short-cut is 1.25–1.45× faster *and* strictly better on the corpus
+    /// whose clusters are wider than `m0`. The reason is `keepPrunedConnections`
+    /// itself: it backfills with the **nearest** rejects, and on a wide cluster
+    /// those are all crowded in the one direction the diversity test just
+    /// rejected. Taking the untested far tail instead keeps longer-range links,
+    /// which is what makes the cluster reachable from outside. The paper's
+    /// algorithm is the more principled one; on this corpus and at this `m0` it
+    /// is measurably the worse one, which is why the deviation is deliberate
+    /// rather than a bug to fix later. `docs/site/rules.md` carries the same
+    /// table for operators.
+    fn select_neighbors_first_rejection(
         slots: &[HnswNode],
         id_of: &[u32],
         candidates: &[(u32, f64)],
         m: usize,
     ) -> Vec<u32> {
         let mut kept: Vec<u32> = Vec::with_capacity(m);
-        let mut rejected: Vec<u32> = Vec::new();
 
         for (i, &(cand, d_base)) in candidates.iter().enumerate() {
             if kept.len() >= m {
                 break;
             }
-            // Once everything still unseen would fit alongside what is kept,
-            // the diversity test cannot change the outcome — the backfill would
-            // put every reject back anyway. Taking them now is the same set for
-            // none of the distance computations, and it is what makes the
-            // neighbour-side prune affordable: that call arrives with exactly
-            // `m + 1` candidates and drops one, so it stops at the first
-            // rejection instead of scoring all m² pairs.
+            // `rejections >= candidates.len() - m`, rearranged to avoid an
+            // underflow when the list is shorter than `m`. Everything from here
+            // on is taken untested: see the doc comment for what that costs.
             if kept.len() + (candidates.len() - i) <= m {
                 kept.extend(
                     candidates[i..]
@@ -751,19 +813,12 @@ impl HnswIndex {
                 .all(|&k| d_base < Self::dist_to(slots, k, cand_vec));
             if diverse {
                 kept.push(cand);
-            } else {
-                rejected.push(cand);
             }
+            // A rejection is not recorded: nothing downstream reads it, because
+            // there is no backfill. The `kept.len() + remaining <= m` test above
+            // is the same condition as `rejections >= candidates.len() - m`.
         }
-
-        // keepPrunedConnections: backfill with the nearest rejects, which are
-        // already in nearest-first order.
-        for cand in rejected {
-            if kept.len() >= m {
-                break;
-            }
-            kept.push(cand);
-        }
+        debug_assert!(kept.len() <= m, "the prune must respect its allowance");
         kept
     }
 
@@ -838,7 +893,7 @@ impl HnswIndex {
         };
 
         let params = hnsw_params();
-        let prune = self.prune_override_for_test.unwrap_or(params.prune);
+        let prune = self.resolved_prune(&params);
         let max_level = self.max_level;
         let mut curr_ep = ep;
 
@@ -876,7 +931,7 @@ impl HnswIndex {
             // every node in a dense cluster pointing back into the same
             // cluster, and the beam never crosses out of it.
             let neighbors =
-                Self::select_neighbors_heuristic(&self.slots, &self.id_of, &candidates, m_lc);
+                Self::select_neighbors_first_rejection(&self.slots, &self.id_of, &candidates, m_lc);
             self.set_layer(slot, lc, neighbors.clone());
 
             // Add bidirectional links and prune over-connected neighbors.
@@ -909,9 +964,12 @@ impl HnswIndex {
                     Prune::Own => scored.iter().take(m_lc).map(|(s, _)| *s).collect(),
                     // Re-decide the whole list by diversity: O(m₀²) distances,
                     // once per over-connected neighbour per insert.
-                    Prune::Both => {
-                        Self::select_neighbors_heuristic(&self.slots, &self.id_of, &scored, m_lc)
-                    }
+                    Prune::Both => Self::select_neighbors_first_rejection(
+                        &self.slots,
+                        &self.id_of,
+                        &scored,
+                        m_lc,
+                    ),
                 };
                 self.set_layer(nb, lc, kept);
             }
@@ -1532,69 +1590,89 @@ mod tests {
         (slots, id_of)
     }
 
-    /// The heuristic's whole point: given two candidates at nearly the same
-    /// distance, one of which sits right behind a neighbour already kept, it
-    /// keeps the one that opens a new direction. Taking the m nearest would
-    /// have kept the redundant one.
+    /// The prune's whole point: given candidates at nearly the same distance,
+    /// some of which sit behind a neighbour already kept, it keeps the ones that
+    /// open a new direction. Sized so the diversity test genuinely runs rather
+    /// than being short-circuited by the tail rule.
     #[test]
-    fn the_heuristic_prefers_a_new_direction_over_a_redundant_neighbour() {
-        // base at the origin direction; candidate 0 due "east"; candidate 1 a
-        // hair further east (redundant — it is behind 0); candidate 2 the same
-        // hair further, but due "north" (a new direction).
-        let base = vec![1.0, 0.0, 0.0];
+    fn the_prune_prefers_a_new_direction_over_a_redundant_neighbour() {
+        // Six candidates, `m` = 2, so the tail short-cut cannot fire until four
+        // rejections have been made: the diversity test runs at least three
+        // times and its verdicts decide the answer. Candidate 0 opens one
+        // direction; 1, 2 and 3 sit behind it at increasing distance; 4 opens a
+        // second direction; 5 is far and behind 0. Keeping the m *nearest* would
+        // answer [0, 1]; deleting the diversity test would also answer [0, 1].
+        let base = l2_normalize(&[1.0, 0.0, 0.0]).unwrap();
         let vecs = vec![
-            vec![0.90, 0.0, 0.44], // 0: nearest
-            vec![0.88, 0.0, 0.47], // 1: almost on top of 0
-            vec![0.88, 0.47, 0.0], // 2: same distance from base, elsewhere
+            vec![0.80, 0.0, 0.60], // 0: nearest, direction A
+            vec![0.78, 0.0, 0.63], // 1: behind 0
+            vec![0.76, 0.0, 0.65], // 2: behind 0
+            vec![0.74, 0.0, 0.67], // 3: behind 0
+            vec![0.70, 0.71, 0.0], // 4: direction B — diverse
+            vec![0.60, 0.0, 0.80], // 5: far, behind 0
         ];
         let (slots, id_of) = slots_of(&vecs);
-        let mut cands: Vec<(u32, f64)> = (0..3u32)
-            .map(|s| {
-                (
-                    s,
-                    HnswIndex::dist_to(&slots, s, &l2_normalize(&base).unwrap()),
-                )
-            })
-            .collect();
-        sort_by_distance(&mut cands);
-        assert_eq!(cands[0].0, 0, "fixture: candidate 0 must be the nearest");
-
-        let kept = HnswIndex::select_neighbors_heuristic(&slots, &id_of, &cands, 2);
-        assert_eq!(
-            kept,
-            vec![0, 2],
-            "the heuristic must drop the candidate that is reachable through one \
-             already kept, and keep the one in a new direction"
-        );
-    }
-
-    /// `keepPrunedConnections`: diversity must never leave a node with fewer
-    /// links than it was allowed, or the node becomes an inbound-only leaf that
-    /// beam search cannot route through.
-    #[test]
-    fn the_heuristic_backfills_rather_than_under_connecting() {
-        // Five candidates all crowded into one direction: every one after the
-        // first is redundant, so pure diversity would keep exactly one.
-        let base = l2_normalize(&[1.0, 0.0]).unwrap();
-        let vecs: Vec<Vec<f64>> = (0..5).map(|i| vec![1.0, 0.01 * (i + 1) as f64]).collect();
-        let (slots, id_of) = slots_of(&vecs);
-        let mut cands: Vec<(u32, f64)> = (0..5u32)
+        let mut cands: Vec<(u32, f64)> = (0..6u32)
             .map(|s| (s, HnswIndex::dist_to(&slots, s, &base)))
             .collect();
         sort_by_distance(&mut cands);
-
-        let kept = HnswIndex::select_neighbors_heuristic(&slots, &id_of, &cands, 4);
-        assert_eq!(kept.len(), 4, "the backfill must fill the allowance");
         assert_eq!(
-            kept[0], cands[0].0,
-            "the nearest candidate is always kept first"
+            cands.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5],
+            "fixture: candidates must arrive in this nearest-first order"
+        );
+
+        let kept = HnswIndex::select_neighbors_first_rejection(&slots, &id_of, &cands, 2);
+        assert_eq!(
+            kept,
+            vec![0, 4],
+            "the prune must reject 1, 2 and 3 as reachable through 0 and keep 4, \
+             which opens a direction 0 does not cover"
+        );
+    }
+
+    /// The documented deviation from Algorithm 4, pinned so it cannot change by
+    /// accident. Once `rejections >= candidates.len() - m` the prune takes the
+    /// remaining candidates **untested** — the farthest ones — where Algorithm 4
+    /// would keep testing and then backfill with the **nearest** reject. This
+    /// fixture is a case where those two answers differ, and it asserts ours.
+    #[test]
+    fn the_prune_keeps_the_untested_tail_where_algorithm_4_would_backfill() {
+        // `m` = 2 over three candidates, so one rejection triggers the tail.
+        // 0 opens a direction; 1 is near but behind 0; 2 is far and behind 0.
+        let base = l2_normalize(&[1.0, 0.0, 0.0]).unwrap();
+        let vecs = vec![
+            vec![0.80, 0.0, 0.60], // 0: nearest
+            vec![0.78, 0.0, 0.63], // 1: behind 0, near
+            vec![0.55, 0.0, 0.84], // 2: behind 0, far
+        ];
+        let (slots, id_of) = slots_of(&vecs);
+        let mut cands: Vec<(u32, f64)> = (0..3u32)
+            .map(|s| (s, HnswIndex::dist_to(&slots, s, &base)))
+            .collect();
+        sort_by_distance(&mut cands);
+        assert_eq!(
+            cands.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "fixture: nearest-first order"
+        );
+
+        let kept = HnswIndex::select_neighbors_first_rejection(&slots, &id_of, &cands, 2);
+        assert_eq!(
+            kept,
+            vec![0, 2],
+            "the short-cut keeps the untested far candidate; full Algorithm 4 \
+             would have rejected it too and backfilled with the nearer reject 1, \
+             answering [0, 1]. If this ever reads [0, 1] the prune has become \
+             Algorithm 4 and `select_neighbors_first_rejection`'s name, its doc \
+             comment and docs/site/rules.md are all now wrong."
         );
     }
 
     /// A dead slot is never linked to. `insert` filters them before scoring,
     /// but the heuristic is the last gate before an adjacency list is written.
     #[test]
-    fn the_heuristic_never_keeps_a_freed_slot() {
+    fn the_prune_never_keeps_a_freed_slot() {
         let vecs = make_unit_vecs(4, 8, 0x7EA0_1234);
         let (slots, mut id_of) = slots_of(&vecs);
         id_of[1] = DEAD;
@@ -1603,24 +1681,32 @@ mod tests {
             .map(|s| (s, HnswIndex::dist_to(&slots, s, &base)))
             .collect();
         sort_by_distance(&mut cands);
-        let kept = HnswIndex::select_neighbors_heuristic(&slots, &id_of, &cands, 4);
+        let kept = HnswIndex::select_neighbors_first_rejection(&slots, &id_of, &cands, 4);
         assert!(
             !kept.contains(&1),
             "a freed slot must not become a neighbour"
         );
     }
 
-    /// No layer may exceed its allowance, whatever the insertion order. The
-    /// prune is the only thing enforcing this, and the heuristic is now the
-    /// prune.
+    /// The memory win, guarded on every `cargo test`: degree bounds per layer
+    /// and payload bytes per node against a stated ceiling.
+    ///
+    /// The whole argument for `m0` = 64 is that adjacency halves, and the 5,000 ×
+    /// 1,536-D measurement that backs it is an `#[ignore]`d release run. This is
+    /// the cheap version that actually runs: a regression that lets degree drift
+    /// — a prune that stops pruning, a `set_layer` that leaks — shows up here
+    /// first.
     #[test]
-    fn no_layer_exceeds_its_allowance() {
+    fn degree_and_adjacency_bytes_stay_within_the_shape() {
         let params = hnsw_params();
         let vecs = make_unit_vecs(1_200, 32, 0xDE6E_E5EE);
         let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"degree-bound"));
         for (i, v) in vecs.iter().enumerate() {
             idx.insert(i as u32, v);
         }
+
+        let mut worst_layer0 = 0usize;
+        let mut worst_upper = 0usize;
         for (s, node) in idx.slots.iter().enumerate() {
             if !HnswIndex::is_live(&idx.id_of, s as u32) {
                 continue;
@@ -1632,8 +1718,45 @@ mod tests {
                     "slot {s} layer {lc} holds {} links for an allowance of {allowed}",
                     layer.len()
                 );
+                if lc == 0 {
+                    worst_layer0 = worst_layer0.max(layer.len());
+                } else {
+                    worst_upper = worst_upper.max(layer.len());
+                }
             }
         }
+
+        // Payload per node. Forward entries are bounded by `m0` on layer 0 plus
+        // `m` on each layer above, and the reverse index holds at most one entry
+        // per (source, target) pair, so it can never exceed the forward count.
+        // `2 * (m0 + m) * 4` bytes is therefore a true ceiling with room for the
+        // upper layers, and it is tight enough to catch `m0` doubling.
+        let mem = idx.memory_stats();
+        let ceiling = 2.0 * (params.m0 + params.m) as f64 * 4.0;
+        eprintln!(
+            "degree: layer0 <= {worst_layer0} (allowance {}), upper <= {worst_upper} \
+             (allowance {}); adjacency {:.1} B/node against a ceiling of {ceiling:.1}; \
+             vector {:.1} B/node",
+            params.m0,
+            params.m,
+            mem.adjacency_bytes_per_node(),
+            (mem.vector_floats * 8) as f64 / mem.live_nodes as f64,
+        );
+        assert_eq!(mem.live_nodes, 1_200);
+        assert!(
+            mem.back_ref_entries <= mem.neighbour_slots,
+            "the reverse index ({}) cannot hold more pairs than the forward one ({})",
+            mem.back_ref_entries,
+            mem.neighbour_slots
+        );
+        assert!(
+            mem.adjacency_bytes_per_node() <= ceiling,
+            "adjacency is {:.1} B/node against a ceiling of {ceiling:.1} — the \
+             index shape grew",
+            mem.adjacency_bytes_per_node()
+        );
+        // 32 f64s per vector, exactly, or the fixture is not what it says.
+        assert_eq!(mem.vector_floats, 1_200 * 32);
     }
 
     /// Recall on a corpus whose clusters are wider than the layer-0 allowance.

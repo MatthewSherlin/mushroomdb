@@ -27,6 +27,13 @@ use std::time::{Duration, Instant};
 #[ignore = "slow: builds a 50k-vector index; set MUSHROOMDB_BENCH_HNSW=1"]
 fn hnsw_insert_cost_is_sublinear_per_vector() {
     if std::env::var("MUSHROOMDB_BENCH_HNSW").as_deref() != Ok("1") {
+        // Not a pass. `--ignored` already keeps this out of a normal run, and
+        // anyone who sweeps `--ignored` without meaning to spend ten minutes
+        // should see why nothing happened rather than a green tick.
+        println!(
+            "SKIPPED hnsw_insert_cost_is_sublinear_per_vector: set \
+             MUSHROOMDB_BENCH_HNSW=1 to run it (~20 min)"
+        );
         return;
     }
     const DIM: usize = 1_536;
@@ -61,6 +68,27 @@ fn hnsw_insert_cost_is_sublinear_per_vector() {
             update[update.len() - 1],
             mem.adjacency_bytes_per_node(),
             mem.bytes_per_node(),
+        );
+
+        // (0) The memory claim, asserted rather than printed. Adjacency is
+        //     bounded by `2 * (m0 + m) * 4` bytes — forward entries by `m0` on
+        //     layer 0 plus `m` per layer above, and the reverse index by one
+        //     entry per (source, target) pair — and the vector half is exact
+        //     arithmetic at `DIM` f64s.
+        let p = core_rules::hnsw::hnsw_params();
+        let adjacency_ceiling = 2.0 * (p.m0 + p.m) as f64 * 4.0;
+        assert!(
+            mem.adjacency_bytes_per_node() <= adjacency_ceiling,
+            "n={n}: adjacency {:.1} B/node exceeds the {adjacency_ceiling:.1} B/node \
+             ceiling for m0={} m={}",
+            mem.adjacency_bytes_per_node(),
+            p.m0,
+            p.m
+        );
+        assert!(
+            mem.bytes_per_node() <= adjacency_ceiling + (DIM * 8) as f64,
+            "n={n}: total {:.1} B/node exceeds adjacency ceiling plus the vector",
+            mem.bytes_per_node()
         );
     }
 

@@ -344,12 +344,33 @@ other.
 | `ef_search` | 400 | 400 | Recall per query | Query latency, linearly. It is a *floor* under the query's own `k`: asking for more than 400 neighbours widens the beam to match |
 | `prune` | `both` | n/a | n/a — `both` is already the higher-recall setting | `own` builds ~5× faster and drops below the recall floor on clustered corpora. See below |
 
-Since 0.6.6 the new node's neighbours are chosen by the HNSW paper's §3.5
-diverse-neighbour heuristic (Algorithm 4): a candidate is kept only when it is
-closer to the node than to every neighbour already kept, because a candidate
+Since 0.6.6 the new node's neighbours are chosen by a diversity test taken from
+the HNSW paper's §3.5 heuristic (Algorithm 4): a candidate is kept only when it
+is closer to the node than to every neighbour already kept, because a candidate
 sitting behind an existing neighbour is already reachable through it. `m0` was
-128 before 0.6.6 purely to compensate for not having that heuristic, and halves
-now that it exists.
+128 before 0.6.6 purely to compensate for not having that test, and halves now
+that it exists.
+
+**It is a short-cut of Algorithm 4, not Algorithm 4.** Once enough candidates
+have been rejected that the rest would fit anyway, mushroomdb takes the
+remainder untested rather than continuing to test and then backfilling with the
+nearest rejects (the paper's `keepPrunedConnections`). The two build different
+graphs, and the short-cut measured better on both axes:
+
+| gate | full Algorithm 4 | shipped short-cut |
+|---|---|---|
+| 5 000 × 1 536-D uniform (`hnsw_5k_1536_recall`) | min 1.0000 / mean 1.0000 in 369 s | min 1.0000 / mean 1.0000 in **254 s** |
+| 40 × 120 clusters, 128-D | min 0.5000 / mean 0.9725 | min **0.8000** / mean **0.9950** |
+| 5 000 clustered (`approximate_recall_5k_timing`) | 1.0000, backfill 226.6 s | 1.0000, backfill **181.5 s** |
+
+The reason the paper's version loses here is `keepPrunedConnections`: it fills a
+shortfall with the *nearest* rejects, and in a cluster wider than `m0` those all
+point back into the cluster the diversity test just turned down. Keeping the
+untested far candidates instead preserves the longer-range links that make a
+cluster reachable from outside it. Expect a different graph from a textbook
+implementation, and do not "fix" the deviation without re-running these three
+gates — `select_neighbors_first_rejection` in `crates/core-rules/src/hnsw.rs`
+carries the same table.
 
 `ef_search` did **not** fall with the rest. At 1,536 dimensions the
 nearest-neighbour distribution is flat enough that recall is a beam-width
@@ -421,6 +442,7 @@ adjacency figure roughly doubles in practice. Halving `m0` halves all of it.
 |---|---|---|
 | `hnsw_5k_1536_recall` (`crates/core-rules/src/hnsw.rs`) | 5,000 × 1,536-D, 50 queries | min recall@10 ≥ 0.90, mean ≥ 0.95 |
 | `recall_survives_insert_remove_churn` (same file) | 5,000 × 1,536-D, then an insert/remove/re-insert sequence | min recall@10 ≥ 0.90, mean ≥ 0.95 against brute force over the survivors |
+| `degree_and_adjacency_bytes_stay_within_the_shape` (same file, **runs on every `cargo test`**) | 1,200 × 32-D | max degree ≤ `m0` on layer 0 and ≤ `m` above; adjacency ≤ `2 × (m0 + m) × 4` B/node — measured 519.7 against a 640 ceiling |
 | `clustered_recall_survives_clusters_wider_than_m0` (same file) | 40 clusters of 120 × 128-D — clusters wider than `m0`, both `prune` shapes | `own`: min ≥ 0.40, mean ≥ 0.90; `both`: min ≥ 0.70, mean ≥ 0.95; and `both` ≥ `own` |
 | `approximate_recall_above_floor_1536dim_1k` (`crates/sim-harness/tests/oracle_equivalence.rs`) | 1,024 × 1,536-D derived edge set | recall ≥ 0.90 |
 | `approximate_recall_5k_timing` (same file) | 5,000 × 1,536-D derived edge set, index pumped to completion first | recall ≥ 0.90 |
