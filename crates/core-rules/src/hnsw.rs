@@ -1,23 +1,31 @@
 //! In-tree HNSW approximate nearest-neighbor index.
 //!
 //! Implements the Malkov & Yashunin (2018) Hierarchical Navigable Small World
-//! algorithm with:
-//!   - M = 32 (max connections per layer above layer 0)
-//!   - M₀ = 128 (max connections at layer 0)
-//!   - ef_construction = 400 (beam width during insertion)
-//!   - ef_search = 400 (beam width during query)
+//! algorithm, including a first-rejection short-cut of the §3.5 diverse-neighbour heuristic (not Algorithm 4; see `select_neighbors_first_rejection`) that
+//! decides which links survive a prune. The index shape lives in
+//! [`HnswParams`]; [`hnsw_params`] reads it once from the environment.
 //!
 //! Parameters are set for high-dimensional text embeddings (768-d to 2048-d).
-//! At these dimensionalities the nearest-neighbour distribution is flat; larger
-//! M and ef are required to route through the hierarchy and recover true k-NN.
+//! At these dimensionalities the nearest-neighbour distribution is flat, so it
+//! is neighbour *diversity* rather than neighbour *count* that lets the beam
+//! route through the hierarchy and recover the true k-NN.
 //!
 //! All vectors are L2-normalized at insert time; cosine similarity reduces to
 //! dot product for unit vectors, which is faster and numerically stable.
 //!
-//! **Determinism**: the level assigned to each node is derived from a seeded
-//! PRNG (`splitmix64`) seeded with `FNV-1a(rule_name) XOR (node_id × PHI)`.
-//! Insertion order + seed fully determines the graph structure, so WAL replay
-//! produces an identical index.
+//! **Determinism**, and its one sharp edge: the level assigned to each node is
+//! derived from a seeded PRNG (`splitmix64`) seeded with
+//! `FNV-1a(rule_name) XOR (node_id × PHI)`, so insertion order and seed fix the
+//! levels. They do **not** fix the graph on their own — the edges also depend on
+//! [`HnswParams`], which [`hnsw_params`] reads from `MUSHROOMDB_HNSW_PARAMS`.
+//!
+//! So: one WAL replayed by two processes with different `MUSHROOMDB_HNSW_PARAMS`
+//! produces two *different* graphs. That is sound, because the graph is derived
+//! state — every edge it yields is recomputable and the blob is never compared
+//! byte-for-byte across replicas — but it does mean the variable belongs with
+//! the deployment's configuration, not with a single node's environment. Set it
+//! identically across replicas, or accept that their approximate answers differ
+//! (each still above the recall floor its own shape was gated at).
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -25,22 +33,173 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 /// Maximum layer cap: prevents pathological depth on tiny graphs.
 const MAX_LEVEL: usize = 16;
-/// `M` — max connections per layer (except layer 0).
-pub const M: usize = 32;
-/// `M₀` — max connections at layer 0.
+
+// ---------------------------------------------------------------------------
+// Index shape
+// ---------------------------------------------------------------------------
+
+/// Index shape. Store-wide, not per rule: nothing asked to tune one rule
+/// differently from another, and a per-rule parameter set would have to be
+/// persisted in `RuleDef` and versioned with it.
 ///
-/// Raised from 64 → 128 (v0.4.2) to support clustered-density graphs where
-/// natural clusters exceed 64 nodes. At M₀=64, nodes beyond the 64th in a
-/// cluster become inbound-only leaves invisible to beam search, capping recall
-/// at ~64/cluster_size. M₀=128 raises the density ceiling to ~128-node
-/// clusters; it does NOT remove the structural pathology — the HNSW §3.5
-/// diverse-neighbour heuristic is the true fix, ledgered for v0.4.3+.
-/// Memory cost: layer-0 adjacency roughly doubles (~256 B → ~512 B/node;
-/// ~256 MB at the 500k-node ceiling). Disclosed in CHANGELOG.
-pub const M0: usize = 128;
+/// Not persisted, either — the parameters bound how a graph is *built*, never
+/// how a built graph is *read*, so a blob written under one shape is read
+/// correctly under any other. That is why the v2 blob's meaning is unchanged by
+/// this struct's existence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HnswParams {
+    /// Max connections per layer above layer 0.
+    pub m: usize,
+    /// Max connections at layer 0.
+    pub m0: usize,
+    /// Beam width during insertion.
+    pub ef_construction: usize,
+    /// Beam width during search; the floor under a query's own `k`.
+    pub ef_search: usize,
+    /// How far the §3.5 diverse-neighbour heuristic reaches.
+    pub prune: Prune,
+}
+
+/// Which side of a new link the §3.5 diverse-neighbour heuristic decides.
+///
+/// The heuristic always chooses the new node's **own** neighbours — that is
+/// where diversity is cheap, because the candidate list is built once per
+/// insert. Applying it a second time on the **neighbour** side, to re-decide
+/// each over-connected neighbour's list, is what costs: that call is O(m₀²)
+/// distance computations and it runs once per neighbour per insert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Prune {
+    /// Heuristic for the new node's own neighbours; keep-the-m-nearest on the
+    /// neighbour side.
+    ///
+    /// **Below the recall floor on clustered corpora at the default `m0`**: it
+    /// scores 0.8581 on `approximate_recall_5k_timing`, whose floor is 0.90. Opt
+    /// in only with a raised `m0` or a corpus measured to tolerate it.
+    ///
+    /// The speed-up depends entirely on the corpus, so quote both numbers: **5×**
+    /// on a raw 5,000 × 1,536-D index of uniformly random vectors (45.8 s against
+    /// 251 s), but only **1.5×** on the clustered corpus the rule engine actually
+    /// derives edges over (123.1 s against 180.5 s of backfill) — and that is the
+    /// corpus where it misses the floor.
+    Own,
+    /// Heuristic on both sides — the paper's Algorithm 4 applied in full. The
+    /// default, because it is the cheapest shape that passes every committed
+    /// recall gate: see `docs/site/rules.md` for the three-way comparison
+    /// against `own` and against raising `m0` instead.
+    #[default]
+    Both,
+}
+
+impl Prune {
+    /// Parse the `prune` field of `MUSHROOMDB_HNSW_PARAMS`.
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "own" => Some(Self::Own),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+}
+
+impl Default for HnswParams {
+    /// The shipped shape, chosen by the recall gates (`hnsw_5k_1536_recall`,
+    /// `approximate_recall_above_floor_1536dim_1k`, `approximate_recall_5k_timing`)
+    /// and not by argument.
+    ///
+    /// `m` falls 32 → 16 and `m0` falls 128 → 64, because M₀ = 128 was standing
+    /// in for the §3.5 diverse-neighbour heuristic the prune now applies; the
+    /// prune's cost is quadratic in `m0`, so the per-insert constant falls with
+    /// it. `ef_construction` falls 400 → 200 because it buys almost nothing once
+    /// the neighbours are diverse.
+    ///
+    /// `ef_search` does **not** fall. At 1,536 dimensions the nearest-neighbour
+    /// distribution is flat enough that recall is a beam-width problem, and
+    /// `hnsw_5k_1536_recall` refused every narrower beam that was tried: at
+    /// `ef_search` = 128 the min recall is 0.30 at `m0` = 32 and 0.70 at
+    /// `m0` = 64, against a floor of 0.90.
+    ///
+    /// `prune` is [`Prune::Both`] because [`Prune::Own`], which builds 5× faster
+    /// on uniform vectors but only 1.5× faster on clustered ones, scores **0.8581** on
+    /// `approximate_recall_5k_timing` against a floor of 0.90 — that corpus's
+    /// clusters are 100 members wide against an `m0` of 64, and the neighbour
+    /// side is where those links get thrown away. The two ways to fix it are
+    /// this and `m0` = 128; this one is both faster end to end (180 s against
+    /// 269 s of backfill) and half the adjacency memory, so it is the default.
+    fn default() -> Self {
+        Self {
+            m: 16,
+            m0: 64,
+            ef_construction: 200,
+            ef_search: 400,
+            prune: Prune::Both,
+        }
+    }
+}
+
+impl HnswParams {
+    /// Parse `m,m0,ef_construction,ef_search[,prune]`. `None` if the shape is
+    /// wrong, or a numeric field is absent, unparseable or zero — a zero would
+    /// produce an index with no edges or a search with no beam. The `prune`
+    /// field is optional and defaults to [`Prune::Both`]; it is the one field
+    /// that is a word rather than a number, so it cannot be confused with the
+    /// four ahead of it.
+    fn parse(s: &str) -> Option<Self> {
+        let fields: Vec<&str> = s.split(',').collect();
+        if fields.len() < 4 || fields.len() > 5 {
+            return None;
+        }
+        let mut num = fields
+            .iter()
+            .take(4)
+            .map(|f| f.trim().parse::<usize>().ok().filter(|&v| v > 0));
+        let mut next = || num.next().flatten();
+        let (m, m0, ef_construction, ef_search) = (next()?, next()?, next()?, next()?);
+        let prune = match fields.get(4) {
+            Some(f) => Prune::parse(f)?,
+            None => Prune::default(),
+        };
+        Some(Self {
+            m,
+            m0,
+            ef_construction,
+            ef_search,
+            prune,
+        })
+    }
+}
+
+/// The index shape this process builds and searches with.
+///
+/// Read once from `MUSHROOMDB_HNSW_PARAMS`, formatted
+/// `m,m0,ef_construction,ef_search[,prune]`, where `prune` is `own` or `both`
+/// and defaults to `both`. Unset or unparseable →
+/// [`HnswParams::default`]. Read once rather than per call so a graph cannot be
+/// half-built under one shape and half under another, and so the value is a
+/// pointer chase on the insert path.
+///
+/// For benchmarks and for an operator who has measured their own corpus; not a
+/// per-rule knob.
+pub fn hnsw_params() -> HnswParams {
+    static PARAMS: std::sync::OnceLock<HnswParams> = std::sync::OnceLock::new();
+    *PARAMS.get_or_init(|| {
+        std::env::var("MUSHROOMDB_HNSW_PARAMS")
+            .ok()
+            .and_then(|s| HnswParams::parse(&s))
+            .unwrap_or_default()
+    })
+}
+
+/// `M` — max connections per layer (except layer 0).
+#[deprecated(note = "read hnsw_params() instead")]
+pub const M: usize = 16;
+/// `M₀` — max connections at layer 0.
+#[deprecated(note = "read hnsw_params() instead")]
+pub const M0: usize = 64;
 /// Beam width for insertion.
-pub const EF_CONSTRUCTION: usize = 400;
+#[deprecated(note = "read hnsw_params() instead")]
+pub const EF_CONSTRUCTION: usize = 200;
 /// Beam width for search.
+#[deprecated(note = "read hnsw_params() instead")]
 pub const EF_SEARCH: usize = 400;
 
 // ---------------------------------------------------------------------------
@@ -156,7 +315,7 @@ fn gen_level(base_seed: u64, node_id: u32) -> usize {
     // Map upper 53 bits to (0, 1] — avoids ln(0).
     let bits = (rng >> 11) | 1; // ensure non-zero
     let uniform = bits as f64 / (1u64 << 53) as f64;
-    let ml = 1.0 / (M as f64).ln();
+    let ml = 1.0 / (hnsw_params().m as f64).ln();
     let level = (-uniform.ln() * ml).floor() as usize;
     level.min(MAX_LEVEL)
 }
@@ -237,10 +396,72 @@ pub struct HnswIndex {
     /// Entry-point **slot**.
     entry_point: Option<u32>,
     max_level: usize,
+    /// Overrides [`hnsw_params`]'s `prune` for this index only.
+    ///
+    /// Exists because `hnsw_params()` reads the environment through a
+    /// `OnceLock`: one process gets one shape, so a test that wants to compare
+    /// both prune strategies cannot get there through the env. Compiled out
+    /// entirely without `test-hooks`, and `#[serde(skip)]` regardless, so it can
+    /// reach neither a production build nor a blob.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[serde(skip)]
+    pub prune_override_for_test: Option<Prune>,
+}
+
+impl HnswIndex {
+    /// The prune this index builds with: the per-index test override when one is
+    /// set, otherwise the process-wide shape.
+    #[inline]
+    fn resolved_prune(&self, params: &HnswParams) -> Prune {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(p) = self.prune_override_for_test {
+            return p;
+        }
+        params.prune
+    }
 }
 
 /// A freed slot's id sentinel.
 const DEAD: u32 = u32::MAX;
+
+/// What an [`HnswIndex`] is holding, in countable units rather than bytes.
+///
+/// Produced by [`HnswIndex::memory_stats`]. Payload only: see that method for
+/// what is deliberately not counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct HnswMemoryStats {
+    /// Vectors currently indexed.
+    pub live_nodes: usize,
+    /// Total neighbour entries across every live node's every layer.
+    pub neighbour_slots: usize,
+    /// Total entries in the reverse adjacency index.
+    pub back_ref_entries: usize,
+    /// Total `f64`s stored across every live node's vector.
+    pub vector_floats: usize,
+}
+
+impl HnswMemoryStats {
+    /// Payload bytes per indexed vector: adjacency (4 B per entry, forward and
+    /// reverse) plus the vector itself (8 B per dimension). Zero for an empty
+    /// index.
+    pub fn bytes_per_node(&self) -> f64 {
+        if self.live_nodes == 0 {
+            return 0.0;
+        }
+        let bytes = (self.neighbour_slots + self.back_ref_entries) * 4 + self.vector_floats * 8;
+        bytes as f64 / self.live_nodes as f64
+    }
+
+    /// The adjacency half of [`Self::bytes_per_node`] — the half the index
+    /// shape controls. The vector half is fixed by the embedding's dimension.
+    pub fn adjacency_bytes_per_node(&self) -> f64 {
+        if self.live_nodes == 0 {
+            return 0.0;
+        }
+        ((self.neighbour_slots + self.back_ref_entries) * 4) as f64 / self.live_nodes as f64
+    }
+}
 
 impl HnswIndex {
     /// Create a new empty HNSW index seeded by `base_seed`.
@@ -384,7 +605,7 @@ impl HnswIndex {
             slot_of,
             id_of,
             free: Vec::new(),
-            back_refs: BTreeMap::new(),
+            ..Self::default()
         };
         // A dangling entry point would have panicked the old `dist_to`; elect a
         // live one instead.
@@ -506,6 +727,101 @@ impl HnswIndex {
         w_heap.into_iter().map(|(OrdF64(d), s)| (s, d)).collect()
     }
 
+    /// The **first-rejection prune** — a short-cut of HNSW Algorithm 4, not
+    /// Algorithm 4 itself. Read this before changing it: the difference is
+    /// deliberate, measured, and visible in the graph.
+    ///
+    /// `candidates` must be `(slot, distance-to-base)` sorted nearest-first; the
+    /// base vector itself is never needed again, only those distances. Walking
+    /// nearest-first, a candidate is **kept** when it is closer to the base than
+    /// to every neighbour already kept — a candidate sitting behind an
+    /// already-kept neighbour is reachable *through* it, so the link would spend
+    /// a slot without adding a route. That much is Algorithm 4's diversity test,
+    /// and it is what `m0` = 128 was paying for before 0.6.6.
+    ///
+    /// **Where it stops being Algorithm 4.** Once `rejections ≥ candidates.len()
+    /// − m`, every candidate still unseen is taken without testing it, and the
+    /// walk ends. Consequences, both real:
+    ///
+    /// * The tail it takes is the **farthest** candidates, untested. Algorithm 4
+    ///   would have gone on testing, and then filled any shortfall with the
+    ///   **nearest** rejects (`keepPrunedConnections`). Those are different sets,
+    ///   so this builds a different graph — it is a short-cut, not an
+    ///   optimisation.
+    /// * On the neighbour side the candidate list is always exactly `m + 1`
+    ///   long, so `candidates.len() − m` is 1 and the walk stops at the **first**
+    ///   rejection. That prune therefore performs exactly one diversity
+    ///   rejection and keeps the rest as it found them, rather than re-deciding
+    ///   the whole adjacency list.
+    /// * Because the walk only ever ends with `kept.len() ≥ m` (or with the tail
+    ///   taken), `keepPrunedConnections` would never fire. There is no backfill
+    ///   here; if you restore the full algorithm you must restore it too, or
+    ///   nodes will under-connect into inbound-only leaves that beam search
+    ///   cannot route through.
+    ///
+    /// **Why the short-cut ships, and it is not only speed.** Full Algorithm 4
+    /// was implemented and measured against this, both at `prune = both`,
+    /// `m0` = 64:
+    ///
+    /// | gate | full Algorithm 4 | this |
+    /// |---|---|---|
+    /// | `hnsw_5k_1536_recall` (5 000 × 1 536-D uniform) | 1.0000 / 1.0000 in **369 s** | 1.0000 / 1.0000 in **254 s** |
+    /// | `clustered_…_wider_than_m0` (40 × 120, 128-D) | min **0.5000** / mean 0.9725 | min **0.8000** / mean 0.9950 |
+    /// | `approximate_recall_5k_timing` (5 000 clustered) | 1.0000, backfill **226.6 s** | 1.0000, backfill **181.5 s** |
+    ///
+    /// So the short-cut is 1.25–1.45× faster *and* strictly better on the corpus
+    /// whose clusters are wider than `m0`. The reason is `keepPrunedConnections`
+    /// itself: it backfills with the **nearest** rejects, and on a wide cluster
+    /// those are all crowded in the one direction the diversity test just
+    /// rejected. Taking the untested far tail instead keeps longer-range links,
+    /// which is what makes the cluster reachable from outside. The paper's
+    /// algorithm is the more principled one; on this corpus and at this `m0` it
+    /// is measurably the worse one, which is why the deviation is deliberate
+    /// rather than a bug to fix later. `docs/site/rules.md` carries the same
+    /// table for operators.
+    fn select_neighbors_first_rejection(
+        slots: &[HnswNode],
+        id_of: &[u32],
+        candidates: &[(u32, f64)],
+        m: usize,
+    ) -> Vec<u32> {
+        let mut kept: Vec<u32> = Vec::with_capacity(m);
+
+        for (i, &(cand, d_base)) in candidates.iter().enumerate() {
+            if kept.len() >= m {
+                break;
+            }
+            // `rejections >= candidates.len() - m`, rearranged to avoid an
+            // underflow when the list is shorter than `m`. Everything from here
+            // on is taken untested: see the doc comment for what that costs.
+            if kept.len() + (candidates.len() - i) <= m {
+                kept.extend(
+                    candidates[i..]
+                        .iter()
+                        .map(|&(c, _)| c)
+                        .filter(|&c| Self::is_live(id_of, c)),
+                );
+                break;
+            }
+            if !Self::is_live(id_of, cand) {
+                continue;
+            }
+            let cand_vec = &slots[cand as usize].vector;
+            // Closer to the base than to anything already kept?
+            let diverse = kept
+                .iter()
+                .all(|&k| d_base < Self::dist_to(slots, k, cand_vec));
+            if diverse {
+                kept.push(cand);
+            }
+            // A rejection is not recorded: nothing downstream reads it, because
+            // there is no backfill. The `kept.len() + remaining <= m` test above
+            // is the same condition as `rejections >= candidates.len() - m`.
+        }
+        debug_assert!(kept.len() <= m, "the prune must respect its allowance");
+        kept
+    }
+
     /// Greedy 1-NN descent from `ep` at `layer`. Returns the nearest slot
     /// found (used for upper-layer descent during insert/search).
     fn greedy_step(slots: &[HnswNode], id_of: &[u32], q: &[f64], ep: u32, layer: usize) -> u32 {
@@ -576,6 +892,8 @@ impl HnswIndex {
             return;
         };
 
+        let params = hnsw_params();
+        let prune = self.resolved_prune(&params);
         let max_level = self.max_level;
         let mut curr_ep = ep;
 
@@ -587,7 +905,7 @@ impl HnswIndex {
         // Phase 2: beam-search + connect at each layer from min(level, max_level)
         // down to 0.
         for lc in (0..=level.min(max_level)).rev() {
-            let m_lc = if lc == 0 { M0 } else { M };
+            let m_lc = if lc == 0 { params.m0 } else { params.m };
 
             // Beam search to collect ef_construction nearest candidates.
             let mut candidates = Self::beam_search(
@@ -596,18 +914,25 @@ impl HnswIndex {
                 &unit,
                 curr_ep,
                 lc,
-                EF_CONSTRUCTION,
+                params.ef_construction,
             );
 
-            // Sort ascending by distance and take M nearest as neighbors.
-            candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            let neighbors: Vec<u32> = candidates.iter().take(m_lc).map(|(s, _)| *s).collect();
-            self.set_layer(slot, lc, neighbors.clone());
+            sort_by_distance(&mut candidates);
 
-            // Advance curr_ep to the nearest candidate.
+            // Advance curr_ep to the nearest candidate before the heuristic
+            // thins the list: the descent wants the nearest node, not the most
+            // diverse one.
             if let Some(&(nearest, _)) = candidates.first() {
                 curr_ep = nearest;
             }
+
+            // The new node's own neighbours go through the heuristic too. This
+            // is where the diversity buys recall: taking the m nearest leaves
+            // every node in a dense cluster pointing back into the same
+            // cluster, and the beam never crosses out of it.
+            let neighbors =
+                Self::select_neighbors_first_rejection(&self.slots, &self.id_of, &candidates, m_lc);
+            self.set_layer(slot, lc, neighbors.clone());
 
             // Add bidirectional links and prune over-connected neighbors.
             for &nb in &neighbors {
@@ -620,29 +945,33 @@ impl HnswIndex {
                     self.link_back_ref(slot, nb);
                 }
 
-                // Prune if over-connected (simple selection: keep M nearest to nb).
                 if self.slots[nb as usize].layers[lc].len() <= m_lc {
                     continue;
                 }
+                // Over-connected. `set_layer` keeps `back_refs` in step for
+                // every link the prune drops, whichever prune that is.
                 let nb_vec: Vec<f64> = self.slots[nb as usize].vector.clone();
                 let current: Vec<u32> = self.slots[nb as usize].layers[lc].clone();
-
-                // Score each current neighbor by distance to nb.
                 let mut scored: Vec<(u32, f64)> = current
                     .iter()
-                    .map(|&s| {
-                        let d = if Self::is_live(&self.id_of, s) {
-                            Self::dist_to(&self.slots, s, &nb_vec)
-                        } else {
-                            f64::MAX
-                        };
-                        (s, d)
-                    })
+                    .filter(|&&s| Self::is_live(&self.id_of, s))
+                    .map(|&s| (s, Self::dist_to(&self.slots, s, &nb_vec)))
                     .collect();
-
-                scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-                scored.truncate(m_lc);
-                self.set_layer(nb, lc, scored.into_iter().map(|(s, _)| s).collect());
+                sort_by_distance(&mut scored);
+                let kept: Vec<u32> = match prune {
+                    // Keep the m nearest. One distance per candidate, already
+                    // computed above.
+                    Prune::Own => scored.iter().take(m_lc).map(|(s, _)| *s).collect(),
+                    // Re-decide the whole list by diversity: O(m₀²) distances,
+                    // once per over-connected neighbour per insert.
+                    Prune::Both => Self::select_neighbors_first_rejection(
+                        &self.slots,
+                        &self.id_of,
+                        &scored,
+                        m_lc,
+                    ),
+                };
+                self.set_layer(nb, lc, kept);
             }
         }
 
@@ -735,7 +1064,7 @@ impl HnswIndex {
         }
 
         note_search();
-        let ef = k.max(EF_SEARCH);
+        let ef = k.max(hnsw_params().ef_search);
         let mut curr_ep = ep;
 
         // Greedy descent from max_level to layer 1.
@@ -755,6 +1084,31 @@ impl HnswIndex {
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(k);
         results
+    }
+
+    /// Count the graph's own storage, so a benchmark can report bytes per
+    /// indexed vector instead of guessing at them.
+    ///
+    /// Counts payload only — the `u32`s in every adjacency list, the `u32`s in
+    /// the reverse index, and the `f64`s of every vector. Allocator headers and
+    /// the per-`Vec`/per-`BTreeSet` bookkeeping are not counted, so this is a
+    /// floor on resident size, not a measurement of it.
+    pub fn memory_stats(&self) -> HnswMemoryStats {
+        let mut neighbour_slots = 0usize;
+        let mut vector_floats = 0usize;
+        for (s, node) in self.slots.iter().enumerate() {
+            if !Self::is_live(&self.id_of, s as u32) {
+                continue;
+            }
+            neighbour_slots += node.layers.iter().map(|l| l.len()).sum::<usize>();
+            vector_floats += node.vector.len();
+        }
+        HnswMemoryStats {
+            live_nodes: self.slot_of.len(),
+            neighbour_slots,
+            back_ref_entries: self.back_refs.values().map(|s| s.len()).sum(),
+            vector_floats,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -926,6 +1280,18 @@ pub fn search_hnsw_blob(blob: &[u8], q: &[f64], k: usize) -> Vec<(u32, f64)> {
 // Vector helpers
 // ---------------------------------------------------------------------------
 
+/// Sort `(slot, distance)` pairs nearest-first, breaking ties on the slot so
+/// the order is a function of the graph and not of heap iteration order. The
+/// §3.5 heuristic reads this order, so a tie decided differently on two
+/// machines would be two different graphs from the same WAL.
+fn sort_by_distance(v: &mut [(u32, f64)]) {
+    v.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
 /// L2-normalize `v`. Returns `None` for the zero vector.
 pub(crate) fn l2_normalize(v: &[f64]) -> Option<Vec<f64>> {
     let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -935,6 +1301,65 @@ pub(crate) fn l2_normalize(v: &[f64]) -> Option<Vec<f64>> {
     Some(v.iter().map(|x| x / norm).collect())
 }
 
+/// Build `n` deterministic unit vectors in `dim` dimensions from a splitmix64
+/// stream seeded with `seed`. Each vector is L2-normalized.
+///
+/// Public — and not `#[cfg(test)]` — so the in-crate recall gate, the
+/// `tests/hnsw_scale.rs` benchmark and any external measurement all draw from
+/// one generator: a recall number and a build time are only comparable when the
+/// vectors behind them are the same vectors.
+#[doc(hidden)]
+pub fn make_unit_vecs(n: usize, dim: usize, seed: u64) -> Vec<Vec<f64>> {
+    let mut state = seed;
+    (0..n)
+        .map(|_| {
+            let raw: Vec<f64> = (0..dim)
+                .map(|_| {
+                    state = splitmix64(state);
+                    // Map to [-1, 1]
+                    (state as i64 as f64) / (i64::MAX as f64)
+                })
+                .collect();
+            l2_normalize(&raw).unwrap_or_else(|| vec![1.0; dim])
+        })
+        .collect()
+}
+
+/// Build `clusters × per_cluster` deterministic unit vectors, each a cluster
+/// centre plus a small perturbation, in cluster order.
+///
+/// Uniformly random high-dimensional vectors are all nearly orthogonal, so they
+/// exercise beam width and nothing else. Real embeddings cluster, and a cluster
+/// wider than the layer-0 allowance is the case the §3.5 heuristic exists for:
+/// without it every member of the cluster spends all its links inside the
+/// cluster and the graph stops being navigable between clusters.
+#[doc(hidden)]
+pub fn make_clustered_unit_vecs(
+    clusters: usize,
+    per_cluster: usize,
+    dim: usize,
+    seed: u64,
+) -> Vec<Vec<f64>> {
+    let centres = make_unit_vecs(clusters, dim, seed);
+    let mut state = seed ^ 0xA5A5_5A5A_1234_9876;
+    let mut out = Vec::with_capacity(clusters * per_cluster);
+    for centre in &centres {
+        for _ in 0..per_cluster {
+            let raw: Vec<f64> = centre
+                .iter()
+                .map(|c| {
+                    state = splitmix64(state);
+                    // A perturbation small enough that cluster membership is
+                    // unambiguous, large enough that members are distinct.
+                    c + 0.12 * (state as i64 as f64) / (i64::MAX as f64) / (dim as f64).sqrt()
+                })
+                .collect();
+            out.push(l2_normalize(&raw).unwrap_or_else(|| centre.clone()));
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -942,24 +1367,6 @@ pub(crate) fn l2_normalize(v: &[f64]) -> Option<Vec<f64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Build `n` deterministic unit vectors in `dim` dimensions using a
-    /// splitmix64 PRNG. Each vector is L2-normalized.
-    fn make_unit_vecs(n: usize, dim: usize, seed: u64) -> Vec<Vec<f64>> {
-        let mut state = seed;
-        (0..n)
-            .map(|_| {
-                let raw: Vec<f64> = (0..dim)
-                    .map(|_| {
-                        state = splitmix64(state);
-                        // Map to [-1, 1]
-                        (state as i64 as f64) / (i64::MAX as f64)
-                    })
-                    .collect();
-                l2_normalize(&raw).unwrap_or_else(|| vec![1.0; dim])
-            })
-            .collect()
-    }
 
     /// Exact brute-force k-NN by cosine (dot product for unit vecs).
     fn exact_knn(vecs: &[Vec<f64>], q: &[f64], k: usize) -> Vec<usize> {
@@ -1049,6 +1456,537 @@ mod tests {
         assert!(r[0].1 >= r[1].1);
         assert!(r[1].1 >= r[2].1);
         assert_eq!(r[0].0, 0, "node 0 must be nearest");
+    }
+
+    // -----------------------------------------------------------------------
+    // Parameters
+    // -----------------------------------------------------------------------
+
+    /// The deprecated constants are the default shape's fields. They are kept
+    /// so an external reference still compiles, and this is what stops them
+    /// drifting away from the values the index actually uses.
+    #[test]
+    #[allow(deprecated)]
+    fn the_deprecated_constants_still_name_the_default_shape() {
+        let d = HnswParams::default();
+        assert_eq!(
+            (M, M0, EF_CONSTRUCTION, EF_SEARCH),
+            (d.m, d.m0, d.ef_construction, d.ef_search)
+        );
+    }
+
+    /// The documented format, and every way of getting it wrong. A bad value
+    /// falls back to the default rather than building a degenerate index: an
+    /// `m0` of 0 is a graph with no edges, an `ef_search` of 0 is a beam with
+    /// no width.
+    #[test]
+    fn params_parse_accepts_the_documented_format_and_nothing_else() {
+        assert_eq!(
+            HnswParams::parse("16,64,200,400"),
+            Some(HnswParams::default())
+        );
+        assert_eq!(
+            HnswParams::parse(" 8 , 64 , 300 , 96 "),
+            Some(HnswParams {
+                m: 8,
+                m0: 64,
+                ef_construction: 300,
+                ef_search: 96,
+                prune: Prune::Both
+            }),
+            "whitespace around a field must not defeat the override"
+        );
+        assert_eq!(
+            HnswParams::parse("16,64,200,400,both"),
+            Some(HnswParams::default()),
+            "the prune field is optional, and `both` is what omitting it means"
+        );
+        assert_eq!(
+            HnswParams::parse("16,64,200,400, own "),
+            Some(HnswParams {
+                prune: Prune::Own,
+                ..HnswParams::default()
+            }),
+            "`own` opts out of the neighbour-side heuristic"
+        );
+        for bad in [
+            "",
+            "16",
+            "16,64,200",
+            "16,64,200,400,64",
+            "16,64,200,400,neither",
+            "16,64,200,400,own,own",
+            "16,64,200,x",
+            "0,64,200,400",
+            "16,0,200,400",
+            "16,64,0,400",
+            "16,64,200,0",
+            "-16,64,200,400",
+        ] {
+            assert_eq!(HnswParams::parse(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    /// The prune strategy changes the graph, so it must change what the
+    /// neighbour-side prune does — and nothing else. Both shapes must respect
+    /// the degree bound and both must answer.
+    #[test]
+    fn both_prune_strategies_build_a_searchable_bounded_graph() {
+        let params = hnsw_params();
+        let vecs = make_unit_vecs(600, 24, 0x9121_5EED);
+        for prune in [Prune::Own, Prune::Both] {
+            let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"prune-shapes"));
+            idx.prune_override_for_test = Some(prune);
+            for (i, v) in vecs.iter().enumerate() {
+                idx.insert(i as u32, v);
+            }
+            assert_eq!(idx.len(), 600, "{prune:?} lost nodes");
+            for (s, node) in idx.slots.iter().enumerate() {
+                if !HnswIndex::is_live(&idx.id_of, s as u32) {
+                    continue;
+                }
+                for (lc, layer) in node.layers.iter().enumerate() {
+                    let allowed = if lc == 0 { params.m0 } else { params.m };
+                    assert!(
+                        layer.len() <= allowed,
+                        "{prune:?} slot {s} layer {lc} holds {} links for an allowance of \
+                         {allowed}",
+                        layer.len()
+                    );
+                }
+            }
+            let hits = idx.search(&vecs[42], 5);
+            assert_eq!(
+                hits.first().map(|&(id, _)| id),
+                Some(42),
+                "{prune:?} search"
+            );
+            for &id in idx.node_ids().iter() {
+                assert_eq!(
+                    idx.back_refs_for_test(id),
+                    idx.scan_back_refs_for_test(id),
+                    "{prune:?} back_refs[{id}] disagrees with a full scan"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The §3.5 diverse-neighbour heuristic
+    // -----------------------------------------------------------------------
+
+    /// Build a throwaway index holding exactly `vecs`, with no edges, so a
+    /// heuristic call can be made against known geometry.
+    fn slots_of(vecs: &[Vec<f64>]) -> (Vec<HnswNode>, Vec<u32>) {
+        let slots = vecs
+            .iter()
+            .map(|v| HnswNode {
+                level: 0,
+                vector: l2_normalize(v).unwrap(),
+                layers: vec![vec![]],
+            })
+            .collect();
+        let id_of = (0..vecs.len() as u32).collect();
+        (slots, id_of)
+    }
+
+    /// The prune's whole point: given candidates at nearly the same distance,
+    /// some of which sit behind a neighbour already kept, it keeps the ones that
+    /// open a new direction. Sized so the diversity test genuinely runs rather
+    /// than being short-circuited by the tail rule.
+    #[test]
+    fn the_prune_prefers_a_new_direction_over_a_redundant_neighbour() {
+        // Six candidates, `m` = 2, so the tail short-cut cannot fire until four
+        // rejections have been made: the diversity test runs at least three
+        // times and its verdicts decide the answer. Candidate 0 opens one
+        // direction; 1, 2 and 3 sit behind it at increasing distance; 4 opens a
+        // second direction; 5 is far and behind 0. Keeping the m *nearest* would
+        // answer [0, 1]; deleting the diversity test would also answer [0, 1].
+        let base = l2_normalize(&[1.0, 0.0, 0.0]).unwrap();
+        let vecs = vec![
+            vec![0.80, 0.0, 0.60], // 0: nearest, direction A
+            vec![0.78, 0.0, 0.63], // 1: behind 0
+            vec![0.76, 0.0, 0.65], // 2: behind 0
+            vec![0.74, 0.0, 0.67], // 3: behind 0
+            vec![0.70, 0.71, 0.0], // 4: direction B — diverse
+            vec![0.60, 0.0, 0.80], // 5: far, behind 0
+        ];
+        let (slots, id_of) = slots_of(&vecs);
+        let mut cands: Vec<(u32, f64)> = (0..6u32)
+            .map(|s| (s, HnswIndex::dist_to(&slots, s, &base)))
+            .collect();
+        sort_by_distance(&mut cands);
+        assert_eq!(
+            cands.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5],
+            "fixture: candidates must arrive in this nearest-first order"
+        );
+
+        let kept = HnswIndex::select_neighbors_first_rejection(&slots, &id_of, &cands, 2);
+        assert_eq!(
+            kept,
+            vec![0, 4],
+            "the prune must reject 1, 2 and 3 as reachable through 0 and keep 4, \
+             which opens a direction 0 does not cover"
+        );
+    }
+
+    /// The documented deviation from Algorithm 4, pinned so it cannot change by
+    /// accident. Once `rejections >= candidates.len() - m` the prune takes the
+    /// remaining candidates **untested** — the farthest ones — where Algorithm 4
+    /// would keep testing and then backfill with the **nearest** reject. This
+    /// fixture is a case where those two answers differ, and it asserts ours.
+    #[test]
+    fn the_prune_keeps_the_untested_tail_where_algorithm_4_would_backfill() {
+        // `m` = 2 over three candidates, so one rejection triggers the tail.
+        // 0 opens a direction; 1 is near but behind 0; 2 is far and behind 0.
+        let base = l2_normalize(&[1.0, 0.0, 0.0]).unwrap();
+        let vecs = vec![
+            vec![0.80, 0.0, 0.60], // 0: nearest
+            vec![0.78, 0.0, 0.63], // 1: behind 0, near
+            vec![0.55, 0.0, 0.84], // 2: behind 0, far
+        ];
+        let (slots, id_of) = slots_of(&vecs);
+        let mut cands: Vec<(u32, f64)> = (0..3u32)
+            .map(|s| (s, HnswIndex::dist_to(&slots, s, &base)))
+            .collect();
+        sort_by_distance(&mut cands);
+        assert_eq!(
+            cands.iter().map(|&(s, _)| s).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "fixture: nearest-first order"
+        );
+
+        let kept = HnswIndex::select_neighbors_first_rejection(&slots, &id_of, &cands, 2);
+        assert_eq!(
+            kept,
+            vec![0, 2],
+            "the short-cut keeps the untested far candidate; full Algorithm 4 \
+             would have rejected it too and backfilled with the nearer reject 1, \
+             answering [0, 1]. If this ever reads [0, 1] the prune has become \
+             Algorithm 4 and `select_neighbors_first_rejection`'s name, its doc \
+             comment and docs/site/rules.md are all now wrong."
+        );
+    }
+
+    /// A dead slot is never linked to. `insert` filters them before scoring,
+    /// but the heuristic is the last gate before an adjacency list is written.
+    #[test]
+    fn the_prune_never_keeps_a_freed_slot() {
+        let vecs = make_unit_vecs(4, 8, 0x7EA0_1234);
+        let (slots, mut id_of) = slots_of(&vecs);
+        id_of[1] = DEAD;
+        let base = l2_normalize(&vecs[0]).unwrap();
+        let mut cands: Vec<(u32, f64)> = (0..4u32)
+            .map(|s| (s, HnswIndex::dist_to(&slots, s, &base)))
+            .collect();
+        sort_by_distance(&mut cands);
+        let kept = HnswIndex::select_neighbors_first_rejection(&slots, &id_of, &cands, 4);
+        assert!(
+            !kept.contains(&1),
+            "a freed slot must not become a neighbour"
+        );
+    }
+
+    /// The memory win, guarded on every `cargo test`: degree bounds per layer
+    /// and payload bytes per node against a stated ceiling.
+    ///
+    /// The whole argument for `m0` = 64 is that adjacency halves, and the 5,000 ×
+    /// 1,536-D measurement that backs it is an `#[ignore]`d release run. This is
+    /// the cheap version that actually runs: a regression that lets degree drift
+    /// — a prune that stops pruning, a `set_layer` that leaks — shows up here
+    /// first.
+    #[test]
+    fn degree_and_adjacency_bytes_stay_within_the_shape() {
+        let params = hnsw_params();
+        let vecs = make_unit_vecs(1_200, 32, 0xDE6E_E5EE);
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"degree-bound"));
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert(i as u32, v);
+        }
+
+        let mut worst_layer0 = 0usize;
+        let mut worst_upper = 0usize;
+        for (s, node) in idx.slots.iter().enumerate() {
+            if !HnswIndex::is_live(&idx.id_of, s as u32) {
+                continue;
+            }
+            for (lc, layer) in node.layers.iter().enumerate() {
+                let allowed = if lc == 0 { params.m0 } else { params.m };
+                assert!(
+                    layer.len() <= allowed,
+                    "slot {s} layer {lc} holds {} links for an allowance of {allowed}",
+                    layer.len()
+                );
+                if lc == 0 {
+                    worst_layer0 = worst_layer0.max(layer.len());
+                } else {
+                    worst_upper = worst_upper.max(layer.len());
+                }
+            }
+        }
+
+        // Payload per node. Forward entries are bounded by `m0` on layer 0 plus
+        // `m` on each layer above, and the reverse index holds at most one entry
+        // per (source, target) pair, so it can never exceed the forward count.
+        // `2 * (m0 + m) * 4` bytes is therefore a true ceiling with room for the
+        // upper layers, and it is tight enough to catch `m0` doubling.
+        let mem = idx.memory_stats();
+        let ceiling = 2.0 * (params.m0 + params.m) as f64 * 4.0;
+        eprintln!(
+            "degree: layer0 <= {worst_layer0} (allowance {}), upper <= {worst_upper} \
+             (allowance {}); adjacency {:.1} B/node against a ceiling of {ceiling:.1}; \
+             vector {:.1} B/node",
+            params.m0,
+            params.m,
+            mem.adjacency_bytes_per_node(),
+            (mem.vector_floats * 8) as f64 / mem.live_nodes as f64,
+        );
+        assert_eq!(mem.live_nodes, 1_200);
+        assert!(
+            mem.back_ref_entries <= mem.neighbour_slots,
+            "the reverse index ({}) cannot hold more pairs than the forward one ({})",
+            mem.back_ref_entries,
+            mem.neighbour_slots
+        );
+        assert!(
+            mem.adjacency_bytes_per_node() <= ceiling,
+            "adjacency is {:.1} B/node against a ceiling of {ceiling:.1} — the \
+             index shape grew",
+            mem.adjacency_bytes_per_node()
+        );
+        // 32 f64s per vector, exactly, or the fixture is not what it says.
+        assert_eq!(mem.vector_floats, 1_200 * 32);
+    }
+
+    /// Recall on a corpus whose clusters are wider than the layer-0 allowance.
+    ///
+    /// This is the case `M₀ = 128` was raised for in v0.4.2 and the case the
+    /// §3.5 heuristic replaces it for: 40 clusters of 120 members each, against
+    /// an `m0` of 64. Without diversity in the selection, every member of a
+    /// cluster spends all 64 of its layer-0 links on other members of the same
+    /// cluster, the cluster becomes a closed component, and a query that enters
+    /// the graph elsewhere never reaches it.
+    ///
+    /// Queries are drawn from the same clustered distribution, so the top-10
+    /// are inside one cluster and finding them means the beam must have got
+    /// into that cluster.
+    ///
+    /// Run with:
+    /// `cargo test --release -p mushroomdb-rules -- clustered_recall_survives_clusters_wider_than_m0 --ignored --nocapture`
+    #[test]
+    #[ignore = "slow: builds a 4,800-vector clustered index"]
+    fn clustered_recall_survives_clusters_wider_than_m0() {
+        const CLUSTERS: usize = 40;
+        const PER_CLUSTER: usize = 120;
+        const DIM: usize = 128;
+        const K: usize = 10;
+
+        assert!(
+            PER_CLUSTER > hnsw_params().m0,
+            "the fixture only proves anything when a cluster is wider than m0 \
+             ({PER_CLUSTER} vs {})",
+            hnsw_params().m0
+        );
+
+        let vecs = make_clustered_unit_vecs(CLUSTERS, PER_CLUSTER, DIM, 0xC1_05_7E_12_34_56_78_9A);
+
+        // Queries: one member of each cluster, nudged. The true top-10 is then
+        // that member and its nine nearest cluster-mates — a well-defined set,
+        // unlike a query at the cluster centre, where 120 near-equidistant
+        // members make "the top 10" a coin toss and recall measures noise.
+        let queries: Vec<Vec<f64>> = (0..CLUSTERS)
+            .map(|c| {
+                let j = c * PER_CLUSTER + 17;
+                let mut q = vecs[j].clone();
+                q[0] += 1e-6;
+                q
+            })
+            .collect();
+        let exact: Vec<BTreeSet<usize>> = queries
+            .iter()
+            .map(|q| exact_knn(&vecs, q, K).into_iter().collect())
+            .collect();
+
+        // Both prune strategies, because this fixture is the only one that can
+        // tell them apart, and the difference is the whole reason `Prune::Both`
+        // exists as an option. Floors are per strategy: they are what was
+        // measured, and the gap between them is the trade-off `rules.md`
+        // documents.
+        let mut scored: Vec<(Prune, f64, f64)> = Vec::new();
+        for prune in [Prune::Own, Prune::Both] {
+            let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"clustered-recall"));
+            idx.prune_override_for_test = Some(prune);
+            for (i, v) in vecs.iter().enumerate() {
+                idx.insert(i as u32, v);
+            }
+            let recalls: Vec<f64> = queries
+                .iter()
+                .zip(exact.iter())
+                .map(|(q, truth)| {
+                    let found = idx
+                        .search(q, K)
+                        .into_iter()
+                        .filter(|(id, _)| truth.contains(&(*id as usize)))
+                        .count();
+                    found as f64 / K as f64
+                })
+                .collect();
+            let min = recalls.iter().cloned().fold(f64::MAX, f64::min);
+            let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
+            eprintln!(
+                "clustered recall@{K} ({CLUSTERS}x{PER_CLUSTER}, dim {DIM}, m0={}, \
+                 prune={prune:?}): min={min:.4} mean={mean:.4}",
+                hnsw_params().m0
+            );
+            scored.push((prune, min, mean));
+        }
+
+        // Measured: Own min 0.5000 / mean 0.9350, Both min 0.8000 / mean 0.9950.
+        // A query here sits inside a 120-member cluster whose members are
+        // genuinely close together, so ranks 8 to 12 are separated by very
+        // little and the tail of the top-10 is the hardest thing this index is
+        // ever asked for. The mean says the beam reached the right cluster; the
+        // min says no single query got stuck in one member's neighbourhood.
+        for &(prune, min, mean) in &scored {
+            let (min_floor, mean_floor) = match prune {
+                Prune::Own => (0.40, 0.90),
+                Prune::Both => (0.70, 0.95),
+            };
+            assert!(
+                min >= min_floor,
+                "{prune:?} min clustered recall@{K} = {min:.4} < {min_floor}"
+            );
+            assert!(
+                mean >= mean_floor,
+                "{prune:?} mean clustered recall@{K} = {mean:.4} < {mean_floor}"
+            );
+        }
+
+        // The reason the option exists: on a corpus whose clusters are wider
+        // than `m0`, the full heuristic must actually be better. If this ever
+        // stops holding, `Prune::Both` is paying 5x the build time for nothing.
+        let own = scored[0];
+        let both = scored[1];
+        assert!(
+            both.1 >= own.1 && both.2 >= own.2,
+            "Prune::Both (min {:.4} mean {:.4}) is not better than Prune::Own \
+             (min {:.4} mean {:.4}) on clusters wider than m0 — the option has no \
+             justification left",
+            both.1,
+            both.2,
+            own.1,
+            own.2
+        );
+    }
+
+    /// Recall after churn. Insert 5,000 1,536-D vectors, remove a fifth,
+    /// re-insert a tenth of them, remove a disjoint seventh, then measure
+    /// recall@10 against brute force over exactly the surviving set. A graph
+    /// that healed badly answers from the wrong neighbourhood; this is the test
+    /// that would have caught a prune that orphaned nodes on removal.
+    ///
+    /// The corpus is the shape `hnsw_5k_1536_recall` uses, and for the same
+    /// reason: `ef_search` is 400, so a graph of a few hundred reachable nodes
+    /// is searched exhaustively and its recall is 1.0 whatever the churn did.
+    /// Only at thousands of survivors does the number mean anything. That makes
+    /// it a release gate rather than a `cargo test` one.
+    ///
+    /// Run with:
+    /// `cargo test --release -p mushroomdb-rules -- recall_survives_insert_remove_churn --ignored --nocapture`
+    #[test]
+    #[ignore = "slow: builds a 5k x 1536-D index and churns it"]
+    fn recall_survives_insert_remove_churn() {
+        const N: usize = 5_000;
+        const DIM: usize = 1_536;
+        const K: usize = 10;
+
+        let vecs = make_unit_vecs(N, DIM, 0xC0FF_EE00_5EED_1234);
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"churn-recall"));
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert(i as u32, v);
+        }
+
+        // Churn: drop every 5th, then bring back every 10th of those, then drop
+        // a disjoint slice. Slots are reused throughout, so a stale adjacency
+        // reference would now name the wrong vector.
+        let mut live: BTreeSet<usize> = (0..N).collect();
+        for i in (0..N).step_by(5) {
+            idx.remove(i as u32);
+            live.remove(&i);
+        }
+        for i in (0..N).step_by(10) {
+            idx.insert(i as u32, &vecs[i]);
+            live.insert(i);
+        }
+        for i in (3..N).step_by(7) {
+            idx.remove(i as u32);
+            live.remove(&i);
+        }
+        assert_eq!(
+            idx.len(),
+            live.len(),
+            "the index and the oracle disagree on size"
+        );
+
+        // back_refs must still be exact — recall means nothing on a corrupt
+        // graph. Spot-checked rather than verified for every node: the full
+        // check is O(n² · m₀), which at n = 5,000 costs more than the whole
+        // rest of this test, and `back_refs_match_a_full_scan` already runs it
+        // exhaustively over a churned 500-node index on every `cargo test`.
+        for &id in idx.node_ids().iter().step_by(53) {
+            assert_eq!(
+                idx.back_refs_for_test(id),
+                idx.scan_back_refs_for_test(id),
+                "back_refs[{id}] disagrees with a full scan after churn"
+            );
+        }
+
+        // Ground truth over the survivors only.
+        let survivors: Vec<usize> = live.iter().copied().collect();
+        let queries = make_unit_vecs(40, DIM, 0x9111_0BED);
+        let mut recalls = Vec::with_capacity(queries.len());
+        for q in &queries {
+            let mut scored: Vec<(usize, f64)> = survivors
+                .iter()
+                .map(|&i| {
+                    let dot: f64 = vecs[i].iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                    (i, dot)
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            let exact: BTreeSet<usize> = scored.into_iter().take(K).map(|(i, _)| i).collect();
+
+            let hits = idx.search(q, K);
+            for (id, _) in &hits {
+                assert!(
+                    live.contains(&(*id as usize)),
+                    "search returned {id}, which was removed"
+                );
+            }
+            let found = hits
+                .iter()
+                .filter(|(id, _)| exact.contains(&(*id as usize)))
+                .count();
+            recalls.push(found as f64 / K as f64);
+        }
+        let min = recalls.iter().cloned().fold(f64::MAX, f64::min);
+        let mean = recalls.iter().sum::<f64>() / recalls.len() as f64;
+        eprintln!(
+            "churn recall@{K}: min={min:.4} mean={mean:.4} over {} survivors",
+            live.len()
+        );
+        // The same floor `hnsw_5k_1536_recall` holds the un-churned graph to.
+        // Everything here is seeded, so these are fixed numbers, not a sample.
+        assert!(min >= 0.90, "min recall@{K} after churn = {min:.4} < 0.90");
+        assert!(
+            mean >= 0.95,
+            "mean recall@{K} after churn = {mean:.4} < 0.95"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -69,3 +69,11 @@ way you declare rules or fulltext fields.
 Use a **property index** for exact scalar equality (`city = 'austin'`). Use a
 [fulltext index](fulltext.md) for tokenized text search (BM25, stemming, phrase
 and prefix queries) over free-text fields.
+
+## Relationship to the vector index
+
+A property index answers equality; the vector index answers nearness. It is not
+declared — it is built by an approximate `VectorSimilar` rule. Its shape, the
+`MUSHROOMDB_HNSW_PARAMS` override, its memory per indexed vector and the recall
+its gates assert are documented under
+[Vector index parameters](rules.md#vector-index-parameters).
