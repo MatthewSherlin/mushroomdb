@@ -164,12 +164,20 @@ non-existent nodes — the role cannot distinguish the two cases.
 
 The sixth is the namespace leg (v0.6.6): a role bound to `namespaces` may only
 **create** a node inside them, because a node it could never read back would be a
-write into another tenancy. It covers `POST /nodes`, a batch, Cypher `CREATE`, the
-node `MERGE` creates, and a placeholder `POST /edges/upsert` auto-creates — a create
-naming no namespace is a create in `default`, so a role not bound to `default` is
-refused there too. A role with no `namespaces` binding is unchanged. Updates need no
-rule of their own: a role can only mutate nodes already in its read mask, which the
-namespace leg has already narrowed. See [masks.md](masks.md#namespaces).
+write into another tenancy. It covers `POST /nodes`, a batch, Cypher `CREATE`, and the
+node a `MERGE` creates (which always lands in `default`, so a namespaced role cannot
+`MERGE`-create at all) — a create naming no namespace is a create in `default`, so a
+role not bound to `default` is refused there too. A role with no `namespaces` binding
+is unchanged. Updates need no rule of their own: a role can only mutate nodes already
+in its read mask, which the namespace leg has already narrowed.
+
+A placeholder endpoint `POST /edges/upsert` would auto-create is refused by the same
+rule (a placeholder carries no props, so it lands in `default`) but with the
+**endpoint** message, `role-bound token: edge endpoint not visible`, not the namespace
+one. That is deliberate: the namespace arm fires only for an endpoint that does *not*
+exist and the visibility arm only for one that does, so two different strings would
+turn the pair into an existence oracle. Hidden ≡ absent holds here as everywhere else.
+See [masks.md](masks.md#namespaces).
 
 #### Threat model
 

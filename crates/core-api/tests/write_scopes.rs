@@ -1566,7 +1566,10 @@ fn test_create_outside_the_roles_namespace_denied() {
     assert!(!db.has_node("bare"));
 
     // An upsert-edge whose placeholder endpoint would be created lands in
-    // `default` too, so it is refused on the same ground.
+    // `default` too, so it is refused on the same ground — but with the
+    // endpoint-visibility wording, which is what keeps hidden and absent
+    // indistinguishable there. See
+    // `test_upsert_placeholder_hidden_equals_absent_for_a_namespaced_role`.
     let authz = writer_authz(&mut db);
     let err = db
         .write_batch_authz(
@@ -1581,7 +1584,7 @@ fn test_create_outside_the_roles_namespace_denied() {
         .unwrap_err();
     assert_eq!(
         denied_reason(&err),
-        "role-bound token: namespace 'default' not in the role's namespaces"
+        "role-bound token: edge endpoint not visible"
     );
     assert!(!db.has_node("ghost"));
 }
@@ -1649,4 +1652,101 @@ fn test_unscoped_role_may_create_in_any_namespace() {
     .unwrap();
     assert_eq!(db.namespace_of("bare").as_deref(), Some("default"));
     assert_eq!(db.namespace_of("tenanted").as_deref(), Some("y"));
+}
+
+/// Hidden ≡ absent for the upsert placeholder gate, byte for byte.
+///
+/// The namespace refusal fires only for an endpoint that does **not** exist and
+/// the visibility refusal only for one that does, so two different strings would
+/// turn `POST /edges/upsert` into an existence oracle: ask for an upsert and read
+/// off whether the key is taken.
+#[test]
+fn test_upsert_placeholder_hidden_equals_absent_for_a_namespaced_role() {
+    let (mut db, _dir) = open_with_tenant_writer("upsert-oracle");
+    // A visible endpoint inside the role's namespace to anchor the edge.
+    db.insert_node("MyLabel", "mine", vec![ns_prop("x")])
+        .unwrap();
+    // A node the role cannot see at all (wrong label, and in another namespace).
+    db.insert_node("Secret", "hidden", vec![ns_prop("y")])
+        .unwrap();
+
+    let upsert = |key: &str| BatchOp::InsertEdgeUpsert {
+        edge_type: "KNOWS".into(),
+        src_key: "mine".into(),
+        dst_key: key.into(),
+        placeholder_label: "MyLabel".into(),
+    };
+
+    let authz = writer_authz(&mut db);
+    let hidden_err = db
+        .write_batch_authz(Some(&authz), vec![upsert("hidden")])
+        .unwrap_err();
+    let authz = writer_authz(&mut db);
+    let absent_err = db
+        .write_batch_authz(Some(&authz), vec![upsert("nobody")])
+        .unwrap_err();
+
+    assert_eq!(
+        denied_reason(&hidden_err),
+        denied_reason(&absent_err),
+        "hidden and absent must be indistinguishable"
+    );
+    assert_eq!(
+        denied_reason(&absent_err),
+        "role-bound token: edge endpoint not visible"
+    );
+    assert!(!db.has_node("nobody"), "nothing was created");
+}
+
+/// A namespaced role cannot MERGE-create: `MERGE` carries only its identifying
+/// property into the create, so the node would land in `default`. The match arm
+/// still works on a node the role can see.
+#[test]
+fn test_merge_create_denied_for_a_namespaced_role() {
+    let (mut db, _dir) = open_with_tenant_writer("merge-ns-role");
+    db.insert_node("MyLabel", "mine", vec![ns_prop("x")])
+        .unwrap();
+
+    let err = db
+        .query_write_authz("writer", "MERGE (n:MyLabel {id: 'fresh'})", &no_params())
+        .unwrap_err();
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: namespace 'default' not in the role's namespaces",
+        "MERGE-create lands in default, which this role may not write"
+    );
+    assert!(!db.has_node("fresh"));
+
+    // The match arm is unaffected: the node is already in the role's mask.
+    db.query_write_authz(
+        "writer",
+        "MERGE (n:MyLabel {id: 'mine'}) ON MATCH SET n.seen = 1",
+        &no_params(),
+    )
+    .unwrap();
+    assert_eq!(db.get_prop("mine", "seen"), Some(Value::Int(1)));
+    assert_eq!(db.namespace_of("mine").as_deref(), Some("x"));
+}
+
+/// A props list naming `ns` twice is refused on the role path too, before the
+/// namespace gate can read one of the two entries.
+#[test]
+fn test_duplicate_ns_refused_on_the_role_path() {
+    let (mut db, _dir) = open_with_tenant_writer("dup-ns-role");
+    let authz = writer_authz(&mut db);
+    let err = db
+        .write_batch_authz(
+            Some(&authz),
+            vec![BatchOp::InsertNode {
+                label: "MyLabel".into(),
+                key: "two".into(),
+                props: vec![ns_prop("x"), ns_prop("y")],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("given more than once"),
+        "expected the duplicate-ns refusal, got {err:?}"
+    );
+    assert!(!db.has_node("two"));
 }

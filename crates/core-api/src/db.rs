@@ -1086,6 +1086,50 @@ fn project_set_return_rows<F: Fs>(
 /// Callers use `std::mem::take` on the engine before calling this, then restore it after.
 /// Extract a `Vec<f64>` from a `Value::List` whose items are all numeric.
 /// Returns `None` for non-list values or lists with non-numeric elements.
+/// Extra candidates pulled from an approximate index before re-scoring, over and
+/// above the `k` asked for.
+///
+/// The index orders candidates by `f32` distances, which agree with the exact
+/// `f64` cosine to about 1e-6. Re-scoring can therefore only reshuffle
+/// candidates inside a band that narrow — it cannot move a hit past one that is
+/// further away by more than 1e-6 — so the only way a true top-`k` member can be
+/// lost is if the index ranked it just outside `k` on the `f32` order. Fetching
+/// `k + 16` covers any such band up to 16 members wide, which at 1e-6 means 16
+/// vectors within a millionth of each other in cosine: a duplicate cluster, and
+/// then the members are interchangeable anyway. `min` is applied to the exact
+/// score, never to the index's, so a hit sitting on the threshold is decided
+/// exactly.
+const VECTOR_RESCORE_MARGIN: usize = 16;
+
+/// Cosine similarity between an already-unit query and node `id`'s `field`
+/// vector, read from the **`f64`** properties. `None` when the node has no
+/// numeric-list vector there, or its norm is zero.
+///
+/// The single definition of the score this API reports. Both the brute-force
+/// scan and the re-scoring step that follows an index lookup go through it, so
+/// the two paths cannot disagree — which is the property
+/// `index_and_brute_force_agree_on_scores` pins.
+fn exact_vector_similarity(
+    view: &GraphView<'_>,
+    id: u32,
+    field: &str,
+    q_unit: &[f64],
+) -> Option<f64> {
+    let v = view.prop(id, field)?;
+    let xs = value_as_float_list(&v.into_value())?;
+    let v_norm: f64 = xs.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if v_norm == 0.0 {
+        return None;
+    }
+    Some(
+        q_unit
+            .iter()
+            .zip(xs.iter())
+            .map(|(a, b)| a * (b / v_norm))
+            .sum(),
+    )
+}
+
 fn value_as_float_list(v: &Value) -> Option<Vec<f64>> {
     match v {
         Value::List(items) => items
@@ -6843,8 +6887,36 @@ impl<F: Fs> GraphDb<F> {
 
     /// The namespace a create-class op would put its node in: the `ns` entry of
     /// the props it carries, normalised, with absent meaning [`NS_DEFAULT`].
-    fn created_namespace(props: &[(String, Value)]) -> &str {
-        namespace_of_value(props.iter().find(|(f, _)| f == NS_PROP).map(|(_, v)| v))
+    fn created_namespace<'a>(key: &str, props: &'a [(String, Value)]) -> Result<&'a str> {
+        Ok(namespace_of_value(Self::sole_ns_entry(key, props)?))
+    }
+
+    /// The one `ns` entry in a node's props, or `None` when it carries none.
+    ///
+    /// A props list naming `ns` twice is refused. Without that refusal the
+    /// write path and the authorisation path can read the same list
+    /// differently — one taking the first entry, the other the last — and
+    /// `CREATE (n:L {ns: 'mine', ns: 'theirs'})` lands a node in a namespace
+    /// the role was checked against the other of. One entry is the only shape
+    /// where "the node's namespace" is a single fact, so it is the only shape
+    /// accepted, and every reader of it agrees by construction.
+    fn sole_ns_entry<'a>(key: &str, props: &'a [(String, Value)]) -> Result<Option<&'a Value>> {
+        let mut found: Option<&'a Value> = None;
+        for (field, value) in props {
+            if field != NS_PROP {
+                continue;
+            }
+            if found.is_some() {
+                return Err(GraphError::RuleInvalid {
+                    detail: format!(
+                        "node {key}: {NS_PROP} is given more than once; a node has exactly \
+                         one namespace"
+                    ),
+                });
+            }
+            found = Some(value);
+        }
+        Ok(found)
     }
 
     /// The definition of the role a write authorisation names.
@@ -6864,6 +6936,11 @@ impl<F: Fs> GraphDb<F> {
         key: &str,
         props: Vec<(String, Value)>,
     ) -> Result<(Vec<(String, Value)>, String)> {
+        // One `ns` or none: this is where that is enforced, so every later
+        // reader of the list — the authorisation gate, the two `apply` arms,
+        // `node_ns` — is looking at a single entry and cannot disagree about
+        // which one counts.
+        Self::sole_ns_entry(key, &props)?;
         let mut name = NS_DEFAULT.to_string();
         let mut out = Vec::with_capacity(props.len());
         for (field, value) in props {
@@ -7332,8 +7409,12 @@ impl<F: Fs> GraphDb<F> {
                 // scope check, so it runs before the key lookup — it discloses
                 // nothing about the store. Covers Cypher `CREATE` and the node
                 // `MERGE` creates, both of which arrive as this op.
+                // Resolved before the role lookup so a props list naming `ns`
+                // twice is refused for every role, scoped or not: it is the same
+                // malformed write the seam refuses, and leaving it to the seam
+                // would mean the gate had already read one of the two.
+                let target = Self::created_namespace(key, props)?;
                 if let Some(def) = self.role_def_for(&authz.role) {
-                    let target = Self::created_namespace(props);
                     if !def.sees_namespace(target) {
                         return Err(GraphError::RoleWriteDenied {
                             reason: format!(
@@ -7542,16 +7623,21 @@ impl<F: Fs> GraphDb<F> {
                 // default namespace. A role that cannot read `default` must not
                 // create one there, for the same reason it may not create a node
                 // there outright.
+                //
+                // The refusal is byte-identical to the hidden-endpoint one above,
+                // and deliberately so: this arm fires only for an endpoint that
+                // does **not** exist, and the one above only for an endpoint that
+                // does. Two different strings would make the pair an existence
+                // oracle — ask for an upsert and read off whether the key is
+                // taken. Hidden ≡ absent is the rule everywhere else in this
+                // table and it holds here too.
                 if let Some(def) = self.role_def_for(&authz.role) {
                     if !def.sees_namespace(NS_DEFAULT) {
                         for ep_key in [src_key.as_str(), dst_key.as_str()] {
                             if self.ids.get(ep_key).is_none() && !batch_created.contains_key(ep_key)
                             {
                                 return Err(GraphError::RoleWriteDenied {
-                                    reason: format!(
-                                        "role-bound token: namespace '{NS_DEFAULT}' not in the \
-                                         role's namespaces"
-                                    ),
+                                    reason: "role-bound token: edge endpoint not visible".into(),
                                 });
                             }
                         }
@@ -8353,6 +8439,16 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Uses the HNSW index when one is available (fast path); otherwise falls
     /// back to an O(n) brute-force scan.
+    ///
+    /// **The index supplies candidates, never scores.** Its own distances are
+    /// `f32` (accurate to ~1e-6, so an exact duplicate scores 0.9999999), so
+    /// every candidate is re-scored from the `f64` property vectors by
+    /// [`exact_vector_similarity`] before `min`, the ordering and the reported
+    /// score are decided. `k + VECTOR_RESCORE_MARGIN` candidates are fetched so
+    /// the re-ordering cannot drop a true top-`k` member; see that constant for
+    /// the rule. The score a caller receives is therefore the same number the
+    /// brute-force path would have produced, to `f64` precision, and `min = 1.0`
+    /// finds an exact duplicate.
     pub fn find_similar_vector(
         &self,
         field: &str,
@@ -8382,17 +8478,30 @@ impl<F: Fs> GraphDb<F> {
         // (merging their results); `Some(lbl)` restricts to rules whose
         // dst_label matches.  Returns `None` when no populated HNSW index
         // covers the request — the O(n) brute-force fallback handles that case.
+        let over_k = k.saturating_add(VECTOR_RESCORE_MARGIN);
         let hnsw_hits = match label {
-            Some(lbl) => self.engine.hnsw_search_dst(field, lbl, &q_unit, k),
-            None => self.engine.hnsw_search_any_dst(field, &q_unit, k),
+            Some(lbl) => self.engine.hnsw_search_dst(field, lbl, &q_unit, over_k),
+            None => self.engine.hnsw_search_any_dst(field, &q_unit, over_k),
         };
         if let Some(hits) = hnsw_hits {
+            // Candidates only: the index's `f32` similarity is discarded and
+            // each hit is re-scored against the `f64` vectors.
+            let view = self.view();
             let mut out: Vec<(String, f64)> = hits
                 .into_iter()
-                .filter(|&(_, sim)| sim >= min)
-                .filter_map(|(id, sim)| self.ids.key_of(id).map(|key| (key.to_string(), sim)))
+                .filter_map(|(id, _)| {
+                    let sim = exact_vector_similarity(&view, id, field, &q_unit)?;
+                    if sim < min {
+                        return None;
+                    }
+                    Some((self.ids.key_of(id)?.to_string(), sim))
+                })
                 .collect();
-            out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            out.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
             out.truncate(k);
             return out;
         }
@@ -8407,18 +8516,7 @@ impl<F: Fs> GraphDb<F> {
         let mut scored: Vec<(String, f64)> = candidate_ids
             .into_iter()
             .filter_map(|id| {
-                let v = view.prop(id, field)?;
-                let v_owned = v.into_value();
-                let xs = value_as_float_list(&v_owned)?;
-                let v_norm: f64 = xs.iter().map(|x| x * x).sum::<f64>().sqrt();
-                if v_norm == 0.0 {
-                    return None;
-                }
-                let dot: f64 = q_unit
-                    .iter()
-                    .zip(xs.iter())
-                    .map(|(a, b)| a * (b / v_norm))
-                    .sum();
+                let dot = exact_vector_similarity(&view, id, field, &q_unit)?;
                 if dot < min {
                     return None;
                 }
@@ -8426,7 +8524,11 @@ impl<F: Fs> GraphDb<F> {
                 Some((key, dot))
             })
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         scored.truncate(k);
         scored
     }
@@ -8438,10 +8540,13 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// # HNSW path (over-fetch policy)
     ///
-    /// When an HNSW index covers the request, this function fetches `4 * k`
-    /// candidates from the index and discards hidden nodes in the post-filter
-    /// step.  If fewer than `k` visible nodes remain after filtering the caller
-    /// receives whatever is available — we do not re-query the index.  The 4×
+    /// When an HNSW index covers the request, this function fetches
+    /// `4 * k + VECTOR_RESCORE_MARGIN` candidates from the index and discards
+    /// hidden nodes in the post-filter step.  If fewer than `k` visible nodes
+    /// remain after filtering the caller receives whatever is available — we do
+    /// not re-query the index.  Every surviving candidate is re-scored from the
+    /// `f64` property vectors, exactly as [`find_similar_vector`] does and for
+    /// the same reason.  The 4×
     /// multiplier is a heuristic suited for sparsely masked graphs; callers
     /// operating under a very selective mask should register a VectorSimilar
     /// rule with a non-approximate index, or use the brute-force path (no HNSW
@@ -8473,18 +8578,35 @@ impl<F: Fs> GraphDb<F> {
 
         // HNSW fast path — over-fetch 4×k so post-masking still yields up to k
         // visible hits.  See doc comment above for the policy rationale.
-        let over_k = k.saturating_mul(4).max(k + 1);
+        let over_k = k
+            .saturating_mul(4)
+            .max(k + 1)
+            .saturating_add(VECTOR_RESCORE_MARGIN);
         let hnsw_hits = match label {
             Some(lbl) => self.engine.hnsw_search_dst(field, lbl, &q_unit, over_k),
             None => self.engine.hnsw_search_any_dst(field, &q_unit, over_k),
         };
         if let Some(hits) = hnsw_hits {
+            // Candidates only — re-scored from the `f64` vectors before `min`,
+            // the ordering or the reported score. The mask is applied first so a
+            // hidden node is never scored.
+            let view = self.view_masked(mask);
             let mut out: Vec<(String, f64)> = hits
                 .into_iter()
-                .filter(|&(id, sim)| sim >= min && mask.visible.contains(&id))
-                .filter_map(|(id, sim)| self.ids.key_of(id).map(|key| (key.to_string(), sim)))
+                .filter(|&(id, _)| mask.visible.contains(&id))
+                .filter_map(|(id, _)| {
+                    let sim = exact_vector_similarity(&view, id, field, &q_unit)?;
+                    if sim < min {
+                        return None;
+                    }
+                    Some((self.ids.key_of(id)?.to_string(), sim))
+                })
                 .collect();
-            out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            out.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
             out.truncate(k);
             return out;
         }
@@ -8504,18 +8626,7 @@ impl<F: Fs> GraphDb<F> {
         let mut scored: Vec<(String, f64)> = candidate_ids
             .into_iter()
             .filter_map(|id| {
-                let v = view.prop(id, field)?;
-                let v_owned = v.into_value();
-                let xs = value_as_float_list(&v_owned)?;
-                let v_norm: f64 = xs.iter().map(|x| x * x).sum::<f64>().sqrt();
-                if v_norm == 0.0 {
-                    return None;
-                }
-                let dot: f64 = q_unit
-                    .iter()
-                    .zip(xs.iter())
-                    .map(|(a, b)| a * (b / v_norm))
-                    .sum();
+                let dot = exact_vector_similarity(&view, id, field, &q_unit)?;
                 if dot < min {
                     return None;
                 }
@@ -8523,7 +8634,11 @@ impl<F: Fs> GraphDb<F> {
                 Some((key, dot))
             })
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         scored.truncate(k);
         scored
     }

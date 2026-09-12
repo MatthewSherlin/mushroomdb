@@ -5768,3 +5768,107 @@ async fn post_rules_accepts_a_namespace() {
     );
     assert!(db.read().rules().iter().all(|r| r.name != "bad_ns"));
 }
+
+/// Binding: the refusals Task 5 settled reach the HTTP surface with the text the
+/// engine settled on — a duplicate `ns` in a Cypher `CREATE`, a `MERGE`-create by
+/// a namespaced role, and a placeholder endpoint refused with the **endpoint**
+/// message rather than the namespace one (hidden ≡ absent: two strings there
+/// would be an existence oracle).
+#[tokio::test]
+async fn the_namespace_write_refusals_reach_the_surface() {
+    let db = SharedDb::open(&tmp("ns-refusal-texts")).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "agent".into(),
+                labels: vec!["AgentNote".into()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: Some(vec!["tenant-a".into()]),
+                write: Some(agent_write_scope()),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    let rtoks: std::collections::HashMap<String, String> =
+        [("role-tok".to_string(), "agent".to_string())]
+            .into_iter()
+            .collect();
+    let app = router_with_role_tokens(db.clone(), Some("admin".into()), rtoks);
+
+    // A props list names `ns` once or not at all, through `POST /query`.
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "admin",
+            json!({"cypher": "CREATE (n:Doc {id: 'd1', ns: 'x', ns: 'y'})"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("given more than once"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(!db.read().has_node("d1"), "nothing was written");
+
+    // A namespaced role cannot MERGE-create: the node would land in `default`.
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "role-tok",
+            json!({"cypher": "MERGE (n:AgentNote {id: 'm1'})"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("namespace 'default' not in the role's namespaces"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(!db.read().has_node("m1"));
+
+    // A placeholder endpoint gets the endpoint message, not the namespace one.
+    let (status, body, _) = send(
+        app,
+        authed_json_req(
+            "POST",
+            "/edges/upsert",
+            "role-tok",
+            json!({
+                "edge_type": "RECALLS",
+                "src_key": "ghost-1",
+                "dst_key": "ghost-2",
+                "placeholder_label": "AgentNote",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let msg = parse_json(&body)["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        msg, "role-bound token: edge endpoint not visible",
+        "hidden must read the same as absent on this arm"
+    );
+    assert!(!db.read().has_node("ghost-1"));
+}

@@ -817,14 +817,16 @@ fn removing_the_ns_property_is_refused() {
         other => panic!("expected NamespaceImmutable, got {other:?}"),
     }
 
-    // (c) Cypher REMOVE, if the dialect reaches it, must not be a way round.
-    if let Ok(_rs) = db.query_write("MATCH (n:Doc) WHERE n.id = 'a' REMOVE n.ns", &no_params()) {
-        assert_eq!(
-            db.namespace_of("a").as_deref(),
-            Some("x"),
-            "no Cypher path may strip the namespace"
-        );
-    }
+    // (c) There is no Cypher path to a property removal at all — the dialect has
+    // no REMOVE — so the statement is a query error, not a second way round the
+    // refusal. Pinned so that adding REMOVE has to decide about `ns` on purpose.
+    let err = db
+        .query_write("MATCH (n:Doc) WHERE n.id = 'a' REMOVE n.ns", &no_params())
+        .expect_err("the dialect has no REMOVE");
+    assert!(
+        matches!(err, GraphError::QueryError { .. }),
+        "expected a query error, got {err:?}"
+    );
 
     // The node is untouched, and stays untouched across a reopen — this is the
     // assertion that would have caught the silent move to `default`.
@@ -951,7 +953,414 @@ fn a_view_may_not_write_the_namespace_property() {
 }
 
 // ---------------------------------------------------------------------------
-// 14. The reader's namespace resolver is the live one's twin
+// 14. A namespaced VectorSimilar rule, which finds candidates through the index
+// ---------------------------------------------------------------------------
+
+/// From 0.6.6 a `VectorSimilar` rule — exact as well as approximate — finds its
+/// candidates through the vector index rather than by scanning. Two things have
+/// to hold for a scoped one: the index holds only its own namespace (so the
+/// beam's floor proof is over the right corpus), and no pair crosses.
+///
+/// The vectors are identical across namespaces, so every pair would match at
+/// `min = 0.9`: a rule that ignored the scoping would derive the full
+/// cross-product and the count is what says it did not.
+#[test]
+fn a_namespaced_vector_rule_never_pairs_across_namespaces() {
+    fn vector_rule(name: &str, namespace: Option<&str>, approximate: bool) -> RuleDef {
+        RuleDef {
+            name: name.into(),
+            src_label: "Vec".into(),
+            dst_label: "Vec".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "NEAR".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: namespace.map(str::to_string),
+        }
+    }
+    /// Every `NEAR` pair over the fixture, sorted.
+    fn near_pairs(db: &GraphDb<core_api::RealFs>, keys: &[&str]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for src in keys {
+            for dst in db
+                .neighbors(src, "NEAR", core_api::Direction::Out)
+                .unwrap_or_default()
+            {
+                out.push((src.to_string(), dst));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    let keys = ["vx1", "vx2", "vx3", "vy1", "vy2", "vy3"];
+    for approximate in [false, true] {
+        let dir = tmp(if approximate {
+            "vec-ns-approx"
+        } else {
+            "vec-ns-exact"
+        });
+        let mut db = GraphDb::open(&dir).unwrap();
+        // Six nodes, three per namespace, all with near-identical unit vectors,
+        // so every ordered pair clears min = 0.9.
+        for (i, key) in keys.iter().enumerate() {
+            let nudge = i as f64 * 1e-4;
+            let emb = Value::List(vec![
+                Value::Float(1.0 - nudge),
+                Value::Float(nudge),
+                Value::Float(0.0),
+            ]);
+            let namespace = if key.starts_with("vx") { "x" } else { "y" };
+            db.insert_node("Vec", key, vec![("emb".into(), emb), ns(namespace)])
+                .unwrap();
+        }
+
+        db.create_rule(vector_rule("scoped", Some("x"), approximate))
+            .unwrap();
+        let pairs = near_pairs(&db, &keys);
+        assert_eq!(
+            pairs.len(),
+            6,
+            "3 x-nodes, every ordered pair but a self-pair (approximate={approximate}): {pairs:?}"
+        );
+        assert!(
+            pairs
+                .iter()
+                .all(|(s, d)| s.starts_with("vx") && d.starts_with("vx")),
+            "no pair may touch namespace y (approximate={approximate}): {pairs:?}"
+        );
+
+        // A node arriving in the other namespace reaches neither side of the
+        // index, so it changes nothing — this is the incremental path, which
+        // files the vector through a different entry point than the backfill.
+        let emb = Value::List(vec![
+            Value::Float(1.0),
+            Value::Float(0.0),
+            Value::Float(0.0),
+        ]);
+        db.insert_node("Vec", "vy4", vec![("emb".into(), emb), ns("y")])
+            .unwrap();
+        assert_eq!(
+            near_pairs(&db, &["vy4"]),
+            Vec::<(String, String)>::new(),
+            "a y node derives nothing under an x-scoped rule"
+        );
+        assert_eq!(near_pairs(&db, &keys).len(), 6);
+
+        // The same rule, global: now every pair crosses freely — 7 nodes.
+        db.delete_rule("scoped").unwrap();
+        db.create_rule(vector_rule("global", None, approximate))
+            .unwrap();
+        let all_keys = ["vx1", "vx2", "vx3", "vy1", "vy2", "vy3", "vy4"];
+        let global = near_pairs(&db, &all_keys);
+        assert_eq!(
+            global.len(),
+            42,
+            "7 nodes × 6 others (approximate={approximate}): {}",
+            global.len()
+        );
+        assert!(
+            global.contains(&("vx1".to_string(), "vy1".to_string())),
+            "a global vector rule may cross the boundary"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 15. A props list names the namespace once, or not at all
+// ---------------------------------------------------------------------------
+
+/// Two `ns` entries in one props list is the shape where "the node's namespace"
+/// stops being a single fact: one reader takes the first entry and another the
+/// last, and a create checked against `x` lands in `y`. One entry or none.
+#[test]
+fn a_duplicate_ns_property_is_refused() {
+    let dir = tmp("dup-ns");
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // (a) insert_node
+    let err = db
+        .insert_node(
+            "Doc",
+            "a",
+            vec![("id".into(), Value::Str("a".into())), ns("x"), ns("y")],
+        )
+        .expect_err("two ns entries must be refused");
+    assert!(
+        err.to_string().contains("given more than once"),
+        "message: {err}"
+    );
+    assert!(!db.has_node("a"), "nothing was written");
+
+    // (b) a batch
+    let mut batch = db.batch();
+    batch.insert_node("Doc", "b", vec![ns("x"), ns("y")]);
+    let err = batch.commit().expect_err("two ns entries must be refused");
+    assert!(err.to_string().contains("given more than once"), "{err}");
+    assert!(!db.has_node("b"));
+
+    // (c) Cypher CREATE carries both entries through to the props list, so what
+    // fires is this refusal and not a parse error.
+    let err = db
+        .query_write("CREATE (n:Doc {id: 'c', ns: 'x', ns: 'y'})", &no_params())
+        .expect_err("two ns entries must be refused");
+    assert!(
+        err.to_string().contains("given more than once"),
+        "the duplicate-ns refusal must be what fires: {err}"
+    );
+    assert!(!db.has_node("c"));
+
+    // One entry is unchanged, and so is none.
+    db.insert_node("Doc", "one", vec![ns("x")]).unwrap();
+    db.insert_node("Doc", "none", vec![]).unwrap();
+    assert_eq!(db.namespace_of("one").as_deref(), Some("x"));
+    assert_eq!(db.namespace_of("none").as_deref(), Some(NS_DEFAULT));
+    db.query_write("CREATE (n:Doc {id: 'cy', ns: 'x'})", &no_params())
+        .unwrap();
+    assert_eq!(db.namespace_of("cy").as_deref(), Some("x"));
+}
+
+// ---------------------------------------------------------------------------
+// 16. MERGE creates in the default namespace, and says so
+// ---------------------------------------------------------------------------
+
+/// `MERGE` carries only its identifying property into the create, so it creates
+/// in the default namespace — for every caller. A role bound to a namespace
+/// therefore cannot MERGE-create, and `ON CREATE SET n.ns` cannot rescue it
+/// because that is a namespace change. The match arm is unaffected.
+#[test]
+fn merge_creates_in_the_default_namespace_only() {
+    let dir = tmp("merge-ns");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Doc", "existing", vec![ns("x")]).unwrap();
+
+    // A full-authority MERGE creates in `default`, even beside a namespaced node.
+    db.query_write("MERGE (n:Doc {id: 'plain'})", &no_params())
+        .unwrap();
+    assert_eq!(db.namespace_of("plain").as_deref(), Some(NS_DEFAULT));
+
+    // `ON CREATE SET n.ns` is a namespace change, and is refused as one — the
+    // node is created in `default` by the same batch, so the set cannot move it.
+    let err = db
+        .query_write(
+            "MERGE (n:Doc {id: 'moved'}) ON CREATE SET n.ns = 'x'",
+            &no_params(),
+        )
+        .expect_err("ON CREATE SET n.ns must be refused");
+    assert!(
+        matches!(err, GraphError::NamespaceImmutable { .. }),
+        "expected NamespaceImmutable, got {err:?}"
+    );
+    assert!(!db.has_node("moved"), "the whole statement was refused");
+
+    // The match arm of a MERGE on a namespaced node still works.
+    db.query_write(
+        "MERGE (n:Doc {id: 'existing'}) ON MATCH SET n.seen = 1",
+        &no_params(),
+    )
+    .unwrap();
+    assert_eq!(db.get_prop("existing", "seen"), Some(Value::Int(1)));
+    assert_eq!(db.namespace_of("existing").as_deref(), Some("x"));
+}
+
+// ---------------------------------------------------------------------------
+// 17. The sliced vector-index build is namespace-scoped too
+// ---------------------------------------------------------------------------
+
+/// A rule whose vector corpus exceeds one build slice has its HNSW graph built
+/// by `pump_index_build`, a slice at a time, through a different code path from
+/// the one-commit build every other test here takes
+/// (`RuleEngine::run_build_slice`). That path files vectors itself, so it needs
+/// the same namespace gate — otherwise a scoped rule's graph holds the other
+/// tenant's vectors, the beam's floor proof is taken over a corpus the rule
+/// cannot see, and the progress it reports counts a different population from
+/// the one `hnsw_build_total` sized.
+///
+/// Twelve nodes, six per namespace, every vector mutually similar above `min`,
+/// and a slice of 2 so the build is genuinely sliced (6 > 2). Exact and
+/// approximate both defer from 0.6.6 — both take this path — so both are run.
+#[test]
+fn a_sliced_build_files_only_its_own_namespace() {
+    /// `i`-th vector: all mutually similar well above 0.9, all distinct.
+    fn vec_of(i: usize) -> Value {
+        Value::List(vec![
+            Value::Float(1.0),
+            Value::Float(i as f64 * 0.01),
+            Value::Float(0.0),
+        ])
+    }
+    fn cosine(a: &[f64], b: &[f64]) -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let nb: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+        dot / (na * nb)
+    }
+    fn raw(i: usize) -> Vec<f64> {
+        vec![1.0, i as f64 * 0.01, 0.0]
+    }
+
+    const MIN: f64 = 0.9;
+    // ids 0..6 are namespace x, 6..12 are namespace y.
+    let key_of = |i: usize| {
+        if i < 6 {
+            format!("x{i}")
+        } else {
+            format!("y{i}")
+        }
+    };
+
+    for approximate in [false, true] {
+        let label = if approximate { "approx" } else { "exact" };
+        let dir = tmp(&format!("sliced-ns-{label}"));
+        let mut db = GraphDb::open(&dir).unwrap();
+        for i in 0..12 {
+            let namespace = if i < 6 { "x" } else { "y" };
+            db.insert_node(
+                "Vec",
+                &key_of(i),
+                vec![("emb".into(), vec_of(i)), ns(namespace)],
+            )
+            .unwrap();
+        }
+
+        // A slice of 2 against a 6-vector population: the build must defer.
+        db.set_hnsw_build_batch(Some(2));
+        db.create_rule(RuleDef {
+            name: "sim".into(),
+            src_label: "Vec".into(),
+            dst_label: "Vec".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: MIN,
+            },
+            edge_type: "SIM".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: Some("x".into()),
+        })
+        .unwrap();
+
+        // The build is outstanding, and it is sized by the x population alone —
+        // this is the counting half of the gate. 12 here would mean the slice
+        // loop and `hnsw_build_total` disagree about whose vectors are in play.
+        let pending = db
+            .builds_in_progress()
+            .into_iter()
+            .find(|b| b.rule == "sim")
+            .unwrap_or_else(|| panic!("{label}: a 6-vector corpus at a slice of 2 must defer"));
+        assert_eq!(
+            pending.total, 6,
+            "{label}: the build covers namespace x only, not all twelve nodes"
+        );
+        assert_eq!(
+            db.stats()
+                .rules
+                .iter()
+                .find(|r| r.name == "sim")
+                .map(|r| r.edges),
+            Some(0),
+            "{label}: a rule that is still building derives nothing"
+        );
+
+        // Pump to completion, keeping the progress of the call that finished it.
+        let mut finished: Vec<core_api::BuildProgress> = Vec::new();
+        loop {
+            let (done, outstanding) = db.pump_index_build_reporting().unwrap();
+            finished.extend(done);
+            if outstanding.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            db.builds_in_progress().is_empty(),
+            "{label}: the build must drain"
+        );
+        let done = finished
+            .iter()
+            .find(|b| b.rule == "sim")
+            .unwrap_or_else(|| panic!("{label}: the finishing slice must report the rule"));
+        assert_eq!(
+            (done.indexed, done.total),
+            (6, 6),
+            "{label}: every x vector filed, and only those"
+        );
+
+        // Index purity, read through the public ANN path. `find_similar_vector`
+        // asks a rule's dst-side HNSW for candidates and then re-scores them, so
+        // with `min = 0.0` and a `k` larger than the whole store the answer is
+        // whatever the graph holds: six x keys if the slice loop honoured the
+        // namespace, twelve if it did not.
+        //
+        // Only reachable for the approximate rule: `hnsw_search_dst` and
+        // `hnsw_search_any_dst` consult `approximate` rules' graphs only, so an
+        // exact rule's graph is not addressable from a query and the probe would
+        // measure the brute-force fallback (all twelve) instead of the index. For
+        // the exact rule the counting assertion above and the derived set below
+        // are what hold the gate.
+        //
+        // This says something about the *index*, not about visibility: an ANN
+        // query is not namespace-scoped, and a role mask is what hides a node.
+        if approximate {
+            let q = raw(0);
+            for scope in [Some("Vec"), None] {
+                let hits = db.find_similar_vector("emb", scope, &q, 50, 0.0);
+                let keys: std::collections::BTreeSet<String> =
+                    hits.iter().map(|(k, _)| k.clone()).collect();
+                assert_eq!(
+                    keys.len(),
+                    6,
+                    "{label}: scope {scope:?} — the scoped rule's graph holds six \
+                     vectors: {keys:?}"
+                );
+                assert!(
+                    keys.iter().all(|k| k.starts_with('x')),
+                    "{label}: scope {scope:?} — no y vector may be in the index: {keys:?}"
+                );
+            }
+        }
+
+        // The derived set is the exact scan restricted to x.
+        let mut want: Vec<(String, String)> = Vec::new();
+        for i in 0..6 {
+            for j in 0..6 {
+                if i != j && cosine(&raw(i), &raw(j)) >= MIN {
+                    want.push((key_of(i), key_of(j)));
+                }
+            }
+        }
+        want.sort();
+        assert_eq!(want.len(), 30, "the fixture must be a full intra-x mesh");
+        let mut got: Vec<(String, String)> = Vec::new();
+        for i in 0..12 {
+            let k = key_of(i);
+            for d in db
+                .neighbors(&k, "SIM", core_api::Direction::Out)
+                .unwrap_or_default()
+            {
+                got.push((k.clone(), d));
+            }
+        }
+        got.sort();
+        assert_eq!(
+            got, want,
+            "{label}: the backfill derives the exact scan restricted to x"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 18. The reader's namespace resolver is the live one's twin
 // ---------------------------------------------------------------------------
 
 /// Keys a namespace mask admits, read through whichever handle built it.
