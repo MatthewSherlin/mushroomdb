@@ -11,8 +11,9 @@
 //! [`tokio::sync::broadcast::error::RecvError::Closed`].
 
 use crate::json::{
-    edge_history_result_json, node_edges_json, node_history_json, node_info_json, params_from_json,
-    parse_ingest_edges, result_set_json, rule_def_from_json,
+    edge_history_result_json, namespace_arg, node_edges_json, node_history_json, node_info_json,
+    params_from_json, parse_ingest_edges, result_set_json, rule_def_from_json, stamp_namespace,
+    stamp_namespace_row,
 };
 use crate::{AppState, AuthIdentity};
 use arrow_bridge::to_ipc_bytes;
@@ -810,6 +811,16 @@ async fn query(
         Some(_) => return err_response("mask must be an array of strings"),
     };
 
+    // The second visibility axis. `namespace` is a leg that **intersects**
+    // whatever restriction the identity and the body already impose — a role
+    // token's binding, a client mask, both — so it can only narrow. A role bound
+    // to namespaces honours them with no `namespace` in the body; one outside
+    // the binding is the empty intersection, never the union.
+    let namespace = match namespace_arg(body.get("namespace")) {
+        Ok(n) => n,
+        Err(e) => return err_response(e),
+    };
+
     // Stub mode discloses node existence, which is exactly the question an
     // as-of read is asking. The two do not compose.
     if as_of.is_some()
@@ -855,11 +866,12 @@ async fn query(
                 Some(ref keys) => AsOfScope::RoleAndKeys(role_name, keys),
                 None => AsOfScope::Role(role_name),
             };
-            return match state
-                .db
-                .read()
-                .query_at_scoped(commit, &cypher, &params, scope)
-            {
+            let g = state.db.read();
+            let out = match namespace.as_deref() {
+                Some(ns) => g.query_at_scoped_in_namespace(commit, &cypher, &params, scope, ns),
+                None => g.query_at_scoped(commit, &cypher, &params, scope),
+            };
+            return match out {
                 Ok(rs) => format_query_result(rs, format),
                 Err(e) => role_mask_err(e),
             };
@@ -875,6 +887,15 @@ async fn query(
             role_mask.intersect(&client_mask)
         } else {
             role_mask
+        };
+        // And the namespace leg intersects whatever that came to, on the same
+        // snapshot the query runs against.
+        let effective_mask = match namespace.as_deref() {
+            Some(ns) => match snap.mask_for_namespace(ns) {
+                Ok(ns_mask) => effective_mask.intersect(&ns_mask),
+                Err(e) => return graph_err(e),
+            },
+            None => effective_mask,
         };
         return match snap.query_masked(&cypher, &params, &effective_mask) {
             Ok(rs) => format_query_result(rs, format),
@@ -896,16 +917,28 @@ async fn query(
     // `stub_hidden: true` opts into MaskMode::Stub for the mask; Cypher query
     // behaviour is identical in both modes (hidden nodes are excluded from
     // query results regardless of mode).
-    if let Some(ref keys) = mask_keys {
+    if mask_keys.is_some() || namespace.is_some() {
         // Time travel: the allow-list resolves against the as-of graph, so a
         // key that did not exist at `commit` resolves to nothing.
         if let Some(commit) = as_of {
-            return match state.db.read().query_at_scoped(
-                commit,
-                &cypher,
-                &params,
-                AsOfScope::Keys(keys),
-            ) {
+            let g = state.db.read();
+            let out = match (&mask_keys, namespace.as_deref()) {
+                (Some(keys), Some(ns)) => g.query_at_scoped_in_namespace(
+                    commit,
+                    &cypher,
+                    &params,
+                    AsOfScope::Keys(keys),
+                    ns,
+                ),
+                (Some(keys), None) => {
+                    g.query_at_scoped(commit, &cypher, &params, AsOfScope::Keys(keys))
+                }
+                (None, Some(ns)) => {
+                    g.query_at_scoped(commit, &cypher, &params, AsOfScope::Namespace(ns))
+                }
+                (None, None) => unreachable!("one of the two is Some in this branch"),
+            };
+            return match out {
                 Ok(rs) => format_query_result(rs, format),
                 Err(e) => graph_err(e),
             };
@@ -916,7 +949,15 @@ async fn query(
             .unwrap_or(false);
         let db = state.db.read();
         let mask = {
-            let m = NodeMask::from_keys(&*db, keys.iter().map(String::as_str));
+            let m = match (&mask_keys, namespace.as_deref()) {
+                (Some(keys), Some(ns)) => {
+                    NodeMask::from_keys(&*db, keys.iter().map(String::as_str))
+                        .intersect(&db.mask_for_namespace(ns))
+                }
+                (Some(keys), None) => NodeMask::from_keys(&*db, keys.iter().map(String::as_str)),
+                (None, Some(ns)) => db.mask_for_namespace(ns),
+                (None, None) => unreachable!("one of the two is Some in this branch"),
+            };
             if stub_hidden {
                 m.with_mode(MaskMode::Stub)
             } else {
@@ -968,11 +1009,20 @@ async fn query(
     format_query_result(rs, format)
 }
 
+/// `GET /stats` — store-wide counts, including the `namespaces` roster.
+///
+/// Role tokens are denied, as they always were, and that is also what settles
+/// the namespace roster on this surface: the roster names every namespace and
+/// its live count, which is a list of other tenants, so narrowing it for a role
+/// token would be a second answer to a question this route never answers for one
+/// at all. A full-access token sees the whole roster; a tenant-scoped client gets
+/// 403 here and asks MCP `stats` with its `role`, which narrows.
 async fn stats(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
 ) -> Response {
-    // v1: deny role tokens — raw counts leak graph size beyond the role's subgraph.
+    // v1: deny role tokens — raw counts leak graph size beyond the role's
+    // subgraph, and `namespaces` would name every other tenant.
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /stats requires a full-access token");
     }
@@ -1123,6 +1173,14 @@ async fn ingest(
         Ok(o) => o,
         Err(e) => return err_response(e),
     };
+    // `namespace` applies to every node this call creates.
+    let namespace = match namespace_arg(body.get("namespace")) {
+        Ok(n) => n,
+        Err(e) => return err_response(e),
+    };
+    if let Err(e) = stamp_namespace(&mut converted.rows, namespace.as_deref()) {
+        return err_response(e);
+    }
     let taken = std::mem::take(&mut converted.rows);
     let edges = match body.get("edges") {
         None | Some(Js::Null) => Vec::new(),
@@ -1627,13 +1685,26 @@ async fn create_node(
         Some(s) => s.to_string(),
         None => return err_response("missing key"),
     };
-    let props = match body.get("props") {
+    let mut props = match body.get("props") {
         None | Some(Js::Null) => vec![],
         Some(v) => match props_from_json_obj(v) {
             Ok(p) => p,
             Err(e) => return err_response(e),
         },
     };
+    // `namespace` is the namespace the node is created in — the same write-once
+    // `ns` property, named on the call instead of buried in `props`.
+    match namespace_arg(body.get("namespace")) {
+        Ok(None) => {}
+        Ok(Some(ns)) => {
+            let mut row: BTreeMap<String, Value> = props.into_iter().collect();
+            if let Err(e) = stamp_namespace_row(&mut row, &ns) {
+                return err_response(e);
+            }
+            props = row.into_iter().collect();
+        }
+        Err(e) => return err_response(e),
+    }
     let db = state.db.clone();
     if let AuthIdentity::Role(role_name) = &identity {
         let role = role_name.clone();

@@ -285,7 +285,8 @@ fn main() -> ExitCode {
             db_dir,
             commit,
             query,
-        }) => match run_asof(&db_dir, commit, query.as_deref()) {
+            namespace,
+        }) => match run_asof(&db_dir, commit, query.as_deref(), namespace.as_deref()) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -315,7 +316,12 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e.to_string()),
         },
-        Ok(Command::Query { db_dir, cypher }) => match run_query(&db_dir, &cypher) {
+        Ok(Command::Query {
+            db_dir,
+            cypher,
+            role,
+            namespace,
+        }) => match run_query(&db_dir, &cypher, role.as_deref(), namespace.as_deref()) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS

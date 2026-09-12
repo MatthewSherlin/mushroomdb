@@ -331,9 +331,9 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb mcp <dir>\|--auto` | Start a stdio MCP JSON-RPC server for agent tools |
 | `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
 | `mushroomdb serve <dir>` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`) |
-| `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted) |
-| `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit |
-| `mushroomdb stats <dir>` | Print node/edge/rule counts |
+| `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted). `--role <name>` answers as one of the store's roles and `--namespace <ns>` from one namespace; together they intersect, so neither widens the other, and either makes the query a read |
+| `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit. `--namespace <ns>` reads one namespace as it was then |
+| `mushroomdb stats <dir>` | Print node/edge/rule counts, plus a `namespaces:` line once a store has more than the implicit `default` one |
 | `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
 | `mushroomdb snapshot <dir> [--keep-wal\|--truncate] [--retention N]` | Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole |

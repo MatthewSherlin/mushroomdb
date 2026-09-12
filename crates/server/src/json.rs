@@ -242,6 +242,71 @@ pub(crate) fn node_history_json(key: &str, result: &HistoryResult<HistoryEntry>)
 /// so a rule created over the wire always stores its score somewhere
 /// queryable. Do not add `#[serde(default)]` on `RuleDef.max_edges` — bincode
 /// is positional.
+/// A `namespace` argument, from an MCP tool's `arguments` or an HTTP body.
+///
+/// Absent or `null` is no namespace restriction — not the `default` namespace,
+/// which is what `"default"` asks for. Anything that is not a string, and any
+/// string that is not a namespace name, is refused here rather than resolved to
+/// an empty mask: a typo that silently answers "nothing" reads like an empty
+/// store.
+///
+/// One parser for every surface, so `query`, the write tools and the HTTP
+/// handlers all say the same thing about the same input.
+pub(crate) fn namespace_arg(v: Option<&Js>) -> Result<Option<String>, String> {
+    match v {
+        None | Some(Js::Null) => Ok(None),
+        Some(Js::String(s)) if core_api::valid_namespace(s) => Ok(Some(s.clone())),
+        Some(Js::String(s)) => Err(format!(
+            "namespace {s:?} is not a valid namespace name — 1 to {} characters of [A-Za-z0-9_.-]",
+            core_api::NS_MAX_LEN
+        )),
+        Some(_) => Err("namespace must be a string naming a namespace".into()),
+    }
+}
+
+/// Stamp `namespace` onto every row an ingest-shaped write will create.
+///
+/// A row that already names its own `ns` must name the same one: the call and
+/// the row disagreeing is a caller that has not decided which namespace it
+/// meant, and silently letting either win would put a node somewhere nobody
+/// asked for. Refused before anything is written, naming the row.
+///
+/// `None` leaves the rows exactly as they came, so a call that passes no
+/// namespace behaves as it did before namespaces existed.
+pub(crate) fn stamp_namespace(
+    rows: &mut [BTreeMap<String, Value>],
+    namespace: Option<&str>,
+) -> Result<(), String> {
+    let Some(ns) = namespace else {
+        return Ok(());
+    };
+    for (i, row) in rows.iter_mut().enumerate() {
+        stamp_namespace_row(row, ns).map_err(|e| format!("row {i}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// [`stamp_namespace`] for a write that creates one node.
+pub(crate) fn stamp_namespace_row(
+    row: &mut BTreeMap<String, Value>,
+    namespace: &str,
+) -> Result<(), String> {
+    match row.get(core_api::NS_PROP) {
+        Some(Value::Str(s)) if s == namespace => Ok(()),
+        Some(existing) => Err(format!(
+            "ns is {existing:?} but the call names namespace {namespace:?}; a node is created in \
+             one namespace, so pass one or the other"
+        )),
+        None => {
+            row.insert(
+                core_api::NS_PROP.to_string(),
+                Value::Str(namespace.to_string()),
+            );
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn rule_def_from_json(v: Js) -> Result<RuleDef, String> {
     let mut def: RuleDef = serde_json::from_value(v).map_err(|e| e.to_string())?;
     if def.max_edges.is_none() {

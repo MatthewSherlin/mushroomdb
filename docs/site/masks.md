@@ -237,6 +237,67 @@ cannot have changed — it is immutable — so there is no second case to explai
 `stats` carries a `namespaces` list with the live node count per namespace, always
 including `default`.
 
+### Namespaces on every surface
+
+Every surface takes a `namespace`, and it means the same thing everywhere: **one more
+leg intersected into whatever restriction already applies.** It can only narrow.
+
+| Surface | How to pass it |
+|---|---|
+| MCP `query` | `"namespace": "tenant-a"` beside `role`, `mask` and `as_of` |
+| MCP `stats` | `"role"` and/or `"namespace"` narrow the `namespaces` roster |
+| MCP `upsert_entity`, `ingest_json` | `"namespace"` — the namespace a created node lands in |
+| MCP `create_rule` | `"namespace"` — scope the rule (see [rules.md](rules.md#namespace-scoping)) |
+| `POST /query` | `"namespace"` in the body |
+| `POST /nodes`, `POST /ingest` | `"namespace"` in the body, applied to every node created |
+| `POST /rules` | `"namespace"` in the `RuleDef` |
+| `GET /stats` | the `namespaces` roster (full-access tokens only — see below) |
+| CLI `query` | `--namespace <ns>`, optionally with `--role <name>` |
+| CLI `asof` | `--namespace <ns>` |
+| CLI `stats`, `doctor` | a `namespaces:` line / a `, N namespaces` clause, both omitted on a single-namespace store |
+| Python | `insert_node(..., namespace=)`, `query(..., role=, namespace=)`, `stats()["namespaces"]`, `create_rule({"namespace": …})` |
+
+The composition rules, which hold on all of them:
+
+- **Namespace alone** — the mask is that namespace's live nodes.
+- **Namespace with a role** — `mask_for_role(role) ∩ mask_for_namespace(ns)`. A role
+  bound to `tenant-a` asked for `tenant-b` answers with **nothing**. Never the union.
+- **Namespace with a client key mask** — the same intersection, so a namespace narrows
+  an allow-list and an allow-list narrows a namespace.
+- **A role bound to namespaces needs no argument at all.** Its binding is part of the
+  one resolver every read path calls, so `POST /query`, `GET /node/{key}`,
+  `/edges`, `/neighborhood` and the history routes narrow with nothing passed, and a
+  node in another namespace answers exactly as an absent key does (404, no stub).
+- **Namespace with `as_of`** — both legs resolve against the graph at that commit.
+- **Absent** — no namespace restriction at all. Not `default`: `"default"` is how you
+  ask for the nodes that name no namespace.
+- **An unused name is an empty mask**, never everything. An *invalid* name is refused
+  outright (`namespace "…" is not a valid namespace name — 1 to 64 characters of
+  [A-Za-z0-9_.-]`), because a typo that silently answers "nothing" reads like an empty
+  store.
+- **Either argument makes the call a read.** A restricted write is refused, as it
+  already was with `role` or `mask`.
+
+On the write surfaces `namespace` is the same write-once `ns` property, named on the
+call instead of buried in the props. A row or a `props` object that carries its own
+`ns` naming a *different* namespace is refused before anything is written — one node
+is created in one namespace. On `upsert_entity` over a node that already exists the
+namespace is written like any other property, so naming the one it is already in is a
+no-op and naming another is the `NamespaceImmutable` refusal above.
+
+### What `stats` discloses
+
+The `namespaces` roster is the one part of `stats` that is a list of *other tenants*.
+
+- `GET /stats` **denies role tokens entirely** (403,
+  `role-bound token: /stats requires a full-access token`), as it did before namespaces
+  existed, so no tenant-scoped HTTP client ever sees the roster.
+- MCP `stats` has no token — it is the local stdio surface, as trusted as the store
+  directory — so it answers in full by default and takes `role` / `namespace` to narrow
+  the roster for a caller that is answering as a tenant. The store-wide counts beside
+  it are unchanged: they were never per-namespace.
+- The CLI prints the whole roster; it is the operator's own shell.
+
 ---
 
 ## Client node masks

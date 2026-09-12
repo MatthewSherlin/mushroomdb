@@ -1812,23 +1812,33 @@ impl GraphDb<RealFs> {
         scope: AsOfScope<'_>,
     ) -> Result<ResultSet> {
         let temporal = self.open_at_for_read(commit, cypher)?;
-        // One resolver answers "what may this role see" — `mask_for_role` — and
-        // it runs against the temporal handle, so the answer is the as-of one.
-        let mask = match scope {
-            AsOfScope::Role(role) => temporal.mask_for_role(role)?,
-            AsOfScope::Keys(keys) => {
-                crate::mask::NodeMask::from_keys(&temporal, keys.iter().map(String::as_str))
-            }
-            AsOfScope::RoleAndKeys(role, keys) => {
-                temporal
-                    .mask_for_role(role)?
-                    .intersect(&crate::mask::NodeMask::from_keys(
-                        &temporal,
-                        keys.iter().map(String::as_str),
-                    ))
-            }
-            AsOfScope::Namespace(namespace) => temporal.mask_for_namespace(namespace),
-        };
+        let mask = temporal.mask_at_scope(scope)?;
+        temporal.query_masked(cypher, params, &mask)
+    }
+
+    /// As [`GraphDb::query_at_scoped`], with `namespace` intersected into
+    /// whatever `scope` resolves to.
+    ///
+    /// This is what a surface needs when a caller passes `namespace` beside a
+    /// `role` or a client mask on a time-travel read: [`AsOfScope`] names one
+    /// restriction, and the namespace is a second one that composes with it
+    /// rather than replacing it. The intersection is the never-widen rule — a
+    /// namespace can only narrow what the scope already allows — and both legs
+    /// are resolved against the graph as it was at `commit`.
+    ///
+    /// `AsOfScope::Namespace(ns)` is still the way to ask for a namespace alone.
+    pub fn query_at_scoped_in_namespace(
+        &self,
+        commit: u64,
+        cypher: &str,
+        params: &std::collections::BTreeMap<String, Value>,
+        scope: AsOfScope<'_>,
+        namespace: &str,
+    ) -> Result<ResultSet> {
+        let temporal = self.open_at_for_read(commit, cypher)?;
+        let mask = temporal
+            .mask_at_scope(scope)?
+            .intersect(&temporal.mask_for_namespace(namespace));
         temporal.query_masked(cypher, params, &mask)
     }
 
@@ -6951,6 +6961,31 @@ impl<F: Fs> GraphDb<F> {
         self.role_masks
             .get_or_build(role, self.commit_seq, || self.build_mask_for_role(role))
             .map(|m| (*m).clone())
+    }
+
+    /// The mask an [`AsOfScope`] names, resolved against this handle.
+    ///
+    /// Shared by [`GraphDb::query_at_scoped`] and
+    /// [`GraphDb::query_at_scoped_in_namespace`] so one scope resolves one way
+    /// however the namespace leg is added.
+    fn mask_at_scope(&self, scope: AsOfScope<'_>) -> Result<crate::mask::NodeMask> {
+        // One resolver answers "what may this role see" — `mask_for_role` — and
+        // it runs against this handle, so on a temporal one the answer is the
+        // as-of one.
+        Ok(match scope {
+            AsOfScope::Role(role) => self.mask_for_role(role)?,
+            AsOfScope::Keys(keys) => {
+                crate::mask::NodeMask::from_keys(self, keys.iter().map(String::as_str))
+            }
+            AsOfScope::RoleAndKeys(role, keys) => {
+                self.mask_for_role(role)?
+                    .intersect(&crate::mask::NodeMask::from_keys(
+                        self,
+                        keys.iter().map(String::as_str),
+                    ))
+            }
+            AsOfScope::Namespace(namespace) => self.mask_for_namespace(namespace),
+        })
     }
 
     /// Resolve `role` against the current graph, ignoring the memo.

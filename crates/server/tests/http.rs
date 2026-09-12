@@ -5039,3 +5039,732 @@ fn slice_rule_json() -> Json {
         "approximate": true
     })
 }
+
+// ── Namespaces on the HTTP surface ───────────────────────────────────────────
+
+/// A store with three namespaces, one role bound to `tenant-a` and one bound to
+/// nothing. `d1` is in the implicit `default` namespace, `a1`/`a2` in
+/// `tenant-a`, `b1` in `tenant-b`; `a1 -> a2` and `b1 -> b1` edges exist so the
+/// edge and neighbourhood routes have something to answer with.
+fn open_ns(name: &str) -> (Router, SharedDb) {
+    let db = SharedDb::open(&tmp(name)).unwrap();
+    {
+        let mut w = db.write();
+        for (key, ns) in [
+            ("d1", None),
+            ("a1", Some("tenant-a")),
+            ("a2", Some("tenant-a")),
+            ("b1", Some("tenant-b")),
+        ] {
+            let mut props = vec![("id".into(), Value::Str(key.into()))];
+            if let Some(ns) = ns {
+                props.push(("ns".into(), Value::Str(ns.into())));
+            }
+            w.insert_node("Doc", key, props).unwrap();
+        }
+        w.insert_edge("LINKS", "a1", "a2").unwrap();
+        w.apply_schema(&Schema {
+            roles: vec![
+                RoleDef {
+                    name: "a-reader".into(),
+                    labels: vec!["Doc".into()],
+                    keys: vec![],
+                    visible_where: None,
+                    namespaces: Some(vec!["tenant-a".into()]),
+                    write: None,
+                },
+                RoleDef {
+                    name: "everyone".into(),
+                    labels: vec!["Doc".into()],
+                    keys: vec![],
+                    visible_where: None,
+                    namespaces: None,
+                    write: None,
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    let rtoks: std::collections::HashMap<String, String> = [
+        ("a-tok".to_string(), "a-reader".to_string()),
+        ("all-tok".to_string(), "everyone".to_string()),
+    ]
+    .into_iter()
+    .collect();
+    let app = router_with_role_tokens(db.clone(), Some("admin".into()), rtoks);
+    (app, db)
+}
+
+/// The `n.id` column of a `/query` response, in order.
+fn ids_of(body: &[u8]) -> Vec<String> {
+    let v = parse_json(body);
+    v["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("rows: {v}"))
+        .iter()
+        .map(|r| r[0].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+const NS_Q: &str = "MATCH (n) RETURN n.id ORDER BY n.id";
+
+/// Binding: `POST /query` takes `namespace`, which narrows a full-access token
+/// to one namespace and resolves a name no node uses to nothing.
+#[tokio::test]
+async fn query_namespace_narrows_a_full_token() {
+    let (app, _db) = open_ns("ns-query-full");
+
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "admin",
+            json!({"cypher": NS_Q, "namespace": "tenant-a"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(ids_of(&body), vec!["a1", "a2"]);
+
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "admin",
+            json!({"cypher": NS_Q, "namespace": "default"}),
+        ),
+    )
+    .await;
+    assert_eq!(ids_of(&body), vec!["d1"], "absent `ns` means `default`");
+
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "admin",
+            json!({"cypher": NS_Q}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        ids_of(&body),
+        vec!["a1", "a2", "b1", "d1"],
+        "no namespace argument is no namespace restriction"
+    );
+
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "admin",
+            json!({"cypher": NS_Q, "namespace": "tenant-z"}),
+        ),
+    )
+    .await;
+    assert!(ids_of(&body).is_empty(), "an unused name is an empty mask");
+
+    // A client mask is narrowed by the namespace, never widened.
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "admin",
+            json!({"cypher": NS_Q, "mask": ["a1", "b1"], "namespace": "tenant-a"}),
+        ),
+    )
+    .await;
+    assert_eq!(ids_of(&body), vec!["a1"]);
+
+    let (status, body, _) = send(
+        app,
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "admin",
+            json!({"cypher": NS_Q, "namespace": "not a name!"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("valid namespace name"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// Binding: a role token bound to one namespace never sees another — on
+/// `/query` with no argument of its own, and through every key-taking read
+/// route. The resolver is what enforces it, so the routes need no argument.
+#[tokio::test]
+async fn a_role_token_bound_to_a_namespace_never_sees_another() {
+    let (app, _db) = open_ns("ns-role-reads");
+
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "a-tok",
+            json!({"cypher": NS_Q}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        ids_of(&body),
+        vec!["a1", "a2"],
+        "the binding applies with no `namespace` argument"
+    );
+
+    // A node in another namespace is as absent as a key that never existed.
+    for (route, code) in [
+        ("/node/b1", StatusCode::NOT_FOUND),
+        ("/node/b1/edges", StatusCode::NOT_FOUND),
+        ("/node/b1/neighborhood", StatusCode::NOT_FOUND),
+        ("/node/b1/history", StatusCode::NOT_FOUND),
+    ] {
+        let (status, body, _) = send(app.clone(), authed_get(route, "a-tok")).await;
+        assert_eq!(
+            status,
+            code,
+            "{route} must not disclose b1: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    // Its own namespace answers normally.
+    let (status, _, _) = send(app.clone(), authed_get("/node/a1", "a-tok")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body, _) = send(app.clone(), authed_get("/node/a1/edges", "a-tok")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        String::from_utf8_lossy(&body).contains("a2"),
+        "the in-namespace edge is visible: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let (status, _, _) = send(
+        app.clone(),
+        authed_get("/node/a1/neighborhood?depth=1", "a-tok"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The history routes answer for a foreign node as they do for an absent one.
+    let (status, _, _) = send(app.clone(), authed_get("/history/edge?a=b1&b=b1", "a-tok")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = send(
+        app.clone(),
+        authed_get(
+            "/history/was_linked?a=b1&b=b1&edge_type=LINKS&at_commit=0",
+            "a-tok",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // And the unscoped role still sees everything its labels allow.
+    let (_, body, _) = send(
+        app,
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "all-tok",
+            json!({"cypher": NS_Q}),
+        ),
+    )
+    .await;
+    assert_eq!(ids_of(&body), vec!["a1", "a2", "b1", "d1"]);
+}
+
+/// Binding: a role token plus a `namespace` outside its binding is the empty
+/// intersection, never the union.
+#[tokio::test]
+async fn a_role_token_plus_a_foreign_namespace_is_empty() {
+    let (app, db) = open_ns("ns-role-intersect");
+
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "a-tok",
+            json!({"cypher": NS_Q, "namespace": "tenant-a"}),
+        ),
+    )
+    .await;
+    assert_eq!(ids_of(&body), vec!["a1", "a2"]);
+
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "a-tok",
+            json!({"cypher": NS_Q, "namespace": "tenant-b"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        ids_of(&body).is_empty(),
+        "role ∩ namespace, never role ∪ namespace"
+    );
+
+    // The same, with a client mask naming a foreign key as well.
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "a-tok",
+            json!({"cypher": NS_Q, "mask": ["a1", "b1"], "namespace": "tenant-b"}),
+        ),
+    )
+    .await;
+    assert!(ids_of(&body).is_empty());
+
+    // A node written after the reader's last fold is in the namespace it was
+    // created in: the role path resolves the namespace leg off the same
+    // effective state the query runs against, delta tail included.
+    db.write()
+        .insert_node(
+            "Doc",
+            "a9",
+            vec![
+                ("id".into(), Value::Str("a9".into())),
+                ("ns".into(), Value::Str("tenant-a".into())),
+            ],
+        )
+        .unwrap();
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "a-tok",
+            json!({"cypher": NS_Q, "namespace": "tenant-a"}),
+        ),
+    )
+    .await;
+    assert_eq!(ids_of(&body), vec!["a1", "a2", "a9"]);
+
+    // A namespace makes the request a read, as a mask does.
+    let (status, body, _) = send(
+        app,
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "admin",
+            json!({"cypher": "CREATE (x:Doc {id:'z1'})", "namespace": "tenant-a"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("read-only"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(!db.read().has_node("z1"), "the write must not have landed");
+}
+
+/// Binding: `as_of` composes with `namespace` for a full token and for a role
+/// token, and both legs are resolved at that commit.
+#[tokio::test]
+async fn as_of_composes_with_a_namespace() {
+    let (app, db) = open_ns("ns-asof");
+    let at = {
+        let mut w = db.write();
+        let at = w.wal_total_commits().unwrap() - 1;
+        w.insert_node(
+            "Doc",
+            "a3",
+            vec![
+                ("id".into(), Value::Str("a3".into())),
+                ("ns".into(), Value::Str("tenant-a".into())),
+            ],
+        )
+        .unwrap();
+        at
+    };
+
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "admin",
+            json!({"cypher": NS_Q, "namespace": "tenant-a", "as_of": at}),
+        ),
+    )
+    .await;
+    assert_eq!(ids_of(&body), vec!["a1", "a2"], "a3 did not exist yet");
+
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "admin",
+            json!({"cypher": NS_Q, "namespace": "tenant-a"}),
+        ),
+    )
+    .await;
+    assert_eq!(ids_of(&body), vec!["a1", "a2", "a3"], "and now it does");
+
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "a-tok",
+            json!({"cypher": NS_Q, "namespace": "tenant-a", "as_of": at}),
+        ),
+    )
+    .await;
+    assert_eq!(ids_of(&body), vec!["a1", "a2"]);
+
+    let (_, body, _) = send(
+        app,
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "a-tok",
+            json!({"cypher": NS_Q, "namespace": "tenant-b", "as_of": at}),
+        ),
+    )
+    .await;
+    assert!(
+        ids_of(&body).is_empty(),
+        "the intersection is the intersection at that commit too"
+    );
+}
+
+/// Binding: `GET /stats` carries `namespaces` for a full token and stays
+/// forbidden to a role token, so the roster is never a cross-tenant
+/// disclosure.
+#[tokio::test]
+async fn stats_carries_namespaces_and_stays_closed_to_role_tokens() {
+    let (app, _db) = open_ns("ns-stats");
+
+    let (status, body, _) = send(app.clone(), authed_get("/stats", "admin")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        parse_json(&body)["namespaces"],
+        json!([
+            {"name": "default", "nodes_live": 1},
+            {"name": "tenant-a", "nodes_live": 2},
+            {"name": "tenant-b", "nodes_live": 1},
+        ])
+    );
+
+    let (status, body, _) = send(app, authed_get("/stats", "a-tok")).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a role token learns no namespace names: {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// Binding: a store that names no namespace reports exactly one, and nothing
+/// else about it changed.
+#[tokio::test]
+async fn stats_on_a_store_without_namespaces_reports_one() {
+    let (app, db) = open("ns-stats-plain");
+    seed_person(&db, "alice");
+    let (status, body, _) = send(app, get("/stats")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        parse_json(&body)["namespaces"],
+        json!([{"name": "default", "nodes_live": 1}])
+    );
+}
+
+/// Binding: `POST /nodes` and `POST /ingest` take `namespace` and apply it to
+/// every node they create; a row that names a different one is refused before
+/// anything is written.
+#[tokio::test]
+async fn writes_place_nodes_in_a_namespace() {
+    let (app, db) = open_ns("ns-writes");
+
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/nodes",
+            "admin",
+            json!({"label": "Doc", "key": "a9", "namespace": "tenant-a", "props": {"id": "a9"}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(db.read().namespace_of("a9").as_deref(), Some("tenant-a"));
+
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/ingest",
+            "admin",
+            json!({
+                "label": "Doc",
+                "namespace": "tenant-a",
+                "rows": [{"id": "a10"}, {"id": "a11"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    {
+        let g = db.read();
+        assert_eq!(g.namespace_of("a10").as_deref(), Some("tenant-a"));
+        assert_eq!(g.namespace_of("a11").as_deref(), Some("tenant-a"));
+    }
+
+    // A row carrying its own, different `ns` is a caller that has not decided.
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/ingest",
+            "admin",
+            json!({
+                "label": "Doc",
+                "namespace": "tenant-a",
+                "rows": [{"id": "x1", "ns": "tenant-b"}],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("namespace"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(!db.read().has_node("x1"), "nothing was written");
+
+    // Changing a namespace is refused with the engine's own text.
+    let (status, body, _) = send(
+        app.clone(),
+        authed_put_json("/node/a9/prop/ns", "admin", json!({"value": "tenant-b"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("a namespace is set at insert and cannot be changed"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(db.read().namespace_of("a9").as_deref(), Some("tenant-a"));
+
+    let (status, body, _) = send(
+        app,
+        authed_json_req(
+            "POST",
+            "/nodes",
+            "admin",
+            json!({"label": "Doc", "key": "z1", "namespace": "no spaces"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("valid namespace name"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// Binding: a role bound to `namespaces` may only create inside them, and the
+/// refusal is the engine's sixth `RoleWriteDenied` reason.
+#[tokio::test]
+async fn a_role_token_writes_only_into_its_own_namespace() {
+    let db = SharedDb::open(&tmp("ns-role-writes")).unwrap();
+    db.write()
+        .apply_schema(&Schema {
+            roles: vec![RoleDef {
+                name: "agent".into(),
+                labels: vec!["AgentNote".into()],
+                keys: vec![],
+                visible_where: None,
+                namespaces: Some(vec!["tenant-a".into()]),
+                write: Some(agent_write_scope()),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+    let rtoks: std::collections::HashMap<String, String> =
+        [("role-tok".to_string(), "agent".to_string())]
+            .into_iter()
+            .collect();
+    let app = router_with_role_tokens(db.clone(), Some("admin".into()), rtoks);
+
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/nodes",
+            "role-tok",
+            json!({"label": "AgentNote", "key": "ok1", "namespace": "tenant-a"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/nodes",
+            "role-tok",
+            json!({"label": "AgentNote", "key": "bad1", "namespace": "tenant-b"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("role-bound token: namespace 'tenant-b' not in the role's namespaces"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(!db.read().has_node("bad1"));
+
+    // No namespace at all is the `default` namespace, which this role cannot
+    // read and so cannot create in either.
+    let (status, body, _) = send(
+        app,
+        authed_json_req(
+            "POST",
+            "/nodes",
+            "role-tok",
+            json!({"label": "AgentNote", "key": "bad2"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("namespace 'default' not in the role's namespaces"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// Binding: `POST /rules` takes `namespace`, and a scoped rule derives only
+/// inside it.
+#[tokio::test]
+async fn post_rules_accepts_a_namespace() {
+    let (app, db) = open_ns("ns-rules");
+    {
+        let mut w = db.write();
+        for (key, ns) in [("c1", "tenant-a"), ("c2", "tenant-a"), ("c3", "tenant-b")] {
+            w.insert_node(
+                "City",
+                key,
+                vec![
+                    ("city".into(), Value::Str("berlin".into())),
+                    ("ns".into(), Value::Str(ns.into())),
+                ],
+            )
+            .unwrap();
+        }
+    }
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/rules",
+            "admin",
+            json!({
+                "name": "same_city_a",
+                "src_label": "City",
+                "dst_label": "City",
+                "predicate": {"FieldEqual": {"field": "city"}},
+                "edge_type": "SAME_CITY",
+                "namespace": "tenant-a",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        db.read()
+            .rules()
+            .iter()
+            .find(|r| r.name == "same_city_a")
+            .and_then(|r| r.namespace.clone())
+            .as_deref(),
+        Some("tenant-a")
+    );
+
+    let (_, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "admin",
+            json!({"cypher": "MATCH (a)-[:SAME_CITY]->(b) RETURN a.id, b.id"}),
+        ),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(!text.contains("c3"), "a scoped rule stays inside: {text}");
+
+    // An invalid name is refused, and nothing is installed.
+    let (status, body, _) = send(
+        app,
+        authed_json_req(
+            "POST",
+            "/rules",
+            "admin",
+            json!({
+                "name": "bad_ns",
+                "src_label": "City",
+                "dst_label": "City",
+                "predicate": {"FieldEqual": {"field": "city"}},
+                "edge_type": "X",
+                "namespace": "no spaces",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(db.read().rules().iter().all(|r| r.name != "bad_ns"));
+}

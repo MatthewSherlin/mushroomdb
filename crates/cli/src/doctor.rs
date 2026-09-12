@@ -620,14 +620,24 @@ fn check_store_and_lock(db_dir: &Path) -> Vec<Check> {
             let stale = db.is_stale().unwrap_or(false);
             let floor = db.wal_horizon_floor();
             let total = db.wal_total_commits().unwrap_or(floor);
+            // A store that names no namespace is one implicit `default`
+            // namespace; saying "1 namespaces" on every single-tenant store
+            // would be noise, so the clause appears only once there is more
+            // than one — the same rule `format_stats` follows.
+            let namespaces = if stats.namespaces.len() > 1 {
+                format!(", {} namespaces", stats.namespaces.len())
+            } else {
+                String::new()
+            };
             out.push(Check::ok(
                 "store",
                 format!(
-                    "{} — {} nodes live ({} tombstoned), {} edges, history from commit {} of {}{}",
+                    "{} — {} nodes live ({} tombstoned), {} edges{}, history from commit {} of {}{}",
                     db_dir.display(),
                     stats.nodes_live,
                     stats.nodes_tombstoned,
                     stats.edges,
+                    namespaces,
                     floor,
                     total,
                     if stale {

@@ -17,9 +17,10 @@ pub mod structure;
 use core_api::repograph;
 use core_api::schema::Schema;
 use core_api::{
-    default_max_edges, is_write_query, AlgoDir, BackupReport, DegreeConfig, Explanation, GraphDb,
-    IngestOptions, LouvainConfig, PageRankConfig, Predicate, RealFs, ResultSet, RuleDef,
-    RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig, WriteGuard,
+    default_max_edges, is_write_query, valid_namespace, AlgoDir, BackupReport, DegreeConfig,
+    Explanation, GraphDb, IngestOptions, LouvainConfig, PageRankConfig, Predicate, RealFs,
+    ResultSet, RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
+    WriteGuard, NS_MAX_LEN,
 };
 use export::ExportFormat;
 use std::collections::{BTreeMap, BTreeSet};
@@ -249,6 +250,8 @@ pub enum Command {
         commit: u64,
         /// Optional Cypher read query to execute against the as-of view.
         query: Option<String>,
+        /// Read only this namespace, as it was at that commit.
+        namespace: Option<String>,
     },
     /// Profile the database and suggest linking rules with estimated edge counts.
     Suggest {
@@ -276,6 +279,10 @@ pub enum Command {
         db_dir: PathBuf,
         /// Positional after dir (remaining args joined), or `--query`.
         cypher: String,
+        /// Answer as one of the store's roles: only the nodes it may see.
+        role: Option<String>,
+        /// Answer from one namespace only. Intersects `role` — never widens it.
+        namespace: Option<String>,
     },
     /// Write `snapshot.bin`. The WAL is archived unless told otherwise.
     Snapshot {
@@ -561,8 +568,11 @@ Usage:
                                    hook body: reads a PostToolUse Grep payload on stdin; prints what
                                    the graph knows about the symbols it matched, else nothing
   mushroomdb suggest <db-dir>
-  mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"]
-  mushroomdb query <db-dir> [--query \"MATCH ...\"] <cypher…>
+  mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"] [--namespace <ns>]
+  mushroomdb query <db-dir> [--query \"MATCH ...\"] [--role <name>] [--namespace <ns>] <cypher…>
+                     --role answers as one of the store's roles and --namespace from one
+                     namespace; together they intersect, so neither ever widens the other
+                     and either one makes the query a read
   mushroomdb snapshot <db-dir> [--keep-wal|--truncate] [--retention N]
                      folds the WAL into snapshot.bin and archives it as wal.<N>.archive,
                      so node_history, edge_history, was_linked and asof keep reaching it;
@@ -1149,6 +1159,7 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut commit: Option<u64> = None;
     let mut query: Option<String> = None;
+    let mut namespace: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
@@ -1178,6 +1189,16 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
         } else if let Some(val) = a.strip_prefix("--query=") {
             query = Some(val.to_string());
             i += 1;
+        } else if a == "--namespace" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --namespace".to_string())?;
+            namespace = Some(val.to_string());
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--namespace=") {
+            namespace = Some(val.to_string());
+            i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -1193,11 +1214,22 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
         db_dir,
         commit,
         query,
+        namespace,
     })
 }
 
 /// Execute an as-of query at the given commit and print results.
-pub fn run_asof(db_dir: &Path, commit: u64, query: Option<&str>) -> Result<String, CliError> {
+///
+/// `namespace` restricts the read to one namespace as it was at that commit —
+/// a namespace cannot change, so that is simply the nodes which existed then and
+/// are in it. A name no node uses answers with nothing, never with everything.
+pub fn run_asof(
+    db_dir: &Path,
+    commit: u64,
+    query: Option<&str>,
+    namespace: Option<&str>,
+) -> Result<String, CliError> {
+    let namespace = check_namespace(namespace)?;
     // Counts come off the opened handle: it knows the archives the live WAL no
     // longer holds, and where history now starts.
     let db = GraphDb::open_at(db_dir, commit)?;
@@ -1215,15 +1247,32 @@ pub fn run_asof(db_dir: &Path, commit: u64, query: Option<&str>) -> Result<Strin
     }
     if let Some(cypher) = query {
         let params = BTreeMap::new();
-        let rs = db.query(cypher, &params)?;
+        let rs = match namespace {
+            Some(ns) => db.query_masked(cypher, &params, &db.mask_for_namespace(ns))?,
+            None => db.query(cypher, &params)?,
+        };
         out.push_str(&format_result_set(&rs));
     }
     Ok(out)
 }
 
+/// A `--namespace` value, refused here rather than resolved to an empty mask: a
+/// typo that silently answers "nothing" reads like an empty store.
+fn check_namespace(namespace: Option<&str>) -> Result<Option<&str>, CliError> {
+    match namespace {
+        Some(ns) if !valid_namespace(ns) => Err(CliError(format!(
+            "namespace {ns:?} is not a valid namespace name — 1 to {NS_MAX_LEN} characters of \
+             [A-Za-z0-9_.-]"
+        ))),
+        other => Ok(other),
+    }
+}
+
 fn parse_query(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut query_flag: Option<String> = None;
+    let mut role: Option<String> = None;
+    let mut namespace: Option<String> = None;
     let mut cypher_parts: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1237,6 +1286,26 @@ fn parse_query(args: &[&str]) -> Result<Command, String> {
             i += 2;
         } else if let Some(val) = a.strip_prefix("--query=") {
             query_flag = Some(val.to_string());
+            i += 1;
+        } else if a == "--role" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --role".to_string())?;
+            role = Some(val.to_string());
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--role=") {
+            role = Some(val.to_string());
+            i += 1;
+        } else if a == "--namespace" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --namespace".to_string())?;
+            namespace = Some(val.to_string());
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--namespace=") {
+            namespace = Some(val.to_string());
             i += 1;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
@@ -1262,12 +1331,42 @@ fn parse_query(args: &[&str]) -> Result<Command, String> {
         }
         cypher_parts.join(" ")
     };
-    Ok(Command::Query { db_dir, cypher })
+    Ok(Command::Query {
+        db_dir,
+        cypher,
+        role,
+        namespace,
+    })
 }
 
 /// Run a Cypher read or write and print columns/rows like [`run_asof`].
-pub fn run_query(db_dir: &Path, cypher: &str) -> Result<String, CliError> {
+///
+/// `role` answers as one of the store's roles and `namespace` from one
+/// namespace; together they **intersect**, so a role bound to one namespace
+/// never sees another and naming a namespace outside its binding answers with
+/// nothing. Either one makes the query a read: a restricted write is refused.
+pub fn run_query(
+    db_dir: &Path,
+    cypher: &str,
+    role: Option<&str>,
+    namespace: Option<&str>,
+) -> Result<String, CliError> {
+    let namespace = check_namespace(namespace)?;
     let params = BTreeMap::new();
+    if role.is_some() || namespace.is_some() {
+        let db = GraphDb::open(db_dir)?;
+        // The same never-widen composition every other surface uses: one mask
+        // per leg, intersected.
+        let mask = match (role, namespace) {
+            (Some(role), Some(ns)) => db
+                .mask_for_role(role)?
+                .intersect(&db.mask_for_namespace(ns)),
+            (Some(role), None) => db.mask_for_role(role)?,
+            (None, Some(ns)) => db.mask_for_namespace(ns),
+            (None, None) => unreachable!("one of the two is Some in this branch"),
+        };
+        return Ok(format_result_set(&db.query_masked(cypher, &params, &mask)?));
+    }
     let is_write = is_write_query(cypher).map_err(CliError)?;
     let rs = if is_write {
         let mut db = GraphDb::open(db_dir)?;
@@ -2167,7 +2266,7 @@ fn reach_line(db_dir: &Path, code_graph: bool) -> String {
         (
             format!(
                 "explain_association <a> <b>{sep}query '<cypher>' (MCP tools; add role: <name> \
-                 to see as a role){sep}or:",
+                 or namespace: <ns> to narrow what it sees){sep}or:",
                 sep = repograph::render::SEP
             ),
             format!("{bin} query {db} '<cypher>'"),
@@ -2635,6 +2734,18 @@ pub fn format_stats(stats: &Stats) -> String {
             "history: reaches back to commit {}",
             stats.history_floor
         );
+    }
+    // A store that names no namespace is one implicit `default` namespace, and
+    // saying so would be noise on every single-tenant store — so the line
+    // appears only once there is more than one, which keeps existing output
+    // byte-identical.
+    if stats.namespaces.len() > 1 {
+        let names: Vec<String> = stats
+            .namespaces
+            .iter()
+            .map(|n| format!("{} ({})", n.name, n.nodes_live))
+            .collect();
+        let _ = writeln!(out, "namespaces: {}", names.join(", "));
     }
     let _ = writeln!(out, "rules: {}", stats.rules.len());
     for r in &stats.rules {
@@ -4326,10 +4437,10 @@ mod tests {
             )
             .expect("insert");
         }
-        let out = run_query(&dir, "MATCH (n:Person) RETURN n.id AS id").expect("query");
+        let out = run_query(&dir, "MATCH (n:Person) RETURN n.id AS id", None, None).expect("query");
         assert!(out.contains("columns:"), "got {out}");
         assert!(out.contains("id=alice"), "got {out}");
-        let _ = run_query(&dir, "CREATE (n:Person {id: 'bob'})").expect("write");
+        let _ = run_query(&dir, "CREATE (n:Person {id: 'bob'})", None, None).expect("write");
         let db = GraphDb::open(&dir).expect("reopen");
         assert!(db.has_node("bob"), "query_write must persist CREATE");
         let _ = std::fs::remove_dir_all(&dir);
@@ -4368,7 +4479,7 @@ mod tests {
         };
         assert!(floor > 0, "the retention must have pruned something");
 
-        let out = run_asof(&dir, total - 1, None).expect("asof");
+        let out = run_asof(&dir, total - 1, None, None).expect("asof");
         assert_eq!(
             out.trim(),
             format!(
@@ -4386,7 +4497,7 @@ mod tests {
             db.insert_node("Person", "a", vec![]).expect("insert");
         }
         assert_eq!(
-            run_asof(&clean, 0, None).expect("asof").trim(),
+            run_asof(&clean, 0, None, None).expect("asof").trim(),
             "as-of commit 0 of 1"
         );
         let _ = std::fs::remove_dir_all(&clean);
@@ -5830,5 +5941,212 @@ mod tests {
     fn version_constant_matches_cargo() {
         assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
         assert!(usage().contains("--version"));
+    }
+    // ── Namespaces on the CLI ────────────────────────────────────────────────
+
+    /// A store with two namespaces and one role bound to the first.
+    fn ns_store(name: &str) -> PathBuf {
+        let dir = tmp(name);
+        let mut db = GraphDb::open(&dir).expect("open");
+        for (key, ns) in [
+            ("d1", None),
+            ("a1", Some("tenant-a")),
+            ("a2", Some("tenant-a")),
+            ("b1", Some("tenant-b")),
+        ] {
+            let mut props = vec![("id".into(), Value::Str(key.into()))];
+            if let Some(ns) = ns {
+                props.push(("ns".into(), Value::Str(ns.into())));
+            }
+            db.insert_node("Doc", key, props).expect("insert");
+        }
+        db.apply_schema(&Schema {
+            roles: vec![core_api::RoleDef {
+                name: "a-reader".into(),
+                keys: vec![],
+                labels: vec!["Doc".into()],
+                visible_where: None,
+                namespaces: Some(vec!["tenant-a".into()]),
+                write: None,
+            }],
+            ..Default::default()
+        })
+        .expect("schema");
+        dir
+    }
+
+    /// `stats` names every namespace and its live count once a store has more
+    /// than the default one.
+    #[test]
+    fn format_stats_lists_namespaces() {
+        let dir = ns_store("stats-namespaces");
+        let text = format_stats(&read_stats(&dir).expect("stats"));
+        assert!(
+            text.contains("namespaces: default (1), tenant-a (2), tenant-b (1)"),
+            "got:\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A single-tenant store's `stats` output is byte-identical to what it was
+    /// before namespaces existed: no line at all.
+    #[test]
+    fn format_stats_omits_the_namespaces_line_on_one_namespace() {
+        let dir = tmp("stats-one-namespace");
+        {
+            let mut db = GraphDb::open(&dir).expect("open");
+            db.insert_node("Person", "a", vec![]).expect("insert");
+        }
+        let text = format_stats(&read_stats(&dir).expect("stats"));
+        assert!(
+            !text.contains("namespaces"),
+            "a store with only `default` says nothing about namespaces, got:\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `query --namespace` and `query --role` parse, and they compose.
+    #[test]
+    fn parse_query_takes_a_role_and_a_namespace() {
+        let Ok(Command::Query {
+            role, namespace, ..
+        }) = parse_args(&[
+            "query",
+            "/tmp/db",
+            "--role",
+            "a-reader",
+            "--namespace",
+            "tenant-a",
+            "MATCH (n) RETURN n",
+        ])
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(role.as_deref(), Some("a-reader"));
+        assert_eq!(namespace.as_deref(), Some("tenant-a"));
+
+        let Ok(Command::Query {
+            role, namespace, ..
+        }) = parse_args(&[
+            "query",
+            "/tmp/db",
+            "--namespace=tenant-b",
+            "MATCH (n) RETURN n",
+        ])
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(role, None);
+        assert_eq!(namespace.as_deref(), Some("tenant-b"));
+
+        assert!(parse_args(&["query", "/tmp/db", "--namespace"]).is_err());
+        assert!(parse_args(&["query", "/tmp/db", "--role"]).is_err());
+        assert!(usage().contains("--namespace <ns>"));
+    }
+
+    /// `query --role` answers as that role, `--namespace` narrows, and the two
+    /// together intersect — a role bound to one namespace never sees another.
+    #[test]
+    fn run_query_with_a_role_and_a_namespace_never_widens() {
+        let dir = ns_store("query-namespace");
+        let q = "MATCH (n) RETURN n.id AS id ORDER BY n.id";
+
+        let all = run_query(&dir, q, None, None).expect("query");
+        assert!(all.contains("id=a1") && all.contains("id=b1") && all.contains("id=d1"));
+
+        let ns = run_query(&dir, q, None, Some("tenant-a")).expect("query");
+        assert!(ns.contains("id=a1") && ns.contains("id=a2"), "got {ns}");
+        assert!(!ns.contains("id=b1") && !ns.contains("id=d1"), "got {ns}");
+
+        let role = run_query(&dir, q, Some("a-reader"), None).expect("query");
+        assert!(
+            role.contains("id=a1") && !role.contains("id=b1"),
+            "got {role}"
+        );
+
+        let both = run_query(&dir, q, Some("a-reader"), Some("tenant-b")).expect("query");
+        assert!(
+            !both.contains("id=a1") && !both.contains("id=b1"),
+            "role ∩ namespace, never role ∪ namespace: {both}"
+        );
+
+        let unknown = run_query(&dir, q, Some("nobody"), None);
+        assert!(unknown.is_err(), "an unknown role is an error");
+        let invalid = run_query(&dir, q, None, Some("no spaces"));
+        assert!(
+            invalid
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.0.contains("valid namespace name")),
+            "{invalid:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `asof --namespace` reads one namespace as it was at a commit.
+    #[test]
+    fn run_asof_in_a_namespace() {
+        let dir = ns_store("asof-namespace");
+        let at = {
+            let db = GraphDb::open(&dir).expect("open");
+            db.wal_total_commits().expect("commits") - 1
+        };
+        {
+            let mut db = GraphDb::open(&dir).expect("open");
+            db.insert_node(
+                "Doc",
+                "a3",
+                vec![
+                    ("id".into(), Value::Str("a3".into())),
+                    ("ns".into(), Value::Str("tenant-a".into())),
+                ],
+            )
+            .expect("insert");
+        }
+        let q = "MATCH (n) RETURN n.id AS id ORDER BY n.id";
+        let then = run_asof(&dir, at, Some(q), Some("tenant-a")).expect("asof");
+        assert!(
+            then.contains("id=a1") && then.contains("id=a2"),
+            "got {then}"
+        );
+        assert!(
+            !then.contains("id=a3") && !then.contains("id=b1"),
+            "a3 did not exist then and b1 is another namespace: {then}"
+        );
+        let now = run_asof(&dir, at + 1, Some(q), Some("tenant-a")).expect("asof");
+        assert!(now.contains("id=a3"), "got {now}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `schema apply` takes a v4 roles file — a role bound to namespaces — and
+    /// the sidecar it writes says version 4.
+    #[test]
+    fn schema_apply_accepts_v4_roles_with_namespaces() {
+        let dir = tmp("schema-v4");
+        {
+            let mut db = GraphDb::open(&dir).expect("open");
+            db.insert_node(
+                "Doc",
+                "a1",
+                vec![("ns".into(), Value::Str("tenant-a".into()))],
+            )
+            .expect("insert");
+        }
+        let file = dir.join("schema.json");
+        std::fs::write(
+            &file,
+            r#"{"roles": [{"name": "a-reader", "labels": ["Doc"], "keys": [],
+                 "namespaces": ["tenant-a"]}]}"#,
+        )
+        .expect("write schema");
+        let out = run_schema_apply(&dir, &file).expect("apply");
+        assert!(out.contains("a-reader"), "got {out}");
+        let sidecar = std::fs::read_to_string(dir.join("roles.json")).expect("roles.json");
+        assert!(
+            sidecar.contains("\"version\": 4") || sidecar.contains("\"version\":4"),
+            "a role with namespaces writes version 4: {sidecar}"
+        );
+        assert!(sidecar.contains("tenant-a"), "{sidecar}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

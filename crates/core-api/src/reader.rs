@@ -537,6 +537,29 @@ impl ReaderSnapshot {
             .map(|m| (*m).clone())
     }
 
+    /// Every live node in `namespace`, as a visibility mask.
+    ///
+    /// The snapshot-reader twin of [`GraphDb::mask_for_namespace`](crate::GraphDb::mask_for_namespace):
+    /// read off the effective state's own `ns` column rather than a derived
+    /// array, exactly as the namespace leg of [`Self::mask_for_role`] is. A name
+    /// no node uses gives an empty mask — a namespace scope never widens.
+    pub fn mask_for_namespace(&self, namespace: &str) -> Result<NodeMask> {
+        let state = self.effective()?;
+        let cv = build_cv(&state.props, &self.base);
+        let mut visible = HashSet::new();
+        for (i, &sym) in state.labels.iter().enumerate() {
+            if sym == u32::MAX {
+                continue; // tombstoned: the label sentinel is what marks it gone
+            }
+            let id = i as u32;
+            let value = cv.get(id, core_storage::NS_PROP).map(|vr| vr.into_value());
+            if core_storage::namespace_of_value(value.as_ref()) == namespace {
+                visible.insert(id);
+            }
+        }
+        Ok(NodeMask::from_ids(visible))
+    }
+
     /// Resolve a node key to its dense id.
     ///
     /// Checks the delta tail (via the cached materialization) so that nodes

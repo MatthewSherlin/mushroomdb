@@ -320,7 +320,17 @@ mushroomdb asof ./db --commit 5 --query "MATCH (n:Person)-[r:FIT]->(p:Project) R
 # as-of commit 5 of 42
 # columns: n, p, score
 #   n=alice  p=proj-01  score=0.87
+
+# One namespace, as it was at that commit.
+mushroomdb asof ./db --commit 5 --namespace tenant-a --query "MATCH (n) RETURN n"
 ```
+
+`--namespace` restricts the read to one namespace. A namespace cannot change — it is
+set at insert and immutable — so that is simply the nodes which existed then and are in
+it; a name no node uses answers with nothing, never with everything. The same
+composition is available through `AsOfScope::Namespace`, `POST /query` with
+`"namespace"`, and the MCP `query` tool, and it intersects a role there rather than
+replacing it. See [masks.md](masks.md#namespaces-on-every-surface).
 
 ### Replay cost
 

@@ -559,3 +559,50 @@ fn always_load_warns_on_a_cli_delivery_install() {
     );
     assert!(!report.had_fail, "{}", report.output);
 }
+
+/// Binding: the `store` check counts namespaces once a store has more than one,
+/// and says nothing about them when it has only the implicit `default` — so the
+/// line on a single-tenant store is what it always was.
+#[test]
+fn doctor_store_check_counts_namespaces() {
+    let root = temp_dir("tenancy");
+    let home = temp_dir("tenancy-home");
+    git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+    let opts = install_opts(Scope::Project, &db, &bin);
+    run_install_with(
+        &root,
+        &home,
+        &opts,
+        &McpCommand::Explicit(bin),
+        &no_externals(),
+    )
+    .expect("install failed");
+
+    {
+        let mut store = GraphDb::open(&db).expect("open");
+        store.insert_node("Doc", "d1", vec![]).expect("insert");
+        let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+            .expect("doctor errored");
+        let line = find_check(&report.output, "store");
+        assert!(
+            !line.contains("namespaces"),
+            "one namespace is no namespaces clause: {line}"
+        );
+    }
+
+    let mut store = GraphDb::open(&db).expect("reopen");
+    store
+        .insert_node(
+            "Doc",
+            "a1",
+            vec![("ns".into(), core_api::Value::Str("tenant-a".into()))],
+        )
+        .expect("insert");
+    drop(store);
+    let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+        .expect("doctor errored");
+    let line = find_check(&report.output, "store");
+    assert!(line.contains(", 2 namespaces"), "{line}");
+}

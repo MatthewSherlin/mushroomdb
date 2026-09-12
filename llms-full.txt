@@ -340,9 +340,9 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb mcp <dir>\|--auto` | Start a stdio MCP JSON-RPC server for agent tools |
 | `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
 | `mushroomdb serve <dir>` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`) |
-| `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted) |
-| `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit |
-| `mushroomdb stats <dir>` | Print node/edge/rule counts |
+| `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted). `--role <name>` answers as one of the store's roles and `--namespace <ns>` from one namespace; together they intersect, so neither widens the other, and either makes the query a read |
+| `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit. `--namespace <ns>` reads one namespace as it was then |
+| `mushroomdb stats <dir>` | Print node/edge/rule counts, plus a `namespaces:` line once a store has more than the implicit `default` one |
 | `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
 | `mushroomdb snapshot <dir> [--keep-wal\|--truncate] [--retention N]` | Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole |
@@ -569,7 +569,7 @@ full design spec is at [docs/design.md](../design.md).
 Pre-1.0 alpha — APIs and formats may change between minor versions. Single
 writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
 
-v0.6.4 is the current release. The shortest way in is the Claude Code plugin —
+v0.6.6 is the current release. The shortest way in is the Claude Code plugin —
 `claude marketplace add MatthewSherlin/mushroomdb` then `claude plugin install
 mushroom@mushroomdb`, and type `/mushroom:mushroom` in a repository. Or run
 `npx mushroomdb install`, which writes the `/mushroom` skill, the MCP server
@@ -2250,6 +2250,10 @@ db.create_rule(RuleDef {
 - A rule persisted before this field existed decodes as `namespace: None` — global,
   which is the behaviour it had.
 
+`namespace` is accepted wherever a `RuleDef` is: `POST /rules`, the MCP `create_rule`
+tool, Python's `create_rule({... "namespace": "tenant-a"})`, and a
+`mushroomdb schema apply` schema file. Omitting it is a global rule on all four.
+
 Namespaces themselves — the reserved `ns` property, how a role binds to one, and the
 cross-namespace edge refusal — are documented in
 [masks.md](masks.md#namespaces).
@@ -2879,15 +2883,15 @@ rows into it.
 
 | Tool | Purpose |
 |---|---|
-| `upsert_entity` | Insert or update a node by key. Creates if absent, updates props if present. |
-| `ingest_json` | Batch-ingest an array of nodes of the same label from JSON. A field whose values point at two labels is skipped with `ambiguous target labels`; declare one `create_rule` KeyMatch rule per target label instead. |
-| `create_rule` | Declare a derivation rule; backfills existing nodes immediately. Propose it and wait for approval — it is a store-wide write. |
+| `upsert_entity` | Insert or update a node by key. Creates if absent, updates props if present. Pass `namespace` for the namespace a created node lands in; on a node that already exists, naming the namespace it is in is a no-op and naming another is refused — a namespace is set at insert and cannot be changed. |
+| `ingest_json` | Batch-ingest an array of nodes of the same label from JSON. Pass `namespace` to put every node the call creates in one namespace; a row carrying a different `ns` is refused before anything is written. A field whose values point at two labels is skipped with `ambiguous target labels`; declare one `create_rule` KeyMatch rule per target label instead. |
+| `create_rule` | Declare a derivation rule; backfills existing nodes immediately. Pass `namespace` to scope it to one namespace — source, via hop and destination — so every edge it derives stays inside; omitted is a global rule, the only kind that may cross a boundary. Propose it and wait for approval — it is a store-wide write. |
 | `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity using HNSW when available; (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). |
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain` | The rules and scores that produced the edges between two nodes, as JSON. `explain_association` above is the same question answered in prose. |
-| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels, narrowed by its `visible_where` property test if it declares one, resolved to that same allow-list. Pass one or the other, never both. Pass `as_of` — a 0-based WAL commit index — to answer from the graph as it was at that commit; it composes with `role` or with `mask` (not both, since the tool refuses that pair), and both are resolved against the graph as it was then. Writes and `stub_hidden` are refused with `as_of`. Deleting a node does not remove it from a role's past, and a role's `keys` resolve to whichever node held the key at that commit — see [masks.md](masks.md). See [Trust model](#trust-model) below. The dialect: `n.key` / `n.label` / `key(n)` / `labels(n)`, `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `IN`, list subscripts (`n.location[0]`), comma-separated patterns sharing variables in one `MATCH`, and `count(DISTINCT …)` after a `WITH`. Full reference: [`query.md`](query.md). |
+| `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels, narrowed by its `visible_where` property test if it declares one, resolved to that same allow-list. Pass one or the other, never both. Pass `namespace` to answer from one namespace only: it is a second leg **intersected** into whichever of the two is present, so it can only narrow — a role bound to `tenant-a` asked for `tenant-b` answers with nothing, never the union — and a role bound to namespaces honours them with no `namespace` argument at all. Omitting it is no namespace restriction; `"default"` names the nodes that name no namespace, and a name no node uses answers with nothing. Pass `as_of` — a 0-based WAL commit index — to answer from the graph as it was at that commit; it composes with `role` or with `mask` (not both, since the tool refuses that pair) and with `namespace`, and every leg is resolved against the graph as it was then. Writes and `stub_hidden` are refused with `as_of`. Deleting a node does not remove it from a role's past, and a role's `keys` resolve to whichever node held the key at that commit — see [masks.md](masks.md). See [Trust model](#trust-model) below. The dialect: `n.key` / `n.label` / `key(n)` / `labels(n)`, `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `IN`, list subscripts (`n.location[0]`), comma-separated patterns sharing variables in one `MATCH`, and `count(DISTINCT …)` after a `WITH`. Full reference: [`query.md`](query.md). |
 | `node_info` | Return a node's key, label, and all properties. |
-| `stats` | Return live node, edge, and rule counts. |
+| `stats` | Return live node, edge, and rule counts, plus `namespaces` — every namespace with a live node and its count. Pass `role` or `namespace` to be told about those namespaces only; the store-wide counts beside them are unchanged. |
 | `node_history` | Every property change for a node since the last truncating snapshot. |
 | `edge_history` | Add/retract lifecycle for all edges between two nodes, with the rule behind each event. |
 | `was_linked` | Point-in-time check: was an edge of this type active at this commit? |
@@ -2897,7 +2901,7 @@ rows into it.
 
 ## Trust model
 
-`mushroomdb mcp` is a local stdio process with no auth. Masks passed via `mask` are cooperative — the caller supplies them, and nothing on the MCP path enforces them. Real access control is the HTTP server's role tokens (`mushroomdb serve --role-token`); never present an MCP mask as a security boundary.
+`mushroomdb mcp` is a local stdio process with no auth. Masks passed via `mask` are cooperative — the caller supplies them, and nothing on the MCP path enforces them, and the same is true of `role` and `namespace`: they are a caller asking to *be answered as* a tenant, not a boundary it is held to. That is also why `stats` answers with the whole namespace roster unless the call narrows it. Real access control is the HTTP server's role tokens (`mushroomdb serve --role-token`), where the binding is enforced and `GET /stats` is refused outright; never present an MCP mask or namespace as a security boundary.
 
 ---
 
@@ -4053,10 +4057,20 @@ All write denials return 403 with a structured JSON body:
 {"error": "role-bound token: edge endpoint not visible"}
 {"error": "role-bound token: edge type 'LINKS' not in write scope (create_edge_types)"}
 {"error": "role-bound token: this endpoint is not permitted"}
+{"error": "role-bound token: namespace 'tenant-b' not in the role's namespaces"}
 ```
 
 The "target node not visible" response is identical for hidden nodes and
 non-existent nodes — the role cannot distinguish the two cases.
+
+The sixth is the namespace leg (v0.6.6): a role bound to `namespaces` may only
+**create** a node inside them, because a node it could never read back would be a
+write into another tenancy. It covers `POST /nodes`, a batch, Cypher `CREATE`, the
+node `MERGE` creates, and a placeholder `POST /edges/upsert` auto-creates — a create
+naming no namespace is a create in `default`, so a role not bound to `default` is
+refused there too. A role with no `namespaces` binding is unchanged. Updates need no
+rule of their own: a role can only mutate nodes already in its read mask, which the
+namespace leg has already narrowed. See [masks.md](masks.md#namespaces).
 
 #### Threat model
 
@@ -4156,6 +4170,26 @@ whichever node held that key at the commit asked for (renaming frees a key for
 reuse). To revoke history, prune archives or narrow the role. See
 [masks.md](masks.md).
 
+`namespace` (optional, v0.6.6): answer from one namespace only.
+
+```json
+{
+  "cypher": "MATCH (n) RETURN n",
+  "namespace": "tenant-a"
+}
+```
+
+It **intersects** every other restriction — a role token's own `namespaces` binding,
+a client `mask`, and `as_of` — so it can only narrow, never widen: a token bound to
+`tenant-a` asking for `tenant-b` gets an empty result, not the union. A role bound to
+namespaces needs no `namespace` in the body at all; the resolver applies its binding
+to `POST /query` and to `GET /node/{key}`, `/edges`, `/neighborhood` and the history
+routes, where a node in another namespace answers exactly as an absent key does.
+Omitting `namespace` is no namespace restriction (not `default`; `"default"` is how
+you name the nodes that name no namespace). A name no node uses is an empty mask; an
+invalid name is a 400 naming the rule. Like `mask`, passing it makes the request a
+read. See [masks.md](masks.md#namespaces-on-every-surface).
+
 **Cost.** An `as_of` read — role-token reads included — replays the WAL under
 the store's read guard for the duration of the query; it does not use the
 lock-free epoch snapshot that a plain read uses. Replay cost grows with the
@@ -4228,12 +4262,22 @@ without `LIMIT` still error at 1,000,000 intermediate rows.
   "nodes_tombstoned": 0,
   "edges": 334,
   "history_floor": 0,
+  "namespaces": [
+    {"name": "default", "nodes_live": 58},
+    {"name": "tenant-a", "nodes_live": 2}
+  ],
   "rules": [
     {"name": "skill_fit", "edges": 90, "tripped": false, "fires": 90, "approximate": false},
     ...
   ]
 }
 ```
+
+`namespaces` (v0.6.6) lists every namespace with at least one live node, in name
+order, always including `default` — so a store that has never named a namespace
+reports exactly one entry. The route requires a full-access token, as it always did,
+which is also what keeps the roster from being a cross-tenant disclosure: a role token
+gets 403 here. MCP `stats` takes `role` / `namespace` to narrow the roster instead.
 
 A rule whose vector index is still being built carries an extra `building`
 object and derives no edges until it disappears:
@@ -4319,6 +4363,21 @@ never causes a panic or blocking I/O.
 `edges` is optional. Unknown node keys in `edges` return 400
 `"node key not found"`.
 
+`namespace` (optional, v0.6.6) is the namespace **every node this call creates** lands
+in — the reserved, write-once `ns` property, named on the call:
+
+```json
+{"label": "Person", "namespace": "tenant-a", "rows": [{"id": "alice"}]}
+```
+
+A row carrying its own `ns` must name the same namespace; a disagreement is a 400
+naming the row, and nothing is written. Omitted means the `default` namespace, and an
+explicit `"default"` stores nothing, so a store that never passes one never grows an
+`ns` column. `POST /nodes` takes the same field for the one node it creates. A
+namespace is set at insert and cannot be changed afterwards — `PUT` or `DELETE` on
+`/node/{key}/prop/ns` is a 400 carrying the `NamespaceImmutable` text. See
+[masks.md](masks.md#namespaces).
+
 Auto-FK inference: fields ending in `_id` whose values match existing node
 keys automatically create `KeyMatch` rules on the first ingest call that
 sees them.
@@ -4354,6 +4413,12 @@ directions (the updated node is evaluated as source AND as destination). This
 creates edges in both directions. An undirected Cypher pattern
 (`MATCH (a)-[:T]-(b)`) then double-counts rows. Prefer directed patterns
 (`-[:T]->`) or add `RETURN DISTINCT a, b`.
+
+`namespace` (optional, v0.6.6) scopes the rule to one namespace: it sees only that
+namespace's nodes — source, via hop and destination — so every edge it derives stays
+inside. Omitted (or null) means a global rule, which is the only kind that may derive
+an edge across a boundary. An invalid name is a 400 and nothing is installed. See
+[rules.md](rules.md#namespace-scoping).
 
 Returns 400 with `{"error": "..."}` on validation failure (unknown field
 type, missing required field, duplicate rule name).
@@ -4804,15 +4869,15 @@ Sixteen tools:
 
 | Tool | Description |
 |---|---|
-| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `role?` (answer as one of the store's roles), `as_of?` (0-based commit index — answer from the graph as it was then; composes with `role` or with `mask`, not both, since the tool refuses `role` + `mask` together; writes and `stub_hidden` refused), `stub_hidden?` (bool; see below) |
-| `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?` |
-| `create_rule` | Declare a linking rule; params: `RuleDef` fields. Over ~2,048 vectors the reply carries `building: {indexed, total}` and a note: the rule is installed but derives no edges until its vector index is built (see [POST /rules](#post-rules)) |
+| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `role?` (answer as one of the store's roles), `namespace?` (answer from one namespace — intersects `role` and `mask`, never widens them; a role bound to namespaces honours them with no argument), `as_of?` (0-based commit index — answer from the graph as it was then; composes with `role` or with `mask`, not both, since the tool refuses `role` + `mask` together, and with `namespace`; writes and `stub_hidden` refused), `stub_hidden?` (bool; see below) |
+| `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?`, `namespace?` (the namespace every node it creates lands in; a row naming a different `ns` is refused) |
+| `create_rule` | Declare a linking rule; params: `RuleDef` fields, including `namespace?` (scope the rule to one namespace; omitted is global). Over ~2,048 vectors the reply carries `building: {indexed, total}` and a note: the rule is installed but derives no edges until its vector index is built (see [POST /rules](#post-rules)) |
 | `explain` | Explain edges; params: `a`, `b` |
-| `stats` | Database statistics (no params) |
+| `stats` | Database statistics, including `namespaces`; params: `role?` and `namespace?`, which narrow the `namespaces` roster (the store-wide counts are unchanged) |
 | `neighborhood` | Typed neighborhood; params: `key`, `depth?`, `dir?` |
 | `node_info` | Node info and props; params: `key` |
 | `node_edges` | Incident edges; params: `key` |
-| `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?` |
+| `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?`, `namespace?` (the namespace a created node lands in; on an existing node, the one it is already in is a no-op and another is refused) |
 | `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?`; (2) edge traversal — `key`, `edge_type?`, `limit?` |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
@@ -4829,7 +4894,9 @@ change which Cypher rows are returned.
 **MCP trust boundary:** the MCP server is a stdio JSON-RPC interface for local trusted
 use. It operates without bearer-token authentication and is not subject to role
 enforcement. All tools have full-access semantics regardless of any role configuration
-on the HTTP server.
+on the HTTP server. `role` and `namespace` on `query` and `stats` are therefore a
+caller asking to *be answered as* a tenant, not an enforced boundary — which is also
+why `stats` answers with the whole namespace roster unless one of them is passed.
 
 ---
 
@@ -4863,13 +4930,19 @@ lock. See [Concurrency](#concurrency-1) below.
 
 ### Insert nodes
 
-`insert_node(label, key, props)` — same argument order as Rust. Raises if the
-key is already live.
+`insert_node(label, key, props, namespace=None)` — same argument order as Rust.
+Raises if the key is already live.
 
 ```python
 db.insert_node("Person", "alice", {"skills": ["graph", "rust"]})
 db.insert_node("Org", "acme", {"skills": ["graph", "rust", "search"]})
+db.insert_node("Doc", "a1", {"title": "t"}, namespace="tenant-a")
 ```
+
+`namespace` (v0.6.6) is the namespace the node is created in — set at insert and
+immutable, so `set_prop(key, "ns", …)` afterwards raises. Omitted (or `"default"`)
+means the `default` namespace and stores nothing. An invalid name raises `ValueError`;
+a `props["ns"]` disagreeing with the argument raises too.
 
 ### Upsert nodes
 
@@ -4950,6 +5023,9 @@ name is already registered:
 db.create_rule(rule, if_not_exists=True)   # True first time, False after
 ```
 
+A `"namespace"` key (v0.6.6) scopes the rule to one namespace — it sees only that
+namespace's nodes, so every edge it derives stays inside. Omitted is a global rule.
+
 **Predicate shape.** The canonical form is the snake_case one that `explain`
 emits, so an explanation round-trips straight back into a new rule:
 
@@ -5013,6 +5089,17 @@ string, so string values are safe against injection regardless of content.
 `query_with_params(cypher, params)` is a retained back-compat alias for
 `query(cypher, params=params)`.
 
+`role` and `namespace` (v0.6.6) restrict what the query may see:
+
+```python
+mine = db.query("MATCH (n) RETURN n", role="a-reader", namespace="tenant-a")
+```
+
+`role` answers as one of the store's `roles.json` roles and `namespace` from one
+namespace; together they **intersect**, so a role bound to `tenant-a` asked for
+`tenant-b` returns `[]` rather than the union. Either argument makes the call a read —
+a write statement raises — and an invalid namespace name raises `ValueError`.
+
 `query_write(cypher, params=None)` takes the same three param shapes:
 
 ```python
@@ -5073,8 +5160,12 @@ explanation = db.explain("alice", "acme")
 
 ```python
 s = db.stats()
-# {"nodes_live": N, "nodes_tombstoned": 0, "edges": E, "rules": [...]}
+# {"nodes_live": N, "nodes_tombstoned": 0, "edges": E, "history_floor": 0,
+#  "namespaces": [{"name": "default", "nodes_live": N}], "rules": [...]}
 ```
+
+`namespaces` (v0.6.6) lists every namespace with at least one live node, in name
+order, always including `default` — one entry on a store that has never named one.
 
 ### Concurrency
 
@@ -5733,7 +5824,17 @@ mushroomdb asof ./db --commit 5 --query "MATCH (n:Person)-[r:FIT]->(p:Project) R
 # as-of commit 5 of 42
 # columns: n, p, score
 #   n=alice  p=proj-01  score=0.87
+
+# One namespace, as it was at that commit.
+mushroomdb asof ./db --commit 5 --namespace tenant-a --query "MATCH (n) RETURN n"
 ```
+
+`--namespace` restricts the read to one namespace. A namespace cannot change — it is
+set at insert and immutable — so that is simply the nodes which existed then and are in
+it; a name no node uses answers with nothing, never with everything. The same
+composition is available through `AsOfScope::Namespace`, `POST /query` with
+`"namespace"`, and the MCP `query` tool, and it intersects a role there rather than
+replacing it. See [masks.md](masks.md#namespaces-on-every-surface).
 
 ### Replay cost
 

@@ -540,3 +540,119 @@ def test_type_stub_covers_every_public_method():
     text = stub.read_text()
     for name in _DOCUMENTED:
         assert f"def {name}(" in text, f"{name} missing from the type stub"
+
+
+# ---------------------------------------------------------------------------
+# 9. Namespaces (v0.6.6)
+# ---------------------------------------------------------------------------
+
+
+def _ns_store(path) -> GraphDb:
+    """Two namespaces and one `roles.json` v4 role bound to the first.
+
+    The binding has no `apply_schema`, so the sidecar is written by hand and the
+    store reopened — which is also the shape an operator deploys.
+    """
+    import json
+    import pathlib
+
+    db = GraphDb.open(str(path))
+    db.insert_node("Doc", "d1", {"id": "d1"})
+    db.insert_node("Doc", "a1", {"id": "a1"}, namespace="tenant-a")
+    db.insert_node("Doc", "a2", {"id": "a2"}, namespace="tenant-a")
+    db.insert_node("Doc", "b1", {"id": "b1"}, namespace="tenant-b")
+    db.close()
+    pathlib.Path(path, "roles.json").write_text(
+        json.dumps(
+            {
+                "version": 4,
+                "roles": [
+                    {
+                        "name": "a-reader",
+                        "labels": ["Doc"],
+                        "keys": [],
+                        "namespaces": ["tenant-a"],
+                    }
+                ],
+            }
+        )
+    )
+    return GraphDb.open(str(path))
+
+
+def test_insert_node_takes_a_namespace(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Doc", "a1", {"id": "a1"}, namespace="tenant-a")
+    db.insert_node("Doc", "d1", {"id": "d1"})
+    assert db.node_info("a1")["props"]["ns"] == "tenant-a"
+    assert "ns" not in db.node_info("d1")["props"], "absent means `default`"
+    # An explicit `default` stores nothing.
+    db.insert_node("Doc", "d2", {"id": "d2"}, namespace="default")
+    assert "ns" not in db.node_info("d2")["props"]
+    with pytest.raises(ValueError):
+        db.insert_node("Doc", "bad", {}, namespace="no spaces")
+    db.close()
+
+
+def test_a_namespace_is_set_at_insert_and_immutable(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Doc", "a1", {"id": "a1"}, namespace="tenant-a")
+    with pytest.raises(RuntimeError) as e:
+        db.set_prop("a1", "ns", "tenant-b")
+    assert "set at insert and cannot be changed" in str(e.value)
+    assert db.node_info("a1")["props"]["ns"] == "tenant-a"
+    db.close()
+
+
+def test_stats_lists_namespaces(tmp_path):
+    db = _ns_store(tmp_path / "db")
+    assert db.stats()["namespaces"] == [
+        {"name": "default", "nodes_live": 1},
+        {"name": "tenant-a", "nodes_live": 2},
+        {"name": "tenant-b", "nodes_live": 1},
+    ]
+    db.close()
+
+    plain = GraphDb.open(str(tmp_path / "plain"))
+    plain.insert_node("Person", "alice", {})
+    assert plain.stats()["namespaces"] == [{"name": "default", "nodes_live": 1}]
+    plain.close()
+
+
+def test_query_takes_a_role_and_a_namespace(tmp_path):
+    db = _ns_store(tmp_path / "db")
+    q = "MATCH (n) RETURN n.id AS id ORDER BY n.id"
+
+    def ids(**kw):
+        return [r["id"] for r in db.query(q, **kw)]
+
+    assert ids() == ["a1", "a2", "b1", "d1"]
+    assert ids(namespace="tenant-a") == ["a1", "a2"]
+    assert ids(namespace="default") == ["d1"]
+    assert ids(namespace="tenant-z") == [], "an unused name is an empty mask"
+    assert ids(role="a-reader") == ["a1", "a2"], "the binding needs no argument"
+    assert ids(role="a-reader", namespace="tenant-a") == ["a1", "a2"]
+    assert ids(role="a-reader", namespace="tenant-b") == [], "never the union"
+    with pytest.raises(RuntimeError):
+        db.query(q, role="nobody")
+    with pytest.raises(ValueError):
+        db.query(q, namespace="no spaces")
+    db.close()
+
+
+def test_create_rule_takes_a_namespace(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Person", "a1", {"team": "red"}, namespace="tenant-a")
+    db.insert_node("Person", "a2", {"team": "red"}, namespace="tenant-a")
+    db.insert_node("Person", "b1", {"team": "red"}, namespace="tenant-b")
+    rule = _fit_rule("same_team_a")
+    rule["namespace"] = "tenant-a"
+    assert db.create_rule(rule) is True
+    pairs = {
+        (r["a"], r["b"])
+        for r in db.query("MATCH (a:Person)-[:SAME_TEAM]->(b:Person) RETURN a, b")
+    }
+    assert pairs == {("a1", "a2"), ("a2", "a1")}, (
+        f"a scoped rule never reaches the other namespace: {pairs}"
+    )
+    db.close()

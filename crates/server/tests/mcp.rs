@@ -4580,3 +4580,412 @@ fn query_with_a_role_honours_a_visible_where_predicate() {
     ));
     assert_eq!(then["rows"], json!([["d1"]]));
 }
+
+// ── Namespaces on the MCP surface ────────────────────────────────────────────
+
+/// Three namespaces and two roles: `a-reader` bound to `tenant-a`, `everyone`
+/// bound to nothing. Every namespace test in this file reads this one store, so
+/// the only thing that differs between them is the argument under test.
+///
+/// `d-*` are in the implicit `default` namespace, `a-*` in `tenant-a`, `b-*` in
+/// `tenant-b`.
+fn ns_store(name: &str) -> SharedDb {
+    let db = open(name);
+    {
+        let mut w = db.write();
+        for (key, ns) in [
+            ("d1", None),
+            ("a1", Some("tenant-a")),
+            ("a2", Some("tenant-a")),
+            ("b1", Some("tenant-b")),
+        ] {
+            let mut props = vec![("id".into(), Value::Str(key.into()))];
+            if let Some(ns) = ns {
+                props.push(("ns".into(), Value::Str(ns.into())));
+            }
+            w.insert_node("Doc", key, props).unwrap();
+        }
+        w.apply_schema(&core_api::Schema {
+            roles: vec![
+                core_api::RoleDef {
+                    name: "a-reader".into(),
+                    keys: vec![],
+                    labels: vec!["Doc".into()],
+                    visible_where: None,
+                    namespaces: Some(vec!["tenant-a".into()]),
+                    write: None,
+                },
+                core_api::RoleDef {
+                    name: "everyone".into(),
+                    keys: vec![],
+                    labels: vec!["Doc".into()],
+                    visible_where: None,
+                    namespaces: None,
+                    write: None,
+                },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    db
+}
+
+fn ns_query(db: SharedDb, args: Js) -> Js {
+    content_json(&one_task_call(db, "query", args))
+}
+
+/// Binding: `namespace` alone answers from that namespace only, and absent it
+/// the same query still sees the whole store.
+#[test]
+fn query_with_a_namespace_answers_from_that_namespace_only() {
+    let db = ns_store("query-namespace");
+    let q = "MATCH (n) RETURN n.id ORDER BY n.id";
+
+    let a = ns_query(db.clone(), json!({"cypher": q, "namespace": "tenant-a"}));
+    assert_eq!(a["rows"], json!([["a1"], ["a2"]]));
+
+    let b = ns_query(db.clone(), json!({"cypher": q, "namespace": "tenant-b"}));
+    assert_eq!(b["rows"], json!([["b1"]]));
+
+    let d = ns_query(db.clone(), json!({"cypher": q, "namespace": "default"}));
+    assert_eq!(d["rows"], json!([["d1"]]), "absent `ns` means `default`");
+
+    let all = ns_query(db.clone(), json!({"cypher": q}));
+    assert_eq!(
+        all["rows"],
+        json!([["a1"], ["a2"], ["b1"], ["d1"]]),
+        "no namespace argument is no namespace restriction"
+    );
+
+    // A name no node uses resolves to nothing, never to everything.
+    let none = ns_query(db, json!({"cypher": q, "namespace": "tenant-z"}));
+    assert_eq!(none["rows"], json!([]));
+}
+
+/// Binding: `namespace` intersects `role` — it can only narrow what the role
+/// already allows, and a role bound to one namespace never sees another even
+/// with no `namespace` argument of its own.
+#[test]
+fn query_with_a_role_and_a_namespace_intersects_and_never_unions() {
+    let db = ns_store("query-role-namespace");
+    let q = "MATCH (n) RETURN n.id ORDER BY n.id";
+
+    let bound = ns_query(db.clone(), json!({"cypher": q, "role": "a-reader"}));
+    assert_eq!(
+        bound["rows"],
+        json!([["a1"], ["a2"]]),
+        "a namespaced role honours its binding with no argument here"
+    );
+
+    let inside = ns_query(
+        db.clone(),
+        json!({"cypher": q, "role": "a-reader", "namespace": "tenant-a"}),
+    );
+    assert_eq!(inside["rows"], json!([["a1"], ["a2"]]));
+
+    let outside = ns_query(
+        db.clone(),
+        json!({"cypher": q, "role": "a-reader", "namespace": "tenant-b"}),
+    );
+    assert_eq!(
+        outside["rows"],
+        json!([]),
+        "role ∩ namespace, never role ∪ namespace"
+    );
+
+    let unscoped = ns_query(
+        db.clone(),
+        json!({"cypher": q, "role": "everyone", "namespace": "tenant-b"}),
+    );
+    assert_eq!(
+        unscoped["rows"],
+        json!([["b1"]]),
+        "an unscoped role is narrowed by the argument"
+    );
+
+    // A client mask is the other restriction, and the namespace narrows it too.
+    let masked = ns_query(
+        db.clone(),
+        json!({"cypher": q, "mask": ["a1", "b1"], "namespace": "tenant-a"}),
+    );
+    assert_eq!(masked["rows"], json!([["a1"]]));
+
+    let bad = error_text(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": q, "namespace": 42}),
+    ));
+    assert!(bad.contains("namespace"), "{bad}");
+
+    let invalid = error_text(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": q, "namespace": "not a namespace!"}),
+    ));
+    assert!(invalid.contains("valid namespace name"), "{invalid}");
+
+    // A namespace makes the call a read, as a mask does.
+    let write = error_text(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "CREATE (x:Doc {id:'z1'})", "namespace": "tenant-a"}),
+    ));
+    assert!(write.contains("read-only"), "{write}");
+    assert!(!db.read().has_node("z1"), "the write must not have landed");
+}
+
+/// Binding: `as_of` composes with `namespace`, alone and beside a role.
+#[test]
+fn query_as_of_composes_with_a_namespace() {
+    let db = ns_store("query-asof-namespace");
+    let at = {
+        let mut w = db.write();
+        let at = w.wal_total_commits().unwrap() - 1;
+        w.insert_node(
+            "Doc",
+            "a3",
+            vec![
+                ("id".into(), Value::Str("a3".into())),
+                ("ns".into(), Value::Str("tenant-a".into())),
+            ],
+        )
+        .unwrap();
+        at
+    };
+    let q = "MATCH (n) RETURN n.id ORDER BY n.id";
+
+    let now = ns_query(db.clone(), json!({"cypher": q, "namespace": "tenant-a"}));
+    assert_eq!(now["rows"], json!([["a1"], ["a2"], ["a3"]]));
+
+    let then = ns_query(
+        db.clone(),
+        json!({"cypher": q, "namespace": "tenant-a", "as_of": at}),
+    );
+    assert_eq!(then["rows"], json!([["a1"], ["a2"]]), "as of before a3");
+
+    let then_role = ns_query(
+        db.clone(),
+        json!({"cypher": q, "role": "a-reader", "namespace": "tenant-a", "as_of": at}),
+    );
+    assert_eq!(then_role["rows"], json!([["a1"], ["a2"]]));
+
+    let then_foreign = ns_query(
+        db,
+        json!({"cypher": q, "role": "a-reader", "namespace": "tenant-b", "as_of": at}),
+    );
+    assert_eq!(
+        then_foreign["rows"],
+        json!([]),
+        "the intersection is the intersection at that commit too"
+    );
+}
+
+/// Binding: `stats` carries `namespaces`, and narrows the roster when the call
+/// names a role or a namespace — the whole-store counts beside it are
+/// unchanged.
+#[test]
+fn stats_carries_namespaces_and_narrows_under_a_role() {
+    let db = ns_store("stats-namespaces");
+
+    let all = content_json(&one_task_call(db.clone(), "stats", json!({})));
+    assert_eq!(
+        all["namespaces"],
+        json!([
+            {"name": "default", "nodes_live": 1},
+            {"name": "tenant-a", "nodes_live": 2},
+            {"name": "tenant-b", "nodes_live": 1},
+        ])
+    );
+
+    let scoped = content_json(&one_task_call(
+        db.clone(),
+        "stats",
+        json!({"role": "a-reader"}),
+    ));
+    assert_eq!(
+        scoped["namespaces"],
+        json!([{"name": "tenant-a", "nodes_live": 2}]),
+        "a role bound to one namespace is told about that one"
+    );
+    assert_eq!(
+        scoped["nodes_live"], all["nodes_live"],
+        "narrowing the roster does not change the store-wide counts"
+    );
+
+    let one = content_json(&one_task_call(
+        db.clone(),
+        "stats",
+        json!({"namespace": "tenant-b"}),
+    ));
+    assert_eq!(
+        one["namespaces"],
+        json!([{"name": "tenant-b", "nodes_live": 1}])
+    );
+
+    let both = content_json(&one_task_call(
+        db.clone(),
+        "stats",
+        json!({"role": "a-reader", "namespace": "tenant-b"}),
+    ));
+    assert_eq!(both["namespaces"], json!([]), "the intersection is empty");
+
+    let unknown = error_text(&one_task_call(db, "stats", json!({"role": "nobody"})));
+    assert!(unknown.contains("unknown role 'nobody'"), "{unknown}");
+}
+
+/// Binding: a store that names no namespace reports exactly one, and `stats` on
+/// it is what it always was.
+#[test]
+fn stats_on_a_store_without_namespaces_reports_one() {
+    let db = open("stats-no-namespaces");
+    seed_person(&db, "alice");
+    let s = content_json(&one_task_call(db, "stats", json!({})));
+    assert_eq!(
+        s["namespaces"],
+        json!([{"name": "default", "nodes_live": 1}])
+    );
+}
+
+/// Binding: `upsert_entity` puts a node it creates in `namespace`, and refuses
+/// to move one that already exists — with the engine's own text.
+#[test]
+fn upsert_entity_creates_in_a_namespace_and_refuses_to_change_it() {
+    let db = open("upsert-namespace");
+
+    let created = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "a9", "label": "Doc", "namespace": "tenant-a", "props": {"title": "t"}}),
+    ));
+    assert_eq!(created["created"], json!(true));
+    assert_eq!(
+        db.read().namespace_of("a9").as_deref(),
+        Some("tenant-a"),
+        "the created node is in the namespace the call named"
+    );
+
+    // Updating props in place is fine; naming the same namespace again is a no-op.
+    let same = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "a9", "namespace": "tenant-a", "props": {"title": "u"}}),
+    ));
+    assert_eq!(same["created"], json!(false));
+
+    let moved = error_text(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "a9", "namespace": "tenant-b", "props": {"title": "v"}}),
+    ));
+    assert!(
+        moved.contains("a namespace is set at insert and cannot be changed"),
+        "{moved}"
+    );
+    assert_eq!(db.read().namespace_of("a9").as_deref(), Some("tenant-a"));
+
+    let invalid = error_text(&one_task_call(
+        db,
+        "upsert_entity",
+        json!({"key": "zz", "label": "Doc", "namespace": "no spaces", "props": {}}),
+    ));
+    assert!(invalid.contains("valid namespace name"), "{invalid}");
+}
+
+/// Binding: `ingest_json` puts every node it creates in `namespace`.
+#[test]
+fn ingest_json_puts_every_created_node_in_a_namespace() {
+    let db = open("ingest-namespace");
+    let rows = r#"[{"id": "t1"}, {"id": "t2"}]"#;
+    let report = content_json(&one_task_call(
+        db.clone(),
+        "ingest_json",
+        json!({"label": "Doc", "rows_json": rows, "namespace": "tenant-a"}),
+    ));
+    assert_eq!(report["inserted"], json!(2), "{report}");
+    let g = db.read();
+    assert_eq!(g.namespace_of("t1").as_deref(), Some("tenant-a"));
+    assert_eq!(g.namespace_of("t2").as_deref(), Some("tenant-a"));
+    assert_eq!(g.namespaces(), vec!["default", "tenant-a"]);
+    drop(g);
+
+    let invalid = error_text(&one_task_call(
+        db,
+        "ingest_json",
+        json!({"label": "Doc", "rows_json": rows, "namespace": ""}),
+    ));
+    assert!(invalid.contains("valid namespace name"), "{invalid}");
+}
+
+/// Binding: `create_rule` takes `namespace`, and a scoped rule derives only
+/// inside it.
+#[test]
+fn create_rule_accepts_a_namespace() {
+    let db = open("create-rule-namespace");
+    {
+        let mut w = db.write();
+        for (key, ns) in [("x1", "tenant-a"), ("x2", "tenant-a"), ("y1", "tenant-b")] {
+            w.insert_node(
+                "Doc",
+                key,
+                vec![
+                    ("city".into(), Value::Str("berlin".into())),
+                    ("ns".into(), Value::Str(ns.into())),
+                ],
+            )
+            .unwrap();
+        }
+    }
+    let ok = content_json(&one_task_call(
+        db.clone(),
+        "create_rule",
+        json!({
+            "name": "same_city_a",
+            "src_label": "Doc",
+            "dst_label": "Doc",
+            "predicate": {"FieldEqual": {"field": "city"}},
+            "edge_type": "SAME_CITY",
+            "namespace": "tenant-a",
+        }),
+    ));
+    assert_eq!(ok["ok"], json!(true));
+    assert_eq!(
+        db.read().rules()[0].namespace.as_deref(),
+        Some("tenant-a"),
+        "the rule stores its namespace"
+    );
+    let pairs = content_json(&one_task_call(
+        db,
+        "query",
+        json!({"cypher": "MATCH (a)-[:SAME_CITY]->(b) RETURN a.id, b.id"}),
+    ));
+    let rows = pairs["rows"].as_array().expect("rows").clone();
+    assert!(
+        rows.iter()
+            .all(|r| r[0] != json!("y1") && r[1] != json!("y1")),
+        "a scoped rule never reaches the other namespace: {rows:?}"
+    );
+}
+
+/// Binding: the `query` and the write schemas advertise `namespace`, so a
+/// client knows to pass it. The tool *lists* are untouched — pinned elsewhere.
+#[test]
+fn the_schemas_advertise_namespace() {
+    let db = open("schema-namespace");
+    let stdin = req(json!(1), "tools/list", None);
+    let (res, out) = exchange_all_tools(db, &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let reply = parse_lines(&out).remove(0);
+    let tools = reply["result"]["tools"].as_array().expect("tools").clone();
+    for name in ["query", "upsert_entity", "ingest_json", "create_rule"] {
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == json!(name))
+            .unwrap_or_else(|| panic!("{name} is listed"));
+        assert_eq!(
+            tool["inputSchema"]["properties"]["namespace"]["type"],
+            json!("string"),
+            "{name} advertises a string `namespace`"
+        );
+    }
+}

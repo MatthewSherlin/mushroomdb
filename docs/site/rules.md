@@ -533,6 +533,10 @@ db.create_rule(RuleDef {
 - A rule persisted before this field existed decodes as `namespace: None` — global,
   which is the behaviour it had.
 
+`namespace` is accepted wherever a `RuleDef` is: `POST /rules`, the MCP `create_rule`
+tool, Python's `create_rule({... "namespace": "tenant-a"})`, and a
+`mushroomdb schema apply` schema file. Omitting it is a global rule on all four.
+
 Namespaces themselves — the reserved `ns` property, how a role binds to one, and the
 cross-namespace edge refusal — are documented in
 [masks.md](masks.md#namespaces).

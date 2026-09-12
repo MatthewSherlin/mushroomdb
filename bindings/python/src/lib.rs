@@ -1,6 +1,7 @@
 use core_api::{
-    default_max_edges, Direction, EdgeAt, Explanation, GraphDb as CoreDb, GraphError,
-    HistoryChange, HistoryEntry, NodeInfo, NodeMask, PredicateSummary, ResultSet, RuleDef, Value,
+    default_max_edges, valid_namespace, Direction, EdgeAt, Explanation, GraphDb as CoreDb,
+    GraphError, HistoryChange, HistoryEntry, NodeInfo, NodeMask, PredicateSummary, ResultSet,
+    RuleDef, Value, NS_MAX_LEN, NS_PROP,
 };
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -61,9 +62,42 @@ impl GraphDb {
 
     /// Insert a new node.  Raises `RuntimeError` (`DuplicateKey`) if `key` is
     /// already live; use `upsert_node` for insert-or-update semantics.
-    #[pyo3(text_signature = "($self, label, key, props)")]
-    fn insert_node(&self, label: &str, key: &str, props: Bound<'_, PyDict>) -> PyResult<()> {
-        let mapped = dict_to_props(&props)?;
+    ///
+    /// `namespace` is the namespace the node is created in — the reserved `ns`
+    /// property, named on the call. Omitted (or `"default"`) means the `default`
+    /// namespace and stores nothing, so a store that never passes one has no
+    /// `ns` column at all. A namespace is set at insert and cannot be changed:
+    /// `set_prop(key, "ns", …)` on an existing node raises.
+    ///
+    /// ```python
+    /// db.insert_node("Doc", "a1", {"title": "t"}, namespace="tenant-a")
+    /// ```
+    #[pyo3(
+        signature = (label, key, props, namespace = None),
+        text_signature = "($self, label, key, props, namespace=None)"
+    )]
+    fn insert_node(
+        &self,
+        label: &str,
+        key: &str,
+        props: Bound<'_, PyDict>,
+        namespace: Option<&str>,
+    ) -> PyResult<()> {
+        let mut mapped = dict_to_props(&props)?;
+        if let Some(ns) = check_namespace(namespace)? {
+            // A `props["ns"]` that disagrees with the argument is a caller that
+            // has not decided which namespace it meant.
+            match mapped.iter().find(|(f, _)| f == NS_PROP) {
+                Some((_, Value::Str(s))) if s == ns => {}
+                Some((_, existing)) => {
+                    return Err(PyValueError::new_err(format!(
+                        "insert_node: props ns is {existing:?} but namespace={ns:?}; a node is \
+                         created in one namespace, so pass one or the other"
+                    )))
+                }
+                None => mapped.push((NS_PROP.to_string(), Value::Str(ns.to_string()))),
+            }
+        }
         self.with_mut(|db| db.insert_node(label, key, mapped))
     }
 
@@ -178,21 +212,53 @@ impl GraphDb {
     ///
     /// Returns one dict per row, keyed by RETURN alias.
     ///
+    /// `role` answers as one of the store's roles (from `roles.json`) and
+    /// `namespace` from one namespace only. They **intersect** — a namespace can
+    /// only narrow what a role already allows, so a role bound to `tenant-a`
+    /// asked for `tenant-b` answers with nothing — and either one makes the call
+    /// a read, so a write statement raises.
+    ///
     /// ```python
     /// rows = db.query(
     ///     "MATCH (n:Person) WHERE n.age > $min RETURN key(n) AS id",
     ///     {"min": 18},
     /// )
+    /// mine = db.query("MATCH (n) RETURN n", role="a-reader", namespace="tenant-a")
     /// ```
-    #[pyo3(signature = (cypher, params = None), text_signature = "($self, cypher, params=None)")]
+    #[pyo3(
+        signature = (cypher, params = None, role = None, namespace = None),
+        text_signature = "($self, cypher, params=None, role=None, namespace=None)"
+    )]
     fn query(
         &self,
         py: Python<'_>,
         cypher: &str,
         params: Option<Bound<'_, PyAny>>,
+        role: Option<&str>,
+        namespace: Option<&str>,
     ) -> PyResult<Vec<Py<PyDict>>> {
         let map = params_to_map(params)?;
-        let rs = self.with_ref(|db| db.query(cypher, &map))?;
+        let namespace = check_namespace(namespace)?;
+        let rs = if role.is_some() || namespace.is_some() {
+            // One mask per leg, intersected — the same never-widen composition
+            // every other surface uses. A role bound to namespaces honours them
+            // with no `namespace` here; one outside its binding is the empty
+            // intersection, never the union. Either argument makes the call a
+            // read: a masked write raises.
+            self.with_ref(|db| {
+                let mask = match (role, namespace) {
+                    (Some(role), Some(ns)) => {
+                        db.mask_for_role(role)?.intersect(&db.mask_for_namespace(ns))
+                    }
+                    (Some(role), None) => db.mask_for_role(role)?,
+                    (None, Some(ns)) => db.mask_for_namespace(ns),
+                    (None, None) => unreachable!("one of the two is Some in this branch"),
+                };
+                db.query_masked(cypher, &map, &mask)
+            })?
+        } else {
+            self.with_ref(|db| db.query(cypher, &map))?
+        };
         result_set_to_rows(py, &rs)
     }
 
@@ -456,6 +522,11 @@ impl GraphDb {
     ///
     /// With `if_not_exists=True`, a rule whose `name` is already registered
     /// returns `False` instead of raising.
+    ///
+    /// A `"namespace"` key scopes the rule to one namespace: it sees only that
+    /// namespace's nodes — source, via hop and destination — so every edge it
+    /// derives stays inside. Omitted means a global rule, the only kind that may
+    /// derive an edge across a boundary.
     #[pyo3(
         signature = (rule, if_not_exists = false),
         text_signature = "($self, rule, if_not_exists=False)"
@@ -861,9 +932,10 @@ impl GraphDb {
         Ok(d.unbind())
     }
 
-    /// Return database statistics: node/edge counts plus per-rule provenance
-    /// size, trip latch, and fire counter.  Shape matches the HTTP `/stats`
-    /// JSON response.
+    /// Return database statistics: node/edge counts, `namespaces` (every
+    /// namespace with at least one live node and its count), plus per-rule
+    /// provenance size, trip latch, and fire counter.  Shape matches the HTTP
+    /// `/stats` JSON response.
     #[pyo3(text_signature = "($self)")]
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         let s = self.with_ref(|db| Ok(db.stats()))?;
@@ -883,6 +955,14 @@ impl GraphDb {
             rules_list.append(rd)?;
         }
         d.set_item("rules", rules_list)?;
+        let ns_list = PyList::empty(py);
+        for n in &s.namespaces {
+            let nd = PyDict::new(py);
+            nd.set_item("name", &n.name)?;
+            nd.set_item("nodes_live", n.nodes_live)?;
+            ns_list.append(nd)?;
+        }
+        d.set_item("namespaces", ns_list)?;
         Ok(d.unbind())
     }
 
@@ -1140,6 +1220,18 @@ fn params_to_map(params: Option<Bound<'_, PyAny>>) -> PyResult<BTreeMap<String, 
     Err(pyo3::exceptions::PyTypeError::new_err(
         "params must be a dict or a list of (name, value) tuples",
     ))
+}
+
+/// A `namespace=` keyword, refused here rather than resolved to an empty mask: a
+/// typo that silently answers "nothing" reads like an empty store.
+fn check_namespace(namespace: Option<&str>) -> PyResult<Option<&str>> {
+    match namespace {
+        Some(ns) if !valid_namespace(ns) => Err(PyValueError::new_err(format!(
+            "namespace {ns:?} is not a valid namespace name — 1 to {NS_MAX_LEN} characters of \
+             [A-Za-z0-9_.-]"
+        ))),
+        other => Ok(other),
+    }
 }
 
 fn dict_to_props(props: &Bound<'_, PyDict>) -> PyResult<Vec<(String, Value)>> {

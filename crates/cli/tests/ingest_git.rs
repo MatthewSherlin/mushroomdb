@@ -1820,7 +1820,7 @@ fn reach_line_of(db_dir: &Path) -> String {
 
 /// Binding: on a store no repository was ingested into, the brief's last line
 /// names the association door — `explain_association` and `query`, with the
-/// `role` argument — and not one code-graph tool.
+/// `role` and `namespace` arguments — and not one code-graph tool.
 ///
 /// The two lines track the two MCP surfaces. A store with no `GitSync` marker
 /// lists neither `explore` nor `context`, so naming either would send a
@@ -1835,8 +1835,8 @@ fn the_reach_line_names_the_association_door_on_a_store_with_no_git_sync_marker(
     assert_eq!(
         reach,
         format!(
-            "explain_association <a> <b> · query '<cypher>' (MCP tools; add role: <name> to see \
-             as a role) · or: {} query '{}' '<cypher>'",
+            "explain_association <a> <b> · query '<cypher>' (MCP tools; add role: <name> or \
+             namespace: <ns> to narrow what it sees) · or: {} query '{}' '<cypher>'",
             cli::install::detect_mcp_command(None).shell(),
             db_dir.display()
         ),
