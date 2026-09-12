@@ -70,9 +70,21 @@ jobs:
       # edges at all and scores 0.0000, which is how it sat dark through 0.6.6's Task 2.
       # At prune=own this gate fails at 0.8581; see docs/site/rules.md.
       - run: cargo test --release -p sim-harness -- approximate_recall_5k_timing --ignored --nocapture
+      # dist_evals_per_insert_is_bounded: counts distance evaluations per insert at
+      # 1k and 5k (dimension 32 — the count is a property of the graph, not of the
+      # dimension). A count, not a wall clock, so it holds on any machine: this is
+      # the gate that notices the insert path doing more work per vector as the
+      # index grows, which no timing-free test did before. Measured 12,739.5 at 1k
+      # and 23,901.7 at 5k, ratio 1.876, against ceilings of 36,000 and 2.8x. ~2 s.
+      - run: cargo test --release -p mushroomdb-rules --features test-hooks -- dist_evals_per_insert_is_bounded --ignored --nocapture
       # exact_vector_rule_recall_5k: an exact VectorSimilar rule over the same
       # 5k × 1536-D corpus; asserts recall >= 0.98 against the same O(n^2)
-      # ground truth the approximate gate uses.
+      # ground truth the approximate gate uses. From 0.6.6 an exact rule finds its
+      # candidates through the index too, so this gate is what holds the beam's
+      # stopping rule honest. Like the approximate one it is over HNSW_BUILD_BATCH
+      # and pumps the build to completion before measuring. Measured: recall
+      # 1.0000 (495000/495000), creation 64 s, ~105 s in total; the same rule with
+      # MUSHROOMDB_VECTOR_SCAN=1 takes 147 s to create and also scores 1.0000.
       - run: cargo test --release -p sim-harness -- exact_vector_rule_recall_5k --ignored --nocapture
 
   # Every historical snapshot format (V5..V9) must open, migrate, and preserve

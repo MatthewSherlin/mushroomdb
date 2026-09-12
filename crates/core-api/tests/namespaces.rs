@@ -949,3 +949,124 @@ fn a_view_may_not_write_the_namespace_property() {
         "{err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 14. A namespaced VectorSimilar rule, which finds candidates through the index
+// ---------------------------------------------------------------------------
+
+/// From 0.6.6 a `VectorSimilar` rule — exact as well as approximate — finds its
+/// candidates through the vector index rather than by scanning. Two things have
+/// to hold for a scoped one: the index holds only its own namespace (so the
+/// beam's floor proof is over the right corpus), and no pair crosses.
+///
+/// The vectors are identical across namespaces, so every pair would match at
+/// `min = 0.9`: a rule that ignored the scoping would derive the full
+/// cross-product and the count is what says it did not.
+#[test]
+fn a_namespaced_vector_rule_never_pairs_across_namespaces() {
+    fn vector_rule(name: &str, namespace: Option<&str>, approximate: bool) -> RuleDef {
+        RuleDef {
+            name: name.into(),
+            src_label: "Vec".into(),
+            dst_label: "Vec".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "NEAR".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: namespace.map(str::to_string),
+        }
+    }
+    /// Every `NEAR` pair over the fixture, sorted.
+    fn near_pairs(db: &GraphDb<core_api::RealFs>, keys: &[&str]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for src in keys {
+            for dst in db
+                .neighbors(src, "NEAR", core_api::Direction::Out)
+                .unwrap_or_default()
+            {
+                out.push((src.to_string(), dst));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    let keys = ["vx1", "vx2", "vx3", "vy1", "vy2", "vy3"];
+    for approximate in [false, true] {
+        let dir = tmp(if approximate {
+            "vec-ns-approx"
+        } else {
+            "vec-ns-exact"
+        });
+        let mut db = GraphDb::open(&dir).unwrap();
+        // Six nodes, three per namespace, all with near-identical unit vectors,
+        // so every ordered pair clears min = 0.9.
+        for (i, key) in keys.iter().enumerate() {
+            let nudge = i as f64 * 1e-4;
+            let emb = Value::List(vec![
+                Value::Float(1.0 - nudge),
+                Value::Float(nudge),
+                Value::Float(0.0),
+            ]);
+            let namespace = if key.starts_with("vx") { "x" } else { "y" };
+            db.insert_node("Vec", key, vec![("emb".into(), emb), ns(namespace)])
+                .unwrap();
+        }
+
+        db.create_rule(vector_rule("scoped", Some("x"), approximate))
+            .unwrap();
+        let pairs = near_pairs(&db, &keys);
+        assert_eq!(
+            pairs.len(),
+            6,
+            "3 x-nodes, every ordered pair but a self-pair (approximate={approximate}): {pairs:?}"
+        );
+        assert!(
+            pairs
+                .iter()
+                .all(|(s, d)| s.starts_with("vx") && d.starts_with("vx")),
+            "no pair may touch namespace y (approximate={approximate}): {pairs:?}"
+        );
+
+        // A node arriving in the other namespace reaches neither side of the
+        // index, so it changes nothing — this is the incremental path, which
+        // files the vector through a different entry point than the backfill.
+        let emb = Value::List(vec![
+            Value::Float(1.0),
+            Value::Float(0.0),
+            Value::Float(0.0),
+        ]);
+        db.insert_node("Vec", "vy4", vec![("emb".into(), emb), ns("y")])
+            .unwrap();
+        assert_eq!(
+            near_pairs(&db, &["vy4"]),
+            Vec::<(String, String)>::new(),
+            "a y node derives nothing under an x-scoped rule"
+        );
+        assert_eq!(near_pairs(&db, &keys).len(), 6);
+
+        // The same rule, global: now every pair crosses freely — 7 nodes.
+        db.delete_rule("scoped").unwrap();
+        db.create_rule(vector_rule("global", None, approximate))
+            .unwrap();
+        let all_keys = ["vx1", "vx2", "vx3", "vy1", "vy2", "vy3", "vy4"];
+        let global = near_pairs(&db, &all_keys);
+        assert_eq!(
+            global.len(),
+            42,
+            "7 nodes × 6 others (approximate={approximate}): {}",
+            global.len()
+        );
+        assert!(
+            global.contains(&("vx1".to_string(), "vy1".to_string())),
+            "a global vector rule may cross the boundary"
+        );
+    }
+}

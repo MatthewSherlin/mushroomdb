@@ -49,6 +49,47 @@ pub fn with_ivf_drift_rebuild<R>(threshold: u64, f: impl FnOnce() -> R) -> R {
     })
 }
 
+/// Beam ceiling for the widening loop an exact `VectorSimilar` rule runs
+/// (see [`CandidateSpec::Hnsw`]'s `floor`). Reaching it with the floor still
+/// unreached means the candidate set is the whole tracked set, which is what the
+/// rule did before 0.6.6.
+pub const EF_MAX: usize = 4_096;
+
+/// Slack on the beam's stopping comparison, covering the `f32` arithmetic the
+/// index answers with ([`crate::hnsw::HnswIndex::search`] documents ~1e-6).
+///
+/// The beam's similarities are a candidate *ordering* number and never a
+/// reported score — every score on an edge is recomputed from the `f64` store.
+/// Requiring the worst hit to be *clearly* below `min` before the beam is
+/// trusted means `f32` rounding can cost one extra doubling and can never cost
+/// a pair.
+const BEAM_FLOOR_SLACK: f64 = 1e-5;
+
+thread_local! {
+    static EF_MAX_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn ef_max() -> usize {
+    EF_MAX_OVERRIDE.with(|c| c.get().unwrap_or(EF_MAX)).max(1)
+}
+
+/// Run `f` with a temporary beam ceiling. Test hook, in the shape of
+/// [`with_hnsw_build_batch`] — it exists so a test can reach the ceiling with a
+/// few hundred vectors instead of the [`EF_MAX`] thousands.
+///
+/// The override is thread-local, so `f` must do its work on the calling thread.
+pub fn with_ef_max<R>(cap: usize, f: impl FnOnce() -> R) -> R {
+    EF_MAX_OVERRIDE.with(|c| {
+        let prev = c.replace(Some(cap));
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Sliced HNSW build (v0.6.6 T2)
 // ---------------------------------------------------------------------------
@@ -314,6 +355,59 @@ pub(crate) fn vector_early_exit_enabled() -> bool {
     }
 }
 
+thread_local! {
+    /// `None` until `MUSHROOMDB_VECTOR_SCAN` has been read on this thread.
+    /// [`with_vector_scan`] replaces it for the duration of a closure.
+    static VECTOR_SCAN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `MUSHROOMDB_VECTOR_SCAN=1` forces every `VectorSimilar` rule back onto the
+/// full-scan candidate path: O(n²) per rule, and every pair above the rule's
+/// `min` provably found.
+///
+/// Same shape as [`vector_early_exit_enabled`] and `vector_dim_reject_enabled`,
+/// except that the switch is an environment variable rather than a test-only
+/// hook — it is the documented way for a caller to buy the exactness guarantee
+/// back.
+pub fn vector_scan_forced() -> bool {
+    VECTOR_SCAN.with(|c| match c.get() {
+        Some(v) => v,
+        None => {
+            let v = std::env::var("MUSHROOMDB_VECTOR_SCAN")
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            c.set(Some(v));
+            v
+        }
+    })
+}
+
+/// Run `f` with the full-scan candidate path forced on or off, whatever
+/// `MUSHROOMDB_VECTOR_SCAN` says. Test hook, in the shape of
+/// [`with_hnsw_build_batch`](crate::with_hnsw_build_batch).
+///
+/// The override is thread-local, so `f` must do its work on the calling thread.
+///
+/// # The engine outlives the closure
+///
+/// This switches which candidate spec a rule is *asked for*, and several
+/// decisions are taken once and remembered: a rule created inside the closure
+/// with the scan forced on builds no HNSW graph, so using that same engine
+/// outside the closure leaves the rule answering from `hnsw_tracked` — correct,
+/// and a full scan — until something rebuilds it. Either keep the engine inside
+/// the closure, as the equivalence test does, or reopen the store afterwards.
+pub fn with_vector_scan<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    VECTOR_SCAN.with(|c| {
+        let prev = c.replace(Some(enabled));
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
+}
+
 /// Force the ScanAll dim fast-reject on or off. Identity-proof hook.
 #[cfg(test)]
 pub fn with_vector_dim_reject<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
@@ -446,6 +540,11 @@ pub enum CandidateSpec<'a> {
         /// Number of approximate candidates to return; typically
         /// `max(max_edges, 64)` from the owning `RuleDef`.
         k: usize,
+        /// `Some(min)` for an exact rule: widen the beam until its worst hit
+        /// falls below `min`, so a qualifying node cannot be sitting outside a
+        /// truncated beam. `None` for an approximate rule: one pass at `k`,
+        /// which is what the rule did before 0.6.6.
+        floor: Option<f64>,
     },
     /// Union of multiple candidate specs, used for `Any` predicates.
     ///
@@ -526,9 +625,31 @@ pub fn candidate_spec_approx(p: &Predicate) -> CandidateSpec<'_> {
 }
 
 /// Like `candidate_spec_approx` but with an explicit HNSW candidate count `k`.
+///
+/// The beam takes no floor, so the search is one pass at `k`: the approximate
+/// rule's behaviour. [`candidate_spec_approx_with_floor`] is the exact rule's
+/// version.
 pub fn candidate_spec_approx_with_k(p: &Predicate, k: usize) -> CandidateSpec<'_> {
+    candidate_spec_approx_with_floor(p, k, false)
+}
+
+/// [`candidate_spec_approx_with_k`], optionally taking each `VectorSimilar`'s
+/// own `min` as the beam's stopping similarity.
+///
+/// `floored` is what separates an exact rule from an approximate one: with it,
+/// the beam widens until its worst hit falls below `min`, so a node above `min`
+/// cannot be sitting outside a truncated beam.
+pub fn candidate_spec_approx_with_floor(
+    p: &Predicate,
+    k: usize,
+    floored: bool,
+) -> CandidateSpec<'_> {
     match p {
-        Predicate::VectorSimilar { field, .. } => CandidateSpec::Hnsw { field, k },
+        Predicate::VectorSimilar { field, min } => CandidateSpec::Hnsw {
+            field,
+            k,
+            floor: floored.then_some(*min),
+        },
         Predicate::All(parts) => {
             debug_assert!(
                 !parts.is_empty(),
@@ -537,11 +658,24 @@ pub fn candidate_spec_approx_with_k(p: &Predicate, k: usize) -> CandidateSpec<'_
             CandidateSpec::Intersect(
                 parts
                     .iter()
-                    .map(|p| candidate_spec_approx_with_k(p, k))
+                    .map(|p| candidate_spec_approx_with_floor(p, k, floored))
                     .collect(),
             )
         }
         other => candidate_spec(other),
+    }
+}
+
+/// True when `spec` probes an HNSW graph anywhere, so the owning rule needs one
+/// built. Every `VectorSimilar`-rooted rule does, exact or approximate, unless
+/// [`vector_scan_forced`] has put it back on the full scan.
+pub fn spec_has_hnsw(spec: &CandidateSpec<'_>) -> bool {
+    match spec {
+        CandidateSpec::Hnsw { .. } => true,
+        CandidateSpec::Union(parts) | CandidateSpec::Intersect(parts) => {
+            parts.iter().any(spec_has_hnsw)
+        }
+        _ => false,
     }
 }
 
@@ -891,6 +1025,7 @@ impl SideIndex {
                 let Some(xs) = get(field).as_ref().and_then(as_numeric_list) else {
                     return false;
                 };
+                self.record_vector_meta(node, &xs);
                 self.hnsw_tracked.insert(node);
                 if let Some(h) = &mut self.hnsw {
                     h.insert(node, &xs);
@@ -919,6 +1054,10 @@ impl SideIndex {
         // Hnsw: maintain hnsw_tracked for fallback, and hnsw graph if initialized.
         if let CandidateSpec::Hnsw { field, .. } = spec {
             if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
+                // An exact rule takes this arm from 0.6.6 on, and the
+                // Cauchy-Schwarz early exit in `compute_desired` reads this
+                // metadata, so it is recorded here as well as on `ScanAll`.
+                self.record_vector_meta(node, &xs);
                 self.hnsw_tracked.insert(node);
                 match leg {
                     // The adopted graph already holds this vector, or the build
@@ -958,17 +1097,34 @@ impl SideIndex {
         }
         if let CandidateSpec::ScanAll { field } = spec {
             if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
-                let mut n2 = 0.0f64;
-                for x in &xs {
-                    n2 += x * x;
-                }
-                let norm = n2.sqrt();
-                self.vec_meta.insert(node, (xs.len() as u32, norm));
-                self.vec_checkpoints.insert(node, compute_ckpts(&xs));
-                // xs is non-empty (as_numeric_list rejects empty lists).
-                self.vec_anchor.insert(node, xs[0]);
+                self.record_vector_meta(node, &xs);
             }
         }
+    }
+
+    /// File `node`'s `(dim, norm)`, suffix-norm checkpoints and anchor — the
+    /// three inputs the Cauchy-Schwarz early exit reads.
+    ///
+    /// Called from the `ScanAll` and `Hnsw` arms of `insert_with` and from
+    /// `insert_hnsw_only`, so an exact `VectorSimilar` rule keeps the early exit
+    /// whichever arm files its vectors. Torn out by the matching arms of
+    /// `remove`.
+    fn record_vector_meta(&mut self, node: u32, xs: &[f64]) {
+        let mut n2 = 0.0f64;
+        for x in xs {
+            n2 += x * x;
+        }
+        self.vec_meta.insert(node, (xs.len() as u32, n2.sqrt()));
+        self.vec_checkpoints.insert(node, compute_ckpts(xs));
+        // xs is non-empty (as_numeric_list rejects empty lists).
+        self.vec_anchor.insert(node, xs[0]);
+    }
+
+    /// Drop what [`SideIndex::record_vector_meta`] filed for `node`.
+    fn forget_vector_meta(&mut self, node: u32) {
+        self.vec_meta.remove(&node);
+        self.vec_checkpoints.remove(&node);
+        self.vec_anchor.remove(&node);
     }
 
     pub fn remove(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
@@ -985,6 +1141,7 @@ impl SideIndex {
         // and optionally compacts the HNSW graph.
         if let CandidateSpec::Hnsw { field, .. } = spec {
             if get(field).as_ref().and_then(as_numeric_list).is_some() {
+                self.forget_vector_meta(node);
                 self.hnsw_tracked.remove(&node);
                 if let Some(h) = &mut self.hnsw {
                     h.remove(node);
@@ -1023,9 +1180,7 @@ impl SideIndex {
         }
         if let CandidateSpec::ScanAll { field } = spec {
             if get(field).as_ref().and_then(as_numeric_list).is_some() {
-                self.vec_meta.remove(&node);
-                self.vec_checkpoints.remove(&node);
-                self.vec_anchor.remove(&node);
+                self.forget_vector_meta(node);
             }
         }
     }
@@ -1110,8 +1265,8 @@ impl SideIndex {
         get: &dyn Fn(&str) -> Option<Value>,
     ) -> BTreeSet<u32> {
         // Hnsw: approximate nearest-neighbor search.
-        if let CandidateSpec::Hnsw { field, k } = spec {
-            return self.hnsw_candidates(field, *k, get);
+        if let CandidateSpec::Hnsw { field, k, floor } = spec {
+            return self.hnsw_candidates(field, *k, *floor, get);
         }
         // VectorClusters: probe the P nearest centroids.
         if let CandidateSpec::VectorClusters { field, .. } = spec {
@@ -1366,20 +1521,83 @@ impl SideIndex {
 
     /// HNSW candidate lookup: `k`-nearest-neighbor search using the built graph.
     ///
-    /// Falls back to returning all tracked nodes when the HNSW is absent or
-    /// empty (e.g. before any insert or when used without `init_hnsw`).
+    /// With `floor` of `None` — an approximate rule — this is one beam pass at
+    /// `k`, which is what it has always been.
+    ///
+    /// With `floor` of `Some(min)` — an exact rule, 0.6.6 on — the beam widens,
+    /// and **there is exactly one way it is allowed to answer**: a beam that
+    /// came back full (`hits.len() == ef`) whose worst hit is below `min` by more
+    /// than [`BEAM_FLOOR_SLACK`] — the beam answers in `f32`, and the slack keeps
+    /// that rounding on the side of widening. Such a beam has proved what it did
+    /// not return — every node it rejected is farther from the query than one
+    /// already known to fail the predicate — so its hits are the candidate set.
+    /// The similarities themselves are discarded here; `compute_desired` rescores
+    /// every candidate from the `f64` store, so `min` is only ever *decided* in
+    /// `f64`.
+    ///
+    /// Every other outcome hands back the whole tracked set, which is the
+    /// pre-0.6.6 exact candidate set:
+    ///
+    /// * **The beam came back short of its own width.** Layer 0 need not be one
+    ///   connected component — a corpus of identical or near-identical vectors
+    ///   is the case that shows it — and a beam that exhausted its frontier has
+    ///   proved nothing about the nodes it could not reach.
+    /// * **The ceiling ([`ef_max`], [`EF_MAX`] by default) was reached with the
+    ///   worst hit still at or above `min`.** A cluster denser than the ceiling
+    ///   then costs a scan; it never costs recall.
+    /// * **A beam as wide as the index itself** (`ef >= h.len()`), where walking
+    ///   the graph cannot beat handing back every vector on the side.
+    /// * **The index cannot answer this query at all**
+    ///   ([`HnswIndex::can_answer`]): no graph, an empty one, a stride that is not
+    ///   the query's dimension, or one that refused a vector it was handed. This
+    ///   is checked *before* any beam runs, because a beam over an index that is
+    ///   missing part of the corpus would "prove" its floor against vectors the
+    ///   index never held. It applies to the approximate path as well.
+    ///
+    /// So the index is a candidate *generator* here and never a silent filter:
+    /// the only way a node is dropped is a beam that proved it is below `min`.
     fn hnsw_candidates(
         &self,
         field: &str,
         k: usize,
+        floor: Option<f64>,
         get: &dyn Fn(&str) -> Option<Value>,
     ) -> BTreeSet<u32> {
         let Some(xs) = get(field).as_ref().and_then(as_numeric_list) else {
             return BTreeSet::new();
         };
         if let Some(h) = &self.hnsw {
-            if !h.is_empty() {
-                return h.search(&xs, k).into_iter().map(|(id, _)| id).collect();
+            // `can_answer`, not `!is_empty()`: an index that refused a vector, or
+            // whose stride is not this query's dimension — a 3-element stray
+            // ingested ahead of the real corpus elects one — is non-empty and
+            // still cannot supply the candidates this query needs. It is asked
+            // before any beam, because a beam over such an index would "conclude"
+            // from an incomplete corpus.
+            if h.can_answer(xs.len()) {
+                let Some(min) = floor else {
+                    return h.search(&xs, k).into_iter().map(|(id, _)| id).collect();
+                };
+                let cap = ef_max();
+                let mut ef = h.ef_for(k);
+                while ef < h.len() {
+                    // `k = ef`: the answer is every hit above the floor, so
+                    // truncating the beam to `k` would be throwing away the
+                    // very candidates the widening is looking for.
+                    let hits = h.search_with_ef(&xs, ef, ef);
+                    // `search` sorts descending, so the last hit is the worst.
+                    let full = hits.len() == ef;
+                    if full && hits[hits.len() - 1].1 < min - BEAM_FLOOR_SLACK {
+                        return hits.into_iter().map(|(id, _)| id).collect();
+                    }
+                    // Short of its width (frontier exhausted, so a wider beam
+                    // reaches nothing new) or at the ceiling with the floor
+                    // still unreached: neither has proved anything about what it
+                    // did not return.
+                    if !full || ef >= cap {
+                        break;
+                    }
+                    ef = ef.saturating_mul(2);
+                }
             }
         }
         // Fallback: full scan of all tracked nodes (superset of true positives).
@@ -2141,7 +2359,11 @@ mod tests {
 
     /// A side seeded with three vectors, plus the `Hnsw` spec that indexes them.
     fn hnsw_side() -> (SideIndex, CandidateSpec<'static>) {
-        let spec = CandidateSpec::Hnsw { field: "emb", k: 8 };
+        let spec = CandidateSpec::Hnsw {
+            field: "emb",
+            k: 8,
+            floor: None,
+        };
         let mut side = SideIndex::default();
         side.init_hnsw("sim");
         for (id, xs) in [
