@@ -1871,7 +1871,30 @@ fn approximate_recall_5k_timing() {
         via_dir: None,
     })
     .unwrap();
+    // Since 0.6.6 a `create_rule` over more than `HNSW_BUILD_BATCH` vectors
+    // installs the rule and returns *before* its edges exist, building the
+    // index a slice at a time instead. 5 000 vectors is well over that, so
+    // without this loop the rule derives nothing and the recall below is 0.0 —
+    // which is exactly how this gate went dark. Pumping to completion is what a
+    // quiescent store does on its own ticker; doing it inside the timed region
+    // keeps `hnsw_ms` meaning "what the whole index cost".
+    let mut pumps = 0u32;
+    loop {
+        let outstanding = db.pump_index_build().unwrap();
+        if outstanding.is_empty() {
+            break;
+        }
+        pumps += 1;
+        assert!(
+            pumps < 10_000,
+            "the build made no progress after {pumps} pumps: {outstanding:?}"
+        );
+    }
     let hnsw_ms = t0.elapsed().as_millis();
+    assert!(
+        db.builds_in_progress().is_empty(),
+        "the index must be whole before recall is measured"
+    );
 
     // Collect approximate edges.
     let approx_edges: BTreeSet<(String, String, String)> = {
@@ -2109,8 +2132,14 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
 ///
 /// The same 5,000 × 1,536-D fixture `approximate_recall_5k_timing` uses, the
 /// same O(n²) ground truth, and the rule's `min` as the beam's stopping
-/// similarity. The floor is higher than the approximate one — 0.98 — because
-/// the beam does not stop until its own worst hit has fallen below `min`.
+/// similarity. The floor is higher than the approximate one — 0.98, not 1.0 —
+/// because it has to survive an index-backed candidate path rather than a full
+/// scan, and without it that change would have nothing asserting it did not
+/// quietly lose edges.
+///
+/// A 5,000-vector corpus is past `HNSW_BUILD_BATCH`, so the build is sliced and
+/// the rule derives nothing until it has been pumped to completion. Measuring
+/// before that is measuring an empty rule.
 ///
 /// `MUSHROOMDB_VECTOR_SCAN=1` runs the identical assertion against the
 /// pre-0.6.6 full-scan candidate path, which is how the before/after wall clock
@@ -2128,7 +2157,9 @@ fn exact_vector_rule_recall_5k() {
     const PER_CLUSTER: usize = 100;
     const N: usize = N_CLUSTERS * PER_CLUSTER; // 5000
     const MIN_SIM: f64 = 0.85;
-    const FLOOR: f64 = 0.98;
+    /// An exact rule must lose almost nothing. Not 1.0: the floor has to
+    /// survive an index-backed candidate path, not just a full scan.
+    const EXACT_RECALL_FLOOR: f64 = 0.98;
     const SEED: u64 = 0xcafe_f00d_dead_1234;
 
     let dir = {
@@ -2217,10 +2248,10 @@ fn exact_vector_rule_recall_5k() {
         exact_edges.len()
     );
     assert!(
-        r >= FLOOR,
+        r >= EXACT_RECALL_FLOOR,
         "5k exact recall {:.4} < floor {:.2} (derived={} exact={})",
         r,
-        FLOOR,
+        EXACT_RECALL_FLOOR,
         derived.len(),
         exact_edges.len()
     );

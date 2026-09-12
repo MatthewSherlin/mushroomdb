@@ -66,18 +66,22 @@ way you declare rules or fulltext fields.
 
 ## Relationship to the vector index
 
-A property index answers equality. Cosine similarity is answered by the in-tree
-HNSW index a [VectorSimilar rule](rules.md#6-vectorsimilar) builds over its two
-sides. From 0.6.6 **both** kinds of VectorSimilar rule take their candidates from
-it: an `approximate: true` rule in one beam pass at `k`, an `approximate: false`
-rule by widening the beam — doubling from 400 up to a ceiling of 4,096 — and then
-re-scoring every candidate exactly, which is why its scores are exact and its
-candidate set carries a committed recall floor of 0.98.
+A property index answers equality; the vector index answers nearness. It is not
+declared — it is built by a [VectorSimilar rule](rules.md#6-vectorsimilar) over
+its two sides. Its shape, the `MUSHROOMDB_HNSW_PARAMS` override, its memory per
+indexed vector and the recall its gates assert are documented under
+[Vector index parameters](rules.md#vector-index-parameters).
+
+From 0.6.6 **both** kinds of VectorSimilar rule take their candidates from it: an
+`approximate: true` rule in one beam pass at `k`, an `approximate: false` rule by
+widening the beam — doubling from `ef_search` (400 by default) up to a ceiling of
+4,096 — and then re-scoring every candidate exactly, which is why its scores are
+exact and its candidate set carries a committed recall floor of 0.98.
 
 For an exact rule the index only ever *narrows* the candidates when a beam comes
 back full with its worst hit below `min`, which is the one case that proves what
 the beam left out. A beam that comes back short of its own width (layer 0 need
-not be one connected component), or that reaches the 4,096 ceiling with its worst
+not be one connected component), or that reaches the ceiling with its worst
 hit still at or above `min`, falls back to every vector on that side — so a dense
 cluster above `min` costs a scan and never costs recall. The same path serves an
 `All([VectorSimilar, …])` rule, whose candidates are that set intersected with

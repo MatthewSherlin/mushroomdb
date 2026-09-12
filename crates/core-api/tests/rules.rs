@@ -2360,6 +2360,18 @@ fn index_backed_vector_rule_answers_from_one_full_beam() {
     );
 }
 
+/// The layer-0 beam width this process searches with — `ef_search` from
+/// [`core_rules::hnsw::hnsw_params`], 400 unless `MUSHROOMDB_HNSW_PARAMS` says
+/// otherwise.
+///
+/// The fixtures below are sized against it: a corpus has to be wider than one
+/// beam before the widening loop runs at all, and wider than two before it
+/// doubles. They assert that rather than assume it, so a configured width turns
+/// into a loud failure instead of a test that quietly proves nothing.
+fn beam_width() -> usize {
+    core_rules::hnsw::hnsw_params().ef_search
+}
+
 /// `n` distinct 2-D unit vectors inside a cone narrow enough that **every** pair
 /// is above `min`: `span` radians must be below `acos(min)` (0.451 for 0.90).
 ///
@@ -2416,6 +2428,12 @@ fn derive_pairs_over(
 #[test]
 fn a_beam_short_of_its_width_falls_back_to_every_vector() {
     const N: u32 = 420;
+    assert!(
+        N as usize > beam_width(),
+        "this fixture must be wider than the configured beam ({}); resize N or \
+         unset MUSHROOMDB_HNSW_PARAMS",
+        beam_width()
+    );
     let same = vec![1.0, 0.0];
 
     core_rules::hnsw_search_count_reset();
@@ -2442,6 +2460,12 @@ fn a_beam_short_of_its_width_falls_back_to_every_vector() {
 fn the_beam_ceiling_falls_back_to_every_vector() {
     const N: u32 = 420;
     const MIN: f64 = 0.90;
+    assert!(
+        N as usize > beam_width(),
+        "this fixture must be wider than the configured beam ({}); resize N or \
+         unset MUSHROOMDB_HNSW_PARAMS",
+        beam_width()
+    );
 
     let got = core_rules::with_ef_max(64, || {
         derive_pairs_over("t4-ceiling", N, exact_vec_rule(MIN), &|i| {
@@ -2473,6 +2497,12 @@ fn the_widening_loop_runs_when_one_cluster_is_wider_than_the_beam() {
     const SRCS: u32 = 20;
     const MIN: f64 = 0.90;
     const SPAN: f64 = 0.40;
+    assert!(
+        DSTS as usize > 2 * beam_width(),
+        "the loop only doubles if the index is past two beam widths ({}); resize \
+         DSTS or unset MUSHROOMDB_HNSW_PARAMS",
+        2 * beam_width()
+    );
 
     let dir = tmp("t4-widen");
     let mut db = GraphDb::open(&dir).unwrap();
@@ -2623,6 +2653,12 @@ fn rebuilding_an_exact_vector_rule_keeps_its_graph() {
     const N: u32 = 420;
     const PER: u32 = 6;
     const MIN: f64 = 0.90;
+    assert!(
+        N as usize > beam_width(),
+        "this fixture must be wider than the configured beam ({}); resize N or \
+         unset MUSHROOMDB_HNSW_PARAMS",
+        beam_width()
+    );
 
     let dir = tmp("t4-rebuild-graph");
     let mut db = GraphDb::open(&dir).unwrap();

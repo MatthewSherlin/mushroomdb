@@ -55,6 +55,16 @@ pub fn with_ivf_drift_rebuild<R>(threshold: u64, f: impl FnOnce() -> R) -> R {
 /// rule did before 0.6.6.
 pub const EF_MAX: usize = 4_096;
 
+/// Slack on the beam's stopping comparison, covering the `f32` arithmetic the
+/// index answers with ([`crate::hnsw::HnswIndex::search`] documents ~1e-6).
+///
+/// The beam's similarities are a candidate *ordering* number and never a
+/// reported score — every score on an edge is recomputed from the `f64` store.
+/// Requiring the worst hit to be *clearly* below `min` before the beam is
+/// trusted means `f32` rounding can cost one extra doubling and can never cost
+/// a pair.
+const BEAM_FLOOR_SLACK: f64 = 1e-5;
+
 thread_local! {
     static EF_MAX_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
@@ -1516,10 +1526,14 @@ impl SideIndex {
     ///
     /// With `floor` of `Some(min)` — an exact rule, 0.6.6 on — the beam widens,
     /// and **there is exactly one way it is allowed to answer**: a beam that
-    /// came back full (`hits.len() == ef`) whose worst hit is below `min`. That
-    /// beam has proved what it did not return — every node it rejected is
-    /// farther from the query than one already known to fail the predicate — so
-    /// its hits are the candidate set.
+    /// came back full (`hits.len() == ef`) whose worst hit is below `min` by more
+    /// than [`BEAM_FLOOR_SLACK`] — the beam answers in `f32`, and the slack keeps
+    /// that rounding on the side of widening. Such a beam has proved what it did
+    /// not return — every node it rejected is farther from the query than one
+    /// already known to fail the predicate — so its hits are the candidate set.
+    /// The similarities themselves are discarded here; `compute_desired` rescores
+    /// every candidate from the `f64` store, so `min` is only ever *decided* in
+    /// `f64`.
     ///
     /// Every other outcome hands back the whole tracked set, which is the
     /// pre-0.6.6 exact candidate set:
@@ -1562,7 +1576,7 @@ impl SideIndex {
                     let hits = h.search_with_ef(&xs, ef, ef);
                     // `search` sorts descending, so the last hit is the worst.
                     let full = hits.len() == ef;
-                    if full && hits[hits.len() - 1].1 < min {
+                    if full && hits[hits.len() - 1].1 < min - BEAM_FLOOR_SLACK {
                         return hits.into_iter().map(|(id, _)| id).collect();
                     }
                     // Short of its width (frontier exhausted, so a wider beam
