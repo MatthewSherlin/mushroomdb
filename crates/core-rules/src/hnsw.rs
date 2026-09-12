@@ -654,6 +654,23 @@ pub struct HnswIndex {
     /// wrong model cannot print a line per node.
     #[serde(skip)]
     dim_mismatches: u64,
+    /// Vectors **evicted** by a stride re-election, kept `(id, unit vector)` so
+    /// that a later re-election to their dimension can put them back.
+    ///
+    /// A re-election drops the one vector standing behind the old stride, and
+    /// that vector may be the *real* corpus: in the order
+    /// `[real, stray, real, …]` the first real vector is evicted by the stray and
+    /// the stray is evicted by the second real one. Parking is what makes the
+    /// first case recoverable — the second real vector re-elects that dimension
+    /// and the parked vector is re-inserted — and [`Self::can_answer`] is what
+    /// makes the gap safe while it lasts.
+    ///
+    /// Bounded by construction: a re-election needs the index to hold at most one
+    /// vector, so this cannot grow with the corpus. Never persisted, and holding
+    /// an `f64` copy of a vector the index is not indexing, which
+    /// [`Self::memory_stats`] does not count.
+    #[serde(skip)]
+    parked: Vec<(u32, Vec<f64>)>,
     /// Reverse adjacency: slot → the slots that list it as a neighbour on *any*
     /// layer. Maintained in lockstep with `HnswNode::layers` by insert, remove
     /// and the prune. Turns removal from O(live nodes × M₀) into O(in-degree).
@@ -771,6 +788,14 @@ impl HnswIndex {
     /// * It has refused nothing (`dim_mismatches == 0`). A refused vector is one
     ///   the caller asked to index and the index does not hold, so its candidate
     ///   set is incomplete and the caller's own scan is the correct answer.
+    /// * Nothing of `q_len` dimensions is **parked** — evicted by a stride
+    ///   re-election and not yet put back. A re-election revives every parked
+    ///   vector of the dimension it elects, so this clause should always hold for
+    ///   the current stride; it is the assertion that makes that a guarantee
+    ///   rather than a claim. A parked vector of some *other* dimension is not a
+    ///   gap in this answer: it is not comparable with anything at this stride,
+    ///   by the same rule (`def.rs`'s `VectorSimilar` refuses a pair of unequal
+    ///   length) that makes it unable to be an edge.
     ///
     /// When this is false the caller must take its exhaustive path —
     /// `index.rs::hnsw_candidates` returns `hnsw_tracked`, and
@@ -778,7 +803,10 @@ impl HnswIndex {
     /// `db.rs::find_similar_vector` brute-forces. Correct and slower beats fast
     /// and short.
     pub fn can_answer(&self, q_len: usize) -> bool {
-        !self.is_empty() && self.dim_mismatches == 0 && self.slab.dim == q_len
+        !self.is_empty()
+            && self.dim_mismatches == 0
+            && self.slab.dim == q_len
+            && !self.parked.iter().any(|(_, v)| v.len() == q_len)
     }
 
     /// Returns all node ids currently in the index.
@@ -1213,40 +1241,80 @@ impl HnswIndex {
     /// exhaustive scan rather than answering from an index that is missing a
     /// vector.
     ///
-    /// **The stride is re-elected when it was elected from a single sample.**
+    /// **The stride is re-elected when it was elected from a single sample, and
+    /// the vector it displaces is parked rather than lost.**
+    ///
     /// The first vector an index takes sets the stride, and that vector may be
     /// the odd one out — one 3-element stray ingested ahead of a corpus of
     /// 1,536-D embeddings would otherwise refuse every real vector and leave a
-    /// non-empty index that can answer nothing. So when the index holds exactly
+    /// non-empty index that can answer nothing. So when the index holds at most
     /// one vector and the incoming one disagrees with it, the stride is
-    /// re-elected to the incoming dimension and the earlier vector is **evicted**
-    /// (`remove`d, graph and all). An eviction is not a refusal: afterwards the
-    /// index holds every vector it was offered at the stride it now has, so it
-    /// stays the fast path. The evicted node loses nothing a rule could have
-    /// used — `def.rs`'s `VectorSimilar` refuses a pair of unequal length, so it
-    /// could never have been an edge of the other dimension's nodes.
+    /// re-elected to the incoming dimension, and the one vector standing behind
+    /// the old stride is **evicted and parked**: removed from the graph, kept as
+    /// `(id, unit vector)` in [`Self::parked`], and re-inserted the moment a
+    /// re-election elects its dimension again.
+    ///
+    /// Parking is not a detail. In the order `[real, stray, real, …]` the first
+    /// real vector is evicted by the stray, and the stray is evicted by the second
+    /// real one — so without parking the first real vector would be gone for good
+    /// from an index that believes itself complete, and the rule would silently
+    /// lose its edges. With it, the second real vector's re-election puts the
+    /// first one back, and [`Self::can_answer`] refuses the fast path for any
+    /// dimension still sitting in the parked list.
+    ///
+    /// An eviction is not a refusal. A refusal discards a vector the index has no
+    /// record of; an eviction keeps it, so the index can say precisely what it is
+    /// missing and stop claiming only that.
     pub fn insert(&mut self, id: u32, v: &[f64]) {
         let Some(unit) = l2_normalize(v) else {
             return; // zero vector — skip, and do not count it as indexed
         };
+        // An explicit insert supersedes any parked copy of the same node: the
+        // caller is telling us this node's vector, and a stale parked one must
+        // never be revived over it.
+        self.parked.retain(|(pid, _)| *pid != id);
         if self.slab.dim != 0 && unit.len() != self.slab.dim {
             // At most one vector in, so the stride was elected on a sample of
             // one — or on a node that has since been removed, leaving a stride
             // with nothing behind it. Either way the election is not evidence
-            // against the incoming vector: re-elect, and evict the single
-            // earlier vector if there is one.
+            // against the incoming vector: re-elect, park the single earlier
+            // vector if there is one, and bring back anything parked at the
+            // dimension now being elected.
             if self.len() <= 1 {
                 let was = self.slab.dim;
-                if let Some((&stray, _)) = self.slot_of.iter().next() {
+                if let Some((&evicted, &slot)) = self.slot_of.iter().next() {
+                    // From the slab rather than from the caller's original `f64`:
+                    // an `f32` widened to `f64` is exact, so this is the vector
+                    // the index was holding.
+                    let kept: Vec<f64> = self.slab.get(slot).iter().map(|&x| x as f64).collect();
                     eprintln!(
                         "mushroomdb: HNSW re-elected its embedding dimension from {was} to {} \
-                         at node {id}, and dropped node {stray}: the first vector indexed \
-                         set the dimension and was the odd one out.",
+                         at node {id}, and parked node {evicted}: the first vector indexed \
+                         set the dimension and was the odd one out. Node {evicted} returns \
+                         to the index if {was} dimensions are elected again; until then \
+                         this index answers {was}-dimension queries through the full scan.",
                         unit.len()
                     );
-                    self.remove(stray);
+                    self.remove(evicted);
+                    self.parked.push((evicted, kept));
                 }
                 self.slab = VecSlab::default();
+                self.slab.dim = unit.len();
+                // Whatever was parked at this dimension belongs in the index
+                // again. Their own inserts cannot re-enter this branch — their
+                // length is the stride — so the recursion is one level deep.
+                let mut revive: Vec<(u32, Vec<f64>)> = Vec::new();
+                self.parked.retain(|entry| {
+                    if entry.1.len() == unit.len() {
+                        revive.push(entry.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for (pid, pv) in revive {
+                    self.insert(pid, &pv);
+                }
             } else {
                 self.dim_mismatches += 1;
                 if self.dim_mismatches == 1 {
@@ -1399,6 +1467,10 @@ impl HnswIndex {
     /// rather than a scan of the whole index. If `id` was the entry point, a
     /// new entry point is elected (highest remaining level).
     pub fn remove(&mut self, id: u32) {
+        // A removed node must not come back through a later stride re-election.
+        // Done before the early return, because the node may be parked rather
+        // than indexed — which is exactly the state a removal has to clear.
+        self.parked.retain(|(pid, _)| *pid != id);
         let Some(slot) = self.slot_of.get(&id).copied() else {
             return;
         };
@@ -2139,6 +2211,104 @@ mod tests {
         }
         assert_eq!(idx.len(), 3, "an emptied index re-elects its stride");
         assert!(idx.can_answer(7) && !idx.can_answer(DIM));
+    }
+
+    /// The order that broke the first attempt at re-election: a real vector, a
+    /// stray, then the rest of the corpus. The stray's re-election displaces the
+    /// first real vector, and the second real vector's re-election displaces the
+    /// stray — so the first one has to come back, and until it does the index
+    /// must not claim it can answer for its dimension.
+    #[test]
+    fn a_real_vector_evicted_by_a_stray_comes_back() {
+        const DIM: usize = 8;
+        let vecs = make_unit_vecs(6, DIM, 0x0E01_C7ED);
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"parked"));
+
+        idx.insert(0, &vecs[0]);
+        assert!(idx.can_answer(DIM));
+
+        // The stray re-elects to 3 and parks node 0.
+        idx.insert(900, &[1.0, 2.0, 3.0]);
+        assert_eq!(idx.node_ids(), [900].into_iter().collect());
+        assert!(
+            !idx.can_answer(DIM),
+            "while an 8-D vector is parked the index must not answer 8-D queries \
+             — that is the window in which node 0 is missing"
+        );
+
+        // The next real vector re-elects to 8, parks the stray, and brings node 0
+        // back.
+        idx.insert(1, &vecs[1]);
+        assert_eq!(
+            idx.node_ids(),
+            [0, 1].into_iter().collect(),
+            "the vector the stray displaced must be re-inserted"
+        );
+        assert!(
+            idx.can_answer(DIM),
+            "with nothing of this dimension parked the index is complete again"
+        );
+        assert!(
+            !idx.can_answer(3),
+            "the stray's dimension is not the stride"
+        );
+
+        for (i, v) in vecs.iter().enumerate().skip(2) {
+            idx.insert(i as u32, v);
+        }
+        assert_eq!(idx.len(), 6, "every real vector is indexed");
+        assert_eq!(
+            idx.search(&vecs[0], 1).first().map(|&(id, _)| id),
+            Some(0),
+            "and the re-inserted one is reachable"
+        );
+        for &id in idx.node_ids().iter() {
+            assert_eq!(
+                idx.back_refs_for_test(id),
+                idx.scan_back_refs_for_test(id),
+                "back_refs[{id}] disagrees with a full scan after a re-insertion"
+            );
+        }
+    }
+
+    /// A node removed while parked must stay removed: a later re-election of its
+    /// dimension must not resurrect a vector the caller deleted.
+    #[test]
+    fn a_removed_node_does_not_return_from_the_parked_list() {
+        const DIM: usize = 8;
+        let vecs = make_unit_vecs(3, DIM, 0xDE1E_7ED0);
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"parked-rm"));
+
+        idx.insert(0, &vecs[0]);
+        idx.insert(900, &[1.0, 2.0, 3.0]); // parks node 0
+        idx.remove(0); // the caller deletes it while it is parked
+        idx.insert(1, &vecs[1]); // re-elects 8 — node 0 must not come back
+        assert_eq!(
+            idx.node_ids(),
+            [1].into_iter().collect(),
+            "a removed node must not be revived by a re-election"
+        );
+        assert!(idx.can_answer(DIM));
+
+        // An explicit insert supersedes a parked copy, so a re-election can never
+        // revive a vector the node no longer has.
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"parked-stale"));
+        idx.insert(0, &vecs[0]); // stride 8
+        idx.insert(900, &[1.0, 2.0, 3.0]); // parks node 0's 8-D vector
+        idx.insert(0, &[7.0, 8.0, 9.0]); // node 0 again, now 3-D
+        assert_eq!(idx.len(), 2, "nodes 900 and 0, both at the 3-D stride");
+        idx.remove(900); // back to one vector, so a re-election is possible
+        idx.insert(2, &vecs[2]); // re-elects 8 and parks node 0's *3-D* vector
+        assert_eq!(
+            idx.node_ids(),
+            [2].into_iter().collect(),
+            "node 0's stale 8-D copy must not be revived — its vector is 3-D now"
+        );
+        assert!(
+            idx.can_answer(8),
+            "nothing of 8 dimensions is parked, so the index is complete at its \
+             stride"
+        );
     }
 
     /// A vector refused *after* the stride has settled leaves the index missing
@@ -3170,30 +3340,61 @@ mod tests {
     }
 
     /// The downgrade this release actually ships into: a reader whose ceiling is
-    /// version 2 — 0.6.6 up to Task 1 — meets a v3 blob and refuses it on the
-    /// version gate, so its caller keeps the `hnsw_tracked` full scan. The old
-    /// reader is simulated by its ceiling rather than by compiling it, because
-    /// the gate is a constant comparison and that is the whole mechanism.
+    /// version 2 — 0.6.6 up to Task 1 — meets a v3 blob and refuses it, so its
+    /// caller keeps the `hnsw_tracked` full scan.
+    ///
+    /// The old reader is reconstructed here rather than asserted about: it read
+    /// the wrapper against the v2 index shape and then refused any version above
+    /// its own ceiling, so [`v2_era_decode`] is those two steps with
+    /// [`HnswIndexV2`] — which this build still carries to *read* v2 blobs — in
+    /// place of the live shape. A v2 blob proves the reconstruction works; a v3
+    /// blob is then refused by it, on whichever of the two steps fires first.
     #[test]
-    fn a_v2_reader_refuses_a_v3_blob() {
-        /// `HNSW_BLOB_VERSION` as 0.6.6-Task-1 shipped it.
+    fn a_v2_reader_refuses_a_v3_blob_and_still_reads_a_v2_one() {
+        /// `HNSW_BLOB_VERSION` as 0.6.6 shipped it before the distance kernel.
         const V2_CEILING: u16 = 2;
 
+        /// The pre-3b decoder, in the two decisions it made: deserialize the
+        /// wrapper against the shape it knew, then refuse an unknown version.
+        fn v2_era_decode(blob: &[u8]) -> Result<usize, String> {
+            match bincode::deserialize::<HnswBlobV2>(blob) {
+                Ok(b) if b.magic == HNSW_BLOB_MAGIC => {
+                    if b.version == 0 || b.version > V2_CEILING {
+                        Err(format!("version {} is not readable", b.version))
+                    } else {
+                        Ok(b.index.slots.len())
+                    }
+                }
+                Ok(b) => Err(format!("unrecognised magic {:?}", b.magic)),
+                Err(e) => Err(format!("not a v2 blob ({e})")),
+            }
+        }
+
         let (_, idx) = blob_fixture();
-        let blob = encode_hnsw_blob(&idx).expect("encode");
-        assert_eq!(&blob[..4], &HNSW_BLOB_MAGIC, "same magic, new version");
-        let version = u16::from_le_bytes([blob[4], blob[5]]);
-        assert_eq!(version, HNSW_BLOB_VERSION);
-        assert!(
-            version == 0 || version > V2_CEILING,
-            "a v3 blob must trip the `version > HNSW_BLOB_VERSION` gate of a \
-             build that reads up to {V2_CEILING}; version {version} would have \
-             been read as if it were v2"
+
+        // Positive control: the reconstruction really does read a v2 blob, so its
+        // refusal below is about the version and not about being broken.
+        let v2 = as_v2_blob(&idx);
+        assert_eq!(
+            v2_era_decode(&v2),
+            Ok(idx.slots.len()),
+            "the reconstructed v2 reader must read a v2 blob"
         );
+
+        // And it refuses this build's blob.
+        let v3 = encode_hnsw_blob(&idx).expect("encode");
+        assert_eq!(&v3[..4], &HNSW_BLOB_MAGIC, "same magic, new version");
+        assert_eq!(u16::from_le_bytes([v3[4], v3[5]]), HNSW_BLOB_VERSION);
+        let err = v2_era_decode(&v3).expect_err(
+            "a build that reads up to v2 must refuse a v3 blob rather than \
+             misread it — its caller then keeps the full scan",
+        );
+        eprintln!("a v2-era reader on a v3 blob: {err}");
+
         // The same gate in this build, for the version after this one: the
         // refusal names the version, which is what the caller logs before it
         // falls back.
-        let mut future = blob.clone();
+        let mut future = v3.clone();
         future[4] = HNSW_BLOB_VERSION as u8 + 1;
         let err = decode_hnsw_blob(&future).expect_err("a future version must not be read");
         assert!(err.contains("version"), "{err}");

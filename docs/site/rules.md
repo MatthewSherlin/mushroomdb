@@ -567,9 +567,18 @@ to the index's own number would return nothing at all. So:
 * `find_similar_vector` and `find_similar_vector_masked` treat the index's hits
   as candidates only: they over-fetch (`k + 16`, and `4k + 16` under a mask),
   re-score every candidate against the `f64` property vectors, and apply `min`,
-  the ordering and the reported score to *that* number. The score you receive is
-  the same one the brute-force scan would have produced, to `f64` precision, and
-  equal scores are broken by key so the two paths agree exactly.
+  the ordering and the reported score to *that* number. Every **score** you
+  receive is the one the brute-force scan would have produced, to `f64`
+  precision, and equal scores are ordered by node key rather than by which path
+  found them.
+
+  **Which** nodes come back can still differ from the scan in one case: a tie
+  cluster wider than the 16-candidate margin. If more than sixteen vectors sit
+  within about 1e-6 of each other across the `k` boundary, the index's `f32` order
+  decides which of those interchangeable members is fetched, so the scan may
+  return a different — equally-scoring — node. Ask for an exact top-`k` over a
+  corpus of near-duplicates through a rule with `approximate: false`, which never
+  touches the index.
 
 A new caller must do the same; `HnswIndex::search`'s doc comment says so.
 
