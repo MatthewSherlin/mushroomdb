@@ -1,7 +1,7 @@
 //! In-tree HNSW approximate nearest-neighbor index.
 //!
 //! Implements the Malkov & Yashunin (2018) Hierarchical Navigable Small World
-//! algorithm, including the §3.5 diverse-neighbour heuristic (Algorithm 4) that
+//! algorithm, including a first-rejection short-cut of the §3.5 diverse-neighbour heuristic (not Algorithm 4; see `select_neighbors_first_rejection`) that
 //! decides which links survive a prune. The index shape lives in
 //! [`HnswParams`]; [`hnsw_params`] reads it once from the environment.
 //!
