@@ -20,7 +20,7 @@ pub use hnsw::{
     hnsw_search_count, hnsw_search_count_reset,
 };
 pub use index::{
-    candidate_spec, hnsw_vector_present, vector_scan_forced, with_hnsw_build_batch,
+    candidate_spec, hnsw_vector_present, vector_scan_forced, with_ef_max, with_hnsw_build_batch,
     with_ivf_drift_rebuild, with_vector_scan, CandidateSpec, RuleIndex, SideIndex, EF_MAX,
     HNSW_BUILD_BATCH, IVF_DRIFT_REBUILD,
 };

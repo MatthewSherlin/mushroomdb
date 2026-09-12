@@ -50,9 +50,35 @@ pub fn with_ivf_drift_rebuild<R>(threshold: u64, f: impl FnOnce() -> R) -> R {
 }
 
 /// Beam ceiling for the widening loop an exact `VectorSimilar` rule runs
-/// (see [`CandidateSpec::Hnsw`]'s `floor`). Past this the candidate set is the
-/// whole tracked set, which is what the rule did before 0.6.6.
+/// (see [`CandidateSpec::Hnsw`]'s `floor`). Reaching it with the floor still
+/// unreached means the candidate set is the whole tracked set, which is what the
+/// rule did before 0.6.6.
 pub const EF_MAX: usize = 4_096;
+
+thread_local! {
+    static EF_MAX_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn ef_max() -> usize {
+    EF_MAX_OVERRIDE.with(|c| c.get().unwrap_or(EF_MAX)).max(1)
+}
+
+/// Run `f` with a temporary beam ceiling. Test hook, in the shape of
+/// [`with_hnsw_build_batch`] — it exists so a test can reach the ceiling with a
+/// few hundred vectors instead of the [`EF_MAX`] thousands.
+///
+/// The override is thread-local, so `f` must do its work on the calling thread.
+pub fn with_ef_max<R>(cap: usize, f: impl FnOnce() -> R) -> R {
+    EF_MAX_OVERRIDE.with(|c| {
+        let prev = c.replace(Some(cap));
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Sliced HNSW build (v0.6.6 T2)
@@ -351,6 +377,15 @@ pub fn vector_scan_forced() -> bool {
 /// [`with_hnsw_build_batch`](crate::with_hnsw_build_batch).
 ///
 /// The override is thread-local, so `f` must do its work on the calling thread.
+///
+/// # The engine outlives the closure
+///
+/// This switches which candidate spec a rule is *asked for*, and several
+/// decisions are taken once and remembered: a rule created inside the closure
+/// with the scan forced on builds no HNSW graph, so using that same engine
+/// outside the closure leaves the rule answering from `hnsw_tracked` — correct,
+/// and a full scan — until something rebuilds it. Either keep the engine inside
+/// the closure, as the equivalence test does, or reopen the store afterwards.
 pub fn with_vector_scan<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
     VECTOR_SCAN.with(|c| {
         let prev = c.replace(Some(enabled));
@@ -1479,21 +1514,30 @@ impl SideIndex {
     /// With `floor` of `None` — an approximate rule — this is one beam pass at
     /// `k`, which is what it has always been.
     ///
-    /// With `floor` of `Some(min)` — an exact rule, 0.6.6 on — the beam widens:
-    /// search, and while the **worst** similarity the search returned is still
-    /// at or above `min`, the beam was truncated at the floor and there may be
-    /// more, so double `ef` and search again. It stops as soon as the worst
-    /// returned similarity is below `min`, because every node the beam then
-    /// rejected is farther from the query than one already known to fail the
-    /// predicate. It also stops when the beam returned fewer hits than it had
-    /// room for (the reachable set is exhausted, so a wider beam finds nothing
-    /// new) and at [`EF_MAX`].
+    /// With `floor` of `Some(min)` — an exact rule, 0.6.6 on — the beam widens,
+    /// and **there is exactly one way it is allowed to answer**: a beam that
+    /// came back full (`hits.len() == ef`) whose worst hit is below `min`. That
+    /// beam has proved what it did not return — every node it rejected is
+    /// farther from the query than one already known to fail the predicate — so
+    /// its hits are the candidate set.
     ///
-    /// Falls back to returning all tracked nodes — the pre-0.6.6 exact
-    /// candidate set — when the HNSW is absent or empty (e.g. before any insert
-    /// or when used without `init_hnsw`), and when a floored beam would be as
-    /// wide as the index itself, where walking the graph cannot beat handing
-    /// back every vector on the side.
+    /// Every other outcome hands back the whole tracked set, which is the
+    /// pre-0.6.6 exact candidate set:
+    ///
+    /// * **The beam came back short of its own width.** Layer 0 need not be one
+    ///   connected component — a corpus of identical or near-identical vectors
+    ///   is the case that shows it — and a beam that exhausted its frontier has
+    ///   proved nothing about the nodes it could not reach.
+    /// * **The ceiling ([`ef_max`], [`EF_MAX`] by default) was reached with the
+    ///   worst hit still at or above `min`.** A cluster denser than the ceiling
+    ///   then costs a scan; it never costs recall.
+    /// * **A beam as wide as the index itself** (`ef >= h.len()`), where walking
+    ///   the graph cannot beat handing back every vector on the side.
+    /// * **No graph at all** — absent or empty, e.g. before any insert or when
+    ///   used without `init_hnsw`.
+    ///
+    /// So the index is a candidate *generator* here and never a silent filter:
+    /// the only way a node is dropped is a beam that proved it is below `min`.
     fn hnsw_candidates(
         &self,
         field: &str,
@@ -1509,22 +1553,26 @@ impl SideIndex {
                 let Some(min) = floor else {
                     return h.search(&xs, k).into_iter().map(|(id, _)| id).collect();
                 };
+                let cap = ef_max();
                 let mut ef = h.ef_for(k);
                 while ef < h.len() {
                     // `k = ef`: the answer is every hit above the floor, so
                     // truncating the beam to `k` would be throwing away the
                     // very candidates the widening is looking for.
                     let hits = h.search_with_ef(&xs, ef, ef);
-                    if hits.is_empty() {
-                        break; // zero-norm query or a dangling entry point
-                    }
                     // `search` sorts descending, so the last hit is the worst.
-                    let worst = hits[hits.len() - 1].1;
-                    let truncated = hits.len() >= ef && worst >= min;
-                    if !truncated || ef >= EF_MAX {
+                    let full = hits.len() == ef;
+                    if full && hits[hits.len() - 1].1 < min {
                         return hits.into_iter().map(|(id, _)| id).collect();
                     }
-                    ef = ef.saturating_mul(2).min(EF_MAX);
+                    // Short of its width (frontier exhausted, so a wider beam
+                    // reaches nothing new) or at the ceiling with the floor
+                    // still unreached: neither has proved anything about what it
+                    // did not return.
+                    if !full || ef >= cap {
+                        break;
+                    }
+                    ef = ef.saturating_mul(2);
                 }
             }
         }

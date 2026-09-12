@@ -1901,11 +1901,31 @@ VectorSimilar rule with `approximate: false` used to compare every pair of
 vectors on the two sides: O(n²), about 12 minutes to backfill 5,000 nodes at
 dim 1536. From 0.6.6 it asks the same in-tree HNSW index the approximate mode
 uses for its candidates, and **the rule's own `min` is the beam's stopping
-rule**: the beam widens — doubling from the default width up to a ceiling of
-4,096 — until the worst hit it returns falls below `min`, at which point no node
-outside the beam can qualify. A rule over fewer vectors than the default beam
-width never walks the graph at all, because a beam that wide is the whole index:
-small rules stay exhaustive.
+rule**: the beam widens, doubling from the default width (400) up to a ceiling of
+4,096, until it has something to conclude.
+
+**The index is a candidate generator here and never a silent filter.** There is
+exactly one outcome that lets it narrow the candidate set: a beam that comes back
+*full* — as many hits as it had room for — whose worst hit is below `min`. That
+beam has proved what it left out, because everything it rejected is farther from
+the query than a node already known to fail the predicate. Every other outcome
+falls back to **every vector on that side of the rule**, the same candidate set
+the rule used before 0.6.6:
+
+- a beam that comes back short of its own width, which is what an HNSW layer 0
+  that is not one connected component looks like — a corpus of identical or
+  near-identical embeddings is the case that produces it;
+- the 4,096 ceiling reached with the worst hit still at or above `min`, so a
+  cluster denser than the ceiling costs a scan and never costs recall;
+- a beam that would be as wide as the index itself, which is every rule over
+  fewer vectors than the default width — small rules stay exhaustive and never
+  walk the graph at all.
+
+**`All([VectorSimilar, …])` conjunct rules take the same path.** The vector
+conjunct contributes the beam's candidates (or the whole side, per the rules
+above) and the other conjuncts contribute their own index lookups; the rule's
+candidate set is the intersection, and `evaluate` then decides every pair as it
+always has.
 
 Scores did not move. Every candidate the beam offers is re-scored exactly,
 from the stored `f64` vectors, by the same code that scored the full scan —
@@ -2019,7 +2039,7 @@ persisted graph fails to load (the reason is logged).
 | Candidates | HNSW, beam widened until its worst hit is below `min` | HNSW approximate k-NN, one pass at k |
 | Scores | Exact, from the stored vectors | Exact, from the stored vectors |
 | Edge recall | floor 0.98 asserted, 1.000 measured (5k/dim 1536, fixed-seed probe); exhaustive below the default beam width | min 0.90, mean 0.998 (5k/dim 1536, fixed-seed probe) |
-| Determinism | Yes | Yes — same rule + data → same graph |
+| Determinism | Same data **and same write order** → same edges; at the beam boundary the candidate set follows the graph, whose shape depends on insertion order | Yes — same rule + data → same graph |
 | WAL replay | Identical | Identical (replayed writes update the loaded HNSW) |
 
 Measured at 5k nodes, dim 1536 (release, fixed-seed probe): creating the exact
@@ -2035,6 +2055,19 @@ Use approximate mode when a lower recall floor and a bounded `k` per source are
 acceptable. When completeness is required (safety-critical graph closure,
 compliance checks) neither mode is enough on its own — set
 `MUSHROOMDB_VECTOR_SCAN=1`, which is the only path that proves it.
+
+**What an exact rule now costs in memory and on disk.** It builds and keeps the
+same two graphs an approximate rule does — one per side — and each holds its own
+copy of every vector it indexes as `f64`, so a rule whose src and dst labels are
+the same stores the corpus twice. At 5,000 × 1,536 dims that is about 61 MB per
+side plus the adjacency lists (M₀ = 128 neighbours at layer 0). Both graphs are
+written into the snapshot so that reopening adopts them instead of rebuilding,
+which is the same trade the approximate mode has always made, and
+`MUSHROOMDB_VECTOR_SCAN=1` does not release it: a session under the variable
+still loads and re-persists the graph, so unsetting it later costs nothing. A
+rule created *while* the variable is set builds no graph at all, and the first
+open without the variable builds one from the node scan (logged, with the vector
+count).
 
 The `explain` endpoint marks approximate edges with `"approximate": true`
 in the predicate summary.

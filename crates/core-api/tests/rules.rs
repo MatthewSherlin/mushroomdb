@@ -2314,10 +2314,16 @@ fn index_backed_vector_rule_equals_brute_force_on_a_fixed_set() {
     }
 }
 
-/// Past the default beam width the widening loop — not the whole-index
-/// fallback — is what answers, and it still finds every qualifying pair.
+/// Past the default beam width the **graph** is what answers — one full-width
+/// beam whose worst hit is below `min`, which is the only outcome allowed to
+/// narrow the candidate set — and it still finds every qualifying pair.
+///
+/// This fixture does not widen: 100 clusters of 6 means a 400-wide beam comes
+/// back with its worst hit far below 0.90 on the first pass.
+/// `the_widening_loop_runs_when_one_cluster_is_wider_than_the_beam` is the one
+/// that widens.
 #[test]
-fn index_backed_vector_rule_widens_the_beam_past_the_default() {
+fn index_backed_vector_rule_answers_from_one_full_beam() {
     const N: u32 = 600;
     const PER: u32 = 6;
     const MIN: f64 = 0.90;
@@ -2330,10 +2336,16 @@ fn index_backed_vector_rule_widens_the_beam_past_the_default() {
     );
     core_rules::hnsw_search_count_reset();
     let index = derive_exact_sim("t4-beam", N, PER, MIN);
+    let searches = core_rules::hnsw_search_count();
     assert!(
-        core_rules::hnsw_search_count() > 0,
+        searches > 0,
         "this fixture is past the default beam width, so the graph — not the \
          whole-index fallback — must be what answered"
+    );
+    assert!(
+        searches < 2 * u64::from(N),
+        "with 100 clusters of 6 the first beam already passes the floor, so no \
+         source should need a second search; got {searches} for {N} sources"
     );
     assert_eq!(
         index
@@ -2348,13 +2360,267 @@ fn index_backed_vector_rule_widens_the_beam_past_the_default() {
     );
 }
 
+/// `n` distinct 2-D unit vectors inside a cone narrow enough that **every** pair
+/// is above `min`: `span` radians must be below `acos(min)` (0.451 for 0.90).
+///
+/// Two dimensions keep the distance kernel cheap, which matters for the
+/// fixtures below — they are deliberately wider than the beam, so they are the
+/// expensive ones.
+fn cone_vec_2(i: u32, n: u32, span: f64) -> Vec<f64> {
+    let t = span * f64::from(i) / f64::from(n - 1);
+    vec![t.cos(), t.sin()]
+}
+
+/// `(src, dst)` for every derived `SIM` edge. No `explain`, so no per-edge
+/// provenance lookup — these fixtures derive hundreds of thousands of edges.
+fn sim_pairs(db: &GraphDb<RealFs>, n: u32) -> std::collections::BTreeSet<(String, String)> {
+    let mut out = std::collections::BTreeSet::new();
+    for i in 0..n {
+        let src = format!("v{i}");
+        for dst in db
+            .neighbors(&src, "SIM", Direction::Out)
+            .unwrap_or_default()
+        {
+            out.insert((src.clone(), dst));
+        }
+    }
+    out
+}
+
+/// Build an exact rule over `n` vectors from `vec_of` and return its edge pairs.
+fn derive_pairs_over(
+    name: &str,
+    n: u32,
+    rule: RuleDef,
+    vec_of: &dyn Fn(u32) -> Vec<f64>,
+) -> std::collections::BTreeSet<(String, String)> {
+    let dir = tmp(name);
+    let mut db = GraphDb::open(&dir).unwrap();
+    for i in 0..n {
+        db.insert_node("V", &format!("v{i}"), vec![("emb".into(), emb(&vec_of(i)))])
+            .unwrap();
+    }
+    db.create_rule(rule).unwrap();
+    while !db.pump_index_build().unwrap().is_empty() {}
+    sim_pairs(&db, n)
+}
+
+/// Layer 0 is not always one connected component — a corpus of identical
+/// embeddings is the case that shows it — and a beam that exhausts its frontier
+/// has proved nothing about the nodes it could not reach. The candidate set in
+/// that case has to be every vector on the side, or the rule silently derives
+/// only its own reachable component.
+///
+/// 420 nodes: one past the 400-wide default beam, which is the smallest corpus
+/// that reaches the widening loop at all.
+#[test]
+fn a_beam_short_of_its_width_falls_back_to_every_vector() {
+    const N: u32 = 420;
+    let same = vec![1.0, 0.0];
+
+    core_rules::hnsw_search_count_reset();
+    let got = derive_pairs_over("t4-duplicates", N, exact_vec_rule(0.90), &|_| same.clone());
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "the graph must have been consulted, else this proves nothing"
+    );
+    assert_eq!(
+        got.len(),
+        (N as usize) * (N as usize - 1),
+        "every pair of identical vectors is above any floor, so every ordered \
+         pair must be derived — a short beam must fall back to the whole side"
+    );
+}
+
+/// Reaching the beam ceiling with the worst hit still at or above `min` means
+/// the beam never proved a thing about what it left out. A cluster denser than
+/// the ceiling therefore costs a scan, never recall.
+///
+/// `with_ef_max(64)` puts the ceiling below the starting width so 420 vectors
+/// reach it; in production it takes more than 4,096.
+#[test]
+fn the_beam_ceiling_falls_back_to_every_vector() {
+    const N: u32 = 420;
+    const MIN: f64 = 0.90;
+
+    let got = core_rules::with_ef_max(64, || {
+        derive_pairs_over("t4-ceiling", N, exact_vec_rule(MIN), &|i| {
+            cone_vec_2(i, N, 0.40)
+        })
+    });
+    assert_eq!(
+        got.len(),
+        (N as usize) * (N as usize - 1),
+        "every vector in the cone is above {MIN} of every other, so capping the \
+         beam must cost time and not pairs"
+    );
+}
+
+/// The widening loop itself: the destination side is one cluster wider than two
+/// beam widths, so every source's first 400-wide pass comes back full with its
+/// worst hit still above `min`, the beam doubles to 800, that pass is full above
+/// the floor too, and 1,600 is wider than the index — so the candidate set ends
+/// as the whole side, after two searches.
+///
+/// The source side is deliberately small (20 query nodes against 810
+/// destinations). The widening loop is a property of the *destination* index, and
+/// 20 sources exercise it exactly as 810 would while keeping the pair
+/// evaluations — which are quadratic in the corpus and nothing to do with the
+/// beam — off the clock.
+#[test]
+fn the_widening_loop_runs_when_one_cluster_is_wider_than_the_beam() {
+    const DSTS: u32 = 810;
+    const SRCS: u32 = 20;
+    const MIN: f64 = 0.90;
+    const SPAN: f64 = 0.40;
+
+    let dir = tmp("t4-widen");
+    let mut db = GraphDb::open(&dir).unwrap();
+    for i in 0..DSTS {
+        db.insert_node(
+            "V",
+            &format!("v{i}"),
+            vec![("emb".into(), emb(&cone_vec_2(i, DSTS, SPAN)))],
+        )
+        .unwrap();
+    }
+    // Query nodes spread through the same cone, so each one's beam is full of
+    // qualifying destinations.
+    for q in 0..SRCS {
+        let at = q * (DSTS / SRCS);
+        db.insert_node(
+            "Q",
+            &format!("q{q}"),
+            vec![("emb".into(), emb(&cone_vec_2(at, DSTS, SPAN)))],
+        )
+        .unwrap();
+    }
+
+    let mut def = exact_vec_rule(MIN);
+    def.src_label = "Q".into();
+    def.max_edges = Some(8);
+
+    core_rules::hnsw_search_count_reset();
+    db.create_rule(def).unwrap();
+    while !db.pump_index_build().unwrap().is_empty() {}
+    let searches = core_rules::hnsw_search_count();
+    assert!(
+        searches >= 2 * u64::from(SRCS),
+        "every source's first beam comes back full above the floor, so every \
+         source must search at least twice; got {searches} for {SRCS} sources"
+    );
+
+    let mut derived: Vec<(String, String)> = Vec::new();
+    for q in 0..SRCS {
+        let src = format!("q{q}");
+        for dst in db
+            .neighbors(&src, "SIM", Direction::Out)
+            .unwrap_or_default()
+        {
+            derived.push((src.clone(), dst));
+        }
+    }
+    assert_eq!(
+        derived.len(),
+        (SRCS as usize) * 8,
+        "top-8 per source over a cone where every destination qualifies"
+    );
+
+    // What the widened beam handed to the scorer, checked against the truth: no
+    // derived destination may score below that source's 8th-best true
+    // similarity. A beam that dropped a near neighbour would have put a worse
+    // one in its place.
+    let dvs: Vec<Vec<f64>> = (0..DSTS).map(|i| cone_vec_2(i, DSTS, SPAN)).collect();
+    let cos = |a: &[f64], b: &[f64]| a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f64>();
+    for q in 0..SRCS {
+        let qv = cone_vec_2(q * (DSTS / SRCS), DSTS, SPAN);
+        let mut sims: Vec<f64> = dvs.iter().map(|v| cos(&qv, v)).collect();
+        sims.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        let eighth = sims[7];
+        for (_, dst) in derived.iter().filter(|(s, _)| *s == format!("q{q}")) {
+            let j: usize = dst[1..].parse().unwrap();
+            let got = cos(&qv, &dvs[j]);
+            assert!(
+                got >= eighth - 1e-12,
+                "q{q}->{dst} scores {got}, below the 8th-best true {eighth}: \
+                 the beam dropped a nearer neighbour"
+            );
+        }
+    }
+}
+
+/// `MUSHROOMDB_VECTOR_SCAN=1` must not cost the store its persisted vector
+/// index. A session with the variable set takes the full-scan candidate path and
+/// never asks the graph anything, but the graph is still loaded from the
+/// snapshot and written back out, so unsetting the variable does not pay for a
+/// rebuild.
+///
+/// The write made while the variable was set reaches the graph through the
+/// open-time scan on the next open — which is what `hnsw_build_count() == 0`
+/// plus the full edge set together show.
+#[test]
+fn the_scan_escape_hatch_keeps_the_persisted_graph() {
+    const N: u32 = 60;
+    const PER: u32 = 5;
+    const MIN: f64 = 0.90;
+
+    let dir = tmp("t4-scan-keeps-graph");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for i in 0..N {
+            db.insert_node(
+                "V",
+                &format!("v{i}"),
+                vec![("emb".into(), emb(&clustered_vec_8_raw(i, PER)))],
+            )
+            .unwrap();
+        }
+        db.create_rule(exact_vec_rule(MIN)).unwrap();
+        db.snapshot().unwrap();
+    }
+
+    // A whole session under the escape hatch: open, write, snapshot.
+    core_rules::with_vector_scan(true, || {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node(
+            "V",
+            &format!("v{N}"),
+            vec![("emb".into(), emb(&clustered_vec_8_raw(N, PER)))],
+        )
+        .unwrap();
+        db.snapshot().unwrap();
+    });
+
+    // Back without it: the graph must come from the snapshot, not a rebuild.
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Other", "o", vec![("v".into(), Value::Int(1))])
+        .unwrap();
+    assert_eq!(
+        db.hnsw_build_count(),
+        0,
+        "a snapshot written under MUSHROOMDB_VECTOR_SCAN dropped the graph"
+    );
+    while !db.pump_index_build().unwrap().is_empty() {}
+    let truth = brute_force_sim(N + 1, PER, MIN);
+    assert_eq!(
+        sim_pairs(&db, N + 1),
+        truth
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the node written under the escape hatch must be in the edge set too"
+    );
+}
+
 /// A rebuild of an exact vector rule — the one a finished sliced build asks
 /// for, and the one `rebuild_rule` asks for — must leave the rule answering
 /// from its graph. Resetting the index without re-initialising the graph is
 /// silent: the rule stays correct and goes quietly back to O(n²).
 #[test]
 fn rebuilding_an_exact_vector_rule_keeps_its_graph() {
-    const N: u32 = 600;
+    // Just past the 400-wide default beam, which is what makes the graph — and
+    // not the whole-index fallback — answer after the rebuild.
+    const N: u32 = 420;
     const PER: u32 = 6;
     const MIN: f64 = 0.90;
 
@@ -2374,15 +2640,16 @@ fn rebuilding_an_exact_vector_rule_keeps_its_graph() {
     db.create_rule(exact_vec_rule(MIN)).unwrap();
     assert!(
         !db.builds_in_progress().is_empty(),
-        "600 vectors past a 64-vector slice must defer"
+        "{N} vectors past a 64-vector slice must defer"
     );
     while !db.pump_index_build().unwrap().is_empty() {}
-    let after_build = weighted_edges(&db, N);
+    // Pairs, not weights: the weights are compared bit-for-bit against both the
+    // scan path and the brute force in
+    // `index_backed_vector_rule_equals_brute_force_on_a_fixed_set`, and
+    // `explain` per edge is the expensive part of this fixture.
+    let after_build = sim_pairs(&db, N);
     assert_eq!(
-        after_build
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>(),
+        after_build,
         brute_force_sim(N, PER, MIN)
             .keys()
             .cloned()
@@ -2396,11 +2663,7 @@ fn rebuilding_an_exact_vector_rule_keeps_its_graph() {
         core_rules::hnsw_search_count() > 0,
         "a rebuilt exact vector rule must still probe its graph"
     );
-    assert_eq!(
-        weighted_edges(&db, N),
-        after_build,
-        "and land on the same edges with the same weights"
-    );
+    assert_eq!(sim_pairs(&db, N), after_build, "and land on the same edges");
 }
 
 /// Changing an embedding retracts exactly the edges whose predicate stopped

@@ -2494,6 +2494,10 @@ impl RuleEngine {
         // no usable blob get `init_hnsw` and are filled by the scan.
         let mut leftover_blobs = hnsw_state;
         let mut adopted: BTreeMap<String, (BTreeSet<u32>, BTreeSet<u32>)> = BTreeMap::new();
+        // Rules whose graph the snapshot did not carry, so this scan has to
+        // build it inline. Reported once below, with the size, because the cost
+        // is superlinear in the vectors and otherwise invisible.
+        let mut built_inline: Vec<String> = Vec::new();
         for name in &rule_names {
             if !uses_hnsw(&self.rules[name]) {
                 continue;
@@ -2507,6 +2511,9 @@ impl RuleEngine {
             }
             if !dst_adopted {
                 self.hnsw_builds += 1;
+            }
+            if !src_adopted || !dst_adopted {
+                built_inline.push(name.clone());
             }
             adopted.insert(name.clone(), (src_ids, dst_ids));
         }
@@ -2523,6 +2530,26 @@ impl RuleEngine {
                 let idx = self.indexes.get_mut(name).unwrap();
                 index_node_for_rule_skipping(id, label_sym, &def, idx, syms, props, skip);
             }
+        }
+
+        // One line per rule whose graph this scan had to build, because it is
+        // the one cost on this path that is superlinear in the corpus and it is
+        // otherwise silent: a store written before vector indexes were persisted,
+        // a rule created since the last snapshot, or a blob that failed to load.
+        for name in &built_inline {
+            let vectors = self
+                .indexes
+                .get(name)
+                .and_then(|idx| idx.dst_side.hnsw_ref().map(|h| h.len()))
+                .unwrap_or(0);
+            // A rule whose side never held a vector built nothing worth saying.
+            if vectors == 0 {
+                continue;
+            }
+            eprintln!(
+                "[mushroomdb] rule {name:?}: no persisted vector index; built one from the \
+                 node scan ({vectors} vectors)"
+            );
         }
 
         // Re-derive the pending builds a mid-build snapshot left behind.
