@@ -1378,7 +1378,11 @@ impl SideIndex {
             return BTreeSet::new();
         };
         if let Some(h) = &self.hnsw {
-            if !h.is_empty() {
+            // `can_answer`, not `!is_empty()`: an index that refused a vector, or
+            // whose stride is not this query's dimension — a 3-element stray
+            // ingested ahead of the real corpus elects one — is non-empty and
+            // still cannot supply the candidates this query needs.
+            if h.can_answer(xs.len()) {
                 return h.search(&xs, k).into_iter().map(|(id, _)| id).collect();
             }
         }

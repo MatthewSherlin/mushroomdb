@@ -416,9 +416,15 @@ impl Ord for OrdF64 {
 /// independently allocated 12 KB block, and that the pair-distance path needs no
 /// copy at all.
 ///
-/// `dim` is 0 until the first vector arrives, and fixed from then on: a slab has
-/// one stride, so a vector of another length has nowhere to go (see
-/// [`HnswIndex::insert`]).
+/// `dim` is 0 until the first vector arrives, and fixed from then on — with one
+/// correction: an election made on a *single* sample can be undone, because the
+/// first vector indexed may be the odd one out (see [`HnswIndex::insert`]).
+///
+/// `data` grows through `Vec::resize`, so its capacity grows geometrically: a
+/// slab can hold up to about twice the bytes its rows need, transiently, and
+/// [`HnswIndex::memory_stats`] does not see that — it counts rows, which is why
+/// it documents itself as a floor on resident size. One amortised doubling is
+/// the price of not copying the whole slab on every insert.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct VecSlab {
     dim: usize,
@@ -633,8 +639,19 @@ pub struct HnswIndex {
     /// per node, and `memory_stats` counts live nodes only, so the figure it
     /// reports stays a floor on resident size rather than a measurement of it.
     slab: VecSlab,
-    /// Vectors refused because their dimension disagreed with the slab's.
-    /// Derived bookkeeping for one log line, never persisted.
+    /// Vectors **refused** because their dimension disagreed with the slab's
+    /// settled stride. Any refusal means the index is missing a vector it was
+    /// offered, so [`HnswIndex::can_answer`] stops claiming the fast path — the
+    /// caller's exhaustive scan is the correct answer and this one is not.
+    ///
+    /// A re-elected stride (see [`HnswIndex::insert`]) **evicts** rather than
+    /// refuses, and does not count here: after it the index holds every vector
+    /// it was offered at the stride it now has.
+    ///
+    /// Not persisted: a loaded index has refused nothing, and the vectors it
+    /// holds are whatever the writer put in it. The first refusal on an index
+    /// logs one line, and later ones are silent, so an ingest pointed at the
+    /// wrong model cannot print a line per node.
     #[serde(skip)]
     dim_mismatches: u64,
     /// Reverse adjacency: slot → the slots that list it as a neighbour on *any*
@@ -737,6 +754,31 @@ impl HnswIndex {
     /// True when no vectors are indexed.
     pub fn is_empty(&self) -> bool {
         self.slot_of.is_empty()
+    }
+
+    /// **Ask this before searching.** True when the index can answer a query of
+    /// `q_len` dimensions *completely* — meaning a caller may use its answer
+    /// instead of an exhaustive scan.
+    ///
+    /// Three things have to hold, and each of them is a way the index can be
+    /// useless rather than wrong:
+    ///
+    /// * It holds something. An empty index answers nothing.
+    /// * Its stride **is** the query's dimension. A slab has one stride, so an
+    ///   index of 1,536-D vectors cannot compare a 3-D query to anything, and —
+    ///   the case that matters — an index that elected a 3-D stride from a stray
+    ///   first vector cannot answer the 1,536-D queries the rule actually makes.
+    /// * It has refused nothing (`dim_mismatches == 0`). A refused vector is one
+    ///   the caller asked to index and the index does not hold, so its candidate
+    ///   set is incomplete and the caller's own scan is the correct answer.
+    ///
+    /// When this is false the caller must take its exhaustive path —
+    /// `index.rs::hnsw_candidates` returns `hnsw_tracked`, and
+    /// `engine.rs::hnsw_search_dst`/`_any_dst` return `None` so
+    /// `db.rs::find_similar_vector` brute-forces. Correct and slower beats fast
+    /// and short.
+    pub fn can_answer(&self, q_len: usize) -> bool {
+        !self.is_empty() && self.dim_mismatches == 0 && self.slab.dim == q_len
     }
 
     /// Returns all node ids currently in the index.
@@ -1162,28 +1204,64 @@ impl HnswIndex {
     /// Zero vectors are silently skipped (cosine is undefined for them).
     /// If `id` already exists it is replaced (remove + re-insert semantics).
     ///
-    /// A vector whose dimension differs from the first one this index took is
+    /// A vector whose dimension differs from the one this index settled on is
     /// **skipped too**, and the first such skip is logged. The slab has one
     /// stride, so there is nowhere to put it; before 0.6.6 the distance
     /// `zip`-truncated to the shorter of the two vectors and produced a number
-    /// that meant nothing, which is a worse answer than no answer.
+    /// that meant nothing, which is a worse answer than no answer. A skip makes
+    /// [`Self::can_answer`] false for good, so the rule falls back to its
+    /// exhaustive scan rather than answering from an index that is missing a
+    /// vector.
+    ///
+    /// **The stride is re-elected when it was elected from a single sample.**
+    /// The first vector an index takes sets the stride, and that vector may be
+    /// the odd one out — one 3-element stray ingested ahead of a corpus of
+    /// 1,536-D embeddings would otherwise refuse every real vector and leave a
+    /// non-empty index that can answer nothing. So when the index holds exactly
+    /// one vector and the incoming one disagrees with it, the stride is
+    /// re-elected to the incoming dimension and the earlier vector is **evicted**
+    /// (`remove`d, graph and all). An eviction is not a refusal: afterwards the
+    /// index holds every vector it was offered at the stride it now has, so it
+    /// stays the fast path. The evicted node loses nothing a rule could have
+    /// used — `def.rs`'s `VectorSimilar` refuses a pair of unequal length, so it
+    /// could never have been an edge of the other dimension's nodes.
     pub fn insert(&mut self, id: u32, v: &[f64]) {
         let Some(unit) = l2_normalize(v) else {
             return; // zero vector — skip, and do not count it as indexed
         };
         if self.slab.dim != 0 && unit.len() != self.slab.dim {
-            self.dim_mismatches += 1;
-            if self.dim_mismatches == 1 {
-                eprintln!(
-                    "mushroomdb: HNSW skipped node {id}: its embedding has {} dimensions \
-                     and this index holds {}. A mixed-dimension index cannot be \
-                     searched; re-embed the collection with one model. Further skips \
-                     on this index are silent.",
-                    unit.len(),
-                    self.slab.dim
-                );
+            // At most one vector in, so the stride was elected on a sample of
+            // one — or on a node that has since been removed, leaving a stride
+            // with nothing behind it. Either way the election is not evidence
+            // against the incoming vector: re-elect, and evict the single
+            // earlier vector if there is one.
+            if self.len() <= 1 {
+                let was = self.slab.dim;
+                if let Some((&stray, _)) = self.slot_of.iter().next() {
+                    eprintln!(
+                        "mushroomdb: HNSW re-elected its embedding dimension from {was} to {} \
+                         at node {id}, and dropped node {stray}: the first vector indexed \
+                         set the dimension and was the odd one out.",
+                        unit.len()
+                    );
+                    self.remove(stray);
+                }
+                self.slab = VecSlab::default();
+            } else {
+                self.dim_mismatches += 1;
+                if self.dim_mismatches == 1 {
+                    eprintln!(
+                        "mushroomdb: HNSW skipped node {id}: its embedding has {} dimensions \
+                         and this index holds {}. A mixed-dimension index cannot be \
+                         searched, so this index will now answer through the full scan \
+                         instead; re-embed the collection with one model. Further skips \
+                         on this index are silent.",
+                        unit.len(),
+                        self.slab.dim
+                    );
+                }
+                return;
             }
-            return;
         }
         note_insert();
 
@@ -1380,15 +1458,22 @@ impl HnswIndex {
     /// Approximate k-nearest-neighbor search by cosine similarity.
     ///
     /// Returns up to `k` results as `(node_id, cosine_similarity)` pairs,
-    /// sorted descending by similarity. Zero-norm query vectors return empty,
-    /// and so does a query whose dimension is not the indexed one: the index
-    /// cannot compare them, and the `hnsw_tracked` full scan is the caller's
-    /// fallback.
+    /// sorted descending by similarity.
     ///
-    /// The similarity is computed from the index's `f32` copies, so it is a
-    /// candidate-ordering number, accurate to ~1e-6, and not a score to report:
-    /// `index.rs::hnsw_candidates` discards it and every reported score is
-    /// recomputed from the `f64` store.
+    /// **This method never falls back.** Zero-norm queries return empty, and so
+    /// does a query whose dimension is not this index's stride — there is
+    /// nothing to compare it against here. The fall-back to an exhaustive scan
+    /// belongs to the caller, and [`Self::can_answer`] is how a caller knows it
+    /// is needed: ask it first, and take your own path when it says no. Every
+    /// caller in this workspace does (`index.rs::hnsw_candidates`,
+    /// `engine.rs::hnsw_search_dst`/`_any_dst`).
+    ///
+    /// **The similarity is for ordering, not for reporting.** It is computed
+    /// from the index's `f32` copies, so it is accurate to ~1e-6 and an exact
+    /// duplicate scores 0.9999999 rather than 1.0. `hnsw_candidates` discards it
+    /// and keeps the ids; `db.rs::find_similar_vector` re-scores every candidate
+    /// against the `f64` property vectors before it applies `min`, orders, or
+    /// reports anything. A new caller must do the same.
     pub fn search(&self, q: &[f64], k: usize) -> Vec<(u32, f64)> {
         let Some(unit_q) = l2_normalize(q) else {
             return vec![];
@@ -1972,6 +2057,93 @@ mod tests {
         idx.insert(1_001, &more[0]);
         assert_eq!(idx.len(), 301, "a 64-D vector is still accepted");
         assert_eq!(hnsw_insert_count(), 1);
+    }
+
+    /// The first vector indexed elects the stride, and it may be the odd one
+    /// out. One 3-element stray ahead of a real corpus must not void the index:
+    /// the stride is re-elected and the stray evicted, and the index stays the
+    /// fast path because it then holds everything it was offered at that stride.
+    #[test]
+    fn a_stray_first_vector_re_elects_the_stride() {
+        const DIM: usize = 64;
+        let vecs = make_unit_vecs(50, DIM, 0x5712_A140);
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"re-elect"));
+
+        // The stray arrives first and elects 3.
+        idx.insert(900, &[1.0, 2.0, 3.0]);
+        assert_eq!(idx.len(), 1);
+        assert!(idx.can_answer(3), "a 3-D index can answer a 3-D query");
+        assert!(!idx.can_answer(DIM), "...and not a 64-D one");
+
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert(i as u32, v);
+        }
+
+        assert_eq!(idx.len(), 50, "every real vector must be indexed");
+        assert!(
+            !idx.node_ids().contains(&900),
+            "the stray must have been evicted, not kept"
+        );
+        assert!(
+            idx.can_answer(DIM),
+            "an index that re-elected its stride has refused nothing and must \
+             stay the fast path"
+        );
+        assert!(!idx.can_answer(3), "the old stride is gone");
+        assert_eq!(
+            idx.search(&vecs[7], 1).first().map(|&(id, _)| id),
+            Some(7),
+            "and it must still answer correctly"
+        );
+        for &id in idx.node_ids().iter() {
+            assert_eq!(
+                idx.back_refs_for_test(id),
+                idx.scan_back_refs_for_test(id),
+                "back_refs[{id}] disagrees with a full scan after the eviction"
+            );
+        }
+
+        // A stride with nothing behind it is not evidence either: drain the
+        // index and it will take whatever dimension arrives next. Re-ingesting a
+        // collection under a new embedding model must not need a new rule.
+        for id in idx.node_ids() {
+            idx.remove(id);
+        }
+        let sevens = make_unit_vecs(3, 7, 0x5E7E_0007);
+        for (i, v) in sevens.iter().enumerate() {
+            idx.insert(i as u32, v);
+        }
+        assert_eq!(idx.len(), 3, "an emptied index re-elects its stride");
+        assert!(idx.can_answer(7) && !idx.can_answer(DIM));
+    }
+
+    /// A vector refused *after* the stride has settled leaves the index missing
+    /// something it was offered, so it must stop claiming it can answer and let
+    /// the caller scan. This is the property `hnsw_candidates`,
+    /// `hnsw_search_dst` and `find_similar_vector` all hang their fallback on.
+    #[test]
+    fn an_index_that_refused_a_vector_will_not_claim_to_answer() {
+        const DIM: usize = 64;
+        let vecs = make_unit_vecs(30, DIM, 0xBADD_14E0);
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"refused"));
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert(i as u32, v);
+        }
+        assert!(idx.can_answer(DIM), "a clean index answers");
+
+        hnsw_insert_count_reset();
+        idx.insert(900, &[1.0, 2.0, 3.0]);
+        assert_eq!(idx.len(), 30, "the stray must not be indexed");
+        assert_eq!(hnsw_insert_count(), 0, "nor counted");
+        assert!(
+            !idx.can_answer(DIM),
+            "an index that refused a vector must send the caller to its scan"
+        );
+        assert!(
+            !idx.search(&vecs[3], 5).is_empty(),
+            "`search` itself still answers — the fallback is the caller's \
+             decision, taken on `can_answer`"
+        );
     }
 
     /// The kernel sums in eight accumulators rather than one, which is a
@@ -2971,6 +3143,36 @@ mod tests {
             err.contains("version"),
             "the refusal must name the version: {err}"
         );
+    }
+
+    /// The downgrade this release actually ships into: a reader whose ceiling is
+    /// version 2 — 0.6.6 up to Task 1 — meets a v3 blob and refuses it on the
+    /// version gate, so its caller keeps the `hnsw_tracked` full scan. The old
+    /// reader is simulated by its ceiling rather than by compiling it, because
+    /// the gate is a constant comparison and that is the whole mechanism.
+    #[test]
+    fn a_v2_reader_refuses_a_v3_blob() {
+        /// `HNSW_BLOB_VERSION` as 0.6.6-Task-1 shipped it.
+        const V2_CEILING: u16 = 2;
+
+        let (_, idx) = blob_fixture();
+        let blob = encode_hnsw_blob(&idx).expect("encode");
+        assert_eq!(&blob[..4], &HNSW_BLOB_MAGIC, "same magic, new version");
+        let version = u16::from_le_bytes([blob[4], blob[5]]);
+        assert_eq!(version, HNSW_BLOB_VERSION);
+        assert!(
+            version == 0 || version > V2_CEILING,
+            "a v3 blob must trip the `version > HNSW_BLOB_VERSION` gate of a \
+             build that reads up to {V2_CEILING}; version {version} would have \
+             been read as if it were v2"
+        );
+        // The same gate in this build, for the version after this one: the
+        // refusal names the version, which is what the caller logs before it
+        // falls back.
+        let mut future = blob.clone();
+        future[4] = HNSW_BLOB_VERSION as u8 + 1;
+        let err = decode_hnsw_blob(&future).expect_err("a future version must not be read");
+        assert!(err.contains("version"), "{err}");
     }
 
     /// Foreign magic is rejected too, and does not fall through to a garbage

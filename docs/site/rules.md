@@ -414,12 +414,13 @@ Measured three ways, all at `m,ef_construction,ef_search` = `16,200,400`:
 | 128 | `own` | 1.0000 | 269.4 s | 1 031 B/node |
 
 Every build time in this section and the one above it was measured **before the
-distance kernel**, which cut all of them by about 4.5× without changing a single
-edge — the same 5 000 × 1 536-D index is 9.56 s at `own` and 43.34 s at `both`
-today. The comparisons between the rows stand; the absolute seconds are history.
+distance kernel**, which cut the 5 000 × 1 536-D build from 45.8 s to **9.56 s**
+at `own` (4.8×) and from 254 s to **43.34 s** at `both` (5.9×) without changing a
+single edge. The comparisons between the rows stand; the absolute seconds are
+history.
 
-`own` is roughly 4.5× faster to build on a corpus of genuinely distinct vectors
-(9.56 s against 43.34 s for the raw 5 000-vector index, with identical
+`own` is **4.5×** faster to build on a corpus of genuinely distinct vectors
+(9.56 s against 43.34 s for the raw 5 000 × 1 536-D index, with identical
 `hnsw_5k_1536_recall` at min 1.0000 / mean 1.0000), which is why it exists. But
 the corpus that matters has **clusters wider than `m0`** — 100 members against
 an `m0` of 64 — and there the neighbour side is exactly where the long-range
@@ -466,12 +467,25 @@ the reverse-adjacency index that makes a removal O(in-degree) holds one more
 
 The index keeps its own copy of every vector as **`f32`, in one contiguous slab**
 addressed by slot, and the store keeps the `f64` properties untouched. That is
-safe for a reason worth stating plainly: **the index's distances choose
-candidates and never report a score.** The similarity a graph search returns is
-discarded, and every weight a rule or a query reports is recomputed from the
-`f64` properties. An `f32` dot of two 1,536-D unit vectors is accurate to about
-2e-6, which is far below the granularity at which candidate order can change, and
-the recall gates below are measured on the `f32` path.
+safe for one reason, and it is a rule every caller has to keep: **the index
+supplies candidates, and the score comes from the `f64` vectors.**
+
+An `f32` dot of two 1,536-D unit vectors is accurate to about 2e-6 — far below
+the granularity at which candidate *order* matters, which is why the recall gates
+below are unchanged on the `f32` path, and nowhere near good enough to *report*.
+An exact duplicate scores 0.9999999 there, so a threshold of `min = 1.0` applied
+to the index's own number would return nothing at all. So:
+
+* Rule weights were always recomputed from the `f64` properties
+  (`def.rs::cosine`), and still are.
+* `find_similar_vector` and `find_similar_vector_masked` treat the index's hits
+  as candidates only: they over-fetch (`k + 16`, and `4k + 16` under a mask),
+  re-score every candidate against the `f64` property vectors, and apply `min`,
+  the ordering and the reported score to *that* number. The score you receive is
+  the same one the brute-force scan would have produced, to `f64` precision, and
+  equal scores are broken by key so the two paths agree exactly.
+
+A new caller must do the same; `HnswIndex::search`'s doc comment says so.
 
 The dot product itself is summed in **eight independent accumulators** over
 `chunks_exact(8)`. IEEE addition is not associative, so a single accumulator is a
@@ -497,15 +511,27 @@ size. What it bought, at 5,000 × 1,536-D:
 | bytes per node | 12,807.2 | **6,663.2** |
 | blob version | 2 | **3** |
 
-**One fixed dimension per index.** A slab has one stride, so the first vector an
-index takes fixes its dimension, and an embedding of any other length is
-**skipped** — logged once per index, not indexed, not counted, not returned. A
-query of the wrong length produces no candidates at all, so an **approximate**
-rule derives no edges for such a node, where before 0.6.6 it could derive one
-from a distance silently truncated to the shorter of the two vectors. A rule with
-`approximate: false` does not use the index and is unaffected. Mixed dimensions
-were never meaningful; this is the version that says so. Re-embed a collection
-with one model rather than mixing two.
+**One fixed dimension per index**, and **the index steps aside when it cannot
+answer for everything.** A slab has one stride, so the dimension of the vectors
+an index holds is settled by the ones it is given, and an embedding of any other
+length is **skipped** — logged once per index, not indexed, not counted. Two
+consequences, and the second is the one that keeps results correct:
+
+* A skipped vector is never an edge. It could not have been one anyway: a
+  `vector_similar` predicate refuses a pair of unequal length, before and after
+  0.6.6. (A rule with `approximate: false` never touches the index at all.)
+* An index that skipped anything, or whose dimension is not the query's, **stops
+  claiming the fast path**: the rule falls back to its full scan and
+  `find_similar_vector` to its brute-force scan. Slower, and exactly right. So a
+  mixed-dimension corpus costs speed, never edges.
+
+The first vector indexed would otherwise set the dimension on a sample of one, so
+a single stray ahead of a real corpus would refuse the whole corpus. That case is
+corrected rather than endured: when an index holds exactly one vector and the next
+one disagrees, it re-elects its dimension to the newcomer's and drops the stray.
+
+Mixed dimensions were never meaningful; this is the version that says so. Re-embed
+a collection with one model rather than mixing two.
 
 **Blob version 3.** The persisted graph carries the slab, so its version is 3.
 Version 2 (0.6.6 before the kernel) and the bare 0.6.5 shape both still load,
