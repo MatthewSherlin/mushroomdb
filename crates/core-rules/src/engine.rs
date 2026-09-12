@@ -2958,7 +2958,11 @@ impl RuleEngine {
             }
             if let Some(idx) = self.indexes.get(name) {
                 if let Some(h) = idx.dst_side.hnsw_ref() {
-                    if !h.is_empty() {
+                    // `can_answer` rather than `!is_empty()`: an index that
+                    // refused a vector, or whose stride is not this query's
+                    // dimension, is non-empty and still cannot answer for every
+                    // node — `None` here is what sends the caller to its scan.
+                    if h.can_answer(q.len()) {
                         return Some(h.search(q, k));
                     }
                 }
@@ -2967,7 +2971,7 @@ impl RuleEngine {
             // no mutation has populated self.indexes yet).
             if let Some(lazy) = self.lazy_hnsw.get() {
                 if let Some((_, Some(h))) = lazy.get(name) {
-                    if !h.is_empty() {
+                    if h.can_answer(q.len()) {
                         return Some(h.search(q, k));
                     }
                 }
@@ -3018,13 +3022,13 @@ impl RuleEngine {
                 .indexes
                 .get(name)
                 .and_then(|idx| idx.dst_side.hnsw_ref())
-                .filter(|h| !h.is_empty());
+                .filter(|h| h.can_answer(q.len()));
             let lazy = self
                 .lazy_hnsw
                 .get()
                 .and_then(|l| l.get(name))
                 .and_then(|(_, dst)| dst.as_ref())
-                .filter(|h| !h.is_empty());
+                .filter(|h| h.can_answer(q.len()));
             let hits: Option<Vec<(u32, f64)>> = live.or(lazy).map(|h| {
                 found_index = true;
                 h.search(q, k)

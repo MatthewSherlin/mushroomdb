@@ -1547,8 +1547,12 @@ impl SideIndex {
     ///   then costs a scan; it never costs recall.
     /// * **A beam as wide as the index itself** (`ef >= h.len()`), where walking
     ///   the graph cannot beat handing back every vector on the side.
-    /// * **No graph at all** — absent or empty, e.g. before any insert or when
-    ///   used without `init_hnsw`.
+    /// * **The index cannot answer this query at all**
+    ///   ([`HnswIndex::can_answer`]): no graph, an empty one, a stride that is not
+    ///   the query's dimension, or one that refused a vector it was handed. This
+    ///   is checked *before* any beam runs, because a beam over an index that is
+    ///   missing part of the corpus would "prove" its floor against vectors the
+    ///   index never held. It applies to the approximate path as well.
     ///
     /// So the index is a candidate *generator* here and never a silent filter:
     /// the only way a node is dropped is a beam that proved it is below `min`.
@@ -1563,7 +1567,13 @@ impl SideIndex {
             return BTreeSet::new();
         };
         if let Some(h) = &self.hnsw {
-            if !h.is_empty() {
+            // `can_answer`, not `!is_empty()`: an index that refused a vector, or
+            // whose stride is not this query's dimension — a 3-element stray
+            // ingested ahead of the real corpus elects one — is non-empty and
+            // still cannot supply the candidates this query needs. It is asked
+            // before any beam, because a beam over such an index would "conclude"
+            // from an incomplete corpus.
+            if h.can_answer(xs.len()) {
                 let Some(min) = floor else {
                     return h.search(&xs, k).into_iter().map(|(id, _)| id).collect();
                 };
