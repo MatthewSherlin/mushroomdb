@@ -20,8 +20,9 @@ pub use hnsw::{
     hnsw_search_count, hnsw_search_count_reset,
 };
 pub use index::{
-    candidate_spec, hnsw_vector_present, with_hnsw_build_batch, with_ivf_drift_rebuild,
-    CandidateSpec, RuleIndex, SideIndex, HNSW_BUILD_BATCH, IVF_DRIFT_REBUILD,
+    candidate_spec, hnsw_vector_present, vector_scan_forced, with_hnsw_build_batch,
+    with_ivf_drift_rebuild, with_vector_scan, CandidateSpec, RuleIndex, SideIndex, EF_MAX,
+    HNSW_BUILD_BATCH, IVF_DRIFT_REBUILD,
 };
 pub use suggest::{
     RuleSuggestion, SuggestConfig, SuggestReport, DEFAULT_SEED as SUGGEST_DEFAULT_SEED,

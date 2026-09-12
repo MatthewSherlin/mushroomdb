@@ -2154,3 +2154,309 @@ fn pump_index_build_is_refused_read_only() {
     let mut db = GraphDb::open_with_options(&dir, opts).unwrap();
     assert!(matches!(db.pump_index_build(), Err(GraphError::ReadOnly)));
 }
+
+// ---------------------------------------------------------------------------
+// 0.6.6 T4: an exact VectorSimilar rule finds its candidates through the index
+// ---------------------------------------------------------------------------
+
+/// A clustered 8-D unit vector: `i / PER` picks the cluster direction, the
+/// remainder perturbs it. Within-cluster cosine lands near 0.99, cross-cluster
+/// near zero, so a `min` of 0.90 separates them and the derived set is not
+/// vacuous.
+fn clustered_vec_8_raw(i: u32, per: u32) -> Vec<f64> {
+    let dir = unit_vec_8_raw(0xC0FF_EE00 + i / per);
+    let noise = unit_vec_8_raw(0x5EED_0000 + i);
+    let mut out: Vec<f64> = dir
+        .iter()
+        .zip(noise.iter())
+        .map(|(d, n)| d + 0.08 * n)
+        .collect();
+    let norm = out.iter().map(|x| x * x).sum::<f64>().sqrt();
+    out.iter_mut().for_each(|x| *x /= norm);
+    out
+}
+
+fn exact_vec_rule(min: f64) -> RuleDef {
+    RuleDef {
+        name: "sim".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min,
+        },
+        edge_type: "SIM".into(),
+        weight_prop: Some("w".into()),
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    }
+}
+
+/// Every `SIM` edge with its weight, so two runs compare edge-for-edge and
+/// bit-for-bit.
+fn weighted_edges(
+    db: &GraphDb<RealFs>,
+    n: u32,
+) -> std::collections::BTreeMap<(String, String), f64> {
+    let mut out = std::collections::BTreeMap::new();
+    for i in 0..n {
+        let src = format!("v{i}");
+        for dst in db
+            .neighbors(&src, "SIM", Direction::Out)
+            .unwrap_or_default()
+        {
+            let w = db
+                .explain(&src, &dst)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.edge_type == "SIM" && e.src_key == src && e.dst_key == dst)
+                .and_then(|e| e.weight)
+                .expect("a derived SIM edge carries its weight");
+            out.insert((src.clone(), dst), w);
+        }
+    }
+    out
+}
+
+/// Build the rule over `n` clustered vectors and return its weighted edge set.
+fn derive_exact_sim(
+    name: &str,
+    n: u32,
+    per: u32,
+    min: f64,
+) -> std::collections::BTreeMap<(String, String), f64> {
+    let dir = tmp(name);
+    let mut db = GraphDb::open(&dir).unwrap();
+    for i in 0..n {
+        db.insert_node(
+            "V",
+            &format!("v{i}"),
+            vec![("emb".into(), emb(&clustered_vec_8_raw(i, per)))],
+        )
+        .unwrap();
+    }
+    db.create_rule(exact_vec_rule(min)).unwrap();
+    while !db.pump_index_build().unwrap().is_empty() {}
+    weighted_edges(&db, n)
+}
+
+/// The brute-force answer, computed here: every ordered pair whose cosine is at
+/// or above `min`, with the cosine as the weight.
+fn brute_force_sim(
+    n: u32,
+    per: u32,
+    min: f64,
+) -> std::collections::BTreeMap<(String, String), f64> {
+    let vs: Vec<Vec<f64>> = (0..n).map(|i| clustered_vec_8_raw(i, per)).collect();
+    let mut out = std::collections::BTreeMap::new();
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let dot: f64 = vs[i as usize]
+                .iter()
+                .zip(vs[j as usize].iter())
+                .map(|(a, b)| a * b)
+                .sum();
+            if dot >= min {
+                out.insert((format!("v{i}"), format!("v{j}")), dot);
+            }
+        }
+    }
+    out
+}
+
+/// On a set small enough for the beam to reach every vector, the index-backed
+/// candidate path and the full-scan path derive identical edge sets — and both
+/// equal the brute-force answer.
+#[test]
+fn index_backed_vector_rule_equals_brute_force_on_a_fixed_set() {
+    const N: u32 = 200;
+    const PER: u32 = 5;
+    const MIN: f64 = 0.90;
+
+    let truth = brute_force_sim(N, PER, MIN);
+    assert!(
+        truth.len() > 100,
+        "a vacuous fixture proves nothing; got {} pairs above {MIN}",
+        truth.len()
+    );
+
+    let index = derive_exact_sim("t4-equiv-index", N, PER, MIN);
+    let scan =
+        core_rules::with_vector_scan(true, || derive_exact_sim("t4-equiv-scan", N, PER, MIN));
+
+    let keys = |m: &std::collections::BTreeMap<(String, String), f64>| {
+        m.keys().cloned().collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(
+        keys(&index),
+        keys(&truth),
+        "index-backed rule must find every true pair"
+    );
+    assert_eq!(
+        keys(&scan),
+        keys(&truth),
+        "the escape hatch must still be exact"
+    );
+    // And the weights agree to the bit, because scoring did not change.
+    assert_eq!(index, scan, "scores are computed exactly on both paths");
+    for ((s, d), w) in &truth {
+        let got = index[&(s.clone(), d.clone())];
+        assert!(
+            (got - w).abs() < 1e-12,
+            "weight {s}->{d}: index {got} brute force {w}"
+        );
+    }
+}
+
+/// Past the default beam width the widening loop — not the whole-index
+/// fallback — is what answers, and it still finds every qualifying pair.
+#[test]
+fn index_backed_vector_rule_widens_the_beam_past_the_default() {
+    const N: u32 = 600;
+    const PER: u32 = 6;
+    const MIN: f64 = 0.90;
+
+    let truth = brute_force_sim(N, PER, MIN);
+    assert!(
+        truth.len() > 500,
+        "a vacuous fixture proves nothing; got {} pairs",
+        truth.len()
+    );
+    core_rules::hnsw_search_count_reset();
+    let index = derive_exact_sim("t4-beam", N, PER, MIN);
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "this fixture is past the default beam width, so the graph — not the \
+         whole-index fallback — must be what answered"
+    );
+    assert_eq!(
+        index
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        truth
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the beam must not drop a qualifying pair"
+    );
+}
+
+/// A rebuild of an exact vector rule — the one a finished sliced build asks
+/// for, and the one `rebuild_rule` asks for — must leave the rule answering
+/// from its graph. Resetting the index without re-initialising the graph is
+/// silent: the rule stays correct and goes quietly back to O(n²).
+#[test]
+fn rebuilding_an_exact_vector_rule_keeps_its_graph() {
+    const N: u32 = 600;
+    const PER: u32 = 6;
+    const MIN: f64 = 0.90;
+
+    let dir = tmp("t4-rebuild-graph");
+    let mut db = GraphDb::open(&dir).unwrap();
+    for i in 0..N {
+        db.insert_node(
+            "V",
+            &format!("v{i}"),
+            vec![("emb".into(), emb(&clustered_vec_8_raw(i, PER)))],
+        )
+        .unwrap();
+    }
+    // A slice well under the corpus, so the build is deferred and its
+    // completion is what issues the backfill.
+    db.set_hnsw_build_batch(Some(64));
+    db.create_rule(exact_vec_rule(MIN)).unwrap();
+    assert!(
+        !db.builds_in_progress().is_empty(),
+        "600 vectors past a 64-vector slice must defer"
+    );
+    while !db.pump_index_build().unwrap().is_empty() {}
+    let after_build = weighted_edges(&db, N);
+    assert_eq!(
+        after_build
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        brute_force_sim(N, PER, MIN)
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the backfill a finished slice-build triggers derives the whole set"
+    );
+
+    core_rules::hnsw_search_count_reset();
+    db.rebuild_rule("sim").unwrap();
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "a rebuilt exact vector rule must still probe its graph"
+    );
+    assert_eq!(
+        weighted_edges(&db, N),
+        after_build,
+        "and land on the same edges with the same weights"
+    );
+}
+
+/// Changing an embedding retracts exactly the edges whose predicate stopped
+/// holding, and putting it back re-derives them.
+#[test]
+fn changing_an_embedding_retracts_and_rederives() {
+    let dir = tmp("t4-retract");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let near = emb(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    let near2 = emb(&[0.99, 0.141, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    let far = emb(&[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+    db.insert_node("V", "a", vec![("emb".into(), near.clone())])
+        .unwrap();
+    db.insert_node("V", "b", vec![("emb".into(), near2.clone())])
+        .unwrap();
+    db.insert_node("V", "c", vec![("emb".into(), far.clone())])
+        .unwrap();
+    db.create_rule(exact_vec_rule(0.9)).unwrap();
+
+    let pairs = |db: &GraphDb<RealFs>| {
+        let mut out = std::collections::BTreeSet::new();
+        for k in ["a", "b", "c"] {
+            for d in db.neighbors(k, "SIM", Direction::Out).unwrap_or_default() {
+                out.insert((k.to_string(), d));
+            }
+        }
+        out
+    };
+    let ab: std::collections::BTreeSet<(String, String)> = [("a", "b"), ("b", "a")]
+        .iter()
+        .map(|(s, d)| (s.to_string(), d.to_string()))
+        .collect();
+    let all: std::collections::BTreeSet<(String, String)> = [
+        ("a", "b"),
+        ("b", "a"),
+        ("a", "c"),
+        ("c", "a"),
+        ("b", "c"),
+        ("c", "b"),
+    ]
+    .iter()
+    .map(|(s, d)| (s.to_string(), d.to_string()))
+    .collect();
+
+    assert_eq!(pairs(&db), ab, "c starts outside the cluster");
+
+    // Move c into the cluster.
+    db.set_prop("c", "emb", near.clone()).unwrap();
+    assert_eq!(pairs(&db), all, "c in the cluster derives both its pairs");
+
+    // Move it back out: exactly c's edges go, nothing stale is left.
+    db.set_prop("c", "emb", far.clone()).unwrap();
+    assert_eq!(pairs(&db), ab, "c leaving retracts exactly its own edges");
+
+    // And in again.
+    db.set_prop("c", "emb", near.clone()).unwrap();
+    assert_eq!(pairs(&db), all, "the edges come back");
+}

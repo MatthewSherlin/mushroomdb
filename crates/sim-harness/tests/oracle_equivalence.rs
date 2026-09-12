@@ -2103,3 +2103,125 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
         "drift counter must be > 0 after deleting a node from an IVF-indexed rule; got {drift_after}"
     );
 }
+
+/// The bounded difference at scale for an **exact** `VectorSimilar` rule, which
+/// from 0.6.6 finds its candidates through the vector index (v0.6.6 T4).
+///
+/// The same 5,000 × 1,536-D fixture `approximate_recall_5k_timing` uses, the
+/// same O(n²) ground truth, and the rule's `min` as the beam's stopping
+/// similarity. The floor is higher than the approximate one — 0.98 — because
+/// the beam does not stop until its own worst hit has fallen below `min`.
+///
+/// `MUSHROOMDB_VECTOR_SCAN=1` runs the identical assertion against the
+/// pre-0.6.6 full-scan candidate path, which is how the before/after wall clock
+/// for the same work is measured.
+///
+/// `#[ignore]`d: the ground truth alone is ~40 s in release and minutes in
+/// debug. Run with
+/// `cargo test --release -p sim-harness -- exact_vector_rule_recall_5k --ignored --nocapture`.
+#[test]
+#[ignore]
+fn exact_vector_rule_recall_5k() {
+    use std::time::Instant;
+
+    const N_CLUSTERS: usize = 50;
+    const PER_CLUSTER: usize = 100;
+    const N: usize = N_CLUSTERS * PER_CLUSTER; // 5000
+    const MIN_SIM: f64 = 0.85;
+    const FLOOR: f64 = 0.98;
+    const SEED: u64 = 0xcafe_f00d_dead_1234;
+
+    let dir = {
+        let d = std::env::temp_dir().join(format!("graphdb-exact-5k-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    };
+
+    let vecs: Vec<Vec<f64>> = (0..N_CLUSTERS)
+        .flat_map(|c| (0..PER_CLUSTER).map(move |m| (c, m)))
+        .map(|(c, m)| clustered_vec_1536(SEED, N_CLUSTERS, c, m))
+        .collect();
+
+    // Insert nodes (not timed — pure data setup).
+    let mut db = GraphDb::open(&dir).unwrap();
+    for (i, v) in vecs.iter().enumerate() {
+        let key = format!("v{i:04}");
+        let val = Value::List(v.iter().copied().map(Value::Float).collect());
+        db.insert_node("V", &key, vec![("emb".into(), val)])
+            .unwrap();
+    }
+
+    // Time the whole rule creation: index build, candidate probing, derivation.
+    // A 5,000-vector corpus is past `HNSW_BUILD_BATCH`, so the build is sliced
+    // and the rule derives nothing until it has been pumped to completion.
+    let t0 = Instant::now();
+    db.create_rule(RuleDef {
+        name: "exact_sim5k".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: MIN_SIM,
+        },
+        edge_type: "ESIM5K".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+    })
+    .unwrap();
+    while !db.pump_index_build().unwrap().is_empty() {}
+    let build_ms = t0.elapsed().as_millis();
+
+    let derived: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for i in 0..N {
+            let src = format!("v{i:04}");
+            for nb in db
+                .neighbors(&src, "ESIM5K", Direction::Out)
+                .unwrap_or_default()
+            {
+                s.insert(("ESIM5K".to_string(), src.clone(), nb));
+            }
+        }
+        s
+    };
+
+    // Exact O(n²) ground truth (slow — run only in release mode).
+    let t1 = Instant::now();
+    let exact_edges: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for i in 0..N {
+            for j in 0..N {
+                if i == j {
+                    continue;
+                }
+                let dot: f64 = vecs[i].iter().zip(vecs[j].iter()).map(|(a, b)| a * b).sum();
+                if dot >= MIN_SIM {
+                    s.insert(("ESIM5K".to_string(), format!("v{i:04}"), format!("v{j:04}")));
+                }
+            }
+        }
+        s
+    };
+    let exact_ms = t1.elapsed().as_millis();
+
+    let r = recall(&derived, &exact_edges);
+    eprintln!(
+        "5k exact rule: creation {build_ms}ms (scan forced: {}) | ground truth {exact_ms}ms | \
+         recall {r:.4} (derived={} exact={})",
+        core_rules::vector_scan_forced(),
+        derived.len(),
+        exact_edges.len()
+    );
+    assert!(
+        r >= FLOOR,
+        "5k exact recall {:.4} < floor {:.2} (derived={} exact={})",
+        r,
+        FLOOR,
+        derived.len(),
+        exact_edges.len()
+    );
+}

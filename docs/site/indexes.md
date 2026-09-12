@@ -64,6 +64,18 @@ way you declare rules or fulltext fields.
     supported). The `id` pseudo-property is always resolved via the identity
     map and is excluded from index intersection.
 
+## Relationship to the vector index
+
+A property index answers equality. Cosine similarity is answered by the in-tree
+HNSW index a [VectorSimilar rule](rules.md#6-vectorsimilar) builds over its two
+sides. From 0.6.6 **both** kinds of VectorSimilar rule take their candidates
+from it: an `approximate: true` rule in one beam pass at `k`, an
+`approximate: false` rule by widening the beam until its worst hit falls below
+the rule's `min` (ceiling 4,096), after which every candidate is re-scored
+exactly — so the scores are exact and the candidate set carries a committed
+recall floor of 0.98, and `MUSHROOMDB_VECTOR_SCAN=1` restores the O(n²) full
+scan for a caller who needs every pair above `min` provably found.
+
 ## Relationship to fulltext
 
 Use a **property index** for exact scalar equality (`city = 'austin'`). Use a

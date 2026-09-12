@@ -4,8 +4,8 @@ use crate::def::{
 };
 use crate::hnsw::HnswIndex;
 use crate::index::{
-    candidate_spec, candidate_spec_approx_with_k, hnsw_build_batch, hnsw_vector_present,
-    ivf_drift_rebuild_threshold, CandidateSpec, RuleIndex,
+    candidate_spec, candidate_spec_approx_with_floor, hnsw_build_batch, hnsw_vector_present,
+    ivf_drift_rebuild_threshold, spec_has_hnsw, vector_scan_forced, CandidateSpec, RuleIndex,
 };
 use core_storage::v8::encode::{decode_ivf_bytes, decode_provenance_bytes};
 use core_storage::v8::seam::{ColumnsView, TopologyView};
@@ -378,18 +378,48 @@ pub struct RuleEngine {
 // Private helpers (free functions, not methods, to avoid whole-struct borrows)
 // ---------------------------------------------------------------------------
 
-/// Rule-aware candidate spec: exact `ScanAll` for `approximate=false`, IVF
-/// `VectorClusters` for `approximate=true` (VectorSimilar-rooted predicates).
+/// Rule-aware candidate spec.
+///
+/// Both exact and approximate `VectorSimilar`-rooted rules probe the vector
+/// index. The difference is the beam: an approximate rule takes one pass at
+/// `k`; an exact rule widens the beam until the beam's own worst hit falls
+/// below the rule's `min`, at which point nothing outside it can qualify.
+/// Scoring is the same code either way — only the set fed into it differs.
+///
+/// `MUSHROOMDB_VECTOR_SCAN=1` returns an exact rule to `candidate_spec`: the
+/// O(n²) full scan, and every pair above `min` provably found.
 fn candidate_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
-    if def.approximate {
-        // k = max(max_edges, 128): return at least 128 candidates so the HNSW
-        // beam's expanded reach (M₀=128 layer-0 edges) is not truncated before
-        // evaluation; bounded by max_edges when set by the caller.
-        let k = def.max_edges.map(|me| me.max(128)).unwrap_or(128) as usize;
-        candidate_spec_approx_with_k(&def.predicate, k)
-    } else {
-        candidate_spec(&def.predicate)
+    if !def.approximate && vector_scan_forced() {
+        return candidate_spec(&def.predicate);
     }
+    // k = max(max_edges, 128): return at least 128 candidates so the HNSW
+    // beam's expanded reach (M₀=128 layer-0 edges) is not truncated before
+    // evaluation; bounded by max_edges when set by the caller.
+    let k = def.max_edges.map(|me| me.max(128)).unwrap_or(128) as usize;
+    candidate_spec_approx_with_floor(&def.predicate, k, !def.approximate)
+}
+
+/// True when `def`'s candidate spec probes an HNSW graph, so this rule needs one
+/// built, persisted and adopted.
+///
+/// From 0.6.6 that is every `VectorSimilar`-rooted rule, exact or approximate —
+/// unless `MUSHROOMDB_VECTOR_SCAN` has put the exact ones back on the full scan,
+/// in which case they need no graph at all.
+fn uses_hnsw(def: &RuleDef) -> bool {
+    // `src_lookup_spec_for` is either this spec or the KeyMatch reverse lookup,
+    // which has no vector leg, so the dst spec decides for both sides.
+    spec_has_hnsw(&candidate_spec_for(def))
+}
+
+/// True when `def` has a vector leg at all — whatever `MUSHROOMDB_VECTOR_SCAN`
+/// says right now.
+///
+/// The question the snapshot asks. A store whose graph was built without the
+/// variable and is then written to with it set would otherwise have that graph
+/// dropped from the next snapshot and rebuilt on the open after, which is a
+/// superlinear cost for a variable the operator may have set for one run.
+fn has_vector_leg(def: &RuleDef) -> bool {
+    spec_has_hnsw(&candidate_spec_approx_with_floor(&def.predicate, 1, false))
 }
 
 /// Rule-aware src-side lookup spec. KeyMatch is still exact on the src side
@@ -1709,10 +1739,12 @@ fn index_node_for_rule_deferring_hnsw(
 /// same indexes each node on both sides but counts it once, so `total` and the
 /// progress a slice reports are on the same scale.
 ///
-/// Zero for a rule with no HNSW leg, which is what keeps every non-approximate
-/// rule on the unchanged one-commit path.
+/// Zero for a rule with no HNSW leg — one with no vector predicate, one whose
+/// vector predicate sits under an `Any`, or any rule at all while
+/// `MUSHROOMDB_VECTOR_SCAN` is set — which is what keeps those on the unchanged
+/// one-commit path.
 fn hnsw_build_total(def: &RuleDef, g: &GraphMut<'_>) -> u64 {
-    if !def.approximate {
+    if !uses_hnsw(def) {
         return 0;
     }
     let src_spec = src_lookup_spec_for(def);
@@ -2358,9 +2390,9 @@ impl RuleEngine {
         // allocation and to satisfy the borrow checker without cloning inside.
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
 
-        // Init HNSW for approximate rules before inserting nodes.
+        // Init HNSW for every rule with a vector leg before inserting nodes.
         for name in &rule_names {
-            if self.rules[name].approximate {
+            if uses_hnsw(&self.rules[name]) {
                 let idx = self.indexes.get_mut(name).unwrap();
                 idx.src_side.init_hnsw(name);
                 idx.dst_side.init_hnsw(name);
@@ -2463,7 +2495,7 @@ impl RuleEngine {
         let mut leftover_blobs = hnsw_state;
         let mut adopted: BTreeMap<String, (BTreeSet<u32>, BTreeSet<u32>)> = BTreeMap::new();
         for name in &rule_names {
-            if !self.rules[name].approximate {
+            if !uses_hnsw(&self.rules[name]) {
                 continue;
             }
             let (src_blob, dst_blob) = leftover_blobs.remove(name).unwrap_or_default();
@@ -2805,14 +2837,15 @@ impl RuleEngine {
         self.indexes_populated
     }
 
-    /// Export HNSW graphs for all approximate rules as opaque bincoded blobs.
+    /// Export the HNSW graph of every rule with a vector leg as an opaque
+    /// bincoded blob.
     ///
     /// Returns a map from rule name to `(src_blob, dst_blob)`.  An empty `Vec`
     /// means the corresponding side has no initialized HNSW graph.
     pub fn export_hnsw_state(&self) -> BTreeMap<String, (Vec<u8>, Vec<u8>)> {
         let mut out = BTreeMap::new();
         for (name, def) in &self.rules {
-            if def.approximate {
+            if has_vector_leg(def) {
                 if let Some(idx) = self.indexes.get(name) {
                     out.insert(
                         name.clone(),
@@ -3062,9 +3095,9 @@ impl RuleEngine {
         let build_total = hnsw_build_total(&def, g);
         let deferred = build_total > batch as u64;
 
-        // Phase 1a: init HNSW for approximate rules before inserting nodes so
-        // each insert also populates the HNSW graph incrementally.
-        if def.approximate {
+        // Phase 1a: init HNSW for a rule with a vector leg before inserting
+        // nodes so each insert also populates the HNSW graph incrementally.
+        if uses_hnsw(&def) {
             let idx = self.indexes.get_mut(&name).unwrap();
             if deferred {
                 // Same empty graph `init_hnsw` gives, reached through the
@@ -3931,7 +3964,7 @@ impl RuleEngine {
         // reset and the scan skips the ids it holds. Every other caller —
         // IVF drift, `delete_rule`'s survivors, an explicit `rebuild_rule` —
         // keeps today's behaviour and rebuilds (and thereby compacts) it.
-        let carry = def.approximate && self.builds_awaiting_backfill.remove(name);
+        let carry = uses_hnsw(&def) && self.builds_awaiting_backfill.remove(name);
         let carried = if carry {
             self.indexes
                 .get_mut(name)
@@ -3945,7 +3978,7 @@ impl RuleEngine {
 
         // Init HNSW before indexing so inserts populate the graph incrementally.
         let mut skip: (BTreeSet<u32>, BTreeSet<u32>) = (BTreeSet::new(), BTreeSet::new());
-        if def.approximate {
+        if uses_hnsw(&def) {
             let (src_h, dst_h) = carried.unwrap_or((None, None));
             let mut built = 0u64;
             let idx = self.indexes.get_mut(name).unwrap();

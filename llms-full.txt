@@ -1896,10 +1896,34 @@ Predicate::VectorSimilar { field: "embedding".into(), min: 0.8 }
 **Demo example:** `similar_interests` — Person.embedding, dim 8, min 0.8.
 114 edges in the demo dataset.
 
-**Scale note:** the exact (full-scan) path is O(n²) in the number of
-nodes carrying the field. At 5k nodes and dim 1536 the exact backfill
-takes about 12 minutes. Use the approximate mode below for large vector
-sets.
+**Candidates come from the vector index — 0.6.6, behaviour change.** A
+VectorSimilar rule with `approximate: false` used to compare every pair of
+vectors on the two sides: O(n²), about 12 minutes to backfill 5,000 nodes at
+dim 1536. From 0.6.6 it asks the same in-tree HNSW index the approximate mode
+uses for its candidates, and **the rule's own `min` is the beam's stopping
+rule**: the beam widens — doubling from the default width up to a ceiling of
+4,096 — until the worst hit it returns falls below `min`, at which point no node
+outside the beam can qualify. A rule over fewer vectors than the default beam
+width never walks the graph at all, because a beam that wide is the whole index:
+small rules stay exhaustive.
+
+Scores did not move. Every candidate the beam offers is re-scored exactly,
+from the stored `f64` vectors, by the same code that scored the full scan —
+so the similarity on the edge, the `weight_prop` value and the `max_edges`
+ranking are bit-for-bit what they were. What changed is the candidate set: the
+derived edge set is no longer *provably* every pair above `min`, it is every
+pair above `min` that the beam found. The committed floor for that is **recall
+≥ 0.98** against an O(n²) ground truth, asserted by
+`exact_vector_rule_recall_5k` (5,000 nodes, dim 1536, in
+`crates/sim-harness/tests/oracle_equivalence.rs`), which measures 1.0000 —
+495,000 of 495,000 pairs — on that fixture. On a corpus small enough for the
+beam to reach every vector the two paths agree edge-for-edge
+(`index_backed_vector_rule_equals_brute_force_on_a_fixed_set`).
+
+**Buying the guarantee back:** set `MUSHROOMDB_VECTOR_SCAN=1` and every exact
+VectorSimilar rule returns to the full scan — O(n²), every pair above `min`
+provably found, and the backfill time that goes with it. Rules with
+`approximate: true` are unaffected by the variable.
 
 ---
 
@@ -1992,18 +2016,25 @@ persisted graph fails to load (the reason is logged).
 
 | Property | Exact (`approximate: false`) | Approximate (`approximate: true`) |
 |---|---|---|
-| Candidates | All vectors with the right label | HNSW approximate k-NN |
-| Per-query edge recall | 1.00 (exact) | min 0.90, mean 0.998 (5k/dim 1536, fixed-seed probe) |
+| Candidates | HNSW, beam widened until its worst hit is below `min` | HNSW approximate k-NN, one pass at k |
+| Scores | Exact, from the stored vectors | Exact, from the stored vectors |
+| Edge recall | floor 0.98 asserted, 1.000 measured (5k/dim 1536, fixed-seed probe); exhaustive below the default beam width | min 0.90, mean 0.998 (5k/dim 1536, fixed-seed probe) |
 | Determinism | Yes | Yes — same rule + data → same graph |
 | WAL replay | Identical | Identical (replayed writes update the loaded HNSW) |
 
-Measured at 5k nodes, dim 1536: exact ~12 min backfill. Approximate
-backfill time is substantially faster — the IVF-Flat-era measurement was
-~17 s; HNSW timing at this scale is not separately published (flag: unsure).
+Measured at 5k nodes, dim 1536 (release, fixed-seed probe): creating the exact
+rule takes 269 s through the index against 142 s for the full scan
+`MUSHROOMDB_VECTOR_SCAN=1` restores. At this size the one-time graph build is
+larger than the whole quadratic scan it removes, and the index path wins on
+creation time only above it; what it buys at 5k is that every later write
+re-derives from a beam instead of a full scan. Approximate backfill time is
+substantially faster still — the IVF-Flat-era measurement was ~17 s; HNSW timing
+at this scale is not separately published (flag: unsure).
 
-Use approximate mode when backfill latency matters more than perfect
-recall. Do not use it when completeness is required (safety-critical
-graph closure, compliance checks).
+Use approximate mode when a lower recall floor and a bounded `k` per source are
+acceptable. When completeness is required (safety-critical graph closure,
+compliance checks) neither mode is enough on its own — set
+`MUSHROOMDB_VECTOR_SCAN=1`, which is the only path that proves it.
 
 The `explain` endpoint marks approximate edges with `"approximate": true`
 in the predicate summary.
@@ -2015,6 +2046,12 @@ Building an HNSW graph is superlinear in the number of vectors, and
 (`core_rules::HNSW_BUILD_BATCH`) the build is therefore sliced: `create_rule`
 installs the rule, files every non-vector index leg, indexes the first 2,048
 vectors, and **returns before its edges exist**.
+
+This applies to both kinds of VectorSimilar rule from 0.6.6 on, because both
+build a graph — an `approximate: false` rule over more than 2,048 vectors is
+sliced exactly as an approximate one is. (A rule whose vector predicate sits
+under an `Any`, and any rule created while `MUSHROOMDB_VECTOR_SCAN=1` is set,
+builds no graph and is never deferred.)
 
 ```text
 create_rule ──▶ rule installed, 2048/120000 indexed, 0 edges

@@ -722,6 +722,24 @@ impl HnswIndex {
     /// Returns up to `k` results as `(node_id, cosine_similarity)` pairs,
     /// sorted descending by similarity. Zero-norm query vectors return empty.
     pub fn search(&self, q: &[f64], k: usize) -> Vec<(u32, f64)> {
+        self.search_with_ef(q, k, self.ef_for(k))
+    }
+
+    /// The beam width [`HnswIndex::search`] uses for `k` results.
+    ///
+    /// Exposed so a caller that widens the beam itself — an exact
+    /// `VectorSimilar` rule looking for *every* hit above a floor — can start
+    /// from the same place `search` would have.
+    pub fn ef_for(&self, k: usize) -> usize {
+        k.max(EF_SEARCH)
+    }
+
+    /// [`HnswIndex::search`], with the layer-0 beam width set independently of
+    /// the result count.
+    ///
+    /// `ef` below `k` is raised to `k`: a beam narrower than the answer cannot
+    /// produce the answer.
+    pub fn search_with_ef(&self, q: &[f64], k: usize, ef: usize) -> Vec<(u32, f64)> {
         let Some(unit_q) = l2_normalize(q) else {
             return vec![];
         };
@@ -735,7 +753,7 @@ impl HnswIndex {
         }
 
         note_search();
-        let ef = k.max(EF_SEARCH);
+        let ef = ef.max(k);
         let mut curr_ep = ep;
 
         // Greedy descent from max_level to layer 1.
