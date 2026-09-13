@@ -1031,10 +1031,10 @@ def test_an_insert_contributes_no_prop_set_records(tmp_path):
     try:
         db.insert_node("Talent", "t1", {"industry": "architecture",
                                         "size_bucket": 2, "status": "published"})
-        kinds = [e["kind"] for e in db.node_history("t1")]
+        kinds = [e["kind"] for e in db.node_history("t1")["history"]]
         assert kinds.count("prop_set") == 3 * INSERT_PROP_SET_RECORDS == 0
         db.set_prop("t1", "status", "draft")
-        assert [e["kind"] for e in db.node_history("t1")].count("prop_set") == 1
+        assert [e["kind"] for e in db.node_history("t1")["history"]].count("prop_set") == 1
     finally:
         db.close()
 
@@ -1055,10 +1055,10 @@ def test_a_deleted_nodes_property_history_survives_the_tombstone(tmp_path):
     try:
         db.insert_node("Talent", "t1", {"industry": "architecture"})
         db.set_prop("t1", "industry", "interior-design")
-        assert [e["kind"] for e in db.node_history("t1")] == [
+        assert [e["kind"] for e in db.node_history("t1")["history"]] == [
             "node_inserted", "prop_set"]
         db.delete_node("t1")
-        assert [e["kind"] for e in db.node_history("t1")] == [
+        assert [e["kind"] for e in db.node_history("t1")["history"]] == [
             "node_inserted", "prop_set", "node_deleted"]
     finally:
         db.close()

@@ -275,6 +275,11 @@ pub struct Stats {
     /// rule chain or shorten it. Never persisted, so it resets on reopen.
     #[serde(default)]
     pub chain_truncations: u64,
+    /// The oldest commit index history still reaches (the WAL horizon floor).
+    /// `0` means nothing has been pruned and history is complete; a non-zero
+    /// value means events before that commit were pruned and are gone.
+    #[serde(default)]
+    pub history_floor: u64,
 }
 
 /// One rule's provenance size, trip latch, and fire counter.
@@ -1114,8 +1119,35 @@ fn build_props_view<'a>(
                 .columns()
                 .expect("base columns section bounds validated at open");
             core_storage::v8::seam::ColumnsView::with_base_cached(props, archived, b.mixed_cache())
+                .with_shared_strings(base_string_table(b))
         }
     }
+}
+
+/// The base columns section paired with the string table that resolves its
+/// string ids — what `ViewStore` needs to read a neighbour's string property
+/// out of a V9 snapshot.
+fn base_columns(
+    base: &Option<std::sync::Arc<core_storage::v8::MappedBase>>,
+) -> Option<core_storage::v8::seam::BaseColumns<'_>> {
+    base.as_ref().map(|b| core_storage::v8::seam::BaseColumns {
+        cols: b
+            .columns()
+            .expect("base columns section bounds validated at open"),
+        strings: base_string_table(b),
+    })
+}
+
+/// The shared string table of a V9 base, or `None` for a pre-V9 one.
+///
+/// Every `ColumnsView` built over a base must carry it: without it a V9
+/// snapshot's string columns, whose own tables are empty, read back as absent.
+fn base_string_table(
+    base: &core_storage::v8::MappedBase,
+) -> Option<&core_storage::v8::layout::ArchivedStringTable> {
+    base.string_table()
+        .transpose()
+        .expect("base strings section bounds validated at open")
 }
 
 fn build_topo_view<'a>(
@@ -1222,6 +1254,14 @@ pub struct GraphDb<F: Fs> {
     /// `None` — `roles.json` was present but corrupt; `mask_for_role` returns
     /// `Err` for any request (fail-loud, never silently grant empty visibility).
     roles: Option<Vec<RoleDef>>,
+    /// Memo for [`mask_for_role`](GraphDb::mask_for_role), keyed by
+    /// `(role, commit_seq)` — a scoped reader between two writes resolves once.
+    ///
+    /// Shared by `Arc` with every [`ReaderSnapshot`](crate::reader::ReaderSnapshot)
+    /// taken from this handle. Replaced (not cleared) whenever the role
+    /// definitions change or the store is reloaded, which `commit_seq` does not
+    /// record; see [`RoleMaskCache`](crate::mask::RoleMaskCache).
+    role_masks: Arc<crate::mask::RoleMaskCache>,
     /// Live subscriptions.  Entries with a dead `Weak` are pruned on the next
     /// distribute_events call.
     subscriptions: Vec<SubEntry>,
@@ -1531,6 +1571,25 @@ fn extract_scan_label(ops: &[PlanOp], syms: &mut Interner) -> Option<u32> {
     None
 }
 
+/// How an as-of read is restricted — the argument to
+/// [`GraphDb::query_at_scoped`].
+///
+/// Every variant is resolved against the graph **as it was at the requested
+/// commit**, not against the current graph.
+#[derive(Debug, Clone, Copy)]
+pub enum AsOfScope<'a> {
+    /// Everything the named role may see. The role *definition* is the current
+    /// one — `roles.json` is a sidecar and has no past version — but its
+    /// `keys` and `labels` are resolved against the as-of graph.
+    Role(&'a str),
+    /// An explicit node-key allow-list. Keys that did not exist at that commit
+    /// resolve to nothing.
+    Keys(&'a [String]),
+    /// A role intersected with a client-supplied allow-list. The intersection
+    /// is the never-widen rule: a client mask can only narrow a role.
+    RoleAndKeys(&'a str, &'a [String]),
+}
+
 impl GraphDb<RealFs> {
     /// Open the database at `dir` with default options.
     ///
@@ -1667,6 +1726,63 @@ impl GraphDb<RealFs> {
         cypher: &str,
         params: &std::collections::BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
+        let temporal = self.open_at_for_read(commit, cypher)?;
+        temporal.query(cypher, params)
+    }
+
+    /// Run a **read-only** Cypher query at `commit`, restricted by `scope`.
+    ///
+    /// The **graph** is as of `commit`; the **role definition** is as it is
+    /// now, because `roles.json` is a sidecar and is never a WAL record — it
+    /// has no past version to read. A role's `keys` and `labels` are resolved
+    /// against the commit-`commit` graph, so a role that may see a label sees
+    /// exactly the nodes that carried it then, and an explicit key that did
+    /// not exist yet resolves to nothing.
+    ///
+    /// [`AsOfScope::RoleAndKeys`] intersects the two: a client allow-list can
+    /// only narrow what a role may see, never widen it.
+    ///
+    /// Write statements are rejected, exactly as [`GraphDb::query_at`] rejects
+    /// them.
+    ///
+    /// # Errors
+    /// - [`GraphError::CommitOutOfRange`] if `commit` is outside the retained
+    ///   range; the error carries that range.
+    /// - [`GraphError::KeyNotFound`] with a `role:` prefix for an unknown role,
+    ///   or [`GraphError::Corrupt`] when `roles.json` was corrupt at open.
+    /// - A query error for a malformed or write query.
+    pub fn query_at_scoped(
+        &self,
+        commit: u64,
+        cypher: &str,
+        params: &std::collections::BTreeMap<String, Value>,
+        scope: AsOfScope<'_>,
+    ) -> Result<ResultSet> {
+        let temporal = self.open_at_for_read(commit, cypher)?;
+        // One resolver answers "what may this role see" — `mask_for_role` — and
+        // it runs against the temporal handle, so the answer is the as-of one.
+        let mask = match scope {
+            AsOfScope::Role(role) => temporal.mask_for_role(role)?,
+            AsOfScope::Keys(keys) => {
+                crate::mask::NodeMask::from_keys(&temporal, keys.iter().map(String::as_str))
+            }
+            AsOfScope::RoleAndKeys(role, keys) => {
+                temporal
+                    .mask_for_role(role)?
+                    .intersect(&crate::mask::NodeMask::from_keys(
+                        &temporal,
+                        keys.iter().map(String::as_str),
+                    ))
+            }
+        };
+        temporal.query_masked(cypher, params, &mask)
+    }
+
+    /// Open the temporal view for a time-travel read and refuse write Cypher.
+    ///
+    /// Shared by [`GraphDb::query_at`] and [`GraphDb::query_at_scoped`] so both
+    /// resolve the commit and reject writes identically.
+    fn open_at_for_read(&self, commit: u64, cypher: &str) -> Result<Self> {
         let dir = self.fs.dir().to_path_buf();
         let temporal = Self::open_at(&dir, commit)?;
         if is_write_tokens(&lex(cypher).map_err(|e| GraphError::QueryError {
@@ -1678,7 +1794,7 @@ impl GraphDb<RealFs> {
                     .into(),
             });
         }
-        temporal.query(cypher, params)
+        Ok(temporal)
     }
 }
 
@@ -1744,6 +1860,7 @@ impl<F: Fs> GraphDb<F> {
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
             roles: Some(vec![]),
+            role_masks: Arc::new(crate::mask::RoleMaskCache::new()),
             subscriptions: Vec::new(),
             query_subscriptions: Vec::new(),
             sub_capacity: DEFAULT_SUB_CAPACITY,
@@ -1801,6 +1918,10 @@ impl<F: Fs> GraphDb<F> {
         self.prop_index = PropertyIndex::new();
         self.commit_seq = 0;
         self.roles = Some(vec![]);
+        // A fresh cache, not a cleared one: any reader snapshot still holding
+        // the old `Arc` keeps it to itself, so nothing it memoised against the
+        // pre-reload store can be read back through this handle.
+        self.role_masks = Arc::new(crate::mask::RoleMaskCache::new());
         self.total_wal_commits = 0;
         self.base = None;
         self.fold_overlay = None;
@@ -1851,10 +1972,13 @@ impl<F: Fs> GraphDb<F> {
         // file. For RealFs this is a true partial read (O(1)); for SimFs the
         // default impl reads all bytes and truncates (still correct).
         let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
+        // V8 and V9 share the mmap-able container; V9 only adds section 12.
         let is_v8 = snap_header.len() >= 6
             && &snap_header[0..4] == b"GDB1"
-            && u16::from_le_bytes([snap_header[4], snap_header[5]])
-                == core_storage::snapshot::VERSION_8;
+            && matches!(
+                u16::from_le_bytes([snap_header[4], snap_header[5]]),
+                core_storage::snapshot::VERSION_8 | core_storage::snapshot::VERSION_9
+            );
         if is_v8 {
             // V8: map the file zero-copy (RealFs) or read full bytes (SimFs).
             // No 2.4GB heap Vec is allocated on RealFs.
@@ -1916,7 +2040,7 @@ impl<F: Fs> GraphDb<F> {
         }
         // WAL-present path: build indexes eagerly BEFORE replay so that the
         // first replayed record does not trigger the lazy-init guard (which
-        // would call reindex_all_load_ivf on an empty graph, defeating the
+        // would call reindex_all_load_state on an empty graph, defeating the
         // point of restoring IVF/HNSW blobs from the snapshot).
         if !records.is_empty() {
             db.ensure_v8_base_sections_loaded();
@@ -2285,7 +2409,8 @@ impl<F: Fs> GraphDb<F> {
         // snapshot are retained without deserializing so that:
         //   - clean-open (empty WAL): indexes stay empty; blobs load on first
         //     ANN query via ensure_hnsw_loaded, or on first mutation via the
-        //     lazy-init guard which calls reindex_all_load_ivf + load_hnsw_state.
+        //     lazy-init guard which calls reindex_all_load_state (the scan
+        //     skips the HNSW build for every side the blob supplies).
         //   - WAL-present: open_with calls consume_retained_state_eager before
         //     replay so HNSW/IVF are live before any record fires the hooks.
         let ivf_bytes = if state.ivf_state.is_empty() {
@@ -2531,6 +2656,7 @@ impl<F: Fs> GraphDb<F> {
                     archived,
                     base.mixed_cache(),
                 )
+                .with_shared_strings(base_string_table(base))
             }
         }
     }
@@ -2595,10 +2721,18 @@ impl<F: Fs> GraphDb<F> {
 
         // Horizon and range check.
         if commit < db.wal_horizon_floor {
-            return Err(GraphError::CommitOutOfRange { commit, total });
+            return Err(GraphError::CommitOutOfRange {
+                commit,
+                total,
+                floor: db.wal_horizon_floor,
+            });
         }
         if commit >= total {
-            return Err(GraphError::CommitOutOfRange { commit, total });
+            return Err(GraphError::CommitOutOfRange {
+                commit,
+                total,
+                floor: db.wal_horizon_floor,
+            });
         }
 
         // Local index into surviving frames (0 = first frame of oldest archive).
@@ -2613,7 +2747,11 @@ impl<F: Fs> GraphDb<F> {
             // If either condition is violated the prefix needed to reconstruct
             // the requested state is gone; refuse rather than return wrong data.
             if db.wal_horizon_floor > 0 || !db.archive_genesis_chain {
-                return Err(GraphError::CommitOutOfRange { commit, total });
+                return Err(GraphError::CommitOutOfRange {
+                    commit,
+                    total,
+                    floor: db.wal_horizon_floor,
+                });
             }
             // Replay all archive frames up to and including the target commit
             // from an empty database state.  Archives must be replayed in order
@@ -2633,8 +2771,10 @@ impl<F: Fs> GraphDb<F> {
             let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
             let is_v8 = snap_header.len() >= 6
                 && &snap_header[0..4] == b"GDB1"
-                && u16::from_le_bytes([snap_header[4], snap_header[5]])
-                    == core_storage::snapshot::VERSION_8;
+                && matches!(
+                    u16::from_le_bytes([snap_header[4], snap_header[5]]),
+                    core_storage::snapshot::VERSION_8 | core_storage::snapshot::VERSION_9
+                );
             if is_v8 {
                 let state = if let Some(snap_path) = db.fs.snapshot_path() {
                     let mapped = core_storage::v8::MappedBase::map(&snap_path).map_err(|e| {
@@ -2744,6 +2884,10 @@ impl<F: Fs> GraphDb<F> {
                 .expect("fold_overlay is always Some after open_with; call reader() after open"),
             self.base.clone(),
             self.delta_tail.clone(),
+            // The snapshot's effective state is exactly this handle's state at
+            // this commit, so it shares the memo and its version key.
+            self.commit_seq,
+            Arc::clone(&self.role_masks),
         )
     }
 
@@ -2805,10 +2949,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -2863,10 +3004,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 // Rule engine: via-hop rules must update when user edges change.
                 let cursor = self.engine.pending_delta_count();
@@ -2897,10 +3035,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -2945,10 +3080,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -2961,10 +3093,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 // Full-text index maintenance: update tokens for this field if indexed.
                 if self.fulltext.field_indexed(field) {
@@ -3072,10 +3201,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3131,10 +3257,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 // Rule engine: via-hop rules fire when user via-edges are inserted.
                 // Resolve etype back to string so on_edge_changed can match rules by name.
@@ -3167,10 +3290,7 @@ impl<F: Fs> GraphDb<F> {
                                 &self.ids,
                                 &self.syms,
                                 &self.labels,
-                                self.base.as_ref().map(|b| {
-                                    b.columns()
-                                        .expect("base columns section bounds validated at open")
-                                }),
+                                base_columns(&self.base),
                             );
                         }
                     }
@@ -3221,10 +3341,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3236,10 +3353,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 if self.fulltext.field_indexed(&field_str) {
                     let label_opt = self.labels.get(*id as usize).and_then(|&sym| {
@@ -3313,10 +3427,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3361,10 +3472,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3427,10 +3535,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3443,10 +3548,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 // Full-text index maintenance: remove tokens for this field.
                 if self.fulltext.field_indexed(field) {
@@ -3503,10 +3605,7 @@ impl<F: Fs> GraphDb<F> {
                     &self.ids,
                     &self.syms,
                     &self.labels,
-                    self.base.as_ref().map(|b| {
-                        b.columns()
-                            .expect("base columns section bounds validated at open")
-                    }),
+                    base_columns(&self.base),
                 );
                 // Rule engine: via-hop rules must retract when user via-edges are deleted.
                 let cursor = self.engine.pending_delta_count();
@@ -3537,10 +3636,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3590,10 +3686,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -3632,10 +3725,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.ids,
                         &self.syms,
                         &self.labels,
-                        self.base.as_ref().map(|b| {
-                            b.columns()
-                                .expect("base columns section bounds validated at open")
-                        }),
+                        base_columns(&self.base),
                     );
                 }
 
@@ -3697,10 +3787,7 @@ impl<F: Fs> GraphDb<F> {
                             &self.ids,
                             &self.syms,
                             &self.labels,
-                            self.base.as_ref().map(|b| {
-                                b.columns()
-                                    .expect("base columns section bounds validated at open")
-                            }),
+                            base_columns(&self.base),
                         );
                     }
                 }
@@ -6321,8 +6408,10 @@ impl<F: Fs> GraphDb<F> {
             return Ok(Some(vec![]));
         }
         match serde_json::from_slice::<RolesFile>(&bytes) {
-            Ok(f) if f.version == 1 || f.version == 2 => Ok(Some(f.roles)),
-            // Corrupt or unrecognised version (>2): poison the roles state.
+            Ok(f) if matches!(f.version, 1..=3) => Ok(Some(f.roles)),
+            // Corrupt or unrecognised version (>3): poison the roles state.
+            // Never widen: a version this binary does not know may carry a
+            // narrowing this binary would not apply.
             _ => Ok(None),
         }
     }
@@ -6334,10 +6423,31 @@ impl<F: Fs> GraphDb<F> {
     /// - `role` does not match any defined role name.
     ///
     /// The mask union is: explicit `keys` (unknown keys silently ignored) plus
-    /// all live nodes carrying any label in `labels`.  Label resolution is live
-    /// — new nodes of an allowed label are visible without re-applying the
-    /// schema.  An empty union = empty mask = sees nothing.
+    /// all live nodes carrying any label in `labels` that also pass the role's
+    /// [`visible_where`](crate::roles::RoleDef::visible_where) predicate, if it
+    /// has one.  Label resolution is live — new nodes of an allowed label are
+    /// visible without re-applying the schema, and a property edited out of the
+    /// predicate takes its node out of the mask on the next read.  An empty
+    /// union = empty mask = sees nothing.
+    ///
+    /// This is the one resolver every read path calls, live and as-of alike, so
+    /// the predicate applies everywhere at once.  On an as-of handle the role
+    /// *definition* is the current one and the graph is the historical one: the
+    /// predicate is evaluated against the property values at the commit being
+    /// read.
+    ///
+    /// The result is memoised per `(role, commit_seq)`, so a scoped reader
+    /// between two writes resolves the role once.  See
+    /// [`RoleMaskCache`](crate::mask::RoleMaskCache) for why that cannot go
+    /// stale.
     pub fn mask_for_role(&self, role: &str) -> Result<crate::mask::NodeMask> {
+        self.role_masks
+            .get_or_build(role, self.commit_seq, || self.build_mask_for_role(role))
+            .map(|m| (*m).clone())
+    }
+
+    /// Resolve `role` against the current graph, ignoring the memo.
+    fn build_mask_for_role(&self, role: &str) -> Result<crate::mask::NodeMask> {
         let roles = self.roles.as_ref().ok_or_else(|| GraphError::Corrupt {
             detail:
                 "roles.json was corrupt at open; fix the file and re-open to restore role access"
@@ -6353,18 +6463,35 @@ impl<F: Fs> GraphDb<F> {
         let mut visible = std::collections::HashSet::new();
 
         // Key leg: resolve explicit keys to dense ids (unknown keys ignored).
+        // An administrative grant, never narrowed by the predicate.
         for key in &def.keys {
             if let Some(id) = self.ids.get(key) {
                 visible.insert(id);
             }
         }
 
-        // Label leg: live scan — iterate labels vec for matching symbol.
+        // Label leg: live scan — iterate labels vec for matching symbol, and
+        // when the role carries a predicate, test the property as well.  The
+        // property comes from the store's own merged view (overlay over the
+        // mmap'd base), so an as-of handle reads the values of its own commit.
+        let props = def.visible_where.as_ref().map(|_| self.props_view());
         for label_name in &def.labels {
             if let Some(sym) = self.syms.get(label_name) {
                 for (i, &s) in self.labels.iter().enumerate() {
-                    if s == sym {
-                        visible.insert(i as u32);
+                    if s != sym {
+                        continue;
+                    }
+                    let id = i as u32;
+                    match (&def.visible_where, &props) {
+                        (Some(pred), Some(view)) => {
+                            let value = view.get(id, &pred.field).map(|vr| vr.into_value());
+                            if pred.holds(value.as_ref()) {
+                                visible.insert(id);
+                            }
+                        }
+                        _ => {
+                            visible.insert(id);
+                        }
                     }
                 }
             }
@@ -6860,6 +6987,12 @@ impl<F: Fs> GraphDb<F> {
             .write_atomic(FileId::Roles, &bytes)
             .map_err(GraphError::Io)?;
         self.roles = Some(roles);
+        // Rewriting the sidecar is not a commit, so `commit_seq` does not move
+        // and a memoised mask would still match its version. Install a fresh
+        // cache instead of clearing the shared one: a reader snapshot frozen
+        // against the old definitions keeps the old `Arc` to itself and can
+        // never publish an answer this handle would read back.
+        self.role_masks = Arc::new(crate::mask::RoleMaskCache::new());
         // Refresh the MVCC frozen overlay so that reader() immediately sees the
         // updated role definitions without waiting for the next K-commit fold.
         self.fold_now();
@@ -7601,6 +7734,25 @@ impl<F: Fs> GraphDb<F> {
         self.engine.hnsw_has_rule(field)
     }
 
+    /// How many HNSW graphs this handle has built from scratch since it was
+    /// opened (one per side of an approximate rule).
+    ///
+    /// An open that restored every graph from the snapshot reports `0`.
+    /// Exposed for tests that assert the open path reuses the persisted index
+    /// rather than rebuilding it; not part of the stable surface.
+    #[doc(hidden)]
+    pub fn hnsw_build_count(&self) -> u64 {
+        self.engine.hnsw_build_count()
+    }
+
+    /// Rules whose vector graphs the clean-open read path still holds a second
+    /// copy of. Zero before the first ANN query and again after the first
+    /// write. Exposed for tests; not part of the stable surface.
+    #[doc(hidden)]
+    pub fn lazy_hnsw_len(&self) -> usize {
+        self.engine.lazy_hnsw_len()
+    }
+
     /// Find nodes whose `field` vector is most similar to `q` (cosine
     /// similarity), returning up to `k` results with similarity ≥ `min`,
     /// sorted descending.
@@ -7620,7 +7772,13 @@ impl<F: Fs> GraphDb<F> {
         min: f64,
     ) -> Vec<(String, f64)> {
         // Ensure any HNSW blobs retained from the snapshot are deserialized
-        // before the first ANN query on a clean-open (no-WAL) path.
+        // before the first ANN query on a clean-open (no-WAL) path.  The
+        // section read has to come first: on a clean open nothing else has
+        // called it, so without it `retained_hnsw_blobs` is empty,
+        // `ensure_hnsw_loaded` caches an empty map in its `OnceLock`, and every
+        // approximate query on the handle runs brute force — correct results,
+        // silently off the index.  Both calls are idempotent and cheap once hot.
+        self.ensure_v8_base_sections_loaded();
         self.engine.ensure_hnsw_loaded();
         // L2-normalise query for cosine via dot product.
         let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -7714,6 +7872,8 @@ impl<F: Fs> GraphDb<F> {
         min: f64,
         mask: &crate::mask::NodeMask,
     ) -> Vec<(String, f64)> {
+        // Section read before the blob decode — see `find_similar_vector`.
+        self.ensure_v8_base_sections_loaded();
         self.engine.ensure_hnsw_loaded();
         let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
         if norm == 0.0 {
@@ -9029,11 +9189,24 @@ impl<F: Fs> GraphDb<F> {
             .any(|(k, vf, vu)| k == record_key && commit >= *vf && vu.is_none_or(|u| commit < u))
     }
 
-    pub fn node_history(&self, key: &str) -> Result<Vec<crate::history::HistoryEntry>> {
-        use crate::history::{HistoryChange, HistoryEntry};
+    /// Return the change history of node `key` by scanning the on-disk WAL.
+    ///
+    /// ## Horizon
+    ///
+    /// History reaches back only as far as the retained WAL. The returned
+    /// [`HistoryResult`](crate::history::HistoryResult) carries `total_commits`
+    /// (the exclusive upper bound for valid commit indices) and `horizon` (the
+    /// oldest commit still reachable). When `horizon > 0`, older events were
+    /// pruned and are not in `items`.
+    pub fn node_history(
+        &self,
+        key: &str,
+    ) -> Result<crate::history::HistoryResult<crate::history::HistoryEntry>> {
+        use crate::history::{HistoryChange, HistoryEntry, HistoryResult};
         use core_storage::wal::WalRecord;
 
         let (frames, _) = self.all_frames()?;
+        let total_commits = self.wal_horizon_floor + frames.len() as u64;
 
         // Resolve commit-bounded alias intervals for `key` (handles renames in the WAL).
         let alias_intervals = self.build_key_alias_intervals(&frames, key);
@@ -9199,7 +9372,11 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        Ok(out)
+        Ok(HistoryResult {
+            items: out,
+            total_commits,
+            horizon: self.wal_horizon_floor,
+        })
     }
 
     /// Return the per-edge change history between nodes `a` and `b` by scanning
@@ -9417,6 +9594,7 @@ impl<F: Fs> GraphDb<F> {
         Ok(HistoryResult {
             items: out,
             total_commits,
+            horizon: self.wal_horizon_floor,
         })
     }
 
@@ -9446,12 +9624,14 @@ impl<F: Fs> GraphDb<F> {
             return Err(GraphError::CommitOutOfRange {
                 commit: at_commit,
                 total: total_commits,
+                floor: self.wal_horizon_floor,
             });
         }
         if at_commit >= total_commits {
             return Err(GraphError::CommitOutOfRange {
                 commit: at_commit,
                 total: total_commits,
+                floor: self.wal_horizon_floor,
             });
         }
 
@@ -9607,6 +9787,7 @@ impl<F: Fs> GraphDb<F> {
             return Err(GraphError::CommitOutOfRange {
                 commit,
                 total: total_commits,
+                floor: self.wal_horizon_floor,
             });
         }
 
@@ -9875,14 +10056,14 @@ impl<F: Fs> GraphDb<F> {
         // as apply() sees them: `on_node_changed` withdraws the node under its
         // old value and refiles it under the new one, so the index must not
         // already reflect the change.
-        engine.reindex_all_load_ivf(
+        engine.reindex_all_load_state(
             &self.ids,
             &syms,
             &self.labels,
             build_props_view(&self.props, &self.base),
             self.engine.export_ivf_state(),
+            self.engine.export_hnsw_state_passthrough(),
         );
-        engine.load_hnsw_state(self.engine.export_hnsw_state_passthrough());
         engine.set_emit_deltas(true);
 
         // --- Apply the hypothetical change and re-derive. ---
@@ -9960,6 +10141,7 @@ impl<F: Fs> GraphDb<F> {
             edges: self.topo_view().edge_count(),
             rules,
             chain_truncations: self.engine.chain_truncations(),
+            history_floor: self.wal_horizon_floor,
         }
     }
 
@@ -10156,6 +10338,16 @@ impl<F: Fs> GraphDb<F> {
                 let archived_cols = old_base.columns().map_err(|e| GraphError::Corrupt {
                     detail: format!("v8 snapshot: columns section: {e:?}"),
                 })?;
+                // `None` when the base predates V9 — the migration path: its
+                // string columns still carry their own tables and this snapshot
+                // is the rewrite that collapses them into section 12.
+                let archived_strings =
+                    old_base
+                        .string_table()
+                        .transpose()
+                        .map_err(|e| GraphError::Corrupt {
+                            detail: format!("v8 snapshot: strings section: {e:?}"),
+                        })?;
                 let archived_edge_props =
                     old_base
                         .edge_props_section()
@@ -10177,6 +10369,7 @@ impl<F: Fs> GraphDb<F> {
                 encode_v8(
                     Some(archived_csr),
                     Some(archived_cols),
+                    archived_strings,
                     Some((archived_edge_props, edge_props_raw)),
                     Some(prov_raw),
                     &self.topo,
@@ -10233,6 +10426,7 @@ impl<F: Fs> GraphDb<F> {
             };
             let mut buf = Vec::new();
             encode_v8(
+                None,
                 None,
                 None,
                 None,

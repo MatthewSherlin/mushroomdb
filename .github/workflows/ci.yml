@@ -50,7 +50,7 @@ jobs:
       # Note: this test takes ~4.5 min (HNSW backfill 227 s + exact O(n²) ground truth ~43 s).
       - run: cargo test --release -p sim-harness -- approximate_recall_5k_timing --ignored --nocapture
 
-  # Every historical snapshot format (V5..V8) must open, migrate, and preserve
+  # Every historical snapshot format (V5..V9) must open, migrate, and preserve
   # data, forever. Naming this job separately means a regression says
   # "format-compat" in CI, not the generic "test" job name.
   format-compat:
@@ -60,8 +60,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
         with: { toolchain: "1.92.0" }
       # Golden-pin + migration matrix: every historical snapshot format
-      # (V5..V8) must open, migrate, and preserve data, forever.
+      # (V5..V9) must open, migrate, and preserve data, forever.
       - run: cargo test -p mushroomdb --test snapshot --test migrate
+      # The V9 string table is shared, not copied per column. This asserts the
+      # snapshot stays under 2x its property payload; it is #[ignore]'d out of
+      # the workspace run because it builds 12k nodes.
+      # Measured: 3,744,000 B of properties -> 5,200,624 B snapshot (1.39x);
+      # the same store under the per-column tables was 36,784,616 B (9.82x).
+      - run: cargo test --release -p mushroomdb --test snapshot -- snapshot_size_is_near_the_property_payload --ignored --nocapture
 
   ui:
     runs-on: ubuntu-latest

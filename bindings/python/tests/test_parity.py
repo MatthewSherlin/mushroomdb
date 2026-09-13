@@ -141,14 +141,14 @@ def test_upsert_node_inserts_then_updates(tmp_path):
 def test_upsert_node_touches_only_changed_provided_fields(tmp_path):
     db = GraphDb.open(str(tmp_path / "db"))
     db.insert_node("Person", "alice", {"team": "red", "age": 30, "city": "NYC"})
-    before = len(db.node_history("alice"))
+    before = len(db.node_history("alice")["history"])
 
     # Only `age` differs; `team` is unchanged and `city` is not provided.
     assert db.upsert_node("Person", "alice", {"team": "red", "age": 31}) == "updated"
     info = db.node_info("alice")
     assert info["props"] == {"team": "red", "age": 31, "city": "NYC"}
 
-    changes = db.node_history("alice")[before:]
+    changes = db.node_history("alice")["history"][before:]
     assert [c.get("field") for c in changes] == ["age"]
     db.close()
 
@@ -184,9 +184,9 @@ def test_upsert_node_label_mismatch_raises(tmp_path):
 def test_upsert_node_empty_props_on_existing_is_a_noop(tmp_path):
     db = GraphDb.open(str(tmp_path / "db"))
     db.insert_node("Person", "alice", {"team": "red"})
-    before = len(db.node_history("alice"))
+    before = len(db.node_history("alice")["history"])
     assert db.upsert_node("Person", "alice", {}) == "updated"
-    assert len(db.node_history("alice")) == before
+    assert len(db.node_history("alice")["history"]) == before
     assert db.node_info("alice")["props"] == {"team": "red"}
     db.close()
 

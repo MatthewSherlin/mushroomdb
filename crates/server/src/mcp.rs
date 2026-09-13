@@ -53,8 +53,8 @@ use crate::json::{
     parse_ingest_edges, result_set_json, rule_def_from_json,
 };
 use core_api::{
-    json_to_rows, json_to_value, AutoFk, GraphError, IngestOptions, MaskMode, NodeMask, SharedDb,
-    Value,
+    json_to_rows, json_to_value, AsOfScope, AutoFk, GraphError, IngestOptions, MaskMode, NodeMask,
+    SharedDb, Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -271,6 +271,52 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
     };
     if role.is_some() && mask_keys.is_some() {
         return CallOutcome::ToolErr("pass role or mask, not both".into());
+    }
+
+    // Optional time travel: a 0-based WAL commit index. The graph is read as
+    // of that commit; a `role` is still the role the store defines now, since
+    // `roles.json` is a sidecar and is never a WAL record.
+    let as_of = match args.get("as_of") {
+        None | Some(Js::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(n) => Some(n),
+            None => {
+                return CallOutcome::ToolErr(
+                    "as_of must be a non-negative integer commit index".into(),
+                )
+            }
+        },
+    };
+
+    if let Some(commit) = as_of {
+        // Stub mode discloses node existence, which is exactly the question an
+        // as-of read is asking. The two do not compose.
+        if args
+            .get("stub_hidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return CallOutcome::ToolErr(
+                "as_of (time-travel) does not compose with stub_hidden".into(),
+            );
+        }
+        let scope = match (role, &mask_keys) {
+            (Some(role), _) => AsOfScope::Role(role),
+            (None, Some(keys)) => AsOfScope::Keys(keys),
+            (None, None) => {
+                return match db.read().query_at(commit, cypher, &params) {
+                    Ok(rs) => CallOutcome::ToolOk(result_set_json(&rs)),
+                    Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+                }
+            }
+        };
+        return match db.read().query_at_scoped(commit, cypher, &params, scope) {
+            Ok(rs) => CallOutcome::ToolOk(result_set_json(&rs)),
+            Err(GraphError::KeyNotFound { key }) if key.starts_with("role:") => {
+                CallOutcome::ToolErr(format!("unknown role '{}'", &key["role:".len()..]))
+            }
+            Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+        };
     }
 
     if role.is_some() || mask_keys.is_some() {
@@ -761,15 +807,11 @@ fn tool_node_history(db: &SharedDb, args: &Js) -> CallOutcome {
         return CallOutcome::ToolErr("missing key".into());
     };
     let g = db.read();
-    let entries = match g.node_history(key) {
+    let result = match g.node_history(key) {
         Ok(e) => e,
         Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
     };
-    let total_commits = match g.wal_total_commits() {
-        Ok(n) => n,
-        Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
-    };
-    CallOutcome::ToolOk(node_history_json(key, &entries, total_commits))
+    CallOutcome::ToolOk(node_history_json(key, &result))
 }
 
 fn tool_edge_history(db: &SharedDb, args: &Js) -> CallOutcome {
@@ -1004,7 +1046,7 @@ fn graph_tools() -> Vec<Js> {
     let Js::Array(tools) = json!([
             {
                 "name": "query",
-                "description": "Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range, the property is not a list, or the index is not an integer, so a subscript never errors and never matches.",
+                "description": "Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Pass 'as_of' to answer from a past commit; it composes with 'role' or with 'mask'. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range, the property is not a list, or the index is not an integer, so a subscript never errors and never matches.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1020,7 +1062,12 @@ fn graph_tools() -> Vec<Js> {
                         },
                         "role": {
                             "type": "string",
-                            "description": "Answer as this role from the store's roles: only the nodes it may see."
+                            "description": "Answer as this role from the store's roles: only the nodes it may see. A role may also be narrowed by one property test (`status in [...]`), declared in the store's roles."
+                        },
+                        "as_of": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "0-based WAL commit index: answer from the graph as it was at that commit. Composes with 'role' or with 'mask' — never both, which is refused as it is without 'as_of' — and whichever is passed is resolved against the graph as it was then. Deleting a node does not remove it from a role's past, and a role's 'keys' resolve to whichever node held the key at that commit. Writes are refused."
                         }
                     },
                     "required": ["cypher"]
@@ -1081,7 +1128,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "stats",
-                "description": "How big is this store — live node, edge and rule counts.",
+                "description": "How big is this store — live node, edge and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
@@ -1162,7 +1209,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "node_history",
-                "description": "What has happened to K — every recorded change to one node, newest last. Events include NodeInserted, PropSet, PropRemoved, EdgeAdded, EdgeRemoved, and NodeDeleted. The response includes `total_commits` (the horizon upper bound). History is WAL-scoped — pre-snapshot commits are not visible.",
+                "description": "What has happened to K — every recorded change to one node, newest last. Events include NodeInserted, PropSet, PropRemoved, EdgeAdded, EdgeRemoved, and NodeDeleted. The response includes `total_commits` (the horizon upper bound) and `horizon`, the oldest commit still retained; events before it are gone. History is WAL-scoped — pre-snapshot commits are not visible.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1173,7 +1220,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "edge_history",
-                "description": "When did A and B become linked, and when did it break — the full add/retract lifecycle for every edge between the two keys. Includes derived (rule-attributed) edges via DerivedEdgeAdded/DerivedEdgeRetracted WAL markers. The response includes `total_commits` (the horizon upper bound).",
+                "description": "When did A and B become linked, and when did it break — the full add/retract lifecycle for every edge between the two keys. Includes derived (rule-attributed) edges via DerivedEdgeAdded/DerivedEdgeRetracted WAL markers. The response includes `total_commits` (the horizon upper bound) and `horizon`, the oldest commit still retained; events before it are gone.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1185,7 +1232,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "was_linked",
-                "description": "Were A and B linked at commit C — whether an edge of `edge_type` existed between the two keys (either direction) at that WAL commit. Returns an error when `at_commit` is outside the visible horizon (`0..total_commits`).",
+                "description": "Were A and B linked at commit C — whether an edge of `edge_type` existed between the two keys (either direction) at that WAL commit. Returns an error when `at_commit` is outside the retained horizon (`horizon..total_commits`).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

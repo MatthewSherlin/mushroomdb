@@ -34,8 +34,7 @@
 //! entry remains green through view-heavy workloads because view updates
 //! bypass the engine's delta path entirely.
 
-use core_storage::v8::layout::ArchivedColumns;
-use core_storage::v8::seam::{ColumnsView, TopologyView};
+use core_storage::v8::seam::{BaseColumns, ColumnsView, TopologyView};
 use core_storage::{ColumnStore, Direction, IdMap, Interner, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -275,7 +274,7 @@ impl ViewStore {
         ids: &IdMap,
         syms: &Interner,
         labels: &[u32],
-        base_cols: Option<&ArchivedColumns>,
+        base_cols: Option<BaseColumns<'_>>,
     ) {
         for def in self.views.values() {
             let Some(et_sym) = syms.get(def.edge_type()) else {
@@ -315,7 +314,7 @@ impl ViewStore {
         ids: &IdMap,
         syms: &Interner,
         labels: &[u32],
-        base_cols: Option<&ArchivedColumns>,
+        base_cols: Option<BaseColumns<'_>>,
     ) {
         for def in self.views.values() {
             let ViewSource::NeighborAgg {
@@ -437,11 +436,13 @@ impl ViewStore {
 /// overlay-only props added during WAL replay or live mutations.
 fn build_cols_view<'a>(
     overlay: &'a ColumnStore,
-    base_cols: Option<&'a ArchivedColumns>,
+    base_cols: Option<BaseColumns<'a>>,
 ) -> ColumnsView<'a> {
     match base_cols {
         None => ColumnsView::owned(overlay),
-        Some(b) => ColumnsView::with_base(overlay, b),
+        // The shared table travels with the columns: without it a V9 base's
+        // string columns, whose own tables are empty, read back as absent.
+        Some(b) => ColumnsView::with_base(overlay, b.cols).with_shared_strings(b.strings),
     }
 }
 
@@ -628,7 +629,7 @@ fn update_node_view(
     ids: &IdMap,
     syms: &Interner,
     labels: &[u32],
-    base_cols: Option<&ArchivedColumns>,
+    base_cols: Option<BaseColumns<'_>>,
 ) {
     // Label check: only subjects with the matching label get this view.
     let Some(label_sym) = syms.get(&def.label) else {

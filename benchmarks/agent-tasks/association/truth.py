@@ -603,7 +603,7 @@ def _history_keys(rng: random.Random, world: dict[str, Any], n: int) -> list[str
 
 def _history_problems(db, world: dict[str, Any], key: str) -> list[str]:
     """Does the engine's per-node history match the changelog for this key?"""
-    events = db.node_history(key)
+    events = db.node_history(key)["history"]
     kinds = [e["kind"] for e in events]
     changes = [c for c in world["changes"] if c["key"] == key]
     problems: list[str] = []

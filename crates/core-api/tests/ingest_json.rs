@@ -179,6 +179,6 @@ fn fk_skip_field_and_reason_are_accessible() {
 
 /// Binding: format version lives on GraphDb, not Stats.
 #[test]
-fn format_version_is_eight() {
-    assert_eq!(GraphDb::<RealFs>::format_version(), 8);
+fn format_version_is_nine() {
+    assert_eq!(GraphDb::<RealFs>::format_version(), 9);
 }

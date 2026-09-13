@@ -41,6 +41,10 @@ The tooling already bounds WAL-only-from-genesis exposure:
 (or snapshot on a schedule). The cost of a periodic snapshot is far smaller than
 a from-genesis rebuild, and it caps how much WAL a crash can leave to replay.
 
+For the operational side of all this — which directory to mount, how to back it
+up, and how `serve --restore-from` seeds a fresh volume on boot — see
+[Running it as a service](service.md).
+
 ## A snapshot does not cost you the past
 
 Folding the WAL into a snapshot is what makes the next open fast, but the WAL is
@@ -52,8 +56,9 @@ So every snapshot mushroomdb takes **on its own** — the ingest's, a
 no flags **archive** the WAL rather than dropping it. The frames are renamed to
 `wal.<N>.archive`, which the history reads still scan and the open path does
 not. You end up with a store that opens fast *and* remembers. An automatic
-snapshot keeps the newest eight archives so the directory cannot grow without
-end; see **Disk** below for what that bound costs.
+snapshot keeps every archive: history is the thing the archives exist for,
+and nothing deletes it unless you ask; see **Disk** below for what that costs
+and how to bound it.
 
 Three flags choose otherwise:
 
@@ -74,24 +79,31 @@ one leaves another `wal.<N>.archive` behind and nothing deletes it. On a
 repository that syncs on every commit that is one new archive per 4 MiB of WAL
 churn, indefinitely.
 
-So the automatic path is bounded and the manual one is not:
+So retention is opt-in, not automatic — nothing prunes unless a caller asks:
 
 | Snapshot | Archives kept |
 |---|---|
-| automatic — the ingest's, `sync`, a `--snapshot-every` tick, shutdown | the newest 8 |
+| automatic — the ingest's, `sync`, a `--snapshot-every` tick, shutdown | all of them |
 | `mushroomdb snapshot <db>` | all of them |
 | `mushroomdb snapshot <db> --retention N` | the newest N |
 
-Steady-state archive size is therefore bounded by 8 × the 4 MiB snapshot
-threshold, plus whatever a single oversized run archived in one go. Pruning is
-not free: it advances the history horizon, so `node_history`, `edge_history` and
-`was_linked` stop reaching commits below it, and because the first prune breaks
-the `wal.genesis` chain, `asof` from then on answers for commits after the last
-snapshot rather than replaying into the archives.
+Left alone, the directory grows with churn: one new archive per 4 MiB of WAL
+on a repository that syncs on every commit, indefinitely. `mushroomdb stats`
+and `mushroomdb doctor` both print where history currently starts, so a
+growing directory is never a surprise. `mushroomdb snapshot <db> --retention
+8` is how to bound it once that trade is worth making. Pruning is not free:
+it advances the history horizon, so `node_history`, `edge_history` and
+`was_linked` stop reaching commits below it, and because the first prune
+breaks the `wal.genesis` chain, `asof` from then on answers for commits after
+the last snapshot rather than replaying into the archives.
 
 The other added cost is one `snapshot.bin`, which is rewritten in place rather
-than accumulated — 37 MB for an 8 MB WAL on a 435-file repository, since a
-snapshot is an expanded image rather than a log.
+than accumulated. A snapshot is an expanded image rather than a log, so it is
+sized by the data it holds and not by the WAL it replaces: a store of 3.7 MB of
+string properties spread over eight columns snapshots to 5.2 MB, 1.39× its
+property payload. A snapshot carries **one** string table, not one per column —
+before 0.6.5 the same store wrote eight copies of the table and came to 36.8 MB,
+9.82×. That change moves the format to V9; see **Recovery vs. refresh** below.
 
 ## Recovery vs. refresh
 
@@ -102,6 +114,13 @@ replayed on top of it. A torn trailing frame — the signature of a crash mid-
 append — is dropped, and with `repair_wal` on (the default) the valid prefix is
 written back over it. That truncation is correct crash recovery: the frame was
 never fsynced, so no caller was ever told it committed.
+
+Recovery is also where the snapshot format is upgraded, and that upgrade is
+one-way: a store snapshotted by 0.6.5 is format V9, and an earlier binary cannot
+open it — it refuses with `snapshot: unsupported version 9` rather than reading
+it wrongly. The first read-write open of a V5–V8 store rewrites `snapshot.bin`
+at V9 and keeps the original beside it as `snapshot.bin.bak` until the next
+clean open, so the way back is to restore that file with the older binary.
 
 **Refresh** happens while the store is open, and it is not recovery. A handle
 tracks how much of the WAL it has applied and, on `refresh()`, decodes only what

@@ -71,10 +71,16 @@ pub enum GraphError {
     },
     /// Attempted mutation on a read-only as-of instance.
     ReadOnly,
-    /// Requested commit index is beyond the valid range.
+    /// Requested commit index is outside the retained range.
+    ///
+    /// The valid range is `floor..total`: `floor` is the oldest commit still
+    /// reachable (the WAL horizon floor, `0` when nothing has been pruned) and
+    /// `total` is the exclusive upper bound. A `floor > 0` means older events
+    /// were pruned and are not retained; retrying at commit 0 will fail too.
     CommitOutOfRange {
         commit: u64,
         total: u64,
+        floor: u64,
     },
     /// Attempted to write to a view-managed property.
     ViewPropReadOnly {
@@ -137,9 +143,22 @@ impl std::fmt::Display for GraphError {
             GraphError::QueryError { detail } => write!(f, "query error: {detail}"),
             GraphError::IngestError { detail } => write!(f, "ingest error: {detail}"),
             GraphError::ReadOnly => write!(f, "as-of instances are read-only"),
-            GraphError::CommitOutOfRange { commit, total } => write!(
+            GraphError::CommitOutOfRange {
+                commit,
+                total,
+                floor: 0,
+            } => write!(
                 f,
                 "commit {commit} is out of range; valid range is 0..{total}"
+            ),
+            GraphError::CommitOutOfRange {
+                commit,
+                total,
+                floor,
+            } => write!(
+                f,
+                "commit {commit} is out of range; valid range is {floor}..{total} \
+                 — events before commit {floor} are not retained"
             ),
             GraphError::ViewPropReadOnly { view_name } => write!(
                 f,

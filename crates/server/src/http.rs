@@ -23,9 +23,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use core_api::{
-    is_write_query, json_to_rows, json_to_value, AutoFk, BackupReport, BatchOp, DegreeConfig, Dir,
-    GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig, ResultSet, SharedDb,
-    SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
+    is_write_query, json_to_rows, json_to_value, AsOfScope, AutoFk, BackupReport, BatchOp,
+    DegreeConfig, Dir, GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig, ResultSet,
+    SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -810,12 +810,15 @@ async fn query(
         Some(_) => return err_response("mask must be an array of strings"),
     };
 
-    // Time-travel is currently supported only on the full-token, unmasked read
-    // path (temporal + RBAC-mask composition is a follow-on).
-    if as_of.is_some() && (matches!(identity, AuthIdentity::Role(_)) || mask_keys.is_some()) {
-        return err_response(
-            "as_of (time-travel) is not yet supported with role tokens or a client mask",
-        );
+    // Stub mode discloses node existence, which is exactly the question an
+    // as-of read is asking. The two do not compose.
+    if as_of.is_some()
+        && body
+            .get("stub_hidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        return err_response("as_of (time-travel) does not compose with stub_hidden");
     }
 
     // Role token: write Cypher routes to query_write_authz (scope + mask
@@ -826,6 +829,9 @@ async fn query(
             Ok(b) => b,
             Err(e) => return err_response(e),
         };
+        if as_of.is_some() && is_write {
+            return err_response("as_of (time-travel) queries are read-only");
+        }
         if is_write {
             let role = role_name.clone();
             let cypher_c = cypher.clone();
@@ -838,6 +844,24 @@ async fn query(
             {
                 Ok(rs) => format_query_result(rs, format),
                 Err(resp) => resp,
+            };
+        }
+        // Time travel: the role's keys and labels are resolved against the
+        // graph as it was at `commit`, and a client mask intersects them
+        // there.  The role *definition* is the current one — `roles.json` is a
+        // sidecar and is never a WAL record, so it has no past version.
+        if let Some(commit) = as_of {
+            let scope = match mask_keys {
+                Some(ref keys) => AsOfScope::RoleAndKeys(role_name, keys),
+                None => AsOfScope::Role(role_name),
+            };
+            return match state
+                .db
+                .read()
+                .query_at_scoped(commit, &cypher, &params, scope)
+            {
+                Ok(rs) => format_query_result(rs, format),
+                Err(e) => role_mask_err(e),
             };
         }
         let snap = state.db.reader();
@@ -873,6 +897,19 @@ async fn query(
     // behaviour is identical in both modes (hidden nodes are excluded from
     // query results regardless of mode).
     if let Some(ref keys) = mask_keys {
+        // Time travel: the allow-list resolves against the as-of graph, so a
+        // key that did not exist at `commit` resolves to nothing.
+        if let Some(commit) = as_of {
+            return match state.db.read().query_at_scoped(
+                commit,
+                &cypher,
+                &params,
+                AsOfScope::Keys(keys),
+            ) {
+                Ok(rs) => format_query_result(rs, format),
+                Err(e) => graph_err(e),
+            };
+        }
         let stub_hidden = body
             .get("stub_hidden")
             .and_then(|v| v.as_bool())
@@ -1867,7 +1904,9 @@ async fn set_node_prop(
 
 /// `GET /node/{key}/history` — return the WAL change history for `key`.
 ///
-/// Response: `{ key, history: [{commit, change}], total_commits }`.
+/// Response: `{ key, history: [{commit, change}], total_commits, horizon }`.
+/// `horizon` is the oldest commit history still reaches; events before it were
+/// pruned and are not in `history`.
 /// Role tokens: if `key` is hidden by the role mask, responds with 404
 /// (same shape as querying an absent key — no existence oracle).
 async fn node_history_handler(
@@ -1885,27 +1924,30 @@ async fn node_history_handler(
         if !role_mask.contains_node(&*g, &key) {
             return key_not_found(key);
         }
-        let entries = match g.node_history(&key) {
+        let result = match g.node_history(&key) {
             Ok(e) => e,
-            Err(e) => return graph_err(e),
-        };
-        let total_commits = match g.wal_total_commits() {
-            Ok(n) => n,
             Err(e) => return graph_err(e),
         };
         // Filter EdgeAdded/EdgeRemoved entries whose `other` endpoint is hidden.
         // A role token must not learn about hidden nodes via edge history events —
         // mirrors the same protection in `node_edges` (http.rs ~978-989).
         use core_api::HistoryChange;
-        let visible: Vec<_> = entries
-            .into_iter()
-            .filter(|entry| match &entry.change {
-                HistoryChange::EdgeAdded { other, .. }
-                | HistoryChange::EdgeRemoved { other, .. } => role_mask.contains_node(&*g, other),
-                _ => true,
-            })
-            .collect();
-        return json_ok(node_history_json(&key, &visible, total_commits));
+        let visible = core_api::HistoryResult {
+            total_commits: result.total_commits,
+            horizon: result.horizon,
+            items: result
+                .items
+                .into_iter()
+                .filter(|entry| match &entry.change {
+                    HistoryChange::EdgeAdded { other, .. }
+                    | HistoryChange::EdgeRemoved { other, .. } => {
+                        role_mask.contains_node(&*g, other)
+                    }
+                    _ => true,
+                })
+                .collect(),
+        };
+        return json_ok(node_history_json(&key, &visible));
     }
     // Full identity: no masking. Return 404 for absent keys (consistent with
     // GET /node/{key} and the Role branch above).
@@ -1913,20 +1955,18 @@ async fn node_history_handler(
     if !g.has_node(&key) {
         return key_not_found(key);
     }
-    let entries = match g.node_history(&key) {
+    let result = match g.node_history(&key) {
         Ok(e) => e,
         Err(e) => return graph_err(e),
     };
-    let total_commits = match g.wal_total_commits() {
-        Ok(n) => n,
-        Err(e) => return graph_err(e),
-    };
-    json_ok(node_history_json(&key, &entries, total_commits))
+    json_ok(node_history_json(&key, &result))
 }
 
 /// `GET /history/edge?a=&b=` — return the edge lifecycle between two nodes.
 ///
-/// Response: `{ a, b, events: [{edge_type, commit, event, rule}], total_commits }`.
+/// Response: `{ a, b, events: [{edge_type, commit, event, rule}], total_commits, horizon }`.
+/// `horizon` is the oldest commit history still reaches; events before it were
+/// pruned and are not in `events`.
 /// Role tokens: BOTH `a` AND `b` must be visible in the role mask, otherwise
 /// responds with 404 for the first invisible key (no existence oracle).
 async fn edge_history_handler(
@@ -2017,9 +2057,9 @@ async fn was_linked_handler(
                 "a": a, "b": b, "edge_type": edge_type,
                 "at_commit": at_commit, "linked": linked,
             })),
-            Err(GraphError::CommitOutOfRange { .. }) => (
+            Err(e @ GraphError::CommitOutOfRange { .. }) => (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("commit {at_commit} is out of range")})),
+                Json(json!({"error": e.to_string()})),
             )
                 .into_response(),
             Err(e) => graph_err(e),
@@ -2033,9 +2073,9 @@ async fn was_linked_handler(
             "a": a, "b": b, "edge_type": edge_type,
             "at_commit": at_commit, "linked": linked,
         })),
-        Err(GraphError::CommitOutOfRange { .. }) => (
+        Err(e @ GraphError::CommitOutOfRange { .. }) => (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("commit {at_commit} is out of range")})),
+            Json(json!({"error": e.to_string()})),
         )
             .into_response(),
         Err(e) => graph_err(e),

@@ -223,15 +223,17 @@ pub(crate) fn edge_history_result_json(
         "b": b,
         "events": events,
         "total_commits": result.total_commits,
+        "horizon": result.horizon,
     })
 }
 
-pub(crate) fn node_history_json(key: &str, entries: &[HistoryEntry], total_commits: u64) -> Js {
-    let history: Vec<Js> = entries.iter().map(history_entry_json).collect();
+pub(crate) fn node_history_json(key: &str, result: &HistoryResult<HistoryEntry>) -> Js {
+    let history: Vec<Js> = result.items.iter().map(history_entry_json).collect();
     json!({
         "key": key,
         "history": history,
-        "total_commits": total_commits,
+        "total_commits": result.total_commits,
+        "horizon": result.horizon,
     })
 }
 

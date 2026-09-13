@@ -8,7 +8,10 @@
 //! - pending_delta_count == 0 after open_at (mirror of T1's post-loop assert)
 //! - Commit out of range returns CommitOutOfRange
 
-use core_api::{Direction, GraphDb, GraphError, IngestOptions, Predicate, RuleDef, Value};
+use core_api::{
+    AsOfScope, Direction, GraphDb, GraphError, IngestOptions, Predicate, ResultSet, RoleDef,
+    RuleDef, Schema, Value,
+};
 use core_storage::wal::wal_commits;
 use std::path::PathBuf;
 
@@ -308,6 +311,7 @@ fn open_at_out_of_range_returns_error() {
         GraphError::CommitOutOfRange {
             commit: 7,
             total: 7,
+            floor: 0,
         } => {}
         other => panic!("expected CommitOutOfRange{{7,7}}, got {other:?}"),
     }
@@ -320,6 +324,7 @@ fn open_at_out_of_range_returns_error() {
         GraphError::CommitOutOfRange {
             commit: 0,
             total: 0,
+            floor: 0,
         } => {}
         other => panic!("expected CommitOutOfRange{{0,0}} for empty WAL, got {other:?}"),
     }
@@ -380,6 +385,7 @@ fn torn_tail_open_at_sees_fewer_commits() {
         GraphError::CommitOutOfRange {
             commit: 2,
             total: 2,
+            floor: 0,
         } => {}
         other => panic!("expected CommitOutOfRange{{2,2}}, got {other:?}"),
     }
@@ -580,4 +586,362 @@ fn read_ops_work_on_as_of_instance() {
     // node_edges
     let edges = db.node_edges("a").unwrap();
     assert!(!edges.is_empty(), "commit 2: a has edges");
+}
+
+// ── As-of composed with a role or a key allow-list (v0.6.5 §6) ───────────────
+
+/// Node keys of a `RETURN n` result set, in row order.
+fn keys_of(rs: &ResultSet) -> Vec<String> {
+    (0..rs.len())
+        .filter_map(|i| match rs.row(i)[0].as_ref() {
+            Some(Value::Str(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A role mask resolved on an as-of view sees the graph as it was then.
+#[test]
+fn query_at_scoped_masks_at_the_requested_commit() {
+    let dir = tmp("asof-scoped");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Public", "p1", vec![]).unwrap(); // commit 0
+    db.apply_schema(&Schema {
+        roles: vec![RoleDef {
+            name: "reader".into(),
+            keys: vec![],
+            labels: vec!["Public".into()],
+            visible_where: None,
+            write: None,
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    let at_one = db.wal_total_commits().unwrap() - 1;
+    db.insert_node("Public", "p2", vec![]).unwrap(); // later
+    db.insert_node("Secret", "s1", vec![]).unwrap();
+
+    let params = std::collections::BTreeMap::new();
+    let now = db
+        .query_at_scoped(
+            db.wal_total_commits().unwrap() - 1,
+            "MATCH (n) RETURN n",
+            &params,
+            AsOfScope::Role("reader"),
+        )
+        .unwrap();
+    assert_eq!(
+        keys_of(&now),
+        vec!["p1", "p2"],
+        "Secret is never visible to reader"
+    );
+
+    let then = db
+        .query_at_scoped(
+            at_one,
+            "MATCH (n) RETURN n",
+            &params,
+            AsOfScope::Role("reader"),
+        )
+        .unwrap();
+    assert_eq!(
+        keys_of(&then),
+        vec!["p1"],
+        "p2 did not exist at that commit"
+    );
+
+    // Writes stay refused, exactly as query_at refuses them.
+    assert!(db
+        .query_at_scoped(
+            at_one,
+            "CREATE (x:Public {id:'z'})",
+            &params,
+            AsOfScope::Role("reader")
+        )
+        .is_err());
+
+    // A key allow-list resolves against the as-of graph too.
+    let ks = vec!["p1".to_string(), "p2".to_string()];
+    let scoped = db
+        .query_at_scoped(at_one, "MATCH (n) RETURN n", &params, AsOfScope::Keys(&ks))
+        .unwrap();
+    assert_eq!(keys_of(&scoped), vec!["p1"]);
+
+    // A role intersected with a client allow-list never widens the role.
+    let wide = vec!["p1".to_string(), "s1".to_string()];
+    let both = db
+        .query_at_scoped(
+            db.wal_total_commits().unwrap() - 1,
+            "MATCH (n) RETURN n",
+            &params,
+            AsOfScope::RoleAndKeys("reader", &wide),
+        )
+        .unwrap();
+    assert_eq!(keys_of(&both), vec!["p1"], "s1 is outside the role");
+
+    // An out-of-range commit carries the retained range.
+    match db.query_at_scoped(
+        9_999,
+        "MATCH (n) RETURN n",
+        &params,
+        AsOfScope::Role("reader"),
+    ) {
+        Err(GraphError::CommitOutOfRange { commit, .. }) => assert_eq!(commit, 9_999),
+        other => panic!("expected CommitOutOfRange, got {other:?}"),
+    }
+}
+
+/// Node-key pairs of a two-column `RETURN a, b` result set, in row order.
+fn pairs_of(rs: &ResultSet) -> Vec<(String, String)> {
+    (0..rs.len())
+        .filter_map(|i| {
+            let row = rs.row(i);
+            match (row[0].as_ref(), row[1].as_ref()) {
+                (Some(Value::Str(a)), Some(Value::Str(b))) => Some((a.clone(), b.clone())),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Deleting a node does not remove it from a role's past.
+///
+/// This is the spec's semantics, and the one an operator can mistake for a
+/// revocation: `DELETE` changes the present, not the WAL.  To take history
+/// away from a role, prune the archives or narrow the role.
+#[test]
+fn query_at_scoped_deletion_is_not_retroactive() {
+    let dir = tmp("asof-scoped-delete");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.apply_schema(&Schema {
+        roles: vec![
+            RoleDef {
+                name: "by_label".into(),
+                keys: vec![],
+                labels: vec!["Public".into()],
+                visible_where: None,
+                write: None,
+            },
+            RoleDef {
+                name: "by_key".into(),
+                keys: vec!["p1".into()],
+                labels: vec![],
+                visible_where: None,
+                write: None,
+            },
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+    db.insert_node("Public", "p1", vec![]).unwrap();
+    db.insert_node("Public", "p2", vec![]).unwrap();
+    db.insert_edge("LINK", "p1", "p2").unwrap();
+    let before = db.wal_total_commits().unwrap() - 1;
+
+    db.delete_node("p1").unwrap();
+    let after = db.wal_total_commits().unwrap() - 1;
+
+    let params = std::collections::BTreeMap::new();
+
+    // The label leg: p1 is gone now, and still there then — with its edge.
+    let now = db
+        .query_at_scoped(
+            after,
+            "MATCH (n) RETURN n",
+            &params,
+            AsOfScope::Role("by_label"),
+        )
+        .unwrap();
+    assert_eq!(keys_of(&now), vec!["p2"], "p1 is deleted now");
+
+    let then = db
+        .query_at_scoped(
+            before,
+            "MATCH (n) RETURN n",
+            &params,
+            AsOfScope::Role("by_label"),
+        )
+        .unwrap();
+    assert_eq!(
+        keys_of(&then),
+        vec!["p1", "p2"],
+        "deleting p1 does not remove it from the role's past"
+    );
+
+    let edges = db
+        .query_at_scoped(
+            before,
+            "MATCH (a)-[:LINK]->(b) RETURN a, b",
+            &params,
+            AsOfScope::Role("by_label"),
+        )
+        .unwrap();
+    assert_eq!(
+        pairs_of(&edges),
+        vec![("p1".to_string(), "p2".to_string())],
+        "the deleted node's edges are readable at a commit where it existed"
+    );
+
+    // The key leg: an explicit key survives its node's deletion, in the past.
+    let by_key_now = db
+        .query_at_scoped(
+            after,
+            "MATCH (n) RETURN n",
+            &params,
+            AsOfScope::Role("by_key"),
+        )
+        .unwrap();
+    assert!(keys_of(&by_key_now).is_empty(), "p1 is deleted now");
+
+    let by_key_then = db
+        .query_at_scoped(
+            before,
+            "MATCH (n) RETURN n",
+            &params,
+            AsOfScope::Role("by_key"),
+        )
+        .unwrap();
+    assert_eq!(
+        keys_of(&by_key_then),
+        vec!["p1"],
+        "keys:[p1] still resolves at a commit where p1 was live"
+    );
+}
+
+/// A role's `keys` name whichever node held that key at the commit asked for.
+///
+/// Keys are not identities: renaming frees a key for reuse, and an as-of read
+/// resolves the key against the graph as it was then, not as it is now.
+#[test]
+fn query_at_scoped_keys_follow_the_commit_not_todays_owner() {
+    let dir = tmp("asof-scoped-reuse");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.apply_schema(&Schema {
+        roles: vec![RoleDef {
+            name: "by_key".into(),
+            keys: vec!["alice".into()],
+            labels: vec![],
+            visible_where: None,
+            write: None,
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    // `alice` is a Secret node to begin with.
+    db.insert_node(
+        "Secret",
+        "alice",
+        vec![("tag".into(), Value::Str("old".into()))],
+    )
+    .unwrap();
+    let before = db.wal_total_commits().unwrap() - 1;
+
+    // Rename frees the key; a brand-new Public node takes it.
+    db.rename_node("alice", "zed").unwrap();
+    db.insert_node(
+        "Public",
+        "alice",
+        vec![("tag".into(), Value::Str("new".into()))],
+    )
+    .unwrap();
+    let after = db.wal_total_commits().unwrap() - 1;
+
+    let params = std::collections::BTreeMap::new();
+    let tag_at = |commit: u64| -> Vec<String> {
+        let rs = db
+            .query_at_scoped(
+                commit,
+                "MATCH (n) RETURN n.tag",
+                &params,
+                AsOfScope::Role("by_key"),
+            )
+            .unwrap();
+        (0..rs.len())
+            .filter_map(|i| match rs.row(i)[0].as_ref() {
+                Some(Value::Str(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        tag_at(before),
+        vec!["old"],
+        "at that commit `alice` was the Secret node, so that is what the role reads"
+    );
+    assert_eq!(
+        tag_at(after),
+        vec!["new"],
+        "today `alice` is the new Public node"
+    );
+}
+
+/// Spec §6.4: an as-of role read is edge-for-edge the hand-built mask on the
+/// same commit — no edge the mask would drop survives, none it would keep is
+/// lost.
+#[test]
+fn query_at_scoped_edges_match_a_hand_built_mask_at_the_same_commit() {
+    let dir = tmp("asof-scoped-edges");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.apply_schema(&Schema {
+        roles: vec![RoleDef {
+            name: "reader".into(),
+            keys: vec![],
+            labels: vec!["Public".into()],
+            visible_where: None,
+            write: None,
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    for key in ["p1", "p2", "p3"] {
+        db.insert_node("Public", key, vec![]).unwrap();
+    }
+    db.insert_node("Secret", "s1", vec![]).unwrap();
+    db.insert_edge("LINK", "p1", "p2").unwrap(); // both visible
+    db.insert_edge("LINK", "p2", "p3").unwrap(); // both visible
+    db.insert_edge("LINK", "p1", "s1").unwrap(); // crosses the mask
+    db.insert_edge("LINK", "s1", "p3").unwrap(); // crosses the mask
+    let at = db.wal_total_commits().unwrap() - 1;
+
+    // Churn after the commit under test; none of it may leak into the answer.
+    db.insert_node("Public", "p4", vec![]).unwrap();
+    db.insert_edge("LINK", "p3", "p4").unwrap();
+
+    let params = std::collections::BTreeMap::new();
+    let cypher = "MATCH (a)-[:LINK]->(b) RETURN a, b";
+
+    // Hand-built expectation: the unrestricted as-of answer, filtered to rows
+    // whose endpoints both carried `Public` at that same commit.
+    let visible: std::collections::HashSet<String> = keys_of(
+        &db.query_at(at, "MATCH (n:Public) RETURN n", &params)
+            .unwrap(),
+    )
+    .into_iter()
+    .collect();
+    let unrestricted = pairs_of(&db.query_at(at, cypher, &params).unwrap());
+    let expected: Vec<(String, String)> = unrestricted
+        .iter()
+        .filter(|(a, b)| visible.contains(a) && visible.contains(b))
+        .cloned()
+        .collect();
+    assert_eq!(
+        expected.len(),
+        2,
+        "the fixture must keep some edges and drop others: {unrestricted:?}"
+    );
+
+    let got = pairs_of(
+        &db.query_at_scoped(at, cypher, &params, AsOfScope::Role("reader"))
+            .unwrap(),
+    );
+    assert_eq!(got, expected, "edge-for-edge with the hand-built mask");
+    assert!(
+        !got.iter().any(|(a, b)| a == "s1" || b == "s1"),
+        "an edge with a hidden endpoint is dropped: {got:?}"
+    );
+    assert!(
+        !got.iter().any(|(a, b)| a == "p4" || b == "p4"),
+        "nothing after the commit leaks in: {got:?}"
+    );
 }

@@ -1138,10 +1138,13 @@ fn v6_snapshot_roundtrip() {
     assert_eq!(db.node_count(), 3);
     assert_eq!(db.edge_count(), 1);
     assert_eq!(db.get_prop("a", "v"), Some(Value::Int(7)));
-    // Verify the snapshot file actually uses V8 container.
+    // Verify the snapshot file actually uses the current mmap-able container.
     let snap = std::fs::read(dir.join("snapshot.bin")).unwrap();
     assert_eq!(&snap[0..4], b"GDB1");
-    assert_eq!(u16::from_le_bytes([snap[4], snap[5]]), 8);
+    assert_eq!(
+        u16::from_le_bytes([snap[4], snap[5]]),
+        core_storage::snapshot::VERSION
+    );
 }
 
 /// V4-refuse is unchanged by V6: a V4-stamped snapshot must still be rejected.
@@ -1514,6 +1517,41 @@ fn golden_v8_pin() {
         db.get_prop("a", "v"),
         Some(Value::Int(42)),
         "V8 fixture must preserve prop v=42 on node 'a'"
+    );
+    assert_eq!(db.neighbors("a", "E", Direction::Out).unwrap(), vec!["b"]);
+}
+
+/// Golden V9 fixture pin: `snapshot()` writes VERSION=9 — the V8 container with
+/// one shared string table (section 12) instead of a copy inside every string
+/// column. Decoding the committed fixture verifies the V9 wire format is stable.
+/// V5-V8 snapshots are still decoded by their own paths, unedited, beside this.
+///
+/// To regenerate (only for an intentional VERSION bump):
+/// `cargo run -p mushroomdb --example gen_golden_fixture -- crates/core-api/tests/fixtures/golden_v9.bin`
+#[test]
+fn golden_v9_pin() {
+    let snap_bytes = include_bytes!("fixtures/golden_v9.bin");
+    assert_eq!(
+        &snap_bytes[0..4],
+        b"GDB1",
+        "V9 fixture must start with GDB1 magic"
+    );
+    assert_eq!(
+        u16::from_le_bytes([snap_bytes[4], snap_bytes[5]]),
+        9,
+        "V9 fixture version field must be 9"
+    );
+    let dir = tmp("golden-v9-pin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("snapshot.bin"), snap_bytes).unwrap();
+    std::fs::write(dir.join("wal.bin"), b"").unwrap();
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.node_count(), 2, "V9 fixture must decode to 2 nodes");
+    assert_eq!(db.edge_count(), 1, "V9 fixture must decode to 1 edge");
+    assert_eq!(
+        db.get_prop("a", "v"),
+        Some(Value::Int(42)),
+        "V9 fixture must preserve prop v=42 on node 'a'"
     );
     assert_eq!(db.neighbors("a", "E", Direction::Out).unwrap(), vec!["b"]);
 }
@@ -2485,6 +2523,80 @@ fn verify_snapshot_structural_pass_and_corruption_detection() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `verify` must structurally validate the shared string table (section 12),
+/// not merely CRC it.
+///
+/// Section 12 is a large section, so `section_bytes` skips its per-touch CRC
+/// during normal operation; `verify_integrity` does recompute it, along with
+/// every other section's, but a checksum mismatch surfaces as an `Err` *row*
+/// in the returned vector, not as an outer `Err`. The outer `Err` this test
+/// asserts on can therefore only come from the bounds check or the rkyv
+/// structural pass, and the assertion on the message pins it to the latter.
+/// The CRC-recomputing variant — which repairs the checksums first, so that
+/// even the row is `Ok` and only the structural pass can reject the crafted
+/// snapshot — lives in `core-storage` as
+/// `verify_rejects_a_structurally_corrupt_string_table`.
+#[test]
+fn verify_rejects_a_corrupted_string_table() {
+    let dir = tmp("verify-strings");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for n in 0..32u32 {
+            db.insert_node(
+                "N",
+                &format!("n{n}"),
+                vec![("tag".into(), Value::Str(format!("tag-value-{n}")))],
+            )
+            .unwrap();
+        }
+        db.snapshot().unwrap();
+    }
+    let path = dir.join("snapshot.bin");
+    let healthy = std::fs::read(&path).unwrap();
+    assert_eq!(
+        u16::from_le_bytes([healthy[4], healthy[5]]),
+        core_storage::snapshot::VERSION,
+        "the store must be at the current version before corrupting it"
+    );
+    core_api::verify_snapshot(&dir).expect("a healthy V9 snapshot must verify");
+
+    // Locate section 12 in the directory.
+    let section_count = u16::from_le_bytes([healthy[6], healthy[7]]) as usize;
+    let mut entry = None;
+    for i in 0..section_count {
+        let base = 8 + i * 16;
+        if healthy[base] == 12 {
+            let off = u32::from_le_bytes(healthy[base + 4..base + 8].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(healthy[base + 8..base + 12].try_into().unwrap()) as usize;
+            entry = Some((off, len));
+            break;
+        }
+    }
+    let (off, len) = entry.expect("a V9 snapshot must carry section 12");
+    assert!(len > 16, "section 12 must hold a real table, got {len} B");
+
+    // Smash the root relative pointer — the last 8 bytes of the payload.
+    let mut detected_any = false;
+    for byte in (len - 8)..len {
+        let mut bytes = healthy.clone();
+        bytes[off + byte] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        if let Err(e) = core_api::verify_snapshot(&dir) {
+            assert!(
+                format!("{e:?}").contains("strings"),
+                "the strings structural pass must be what rejects it; got {e:?}"
+            );
+            detected_any = true;
+        }
+    }
+    assert!(
+        detected_any,
+        "verify must reject a structurally corrupt section 12"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------------
 // V6/V7 richer-content round-trips (format-compat)
 // ---------------------------------------------------------------------------
@@ -2892,5 +3004,132 @@ fn open_after_snapshot_is_not_slower_than_wal_replay() {
         snapshot.as_secs_f64() <= replay.as_secs_f64() * 3.0,
         "opening the snapshot took {snapshot:?} against {replay:?} of WAL replay; \
          a snapshot must not cost more than the log it replaces"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// V9: one shared string table per snapshot
+// ---------------------------------------------------------------------------
+
+/// The string table is written once per snapshot, not once per string column.
+#[test]
+fn shared_string_table_is_written_once() {
+    const MARKER: &str = "mushroom-marker-42";
+    let dir = tmp("shared-string-table");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for n in 0..200u32 {
+            let props: Vec<(String, Value)> = (0..8)
+                .map(|f| {
+                    (
+                        format!("f{f}"),
+                        Value::Str(if n % 8 == f {
+                            MARKER.to_string()
+                        } else {
+                            format!("v{}", n % 13)
+                        }),
+                    )
+                })
+                .collect();
+            db.insert_node("D", &format!("d{n}"), props).unwrap();
+        }
+        db.snapshot().unwrap();
+    }
+    let bytes = std::fs::read(dir.join("snapshot.bin")).unwrap();
+    let hits = bytes
+        .windows(MARKER.len())
+        .filter(|w| *w == MARKER.as_bytes())
+        .count();
+    assert_eq!(
+        hits, 1,
+        "the marker must appear once, in the shared table; got {hits} copies"
+    );
+
+    let db = GraphDb::open(&dir).unwrap();
+    for n in 0..200u32 {
+        for f in 0..8u32 {
+            let want = if n % 8 == f {
+                MARKER.to_string()
+            } else {
+                format!("v{}", n % 13)
+            };
+            assert_eq!(
+                db.get_prop(&format!("d{n}"), &format!("f{f}")),
+                Some(Value::Str(want)),
+                "d{n}.f{f} must survive the shared table"
+            );
+        }
+    }
+}
+
+/// A pre-V9 snapshot has no shared section and its per-column tables still answer.
+///
+/// `golden_v8.bin` holds only an Int property, so this checks that a real V8
+/// file still opens and reads correctly — not string resolution specifically.
+/// The pre-V9 string-table fallback itself is covered by
+/// `a_pre_v9_column_resolves_through_its_own_table` in
+/// `crates/core-storage/src/v8/seam.rs`, and by
+/// `v8_string_props_survive_the_migration_to_v9` in
+/// `crates/core-api/tests/migrate.rs`.
+#[test]
+fn a_v8_snapshot_still_reads_its_properties() {
+    let dir = tmp("v8-strings-compat");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("snapshot.bin"),
+        include_bytes!("fixtures/golden_v8.bin"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("wal.bin"), b"").unwrap();
+    // Read-only so the auto-migrate rewrite does not turn it into V9 under us.
+    let db = GraphDb::open_with_options(
+        &dir,
+        core_api::OpenOptions {
+            read_only: true,
+            ..core_api::OpenOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(db.node_count(), 2);
+    assert_eq!(db.get_prop("a", "v"), Some(Value::Int(42)));
+}
+
+/// ~3.8 MB of string properties across 8 columns must not cost a 9x snapshot.
+/// Pre-0.6.5 this store wrote 8 copies of the whole intern table and landed at 9.82x.
+///
+/// The vocabulary is one distinct value per (node, field) on purpose: the cost
+/// of the old per-column copy is `columns x table`, so a small vocabulary hides
+/// the bug however many property bytes are written. Measured on this store:
+/// 36,784,616 B (9.82x) before the shared section, 5,200,624 B (1.39x) after.
+#[test]
+#[ignore = "slow: 12k nodes; run in the format-compat job"]
+fn snapshot_size_is_near_the_property_payload() {
+    let dir = tmp("snapshot-size");
+    let vocab: Vec<String> = (0..96_000)
+        .map(|i| format!("value-{i:05}-{}", "x".repeat(27)))
+        .collect();
+    let mut payload = 0usize;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for n in 0..12_000u32 {
+            let props: Vec<(String, Value)> = (0..8u32)
+                .map(|f| {
+                    let v = &vocab[((n * 8 + f) as usize) % vocab.len()];
+                    payload += v.len();
+                    (format!("f{f}"), Value::Str(v.clone()))
+                })
+                .collect();
+            db.insert_node("D", &format!("d{n}"), props).unwrap();
+        }
+        db.snapshot().unwrap();
+    }
+    let size = std::fs::metadata(dir.join("snapshot.bin")).unwrap().len() as usize;
+    println!(
+        "property payload {payload} B, snapshot.bin {size} B, ratio {:.2}x",
+        size as f64 / payload as f64
+    );
+    assert!(
+        size < payload * 2,
+        "snapshot.bin {size} B must be under 2x the {payload} B of properties"
     );
 }

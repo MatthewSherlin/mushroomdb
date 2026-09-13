@@ -235,6 +235,8 @@ fn doctor_understands_auto_entries() {
     let store = find_check(&report.output, "store");
     assert!(store.starts_with("ok"), "{store}");
     assert!(store.contains(&db.display().to_string()), "{store}");
+    // And it says how far back the history behind those counts reaches.
+    assert!(store.contains("history from commit 0 of "), "{store}");
     // All three hook events, named: a missing one is a warning, not silence.
     let hooks = find_check(&report.output, "hooks");
     assert!(hooks.starts_with("ok"), "{hooks}");

@@ -265,8 +265,11 @@ destination-side vectors (cosine similarity, in-tree implementation — no
 external ANN dependency). Each node insertion incrementally updates the HNSW
 graph. On each lookup, the HNSW index returns the approximate k nearest
 neighbors. IVF-Flat centroids are also maintained as a fallback; the primary
-candidate path is HNSW. The HNSW graph is persisted in V7 snapshots alongside
-IVF centroids so WAL replay and snapshot open avoid full re-fitting.
+candidate path is HNSW. The HNSW graph is persisted in the snapshot alongside
+IVF centroids so WAL replay and snapshot open avoid full re-fitting. Opening a
+store whose snapshot holds that graph loads it directly and never rebuilds it;
+the rebuild is the fallback for a rule with no persisted graph, or one whose
+persisted graph fails to load (the reason is logged).
 
 **Trade-offs:**
 
@@ -275,7 +278,7 @@ IVF centroids so WAL replay and snapshot open avoid full re-fitting.
 | Candidates | All vectors with the right label | HNSW approximate k-NN |
 | Per-query edge recall | 1.00 (exact) | min 0.90, mean 0.998 (5k/dim 1536, fixed-seed probe) |
 | Determinism | Yes | Yes — same rule + data → same graph |
-| WAL replay | Identical | Identical (HNSW rebuilt on replay) |
+| WAL replay | Identical | Identical (replayed writes update the loaded HNSW) |
 
 Measured at 5k nodes, dim 1536: exact ~12 min backfill. Approximate
 backfill time is substantially faster — the IVF-Flat-era measurement was

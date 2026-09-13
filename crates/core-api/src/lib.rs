@@ -24,10 +24,11 @@ pub use core_rules::{
 pub use core_storage::{Direction, GraphError, Result, Value};
 pub use db::{query_sub_exec_count, reset_query_sub_exec_count};
 pub use db::{
-    snapshot_version_at, write_snapshot_bak, BackupReport, BatchBuilder, BatchOp, DeleteReport,
-    EdgeAt, EdgeInfo, Explanation, ExportEdge, FsyncPolicy, GraphDb, MaskedEdge, MaskedNodeResult,
-    MutationEvent, NodeInfo, NodeRef, OpenOptions, Precondition, PredicateSummary, RuleStats,
-    SlowQueryEntry, SlowQuerySnapshot, SnapshotOptions, Stats, WhatIf, WriteAuthz, WRITE_LOCK_WAIT,
+    snapshot_version_at, write_snapshot_bak, AsOfScope, BackupReport, BatchBuilder, BatchOp,
+    DeleteReport, EdgeAt, EdgeInfo, Explanation, ExportEdge, FsyncPolicy, GraphDb, MaskedEdge,
+    MaskedNodeResult, MutationEvent, NodeInfo, NodeRef, OpenOptions, Precondition,
+    PredicateSummary, RuleStats, SlowQueryEntry, SlowQuerySnapshot, SnapshotOptions, Stats, WhatIf,
+    WriteAuthz, WRITE_LOCK_WAIT,
 };
 
 /// Current on-disk snapshot format version written by this build.
@@ -39,9 +40,9 @@ pub use history::{EdgeEvent, EdgeHistoryEvent, HistoryChange, HistoryEntry, Hist
 pub use ingest::{
     json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
-pub use mask::{MaskMode, NodeMask};
+pub use mask::{MaskMode, NodeMask, RoleMaskCache};
 pub use reader::{CommitDelta, FrozenOverlay, ReaderSnapshot, FOLD_EVERY_K};
-pub use roles::{RoleDef, WriteScope};
+pub use roles::{PropPredicate, RoleDef, WriteScope};
 pub use schema::{Schema, SchemaDiff};
 pub use shared::{SharedDb, WriteGuard};
 pub use subscription::{DbEvent, Subscription, DEFAULT_SUB_CAPACITY};

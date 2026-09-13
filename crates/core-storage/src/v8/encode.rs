@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! [0..4]       MAGIC "GDB1"
-//! [4..6]       VERSION = 8 (u16 LE)
+//! [4..6]       VERSION = 9 (u16 LE); V8 wrote 8 into the same container
 //! [6..8]       section_count (u16 LE)
 //! [8..8+16*N]  directory: {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32} * N
 //! [8+16*N..+4] whole-header crc32 (over bytes 0..8+16*N)
@@ -25,6 +25,8 @@
 //!   8 = RULES_META (rkyv)
 //!   9 = VIEWS (rkyv)
 //!  10 = IVF_STATE (bincode BTreeMap<String,PerRuleIvfState>; retained undecoded at open)
+//!  11 = LAST_CHANGE (bincode HashMap<u32,u64>)
+//!  12 = STRINGS (rkyv StringTableData — the one table every Str column indexes; V9 only)
 
 use crate::columns::ColumnStore;
 use crate::edge_props::EdgeProps;
@@ -36,12 +38,13 @@ use crate::types::{GraphError, Result, Value};
 use crate::v8::layout::{
     ColumnData, ColumnsData, CsrAdjMap, CsrData, CsrEtype, CsrRow, EdgePropEntry, EdgePropsData,
     FieldEntry, HnswRuleEntry, HnswSectionData, IdMapData, InternerData, ProvenanceEntry,
-    ProvenanceSectionData, RuleFireEntry, RuleTripEntry, RulesMetaData, Triple, ViewsSectionData,
+    ProvenanceSectionData, RuleFireEntry, RuleTripEntry, RulesMetaData, StringTableData, Triple,
+    ViewsSectionData,
 };
 use crate::v8::{
     HEADER_SIZE, SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_IDS, SECTION_IVF_STATE,
-    SECTION_LAST_CHANGE, SECTION_META, SECTION_PROVENANCE, SECTION_RULES_META, SECTION_SYMS,
-    SECTION_TOPOLOGY, SECTION_VIEWS,
+    SECTION_LAST_CHANGE, SECTION_META, SECTION_PROVENANCE, SECTION_RULES_META, SECTION_STRINGS,
+    SECTION_SYMS, SECTION_TOPOLOGY, SECTION_VIEWS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -113,6 +116,12 @@ pub struct V8Meta {
 /// `cols`.  When `None`, `cols` is encoded directly (initial snapshot or
 /// V5–V7 legacy path).
 ///
+/// `base_strings` is the shared string table (section 12) of that same
+/// snapshot, or `None` when the base predates it (V8 and earlier) and every
+/// base string column therefore carries its own copy.  It is only read when
+/// `base_cols` is `Some`; passing a table from a different snapshot would
+/// resolve the base's string ids against the wrong vocabulary.
+///
 /// `base_edge_props` controls section 5 (EDGE_PROPS):
 ///   - `None`: encode from `meta.edge_props` overlay alone (initial snapshot or V5-V7 path).
 ///   - `Some((archived, raw))` with `meta.edge_props.is_clean()`: passthrough `raw` bytes
@@ -126,6 +135,7 @@ pub struct V8Meta {
 pub fn encode_v8<W: Write>(
     base_topo: Option<&crate::v8::layout::ArchivedCsr>,
     base_cols: Option<&crate::v8::layout::ArchivedColumns>,
+    base_strings: Option<&crate::v8::layout::ArchivedStringTable>,
     base_edge_props: Option<(&crate::v8::layout::ArchivedEdgeProps, &[u8])>,
     base_provenance_raw: Option<&[u8]>,
     topo: &Topology,
@@ -141,10 +151,16 @@ pub fn encode_v8<W: Write>(
         None => rkyv_encode(&topology_to_csr(topo))?,
     };
 
-    let cols_bytes = match base_cols {
-        Some(archived) => rkyv_encode(&columns_merge_to_data(archived, cols)?)?,
-        None => rkyv_encode(&columnstore_to_data(cols)?)?,
+    // Sections 1 and 12 are produced together: the columns hold string ids, the
+    // one shared table holds the vocabulary they index.
+    let (cols_data, strings_data) = match base_cols {
+        Some(archived) => columns_merge_to_data(archived, base_strings, cols)?,
+        None => columnstore_to_data(cols)?,
     };
+    let cols_bytes = rkyv_encode(&cols_data)?;
+    let strings_bytes = rkyv_encode(&strings_data)?;
+    drop(cols_data);
+    drop(strings_data);
     let ids_bytes = rkyv_encode(&idmap_to_data(ids))?;
     let syms_bytes = rkyv_encode(&interner_to_data(syms))?;
     let meta_bytes = bincode::serialize(meta).map_err(|e| GraphError::Corrupt {
@@ -210,6 +226,10 @@ pub fn encode_v8<W: Write>(
     let sections: &[(u8, &[u8])] = &[
         (SECTION_TOPOLOGY, &topo_bytes),
         (SECTION_COLUMNS, &cols_bytes),
+        // Next to the columns it belongs to, not appended at the end: the last
+        // section in the file is deliberately a small, eagerly-CRC'd one so a
+        // flipped trailing byte is still caught at open.
+        (SECTION_STRINGS, &strings_bytes),
         (SECTION_IDS, &ids_bytes),
         (SECTION_SYMS, &syms_bytes),
         (SECTION_META, &meta_bytes),
@@ -248,7 +268,7 @@ pub fn encode_v8<W: Write>(
     // 3. Build the 4 KB header page.
     let mut header = vec![0u8; HEADER_SIZE];
     header[0..4].copy_from_slice(b"GDB1");
-    header[4..6].copy_from_slice(&8u16.to_le_bytes());
+    header[4..6].copy_from_slice(&crate::snapshot::VERSION_9.to_le_bytes());
     header[6..8].copy_from_slice(&(n as u16).to_le_bytes());
 
     let mut pos = 8usize;
@@ -544,10 +564,12 @@ fn merge_sorted_unique_vecs(a: &[u32], b: &[u32]) -> Vec<u32> {
 /// every V8 open (the main C1 win).
 fn columns_merge_to_data(
     base: &crate::v8::layout::ArchivedColumns,
+    base_strings: Option<&crate::v8::layout::ArchivedStringTable>,
     overlay: &ColumnStore,
-) -> Result<ColumnsData> {
-    // 1. Materialise base.
-    let mut merged = archived_to_columnstore(base);
+) -> Result<(ColumnsData, StringTableData)> {
+    // 1. Materialise base.  `base_strings` is `None` for a pre-V9 base, whose
+    //    columns still carry their own tables — that is the migration path.
+    let mut merged = archived_to_columnstore(base, base_strings);
     // 2. Apply tombstones (base-only props deleted since last snapshot).
     for (node, fields) in &overlay.prop_tombstones {
         for field in fields {
@@ -564,10 +586,14 @@ fn columns_merge_to_data(
     columnstore_to_data(&merged)
 }
 
-fn columnstore_to_data(store: &ColumnStore) -> Result<ColumnsData> {
+/// Pack a `ColumnStore` into the archived column layout plus the one string
+/// table every `Str` column in it indexes.  The two are always written as a
+/// pair (columns section 1, strings section 12) and are only meaningful
+/// together: the columns carry ids, the table carries the vocabulary.
+fn columnstore_to_data(store: &ColumnStore) -> Result<(ColumnsData, StringTableData)> {
     let mut buf = Vec::new();
     store.pack(&mut buf);
-    let mut data = decode_all_columns(&buf)?;
+    let (mut data, strings) = decode_all_columns(&buf)?;
     // Post-process: promote Mixed columns that are pure all-float lists of equal
     // dimension to ColumnData::Vector for zero-copy raw-f64 access (B2).
     for field in data.fields.iter_mut() {
@@ -579,7 +605,7 @@ fn columnstore_to_data(store: &ColumnStore) -> Result<ColumnsData> {
             }
         }
     }
-    Ok(data)
+    Ok((data, strings))
 }
 
 /// Try to promote a Mixed column map to `ColumnData::Vector` if all values are
@@ -640,7 +666,11 @@ fn try_promote_to_vector(map: &HashMap<u32, Value>) -> Option<ColumnData> {
     })
 }
 
-fn decode_all_columns(buf: &[u8]) -> Result<ColumnsData> {
+/// Decode the pack format into the archived column layout and the shared
+/// string table.  The pack format has always written the intern table exactly
+/// once; up to V8 every `Str` column got a `clone()` of it, which is the whole
+/// bloat this returns separately instead.
+fn decode_all_columns(buf: &[u8]) -> Result<(ColumnsData, StringTableData)> {
     use crate::pack::{read_exact, read_f64s, read_i64s, read_str, read_u32, read_u32s};
     let mut pos = 0usize;
 
@@ -707,10 +737,13 @@ fn decode_all_columns(buf: &[u8]) -> Result<ColumnsData> {
                 let present = unpack_bitmap(buf, &mut pos).ok_or_else(|| GraphError::Corrupt {
                     detail: format!("v8: column '{fname}' pack decode: truncated Str bitmap"),
                 })?;
+                // Empty on purpose: the table lives once in section 12 and the
+                // reader resolves through it.  A pre-V9 reader that finds these
+                // empty is exactly why the format version moves to 9.
                 ColumnData::Str {
                     ids,
                     present,
-                    strings: intern_strings.clone(),
+                    strings: Vec::new(),
                 }
             }
             4 => {
@@ -737,7 +770,12 @@ fn decode_all_columns(buf: &[u8]) -> Result<ColumnsData> {
     }
 
     fields.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(ColumnsData { fields })
+    Ok((
+        ColumnsData { fields },
+        StringTableData {
+            strings: intern_strings,
+        },
+    ))
 }
 
 fn unpack_bitmap(buf: &[u8], pos: &mut usize) -> Option<Vec<u64>> {
@@ -800,7 +838,15 @@ pub fn csr_to_topology(archived: &crate::v8::layout::ArchivedCsr) -> Topology {
 }
 
 /// Reconstruct a `ColumnStore` from archived columns.
-pub fn archived_to_columnstore(archived: &crate::v8::layout::ArchivedColumns) -> ColumnStore {
+///
+/// `shared` is the snapshot's section-12 string table when it has one.  The
+/// resolution rule is the same one the seam uses: if the shared table is
+/// present it is the table; otherwise the column's own `strings` is.  Pass
+/// `None` for a pre-V9 base.
+pub fn archived_to_columnstore(
+    archived: &crate::v8::layout::ArchivedColumns,
+    shared: Option<&crate::v8::layout::ArchivedStringTable>,
+) -> ColumnStore {
     let mut store = ColumnStore::new();
     for field in archived.fields.iter() {
         let name: &str = field.name.as_str();
@@ -834,8 +880,12 @@ pub fn archived_to_columnstore(archived: &crate::v8::layout::ArchivedColumns) ->
                 present,
                 strings,
             } => {
+                let table = match shared {
+                    Some(t) => &t.strings,
+                    None => strings,
+                };
                 let strings_vec: Vec<String> =
-                    strings.iter().map(|s| s.as_str().to_string()).collect();
+                    table.iter().map(|s| s.as_str().to_string()).collect();
                 bitmap_for_each(present.as_slice(), |node| {
                     let idx = node as usize;
                     if idx < ids.len() {

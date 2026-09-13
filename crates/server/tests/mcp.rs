@@ -205,6 +205,11 @@ fn tools_list_returns_all_tools_with_schemas() {
     assert_eq!(query["inputSchema"]["type"], "object");
     assert!(query["inputSchema"]["properties"].get("cypher").is_some());
     assert!(query["inputSchema"]["properties"].get("params").is_some());
+    // A host defers the schema, so `as_of` has to be findable in it.
+    assert_eq!(
+        query["inputSchema"]["properties"]["as_of"]["type"],
+        json!("integer")
+    );
     assert_eq!(query["inputSchema"]["required"], json!(["cypher"]));
 
     let ingest = by_name("ingest_json");
@@ -3412,6 +3417,7 @@ fn every_association_tool_description_opens_with_its_question() {
     let q = described("query");
     assert!(q.contains("Cypher"), "{q}");
     assert!(q.contains("'role'"), "{q}");
+    assert!(q.contains("'as_of'"), "{q}");
 }
 
 /// Binding: a key the graph does not hold is a tool error that names the key,
@@ -3461,6 +3467,7 @@ fn roles_store(name: &str) -> SharedDb {
                 name: "client".into(),
                 keys: vec![],
                 labels: vec!["Company".into()],
+                visible_where: None,
                 write: None,
             }],
             ..Default::default()
@@ -3514,6 +3521,90 @@ fn query_with_a_role_sees_only_that_roles_labels() {
         both.contains("role") && both.contains("mask"),
         "one restriction or the other, never both: {both}"
     );
+}
+
+/// Binding: `query` takes `as_of` — a past commit — and it composes with
+/// `role` and with `mask`.  Both restrictions are resolved against the graph
+/// as it was at that commit, and a write at a past commit is a tool error.
+#[test]
+fn query_as_of_composes_with_a_role_and_a_mask() {
+    let db = open("query-asof-role");
+    let at_one = {
+        let mut w = db.write();
+        w.insert_node("Public", "p1", vec![]).unwrap();
+        let at = w.wal_total_commits().unwrap() - 1;
+        w.insert_node("Public", "p2", vec![]).unwrap();
+        w.insert_node("Secret", "s1", vec![]).unwrap();
+        w.apply_schema(&core_api::Schema {
+            roles: vec![core_api::RoleDef {
+                name: "reader".into(),
+                keys: vec![],
+                labels: vec!["Public".into()],
+                visible_where: None,
+                write: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        at
+    };
+
+    // A role at a past commit sees only what it could see then.
+    let then = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "role": "reader", "as_of": at_one}),
+    ));
+    assert_eq!(then["rows"], json!([["p1"]]));
+
+    // The same role now sees both Public nodes and never the Secret one.
+    let now = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "role": "reader"}),
+    ));
+    assert_eq!(now["rows"], json!([["p1"], ["p2"]]));
+
+    // `as_of` alone time-travels, unrestricted.
+    let plain = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": at_one}),
+    ));
+    assert_eq!(plain["rows"], json!([["p1"]]));
+
+    // `as_of` with a mask resolves the allow-list against the as-of graph.
+    let masked = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "mask": ["p1", "p2"], "as_of": at_one}),
+    ));
+    assert_eq!(masked["rows"], json!([["p1"]]));
+
+    // A write at a past commit is a tool error, not a write.
+    let write = error_text(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "CREATE (x:Public {id:'z'})", "as_of": at_one}),
+    ));
+    assert!(write.contains("read-only"), "{write}");
+    assert!(!db.read().has_node("z"), "the write must not have landed");
+
+    // A non-integer `as_of` names what it wants.
+    let bad = error_text(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "as_of": "yesterday"}),
+    ));
+    assert!(bad.contains("as_of"), "{bad}");
+
+    // An out-of-range commit carries the retained range.
+    let far = error_text(&one_task_call(
+        db,
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n", "role": "reader", "as_of": 9_999}),
+    ));
+    assert!(far.contains("out of range"), "{far}");
 }
 
 /// Binding: a store carrying the `GitSync` marker — a repository was ingested
@@ -4370,4 +4461,107 @@ fn recall_is_framed_once_not_twice() {
         json!(full),
         "recall's own digest already opens with the framing line"
     );
+}
+
+/// Binding: every history reply says where history starts, and `was_linked`
+/// refuses an unreachable commit by naming the range it accepts.
+#[test]
+fn history_replies_carry_the_horizon() {
+    let db = open("mcp-horizon");
+    seed_person(&db, "alice");
+    seed_person(&db, "bob");
+    db.write().insert_edge("LINK", "alice", "bob").unwrap();
+
+    let stdin = format!(
+        "{}{}{}",
+        call(1, "node_history", json!({"key": "alice"})),
+        call(2, "edge_history", json!({"a": "alice", "b": "bob"})),
+        call(
+            3,
+            "was_linked",
+            json!({"a": "alice", "b": "bob", "edge_type": "LINK", "at_commit": 99999})
+        ),
+    );
+    let (res, out) = exchange(db, &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+
+    let nh = content_json(&replies[0]);
+    assert_eq!(nh["horizon"], json!(0), "node_history must report it: {nh}");
+    assert!(nh["history"].is_array(), "{nh}");
+    let eh = content_json(&replies[1]);
+    assert_eq!(eh["horizon"], json!(0), "edge_history must report it: {eh}");
+
+    let err = error_text(&replies[2]);
+    assert!(
+        err.contains("valid range is"),
+        "the refusal must name the range it accepts: {err}"
+    );
+}
+
+/// Binding: a role narrowed by `visible_where` answers through `query` with
+/// only the nodes that pass the predicate, live and at a past commit alike.
+#[test]
+fn query_with_a_role_honours_a_visible_where_predicate() {
+    let db = open("query-role-predicate");
+    let at_one = {
+        let mut w = db.write();
+        w.insert_node(
+            "Doc",
+            "d1",
+            vec![
+                ("id".into(), Value::Str("d1".into())),
+                ("status".into(), Value::Str("published".into())),
+            ],
+        )
+        .unwrap();
+        let at = w.wal_total_commits().unwrap() - 1;
+        w.insert_node(
+            "Doc",
+            "d2",
+            vec![
+                ("id".into(), Value::Str("d2".into())),
+                ("status".into(), Value::Str("draft".into())),
+            ],
+        )
+        .unwrap();
+        // No status at all: absent is not a match.
+        w.insert_node("Doc", "d3", vec![("id".into(), Value::Str("d3".into()))])
+            .unwrap();
+        w.apply_schema(&core_api::Schema {
+            roles: vec![core_api::RoleDef {
+                name: "publisher".into(),
+                keys: vec![],
+                labels: vec!["Doc".into()],
+                visible_where: Some(core_api::PropPredicate {
+                    field: "status".into(),
+                    eq: None,
+                    in_: Some(vec![Value::Str("published".into())]),
+                }),
+                write: None,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        at
+    };
+
+    let rows = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n.id ORDER BY n.id", "role": "publisher"}),
+    ));
+    assert_eq!(
+        rows["rows"],
+        json!([["d1"]]),
+        "only the published document passes the predicate"
+    );
+
+    // The predicate is part of the same one resolver, so as_of honours it too.
+    let then = content_json(&one_task_call(
+        db,
+        "query",
+        json!({"cypher": "MATCH (n) RETURN n.id", "role": "publisher", "as_of": at_one}),
+    ));
+    assert_eq!(then["rows"], json!([["d1"]]));
 }

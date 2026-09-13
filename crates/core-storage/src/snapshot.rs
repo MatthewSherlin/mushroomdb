@@ -18,8 +18,18 @@ pub const VERSION_6: u16 = 6;
 pub const VERSION_7: u16 = 7;
 /// V8: 4KB header page + rkyv sections (mmap-able zero-copy).
 pub const VERSION_8: u16 = 8;
+/// V9: the V8 container with one shared string table (section 12) instead of a
+/// full copy of the table inside every string column.
+///
+/// The container is unchanged — same `GDB1` magic, same 4 KB header page, same
+/// 16-byte directory entries, same per-section CRC — so both versions decode
+/// through `MappedBase`.  The version still moves, because a V8 reader opening
+/// a V9 snapshot would find every column's own `strings` empty and silently
+/// drop every string property.  Refusing the open with `snapshot: unsupported
+/// version 9` is the point of the bump.
+pub const VERSION_9: u16 = 9;
 /// Current default encoding version.
-pub const VERSION: u16 = VERSION_8;
+pub const VERSION: u16 = VERSION_9;
 
 /// IVF state for one side (src or dst) of a single approximate rule.
 /// Persisted in V4 snapshots so `open()` can restore cluster assignments
@@ -156,6 +166,7 @@ fn encode_v8_from_state(state: &SnapshotState) -> Result<Vec<u8>> {
         None,
         None,
         None,
+        None,
         &state.topo,
         &state.props,
         &state.ids,
@@ -242,8 +253,9 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
         VERSION_5 => decode_v5(&bytes[6..]),
         VERSION_6 => decode_v6(&bytes[6..]),
         VERSION_7 => decode_v7(&bytes[6..]),
-        VERSION_8 => {
-            // V8 is a file-based format; decode via MappedBase from owned bytes.
+        // V8 and V9 are the same file-based container; `decode_v8_from_mapped`
+        // reads the shared string section when the directory carries one.
+        VERSION_8 | VERSION_9 => {
             let mapped = crate::v8::MappedBase::from_bytes(bytes.to_vec())?;
             decode_v8_from_mapped(&mapped)
         }
@@ -268,9 +280,10 @@ pub fn decode(bytes: &[u8]) -> Result<Option<SnapshotState>> {
 /// hot production path in `db.rs` does NOT call this — it uses zero-copy
 /// seam views backed by `MappedBase::topology()` (unchecked) directly.
 ///
-/// This function uses `rkyv::access` (validated) for all large sections so
-/// that corrupt bytes return `GraphError::Corrupt` rather than UB.  Small
-/// sections (IDS, SYMS, RULES_META, VIEWS) already CRC-check on first touch.
+/// This function uses `rkyv::access` (validated) for all large sections — the
+/// shared string table (12) included — so that corrupt bytes return
+/// `GraphError::Corrupt` rather than UB.  Small sections (IDS, SYMS,
+/// RULES_META, VIEWS) already CRC-check on first touch.
 pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<SnapshotState>> {
     use crate::v8::encode::{
         archived_edge_props_to_owned, archived_hnsw_to_owned, archived_provenance_to_owned,
@@ -279,7 +292,8 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
         decode_meta,
     };
     use crate::v8::{
-        SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_PROVENANCE, SECTION_TOPOLOGY,
+        SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_PROVENANCE, SECTION_STRINGS,
+        SECTION_TOPOLOGY,
     };
 
     // Large sections: use validated rkyv::access so corrupt bytes return
@@ -301,7 +315,29 @@ pub fn decode_v8_from_mapped(mapped: &crate::v8::MappedBase) -> Result<Option<Sn
         .map_err(|e| GraphError::Corrupt {
             detail: format!("v8: columns rkyv access: {e}"),
         })?;
-    let props = archived_to_columnstore(archived_cols);
+    // Shared string table (section 12).  `None` only when the directory has no
+    // entry — a pre-V9 snapshot, whose columns carry their own tables.  An
+    // unreadable section is an error, never "absent": treating it as absent
+    // would hand back the empty per-column tables a V9 snapshot writes and
+    // silently drop every string property.
+    //
+    // Validated `rkyv::access`, not the `access_unchecked` that
+    // `MappedBase::string_table()` uses: this is the fuzz-safe decode path, and
+    // its contract is that corrupt bytes return `GraphError::Corrupt` rather
+    // than resolving a bad relative pointer into UB.
+    let shared_strings = if mapped.has_section(SECTION_STRINGS) {
+        Some(
+            rkyv::access::<crate::v8::layout::ArchivedStringTableData, rkyv::rancor::Error>(
+                mapped.section_bytes(SECTION_STRINGS)?,
+            )
+            .map_err(|e| GraphError::Corrupt {
+                detail: format!("v8: strings rkyv access: {e}"),
+            })?,
+        )
+    } else {
+        None
+    };
+    let props = archived_to_columnstore(archived_cols, shared_strings);
 
     let archived_ids = mapped.ids()?;
     let ids = archived_to_idmap(archived_ids);
@@ -490,14 +526,14 @@ mod tests {
     }
 
     #[test]
-    fn decode_v6_bytes_still_works_after_version_8_default_encode() {
+    fn decode_v6_bytes_still_works_after_version_9_default_encode() {
         let state = tiny_state();
         let v6 = encode_v6(&state);
         assert_eq!(&v6[0..4], MAGIC);
         assert_eq!(u16::from_le_bytes([v6[4], v6[5]]), VERSION_6);
-        let v8 = encode(&state).unwrap();
-        assert_eq!(u16::from_le_bytes([v8[4], v8[5]]), VERSION_8);
-        assert_eq!(VERSION, VERSION_8);
+        let v9 = encode(&state).unwrap();
+        assert_eq!(u16::from_le_bytes([v9[4], v9[5]]), VERSION_9);
+        assert_eq!(VERSION, VERSION_9);
 
         let back6 = decode(&v6).unwrap().unwrap();
         assert!(
@@ -519,14 +555,18 @@ mod tests {
             &[1]
         );
 
-        let back8 = decode(&v8).unwrap().unwrap();
+        let back9 = decode(&v9).unwrap().unwrap();
         assert!(
-            back8.wal_truncated,
-            "V8 meta must round-trip wal_truncated=true"
+            back9.wal_truncated,
+            "V9 meta must round-trip wal_truncated=true"
         );
-        assert_eq!(back8.ids.get("b"), Some(1));
-        assert_eq!(back8.props.get(1, "name"), Some(&Value::Str("bob".into())));
-        assert_eq!(back8.topo.edge_count(), 1);
-        assert_eq!(back8.labels, vec![back8.syms.get("N").unwrap(); 2]);
+        assert_eq!(back9.ids.get("b"), Some(1));
+        assert_eq!(
+            back9.props.get(1, "name"),
+            Some(&Value::Str("bob".into())),
+            "a string property must survive the shared table"
+        );
+        assert_eq!(back9.topo.edge_count(), 1);
+        assert_eq!(back9.labels, vec![back9.syms.get("N").unwrap(); 2]);
     }
 }
