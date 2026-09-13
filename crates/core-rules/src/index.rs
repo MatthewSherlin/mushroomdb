@@ -2425,6 +2425,35 @@ mod tests {
         );
     }
 
+    /// A truncated blob is treated exactly as an unknown version: an empty
+    /// graph, an empty skip set, and a rebuild for the caller's node scan.
+    #[test]
+    fn an_unreadable_blob_leaves_the_graph_empty() {
+        let (side, spec) = hnsw_side();
+        let mut blob = side.export_hnsw_blob();
+        blob.truncate(blob.len() / 2);
+
+        let mut fresh = SideIndex::default();
+        let (ids, adopted) = fresh.init_or_adopt_hnsw("sim", &blob);
+        assert!(!adopted, "an unreadable blob must not count as adopted");
+        assert!(ids.is_empty(), "nothing may be skipped by the scan");
+        assert!(!fresh.has_hnsw(), "the graph must be empty");
+
+        // The scan then fills it, and the full-scan fallback covers the gap.
+        for (id, xs) in [
+            (1u32, vec![1.0, 0.0]),
+            (2, vec![0.0, 1.0]),
+            (3, vec![0.7, 0.7]),
+        ] {
+            fresh.insert_skipping(&spec, id, &ids, &getter(&emb(&xs)));
+        }
+        assert!(fresh.has_hnsw());
+        assert_eq!(
+            fresh.candidates(&spec, &getter(&emb(&[1.0, 0.0]))),
+            BTreeSet::from([1, 2, 3])
+        );
+    }
+
     /// `insert_skipping` still tracks a skipped node for the fallback scan; it
     /// only declines to insert it into the graph a second time.
     #[test]

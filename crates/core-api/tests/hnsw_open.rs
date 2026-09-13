@@ -167,6 +167,54 @@ fn wal_replayed_embeddings_are_searchable_after_open() {
     );
 }
 
+/// The lazy populate path must not drop an embedding the persisted blob
+/// predates.
+///
+/// Clean open (the snapshot truncated the WAL), so the indexes populate through
+/// `ensure_indexes_populated` on the first write — and that first write is
+/// itself the post-snapshot embedding, so the node scan runs with `late`
+/// already in the graph while the blob only knows `d0..d7`.
+#[test]
+fn lazy_open_indexes_an_embedding_the_blob_predates() {
+    let dir = tmp("hnsw-open-lazy-late");
+    {
+        let mut db = seed(&dir);
+        db.snapshot().unwrap();
+    }
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Doc", "late", vec![("emb".into(), emb(&[0.995, 0.1]))])
+        .unwrap();
+    assert_eq!(
+        db.hnsw_build_count(),
+        0,
+        "the lazy populate rebuilt a graph the snapshot already holds"
+    );
+
+    let keys = keys_of(&db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 3, 0.5));
+    assert!(
+        keys.iter().any(|k| k == "late"),
+        "the post-snapshot embedding must be in the adopted index; got {keys:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k == "d0"),
+        "a pre-snapshot embedding must still be in the adopted index; got {keys:?}"
+    );
+
+    // Discriminating: k = 1 at `late`'s exact vector. An id the scan tracked but
+    // never inserted into the graph cannot win this search at all.
+    let exact = db.find_similar_vector("emb", Some("Doc"), &[0.995, 0.1], 1, 0.0);
+    assert_eq!(
+        exact.len(),
+        1,
+        "top-1 at the post-snapshot vector came back empty; got {exact:?}"
+    );
+    assert_eq!(
+        exact[0].0, "late",
+        "top-1 at `late`'s own vector must be `late`; got {exact:?}"
+    );
+}
+
 /// Post-snapshot writes of every shape the index has to absorb: an INSERT, an
 /// embedding UPDATE that moves a node between clusters, and a DELETE.
 ///
@@ -398,6 +446,23 @@ fn query_results_identical_across_snapshot_and_reopen() {
     );
 }
 
+/// Exact k-NN over `DOCS`, computed here rather than by the database: the
+/// reference the approximate path has to reproduce.
+fn brute_force(q: &[f64; 2], k: usize, min: f64) -> Vec<String> {
+    let qn = (q[0] * q[0] + q[1] * q[1]).sqrt();
+    let mut scored: Vec<(String, f64)> = DOCS
+        .iter()
+        .map(|(key, v)| {
+            let vn = (v[0] * v[0] + v[1] * v[1]).sqrt();
+            (key.to_string(), (q[0] * v[0] + q[1] * v[1]) / (qn * vn))
+        })
+        .filter(|&(_, sim)| sim >= min)
+        .collect();
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    scored.truncate(k);
+    scored.into_iter().map(|(key, _)| key).collect()
+}
+
 /// Clean open, **before any mutation**: the first approximate query must be
 /// answered by the persisted graph, not by the brute-force fallback.
 ///
@@ -405,8 +470,11 @@ fn query_results_identical_across_snapshot_and_reopen() {
 /// retained blobs on the read side under a shared lock. It is separate from
 /// `ensure_indexes_populated`, and a decode failure there is silent: the
 /// results are still correct — brute force gets the same answer — so only a
-/// counter can tell the two apart. 0.6.6's versioned blob broke exactly this
-/// site by leaving it on a bare `bincode::deserialize::<HnswIndex>`.
+/// counter can tell the two apart. Three things have broken it: the retained
+/// blobs were never read out of the snapshot before the `OnceLock` latched (so
+/// it latched an empty map for the handle's life), the label-less entry point
+/// could not reach the lazily decoded graphs at all, and 0.6.6's versioned blob
+/// left this site on a bare `bincode::deserialize::<HnswIndex>`.
 #[test]
 fn clean_open_first_query_is_served_by_the_index() {
     let dir = tmp("hnsw-open-lazy");
@@ -416,26 +484,29 @@ fn clean_open_first_query_is_served_by_the_index() {
     }
 
     let db = GraphDb::open(&dir).unwrap();
+    let q = [1.0, 0.0];
+    let expected = brute_force(&q, 2, 0.0);
+
     core_rules::hnsw_search_count_reset();
-    let hits = db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 2, 0.0);
+    let hits = db.find_similar_vector("emb", Some("Doc"), &q, 2, 0.0);
     assert!(
         core_rules::hnsw_search_count() > 0,
         "the first query on a clean open fell back to a full scan: the retained \
-         HNSW blob did not decode"
+         HNSW blob was never decoded"
     );
-    assert!(
-        hits.iter().any(|(k, _)| k == "d0"),
-        "persisted HNSW must still find d0; got {hits:?}"
-    );
+    assert_eq!(keys_of(&hits), expected, "index disagrees with brute force");
 
     // Same for the cross-label entry point used by hybrid search.
     core_rules::hnsw_search_count_reset();
-    let any = db.find_similar_vector("emb", None, &[1.0, 0.0], 2, 0.0);
+    let any = db.find_similar_vector("emb", None, &q, 2, 0.0);
     assert!(
         core_rules::hnsw_search_count() > 0,
         "the label-less query fell back to a full scan"
     );
-    assert!(any.iter().any(|(k, _)| k == "d0"), "got {any:?}");
+    assert_eq!(keys_of(&any), expected, "index disagrees with brute force");
+
+    // Still no mutation has happened: the read path must not have built one.
+    assert_eq!(db.hnsw_build_count(), 0, "clean open rebuilt a graph");
 }
 
 /// The lazily-decoded blobs are a *bridge* from the open to the first write,
@@ -445,7 +516,7 @@ fn clean_open_first_query_is_served_by_the_index() {
 /// ANN query and then wrote otherwise holds two copies of every approximate
 /// rule's graph for the rest of its life.
 #[test]
-fn the_lazy_graphs_are_released_once_the_live_index_owns_them() {
+fn the_first_write_releases_the_lazy_index_copy() {
     let dir = tmp("hnsw-open-lazy-release");
     {
         let mut db = seed(&dir);
@@ -453,10 +524,13 @@ fn the_lazy_graphs_are_released_once_the_live_index_owns_them() {
     }
 
     let mut db = GraphDb::open(&dir).unwrap();
-    // The ANN read path decodes the blobs into the lazy map.
-    let _ = db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 2, 0.0);
-    assert!(
-        db.lazy_hnsw_len() > 0,
+    assert_eq!(db.lazy_hnsw_len(), 0, "nothing is decoded before the query");
+
+    let q = [1.0, 0.0];
+    let before = db.find_similar_vector("emb", Some("Doc"), &q, 2, 0.0);
+    assert_eq!(
+        db.lazy_hnsw_len(),
+        1,
         "the clean-open read path did not decode any blob, so this test proves nothing"
     );
 
@@ -469,14 +543,26 @@ fn the_lazy_graphs_are_released_once_the_live_index_owns_them() {
         "the lazy graphs survived the write that moved them into the live index: \
          every approximate rule's graph is held twice"
     );
+
+    // And the live index — not a re-decoded copy — answers from here on.
+    core_rules::hnsw_search_count_reset();
+    let after = db.find_similar_vector("emb", Some("Doc"), &q, 2, 0.0);
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "the query after the first write fell back to a full scan"
+    );
+    assert_eq!(db.lazy_hnsw_len(), 0, "the copy came back");
+    assert_eq!(keys_of(&before), keys_of(&after));
 }
 
 /// A live graph emptied by deletes is the truth, not a reason to consult the
-/// snapshot. `live.or(lazy)` made an emptied index claim it had an answer,
-/// which suppressed the brute-force scan that would have found the vectors no
-/// rule covers.
+/// snapshot. The lazy copy is a picture of the snapshot, so if it survives the
+/// write that empties the live graph, the fallthrough in `hnsw_search_dst` /
+/// `hnsw_search_any_dst` reaches it and the query is answered by a graph full
+/// of nodes that no longer exist — which also suppresses the brute-force scan
+/// that would have found the vectors no rule covers.
 #[test]
-fn deleting_every_embedded_node_leaves_nothing_to_find() {
+fn deleting_every_embedding_on_a_side_consults_no_stale_graph() {
     let dir = tmp("hnsw-open-lazy-stale");
     {
         let mut db = seed(&dir);
@@ -488,21 +574,25 @@ fn deleting_every_embedded_node_leaves_nothing_to_find() {
     }
 
     let mut db = GraphDb::open(&dir).unwrap();
-    // Decode the blobs first, so the stale copy exists when the deletes land.
-    let before = db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.0);
+    let q = [1.0, 0.0];
+    // Decode the blob on the read path first — this is the window the bug
+    // lived in.
+    let before = db.find_similar_vector("emb", Some("Doc"), &q, 8, 0.0);
     assert!(!before.is_empty(), "the seeded store must answer at all");
+    assert_eq!(db.lazy_hnsw_len(), 1);
 
     for (k, _) in DOCS {
         db.delete_node(k).unwrap();
     }
 
+    core_rules::hnsw_search_count_reset();
     assert_eq!(
-        db.find_similar_vector("emb", Some("Doc"), &[1.0, 0.0], 8, 0.0),
+        db.find_similar_vector("emb", Some("Doc"), &q, 8, 0.0),
         Vec::<(String, f64)>::new(),
-        "the emptied index fell back to the snapshot's graph"
+        "a labelled query answered from the snapshot's copy of a deleted side"
     );
     let any: Vec<String> = db
-        .find_similar_vector("emb", None, &[1.0, 0.0], 8, 0.0)
+        .find_similar_vector("emb", None, &q, 8, 0.0)
         .into_iter()
         .map(|(k, _)| k)
         .collect();
@@ -511,5 +601,10 @@ fn deleting_every_embedded_node_leaves_nothing_to_find() {
         vec!["note".to_string()],
         "the emptied index answered for the whole store out of the snapshot's \
          graph, hiding the vector no rule indexes"
+    );
+    assert_eq!(
+        core_rules::hnsw_search_count(),
+        0,
+        "an emptied side still walked a graph: the stale copy is reachable"
     );
 }

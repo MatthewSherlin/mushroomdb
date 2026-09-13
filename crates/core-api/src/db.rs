@@ -8421,9 +8421,10 @@ impl<F: Fs> GraphDb<F> {
 
     /// How many rules this handle still holds a lazily-decoded HNSW graph for.
     ///
-    /// See [`core_rules::RuleEngine::lazy_hnsw_len`]. Exposed for tests that
-    /// assert the lazy copies are released once the live indexes own them; not
-    /// part of the stable surface.
+    /// Zero before the first ANN query on a clean open, and again once the
+    /// live indexes own the graphs. See [`core_rules::RuleEngine::lazy_hnsw_len`].
+    /// Exposed for tests that assert the lazy copies are released; not part of
+    /// the stable surface.
     #[doc(hidden)]
     pub fn lazy_hnsw_len(&self) -> usize {
         self.engine.lazy_hnsw_len()
