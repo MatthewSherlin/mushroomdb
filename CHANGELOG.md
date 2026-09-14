@@ -41,6 +41,8 @@
 
 - **A single-namespace role's `MERGE` create is new behaviour.** Under 0.6.6
   the same statement was refused; now it writes into that namespace.
+- **The CI bench baseline is re-taken at 0.6.6.** The `bench` job now
+  compares against run `34880373108` (`ubuntu-latest`, 2026-09-14).
 
 ## v0.6.6 — the scale release
 

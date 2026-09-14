@@ -1,8 +1,8 @@
 {
-  "ingest_wall_s": 1.134343,
-  "rule_backfill_wall_s": 13.767794,
-  "snapshot_write_s": 0.728758,
-  "snapshot_open_s": 0.002227,
-  "query_p50_ms": 0.012519,
-  "backfill_field_equal_5k_wall_s": 8.982503
+  "ingest_wall_s": 1.10741,
+  "rule_backfill_wall_s": 15.141999,
+  "snapshot_write_s": 0.850386,
+  "snapshot_open_s": 0.002675,
+  "query_p50_ms": 0.011733,
+  "backfill_field_equal_5k_wall_s": 9.603178
 }
