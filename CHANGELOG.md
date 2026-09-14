@@ -129,6 +129,13 @@ rather than comparisons with 0.6.5, are in
   build outstanding, and a snapshot taken mid-build records the fact in its index blob so that a
   reader opening it declines too. Either way the caller gets the exhaustive answer, and the fast
   path returns when the build finishes.
+- **`mushroomdb doctor`'s handshake waits as long as the store took to open.** The check spawns
+  the MCP server, which has to open the same store `doctor` just opened — and a WAL-only store
+  replays its vector rules' index builds every time, which can take longer than the fixed 10-second
+  deadline the handshake used. `doctor` therefore reported a healthy server as unreachable,
+  moments after its own open had taken longer than that without complaint. The deadline is now at
+  least 10 seconds and otherwise twice the open it measured plus 5 seconds, and a handshake that
+  still times out names the open time and points at `build-index` and `snapshot`.
 - **`find_similar` reports an exact similarity again.** `find_similar_vector`,
   `find_similar_vector_masked` and the MCP `find_similar` tool re-score every candidate the index
   returns against the `f64` property vectors, so `min = 1.0` finds an exact duplicate and the index
