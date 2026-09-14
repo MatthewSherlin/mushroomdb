@@ -27,7 +27,7 @@
   unless the pattern names one. Pinned by
   `merge_creates_inside_a_single_namespace_role`.
 - **A masked approximate search returns `k` hits.** `find_similar_vector_masked`
-  and the masked MCP `find_similar` used to over-fetch `4k` from the store-wide
+  and the masked MCP `find_similar` used to over-fetch from the store-wide
   index and stop, so a tenant whose nearest neighbours were mostly other
   tenants' nodes got a short result. The beam now starts at an over-fetch of
   `k` divided by the mask's selectivity, doubles until it has `k` visible hits
@@ -43,6 +43,28 @@
   the same statement was refused; now it writes into that namespace.
 - **The CI bench baseline is re-taken at 0.6.6.** The `bench` job now
   compares against run `34880373108` (`ubuntu-latest`, 2026-09-14).
+
+#### Known limits
+
+- **`stats` over MCP answers with every namespace name unless it is asked to
+  narrow.** The MCP server is a cooperative surface with no auth, so `stats`
+  reports the full roster by default and narrows only when given `role` or
+  `namespace`; the store-wide counts beside the roster are unchanged either
+  way. A tenant that must not learn the other tenants' names belongs behind
+  `serve --role-token`, where HTTP `GET /stats` is closed to role tokens
+  entirely.
+- **A refused or parked vector is re-derived on reopen rather than persisted.**
+  `dim_mismatches` and the parked list are not in the blob; what restores them
+  is the open-time node scan, which re-offers every vector the persisted graph
+  lacks and gets the same refusals. The state is therefore rebuilt rather than
+  remembered, which `a_refused_vector_is_still_refused_after_a_reopen` and
+  `a_parked_vector_survives_a_reopen` pin at store level.
+- **The scale benchmark's two growth assertions stay red.** The build grows
+  15.48× from 2,000 to 10,000 vectors against a ceiling of 8×, and 50,000
+  vectors take 1,018.05 s against a ceiling of 300 s. The figures, and the
+  evaluation-count gate that watches the same thing as a machine-independent
+  count, are in
+  [`benchmarks/results/hnsw-scale-0.6.6.md`](benchmarks/results/hnsw-scale-0.6.6.md).
 
 ## v0.6.6 — the scale release
 
