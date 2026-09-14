@@ -78,7 +78,7 @@
 
 use core_api::{
     schema::Schema, BatchOp, Direction, GraphDb, GraphError, Predicate, RoleDef, RuleDef, Value,
-    WriteScope,
+    WriteScope, MERGE_CREATE_NEEDS_ONE_NAMESPACE,
 };
 use std::collections::BTreeMap;
 
@@ -1608,13 +1608,17 @@ fn test_cypher_create_outside_the_roles_namespace_denied() {
     );
     assert!(!db.has_node("theirs"));
 
-    // MERGE's create arm is the same op, so the same refusal.
+    // MERGE naming a foreign `ns` is the same op, so the same refusal.
     let err = db
-        .query_write_authz("writer", "MERGE (n:MyLabel {id: 'merged'})", &no_params())
+        .query_write_authz(
+            "writer",
+            "MERGE (n:MyLabel {id: 'merged', ns: 'y'})",
+            &no_params(),
+        )
         .unwrap_err();
     assert_eq!(
         denied_reason(&err),
-        "role-bound token: namespace 'default' not in the role's namespaces"
+        "role-bound token: namespace 'y' not in the role's namespaces"
     );
     assert!(!db.has_node("merged"));
 
@@ -1698,12 +1702,20 @@ fn test_upsert_placeholder_hidden_equals_absent_for_a_namespaced_role() {
     assert!(!db.has_node("nobody"), "nothing was created");
 }
 
-/// A namespaced role cannot MERGE-create: `MERGE` carries only its identifying
-/// property into the create, so the node would land in `default`. The match arm
-/// still works on a node the role can see.
+/// A role bound to two namespaces cannot MERGE-create unless the pattern names
+/// one. The match arm still works on a node the role can see.
 #[test]
 fn test_merge_create_denied_for_a_namespaced_role() {
-    let (mut db, _dir) = open_with_tenant_writer("merge-ns-role");
+    let dir = tmp("merge-ns-role");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.apply_schema(&Schema {
+        roles: vec![RoleDef {
+            namespaces: Some(vec!["x".into(), "y".into()]),
+            ..writer_role()
+        }],
+        ..Default::default()
+    })
+    .unwrap();
     db.insert_node("MyLabel", "mine", vec![ns_prop("x")])
         .unwrap();
 
@@ -1712,8 +1724,8 @@ fn test_merge_create_denied_for_a_namespaced_role() {
         .unwrap_err();
     assert_eq!(
         denied_reason(&err),
-        "role-bound token: namespace 'default' not in the role's namespaces",
-        "MERGE-create lands in default, which this role may not write"
+        MERGE_CREATE_NEEDS_ONE_NAMESPACE,
+        "a two-namespace role must name one namespace to MERGE-create"
     );
     assert!(!db.has_node("fresh"));
 

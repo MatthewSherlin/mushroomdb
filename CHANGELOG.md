@@ -19,6 +19,18 @@
   committed. Every per-property check now runs first and the sets land in one
   WAL commit. The v0.6.6 known limit is closed. Pinned by
   `upsert_entity_update_is_all_or_nothing`.
+- **`MERGE` creates inside a single-namespace role's namespace.** A role bound
+  to exactly one namespace no longer has its MERGE create arm land in `default`
+  (which it cannot write). When the pattern does not name `ns`, the create
+  stamps that namespace. A role bound to two or more namespaces is still
+  refused (`role-bound token: MERGE create requires the role to name one namespace`)
+  unless the pattern names one. Pinned by
+  `merge_creates_inside_a_single_namespace_role`.
+
+#### Changed
+
+- **A single-namespace role's `MERGE` create is new behaviour.** Under 0.6.6
+  the same statement was refused; now it writes into that namespace.
 
 ## v0.6.6 — the scale release
 

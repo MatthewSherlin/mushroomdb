@@ -7,6 +7,7 @@ use axum::Router;
 use core_api::{
     json_to_value, schema::Schema, Explanation, FkSkip, IngestReport, Predicate, PredicateSummary,
     RoleDef, RuleDef, RuleStats, SharedDb, SnapshotOptions, Stats, Value, WriteScope,
+    MERGE_CREATE_NEEDS_ONE_NAMESPACE,
 };
 use serde_json::{json, Value as Json};
 #[cfg(feature = "embed-ui")]
@@ -5856,7 +5857,7 @@ async fn post_rules_accepts_a_namespace() {
 
 /// Binding: the refusals Task 5 settled reach the HTTP surface with the text the
 /// engine settled on — a duplicate `ns` in a Cypher `CREATE`, a `MERGE`-create by
-/// a namespaced role, and a placeholder endpoint refused with the **endpoint**
+/// a two-namespace role, and a placeholder endpoint refused with the **endpoint**
 /// message rather than the namespace one (hidden ≡ absent: two strings there
 /// would be an existence oracle).
 #[tokio::test]
@@ -5864,21 +5865,33 @@ async fn the_namespace_write_refusals_reach_the_surface() {
     let db = SharedDb::open(&tmp("ns-refusal-texts")).unwrap();
     db.write()
         .apply_schema(&Schema {
-            roles: vec![RoleDef {
-                name: "agent".into(),
-                labels: vec!["AgentNote".into()],
-                keys: vec![],
-                visible_where: None,
-                namespaces: Some(vec!["tenant-a".into()]),
-                write: Some(agent_write_scope()),
-            }],
+            roles: vec![
+                RoleDef {
+                    name: "agent".into(),
+                    labels: vec!["AgentNote".into()],
+                    keys: vec![],
+                    visible_where: None,
+                    namespaces: Some(vec!["tenant-a".into()]),
+                    write: Some(agent_write_scope()),
+                },
+                RoleDef {
+                    name: "multi".into(),
+                    labels: vec!["AgentNote".into()],
+                    keys: vec![],
+                    visible_where: None,
+                    namespaces: Some(vec!["tenant-a".into(), "tenant-b".into()]),
+                    write: Some(agent_write_scope()),
+                },
+            ],
             ..Default::default()
         })
         .unwrap();
-    let rtoks: std::collections::HashMap<String, String> =
-        [("role-tok".to_string(), "agent".to_string())]
-            .into_iter()
-            .collect();
+    let rtoks: std::collections::HashMap<String, String> = [
+        ("role-tok".to_string(), "agent".to_string()),
+        ("multi-tok".to_string(), "multi".to_string()),
+    ]
+    .into_iter()
+    .collect();
     let app = router_with_role_tokens(db.clone(), Some("admin".into()), rtoks);
 
     // A props list names `ns` once or not at all, through `POST /query`.
@@ -5903,13 +5916,13 @@ async fn the_namespace_write_refusals_reach_the_surface() {
     );
     assert!(!db.read().has_node("d1"), "nothing was written");
 
-    // A namespaced role cannot MERGE-create: the node would land in `default`.
+    // A two-namespace role cannot MERGE-create unless the pattern names one.
     let (status, body, _) = send(
         app.clone(),
         authed_json_req(
             "POST",
             "/query?format=json",
-            "role-tok",
+            "multi-tok",
             json!({"cypher": "MERGE (n:AgentNote {id: 'm1'})"}),
         ),
     )
@@ -5920,15 +5933,52 @@ async fn the_namespace_write_refusals_reach_the_surface() {
         "{}",
         String::from_utf8_lossy(&body)
     );
-    assert!(
-        parse_json(&body)["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("namespace 'default' not in the role's namespaces"),
+    assert_eq!(
+        parse_json(&body)["error"].as_str().unwrap_or_default(),
+        MERGE_CREATE_NEEDS_ONE_NAMESPACE,
         "{}",
         String::from_utf8_lossy(&body)
     );
     assert!(!db.read().has_node("m1"));
+
+    // A single-namespace role's MERGE-create stamps that namespace.
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "role-tok",
+            json!({"cypher": "MERGE (n:AgentNote {id: 'm2'})"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(db.read().namespace_of("m2").as_deref(), Some("tenant-a"));
+
+    // Naming a foreign `ns` is the same cross-namespace create refusal.
+    let (status, body, _) = send(
+        app.clone(),
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "role-tok",
+            json!({"cypher": "MERGE (n:AgentNote {id: 'm3', ns: 'other'})"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(
+        parse_json(&body)["error"].as_str().unwrap_or_default(),
+        "role-bound token: namespace 'other' not in the role's namespaces",
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(!db.read().has_node("m3"));
 
     // A placeholder endpoint gets the endpoint message, not the namespace one.
     let (status, body, _) = send(

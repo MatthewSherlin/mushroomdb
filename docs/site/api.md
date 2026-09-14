@@ -157,6 +157,7 @@ All write denials return 403 with a structured JSON body:
 {"error": "role-bound token: edge type 'LINKS' not in write scope (create_edge_types)"}
 {"error": "role-bound token: this endpoint is not permitted"}
 {"error": "role-bound token: namespace 'tenant-b' not in the role's namespaces"}
+{"error": "role-bound token: MERGE create requires the role to name one namespace"}
 ```
 
 The "target node not visible" response is identical for hidden nodes and
@@ -164,12 +165,16 @@ non-existent nodes — the role cannot distinguish the two cases.
 
 The sixth is the namespace leg (v0.6.6): a role bound to `namespaces` may only
 **create** a node inside them, because a node it could never read back would be a
-write into another tenancy. It covers `POST /nodes`, a batch, Cypher `CREATE`, and the
-node a `MERGE` creates (which always lands in `default`, so a namespaced role cannot
-`MERGE`-create at all) — a create naming no namespace is a create in `default`, so a
-role not bound to `default` is refused there too. A role with no `namespaces` binding
-is unchanged. Updates need no rule of their own: a role can only mutate nodes already
-in its read mask, which the namespace leg has already narrowed.
+write into another tenancy. It covers `POST /nodes`, a batch, Cypher `CREATE`, and a
+`MERGE` that names `ns`. A create naming no namespace is a create in `default`, so a
+role not bound to `default` is refused there too — except a `MERGE` whose executing
+role is bound to exactly one namespace, which stamps that namespace on the create
+arm. A role bound to two or more namespaces cannot `MERGE`-create unless the
+pattern names one `ns`; the refusal is
+`role-bound token: MERGE create requires the role to name one namespace`.
+A role with no `namespaces` binding is unchanged. Updates need no rule of their
+own: a role can only mutate nodes already in its read mask, which the namespace
+leg has already narrowed.
 
 A placeholder endpoint `POST /edges/upsert` would auto-create is refused by the same
 rule (a placeholder carries no props, so it lands in `default`) but with the
@@ -331,7 +336,7 @@ Relationship patterns `->`, `<-`, `-` with optional type and variable.
 - `MATCH … DELETE r` — delete a manual edge; error if derived
 - `MATCH (n) DETACH DELETE n` — delete node + all incident edges (derived edges retracted via rule engine; top-k backfill fires)
 - `MATCH (n) DELETE n` — delete isolated node (error if any edges remain — use DETACH DELETE)
-- `MERGE (n:Label {id: 'key'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]` — match-or-create with optional per-clause SET and projection
+- `MERGE (n:Label {id: 'key'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]` — match-or-create with optional per-clause SET and projection. A single-namespace role's create arm stamps that namespace when the pattern does not name `ns`; a two-namespace role must name one (`MERGE (n:Label {id: 'key', ns: 'tenant-a'})`)
 
 **Aggregate functions** in `RETURN`:
 

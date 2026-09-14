@@ -4847,6 +4847,31 @@ fn stats_on_a_store_without_namespaces_reports_one() {
     );
 }
 
+/// Binding: a full-authority MCP `query` MERGE without `ns` still lands in
+/// `default`; naming `ns` in the pattern creates there. Role-scoped MERGE is
+/// an HTTP surface (MCP `query` with `role` is read-only).
+#[test]
+fn merge_create_names_a_namespace_or_lands_in_default() {
+    let db = open("mcp-merge-ns");
+    content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MERGE (n:Doc {id: 'plain'})"}),
+    ));
+    assert_eq!(db.read().namespace_of("plain").as_deref(), Some("default"));
+
+    content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MERGE (n:Doc {id: 'named', ns: 'tenant-a'})"}),
+    ));
+    assert_eq!(
+        db.read().namespace_of("named").as_deref(),
+        Some("tenant-a"),
+        "a MERGE that names ns creates in that namespace"
+    );
+}
+
 /// Binding: `upsert_entity` puts a node it creates in `namespace`, and refuses
 /// to move one that already exists — with the engine's own text.
 #[test]

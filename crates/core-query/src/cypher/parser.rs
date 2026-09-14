@@ -8,7 +8,7 @@ use super::ast::{
 };
 use super::Tok;
 use crate::filter::CmpOp;
-use core_storage::Value;
+use core_storage::{Value, NS_PROP};
 
 /// Max parenthesized-expression nesting. Deeper input is `Err`, not a stack overflow.
 const MAX_PAREN_DEPTH: usize = 64;
@@ -1390,12 +1390,34 @@ impl<'a> Parser<'a> {
                 "MERGE requires a property map with exactly one key (e.g., MERGE (n:Label {id: 'x'}))",
             ));
         }
-        let mut props = self.literal_props()?;
-        if props.len() != 1 {
-            return Err(format!(
-                "MERGE supports exactly one key property (got {}); use CREATE for multi-prop nodes",
-                props.len()
-            ));
+        let props = self.literal_props()?;
+        let mut ns = None;
+        let mut rest = Vec::new();
+        for (k, v) in props {
+            if k == NS_PROP {
+                if ns.is_some() {
+                    return Err(
+                        self.err("ns is given more than once; a node has exactly one namespace")
+                    );
+                }
+                ns = Some(v);
+            } else {
+                rest.push((k, v));
+            }
+        }
+        if rest.len() != 1 {
+            // A lone `ns` is the identifying key, not a namespace stamp.
+            if rest.is_empty() {
+                if let Some(v) = ns.take() {
+                    rest.push((NS_PROP.to_string(), v));
+                }
+            }
+            if rest.len() != 1 {
+                return Err(format!(
+                    "MERGE supports exactly one key property (got {}); use CREATE for multi-prop nodes",
+                    rest.len() + usize::from(ns.is_some()),
+                ));
+            }
         }
         self.expect(&Tok::RParen, "expected ')' to close MERGE pattern")?;
         let mut on_create = Vec::new();
@@ -1420,11 +1442,12 @@ impl<'a> Parser<'a> {
         if self.pos < self.toks.len() {
             return Err(self.unsupported_or_unexpected("unexpected tokens after MERGE"));
         }
-        let (key_field, key_value) = props.remove(0);
+        let (key_field, key_value) = rest.remove(0);
         Ok(WriteStatement::Merge(MergeStmt {
             label,
             key_field,
             key_value,
+            ns,
             var,
             on_create,
             on_match,
@@ -2407,6 +2430,30 @@ LIMIT 10";
             }
             other => panic!("expected Merge, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn merge_ns_property_parses_beside_the_key() {
+        use super::parse_write;
+        use crate::cypher::ast::WriteStatement;
+
+        let toks = crate::cypher::lex("MERGE (n:Doc {id: 'x', ns: 'other'})").unwrap();
+        let stmt = parse_write(&toks).expect("MERGE may name ns beside the identifying key");
+        match stmt {
+            WriteStatement::Merge(s) => {
+                assert_eq!(s.key_field, "id");
+                assert_eq!(s.key_value, Value::Str("x".into()));
+                assert_eq!(s.ns, Some(Value::Str("other".into())));
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+
+        let toks = crate::cypher::lex("MERGE (n:Doc {id: 'x', name: 'Alice'})").unwrap();
+        let err = parse_write(&toks).expect_err("a non-ns extra property is still refused");
+        assert!(
+            err.contains("one key property") || err.contains("exactly one"),
+            "error must mention the single-key constraint, got: {err}"
+        );
     }
 
     #[test]

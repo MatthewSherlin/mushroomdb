@@ -1538,6 +1538,13 @@ impl Default for OpenOptions {
 /// hang.
 pub const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Refusal when a `MERGE` create cannot choose a namespace.
+///
+/// A role bound to two or more namespaces cannot have its create arm land in
+/// `default`, and the statement did not name `ns`. The role must name one.
+pub const MERGE_CREATE_NEEDS_ONE_NAMESPACE: &str =
+    "role-bound token: MERGE create requires the role to name one namespace";
+
 /// Interval between poll attempts while waiting for the cross-process lock.
 pub(crate) const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -9319,6 +9326,47 @@ impl<F: Fs> GraphDb<F> {
         Ok(rs)
     }
 
+    /// Props the MERGE create arm inserts: the identifying key, plus `ns` when
+    /// the pattern named one, or the executing role's sole namespace when it
+    /// did not. A role bound to two or more namespaces cannot choose, and is
+    /// refused with [`MERGE_CREATE_NEEDS_ONE_NAMESPACE`]. The authorizer still
+    /// refuses a named `ns` the role cannot write.
+    fn merge_create_props(
+        &self,
+        key_field: &str,
+        key_value: &Value,
+        named_ns: Option<&Value>,
+    ) -> Result<Vec<(String, Value)>> {
+        let mut props = vec![(key_field.to_string(), key_value.clone())];
+        if let Some(ns) = named_ns {
+            props.push((NS_PROP.to_string(), ns.clone()));
+            return Ok(props);
+        }
+        if let Some(ns) = self.merge_create_stamp_ns()? {
+            props.push((NS_PROP.to_string(), Value::Str(ns)));
+        }
+        Ok(props)
+    }
+
+    /// The namespace a role-scoped MERGE create stamps when the pattern does
+    /// not name `ns`. `None` = unscoped / full authority, so the node lands in
+    /// `default`.
+    fn merge_create_stamp_ns(&self) -> Result<Option<String>> {
+        let Some(authz) = self.pending_write_authz.as_ref() else {
+            return Ok(None);
+        };
+        let Some(def) = self.role_def_for(&authz.role) else {
+            return Ok(None);
+        };
+        match def.namespaces.as_deref() {
+            Some([only]) => Ok(Some(only.clone())),
+            Some(_) => Err(GraphError::RoleWriteDenied {
+                reason: MERGE_CREATE_NEEDS_ONE_NAMESPACE.to_string(),
+            }),
+            None => Ok(None),
+        }
+    }
+
     fn exec_merge(
         &mut self,
         stmt: core_query::cypher::MergeStmt,
@@ -9417,11 +9465,15 @@ impl<F: Fs> GraphDb<F> {
         };
 
         let existed = merge_existed;
+        let create_props = if existed {
+            None
+        } else {
+            Some(self.merge_create_props(&stmt.key_field, &stmt.key_value, stmt.ns.as_ref())?)
+        };
         let mut created = 0i64;
-        if !existed || !stmt.on_match.is_empty() {
+        if create_props.is_some() || !stmt.on_match.is_empty() {
             let mut batch = self.batch();
-            if !existed {
-                let props = vec![(stmt.key_field.clone(), stmt.key_value.clone())];
+            if let Some(props) = create_props {
                 batch.insert_node(&stmt.label, &key, props);
                 for sc in &stmt.on_create {
                     let value = resolve_merge_set_value(&sc.value, params)?;

@@ -29,7 +29,8 @@ pub use db::{
     BatchBuilder, BatchOp, DeleteReport, EdgeAt, EdgeInfo, Explanation, ExportEdge, FsyncPolicy,
     GraphDb, MaskedEdge, MaskedNodeResult, MutationEvent, NamespaceStats, NodeInfo, NodeRef,
     OpenOptions, Precondition, PredicateSummary, RuleStats, SlowQueryEntry, SlowQuerySnapshot,
-    SnapshotOptions, Stats, WhatIf, WriteAuthz, NS_DEFAULT, NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
+    SnapshotOptions, Stats, WhatIf, WriteAuthz, MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT,
+    NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
 };
 
 /// Current on-disk snapshot format version written by this build.

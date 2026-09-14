@@ -15,10 +15,12 @@
 //! 7.  `an_existing_store_is_one_namespace`
 //! 8.  `a_scoped_rule_derives_only_inside_its_namespace`
 //! 9.  `a_user_edge_may_not_cross_a_namespace`
+//! 19. `merge_creates_inside_a_single_namespace_role`
 
 use core_api::schema::Schema;
 use core_api::{
-    valid_namespace, GraphDb, GraphError, Predicate, RoleDef, RuleDef, Value, NS_DEFAULT, NS_PROP,
+    valid_namespace, GraphDb, GraphError, Predicate, RoleDef, RuleDef, Value, WriteScope,
+    MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT, NS_PROP,
 };
 use std::collections::BTreeMap;
 
@@ -275,6 +277,21 @@ fn role(name: &str, labels: &[&str], namespaces: Option<&[&str]>) -> RoleDef {
         visible_where: None,
         namespaces: namespaces.map(|ns| ns.iter().map(|s| s.to_string()).collect()),
         write: None,
+    }
+}
+
+/// A write-capable role over `labels`, optionally bound to `namespaces`.
+fn write_role(name: &str, labels: &[&str], namespaces: Option<&[&str]>) -> RoleDef {
+    let labels_v: Vec<String> = labels.iter().map(|s| s.to_string()).collect();
+    RoleDef {
+        write: Some(WriteScope {
+            create_labels: labels_v.clone(),
+            update_labels: labels_v.clone(),
+            delete_labels: labels_v.clone(),
+            create_edge_types: vec![],
+            delete_edge_types: vec![],
+        }),
+        ..role(name, labels, namespaces)
     }
 }
 
@@ -1167,10 +1184,10 @@ fn a_duplicate_ns_property_is_refused() {
 // 16. MERGE creates in the default namespace, and says so
 // ---------------------------------------------------------------------------
 
-/// `MERGE` carries only its identifying property into the create, so it creates
-/// in the default namespace — for every caller. A role bound to a namespace
-/// therefore cannot MERGE-create, and `ON CREATE SET n.ns` cannot rescue it
-/// because that is a namespace change. The match arm is unaffected.
+/// A global (no-role) `MERGE` still creates in the default namespace. Role-scoped
+/// MERGE-create is section 19: a single-namespace role stamps its namespace.
+/// `ON CREATE SET n.ns` cannot move the node, because that is a namespace
+/// change. The match arm is unaffected.
 #[test]
 fn merge_creates_in_the_default_namespace_only() {
     let dir = tmp("merge-ns");
@@ -1488,4 +1505,86 @@ fn the_readers_namespace_resolver_is_the_live_ones_twin() {
         );
     }
     assert_eq!(live_ns_keys(&db, "x"), x);
+}
+
+// ---------------------------------------------------------------------------
+// 19. MERGE creates inside a single-namespace role's namespace
+// ---------------------------------------------------------------------------
+
+/// A role bound to exactly one namespace can MERGE-create there. A role bound
+/// to two cannot, unless the pattern names `ns`. A global MERGE is still
+/// `default`. Naming a foreign `ns` is the same cross-namespace create refusal
+/// as `CREATE`.
+#[test]
+fn merge_creates_inside_a_single_namespace_role() {
+    let dir = tmp("merge-single-ns");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.apply_schema(&Schema {
+        roles: vec![
+            write_role("one", &["Doc"], Some(&["tenant-a"])),
+            write_role("two", &["Doc"], Some(&["tenant-a", "tenant-b"])),
+        ],
+        ..Default::default()
+    })
+    .unwrap();
+
+    // (a) Single-namespace role: a missing node is created in that namespace,
+    // and a second MERGE matches it (no duplicate).
+    let created = db
+        .query_write_authz("one", "MERGE (n:Doc {id: 'x'})", &no_params())
+        .expect("a single-namespace role may MERGE-create");
+    assert_eq!(created.get(0, "created"), Some(&Value::Int(1)));
+    assert_eq!(db.namespace_of("x").as_deref(), Some("tenant-a"));
+    let matched = db
+        .query_write_authz("one", "MERGE (n:Doc {id: 'x'})", &no_params())
+        .expect("the second MERGE matches the node just created");
+    assert_eq!(matched.get(0, "created"), Some(&Value::Int(0)));
+    assert_eq!(db.namespace_of("x").as_deref(), Some("tenant-a"));
+    assert_eq!(
+        db.query("MATCH (n:Doc {id: 'x'}) RETURN n", &no_params())
+            .unwrap()
+            .len(),
+        1,
+        "the second MERGE must not insert a duplicate"
+    );
+
+    // (b) Two-namespace role: the create is refused; the role must name one.
+    let err = db
+        .query_write_authz("two", "MERGE (n:Doc {id: 'y'})", &no_params())
+        .expect_err("a two-namespace role cannot MERGE-create without naming ns");
+    match err {
+        GraphError::RoleWriteDenied { reason } => {
+            assert_eq!(reason, MERGE_CREATE_NEEDS_ONE_NAMESPACE);
+        }
+        other => panic!("expected RoleWriteDenied, got {other:?}"),
+    }
+    assert!(!db.has_node("y"));
+    db.query_write_authz(
+        "two",
+        "MERGE (n:Doc {id: 'y', ns: 'tenant-a'})",
+        &no_params(),
+    )
+    .expect("naming one of the role's namespaces is enough");
+    assert_eq!(db.namespace_of("y").as_deref(), Some("tenant-a"));
+
+    // (c) A global (no-role) MERGE is unchanged: default namespace.
+    db.query_write("MERGE (n:Doc {id: 'g'})", &no_params())
+        .unwrap();
+    assert_eq!(db.namespace_of("g").as_deref(), Some(NS_DEFAULT));
+
+    // (d) Naming a foreign `ns` under a single-namespace role is refused as
+    // any other create outside the role's namespaces.
+    let err = db
+        .query_write_authz("one", "MERGE (n:Doc {id: 'z', ns: 'other'})", &no_params())
+        .expect_err("an explicit foreign ns is a cross-namespace create");
+    match err {
+        GraphError::RoleWriteDenied { reason } => {
+            assert_eq!(
+                reason,
+                "role-bound token: namespace 'other' not in the role's namespaces"
+            );
+        }
+        other => panic!("expected RoleWriteDenied, got {other:?}"),
+    }
+    assert!(!db.has_node("z"));
 }

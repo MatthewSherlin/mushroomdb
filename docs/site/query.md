@@ -460,10 +460,13 @@ edges (openCypher semantics).  If any edges remain the executor returns:
 MERGE (n:Person {id: 'alice'})
 ```
 
-- Match-or-create by a single key property only.
+- Match-or-create by a single key property. An optional `ns` names the
+  namespace the create arm writes into (`MERGE (n:Doc {id: 'x', ns: 'tenant-a'})`).
+- A role bound to exactly one namespace stamps that namespace when the
+  pattern does not name `ns`. A role bound to two or more must name one.
 - `ON CREATE SET` / `ON MATCH SET` apply inside the same write batch as the
   insert-or-skip. Both may appear on one MERGE.
-- Multi-property maps are not supported.
+- Other extra properties are not supported.
 
 ---
 
@@ -721,7 +724,8 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | Form | Error message (excerpt) |
 |---|---|
 | Bare `RETURN r` for a relationship variable | `cannot return relationship variable '…' bare; return its properties (….field) instead` |
-| `MERGE (n:L {id: 'x', extra: 2})` (multi-property) | `MERGE supports exactly one key property (got 2)` |
+| `MERGE (n:L {id: 'x', extra: 2})` (multi-property other than `ns`) | `MERGE supports exactly one key property (got 2)` |
+| `MERGE (n:L {id: 'x'})` by a role bound to two namespaces | `role-bound token: MERGE create requires the role to name one namespace` |
 | `DELETE n` when node has incident edges | `Cannot delete node … because it still has incident edges. Use DETACH DELETE…` |
 | `DELETE r` on derived (rule-owned) edge | `cannot delete derived edge; retract via the rule or change the property` |
 | `CREATE (a), (b)` comma-separated form | `parse error: unexpected tokens after CREATE pattern (found Comma)` |
