@@ -182,8 +182,9 @@ Predicate::VectorSimilar { field: "embedding".into(), min: 0.8 }
 
 **Candidates come from the vector index — 0.6.6, behaviour change.** A
 VectorSimilar rule with `approximate: false` used to compare every pair of
-vectors on the two sides: O(n²), about 12 minutes to backfill 5,000 nodes at
-dim 1536. From 0.6.6 it asks the same in-tree HNSW index the approximate mode
+vectors on the two sides: O(n²), measured at 147 s to create the rule over
+5,000 nodes at dim 1536 (`exact_vector_rule_recall_5k` with
+`MUSHROOMDB_VECTOR_SCAN=1`). From 0.6.6 it asks the same in-tree HNSW index the approximate mode
 uses for its candidates, and **the rule's own `min` is the beam's stopping
 rule**: the beam widens, doubling from `ef_search`
 ([400 by default](#vector-index-parameters)) up to a ceiling of 4,096, until it
@@ -330,7 +331,7 @@ persisted graph fails to load (the reason is logged).
 |---|---|---|
 | Candidates | HNSW, beam widened until its worst hit is below `min`; every other outcome is every vector on the side | HNSW approximate k-NN, one pass at k |
 | Scores | Exact, from the stored vectors | Exact, from the stored vectors |
-| Edge recall | floor 0.98 asserted by `exact_vector_rule_recall_5k` (5k/dim 1536, fixed-seed probe); exhaustive below one beam width | min 0.90, mean 0.998 (5k/dim 1536, fixed-seed probe) |
+| Edge recall | floor 0.98 asserted by `exact_vector_rule_recall_5k`, measured 1.0 (5k/dim 1536, fixed-seed probe); exhaustive below one beam width | floors min 0.90 / mean 0.95 asserted by `hnsw_5k_1536_recall`, measured min 1.0 / mean 1.0 (5k/dim 1536, fixed-seed probe) |
 | Determinism | Same data **and same write order** → same edges; at the beam boundary the candidate set follows the graph, whose shape depends on insertion order | Yes — same rule + data → same graph |
 | WAL replay | Identical | Identical (replayed writes update the loaded HNSW) |
 
@@ -343,9 +344,11 @@ both printed by `exact_vector_rule_recall_5k`):
 | `MUSHROOMDB_VECTOR_SCAN=1` (the O(n²) scan) | 147.4 s | 1.0000 |
 
 The index path replaces a quadratic derivation with a beam and pays a one-time
-graph build for it. That build is the term that moves: under 0.6.6's first cut —
-`m0` = 128, `ef_construction` = 400 and an `f64` distance — it was larger than
-the whole scan it removed and creation came out at 287 s, *slower* than the scan.
+graph build for it. That build is the term that moves: measured mid-release, at
+the halved parameters but still on the `f64` distance, creation came out at
+287 s — *slower* than the scan it removed. (The earlier `m0` = 128 shape was
+269 s at its own measurement; neither is a 0.6.5 figure, since 0.6.5 had no
+index-backed exact rule to time.)
 The halved [index parameters](#vector-index-parameters) and the `f32` slab
 kernel cut it to the figure above. Quote the test, not this table, after any
 further change to either: the gap is a property of the graph's shape, and the
@@ -397,11 +400,24 @@ While a rule is in that state:
   (`{"rule", "indexed", "total"}`), and `POST /rules` answered `202 Accepted`.
 - It derives **no** edges. Never a partial set: the backfill is a single commit
   that runs after the index is whole, through the same path `rebuild_rule` uses.
+- **No search answers from it while it is partial.** `find_similar`,
+  `hybrid_search` and a rule's own candidate lookup all decline a rule with a
+  build outstanding and take the exhaustive path instead, so a query mid-build
+  is slower and never answers about the fraction of the corpus the index has
+  reached. A snapshot taken mid-build records the fact in its index blob, so a
+  reader that opens it declines for the same reason with no live state to
+  consult.
 - Three things advance it, and any one of them is enough:
   1. **Any write.** Every durable commit does one slice on its way out, so a
-     store that is being written to finishes on its own.
+     store that is being written to finishes on its own. That slice is paid for
+     by the writer, under the write lock: 2,048 inserts, which at 1,536
+     dimensions is roughly 9–27 seconds. A latency-sensitive writer should let
+     `build-index` finish the build first.
   2. **`mushroomdb serve`.** A 1-second ticker calls `pump_index_build`, so a
-     quiescent server finishes too.
+     quiescent server finishes a build **its own handle has registered**. A
+     freshly restarted `serve` has not registered anything yet — the ticker sees
+     no pending build until the first write or a `build-index` run populates the
+     indexes — so a restart mid-build does not resume it on its own.
   3. **`mushroomdb build-index <db-dir> [--rule <name>]`.** Drives it to
      completion now, one progress line per slice, for an operator who wants the
      build done before traffic arrives. `--rule` narrows the report, not the
@@ -412,7 +428,10 @@ While a rule is in that state:
 
 A store killed mid-build reopens with the rule present and its index partly
 built; the snapshot's graph covers what it carried, the open-time scan covers
-the rest, and the next pump issues the backfill.
+the rest, and the next pump issues the backfill. The scan is **not** sliced: it
+inserts the whole remainder in one pass under the write lock, so a 50,000-vector
+corpus killed after its first slice pays the rest of that build in one blocking
+call, and only the edge backfill is left to the slice loop.
 
 How that is told apart from an ordinary write: a store restored from a snapshot
 defers building its candidate indexes until the first write, and the write path
@@ -430,10 +449,11 @@ pending build it therefore reports the `gained` edges the rule *would* derive,
 which the live store will not derive until its backfill runs. The preview is
 right about the end state and early about the timing.
 
-**Breaking change in 0.6.6:** code that created an approximate rule over more
+**Breaking change in 0.6.6:** code that created a VectorSimilar rule over more
 than 2,048 vectors and immediately asserted an edge count must now pump first.
-At or below 2,048 vectors nothing changed — one commit, edges present the
-moment `create_rule` returns.
+This is the vector index's threshold, not the approximate mode's, so an exact
+rule over that many vectors defers too. At or below 2,048 vectors nothing
+changed — one commit, edges present the moment `create_rule` returns.
 
 ### Vector index parameters
 

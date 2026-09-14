@@ -110,8 +110,14 @@ A node's namespace is a reserved node property, `ns`:
 ```
 
 - **Absent `ns` means the namespace `default`.** Every node in a store that has
-  never named a namespace is in `default`, so nothing about an existing store
-  changes when this version is installed.
+  never named a namespace is in `default`, so nothing about such a store changes
+  when this version is installed.
+- **A store that already used `ns` for something else does change.** `ns` is
+  reserved from 0.6.6 on, and existing string values are read as namespace names
+  on the first open: those nodes leave `default`, `ns` becomes unwritable on
+  them, and a value outside the name rules above can be listed by `stats` where
+  no surface will accept it back. There is no migration — rename the property
+  before upgrading if it meant something else.
 - **Writing `ns: "default"` explicitly stores nothing.** A single-tenant store
   carries no `ns` column at all and pays nothing for the feature.
 - **A name is 1–64 characters of `[A-Za-z0-9_.-]`.** `/` is excluded on purpose:
@@ -138,7 +144,8 @@ changed to tenant-b — delete and re-insert the node instead
 
 **Removing `ns` is changing it**, to `default` — the namespace an absent property
 names — so it is refused with the same error: `remove_prop`, a batched
-`RemoveProp`, Cypher `REMOVE n.ns`, and `DELETE /node/{key}/prop/ns` all return it.
+`RemoveProp`, and `DELETE /node/{key}/prop/ns` all return it. (The Cypher dialect
+has no `REMOVE`, so that spelling is a query error before it reaches this check.)
 
 Writing the namespace a node is already in is a no-op, not an error, and so is
 removing `ns` from a node already in `default`: neither changes a namespace, and

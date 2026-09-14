@@ -6,22 +6,36 @@ The vector index was the ceiling. Opening a store rebuilt the HNSW graph it had 
 changed embedding cost a walk of the whole graph, `create_rule` over a large corpus held its commit
 for the length of the build, and an exact `VectorSimilar` rule still compared every pair. This
 release takes those four in turn and then replaces the distance kernel underneath them, which is
-where most of the speed comes from: a 50,000-vector index now builds, where before it was not
-reached at all. It also adds namespaces, so one store can hold several tenants and a role can be
-bound to theirs. Every number below comes from a benchmark or a gate this release commits.
+where most of the speed comes from. It also adds namespaces, so one store can hold several tenants
+and a role can be bound to theirs. Every number below comes from a benchmark or a gate this
+release commits; the full printed table, and which of its columns are within-0.6.6 comparisons
+rather than comparisons with 0.6.5, are in
+[`benchmarks/results/hnsw-scale-0.6.6.md`](benchmarks/results/hnsw-scale-0.6.6.md).
 
 #### BREAKING
 
+- **A store written by 0.6.6 cannot be opened by 0.6.5.** `RuleDef` gains an appended `namespace`
+  field. A rule persisted by 0.6.5 still decodes here, as a global rule; the reverse does not
+  hold — 0.6.5's decoder knows only the older shapes and rejects trailing bytes, so it fails with
+  `rule_def deserialize` and the open is refused rather than degraded. Every rule 0.6.6 snapshots
+  is re-encoded this way, including rules 0.6.5 itself created. **Roll back only from a snapshot
+  taken before the upgrade.** Pinned by `a_0_6_5_decoder_cannot_read_a_0_6_6_rule`.
 - **The persisted vector index is blob version 3 (`MHNS`), and the upgrade is one way.** A 0.6.6
   binary reads version 1, 2 and 3 blobs and writes version 3. A 0.6.5 binary meeting a version-3
-  blob refuses it and falls back to a full scan, so its answers stay correct and get slower. The
-  snapshot format itself is untouched — see "Not in this release".
+  blob refuses *the blob* and falls back to a full scan — correct and slower — but it will not get
+  that far on a real store, because the `RuleDef` line above refuses the open first. The snapshot
+  format itself is untouched; see "Not in this release".
 - **`create_rule` on a large vector corpus returns before its edges exist.** A rule whose vector
   index does not fit in one build slice is installed, reports its progress through `stats`
   (`building: {indexed, total}`) and `POST /rules` (**202 Accepted**), and derives its edges in a
-  second commit once the index is whole — never a partial set. A write advances the build,
-  `mushroomdb serve` advances it once a second, and `mushroomdb build-index <db>` drives it to
-  completion. A corpus at or below the slice size behaves exactly as it did before.
+  second commit once the index is whole — never a partial set, and no search answers from the
+  partial index either (see Fixed). A write advances the build, `mushroomdb serve` advances a build
+  its handle has registered once a second, and `mushroomdb build-index <db>` drives it to
+  completion. **After a restart the first write or `mushroomdb build-index` is what registers an
+  outstanding build** — a freshly opened `serve` has nothing to advance until then. A corpus at or
+  below the slice size behaves exactly as it did before, and this applies to a `VectorSimilar` rule
+  in **either** mode, not only an approximate one: the slice threshold is the vector index, which
+  both build.
 - **An exact `VectorSimilar` rule finds its candidates through the vector index.** Its scores and
   weights are still computed exactly, on those candidates; the rule's `min` is the beam's stopping
   rule, and a beam that cannot prove that floor widens until it can or falls back to the exhaustive
@@ -36,7 +50,11 @@ bound to theirs. Every number below comes from a benchmark or a gate this releas
   later write naming a different `ns`, and a property delete that would strip it, are both refused.
   A single write may name `ns` at most once — with two entries the write path and the authorization
   path could read different namespaces from the same list. Absent means the default namespace, so
-  an existing store is one namespace and nothing is rewritten.
+  a store with no `ns` property anywhere is one namespace and nothing is rewritten. **A store that
+  already used `ns` as an ordinary string property is not**: those values become namespace names on
+  the first 0.6.6 open, so those nodes leave the default namespace, `ns` stops being writable on
+  them, and a value that is not a legal namespace name can end up listed by `stats` where no
+  surface can pass it back. Rename the property before upgrading if it meant something else.
 - **`MERGE` cannot create into a namespace, for any caller.** A MERGE pattern carries only its
   identifying property, so its create arm always lands in the default namespace — which means a
   role bound to namespaces cannot MERGE-create at all. Use `CREATE`, `insert_node` or `ingest`,
@@ -46,8 +64,9 @@ bound to theirs. Every number below comes from a benchmark or a gate this releas
   shorter of the two vectors, which produced a meaningless similarity. An index that skipped a
   vector, or whose dimension is not the query's, stops claiming the fast path: the rule falls back
   to its full scan and `find_similar_vector` to brute force, so a mixed-dimension corpus costs
-  speed, never results. Rules with `approximate: false` are unaffected. Re-embed a collection with
-  a single model.
+  speed, never results. A rule with `approximate: false` probes the same index and takes the same
+  fallback, so its **results** are unaffected and its speed is not. Re-embed a collection with a
+  single model.
 
 #### Added
 
@@ -67,13 +86,18 @@ bound to theirs. Every number below comes from a benchmark or a gate this releas
 #### Changed
 
 - **The index stores each vector as `f32` in one contiguous slab and sums the dot product in eight
-  independent accumulators.** This is where the release's speed is. On the committed scale
-  benchmark, building a 1,536-dimension index takes 8.5 s at 2,000 vectors, 132 s at 10,000 and
-  1,018 s at 50,000, against 49.6 s, 731 s and a run that was never reached. The index holds 6,663
-  bytes per vector instead of 12,807 — 48 % less — and the persisted blob halves with it. Recall is
-  unchanged on all six gates. The store's own `f64` copy of every vector is untouched; only the
-  index's copy is narrowed, and every similarity a caller is shown is still computed from the `f64`
-  properties.
+  independent accumulators.** This is where the release's speed is, and it is what pays for the
+  diverse-neighbour prune below. Measured across releases by the one gate that ran on both sides:
+  `approximate_recall_5k_timing`'s HNSW backfill was **227 s on 0.6.5** (recorded in
+  `.github/workflows/ci.yml` at tag `v0.6.5`) and is **49 s** here, at the same recall of 1.0.
+  Measured within this release, before and after the kernel alone, a 1,536-dimension build takes
+  8.5 s at 2,000 vectors and 132 s at 10,000 against 49.6 s and 731 s, and 50,000 vectors build in
+  1,018 s where that size was never run at the earlier cost. The index holds 6,663 bytes per vector
+  instead of 12,807 — 48 % less — and the persisted blob halves with it. Recall is unchanged on all
+  six gates. The store's own `f64` copy of every vector is untouched; only the index's copy is
+  narrowed, and every similarity a caller is shown is still computed from the `f64` properties.
+  Every figure here, and which comparison each one is,
+  is in [`benchmarks/results/hnsw-scale-0.6.6.md`](benchmarks/results/hnsw-scale-0.6.6.md).
 
 #### Fixed
 
@@ -81,16 +105,30 @@ bound to theirs. Every number below comes from a benchmark or a gate this releas
   a whole HNSW graph and then threw it away in favour of the persisted one. It now adopts the
   persisted graph and inserts only the nodes written after the snapshot.
 - **A changed embedding no longer costs a scan of the whole index.** Removal walked every node in
-  the graph to strip back-references; a reverse-adjacency map makes it O(in-degree). Measured on
-  the committed benchmark: one re-embed costs 2.4 ms at 2,000 vectors, 6.6 ms at 10,000 and 14.3 ms
-  at 50,000, against 14.1 ms and 30.7 ms at the first two sizes before this release.
-- **The HNSW §3.5 diverse-neighbour heuristic replaces the nearest-M prune**, which is what the
-  raised `M₀` was standing in for. Parameters are now `HnswParams` with documented defaults and a
+  the graph to strip back-references; a reverse-adjacency map makes it O(in-degree), which
+  `remove_is_not_a_full_scan` asserts as an operation count rather than a wall clock. At the
+  shipped kernel one re-embed costs 2.4 ms at 2,000 vectors, 6.6 ms at 10,000 and 14.3 ms at
+  50,000 — that is the cost after both this fix and the kernel, not a measurement of either alone.
+- **A diverse-neighbour prune replaces the nearest-M one**, which is what the raised `M₀` was
+  standing in for. It is a **first-rejection short-cut** of the HNSW paper's §3.5 algorithm, not
+  that algorithm: it keeps the untested far tail where the paper backfills with the nearest
+  rejects, which is both faster and — on a corpus whose clusters are wider than `M₀` — measurably
+  better. `docs/site/rules.md` carries the comparison, and anyone "correcting" it toward the paper
+  should read that table first. Parameters are now `HnswParams` with documented defaults and a
   `MUSHROOMDB_HNSW_PARAMS` override; the three recall gates already in CI pass unchanged, and four
   more join them. It costs build time at a fixed corpus size — 5,000 × 1,536 dimensions takes
   43.3 s with it against 9.6 s with the nearest-M prune — and the cheaper prune misses the 0.90
   recall floor on a clustered corpus at 0.8581, which is why the diverse one is the default and the
   other is an opt-out with its cost recorded beside it.
+- **A search during a deferred build is answered exactly, not from the part of the index that
+  exists.** The sliced build made `find_similar` and `hybrid_search` able to be *wrong* rather than
+  slow for the first time: after `create_rule` returned 202 the graph held one slice, looked
+  perfectly answerable, and was used — so a query whose true nearest neighbour sat outside that
+  slice got the nearest of the slice instead, with nothing in the result saying so. On a quiescent
+  embedded store that was permanent. Both paths now decline: a live handle skips a rule with a
+  build outstanding, and a snapshot taken mid-build records the fact in its index blob so that a
+  reader opening it declines too. Either way the caller gets the exhaustive answer, and the fast
+  path returns when the build finishes.
 - **`find_similar` reports an exact similarity again.** `find_similar_vector`,
   `find_similar_vector_masked` and the MCP `find_similar` tool re-score every candidate the index
   returns against the `f64` property vectors, so `min = 1.0` finds an exact duplicate and the index
@@ -104,11 +142,25 @@ bound to theirs. Every number below comes from a benchmark or a gate this releas
   narrows only when given `role` or `namespace`; the store-wide counts beside the roster are
   unchanged either way. A tenant that must not learn the other tenants' names belongs behind
   `serve --role-token`, where HTTP `GET /stats` is closed to role tokens entirely.
-- **A refused or parked vector is not persisted as such.** `dim_mismatches` and the parked list are
-  rebuilt-from-nothing on reopen, so an index that refused a vector, was snapshotted and reopened
-  comes back claiming the fast path while still missing that vector. Rules are unaffected — an
-  unequal-length pair is never an edge — and `find_similar` omits the node rather than scoring it
-  wrongly.
+- **A refused or parked vector is re-derived on reopen rather than persisted.** `dim_mismatches`
+  and the parked list are not in the blob; what restores them is the open-time node scan, which
+  re-offers every vector the persisted graph lacks and gets the same refusals. The state is
+  therefore rebuilt rather than remembered, which `a_refused_vector_is_still_refused_after_a_reopen`
+  and `a_parked_vector_survives_a_reopen` pin at store level. A mixed-dimension index upgraded from
+  a 0.6.5 or pre-kernel blob counts its padded positions as refusals for the same reason.
+- **`upsert_entity`'s update path is not atomic.** It sets one property at a time, so a write that
+  is refused partway — naming a different `ns` on an existing node, for instance — leaves the
+  properties ahead of the refusal committed and returns an error. Send a single-property update, or
+  use `POST /query` with a Cypher `SET`, when that matters.
+- **A masked approximate search can return fewer than `k`.** `find_similar` under a role bound to
+  namespaces over-fetches from the store-wide index and then filters by the mask, so a tenant whose
+  nearest neighbours are mostly other tenants' nodes can get far fewer hits than a full scan would
+  find. Nothing leaks; the result is short, not wrong. `MUSHROOMDB_VECTOR_SCAN=1` or an exact rule
+  avoids it.
+- **A full-authority edge upsert cannot auto-create an endpoint outside the default namespace.**
+  The placeholder node it would create carries no properties, so it would land in the default
+  namespace and the cross-boundary check refuses the edge. Create the endpoint first, with its
+  `ns`.
 - **`MERGE` has no way to name a namespace.** See BREAKING above; a role bound to namespaces must
   use `CREATE`, `insert_node` or `ingest` to create.
 - **No test ties a documented refusal string to the code that emits it.** The namespace work adds
@@ -125,14 +177,23 @@ bound to theirs. Every number below comes from a benchmark or a gate this releas
 
 No snapshot format change: V9 stays V9, and the `format-compat` contract (V5…V9 open, migrate and
 preserve data) is untouched. The vector index rides the opaque section it already rode, with its
-own magic and version inside it; a 0.6.5 binary meeting a 0.6.6 index falls back to a full scan
-rather than reading it wrongly.
+own magic and version inside it, so a 0.6.5 binary meeting a 0.6.6 index blob would fall back to a
+full scan rather than read it wrongly — though on a real store it refuses the open first, for the
+`RuleDef` reason under BREAKING.
 
 The scale benchmark's two growth assertions stay red, deliberately and unedited: the build is
 15.5× per 5× of vectors against a ceiling of 8×, and 50,000 vectors take 1,018 s against a ceiling
 of 300 s. A constant-factor kernel cancels out of a ratio, so closing them means cutting the
 distance-evaluation count itself, which changes the graph and therefore the recall table. That is
-0.7's problem, and the benchmark says so rather than being loosened.
+0.7's problem, and the benchmark says so rather than being loosened. The figures, and the
+evaluation-count gate that watches the same thing as a machine-independent count, are in
+[`benchmarks/results/hnsw-scale-0.6.6.md`](benchmarks/results/hnsw-scale-0.6.6.md).
+
+A build in progress is paid for by writers: every durable write does one slice of it, which at
+2,048 vectors of 1,536 dimensions is roughly 9–27 seconds under the write lock. A reopen mid-build
+does not resume the slicing at all — the open-time scan finishes the whole remaining index in one
+pass, and only the edge backfill is left to the slice loop. Run `mushroomdb build-index` before
+traffic arrives rather than discovering either through latency.
 
 ## v0.6.5 — the knowledge-base release
 

@@ -532,10 +532,10 @@ an edge across a boundary. An invalid name is a 400 and nothing is installed. Se
 Returns 400 with `{"error": "..."}` on validation failure (unknown field
 type, missing required field, duplicate rule name).
 
-**202 while the index builds.** An approximate VectorSimilar rule over more
-than 2,048 vectors cannot index its corpus in one commit, so the route installs
-the rule, indexes the first slice, and returns `202 Accepted` with the progress
-instead of `200`:
+**202 while the index builds.** A VectorSimilar rule — in **either** mode, since
+both build the vector index — over more than 2,048 vectors cannot index its
+corpus in one commit, so the route installs the rule, indexes the first slice,
+and returns `202 Accepted` with the progress instead of `200`:
 
 ```json
 {"rule": "sim", "building": {"indexed": 2048, "total": 120000}}

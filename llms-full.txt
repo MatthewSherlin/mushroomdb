@@ -172,7 +172,7 @@ Six predicate kinds ship today. They compose via `All(...)` (AND, score = min) a
 
 Auto-FK: fields ending in `_id` whose values match existing node keys get `KeyMatch` rules created
 automatically at ingest time. `VectorSimilar` accepts `approximate: true` to switch candidate
-selection to in-tree HNSW (per-query recall min 0.90, mean 0.998 at 5k nodes / dim 1536,
+selection to in-tree HNSW (per-query recall floors min 0.90 / mean 0.95, measured 1.0 / 1.0 at 5k nodes / dim 1536,
 fixed-seed probe). Full reference: [`docs/site/rules.md`](docs/site/rules.md).
 
 ### Built on the same engine
@@ -261,7 +261,7 @@ the server answers — and `mushroomdb mcp <db> --all-tools` lists the whole set
 |---|---|
 | `upsert_entity` | Insert or update a node by key (no existence check needed) |
 | `ingest_json` | Batch-ingest nodes of one label from a JSON array |
-| `create_rule` | Declare a derivation rule; backfills existing nodes immediately |
+| `create_rule` | Declare a derivation rule; backfills existing nodes in the same commit (a vector index over 2,048 vectors builds in slices, and the edges arrive in a later commit) |
 | `find_similar` | Find similar nodes by query vector (HNSW) or by derived edge traversal |
 | `hybrid_search` | RRF over fulltext + vector results |
 | `explain` | The rules and scores that link two nodes, as JSON — `explain_association` above answers the same question in prose |
@@ -378,7 +378,7 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 | Cold start without a snapshot re-fires all rules | Snapshots persist derived edges, ANN state, and view definitions. At 100k nodes / ~10M derived edges: **0.02 s** from a V8 snapshot vs **8.16 min** WAL-only (ANN re-fit dominates). Call `snapshot()` before close. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
 | Two-hop Cypher joins at scale | Dense patterns producing >1,000,000 intermediate rows error without `LIMIT`. Add `LIMIT n` — the pull-based executor stops early and never materializes the full binding table. |
 | Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE, MATCH…DETACH DELETE, and MERGE (single-key, with `ON CREATE SET` / `ON MATCH SET`) are supported. Derived edges cannot be deleted manually. Variable-length paths are hard-capped at 10 hops; unbounded `*min..` is rejected at parse time. Full coverage table: [`docs/site/query.md`](docs/site/query.md). |
-| Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection. Per-query recall min 0.90, mean 0.998 at 5k / dim 1536 (fixed-seed probe). Review the trade-off before using it in completeness-critical workloads. |
+| Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection. Per-query recall floors min 0.90 / mean 0.95, measured 1.0 / 1.0 at 5k / dim 1536 (fixed-seed probe). Review the trade-off before using it in completeness-critical workloads. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
 | Python bindings return dicts | pandas/polars zero-copy is not wired yet. HTTP `POST /query` defaults to Arrow IPC; JSON via `?format=json`. |
 
@@ -1899,8 +1899,9 @@ Predicate::VectorSimilar { field: "embedding".into(), min: 0.8 }
 
 **Candidates come from the vector index — 0.6.6, behaviour change.** A
 VectorSimilar rule with `approximate: false` used to compare every pair of
-vectors on the two sides: O(n²), about 12 minutes to backfill 5,000 nodes at
-dim 1536. From 0.6.6 it asks the same in-tree HNSW index the approximate mode
+vectors on the two sides: O(n²), measured at 147 s to create the rule over
+5,000 nodes at dim 1536 (`exact_vector_rule_recall_5k` with
+`MUSHROOMDB_VECTOR_SCAN=1`). From 0.6.6 it asks the same in-tree HNSW index the approximate mode
 uses for its candidates, and **the rule's own `min` is the beam's stopping
 rule**: the beam widens, doubling from `ef_search`
 ([400 by default](#vector-index-parameters)) up to a ceiling of 4,096, until it
@@ -2047,7 +2048,7 @@ persisted graph fails to load (the reason is logged).
 |---|---|---|
 | Candidates | HNSW, beam widened until its worst hit is below `min`; every other outcome is every vector on the side | HNSW approximate k-NN, one pass at k |
 | Scores | Exact, from the stored vectors | Exact, from the stored vectors |
-| Edge recall | floor 0.98 asserted by `exact_vector_rule_recall_5k` (5k/dim 1536, fixed-seed probe); exhaustive below one beam width | min 0.90, mean 0.998 (5k/dim 1536, fixed-seed probe) |
+| Edge recall | floor 0.98 asserted by `exact_vector_rule_recall_5k`, measured 1.0 (5k/dim 1536, fixed-seed probe); exhaustive below one beam width | floors min 0.90 / mean 0.95 asserted by `hnsw_5k_1536_recall`, measured min 1.0 / mean 1.0 (5k/dim 1536, fixed-seed probe) |
 | Determinism | Same data **and same write order** → same edges; at the beam boundary the candidate set follows the graph, whose shape depends on insertion order | Yes — same rule + data → same graph |
 | WAL replay | Identical | Identical (replayed writes update the loaded HNSW) |
 
@@ -2060,9 +2061,11 @@ both printed by `exact_vector_rule_recall_5k`):
 | `MUSHROOMDB_VECTOR_SCAN=1` (the O(n²) scan) | 147.4 s | 1.0000 |
 
 The index path replaces a quadratic derivation with a beam and pays a one-time
-graph build for it. That build is the term that moves: under 0.6.6's first cut —
-`m0` = 128, `ef_construction` = 400 and an `f64` distance — it was larger than
-the whole scan it removed and creation came out at 287 s, *slower* than the scan.
+graph build for it. That build is the term that moves: measured mid-release, at
+the halved parameters but still on the `f64` distance, creation came out at
+287 s — *slower* than the scan it removed. (The earlier `m0` = 128 shape was
+269 s at its own measurement; neither is a 0.6.5 figure, since 0.6.5 had no
+index-backed exact rule to time.)
 The halved [index parameters](#vector-index-parameters) and the `f32` slab
 kernel cut it to the figure above. Quote the test, not this table, after any
 further change to either: the gap is a property of the graph's shape, and the
@@ -2114,11 +2117,24 @@ While a rule is in that state:
   (`{"rule", "indexed", "total"}`), and `POST /rules` answered `202 Accepted`.
 - It derives **no** edges. Never a partial set: the backfill is a single commit
   that runs after the index is whole, through the same path `rebuild_rule` uses.
+- **No search answers from it while it is partial.** `find_similar`,
+  `hybrid_search` and a rule's own candidate lookup all decline a rule with a
+  build outstanding and take the exhaustive path instead, so a query mid-build
+  is slower and never answers about the fraction of the corpus the index has
+  reached. A snapshot taken mid-build records the fact in its index blob, so a
+  reader that opens it declines for the same reason with no live state to
+  consult.
 - Three things advance it, and any one of them is enough:
   1. **Any write.** Every durable commit does one slice on its way out, so a
-     store that is being written to finishes on its own.
+     store that is being written to finishes on its own. That slice is paid for
+     by the writer, under the write lock: 2,048 inserts, which at 1,536
+     dimensions is roughly 9–27 seconds. A latency-sensitive writer should let
+     `build-index` finish the build first.
   2. **`mushroomdb serve`.** A 1-second ticker calls `pump_index_build`, so a
-     quiescent server finishes too.
+     quiescent server finishes a build **its own handle has registered**. A
+     freshly restarted `serve` has not registered anything yet — the ticker sees
+     no pending build until the first write or a `build-index` run populates the
+     indexes — so a restart mid-build does not resume it on its own.
   3. **`mushroomdb build-index <db-dir> [--rule <name>]`.** Drives it to
      completion now, one progress line per slice, for an operator who wants the
      build done before traffic arrives. `--rule` narrows the report, not the
@@ -2129,7 +2145,10 @@ While a rule is in that state:
 
 A store killed mid-build reopens with the rule present and its index partly
 built; the snapshot's graph covers what it carried, the open-time scan covers
-the rest, and the next pump issues the backfill.
+the rest, and the next pump issues the backfill. The scan is **not** sliced: it
+inserts the whole remainder in one pass under the write lock, so a 50,000-vector
+corpus killed after its first slice pays the rest of that build in one blocking
+call, and only the edge backfill is left to the slice loop.
 
 How that is told apart from an ordinary write: a store restored from a snapshot
 defers building its candidate indexes until the first write, and the write path
@@ -2147,10 +2166,11 @@ pending build it therefore reports the `gained` edges the rule *would* derive,
 which the live store will not derive until its backfill runs. The preview is
 right about the end state and early about the timing.
 
-**Breaking change in 0.6.6:** code that created an approximate rule over more
+**Breaking change in 0.6.6:** code that created a VectorSimilar rule over more
 than 2,048 vectors and immediately asserted an edge count must now pump first.
-At or below 2,048 vectors nothing changed — one commit, edges present the
-moment `create_rule` returns.
+This is the vector index's threshold, not the approximate mode's, so an exact
+rule over that many vectors defers too. At or below 2,048 vectors nothing
+changed — one commit, edges present the moment `create_rule` returns.
 
 ### Vector index parameters
 
@@ -3090,7 +3110,7 @@ rows into it.
 |---|---|
 | `upsert_entity` | Insert or update a node by key. Creates if absent, updates props if present. Pass `namespace` for the namespace a created node lands in; on a node that already exists, naming the namespace it is in is a no-op and naming another is refused — a namespace is set at insert and cannot be changed. |
 | `ingest_json` | Batch-ingest an array of nodes of the same label from JSON. Pass `namespace` to put every node the call creates in one namespace; a row carrying a different `ns` is refused before anything is written. A field whose values point at two labels is skipped with `ambiguous target labels`; declare one `create_rule` KeyMatch rule per target label instead. |
-| `create_rule` | Declare a derivation rule; backfills existing nodes immediately. Pass `namespace` to scope it to one namespace — source, via hop and destination — so every edge it derives stays inside; omitted is a global rule, the only kind that may cross a boundary. Propose it and wait for approval — it is a store-wide write. |
+| `create_rule` | Declare a derivation rule; backfills existing nodes in the same commit, unless it has a vector index over more than 2,048 vectors, in which case the build is sliced and the edges arrive in a later commit (`stats` reports the progress). Pass `namespace` to scope it to one namespace — source, via hop and destination — so every edge it derives stays inside; omitted is a global rule, the only kind that may cross a boundary. Propose it and wait for approval — it is a store-wide write. |
 | `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity using HNSW when available; (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). |
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain` | The rules and scores that produced the edges between two nodes, as JSON. `explain_association` above is the same question answered in prose. |
@@ -4638,10 +4658,10 @@ an edge across a boundary. An invalid name is a 400 and nothing is installed. Se
 Returns 400 with `{"error": "..."}` on validation failure (unknown field
 type, missing required field, duplicate rule name).
 
-**202 while the index builds.** An approximate VectorSimilar rule over more
-than 2,048 vectors cannot index its corpus in one commit, so the route installs
-the rule, indexes the first slice, and returns `202 Accepted` with the progress
-instead of `200`:
+**202 while the index builds.** A VectorSimilar rule — in **either** mode, since
+both build the vector index — over more than 2,048 vectors cannot index its
+corpus in one commit, so the route installs the rule, indexes the first slice,
+and returns `202 Accepted` with the progress instead of `200`:
 
 ```json
 {"rule": "sim", "building": {"indexed": 2048, "total": 120000}}

@@ -35,8 +35,9 @@ jobs:
   # are unguarded — a recall regression would pass CI. Measured at the 0.6.6
   # default shape (m=16, m0=64, ef_construction=200, ef_search=400, prune=both):
   # the uniform 5k gate is at min 1.0000 / mean 1.0000, the two clustered ones at
-  # 1.0000, and the 40x120 fixture at min 0.8000 / mean 0.9950. The whole job is
-  # roughly 20 min of wall clock.
+  # 1.0000, and the 40x120 fixture at min 0.8000 / mean 0.9950. Every wall clock
+  # below is measured on the shipped f32 distance kernel; the job is roughly
+  # 5 min on aarch64 and slower on this runner, whose baseline x86-64 has no FMA.
   # Timing gates (group-commit throughput, reader-burst p95) stay out of CI and
   # are covered by the median-of-3 bench-compare job instead.
   recall-gates:
@@ -46,26 +47,30 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
         with: { toolchain: "1.92.0" }
       # hnsw_5k_1536_recall: 5k vectors × 1536-D HNSW; asserts min recall@10 ≥ 0.90, mean ≥ 0.95.
-      # Measured: min 1.0000 / mean 1.0000, ~250 s.
+      # Measured: min 1.0000 / mean 1.0000, ~46 s.
       - run: cargo test --release -p mushroomdb-rules -- hnsw_5k_1536_recall --ignored --nocapture
       # clustered_recall_survives_clusters_wider_than_m0: 40 clusters of 120 × 128-D, so a
-      # cluster is wider than m0=64 — the case the §3.5 heuristic replaced M₀=128 for.
+      # cluster is wider than m0=64 — the case the diverse-neighbour prune replaced M₀=128
+      # for. That prune is a first-rejection short-cut of HNSW §3.5, not §3.5 itself; see
+      # docs/site/rules.md before "correcting" it toward the paper.
       # Runs both prune shapes and asserts each against its own floor plus both >= own:
       # own min 0.5000 / mean 0.9350 (floors 0.40/0.90), both min 0.8000 / mean 0.9950
-      # (floors 0.70/0.95). ~8 s.
+      # (floors 0.70/0.95). ~3 s.
       - run: cargo test --release -p mushroomdb-rules -- clustered_recall_survives_clusters_wider_than_m0 --ignored --nocapture
       # recall_survives_insert_remove_churn: the same 5k × 1536-D corpus put through an
       # insert/remove/re-insert sequence, then scored against brute force over the
       # survivors. Asserts min recall@10 ≥ 0.90, mean ≥ 0.95 — a graph that heals badly
       # answers from the wrong neighbourhood, and nothing else in CI would notice.
-      # Measured: min 1.0000 / mean 1.0000 over 3857 survivors, ~260 s.
+      # Measured: min 1.0000 / mean 1.0000 over 3857 survivors, ~47 s.
       - run: cargo test --release -p mushroomdb-rules -- recall_survives_insert_remove_churn --ignored --nocapture
       # approximate_recall_above_floor_1536dim_1k: 1024-node HNSW × 1536-D; asserts recall ≥ 0.90.
-      # ~25 s. Under HNSW_BUILD_BATCH, so create_rule still backfills inline here.
+      # ~9 s. Under HNSW_BUILD_BATCH, so create_rule still backfills inline here.
       - run: cargo test --release -p sim-harness -- approximate_recall_above_floor_1536dim_1k --ignored --nocapture
       # approximate_recall_5k_timing: 5k-node HNSW × 1536-D; asserts recall ≥ 0.90.
-      # Measured: recall 1.0000 (495000/495000), backfill 181 s, ~240 s in total with the
-      # O(n^2) ground truth. 5000 vectors is over HNSW_BUILD_BATCH, so the test pumps
+      # Measured: recall 1.0000 (495000/495000), backfill 49 s, ~70 s in total with the
+      # O(n^2) ground truth. This is the one gate with a v0.6.5 number to compare against:
+      # its backfill was 227 s there (see this file at tag v0.6.5), at the same recall.
+      # 5000 vectors is over HNSW_BUILD_BATCH, so the test pumps
       # pump_index_build() to completion before measuring — without that it derives no
       # edges at all and scores 0.0000, which is how it sat dark through 0.6.6's Task 2.
       # At prune=own this gate fails at 0.8581; see docs/site/rules.md.
@@ -83,7 +88,7 @@ jobs:
       # candidates through the index too, so this gate is what holds the beam's
       # stopping rule honest. Like the approximate one it is over HNSW_BUILD_BATCH
       # and pumps the build to completion before measuring. Measured: recall
-      # 1.0000 (495000/495000), creation 64 s, ~105 s in total; the same rule with
+      # 1.0000 (495000/495000), creation 63 s, ~85 s in total; the same rule with
       # MUSHROOMDB_VECTOR_SCAN=1 takes 147 s to create and also scores 1.0000.
       - run: cargo test --release -p sim-harness -- exact_vector_rule_recall_5k --ignored --nocapture
 
