@@ -319,7 +319,8 @@ call instead of buried in the props. A row or a `props` object that carries its 
 `ns` naming a *different* namespace is refused before anything is written — one node
 is created in one namespace. On `upsert_entity` over a node that already exists the
 namespace is written like any other property, so naming the one it is already in is a
-no-op and naming another is the `NamespaceImmutable` refusal above.
+no-op and naming another is the `NamespaceImmutable` refusal above — and that
+refusal is atomic with the rest of the update: no sibling property is committed.
 
 ### What `stats` discloses
 

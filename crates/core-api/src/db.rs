@@ -5469,6 +5469,11 @@ impl<F: Fs> GraphDb<F> {
                         }
                     }
                     BatchOp::SetProp { key, field, value } => {
+                        if let Some(view_name) = preview.db.view_store.view_for_prop(&field) {
+                            return Err(GraphError::ViewPropReadOnly {
+                                view_name: view_name.to_string(),
+                            });
+                        }
                         preview.check_live_key(&key)?;
                         preview.note_set_prop(&key, &field, &value);
                         recs.push(WalRecord::SetProp { key, field, value });
@@ -5720,6 +5725,35 @@ impl<F: Fs> GraphDb<F> {
             field: field.into(),
             value,
         }])
+    }
+
+    /// Set several properties on one live node in a single WAL commit.
+    ///
+    /// Every per-property check [`set_prop`](Self::set_prop) runs — view-owned
+    /// names, live key, the `ns` immutability rule and its type — is evaluated
+    /// for the whole list before any record is logged. The first refusal
+    /// returns and the node is unchanged. An empty list writes nothing.
+    pub fn set_props(&mut self, key: &str, props: Vec<(String, Value)>) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        MutPreview::new(self).check_live_key(key)?;
+        for (field, _) in &props {
+            if let Some(view_name) = self.view_store.view_for_prop(field) {
+                return Err(GraphError::ViewPropReadOnly {
+                    view_name: view_name.to_string(),
+                });
+            }
+        }
+        if props.is_empty() {
+            return Ok(());
+        }
+        self.write_batch(|b| {
+            for (field, value) in props {
+                b.set_prop(key, &field, value);
+            }
+        })
+        .map(|_| ())
     }
 
     /// Remove a property. Returns `Ok(false)` (and does not log) if the field

@@ -13,6 +13,12 @@
   handful of vectors written after a *complete* snapshot; an incomplete blob is
   left to `pump_index_build`. Pinned by `an_interrupted_build_resumes_on_reopen`
   and `a_search_after_a_mid_build_reopen_is_exact`.
+- **`upsert_entity` refuses the whole update or applies all of it.** The update
+  path used to set one property at a time, so a write refused partway — a
+  different `ns`, a reserved name — left the properties ahead of the refusal
+  committed. Every per-property check now runs first and the sets land in one
+  WAL commit. The v0.6.6 known limit is closed. Pinned by
+  `upsert_entity_update_is_all_or_nothing`.
 
 ## v0.6.6 — the scale release
 

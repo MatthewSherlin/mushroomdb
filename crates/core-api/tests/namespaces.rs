@@ -194,6 +194,42 @@ fn a_namespace_is_set_at_insert_and_immutable() {
     assert_eq!(db.namespace_of("a2").as_deref(), Some("x"));
 }
 
+/// Binding: `set_props` checks every field before it writes any of them, so a
+/// refused `ns` change does not leave a sibling property committed.
+#[test]
+fn set_props_is_all_or_nothing() {
+    let mut db = GraphDb::open(&tmp("set-props-atomic")).unwrap();
+    db.insert_node(
+        "Doc",
+        "a",
+        vec![
+            ("id".into(), Value::Str("a".into())),
+            ("x".into(), Value::Int(1)),
+        ],
+    )
+    .unwrap();
+    let before = db.commit_seq();
+    match db.set_props(
+        "a",
+        vec![
+            ("b".into(), Value::Int(2)),
+            (NS_PROP.into(), Value::Str("other".into())),
+        ],
+    ) {
+        Err(GraphError::NamespaceImmutable { from, to, .. }) => {
+            assert_eq!((from.as_str(), to.as_str()), (NS_DEFAULT, "other"));
+        }
+        other => panic!("expected NamespaceImmutable, got {other:?}"),
+    }
+    assert_eq!(db.get_prop("a", "b"), None, "b must not land");
+    assert_eq!(db.get_prop("a", "x"), Some(Value::Int(1)));
+    assert_eq!(
+        db.commit_seq(),
+        before,
+        "a refused set_props is not a commit"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3. Invalid namespace names
 // ---------------------------------------------------------------------------
