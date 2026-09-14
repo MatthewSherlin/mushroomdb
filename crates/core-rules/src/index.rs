@@ -69,7 +69,8 @@ thread_local! {
     static EF_MAX_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-pub(crate) fn ef_max() -> usize {
+/// The beam ceiling the widening loop consults, honouring [`with_ef_max`].
+pub fn ef_max() -> usize {
     EF_MAX_OVERRIDE.with(|c| c.get().unwrap_or(EF_MAX)).max(1)
 }
 

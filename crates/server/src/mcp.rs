@@ -1341,7 +1341,7 @@ fn graph_tools() -> Vec<Js> {
                         "mask": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Optional node key allow-list for vector-search mode. When present, only nodes whose key appears in this list are eligible for results. Hidden nodes are excluded before k-truncation so callers still receive up to k visible hits. Unknown keys are silently ignored."
+                            "description": "Optional node key allow-list for vector-search mode. When present, only nodes whose key appears in this list are eligible for results. Hidden nodes are excluded before k-truncation. The beam widens until it has k visible hits, then falls back to an exhaustive masked scan at the same cap an exact VectorSimilar rule uses, so the result is not short while more visible hits exist. Unknown keys are silently ignored."
                         },
                         "key": { "type": "string", "description": "Source node key for edge-traversal mode." },
                         "edge_type": { "type": "string", "description": "Edge type to filter by in edge-traversal mode (default: SIMILAR)." },

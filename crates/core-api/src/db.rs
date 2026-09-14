@@ -11,8 +11,8 @@ use core_query::cypher::{
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
-    decode_rule_def, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView, Predicate,
-    RuleDef, RuleEngine, ViewDef, ViewStore,
+    decode_rule_def, ef_max, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView,
+    Predicate, RuleDef, RuleEngine, ViewDef, ViewStore,
 };
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
@@ -8639,26 +8639,26 @@ impl<F: Fs> GraphDb<F> {
     /// **before** k-truncation so a caller still receives up to `k` visible
     /// hits.
     ///
-    /// # HNSW path (over-fetch policy)
+    /// # HNSW path (widening beam)
     ///
-    /// When an HNSW index covers the request, this function fetches
-    /// `4 * k + VECTOR_RESCORE_MARGIN` candidates from the index and discards
-    /// hidden nodes in the post-filter step.  If fewer than `k` visible nodes
-    /// remain after filtering the caller receives whatever is available — we do
-    /// not re-query the index.  Every surviving candidate is re-scored from the
-    /// `f64` property vectors, exactly as [`find_similar_vector`] does and for
-    /// the same reason.  The 4×
-    /// multiplier is a heuristic suited for sparsely masked graphs; callers
-    /// operating under a very selective mask should register a VectorSimilar
-    /// rule with a non-approximate index, or use the brute-force path (no HNSW
-    /// rule) which exhaustively filters through the masked [`GraphView`].
+    /// When an HNSW index covers the request, the beam starts at an over-fetch
+    /// of `k × n / |visible|` (plus the rescore margin) when the mask's
+    /// selectivity is known from the index length, otherwise at `k` plus that
+    /// margin. If fewer than `k` visible candidates remain after the mask and
+    /// `min` filter, the beam doubles — the same ×2 loop exact `VectorSimilar`
+    /// rules use, capped at `ef_max()` (`EF_MAX` = 4,096). Reaching the cap,
+    /// or a beam that comes back short of its own width, falls through to the
+    /// exhaustive masked scan rather than returning a short result.
+    ///
+    /// Every surviving candidate is re-scored from the `f64` property vectors,
+    /// exactly as [`find_similar_vector`] does and for the same reason.
     ///
     /// # Brute-force path
     ///
-    /// When no HNSW index covers the request the function builds a masked
-    /// [`GraphView`] so that `nodes_all` / `nodes_with_label` return only
-    /// visible nodes, guaranteeing exact `k` results (or all visible nodes if
-    /// fewer than `k` exist).
+    /// When no HNSW index covers the request, or the beam cannot admit `k`
+    /// hits, the function builds a masked [`GraphView`] so that `nodes_all` /
+    /// `nodes_with_label` return only visible nodes, guaranteeing exact `k`
+    /// results (or all visible nodes if fewer than `k` exist).
     pub fn find_similar_vector_masked(
         &self,
         field: &str,
@@ -8672,44 +8672,53 @@ impl<F: Fs> GraphDb<F> {
         self.ensure_v8_base_sections_loaded();
         self.engine.ensure_hnsw_loaded();
         let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm == 0.0 {
+        if norm == 0.0 || k == 0 || mask.is_empty() {
             return vec![];
         }
         let q_unit: Vec<f64> = q.iter().map(|x| x / norm).collect();
 
-        // HNSW fast path — over-fetch 4×k so post-masking still yields up to k
-        // visible hits.  See doc comment above for the policy rationale.
-        let over_k = k
-            .saturating_mul(4)
-            .max(k + 1)
-            .saturating_add(VECTOR_RESCORE_MARGIN);
-        let hnsw_hits = match label {
-            Some(lbl) => self.engine.hnsw_search_dst(field, lbl, &q_unit, over_k),
-            None => self.engine.hnsw_search_any_dst(field, &q_unit, over_k),
+        let index_len = match label {
+            Some(lbl) => self.engine.hnsw_dst_len(field, lbl, q_unit.len()),
+            None => self.engine.hnsw_any_dst_len(field, q_unit.len()),
         };
-        if let Some(hits) = hnsw_hits {
-            // Candidates only — re-scored from the `f64` vectors before `min`,
-            // the ordering or the reported score. The mask is applied first so a
-            // hidden node is never scored.
-            let view = self.view_masked(mask);
-            let mut out: Vec<(String, f64)> = hits
-                .into_iter()
-                .filter(|&(id, _)| mask.visible.contains(&id))
-                .filter_map(|(id, _)| {
-                    let sim = exact_vector_similarity(&view, id, field, &q_unit)?;
-                    if sim < min {
-                        return None;
-                    }
-                    Some((self.ids.key_of(id)?.to_string(), sim))
-                })
-                .collect();
-            out.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            out.truncate(k);
-            return out;
+        if let Some(n) = index_len {
+            // Same ceiling the exact-rule widening loop in `hnsw_candidates`
+            // consults — including the `with_ef_max` test hook.
+            let cap = ef_max();
+            let visible = mask.len();
+            let mut ef = k.saturating_add(VECTOR_RESCORE_MARGIN);
+            if visible > 0 && n > 0 {
+                let over = k
+                    .saturating_mul(n)
+                    .div_ceil(visible)
+                    .saturating_add(VECTOR_RESCORE_MARGIN);
+                ef = ef.max(over);
+            }
+            loop {
+                let hits = match label {
+                    Some(lbl) => self
+                        .engine
+                        .hnsw_search_dst_with_ef(field, lbl, &q_unit, ef, ef),
+                    None => self
+                        .engine
+                        .hnsw_search_any_dst_with_ef(field, &q_unit, ef, ef),
+                };
+                let Some(hits) = hits else {
+                    break;
+                };
+                let full = hits.len() == ef;
+                let mut out = self.score_masked_hnsw_hits(&hits, field, &q_unit, min, mask);
+                if out.len() >= k {
+                    out.truncate(k);
+                    return out;
+                }
+                // Short of its width (frontier exhausted) or at the ceiling:
+                // a wider beam reaches nothing new, so the scan answers.
+                if !full || ef >= cap {
+                    break;
+                }
+                ef = ef.saturating_mul(2);
+            }
         }
 
         // Brute-force fallback — masked view ensures only visible nodes are
@@ -8742,6 +8751,37 @@ impl<F: Fs> GraphDb<F> {
         });
         scored.truncate(k);
         scored
+    }
+
+    /// Re-score HNSW candidates from the `f64` vectors, drop hidden / below-`min`
+    /// hits, order by score then key. The index's own `f32` similarity is discarded.
+    fn score_masked_hnsw_hits(
+        &self,
+        hits: &[(u32, f64)],
+        field: &str,
+        q_unit: &[f64],
+        min: f64,
+        mask: &crate::mask::NodeMask,
+    ) -> Vec<(String, f64)> {
+        let view = self.view_masked(mask);
+        let mut out: Vec<(String, f64)> = hits
+            .iter()
+            .copied()
+            .filter(|&(id, _)| mask.visible.contains(&id))
+            .filter_map(|(id, _)| {
+                let sim = exact_vector_similarity(&view, id, field, q_unit)?;
+                if sim < min {
+                    return None;
+                }
+                Some((self.ids.key_of(id)?.to_string(), sim))
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out
     }
 
     /// Read a single property from an edge.

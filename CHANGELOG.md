@@ -26,6 +26,16 @@
   refused (`role-bound token: MERGE create requires the role to name one namespace`)
   unless the pattern names one. Pinned by
   `merge_creates_inside_a_single_namespace_role`.
+- **A masked approximate search returns `k` hits.** `find_similar_vector_masked`
+  and the masked MCP `find_similar` used to over-fetch `4k` from the store-wide
+  index and stop, so a tenant whose nearest neighbours were mostly other
+  tenants' nodes got a short result. The beam now starts at an over-fetch of
+  `k` divided by the mask's selectivity, doubles until it has `k` visible hits
+  or reaches `EF_MAX` (the same cap an exact `VectorSimilar` rule uses), and
+  at the cap falls back to an exhaustive masked scan. Nothing leaks; the
+  result is no longer short. Pinned by
+  `a_masked_search_widens_its_beam_until_it_has_k` and
+  `a_masked_search_at_the_beam_cap_falls_back_to_the_scan`.
 
 #### Changed
 

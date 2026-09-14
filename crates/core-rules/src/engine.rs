@@ -3159,6 +3159,45 @@ impl RuleEngine {
         }
     }
 
+    /// Dst-side HNSW graph that can answer a query of `q_len` for this rule.
+    ///
+    /// A sliced build still in `pending_builds` is skipped — the graph holds a
+    /// prefix of its corpus and must not answer. Live indexes first, then the
+    /// lazily-decoded blobs, matching [`Self::hnsw_search_dst`].
+    fn dst_hnsw_answering(&self, name: &str, q_len: usize) -> Option<&HnswIndex> {
+        if self.pending_builds.contains_key(name) {
+            return None;
+        }
+        let live = self
+            .indexes
+            .get(name)
+            .and_then(|idx| idx.dst_side.hnsw_ref())
+            .filter(|h| h.can_answer(q_len));
+        let lazy = self
+            .lazy_hnsw
+            .get()
+            .and_then(|l| l.get(name))
+            .and_then(|(_, dst)| dst.as_ref())
+            .filter(|h| h.can_answer(q_len));
+        live.or(lazy)
+    }
+
+    /// First dst-side index covering `(dst_label, field)` that can answer.
+    fn hnsw_dst_index(&self, field: &str, dst_label: &str, q_len: usize) -> Option<&HnswIndex> {
+        for (name, def) in &self.rules {
+            if !def.approximate || def.dst_label != dst_label {
+                continue;
+            }
+            if !predicate_covers_field(&def.predicate, field) {
+                continue;
+            }
+            if let Some(h) = self.dst_hnsw_answering(name, q_len) {
+                return Some(h);
+            }
+        }
+        None
+    }
+
     /// Find approximate nearest-neighbor ids on the dst side of the first
     /// approximate VectorSimilar rule covering `(dst_label, field)`.
     ///
@@ -3170,45 +3209,28 @@ impl RuleEngine {
         q: &[f64],
         k: usize,
     ) -> Option<Vec<(u32, f64)>> {
-        for (name, def) in &self.rules {
-            if !def.approximate || def.dst_label != dst_label {
-                continue;
-            }
-            // Check that the predicate covers this vector field.
-            if !predicate_covers_field(&def.predicate, field) {
-                continue;
-            }
-            // A rule whose sliced build is unfinished has a graph holding a
-            // prefix of its corpus: it would answer, and answer about the wrong
-            // set, with nothing in the result to say so. Skipping it here is the
-            // same door `can_answer == false` uses — the caller brute-forces and
-            // gets the exact answer, slower. The build advances on every write,
-            // on `serve`'s tick and on `mushroomdb build-index`.
-            if self.pending_builds.contains_key(name) {
-                continue;
-            }
-            if let Some(idx) = self.indexes.get(name) {
-                if let Some(h) = idx.dst_side.hnsw_ref() {
-                    // `can_answer` rather than `!is_empty()`: an index that
-                    // refused a vector, or whose stride is not this query's
-                    // dimension, is non-empty and still cannot answer for every
-                    // node — `None` here is what sends the caller to its scan.
-                    if h.can_answer(q.len()) {
-                        return Some(h.search(q, k));
-                    }
-                }
-            }
-            // Fallback: blobs deserialized via ensure_hnsw_loaded (read path,
-            // no mutation has populated self.indexes yet).
-            if let Some(lazy) = self.lazy_hnsw.get() {
-                if let Some((_, Some(h))) = lazy.get(name) {
-                    if h.can_answer(q.len()) {
-                        return Some(h.search(q, k));
-                    }
-                }
-            }
-        }
-        None
+        self.hnsw_dst_index(field, dst_label, q.len())
+            .map(|h| h.search(q, k))
+    }
+
+    /// [`Self::hnsw_search_dst`] with an explicit layer-0 beam width, so a
+    /// caller can widen the beam the same way exact `VectorSimilar` rules do.
+    pub fn hnsw_search_dst_with_ef(
+        &self,
+        field: &str,
+        dst_label: &str,
+        q: &[f64],
+        k: usize,
+        ef: usize,
+    ) -> Option<Vec<(u32, f64)>> {
+        self.hnsw_dst_index(field, dst_label, q.len())
+            .map(|h| h.search_with_ef(q, k, ef))
+    }
+
+    /// Number of vectors in the dst-side index that would answer this query.
+    pub fn hnsw_dst_len(&self, field: &str, dst_label: &str, q_len: usize) -> Option<usize> {
+        self.hnsw_dst_index(field, dst_label, q_len)
+            .map(|h| h.len())
     }
 
     /// Returns `true` if any approximate VectorSimilar rule covers `field`.
@@ -3233,6 +3255,46 @@ impl RuleEngine {
     /// Returns `None` when no applicable rule has a populated HNSW index
     /// (same sentinel convention as `hnsw_search_dst`).
     pub fn hnsw_search_any_dst(&self, field: &str, q: &[f64], k: usize) -> Option<Vec<(u32, f64)>> {
+        self.merge_dst_searches(field, q, k, |h| h.search(q, k))
+    }
+
+    /// [`Self::hnsw_search_any_dst`] with an explicit layer-0 beam width.
+    pub fn hnsw_search_any_dst_with_ef(
+        &self,
+        field: &str,
+        q: &[f64],
+        k: usize,
+        ef: usize,
+    ) -> Option<Vec<(u32, f64)>> {
+        self.merge_dst_searches(field, q, k, |h| h.search_with_ef(q, k, ef))
+    }
+
+    /// Sum of vector counts across dst-side indexes covering `field`.
+    pub fn hnsw_any_dst_len(&self, field: &str, q_len: usize) -> Option<usize> {
+        let mut total = 0usize;
+        let mut found = false;
+        for (name, def) in &self.rules {
+            if !def.approximate {
+                continue;
+            }
+            if !predicate_covers_field(&def.predicate, field) {
+                continue;
+            }
+            if let Some(h) = self.dst_hnsw_answering(name, q_len) {
+                found = true;
+                total = total.saturating_add(h.len());
+            }
+        }
+        found.then_some(total)
+    }
+
+    fn merge_dst_searches(
+        &self,
+        field: &str,
+        q: &[f64],
+        k: usize,
+        search: impl Fn(&HnswIndex) -> Vec<(u32, f64)>,
+    ) -> Option<Vec<(u32, f64)>> {
         let mut merged: std::collections::BTreeMap<u32, f64> = std::collections::BTreeMap::new();
         let mut found_index = false;
 
@@ -3244,43 +3306,25 @@ impl RuleEngine {
                 continue;
             }
             // As in `hnsw_search_dst`: a half-built graph answers about a prefix
-            // of the corpus, so it does not answer here at all.
-            if self.pending_builds.contains_key(name) {
-                continue;
-            }
-            // Live index first, then the lazily-decoded blobs — as a *fallback*,
-            // not an alternative. `self.indexes` holds an entry for every rule
-            // from `from_persist` onwards, so an `else if` here would mean a
+            // of the corpus, so it does not answer here at all. Live index
+            // first, then the lazily-decoded blobs — as a *fallback*, not an
+            // alternative. `self.indexes` holds an entry for every rule from
+            // `from_persist` onwards, so an `else if` here would mean a
             // clean-open handle never reached `lazy_hnsw` at all and answered
-            // every label-less query by brute force. `hnsw_search_dst` has
-            // always chained these correctly; this arm had not.
-            let live = self
-                .indexes
-                .get(name)
-                .and_then(|idx| idx.dst_side.hnsw_ref())
-                .filter(|h| h.can_answer(q.len()));
-            let lazy = self
-                .lazy_hnsw
-                .get()
-                .and_then(|l| l.get(name))
-                .and_then(|(_, dst)| dst.as_ref())
-                .filter(|h| h.can_answer(q.len()));
-            let hits: Option<Vec<(u32, f64)>> = live.or(lazy).map(|h| {
-                found_index = true;
-                h.search(q, k)
-            });
-
-            if let Some(hits) = hits {
-                for (id, score) in hits {
-                    merged
-                        .entry(id)
-                        .and_modify(|s| {
-                            if score > *s {
-                                *s = score;
-                            }
-                        })
-                        .or_insert(score);
-                }
+            // every label-less query by brute force.
+            let Some(h) = self.dst_hnsw_answering(name, q.len()) else {
+                continue;
+            };
+            found_index = true;
+            for (id, score) in search(h) {
+                merged
+                    .entry(id)
+                    .and_modify(|s| {
+                        if score > *s {
+                            *s = score;
+                        }
+                    })
+                    .or_insert(score);
             }
         }
 

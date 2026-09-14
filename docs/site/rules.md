@@ -590,7 +590,9 @@ to the index's own number would return nothing at all. So:
 * Rule weights were always recomputed from the `f64` properties
   (`def.rs::cosine`), and still are.
 * `find_similar_vector` and `find_similar_vector_masked` treat the index's hits
-  as candidates only: they over-fetch (`k + 16`, and `4k + 16` under a mask),
+  as candidates only: they over-fetch (`k + 16`; under a mask, `k × n / |visible|`
+  when selectivity is known, then a ×2 beam-widening loop capped at `EF_MAX`,
+  falling back to an exhaustive masked scan rather than returning short of `k`),
   re-score every candidate against the `f64` property vectors, and apply `min`,
   the ordering and the reported score to *that* number. Every **score** you
   receive is the one the brute-force scan would have produced, to `f64`
