@@ -1293,6 +1293,12 @@ async fn create_rule(
     // A corpus too large to index in one commit leaves the rule installed but
     // deriving nothing, so the route says "accepted", not "done", and hands
     // back the progress the caller can poll on `GET /stats`.
+    //
+    // Read under a *separate* lock from the write above, so a concurrent pump
+    // can finish the build in between and this route then answers 200 for a
+    // create that really did defer. Benign — 200 means "the edges are there",
+    // which by then they are — and the caller's contract is to poll `GET /stats`
+    // either way.
     let building = state
         .db
         .read()

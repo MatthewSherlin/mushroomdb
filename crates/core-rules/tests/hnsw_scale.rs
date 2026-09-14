@@ -119,7 +119,10 @@ fn hnsw_insert_cost_is_sublinear_per_vector() {
     let u = update[2].as_secs_f64() / update[0].as_secs_f64();
     assert!(
         u < 3.0,
-        "update cost grew {u:.2}x from 2k to 50k; removal is still O(N)"
+        "update cost grew {u:.2}x from 2k to 50k. An update is a remove plus an \
+         insert, and removal is pinned at O(in-degree) by \
+         remove_touches_only_the_nodes_that_list_it — so this is the *insert* \
+         growing with n, the same term assertion (1) measures, not a removal scan."
     );
     assert!(
         update[2] < Duration::from_millis(25),

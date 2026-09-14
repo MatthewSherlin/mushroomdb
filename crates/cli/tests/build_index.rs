@@ -159,7 +159,10 @@ fn build_index_says_so_when_there_is_nothing_to_build() {
 
 /// `--rule` narrows the **report**, not the work: pending builds share one
 /// write lock, so splitting them would only mean taking it more often. A name
-/// that is not building is not an error, it is nothing to say.
+/// that is not building is not an error, it is nothing to say — but a name that
+/// is not a rule at all is a typo, and the two say so differently. The test
+/// above covers the first case (`"sim"` once it is built); this one covers the
+/// second.
 #[test]
 fn build_index_filters_by_rule() {
     let dir = tmp("filter");
@@ -171,8 +174,8 @@ fn build_index_filters_by_rule() {
     let mut db = seed(&other, 300, Some(64));
     assert_eq!(
         build_index_on(&mut db, Some("other")).unwrap(),
-        "nothing to build for rule \"other\"\n",
-        "a name that is not building reports nothing"
+        "no rule named \"other\" in this store; nothing to build\n",
+        "a name that is not a rule must not read as a finished build"
     );
     assert!(
         db.builds_in_progress().is_empty(),

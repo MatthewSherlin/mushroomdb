@@ -1629,6 +1629,9 @@ pub fn run_build_index(db_dir: &Path, rule: Option<&str>) -> Result<String, CliE
 pub fn build_index_on(db: &mut GraphDb<RealFs>, rule: Option<&str>) -> Result<String, CliError> {
     let mut out = String::new();
     let interesting = |name: &str| rule.is_none_or(|r| r == name);
+    // Read before pumping, so that "no such rule" and "that rule is already
+    // built" can be told apart in the empty case below.
+    let known_rules: Vec<String> = db.stats().rules.iter().map(|r| r.name.clone()).collect();
 
     // Pump before looking. A freshly opened handle holds no pending build until
     // its indexes are populated, and populating them is what recognises a build
@@ -1655,6 +1658,12 @@ pub fn build_index_on(db: &mut GraphDb<RealFs>, rule: Option<&str>) -> Result<St
     }
     if out.is_empty() {
         match rule {
+            // Distinguish the two ways this can be empty, because they need
+            // different things from the operator: a finished build is fine, a
+            // name that is not a rule is a typo.
+            Some(r) if !known_rules.iter().any(|k| k == r) => out.push_str(&format!(
+                "no rule named {r:?} in this store; nothing to build\n"
+            )),
             Some(r) => out.push_str(&format!("nothing to build for rule {r:?}\n")),
             None => out.push_str("nothing to build\n"),
         }
