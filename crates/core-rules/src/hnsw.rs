@@ -191,10 +191,25 @@ impl HnswParams {
 pub fn hnsw_params() -> HnswParams {
     static PARAMS: std::sync::OnceLock<HnswParams> = std::sync::OnceLock::new();
     *PARAMS.get_or_init(|| {
-        std::env::var("MUSHROOMDB_HNSW_PARAMS")
-            .ok()
-            .and_then(|s| HnswParams::parse(&s))
-            .unwrap_or_default()
+        let Ok(raw) = std::env::var("MUSHROOMDB_HNSW_PARAMS") else {
+            return HnswParams::default();
+        };
+        match HnswParams::parse(&raw) {
+            Some(p) => p,
+            None => {
+                // Silence here means an operator who mistyped the variable gets
+                // the defaults and a graph built under a shape they did not
+                // ask for, with nothing to tell them apart from a shape they
+                // did. One line, once per process.
+                eprintln!(
+                    "mushroomdb: MUSHROOMDB_HNSW_PARAMS={raw:?} is not \
+                     `m,m0,ef_construction,ef_search[,own|both]` with non-zero numbers; \
+                     using the defaults {:?}",
+                    HnswParams::default()
+                );
+                HnswParams::default()
+            }
+        }
     })
 }
 
@@ -542,7 +557,7 @@ fn dist_to(slab: &VecSlab, slot: u32, q: &[f32]) -> f64 {
 /// vectors; it is copied as far as it goes and zero-filled beyond, because the
 /// node is already in the graph and dropping it would leave adjacency naming a
 /// slot that is not there. One log line names how many.
-fn slab_of_decoded(vectors: &[Vec<f64>]) -> VecSlab {
+fn slab_of_decoded(vectors: &[Vec<f64>]) -> (VecSlab, u64) {
     let dim = vectors
         .iter()
         .map(|v| v.len())
@@ -553,7 +568,7 @@ fn slab_of_decoded(vectors: &[Vec<f64>]) -> VecSlab {
         data: vec![0.0; vectors.len() * dim],
     };
     if dim == 0 {
-        return slab;
+        return (slab, 0);
     }
     let mut odd = 0usize;
     for (slot, v) in vectors.iter().enumerate() {
@@ -574,10 +589,11 @@ fn slab_of_decoded(vectors: &[Vec<f64>]) -> VecSlab {
         eprintln!(
             "mushroomdb: HNSW loaded {odd} node(s) whose embedding is not {dim} \
              dimensions; they were padded to the index's stride. Re-embed the \
-             collection with one model — their distances were already meaningless."
+             collection with one model — their distances were already meaningless. \
+             This index will not claim the fast path while they are in it."
         );
     }
-    slab
+    (slab, odd as u64)
 }
 
 /// The `f32` form of a unit `f64` vector — the query shape every search path
@@ -681,6 +697,25 @@ pub struct HnswIndex {
     /// from the decoded adjacency lists (see `rebuild_back_refs`).
     #[serde(skip)]
     back_refs: BTreeMap<u32, BTreeSet<u32>>,
+    /// True when this graph was decoded from a blob a sliced build had not
+    /// finished writing, so it holds a prefix of its rule's corpus.
+    ///
+    /// A partial graph answers a search perfectly well — it just answers about
+    /// the wrong set, and nothing in the result says so. That is the one shape
+    /// of wrongness this index is not allowed to have, so
+    /// [`Self::can_answer`] refuses and the caller takes its exhaustive path.
+    ///
+    /// Only the **read** path ever sees this set: a live handle's authority on
+    /// an unfinished build is `RuleEngine::pending_builds`, and
+    /// [`SideIndex::adopt_hnsw`] clears the flag because the open-time node
+    /// scan that follows it supplies every vector the blob lacked. It is the
+    /// lazily-decoded copy on a clean open — which no scan follows — that needs
+    /// evidence carried in the bytes.
+    ///
+    /// Not serialized as part of the index: it is a property of the *blob*, and
+    /// [`HnswBlob::complete`] is where it lives on disk.
+    #[serde(skip)]
+    incomplete: bool,
     /// Entry-point **slot**.
     entry_point: Option<u32>,
     max_level: usize,
@@ -806,9 +841,27 @@ impl HnswIndex {
     /// and short.
     pub fn can_answer(&self, q_len: usize) -> bool {
         !self.is_empty()
+            && !self.incomplete
             && self.dim_mismatches == 0
             && self.slab.dim == q_len
             && !self.parked.iter().any(|(_, v)| v.len() == q_len)
+    }
+
+    /// Declare this graph whole, clearing the [`Self::incomplete`] flag a
+    /// partial blob set.
+    ///
+    /// Called by [`SideIndex::adopt_hnsw`], because every adoption is followed
+    /// by the open-time node scan that supplies whatever the blob was missing,
+    /// and by nothing else: the lazily-decoded read-path copy has no scan
+    /// behind it and must keep refusing until a write populates the live index.
+    pub fn mark_complete(&mut self) {
+        self.incomplete = false;
+    }
+
+    /// True when this graph came from a blob written mid-build.
+    #[doc(hidden)]
+    pub fn is_incomplete(&self) -> bool {
+        self.incomplete
     }
 
     /// Returns all node ids currently in the index.
@@ -931,11 +984,19 @@ impl HnswIndex {
             })
             .collect();
 
+        let (slab, odd) = slab_of_decoded(&vectors);
         let mut out = Self {
             base_seed: v1.base_seed,
             entry_point: v1.entry_point.and_then(|e| slot_of.get(&e).copied()),
             max_level: v1.max_level,
-            slab: slab_of_decoded(&vectors),
+            slab,
+            // A padded position is a vector the index does not really hold, so
+            // it counts exactly as a refusal does: `can_answer` goes false and
+            // every caller takes its exhaustive path. Without this an upgraded
+            // mixed-dimension index claims the fast path over fabricated
+            // coordinates, which is the one thing the BREAKING note promises it
+            // will not do.
+            dim_mismatches: odd,
             slots,
             slot_of,
             id_of,
@@ -974,9 +1035,12 @@ impl HnswIndex {
                 }
             })
             .collect();
+        let (slab, odd) = slab_of_decoded(&vectors);
         let mut out = Self {
             base_seed: v2.base_seed,
-            slab: slab_of_decoded(&vectors),
+            slab,
+            // See `from_v1`: a padded position counts as a refusal.
+            dim_mismatches: odd,
             slots,
             slot_of: v2.slot_of,
             id_of: v2.id_of,
@@ -1319,6 +1383,13 @@ impl HnswIndex {
                     self.insert(pid, &pv);
                 }
             } else {
+                // A refusal still has to honour this method's contract that an
+                // existing id is *replaced*: the `remove` below is past the
+                // early return, so without this the index would keep the old
+                // vector under an id whose new embedding it just rejected.
+                if self.slot_of.contains_key(&id) {
+                    self.remove(id);
+                }
                 self.dim_mismatches += 1;
                 if self.dim_mismatches == 1 {
                     eprintln!(
@@ -1723,6 +1794,17 @@ pub struct HnswBlob {
     pub magic: [u8; 4],
     pub version: u16,
     pub index: HnswIndex,
+    /// False when the rule's sliced build had not finished when this blob was
+    /// written, so the graph inside holds a prefix of the corpus.
+    ///
+    /// `RuleEngine::pending_builds` is not persisted, so a snapshot taken
+    /// mid-build has to carry its own evidence: without this, a reader opening
+    /// that snapshot decodes the partial graph, finds it perfectly answerable
+    /// and serves `find_similar` from a fraction of the corpus with no signal.
+    /// A `false` here makes [`HnswIndex::can_answer`] refuse, which sends every
+    /// such query to the exhaustive scan until a write, `mushroomdb build-index`
+    /// or `serve`'s pump finishes the build.
+    pub complete: bool,
 }
 
 /// Serialize-only twin of [`HnswBlob`] so encoding never clones the index.
@@ -1731,6 +1813,7 @@ struct HnswBlobRef<'a> {
     magic: [u8; 4],
     version: u16,
     index: &'a HnswIndex,
+    complete: bool,
 }
 
 /// The 0.6.5 on-disk shape: node ids key the map *and* name the adjacency
@@ -1787,11 +1870,16 @@ struct HnswBlobV2 {
 }
 
 /// Serialize `index` as a versioned blob. `None` only if bincode fails.
-pub fn encode_hnsw_blob(index: &HnswIndex) -> Option<Vec<u8>> {
+///
+/// `complete` is false when the rule's sliced build is still owed vectors, and
+/// is what stops a reader over this snapshot answering from a prefix of the
+/// corpus. Every caller that cannot be mid-build passes `true`.
+pub fn encode_hnsw_blob(index: &HnswIndex, complete: bool) -> Option<Vec<u8>> {
     bincode::serialize(&HnswBlobRef {
         magic: HNSW_BLOB_MAGIC,
         version: HNSW_BLOB_VERSION,
         index,
+        complete,
     })
     .ok()
 }
@@ -1824,10 +1912,36 @@ pub fn decode_hnsw_blob(blob: &[u8]) -> Result<HnswIndex, String> {
         return match version {
             3 => bincode::deserialize::<HnswBlob>(blob)
                 .map_err(|e| format!("HNSW v3 blob did not decode ({e})"))
-                .map(|b| {
+                .and_then(|b| {
                     let mut index = b.index;
+                    // bincode will happily decode a `Vec<f32>` shorter than the
+                    // slots claim — it reads the length prefix it is given. A
+                    // short slab then hands `dot_f32` two slices of unequal
+                    // length, which is a `debug_assert` in a debug build and a
+                    // garbage distance in a release one. Refuse instead: the
+                    // caller keeps its `hnsw_tracked` scan.
+                    if index.slab.dim != 0
+                        && index.slab.data.len() < index.slots.len() * index.slab.dim
+                    {
+                        return Err(format!(
+                            "HNSW v3 blob is truncated: the slab holds {} floats, {} slots \
+                             of {} dimensions need {}",
+                            index.slab.data.len(),
+                            index.slots.len(),
+                            index.slab.dim,
+                            index.slots.len() * index.slab.dim
+                        ));
+                    }
+                    if index.id_of.len() != index.slots.len() {
+                        return Err(format!(
+                            "HNSW v3 blob is inconsistent: {} slots against {} id entries",
+                            index.slots.len(),
+                            index.id_of.len()
+                        ));
+                    }
                     index.rebuild_back_refs();
-                    index
+                    index.incomplete = !b.complete;
+                    Ok(index)
                 }),
             2 => bincode::deserialize::<HnswBlobV2>(blob)
                 .map_err(|e| format!("HNSW v2 blob did not decode ({e})"))
@@ -3181,6 +3295,13 @@ mod tests {
 
     /// Re-express a live index in the id-keyed 0.6.5 shape.
     fn as_v1_blob(idx: &HnswIndex) -> Vec<u8> {
+        as_v1_blob_with(idx, &[])
+    }
+
+    /// [`as_v1_blob`], but `by_id[id]` overrides the vector written for `id`
+    /// when it is present — the only way to build a mixed-dimension blob, since
+    /// this build refuses one on the way in and an older build did not.
+    fn as_v1_blob_with(idx: &HnswIndex, by_id: &[Vec<f64>]) -> Vec<u8> {
         let nodes: BTreeMap<u32, V1Node> = idx
             .slot_of
             .iter()
@@ -3190,7 +3311,10 @@ mod tests {
                     id,
                     V1Node {
                         level: n.level,
-                        vector: vector_of(idx, s),
+                        vector: by_id
+                            .get(id as usize)
+                            .cloned()
+                            .unwrap_or_else(|| vector_of(idx, s)),
                         layers: n
                             .layers
                             .iter()
@@ -3212,13 +3336,21 @@ mod tests {
     /// Re-express a live index in the slot-keyed blob-v2 shape — 0.6.6 before the
     /// distance kernel, with an `f64` vector inside every node.
     fn as_v2_blob(idx: &HnswIndex) -> Vec<u8> {
+        as_v2_blob_with(idx, &[])
+    }
+
+    /// [`as_v2_blob`], with the same `by_id` override as [`as_v1_blob_with`].
+    fn as_v2_blob_with(idx: &HnswIndex, by_id: &[Vec<f64>]) -> Vec<u8> {
         let slots: Vec<V2Node> = idx
             .slots
             .iter()
             .enumerate()
             .map(|(s, n)| V2Node {
                 level: n.level,
-                vector: vector_of(idx, s as u32),
+                vector: by_id
+                    .get(*idx.id_of.get(s).unwrap_or(&DEAD) as usize)
+                    .cloned()
+                    .unwrap_or_else(|| vector_of(idx, s as u32)),
                 layers: n.layers.clone(),
             })
             .collect();
@@ -3280,11 +3412,167 @@ mod tests {
         assert_matches(&loaded, &idx, &vecs[3]);
     }
 
+    /// A mixed-dimension v1 or v2 blob upgrades into an index that **declines**
+    /// the fast path.
+    ///
+    /// 0.6.5 accepted vectors of unequal length, so this is exactly where a
+    /// mixed-dimension graph can come from. `slab_of_decoded` pads the odd ones
+    /// to the elected stride, which puts a fabricated position in the graph;
+    /// counting each as a refusal is what makes the release's promise — "an
+    /// index that skipped a vector stops claiming the fast path" — true on the
+    /// upgrade path too. The odd node stays in the graph, because dropping it
+    /// would leave adjacency naming a slot that is not there.
+    #[test]
+    fn a_mixed_dimension_upgrade_declines_the_fast_path() {
+        for shape in ["v1", "v2"] {
+            let mut vecs = make_unit_vecs(40, 24, 0x0D1D_0DDD);
+            let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"mixed"));
+            for (i, v) in vecs.iter().enumerate() {
+                idx.insert(i as u32, v);
+            }
+            // Shorten one vector *in the encoded bytes*, which is the only way
+            // a mixed-dimension graph can exist: this build refuses one on the
+            // way in, and an older build did not.
+            vecs[7].truncate(23);
+            let blob = match shape {
+                "v1" => as_v1_blob_with(&idx, &vecs),
+                _ => as_v2_blob_with(&idx, &vecs),
+            };
+
+            let loaded = decode_hnsw_blob(&blob).expect("a mixed blob still loads");
+            assert_eq!(
+                loaded.node_ids(),
+                idx.node_ids(),
+                "{shape}: the odd node must stay in the graph"
+            );
+            assert!(
+                !loaded.can_answer(24),
+                "{shape}: an index holding a padded position must not claim the fast path"
+            );
+            // And it is still a usable graph — the caller's scan is what answers,
+            // but nothing here may panic.
+            let _ = loaded.search(&vecs[3], 5);
+        }
+    }
+
+    /// A truncated v3 slab is refused, not decoded into a graph whose distance
+    /// kernel reads past the rows it has.
+    #[test]
+    fn a_truncated_v3_slab_is_refused() {
+        let (_vecs, mut idx) = blob_fixture();
+
+        // A *well-formed* blob whose slab is short of what its slots claim.
+        // bincode reads the length prefix it is given, so this decodes happily
+        // and `VecSlab::get` then hands `dot_f32` an empty slice against a
+        // 24-element query — a `debug_assert` in debug, a garbage distance in
+        // release. The header check has to catch it before that.
+        let full = idx.slab.data.len();
+        idx.slab.data.truncate(full - idx.slab.dim);
+        let blob = encode_hnsw_blob(&idx, true).expect("encode");
+
+        let err = decode_hnsw_blob(&blob).expect_err("a truncated slab must be refused");
+        assert!(
+            err.contains("truncated"),
+            "the error must name the problem; got {err:?}"
+        );
+
+        // An inconsistent slot/id pairing is refused by the same gate.
+        let (_v, mut bad) = blob_fixture();
+        bad.id_of.pop();
+        let err = decode_hnsw_blob(&encode_hnsw_blob(&bad, true).expect("encode"))
+            .expect_err("a slot/id mismatch must be refused");
+        assert!(
+            err.contains("inconsistent"),
+            "the error must name the problem; got {err:?}"
+        );
+    }
+
+    /// A blob written mid-build says so, and the graph it decodes to refuses to
+    /// answer until something finishes the build.
+    #[test]
+    fn an_incomplete_blob_refuses_to_answer() {
+        let (vecs, idx) = blob_fixture();
+
+        let whole = decode_hnsw_blob(&encode_hnsw_blob(&idx, true).expect("encode"))
+            .expect("a complete blob loads");
+        assert!(whole.can_answer(24), "a complete blob must answer");
+        assert!(!whole.is_incomplete());
+
+        let partial = decode_hnsw_blob(&encode_hnsw_blob(&idx, false).expect("encode"))
+            .expect("an incomplete blob still loads");
+        assert!(
+            partial.is_incomplete(),
+            "the flag must survive the round trip"
+        );
+        assert!(
+            !partial.can_answer(24),
+            "a graph holding a prefix of its corpus must not claim the fast path"
+        );
+        // It is a real graph, not a broken one: the flag is about completeness,
+        // not about validity, and `mark_complete` is what the adopting side
+        // calls once the open-time scan has filled it in.
+        assert_eq!(partial.node_ids(), idx.node_ids());
+        let mut adopted = partial;
+        adopted.mark_complete();
+        assert!(adopted.can_answer(24));
+        assert_eq!(adopted.search(&vecs[3], 5), whole.search(&vecs[3], 5));
+    }
+
+    /// A refused insert still replaces the id it was offered for.
+    ///
+    /// `insert`'s contract is that an existing id is replaced; the refusal arm
+    /// returns before the `remove` that implements it, so without the paired
+    /// remove the index keeps the *old* vector under an id whose new embedding
+    /// it just rejected — a stale answer under a live key. The engine removes
+    /// first today, so this is a guard on the method, not a live defect.
+    #[test]
+    fn a_refused_insert_does_not_leave_a_stale_vector() {
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"stale"));
+        let vecs = make_unit_vecs(4, 8, 0x57A1_E000);
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert(i as u32, v);
+        }
+        assert!(idx.node_ids().contains(&0));
+
+        // Re-embed node 0 at the wrong dimension: the index cannot hold it.
+        idx.insert(0, &make_unit_vecs(1, 4, 0x57A1_E001)[0]);
+        assert!(
+            !idx.node_ids().contains(&0),
+            "the refused id must not keep its old vector"
+        );
+        assert!(
+            !idx.can_answer(8),
+            "a refusal means the index is missing a vector it was offered"
+        );
+    }
+
+    /// A set-but-malformed `MUSHROOMDB_HNSW_PARAMS` falls back to the defaults.
+    ///
+    /// The warning itself is an `eprintln!` and not asserted here; what is
+    /// asserted is that no malformed spelling silently becomes a *different*
+    /// shape, which is the property the graph depends on.
+    #[test]
+    fn a_malformed_params_string_yields_the_defaults() {
+        for bad in [
+            "",
+            "16,64,200",
+            "16,64,200,400,neither",
+            "a,b,c,d",
+            "16,0,200,400",
+        ] {
+            assert_eq!(
+                HnswParams::parse(bad),
+                None,
+                "{bad:?} must not parse to a shape"
+            );
+        }
+    }
+
     /// This build's wrapper round-trips, and it is version 3.
     #[test]
     fn a_v3_blob_round_trips() {
         let (vecs, idx) = blob_fixture();
-        let blob = encode_hnsw_blob(&idx).expect("encode");
+        let blob = encode_hnsw_blob(&idx, true).expect("encode");
         assert_eq!(
             &blob[..4],
             &HNSW_BLOB_MAGIC,
@@ -3333,7 +3621,7 @@ mod tests {
     #[test]
     fn an_unknown_version_is_rejected() {
         let (_, idx) = blob_fixture();
-        let mut blob = encode_hnsw_blob(&idx).expect("encode");
+        let mut blob = encode_hnsw_blob(&idx, true).expect("encode");
         blob[4] = HNSW_BLOB_VERSION as u8 + 1; // bump the version's low byte
         let err = decode_hnsw_blob(&blob).expect_err("a future version must not be read");
         assert!(
@@ -3385,7 +3673,7 @@ mod tests {
         );
 
         // And it refuses this build's blob.
-        let v3 = encode_hnsw_blob(&idx).expect("encode");
+        let v3 = encode_hnsw_blob(&idx, true).expect("encode");
         assert_eq!(&v3[..4], &HNSW_BLOB_MAGIC, "same magic, new version");
         assert_eq!(u16::from_le_bytes([v3[4], v3[5]]), HNSW_BLOB_VERSION);
         let err = v2_era_decode(&v3).expect_err(
@@ -3408,7 +3696,7 @@ mod tests {
     #[test]
     fn a_foreign_magic_is_rejected() {
         let (_, idx) = blob_fixture();
-        let mut blob = encode_hnsw_blob(&idx).expect("encode");
+        let mut blob = encode_hnsw_blob(&idx, true).expect("encode");
         blob[0] = b'X';
         assert!(
             decode_hnsw_blob(&blob).is_err(),
@@ -3438,7 +3726,7 @@ mod tests {
         }
 
         let (_, idx) = blob_fixture();
-        let blob = encode_hnsw_blob(&idx).expect("encode");
+        let blob = encode_hnsw_blob(&idx, true).expect("encode");
         assert!(
             bincode::deserialize::<V1ReadIndex>(&blob).is_err(),
             "a 0.6.5 reader must reject a 0.6.6 blob, not misread it"

@@ -2945,11 +2945,17 @@ impl RuleEngine {
         for (name, def) in &self.rules {
             if has_vector_leg(def) {
                 if let Some(idx) = self.indexes.get(name) {
+                    // A rule still in `pending_builds` has a graph holding a
+                    // prefix of its corpus. `pending_builds` is not persisted,
+                    // so the blob has to carry that fact itself or a reader
+                    // over this snapshot will answer `find_similar` from the
+                    // prefix and say nothing about it.
+                    let complete = !self.pending_builds.contains_key(name);
                     out.insert(
                         name.clone(),
                         (
-                            idx.src_side.export_hnsw_blob(),
-                            idx.dst_side.export_hnsw_blob(),
+                            idx.src_side.export_hnsw_blob(complete),
+                            idx.dst_side.export_hnsw_blob(complete),
                         ),
                     );
                 }
@@ -3027,6 +3033,15 @@ impl RuleEngine {
             if !predicate_covers_field(&def.predicate, field) {
                 continue;
             }
+            // A rule whose sliced build is unfinished has a graph holding a
+            // prefix of its corpus: it would answer, and answer about the wrong
+            // set, with nothing in the result to say so. Skipping it here is the
+            // same door `can_answer == false` uses — the caller brute-forces and
+            // gets the exact answer, slower. The build advances on every write,
+            // on `serve`'s tick and on `mushroomdb build-index`.
+            if self.pending_builds.contains_key(name) {
+                continue;
+            }
             if let Some(idx) = self.indexes.get(name) {
                 if let Some(h) = idx.dst_side.hnsw_ref() {
                     // `can_answer` rather than `!is_empty()`: an index that
@@ -3081,6 +3096,11 @@ impl RuleEngine {
                 continue;
             }
             if !predicate_covers_field(&def.predicate, field) {
+                continue;
+            }
+            // As in `hnsw_search_dst`: a half-built graph answers about a prefix
+            // of the corpus, so it does not answer here at all.
+            if self.pending_builds.contains_key(name) {
                 continue;
             }
             // Live index first, then the lazily-decoded blobs — as a *fallback*,

@@ -1750,12 +1750,16 @@ const SLICE_DIM: usize = 32;
 /// next axis so no two vectors are literally equal. Cosine within a cluster is
 /// ~1.0 and between clusters ~0.0, which puts the 0.9 threshold nowhere near a
 /// tie — the derived edge set is the same set whichever path builds the graph.
-fn slice_vec(i: usize) -> Value {
+fn slice_vec_raw(i: usize) -> Vec<f64> {
     let axis = (i / 10) % SLICE_DIM;
     let mut xs = vec![0.0f64; SLICE_DIM];
     xs[axis] = 1.0;
     xs[(axis + 1) % SLICE_DIM] = (i % 10) as f64 * 0.001;
-    emb(&xs)
+    xs
+}
+
+fn slice_vec(i: usize) -> Value {
+    emb(&slice_vec_raw(i))
 }
 
 fn store_with_vectors(name: &str, n: usize) -> (std::path::PathBuf, GraphDb<RealFs>) {
@@ -1947,6 +1951,108 @@ fn an_interrupted_build_resumes_on_reopen() {
         edge_set(&db, "SIM", 300),
         want,
         "the resumed build derives the same edges"
+    );
+}
+
+/// A search during a deferred build answers exactly, not from the prefix the
+/// index has reached.
+///
+/// The sliced build made `find_similar` able to be *wrong* rather than slow for
+/// the first time: after `create_rule` returns 202 the graph holds one slice,
+/// `can_answer` is true of it, and the search path used to take it — so a query
+/// whose true nearest neighbour sits outside the first slice got the nearest of
+/// the first 64 vectors instead, with nothing in the result saying so. On a
+/// quiescent embedded store (no writes, no `serve`, no `build-index`) that is
+/// permanent. The rule is the release's rule everywhere else: slower, never
+/// wrong.
+#[test]
+fn a_search_during_a_build_is_exact_not_partial() {
+    let (_d, mut db) = store_with_vectors("slice-search-live", 300);
+    let q = slice_vec_raw(200);
+
+    core_rules::with_hnsw_build_batch(64, || {
+        db.create_rule(slice_rule()).unwrap();
+        let p = building_of(&db, "sim").expect("the fixture must defer its build");
+        assert_eq!(p.indexed, 64, "only the first slice is indexed");
+
+        // v200 is an exact match for `q` and sits far outside the first slice.
+        let hits = db.find_similar_vector("emb", Some("V"), &q, 1, 0.99);
+        assert_eq!(
+            hits.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["v200"],
+            "a query mid-build must be answered exhaustively, not from the \
+             {} vectors the index has reached; got {hits:?}",
+            p.indexed
+        );
+
+        // The label-less entry point (hybrid search's) takes the same door.
+        let any = db.find_similar_vector("emb", None, &q, 1, 0.99);
+        assert_eq!(
+            any.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+            vec!["v200"],
+            "the label-less query answered from the partial graph; got {any:?}"
+        );
+
+        while !db.pump_index_build().unwrap().is_empty() {}
+    });
+
+    assert!(building_of(&db, "sim").is_none(), "the build must finish");
+    let after = db.find_similar_vector("emb", Some("V"), &q, 1, 0.99);
+    assert_eq!(
+        after.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["v200"],
+        "the finished index must give the same answer; got {after:?}"
+    );
+}
+
+/// The same guarantee across a snapshot taken mid-build, with no write after
+/// the reopen.
+///
+/// This is the half a `pending_builds` check cannot cover: that map is not
+/// persisted, and the reader that opens this store decodes the partial graph on
+/// its read path (`ensure_hnsw_loaded`) without any scan behind it. The
+/// evidence has to ride in the blob, which is what `HnswBlob::complete` is for.
+#[test]
+fn a_reader_over_a_mid_build_snapshot_answers_exactly() {
+    let (dir, mut db) = store_with_vectors("slice-search-lazy", 300);
+    let q = slice_vec_raw(200);
+
+    core_rules::with_hnsw_build_batch(64, || {
+        db.create_rule(slice_rule()).unwrap();
+        assert!(building_of(&db, "sim").is_some(), "must be mid-build");
+        db.snapshot().unwrap();
+    });
+    drop(db);
+
+    // A clean open: no WAL to replay, so nothing populates the live indexes and
+    // the first query is served from the lazily-decoded blob.
+    let db = GraphDb::open(&dir).unwrap();
+    let hits = db.find_similar_vector("emb", Some("V"), &q, 1, 0.99);
+    assert_eq!(
+        hits.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["v200"],
+        "a reader over a mid-build snapshot answered from the partial graph; got {hits:?}"
+    );
+    assert_eq!(
+        core_rules::hnsw_search_count(),
+        0,
+        "the partial graph must not have been walked at all"
+    );
+    drop(db);
+
+    // And the build still finishes from there.
+    let mut db = GraphDb::open(&dir).unwrap();
+    core_rules::with_hnsw_build_batch(64, || while !db.pump_index_build().unwrap().is_empty() {});
+    assert!(building_of(&db, "sim").is_none());
+    core_rules::hnsw_search_count_reset();
+    let after = db.find_similar_vector("emb", Some("V"), &q, 1, 0.99);
+    assert_eq!(
+        after.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["v200"]
+    );
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "once the build is done the index must serve the query again"
     );
 }
 

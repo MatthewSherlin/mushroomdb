@@ -1607,10 +1607,16 @@ impl SideIndex {
     /// Export the HNSW graph as an opaque versioned blob.
     ///
     /// Returns an empty `Vec` when the HNSW is not initialized.
-    pub fn export_hnsw_blob(&self) -> Vec<u8> {
+    ///
+    /// `complete` is false when the rule's sliced build still owes this side
+    /// vectors; it rides in the blob so that a reader opening the snapshot
+    /// knows the graph is a prefix and takes its exhaustive path rather than
+    /// answering confidently about a fraction of the corpus. The engine reads
+    /// it from `pending_builds`, which is not itself persisted.
+    pub fn export_hnsw_blob(&self, complete: bool) -> Vec<u8> {
         self.hnsw
             .as_ref()
-            .and_then(crate::hnsw::encode_hnsw_blob)
+            .and_then(|h| crate::hnsw::encode_hnsw_blob(h, complete))
             .unwrap_or_default()
     }
 
@@ -1660,7 +1666,14 @@ impl SideIndex {
     /// `hnsw_tracked` is repopulated from the graph's node ids so candidates
     /// and removal work against the installed graph rather than whatever the
     /// preceding node scan happened to record.
-    pub fn adopt_hnsw(&mut self, h: HnswIndex) {
+    pub fn adopt_hnsw(&mut self, mut h: HnswIndex) {
+        // Every adoption is an open-time path, and every open-time path runs
+        // the node scan that supplies whatever a mid-build blob was missing, so
+        // a live index is whole by the time anything reads it. The unfinished
+        // build is still owed its *backfill*, and `RuleEngine::pending_builds`
+        // is what holds that — see `hnsw_search_dst`. The flag exists for the
+        // lazily-decoded read-path copy, which has no scan behind it.
+        h.mark_complete();
         self.hnsw_tracked = h.node_ids();
         self.hnsw = Some(h);
     }
@@ -2381,7 +2394,7 @@ mod tests {
     #[test]
     fn init_or_adopt_hnsw_adopts_a_usable_blob() {
         let (side, spec) = hnsw_side();
-        let blob = side.export_hnsw_blob();
+        let blob = side.export_hnsw_blob(true);
 
         let mut fresh = SideIndex::default();
         let (ids, adopted) = fresh.init_or_adopt_hnsw("sim", &blob);
@@ -2401,7 +2414,7 @@ mod tests {
     #[test]
     fn an_unknown_version_leaves_the_graph_empty() {
         let (side, spec) = hnsw_side();
-        let mut blob = side.export_hnsw_blob();
+        let mut blob = side.export_hnsw_blob(true);
         blob[4] = 99; // the version's low byte
 
         let mut fresh = SideIndex::default();
@@ -2430,7 +2443,7 @@ mod tests {
     #[test]
     fn an_unreadable_blob_leaves_the_graph_empty() {
         let (side, spec) = hnsw_side();
-        let mut blob = side.export_hnsw_blob();
+        let mut blob = side.export_hnsw_blob(true);
         blob.truncate(blob.len() / 2);
 
         let mut fresh = SideIndex::default();
@@ -2459,7 +2472,7 @@ mod tests {
     #[test]
     fn insert_skipping_tracks_but_does_not_reinsert() {
         let (side, spec) = hnsw_side();
-        let blob = side.export_hnsw_blob();
+        let blob = side.export_hnsw_blob(true);
 
         let mut fresh = SideIndex::default();
         let (already, _) = fresh.init_or_adopt_hnsw("sim", &blob);
