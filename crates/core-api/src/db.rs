@@ -5953,8 +5953,9 @@ impl<F: Fs> GraphDb<F> {
     /// index just became whole, which the caller must `RebuildRule`.
     ///
     /// Goes through the engine even with nothing pending when the indexes have
-    /// not been populated yet: that call is what re-derives a build a mid-build
-    /// snapshot left behind if open did not already register it from the blob.
+    /// not been populated yet: that call adopts the persisted graphs and, for
+    /// an incomplete blob already registered at open, leaves the remainder to
+    /// this slice rather than inserting it inline.
     fn pump_one_slice(&mut self) -> Vec<BuildProgress> {
         // The retained snapshot blobs — and the id count an interrupted build
         // is recognised against — arrive with the V8 base sections, which a

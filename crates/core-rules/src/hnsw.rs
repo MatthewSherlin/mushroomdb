@@ -707,8 +707,9 @@ pub struct HnswIndex {
     ///
     /// Only the **read** path ever sees this set: a live handle's authority on
     /// an unfinished build is `RuleEngine::pending_builds`, and
-    /// [`SideIndex::adopt_hnsw`] clears the flag because the open-time node
-    /// scan that follows it supplies every vector the blob lacked. It is the
+    /// [`SideIndex::adopt_hnsw`] clears the flag. An incomplete blob's remainder
+    /// is sliced by `pump_index_build`; a complete blob's missing nodes (writes
+    /// after the snapshot) are still supplied by the open-time scan. It is the
     /// lazily-decoded copy on a clean open — which no scan follows — that needs
     /// evidence carried in the bytes.
     ///
@@ -805,6 +806,11 @@ impl HnswIndex {
         self.slot_of.len()
     }
 
+    /// True when `id` currently has a vector in this graph.
+    pub fn contains(&self, id: u32) -> bool {
+        self.slot_of.contains_key(&id)
+    }
+
     /// True when no vectors are indexed.
     pub fn is_empty(&self) -> bool {
         self.slot_of.is_empty()
@@ -850,10 +856,10 @@ impl HnswIndex {
     /// Declare this graph whole, clearing the [`Self::incomplete`] flag a
     /// partial blob set.
     ///
-    /// Called by [`SideIndex::adopt_hnsw`], because every adoption is followed
-    /// by the open-time node scan that supplies whatever the blob was missing,
-    /// and by nothing else: the lazily-decoded read-path copy has no scan
-    /// behind it and must keep refusing until a write populates the live index.
+    /// Called by [`SideIndex::adopt_hnsw`]. A live handle's authority on an
+    /// unfinished build is `RuleEngine::pending_builds` (see `hnsw_search_dst`);
+    /// this flag is what the lazily-decoded read-path copy uses, which has no
+    /// scan and no pending-build map behind it.
     pub fn mark_complete(&mut self) {
         self.incomplete = false;
     }

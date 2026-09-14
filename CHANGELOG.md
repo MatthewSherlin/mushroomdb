@@ -8,6 +8,11 @@
   write.** A snapshot taken mid-build carries `complete == false` on its HNSW
   blob; opening the store registers that rule so the 1-second ticker has
   something to pump. Pinned by `a_reopened_store_pumps_its_outstanding_build_without_a_write`.
+- **A reopen after a killed build slices the remainder**, rather than inserting
+  it in one pass under the write lock. The open-time scan still inserts a
+  handful of vectors written after a *complete* snapshot; an incomplete blob is
+  left to `pump_index_build`. Pinned by `an_interrupted_build_resumes_on_reopen`
+  and `a_search_after_a_mid_build_reopen_is_exact`.
 
 ## v0.6.6 — the scale release
 

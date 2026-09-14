@@ -1667,12 +1667,13 @@ impl SideIndex {
     /// and removal work against the installed graph rather than whatever the
     /// preceding node scan happened to record.
     pub fn adopt_hnsw(&mut self, mut h: HnswIndex) {
-        // Every adoption is an open-time path, and every open-time path runs
-        // the node scan that supplies whatever a mid-build blob was missing, so
-        // a live index is whole by the time anything reads it. The unfinished
-        // build is still owed its *backfill*, and `RuleEngine::pending_builds`
-        // is what holds that — see `hnsw_search_dst`. The flag exists for the
-        // lazily-decoded read-path copy, which has no scan behind it.
+        // Completeness of a live index is `RuleEngine::pending_builds`, not
+        // this flag: an unfinished build is skipped in `hnsw_search_dst`
+        // whether the adopted graph still carries `incomplete` or not. Clearing
+        // it here keeps the flag for the lazily-decoded read-path copy, which
+        // has no `pending_builds` behind it. A complete blob's missing nodes
+        // (writes after the snapshot) are still supplied by the open-time
+        // scan; an incomplete blob's remainder is left to `pump_index_build`.
         h.mark_complete();
         self.hnsw_tracked = h.node_ids();
         self.hnsw = Some(h);

@@ -1945,27 +1945,35 @@ fn an_interrupted_build_resumes_on_reopen() {
 
     let mut db = GraphDb::open(&dir).unwrap();
     assert_eq!(edges_of(&db, "sim"), 0, "the partial build derived nothing");
+    let start = building_of(&db, "sim").expect("a reopen must still be building");
+    assert_eq!(start.indexed, 128, "two slices in, persisted");
+    assert_eq!(start.total, 300);
 
-    // A reopen does **not** resume the slicing: the open-time node scan adopts
-    // the persisted graph and then inserts every id the blob lacked, in one
-    // unsliced pass, and only the backfill is left to the slice loop. That is
-    // the behaviour the plan allowed and it is what `rules.md` and the CHANGELOG
-    // have to say out loud, because the pass is O(remaining vectors) under the
-    // write lock — on a 50,000-vector corpus killed after its first slice it is
-    // the whole build in one blocking call.
-    //
-    // Pinned here rather than described only in prose: 172 ids per side are
-    // missing from a 300-vector corpus snapshotted two slices in, and both
-    // sides are filled, so the count is far above the 64 a resumed slice would
-    // have done.
+    // A reopen slices the remainder: the open-time scan does not insert the
+    // vectors the persisted graph lacked. The first pump does at most one
+    // batch (64 nodes × both sides of a self-similar rule), and repeated pumps
+    // finish the index and the backfill. 172 ids per side are missing from a
+    // 300-vector corpus snapshotted two slices in; finishing them in one pass
+    // is the known-limit this pins closed.
     core_rules::hnsw_insert_count_reset();
-    core_rules::with_hnsw_build_batch(64, || while !db.pump_index_build().unwrap().is_empty() {});
-    let inserts = core_rules::hnsw_insert_count();
-    assert!(
-        inserts > 64,
-        "a reopen is documented to finish the index inline, not to resume slicing; \
-         {inserts} inserts would mean it now slices and the docs need changing"
-    );
+    core_rules::with_hnsw_build_batch(64, || {
+        db.pump_index_build().unwrap();
+        let inserts = core_rules::hnsw_insert_count();
+        assert!(
+            inserts <= 64 * 2,
+            "the first pump after a mid-build reopen must insert at most one \
+             slice (64 nodes × 2 sides); {inserts} would mean the open-time \
+             scan still finished the remainder inline"
+        );
+        let mid = building_of(&db, "sim").expect("the first pump must not finish the remainder");
+        assert!(
+            mid.indexed <= start.indexed + 64,
+            "indexed must grow by at most one batch; {} -> {}",
+            start.indexed,
+            mid.indexed
+        );
+        while !db.pump_index_build().unwrap().is_empty() {}
+    });
     assert!(building_of(&db, "sim").is_none());
     assert_eq!(
         edge_set(&db, "SIM", 300),
@@ -2122,6 +2130,69 @@ fn a_reader_over_a_mid_build_snapshot_answers_exactly() {
     assert!(
         core_rules::hnsw_search_count() > 0,
         "once the build is done the index must serve the query again"
+    );
+}
+
+/// After a mid-build reopen, `find_similar` is still exact — the live
+/// `pending_builds` gate, not only the blob's `complete` flag.
+///
+/// Open registers the unfinished blob, then the first pump populates the live
+/// indexes (`adopt_hnsw` marks the adopted prefix complete) without finishing
+/// the remainder. A query whose true nearest neighbour sits outside that prefix
+/// must still brute-force; walking the live graph would be the 0.6.6 bug
+/// `a_search_during_a_build_is_exact_not_partial` pinned, now across a restart.
+#[test]
+fn a_search_after_a_mid_build_reopen_is_exact() {
+    let (dir, mut db) = store_with_vectors("slice-search-reopen", 300);
+    let q = slice_vec_raw(200);
+
+    core_rules::with_hnsw_build_batch(64, || {
+        db.create_rule(slice_rule()).unwrap();
+        let p = building_of(&db, "sim").expect("the fixture must defer its build");
+        assert_eq!(p.indexed, 64, "only the first slice is indexed");
+        db.snapshot().unwrap();
+    });
+    drop(db);
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert!(
+        building_of(&db, "sim").is_some(),
+        "open must register the unfinished build"
+    );
+
+    // Populate the live indexes without finishing the remainder, so the
+    // pending_builds skip in `hnsw_search_dst` is what keeps the prefix off
+    // the answer — not the lazily-decoded blob's `incomplete` flag.
+    core_rules::with_hnsw_build_batch(64, || {
+        db.pump_index_build().unwrap();
+    });
+    let p = building_of(&db, "sim").expect("the first pump must leave the build outstanding");
+    assert!(
+        p.indexed < 200,
+        "v200 must still sit outside the built slice; indexed={}",
+        p.indexed
+    );
+
+    core_rules::hnsw_search_count_reset();
+    let hits = db.find_similar_vector("emb", Some("V"), &q, 1, 0.99);
+    assert_eq!(
+        hits.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["v200"],
+        "a query after a mid-build reopen must be answered exhaustively, not \
+         from the {} vectors the index has reached; got {hits:?}",
+        p.indexed
+    );
+    assert_eq!(
+        core_rules::hnsw_search_count(),
+        0,
+        "the live gate must skip the partial graph"
+    );
+
+    let any = db.find_similar_vector("emb", None, &q, 1, 0.99);
+    assert_eq!(
+        any.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["v200"],
+        "the label-less query answered from the partial graph; got {any:?}"
     );
 }
 

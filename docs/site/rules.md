@@ -428,14 +428,14 @@ A store killed mid-build reopens with the rule present, its index partly built,
 and that build already registered: `stats().building` is populated from the
 blob's `complete == false` flag, so `serve`'s ticker and `pump_index_build`
 have something to advance without a write. The snapshot's graph covers what it
-carried, the open-time scan covers the rest, and the next pump issues the
-backfill. The scan is **not** sliced: it inserts the whole remainder in one
-pass under the write lock, so a 50,000-vector corpus killed after its first
-slice pays the rest of that build in one blocking call, and only the edge
-backfill is left to the slice loop. A snapshot taken after that reopen but
-before the next pump still records the index as incomplete, so a reader opening
-that snapshot answers by brute force until a write, `serve`, or `build-index`
-pumps it — slower, never wrong.
+carried; the remainder is sliced the same way `create_rule` sliced it — one
+batch per pump, under the write lock, never the whole rest of the corpus in
+one pass. A handful of vectors written after a *complete* snapshot still land
+inline on open: that is the fast path 0.6.5 fixed and it stays. A snapshot
+taken after that reopen but before the next pump still records the index as
+incomplete, so a reader opening that snapshot answers by brute force until a
+write, `serve`, or `build-index` pumps it — slower, never wrong. A live handle
+whose build is still outstanding takes the same door.
 
 How that is told apart from an ordinary write: a store restored from a snapshot
 defers building its candidate indexes until the first write, and the write path
