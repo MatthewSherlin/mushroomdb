@@ -843,6 +843,21 @@ async fn query(
         if as_of.is_some() && is_write {
             return err_response("as_of (time-travel) queries are read-only");
         }
+        // `mask` and `namespace` are read guards: both documented as making the
+        // request a read, and the full-token branch below enforces that by
+        // routing anything carrying either to `query_masked`, which refuses a
+        // write. The role branch used to check `is_write` first and never look
+        // at them, so a client sending a write *with* a namespace as its guard
+        // got the write executed instead of the 400 the docs promise. Not a
+        // widening — `check_single_op_authz` still gates the write — but the
+        // guard the caller asked for was not applied.
+        if is_write && (mask_keys.is_some() || namespace.is_some()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "masked queries are read-only"})),
+            )
+                .into_response();
+        }
         if is_write {
             let role = role_name.clone();
             let cypher_c = cypher.clone();

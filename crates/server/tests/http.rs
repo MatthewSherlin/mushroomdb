@@ -5081,6 +5081,16 @@ fn open_ns(name: &str) -> (Router, SharedDb) {
                     namespaces: None,
                     write: None,
                 },
+                // Bound to tenant-a *and* able to write, so a refusal on this
+                // role proves the read guard fired rather than authorization.
+                RoleDef {
+                    name: "a-writer".into(),
+                    labels: vec!["Doc".into(), "AgentNote".into()],
+                    keys: vec![],
+                    visible_where: None,
+                    namespaces: Some(vec!["tenant-a".into()]),
+                    write: Some(agent_write_scope()),
+                },
             ],
             ..Default::default()
         })
@@ -5089,6 +5099,7 @@ fn open_ns(name: &str) -> (Router, SharedDb) {
     let rtoks: std::collections::HashMap<String, String> = [
         ("a-tok".to_string(), "a-reader".to_string()),
         ("all-tok".to_string(), "everyone".to_string()),
+        ("aw-tok".to_string(), "a-writer".to_string()),
     ]
     .into_iter()
     .collect();
@@ -5377,6 +5388,80 @@ async fn a_role_token_plus_a_foreign_namespace_is_empty() {
         String::from_utf8_lossy(&body)
     );
     assert!(!db.read().has_node("z1"), "the write must not have landed");
+}
+
+/// The read guard holds for a **role token** too, which is the shape a tenant
+/// actually deploys.
+///
+/// The role branch checked `is_write` first and dispatched to
+/// `query_write_authz` without ever reading `namespace` or `mask`, so a client
+/// that sent a write with a namespace as its guard got the write *executed*.
+/// The write was still authorized — this was never a widening — but the caller
+/// asked for a read and the documented 400 never came. `a-writer` is bound to
+/// `tenant-a` and may create `AgentNote`, so a refusal here can only be the
+/// guard.
+#[tokio::test]
+async fn a_role_token_write_carrying_a_read_guard_is_refused() {
+    let (app, db) = open_ns("ns-role-write-guard");
+
+    for (label, body) in [
+        (
+            "namespace",
+            json!({"cypher": "CREATE (x:AgentNote {id:'z9', ns:'tenant-a'})", "namespace": "tenant-a"}),
+        ),
+        (
+            "mask",
+            json!({"cypher": "CREATE (x:AgentNote {id:'z9', ns:'tenant-a'})", "mask": ["a1"]}),
+        ),
+        (
+            "both",
+            json!({"cypher": "CREATE (x:AgentNote {id:'z9', ns:'tenant-a'})", "mask": ["a1"], "namespace": "tenant-a"}),
+        ),
+    ] {
+        let (status, out, _) = send(
+            app.clone(),
+            authed_json_req("POST", "/query?format=json", "aw-tok", body),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{label}: a write carrying a read guard must be refused; got {}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            parse_json(&out)["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("read-only"),
+            "{label}: {}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            !db.read().has_node("z9"),
+            "{label}: the write must not have landed"
+        );
+    }
+
+    // Without a guard the same role writes, so the refusals above are the guard
+    // and not the authorization.
+    let (status, out, _) = send(
+        app,
+        authed_json_req(
+            "POST",
+            "/query?format=json",
+            "aw-tok",
+            json!({"cypher": "CREATE (x:AgentNote {id:'z9', ns:'tenant-a'})"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the unguarded write must succeed: {}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(db.read().has_node("z9"));
 }
 
 /// Binding: `as_of` composes with `namespace` for a full token and for a role
