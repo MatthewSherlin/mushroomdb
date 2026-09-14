@@ -346,9 +346,8 @@ both printed by `exact_vector_rule_recall_5k`):
 The index path replaces a quadratic derivation with a beam and pays a one-time
 graph build for it. That build is the term that moves: measured mid-release, at
 the halved parameters but still on the `f64` distance, creation came out at
-287 s — *slower* than the scan it removed. (The earlier `m0` = 128 shape was
-269 s at its own measurement; neither is a 0.6.5 figure, since 0.6.5 had no
-index-backed exact rule to time.)
+287 s — *slower* than the scan it removed. (That is a within-release figure,
+not a 0.6.5 one: 0.6.5 had no index-backed exact rule to time.)
 The halved [index parameters](#vector-index-parameters) and the `f32` slab
 kernel cut it to the figure above. Quote the test, not this table, after any
 further change to either: the gap is a property of the graph's shape, and the
@@ -431,7 +430,10 @@ built; the snapshot's graph covers what it carried, the open-time scan covers
 the rest, and the next pump issues the backfill. The scan is **not** sliced: it
 inserts the whole remainder in one pass under the write lock, so a 50,000-vector
 corpus killed after its first slice pays the rest of that build in one blocking
-call, and only the edge backfill is left to the slice loop.
+call, and only the edge backfill is left to the slice loop. A snapshot taken
+after that reopen but before the next pump still records the index as
+incomplete, so a reader opening that snapshot answers by brute force until a
+write or `build-index` pumps it — slower, never wrong.
 
 How that is told apart from an ordinary write: a store restored from a snapshot
 defers building its candidate indexes until the first write, and the write path
