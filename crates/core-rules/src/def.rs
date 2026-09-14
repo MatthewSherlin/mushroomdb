@@ -65,6 +65,19 @@ pub struct RuleDef {
     /// APPENDED field — same pre-alpha no-migration ruling as `via_label`.
     #[serde(default)]
     pub via_dir: Option<core_storage::Direction>,
+    /// The namespace this rule operates in.
+    ///
+    /// `None` = **global**: the rule sees every node and its derived edges may
+    /// cross namespaces. `Some(ns)` = **scoped**: it sees only nodes in `ns` —
+    /// src, via and dst alike — so every edge it derives is intra-namespace by
+    /// construction, with no pair-level check anywhere.
+    ///
+    /// APPENDED field — same pre-alpha no-migration ruling as `max_edges`,
+    /// `approximate` and `via_dir` (def.rs:33, :51): a rule bincoded before this
+    /// field existed breaks positional decode. `#[serde(default)]` covers JSON
+    /// only.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 /// Score-combination conventions for composed predicates:
@@ -163,7 +176,27 @@ impl RuleDef {
             }
             (None, None) => {}
         }
+        if let Some(ns) = &self.namespace {
+            if !core_storage::valid_namespace(ns) {
+                return Err(format!(
+                    "namespace {ns:?} is not a valid namespace name — 1 to {} characters \
+                     of [A-Za-z0-9_.-]",
+                    core_storage::NS_MAX_LEN
+                ));
+            }
+        }
         Ok(())
+    }
+
+    /// Whether a node in `namespace` is visible to this rule.
+    ///
+    /// Always true for a global rule, which is what keeps every rule written
+    /// before namespaces existed on exactly the code path it had.
+    pub fn sees_namespace(&self, namespace: &str) -> bool {
+        match &self.namespace {
+            None => true,
+            Some(ns) => ns == namespace,
+        }
     }
 
     pub fn watched_fields(&self) -> BTreeSet<String> {
@@ -623,22 +656,45 @@ struct LegacyRuleDefNoVia {
     approximate: bool,
 }
 
+/// Stores created before the `namespace` field was added (v0.6.6) encode
+/// `RuleDef` with these eleven fields — everything through `via_dir`.
+///
+/// **FROZEN — never add, remove, or reorder fields.**  Its sole purpose is to
+/// match the exact positional bincode layout that shipped through v0.6.5. Any
+/// schema change must produce a new `LegacyRuleDef*` variant instead.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyRuleDefNoNamespace {
+    name: String,
+    src_label: String,
+    dst_label: String,
+    predicate: Predicate,
+    edge_type: String,
+    weight_prop: Option<String>,
+    max_edges: Option<u64>,
+    approximate: bool,
+    via_label: Option<String>,
+    via_edge: Option<String>,
+    via_dir: Option<core_storage::Direction>,
+}
+
 /// Decode a bincode-encoded `RuleDef` from persisted bytes.
 ///
-/// Tries the current wire shape first (all fields including `via_label`,
-/// `via_edge`, `via_dir`).  If that fails, falls back to the pre-0.1.2 legacy
-/// shape (`LegacyRuleDefNoVia` — 8 fields, no `via_*`), mapping the missing
-/// fields to `None`.
+/// Tries the current wire shape first (all fields including `namespace`), then
+/// the v0.6.5 shape (`LegacyRuleDefNoNamespace` — eleven fields, no
+/// `namespace`), then the pre-0.1.2 shape (`LegacyRuleDefNoVia` — eight fields,
+/// no `via_*`), mapping each missing field to `None`.
 ///
-/// Both decoders use `reject_trailing_bytes`, which makes the two wire shapes
-/// unambiguous:
-/// - Legacy bytes lack the three `via_*` Option fields; the current-shape
-///   decoder hits EOF trying to read them → falls through to legacy.
-/// - Current bytes with `via_*=None` carry three trailing `0x00` bytes; the
-///   legacy decoder would see trailing bytes and be rejected, so the
-///   current-shape decoder wins.
+/// Every decoder uses `reject_trailing_bytes`, which makes the three wire shapes
+/// unambiguous — each older shape is a strict prefix of the next, so a newer
+/// decoder hits EOF on older bytes and an older decoder sees trailing bytes on
+/// newer ones:
+/// - v0.6.5 bytes lack the `namespace` Option; the current-shape decoder hits
+///   EOF reading it → falls through.
+/// - Current bytes with `namespace=None` carry one extra trailing `0x00` that
+///   the eleven-field decoder rejects, so the current-shape decoder wins.
+/// - The same argument one step down for the three `via_*` fields.
 ///
-/// If both attempts fail, returns `Err` naming both error messages.
+/// If every attempt fails, returns `Err` naming the error messages.
 pub fn decode_rule_def(bytes: &[u8]) -> Result<RuleDef, String> {
     use bincode::Options as _;
     // Use fixint encoding to match bincode::serialize / bincode::deserialize
@@ -655,6 +711,25 @@ pub fn decode_rule_def(bytes: &[u8]) -> Result<RuleDef, String> {
     match opts.deserialize::<RuleDef>(bytes) {
         Ok(def) => Ok(def),
         Err(current_err) => {
+            // v0.6.5 shape: everything through `via_dir`, no `namespace`. A rule
+            // written before namespaces existed is global, which is the
+            // behaviour it had.
+            if let Ok(prev) = opts.deserialize::<LegacyRuleDefNoNamespace>(bytes) {
+                return Ok(RuleDef {
+                    name: prev.name,
+                    src_label: prev.src_label,
+                    dst_label: prev.dst_label,
+                    predicate: prev.predicate,
+                    edge_type: prev.edge_type,
+                    weight_prop: prev.weight_prop,
+                    max_edges: prev.max_edges,
+                    approximate: prev.approximate,
+                    via_label: prev.via_label,
+                    via_edge: prev.via_edge,
+                    via_dir: prev.via_dir,
+                    namespace: None,
+                });
+            }
             // Fall through to legacy attempt; preserve error for final message.
             match opts.deserialize::<LegacyRuleDefNoVia>(bytes) {
                 Ok(legacy) => Ok(RuleDef {
@@ -669,6 +744,7 @@ pub fn decode_rule_def(bytes: &[u8]) -> Result<RuleDef, String> {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 }),
                 Err(legacy_err) => Err(format!(
                     "corrupt rule_def — current-shape: {current_err}; \
@@ -802,6 +878,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         assert!(ok.validate().is_ok());
         assert_eq!(
@@ -1026,6 +1103,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         assert!(ok_vec.validate().is_ok());
 
@@ -1050,6 +1128,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         assert!(ok_all.validate().is_ok());
 
@@ -1066,6 +1145,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         assert!(bad_fe.validate().is_err());
 
@@ -1085,6 +1165,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         assert!(bad_ov.validate().is_err());
 
@@ -1107,6 +1188,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         assert!(bad_all_order.validate().is_err());
     }
@@ -1129,6 +1211,7 @@ mod tests {
             via_label: Some("Mid".into()),
             via_edge: Some("hop".into()),
             via_dir: None,
+            namespace: None,
         };
         let err = bad.validate().unwrap_err();
         assert_eq!(err, "via-hop rules do not support approximate: true");
@@ -1179,6 +1262,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -1555,6 +1639,7 @@ mod wire_pins {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -1571,6 +1656,7 @@ mod wire_pins {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -1587,7 +1673,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 102, 107, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0,
-                0, 0, 0, 0
+                0, 0, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -1598,7 +1684,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 1, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 105, 110, 100, 1, 0, 0, 0, 0, 0, 0, 0, 69,
-                0, 0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -1610,7 +1696,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 116, 97, 103, 115, 0, 0, 0, 0, 0, 0, 224,
-                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0
+                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -1626,7 +1712,7 @@ mod wire_pins {
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 102,
                 107, 2, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 116, 97, 103, 115, 0, 0, 0, 0, 0, 0, 224,
-                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0
+                63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0, 0
             ]
         );
     }
@@ -1643,7 +1729,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 4, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 121, 101, 97, 114, 0, 0, 0, 0, 0, 0, 0, 64,
-                1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0
+                1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -1655,7 +1741,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 5, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 108, 111, 99, 0, 0, 0, 0, 0, 0, 121, 64, 1,
-                0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0, 0
             ]
         );
         assert_eq!(
@@ -1667,7 +1753,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 6, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 101, 109, 98, 205, 204, 204, 204, 204, 204,
-                236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0
+                236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0, 0
             ]
         );
     }
@@ -1697,7 +1783,7 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 102, 1,
-                0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0, 0
             ],
             "Any([FieldEqual{{f}}]) exact-bytes pin failed — discriminant or field layout changed"
         );
@@ -1736,11 +1822,12 @@ mod wire_pins {
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, 114, 1, 0, 0, 0, 0, 0, 0, 0, 65, 1, 0, 0, 0, 0, 0, 0, 0,
                 66, 6, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 101, 109, 98, 205, 204, 204, 204, 204, 204,
-                236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 1, 0, 0, 0
+                236, 63, 1, 0, 0, 0, 0, 0, 0, 0, 69, 0, 0, 1, 0, 0, 0, 0
             ]
         );
         // exact vs approx: same length; differ only at the `approximate` byte
-        // (4th from the end; last 3 bytes are via_label/via_edge/via_dir = None).
+        // (5th from the end; the last 4 bytes are via_label/via_edge/via_dir and
+        // namespace, all None).
         let exact = bincode::serialize(&pin(Predicate::VectorSimilar {
             field: "emb".into(),
             min: 0.9,
@@ -1754,13 +1841,13 @@ mod wire_pins {
         assert_eq!(exact.len(), approx.len());
         let n = exact.len();
         // Everything before `approximate` is identical.
-        assert_eq!(&exact[..n - 4], &approx[..n - 4]);
-        // `approximate` byte at index n-4.
-        assert_eq!(exact[n - 4], 0u8, "exact: approximate=false");
-        assert_eq!(approx[n - 4], 1u8, "approx: approximate=true");
-        // Trailing via bytes are both None.
-        assert_eq!(&exact[n - 3..], &[0u8, 0, 0]);
-        assert_eq!(&approx[n - 3..], &[0u8, 0, 0]);
+        assert_eq!(&exact[..n - 5], &approx[..n - 5]);
+        // `approximate` byte at index n-5.
+        assert_eq!(exact[n - 5], 0u8, "exact: approximate=false");
+        assert_eq!(approx[n - 5], 1u8, "approx: approximate=true");
+        // Trailing via + namespace bytes are both None.
+        assert_eq!(&exact[n - 4..], &[0u8, 0, 0, 0]);
+        assert_eq!(&approx[n - 4..], &[0u8, 0, 0, 0]);
     }
 
     // -----------------------------------------------------------------------
@@ -1797,6 +1884,7 @@ mod wire_pins {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -1823,6 +1911,7 @@ mod wire_pins {
             via_label: Some("Mid".into()),
             via_edge: Some("hop".into()),
             via_dir: Some(core_storage::Direction::Out),
+            namespace: None,
             ..base_current()
         };
         let bytes = bincode::serialize(&current).unwrap();
@@ -1857,15 +1946,17 @@ mod wire_pins {
         let current_bytes = bincode::serialize(&current).unwrap();
         let legacy_bytes = bincode::serialize(&legacy).unwrap();
 
-        // The two encodings must differ (current has 3 extra Option::None bytes).
+        // The two encodings must differ (current has 4 extra Option::None bytes:
+        // the three `via_*` fields plus `namespace`).
         assert_ne!(
             current_bytes, legacy_bytes,
             "current and legacy encodings must not be byte-identical"
         );
         assert_eq!(
             current_bytes.len(),
-            legacy_bytes.len() + 3,
-            "current is exactly 3 bytes longer (three Option::None fields)"
+            legacy_bytes.len() + 4,
+            "current is exactly 4 bytes longer (three via Option::None fields \
+             plus namespace)"
         );
 
         // Both decode to the same RuleDef.
@@ -1880,5 +1971,113 @@ mod wire_pins {
         assert!(from_current.via_label.is_none());
         assert!(from_current.via_edge.is_none());
         assert!(from_current.via_dir.is_none());
+        assert!(from_current.namespace.is_none());
+    }
+
+    /// The v0.6.5 wire shape (eleven fields, no `namespace`) decodes as a global
+    /// rule, which is the behaviour it had. Its bytes are one byte shorter than
+    /// the current shape, so `reject_trailing_bytes` keeps the two unambiguous.
+    #[test]
+    fn decode_rule_def_pre_namespace_shape_decodes_as_global() {
+        let prev = LegacyRuleDefNoNamespace {
+            name: "r".into(),
+            src_label: "A".into(),
+            dst_label: "B".into(),
+            predicate: Predicate::FieldEqual {
+                field: "ind".into(),
+            },
+            edge_type: "E".into(),
+            weight_prop: None,
+            max_edges: Some(10),
+            approximate: false,
+            via_label: Some("Mid".into()),
+            via_edge: Some("hop".into()),
+            via_dir: Some(core_storage::Direction::In),
+        };
+        let prev_bytes = bincode::serialize(&prev).unwrap();
+        let got = decode_rule_def(&prev_bytes).expect("the v0.6.5 shape must still decode");
+        assert_eq!(got.via_label.as_deref(), Some("Mid"));
+        assert_eq!(got.via_dir, Some(core_storage::Direction::In));
+        assert!(
+            got.namespace.is_none(),
+            "a rule written before namespaces existed is global"
+        );
+
+        // Current bytes with namespace=None carry one extra trailing 0x00, so
+        // they are never misread as the eleven-field shape.
+        let current = RuleDef {
+            namespace: None,
+            ..base_current()
+        };
+        let current_bytes = bincode::serialize(&current).unwrap();
+        let eleven = bincode::serialize(&LegacyRuleDefNoNamespace {
+            name: current.name.clone(),
+            src_label: current.src_label.clone(),
+            dst_label: current.dst_label.clone(),
+            predicate: current.predicate.clone(),
+            edge_type: current.edge_type.clone(),
+            weight_prop: current.weight_prop.clone(),
+            max_edges: current.max_edges,
+            approximate: current.approximate,
+            via_label: current.via_label.clone(),
+            via_edge: current.via_edge.clone(),
+            via_dir: current.via_dir,
+        })
+        .unwrap();
+        assert_eq!(current_bytes.len(), eleven.len() + 1);
+        assert_eq!(decode_rule_def(&current_bytes).unwrap(), current);
+
+        // A scoped rule round-trips through the current shape.
+        let scoped = RuleDef {
+            namespace: Some("tenant-a".into()),
+            ..base_current()
+        };
+        let bytes = bincode::serialize(&scoped).unwrap();
+        assert_eq!(decode_rule_def(&bytes).unwrap(), scoped);
+    }
+
+    /// **0.6.5 cannot read a rule 0.6.6 wrote, and that means it cannot open
+    /// the store at all.**
+    ///
+    /// The `namespace` append is positional, so 0.6.6's encoding carries one
+    /// trailing byte that 0.6.5's decoder — which knows only the eleven- and
+    /// eight-field shapes, and also rejects trailing bytes — errors on twice.
+    /// Both of its load sites map that to `GraphError::Corrupt`, so the open
+    /// fails rather than degrading. Every rule 0.6.6 snapshots is re-encoded
+    /// this way, including rules 0.6.5 itself created, and a store with a vector
+    /// index has a rule by definition.
+    ///
+    /// This is the test behind the CHANGELOG's BREAKING line: the downgrade is a
+    /// refused open, not a slower read, and an operator planning a rollback has
+    /// to hear that from the release notes rather than from the error.
+    #[test]
+    fn a_0_6_5_decoder_cannot_read_a_0_6_6_rule() {
+        use bincode::Options as _;
+        // Exactly what 0.6.5 does: the two shapes it knows, fixint, trailing
+        // bytes rejected.
+        let opts = bincode::options()
+            .with_fixint_encoding()
+            .with_no_limit()
+            .reject_trailing_bytes();
+
+        for namespace in [None, Some("tenant-a".to_string())] {
+            let def = RuleDef {
+                namespace,
+                ..base_current()
+            };
+            let bytes = bincode::serialize(&def).unwrap();
+
+            assert!(
+                opts.deserialize::<LegacyRuleDefNoNamespace>(&bytes)
+                    .is_err(),
+                "0.6.5's eleven-field decoder must refuse 0.6.6 bytes"
+            );
+            assert!(
+                opts.deserialize::<LegacyRuleDefNoVia>(&bytes).is_err(),
+                "0.6.5's eight-field decoder must refuse them too"
+            );
+            // And this build still reads them, which is the forward direction.
+            assert_eq!(decode_rule_def(&bytes).unwrap(), def);
+        }
     }
 }

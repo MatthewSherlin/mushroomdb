@@ -27,6 +27,7 @@ fn overlap(name: &str, field: &str, edge_type: &str) -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -339,6 +340,7 @@ fn harness_industry_alignment_timing() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     let t_rule = std::time::Instant::now();
     db.create_rule(rule).expect("create IA rule");
@@ -1849,6 +1851,7 @@ fn fn_type_on_derived_edge() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     {

@@ -32,6 +32,7 @@ fn overlap_rule(name: &str, etype: &str) -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -349,6 +350,7 @@ fn subscribe_rule_events_arrive_after_commit_in_order() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -459,6 +461,7 @@ fn subscribe_lagged_when_queue_full() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -503,6 +506,7 @@ fn subscription_drop_unregisters_cleanly() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -538,6 +542,7 @@ fn replay_is_silent_for_subscriptions() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         db.create_rule(rule).unwrap();
         db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))])
@@ -578,6 +583,7 @@ fn subscribe_writes_receives_write_events_only() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
     let sub = db.subscribe_writes().unwrap();
@@ -646,6 +652,7 @@ fn subscribe_rule_receives_retract_on_node_delete() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
     db.insert_node("A", "n1", vec![("tags".into(), tags(&["x"]))])

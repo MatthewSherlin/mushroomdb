@@ -60,6 +60,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         1 => RuleDef {
             name: "r_fe".into(),
@@ -73,6 +74,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         2 => RuleDef {
             name: "r_ov".into(),
@@ -89,6 +91,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         3 => RuleDef {
             name: "r_all".into(),
@@ -108,6 +111,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         // Template 4: shares edge_type "r_fe" with r_fe — exercises C1 (co-owned
         // edge type survival after rule deletion).  Different name and lower min
@@ -127,6 +131,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         5 => RuleDef {
             name: "r_nw".into(),
@@ -143,6 +148,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         6 => RuleDef {
             name: "r_nz".into(),
@@ -159,6 +165,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         7 => RuleDef {
             name: "r_geo".into(),
@@ -175,6 +182,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         8 => RuleDef {
             name: "r_vec".into(),
@@ -191,6 +199,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         },
         // Template 9: via-hop rule. Semantics: L0 -[e0]-> L1, FieldEqual(f)
         // between L1(via) and L0(dst), fire r_via edge src→dst.
@@ -208,6 +217,7 @@ fn rule_template(idx: u8) -> RuleDef {
             via_label: Some("L1".into()),
             via_edge: Some("e0".into()),
             via_dir: None,
+            namespace: None,
         },
     }
 }
@@ -1415,6 +1425,7 @@ fn approximate_wal_replay_identity() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -1514,6 +1525,7 @@ fn approximate_recall_above_floor_quiesced() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -1623,6 +1635,7 @@ fn approximate_recall_above_floor_after_rebuild() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -1768,6 +1781,7 @@ fn approximate_recall_above_floor_1536dim_1k() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -1869,9 +1883,33 @@ fn approximate_recall_5k_timing() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
+    // Since 0.6.6 a `create_rule` over more than `HNSW_BUILD_BATCH` vectors
+    // installs the rule and returns *before* its edges exist, building the
+    // index a slice at a time instead. 5 000 vectors is well over that, so
+    // without this loop the rule derives nothing and the recall below is 0.0 —
+    // which is exactly how this gate went dark. Pumping to completion is what a
+    // quiescent store does on its own ticker; doing it inside the timed region
+    // keeps `hnsw_ms` meaning "what the whole index cost".
+    let mut pumps = 0u32;
+    loop {
+        let outstanding = db.pump_index_build().unwrap();
+        if outstanding.is_empty() {
+            break;
+        }
+        pumps += 1;
+        assert!(
+            pumps < 10_000,
+            "the build made no progress after {pumps} pumps: {outstanding:?}"
+        );
+    }
     let hnsw_ms = t0.elapsed().as_millis();
+    assert!(
+        db.builds_in_progress().is_empty(),
+        "the index must be whole before recall is measured"
+    );
 
     // Collect approximate edges.
     let approx_edges: BTreeSet<(String, String, String)> = {
@@ -2001,6 +2039,7 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -2101,5 +2140,573 @@ fn ivf_cleanup_on_delete_under_approximate_rule() {
     assert!(
         drift_after > 0,
         "drift counter must be > 0 after deleting a node from an IVF-indexed rule; got {drift_after}"
+    );
+}
+
+/// The bounded difference at scale for an **exact** `VectorSimilar` rule, which
+/// from 0.6.6 finds its candidates through the vector index (v0.6.6 T4).
+///
+/// The same 5,000 × 1,536-D fixture `approximate_recall_5k_timing` uses, the
+/// same O(n²) ground truth, and the rule's `min` as the beam's stopping
+/// similarity. The floor is higher than the approximate one — 0.98, not 1.0 —
+/// because it has to survive an index-backed candidate path rather than a full
+/// scan, and without it that change would have nothing asserting it did not
+/// quietly lose edges.
+///
+/// A 5,000-vector corpus is past `HNSW_BUILD_BATCH`, so the build is sliced and
+/// the rule derives nothing until it has been pumped to completion. Measuring
+/// before that is measuring an empty rule.
+///
+/// `MUSHROOMDB_VECTOR_SCAN=1` runs the identical assertion against the
+/// pre-0.6.6 full-scan candidate path, which is how the before/after wall clock
+/// for the same work is measured.
+///
+/// `#[ignore]`d: the ground truth alone is ~40 s in release and minutes in
+/// debug. Run with
+/// `cargo test --release -p sim-harness -- exact_vector_rule_recall_5k --ignored --nocapture`.
+#[test]
+#[ignore]
+fn exact_vector_rule_recall_5k() {
+    use std::time::Instant;
+
+    const N_CLUSTERS: usize = 50;
+    const PER_CLUSTER: usize = 100;
+    const N: usize = N_CLUSTERS * PER_CLUSTER; // 5000
+    const MIN_SIM: f64 = 0.85;
+    /// An exact rule must lose almost nothing. Not 1.0: the floor has to
+    /// survive an index-backed candidate path, not just a full scan.
+    const EXACT_RECALL_FLOOR: f64 = 0.98;
+    const SEED: u64 = 0xcafe_f00d_dead_1234;
+
+    let dir = {
+        let d = std::env::temp_dir().join(format!("graphdb-exact-5k-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    };
+
+    let vecs: Vec<Vec<f64>> = (0..N_CLUSTERS)
+        .flat_map(|c| (0..PER_CLUSTER).map(move |m| (c, m)))
+        .map(|(c, m)| clustered_vec_1536(SEED, N_CLUSTERS, c, m))
+        .collect();
+
+    // Insert nodes (not timed — pure data setup).
+    let mut db = GraphDb::open(&dir).unwrap();
+    for (i, v) in vecs.iter().enumerate() {
+        let key = format!("v{i:04}");
+        let val = Value::List(v.iter().copied().map(Value::Float).collect());
+        db.insert_node("V", &key, vec![("emb".into(), val)])
+            .unwrap();
+    }
+
+    // Time the whole rule creation: index build, candidate probing, derivation.
+    // A 5,000-vector corpus is past `HNSW_BUILD_BATCH`, so the build is sliced
+    // and the rule derives nothing until it has been pumped to completion.
+    let t0 = Instant::now();
+    db.create_rule(RuleDef {
+        name: "exact_sim5k".into(),
+        src_label: "V".into(),
+        dst_label: "V".into(),
+        predicate: Predicate::VectorSimilar {
+            field: "emb".into(),
+            min: MIN_SIM,
+        },
+        edge_type: "ESIM5K".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    })
+    .unwrap();
+    while !db.pump_index_build().unwrap().is_empty() {}
+    let build_ms = t0.elapsed().as_millis();
+
+    let derived: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for i in 0..N {
+            let src = format!("v{i:04}");
+            for nb in db
+                .neighbors(&src, "ESIM5K", Direction::Out)
+                .unwrap_or_default()
+            {
+                s.insert(("ESIM5K".to_string(), src.clone(), nb));
+            }
+        }
+        s
+    };
+
+    // Exact O(n²) ground truth (slow — run only in release mode).
+    let t1 = Instant::now();
+    let exact_edges: BTreeSet<(String, String, String)> = {
+        let mut s = BTreeSet::new();
+        for i in 0..N {
+            for j in 0..N {
+                if i == j {
+                    continue;
+                }
+                let dot: f64 = vecs[i].iter().zip(vecs[j].iter()).map(|(a, b)| a * b).sum();
+                if dot >= MIN_SIM {
+                    s.insert(("ESIM5K".to_string(), format!("v{i:04}"), format!("v{j:04}")));
+                }
+            }
+        }
+        s
+    };
+    let exact_ms = t1.elapsed().as_millis();
+
+    let r = recall(&derived, &exact_edges);
+    eprintln!(
+        "5k exact rule: creation {build_ms}ms (scan forced: {}) | ground truth {exact_ms}ms | \
+         recall {r:.4} (derived={} exact={})",
+        core_rules::vector_scan_forced(),
+        derived.len(),
+        exact_edges.len()
+    );
+    assert!(
+        r >= EXACT_RECALL_FLOOR,
+        "5k exact recall {:.4} < floor {:.2} (derived={} exact={})",
+        r,
+        EXACT_RECALL_FLOOR,
+        derived.len(),
+        exact_edges.len()
+    );
+}
+
+/// Deterministic oracle comparison for a **namespace-scoped** rule (v0.6.6 §7.4).
+///
+/// The oracle derives by brute force with its own namespace filter, so this is
+/// the independent check that the engine's scoping — candidate index, pair
+/// loops, via hop — agrees with the obvious reading of the rule. Six nodes that
+/// all satisfy the predicate, three per namespace, so a rule that ignored the
+/// scoping would derive a visibly larger set.
+#[test]
+fn scoped_rule_matches_the_oracle() {
+    let scoped = RuleDef {
+        name: "r_ns".into(),
+        src_label: "L0".into(),
+        dst_label: "L1".into(),
+        predicate: Predicate::FieldEqual { field: "f".into() },
+        edge_type: "r_ns".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: Some("x".into()),
+    };
+
+    let collect = |db: &GraphDb<SimFs>| -> BTreeSet<(String, String, String)> {
+        let mut out = BTreeSet::new();
+        for key in ["sx1", "sx2", "sy1", "dx1", "dy1", "dy2"] {
+            for nb in db
+                .neighbors(key, "r_ns", Direction::Out)
+                .unwrap_or_default()
+            {
+                out.insert(("r_ns".to_string(), key.to_string(), nb));
+            }
+        }
+        out
+    };
+
+    let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+    let mut oracle = Oracle::new();
+    let props = |ns: &str| {
+        vec![
+            ("f".to_string(), Value::Str("same".into())),
+            ("ns".to_string(), Value::Str(ns.to_string())),
+        ]
+    };
+    for (label, key, ns) in [
+        ("L0", "sx1", "x"),
+        ("L0", "sx2", "x"),
+        ("L0", "sy1", "y"),
+        ("L1", "dx1", "x"),
+        ("L1", "dy1", "y"),
+        ("L1", "dy2", "y"),
+    ] {
+        let p = props(ns);
+        db.insert_node(label, key, p.clone()).unwrap();
+        oracle.insert_node(label, key, &p);
+    }
+
+    // Backfill.
+    db.create_rule(scoped.clone()).unwrap();
+    oracle.create_rule(scoped.clone());
+    let eng = collect(&db);
+    let orc: BTreeSet<_> = oracle
+        .all_edges()
+        .into_iter()
+        .filter(|(et, _, _)| et == "r_ns")
+        .collect();
+    assert_eq!(eng, orc, "backfill: engine and oracle must agree");
+    assert_eq!(
+        eng.len(),
+        2,
+        "non-vacuous: sx1→dx1 and sx2→dx1 only, never a y node: {eng:?}"
+    );
+
+    // Incremental: a node arriving in each namespace.
+    for (label, key, ns) in [("L1", "dx2", "x"), ("L0", "sy2", "y")] {
+        let p = props(ns);
+        db.insert_node(label, key, p.clone()).unwrap();
+        oracle.insert_node(label, key, &p);
+    }
+    let mut eng = BTreeSet::new();
+    for key in ["sx1", "sx2", "sy1", "sy2"] {
+        for nb in db
+            .neighbors(key, "r_ns", Direction::Out)
+            .unwrap_or_default()
+        {
+            eng.insert(("r_ns".to_string(), key.to_string(), nb));
+        }
+    }
+    let orc: BTreeSet<_> = oracle
+        .all_edges()
+        .into_iter()
+        .filter(|(et, _, _)| et == "r_ns")
+        .collect();
+    assert_eq!(eng, orc, "incremental: engine and oracle must agree");
+    assert_eq!(eng.len(), 4, "two x sources × two x destinations: {eng:?}");
+
+    // A prop change inside the namespace retracts, and the oracle says so too.
+    db.set_prop("sx1", "f", Value::Str("other".into())).unwrap();
+    oracle.set_prop("sx1", "f", Value::Str("other".into()));
+    let mut eng = BTreeSet::new();
+    for key in ["sx1", "sx2", "sy1", "sy2"] {
+        for nb in db
+            .neighbors(key, "r_ns", Direction::Out)
+            .unwrap_or_default()
+        {
+            eng.insert(("r_ns".to_string(), key.to_string(), nb));
+        }
+    }
+    let orc: BTreeSet<_> = oracle
+        .all_edges()
+        .into_iter()
+        .filter(|(et, _, _)| et == "r_ns")
+        .collect();
+    assert_eq!(eng, orc, "retraction: engine and oracle must agree");
+    assert_eq!(eng.len(), 2, "sx1 dropped out: {eng:?}");
+
+    // The same rule made global derives every pair, crossing ones included.
+    db.delete_rule("r_ns").unwrap();
+    oracle.delete_rule("r_ns");
+    let global = RuleDef {
+        namespace: None,
+        ..scoped
+    };
+    db.create_rule(global.clone()).unwrap();
+    oracle.create_rule(global);
+    let mut eng = BTreeSet::new();
+    for key in ["sx1", "sx2", "sy1", "sy2"] {
+        for nb in db
+            .neighbors(key, "r_ns", Direction::Out)
+            .unwrap_or_default()
+        {
+            eng.insert(("r_ns".to_string(), key.to_string(), nb));
+        }
+    }
+    let orc: BTreeSet<_> = oracle
+        .all_edges()
+        .into_iter()
+        .filter(|(et, _, _)| et == "r_ns")
+        .collect();
+    assert_eq!(eng, orc, "global: engine and oracle must agree");
+    assert!(
+        eng.contains(&("r_ns".to_string(), "sy1".to_string(), "dx1".to_string())),
+        "a global rule crosses the boundary: {eng:?}"
+    );
+}
+
+/// The via-hop half of the same comparison: a scoped rule must not hop through
+/// another namespace to reach a destination, and the oracle — which expands the
+/// hop itself, with its own namespace filter — is the independent check.
+///
+/// `sx1 -[e0]→ hx (x)` and `sx1 -[e0]→ hy (y)`: the same source reaches a via
+/// node in each namespace, and each via node is the only route to one
+/// destination. A rule scoped to `x` must derive the `x` destination only.
+#[test]
+fn scoped_via_rule_matches_the_oracle() {
+    let rule = |namespace: Option<&str>| RuleDef {
+        name: "r_vns".into(),
+        src_label: "L0".into(),
+        dst_label: "L1".into(),
+        predicate: Predicate::FieldEqual { field: "f".into() },
+        edge_type: "r_vns".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("L2".into()),
+        via_edge: Some("e0".into()),
+        via_dir: None, // Out: src → via
+        namespace: namespace.map(str::to_string),
+    };
+    let srcs = ["sx1"];
+    let collect = |db: &GraphDb<SimFs>| -> BTreeSet<(String, String, String)> {
+        let mut out = BTreeSet::new();
+        for key in srcs {
+            for nb in db
+                .neighbors(key, "r_vns", Direction::Out)
+                .unwrap_or_default()
+            {
+                out.insert(("r_vns".to_string(), key.to_string(), nb));
+            }
+        }
+        out
+    };
+    let orc = |oracle: &Oracle| -> BTreeSet<(String, String, String)> {
+        oracle
+            .all_edges()
+            .into_iter()
+            .filter(|(et, _, _)| et == "r_vns")
+            .collect()
+    };
+
+    let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+    let mut oracle = Oracle::new();
+    // Each via node shares `f` with exactly one destination, so the hop decides
+    // which destination is reachable; both hops leave the same source.
+    for (label, key, ns, f) in [
+        ("L0", "sx1", "x", "anything"),
+        ("L2", "hx", "x", "in-x"),
+        ("L2", "hy", "y", "in-y"),
+        ("L1", "dx", "x", "in-x"),
+        ("L1", "dy", "y", "in-y"),
+    ] {
+        let props = vec![
+            ("f".to_string(), Value::Str(f.into())),
+            ("ns".to_string(), Value::Str(ns.into())),
+        ];
+        db.insert_node(label, key, props.clone()).unwrap();
+        oracle.insert_node(label, key, &props);
+    }
+    // `sx1 → hx` is the hop inside x. The hop into y, `sx1 → hy`, is exactly the
+    // edge the CrossNamespace guard refuses — a user edge cannot cross — which is
+    // worth pinning here because it bounds what a via-hop rule can ever see: a
+    // scoped rule's hop is intra-namespace by the time it is asked.
+    db.insert_edge("e0", "sx1", "hx").unwrap();
+    oracle.insert_edge("e0", "sx1", "hx");
+    assert!(
+        matches!(
+            db.insert_edge("e0", "sx1", "hy"),
+            Err(GraphError::CrossNamespace { .. })
+        ),
+        "a user edge may not cross a namespace boundary"
+    );
+
+    // Scoped to x: the one reachable destination is dx, through hx.
+    db.create_rule(rule(Some("x"))).unwrap();
+    oracle.create_rule(rule(Some("x")));
+    let eng = collect(&db);
+    assert_eq!(
+        eng,
+        orc(&oracle),
+        "scoped via: engine and oracle must agree"
+    );
+    assert_eq!(
+        eng,
+        BTreeSet::from([("r_vns".to_string(), "sx1".to_string(), "dx".to_string())]),
+        "non-vacuous: sx1 → dx through hx, and nothing else: {eng:?}"
+    );
+
+    // The same rule made global derives the same set here, because the only hop
+    // that exists is the intra-x one: the crossing hop was refused above, so a
+    // global via-hop rule has nothing extra to walk. Agreement with the oracle is
+    // the point — both arrive at the same answer by different routes.
+    db.delete_rule("r_vns").unwrap();
+    oracle.delete_rule("r_vns");
+    db.create_rule(rule(None)).unwrap();
+    oracle.create_rule(rule(None));
+    let eng = collect(&db);
+    assert_eq!(
+        eng,
+        orc(&oracle),
+        "global via: engine and oracle must agree"
+    );
+    assert_eq!(
+        eng,
+        BTreeSet::from([("r_vns".to_string(), "sx1".to_string(), "dx".to_string())]),
+        "the only hop that exists is sx1 → hx, so the answer is the same set: {eng:?}"
+    );
+
+    // A second source in y with its own hop: the scoped rule ignores it, the
+    // global one derives it.
+    let sy1_props = vec![
+        ("f".to_string(), Value::Str("anything".into())),
+        ("ns".to_string(), Value::Str("y".into())),
+    ];
+    db.insert_node("L0", "sy1", sy1_props.clone()).unwrap();
+    oracle.insert_node("L0", "sy1", &sy1_props);
+    db.insert_edge("e0", "sy1", "hy").unwrap();
+    oracle.insert_edge("e0", "sy1", "hy");
+    let both = |db: &GraphDb<SimFs>| -> BTreeSet<(String, String, String)> {
+        let mut out = BTreeSet::new();
+        for key in ["sx1", "sy1"] {
+            for nb in db
+                .neighbors(key, "r_vns", Direction::Out)
+                .unwrap_or_default()
+            {
+                out.insert(("r_vns".to_string(), key.to_string(), nb));
+            }
+        }
+        out
+    };
+    assert_eq!(both(&db), orc(&oracle), "global via, two sources");
+    assert_eq!(both(&db).len(), 2, "sx1 → dx and sy1 → dy: {:?}", both(&db));
+
+    db.delete_rule("r_vns").unwrap();
+    oracle.delete_rule("r_vns");
+    db.create_rule(rule(Some("x"))).unwrap();
+    oracle.create_rule(rule(Some("x")));
+    assert_eq!(both(&db), orc(&oracle), "scoped via, two sources");
+    assert_eq!(
+        both(&db),
+        BTreeSet::from([("r_vns".to_string(), "sx1".to_string(), "dx".to_string())]),
+        "the y source and its hop are invisible to the x-scoped rule: {:?}",
+        both(&db)
+    );
+}
+
+/// The via-hop namespace gate, reached through a hop that **crosses** the
+/// boundary (v0.6.6 §7.4).
+///
+/// A user edge cannot cross, so the only way a crossing hop exists is a global
+/// rule deriving one — which is exactly what this builds: a global rule writes
+/// `sx1 -HOP→ hy`, and a rule scoped to `x` then uses `HOP` as its `via_edge`.
+/// The foreign hub `hy` shares its tag with an **x** destination, so without the
+/// via-side gate the scoped rule would derive `sx1 → dx` *through another
+/// tenant's node*; the in-x hub `hx` deliberately does not match `dx`, so that
+/// edge can only come from the foreign hop.
+///
+/// The oracle expands via-hops over its own edge set, so it is told about the
+/// crossing edge the global rule derived (`insert_edge`) — the engine has it in
+/// its topology either way, and what is being compared is the *scoped* rule's
+/// edge type, never `HOP` itself.
+#[test]
+fn a_scoped_via_rule_ignores_a_derived_crossing_hop() {
+    // Global: Src → Hub on a shared `link`, deriving HOP edges that may cross.
+    let hop_rule = RuleDef {
+        name: "r_hop".into(),
+        src_label: "L0".into(),
+        dst_label: "L2".into(),
+        predicate: Predicate::FieldEqual {
+            field: "link".into(),
+        },
+        edge_type: "HOP".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    };
+    // Scoped to x: Src -[HOP]→ Hub, predicate between Hub and Doc.
+    let via_rule = |namespace: Option<&str>| RuleDef {
+        name: "r_vcross".into(),
+        src_label: "L0".into(),
+        dst_label: "L1".into(),
+        predicate: Predicate::FieldEqual {
+            field: "tag".into(),
+        },
+        edge_type: "VCROSS".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: Some("L2".into()),
+        via_edge: Some("HOP".into()),
+        via_dir: None, // Out: src → via
+        namespace: namespace.map(str::to_string),
+    };
+
+    let collect = |db: &GraphDb<SimFs>| -> BTreeSet<(String, String, String)> {
+        let mut out = BTreeSet::new();
+        for key in ["sx1"] {
+            for nb in db
+                .neighbors(key, "VCROSS", Direction::Out)
+                .unwrap_or_default()
+            {
+                out.insert(("VCROSS".to_string(), key.to_string(), nb));
+            }
+        }
+        out
+    };
+    let orc = |oracle: &Oracle| -> BTreeSet<(String, String, String)> {
+        oracle
+            .all_edges()
+            .into_iter()
+            .filter(|(et, _, _)| et == "VCROSS")
+            .collect()
+    };
+
+    let mut db = GraphDb::open_with(SimFs::new()).unwrap();
+    let mut oracle = Oracle::new();
+    // `hy` (namespace y) carries the tag of `dx` (namespace x): the trap.
+    // `hx` (namespace x) carries a tag only `dz` (namespace x) answers, so the
+    // rule has something legitimate to derive and the test is not vacuous.
+    for (label, key, ns, field, value) in [
+        ("L0", "sx1", "x", "link", "L"),
+        ("L2", "hx", "x", "tag", "T-HX"),
+        ("L2", "hy", "y", "tag", "T-DX"),
+        ("L1", "dx", "x", "tag", "T-DX"),
+        ("L1", "dz", "x", "tag", "T-HX"),
+    ] {
+        let mut props = vec![("ns".to_string(), Value::Str(ns.into()))];
+        props.push((field.to_string(), Value::Str(value.into())));
+        if label == "L2" {
+            // Both hubs are reachable from sx1, so the hop itself never decides
+            // which destination is in play — the namespace gate does.
+            props.push(("link".to_string(), Value::Str("L".into())));
+        }
+        db.insert_node(label, key, props.clone()).unwrap();
+        oracle.insert_node(label, key, &props);
+    }
+
+    // The global rule derives both hops, including the crossing one.
+    db.create_rule(hop_rule).unwrap();
+    let hops: BTreeSet<String> = db
+        .neighbors("sx1", "HOP", Direction::Out)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        hops,
+        BTreeSet::from(["hx".to_string(), "hy".to_string()]),
+        "a global rule may derive a crossing edge, and this test needs it to: {hops:?}"
+    );
+    // Tell the oracle the edges exist; it models via-hops over its edge set.
+    oracle.insert_edge("HOP", "sx1", "hx");
+    oracle.insert_edge("HOP", "sx1", "hy");
+
+    // Scoped to x: the foreign hub is not a hop this rule may take, so `dx` —
+    // reachable only through `hy` — is not derived. `dz` is, through `hx`.
+    db.create_rule(via_rule(Some("x"))).unwrap();
+    oracle.create_rule(via_rule(Some("x")));
+    let eng = collect(&db);
+    assert_eq!(eng, orc(&oracle), "scoped: engine and oracle must agree");
+    assert_eq!(
+        eng,
+        BTreeSet::from([("VCROSS".to_string(), "sx1".to_string(), "dz".to_string())]),
+        "only the hop inside x may be taken, so dx is unreachable: {eng:?}"
+    );
+
+    // Global: the same rule may hop through the other namespace, and then `dx`
+    // appears. That is the difference the gate makes, stated as an edge.
+    db.delete_rule("r_vcross").unwrap();
+    oracle.delete_rule("r_vcross");
+    db.create_rule(via_rule(None)).unwrap();
+    oracle.create_rule(via_rule(None));
+    let eng = collect(&db);
+    assert_eq!(eng, orc(&oracle), "global: engine and oracle must agree");
+    assert_eq!(
+        eng,
+        BTreeSet::from([
+            ("VCROSS".to_string(), "sx1".to_string(), "dx".to_string()),
+            ("VCROSS".to_string(), "sx1".to_string(), "dz".to_string()),
+        ]),
+        "a global via-hop rule may reach dx through hy: {eng:?}"
     );
 }

@@ -163,7 +163,7 @@ Six predicate kinds ship today. They compose via `All(...)` (AND, score = min) a
 
 Auto-FK: fields ending in `_id` whose values match existing node keys get `KeyMatch` rules created
 automatically at ingest time. `VectorSimilar` accepts `approximate: true` to switch candidate
-selection to in-tree HNSW (per-query recall min 0.90, mean 0.998 at 5k nodes / dim 1536,
+selection to in-tree HNSW (per-query recall floors min 0.90 / mean 0.95, measured 1.0 / 1.0 at 5k nodes / dim 1536,
 fixed-seed probe). Full reference: [`docs/site/rules.md`](docs/site/rules.md).
 
 ### Built on the same engine
@@ -252,7 +252,7 @@ the server answers — and `mushroomdb mcp <db> --all-tools` lists the whole set
 |---|---|
 | `upsert_entity` | Insert or update a node by key (no existence check needed) |
 | `ingest_json` | Batch-ingest nodes of one label from a JSON array |
-| `create_rule` | Declare a derivation rule; backfills existing nodes immediately |
+| `create_rule` | Declare a derivation rule; backfills existing nodes in the same commit (a vector index over 2,048 vectors builds in slices, and the edges arrive in a later commit) |
 | `find_similar` | Find similar nodes by query vector (HNSW) or by derived edge traversal |
 | `hybrid_search` | RRF over fulltext + vector results |
 | `explain` | The rules and scores that link two nodes, as JSON — `explain_association` above answers the same question in prose |
@@ -331,9 +331,9 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb mcp <dir>\|--auto` | Start a stdio MCP JSON-RPC server for agent tools |
 | `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
 | `mushroomdb serve <dir>` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`) |
-| `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted) |
-| `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit |
-| `mushroomdb stats <dir>` | Print node/edge/rule counts |
+| `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted). `--role <name>` answers as one of the store's roles and `--namespace <ns>` from one namespace; together they intersect, so neither widens the other, and either makes the query a read |
+| `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit. `--namespace <ns>` reads one namespace as it was then |
+| `mushroomdb stats <dir>` | Print node/edge/rule counts, plus a `namespaces:` line once a store has more than the implicit `default` one |
 | `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
 | `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
 | `mushroomdb snapshot <dir> [--keep-wal\|--truncate] [--retention N]` | Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole |
@@ -369,7 +369,7 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 | Cold start without a snapshot re-fires all rules | Snapshots persist derived edges, ANN state, and view definitions. At 100k nodes / ~10M derived edges: **0.02 s** from a V8 snapshot vs **8.16 min** WAL-only (ANN re-fit dominates). Call `snapshot()` before close. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
 | Two-hop Cypher joins at scale | Dense patterns producing >1,000,000 intermediate rows error without `LIMIT`. Add `LIMIT n` — the pull-based executor stops early and never materializes the full binding table. |
 | Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE, MATCH…DETACH DELETE, and MERGE (single-key, with `ON CREATE SET` / `ON MATCH SET`) are supported. Derived edges cannot be deleted manually. Variable-length paths are hard-capped at 10 hops; unbounded `*min..` is rejected at parse time. Full coverage table: [`docs/site/query.md`](docs/site/query.md). |
-| Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection. Per-query recall min 0.90, mean 0.998 at 5k / dim 1536 (fixed-seed probe). Review the trade-off before using it in completeness-critical workloads. |
+| Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection. Per-query recall floors min 0.90 / mean 0.95, measured 1.0 / 1.0 at 5k / dim 1536 (fixed-seed probe). Review the trade-off before using it in completeness-critical workloads. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
 | Python bindings return dicts | pandas/polars zero-copy is not wired yet. HTTP `POST /query` defaults to Arrow IPC; JSON via `?format=json`. |
 

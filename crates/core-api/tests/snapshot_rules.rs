@@ -149,6 +149,7 @@ fn key_match_round_trip() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }],
         |db| {
             db.insert_node("Org", "o1", vec![]).unwrap();
@@ -198,6 +199,7 @@ fn field_equal_round_trip() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }],
         |db| {
             db.insert_node(
@@ -252,6 +254,7 @@ fn overlap_round_trip() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }],
         |db| {
             db.insert_node("Org", "o1", vec![("tags".into(), strs(&["a", "b"]))])
@@ -300,6 +303,7 @@ fn numeric_within_round_trip() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }],
         |db| {
             db.insert_node("Org", "o1", vec![("year".into(), Value::Float(2000.0))])
@@ -342,6 +346,7 @@ fn geo_radius_round_trip() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }],
         |db| {
             // Paris.
@@ -400,6 +405,7 @@ fn vector_similar_round_trip() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }],
         |db| {
             db.insert_node(
@@ -475,6 +481,7 @@ fn all_round_trip() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }],
         |db| {
             db.insert_node(
@@ -546,6 +553,7 @@ fn any_round_trip() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }],
         |db| {
             db.insert_node(
@@ -615,6 +623,7 @@ fn via_hop_round_trip() {
             via_label: Some("Org".into()),
             via_edge: Some("WORKS_AT".into()),
             via_dir: None,
+            namespace: None,
         }],
         |db| {
             // p1 reaches proj1 through TWO via-orgs (org1a, org1b); p2 reaches
@@ -693,6 +702,7 @@ fn chain_round_trip() {
                 via_label: None,
                 via_edge: None,
                 via_dir: None,
+                namespace: None,
             },
             // Rule B: Team -> Task, via Tasks ASSIGNED_TO this Team,
             // FieldEqual(tag) between via-Task and dst-Task.
@@ -710,6 +720,7 @@ fn chain_round_trip() {
                 via_label: Some("Task".into()),
                 via_edge: Some("ASSIGNED_TO".into()),
                 via_dir: Some(Direction::In),
+                namespace: None,
             },
         ],
         |db| {

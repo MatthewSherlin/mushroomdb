@@ -37,6 +37,7 @@ fn overlap_rule(name: &str, field: &str, edge_type: &str) -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -302,6 +303,7 @@ fn set_overlap_on_off_via_cypher() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -495,6 +497,7 @@ fn detach_delete_node_via_cypher_fires_rules_on_reinsert() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     db.query_write("CREATE (n:N {id: 'a', k: 'x'})", &no_params())

@@ -194,6 +194,48 @@ impl<F: Fs> GraphDb<F> {
                         });
                     }
                 }
+                if let Some(list) = &role_def.namespaces {
+                    if list.is_empty() {
+                        return Err(GraphError::RuleInvalid {
+                            detail: format!(
+                                "role '{}': namespaces: [] would make the role see nothing; \
+                                 omit keys and labels instead",
+                                role_def.name
+                            ),
+                        });
+                    }
+                    for name in list {
+                        if !core_storage::valid_namespace(name) {
+                            return Err(GraphError::RuleInvalid {
+                                detail: format!(
+                                    "role '{}': {name:?} is not a valid namespace name — 1 to \
+                                     {} characters of [A-Za-z0-9_.-]",
+                                    role_def.name,
+                                    core_storage::NS_MAX_LEN
+                                ),
+                            });
+                        }
+                    }
+                    // The namespace leg intersects `keys`, so a key naming a
+                    // live node in another namespace would silently resolve to
+                    // nothing. Loud instead: a key list that disagrees with the
+                    // namespace binding is a mistake, not a grant. A key naming
+                    // no live node is still ignored, as it is without a binding.
+                    for key in &role_def.keys {
+                        if let Some(key_ns) = self.namespace_of(key) {
+                            if !role_def.sees_namespace(&key_ns) {
+                                return Err(GraphError::RuleInvalid {
+                                    detail: format!(
+                                        "role '{}': key '{key}' is in namespace '{key_ns}', \
+                                         which is outside the role's namespaces [{}]",
+                                        role_def.name,
+                                        list.join(", ")
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
                 if let Some(write) = &role_def.write {
                     let read_labels: std::collections::HashSet<&str> =
                         role_def.labels.iter().map(String::as_str).collect();

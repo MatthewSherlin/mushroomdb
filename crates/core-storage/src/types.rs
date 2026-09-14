@@ -128,6 +128,69 @@ pub enum GraphError {
     Busy {
         holder: Option<u32>,
     },
+    /// A write tried to change a node's namespace.
+    ///
+    /// A namespace is a tenancy boundary, set when the node is inserted and
+    /// fixed for its lifetime: moving a node between tenants is a deletion from
+    /// one and a creation in the other, and saying so is more honest than a
+    /// property edit that silently re-homes every edge the node carries.
+    NamespaceImmutable {
+        key: String,
+        from: String,
+        to: String,
+    },
+    /// A user-written edge would join two nodes in different namespaces.
+    ///
+    /// Only a **global** rule (one with no `namespace`) may derive an edge
+    /// across the boundary; a namespaced rule sees one namespace's nodes only,
+    /// so its edges are intra-namespace by construction.
+    CrossNamespace {
+        src: String,
+        src_ns: String,
+        dst: String,
+        dst_ns: String,
+    },
+}
+
+/// The reserved property that names a node's namespace.
+///
+/// Absent means [`NS_DEFAULT`]. Writing `NS_DEFAULT` explicitly stores nothing,
+/// so a store that never leaves the default namespace carries no `ns` column and
+/// pays nothing for the feature.
+pub const NS_PROP: &str = "ns";
+
+/// The namespace a node with no [`NS_PROP`] property is in.
+pub const NS_DEFAULT: &str = "default";
+
+/// Longest accepted namespace name, in characters.
+pub const NS_MAX_LEN: usize = 64;
+
+/// A valid namespace name: 1–[`NS_MAX_LEN`] characters of `[A-Za-z0-9_.-]`.
+///
+/// Deliberately narrower than a key: a namespace is an administrative label that
+/// appears in `roles.json`, in a rule definition and in `stats`, so it stays
+/// spellable without quoting. `/` is excluded on purpose — keys already contain
+/// it (`ingest-git` keys files on their repository path) and a namespace must
+/// never read as a key prefix.
+pub fn valid_namespace(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= NS_MAX_LEN
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+}
+
+/// The namespace a node's [`NS_PROP`] value names.
+///
+/// Absent, or any value that is not a string, resolves to [`NS_DEFAULT`]: the
+/// write path refuses a non-string `ns`, so this only decides what a store
+/// hand-edited outside this binary reads as, and the default is the narrowing
+/// answer for a namespaced role.
+pub fn namespace_of_value(v: Option<&Value>) -> &str {
+    match v {
+        Some(Value::Str(s)) => s.as_str(),
+        _ => NS_DEFAULT,
+    }
 }
 
 impl std::fmt::Display for GraphError {
@@ -181,6 +244,21 @@ impl std::fmt::Display for GraphError {
             GraphError::Busy { holder: None } => {
                 write!(f, "store is busy: write lock held by another process")
             }
+            GraphError::NamespaceImmutable { key, from, to } => write!(
+                f,
+                "node {key} is in namespace {from}; a namespace is set at insert and cannot \
+                 be changed to {to} — delete and re-insert the node instead"
+            ),
+            GraphError::CrossNamespace {
+                src,
+                src_ns,
+                dst,
+                dst_ns,
+            } => write!(
+                f,
+                "edge {src} → {dst} crosses a namespace boundary ({src_ns} → {dst_ns}); \
+                 only a global rule may derive one"
+            ),
         }
     }
 }

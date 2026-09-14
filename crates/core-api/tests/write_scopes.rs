@@ -118,6 +118,7 @@ fn writer_role() -> RoleDef {
         keys: vec![],
         labels: vec!["MyLabel".into(), "Visible".into()],
         visible_where: None,
+        namespaces: None,
         write: Some(WriteScope {
             create_labels: vec!["MyLabel".into()],
             update_labels: vec!["MyLabel".into(), "Visible".into()],
@@ -294,6 +295,7 @@ fn test_update_scope_denied() {
             keys: vec![],
             labels: vec!["MyLabel".into(), "ReadOnly".into()],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec!["MyLabel".into()], // ReadOnly NOT in update_labels
@@ -422,6 +424,7 @@ fn derived_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -647,6 +650,7 @@ fn test_merge_update_only_hidden_eq_absent() {
             keys: vec![],
             labels: vec!["MyLabel".into()],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec![], // no create scope
                 update_labels: vec!["MyLabel".into()],
@@ -719,6 +723,7 @@ fn test_merge_create_only_disclosure_pinned() {
             keys: vec![],
             labels: vec!["MyLabel".into()],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec![],
@@ -798,6 +803,7 @@ fn test_merge_on_create_set_with_role_authz() {
             keys: vec![],
             labels: vec!["MyLabel".into()],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec![], // empty — no update scope
@@ -1100,6 +1106,7 @@ fn test_create_rule_forbidden_for_role() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     let ops = vec![BatchOp::CreateRule(rule)];
     let err = db.write_batch_authz(Some(&authz), ops).unwrap_err();
@@ -1179,6 +1186,7 @@ fn test_delete_recreate_setprop_respects_update_labels() {
             keys: vec![],
             labels: vec!["MyLabel".into()],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec!["MyLabel".into()],
                 update_labels: vec![], // intentionally empty
@@ -1472,4 +1480,273 @@ fn test_predicate_narrows_the_write_target_set() {
         denied_reason(&absent),
         "hidden-by-predicate must be byte-equal to absent — no existence oracle"
     );
+}
+
+// ── Namespace binding on the create gate (v0.6.6 §7) ─────────────────────────
+
+/// `writer`, bound to namespace `x`, with the same write scope.
+fn tenant_writer_role() -> RoleDef {
+    RoleDef {
+        namespaces: Some(vec!["x".into()]),
+        ..writer_role()
+    }
+}
+
+fn open_with_tenant_writer(name: &str) -> (GraphDb<core_storage::fs::RealFs>, std::path::PathBuf) {
+    let dir = tmp(name);
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.apply_schema(&Schema {
+        roles: vec![tenant_writer_role()],
+        ..Default::default()
+    })
+    .unwrap();
+    (db, dir)
+}
+
+fn ns_prop(n: &str) -> (String, Value) {
+    (core_api::NS_PROP.to_string(), Value::Str(n.to_string()))
+}
+
+/// A role bound to a namespace may only create inside it. The never-widen rule
+/// is about what a write makes visible to *any* party: a node the writer could
+/// never read back is a write into somebody else's tenancy.
+#[test]
+fn test_create_outside_the_roles_namespace_denied() {
+    let (mut db, _dir) = open_with_tenant_writer("create-foreign-ns");
+    let authz = writer_authz(&mut db);
+
+    // Inside the role's namespace: allowed.
+    db.write_batch_authz(
+        Some(&authz),
+        vec![BatchOp::InsertNode {
+            label: "MyLabel".into(),
+            key: "mine".into(),
+            props: vec![ns_prop("x")],
+        }],
+    )
+    .unwrap();
+    assert_eq!(db.namespace_of("mine").as_deref(), Some("x"));
+
+    // Another tenant's namespace: denied, and nothing is written.
+    let authz = writer_authz(&mut db);
+    let err = db
+        .write_batch_authz(
+            Some(&authz),
+            vec![BatchOp::InsertNode {
+                label: "MyLabel".into(),
+                key: "theirs".into(),
+                props: vec![ns_prop("y")],
+            }],
+        )
+        .unwrap_err();
+    assert!(is_role_write_denied(&err), "got {err:?}");
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: namespace 'y' not in the role's namespaces"
+    );
+    assert!(!db.has_node("theirs"));
+
+    // The default namespace is a namespace like any other: an `ns`-less create
+    // by an x-bound role lands in `default` and is denied too.
+    let authz = writer_authz(&mut db);
+    let err = db
+        .write_batch_authz(
+            Some(&authz),
+            vec![BatchOp::InsertNode {
+                label: "MyLabel".into(),
+                key: "bare".into(),
+                props: vec![],
+            }],
+        )
+        .unwrap_err();
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: namespace 'default' not in the role's namespaces"
+    );
+    assert!(!db.has_node("bare"));
+
+    // An upsert-edge whose placeholder endpoint would be created lands in
+    // `default` too, so it is refused on the same ground — but with the
+    // endpoint-visibility wording, which is what keeps hidden and absent
+    // indistinguishable there. See
+    // `test_upsert_placeholder_hidden_equals_absent_for_a_namespaced_role`.
+    let authz = writer_authz(&mut db);
+    let err = db
+        .write_batch_authz(
+            Some(&authz),
+            vec![BatchOp::InsertEdgeUpsert {
+                edge_type: "KNOWS".into(),
+                src_key: "mine".into(),
+                dst_key: "ghost".into(),
+                placeholder_label: "MyLabel".into(),
+            }],
+        )
+        .unwrap_err();
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: edge endpoint not visible"
+    );
+    assert!(!db.has_node("ghost"));
+}
+
+/// The same gate on the Cypher path: `CREATE` and the node `MERGE` creates both
+/// arrive as `BatchOp::InsertNode`.
+#[test]
+fn test_cypher_create_outside_the_roles_namespace_denied() {
+    let (mut db, _dir) = open_with_tenant_writer("cypher-foreign-ns");
+
+    let err = db
+        .query_write_authz(
+            "writer",
+            "CREATE (n:MyLabel {id: 'theirs', ns: 'y'})",
+            &no_params(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: namespace 'y' not in the role's namespaces"
+    );
+    assert!(!db.has_node("theirs"));
+
+    // MERGE's create arm is the same op, so the same refusal.
+    let err = db
+        .query_write_authz("writer", "MERGE (n:MyLabel {id: 'merged'})", &no_params())
+        .unwrap_err();
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: namespace 'default' not in the role's namespaces"
+    );
+    assert!(!db.has_node("merged"));
+
+    // Inside the namespace the same statement succeeds.
+    db.query_write_authz(
+        "writer",
+        "CREATE (n:MyLabel {id: 'mine', ns: 'x'})",
+        &no_params(),
+    )
+    .unwrap();
+    assert_eq!(db.namespace_of("mine").as_deref(), Some("x"));
+}
+
+/// A role with no namespace binding is unchanged: it creates wherever it likes,
+/// exactly as it did before namespaces existed.
+#[test]
+fn test_unscoped_role_may_create_in_any_namespace() {
+    let (mut db, _dir) = open_with_writer("create-unscoped-ns");
+    let authz = writer_authz(&mut db);
+    db.write_batch_authz(
+        Some(&authz),
+        vec![
+            BatchOp::InsertNode {
+                label: "MyLabel".into(),
+                key: "bare".into(),
+                props: vec![],
+            },
+            BatchOp::InsertNode {
+                label: "MyLabel".into(),
+                key: "tenanted".into(),
+                props: vec![ns_prop("y")],
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(db.namespace_of("bare").as_deref(), Some("default"));
+    assert_eq!(db.namespace_of("tenanted").as_deref(), Some("y"));
+}
+
+/// Hidden ≡ absent for the upsert placeholder gate, byte for byte.
+///
+/// The namespace refusal fires only for an endpoint that does **not** exist and
+/// the visibility refusal only for one that does, so two different strings would
+/// turn `POST /edges/upsert` into an existence oracle: ask for an upsert and read
+/// off whether the key is taken.
+#[test]
+fn test_upsert_placeholder_hidden_equals_absent_for_a_namespaced_role() {
+    let (mut db, _dir) = open_with_tenant_writer("upsert-oracle");
+    // A visible endpoint inside the role's namespace to anchor the edge.
+    db.insert_node("MyLabel", "mine", vec![ns_prop("x")])
+        .unwrap();
+    // A node the role cannot see at all (wrong label, and in another namespace).
+    db.insert_node("Secret", "hidden", vec![ns_prop("y")])
+        .unwrap();
+
+    let upsert = |key: &str| BatchOp::InsertEdgeUpsert {
+        edge_type: "KNOWS".into(),
+        src_key: "mine".into(),
+        dst_key: key.into(),
+        placeholder_label: "MyLabel".into(),
+    };
+
+    let authz = writer_authz(&mut db);
+    let hidden_err = db
+        .write_batch_authz(Some(&authz), vec![upsert("hidden")])
+        .unwrap_err();
+    let authz = writer_authz(&mut db);
+    let absent_err = db
+        .write_batch_authz(Some(&authz), vec![upsert("nobody")])
+        .unwrap_err();
+
+    assert_eq!(
+        denied_reason(&hidden_err),
+        denied_reason(&absent_err),
+        "hidden and absent must be indistinguishable"
+    );
+    assert_eq!(
+        denied_reason(&absent_err),
+        "role-bound token: edge endpoint not visible"
+    );
+    assert!(!db.has_node("nobody"), "nothing was created");
+}
+
+/// A namespaced role cannot MERGE-create: `MERGE` carries only its identifying
+/// property into the create, so the node would land in `default`. The match arm
+/// still works on a node the role can see.
+#[test]
+fn test_merge_create_denied_for_a_namespaced_role() {
+    let (mut db, _dir) = open_with_tenant_writer("merge-ns-role");
+    db.insert_node("MyLabel", "mine", vec![ns_prop("x")])
+        .unwrap();
+
+    let err = db
+        .query_write_authz("writer", "MERGE (n:MyLabel {id: 'fresh'})", &no_params())
+        .unwrap_err();
+    assert_eq!(
+        denied_reason(&err),
+        "role-bound token: namespace 'default' not in the role's namespaces",
+        "MERGE-create lands in default, which this role may not write"
+    );
+    assert!(!db.has_node("fresh"));
+
+    // The match arm is unaffected: the node is already in the role's mask.
+    db.query_write_authz(
+        "writer",
+        "MERGE (n:MyLabel {id: 'mine'}) ON MATCH SET n.seen = 1",
+        &no_params(),
+    )
+    .unwrap();
+    assert_eq!(db.get_prop("mine", "seen"), Some(Value::Int(1)));
+    assert_eq!(db.namespace_of("mine").as_deref(), Some("x"));
+}
+
+/// A props list naming `ns` twice is refused on the role path too, before the
+/// namespace gate can read one of the two entries.
+#[test]
+fn test_duplicate_ns_refused_on_the_role_path() {
+    let (mut db, _dir) = open_with_tenant_writer("dup-ns-role");
+    let authz = writer_authz(&mut db);
+    let err = db
+        .write_batch_authz(
+            Some(&authz),
+            vec![BatchOp::InsertNode {
+                label: "MyLabel".into(),
+                key: "two".into(),
+                props: vec![ns_prop("x"), ns_prop("y")],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("given more than once"),
+        "expected the duplicate-ns refusal, got {err:?}"
+    );
+    assert!(!db.has_node("two"));
 }

@@ -484,6 +484,7 @@ pub fn rules() -> Vec<RuleDef> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     });
     out.push(RuleDef {
         name: "knows".into(),
@@ -497,6 +498,7 @@ pub fn rules() -> Vec<RuleDef> {
         via_label: Some("File".into()),
         via_edge: Some("TOP_AUTHOR".into()),
         via_dir: Some(Direction::In),
+        namespace: None,
     });
     out
 }
@@ -518,5 +520,6 @@ fn key_rule(name: &str, src: &str, dst: &str, field: &str, edge: &str) -> RuleDe
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }

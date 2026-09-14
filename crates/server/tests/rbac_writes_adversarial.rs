@@ -65,6 +65,7 @@ fn open_adv(
                 labels: labels.iter().map(|s| s.to_string()).collect(),
                 keys: vec![],
                 visible_where: None,
+                namespaces: None,
                 write: write.clone(),
             })
             .collect(),
@@ -344,6 +345,7 @@ async fn rule_tripped_hidden_edge_not_revealed() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
 
     let (app, db) = open_adv(
@@ -662,6 +664,7 @@ fn write_scope_read_mask_orthogonality() {
                 labels: vec![],
                 keys: vec![],
                 visible_where: None,
+                namespaces: None,
                 write: Some(WriteScope {
                     create_labels: vec!["AgentNote".into()],
                     update_labels: vec![],
@@ -694,6 +697,7 @@ fn write_scope_read_mask_orthogonality() {
                 labels: vec![], // read scope: empty
                 keys: vec![],
                 visible_where: None,
+                namespaces: None,
                 write: Some(WriteScope {
                     create_labels: vec![],
                     update_labels: vec!["AgentNote".into()], // not in read labels
@@ -726,6 +730,7 @@ fn write_scope_read_mask_orthogonality() {
                 labels: vec![], // read scope: empty
                 keys: vec![],
                 visible_where: None,
+                namespaces: None,
                 write: Some(WriteScope {
                     create_labels: vec![],
                     update_labels: vec![],
@@ -783,6 +788,7 @@ fn concurrent_writer_interference() {
             labels: vec!["AgentNote".into()],
             keys: vec![],
             visible_where: None,
+            namespaces: None,
             write: Some(WriteScope {
                 create_labels: vec!["AgentNote".into()],
                 update_labels: vec!["AgentNote".into()],

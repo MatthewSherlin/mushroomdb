@@ -156,10 +156,28 @@ All write denials return 403 with a structured JSON body:
 {"error": "role-bound token: edge endpoint not visible"}
 {"error": "role-bound token: edge type 'LINKS' not in write scope (create_edge_types)"}
 {"error": "role-bound token: this endpoint is not permitted"}
+{"error": "role-bound token: namespace 'tenant-b' not in the role's namespaces"}
 ```
 
 The "target node not visible" response is identical for hidden nodes and
 non-existent nodes — the role cannot distinguish the two cases.
+
+The sixth is the namespace leg (v0.6.6): a role bound to `namespaces` may only
+**create** a node inside them, because a node it could never read back would be a
+write into another tenancy. It covers `POST /nodes`, a batch, Cypher `CREATE`, and the
+node a `MERGE` creates (which always lands in `default`, so a namespaced role cannot
+`MERGE`-create at all) — a create naming no namespace is a create in `default`, so a
+role not bound to `default` is refused there too. A role with no `namespaces` binding
+is unchanged. Updates need no rule of their own: a role can only mutate nodes already
+in its read mask, which the namespace leg has already narrowed.
+
+A placeholder endpoint `POST /edges/upsert` would auto-create is refused by the same
+rule (a placeholder carries no props, so it lands in `default`) but with the
+**endpoint** message, `role-bound token: edge endpoint not visible`, not the namespace
+one. That is deliberate: the namespace arm fires only for an endpoint that does *not*
+exist and the visibility arm only for one that does, so two different strings would
+turn the pair into an existence oracle. Hidden ≡ absent holds here as everywhere else.
+See [masks.md](masks.md#namespaces).
 
 #### Threat model
 
@@ -224,11 +242,13 @@ Request body:
 }
 ```
 
-`stub_hidden` (optional, default `false`): when `true`, hidden nodes in the client
-mask appear as `{"key": "…", "restricted": true}` rather than being omitted. See
-[masks.md](masks.md) for the full policy. Note: Cypher result rows are **always
-omit-only** — `stub_hidden` has no effect on which rows the query returns; it only
-affects the node-info, edges, and neighborhood endpoints.
+`stub_hidden` (optional, default `false`): when `true`, hidden nodes in the mask the
+request resolved to appear as `{"key": "…", "restricted": true}` rather than being
+omitted. That mask is whichever one applies — a client `mask`, a `namespace` alone, or
+the two intersected — so a `namespace`-only request honours `stub_hidden` exactly as a
+key allow-list does. See [masks.md](masks.md) for the full policy. Note: Cypher result
+rows are **always omit-only** — `stub_hidden` has no effect on which rows the query
+returns; it only affects the node-info, edges, and neighborhood endpoints.
 
 Role tokens: `stub_hidden` is silently ignored — except with `as_of`, where it is
 refused (`as_of (time-travel) does not compose with stub_hidden`). Hidden nodes are
@@ -258,6 +278,26 @@ now-deleted node at a commit where it was live, and a role's `keys` resolve to
 whichever node held that key at the commit asked for (renaming frees a key for
 reuse). To revoke history, prune archives or narrow the role. See
 [masks.md](masks.md).
+
+`namespace` (optional, v0.6.6): answer from one namespace only.
+
+```json
+{
+  "cypher": "MATCH (n) RETURN n",
+  "namespace": "tenant-a"
+}
+```
+
+It **intersects** every other restriction — a role token's own `namespaces` binding,
+a client `mask`, and `as_of` — so it can only narrow, never widen: a token bound to
+`tenant-a` asking for `tenant-b` gets an empty result, not the union. A role bound to
+namespaces needs no `namespace` in the body at all; the resolver applies its binding
+to `POST /query` and to `GET /node/{key}`, `/edges`, `/neighborhood` and the history
+routes, where a node in another namespace answers exactly as an absent key does.
+Omitting `namespace` is no namespace restriction (not `default`; `"default"` is how
+you name the nodes that name no namespace). A name no node uses is an empty mask; an
+invalid name is a 400 naming the rule. Like `mask`, passing it makes the request a
+read. See [masks.md](masks.md#namespaces-on-every-surface).
 
 **Cost.** An `as_of` read — role-token reads included — replays the WAL under
 the store's read guard for the duration of the query; it does not use the
@@ -331,12 +371,34 @@ without `LIMIT` still error at 1,000,000 intermediate rows.
   "nodes_tombstoned": 0,
   "edges": 334,
   "history_floor": 0,
+  "namespaces": [
+    {"name": "default", "nodes_live": 58},
+    {"name": "tenant-a", "nodes_live": 2}
+  ],
   "rules": [
     {"name": "skill_fit", "edges": 90, "tripped": false, "fires": 90, "approximate": false},
     ...
   ]
 }
 ```
+
+`namespaces` (v0.6.6) lists every namespace with at least one live node, in name
+order, always including `default` — so a store that has never named a namespace
+reports exactly one entry. The route requires a full-access token, as it always did,
+which is also what keeps the roster from being a cross-tenant disclosure: a role token
+gets 403 here. MCP `stats` takes `role` / `namespace` to narrow the roster instead.
+
+A rule whose vector index is still being built carries an extra `building`
+object and derives no edges until it disappears:
+
+```json
+{"name": "sim", "edges": 0, "tripped": false, "fires": 0, "approximate": true,
+ "building": {"rule": "sim", "indexed": 2048, "total": 120000}}
+```
+
+The field is absent for every rule that is not building. See
+[POST /rules](#post-rules) for what starts a build and
+`mushroomdb build-index` for finishing one on a quiet store.
 
 ---
 
@@ -410,6 +472,21 @@ never causes a panic or blocking I/O.
 `edges` is optional. Unknown node keys in `edges` return 400
 `"node key not found"`.
 
+`namespace` (optional, v0.6.6) is the namespace **every node this call creates** lands
+in — the reserved, write-once `ns` property, named on the call:
+
+```json
+{"label": "Person", "namespace": "tenant-a", "rows": [{"id": "alice"}]}
+```
+
+A row carrying its own `ns` must name the same namespace; a disagreement is a 400
+naming the row, and nothing is written. Omitted means the `default` namespace, and an
+explicit `"default"` stores nothing, so a store that never passes one never grows an
+`ns` column. `POST /nodes` takes the same field for the one node it creates. A
+namespace is set at insert and cannot be changed afterwards — `PUT` or `DELETE` on
+`/node/{key}/prop/ns` is a 400 carrying the `NamespaceImmutable` text. See
+[masks.md](masks.md#namespaces).
+
 Auto-FK inference: fields ending in `_id` whose values match existing node
 keys automatically create `KeyMatch` rules on the first ingest call that
 sees them.
@@ -446,8 +523,29 @@ creates edges in both directions. An undirected Cypher pattern
 (`MATCH (a)-[:T]-(b)`) then double-counts rows. Prefer directed patterns
 (`-[:T]->`) or add `RETURN DISTINCT a, b`.
 
+`namespace` (optional, v0.6.6) scopes the rule to one namespace: it sees only that
+namespace's nodes — source, via hop and destination — so every edge it derives stays
+inside. Omitted (or null) means a global rule, which is the only kind that may derive
+an edge across a boundary. An invalid name is a 400 and nothing is installed. See
+[rules.md](rules.md#namespace-scoping).
+
 Returns 400 with `{"error": "..."}` on validation failure (unknown field
 type, missing required field, duplicate rule name).
+
+**202 while the index builds.** A VectorSimilar rule — in **either** mode, since
+both build the vector index — over more than 2,048 vectors cannot index its
+corpus in one commit, so the route installs the rule, indexes the first slice,
+and returns `202 Accepted` with the progress instead of `200`:
+
+```json
+{"rule": "sim", "building": {"indexed": 2048, "total": 120000}}
+```
+
+The rule derives **no** edges until the build finishes — never a partial set —
+and `GET /stats` reports the same progress under `building`. Every write
+advances the build by one slice, `mushroomdb serve` advances it once a second,
+and `mushroomdb build-index <db-dir>` drives it to completion. At or below
+2,048 vectors nothing changes: one commit, `200`, edges present on return.
 
 Predicate JSON shapes:
 
@@ -869,7 +967,7 @@ Response:
   "result": {
     "capabilities": {"tools": {}},
     "protocolVersion": "2024-11-05",
-    "serverInfo": {"name": "mushroomdb", "version": "0.6.5"}
+    "serverInfo": {"name": "mushroomdb", "version": "0.6.6"}
   }
 }
 ```
@@ -880,15 +978,15 @@ Sixteen tools:
 
 | Tool | Description |
 |---|---|
-| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `role?` (answer as one of the store's roles), `as_of?` (0-based commit index — answer from the graph as it was then; composes with `role` or with `mask`, not both, since the tool refuses `role` + `mask` together; writes and `stub_hidden` refused), `stub_hidden?` (bool; see below) |
-| `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?` |
-| `create_rule` | Declare a linking rule; params: `RuleDef` fields |
+| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `role?` (answer as one of the store's roles), `namespace?` (answer from one namespace — intersects `role` and `mask`, never widens them; a role bound to namespaces honours them with no argument), `as_of?` (0-based commit index — answer from the graph as it was then; composes with `role` or with `mask`, not both, since the tool refuses `role` + `mask` together, and with `namespace`; writes and `stub_hidden` refused), `stub_hidden?` (bool; see below) |
+| `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?`, `namespace?` (the namespace every node it creates lands in; a row naming a different `ns` is refused) |
+| `create_rule` | Declare a linking rule; params: `RuleDef` fields, including `namespace?` (scope the rule to one namespace; omitted is global). Over ~2,048 vectors the reply carries `building: {indexed, total}` and a note: the rule is installed but derives no edges until its vector index is built (see [POST /rules](#post-rules)) |
 | `explain` | Explain edges; params: `a`, `b` |
-| `stats` | Database statistics (no params) |
+| `stats` | Database statistics, including `namespaces`; params: `role?` and `namespace?`, which narrow the `namespaces` roster (the store-wide counts are unchanged) |
 | `neighborhood` | Typed neighborhood; params: `key`, `depth?`, `dir?` |
 | `node_info` | Node info and props; params: `key` |
 | `node_edges` | Incident edges; params: `key` |
-| `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?` |
+| `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?`, `namespace?` (the namespace a created node lands in; on an existing node, the one it is already in is a no-op and another is refused) |
 | `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?`; (2) edge traversal — `key`, `edge_type?`, `limit?` |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
@@ -905,7 +1003,9 @@ change which Cypher rows are returned.
 **MCP trust boundary:** the MCP server is a stdio JSON-RPC interface for local trusted
 use. It operates without bearer-token authentication and is not subject to role
 enforcement. All tools have full-access semantics regardless of any role configuration
-on the HTTP server.
+on the HTTP server. `role` and `namespace` on `query` and `stats` are therefore a
+caller asking to *be answered as* a tenant, not an enforced boundary — which is also
+why `stats` answers with the whole namespace roster unless one of them is passed.
 
 ---
 
@@ -939,13 +1039,19 @@ lock. See [Concurrency](#concurrency-1) below.
 
 ### Insert nodes
 
-`insert_node(label, key, props)` — same argument order as Rust. Raises if the
-key is already live.
+`insert_node(label, key, props, namespace=None)` — same argument order as Rust.
+Raises if the key is already live.
 
 ```python
 db.insert_node("Person", "alice", {"skills": ["graph", "rust"]})
 db.insert_node("Org", "acme", {"skills": ["graph", "rust", "search"]})
+db.insert_node("Doc", "a1", {"title": "t"}, namespace="tenant-a")
 ```
+
+`namespace` (v0.6.6) is the namespace the node is created in — set at insert and
+immutable, so `set_prop(key, "ns", …)` afterwards raises. Omitted (or `"default"`)
+means the `default` namespace and stores nothing. An invalid name raises `ValueError`;
+a `props["ns"]` disagreeing with the argument raises too.
 
 ### Upsert nodes
 
@@ -1026,6 +1132,9 @@ name is already registered:
 db.create_rule(rule, if_not_exists=True)   # True first time, False after
 ```
 
+A `"namespace"` key (v0.6.6) scopes the rule to one namespace — it sees only that
+namespace's nodes, so every edge it derives stays inside. Omitted is a global rule.
+
 **Predicate shape.** The canonical form is the snake_case one that `explain`
 emits, so an explanation round-trips straight back into a new rule:
 
@@ -1089,6 +1198,17 @@ string, so string values are safe against injection regardless of content.
 `query_with_params(cypher, params)` is a retained back-compat alias for
 `query(cypher, params=params)`.
 
+`role` and `namespace` (v0.6.6) restrict what the query may see:
+
+```python
+mine = db.query("MATCH (n) RETURN n", role="a-reader", namespace="tenant-a")
+```
+
+`role` answers as one of the store's `roles.json` roles and `namespace` from one
+namespace; together they **intersect**, so a role bound to `tenant-a` asked for
+`tenant-b` returns `[]` rather than the union. Either argument makes the call a read —
+a write statement raises — and an invalid namespace name raises `ValueError`.
+
 `query_write(cypher, params=None)` takes the same three param shapes:
 
 ```python
@@ -1149,8 +1269,12 @@ explanation = db.explain("alice", "acme")
 
 ```python
 s = db.stats()
-# {"nodes_live": N, "nodes_tombstoned": 0, "edges": E, "rules": [...]}
+# {"nodes_live": N, "nodes_tombstoned": 0, "edges": E, "history_floor": 0,
+#  "namespaces": [{"name": "default", "nodes_live": N}], "rules": [...]}
 ```
+
+`namespaces` (v0.6.6) lists every namespace with at least one live node, in name
+order, always including `default` — one entry on a store that has never named one.
 
 ### Concurrency
 

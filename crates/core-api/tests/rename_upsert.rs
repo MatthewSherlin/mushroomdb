@@ -310,6 +310,7 @@ fn insert_edge_upsert_rules_fire_on_placeholder() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // Upsert creates p1 and p2 as Placeholder; set props in the same batch.
@@ -414,6 +415,7 @@ fn edge_history_sees_derived_events_after_rename() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // Rule fires: DerivedEdgeAdded written with src="x", dst="y"
@@ -452,6 +454,7 @@ fn was_linked_resolves_through_rename() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // Rule fires at commit N. Rename happens at commit N+1.

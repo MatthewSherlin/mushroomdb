@@ -1074,6 +1074,7 @@ fn concurrent_writes_keep_rules_and_index_consistent() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
     db.write().enable_index("Talent", "city").unwrap();

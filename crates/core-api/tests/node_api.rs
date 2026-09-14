@@ -34,6 +34,7 @@ fn open_mixed(name: &str) -> GraphDb<core_storage::fs::RealFs> {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // Non-alpha insert order so node_info props must come back as BTreeMap order.

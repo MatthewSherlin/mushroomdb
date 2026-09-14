@@ -823,6 +823,7 @@ fn seeded_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::RealFs
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }],
         views: vec![],
         roles: vec![
@@ -831,6 +832,7 @@ fn seeded_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::RealFs
                 keys: vec![],
                 labels: vec!["Person".into(), "Project".into()],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             },
             RoleDef {
@@ -838,6 +840,7 @@ fn seeded_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::RealFs
                 keys: vec![],
                 labels: vec!["Person".into()],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             },
         ],
@@ -915,6 +918,7 @@ fn seeded_memory_store_with_two_source_edge_types(
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }],
         views: vec![],
         roles: vec![],
@@ -1596,6 +1600,7 @@ fn role_scoped_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::R
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }],
         views: vec![],
         roles: vec![
@@ -1606,6 +1611,7 @@ fn role_scoped_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::R
                 keys: vec![],
                 labels: vec!["Company".into(), "Job".into()],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             },
             RoleDef {
@@ -1613,6 +1619,7 @@ fn role_scoped_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::R
                 keys: vec![],
                 labels: vec!["Company".into(), "Job".into(), "Talent".into()],
                 visible_where: None,
+                namespaces: None,
                 write: None,
             },
         ],

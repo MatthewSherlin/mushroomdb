@@ -4,12 +4,61 @@ use crate::def::{
 };
 use crate::hnsw::HnswIndex;
 use crate::index::{
-    candidate_spec, candidate_spec_approx_with_k, ivf_drift_rebuild_threshold, CandidateSpec,
-    RuleIndex,
+    candidate_spec, candidate_spec_approx_with_floor, hnsw_build_batch, hnsw_vector_present,
+    ivf_drift_rebuild_threshold, spec_has_hnsw, vector_scan_forced, CandidateSpec, RuleIndex,
 };
 use core_storage::v8::encode::{decode_ivf_bytes, decode_provenance_bytes};
 use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::{EdgeProps, IdMap, Interner, Topology, Value};
+use serde::{Deserialize, Serialize};
+
+/// Whether `def` may see node `id` — the namespace scoping check (v0.6.6 §7.4).
+///
+/// A global rule (`def.namespace == None`) sees every node and takes no column
+/// read at all, so every rule written before namespaces existed runs exactly the
+/// code it ran before. A scoped rule sees only nodes in its namespace, which is
+/// what makes every edge it derives intra-namespace: the check is applied to
+/// each side where candidates are enumerated, so no pair-level check exists.
+fn rule_sees_node(def: &RuleDef, id: u32, props: &ColumnsView<'_>) -> bool {
+    match &def.namespace {
+        None => true,
+        Some(ns) => {
+            let value = props
+                .get(id, core_storage::NS_PROP)
+                .map(|vr| vr.into_value());
+            core_storage::namespace_of_value(value.as_ref()) == ns.as_str()
+        }
+    }
+}
+
+/// [`rule_sees_node`] against the graph handle a hook already holds.
+fn rule_sees(def: &RuleDef, id: u32, g: &GraphMut<'_>) -> bool {
+    if def.namespace.is_none() {
+        return true;
+    }
+    rule_sees_node(def, id, &g.props)
+}
+
+/// Decode one side's retained HNSW blob for the lazy clean-open read path.
+///
+/// Empty means "this side had no graph"; a decode failure is reported once on
+/// stderr, because the consequence — every ANN query on this store running
+/// brute force until the first write — is otherwise invisible.
+fn lazy_decode(rule: &str, side: &str, blob: &[u8]) -> Option<HnswIndex> {
+    if blob.is_empty() {
+        return None;
+    }
+    match crate::hnsw::decode_hnsw_blob(blob) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!(
+                "[mushroomdb] rule {rule:?}: persisted {side}-side HNSW index failed to load \
+                 ({e}); approximate queries fall back to a full scan until the next write"
+            );
+            None
+        }
+    }
+}
 
 /// Decode raw IVF section bytes into the `RuleIvfExport` format consumed by
 /// `reindex_all_load_state`.  Returns an empty map when `bytes` is empty.
@@ -28,6 +77,7 @@ fn decode_ivf_bytes_to_export(bytes: &[u8]) -> BTreeMap<String, RuleIvfExport> {
         .collect()
 }
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
 
 /// A single derived-edge fire or retract captured during a commit.
@@ -156,6 +206,34 @@ type HnswBlobMap = BTreeMap<String, (Vec<u8>, Vec<u8>)>;
 /// Lazily-decoded HNSW graph pair (src-side, dst-side) keyed by rule name.
 type LazyHnswMap = BTreeMap<String, (Option<HnswIndex>, Option<HnswIndex>)>;
 
+/// How far a rule's vector index has got, for a rule whose build did not fit
+/// in one commit.
+///
+/// `indexed == total` means the graph is whole and only the backfill is
+/// outstanding — the rule still derives no edges until it disappears from
+/// [`RuleEngine::builds_in_progress`]. Never persisted: a reopen re-derives it
+/// from the adopted graph and the node scan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildProgress {
+    pub rule: String,
+    pub indexed: u64,
+    pub total: u64,
+}
+
+/// The engine-side bookkeeping behind one [`BuildProgress`].
+///
+/// `cursor` is the next node id a slice will look at and `limit` the id bound
+/// fixed when the rule was created, so the build walks a stable range even as
+/// writes append new nodes — those go into the graph through the ordinary
+/// write path instead.
+#[derive(Clone, Debug)]
+struct PendingBuild {
+    indexed: u64,
+    total: u64,
+    cursor: u32,
+    limit: u32,
+}
+
 /// Lazily-decoded provenance state used by `&self` read paths
 /// (`stats()`, `explain()`, `provenance_touching`).
 ///
@@ -211,6 +289,28 @@ pub struct RuleEngine {
     /// [`crate::IVF_DRIFT_REBUILD`] during the last index maintenance.
     /// Drained by [`RuleEngine::take_rebuild_needed`] after apply.
     rebuild_needed: BTreeSet<String>,
+    /// Rules whose HNSW graph is still being filled a slice at a time, keyed by
+    /// rule name. A rule listed here derives **no** edges: its backfill runs as
+    /// one commit once the graph is whole, so there is never a partial edge set.
+    ///
+    /// Never persisted. A reopen re-derives an entry for any rule whose
+    /// persisted graph turned out to be shorter than the node scan
+    /// (`reindex_all_load_state`), which is exactly the mid-build case.
+    pending_builds: BTreeMap<String, PendingBuild>,
+    /// Rules whose sliced build has just finished and whose backfill has not
+    /// run yet. Drained by `rebuild_inner`, which carries the finished graph
+    /// across its reindex instead of rebuilding it. Never persisted; a stale
+    /// entry only costs the next rebuild its compaction.
+    builds_awaiting_backfill: BTreeSet<String>,
+    /// Per-handle build-slice size, overriding [`crate::HNSW_BUILD_BATCH`] and
+    /// the `with_hnsw_build_batch` thread-local when set.
+    ///
+    /// Test hook, never persisted. The thread-local is enough for a test that
+    /// drives the engine directly, but a server runs its writes on a blocking
+    /// thread pool, and a process-global would leak between tests running in
+    /// parallel; a value on the handle reaches the write wherever it runs and
+    /// no further.
+    hnsw_build_batch: Option<usize>,
     /// Whether candidate indexes have been populated.  Starts `false` after a
     /// snapshot restore that defers index building.  Set to `true` by
     /// `reindex_all`, `reindex_all_load_state`, and `create_rule`.  On the first
@@ -234,6 +334,15 @@ pub struct RuleEngine {
     /// instead of at open time to avoid the ~544 MiB bincode overhead.
     /// Wrapped in Mutex so `store_snapshot_state` can take `&self`.
     retained_ivf_bytes: Mutex<Option<Vec<u8>>>,
+    /// How many id slots the snapshot held, recorded by `store_snapshot_state`.
+    ///
+    /// Ids are dense and never reused, so every node created since the snapshot
+    /// has an id at or above this. That is what lets `reindex_all_load_state`
+    /// tell "the persisted graph was cut short mid-build" (a vector missing
+    /// *below* the line) from "this is simply a newer node" (missing at or
+    /// above it) — including the node whose own `apply` is what tripped the
+    /// lazy index build in the first place.
+    retained_node_count: AtomicU32,
     /// Raw rkyv bytes of the provenance section retained from the last snapshot.
     ///
     /// Wrapped in `Mutex` so the `&self` read path (`ensure_provenance_loaded`)
@@ -255,10 +364,10 @@ pub struct RuleEngine {
     ///
     /// Populated once by `ensure_hnsw_loaded` on the first ANN query after a
     /// snapshot open with no WAL.  `OnceLock` guarantees exactly-once init
-    /// even under concurrent shared-read access.  Released by
-    /// `mark_indexes_populated` the moment the live indexes take over, so the
-    /// handle never carries two copies of a graph and never answers from the
-    /// snapshot's picture of a side the live index has since emptied.
+    /// even under concurrent shared-read access.  It is a bridge from the open
+    /// to the first write, not a second copy: whichever path installs the
+    /// persisted graphs into `indexes` (`consume_retained_state_eager` or
+    /// `ensure_indexes_populated`) drops it again via `release_lazy_hnsw`.
     lazy_hnsw: OnceLock<LazyHnswMap>,
     /// Current chaining level. `0` while a top-level hook runs; `1..=MAX_CHAIN_DEPTH`
     /// while [`RuleEngine::chain_from`] re-enters `on_edge_changed`. Non-zero
@@ -296,18 +405,48 @@ pub struct RuleEngine {
 // Private helpers (free functions, not methods, to avoid whole-struct borrows)
 // ---------------------------------------------------------------------------
 
-/// Rule-aware candidate spec: exact `ScanAll` for `approximate=false`, IVF
-/// `VectorClusters` for `approximate=true` (VectorSimilar-rooted predicates).
+/// Rule-aware candidate spec.
+///
+/// Both exact and approximate `VectorSimilar`-rooted rules probe the vector
+/// index. The difference is the beam: an approximate rule takes one pass at
+/// `k`; an exact rule widens the beam until the beam's own worst hit falls
+/// below the rule's `min`, at which point nothing outside it can qualify.
+/// Scoring is the same code either way — only the set fed into it differs.
+///
+/// `MUSHROOMDB_VECTOR_SCAN=1` returns an exact rule to `candidate_spec`: the
+/// O(n²) full scan, and every pair above `min` provably found.
 fn candidate_spec_for(def: &RuleDef) -> CandidateSpec<'_> {
-    if def.approximate {
-        // k = max(max_edges, 128): return at least 128 candidates so the HNSW
-        // beam's expanded reach (M₀=128 layer-0 edges) is not truncated before
-        // evaluation; bounded by max_edges when set by the caller.
-        let k = def.max_edges.map(|me| me.max(128)).unwrap_or(128) as usize;
-        candidate_spec_approx_with_k(&def.predicate, k)
-    } else {
-        candidate_spec(&def.predicate)
+    if !def.approximate && vector_scan_forced() {
+        return candidate_spec(&def.predicate);
     }
+    // k = max(max_edges, 128): return at least 128 candidates so the HNSW
+    // beam's expanded reach (M₀=128 layer-0 edges) is not truncated before
+    // evaluation; bounded by max_edges when set by the caller.
+    let k = def.max_edges.map(|me| me.max(128)).unwrap_or(128) as usize;
+    candidate_spec_approx_with_floor(&def.predicate, k, !def.approximate)
+}
+
+/// True when `def`'s candidate spec probes an HNSW graph, so this rule needs one
+/// built, persisted and adopted.
+///
+/// From 0.6.6 that is every `VectorSimilar`-rooted rule, exact or approximate —
+/// unless `MUSHROOMDB_VECTOR_SCAN` has put the exact ones back on the full scan,
+/// in which case they need no graph at all.
+fn uses_hnsw(def: &RuleDef) -> bool {
+    // `src_lookup_spec_for` is either this spec or the KeyMatch reverse lookup,
+    // which has no vector leg, so the dst spec decides for both sides.
+    spec_has_hnsw(&candidate_spec_for(def))
+}
+
+/// True when `def` has a vector leg at all — whatever `MUSHROOMDB_VECTOR_SCAN`
+/// says right now.
+///
+/// The question the snapshot asks. A store whose graph was built without the
+/// variable and is then written to with it set would otherwise have that graph
+/// dropped from the next snapshot and rebuilt on the open after, which is a
+/// superlinear cost for a variable the operator may have set for one run.
+fn has_vector_leg(def: &RuleDef) -> bool {
+    spec_has_hnsw(&candidate_spec_approx_with_floor(&def.predicate, 1, false))
 }
 
 /// Rule-aware src-side lookup spec. KeyMatch is still exact on the src side
@@ -380,6 +519,10 @@ fn compute_desired(
         return BTreeMap::new();
     };
     if g.labels.get(n as usize).copied() != Some(my_sym) {
+        return BTreeMap::new();
+    }
+    // Namespace scoping: a scoped rule sees neither side outside its namespace.
+    if !rule_sees(def, n, g) {
         return BTreeMap::new();
     }
     let other_sym = g.syms.get(other_label);
@@ -487,6 +630,9 @@ fn compute_desired(
         }
         if g.labels.get(m as usize).copied() != other_sym {
             continue; // label filter
+        }
+        if !rule_sees(def, m, g) {
+            continue; // namespace filter — the other side of the pair
         }
         let m_key = match g.ids.key_of(m) {
             Some(k) => k,
@@ -647,7 +793,8 @@ fn compute_desired_via(
             if Some(src_id) == doomed {
                 return BTreeMap::new();
             }
-            if g.labels.get(src_id as usize).copied() == Some(src_sym) {
+            if g.labels.get(src_id as usize).copied() == Some(src_sym) && rule_sees(def, src_id, g)
+            {
                 vec![src_id]
             } else {
                 return BTreeMap::new();
@@ -662,6 +809,7 @@ fn compute_desired_via(
                             g.labels.get(id as usize).copied(),
                             Some(s) if s != u32::MAX && s == src_sym
                         )
+                        && rule_sees(def, id, g)
                 })
                 .collect()
         }
@@ -673,7 +821,8 @@ fn compute_desired_via(
             if Some(dst_id) == doomed {
                 return BTreeMap::new();
             }
-            if g.labels.get(dst_id as usize).copied() == Some(dst_sym) {
+            if g.labels.get(dst_id as usize).copied() == Some(dst_sym) && rule_sees(def, dst_id, g)
+            {
                 Some(dst_id)
             } else {
                 return BTreeMap::new();
@@ -699,7 +848,13 @@ fn compute_desired_via(
             .neighbors(via_etype, via_dir, src)
             .iter()
             .copied()
-            .filter(|&v| Some(v) != doomed && g.labels.get(v as usize).copied() == Some(via_sym))
+            .filter(|&v| {
+                Some(v) != doomed
+                    && g.labels.get(v as usize).copied() == Some(via_sym)
+                    // The via node is a node: a scoped rule does not hop through
+                    // one in another namespace.
+                    && rule_sees(def, v, g)
+            })
             .collect();
 
         if via_neighbors.is_empty() {
@@ -737,6 +892,7 @@ fn compute_desired_via(
                             g.labels.get(id as usize).copied(),
                             Some(s) if s != u32::MAX && s == dst_sym
                         )
+                        && rule_sees(def, id, g)
                 })
                 .collect()
         } else {
@@ -748,6 +904,7 @@ fn compute_desired_via(
                             g.labels.get(id as usize).copied(),
                             Some(s) if s != u32::MAX && s == dst_sym
                         )
+                        && rule_sees(def, id, g)
                 })
                 .collect()
         };
@@ -1207,6 +1364,11 @@ fn pair_still_desired(def: &RuleDef, s: u32, d: u32, g: &GraphMut<'_>) -> bool {
     if g.labels.get(d as usize).copied() != Some(dst_sym) {
         return false;
     }
+    // A scoped rule desires no pair with an endpoint outside its namespace, so
+    // the retract pass withdraws an edge whose endpoint moved out of reach.
+    if !rule_sees(def, s, g) || !rule_sees(def, d, g) {
+        return false;
+    }
     let s_key = match g.ids.key_of(s) {
         Some(k) => k,
         None => return false,
@@ -1580,7 +1742,7 @@ fn bump_fires_for_participants(def: &RuleDef, g: &GraphMut<'_>, fires: &mut u64)
             Some(s) if s != u32::MAX => s,
             _ => continue,
         };
-        if src_sym == Some(label_sym) || dst_sym == Some(label_sym) {
+        if (src_sym == Some(label_sym) || dst_sym == Some(label_sym)) && rule_sees(def, id, g) {
             *fires += 1;
         }
     }
@@ -1599,6 +1761,73 @@ fn index_node_for_rule(
     index_node_for_rule_skipping(id, label_sym, def, index, syms, props, &NONE);
 }
 
+/// `index_node_for_rule`, but the sliced build's version: every leg except the
+/// HNSW graph is filed now, and the vectors arrive later through
+/// [`RuleEngine::run_build_slice`].
+fn index_node_for_rule_deferring_hnsw(
+    id: u32,
+    label_sym: u32,
+    def: &RuleDef,
+    index: &mut RuleIndex,
+    syms: &Interner,
+    props: ColumnsView<'_>,
+) {
+    if !rule_sees_node(def, id, &props) {
+        return;
+    }
+    let get = |f: &str| props.get(id, f).map(|vr| vr.into_value());
+    if syms.get(&def.src_label) == Some(label_sym) {
+        let spec = src_lookup_spec_for(def);
+        index.src_side.insert_deferring_hnsw(&spec, id, &get);
+    }
+    if syms.get(&def.dst_label) == Some(label_sym) {
+        let spec = candidate_spec_for(def);
+        index.dst_side.insert_deferring_hnsw(&spec, id, &get);
+    }
+}
+
+/// How many nodes `def` would put at least one vector into an HNSW graph for.
+///
+/// Counted in **nodes**, not vectors: a rule whose src and dst labels are the
+/// same indexes each node on both sides but counts it once, so `total` and the
+/// progress a slice reports are on the same scale.
+///
+/// Zero for a rule with no HNSW leg — one with no vector predicate, one whose
+/// vector predicate sits under an `Any`, or any rule at all while
+/// `MUSHROOMDB_VECTOR_SCAN` is set — which is what keeps those on the unchanged
+/// one-commit path.
+fn hnsw_build_total(def: &RuleDef, g: &GraphMut<'_>) -> u64 {
+    if !uses_hnsw(def) {
+        return 0;
+    }
+    let src_spec = src_lookup_spec_for(def);
+    let dst_spec = candidate_spec_for(def);
+    let src_sym = g.syms.get(&def.src_label);
+    let dst_sym = g.syms.get(&def.dst_label);
+    let mut total = 0u64;
+    for id in 0..g.ids.len() as u32 {
+        let label_sym = match g.labels.get(id as usize).copied() {
+            Some(s) if s != u32::MAX => s,
+            _ => continue,
+        };
+        if src_sym != Some(label_sym) && dst_sym != Some(label_sym) {
+            continue;
+        }
+        // A scoped rule files no vector for a node outside its namespace, so it
+        // must not count one either or the build never reports complete.
+        if !rule_sees(def, id, g) {
+            continue;
+        }
+        let get = |f: &str| g.props.get(id, f).map(|vr| vr.into_value());
+        let hit = (src_sym == Some(label_sym) && hnsw_vector_present(&src_spec, &get))
+            || (dst_sym == Some(label_sym) && hnsw_vector_present(&dst_spec, &get));
+        if hit {
+            total += 1;
+        }
+    }
+    total
+}
+
 /// `index_node_for_rule`, but the open-time scan's version: `skip` holds the
 /// `(src, dst)` node ids the adopted HNSW graphs already contain, so the scan
 /// only inserts vectors the persisted graphs did not carry.
@@ -1611,6 +1840,11 @@ fn index_node_for_rule_skipping(
     props: ColumnsView<'_>,
     skip: &(BTreeSet<u32>, BTreeSet<u32>),
 ) {
+    // Namespace scoping: a scoped rule's candidate index holds only its own
+    // namespace, so a probe can never offer a candidate across the boundary.
+    if !rule_sees_node(def, id, &props) {
+        return;
+    }
     let get = |f: &str| props.get(id, f).map(|vr| vr.into_value());
     if syms.get(&def.src_label) == Some(label_sym) {
         let spec = src_lookup_spec_for(def);
@@ -1943,12 +2177,16 @@ impl RuleEngine {
             pending_deltas: Vec::new(),
             emit_deltas: false,
             rebuild_needed: BTreeSet::new(),
+            pending_builds: BTreeMap::new(),
+            builds_awaiting_backfill: BTreeSet::new(),
+            hnsw_build_batch: None,
             // Candidate indexes start empty; caller must either call
             // consume_retained_state_eager (WAL-present open) or rely on the
             // lazy init in the mutation hooks (clean open, first-write cost).
             indexes_populated: false,
             retained_hnsw_blobs: Mutex::new(BTreeMap::new()),
             retained_ivf_bytes: Mutex::new(None),
+            retained_node_count: AtomicU32::new(0),
             retained_provenance_bytes: Mutex::new(None),
             lazy_provenance: OnceLock::new(),
             lazy_hnsw: OnceLock::new(),
@@ -1989,6 +2227,165 @@ impl RuleEngine {
         self.rebuild_needed.insert(name);
     }
 
+    // -----------------------------------------------------------------------
+    // Sliced HNSW builds (v0.6.6 T2)
+    // -----------------------------------------------------------------------
+
+    /// Override the build-slice size for this engine. `None` restores
+    /// [`crate::HNSW_BUILD_BATCH`] (or whatever `with_hnsw_build_batch` has
+    /// installed on the calling thread).
+    ///
+    /// Test observability, not stable surface.
+    #[doc(hidden)]
+    pub fn set_hnsw_build_batch(&mut self, batch: Option<usize>) {
+        self.hnsw_build_batch = batch.map(|b| b.max(1));
+    }
+
+    /// Never zero: a zero slice would insert nothing per pump, and
+    /// `build_index_on` would spin forever on a build that cannot advance.
+    fn build_batch(&self) -> usize {
+        self.hnsw_build_batch
+            .unwrap_or_else(hnsw_build_batch)
+            .max(1)
+    }
+
+    /// Rules whose vector index is still being built, in name order.
+    ///
+    /// Empty for every store whose rules were created over a corpus at or
+    /// below [`crate::HNSW_BUILD_BATCH`] vectors — that is, for every store
+    /// that behaved the way 0.6.5 behaved.
+    pub fn builds_in_progress(&self) -> Vec<BuildProgress> {
+        self.pending_builds
+            .iter()
+            .map(|(name, pb)| BuildProgress {
+                rule: name.clone(),
+                indexed: pb.indexed,
+                total: pb.total,
+            })
+            .collect()
+    }
+
+    /// Advance every pending build by one slice.
+    ///
+    /// Returns the builds that finished, in rule order, carrying their final
+    /// `indexed`/`total` so a caller can report what it just completed. The
+    /// caller **must** backfill each of them through `RebuildRule`: the rule
+    /// derives nothing until it does, and it has already vanished from
+    /// [`RuleEngine::builds_in_progress`].
+    ///
+    /// Does at most [`crate::HNSW_BUILD_BATCH`] vector inserts per pending
+    /// rule, so a caller can drive a large build to completion without holding
+    /// a write lock for more than a slice at a time.
+    pub fn pump_index_build(&mut self, g: &mut GraphMut<'_>) -> Vec<BuildProgress> {
+        // A clean-open handle that has never written reaches this with empty
+        // indexes and a rule set restored from the snapshot. Populating them is
+        // also what re-derives a pending build that a mid-build snapshot left
+        // behind, so it has to happen before the map is read.
+        self.ensure_indexes_populated(g);
+        if self.pending_builds.is_empty() {
+            return Vec::new();
+        }
+        let batch = self.build_batch();
+        let names: Vec<String> = self.pending_builds.keys().cloned().collect();
+        let mut finished: Vec<BuildProgress> = Vec::new();
+        for name in names {
+            let Some(pb) = self.pending_builds.get(&name).cloned() else {
+                continue;
+            };
+            let Some(def) = self.rules.get(&name).cloned() else {
+                // The rule was dropped while its build was outstanding.
+                self.pending_builds.remove(&name);
+                continue;
+            };
+            let (inserted, cursor) =
+                self.run_build_slice(&name, &def, pb.cursor, pb.limit, batch, g);
+            let entry = self
+                .pending_builds
+                .get_mut(&name)
+                .expect("pending build removed mid-slice");
+            entry.indexed = entry.indexed.saturating_add(inserted).min(entry.total);
+            entry.cursor = cursor;
+            if cursor >= pb.limit {
+                // The graph is whole: fit the legacy IVF fallback exactly where
+                // the one-commit path fits it, then hand the name back so the
+                // caller can run the backfill as its own commit.
+                if let Some(idx) = self.indexes.get_mut(&name) {
+                    idx.src_side.fit_ivf_clusters(&name);
+                    idx.dst_side.fit_ivf_clusters(&name);
+                }
+                let done = self
+                    .pending_builds
+                    .remove(&name)
+                    .expect("pending build vanished mid-slice");
+                // Tells the `RebuildRule` this name is about to trigger that the
+                // graph is already built and must be carried, not rebuilt.
+                self.builds_awaiting_backfill.insert(name.clone());
+                finished.push(BuildProgress {
+                    rule: name,
+                    indexed: done.indexed,
+                    total: done.total,
+                });
+            }
+        }
+        finished
+    }
+
+    /// Insert up to `batch` vector-bearing nodes from `[cursor, limit)` into
+    /// `name`'s HNSW graphs. Returns `(nodes inserted, new cursor)`.
+    ///
+    /// Counts nodes by the same predicate [`hnsw_build_total`] counts them
+    /// with, so `indexed` can never overshoot `total`.
+    fn run_build_slice(
+        &mut self,
+        name: &str,
+        def: &RuleDef,
+        cursor: u32,
+        limit: u32,
+        batch: usize,
+        g: &GraphMut<'_>,
+    ) -> (u64, u32) {
+        let src_spec = src_lookup_spec_for(def);
+        let dst_spec = candidate_spec_for(def);
+        let src_sym = g.syms.get(&def.src_label);
+        let dst_sym = g.syms.get(&def.dst_label);
+        let Some(idx) = self.indexes.get_mut(name) else {
+            return (0, limit);
+        };
+        let mut inserted = 0u64;
+        let mut id = cursor;
+        while id < limit && (inserted as usize) < batch {
+            let at = id;
+            id += 1;
+            let label_sym = match g.labels.get(at as usize).copied() {
+                Some(s) if s != u32::MAX => s,
+                _ => continue,
+            };
+            if src_sym != Some(label_sym) && dst_sym != Some(label_sym) {
+                continue;
+            }
+            // Namespace scoping (v0.6.6 §7.4): the sliced build files the
+            // vectors `index_node_for_rule_deferring_hnsw` deferred, so it has to
+            // apply the same gate — a scoped rule's HNSW graph holds its own
+            // namespace only. `hnsw_build_total` counts the same way, so the
+            // progress this slice reports is against the same population.
+            if !rule_sees(def, at, g) {
+                continue;
+            }
+            let get = |f: &str| g.props.get(at, f).map(|vr| vr.into_value());
+            let mut any = false;
+            if src_sym == Some(label_sym) {
+                any |= idx.src_side.insert_hnsw_only(&src_spec, at, &get);
+            }
+            if dst_sym == Some(label_sym) {
+                any |= idx.dst_side.insert_hnsw_only(&dst_spec, at, &get);
+            }
+            if any {
+                inserted += 1;
+            }
+        }
+        (inserted, id)
+    }
+
     fn maybe_queue_ivf_rebuild(&mut self, rule_name: &str, def: &RuleDef) {
         if !def.approximate {
             return;
@@ -2015,34 +2412,17 @@ impl RuleEngine {
         self.hnsw_builds
     }
 
-    /// Number of rules whose graphs the clean-open read path still holds in
-    /// `lazy_hnsw`.
+    /// How many rules currently hold a lazily-decoded HNSW graph pair.
     ///
-    /// Zero once the live indexes are populated: `mark_indexes_populated`
-    /// releases the lazy copies at that moment. Test observability, not stable
-    /// surface.
+    /// Zero before the first ANN query on a clean open, and zero again once a
+    /// write has moved the persisted graphs into the live indexes. A non-zero
+    /// count after a write means the handle is holding two copies of every
+    /// approximate rule's graph.
+    ///
+    /// Test observability, not stable surface.
     #[doc(hidden)]
     pub fn lazy_hnsw_len(&self) -> usize {
         self.lazy_hnsw.get().map_or(0, |m| m.len())
-    }
-
-    /// Declare the live per-rule indexes authoritative and release the
-    /// read-path copies.
-    ///
-    /// `lazy_hnsw` holds a second, full copy of every approximate rule's graph,
-    /// decoded by `ensure_hnsw_loaded` for queries that arrive before the first
-    /// write. Once the live indexes exist that copy is both redundant — double
-    /// the resident memory for every approximate rule — and *stale*: it is a
-    /// picture of the snapshot, so a side whose live graph has since been
-    /// emptied would fall through to it and answer with deleted nodes.
-    ///
-    /// Resetting the `OnceLock` rather than clearing the map matters: a later
-    /// `ensure_hnsw_loaded` then re-runs `get_or_init` against the
-    /// already-drained `retained_hnsw_blobs` and latches an empty map, so the
-    /// copies never come back.
-    fn mark_indexes_populated(&mut self) {
-        self.indexes_populated = true;
-        self.lazy_hnsw = OnceLock::new();
     }
 
     /// Export IVF state for all approximate rules.  Passed to `snapshot()` in
@@ -2081,9 +2461,9 @@ impl RuleEngine {
         // allocation and to satisfy the borrow checker without cloning inside.
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
 
-        // Init HNSW for approximate rules before inserting nodes.
+        // Init HNSW for every rule with a vector leg before inserting nodes.
         for name in &rule_names {
-            if self.rules[name].approximate {
+            if uses_hnsw(&self.rules[name]) {
                 let idx = self.indexes.get_mut(name).unwrap();
                 idx.src_side.init_hnsw(name);
                 idx.dst_side.init_hnsw(name);
@@ -2111,7 +2491,8 @@ impl RuleEngine {
                 idx.dst_side.fit_ivf_clusters(name);
             }
         }
-        self.mark_indexes_populated();
+        self.indexes_populated = true;
+        self.release_lazy_hnsw();
     }
 
     /// Like `reindex_all` but LOADS persisted IVF state for approximate rules
@@ -2160,8 +2541,8 @@ impl RuleEngine {
     ///   * `hnsw_state` has no entry for the rule — a store written before HNSW
     ///     persistence existed, or a rule created since the last snapshot;
     ///   * the blob for that side is empty — the side had no graph to export;
-    ///   * the blob fails to deserialize — the reason is logged to stderr and
-    ///     the scan rebuilds the graph.
+    ///   * the blob is corrupt or carries a version this build does not read —
+    ///     the reason is logged to stderr and the scan rebuilds the graph.
     ///
     /// Entries naming a rule this engine does not treat as approximate are left
     /// for `load_hnsw_state` after the scan, exactly as before.
@@ -2184,8 +2565,12 @@ impl RuleEngine {
         // no usable blob get `init_hnsw` and are filled by the scan.
         let mut leftover_blobs = hnsw_state;
         let mut adopted: BTreeMap<String, (BTreeSet<u32>, BTreeSet<u32>)> = BTreeMap::new();
+        // Rules whose graph the snapshot did not carry, so this scan has to
+        // build it inline. Reported once below, with the size, because the cost
+        // is superlinear in the vectors and otherwise invisible.
+        let mut built_inline: Vec<String> = Vec::new();
         for name in &rule_names {
-            if !self.rules[name].approximate {
+            if !uses_hnsw(&self.rules[name]) {
                 continue;
             }
             let (src_blob, dst_blob) = leftover_blobs.remove(name).unwrap_or_default();
@@ -2197,6 +2582,9 @@ impl RuleEngine {
             }
             if !dst_adopted {
                 self.hnsw_builds += 1;
+            }
+            if !src_adopted || !dst_adopted {
+                built_inline.push(name.clone());
             }
             adopted.insert(name.clone(), (src_ids, dst_ids));
         }
@@ -2213,6 +2601,80 @@ impl RuleEngine {
                 let idx = self.indexes.get_mut(name).unwrap();
                 index_node_for_rule_skipping(id, label_sym, &def, idx, syms, props, skip);
             }
+        }
+
+        // One line per rule whose graph this scan had to build, because it is
+        // the one cost on this path that is superlinear in the corpus and it is
+        // otherwise silent: a store written before vector indexes were persisted,
+        // a rule created since the last snapshot, or a blob that failed to load.
+        for name in &built_inline {
+            let vectors = self
+                .indexes
+                .get(name)
+                .and_then(|idx| idx.dst_side.hnsw_ref().map(|h| h.len()))
+                .unwrap_or(0);
+            // A rule whose side never held a vector built nothing worth saying.
+            if vectors == 0 {
+                continue;
+            }
+            eprintln!(
+                "[mushroomdb] rule {name:?}: no persisted vector index; built one from the \
+                 node scan ({vectors} vectors)"
+            );
+        }
+
+        // Re-derive the pending builds a mid-build snapshot left behind.
+        //
+        // `pending_builds` is never persisted, so the evidence that a build was
+        // unfinished is that the scan had to supply a vector the adopted graph
+        // did not carry. That is only sound because the write path populates
+        // the indexes *before* it applies a record (`needs_index_population`):
+        // the scan sees exactly the persisted state, so a vector it has to
+        // supply really was missing from the snapshot's graph rather than being
+        // the in-flight write's own.
+        //
+        // `retained_node_count` is the belt to that's braces. Ids are dense and
+        // never reused, so a node the snapshot did not hold has an id at or
+        // above the count it recorded; restricting the evidence to ids below
+        // the line keeps any path that still populates lazily — a `what_if`
+        // clone, or a caller reaching the engine directly — from reading its
+        // own newer nodes as an interrupted build.
+        //
+        // The scan has already finished the graph; what is still owed is the
+        // backfill, so the entry is registered complete and the next pump turns
+        // it into one `RebuildRule`.
+        let snapshot_ids = self.retained_node_count.load(AtomicOrdering::Relaxed);
+        for (name, (src_ids, dst_ids)) in &adopted {
+            if src_ids.is_empty() && dst_ids.is_empty() {
+                continue; // nothing was adopted: this was a plain rebuild
+            }
+            let Some(idx) = self.indexes.get(name) else {
+                continue;
+            };
+            let src_now = idx.src_side.hnsw_ref().map(|h| h.node_ids());
+            let dst_now = idx.dst_side.hnsw_ref().map(|h| h.node_ids());
+            let cut_short = |now: &Option<BTreeSet<u32>>, adopted: &BTreeSet<u32>| {
+                now.as_ref().is_some_and(|now| {
+                    now.iter()
+                        .take_while(|id| **id < snapshot_ids)
+                        .any(|id| !adopted.contains(id))
+                })
+            };
+            if !cut_short(&src_now, src_ids) && !cut_short(&dst_now, dst_ids) {
+                continue; // the persisted graph was whole
+            }
+            let total = src_now
+                .map_or(0, |s| s.len())
+                .max(dst_now.map_or(0, |s| s.len())) as u64;
+            self.pending_builds.insert(
+                name.clone(),
+                PendingBuild {
+                    indexed: total,
+                    total,
+                    cursor: ids.len() as u32,
+                    limit: ids.len() as u32,
+                },
+            );
         }
 
         // Any blob naming a rule that is not approximate here (or not a rule at
@@ -2236,7 +2698,8 @@ impl RuleEngine {
                 idx.dst_side.fit_ivf_clusters(name);
             }
         }
-        self.mark_indexes_populated();
+        self.indexes_populated = true;
+        self.release_lazy_hnsw();
     }
 
     /// Store HNSW blobs and raw IVF bytes from a snapshot **without deserializing**.
@@ -2246,11 +2709,19 @@ impl RuleEngine {
     ///   - `consume_retained_state_eager` (WAL-present open, before WAL replay)
     ///   - The mutation-hook lazy-init guard (clean open, first-write cost)
     ///   - `ensure_hnsw_loaded` (first ANN query on a clean open)
+    ///
+    /// `node_count` is the number of id slots the snapshot holds. It is the
+    /// line between "the snapshot had this node" and "this node is newer",
+    /// which `reindex_all_load_state` needs to recognise an interrupted build
+    /// without mistaking an in-flight write for one.
     pub fn store_snapshot_state(
         &self,
         hnsw_blobs: BTreeMap<String, (Vec<u8>, Vec<u8>)>,
         ivf_bytes: Vec<u8>,
+        node_count: u32,
     ) {
+        self.retained_node_count
+            .store(node_count, AtomicOrdering::Relaxed);
         *self
             .retained_hnsw_blobs
             .lock()
@@ -2401,20 +2872,61 @@ impl RuleEngine {
             snapshot
                 .into_iter()
                 .map(|(name, sb, db)| {
-                    let src = if !sb.is_empty() {
-                        bincode::deserialize::<HnswIndex>(&sb).ok()
-                    } else {
-                        None
-                    };
-                    let dst = if !db.is_empty() {
-                        bincode::deserialize::<HnswIndex>(&db).ok()
-                    } else {
-                        None
-                    };
+                    // Must go through `decode_hnsw_blob`, not a bare bincode
+                    // decode: the persisted bytes are the versioned `MHNS`
+                    // wrapper, and a 0.6.5 store's bytes are the old id-keyed
+                    // shape.  Getting this wrong is silent — `lazy_hnsw` stays
+                    // empty and every ANN query on a clean-open store falls
+                    // back to brute force until the first write.
+                    let src = lazy_decode(&name, "src", &sb);
+                    let dst = lazy_decode(&name, "dst", &db);
                     (name, (src, dst))
                 })
                 .collect()
         });
+    }
+
+    /// Drop the lazily-decoded HNSW graphs.
+    ///
+    /// Called at every site that sets `indexes_populated` — the two reindex
+    /// entry points and both arms of `create_rule` — so the lazy copies never
+    /// outlive the live indexes taking over. Two things go wrong if they are
+    /// kept:
+    ///
+    /// * **Memory.** A handle that served one ANN query and then wrote holds
+    ///   the graph twice — once decoded here, once in the live index — for the
+    ///   rest of its life, and the snapshot copy is never consulted again.
+    /// * **Staleness.** The ANN read paths chain `live.or(lazy)`, and `live`
+    ///   is filtered on `!is_empty()`. A live graph legitimately emptied by
+    ///   deletes would therefore fall through to the graph the store held at
+    ///   snapshot time, which suppresses the brute-force scan.
+    ///
+    /// Safe to call unconditionally: `ensure_hnsw_loaded` re-initializes the
+    /// `OnceLock` on demand, and by this point the retained blobs have been
+    /// taken, so it re-initializes to an empty map.
+    fn release_lazy_hnsw(&mut self) {
+        self.lazy_hnsw = OnceLock::new();
+    }
+
+    /// True when a write has to populate the candidate indexes before it
+    /// mutates anything.
+    ///
+    /// The lazy population is a full node scan, and it reads the graph it is
+    /// handed. Run from inside a hook it therefore reads the *half-applied*
+    /// record — the in-flight node's new label and props are already in the
+    /// columns — and the scan then attributes that node's vector to the
+    /// snapshot, which is how a perfectly ordinary write came to look like a
+    /// build the store had been killed in the middle of. Hoisting it to before
+    /// the mutation makes the scan see exactly the persisted state, and the
+    /// write's own hook then inserts its vector through the normal path.
+    pub fn needs_index_population(&self) -> bool {
+        !self.indexes_populated && !self.rules.is_empty()
+    }
+
+    /// Build every rule's candidate index from `g` if that has not happened
+    /// yet. The `&mut self` entry point behind [`RuleEngine::needs_index_population`].
+    pub fn populate_indexes(&mut self, g: &GraphMut<'_>) {
+        self.ensure_indexes_populated(g);
     }
 
     /// Returns `true` if candidate indexes have been built (either eagerly or
@@ -2423,20 +2935,27 @@ impl RuleEngine {
         self.indexes_populated
     }
 
-    /// Export HNSW graphs for all approximate rules as opaque bincoded blobs.
+    /// Export the HNSW graph of every rule with a vector leg as an opaque
+    /// bincoded blob.
     ///
     /// Returns a map from rule name to `(src_blob, dst_blob)`.  An empty `Vec`
     /// means the corresponding side has no initialized HNSW graph.
     pub fn export_hnsw_state(&self) -> BTreeMap<String, (Vec<u8>, Vec<u8>)> {
         let mut out = BTreeMap::new();
         for (name, def) in &self.rules {
-            if def.approximate {
+            if has_vector_leg(def) {
                 if let Some(idx) = self.indexes.get(name) {
+                    // A rule still in `pending_builds` has a graph holding a
+                    // prefix of its corpus. `pending_builds` is not persisted,
+                    // so the blob has to carry that fact itself or a reader
+                    // over this snapshot will answer `find_similar` from the
+                    // prefix and say nothing about it.
+                    let complete = !self.pending_builds.contains_key(name);
                     out.insert(
                         name.clone(),
                         (
-                            idx.src_side.export_hnsw_blob(),
-                            idx.dst_side.export_hnsw_blob(),
+                            idx.src_side.export_hnsw_blob(complete),
+                            idx.dst_side.export_hnsw_blob(complete),
                         ),
                     );
                 }
@@ -2514,9 +3033,22 @@ impl RuleEngine {
             if !predicate_covers_field(&def.predicate, field) {
                 continue;
             }
+            // A rule whose sliced build is unfinished has a graph holding a
+            // prefix of its corpus: it would answer, and answer about the wrong
+            // set, with nothing in the result to say so. Skipping it here is the
+            // same door `can_answer == false` uses — the caller brute-forces and
+            // gets the exact answer, slower. The build advances on every write,
+            // on `serve`'s tick and on `mushroomdb build-index`.
+            if self.pending_builds.contains_key(name) {
+                continue;
+            }
             if let Some(idx) = self.indexes.get(name) {
                 if let Some(h) = idx.dst_side.hnsw_ref() {
-                    if !h.is_empty() {
+                    // `can_answer` rather than `!is_empty()`: an index that
+                    // refused a vector, or whose stride is not this query's
+                    // dimension, is non-empty and still cannot answer for every
+                    // node — `None` here is what sends the caller to its scan.
+                    if h.can_answer(q.len()) {
                         return Some(h.search(q, k));
                     }
                 }
@@ -2525,7 +3057,7 @@ impl RuleEngine {
             // no mutation has populated self.indexes yet).
             if let Some(lazy) = self.lazy_hnsw.get() {
                 if let Some((_, Some(h))) = lazy.get(name) {
-                    if !h.is_empty() {
+                    if h.can_answer(q.len()) {
                         return Some(h.search(q, k));
                     }
                 }
@@ -2566,23 +3098,28 @@ impl RuleEngine {
             if !predicate_covers_field(&def.predicate, field) {
                 continue;
             }
-            // The live index first, then the blobs `ensure_hnsw_loaded`
-            // decoded on the read path — the same order `hnsw_search_dst`
-            // uses, and it must be a fallthrough rather than an `else`.  On a
-            // clean open `self.indexes` holds an entry for every rule with no
-            // HNSW graph in it, so an `else if` here made the decoded blob
-            // unreachable and every label-less query ran brute force.
+            // As in `hnsw_search_dst`: a half-built graph answers about a prefix
+            // of the corpus, so it does not answer here at all.
+            if self.pending_builds.contains_key(name) {
+                continue;
+            }
+            // Live index first, then the lazily-decoded blobs — as a *fallback*,
+            // not an alternative. `self.indexes` holds an entry for every rule
+            // from `from_persist` onwards, so an `else if` here would mean a
+            // clean-open handle never reached `lazy_hnsw` at all and answered
+            // every label-less query by brute force. `hnsw_search_dst` has
+            // always chained these correctly; this arm had not.
             let live = self
                 .indexes
                 .get(name)
                 .and_then(|idx| idx.dst_side.hnsw_ref())
-                .filter(|h| !h.is_empty());
+                .filter(|h| h.can_answer(q.len()));
             let lazy = self
                 .lazy_hnsw
                 .get()
-                .and_then(|lazy| lazy.get(name))
+                .and_then(|l| l.get(name))
                 .and_then(|(_, dst)| dst.as_ref())
-                .filter(|h| !h.is_empty());
+                .filter(|h| h.can_answer(q.len()));
             let hits: Option<Vec<(u32, f64)>> = live.or(lazy).map(|h| {
                 found_index = true;
                 h.search(q, k)
@@ -2672,12 +3209,28 @@ impl RuleEngine {
         let n_total = g.ids.len() as u32;
         let def = self.rules[&name].clone();
 
-        // Phase 1a: init HNSW for approximate rules before inserting nodes so
-        // each insert also populates the HNSW graph incrementally.
-        if def.approximate {
+        // A corpus that fits in one slice is built inline and backfilled below,
+        // byte for byte as it was before 0.6.6. A larger one is built a slice
+        // at a time by `pump_index_build`, and this call returns with the rule
+        // installed, consistent, and deriving nothing yet.
+        let batch = self.build_batch();
+        let build_total = hnsw_build_total(&def, g);
+        let deferred = build_total > batch as u64;
+
+        // Phase 1a: init HNSW for a rule with a vector leg before inserting
+        // nodes so each insert also populates the HNSW graph incrementally.
+        if uses_hnsw(&def) {
             let idx = self.indexes.get_mut(&name).unwrap();
-            idx.src_side.init_hnsw(&name);
-            idx.dst_side.init_hnsw(&name);
+            if deferred {
+                // Same empty graph `init_hnsw` gives, reached through the
+                // adopt-aware entry point so the sliced build and the open-time
+                // scan agree on how a graph comes into existence.
+                idx.src_side.init_or_adopt_hnsw(&name, &[]);
+                idx.dst_side.init_or_adopt_hnsw(&name, &[]);
+            } else {
+                idx.src_side.init_hnsw(&name);
+                idx.dst_side.init_hnsw(&name);
+            }
             self.hnsw_builds += 2;
         }
 
@@ -2687,7 +3240,36 @@ impl RuleEngine {
                 _ => continue,
             };
             let idx = self.indexes.get_mut(&name).unwrap();
-            index_node_for_rule(id, label_sym, &def, idx, g.syms, g.props);
+            if deferred {
+                // The non-vector legs are O(n) and cheap, and the rule would be
+                // internally inconsistent without them; only the graph waits.
+                index_node_for_rule_deferring_hnsw(id, label_sym, &def, idx, g.syms, g.props);
+            } else {
+                index_node_for_rule(id, label_sym, &def, idx, g.syms, g.props);
+            }
+        }
+
+        if deferred {
+            self.pending_builds.insert(
+                name.clone(),
+                PendingBuild {
+                    indexed: 0,
+                    total: build_total,
+                    cursor: 0,
+                    limit: n_total,
+                },
+            );
+            let (inserted, cursor) = self.run_build_slice(&name, &def, 0, n_total, batch, g);
+            let entry = self.pending_builds.get_mut(&name).expect("just inserted");
+            entry.indexed = inserted;
+            entry.cursor = cursor;
+            // The engine's other rules were populated by `ensure_indexes_populated`
+            // above and this rule's non-vector legs are whole, so the flag is as
+            // true here as it is on the one-commit path.
+            self.indexes_populated = true;
+            self.release_lazy_hnsw();
+            self.end_chain(scope, g);
+            return Ok(());
         }
 
         // Phase 1b: fit IVF clusters for approximate rules (after all nodes indexed).
@@ -2766,7 +3348,8 @@ impl RuleEngine {
         // This rule's index is now populated. If prior rules' indexes were
         // already populated (or there are no other rules) mark the whole engine
         // as ready; otherwise a later reindex_all call will set the flag.
-        self.mark_indexes_populated();
+        self.indexes_populated = true;
+        self.release_lazy_hnsw();
 
         self.end_chain(scope, g);
         Ok(())
@@ -2785,6 +3368,10 @@ impl RuleEngine {
         self.indexes.remove(name);
         self.tripped.remove(name);
         self.fires.remove(name);
+        // A rule that is gone is not building: its slice state would otherwise
+        // keep it in `builds_in_progress` until the next pump noticed.
+        self.pending_builds.remove(name);
+        self.builds_awaiting_backfill.remove(name);
         let mut leftover = self.provenance.remove(name).unwrap_or_default();
         // intern so the symbol exists; edge_type was already interned at create time.
         let _et = g.syms.intern(&def.edge_type);
@@ -2868,6 +3455,13 @@ impl RuleEngine {
         for rule_name in rule_names {
             let def = self.rules[&rule_name].clone();
 
+            // Namespace scoping (v0.6.6 §7.4): a scoped rule does not see this
+            // node at all, so neither its candidate index nor its derived edges
+            // can reach across the boundary. A global rule takes no read here.
+            if !rule_sees(&def, n, g) {
+                continue;
+            }
+
             if def.via_label.is_some() {
                 // --- Via-hop rule path ---
                 self.on_node_changed_via(&rule_name, &def, n, n_label, changed.clone(), g);
@@ -2919,6 +3513,18 @@ impl RuleEngine {
                         let spec = candidate_spec_for(&def);
                         idx.dst_side.insert(&spec, n, &cur_getter);
                     }
+                }
+
+                // A rule whose vector index is still being built derives
+                // nothing. The write above has gone into the index and will be
+                // there when the build completes; deriving from a half-built
+                // graph here would put a partial, wrong edge set on the store
+                // for the duration, and the backfill that runs when the build
+                // finishes derives the whole set anyway. The drift counter is
+                // left alone too: a rebuild queued now would throw the sliced
+                // build away and redo it in one commit.
+                if self.pending_builds.contains_key(&rule_name) {
+                    continue;
                 }
 
                 self.maybe_queue_ivf_rebuild(&rule_name, &def);
@@ -3368,6 +3974,11 @@ impl RuleEngine {
                 }
             }
 
+            // A rule that is still building owns no edges to retract, and a
+            // drift rebuild queued now would discard its sliced graph.
+            if self.pending_builds.contains_key(&rule_name) {
+                continue;
+            }
             self.maybe_queue_ivf_rebuild(&rule_name, &def);
         }
 
@@ -3470,17 +4081,57 @@ impl RuleEngine {
             return Err(format!("rule {:?} not found", name));
         }
         self.rebuild_needed.remove(name);
+        // A full reindex builds the whole graph, so whatever a sliced build had
+        // left to do is done by the time this returns.
+        self.pending_builds.remove(name);
         let def = self.rules[name].clone();
+
+        // The rebuild a finished slice-build asks for is about the derived
+        // edges, not the graph: rebuilding the graph here would redo, in one
+        // commit, exactly the superlinear build the slicing spent several
+        // commits avoiding. So that one caller carries its graph across the
+        // reset and the scan skips the ids it holds. Every other caller —
+        // IVF drift, `delete_rule`'s survivors, an explicit `rebuild_rule` —
+        // keeps today's behaviour and rebuilds (and thereby compacts) it.
+        let carry = uses_hnsw(&def) && self.builds_awaiting_backfill.remove(name);
+        let carried = if carry {
+            self.indexes
+                .get_mut(name)
+                .map(|idx| (idx.src_side.take_hnsw(), idx.dst_side.take_hnsw()))
+        } else {
+            None
+        };
 
         // Reindex this rule from scratch (indexes only).
         *self.indexes.get_mut(name).unwrap() = RuleIndex::default();
 
         // Init HNSW before indexing so inserts populate the graph incrementally.
-        if def.approximate {
+        let mut skip: (BTreeSet<u32>, BTreeSet<u32>) = (BTreeSet::new(), BTreeSet::new());
+        if uses_hnsw(&def) {
+            let (src_h, dst_h) = carried.unwrap_or((None, None));
+            let mut built = 0u64;
             let idx = self.indexes.get_mut(name).unwrap();
-            idx.src_side.init_hnsw(name);
-            idx.dst_side.init_hnsw(name);
-            self.hnsw_builds += 2;
+            match src_h {
+                Some(h) => {
+                    skip.0 = h.node_ids();
+                    idx.src_side.adopt_hnsw(h);
+                }
+                None => {
+                    idx.src_side.init_hnsw(name);
+                    built += 1;
+                }
+            }
+            match dst_h {
+                Some(h) => {
+                    skip.1 = h.node_ids();
+                    idx.dst_side.adopt_hnsw(h);
+                }
+                None => {
+                    idx.dst_side.init_hnsw(name);
+                    built += 1;
+                }
+            }
+            self.hnsw_builds += built;
         }
 
         let n_total = g.ids.len() as u32;
@@ -3490,7 +4141,7 @@ impl RuleEngine {
                 _ => continue,
             };
             let idx = self.indexes.get_mut(name).unwrap();
-            index_node_for_rule(id, label_sym, &def, idx, g.syms, g.props);
+            index_node_for_rule_skipping(id, label_sym, &def, idx, g.syms, g.props, &skip);
         }
 
         // Fit IVF clusters for approximate rules after reindex (drift reset).
@@ -3613,6 +4264,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -3636,6 +4288,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -3918,6 +4571,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 },
                 &mut g,
             )
@@ -3965,6 +4619,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 },
                 &mut g,
             )
@@ -4031,6 +4686,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 },
                 &mut g,
             )
@@ -4137,6 +4793,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 },
                 &mut g,
             )
@@ -4158,6 +4815,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 },
                 &mut g,
             )
@@ -4221,6 +4879,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -4296,6 +4955,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         let mut eng = RuleEngine::new();
         {
@@ -4350,6 +5010,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         let mut eng = RuleEngine::new();
 
@@ -4534,6 +5195,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -4553,6 +5215,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -4572,6 +5235,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -4686,6 +5350,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 
@@ -4825,6 +5490,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
         {
             let mut g = fx.g();
@@ -5106,6 +5772,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 };
 
                 let build = || {
@@ -5157,6 +5824,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 };
 
                 let build = || {
@@ -5206,6 +5874,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 };
 
                 let build = || {
@@ -5266,6 +5935,7 @@ mod tests {
                     via_label: None,
                     via_edge: None,
                     via_dir: None,
+                    namespace: None,
                 };
 
                 let build = || {
@@ -5386,6 +6056,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
 
         // Baseline: RSS before any create_rule allocation.
@@ -5495,6 +6166,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
 
         // Build three identical fixtures (independent topo state, same data).
@@ -5601,6 +6273,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
 
         let mut eng = RuleEngine::new();
@@ -5714,6 +6387,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         };
 
         // Three independent fixtures with the same razor pair.
@@ -5857,6 +6531,7 @@ mod tests {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         }
     }
 

@@ -38,6 +38,7 @@ fn sim_rule() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -467,12 +468,13 @@ fn brute_force(q: &[f64; 2], k: usize, min: f64) -> Vec<String> {
 ///
 /// This is the `ensure_hnsw_loaded` path (`engine.rs`), which decodes the
 /// retained blobs on the read side under a shared lock. It is separate from
-/// `ensure_indexes_populated`, and its failure is silent: the results are
-/// still correct — brute force gets the same answer — so only a counter can
-/// tell the two apart. Two things used to break it on a clean open: the
-/// retained blobs were never read out of the snapshot before the `OnceLock`
-/// latched (so it latched an empty map for the handle's life), and the
-/// label-less entry point could not reach the lazily decoded graphs at all.
+/// `ensure_indexes_populated`, and a decode failure there is silent: the
+/// results are still correct — brute force gets the same answer — so only a
+/// counter can tell the two apart. Three things have broken it: the retained
+/// blobs were never read out of the snapshot before the `OnceLock` latched (so
+/// it latched an empty map for the handle's life), the label-less entry point
+/// could not reach the lazily decoded graphs at all, and 0.6.6's versioned blob
+/// left this site on a bare `bincode::deserialize::<HnswIndex>`.
 #[test]
 fn clean_open_first_query_is_served_by_the_index() {
     let dir = tmp("hnsw-open-lazy");
@@ -507,10 +509,12 @@ fn clean_open_first_query_is_served_by_the_index() {
     assert_eq!(db.hnsw_build_count(), 0, "clean open rebuilt a graph");
 }
 
-/// The lazy copy is a *transient*: it exists only for the window between a
-/// clean open and the first write. Once the write has moved the persisted
-/// blobs into the live indexes, holding on to it would double the resident
-/// memory of every approximate rule for the life of the handle.
+/// The lazily-decoded blobs are a *bridge* from the open to the first write,
+/// not a second copy of the index. Once `ensure_indexes_populated` (or the
+/// eager consume on a WAL-present open) has moved the persisted graphs into
+/// the live indexes, the lazy map must be dropped: a handle that served one
+/// ANN query and then wrote otherwise holds two copies of every approximate
+/// rule's graph for the rest of its life.
 #[test]
 fn the_first_write_releases_the_lazy_index_copy() {
     let dir = tmp("hnsw-open-lazy-release");
@@ -524,15 +528,20 @@ fn the_first_write_releases_the_lazy_index_copy() {
 
     let q = [1.0, 0.0];
     let before = db.find_similar_vector("emb", Some("Doc"), &q, 2, 0.0);
-    assert_eq!(db.lazy_hnsw_len(), 1, "the query did not decode the blob");
+    assert_eq!(
+        db.lazy_hnsw_len(),
+        1,
+        "the clean-open read path did not decode any blob, so this test proves nothing"
+    );
 
-    // The first write populates the live indexes from the same blobs.
+    // The first write installs the same graphs into `self.indexes`.
     db.insert_node("Other", "o", vec![("v".into(), Value::Int(1))])
         .unwrap();
     assert_eq!(
         db.lazy_hnsw_len(),
         0,
-        "the read-path copy outlived the live index it duplicates"
+        "the lazy graphs survived the write that moved them into the live index: \
+         every approximate rule's graph is held twice"
     );
 
     // And the live index — not a re-decoded copy — answers from here on.
@@ -546,20 +555,21 @@ fn the_first_write_releases_the_lazy_index_copy() {
     assert_eq!(keys_of(&before), keys_of(&after));
 }
 
-/// Emptying a side must be believed. The lazy copy is a picture of the
-/// snapshot, so if it survives the write that empties the live graph, the
-/// fallthrough in `hnsw_search_dst` / `hnsw_search_any_dst` reaches it and the
-/// query is answered by a graph full of nodes that no longer exist.
-///
-/// The id map currently masks the damage at this level — `key_of` drops every
-/// stale id, so the caller sees an empty result either way — but the search
-/// counter shows whether the stale graph was walked at all, and nothing
-/// guarantees that masking holds if ids are ever recycled.
+/// A live graph emptied by deletes is the truth, not a reason to consult the
+/// snapshot. The lazy copy is a picture of the snapshot, so if it survives the
+/// write that empties the live graph, the fallthrough in `hnsw_search_dst` /
+/// `hnsw_search_any_dst` reaches it and the query is answered by a graph full
+/// of nodes that no longer exist — which also suppresses the brute-force scan
+/// that would have found the vectors no rule covers.
 #[test]
 fn deleting_every_embedding_on_a_side_consults_no_stale_graph() {
     let dir = tmp("hnsw-open-lazy-stale");
     {
         let mut db = seed(&dir);
+        // Carries `emb` but no approximate rule covers its label, so only the
+        // brute-force path can ever return it.
+        db.insert_node("Note", "note", vec![("emb".into(), emb(&[1.0, 0.0]))])
+            .unwrap();
         db.snapshot().unwrap();
     }
 
@@ -567,9 +577,8 @@ fn deleting_every_embedding_on_a_side_consults_no_stale_graph() {
     let q = [1.0, 0.0];
     // Decode the blob on the read path first — this is the window the bug
     // lived in.
-    assert!(!db
-        .find_similar_vector("emb", Some("Doc"), &q, 2, 0.0)
-        .is_empty());
+    let before = db.find_similar_vector("emb", Some("Doc"), &q, 8, 0.0);
+    assert!(!before.is_empty(), "the seeded store must answer at all");
     assert_eq!(db.lazy_hnsw_len(), 1);
 
     for (k, _) in DOCS {
@@ -579,13 +588,19 @@ fn deleting_every_embedding_on_a_side_consults_no_stale_graph() {
     core_rules::hnsw_search_count_reset();
     assert_eq!(
         db.find_similar_vector("emb", Some("Doc"), &q, 8, 0.0),
-        vec![],
+        Vec::<(String, f64)>::new(),
         "a labelled query answered from the snapshot's copy of a deleted side"
     );
+    let any: Vec<String> = db
+        .find_similar_vector("emb", None, &q, 8, 0.0)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
     assert_eq!(
-        db.find_similar_vector("emb", None, &q, 8, 0.0),
-        vec![],
-        "a label-less query answered from the snapshot's copy of a deleted side"
+        any,
+        vec!["note".to_string()],
+        "the emptied index answered for the whole store out of the snapshot's \
+         graph, hiding the vector no rule indexes"
     );
     assert_eq!(
         core_rules::hnsw_search_count(),

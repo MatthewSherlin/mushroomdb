@@ -41,8 +41,18 @@ class GraphDb:
         `read_only=True` for a handle that never writes and never waits.
         """
 
-    def insert_node(self, label: str, key: str, props: dict[str, Scalar]) -> None:
-        """Insert a new node; raises if `key` is already live."""
+    def insert_node(
+        self,
+        label: str,
+        key: str,
+        props: dict[str, Scalar],
+        namespace: str | None = None,
+    ) -> None:
+        """Insert a new node; raises if `key` is already live.
+
+        `namespace` is the namespace the node is created in — set at insert and
+        immutable. Omitted means the `default` namespace.
+        """
 
     def upsert_node(
         self, label: str, key: str, props: dict[str, Scalar]
@@ -69,8 +79,18 @@ class GraphDb:
     def remove_prop(self, key: str, field: str) -> bool:
         """Remove a property; False if it was already absent."""
 
-    def query(self, cypher: str, params: Params = None) -> list[Row]:
-        """Execute a read query and return one dict per row."""
+    def query(
+        self,
+        cypher: str,
+        params: Params = None,
+        role: str | None = None,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        """Execute a read query and return one dict per row.
+
+        `role` answers as one of the store's roles and `namespace` from one
+        namespace; together they intersect, so neither ever widens the other.
+        """
 
     def query_with_params(
         self, cypher: str, params: Sequence[tuple[str, Scalar]]
@@ -87,7 +107,10 @@ class GraphDb:
         """Rename a node's key, preserving its edges and history."""
 
     def create_rule(self, rule: dict[str, Any], if_not_exists: bool = False) -> bool:
-        """Register a linking rule; False when `if_not_exists` skips a duplicate."""
+        """Register a linking rule; False when `if_not_exists` skips a duplicate.
+
+        A `"namespace"` key scopes the rule to one namespace; omitted is global.
+        """
 
     def explain(self, a: str, b: str) -> list[Row]:
         """Why are `a` and `b` linked? One dict per derived edge."""
@@ -185,7 +208,7 @@ class GraphDb:
         """Atomically apply edge inserts and deletes in a single WAL commit."""
 
     def stats(self) -> dict[str, Any]:
-        """Node/edge counts, `history_floor`, and per-rule size, latch, and fires."""
+        """Node/edge counts, `history_floor`, `namespaces`, and per-rule size, latch, and fires."""
 
     def snapshot(self) -> None:
         """Write a durable snapshot and truncate the WAL tail."""

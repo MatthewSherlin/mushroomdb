@@ -35,6 +35,7 @@ fn rule_fe_k1() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -54,6 +55,7 @@ fn rule_nw_k3() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -79,6 +81,7 @@ fn rule_any_k2() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -367,6 +370,7 @@ fn topk_evicted_pair_has_no_explain_entry() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -498,6 +502,7 @@ fn topk_approx_recall_floor() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 

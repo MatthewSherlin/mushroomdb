@@ -31,8 +31,13 @@ jobs:
 
   # Correctness gates that are #[ignore]'d out of `cargo test --workspace`
   # because they are slow, but are NOT timing-sensitive (they assert a recall
-  # FLOOR, not wall-clock). Without this job the published HNSW recall number
-  # (min 0.90 / mean 0.998) is unguarded — a recall regression would pass CI.
+  # FLOOR, not wall-clock). Without this job the published HNSW recall numbers
+  # are unguarded — a recall regression would pass CI. Measured at the 0.6.6
+  # default shape (m=16, m0=64, ef_construction=200, ef_search=400, prune=both):
+  # the uniform 5k gate is at min 1.0000 / mean 1.0000, the two clustered ones at
+  # 1.0000, and the 40x120 fixture at min 0.8000 / mean 0.9950. Every wall clock
+  # below is measured on the shipped f32 distance kernel; the job is roughly
+  # 5 min on aarch64 and slower on this runner, whose baseline x86-64 has no FMA.
   # Timing gates (group-commit throughput, reader-burst p95) stay out of CI and
   # are covered by the median-of-3 bench-compare job instead.
   recall-gates:
@@ -42,13 +47,50 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
         with: { toolchain: "1.92.0" }
       # hnsw_5k_1536_recall: 5k vectors × 1536-D HNSW; asserts min recall@10 ≥ 0.90, mean ≥ 0.95.
+      # Measured: min 1.0000 / mean 1.0000, ~46 s.
       - run: cargo test --release -p mushroomdb-rules -- hnsw_5k_1536_recall --ignored --nocapture
+      # clustered_recall_survives_clusters_wider_than_m0: 40 clusters of 120 × 128-D, so a
+      # cluster is wider than m0=64 — the case the diverse-neighbour prune replaced M₀=128
+      # for. That prune is a first-rejection short-cut of HNSW §3.5, not §3.5 itself; see
+      # docs/site/rules.md before "correcting" it toward the paper.
+      # Runs both prune shapes and asserts each against its own floor plus both >= own:
+      # own min 0.5000 / mean 0.9350 (floors 0.40/0.90), both min 0.8000 / mean 0.9950
+      # (floors 0.70/0.95). ~3 s.
+      - run: cargo test --release -p mushroomdb-rules -- clustered_recall_survives_clusters_wider_than_m0 --ignored --nocapture
+      # recall_survives_insert_remove_churn: the same 5k × 1536-D corpus put through an
+      # insert/remove/re-insert sequence, then scored against brute force over the
+      # survivors. Asserts min recall@10 ≥ 0.90, mean ≥ 0.95 — a graph that heals badly
+      # answers from the wrong neighbourhood, and nothing else in CI would notice.
+      # Measured: min 1.0000 / mean 1.0000 over 3857 survivors, ~47 s.
+      - run: cargo test --release -p mushroomdb-rules -- recall_survives_insert_remove_churn --ignored --nocapture
       # approximate_recall_above_floor_1536dim_1k: 1024-node HNSW × 1536-D; asserts recall ≥ 0.90.
+      # ~9 s. Under HNSW_BUILD_BATCH, so create_rule still backfills inline here.
       - run: cargo test --release -p sim-harness -- approximate_recall_above_floor_1536dim_1k --ignored --nocapture
-      # approximate_recall_5k_timing: 5k-node HNSW × 1536-D; asserts recall ≥ 0.90 at M₀=128.
-      # Measured: recall 1.0000 (approx=495000 exact=495000) at M₀=128/k=128/ef=400.
-      # Note: this test takes ~4.5 min (HNSW backfill 227 s + exact O(n²) ground truth ~43 s).
+      # approximate_recall_5k_timing: 5k-node HNSW × 1536-D; asserts recall ≥ 0.90.
+      # Measured: recall 1.0000 (495000/495000), backfill 49 s, ~70 s in total with the
+      # O(n^2) ground truth. This is the one gate with a v0.6.5 number to compare against:
+      # its backfill was 227 s there (see this file at tag v0.6.5), at the same recall.
+      # 5000 vectors is over HNSW_BUILD_BATCH, so the test pumps
+      # pump_index_build() to completion before measuring — without that it derives no
+      # edges at all and scores 0.0000, which is how it sat dark through 0.6.6's Task 2.
+      # At prune=own this gate fails at 0.8581; see docs/site/rules.md.
       - run: cargo test --release -p sim-harness -- approximate_recall_5k_timing --ignored --nocapture
+      # dist_evals_per_insert_is_bounded: counts distance evaluations per insert at
+      # 1k and 5k (dimension 32 — the count is a property of the graph, not of the
+      # dimension). A count, not a wall clock, so it holds on any machine: this is
+      # the gate that notices the insert path doing more work per vector as the
+      # index grows, which no timing-free test did before. Measured 12,739.5 at 1k
+      # and 23,901.7 at 5k, ratio 1.876, against ceilings of 36,000 and 2.8x. ~2 s.
+      - run: cargo test --release -p mushroomdb-rules --features test-hooks -- dist_evals_per_insert_is_bounded --ignored --nocapture
+      # exact_vector_rule_recall_5k: an exact VectorSimilar rule over the same
+      # 5k × 1536-D corpus; asserts recall >= 0.98 against the same O(n^2)
+      # ground truth the approximate gate uses. From 0.6.6 an exact rule finds its
+      # candidates through the index too, so this gate is what holds the beam's
+      # stopping rule honest. Like the approximate one it is over HNSW_BUILD_BATCH
+      # and pumps the build to completion before measuring. Measured: recall
+      # 1.0000 (495000/495000), creation 63 s, ~85 s in total; the same rule with
+      # MUSHROOMDB_VECTOR_SCAN=1 takes 147 s to create and also scores 1.0000.
+      - run: cargo test --release -p sim-harness -- exact_vector_rule_recall_5k --ignored --nocapture
 
   # Every historical snapshot format (V5..V9) must open, migrate, and preserve
   # data, forever. Naming this job separately means a regression says

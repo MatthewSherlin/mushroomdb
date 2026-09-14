@@ -479,6 +479,7 @@ pub fn suggest_rules(
                         via_label: None,
                         via_edge: None,
                         via_dir: None,
+                        namespace: None,
                     };
                     let examples_preview: Vec<String> = fp
                         .str_distinct
@@ -599,6 +600,7 @@ pub fn suggest_rules(
                         via_label: None,
                         via_edge: None,
                         via_dir: None,
+                        namespace: None,
                     };
                     let rationale = format!(
                         "Field '{field}' is a token list in both {src_label} and {dst_label}. \
@@ -688,6 +690,7 @@ pub fn suggest_rules(
                         via_label: None,
                         via_edge: None,
                         via_dir: None,
+                        namespace: None,
                     };
                     let rationale = format!(
                         "Field '{field}' has low cardinality in {src_label} \
@@ -803,6 +806,7 @@ pub fn suggest_rules(
                         via_label: None,
                         via_edge: None,
                         via_dir: None,
+                        namespace: None,
                     };
                     let rationale = format!(
                         "Field '{field}' is numeric in {src_label} (range [{src_min:.2}, {src_max:.2}]) \
@@ -891,6 +895,7 @@ pub fn suggest_rules(
                         via_label: None,
                         via_edge: None,
                         via_dir: None,
+                        namespace: None,
                     };
                     let rationale = format!(
                         "Field '{field}' is a float-array of dim {sdim} in both {src_label} \

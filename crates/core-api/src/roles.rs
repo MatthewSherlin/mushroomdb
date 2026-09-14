@@ -17,16 +17,21 @@
 //! `roles.json` format: `{ "version": 1, "roles": [...] }` (no write scopes)
 //! or `{ "version": 2, "roles": [...] }` (at least one role has a write scope)
 //! or `{ "version": 3, "roles": [...] }` (at least one role has a
-//! [`visible_where`](RoleDef::visible_where) predicate).
+//! [`visible_where`](RoleDef::visible_where) predicate)
+//! or `{ "version": 4, "roles": [...] }` (at least one role is bound to
+//! [`namespaces`](RoleDef::namespaces)).
 //! The highest applicable version is written and no higher: version 2 is
 //! written only when a write scope is present, version 3 only when a predicate
-//! is. Version 1 is kept for forward-compat honesty — a v0.2 server can load v1
+//! is, version 4 only when a namespace binding is. Version 1 is kept for
+//! forward-compat honesty — a v0.2 server can load v1
 //! safely and the `write` field (absent from v1) is ignored by serde's
 //! `#[serde(default)]` when a v2 sidecar is loaded by an older binary.
 //! Version 3 is deliberately *not* loadable by an older binary: a binary that
 //! does not know `visible_where` would resolve a narrowed role to its full
 //! label set, so an unrecognised version poisons instead, which denies rather
-//! than over-grants.
+//! than over-grants. Version 4 is the same bargain for `namespaces`: a binary
+//! that does not know the field would resolve a tenant-scoped role across every
+//! tenant.
 //! Files are written atomically (temp → fsync → rename → dir-sync); a no-change
 //! re-apply leaves the file byte-identical.
 
@@ -234,9 +239,43 @@ pub struct RoleDef {
     /// a restriction is the wrong way to be wrong.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visible_where: Option<PropPredicate>,
+    /// Namespaces this role may read.
+    ///
+    /// Absent = unscoped, which is exactly the behaviour every role had before
+    /// version 4, so no existing role changes meaning. `Some(list)` restricts:
+    ///
+    /// ```text
+    /// visible = ( keys ∪ { n : label(n) ∈ labels ∧ visible_where(n) } )
+    ///           ∩ { n : ns(n) ∈ namespaces }
+    /// ```
+    ///
+    /// The namespace leg **intersects `keys` too**, unlike
+    /// [`visible_where`](Self::visible_where), which narrows only the label leg.
+    /// A namespace is a tenancy boundary, and an explicitly named key in another
+    /// tenant's namespace is a mistake rather than an administrative grant —
+    /// `apply_schema` rejects a role whose `keys` name a live node outside its
+    /// namespaces, naming both the key and its namespace.
+    ///
+    /// `Some([])` is rejected at apply time: a role that sees nothing is written
+    /// by omitting `keys` and `labels`, not by closing the namespace leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespaces: Option<Vec<String>>,
     /// Absent or null = read-only role (v1 behavior, backward compatible).
     #[serde(default)]
     pub write: Option<WriteScope>,
+}
+
+impl RoleDef {
+    /// Whether `namespace` is inside this role's namespace binding.
+    ///
+    /// `true` for every namespace when the role is unscoped — absent
+    /// `namespaces` means the intersection is skipped entirely.
+    pub fn sees_namespace(&self, namespace: &str) -> bool {
+        match &self.namespaces {
+            None => true,
+            Some(list) => list.iter().any(|n| n == namespace),
+        }
+    }
 }
 
 /// On-disk wrapper for `roles.json`.  Version field allows future format bumps.
@@ -244,7 +283,8 @@ pub struct RoleDef {
 /// Version 1: no write scopes (all roles read-only, v0.2 compatible).
 /// Version 2: at least one role carries a `write` field.
 /// Version 3: at least one role carries a `visible_where` predicate.
-/// Version >3: unrecognised — roles state is poisoned on load.
+/// Version 4: at least one role carries a `namespaces` binding.
+/// Version >4: unrecognised — roles state is poisoned on load.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct RolesFile {
     pub version: u32,
@@ -254,8 +294,9 @@ pub(crate) struct RolesFile {
 impl RolesFile {
     /// Build a `RolesFile` choosing the correct version automatically.
     ///
-    /// Picks 3 > 2 > 1, the highest the content actually needs: version 3 iff
-    /// any role carries a `visible_where` predicate, else version 2 iff any
+    /// Picks 4 > 3 > 2 > 1, the highest the content actually needs: version 4
+    /// iff any role carries a `namespaces` binding, else version 3 iff any role
+    /// carries a `visible_where` predicate, else version 2 iff any
     /// role carries a write scope, else version 1. This preserves
     /// forward-compatibility where it is safe to: a v0.2 server loading a v1
     /// sidecar sees no behavioral change, and a v0.2 server loading a v2
@@ -267,8 +308,12 @@ impl RolesFile {
     /// resolve a narrowed role to its whole label set, which widens. Version 3
     /// is therefore unrecognised by every binary that predates it, and an
     /// unrecognised version poisons the roles state rather than loading it.
+    /// A namespace binding is the same shape of narrowing, so version 4 is
+    /// unreadable by a 0.6.5 binary for the same reason.
     pub(crate) fn new_versioned(roles: Vec<RoleDef>) -> Self {
-        let version = if roles.iter().any(|r| r.visible_where.is_some()) {
+        let version = if roles.iter().any(|r| r.namespaces.is_some()) {
+            4
+        } else if roles.iter().any(|r| r.visible_where.is_some()) {
             3
         } else if roles.iter().any(|r| r.write.is_some()) {
             2

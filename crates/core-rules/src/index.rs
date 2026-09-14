@@ -49,6 +49,113 @@ pub fn with_ivf_drift_rebuild<R>(threshold: u64, f: impl FnOnce() -> R) -> R {
     })
 }
 
+/// Beam ceiling for the widening loop an exact `VectorSimilar` rule runs
+/// (see [`CandidateSpec::Hnsw`]'s `floor`). Reaching it with the floor still
+/// unreached means the candidate set is the whole tracked set, which is what the
+/// rule did before 0.6.6.
+pub const EF_MAX: usize = 4_096;
+
+/// Slack on the beam's stopping comparison, covering the `f32` arithmetic the
+/// index answers with ([`crate::hnsw::HnswIndex::search`] documents ~1e-6).
+///
+/// The beam's similarities are a candidate *ordering* number and never a
+/// reported score — every score on an edge is recomputed from the `f64` store.
+/// Requiring the worst hit to be *clearly* below `min` before the beam is
+/// trusted means `f32` rounding can cost one extra doubling and can never cost
+/// a pair.
+const BEAM_FLOOR_SLACK: f64 = 1e-5;
+
+thread_local! {
+    static EF_MAX_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn ef_max() -> usize {
+    EF_MAX_OVERRIDE.with(|c| c.get().unwrap_or(EF_MAX)).max(1)
+}
+
+/// Run `f` with a temporary beam ceiling. Test hook, in the shape of
+/// [`with_hnsw_build_batch`] — it exists so a test can reach the ceiling with a
+/// few hundred vectors instead of the [`EF_MAX`] thousands.
+///
+/// The override is thread-local, so `f` must do its work on the calling thread.
+pub fn with_ef_max<R>(cap: usize, f: impl FnOnce() -> R) -> R {
+    EF_MAX_OVERRIDE.with(|c| {
+        let prev = c.replace(Some(cap));
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Sliced HNSW build (v0.6.6 T2)
+// ---------------------------------------------------------------------------
+
+/// Vectors inserted into one rule's HNSW graph per build slice. `create_rule`
+/// does one slice inline; `pump_index_build` does one slice per pending rule
+/// per call. A corpus at or below this size is built in a single commit and
+/// behaves exactly as it did before 0.6.6.
+pub const HNSW_BUILD_BATCH: usize = 2_048;
+
+thread_local! {
+    static HNSW_BUILD_BATCH_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn hnsw_build_batch() -> usize {
+    HNSW_BUILD_BATCH_OVERRIDE
+        .with(|c| c.get().unwrap_or(HNSW_BUILD_BATCH))
+        .max(1)
+}
+
+/// Run `f` with a temporary build-slice size. Test hook, in the shape of
+/// [`with_ivf_drift_rebuild`]. Restores the previous override (including
+/// across panics).
+///
+/// The override is thread-local, so `f` must do its `create_rule` **and** its
+/// pumping on the calling thread.
+pub fn with_hnsw_build_batch<R>(batch: usize, f: impl FnOnce() -> R) -> R {
+    HNSW_BUILD_BATCH_OVERRIDE.with(|c| {
+        let prev = c.replace(Some(batch));
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
+}
+
+/// What an insert does with the `Hnsw` leg of a candidate spec. Every variant
+/// records `hnsw_tracked` — that set is the fallback candidate list and has to
+/// cover the whole side regardless of who fills the graph.
+enum HnswLeg<'a> {
+    /// Insert the vector into the graph. The ordinary write path.
+    All,
+    /// Skip ids the adopted graph already holds. The open-time scan.
+    Skip(&'a BTreeSet<u32>),
+    /// Leave the graph alone; a build slice supplies the vector later.
+    Defer,
+}
+
+/// Whether `spec` would put at least one vector of `node`'s props into an HNSW
+/// graph — the predicate a sliced build counts with, so that the total it
+/// reports and the progress it makes are decided by the same rule.
+pub fn hnsw_vector_present(spec: &CandidateSpec, get: &dyn Fn(&str) -> Option<Value>) -> bool {
+    match spec {
+        CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) => {
+            specs.iter().any(|s| hnsw_vector_present(s, get))
+        }
+        CandidateSpec::Hnsw { field, .. } => {
+            get(field).as_ref().and_then(as_numeric_list).is_some()
+        }
+        _ => false,
+    }
+}
+
 /// k = ceil(sqrt(n)) clamped to [IVF_K_MIN, IVF_K_MAX].
 pub fn cluster_k(n: usize) -> usize {
     if n == 0 {
@@ -248,6 +355,59 @@ pub(crate) fn vector_early_exit_enabled() -> bool {
     }
 }
 
+thread_local! {
+    /// `None` until `MUSHROOMDB_VECTOR_SCAN` has been read on this thread.
+    /// [`with_vector_scan`] replaces it for the duration of a closure.
+    static VECTOR_SCAN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `MUSHROOMDB_VECTOR_SCAN=1` forces every `VectorSimilar` rule back onto the
+/// full-scan candidate path: O(n²) per rule, and every pair above the rule's
+/// `min` provably found.
+///
+/// Same shape as [`vector_early_exit_enabled`] and `vector_dim_reject_enabled`,
+/// except that the switch is an environment variable rather than a test-only
+/// hook — it is the documented way for a caller to buy the exactness guarantee
+/// back.
+pub fn vector_scan_forced() -> bool {
+    VECTOR_SCAN.with(|c| match c.get() {
+        Some(v) => v,
+        None => {
+            let v = std::env::var("MUSHROOMDB_VECTOR_SCAN")
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            c.set(Some(v));
+            v
+        }
+    })
+}
+
+/// Run `f` with the full-scan candidate path forced on or off, whatever
+/// `MUSHROOMDB_VECTOR_SCAN` says. Test hook, in the shape of
+/// [`with_hnsw_build_batch`](crate::with_hnsw_build_batch).
+///
+/// The override is thread-local, so `f` must do its work on the calling thread.
+///
+/// # The engine outlives the closure
+///
+/// This switches which candidate spec a rule is *asked for*, and several
+/// decisions are taken once and remembered: a rule created inside the closure
+/// with the scan forced on builds no HNSW graph, so using that same engine
+/// outside the closure leaves the rule answering from `hnsw_tracked` — correct,
+/// and a full scan — until something rebuilds it. Either keep the engine inside
+/// the closure, as the equivalence test does, or reopen the store afterwards.
+pub fn with_vector_scan<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    VECTOR_SCAN.with(|c| {
+        let prev = c.replace(Some(enabled));
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        c.set(prev);
+        match out {
+            Ok(v) => v,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    })
+}
+
 /// Force the ScanAll dim fast-reject on or off. Identity-proof hook.
 #[cfg(test)]
 pub fn with_vector_dim_reject<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
@@ -380,6 +540,11 @@ pub enum CandidateSpec<'a> {
         /// Number of approximate candidates to return; typically
         /// `max(max_edges, 64)` from the owning `RuleDef`.
         k: usize,
+        /// `Some(min)` for an exact rule: widen the beam until its worst hit
+        /// falls below `min`, so a qualifying node cannot be sitting outside a
+        /// truncated beam. `None` for an approximate rule: one pass at `k`,
+        /// which is what the rule did before 0.6.6.
+        floor: Option<f64>,
     },
     /// Union of multiple candidate specs, used for `Any` predicates.
     ///
@@ -460,9 +625,31 @@ pub fn candidate_spec_approx(p: &Predicate) -> CandidateSpec<'_> {
 }
 
 /// Like `candidate_spec_approx` but with an explicit HNSW candidate count `k`.
+///
+/// The beam takes no floor, so the search is one pass at `k`: the approximate
+/// rule's behaviour. [`candidate_spec_approx_with_floor`] is the exact rule's
+/// version.
 pub fn candidate_spec_approx_with_k(p: &Predicate, k: usize) -> CandidateSpec<'_> {
+    candidate_spec_approx_with_floor(p, k, false)
+}
+
+/// [`candidate_spec_approx_with_k`], optionally taking each `VectorSimilar`'s
+/// own `min` as the beam's stopping similarity.
+///
+/// `floored` is what separates an exact rule from an approximate one: with it,
+/// the beam widens until its worst hit falls below `min`, so a node above `min`
+/// cannot be sitting outside a truncated beam.
+pub fn candidate_spec_approx_with_floor(
+    p: &Predicate,
+    k: usize,
+    floored: bool,
+) -> CandidateSpec<'_> {
     match p {
-        Predicate::VectorSimilar { field, .. } => CandidateSpec::Hnsw { field, k },
+        Predicate::VectorSimilar { field, min } => CandidateSpec::Hnsw {
+            field,
+            k,
+            floor: floored.then_some(*min),
+        },
         Predicate::All(parts) => {
             debug_assert!(
                 !parts.is_empty(),
@@ -471,11 +658,24 @@ pub fn candidate_spec_approx_with_k(p: &Predicate, k: usize) -> CandidateSpec<'_
             CandidateSpec::Intersect(
                 parts
                     .iter()
-                    .map(|p| candidate_spec_approx_with_k(p, k))
+                    .map(|p| candidate_spec_approx_with_floor(p, k, floored))
                     .collect(),
             )
         }
         other => candidate_spec(other),
+    }
+}
+
+/// True when `spec` probes an HNSW graph anywhere, so the owning rule needs one
+/// built. Every `VectorSimilar`-rooted rule does, exact or approximate, unless
+/// [`vector_scan_forced`] has put it back on the full scan.
+pub fn spec_has_hnsw(spec: &CandidateSpec<'_>) -> bool {
+    match spec {
+        CandidateSpec::Hnsw { .. } => true,
+        CandidateSpec::Union(parts) | CandidateSpec::Intersect(parts) => {
+            parts.iter().any(spec_has_hnsw)
+        }
+        _ => false,
     }
 }
 
@@ -766,7 +966,7 @@ impl SideIndex {
     }
 
     pub fn insert(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
-        self.insert_skipping(spec, node, &BTreeSet::new(), get);
+        self.insert_with(spec, node, &HnswLeg::All, get);
     }
 
     /// `insert`, but skip the HNSW graph for ids in `already` — the open-time
@@ -782,20 +982,89 @@ impl SideIndex {
         already: &BTreeSet<u32>,
         get: &dyn Fn(&str) -> Option<Value>,
     ) {
+        self.insert_with(spec, node, &HnswLeg::Skip(already), get);
+    }
+
+    /// `insert`, but the HNSW graph is left untouched — the sliced-build
+    /// version, where [`SideIndex::insert_hnsw_only`] supplies the vectors a
+    /// slice at a time.
+    ///
+    /// Every other leg of `spec` (by-key buckets, IVF, `ScanAll` metadata) is
+    /// filed exactly as `insert` files it, and `hnsw_tracked` is still
+    /// recorded, so the rule's non-vector state is whole from the moment it is
+    /// created.
+    pub fn insert_deferring_hnsw(
+        &mut self,
+        spec: &CandidateSpec,
+        node: u32,
+        get: &dyn Fn(&str) -> Option<Value>,
+    ) {
+        self.insert_with(spec, node, &HnswLeg::Defer, get);
+    }
+
+    /// Insert `node` into the HNSW graph only, leaving every other leg of
+    /// `spec` alone — the second half of [`SideIndex::insert_deferring_hnsw`].
+    ///
+    /// Returns `true` when a vector actually went into a graph, which is how a
+    /// build slice counts what it has done.
+    pub fn insert_hnsw_only(
+        &mut self,
+        spec: &CandidateSpec,
+        node: u32,
+        get: &dyn Fn(&str) -> Option<Value>,
+    ) -> bool {
+        match spec {
+            CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) => {
+                let mut any = false;
+                for s in specs {
+                    any |= self.insert_hnsw_only(s, node, get);
+                }
+                any
+            }
+            CandidateSpec::Hnsw { field, .. } => {
+                let Some(xs) = get(field).as_ref().and_then(as_numeric_list) else {
+                    return false;
+                };
+                self.record_vector_meta(node, &xs);
+                self.hnsw_tracked.insert(node);
+                if let Some(h) = &mut self.hnsw {
+                    h.insert(node, &xs);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn insert_with(
+        &mut self,
+        spec: &CandidateSpec,
+        node: u32,
+        leg: &HnswLeg<'_>,
+        get: &dyn Fn(&str) -> Option<Value>,
+    ) {
         // Union / Intersect: recurse into each child spec. insert() is
         // idempotent for ScanAll metadata (same-value overwrite).
         if let CandidateSpec::Union(specs) | CandidateSpec::Intersect(specs) = spec {
             for s in specs {
-                self.insert_skipping(s, node, already, get);
+                self.insert_with(s, node, leg, get);
             }
             return;
         }
         // Hnsw: maintain hnsw_tracked for fallback, and hnsw graph if initialized.
         if let CandidateSpec::Hnsw { field, .. } = spec {
             if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
+                // An exact rule takes this arm from 0.6.6 on, and the
+                // Cauchy-Schwarz early exit in `compute_desired` reads this
+                // metadata, so it is recorded here as well as on `ScanAll`.
+                self.record_vector_meta(node, &xs);
                 self.hnsw_tracked.insert(node);
-                if already.contains(&node) {
-                    return; // the adopted graph already holds this vector
+                match leg {
+                    // The adopted graph already holds this vector, or the build
+                    // is sliced and a later slice will supply it.
+                    HnswLeg::Skip(already) if already.contains(&node) => return,
+                    HnswLeg::Defer => return,
+                    _ => {}
                 }
                 if let Some(h) = &mut self.hnsw {
                     h.insert(node, &xs);
@@ -828,17 +1097,34 @@ impl SideIndex {
         }
         if let CandidateSpec::ScanAll { field } = spec {
             if let Some(xs) = get(field).as_ref().and_then(as_numeric_list) {
-                let mut n2 = 0.0f64;
-                for x in &xs {
-                    n2 += x * x;
-                }
-                let norm = n2.sqrt();
-                self.vec_meta.insert(node, (xs.len() as u32, norm));
-                self.vec_checkpoints.insert(node, compute_ckpts(&xs));
-                // xs is non-empty (as_numeric_list rejects empty lists).
-                self.vec_anchor.insert(node, xs[0]);
+                self.record_vector_meta(node, &xs);
             }
         }
+    }
+
+    /// File `node`'s `(dim, norm)`, suffix-norm checkpoints and anchor — the
+    /// three inputs the Cauchy-Schwarz early exit reads.
+    ///
+    /// Called from the `ScanAll` and `Hnsw` arms of `insert_with` and from
+    /// `insert_hnsw_only`, so an exact `VectorSimilar` rule keeps the early exit
+    /// whichever arm files its vectors. Torn out by the matching arms of
+    /// `remove`.
+    fn record_vector_meta(&mut self, node: u32, xs: &[f64]) {
+        let mut n2 = 0.0f64;
+        for x in xs {
+            n2 += x * x;
+        }
+        self.vec_meta.insert(node, (xs.len() as u32, n2.sqrt()));
+        self.vec_checkpoints.insert(node, compute_ckpts(xs));
+        // xs is non-empty (as_numeric_list rejects empty lists).
+        self.vec_anchor.insert(node, xs[0]);
+    }
+
+    /// Drop what [`SideIndex::record_vector_meta`] filed for `node`.
+    fn forget_vector_meta(&mut self, node: u32) {
+        self.vec_meta.remove(&node);
+        self.vec_checkpoints.remove(&node);
+        self.vec_anchor.remove(&node);
     }
 
     pub fn remove(&mut self, spec: &CandidateSpec, node: u32, get: &dyn Fn(&str) -> Option<Value>) {
@@ -855,6 +1141,7 @@ impl SideIndex {
         // and optionally compacts the HNSW graph.
         if let CandidateSpec::Hnsw { field, .. } = spec {
             if get(field).as_ref().and_then(as_numeric_list).is_some() {
+                self.forget_vector_meta(node);
                 self.hnsw_tracked.remove(&node);
                 if let Some(h) = &mut self.hnsw {
                     h.remove(node);
@@ -893,9 +1180,7 @@ impl SideIndex {
         }
         if let CandidateSpec::ScanAll { field } = spec {
             if get(field).as_ref().and_then(as_numeric_list).is_some() {
-                self.vec_meta.remove(&node);
-                self.vec_checkpoints.remove(&node);
-                self.vec_anchor.remove(&node);
+                self.forget_vector_meta(node);
             }
         }
     }
@@ -980,8 +1265,8 @@ impl SideIndex {
         get: &dyn Fn(&str) -> Option<Value>,
     ) -> BTreeSet<u32> {
         // Hnsw: approximate nearest-neighbor search.
-        if let CandidateSpec::Hnsw { field, k } = spec {
-            return self.hnsw_candidates(field, *k, get);
+        if let CandidateSpec::Hnsw { field, k, floor } = spec {
+            return self.hnsw_candidates(field, *k, *floor, get);
         }
         // VectorClusters: probe the P nearest centroids.
         if let CandidateSpec::VectorClusters { field, .. } = spec {
@@ -1236,33 +1521,102 @@ impl SideIndex {
 
     /// HNSW candidate lookup: `k`-nearest-neighbor search using the built graph.
     ///
-    /// Falls back to returning all tracked nodes when the HNSW is absent or
-    /// empty (e.g. before any insert or when used without `init_hnsw`).
+    /// With `floor` of `None` — an approximate rule — this is one beam pass at
+    /// `k`, which is what it has always been.
+    ///
+    /// With `floor` of `Some(min)` — an exact rule, 0.6.6 on — the beam widens,
+    /// and **there is exactly one way it is allowed to answer**: a beam that
+    /// came back full (`hits.len() == ef`) whose worst hit is below `min` by more
+    /// than [`BEAM_FLOOR_SLACK`] — the beam answers in `f32`, and the slack keeps
+    /// that rounding on the side of widening. Such a beam has proved what it did
+    /// not return — every node it rejected is farther from the query than one
+    /// already known to fail the predicate — so its hits are the candidate set.
+    /// The similarities themselves are discarded here; `compute_desired` rescores
+    /// every candidate from the `f64` store, so `min` is only ever *decided* in
+    /// `f64`.
+    ///
+    /// Every other outcome hands back the whole tracked set, which is the
+    /// pre-0.6.6 exact candidate set:
+    ///
+    /// * **The beam came back short of its own width.** Layer 0 need not be one
+    ///   connected component — a corpus of identical or near-identical vectors
+    ///   is the case that shows it — and a beam that exhausted its frontier has
+    ///   proved nothing about the nodes it could not reach.
+    /// * **The ceiling ([`ef_max`], [`EF_MAX`] by default) was reached with the
+    ///   worst hit still at or above `min`.** A cluster denser than the ceiling
+    ///   then costs a scan; it never costs recall.
+    /// * **A beam as wide as the index itself** (`ef >= h.len()`), where walking
+    ///   the graph cannot beat handing back every vector on the side.
+    /// * **The index cannot answer this query at all**
+    ///   ([`HnswIndex::can_answer`]): no graph, an empty one, a stride that is not
+    ///   the query's dimension, or one that refused a vector it was handed. This
+    ///   is checked *before* any beam runs, because a beam over an index that is
+    ///   missing part of the corpus would "prove" its floor against vectors the
+    ///   index never held. It applies to the approximate path as well.
+    ///
+    /// So the index is a candidate *generator* here and never a silent filter:
+    /// the only way a node is dropped is a beam that proved it is below `min`.
     fn hnsw_candidates(
         &self,
         field: &str,
         k: usize,
+        floor: Option<f64>,
         get: &dyn Fn(&str) -> Option<Value>,
     ) -> BTreeSet<u32> {
         let Some(xs) = get(field).as_ref().and_then(as_numeric_list) else {
             return BTreeSet::new();
         };
         if let Some(h) = &self.hnsw {
-            if !h.is_empty() {
-                return h.search(&xs, k).into_iter().map(|(id, _)| id).collect();
+            // `can_answer`, not `!is_empty()`: an index that refused a vector, or
+            // whose stride is not this query's dimension — a 3-element stray
+            // ingested ahead of the real corpus elects one — is non-empty and
+            // still cannot supply the candidates this query needs. It is asked
+            // before any beam, because a beam over such an index would "conclude"
+            // from an incomplete corpus.
+            if h.can_answer(xs.len()) {
+                let Some(min) = floor else {
+                    return h.search(&xs, k).into_iter().map(|(id, _)| id).collect();
+                };
+                let cap = ef_max();
+                let mut ef = h.ef_for(k);
+                while ef < h.len() {
+                    // `k = ef`: the answer is every hit above the floor, so
+                    // truncating the beam to `k` would be throwing away the
+                    // very candidates the widening is looking for.
+                    let hits = h.search_with_ef(&xs, ef, ef);
+                    // `search` sorts descending, so the last hit is the worst.
+                    let full = hits.len() == ef;
+                    if full && hits[hits.len() - 1].1 < min - BEAM_FLOOR_SLACK {
+                        return hits.into_iter().map(|(id, _)| id).collect();
+                    }
+                    // Short of its width (frontier exhausted, so a wider beam
+                    // reaches nothing new) or at the ceiling with the floor
+                    // still unreached: neither has proved anything about what it
+                    // did not return.
+                    if !full || ef >= cap {
+                        break;
+                    }
+                    ef = ef.saturating_mul(2);
+                }
             }
         }
         // Fallback: full scan of all tracked nodes (superset of true positives).
         self.hnsw_tracked.clone()
     }
 
-    /// Export the HNSW graph as an opaque bincoded blob.
+    /// Export the HNSW graph as an opaque versioned blob.
     ///
     /// Returns an empty `Vec` when the HNSW is not initialized.
-    pub fn export_hnsw_blob(&self) -> Vec<u8> {
+    ///
+    /// `complete` is false when the rule's sliced build still owes this side
+    /// vectors; it rides in the blob so that a reader opening the snapshot
+    /// knows the graph is a prefix and takes its exhaustive path rather than
+    /// answering confidently about a fraction of the corpus. The engine reads
+    /// it from `pending_builds`, which is not itself persisted.
+    pub fn export_hnsw_blob(&self, complete: bool) -> Vec<u8> {
         self.hnsw
             .as_ref()
-            .and_then(|h| bincode::serialize(h).ok())
+            .and_then(|h| crate::hnsw::encode_hnsw_blob(h, complete))
             .unwrap_or_default()
     }
 
@@ -1270,12 +1624,10 @@ impl SideIndex {
     ///
     /// The `hnsw_tracked` set is populated from the restored graph's node ids
     /// so candidates/remove work correctly after restore.
-    /// Silently ignores empty or corrupt blobs (HNSW stays uninitialized).
+    /// Silently ignores empty, corrupt, or unknown-version blobs (the HNSW
+    /// stays uninitialized and the side keeps its full-scan fallback).
     pub fn load_hnsw_blob(&mut self, blob: &[u8]) {
-        if blob.is_empty() {
-            return;
-        }
-        if let Ok(h) = bincode::deserialize::<HnswIndex>(blob) {
+        if let Ok(h) = crate::hnsw::decode_hnsw_blob(blob) {
             self.adopt_hnsw(h);
         }
     }
@@ -1283,16 +1635,16 @@ impl SideIndex {
     /// Initialise this side's HNSW graph, adopting `blob` when it holds one.
     ///
     /// Returns the node ids the adopted graph already contains, so an open-time
-    /// scan can skip re-inserting them. An empty or corrupt blob yields an
-    /// empty graph and an empty set — exactly what `init_hnsw` gives today —
-    /// and the scan then builds the graph as it always did.
+    /// scan can skip re-inserting them. An empty, corrupt, or unknown-version
+    /// blob yields an empty graph and an empty set — exactly what `init_hnsw`
+    /// gives today — and the scan then builds the graph as it always did.
     ///
     /// `true` in the second slot means "this side was adopted, not built", which
     /// is what the caller counts as a skipped build.
     pub fn init_or_adopt_hnsw(&mut self, rule_name: &str, blob: &[u8]) -> (BTreeSet<u32>, bool) {
         self.hnsw = None;
         if !blob.is_empty() {
-            match bincode::deserialize::<HnswIndex>(blob) {
+            match crate::hnsw::decode_hnsw_blob(blob) {
                 Ok(h) => self.adopt_hnsw(h),
                 Err(e) => eprintln!(
                     "[mushroomdb] rule {rule_name:?}: a persisted HNSW index failed to load \
@@ -1314,7 +1666,14 @@ impl SideIndex {
     /// `hnsw_tracked` is repopulated from the graph's node ids so candidates
     /// and removal work against the installed graph rather than whatever the
     /// preceding node scan happened to record.
-    pub fn adopt_hnsw(&mut self, h: HnswIndex) {
+    pub fn adopt_hnsw(&mut self, mut h: HnswIndex) {
+        // Every adoption is an open-time path, and every open-time path runs
+        // the node scan that supplies whatever a mid-build blob was missing, so
+        // a live index is whole by the time anything reads it. The unfinished
+        // build is still owed its *backfill*, and `RuleEngine::pending_builds`
+        // is what holds that — see `hnsw_search_dst`. The flag exists for the
+        // lazily-decoded read-path copy, which has no scan behind it.
+        h.mark_complete();
         self.hnsw_tracked = h.node_ids();
         self.hnsw = Some(h);
     }
@@ -1327,6 +1686,15 @@ impl SideIndex {
     /// Borrow the HNSW index, if initialized.
     pub fn hnsw_ref(&self) -> Option<&HnswIndex> {
         self.hnsw.as_ref()
+    }
+
+    /// Remove and return this side's HNSW graph, leaving the side without one.
+    ///
+    /// Lets a caller that is about to reset the whole `SideIndex` carry the
+    /// graph across — the graph is the expensive part and is not always worth
+    /// rebuilding.
+    pub fn take_hnsw(&mut self) -> Option<HnswIndex> {
+        self.hnsw.take()
     }
 }
 
@@ -2004,7 +2372,11 @@ mod tests {
 
     /// A side seeded with three vectors, plus the `Hnsw` spec that indexes them.
     fn hnsw_side() -> (SideIndex, CandidateSpec<'static>) {
-        let spec = CandidateSpec::Hnsw { field: "emb", k: 8 };
+        let spec = CandidateSpec::Hnsw {
+            field: "emb",
+            k: 8,
+            floor: None,
+        };
         let mut side = SideIndex::default();
         side.init_hnsw("sim");
         for (id, xs) in [
@@ -2022,7 +2394,7 @@ mod tests {
     #[test]
     fn init_or_adopt_hnsw_adopts_a_usable_blob() {
         let (side, spec) = hnsw_side();
-        let blob = side.export_hnsw_blob();
+        let blob = side.export_hnsw_blob(true);
 
         let mut fresh = SideIndex::default();
         let (ids, adopted) = fresh.init_or_adopt_hnsw("sim", &blob);
@@ -2036,13 +2408,42 @@ mod tests {
         );
     }
 
-    /// A blob this build cannot read leaves an empty graph, an empty skip set,
-    /// and a rebuild for the caller's node scan. Until that scan runs, the side
-    /// answers from `hnsw_tracked`.
+    /// A blob whose version this build does not know is treated exactly as a
+    /// corrupt one: an empty graph, an empty skip set, and the caller's node
+    /// scan rebuilds. Until it does, the side answers from `hnsw_tracked`.
+    #[test]
+    fn an_unknown_version_leaves_the_graph_empty() {
+        let (side, spec) = hnsw_side();
+        let mut blob = side.export_hnsw_blob(true);
+        blob[4] = 99; // the version's low byte
+
+        let mut fresh = SideIndex::default();
+        let (ids, adopted) = fresh.init_or_adopt_hnsw("sim", &blob);
+        assert!(!adopted, "an unreadable blob must not count as adopted");
+        assert!(ids.is_empty(), "nothing may be skipped by the scan");
+        assert!(!fresh.has_hnsw(), "the graph must be empty");
+
+        // The scan then fills it, and the full-scan fallback covers the gap.
+        for (id, xs) in [
+            (1u32, vec![1.0, 0.0]),
+            (2, vec![0.0, 1.0]),
+            (3, vec![0.7, 0.7]),
+        ] {
+            fresh.insert_skipping(&spec, id, &ids, &getter(&emb(&xs)));
+        }
+        assert!(fresh.has_hnsw());
+        assert_eq!(
+            fresh.candidates(&spec, &getter(&emb(&[1.0, 0.0]))),
+            BTreeSet::from([1, 2, 3])
+        );
+    }
+
+    /// A truncated blob is treated exactly as an unknown version: an empty
+    /// graph, an empty skip set, and a rebuild for the caller's node scan.
     #[test]
     fn an_unreadable_blob_leaves_the_graph_empty() {
         let (side, spec) = hnsw_side();
-        let mut blob = side.export_hnsw_blob();
+        let mut blob = side.export_hnsw_blob(true);
         blob.truncate(blob.len() / 2);
 
         let mut fresh = SideIndex::default();
@@ -2071,7 +2472,7 @@ mod tests {
     #[test]
     fn insert_skipping_tracks_but_does_not_reinsert() {
         let (side, spec) = hnsw_side();
-        let blob = side.export_hnsw_blob();
+        let blob = side.export_hnsw_blob(true);
 
         let mut fresh = SideIndex::default();
         let (already, _) = fresh.init_or_adopt_hnsw("sim", &blob);

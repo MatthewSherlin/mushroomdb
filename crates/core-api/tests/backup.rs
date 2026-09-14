@@ -55,6 +55,7 @@ fn build_store_with_archives(dir: &std::path::Path) -> usize {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -85,6 +86,7 @@ fn build_store_with_archives(dir: &std::path::Path) -> usize {
             keys: vec![],
             labels: vec!["Person".into()],
             visible_where: None,
+            namespaces: None,
             write: None,
         }],
     };
@@ -291,6 +293,7 @@ fn all_edges_for_export_includes_derived_with_rule() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 

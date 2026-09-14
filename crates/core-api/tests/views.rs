@@ -320,6 +320,7 @@ fn degree_view_over_derived_edges_fire_and_retract() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     db.create_rule(rule).unwrap();
 
@@ -732,6 +733,7 @@ fn pending_deltas_are_clean_through_view_heavy_workload() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
     db.insert_node("Org", "o1", vec![]).unwrap();
     db.create_rule(rule).unwrap();

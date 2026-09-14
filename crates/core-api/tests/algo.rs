@@ -173,6 +173,7 @@ fn pagerank_over_derived_edges() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // After rule fires: x→y and y→x exist as derived edges.
@@ -220,6 +221,7 @@ fn algos_see_derived_edges_after_snapshot_reopen() {
             via_label: None,
             via_edge: None,
             via_dir: None,
+            namespace: None,
         })
         .unwrap();
         // Persist a V8 snapshot; derived edges move into the mmap base and the
@@ -349,6 +351,7 @@ fn pagerank_derived_edge_type_filter() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     // Filter to only LINKED (derived) edges: z has no LINKED edge, so z should score lower.
@@ -972,6 +975,7 @@ fn pagerank_on_demo_graph() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -1027,6 +1031,7 @@ fn wcc_min_weight_filters_edges() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -1116,6 +1121,7 @@ fn pagerank_uses_weights_when_prop_set() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
 
@@ -1294,6 +1300,7 @@ fn louvain_respects_min_weight_and_resolution() {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .unwrap();
     insert_edge(&mut db, "TO_A", "br-a", "a1");

@@ -425,6 +425,18 @@ fn mask_for_role_from(
             }
         }
     }
+    // Namespace leg — the live resolver's retain, against the frozen overlay's
+    // own `ns` column (the reader has no derived `node_ns` array: its effective
+    // state is assembled per snapshot, and reading the column it would mirror is
+    // the same answer by construction). Intersects the key leg too; see
+    // `RoleDef::namespaces`.
+    if def.namespaces.is_some() {
+        let cv = build_cv(&state.props, base);
+        visible.retain(|&id| {
+            let value = cv.get(id, core_storage::NS_PROP).map(|vr| vr.into_value());
+            def.sees_namespace(core_storage::namespace_of_value(value.as_ref()))
+        });
+    }
     Ok(NodeMask::from_ids(visible))
 }
 
@@ -523,6 +535,29 @@ impl ReaderSnapshot {
                 mask_for_role_from(self.effective()?, &self.base, role)
             })
             .map(|m| (*m).clone())
+    }
+
+    /// Every live node in `namespace`, as a visibility mask.
+    ///
+    /// The snapshot-reader twin of [`GraphDb::mask_for_namespace`](crate::GraphDb::mask_for_namespace):
+    /// read off the effective state's own `ns` column rather than a derived
+    /// array, exactly as the namespace leg of [`Self::mask_for_role`] is. A name
+    /// no node uses gives an empty mask — a namespace scope never widens.
+    pub fn mask_for_namespace(&self, namespace: &str) -> Result<NodeMask> {
+        let state = self.effective()?;
+        let cv = build_cv(&state.props, &self.base);
+        let mut visible = HashSet::new();
+        for (i, &sym) in state.labels.iter().enumerate() {
+            if sym == u32::MAX {
+                continue; // tombstoned: the label sentinel is what marks it gone
+            }
+            let id = i as u32;
+            let value = cv.get(id, core_storage::NS_PROP).map(|vr| vr.into_value());
+            if core_storage::namespace_of_value(value.as_ref()) == namespace {
+                visible.insert(id);
+            }
+        }
+        Ok(NodeMask::from_ids(visible))
     }
 
     /// Resolve a node key to its dense id.

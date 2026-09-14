@@ -49,12 +49,12 @@
 //! EOF on `reader` returns `Ok(())`. Read/write I/O errors propagate.
 
 use crate::json::{
-    edge_history_result_json, node_history_json, node_info_json, params_from_json,
-    parse_ingest_edges, result_set_json, rule_def_from_json,
+    edge_history_result_json, namespace_arg, node_history_json, node_info_json, params_from_json,
+    parse_ingest_edges, result_set_json, rule_def_from_json, stamp_namespace, stamp_namespace_row,
 };
 use core_api::{
     json_to_rows, json_to_value, AsOfScope, AutoFk, GraphError, IngestOptions, MaskMode, NodeMask,
-    SharedDb, Value,
+    SharedDb, Value, NS_PROP,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -223,7 +223,7 @@ fn dispatch_call(db: &SharedDb, db_dir: Option<&Path>, params: Option<&Js>) -> C
         "ingest_json" => tool_ingest(db, args),
         "create_rule" => tool_create_rule(db, args),
         "explain" => tool_explain(db, args),
-        "stats" => tool_stats(db),
+        "stats" => tool_stats(db, args),
         "node_info" => tool_node_info(db, args),
         "upsert_entity" => tool_upsert_entity(db, args),
         "find_similar" => tool_find_similar(db, args),
@@ -273,6 +273,17 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
         return CallOutcome::ToolErr("pass role or mask, not both".into());
     }
 
+    // The second visibility axis. `namespace` is not a third way to say what
+    // `role` and `mask` say — it is a leg that **intersects** whichever of them
+    // is present (and stands alone when neither is), so it can only narrow what
+    // they already allow. A role bound to namespaces honours them with no
+    // argument here; passing one outside the binding is the empty intersection,
+    // never the union.
+    let namespace = match namespace_arg(args.get("namespace")) {
+        Ok(n) => n,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+
     // Optional time travel: a 0-based WAL commit index. The graph is read as
     // of that commit; a `role` is still the role the store defines now, since
     // `roles.json` is a sidecar and is never a WAL record.
@@ -303,14 +314,24 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
         let scope = match (role, &mask_keys) {
             (Some(role), _) => AsOfScope::Role(role),
             (None, Some(keys)) => AsOfScope::Keys(keys),
-            (None, None) => {
-                return match db.read().query_at(commit, cypher, &params) {
-                    Ok(rs) => CallOutcome::ToolOk(result_set_json(&rs)),
-                    Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+            (None, None) => match namespace.as_deref() {
+                // A namespace alone is its own as-of scope.
+                Some(ns) => AsOfScope::Namespace(ns),
+                None => {
+                    return match db.read().query_at(commit, cypher, &params) {
+                        Ok(rs) => CallOutcome::ToolOk(result_set_json(&rs)),
+                        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+                    }
                 }
-            }
+            },
         };
-        return match db.read().query_at_scoped(commit, cypher, &params, scope) {
+        let g = db.read();
+        let out = match (namespace.as_deref(), role.is_some() || mask_keys.is_some()) {
+            // Both legs: the namespace intersects the scope at that commit.
+            (Some(ns), true) => g.query_at_scoped_in_namespace(commit, cypher, &params, scope, ns),
+            _ => g.query_at_scoped(commit, cypher, &params, scope),
+        };
+        return match out {
             Ok(rs) => CallOutcome::ToolOk(result_set_json(&rs)),
             Err(GraphError::KeyNotFound { key }) if key.starts_with("role:") => {
                 CallOutcome::ToolErr(format!("unknown role '{}'", &key["role:".len()..]))
@@ -319,7 +340,7 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
         };
     }
 
-    if role.is_some() || mask_keys.is_some() {
+    if role.is_some() || mask_keys.is_some() || namespace.is_some() {
         let stub_hidden = args
             .get("stub_hidden")
             .and_then(|v| v.as_bool())
@@ -336,7 +357,19 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
                 Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
             },
             (None, Some(keys)) => NodeMask::from_keys(&*g, keys.iter().map(String::as_str)),
-            (None, None) => unreachable!("one of the two is Some in this branch"),
+            // A namespace alone: the namespace leg is the whole mask.
+            (None, None) => g.mask_for_namespace(
+                namespace
+                    .as_deref()
+                    .expect("one of the three is Some in this branch"),
+            ),
+        };
+        // With a role or a client mask present, the namespace is a second leg
+        // intersected into it — the same `NodeMask::intersect` the
+        // role-plus-client-mask path uses, so never-widen holds by construction.
+        let mask = match (namespace.as_deref(), role.is_some() || mask_keys.is_some()) {
+            (Some(ns), true) => mask.intersect(&g.mask_for_namespace(ns)),
+            _ => mask,
         };
         let mask = if stub_hidden {
             mask.with_mode(MaskMode::Stub)
@@ -424,6 +457,14 @@ fn tool_ingest(db: &SharedDb, args: &Js) -> CallOutcome {
         Ok(c) => c,
         Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
     };
+    // `namespace` applies to every node this call creates.
+    let namespace = match namespace_arg(args.get("namespace")) {
+        Ok(n) => n,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    if let Err(e) = stamp_namespace(&mut converted.rows, namespace.as_deref()) {
+        return CallOutcome::ToolErr(e);
+    }
     let taken = std::mem::take(&mut converted.rows);
     let report = {
         let mut g = db.write();
@@ -448,9 +489,32 @@ fn tool_create_rule(db: &SharedDb, args: &Js) -> CallOutcome {
         let mut g = db.write();
         g.create_rule(def)
     };
-    match res {
-        Ok(()) => CallOutcome::ToolOk(json!({"ok": true, "name": name})),
-        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+    if let Err(e) = res {
+        return CallOutcome::ToolErr(graph_err_msg(e));
+    }
+    // A rule over a corpus too large to index in one commit is installed but
+    // derives nothing yet. Saying "ok" there would tell the caller to go and
+    // query edges that do not exist, so report the build instead — `stats`
+    // carries the same progress under each rule's `building`.
+    let building = db
+        .read()
+        .builds_in_progress()
+        .into_iter()
+        .find(|b| b.rule == name);
+    match building {
+        Some(b) => CallOutcome::ToolOk(json!({
+            "ok": true,
+            "name": name,
+            "building": {"indexed": b.indexed, "total": b.total},
+            "note": format!(
+                "the vector index for {name:?} is still being built ({}/{} vectors); \
+                 this rule derives no edges until it finishes. Every write advances it, \
+                 and `mushroomdb build-index <db-dir>` finishes it now. Poll `stats` — \
+                 the rule's `building` field disappears when its edges are in.",
+                b.indexed, b.total
+            ),
+        })),
+        None => CallOutcome::ToolOk(json!({"ok": true, "name": name})),
     }
 }
 
@@ -474,11 +538,56 @@ fn tool_explain(db: &SharedDb, args: &Js) -> CallOutcome {
     }
 }
 
-fn tool_stats(db: &SharedDb) -> CallOutcome {
-    let snap = {
-        let g = db.read();
-        g.stats()
+/// `stats`, with the namespace roster narrowed when the caller names a role or a
+/// namespace.
+///
+/// The roster is the one part of `stats` that is a list of *other tenants*:
+/// every namespace and its live count. A caller answering as a role should be
+/// told about its own namespaces and no others, so `role` narrows the roster to
+/// the role's binding and `namespace` to that one name. The store-wide counts
+/// beside it are unchanged — they were never per-namespace and narrowing them
+/// would make the two halves of one body disagree.
+fn tool_stats(db: &SharedDb, args: &Js) -> CallOutcome {
+    let role = match args.get("role") {
+        None | Some(Js::Null) => None,
+        Some(Js::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(_) => return CallOutcome::ToolErr("role must be a non-empty string".into()),
     };
+    let namespace = match namespace_arg(args.get("namespace")) {
+        Ok(n) => n,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let (snap, role_def) = {
+        let g = db.read();
+        let def = match &role {
+            Some(r) => {
+                // Resolve through the same resolver `query` uses, so a store
+                // whose `roles.json` was corrupt at open says so here too
+                // instead of reporting the role simply unknown — one answer per
+                // cause, the same one on both tools. The mask is memoised per
+                // (role, commit_seq), so asking costs nothing a `query` with the
+                // same role would not already have paid.
+                if let Err(e) = g.mask_for_role(r) {
+                    return match e {
+                        GraphError::KeyNotFound { .. } => {
+                            CallOutcome::ToolErr(format!("unknown role '{r}'"))
+                        }
+                        other => CallOutcome::ToolErr(graph_err_msg(other)),
+                    };
+                }
+                g.roles().into_iter().find(|d| &d.name == r)
+            }
+            None => None,
+        };
+        (g.stats(), def)
+    };
+    let mut snap = snap;
+    if role_def.is_some() || namespace.is_some() {
+        snap.namespaces.retain(|n| {
+            role_def.as_ref().is_none_or(|d| d.sees_namespace(&n.name))
+                && namespace.as_deref().is_none_or(|ns| ns == n.name)
+        });
+    }
     match serde_json::to_value(&snap) {
         Ok(v) => CallOutcome::ToolOk(v),
         Err(e) => CallOutcome::ToolErr(e.to_string()),
@@ -507,6 +616,21 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
 /// If the node does not exist: `label` is required; the node is ingested with
 /// `key_field = "id"` and the supplied props.
 ///
+/// `namespace` is the namespace a node this call **creates** is created in. On a
+/// node that already exists it is written like any other property, which is what
+/// makes naming the namespace the node is already in a no-op and naming another
+/// one the engine's `NamespaceImmutable` refusal — one rule, stated once, in the
+/// place that owns it. A no-op `ns` writes nothing and is not counted in
+/// `updated_fields`, because nothing was updated.
+///
+/// `id` in `props` is **dropped on both paths**: it is the node's key. The create
+/// path stores `id` from `key` (it ingests with `key_field: "id"`), and
+/// `rename_node` is the only way to change it. One row builder now serves the
+/// create and the update path, so the rule is the same on both — before v0.6.6 the
+/// update path wrote `props.id` straight through `set_prop`, which could leave a
+/// stored `id` disagreeing with the key the node is reached by, while the create
+/// path had always ignored it.
+///
 /// Returns `{ok, key, created, updated_fields?}`.
 fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
     let Some(key) = args.get("key").and_then(Js::as_str) else {
@@ -516,6 +640,33 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
     let Some(props_obj) = args.get("props").and_then(Js::as_object) else {
         return CallOutcome::ToolErr("missing props".into());
     };
+    let namespace = match namespace_arg(args.get("namespace")) {
+        Ok(n) => n,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+
+    // One row, stamped with the namespace, whichever path takes it: the
+    // conflict rule between an explicit `props.ns` and `namespace` is then the
+    // same one `ingest_json` applies.
+    let mut row: BTreeMap<String, Value> = BTreeMap::new();
+    for (field, json_val) in props_obj {
+        if field == "id" {
+            continue;
+        }
+        match json_to_value(json_val.clone()) {
+            Some(v) => {
+                row.insert(field.clone(), v);
+            }
+            None => {
+                return CallOutcome::ToolErr(format!("prop {field} is not a supported value type"))
+            }
+        }
+    }
+    if let Some(ns) = namespace.as_deref() {
+        if let Err(e) = stamp_namespace_row(&mut row, ns) {
+            return CallOutcome::ToolErr(e);
+        }
+    }
 
     let exists = {
         let g = db.read();
@@ -525,20 +676,19 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
     if exists {
         let mut g = db.write();
         let mut count = 0usize;
-        for (field, json_val) in props_obj {
-            match json_to_value(json_val.clone()) {
-                Some(v) => {
-                    if let Err(e) = g.set_prop(key, field, v) {
-                        return CallOutcome::ToolErr(graph_err_msg(e));
-                    }
-                    count += 1;
-                }
-                None => {
-                    return CallOutcome::ToolErr(format!(
-                        "prop {field} is not a supported value type"
-                    ))
-                }
+        for (field, v) in &row {
+            // The namespace a node is already in is the engine's no-op: it
+            // writes no record and takes no commit, so counting it as an updated
+            // field would report an update that did not happen. Asking first
+            // also keeps the refusal for a *different* namespace coming from the
+            // engine rather than from a second rule stated here.
+            if field == NS_PROP && Some(v) == g.namespace_of(key).map(Value::Str).as_ref() {
+                continue;
             }
+            if let Err(e) = g.set_prop(key, field, v.clone()) {
+                return CallOutcome::ToolErr(graph_err_msg(e));
+            }
+            count += 1;
         }
         CallOutcome::ToolOk(json!({
             "ok": true,
@@ -550,23 +700,8 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
         let Some(label) = label_opt else {
             return CallOutcome::ToolErr("label required when creating a new entity".into());
         };
-        let mut row: BTreeMap<String, Value> = BTreeMap::new();
+        let mut row = row;
         row.insert("id".to_string(), Value::Str(key.to_string()));
-        for (field, json_val) in props_obj {
-            if field == "id" {
-                continue;
-            }
-            match json_to_value(json_val.clone()) {
-                Some(v) => {
-                    row.insert(field.clone(), v);
-                }
-                None => {
-                    return CallOutcome::ToolErr(format!(
-                        "prop {field} is not a supported value type"
-                    ))
-                }
-            }
-        }
         let opts = IngestOptions {
             key_field: "id".to_string(),
             auto_fk: AutoFk::Off,
@@ -1046,7 +1181,7 @@ fn graph_tools() -> Vec<Js> {
     let Js::Array(tools) = json!([
             {
                 "name": "query",
-                "description": "Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Pass 'as_of' to answer from a past commit; it composes with 'role' or with 'mask'. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range, the property is not a list, or the index is not an integer, so a subscript never errors and never matches.",
+                "description": "Who may see this, and anything else one pattern can answer — run a Cypher query (read or write) against the graph. Pass 'role' to answer as one of the store's roles: only the nodes that role may see, writes refused. 'mask' is the same restriction written out as an explicit key allow-list. Pass 'as_of' to answer from a past commit; it composes with 'role' or with 'mask'. Pass 'namespace' to answer from one namespace only. Cypher dialect: MATCH/WHERE/RETURN, CREATE, MERGE, SET, DELETE, with $named parameters in 'params'. A node's key and label read as properties (n.key, n.label) or as key(n)/labels(n). One MATCH takes comma-separated patterns that share variables — MATCH (t)-[:A]->(c), (t)-[:B]->(c) is the intersection of both, and count(DISTINCT t) after WITH counts each t once. WHERE takes STARTS WITH, ENDS WITH, CONTAINS, IN, and a list subscript (n.location[0]) — which is null when the index is out of range, the property is not a list, or the index is not an integer, so a subscript never errors and never matches.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1068,6 +1203,10 @@ fn graph_tools() -> Vec<Js> {
                             "type": "integer",
                             "minimum": 0,
                             "description": "0-based WAL commit index: answer from the graph as it was at that commit. Composes with 'role' or with 'mask' — never both, which is refused as it is without 'as_of' — and whichever is passed is resolved against the graph as it was then. Deleting a node does not remove it from a role's past, and a role's 'keys' resolve to whichever node held the key at that commit. Writes are refused."
+                        },
+                        "namespace": {
+                            "type": "string",
+                            "description": "Answer only from this namespace. Intersects with 'role' and 'mask' — it can only narrow what they already allow. A role bound to namespaces honours them with no argument here. 'default' is the namespace of every node that names none; a name no node uses answers with nothing."
                         }
                     },
                     "required": ["cypher"]
@@ -1089,6 +1228,10 @@ fn graph_tools() -> Vec<Js> {
                         "edges": {
                             "type": "array",
                             "description": "Optional user edges [{edge_type, src, dst}]."
+                        },
+                        "namespace": {
+                            "type": "string",
+                            "description": "Namespace for every node this call creates. Omitted means the 'default' namespace. A row that carries its own 'ns' must name the same namespace. A namespace is set at insert and cannot be changed afterwards."
                         }
                     },
                     "required": ["label", "rows_json"]
@@ -1109,7 +1252,11 @@ fn graph_tools() -> Vec<Js> {
                             "type": ["string", "null"],
                             "description": "Edge property that stores the score (default: weight)."
                         },
-                        "max_edges": { "type": ["integer", "null"] }
+                        "max_edges": { "type": ["integer", "null"] },
+                        "namespace": {
+                            "type": "string",
+                            "description": "Scope the rule to one namespace: it sees only that namespace's nodes — source, via hop and destination — so every edge it derives stays inside. Omitted means a global rule, which is the only kind that may derive an edge across a boundary."
+                        }
                     },
                     "required": ["name", "src_label", "dst_label", "predicate", "edge_type"]
                 }
@@ -1128,10 +1275,19 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "stats",
-                "description": "How big is this store — live node, edge and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned).",
+                "description": "How big is this store — live node, edge and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned), and `namespaces`, every namespace with at least one live node and its count. Pass 'role' or 'namespace' to be told about those namespaces only.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {}
+                    "properties": {
+                        "role": {
+                            "type": "string",
+                            "description": "Report only the namespaces this role may see. The store-wide counts beside them are unchanged."
+                        },
+                        "namespace": {
+                            "type": "string",
+                            "description": "Report only this namespace. Intersects with 'role'."
+                        }
+                    }
                 }
             },
             {
@@ -1147,7 +1303,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "upsert_entity",
-                "description": "Record what is now true about K — insert or update a node by key. If the key exists, updates the supplied properties. If not, creates a new node with the given label and properties. Useful for agent memory: store or refresh an entity without checking existence first.",
+                "description": "Record what is now true about K — insert or update a node by key. If the key exists, updates the supplied properties. If not, creates a new node with the given label and properties. 'id' in 'props' is ignored on both paths: a created node stores 'id' as its key, and 'rename_node' is the only way to change it. Useful for agent memory: store or refresh an entity without checking existence first.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1156,6 +1312,10 @@ fn graph_tools() -> Vec<Js> {
                         "props": {
                             "type": "object",
                             "description": "Properties to set. Values must be scalars (string, number, bool) or arrays of scalars."
+                        },
+                        "namespace": {
+                            "type": "string",
+                            "description": "Namespace for a node this call creates. Omitted means the 'default' namespace. On a node that already exists, naming the namespace it is in is a no-op and naming another one is refused — a namespace is set at insert and cannot be changed."
                         }
                     },
                     "required": ["key", "props"]
@@ -1395,6 +1555,7 @@ mod tests {
                 via_label: None,
                 via_edge: None,
                 via_dir: None,
+                namespace: None,
             })
             .expect("rule");
         }
@@ -1605,6 +1766,80 @@ mod tests {
         assert!(!is_error(&resp));
         let result = tool_text(&resp);
         assert_eq!(result["nodes_live"], 2);
+    }
+
+    /// A rule whose corpus is too large to index in one commit must not come
+    /// back as a bare "ok": the caller would go straight to querying edges that
+    /// do not exist yet.
+    #[test]
+    fn create_rule_reports_a_build_it_could_not_finish() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            for i in 0..300usize {
+                const D: usize = 32;
+                let axis = (i / 10) % D;
+                let mut xs = vec![0.0f64; D];
+                xs[axis] = 1.0;
+                xs[(axis + 1) % D] = (i % 10) as f64 * 0.001;
+                g.insert_node(
+                    "V",
+                    &format!("v{i}"),
+                    vec![(
+                        "emb".into(),
+                        Value::List(xs.into_iter().map(Value::Float).collect()),
+                    )],
+                )
+                .expect("insert");
+            }
+            g.set_hnsw_build_batch(Some(64));
+        }
+        let args = json!({
+            "name": "sim",
+            "src_label": "V",
+            "dst_label": "V",
+            "predicate": {"VectorSimilar": {"field": "emb", "min": 0.9}},
+            "edge_type": "SIM",
+            "weight_prop": null,
+            "max_edges": null,
+            "approximate": true
+        });
+        let resp = tool_call(&db, 1, "create_rule", args);
+        assert!(!is_error(&resp), "{resp}");
+        let result = tool_text(&resp);
+        assert_eq!(result["name"], json!("sim"));
+        assert_eq!(result["building"], json!({"indexed": 64, "total": 300}));
+        let note = result["note"].as_str().expect("a note explaining the wait");
+        assert!(
+            note.contains("derives no edges until it finishes") && note.contains("build-index"),
+            "the note must say the edges are not there yet and how to finish: {note}"
+        );
+
+        // `stats` carries the same progress.
+        let stats = tool_text(&tool_call(&db, 2, "stats", json!({})));
+        let rule = stats["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|r| r["name"] == "sim")
+            .expect("the rule is installed while it builds");
+        assert_eq!(rule["edges"], json!(0));
+        assert_eq!(
+            rule["building"],
+            json!({"rule": "sim", "indexed": 64, "total": 300})
+        );
+
+        // Finished, the report is the plain one again.
+        while !db.write().pump_index_build().expect("pump").is_empty() {}
+        let stats = tool_text(&tool_call(&db, 3, "stats", json!({})));
+        let rule = stats["rules"]
+            .as_array()
+            .expect("rules")
+            .iter()
+            .find(|r| r["name"] == "sim")
+            .expect("rule");
+        assert!(rule.get("building").is_none(), "{rule}");
+        assert!(rule["edges"].as_u64().expect("edges") > 0);
     }
 
     #[test]

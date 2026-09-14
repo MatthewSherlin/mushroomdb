@@ -198,6 +198,7 @@ fn rule_works_at() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -216,6 +217,7 @@ fn rule_on_project() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -235,6 +237,7 @@ fn rule_skill_fit() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -254,6 +257,7 @@ fn rule_vector_sim() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -291,6 +295,7 @@ fn rule_field_equal_scale() -> RuleDef {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     }
 }
 
@@ -387,6 +392,7 @@ fn open_shaped_store(dir: &std::path::Path) {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     })
     .expect("co_changed");
     db.create_rule(RuleDef {
@@ -404,6 +410,7 @@ fn open_shaped_store(dir: &std::path::Path) {
         via_label: Some("File".into()),
         via_edge: Some("TOP_AUTHOR".into()),
         via_dir: Some(core_storage::Direction::In),
+        namespace: None,
     })
     .expect("knows");
 
@@ -680,6 +687,7 @@ fn vector_semantic_backfill(c: &mut Criterion) {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
 
     c.bench_function("vector_semantic_backfill_500", |b| {
@@ -716,6 +724,7 @@ fn vector_semantic_backfill(c: &mut Criterion) {
         via_label: None,
         via_edge: None,
         via_dir: None,
+        namespace: None,
     };
 
     c.bench_function("vector_semantic_backfill_500_approximate", |b| {

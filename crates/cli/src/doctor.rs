@@ -234,8 +234,19 @@ pub fn run_doctor_with(
     }
 
     // 3. store, then the write-lock probe (same check family, adjacent lines).
+    //
+    // How long that open took is carried down to the handshake, which spawns a
+    // server that must repeat it before it can answer anything.
+    let mut store_opened_in: Option<Duration> = None;
     match &store {
-        Some(store) => checks.extend(check_store_and_lock(store.path())),
+        Some(store) => {
+            let StoreChecks {
+                checks: cs,
+                opened_in,
+            } = check_store_and_lock(store.path());
+            checks.extend(cs);
+            store_opened_in = opened_in;
+        }
         None => checks.push(Check::fail(
             "store",
             no_store_message(mcp_delivery),
@@ -310,7 +321,7 @@ pub fn run_doctor_with(
 
     // 6. self-handshake — spawn the configured command for real.
     match &primary {
-        Some((_, entry)) => checks.push(check_handshake(entry)),
+        Some((_, entry)) => checks.push(check_handshake(entry, store_opened_in)),
         // No entry and none expected: nothing to spawn, and nothing wrong.
         None if !mcp_delivery => checks.push(Check::skip(
             "handshake",
@@ -604,8 +615,19 @@ fn run_capturing(bin: &Path, args: &[String], timeout: Duration) -> RunOutcome {
 // store + lock
 // ---------------------------------------------------------------------------
 
-fn check_store_and_lock(db_dir: &Path) -> Vec<Check> {
+/// The store and lock checks, plus how long the store took to open.
+///
+/// The open time is not reported to the user — it is handed to the handshake
+/// check, which spawns a server that has to do the same open again. See
+/// [`handshake_deadline`].
+struct StoreChecks {
+    checks: Vec<Check>,
+    opened_in: Option<Duration>,
+}
+
+fn check_store_and_lock(db_dir: &Path) -> StoreChecks {
     let mut out = Vec::new();
+    let started = Instant::now();
     let store = GraphDb::open_with_options(
         db_dir,
         OpenOptions {
@@ -614,20 +636,33 @@ fn check_store_and_lock(db_dir: &Path) -> Vec<Check> {
             repair_wal: true,
         },
     );
+    // Measured whether or not the open succeeded: a slow *failing* open is
+    // still evidence about what the spawned server is in for.
+    let mut opened_in = started.elapsed();
     match store {
         Ok(db) => {
             let stats = db.stats();
             let stale = db.is_stale().unwrap_or(false);
             let floor = db.wal_horizon_floor();
             let total = db.wal_total_commits().unwrap_or(floor);
+            // A store that names no namespace is one implicit `default`
+            // namespace; saying "1 namespaces" on every single-tenant store
+            // would be noise, so the clause appears only once there is more
+            // than one — the same rule `format_stats` follows.
+            let namespaces = if stats.namespaces.len() > 1 {
+                format!(", {} namespaces", stats.namespaces.len())
+            } else {
+                String::new()
+            };
             out.push(Check::ok(
                 "store",
                 format!(
-                    "{} — {} nodes live ({} tombstoned), {} edges, history from commit {} of {}{}",
+                    "{} — {} nodes live ({} tombstoned), {} edges{}, history from commit {} of {}{}",
                     db_dir.display(),
                     stats.nodes_live,
                     stats.nodes_tombstoned,
                     stats.edges,
+                    namespaces,
                     floor,
                     total,
                     if stale {
@@ -642,8 +677,15 @@ fn check_store_and_lock(db_dir: &Path) -> Vec<Check> {
             // Briefly try to take the write lock. Success means nobody else
             // holds it; the handle is dropped immediately, before this
             // function returns, so the lock is never held past the check.
+            //
+            // Timed as well as the read-only open above, and the larger of the
+            // two is what the handshake budgets from: this one is the
+            // read-write shape the MCP server itself uses, and the read-only
+            // open before it may do less work.
+            let write_started = Instant::now();
             match GraphDb::open_with_options(db_dir, OpenOptions::default()) {
                 Ok(handle) => {
+                    opened_in = opened_in.max(write_started.elapsed());
                     drop(handle);
                     out.push(Check::ok(
                         "lock",
@@ -664,7 +706,10 @@ fn check_store_and_lock(db_dir: &Path) -> Vec<Check> {
             Some(format!("mushroomdb verify {}", db_dir.display())),
         )),
     }
-    out
+    StoreChecks {
+        checks: out,
+        opened_in: Some(opened_in),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -869,7 +914,57 @@ fn check_scope_conflict(project_root: &Path, home: &Path, scope: Scope) -> Check
 // self-handshake
 // ---------------------------------------------------------------------------
 
+/// Floor for the handshake deadline. Enough for any store that opens quickly,
+/// and short enough that a genuinely broken server is reported rather than
+/// waited on.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Slack added on top of twice the observed open, to cover process spawn,
+/// dynamic linking and the two round trips the handshake itself costs.
+const HANDSHAKE_SPAWN_SLACK: Duration = Duration::from_secs(5);
+
+/// The clause appended to a failed handshake's fix hint when the store's own
+/// open is why the deadline was generous.
+///
+/// A server that must open a slow store before it can answer anything is not a
+/// broken server, and saying so saves the reader from debugging a command that
+/// is fine. The trigger is that [`handshake_deadline`] was *raised above its
+/// floor* — exactly the case where the store's cost is the thing worth naming —
+/// rather than the open alone crossing ten seconds, which would stay silent on
+/// the five-second opens that already scale the deadline past the floor.
+fn slow_store_hint(store_opened_in: Option<Duration>, deadline: Duration) -> String {
+    match store_opened_in {
+        Some(open) if deadline > HANDSHAKE_TIMEOUT => format!(
+            "; the store took {:.1}s to open here, so the server was already given \
+             {:.1}s and still did not answer — if the command is right, run \
+             `mushroomdb build-index` and `mushroomdb snapshot` to make the open cheap",
+            open.as_secs_f64(),
+            deadline.as_secs_f64()
+        ),
+        _ => String::new(),
+    }
+}
+
+/// How long to wait for the spawned server's `initialize` and `tools/list`.
+///
+/// The server has to open the same store `doctor` just opened, and that open is
+/// not always cheap: a WAL-only store replays its vector rules' index builds
+/// every time, which on a debug build of a 200-vector 1,536-dimension corpus is
+/// over ten seconds. A fixed 10 s deadline therefore failed the handshake on a
+/// store whose *own* open, moments earlier, had taken longer than that without
+/// anyone calling it a fault.
+///
+/// So the deadline follows the evidence: at least [`HANDSHAKE_TIMEOUT`], and
+/// otherwise twice the open `doctor` measured plus [`HANDSHAKE_SPAWN_SLACK`].
+/// Twice, because the spawned server opens the store on a cold page cache while
+/// `doctor`'s own open has just warmed it, and because a debug build's timing
+/// varies more than a release one's.
+fn handshake_deadline(store_opened_in: Option<Duration>) -> Duration {
+    match store_opened_in {
+        Some(open) => HANDSHAKE_TIMEOUT.max(open * 2 + HANDSHAKE_SPAWN_SLACK),
+        None => HANDSHAKE_TIMEOUT,
+    }
+}
 
 struct HandshakeOk {
     version: String,
@@ -878,8 +973,9 @@ struct HandshakeOk {
     task_tool: String,
 }
 
-fn check_handshake(entry: &ConfigEntry) -> Check {
-    match self_handshake(&entry.command, &entry.args) {
+fn check_handshake(entry: &ConfigEntry, store_opened_in: Option<Duration>) -> Check {
+    let deadline = handshake_deadline(store_opened_in);
+    match self_handshake(&entry.command, &entry.args, deadline) {
         Ok(HandshakeOk {
             version,
             tool_count,
@@ -896,9 +992,10 @@ fn check_handshake(entry: &ConfigEntry) -> Check {
             msg,
             Some(format!(
                 "verify `{} {}` runs mushroomdb's MCP server, or re-run `mushroomdb install` \
-                 to rewrite the command",
+                 to rewrite the command{}",
                 entry.command,
-                entry.args.join(" ")
+                entry.args.join(" "),
+                slow_store_hint(store_opened_in, deadline)
             )),
         ),
     }
@@ -907,10 +1004,15 @@ fn check_handshake(entry: &ConfigEntry) -> Check {
 /// Spawn `command args…`, speak one `initialize` and one `tools/list` request
 /// over its stdio, and check the response.
 ///
-/// Reads with a 10s deadline; closes stdin once both responses are in (or the
-/// deadline passes) so a well-behaved server exits on EOF, then reaps it with
-/// a short bounded wait — a broken server never hangs `doctor`.
-fn self_handshake(command: &str, args: &[String]) -> Result<HandshakeOk, String> {
+/// Reads with `deadline` (see [`handshake_deadline`]); closes stdin once both
+/// responses are in (or the deadline passes) so a well-behaved server exits on
+/// EOF, then reaps it with a short bounded wait — a broken server never hangs
+/// `doctor`.
+fn self_handshake(
+    command: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<HandshakeOk, String> {
     let mut child = Command::new(command)
         .args(args)
         .stdin(Stdio::piped())
@@ -949,7 +1051,7 @@ fn self_handshake(command: &str, args: &[String]) -> Result<HandshakeOk, String>
     let mut init_resp: Option<Js> = None;
     let mut list_resp: Option<Js> = None;
     if sent.is_ok() {
-        let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+        let deadline = Instant::now() + timeout;
         while (init_resp.is_none() || list_resp.is_none()) && Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
@@ -988,12 +1090,10 @@ fn self_handshake(command: &str, args: &[String]) -> Result<HandshakeOk, String>
     if sent.is_err() {
         return Err(format!("cannot write to `{command}`'s stdin"));
     }
-    let init = init_resp.ok_or_else(|| {
-        format!("`{command}` did not answer `initialize` within {HANDSHAKE_TIMEOUT:?}")
-    })?;
-    let list = list_resp.ok_or_else(|| {
-        format!("`{command}` did not answer `tools/list` within {HANDSHAKE_TIMEOUT:?}")
-    })?;
+    let init = init_resp
+        .ok_or_else(|| format!("`{command}` did not answer `initialize` within {timeout:?}"))?;
+    let list = list_resp
+        .ok_or_else(|| format!("`{command}` did not answer `tools/list` within {timeout:?}"))?;
 
     let version = init["result"]["serverInfo"]["version"]
         .as_str()
@@ -1036,3 +1136,93 @@ fn self_handshake(command: &str, args: &[String]) -> Result<HandshakeOk, String>
 /// particular name would fail `doctor` on exactly the stores the other surface
 /// exists for.
 const TASK_PATH_TOOLS: [&str; 2] = ["explore", "explain_association"];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The deadline never drops below its floor, and it scales with a slow open.
+    ///
+    /// The floor is what keeps a broken server from being waited on: a store
+    /// that opens in milliseconds gives `2 × open + 5 s` well under 10 s, and
+    /// the handshake must still get the full 10 s. Above the floor the evidence
+    /// wins, because a server that has to repeat a 13 s open cannot answer in
+    /// 10 s however healthy it is.
+    #[test]
+    fn the_handshake_deadline_holds_its_floor_and_scales() {
+        // No measurement at all — the store check did not run, or there is no
+        // store. Nothing to scale from, so the floor stands.
+        assert_eq!(handshake_deadline(None), HANDSHAKE_TIMEOUT);
+
+        // Fast opens: 2 × open + 5 s is below the floor, so the floor holds.
+        for ms in [0, 1, 50, 500, 2_400] {
+            assert_eq!(
+                handshake_deadline(Some(Duration::from_millis(ms))),
+                HANDSHAKE_TIMEOUT,
+                "a {ms}ms open must not shorten the deadline below its floor"
+            );
+        }
+
+        // 2.5 s is the crossover: 2 × 2.5 + 5 == 10 s exactly.
+        assert_eq!(
+            handshake_deadline(Some(Duration::from_millis(2_500))),
+            HANDSHAKE_TIMEOUT
+        );
+
+        // Above it the measurement decides.
+        assert_eq!(
+            handshake_deadline(Some(Duration::from_secs(3))),
+            Duration::from_secs(11)
+        );
+        // The CI failure this exists for: a 13.3 s open got a 10 s deadline.
+        let ci = Duration::from_millis(13_300);
+        let got = handshake_deadline(Some(ci));
+        assert_eq!(got, Duration::from_millis(31_600));
+        assert!(
+            got > ci,
+            "the deadline must exceed the open it was measured from"
+        );
+
+        // Monotonic: a slower open never buys a shorter deadline.
+        let mut prev = handshake_deadline(Some(Duration::ZERO));
+        for s in 1..60 {
+            let next = handshake_deadline(Some(Duration::from_secs(s)));
+            assert!(next >= prev, "deadline shrank at a {s}s open");
+            prev = next;
+        }
+    }
+
+    /// The fix hint names the store's cost exactly when that cost is why the
+    /// deadline was raised — and says nothing at the floor, where the store is
+    /// not the explanation and mentioning it would send the reader the wrong
+    /// way.
+    #[test]
+    fn the_fix_hint_names_a_slow_store_only_when_it_is_the_reason() {
+        // At the floor: silent, whether or not an open was measured.
+        assert_eq!(slow_store_hint(None, HANDSHAKE_TIMEOUT), "");
+        assert_eq!(
+            slow_store_hint(Some(Duration::from_millis(80)), HANDSHAKE_TIMEOUT),
+            ""
+        );
+        // Never speaks without a measurement, even on a raised deadline.
+        assert_eq!(slow_store_hint(None, Duration::from_secs(40)), "");
+
+        // Raised: the hint carries both numbers and the two commands that fix
+        // a slow open.
+        let open = Duration::from_millis(13_300);
+        let hint = slow_store_hint(Some(open), handshake_deadline(Some(open)));
+        assert!(hint.contains("13.3s"), "the open time: {hint}");
+        assert!(hint.contains("31.6s"), "the deadline it bought: {hint}");
+        assert!(hint.contains("build-index"), "{hint}");
+        assert!(hint.contains("snapshot"), "{hint}");
+
+        // A 4.8s open already raises the deadline past the floor, and that is
+        // the case the first spelling of this hint missed.
+        let modest = Duration::from_millis(4_800);
+        assert!(handshake_deadline(Some(modest)) > HANDSHAKE_TIMEOUT);
+        assert!(
+            slow_store_hint(Some(modest), handshake_deadline(Some(modest))).contains("4.8s"),
+            "an open below ten seconds can still be the reason"
+        );
+    }
+}
