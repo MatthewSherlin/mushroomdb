@@ -1945,7 +1945,27 @@ fn an_interrupted_build_resumes_on_reopen() {
 
     let mut db = GraphDb::open(&dir).unwrap();
     assert_eq!(edges_of(&db, "sim"), 0, "the partial build derived nothing");
+
+    // A reopen does **not** resume the slicing: the open-time node scan adopts
+    // the persisted graph and then inserts every id the blob lacked, in one
+    // unsliced pass, and only the backfill is left to the slice loop. That is
+    // the behaviour the plan allowed and it is what `rules.md` and the CHANGELOG
+    // have to say out loud, because the pass is O(remaining vectors) under the
+    // write lock — on a 50,000-vector corpus killed after its first slice it is
+    // the whole build in one blocking call.
+    //
+    // Pinned here rather than described only in prose: 172 ids per side are
+    // missing from a 300-vector corpus snapshotted two slices in, and both
+    // sides are filled, so the count is far above the 64 a resumed slice would
+    // have done.
+    core_rules::hnsw_insert_count_reset();
     core_rules::with_hnsw_build_batch(64, || while !db.pump_index_build().unwrap().is_empty() {});
+    let inserts = core_rules::hnsw_insert_count();
+    assert!(
+        inserts > 64,
+        "a reopen is documented to finish the index inline, not to resume slicing; \
+         {inserts} inserts would mean it now slices and the docs need changing"
+    );
     assert!(building_of(&db, "sim").is_none());
     assert_eq!(
         edge_set(&db, "SIM", 300),

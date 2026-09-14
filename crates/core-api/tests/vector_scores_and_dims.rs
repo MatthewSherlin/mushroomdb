@@ -333,3 +333,101 @@ fn two_strays_ahead_of_the_corpus_fall_back_to_the_scan() {
         "and the scan answers exactly: {hits:?}"
     );
 }
+
+/// A refused vector survives a snapshot and a reopen as a refusal.
+///
+/// `dim_mismatches` is `#[serde(skip)]`, so the reopened index starts its
+/// counter at zero. What makes that safe is not the counter but the open-time
+/// node scan: it re-offers every id the adopted graph lacks, the stray is
+/// refused again, and the index declines the fast path exactly as it did before
+/// the snapshot. Nothing at the store level pinned that, so this test does —
+/// the eager path (a WAL to replay) and the clean-open path (a write after a
+/// snapshot with no WAL) both.
+#[test]
+fn a_refused_vector_is_still_refused_after_a_reopen() {
+    let dir = tmp("dims-reopen-refused");
+    let want = {
+        // Two strays ahead of the corpus: past what a single-sample re-election
+        // can fix, so these are genuine refusals rather than evictions.
+        let mut db = seed(&dir, Some(true), &[0, 0]);
+        let want = edge_map(&db);
+        db.snapshot().unwrap();
+        drop(db);
+        want
+    };
+
+    // Clean open, before any write: the lazily-decoded copy must not claim the
+    // fast path either.
+    let db = GraphDb::open(&dir).unwrap();
+    core_rules::hnsw_search_count_reset();
+    let hits = db.find_similar_vector("emb", Some("Doc"), &[0.98, 0.2], 5, 1.0);
+    assert_eq!(
+        core_rules::hnsw_search_count(),
+        0,
+        "a reopened index holding a refusal must not be asked"
+    );
+    assert_eq!(
+        hits.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["d0", "d5"],
+        "and the scan answers exactly: {hits:?}"
+    );
+    drop(db);
+
+    // And a write, which populates the live indexes through the node scan,
+    // leaves the same state rather than a graph that has forgotten the stray.
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Other", "o", vec![("v".into(), Value::Int(1))])
+        .unwrap();
+    assert_eq!(edge_map(&db), want, "the edge set must survive the reopen");
+    core_rules::hnsw_search_count_reset();
+    let hits = db.find_similar_vector("emb", Some("Doc"), &[0.98, 0.2], 5, 1.0);
+    assert_eq!(
+        core_rules::hnsw_search_count(),
+        0,
+        "after the write the live index must still decline the fast path"
+    );
+    assert_eq!(
+        hits.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["d0", "d5"]
+    );
+}
+
+/// A parked vector survives a snapshot and a reopen without losing an edge.
+///
+/// `parked` is `#[serde(skip)]` too, and the order `[real, stray, real, …]` is
+/// the one that exercises it: the stray evicts `d0`, `d1` re-elects the real
+/// dimension and revives it. After a reopen the list is empty, so what has to
+/// hold is that the re-offered vectors rebuild the same state — the same edges,
+/// and `d0` still found at `min = 1.0`.
+#[test]
+fn a_parked_vector_survives_a_reopen() {
+    let dir = tmp("dims-reopen-parked");
+    let want = {
+        let mut db = seed(&dir, Some(true), &[1]);
+        let want = edge_map(&db);
+        db.snapshot().unwrap();
+        drop(db);
+        want
+    };
+
+    let db = GraphDb::open(&dir).unwrap();
+    // `d0` is the vector the stray evicted and `d1`'s re-election revived; it
+    // and `d5` are the exact duplicate pair, so losing the parked copy loses
+    // half of it.
+    let hits = db.find_similar_vector("emb", Some("Doc"), &[0.98, 0.2], 5, 1.0);
+    assert_eq!(
+        hits.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["d0", "d5"],
+        "the exact duplicate pair must survive the reopen: {hits:?}"
+    );
+    drop(db);
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Other", "o", vec![("v".into(), Value::Int(1))])
+        .unwrap();
+    assert_eq!(
+        edge_map(&db),
+        want,
+        "a reopen must not lose the edge the parked vector earned"
+    );
+}

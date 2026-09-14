@@ -2035,4 +2035,49 @@ mod wire_pins {
         let bytes = bincode::serialize(&scoped).unwrap();
         assert_eq!(decode_rule_def(&bytes).unwrap(), scoped);
     }
+
+    /// **0.6.5 cannot read a rule 0.6.6 wrote, and that means it cannot open
+    /// the store at all.**
+    ///
+    /// The `namespace` append is positional, so 0.6.6's encoding carries one
+    /// trailing byte that 0.6.5's decoder — which knows only the eleven- and
+    /// eight-field shapes, and also rejects trailing bytes — errors on twice.
+    /// Both of its load sites map that to `GraphError::Corrupt`, so the open
+    /// fails rather than degrading. Every rule 0.6.6 snapshots is re-encoded
+    /// this way, including rules 0.6.5 itself created, and a store with a vector
+    /// index has a rule by definition.
+    ///
+    /// This is the test behind the CHANGELOG's BREAKING line: the downgrade is a
+    /// refused open, not a slower read, and an operator planning a rollback has
+    /// to hear that from the release notes rather than from the error.
+    #[test]
+    fn a_0_6_5_decoder_cannot_read_a_0_6_6_rule() {
+        use bincode::Options as _;
+        // Exactly what 0.6.5 does: the two shapes it knows, fixint, trailing
+        // bytes rejected.
+        let opts = bincode::options()
+            .with_fixint_encoding()
+            .with_no_limit()
+            .reject_trailing_bytes();
+
+        for namespace in [None, Some("tenant-a".to_string())] {
+            let def = RuleDef {
+                namespace,
+                ..base_current()
+            };
+            let bytes = bincode::serialize(&def).unwrap();
+
+            assert!(
+                opts.deserialize::<LegacyRuleDefNoNamespace>(&bytes)
+                    .is_err(),
+                "0.6.5's eleven-field decoder must refuse 0.6.6 bytes"
+            );
+            assert!(
+                opts.deserialize::<LegacyRuleDefNoVia>(&bytes).is_err(),
+                "0.6.5's eight-field decoder must refuse them too"
+            );
+            // And this build still reads them, which is the forward direction.
+            assert_eq!(decode_rule_def(&bytes).unwrap(), def);
+        }
+    }
 }
