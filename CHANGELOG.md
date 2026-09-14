@@ -1,5 +1,139 @@
 # Changelog
 
+## v0.6.6 — the scale release
+
+The vector index was the ceiling. Opening a store rebuilt the HNSW graph it had just loaded, a
+changed embedding cost a walk of the whole graph, `create_rule` over a large corpus held its commit
+for the length of the build, and an exact `VectorSimilar` rule still compared every pair. This
+release takes those four in turn and then replaces the distance kernel underneath them, which is
+where most of the speed comes from: a 50,000-vector index now builds, where before it was not
+reached at all. It also adds namespaces, so one store can hold several tenants and a role can be
+bound to theirs. Every number below comes from a benchmark or a gate this release commits.
+
+#### BREAKING
+
+- **The persisted vector index is blob version 3 (`MHNS`), and the upgrade is one way.** A 0.6.6
+  binary reads version 1, 2 and 3 blobs and writes version 3. A 0.6.5 binary meeting a version-3
+  blob refuses it and falls back to a full scan, so its answers stay correct and get slower. The
+  snapshot format itself is untouched — see "Not in this release".
+- **`create_rule` on a large vector corpus returns before its edges exist.** A rule whose vector
+  index does not fit in one build slice is installed, reports its progress through `stats`
+  (`building: {indexed, total}`) and `POST /rules` (**202 Accepted**), and derives its edges in a
+  second commit once the index is whole — never a partial set. A write advances the build,
+  `mushroomdb serve` advances it once a second, and `mushroomdb build-index <db>` drives it to
+  completion. A corpus at or below the slice size behaves exactly as it did before.
+- **An exact `VectorSimilar` rule finds its candidates through the vector index.** Its scores and
+  weights are still computed exactly, on those candidates; the rule's `min` is the beam's stopping
+  rule, and a beam that cannot prove that floor widens until it can or falls back to the exhaustive
+  candidate set. What changes is that the candidate set is no longer provably every pair: the
+  committed gate `exact_vector_rule_recall_5k` asserts recall ≥ 0.98 against a brute-force ground
+  truth at 5,000 vectors, and measures 1.0. `MUSHROOMDB_VECTOR_SCAN=1` restores the full scan and
+  the guarantee it carries, at O(n²).
+- **`roles.json` version 4** is written when any role carries `namespaces`. An older binary refuses
+  a version-4 file and denies every role, which is the safe direction but is a hard stop — roll
+  roles forward only once every reader is on 0.6.6.
+- **`ns` is a reserved property, and it is write-once.** A node's namespace is fixed at insert: a
+  later write naming a different `ns`, and a property delete that would strip it, are both refused.
+  A single write may name `ns` at most once — with two entries the write path and the authorization
+  path could read different namespaces from the same list. Absent means the default namespace, so
+  an existing store is one namespace and nothing is rewritten.
+- **`MERGE` cannot create into a namespace, for any caller.** A MERGE pattern carries only its
+  identifying property, so its create arm always lands in the default namespace — which means a
+  role bound to namespaces cannot MERGE-create at all. Use `CREATE`, `insert_node` or `ingest`,
+  which take `ns` like any other property.
+- **An embedding whose dimension differs from the ones an index already holds is no longer
+  indexed**, and the first skip per index is logged. Such a pair was previously compared over the
+  shorter of the two vectors, which produced a meaningless similarity. An index that skipped a
+  vector, or whose dimension is not the query's, stops claiming the fast path: the rule falls back
+  to its full scan and `find_similar_vector` to brute force, so a mixed-dimension corpus costs
+  speed, never results. Rules with `approximate: false` are unaffected. Re-embed a collection with
+  a single model.
+
+#### Added
+
+- **Namespaces.** A node carries a reserved `ns` property, set at insert and immutable afterwards;
+  absent means the default namespace, so an existing store is one namespace and nothing is
+  rewritten. A role may be bound to namespaces (`"namespaces": ["tenant-a"]`) and then sees only
+  those — intersected with its labels, its keys and its `visible_where`. A rule is scoped
+  (`"namespace": "tenant-a"`) or global; a scoped rule's edges never cross, and a user-written edge
+  across a boundary is refused. `query`, `/query`, the CLI and Python take a `namespace`; `stats`
+  reports per-namespace node counts; `as_of` composes with all of it.
+- **`mushroomdb build-index <db-dir> [--rule <name>]`** — finish a deferred vector-index build
+  before traffic arrives.
+- **`MUSHROOMDB_HNSW_PARAMS`** — `m,m0,ef_construction,ef_search[,prune]`, read once per process,
+  for an operator who has measured their own corpus. The shipped defaults and the measurements that
+  chose them are in [`docs/site/rules.md`](docs/site/rules.md).
+
+#### Changed
+
+- **The index stores each vector as `f32` in one contiguous slab and sums the dot product in eight
+  independent accumulators.** This is where the release's speed is. On the committed scale
+  benchmark, building a 1,536-dimension index takes 8.5 s at 2,000 vectors, 132 s at 10,000 and
+  1,018 s at 50,000, against 49.6 s, 731 s and a run that was never reached. The index holds 6,663
+  bytes per vector instead of 12,807 — 48 % less — and the persisted blob halves with it. Recall is
+  unchanged on all six gates. The store's own `f64` copy of every vector is untouched; only the
+  index's copy is narrowed, and every similarity a caller is shown is still computed from the `f64`
+  properties.
+
+#### Fixed
+
+- **Opening a store no longer rebuilds the vector index it just loaded.** The open-time scan built
+  a whole HNSW graph and then threw it away in favour of the persisted one. It now adopts the
+  persisted graph and inserts only the nodes written after the snapshot.
+- **A changed embedding no longer costs a scan of the whole index.** Removal walked every node in
+  the graph to strip back-references; a reverse-adjacency map makes it O(in-degree). Measured on
+  the committed benchmark: one re-embed costs 2.4 ms at 2,000 vectors, 6.6 ms at 10,000 and 14.3 ms
+  at 50,000, against 14.1 ms and 30.7 ms at the first two sizes before this release.
+- **The HNSW §3.5 diverse-neighbour heuristic replaces the nearest-M prune**, which is what the
+  raised `M₀` was standing in for. Parameters are now `HnswParams` with documented defaults and a
+  `MUSHROOMDB_HNSW_PARAMS` override; the three recall gates already in CI pass unchanged, and four
+  more join them. It costs build time at a fixed corpus size — 5,000 × 1,536 dimensions takes
+  43.3 s with it against 9.6 s with the nearest-M prune — and the cheaper prune misses the 0.90
+  recall floor on a clustered corpus at 0.8581, which is why the diverse one is the default and the
+  other is an opt-out with its cost recorded beside it.
+- **`find_similar` reports an exact similarity again.** `find_similar_vector`,
+  `find_similar_vector_masked` and the MCP `find_similar` tool re-score every candidate the index
+  returns against the `f64` property vectors, so `min = 1.0` finds an exact duplicate and the index
+  and brute-force paths return the same scores in the same order. Equal scores are broken by node
+  key.
+
+#### Known limits
+
+- **`stats` over MCP answers with every namespace name unless it is asked to narrow.** The MCP
+  server is a cooperative surface with no auth, so `stats` reports the full roster by default and
+  narrows only when given `role` or `namespace`; the store-wide counts beside the roster are
+  unchanged either way. A tenant that must not learn the other tenants' names belongs behind
+  `serve --role-token`, where HTTP `GET /stats` is closed to role tokens entirely.
+- **A refused or parked vector is not persisted as such.** `dim_mismatches` and the parked list are
+  rebuilt-from-nothing on reopen, so an index that refused a vector, was snapshotted and reopened
+  comes back claiming the fast path while still missing that vector. Rules are unaffected — an
+  unequal-length pair is never an edge — and `find_similar` omits the node rather than scoring it
+  wrongly.
+- **`MERGE` has no way to name a namespace.** See BREAKING above; a role bound to namespaces must
+  use `CREATE`, `insert_node` or `ingest` to create.
+- **No test ties a documented refusal string to the code that emits it.** The namespace work adds
+  about ten quoted refusal texts to `masks.md` and `api.md`, and `scripts/check-claims.sh` does not
+  cover them, so a reworded error and its documentation can drift apart.
+- **`docs/site/masks.md` and `docs/site/service.md` are not in the LLM bundle.**
+  `scripts/gen-llms-full.sh` links both pages rather than concatenating them, so the namespace
+  composition rules and the deployment page do not reach `llms-full.txt`. The same statements reach
+  it through `api.md` and `mcp.md`.
+- **Role-token `as_of` still replays the WAL under the store's read guard**, unchanged from 0.6.5,
+  and the namespace leg composes into that same path. There is no rate limit.
+
+#### Not in this release
+
+No snapshot format change: V9 stays V9, and the `format-compat` contract (V5…V9 open, migrate and
+preserve data) is untouched. The vector index rides the opaque section it already rode, with its
+own magic and version inside it; a 0.6.5 binary meeting a 0.6.6 index falls back to a full scan
+rather than reading it wrongly.
+
+The scale benchmark's two growth assertions stay red, deliberately and unedited: the build is
+15.5× per 5× of vectors against a ceiling of 8×, and 50,000 vectors take 1,018 s against a ceiling
+of 300 s. A constant-factor kernel cancels out of a ratio, so closing them means cutting the
+distance-evaluation count itself, which changes the graph and therefore the recall table. That is
+0.7's problem, and the benchmark says so rather than being loosened.
+
 ## v0.6.5 — the knowledge-base release
 
 A team running mushroomdb as a sidecar graph beside a document knowledge base wrote down what

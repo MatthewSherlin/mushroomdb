@@ -26,15 +26,15 @@ required-features = ["mp-test"]
 mp-test = []
 
 [dependencies]
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.5" }
-core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.6.5" }
-core-query = { package = "mushroomdb-query", path = "../core-query", version = "0.6.5" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.6" }
+core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.6.6" }
+core-query = { package = "mushroomdb-query", path = "../core-query", version = "0.6.6" }
 bincode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.5" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.6" }
 # `test-hooks` exposes `core_rules::hnsw_insert_count`, which
 # `tests/rules.rs::reopening_does_not_rebuild_the_vector_index` uses to assert
 # that an open adopts the persisted graph instead of inserting into a new one,
@@ -42,7 +42,7 @@ core-storage = { package = "mushroomdb-storage", path = "../core-storage", versi
 # `tests/hnsw_open.rs::clean_open_first_query_is_served_by_the_index` uses to
 # assert the first query on a clean open is answered by the persisted graph
 # rather than by the (equally correct, but O(n)) brute-force fallback.
-core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.6.5", features = [
+core-rules = { package = "mushroomdb-rules", path = "../core-rules", version = "0.6.6", features = [
     "test-hooks",
 ] }
 # Path-only (no version): sim-harness is publish=false; a version key makes
