@@ -632,9 +632,9 @@ fn run_serve(
                     // Under the *read* lock first: a store with nothing
                     // building must not pay a write lock once a second, and an
                     // idle server must not force the first-write index scan
-                    // just because it has been running for a second. A build a
-                    // reopen has to recognise is registered by the first
-                    // write's index population, or by `mushroomdb build-index`.
+                    // just because it has been running for a second. Open
+                    // registers a build a snapshot cut short, so a restarted
+                    // serve sees it here without a write.
                     if db_build.read().builds_in_progress().is_empty() {
                         continue;
                     }

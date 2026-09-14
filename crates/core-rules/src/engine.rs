@@ -212,7 +212,8 @@ type LazyHnswMap = BTreeMap<String, (Option<HnswIndex>, Option<HnswIndex>)>;
 /// `indexed == total` means the graph is whole and only the backfill is
 /// outstanding — the rule still derives no edges until it disappears from
 /// [`RuleEngine::builds_in_progress`]. Never persisted: a reopen re-derives it
-/// from the adopted graph and the node scan.
+/// from a blob with `complete == false`, or from the adopted graph and the
+/// node scan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildProgress {
     pub rule: String,
@@ -293,9 +294,9 @@ pub struct RuleEngine {
     /// rule name. A rule listed here derives **no** edges: its backfill runs as
     /// one commit once the graph is whole, so there is never a partial edge set.
     ///
-    /// Never persisted. A reopen re-derives an entry for any rule whose
-    /// persisted graph turned out to be shorter than the node scan
-    /// (`reindex_all_load_state`), which is exactly the mid-build case.
+    /// Never persisted. A reopen re-derives an entry from a blob whose
+    /// `complete` flag is false (clean open) or from a persisted graph shorter
+    /// than the node scan (`reindex_all_load_state`, WAL-present open).
     pending_builds: BTreeMap<String, PendingBuild>,
     /// Rules whose sliced build has just finished and whose backfill has not
     /// run yet. Drained by `rebuild_inner`, which carries the finished graph
@@ -2666,15 +2667,8 @@ impl RuleEngine {
             let total = src_now
                 .map_or(0, |s| s.len())
                 .max(dst_now.map_or(0, |s| s.len())) as u64;
-            self.pending_builds.insert(
-                name.clone(),
-                PendingBuild {
-                    indexed: total,
-                    total,
-                    cursor: ids.len() as u32,
-                    limit: ids.len() as u32,
-                },
-            );
+            let n = ids.len() as u32;
+            self.remember_pending_build(name.clone(), total, total, n, n);
         }
 
         // Any blob naming a rule that is not approximate here (or not a rule at
@@ -2735,6 +2729,121 @@ impl RuleEngine {
             Some(ivf_bytes)
         };
         // indexes_populated remains false.
+    }
+
+    /// Register a sliced build a snapshot cut short, from blobs whose
+    /// `complete` flag is false.
+    ///
+    /// `pending_builds` is not persisted; the blob flag is. A clean open never
+    /// runs the node scan, so this is how `serve`'s ticker learns there is work
+    /// without waiting for a write.
+    ///
+    /// `extra` is the incomplete `(src, dst)` pair per rule, typically peeked
+    /// from a V8 mmap without copying complete graphs. When it is empty, the
+    /// retained blobs from [`Self::store_snapshot_state`] are inspected
+    /// instead (V5–V7, or a caller that already loaded the section).
+    ///
+    /// No-op when indexes are already populated: the scan's `cut_short` path
+    /// owns that case and uses the same [`PendingBuild`] representation.
+    pub fn register_incomplete_hnsw_builds(
+        &mut self,
+        extra: &BTreeMap<String, (Vec<u8>, Vec<u8>)>,
+        g: &GraphMut<'_>,
+    ) {
+        if self.indexes_populated {
+            return;
+        }
+        let retained = self
+            .retained_hnsw_blobs
+            .lock()
+            .expect("retained_hnsw_blobs lock poisoned");
+        if extra.is_empty() && retained.is_empty() {
+            return;
+        }
+        let names: Vec<String> = extra
+            .keys()
+            .cloned()
+            .chain(retained.keys().filter(|n| !extra.contains_key(*n)).cloned())
+            .collect();
+        let mut found: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+        for name in names {
+            if !self.rules.get(&name).is_some_and(uses_hnsw) {
+                continue;
+            }
+            let Some((src, dst)) = extra.get(&name).or_else(|| retained.get(&name)) else {
+                continue;
+            };
+            if crate::hnsw::hnsw_blob_complete(src) != Some(false)
+                && crate::hnsw::hnsw_blob_complete(dst) != Some(false)
+            {
+                continue;
+            }
+            found.push((name, src.clone(), dst.clone()));
+        }
+        drop(retained);
+        for (name, src, dst) in found {
+            self.register_one_incomplete_build(&name, &src, &dst, g);
+        }
+    }
+
+    fn register_one_incomplete_build(
+        &mut self,
+        name: &str,
+        src_blob: &[u8],
+        dst_blob: &[u8],
+        g: &GraphMut<'_>,
+    ) {
+        let src = if src_blob.is_empty() {
+            None
+        } else {
+            crate::hnsw::decode_hnsw_blob(src_blob).ok()
+        };
+        let dst = if dst_blob.is_empty() {
+            None
+        } else {
+            crate::hnsw::decode_hnsw_blob(dst_blob).ok()
+        };
+        if src.is_none() && dst.is_none() {
+            return;
+        }
+        let indexed = src
+            .as_ref()
+            .map(|h| h.len())
+            .unwrap_or(0)
+            .max(dst.as_ref().map(|h| h.len()).unwrap_or(0)) as u64;
+        let Some(def) = self.rules.get(name).cloned() else {
+            return;
+        };
+        let total = hnsw_build_total(&def, g).max(indexed);
+        let limit = g.ids.len() as u32;
+        let cursor = src
+            .iter()
+            .chain(dst.iter())
+            .filter_map(|h| h.node_ids().iter().next_back().copied())
+            .max()
+            .map(|id| id.saturating_add(1))
+            .unwrap_or(0)
+            .min(limit);
+        self.remember_pending_build(name.to_string(), indexed, total, cursor, limit);
+    }
+
+    fn remember_pending_build(
+        &mut self,
+        name: String,
+        indexed: u64,
+        total: u64,
+        cursor: u32,
+        limit: u32,
+    ) {
+        self.pending_builds.insert(
+            name,
+            PendingBuild {
+                indexed,
+                total,
+                cursor,
+                limit,
+            },
+        );
     }
 
     /// Store raw rkyv provenance bytes retained from a V8 snapshot.
@@ -3250,15 +3359,7 @@ impl RuleEngine {
         }
 
         if deferred {
-            self.pending_builds.insert(
-                name.clone(),
-                PendingBuild {
-                    indexed: 0,
-                    total: build_total,
-                    cursor: 0,
-                    limit: n_total,
-                },
-            );
+            self.remember_pending_build(name.clone(), 0, build_total, 0, n_total);
             let (inserted, cursor) = self.run_build_slice(&name, &def, 0, n_total, batch, g);
             let entry = self.pending_builds.get_mut(&name).expect("just inserted");
             entry.indexed = inserted;

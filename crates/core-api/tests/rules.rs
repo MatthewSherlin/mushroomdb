@@ -1974,6 +1974,55 @@ fn an_interrupted_build_resumes_on_reopen() {
     );
 }
 
+/// A freshly opened handle registers a build a snapshot cut short, so
+/// `pump_index_build` advances it with no write — the same thing `serve`'s
+/// ticker needs to see under a read lock.
+#[test]
+fn a_reopened_store_pumps_its_outstanding_build_without_a_write() {
+    let (dir, mut db) = store_with_vectors("slice-reopen-pump", 300);
+    core_rules::with_hnsw_build_batch(64, || {
+        db.create_rule(slice_rule()).unwrap();
+        let p = building_of(&db, "sim").expect("create_rule defers above the slice");
+        assert_eq!(p.indexed, 64, "create_rule does exactly one slice inline");
+        assert_eq!(p.total, 300);
+        db.snapshot().unwrap();
+    });
+    drop(db);
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    let start =
+        building_of(&db, "sim").expect("a reopened store must register the unfinished build");
+    assert_eq!(start.total, 300);
+    assert_eq!(start.indexed, 64, "the persisted graph is one slice");
+    assert_eq!(edges_of(&db, "sim"), 0, "the partial build derived nothing");
+
+    let mut last = start.indexed;
+    let mut pumps = 0;
+    core_rules::with_hnsw_build_batch(64, || loop {
+        let outstanding = db.pump_index_build().unwrap();
+        pumps += 1;
+        assert!(pumps < 32, "the build never finished under pumps");
+        if outstanding.is_empty() {
+            break;
+        }
+        let now = outstanding
+            .iter()
+            .find(|b| b.rule == "sim")
+            .map(|b| b.indexed)
+            .expect("the outstanding build is this rule");
+        assert!(
+            now > last,
+            "each pump must advance the build; {last} -> {now}"
+        );
+        last = now;
+    });
+    assert!(building_of(&db, "sim").is_none());
+    assert!(
+        edges_of(&db, "sim") > 0,
+        "enough pumps must backfill the rule's edges"
+    );
+}
+
 /// A search during a deferred build answers exactly, not from the prefix the
 /// index has reached.
 ///

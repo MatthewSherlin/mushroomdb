@@ -543,9 +543,11 @@ and returns `202 Accepted` with the progress instead of `200`:
 
 The rule derives **no** edges until the build finishes — never a partial set —
 and `GET /stats` reports the same progress under `building`. Every write
-advances the build by one slice, `mushroomdb serve` advances it once a second,
-and `mushroomdb build-index <db-dir>` drives it to completion. At or below
-2,048 vectors nothing changes: one commit, `200`, edges present on return.
+advances the build by one slice, `mushroomdb serve` advances it once a second
+(including after a restart: open registers a build a snapshot cut short, so
+the ticker does not wait for a write), and `mushroomdb build-index <db-dir>`
+drives it to completion. At or below 2,048 vectors nothing changes: one
+commit, `200`, edges present on return.
 
 Predicate JSON shapes:
 

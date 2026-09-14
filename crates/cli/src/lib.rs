@@ -1633,10 +1633,9 @@ pub fn build_index_on(db: &mut GraphDb<RealFs>, rule: Option<&str>) -> Result<St
     // built" can be told apart in the empty case below.
     let known_rules: Vec<String> = db.stats().rules.iter().map(|r| r.name.clone()).collect();
 
-    // Pump before looking. A freshly opened handle holds no pending build until
-    // its indexes are populated, and populating them is what recognises a build
-    // a mid-build snapshot cut short — so asking `builds_in_progress()` first
-    // would answer "nothing to build" on exactly the store this command is for.
+    // Pump before looking. Open registers a build a snapshot cut short, but a
+    // resumed build can still be registered and finished inside a single call,
+    // so the outstanding list alone cannot show that anything happened.
     loop {
         let (finished, outstanding) = db.pump_index_build_reporting()?;
         for b in &outstanding {

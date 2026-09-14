@@ -2196,6 +2196,9 @@ impl<F: Fs> GraphDb<F> {
         // record as well; this pass is what makes a snapshot-only open right,
         // and it reads nothing on a store with no `ns` column.
         db.rebuild_node_ns();
+        // A mid-build snapshot's HNSW blob carries `complete == false`.
+        // Register it so `serve`'s ticker sees work without waiting for a write.
+        db.register_outstanding_index_builds();
         // Load roles sidecar. Missing file = no roles (Some(vec![])).
         // Corrupt/unparseable = poisoned (None); mask_for_role will fail-loud.
         db.roles = Self::load_roles_from_fs(&db.fs)?;
@@ -5860,6 +5863,8 @@ impl<F: Fs> GraphDb<F> {
     /// Rules whose vector index is still being built, in name order.
     ///
     /// The same list [`GraphDb::stats`] reports per rule in `building`.
+    /// After a clean open this includes a build a snapshot cut short, so
+    /// `serve`'s ticker can pump it without a write.
     pub fn builds_in_progress(&self) -> Vec<BuildProgress> {
         self.engine.builds_in_progress()
     }
@@ -5949,7 +5954,7 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Goes through the engine even with nothing pending when the indexes have
     /// not been populated yet: that call is what re-derives a build a mid-build
-    /// snapshot left behind, and a fresh handle has no other way to learn of it.
+    /// snapshot left behind if open did not already register it from the blob.
     fn pump_one_slice(&mut self) -> Vec<BuildProgress> {
         // The retained snapshot blobs — and the id count an interrupted build
         // is recognised against — arrive with the V8 base sections, which a
@@ -5972,6 +5977,59 @@ impl<F: Fs> GraphDb<F> {
         };
         self.engine = eng;
         finished
+    }
+
+    /// Register a sliced build a snapshot cut short, from blobs with
+    /// `complete == false`.
+    ///
+    /// Peeks the V8 mmap for incomplete entries without copying complete
+    /// graphs. V5–V7 already hold the blobs in the engine from restore.
+    fn register_outstanding_index_builds(&mut self) {
+        if self.engine.indexes_populated() {
+            return;
+        }
+        let extra = self.collect_incomplete_hnsw_blobs();
+        let mut eng = std::mem::take(&mut self.engine);
+        {
+            let gm = make_graph_mut(
+                &self.ids,
+                &mut self.syms,
+                &self.labels,
+                build_props_view(&self.props, &self.base),
+                &mut self.topo,
+                &self.base,
+                &mut self.edge_props,
+            );
+            eng.register_incomplete_hnsw_builds(&extra, &gm);
+        }
+        self.engine = eng;
+    }
+
+    /// Incomplete `(src, dst)` HNSW blobs from the V8 mmap, copied only when
+    /// `complete` is false. Empty when there is no mmap base (V5–V7 uses the
+    /// engine's retained map instead).
+    fn collect_incomplete_hnsw_blobs(&self) -> BTreeMap<String, (Vec<u8>, Vec<u8>)> {
+        let Some(base) = &self.base else {
+            return BTreeMap::new();
+        };
+        let Ok(archived) = base.hnsw_section() else {
+            return BTreeMap::new();
+        };
+        archived
+            .rules
+            .iter()
+            .filter_map(|e| {
+                let src = e.src_blob.as_slice();
+                let dst = e.dst_blob.as_slice();
+                if core_rules::hnsw::hnsw_blob_complete(src) == Some(false)
+                    || core_rules::hnsw::hnsw_blob_complete(dst) == Some(false)
+                {
+                    Some((e.name.as_str().to_string(), (src.to_vec(), dst.to_vec())))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// WAL-log rule deletion. Returns RuleNotFound if the rule does not exist.

@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.6.7 — the hardening patch
+
+#### Fixed
+
+- **`serve` advances an outstanding build after a restart without waiting for a
+  write.** A snapshot taken mid-build carries `complete == false` on its HNSW
+  blob; opening the store registers that rule so the 1-second ticker has
+  something to pump. Pinned by `a_reopened_store_pumps_its_outstanding_build_without_a_write`.
+
 ## v0.6.6 — the scale release
 
 The vector index was the ceiling. Opening a store rebuilt the HNSW graph it had just loaded, a

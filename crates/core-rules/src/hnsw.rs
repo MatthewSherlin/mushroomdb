@@ -1803,7 +1803,9 @@ pub struct HnswBlob {
     /// and serves `find_similar` from a fraction of the corpus with no signal.
     /// A `false` here makes [`HnswIndex::can_answer`] refuse, which sends every
     /// such query to the exhaustive scan until a write, `mushroomdb build-index`
-    /// or `serve`'s pump finishes the build.
+    /// or `serve`'s pump finishes the build. Open also reads it to register the
+    /// rule in `pending_builds`, so a restarted `serve` has something to pump
+    /// without waiting for a write.
     pub complete: bool,
 }
 
@@ -1882,6 +1884,36 @@ pub fn encode_hnsw_blob(index: &HnswIndex, complete: bool) -> Option<Vec<u8>> {
         complete,
     })
     .ok()
+}
+
+/// Whether a persisted blob was written as a finished graph.
+///
+/// v3 carries `complete` as its last field, so this peeks without decoding the
+/// index. v1 and v2 have no flag and were always whole. `None` if the bytes are
+/// empty or not a blob this build can read.
+pub fn hnsw_blob_complete(blob: &[u8]) -> Option<bool> {
+    if blob.is_empty() {
+        return None;
+    }
+    if blob.len() >= HNSW_BLOB_HEADER_LEN && blob[..4] == HNSW_BLOB_MAGIC {
+        let version = u16::from_le_bytes([blob[4], blob[5]]);
+        return match version {
+            3 => {
+                if blob.len() < HNSW_BLOB_HEADER_LEN + 1 {
+                    return None;
+                }
+                match blob[blob.len() - 1] {
+                    0 => Some(false),
+                    1 => Some(true),
+                    _ => None,
+                }
+            }
+            1 | 2 => Some(true),
+            _ => None,
+        };
+    }
+    // No wrapper: a 0.6.5 v1 blob. Sliced builds did not exist.
+    Some(true)
 }
 
 /// Decode a persisted HNSW blob.
@@ -3516,6 +3548,21 @@ mod tests {
         adopted.mark_complete();
         assert!(adopted.can_answer(24));
         assert_eq!(adopted.search(&vecs[3], 5), whole.search(&vecs[3], 5));
+    }
+
+    /// v3 writes `complete` as the last byte, so open can peek it without
+    /// decoding the graph.
+    #[test]
+    fn hnsw_blob_complete_peeks_the_last_byte() {
+        let (_vecs, idx) = blob_fixture();
+        let whole = encode_hnsw_blob(&idx, true).expect("encode");
+        let partial = encode_hnsw_blob(&idx, false).expect("encode");
+        assert_eq!(hnsw_blob_complete(&whole), Some(true));
+        assert_eq!(hnsw_blob_complete(&partial), Some(false));
+        assert_eq!(&whole[..whole.len() - 1], &partial[..partial.len() - 1]);
+        assert_eq!(whole[whole.len() - 1], 1);
+        assert_eq!(partial[partial.len() - 1], 0);
+        assert_eq!(hnsw_blob_complete(&[]), None);
     }
 
     /// A refused insert still replaces the id it was offered for.
