@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.6.8 — sidecar exact reads
+
+#### Added
+
+- **`pairwise_similar` returns exact cosine top-k among a caller key set.**
+  Self is excluded. Unknown keys, missing embeddings, zero-norm vectors and
+  wrong-dimension vectors are skipped; empty-after-skip is `[]`. Dimension is
+  the mode (ties pick the larger). Gram for n ≤ 4096, gemv through 8192 unique
+  keys, then a `QueryError` that names the cap. Never HNSW. Pinned by
+  `pairwise_similar_equals_naive_all_pairs`.
+- **`find_similar` takes additive `where=` and `exact=`.** `where` is a
+  property predicate (`field` plus `eq` or `in`); Python raises `ValueError`
+  on an invalid dict, Rust `QueryError`. `where=` or `exact=True` skip HNSW
+  and GEMM-brute the candidate set; `mask=` alone still uses the 0.6.7
+  widening beam. MCP vector mode accepts both as optional arguments; edge
+  mode ignores them; MCP default `min` stays 0.8. Pinned by
+  `find_similar_where_eq_matches_key_list_mask` and `exact_true_skips_hnsw`.
+- **`degree` and `degrees` read unique neighbour counts from CSR row length.**
+  Duplicate inserts do not raise the count. Unknown key is `KeyNotFound`;
+  unknown edge type is 0. `"both"` is out+in sum. `degrees` sorts degree
+  descending, key ascending. Pinned by `duplicate_edge_does_not_increase_degree`.
+
+#### Changed
+
+- **Brute `find_similar` uses GEMM and returns the same scores as the scalar
+  loop.** `matrixmultiply` 0.3, default features only. HNSW branches and the
+  HNSW sort are untouched. Pinned by `gemm_brute_equals_scalar_on_256`.
+- **Mixed-dimension candidates are skipped**, on GEMM and on the scalar
+  helper, instead of a partial `zip` dot. Pinned by
+  `mixed_dim_candidate_is_skipped`.
+- **Brute sort is similarity descending, then key ascending.** The key-asc
+  tie-break is new on the brute path only; HNSW sort stays as it was.
+
+#### Known limits
+
+- **Unique degree is not row-count multiplicity.** Topology stores a set
+  (`add_edge` returns false on a duplicate). Unresolved NULL targets stay
+  outside this readout.
+- **The HNSW path is unchanged and still approximate.** `exact=True` or
+  `where=` force GEMM; `mask=` alone does not. Approximate `VectorSimilar`
+  rules still go through the index.
+- **MCP listing is unchanged.** `ASSOCIATION_TOOLS` is still the same fifteen
+  tools in the same order. No `pairwise_similar` tool, no HTTP `find_similar`.
+
 ## v0.6.7 — the hardening patch
 
 #### Fixed

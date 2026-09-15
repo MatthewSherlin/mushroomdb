@@ -19,7 +19,7 @@ test-hooks = []
 
 [dependencies]
 bincode = { workspace = true }
-core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.7" }
+core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.8" }
 serde = { workspace = true }
 
 [dev-dependencies]

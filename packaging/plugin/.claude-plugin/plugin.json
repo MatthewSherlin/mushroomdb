@@ -1,6 +1,6 @@
 {
   "name": "mushroom",
-  "version": "0.6.7",
+  "version": "0.6.8",
   "description": "Graph memory for agents: entities, rule-derived relationships, explain, time travel, visibility.",
   "author": { "name": "Matthew Sherlin" },
   "repository": "https://github.com/MatthewSherlin/mushroomdb",
