@@ -212,7 +212,8 @@ type LazyHnswMap = BTreeMap<String, (Option<HnswIndex>, Option<HnswIndex>)>;
 /// `indexed == total` means the graph is whole and only the backfill is
 /// outstanding — the rule still derives no edges until it disappears from
 /// [`RuleEngine::builds_in_progress`]. Never persisted: a reopen re-derives it
-/// from the adopted graph and the node scan.
+/// from a blob with `complete == false`, or from the adopted graph and the
+/// node scan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildProgress {
     pub rule: String,
@@ -293,9 +294,9 @@ pub struct RuleEngine {
     /// rule name. A rule listed here derives **no** edges: its backfill runs as
     /// one commit once the graph is whole, so there is never a partial edge set.
     ///
-    /// Never persisted. A reopen re-derives an entry for any rule whose
-    /// persisted graph turned out to be shorter than the node scan
-    /// (`reindex_all_load_state`), which is exactly the mid-build case.
+    /// Never persisted. A reopen re-derives an entry from a blob whose
+    /// `complete` flag is false (clean open) or from a persisted graph shorter
+    /// than the node scan (`reindex_all_load_state`, WAL-present open).
     pending_builds: BTreeMap<String, PendingBuild>,
     /// Rules whose sliced build has just finished and whose backfill has not
     /// run yet. Drained by `rebuild_inner`, which carries the finished graph
@@ -2278,9 +2279,9 @@ impl RuleEngine {
     /// a write lock for more than a slice at a time.
     pub fn pump_index_build(&mut self, g: &mut GraphMut<'_>) -> Vec<BuildProgress> {
         // A clean-open handle that has never written reaches this with empty
-        // indexes and a rule set restored from the snapshot. Populating them is
-        // also what re-derives a pending build that a mid-build snapshot left
-        // behind, so it has to happen before the map is read.
+        // indexes and a rule set restored from the snapshot. Populating them
+        // adopts the persisted graphs and, for an incomplete blob already in
+        // `pending_builds`, leaves the remainder to the slice loop below.
         self.ensure_indexes_populated(g);
         if self.pending_builds.is_empty() {
             return Vec::new();
@@ -2334,7 +2335,10 @@ impl RuleEngine {
     /// `name`'s HNSW graphs. Returns `(nodes inserted, new cursor)`.
     ///
     /// Counts nodes by the same predicate [`hnsw_build_total`] counts them
-    /// with, so `indexed` can never overshoot `total`.
+    /// with, so `indexed` can never overshoot `total`. Ids already in the
+    /// graph are skipped and not counted: a reopen of an incomplete blob
+    /// starts the cursor at 0 so a write-during-build that landed a high id
+    /// cannot hide a gap, and walking the prefix has to be free.
     fn run_build_slice(
         &mut self,
         name: &str,
@@ -2371,12 +2375,14 @@ impl RuleEngine {
             if !rule_sees(def, at, g) {
                 continue;
             }
+            let src_has = idx.src_side.hnsw_ref().is_some_and(|h| h.contains(at));
+            let dst_has = idx.dst_side.hnsw_ref().is_some_and(|h| h.contains(at));
             let get = |f: &str| g.props.get(at, f).map(|vr| vr.into_value());
             let mut any = false;
-            if src_sym == Some(label_sym) {
+            if src_sym == Some(label_sym) && !src_has {
                 any |= idx.src_side.insert_hnsw_only(&src_spec, at, &get);
             }
-            if dst_sym == Some(label_sym) {
+            if dst_sym == Some(label_sym) && !dst_has {
                 any |= idx.dst_side.insert_hnsw_only(&dst_spec, at, &get);
             }
             if any {
@@ -2535,7 +2541,9 @@ impl RuleEngine {
     /// replaced it wholesale anyway, so the build was pure waste on every open.
     /// Adopting first also means a node the scan *does* see but the graph does
     /// not — a rule whose blob predates a write — is inserted rather than
-    /// dropped.
+    /// dropped.  An incomplete blob already registered in `pending_builds` is
+    /// the exception: the scan files every non-vector leg and leaves the HNSW
+    /// remainder to [`RuleEngine::pump_index_build`].
     ///
     /// A side falls back to the full rebuild when:
     ///   * `hnsw_state` has no entry for the rule — a store written before HNSW
@@ -2589,6 +2597,12 @@ impl RuleEngine {
             adopted.insert(name.clone(), (src_ids, dst_ids));
         }
 
+        // Rules whose remainder is already registered (a mid-build blob
+        // `register_incomplete_hnsw_builds` saw at open): leave HNSW inserts
+        // to `pump_index_build`. Complete blobs keep the inline path so a
+        // handful of vectors written after the snapshot still land in one pass.
+        let defer_hnsw: BTreeSet<String> = self.pending_builds.keys().cloned().collect();
+
         let empty: (BTreeSet<u32>, BTreeSet<u32>) = (BTreeSet::new(), BTreeSet::new());
         for id in 0..ids.len() as u32 {
             let label_sym = match labels.get(id as usize).copied() {
@@ -2599,7 +2613,11 @@ impl RuleEngine {
                 let def = self.rules[name].clone();
                 let skip = adopted.get(name).unwrap_or(&empty);
                 let idx = self.indexes.get_mut(name).unwrap();
-                index_node_for_rule_skipping(id, label_sym, &def, idx, syms, props, skip);
+                if defer_hnsw.contains(name) {
+                    index_node_for_rule_deferring_hnsw(id, label_sym, &def, idx, syms, props);
+                } else {
+                    index_node_for_rule_skipping(id, label_sym, &def, idx, syms, props, skip);
+                }
             }
         }
 
@@ -2625,13 +2643,23 @@ impl RuleEngine {
 
         // Re-derive the pending builds a mid-build snapshot left behind.
         //
-        // `pending_builds` is never persisted, so the evidence that a build was
-        // unfinished is that the scan had to supply a vector the adopted graph
-        // did not carry. That is only sound because the write path populates
-        // the indexes *before* it applies a record (`needs_index_population`):
-        // the scan sees exactly the persisted state, so a vector it has to
-        // supply really was missing from the snapshot's graph rather than being
-        // the in-flight write's own.
+        // `pending_builds` is never persisted. On a clean reopen, open already
+        // registered the unfinished blob (`register_incomplete_hnsw_builds`);
+        // the scan above deferred those HNSW inserts, so we keep that entry
+        // and reset its cursor to 0. Open stored `max(node_ids)+1`, which is
+        // not the slice cursor `run_build_slice` left behind: a write-during-
+        // build that inserted a higher id would skip the gap if we resumed
+        // from there. Starting at 0, `run_build_slice` skips ids already in
+        // the graph.
+        //
+        // WAL-present opens still go through `cut_short` (`indexes_populated`
+        // already true, so open's registration is a no-op). Evidence that a
+        // build was unfinished is that the scan had to supply a vector the
+        // adopted graph did not carry. That is only sound because the write
+        // path populates the indexes *before* it applies a record
+        // (`needs_index_population`): the scan sees exactly the persisted
+        // state, so a vector it has to supply really was missing from the
+        // snapshot's graph rather than being the in-flight write's own.
         //
         // `retained_node_count` is the belt to that's braces. Ids are dense and
         // never reused, so a node the snapshot did not hold has an id at or
@@ -2640,11 +2668,21 @@ impl RuleEngine {
         // clone, or a caller reaching the engine directly — from reading its
         // own newer nodes as an interrupted build.
         //
-        // The scan has already finished the graph; what is still owed is the
-        // backfill, so the entry is registered complete and the next pump turns
-        // it into one `RebuildRule`.
+        // On this path the scan has already finished the graph; what is still
+        // owed is the backfill, so the entry is registered complete and the
+        // next pump turns it into one `RebuildRule`.
+        let n = ids.len() as u32;
+        for name in &defer_hnsw {
+            if let Some(pb) = self.pending_builds.get_mut(name) {
+                pb.cursor = 0;
+                pb.limit = n;
+            }
+        }
         let snapshot_ids = self.retained_node_count.load(AtomicOrdering::Relaxed);
         for (name, (src_ids, dst_ids)) in &adopted {
+            if defer_hnsw.contains(name) {
+                continue; // already registered; remainder is sliced, not inline
+            }
             if src_ids.is_empty() && dst_ids.is_empty() {
                 continue; // nothing was adopted: this was a plain rebuild
             }
@@ -2666,15 +2704,7 @@ impl RuleEngine {
             let total = src_now
                 .map_or(0, |s| s.len())
                 .max(dst_now.map_or(0, |s| s.len())) as u64;
-            self.pending_builds.insert(
-                name.clone(),
-                PendingBuild {
-                    indexed: total,
-                    total,
-                    cursor: ids.len() as u32,
-                    limit: ids.len() as u32,
-                },
-            );
+            self.remember_pending_build(name.clone(), total, total, n, n);
         }
 
         // Any blob naming a rule that is not approximate here (or not a rule at
@@ -2735,6 +2765,121 @@ impl RuleEngine {
             Some(ivf_bytes)
         };
         // indexes_populated remains false.
+    }
+
+    /// Register a sliced build a snapshot cut short, from blobs whose
+    /// `complete` flag is false.
+    ///
+    /// `pending_builds` is not persisted; the blob flag is. A clean open never
+    /// runs the node scan, so this is how `serve`'s ticker learns there is work
+    /// without waiting for a write.
+    ///
+    /// `extra` is the incomplete `(src, dst)` pair per rule, typically peeked
+    /// from a V8 mmap without copying complete graphs. When it is empty, the
+    /// retained blobs from [`Self::store_snapshot_state`] are inspected
+    /// instead (V5–V7, or a caller that already loaded the section).
+    ///
+    /// No-op when indexes are already populated: the scan's `cut_short` path
+    /// owns that case and uses the same [`PendingBuild`] representation.
+    pub fn register_incomplete_hnsw_builds(
+        &mut self,
+        extra: &BTreeMap<String, (Vec<u8>, Vec<u8>)>,
+        g: &GraphMut<'_>,
+    ) {
+        if self.indexes_populated {
+            return;
+        }
+        let retained = self
+            .retained_hnsw_blobs
+            .lock()
+            .expect("retained_hnsw_blobs lock poisoned");
+        if extra.is_empty() && retained.is_empty() {
+            return;
+        }
+        let names: Vec<String> = extra
+            .keys()
+            .cloned()
+            .chain(retained.keys().filter(|n| !extra.contains_key(*n)).cloned())
+            .collect();
+        let mut found: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+        for name in names {
+            if !self.rules.get(&name).is_some_and(uses_hnsw) {
+                continue;
+            }
+            let Some((src, dst)) = extra.get(&name).or_else(|| retained.get(&name)) else {
+                continue;
+            };
+            if crate::hnsw::hnsw_blob_complete(src) != Some(false)
+                && crate::hnsw::hnsw_blob_complete(dst) != Some(false)
+            {
+                continue;
+            }
+            found.push((name, src.clone(), dst.clone()));
+        }
+        drop(retained);
+        for (name, src, dst) in found {
+            self.register_one_incomplete_build(&name, &src, &dst, g);
+        }
+    }
+
+    fn register_one_incomplete_build(
+        &mut self,
+        name: &str,
+        src_blob: &[u8],
+        dst_blob: &[u8],
+        g: &GraphMut<'_>,
+    ) {
+        let src = if src_blob.is_empty() {
+            None
+        } else {
+            crate::hnsw::decode_hnsw_blob(src_blob).ok()
+        };
+        let dst = if dst_blob.is_empty() {
+            None
+        } else {
+            crate::hnsw::decode_hnsw_blob(dst_blob).ok()
+        };
+        if src.is_none() && dst.is_none() {
+            return;
+        }
+        let indexed = src
+            .as_ref()
+            .map(|h| h.len())
+            .unwrap_or(0)
+            .max(dst.as_ref().map(|h| h.len()).unwrap_or(0)) as u64;
+        let Some(def) = self.rules.get(name).cloned() else {
+            return;
+        };
+        let total = hnsw_build_total(&def, g).max(indexed);
+        let limit = g.ids.len() as u32;
+        let cursor = src
+            .iter()
+            .chain(dst.iter())
+            .filter_map(|h| h.node_ids().iter().next_back().copied())
+            .max()
+            .map(|id| id.saturating_add(1))
+            .unwrap_or(0)
+            .min(limit);
+        self.remember_pending_build(name.to_string(), indexed, total, cursor, limit);
+    }
+
+    fn remember_pending_build(
+        &mut self,
+        name: String,
+        indexed: u64,
+        total: u64,
+        cursor: u32,
+        limit: u32,
+    ) {
+        self.pending_builds.insert(
+            name,
+            PendingBuild {
+                indexed,
+                total,
+                cursor,
+                limit,
+            },
+        );
     }
 
     /// Store raw rkyv provenance bytes retained from a V8 snapshot.
@@ -3014,6 +3159,45 @@ impl RuleEngine {
         }
     }
 
+    /// Dst-side HNSW graph that can answer a query of `q_len` for this rule.
+    ///
+    /// A sliced build still in `pending_builds` is skipped — the graph holds a
+    /// prefix of its corpus and must not answer. Live indexes first, then the
+    /// lazily-decoded blobs, matching [`Self::hnsw_search_dst`].
+    fn dst_hnsw_answering(&self, name: &str, q_len: usize) -> Option<&HnswIndex> {
+        if self.pending_builds.contains_key(name) {
+            return None;
+        }
+        let live = self
+            .indexes
+            .get(name)
+            .and_then(|idx| idx.dst_side.hnsw_ref())
+            .filter(|h| h.can_answer(q_len));
+        let lazy = self
+            .lazy_hnsw
+            .get()
+            .and_then(|l| l.get(name))
+            .and_then(|(_, dst)| dst.as_ref())
+            .filter(|h| h.can_answer(q_len));
+        live.or(lazy)
+    }
+
+    /// First dst-side index covering `(dst_label, field)` that can answer.
+    fn hnsw_dst_index(&self, field: &str, dst_label: &str, q_len: usize) -> Option<&HnswIndex> {
+        for (name, def) in &self.rules {
+            if !def.approximate || def.dst_label != dst_label {
+                continue;
+            }
+            if !predicate_covers_field(&def.predicate, field) {
+                continue;
+            }
+            if let Some(h) = self.dst_hnsw_answering(name, q_len) {
+                return Some(h);
+            }
+        }
+        None
+    }
+
     /// Find approximate nearest-neighbor ids on the dst side of the first
     /// approximate VectorSimilar rule covering `(dst_label, field)`.
     ///
@@ -3025,45 +3209,28 @@ impl RuleEngine {
         q: &[f64],
         k: usize,
     ) -> Option<Vec<(u32, f64)>> {
-        for (name, def) in &self.rules {
-            if !def.approximate || def.dst_label != dst_label {
-                continue;
-            }
-            // Check that the predicate covers this vector field.
-            if !predicate_covers_field(&def.predicate, field) {
-                continue;
-            }
-            // A rule whose sliced build is unfinished has a graph holding a
-            // prefix of its corpus: it would answer, and answer about the wrong
-            // set, with nothing in the result to say so. Skipping it here is the
-            // same door `can_answer == false` uses — the caller brute-forces and
-            // gets the exact answer, slower. The build advances on every write,
-            // on `serve`'s tick and on `mushroomdb build-index`.
-            if self.pending_builds.contains_key(name) {
-                continue;
-            }
-            if let Some(idx) = self.indexes.get(name) {
-                if let Some(h) = idx.dst_side.hnsw_ref() {
-                    // `can_answer` rather than `!is_empty()`: an index that
-                    // refused a vector, or whose stride is not this query's
-                    // dimension, is non-empty and still cannot answer for every
-                    // node — `None` here is what sends the caller to its scan.
-                    if h.can_answer(q.len()) {
-                        return Some(h.search(q, k));
-                    }
-                }
-            }
-            // Fallback: blobs deserialized via ensure_hnsw_loaded (read path,
-            // no mutation has populated self.indexes yet).
-            if let Some(lazy) = self.lazy_hnsw.get() {
-                if let Some((_, Some(h))) = lazy.get(name) {
-                    if h.can_answer(q.len()) {
-                        return Some(h.search(q, k));
-                    }
-                }
-            }
-        }
-        None
+        self.hnsw_dst_index(field, dst_label, q.len())
+            .map(|h| h.search(q, k))
+    }
+
+    /// [`Self::hnsw_search_dst`] with an explicit layer-0 beam width, so a
+    /// caller can widen the beam the same way exact `VectorSimilar` rules do.
+    pub fn hnsw_search_dst_with_ef(
+        &self,
+        field: &str,
+        dst_label: &str,
+        q: &[f64],
+        k: usize,
+        ef: usize,
+    ) -> Option<Vec<(u32, f64)>> {
+        self.hnsw_dst_index(field, dst_label, q.len())
+            .map(|h| h.search_with_ef(q, k, ef))
+    }
+
+    /// Number of vectors in the dst-side index that would answer this query.
+    pub fn hnsw_dst_len(&self, field: &str, dst_label: &str, q_len: usize) -> Option<usize> {
+        self.hnsw_dst_index(field, dst_label, q_len)
+            .map(|h| h.len())
     }
 
     /// Returns `true` if any approximate VectorSimilar rule covers `field`.
@@ -3088,6 +3255,46 @@ impl RuleEngine {
     /// Returns `None` when no applicable rule has a populated HNSW index
     /// (same sentinel convention as `hnsw_search_dst`).
     pub fn hnsw_search_any_dst(&self, field: &str, q: &[f64], k: usize) -> Option<Vec<(u32, f64)>> {
+        self.merge_dst_searches(field, q, k, |h| h.search(q, k))
+    }
+
+    /// [`Self::hnsw_search_any_dst`] with an explicit layer-0 beam width.
+    pub fn hnsw_search_any_dst_with_ef(
+        &self,
+        field: &str,
+        q: &[f64],
+        k: usize,
+        ef: usize,
+    ) -> Option<Vec<(u32, f64)>> {
+        self.merge_dst_searches(field, q, k, |h| h.search_with_ef(q, k, ef))
+    }
+
+    /// Sum of vector counts across dst-side indexes covering `field`.
+    pub fn hnsw_any_dst_len(&self, field: &str, q_len: usize) -> Option<usize> {
+        let mut total = 0usize;
+        let mut found = false;
+        for (name, def) in &self.rules {
+            if !def.approximate {
+                continue;
+            }
+            if !predicate_covers_field(&def.predicate, field) {
+                continue;
+            }
+            if let Some(h) = self.dst_hnsw_answering(name, q_len) {
+                found = true;
+                total = total.saturating_add(h.len());
+            }
+        }
+        found.then_some(total)
+    }
+
+    fn merge_dst_searches(
+        &self,
+        field: &str,
+        q: &[f64],
+        k: usize,
+        search: impl Fn(&HnswIndex) -> Vec<(u32, f64)>,
+    ) -> Option<Vec<(u32, f64)>> {
         let mut merged: std::collections::BTreeMap<u32, f64> = std::collections::BTreeMap::new();
         let mut found_index = false;
 
@@ -3099,43 +3306,25 @@ impl RuleEngine {
                 continue;
             }
             // As in `hnsw_search_dst`: a half-built graph answers about a prefix
-            // of the corpus, so it does not answer here at all.
-            if self.pending_builds.contains_key(name) {
-                continue;
-            }
-            // Live index first, then the lazily-decoded blobs — as a *fallback*,
-            // not an alternative. `self.indexes` holds an entry for every rule
-            // from `from_persist` onwards, so an `else if` here would mean a
+            // of the corpus, so it does not answer here at all. Live index
+            // first, then the lazily-decoded blobs — as a *fallback*, not an
+            // alternative. `self.indexes` holds an entry for every rule from
+            // `from_persist` onwards, so an `else if` here would mean a
             // clean-open handle never reached `lazy_hnsw` at all and answered
-            // every label-less query by brute force. `hnsw_search_dst` has
-            // always chained these correctly; this arm had not.
-            let live = self
-                .indexes
-                .get(name)
-                .and_then(|idx| idx.dst_side.hnsw_ref())
-                .filter(|h| h.can_answer(q.len()));
-            let lazy = self
-                .lazy_hnsw
-                .get()
-                .and_then(|l| l.get(name))
-                .and_then(|(_, dst)| dst.as_ref())
-                .filter(|h| h.can_answer(q.len()));
-            let hits: Option<Vec<(u32, f64)>> = live.or(lazy).map(|h| {
-                found_index = true;
-                h.search(q, k)
-            });
-
-            if let Some(hits) = hits {
-                for (id, score) in hits {
-                    merged
-                        .entry(id)
-                        .and_modify(|s| {
-                            if score > *s {
-                                *s = score;
-                            }
-                        })
-                        .or_insert(score);
-                }
+            // every label-less query by brute force.
+            let Some(h) = self.dst_hnsw_answering(name, q.len()) else {
+                continue;
+            };
+            found_index = true;
+            for (id, score) in search(h) {
+                merged
+                    .entry(id)
+                    .and_modify(|s| {
+                        if score > *s {
+                            *s = score;
+                        }
+                    })
+                    .or_insert(score);
             }
         }
 
@@ -3250,15 +3439,7 @@ impl RuleEngine {
         }
 
         if deferred {
-            self.pending_builds.insert(
-                name.clone(),
-                PendingBuild {
-                    indexed: 0,
-                    total: build_total,
-                    cursor: 0,
-                    limit: n_total,
-                },
-            );
+            self.remember_pending_build(name.clone(), 0, build_total, 0, n_total);
             let (inserted, cursor) = self.run_build_slice(&name, &def, 0, n_total, batch, g);
             let entry = self.pending_builds.get_mut(&name).expect("just inserted");
             entry.indexed = inserted;

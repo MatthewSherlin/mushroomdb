@@ -157,6 +157,7 @@ All write denials return 403 with a structured JSON body:
 {"error": "role-bound token: edge type 'LINKS' not in write scope (create_edge_types)"}
 {"error": "role-bound token: this endpoint is not permitted"}
 {"error": "role-bound token: namespace 'tenant-b' not in the role's namespaces"}
+{"error": "role-bound token: MERGE create requires the role to name one namespace"}
 ```
 
 The "target node not visible" response is identical for hidden nodes and
@@ -164,12 +165,16 @@ non-existent nodes — the role cannot distinguish the two cases.
 
 The sixth is the namespace leg (v0.6.6): a role bound to `namespaces` may only
 **create** a node inside them, because a node it could never read back would be a
-write into another tenancy. It covers `POST /nodes`, a batch, Cypher `CREATE`, and the
-node a `MERGE` creates (which always lands in `default`, so a namespaced role cannot
-`MERGE`-create at all) — a create naming no namespace is a create in `default`, so a
-role not bound to `default` is refused there too. A role with no `namespaces` binding
-is unchanged. Updates need no rule of their own: a role can only mutate nodes already
-in its read mask, which the namespace leg has already narrowed.
+write into another tenancy. It covers `POST /nodes`, a batch, Cypher `CREATE`, and a
+`MERGE` that names `ns`. A create naming no namespace is a create in `default`, so a
+role not bound to `default` is refused there too — except a `MERGE` whose executing
+role is bound to exactly one namespace, which stamps that namespace on the create
+arm. A role bound to two or more namespaces cannot `MERGE`-create unless the
+pattern names one `ns`; the refusal is
+`role-bound token: MERGE create requires the role to name one namespace`.
+A role with no `namespaces` binding is unchanged. Updates need no rule of their
+own: a role can only mutate nodes already in its read mask, which the namespace
+leg has already narrowed.
 
 A placeholder endpoint `POST /edges/upsert` would auto-create is refused by the same
 rule (a placeholder carries no props, so it lands in `default`) but with the
@@ -331,7 +336,7 @@ Relationship patterns `->`, `<-`, `-` with optional type and variable.
 - `MATCH … DELETE r` — delete a manual edge; error if derived
 - `MATCH (n) DETACH DELETE n` — delete node + all incident edges (derived edges retracted via rule engine; top-k backfill fires)
 - `MATCH (n) DELETE n` — delete isolated node (error if any edges remain — use DETACH DELETE)
-- `MERGE (n:Label {id: 'key'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]` — match-or-create with optional per-clause SET and projection
+- `MERGE (n:Label {id: 'key'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]` — match-or-create with optional per-clause SET and projection. A single-namespace role's create arm stamps that namespace when the pattern does not name `ns`; a two-namespace role must name one (`MERGE (n:Label {id: 'key', ns: 'tenant-a'})`)
 
 **Aggregate functions** in `RETURN`:
 
@@ -543,9 +548,11 @@ and returns `202 Accepted` with the progress instead of `200`:
 
 The rule derives **no** edges until the build finishes — never a partial set —
 and `GET /stats` reports the same progress under `building`. Every write
-advances the build by one slice, `mushroomdb serve` advances it once a second,
-and `mushroomdb build-index <db-dir>` drives it to completion. At or below
-2,048 vectors nothing changes: one commit, `200`, edges present on return.
+advances the build by one slice, `mushroomdb serve` advances it once a second
+(including after a restart: open registers a build a snapshot cut short, so
+the ticker does not wait for a write), and `mushroomdb build-index <db-dir>`
+drives it to completion. At or below 2,048 vectors nothing changes: one
+commit, `200`, edges present on return.
 
 Predicate JSON shapes:
 
@@ -967,7 +974,7 @@ Response:
   "result": {
     "capabilities": {"tools": {}},
     "protocolVersion": "2024-11-05",
-    "serverInfo": {"name": "mushroomdb", "version": "0.6.6"}
+    "serverInfo": {"name": "mushroomdb", "version": "0.6.7"}
   }
 }
 ```
@@ -986,8 +993,8 @@ Sixteen tools:
 | `neighborhood` | Typed neighborhood; params: `key`, `depth?`, `dir?` |
 | `node_info` | Node info and props; params: `key` |
 | `node_edges` | Incident edges; params: `key` |
-| `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?`, `namespace?` (the namespace a created node lands in; on an existing node, the one it is already in is a no-op and another is refused) |
-| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?`; (2) edge traversal — `key`, `edge_type?`, `limit?` |
+| `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?`, `namespace?` (the namespace a created node lands in; on an existing node, the one it is already in is a no-op and another is refused). An update is atomic: every property is checked before any is written, so a refusal leaves the node unchanged. |
+| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?`; (2) edge traversal — `key`, `edge_type?`, `limit?`. Vector search under a mask (a role, or the MCP `mask` allow-list) widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist. |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
 | `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits, horizon}` |

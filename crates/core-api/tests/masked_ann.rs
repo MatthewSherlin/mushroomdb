@@ -7,8 +7,12 @@
 //!     receives up to k visible hits.
 //!  4. Labeled (Some("Label")) and any-label (None) variants.
 //!  5. Adversarial: a hidden node's key/score never appears in output.
+//!  6. A selective mask whose nearest neighbours sit outside it still returns
+//!     `k` hits, in brute-force order; at the beam cap the path falls back to
+//!     the exhaustive masked scan.
 
 use core_api::{GraphDb, NodeMask, Predicate, RuleDef, Value};
+use core_storage::fs::RealFs;
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -28,13 +32,17 @@ fn emb(xs: &[f64]) -> Value {
 }
 
 fn approx_rule(src: &str, dst: &str, field: &str, edge: &str) -> RuleDef {
+    approx_rule_min(src, dst, field, edge, 0.5)
+}
+
+fn approx_rule_min(src: &str, dst: &str, field: &str, edge: &str, min: f64) -> RuleDef {
     RuleDef {
         name: format!("ann_{edge}"),
         src_label: src.into(),
         dst_label: dst.into(),
         predicate: Predicate::VectorSimilar {
             field: field.into(),
-            min: 0.5,
+            min,
         },
         edge_type: edge.into(),
         weight_prop: None,
@@ -310,4 +318,125 @@ fn adversarial_hnsw_hidden_node_never_leaks() {
         "poison score of 1.0 must not appear in HNSW-masked results; got {max_score}"
     );
     assert!(!hits.is_empty(), "visible nodes must still be returned");
+}
+
+// ---------------------------------------------------------------------------
+// 6. Selective mask: 10 nearest overall sit outside it; still returns k
+// ---------------------------------------------------------------------------
+
+/// 500 vectors, 20 of them visible. The query's 10 nearest overall are all
+/// hidden, so a 4×k over-fetch from the store-wide index comes back short.
+struct SelectiveMask {
+    db: GraphDb<RealFs>,
+    mask: NodeMask,
+    expected: Vec<(String, f64)>,
+    query: [f64; 2],
+}
+
+fn selective_mask_fixture(name: &str) -> SelectiveMask {
+    const N_NEAR: u32 = 480;
+    const N_FAR: u32 = 20;
+    let dir = tmp(name);
+    let mut db = GraphDb::open(&dir).unwrap();
+    // Near cluster: almost colinear with the query. Inserted first so they
+    // dominate the index neighbourhood the 4×k over-fetch walks.
+    for i in 0..N_NEAR {
+        let y = (i as f64 + 1.0) * 1e-4;
+        db.insert_node("V", &format!("n{i}"), vec![("emb".into(), emb(&[1.0, y]))])
+            .unwrap();
+    }
+    // Far cluster: the only visible nodes. Larger `i` is slightly closer to
+    // the query, so brute-force order is `m19` … `m10` for k=10.
+    let mut visible = Vec::with_capacity(N_FAR as usize);
+    for i in 0..N_FAR {
+        let x = (i as f64 + 1.0) * 0.01;
+        let key = format!("m{i}");
+        db.insert_node("V", &key, vec![("emb".into(), emb(&[x, 1.0]))])
+            .unwrap();
+        visible.push(key);
+    }
+    let mask = NodeMask::from_keys(&db, visible.iter().map(String::as_str));
+    let query = [1.0_f64, 0.0];
+    let expected = db.find_similar_vector_masked("emb", Some("V"), &query, 10, 0.0, &mask);
+    assert_eq!(
+        expected.len(),
+        10,
+        "brute-force masked search must have 10 visible hits to compare against"
+    );
+    SelectiveMask {
+        db,
+        mask,
+        expected,
+        query,
+    }
+}
+
+#[test]
+fn a_masked_search_widens_its_beam_until_it_has_k() {
+    let mut fx = selective_mask_fixture("widen-k");
+    let overall = fx
+        .db
+        .find_similar_vector("emb", Some("V"), &fx.query, 10, 0.0);
+    assert_eq!(overall.len(), 10);
+    for (key, _) in &overall {
+        assert!(
+            key.starts_with('n'),
+            "the 10 nearest overall must sit outside the mask; got {key}"
+        );
+    }
+
+    // min=1.0 so the rule builds the index without deriving a dense near-cluster
+    // edge set (every near pair is above 0.5).
+    fx.db
+        .create_rule(approx_rule_min("V", "V", "emb", "SIM", 1.0))
+        .unwrap();
+    assert!(fx.db.has_vector_rule("emb"), "HNSW rule must be registered");
+
+    core_rules::hnsw_search_count_reset();
+    let hits = fx
+        .db
+        .find_similar_vector_masked("emb", Some("V"), &fx.query, 10, 0.0, &fx.mask);
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "the index must have been consulted, else this is the brute-force path"
+    );
+    assert_eq!(
+        hits.len(),
+        10,
+        "masked approximate search must return k=10, not the short over-fetch"
+    );
+    for (key, _) in &hits {
+        assert!(
+            key.starts_with('m'),
+            "every hit must be inside the mask; got {key}"
+        );
+    }
+    assert_eq!(
+        hits, fx.expected,
+        "HNSW-masked hits must match the brute-force masked order and scores"
+    );
+}
+
+/// Reaching [`core_rules::EF_MAX`] (here lowered to 32) without `k` admits
+/// must cost a scan, never a short result. The far cluster is outside a
+/// 32-wide beam over the near cluster, so the cap is what forces the fallback.
+#[test]
+fn a_masked_search_at_the_beam_cap_falls_back_to_the_scan() {
+    let mut fx = selective_mask_fixture("widen-cap");
+    fx.db
+        .create_rule(approx_rule_min("V", "V", "emb", "SIM", 1.0))
+        .unwrap();
+    assert!(fx.db.has_vector_rule("emb"));
+
+    core_rules::hnsw_search_count_reset();
+    let hits = core_rules::with_ef_max(32, || {
+        fx.db
+            .find_similar_vector_masked("emb", Some("V"), &fx.query, 10, 0.0, &fx.mask)
+    });
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "the index must have been tried before the exhaustive fallback"
+    );
+    assert_eq!(hits.len(), 10);
+    assert_eq!(hits, fx.expected);
 }

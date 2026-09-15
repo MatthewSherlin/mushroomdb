@@ -612,9 +612,11 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
 
 /// Insert a new node or update an existing node's properties, keyed by `key`.
 ///
-/// If the node exists: each prop in `props` is written via `set_prop`.
-/// If the node does not exist: `label` is required; the node is ingested with
-/// `key_field = "id"` and the supplied props.
+/// If the node exists: every supplied property is checked (reserved names, the
+/// `ns` rule, a view-owned field, type) and then all of them are written in one
+/// engine commit — a refusal leaves the node unchanged. If the node does not
+/// exist: `label` is required; the node is ingested with `key_field = "id"` and
+/// the supplied props.
 ///
 /// `namespace` is the namespace a node this call **creates** is created in. On a
 /// node that already exists it is written like any other property, which is what
@@ -675,20 +677,21 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
 
     if exists {
         let mut g = db.write();
-        let mut count = 0usize;
-        for (field, v) in &row {
+        let mut to_set: Vec<(String, Value)> = Vec::new();
+        for (field, v) in row {
             // The namespace a node is already in is the engine's no-op: it
             // writes no record and takes no commit, so counting it as an updated
             // field would report an update that did not happen. Asking first
             // also keeps the refusal for a *different* namespace coming from the
             // engine rather than from a second rule stated here.
-            if field == NS_PROP && Some(v) == g.namespace_of(key).map(Value::Str).as_ref() {
+            if field == NS_PROP && Some(&v) == g.namespace_of(key).map(Value::Str).as_ref() {
                 continue;
             }
-            if let Err(e) = g.set_prop(key, field, v.clone()) {
-                return CallOutcome::ToolErr(graph_err_msg(e));
-            }
-            count += 1;
+            to_set.push((field, v));
+        }
+        let count = to_set.len();
+        if let Err(e) = g.set_props(key, to_set) {
+            return CallOutcome::ToolErr(graph_err_msg(e));
         }
         CallOutcome::ToolOk(json!({
             "ok": true,
@@ -700,7 +703,6 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
         let Some(label) = label_opt else {
             return CallOutcome::ToolErr("label required when creating a new entity".into());
         };
-        let mut row = row;
         row.insert("id".to_string(), Value::Str(key.to_string()));
         let opts = IngestOptions {
             key_field: "id".to_string(),
@@ -1303,7 +1305,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "upsert_entity",
-                "description": "Record what is now true about K — insert or update a node by key. If the key exists, updates the supplied properties. If not, creates a new node with the given label and properties. 'id' in 'props' is ignored on both paths: a created node stores 'id' as its key, and 'rename_node' is the only way to change it. Useful for agent memory: store or refresh an entity without checking existence first.",
+                "description": "Record what is now true about K — insert or update a node by key. If the key exists, updates the supplied properties atomically: every property is checked before any is written, so a refusal leaves the node unchanged. If not, creates a new node with the given label and properties. 'id' in 'props' is ignored on both paths: a created node stores 'id' as its key, and 'rename_node' is the only way to change it. Useful for agent memory: store or refresh an entity without checking existence first.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1339,7 +1341,7 @@ fn graph_tools() -> Vec<Js> {
                         "mask": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Optional node key allow-list for vector-search mode. When present, only nodes whose key appears in this list are eligible for results. Hidden nodes are excluded before k-truncation so callers still receive up to k visible hits. Unknown keys are silently ignored."
+                            "description": "Optional node key allow-list for vector-search mode. When present, only nodes whose key appears in this list are eligible for results. Hidden nodes are excluded before k-truncation. The beam widens until it has k visible hits, then falls back to an exhaustive masked scan at the same cap an exact VectorSimilar rule uses, so the result is not short while more visible hits exist. Unknown keys are silently ignored."
                         },
                         "key": { "type": "string", "description": "Source node key for edge-traversal mode." },
                         "edge_type": { "type": "string", "description": "Edge type to filter by in edge-traversal mode (default: SIMILAR)." },

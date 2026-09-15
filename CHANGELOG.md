@@ -1,5 +1,71 @@
 # Changelog
 
+## v0.6.7 — the hardening patch
+
+#### Fixed
+
+- **`serve` advances an outstanding build after a restart without waiting for a
+  write.** A snapshot taken mid-build carries `complete == false` on its HNSW
+  blob; opening the store registers that rule so the 1-second ticker has
+  something to pump. Pinned by `a_reopened_store_pumps_its_outstanding_build_without_a_write`.
+- **A reopen after a killed build slices the remainder**, rather than inserting
+  it in one pass under the write lock. The open-time scan still inserts a
+  handful of vectors written after a *complete* snapshot; an incomplete blob is
+  left to `pump_index_build`. Pinned by `an_interrupted_build_resumes_on_reopen`
+  and `a_search_after_a_mid_build_reopen_is_exact`.
+- **`upsert_entity` refuses the whole update or applies all of it.** The update
+  path used to set one property at a time, so a write refused partway — a
+  different `ns`, a reserved name — left the properties ahead of the refusal
+  committed. Every per-property check now runs first and the sets land in one
+  WAL commit. The v0.6.6 known limit is closed. Pinned by
+  `upsert_entity_update_is_all_or_nothing`.
+- **`MERGE` creates inside a single-namespace role's namespace.** A role bound
+  to exactly one namespace no longer has its MERGE create arm land in `default`
+  (which it cannot write). When the pattern does not name `ns`, the create
+  stamps that namespace. A role bound to two or more namespaces is still
+  refused (`role-bound token: MERGE create requires the role to name one namespace`)
+  unless the pattern names one. Pinned by
+  `merge_creates_inside_a_single_namespace_role`.
+- **A masked approximate search returns `k` hits.** `find_similar_vector_masked`
+  and the masked MCP `find_similar` used to over-fetch from the store-wide
+  index and stop, so a tenant whose nearest neighbours were mostly other
+  tenants' nodes got a short result. The beam now starts at an over-fetch of
+  `k` divided by the mask's selectivity, doubles until it has `k` visible hits
+  or reaches `EF_MAX` (the same cap an exact `VectorSimilar` rule uses), and
+  at the cap falls back to an exhaustive masked scan. Nothing leaks; the
+  result is no longer short. Pinned by
+  `a_masked_search_widens_its_beam_until_it_has_k` and
+  `a_masked_search_at_the_beam_cap_falls_back_to_the_scan`.
+
+#### Changed
+
+- **A single-namespace role's `MERGE` create is new behaviour.** Under 0.6.6
+  the same statement was refused; now it writes into that namespace.
+- **The CI bench baseline is re-taken at 0.6.6.** The `bench` job now
+  compares against run `34880373108` (`ubuntu-latest`, 2026-09-14).
+
+#### Known limits
+
+- **`stats` over MCP answers with every namespace name unless it is asked to
+  narrow.** The MCP server is a cooperative surface with no auth, so `stats`
+  reports the full roster by default and narrows only when given `role` or
+  `namespace`; the store-wide counts beside the roster are unchanged either
+  way. A tenant that must not learn the other tenants' names belongs behind
+  `serve --role-token`, where HTTP `GET /stats` is closed to role tokens
+  entirely.
+- **A refused or parked vector is re-derived on reopen rather than persisted.**
+  `dim_mismatches` and the parked list are not in the blob; what restores them
+  is the open-time node scan, which re-offers every vector the persisted graph
+  lacks and gets the same refusals. The state is therefore rebuilt rather than
+  remembered, which `a_refused_vector_is_still_refused_after_a_reopen` and
+  `a_parked_vector_survives_a_reopen` pin at store level.
+- **The scale benchmark's two growth assertions stay red.** The build grows
+  15.48× from 2,000 to 10,000 vectors against a ceiling of 8×, and 50,000
+  vectors take 1,018.05 s against a ceiling of 300 s. The figures, and the
+  evaluation-count gate that watches the same thing as a machine-independent
+  count, are in
+  [`benchmarks/results/hnsw-scale-0.6.6.md`](benchmarks/results/hnsw-scale-0.6.6.md).
+
 ## v0.6.6 — the scale release
 
 The vector index was the ceiling. Opening a store rebuilt the HNSW graph it had just loaded, a

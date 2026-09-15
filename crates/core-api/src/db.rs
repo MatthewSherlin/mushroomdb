@@ -11,8 +11,8 @@ use core_query::cypher::{
 };
 use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
-    decode_rule_def, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView, Predicate,
-    RuleDef, RuleEngine, ViewDef, ViewStore,
+    decode_rule_def, ef_max, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView,
+    Predicate, RuleDef, RuleEngine, ViewDef, ViewStore,
 };
 use core_storage::fs::{FileId, Fs, FsIntrospect, RealFs};
 use core_storage::fulltext::FulltextIndex;
@@ -1538,6 +1538,13 @@ impl Default for OpenOptions {
 /// hang.
 pub const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Refusal when a `MERGE` create cannot choose a namespace.
+///
+/// A role bound to two or more namespaces cannot have its create arm land in
+/// `default`, and the statement did not name `ns`. The role must name one.
+pub const MERGE_CREATE_NEEDS_ONE_NAMESPACE: &str =
+    "role-bound token: MERGE create requires the role to name one namespace";
+
 /// Interval between poll attempts while waiting for the cross-process lock.
 pub(crate) const LOCK_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -2196,6 +2203,9 @@ impl<F: Fs> GraphDb<F> {
         // record as well; this pass is what makes a snapshot-only open right,
         // and it reads nothing on a store with no `ns` column.
         db.rebuild_node_ns();
+        // A mid-build snapshot's HNSW blob carries `complete == false`.
+        // Register it so `serve`'s ticker sees work without waiting for a write.
+        db.register_outstanding_index_builds();
         // Load roles sidecar. Missing file = no roles (Some(vec![])).
         // Corrupt/unparseable = poisoned (None); mask_for_role will fail-loud.
         db.roles = Self::load_roles_from_fs(&db.fs)?;
@@ -5466,6 +5476,11 @@ impl<F: Fs> GraphDb<F> {
                         }
                     }
                     BatchOp::SetProp { key, field, value } => {
+                        if let Some(view_name) = preview.db.view_store.view_for_prop(&field) {
+                            return Err(GraphError::ViewPropReadOnly {
+                                view_name: view_name.to_string(),
+                            });
+                        }
                         preview.check_live_key(&key)?;
                         preview.note_set_prop(&key, &field, &value);
                         recs.push(WalRecord::SetProp { key, field, value });
@@ -5719,6 +5734,35 @@ impl<F: Fs> GraphDb<F> {
         }])
     }
 
+    /// Set several properties on one live node in a single WAL commit.
+    ///
+    /// Every per-property check [`set_prop`](Self::set_prop) runs — view-owned
+    /// names, live key, the `ns` immutability rule and its type — is evaluated
+    /// for the whole list before any record is logged. The first refusal
+    /// returns and the node is unchanged. An empty list writes nothing.
+    pub fn set_props(&mut self, key: &str, props: Vec<(String, Value)>) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        MutPreview::new(self).check_live_key(key)?;
+        for (field, _) in &props {
+            if let Some(view_name) = self.view_store.view_for_prop(field) {
+                return Err(GraphError::ViewPropReadOnly {
+                    view_name: view_name.to_string(),
+                });
+            }
+        }
+        if props.is_empty() {
+            return Ok(());
+        }
+        self.write_batch(|b| {
+            for (field, value) in props {
+                b.set_prop(key, &field, value);
+            }
+        })
+        .map(|_| ())
+    }
+
     /// Remove a property. Returns `Ok(false)` (and does not log) if the field
     /// is already absent. Unknown or tombstoned keys are `Err(KeyNotFound)`.
     pub fn remove_prop(&mut self, key: &str, field: &str) -> Result<bool> {
@@ -5860,6 +5904,8 @@ impl<F: Fs> GraphDb<F> {
     /// Rules whose vector index is still being built, in name order.
     ///
     /// The same list [`GraphDb::stats`] reports per rule in `building`.
+    /// After a clean open this includes a build a snapshot cut short, so
+    /// `serve`'s ticker can pump it without a write.
     pub fn builds_in_progress(&self) -> Vec<BuildProgress> {
         self.engine.builds_in_progress()
     }
@@ -5948,8 +5994,9 @@ impl<F: Fs> GraphDb<F> {
     /// index just became whole, which the caller must `RebuildRule`.
     ///
     /// Goes through the engine even with nothing pending when the indexes have
-    /// not been populated yet: that call is what re-derives a build a mid-build
-    /// snapshot left behind, and a fresh handle has no other way to learn of it.
+    /// not been populated yet: that call adopts the persisted graphs and, for
+    /// an incomplete blob already registered at open, leaves the remainder to
+    /// this slice rather than inserting it inline.
     fn pump_one_slice(&mut self) -> Vec<BuildProgress> {
         // The retained snapshot blobs — and the id count an interrupted build
         // is recognised against — arrive with the V8 base sections, which a
@@ -5972,6 +6019,59 @@ impl<F: Fs> GraphDb<F> {
         };
         self.engine = eng;
         finished
+    }
+
+    /// Register a sliced build a snapshot cut short, from blobs with
+    /// `complete == false`.
+    ///
+    /// Peeks the V8 mmap for incomplete entries without copying complete
+    /// graphs. V5–V7 already hold the blobs in the engine from restore.
+    fn register_outstanding_index_builds(&mut self) {
+        if self.engine.indexes_populated() {
+            return;
+        }
+        let extra = self.collect_incomplete_hnsw_blobs();
+        let mut eng = std::mem::take(&mut self.engine);
+        {
+            let gm = make_graph_mut(
+                &self.ids,
+                &mut self.syms,
+                &self.labels,
+                build_props_view(&self.props, &self.base),
+                &mut self.topo,
+                &self.base,
+                &mut self.edge_props,
+            );
+            eng.register_incomplete_hnsw_builds(&extra, &gm);
+        }
+        self.engine = eng;
+    }
+
+    /// Incomplete `(src, dst)` HNSW blobs from the V8 mmap, copied only when
+    /// `complete` is false. Empty when there is no mmap base (V5–V7 uses the
+    /// engine's retained map instead).
+    fn collect_incomplete_hnsw_blobs(&self) -> BTreeMap<String, (Vec<u8>, Vec<u8>)> {
+        let Some(base) = &self.base else {
+            return BTreeMap::new();
+        };
+        let Ok(archived) = base.hnsw_section() else {
+            return BTreeMap::new();
+        };
+        archived
+            .rules
+            .iter()
+            .filter_map(|e| {
+                let src = e.src_blob.as_slice();
+                let dst = e.dst_blob.as_slice();
+                if core_rules::hnsw::hnsw_blob_complete(src) == Some(false)
+                    || core_rules::hnsw::hnsw_blob_complete(dst) == Some(false)
+                {
+                    Some((e.name.as_str().to_string(), (src.to_vec(), dst.to_vec())))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// WAL-log rule deletion. Returns RuleNotFound if the rule does not exist.
@@ -8539,26 +8639,26 @@ impl<F: Fs> GraphDb<F> {
     /// **before** k-truncation so a caller still receives up to `k` visible
     /// hits.
     ///
-    /// # HNSW path (over-fetch policy)
+    /// # HNSW path (widening beam)
     ///
-    /// When an HNSW index covers the request, this function fetches
-    /// `4 * k + VECTOR_RESCORE_MARGIN` candidates from the index and discards
-    /// hidden nodes in the post-filter step.  If fewer than `k` visible nodes
-    /// remain after filtering the caller receives whatever is available — we do
-    /// not re-query the index.  Every surviving candidate is re-scored from the
-    /// `f64` property vectors, exactly as [`find_similar_vector`] does and for
-    /// the same reason.  The 4×
-    /// multiplier is a heuristic suited for sparsely masked graphs; callers
-    /// operating under a very selective mask should register a VectorSimilar
-    /// rule with a non-approximate index, or use the brute-force path (no HNSW
-    /// rule) which exhaustively filters through the masked [`GraphView`].
+    /// When an HNSW index covers the request, the beam starts at an over-fetch
+    /// of `k × n / |visible|` (plus the rescore margin) when the mask's
+    /// selectivity is known from the index length, otherwise at `k` plus that
+    /// margin. If fewer than `k` visible candidates remain after the mask and
+    /// `min` filter, the beam doubles — the same ×2 loop exact `VectorSimilar`
+    /// rules use, capped at `ef_max()` (`EF_MAX` = 4,096). Reaching the cap,
+    /// or a beam that comes back short of its own width, falls through to the
+    /// exhaustive masked scan rather than returning a short result.
+    ///
+    /// Every surviving candidate is re-scored from the `f64` property vectors,
+    /// exactly as [`find_similar_vector`] does and for the same reason.
     ///
     /// # Brute-force path
     ///
-    /// When no HNSW index covers the request the function builds a masked
-    /// [`GraphView`] so that `nodes_all` / `nodes_with_label` return only
-    /// visible nodes, guaranteeing exact `k` results (or all visible nodes if
-    /// fewer than `k` exist).
+    /// When no HNSW index covers the request, or the beam cannot admit `k`
+    /// hits, the function builds a masked [`GraphView`] so that `nodes_all` /
+    /// `nodes_with_label` return only visible nodes, guaranteeing exact `k`
+    /// results (or all visible nodes if fewer than `k` exist).
     pub fn find_similar_vector_masked(
         &self,
         field: &str,
@@ -8572,44 +8672,53 @@ impl<F: Fs> GraphDb<F> {
         self.ensure_v8_base_sections_loaded();
         self.engine.ensure_hnsw_loaded();
         let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm == 0.0 {
+        if norm == 0.0 || k == 0 || mask.is_empty() {
             return vec![];
         }
         let q_unit: Vec<f64> = q.iter().map(|x| x / norm).collect();
 
-        // HNSW fast path — over-fetch 4×k so post-masking still yields up to k
-        // visible hits.  See doc comment above for the policy rationale.
-        let over_k = k
-            .saturating_mul(4)
-            .max(k + 1)
-            .saturating_add(VECTOR_RESCORE_MARGIN);
-        let hnsw_hits = match label {
-            Some(lbl) => self.engine.hnsw_search_dst(field, lbl, &q_unit, over_k),
-            None => self.engine.hnsw_search_any_dst(field, &q_unit, over_k),
+        let index_len = match label {
+            Some(lbl) => self.engine.hnsw_dst_len(field, lbl, q_unit.len()),
+            None => self.engine.hnsw_any_dst_len(field, q_unit.len()),
         };
-        if let Some(hits) = hnsw_hits {
-            // Candidates only — re-scored from the `f64` vectors before `min`,
-            // the ordering or the reported score. The mask is applied first so a
-            // hidden node is never scored.
-            let view = self.view_masked(mask);
-            let mut out: Vec<(String, f64)> = hits
-                .into_iter()
-                .filter(|&(id, _)| mask.visible.contains(&id))
-                .filter_map(|(id, _)| {
-                    let sim = exact_vector_similarity(&view, id, field, &q_unit)?;
-                    if sim < min {
-                        return None;
-                    }
-                    Some((self.ids.key_of(id)?.to_string(), sim))
-                })
-                .collect();
-            out.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            out.truncate(k);
-            return out;
+        if let Some(n) = index_len {
+            // Same ceiling the exact-rule widening loop in `hnsw_candidates`
+            // consults — including the `with_ef_max` test hook.
+            let cap = ef_max();
+            let visible = mask.len();
+            let mut ef = k.saturating_add(VECTOR_RESCORE_MARGIN);
+            if visible > 0 && n > 0 {
+                let over = k
+                    .saturating_mul(n)
+                    .div_ceil(visible)
+                    .saturating_add(VECTOR_RESCORE_MARGIN);
+                ef = ef.max(over);
+            }
+            loop {
+                let hits = match label {
+                    Some(lbl) => self
+                        .engine
+                        .hnsw_search_dst_with_ef(field, lbl, &q_unit, ef, ef),
+                    None => self
+                        .engine
+                        .hnsw_search_any_dst_with_ef(field, &q_unit, ef, ef),
+                };
+                let Some(hits) = hits else {
+                    break;
+                };
+                let full = hits.len() == ef;
+                let mut out = self.score_masked_hnsw_hits(&hits, field, &q_unit, min, mask);
+                if out.len() >= k {
+                    out.truncate(k);
+                    return out;
+                }
+                // Short of its width (frontier exhausted) or at the ceiling:
+                // a wider beam reaches nothing new, so the scan answers.
+                if !full || ef >= cap {
+                    break;
+                }
+                ef = ef.saturating_mul(2);
+            }
         }
 
         // Brute-force fallback — masked view ensures only visible nodes are
@@ -8642,6 +8751,37 @@ impl<F: Fs> GraphDb<F> {
         });
         scored.truncate(k);
         scored
+    }
+
+    /// Re-score HNSW candidates from the `f64` vectors, drop hidden / below-`min`
+    /// hits, order by score then key. The index's own `f32` similarity is discarded.
+    fn score_masked_hnsw_hits(
+        &self,
+        hits: &[(u32, f64)],
+        field: &str,
+        q_unit: &[f64],
+        min: f64,
+        mask: &crate::mask::NodeMask,
+    ) -> Vec<(String, f64)> {
+        let view = self.view_masked(mask);
+        let mut out: Vec<(String, f64)> = hits
+            .iter()
+            .copied()
+            .filter(|&(id, _)| mask.visible.contains(&id))
+            .filter_map(|(id, _)| {
+                let sim = exact_vector_similarity(&view, id, field, q_unit)?;
+                if sim < min {
+                    return None;
+                }
+                Some((self.ids.key_of(id)?.to_string(), sim))
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out
     }
 
     /// Read a single property from an edge.
@@ -9226,6 +9366,47 @@ impl<F: Fs> GraphDb<F> {
         Ok(rs)
     }
 
+    /// Props the MERGE create arm inserts: the identifying key, plus `ns` when
+    /// the pattern named one, or the executing role's sole namespace when it
+    /// did not. A role bound to two or more namespaces cannot choose, and is
+    /// refused with [`MERGE_CREATE_NEEDS_ONE_NAMESPACE`]. The authorizer still
+    /// refuses a named `ns` the role cannot write.
+    fn merge_create_props(
+        &self,
+        key_field: &str,
+        key_value: &Value,
+        named_ns: Option<&Value>,
+    ) -> Result<Vec<(String, Value)>> {
+        let mut props = vec![(key_field.to_string(), key_value.clone())];
+        if let Some(ns) = named_ns {
+            props.push((NS_PROP.to_string(), ns.clone()));
+            return Ok(props);
+        }
+        if let Some(ns) = self.merge_create_stamp_ns()? {
+            props.push((NS_PROP.to_string(), Value::Str(ns)));
+        }
+        Ok(props)
+    }
+
+    /// The namespace a role-scoped MERGE create stamps when the pattern does
+    /// not name `ns`. `None` = unscoped / full authority, so the node lands in
+    /// `default`.
+    fn merge_create_stamp_ns(&self) -> Result<Option<String>> {
+        let Some(authz) = self.pending_write_authz.as_ref() else {
+            return Ok(None);
+        };
+        let Some(def) = self.role_def_for(&authz.role) else {
+            return Ok(None);
+        };
+        match def.namespaces.as_deref() {
+            Some([only]) => Ok(Some(only.clone())),
+            Some(_) => Err(GraphError::RoleWriteDenied {
+                reason: MERGE_CREATE_NEEDS_ONE_NAMESPACE.to_string(),
+            }),
+            None => Ok(None),
+        }
+    }
+
     fn exec_merge(
         &mut self,
         stmt: core_query::cypher::MergeStmt,
@@ -9324,11 +9505,15 @@ impl<F: Fs> GraphDb<F> {
         };
 
         let existed = merge_existed;
+        let create_props = if existed {
+            None
+        } else {
+            Some(self.merge_create_props(&stmt.key_field, &stmt.key_value, stmt.ns.as_ref())?)
+        };
         let mut created = 0i64;
-        if !existed || !stmt.on_match.is_empty() {
+        if create_props.is_some() || !stmt.on_match.is_empty() {
             let mut batch = self.batch();
-            if !existed {
-                let props = vec![(stmt.key_field.clone(), stmt.key_value.clone())];
+            if let Some(props) = create_props {
                 batch.insert_node(&stmt.label, &key, props);
                 for sc in &stmt.on_create {
                     let value = resolve_merge_set_value(&sc.value, params)?;

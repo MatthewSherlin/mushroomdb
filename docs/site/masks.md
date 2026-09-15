@@ -214,9 +214,11 @@ The refusal is a 403 with
 role-bound token: namespace '<ns>' not in the role's namespaces
 ```
 
-and it covers `POST /nodes`, a batch, Cypher `CREATE`, and the node `MERGE` creates. A
-create without an `ns` is a create in `default`, so an `x`-bound role is refused there
-too. A role with no `namespaces` binding is unchanged: it writes wherever its label
+and it covers `POST /nodes`, a batch, Cypher `CREATE`, and the node `MERGE` creates
+when the pattern names `ns`. A create without an `ns` is a create in `default`, so
+an `x`-bound role is refused there too — except a `MERGE` whose executing role is
+bound to exactly one namespace, which stamps that namespace on the create arm. A
+role with no `namespaces` binding is unchanged: it writes wherever its label
 scope allows.
 
 A placeholder endpoint `POST /edges/upsert` would auto-create is refused by the same
@@ -229,24 +231,27 @@ as everywhere else.
 Updates need no separate rule — a role can only mutate nodes already in its read
 mask, and the namespace leg has already narrowed that.
 
-**`MERGE` creates in the default namespace, for every caller.** A `MERGE` pattern
-carries exactly one identifying property (`MERGE (n:Doc {id: 'x'})`), and only that
-property reaches the node it creates, so there is no way to name a namespace in a
-`MERGE` — and `ON CREATE SET n.ns = …` cannot stand in for one, because that is a
-namespace change and is refused as one. The consequences, stated plainly:
+**`MERGE` creates inside a single-namespace role's namespace.** A `MERGE` pattern
+carries its identifying property (`MERGE (n:Doc {id: 'x'})`). When the executing
+role is bound to exactly one namespace and the pattern does not name `ns`, the
+create arm stamps that namespace. A global (no-role) `MERGE` still lands in
+`default`. A role bound to two or more namespaces cannot `MERGE`-create unless
+the pattern names one `ns`; the refusal is
 
-- A role bound to namespaces **cannot `MERGE`-create**: the node would land in
-  `default`, which it may not write. It gets the namespace refusal above.
-- Its `MERGE` **match** arm is unaffected — the node it matches is already in the
-  role's mask, and `ON MATCH SET` works as it always has.
-- To create a node in a namespace, use `CREATE (n:Doc {id: 'x', ns: 'tenant-a'})`,
-  `insert_node`, or `/ingest`, all of which take `ns` like any other property.
+```
+role-bound token: MERGE create requires the role to name one namespace
+```
 
-This is deliberately the loud answer rather than the convenient one. A role bound to
-exactly one namespace *could* have its creates default into that namespace, but then
-the same statement would write different data under different tokens, and it would
-write a property the caller never named. If that default is wanted, it belongs
-alongside an explicit `namespace` argument on the write surfaces, decided once.
+Naming `ns` in the pattern (`MERGE (n:Doc {id: 'x', ns: 'other'})`) is a create
+in that namespace, and a role that cannot write there is refused as any other
+cross-namespace create. `ON CREATE SET n.ns = …` is still a namespace change and
+is refused as one.
+
+- A role bound to exactly one namespace **can `MERGE`-create**: the node lands
+  in that namespace. A second `MERGE` of the same key matches it.
+- A role bound to two or more namespaces **must name one** with `ns`.
+- The `MERGE` **match** arm is unaffected — the node it matches is already in
+  the role's mask, and `ON MATCH SET` works as it always has.
 
 ### No cross-namespace edges
 
@@ -319,7 +324,8 @@ call instead of buried in the props. A row or a `props` object that carries its 
 `ns` naming a *different* namespace is refused before anything is written — one node
 is created in one namespace. On `upsert_entity` over a node that already exists the
 namespace is written like any other property, so naming the one it is already in is a
-no-op and naming another is the `NamespaceImmutable` refusal above.
+no-op and naming another is the `NamespaceImmutable` refusal above — and that
+refusal is atomic with the rest of the update: no sibling property is committed.
 
 ### What `stats` discloses
 

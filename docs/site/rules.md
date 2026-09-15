@@ -413,10 +413,9 @@ While a rule is in that state:
      dimensions is roughly 9–27 seconds. A latency-sensitive writer should let
      `build-index` finish the build first.
   2. **`mushroomdb serve`.** A 1-second ticker calls `pump_index_build`, so a
-     quiescent server finishes a build **its own handle has registered**. A
-     freshly restarted `serve` has not registered anything yet — the ticker sees
-     no pending build until the first write or a `build-index` run populates the
-     indexes — so a restart mid-build does not resume it on its own.
+     quiescent server finishes a build **its own handle has registered**. Open
+     registers a build a snapshot cut short, so a restarted `serve` advances it
+     without waiting for a write.
   3. **`mushroomdb build-index <db-dir> [--rule <name>]`.** Drives it to
      completion now, one progress line per slice, for an operator who wants the
      build done before traffic arrives. `--rule` narrows the report, not the
@@ -425,15 +424,18 @@ While a rule is in that state:
      per call, and `Err(ReadOnly)` on a read-only handle (it could advance the
      index but not commit the backfill).
 
-A store killed mid-build reopens with the rule present and its index partly
-built; the snapshot's graph covers what it carried, the open-time scan covers
-the rest, and the next pump issues the backfill. The scan is **not** sliced: it
-inserts the whole remainder in one pass under the write lock, so a 50,000-vector
-corpus killed after its first slice pays the rest of that build in one blocking
-call, and only the edge backfill is left to the slice loop. A snapshot taken
-after that reopen but before the next pump still records the index as
+A store killed mid-build reopens with the rule present, its index partly built,
+and that build already registered: `stats().building` is populated from the
+blob's `complete == false` flag, so `serve`'s ticker and `pump_index_build`
+have something to advance without a write. The snapshot's graph covers what it
+carried; the remainder is sliced the same way `create_rule` sliced it — one
+batch per pump, under the write lock, never the whole rest of the corpus in
+one pass. A handful of vectors written after a *complete* snapshot still land
+inline on open: that is the fast path 0.6.5 fixed and it stays. A snapshot
+taken after that reopen but before the next pump still records the index as
 incomplete, so a reader opening that snapshot answers by brute force until a
-write or `build-index` pumps it — slower, never wrong.
+write, `serve`, or `build-index` pumps it — slower, never wrong. A live handle
+whose build is still outstanding takes the same door.
 
 How that is told apart from an ordinary write: a store restored from a snapshot
 defers building its candidate indexes until the first write, and the write path
@@ -588,7 +590,9 @@ to the index's own number would return nothing at all. So:
 * Rule weights were always recomputed from the `f64` properties
   (`def.rs::cosine`), and still are.
 * `find_similar_vector` and `find_similar_vector_masked` treat the index's hits
-  as candidates only: they over-fetch (`k + 16`, and `4k + 16` under a mask),
+  as candidates only: they over-fetch (`k + 16`; under a mask, `k × n / |visible|`
+  when selectivity is known, then a ×2 beam-widening loop capped at `EF_MAX`,
+  falling back to an exhaustive masked scan rather than returning short of `k`),
   re-score every candidate against the `f64` property vectors, and apply `min`,
   the ordering and the reported score to *that* number. Every **score** you
   receive is the one the brute-force scan would have produced, to `f64`

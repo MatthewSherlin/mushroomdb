@@ -469,15 +469,20 @@ pub struct MatchDeleteNodeStmt {
 
 /// `MERGE (n:Label {id: 'x'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]`
 ///
-/// Exactly one property is allowed (the key). More properties → named error.
-/// `ON CREATE SET` / `ON MATCH SET` apply inside the same write batch as the
-/// insert-or-skip. `returns`, when `Some`, projects the node after commit.
+/// Exactly one identifying property is allowed (the key). An optional `ns`
+/// names the namespace the create arm writes into; any other extra property
+/// is a named error. `ON CREATE SET` / `ON MATCH SET` apply inside the same
+/// write batch as the insert-or-skip. `returns`, when `Some`, projects the
+/// node after commit.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeStmt {
     pub label: String,
     /// The single property that identifies the node. Value must be a string.
     pub key_field: String,
     pub key_value: core_storage::Value,
+    /// Optional `ns` named in the MERGE pattern, distinct from the identifying
+    /// key. Absent = the create arm does not name a namespace.
+    pub ns: Option<core_storage::Value>,
     /// Optional bound variable for the MERGE node (for RETURN projection).
     pub var: Option<String>,
     /// `ON CREATE SET` assignments, applied only when the node is inserted.

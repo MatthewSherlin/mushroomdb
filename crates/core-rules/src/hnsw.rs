@@ -707,8 +707,9 @@ pub struct HnswIndex {
     ///
     /// Only the **read** path ever sees this set: a live handle's authority on
     /// an unfinished build is `RuleEngine::pending_builds`, and
-    /// [`SideIndex::adopt_hnsw`] clears the flag because the open-time node
-    /// scan that follows it supplies every vector the blob lacked. It is the
+    /// [`SideIndex::adopt_hnsw`] clears the flag. An incomplete blob's remainder
+    /// is sliced by `pump_index_build`; a complete blob's missing nodes (writes
+    /// after the snapshot) are still supplied by the open-time scan. It is the
     /// lazily-decoded copy on a clean open — which no scan follows — that needs
     /// evidence carried in the bytes.
     ///
@@ -805,6 +806,11 @@ impl HnswIndex {
         self.slot_of.len()
     }
 
+    /// True when `id` currently has a vector in this graph.
+    pub fn contains(&self, id: u32) -> bool {
+        self.slot_of.contains_key(&id)
+    }
+
     /// True when no vectors are indexed.
     pub fn is_empty(&self) -> bool {
         self.slot_of.is_empty()
@@ -850,10 +856,10 @@ impl HnswIndex {
     /// Declare this graph whole, clearing the [`Self::incomplete`] flag a
     /// partial blob set.
     ///
-    /// Called by [`SideIndex::adopt_hnsw`], because every adoption is followed
-    /// by the open-time node scan that supplies whatever the blob was missing,
-    /// and by nothing else: the lazily-decoded read-path copy has no scan
-    /// behind it and must keep refusing until a write populates the live index.
+    /// Called by [`SideIndex::adopt_hnsw`]. A live handle's authority on an
+    /// unfinished build is `RuleEngine::pending_builds` (see `hnsw_search_dst`);
+    /// this flag is what the lazily-decoded read-path copy uses, which has no
+    /// scan and no pending-build map behind it.
     pub fn mark_complete(&mut self) {
         self.incomplete = false;
     }
@@ -1803,7 +1809,9 @@ pub struct HnswBlob {
     /// and serves `find_similar` from a fraction of the corpus with no signal.
     /// A `false` here makes [`HnswIndex::can_answer`] refuse, which sends every
     /// such query to the exhaustive scan until a write, `mushroomdb build-index`
-    /// or `serve`'s pump finishes the build.
+    /// or `serve`'s pump finishes the build. Open also reads it to register the
+    /// rule in `pending_builds`, so a restarted `serve` has something to pump
+    /// without waiting for a write.
     pub complete: bool,
 }
 
@@ -1882,6 +1890,36 @@ pub fn encode_hnsw_blob(index: &HnswIndex, complete: bool) -> Option<Vec<u8>> {
         complete,
     })
     .ok()
+}
+
+/// Whether a persisted blob was written as a finished graph.
+///
+/// v3 carries `complete` as its last field, so this peeks without decoding the
+/// index. v1 and v2 have no flag and were always whole. `None` if the bytes are
+/// empty or not a blob this build can read.
+pub fn hnsw_blob_complete(blob: &[u8]) -> Option<bool> {
+    if blob.is_empty() {
+        return None;
+    }
+    if blob.len() >= HNSW_BLOB_HEADER_LEN && blob[..4] == HNSW_BLOB_MAGIC {
+        let version = u16::from_le_bytes([blob[4], blob[5]]);
+        return match version {
+            3 => {
+                if blob.len() < HNSW_BLOB_HEADER_LEN + 1 {
+                    return None;
+                }
+                match blob[blob.len() - 1] {
+                    0 => Some(false),
+                    1 => Some(true),
+                    _ => None,
+                }
+            }
+            1 | 2 => Some(true),
+            _ => None,
+        };
+    }
+    // No wrapper: a 0.6.5 v1 blob. Sliced builds did not exist.
+    Some(true)
 }
 
 /// Decode a persisted HNSW blob.
@@ -3516,6 +3554,21 @@ mod tests {
         adopted.mark_complete();
         assert!(adopted.can_answer(24));
         assert_eq!(adopted.search(&vecs[3], 5), whole.search(&vecs[3], 5));
+    }
+
+    /// v3 writes `complete` as the last byte, so open can peek it without
+    /// decoding the graph.
+    #[test]
+    fn hnsw_blob_complete_peeks_the_last_byte() {
+        let (_vecs, idx) = blob_fixture();
+        let whole = encode_hnsw_blob(&idx, true).expect("encode");
+        let partial = encode_hnsw_blob(&idx, false).expect("encode");
+        assert_eq!(hnsw_blob_complete(&whole), Some(true));
+        assert_eq!(hnsw_blob_complete(&partial), Some(false));
+        assert_eq!(&whole[..whole.len() - 1], &partial[..partial.len() - 1]);
+        assert_eq!(whole[whole.len() - 1], 1);
+        assert_eq!(partial[partial.len() - 1], 0);
+        assert_eq!(hnsw_blob_complete(&[]), None);
     }
 
     /// A refused insert still replaces the id it was offered for.

@@ -20,7 +20,7 @@
 //! shape, unknown key, …).
 
 use core_api::repograph::UNTRUSTED_FRAMING;
-use core_api::{SharedDb, Value};
+use core_api::{Direction, SharedDb, Value, ViewDef, ViewSource};
 use serde_json::{json, Value as Js};
 use server::run_mcp_stdio;
 use std::collections::BTreeSet;
@@ -4847,6 +4847,31 @@ fn stats_on_a_store_without_namespaces_reports_one() {
     );
 }
 
+/// Binding: a full-authority MCP `query` MERGE without `ns` still lands in
+/// `default`; naming `ns` in the pattern creates there. Role-scoped MERGE is
+/// an HTTP surface (MCP `query` with `role` is read-only).
+#[test]
+fn merge_create_names_a_namespace_or_lands_in_default() {
+    let db = open("mcp-merge-ns");
+    content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MERGE (n:Doc {id: 'plain'})"}),
+    ));
+    assert_eq!(db.read().namespace_of("plain").as_deref(), Some("default"));
+
+    content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MERGE (n:Doc {id: 'named', ns: 'tenant-a'})"}),
+    ));
+    assert_eq!(
+        db.read().namespace_of("named").as_deref(),
+        Some("tenant-a"),
+        "a MERGE that names ns creates in that namespace"
+    );
+}
+
 /// Binding: `upsert_entity` puts a node it creates in `namespace`, and refuses
 /// to move one that already exists — with the engine's own text.
 #[test]
@@ -5025,6 +5050,10 @@ fn the_schemas_advertise_namespace() {
         desc.contains("'id' in 'props' is ignored on both paths"),
         "{desc}"
     );
+    assert!(
+        desc.contains("atomically") || desc.contains("atomic"),
+        "upsert_entity says the update is atomic: {desc}"
+    );
 }
 
 /// Binding: `upsert_entity` never takes `id` from `props` — on the update path
@@ -5078,6 +5107,105 @@ fn upsert_entity_never_takes_id_from_props() {
     let node = content_json(&one_task_call(db, "node_info", json!({"key": "alice"})));
     assert_eq!(node["props"]["team"], json!("blue"));
     assert_eq!(node["props"]["id"], json!("alice"), "still the key: {node}");
+}
+
+/// Binding: an `upsert_entity` update is all-or-nothing. A refusal partway
+/// (a different `ns`, a property the caller may not write) leaves the node
+/// untouched: no sibling property lands, `commit_seq` does not move, and
+/// `updated_fields` is not reported. The assertion is on the final state, not
+/// on the order the props object happens to iterate.
+#[test]
+fn upsert_entity_update_is_all_or_nothing() {
+    let db = open("upsert-atomic");
+    let created = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "n1", "label": "Doc", "props": {"a": 1}}),
+    ));
+    assert_eq!(created["created"], json!(true));
+    let before = db.read().commit_seq();
+
+    // `b` sorts before `ns` in the BTreeMap the tool builds, so a
+    // one-property-at-a-time loop commits `b` and then refuses `ns`. The
+    // test must not depend on that order: whatever the map does, the node
+    // after the call is the node before the call.
+    let refused = one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "n1", "props": {"b": 2, "ns": "other"}}),
+    );
+    let msg = error_text(&refused);
+    assert!(
+        msg.contains("a namespace is set at insert and cannot be changed"),
+        "{msg}"
+    );
+    assert!(
+        refused["result"].get("updated_fields").is_none(),
+        "a refusal is not an update: {refused}"
+    );
+    let node = content_json(&one_task_call(
+        db.clone(),
+        "node_info",
+        json!({"key": "n1"}),
+    ));
+    assert!(
+        node["props"].get("b").is_none(),
+        "a refused ns change must not leave b committed: {node}"
+    );
+    assert_eq!(node["props"]["a"], json!(1));
+    assert_eq!(
+        db.read().commit_seq(),
+        before,
+        "a refused update must not take a commit"
+    );
+
+    // Second case: a property whose write is refused (a view-owned name —
+    // the same per-property refusal a role token hits when it may not write
+    // one field of a multi-prop update) refuses the whole call. `pop` sorts
+    // after `b`, so a sequential loop would land `b` and then refuse `pop`.
+    {
+        let mut w = db.write();
+        w.create_view(ViewDef {
+            name: "doc_deg".into(),
+            label: "Doc".into(),
+            view_prop: "pop".into(),
+            source: ViewSource::Degree {
+                edge_type: "REL".into(),
+                direction: Direction::Out,
+            },
+        })
+        .unwrap();
+    }
+    let before_view = db.read().commit_seq();
+    let view_refused = one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "n1", "props": {"b": 2, "pop": 9}}),
+    );
+    let view_msg = error_text(&view_refused);
+    assert!(
+        view_msg.contains("managed by view") && view_msg.contains("doc_deg"),
+        "{view_msg}"
+    );
+    assert!(
+        view_refused["result"].get("updated_fields").is_none(),
+        "a refusal is not an update: {view_refused}"
+    );
+    let node = content_json(&one_task_call(
+        db.clone(),
+        "node_info",
+        json!({"key": "n1"}),
+    ));
+    assert!(
+        node["props"].get("b").is_none(),
+        "a refused reserved-name write must not leave b committed: {node}"
+    );
+    assert_eq!(node["props"]["a"], json!(1));
+    assert_eq!(
+        db.read().commit_seq(),
+        before_view,
+        "a refused update must not take a commit"
+    );
 }
 
 /// Binding: naming the namespace a node is already in writes nothing and counts
