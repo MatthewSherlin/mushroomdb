@@ -33,6 +33,7 @@ pub use db::{
     SnapshotOptions, Stats, WhatIf, WriteAuthz, MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT,
     NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
 };
+pub use exact_knn::{with_pairwise_caps, PAIRWISE_GRAM_MAX, PAIRWISE_MAX_N};
 
 /// Current on-disk snapshot format version written by this build.
 ///

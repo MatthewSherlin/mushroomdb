@@ -177,6 +177,15 @@ class GraphDb:
     ) -> list[tuple[str, float]]:
         """The `k` nearest nodes to `vector` by cosine similarity on `field`."""
 
+    def pairwise_similar(
+        self,
+        keys: Sequence[str],
+        field: str,
+        k: int = 10,
+        min: float = 0.0,
+    ) -> list[tuple[str, list[tuple[str, float]]]]:
+        """Exact per-key cosine top-k among `keys`. Self excluded. No HNSW."""
+
     def search_hybrid(
         self,
         text_field: str,

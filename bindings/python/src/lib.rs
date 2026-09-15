@@ -440,6 +440,37 @@ impl GraphDb {
         }
     }
 
+    /// Exact per-key cosine top-k among `keys`. Self excluded. No HNSW.
+    ///
+    /// Unknown keys, missing embeddings, zero-norm and wrong-dim vectors are
+    /// skipped. Duplicate keys collapse to first-seen order. Empty `keys`
+    /// returns `[]`.
+    ///
+    /// ```python
+    /// hits = db.pairwise_similar(["a", "b", "c"], "embedding", k=5, min=0.0)
+    /// ```
+    #[allow(deprecated)]
+    #[pyo3(
+        signature = (keys, field, k = 10, min = 0.0),
+        text_signature = "($self, keys, field, k=10, min=0.0)"
+    )]
+    fn pairwise_similar(
+        &self,
+        py: Python<'_>,
+        keys: Vec<String>,
+        field: &str,
+        k: usize,
+        min: f64,
+    ) -> PyResult<Vec<(String, Vec<(String, f64)>)>> {
+        let field = field.to_owned();
+        self.with_ref(|db| {
+            py.allow_threads(|| {
+                let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+                db.pairwise_similar(&refs, &field, k, min)
+            })
+        })
+    }
+
     /// Hybrid RRF search combining fulltext and vector similarity.
     ///
     /// Fuses up to `4*k` fulltext hits on `text_field` for `query_text` with

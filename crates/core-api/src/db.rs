@@ -35,7 +35,7 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Print a timing checkpoint when MUSHROOMDB_TRACE_OPEN is set.
@@ -8756,6 +8756,129 @@ impl<F: Fs> GraphDb<F> {
         });
         scored.truncate(k);
         scored
+    }
+
+    /// Exact cosine top-k for each key in `keys`, scored only against `keys`.
+    ///
+    /// `min` is cosine similarity in [-1, 1], inclusive (`score >= min`), the
+    /// same unit and inequality as `find_similar_vector`. Self-matches are
+    /// excluded. Unknown keys, keys with no `field`, zero-norm or wrong-dim
+    /// embeddings are omitted as both query and candidate. Duplicate keys are
+    /// collapsed, first-seen order. Empty `keys` → empty `Ok(vec![])`. Never
+    /// uses HNSW. `n > PAIRWISE_MAX_N` → `QueryError`.
+    #[allow(clippy::type_complexity)]
+    pub fn pairwise_similar(
+        &self,
+        keys: &[&str],
+        field: &str,
+        k: usize,
+        min: f64,
+    ) -> Result<Vec<(String, Vec<(String, f64)>)>> {
+        let mut seen = HashSet::new();
+        let mut unique_ids = Vec::new();
+        for key in keys {
+            let Some(id) = self.ids.get(key) else {
+                continue;
+            };
+            if seen.insert(id) {
+                unique_ids.push(id);
+            }
+        }
+        let max_n = crate::exact_knn::pairwise_max_n();
+        if unique_ids.len() > max_n {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "pairwise_similar: n={} exceeds PAIRWISE_MAX_N ({max_n})",
+                    unique_ids.len()
+                ),
+            });
+        }
+        if unique_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let view = self.view();
+        let mut rows: Vec<(u32, std::borrow::Cow<'_, [f64]>)> = Vec::new();
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for id in unique_ids {
+            let Some(v) = crate::exact_knn::vector_f64(&view, id, field) else {
+                continue;
+            };
+            let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm == 0.0 {
+                continue;
+            }
+            *counts.entry(v.len()).or_default() += 1;
+            rows.push((id, v));
+        }
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dim = counts
+            .into_iter()
+            .max_by_key(|&(d, c)| (c, d))
+            .map(|(d, _)| d)
+            .expect("rows non-empty");
+        let packed = crate::exact_knn::pack(rows.iter().map(|(id, v)| (*id, v.as_ref())), dim);
+        let n = packed.ids.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let src_keys: Vec<String> = packed
+            .ids
+            .iter()
+            .map(|&id| self.ids.key_of(id).unwrap_or("").to_string())
+            .collect();
+
+        let mut out = Vec::with_capacity(n);
+        if n <= crate::exact_knn::pairwise_gram_max() {
+            let sims = crate::exact_knn::gram(&packed);
+            for i in 0..n {
+                out.push(Self::topk_from_row(
+                    &src_keys,
+                    i,
+                    &sims[i * n..(i + 1) * n],
+                    k,
+                    min,
+                ));
+            }
+        } else {
+            for i in 0..n {
+                let row = &packed.data[i * packed.dim..(i + 1) * packed.dim];
+                let scores = crate::exact_knn::gemv(&packed, row);
+                out.push(Self::topk_from_row(&src_keys, i, &scores, k, min));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Neighbours of packed row `i`: drop self, keep `score >= min`, sort
+    /// `(sim desc, key asc)`, truncate to `k`. Packed srcs with no survivors
+    /// still appear as `(src, [])`.
+    fn topk_from_row(
+        src_keys: &[String],
+        i: usize,
+        scores: &[f64],
+        k: usize,
+        min: f64,
+    ) -> (String, Vec<(String, f64)>) {
+        let mut neigh: Vec<(String, f64)> = scores
+            .iter()
+            .enumerate()
+            .filter_map(|(j, &sim)| {
+                if i == j || sim < min {
+                    return None;
+                }
+                Some((src_keys[j].clone(), sim))
+            })
+            .collect();
+        neigh.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        neigh.truncate(k);
+        (src_keys[i].clone(), neigh)
     }
 
     /// Re-score HNSW candidates from the `f64` vectors, drop hidden / below-`min`

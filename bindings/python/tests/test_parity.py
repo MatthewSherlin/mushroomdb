@@ -496,6 +496,7 @@ _DOCUMENTED = [
     "snapshot",
     "refresh",
     "close",
+    "pairwise_similar",
 ]
 
 

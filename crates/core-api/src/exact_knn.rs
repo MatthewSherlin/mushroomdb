@@ -1,10 +1,43 @@
 //! Exact cosine kernel: pack L2-normalised rows, GEMV / gram via one `dgemm`.
 //!
-//! Used by brute `find_similar` (and later `pairwise_similar`). Not used by HNSW.
+//! Used by brute `find_similar` and `pairwise_similar`. Not used by HNSW.
 
 use core_query::GraphView;
 use core_storage::Value;
 use std::borrow::Cow;
+use std::cell::Cell;
+
+/// Above this packed n, `pairwise_similar` uses n `gemv`s instead of `gram`.
+pub const PAIRWISE_GRAM_MAX: usize = 4_096;
+/// Hard refuse for `pairwise_similar` on resolved unique key count.
+pub const PAIRWISE_MAX_N: usize = 8_192;
+
+thread_local! {
+    static PAIRWISE_GRAM_MAX_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+    static PAIRWISE_MAX_N_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+pub(crate) fn pairwise_gram_max() -> usize {
+    PAIRWISE_GRAM_MAX_OVERRIDE.with(|c| c.get().unwrap_or(PAIRWISE_GRAM_MAX))
+}
+
+pub(crate) fn pairwise_max_n() -> usize {
+    PAIRWISE_MAX_N_OVERRIDE.with(|c| c.get().unwrap_or(PAIRWISE_MAX_N))
+}
+
+/// Run `f` with temporary pairwise n caps. Restores the previous overrides
+/// (including across panics). Thread-local, same shape as `HNSW_BUILD_BATCH`.
+pub fn with_pairwise_caps<R>(gram_max: usize, max_n: usize, f: impl FnOnce() -> R) -> R {
+    let prev_gram = PAIRWISE_GRAM_MAX_OVERRIDE.with(|c| c.replace(Some(gram_max)));
+    let prev_n = PAIRWISE_MAX_N_OVERRIDE.with(|c| c.replace(Some(max_n)));
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    PAIRWISE_GRAM_MAX_OVERRIDE.with(|c| c.set(prev_gram));
+    PAIRWISE_MAX_N_OVERRIDE.with(|c| c.set(prev_n));
+    match out {
+        Ok(v) => v,
+        Err(p) => std::panic::resume_unwind(p),
+    }
+}
 
 /// Row-major packed, L2-normalised f64 matrix. Not persisted.
 pub struct PackedVectors {
@@ -69,7 +102,7 @@ pub fn gemv(packed: &PackedVectors, q_unit: &[f64]) -> Vec<f64> {
 }
 
 /// `out` is n×n row-major `A Aᵀ`. Diagonal is ~1 for unit rows.
-#[allow(dead_code)]
+/// Callers must not invoke this for `n > PAIRWISE_GRAM_MAX`.
 pub fn gram(packed: &PackedVectors) -> Vec<f64> {
     let n = packed.ids.len();
     let dim = packed.dim;
