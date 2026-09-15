@@ -88,6 +88,10 @@ cluster above `min` costs a scan and never costs recall. The same path serves an
 the other conjuncts' index lookups. `MUSHROOMDB_VECTOR_SCAN=1` restores the
 O(n²) full scan for a caller who needs every pair above `min` provably found.
 
+Query-time `find_similar` is a different path from rule derivation: brute
+`find_similar` is exact GEMM, HNSW is still the approximate path, and
+`exact=True` (or a `where=` predicate) forces GEMM.
+
 ## Relationship to fulltext
 
 Use a **property index** for exact scalar equality (`city = 'austin'`). Use a

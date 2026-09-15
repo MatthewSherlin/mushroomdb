@@ -106,10 +106,13 @@ Each `Community` carries `id` (0-based, assigned by output order), `members` (so
 | Write top-k scores to a property for querying | `degree_centrality` + `write_scores` |
 | Live degree property always available in Cypher queries | Degree materialized view |
 | Triggered on every edge insert/delete with no query overhead | Degree materialized view |
+| Unique degree of one key or a labelled/keyed subset, no write | `degree` / `degrees` (Python) |
 
 A **Degree materialized view** is maintained incrementally — every `insert_edge` / `delete_edge` updates just the affected node's count and stores it as a live property. Use it when you need `WHERE n.out_degree > 5` in a query with zero latency.
 
 `degree_centrality` is a one-shot compute: it scans the whole graph on demand and is **not** persisted unless you call `write_scores`. Use it for batch ranking, one-time exports, or feeding `write_scores`.
+
+Python `degree` / `degrees` are the read-only subset API (unique-neighbour count for one key or a caller-supplied set; adjacency is a set), distinct from `degree_centrality` and from Degree views. See [api.md](api.md#degree).
 
 ## Write-back
 
