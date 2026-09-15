@@ -1,5 +1,6 @@
 pub mod algo;
 mod db;
+mod exact_knn;
 pub mod history;
 mod ingest;
 pub mod mask;

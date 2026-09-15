@@ -32,6 +32,7 @@ core-query = { package = "mushroomdb-query", path = "../core-query", version = "
 bincode = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+matrixmultiply = { workspace = true }
 
 [dev-dependencies]
 core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.6.7" }

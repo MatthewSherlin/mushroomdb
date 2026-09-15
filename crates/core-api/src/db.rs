@@ -8607,31 +8607,14 @@ impl<F: Fs> GraphDb<F> {
             return out;
         }
 
-        // Brute-force fallback: O(n) scan (only reached when no HNSW index
-        // covers the request).
+        // Brute-force fallback: GEMM over packed unit rows (only reached when
+        // no HNSW index covers the request). Mixed-dim and zero-norm rows skip.
         let view = self.view();
         let candidate_ids: Vec<u32> = match label {
             Some(lbl) => view.nodes_with_label(lbl),
             None => view.nodes_all(),
         };
-        let mut scored: Vec<(String, f64)> = candidate_ids
-            .into_iter()
-            .filter_map(|id| {
-                let dot = exact_vector_similarity(&view, id, field, &q_unit)?;
-                if dot < min {
-                    return None;
-                }
-                let key = self.ids.key_of(id)?.to_string();
-                Some((key, dot))
-            })
-            .collect();
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        scored.truncate(k);
-        scored
+        self.brute_vector_hits(&view, candidate_ids, field, &q_unit, k, min)
     }
 
     /// Like [`find_similar_vector`] but restricts results to nodes visible in
@@ -8733,15 +8716,37 @@ impl<F: Fs> GraphDb<F> {
                 .collect(),
             None => view.nodes_all(),
         };
-        let mut scored: Vec<(String, f64)> = candidate_ids
+        self.brute_vector_hits(&view, candidate_ids, field, &q_unit, k, min)
+    }
+
+    /// Exact brute kNN: pack candidates at `q_unit`'s dim, GEMV, keep
+    /// `score >= min`, sort `(sim desc, key asc)`, truncate to `k`.
+    fn brute_vector_hits(
+        &self,
+        view: &GraphView<'_>,
+        candidate_ids: impl IntoIterator<Item = u32>,
+        field: &str,
+        q_unit: &[f64],
+        k: usize,
+        min: f64,
+    ) -> Vec<(String, f64)> {
+        let rows: Vec<(u32, std::borrow::Cow<'_, [f64]>)> = candidate_ids
             .into_iter()
-            .filter_map(|id| {
-                let dot = exact_vector_similarity(&view, id, field, &q_unit)?;
-                if dot < min {
+            .filter_map(|id| crate::exact_knn::vector_f64(view, id, field).map(|v| (id, v)))
+            .collect();
+        let packed =
+            crate::exact_knn::pack(rows.iter().map(|(id, v)| (*id, v.as_ref())), q_unit.len());
+        let scores = crate::exact_knn::gemv(&packed, q_unit);
+        let mut scored: Vec<(String, f64)> = packed
+            .ids
+            .iter()
+            .zip(scores.iter())
+            .filter_map(|(&id, &sim)| {
+                if sim < min {
                     return None;
                 }
                 let key = self.ids.key_of(id)?.to_string();
-                Some((key, dot))
+                Some((key, sim))
             })
             .collect();
         scored.sort_by(|a, b| {
