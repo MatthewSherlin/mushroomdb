@@ -463,8 +463,8 @@ impl GraphDb {
         min: f64,
     ) -> PyResult<Vec<(String, Vec<(String, f64)>)>> {
         let field = field.to_owned();
-        self.with_ref(|db| {
-            py.allow_threads(|| {
+        py.allow_threads(|| {
+            self.with_ref(|db| {
                 let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
                 db.pairwise_similar(&refs, &field, k, min)
             })
