@@ -3,7 +3,8 @@
 //! Nested-loop cosine lives **in this file**. Do not call `exact_knn::`.
 
 use core_api::{
-    with_pairwise_caps, GraphDb, GraphError, Predicate, RuleDef, Value, PAIRWISE_MAX_N,
+    with_pairwise_caps, GraphDb, GraphError, NodeMask, Predicate, PropPredicate, RuleDef, Value,
+    PAIRWISE_MAX_N,
 };
 use core_storage::fs::RealFs;
 
@@ -509,4 +510,326 @@ fn pairwise_similar_boundary_min_inclusive() {
         "expected cosine 0.5, got {}",
         a_neigh[0].1
     );
+}
+
+fn pred_eq(field: &str, value: &str) -> PropPredicate {
+    PropPredicate {
+        field: field.into(),
+        eq: Some(Value::Str(value.into())),
+        in_: None,
+    }
+}
+
+fn pred_in(field: &str, values: &[&str]) -> PropPredicate {
+    PropPredicate {
+        field: field.into(),
+        eq: None,
+        in_: Some(values.iter().map(|s| Value::Str((*s).into())).collect()),
+    }
+}
+
+fn insert_doc(db: &mut Db, key: &str, scope: Option<&str>, v: &[f64]) {
+    let mut props = vec![("emb".into(), emb(v))];
+    if let Some(s) = scope {
+        props.push(("resource_scope_id".into(), Value::Str(s.into())));
+    }
+    db.insert_node("Document", key, props).unwrap();
+}
+
+/// Three Document nodes, `resource_scope_id` in `{a, a, b}`; `where={eq: a}`
+/// returns the same keys and scores as `mask=[those two keys]`.
+#[test]
+fn find_similar_where_eq_matches_key_list_mask() {
+    let dir = tmp("where-eq-mask");
+    let mut db = GraphDb::open(&dir).unwrap();
+    insert_doc(&mut db, "d1", Some("a"), &[1.0, 0.0]);
+    insert_doc(&mut db, "d2", Some("a"), &[0.9, 0.1]);
+    insert_doc(&mut db, "d3", Some("b"), &[1.0, 0.0]);
+    let q = [1.0, 0.0];
+    let pred = pred_eq("resource_scope_id", "a");
+    let by_where = db
+        .find_similar_vector_filtered(
+            "emb",
+            Some("Document"),
+            &q,
+            10,
+            0.0,
+            None,
+            Some(&pred),
+            false,
+        )
+        .unwrap();
+    let mask = NodeMask::from_keys(&db, ["d1", "d2"]);
+    let by_mask = db.find_similar_vector_masked("emb", Some("Document"), &q, 10, 0.0, &mask);
+    assert_eq!(by_where, by_mask, "where eq a must match mask=[d1,d2]");
+    let keys: Vec<&str> = by_where.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["d1", "d2"]);
+}
+
+#[test]
+fn find_similar_where_in_matches_union_of_eq() {
+    let dir = tmp("where-in-union");
+    let mut db = GraphDb::open(&dir).unwrap();
+    insert_doc(&mut db, "d1", Some("a"), &[1.0, 0.0]);
+    insert_doc(&mut db, "d2", Some("b"), &[0.0, 1.0]);
+    insert_doc(&mut db, "d3", Some("c"), &[0.7, 0.7]);
+    let q = [1.0, 0.0];
+    let eq_a = db
+        .find_similar_vector_filtered(
+            "emb",
+            Some("Document"),
+            &q,
+            10,
+            0.0,
+            None,
+            Some(&pred_eq("resource_scope_id", "a")),
+            false,
+        )
+        .unwrap();
+    let eq_b = db
+        .find_similar_vector_filtered(
+            "emb",
+            Some("Document"),
+            &q,
+            10,
+            0.0,
+            None,
+            Some(&pred_eq("resource_scope_id", "b")),
+            false,
+        )
+        .unwrap();
+    let by_in = db
+        .find_similar_vector_filtered(
+            "emb",
+            Some("Document"),
+            &q,
+            10,
+            0.0,
+            None,
+            Some(&pred_in("resource_scope_id", &["a", "b"])),
+            false,
+        )
+        .unwrap();
+    let mut union = eq_a;
+    union.extend(eq_b);
+    union.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    assert_eq!(by_in, union);
+    let keys: Vec<&str> = by_in.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["d1", "d2"]);
+}
+
+#[test]
+fn find_similar_where_missing_property_fails() {
+    let dir = tmp("where-missing");
+    let mut db = GraphDb::open(&dir).unwrap();
+    insert_doc(&mut db, "kept", Some("a"), &[1.0, 0.0]);
+    insert_doc(&mut db, "bare", None, &[1.0, 0.0]);
+    let hits = db
+        .find_similar_vector_filtered(
+            "emb",
+            Some("Document"),
+            &[1.0, 0.0],
+            10,
+            0.0,
+            None,
+            Some(&pred_eq("resource_scope_id", "a")),
+            false,
+        )
+        .unwrap();
+    let keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(keys, vec!["kept"], "node without the field must be absent");
+}
+
+#[test]
+fn find_similar_where_empty_in_matches_nothing() {
+    let dir = tmp("where-empty-in");
+    let mut db = GraphDb::open(&dir).unwrap();
+    insert_doc(&mut db, "d1", Some("a"), &[1.0, 0.0]);
+    let hits = db
+        .find_similar_vector_filtered(
+            "emb",
+            Some("Document"),
+            &[1.0, 0.0],
+            10,
+            0.0,
+            None,
+            Some(&pred_in("resource_scope_id", &[])),
+            false,
+        )
+        .unwrap();
+    assert!(hits.is_empty(), "empty in must match nothing, got {hits:?}");
+}
+
+#[test]
+fn find_similar_where_and_mask_intersect() {
+    let dir = tmp("where-mask-intersect");
+    let mut db = GraphDb::open(&dir).unwrap();
+    insert_doc(&mut db, "d1", Some("a"), &[1.0, 0.0]);
+    insert_doc(&mut db, "d2", Some("a"), &[0.9, 0.1]);
+    insert_doc(&mut db, "d3", Some("b"), &[1.0, 0.0]);
+    let mask = NodeMask::from_keys(&db, ["d2", "d3"]);
+    let hits = db
+        .find_similar_vector_filtered(
+            "emb",
+            Some("Document"),
+            &[1.0, 0.0],
+            10,
+            0.0,
+            Some(&mask),
+            Some(&pred_eq("resource_scope_id", "a")),
+            false,
+        )
+        .unwrap();
+    let keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["d2"],
+        "mask ∩ where must not widen, got {hits:?}"
+    );
+}
+
+/// A node matching label and where but absent from the mask must not appear
+/// (`nodes_with_label` does not apply the mask).
+#[test]
+fn find_similar_label_and_mask_and_where() {
+    let dir = tmp("where-label-mask");
+    let mut db = GraphDb::open(&dir).unwrap();
+    insert_doc(&mut db, "d1", Some("a"), &[1.0, 0.0]);
+    insert_doc(&mut db, "d2", Some("a"), &[0.95, 0.05]);
+    db.insert_node(
+        "Other",
+        "o1",
+        vec![
+            ("emb".into(), emb(&[1.0, 0.0])),
+            ("resource_scope_id".into(), Value::Str("a".into())),
+        ],
+    )
+    .unwrap();
+    let mask = NodeMask::from_keys(&db, ["d1", "o1"]);
+    let hits = db
+        .find_similar_vector_filtered(
+            "emb",
+            Some("Document"),
+            &[1.0, 0.0],
+            10,
+            0.0,
+            Some(&mask),
+            Some(&pred_eq("resource_scope_id", "a")),
+            false,
+        )
+        .unwrap();
+    let keys: Vec<&str> = hits.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["d1"],
+        "d2 matches label+where but is not in mask; o1 is wrong label; got {hits:?}"
+    );
+}
+
+#[test]
+fn find_similar_where_uses_property_index_when_enabled() {
+    let dir = tmp("where-index");
+    let mut db = GraphDb::open(&dir).unwrap();
+    insert_doc(&mut db, "d1", Some("a"), &[1.0, 0.0]);
+    insert_doc(&mut db, "d2", Some("a"), &[0.8, 0.2]);
+    insert_doc(&mut db, "d3", Some("b"), &[1.0, 0.0]);
+    let pred = pred_eq("resource_scope_id", "a");
+    let q = [1.0, 0.0];
+    let scan = db
+        .find_similar_vector_filtered(
+            "emb",
+            Some("Document"),
+            &q,
+            10,
+            0.0,
+            None,
+            Some(&pred),
+            false,
+        )
+        .unwrap();
+    db.enable_index("Document", "resource_scope_id").unwrap();
+    assert!(db.is_index_enabled("Document", "resource_scope_id"));
+    let indexed = db
+        .find_similar_vector_filtered(
+            "emb",
+            Some("Document"),
+            &q,
+            10,
+            0.0,
+            None,
+            Some(&pred),
+            false,
+        )
+        .unwrap();
+    assert_eq!(scan, indexed, "indexed where eq must match the scan");
+}
+
+#[test]
+fn find_similar_where_invalid_is_refused() {
+    let dir = tmp("where-invalid");
+    let db = GraphDb::open(&dir).unwrap();
+    let pred = PropPredicate {
+        field: "resource_scope_id".into(),
+        eq: Some(Value::Str("a".into())),
+        in_: Some(vec![Value::Str("b".into())]),
+    };
+    let err = db
+        .find_similar_vector_filtered(
+            "emb",
+            Some("Document"),
+            &[1.0, 0.0],
+            10,
+            0.0,
+            None,
+            Some(&pred),
+            false,
+        )
+        .expect_err("both eq and in must be refused");
+    match err {
+        GraphError::QueryError { detail } => {
+            assert!(
+                detail.contains("where"),
+                "QueryError must use validate_named(\"where\"), got {detail}"
+            );
+            assert!(
+                detail.contains("both"),
+                "QueryError must name both eq and in, got {detail}"
+            );
+        }
+        other => panic!("expected QueryError, got {other:?}"),
+    }
+}
+
+/// Approximate rule present: `exact=true` does not consult HNSW; `exact=false`
+/// does.
+#[test]
+fn exact_true_skips_hnsw() {
+    let (mut db, _nodes) = seed_pairwise("exact-true-hnsw", 16, 8);
+    db.create_rule(sim_rule()).unwrap();
+    assert!(db.has_vector_rule("emb"));
+    let q = fill_vec(99, 8);
+    core_rules::hnsw_search_count_reset();
+    let exact = db
+        .find_similar_vector_filtered("emb", Some("Item"), &q, 5, 0.0, None, None, true)
+        .unwrap();
+    assert_eq!(
+        core_rules::hnsw_search_count(),
+        0,
+        "exact=true must not call hnsw_search"
+    );
+    core_rules::hnsw_search_count_reset();
+    let approx = db.find_similar_vector("emb", Some("Item"), &q, 5, 0.0);
+    assert!(
+        core_rules::hnsw_search_count() > 0,
+        "exact=false with a covering rule must use HNSW"
+    );
+    let brute = db
+        .find_similar_vector_filtered("emb", Some("Item"), &q, 5, 0.0, None, None, true)
+        .unwrap();
+    assert_eq!(exact, brute);
+    let _ = approx;
 }

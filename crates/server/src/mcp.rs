@@ -54,7 +54,7 @@ use crate::json::{
 };
 use core_api::{
     json_to_rows, json_to_value, AsOfScope, AutoFk, GraphError, IngestOptions, MaskMode, NodeMask,
-    SharedDb, Value, NS_PROP,
+    PropPredicate, SharedDb, Value, NS_PROP,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -768,14 +768,36 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
             .map(|n| n as usize)
             .unwrap_or(10);
         let min = args.get("min").and_then(Js::as_f64).unwrap_or(0.8);
+        let where_pred = match parse_where_arg(args) {
+            Ok(p) => p,
+            Err(e) => return CallOutcome::ToolErr(e),
+        };
+        let exact = match args.get("exact") {
+            None => false,
+            Some(v) => match v.as_bool() {
+                Some(b) => b,
+                None => return CallOutcome::ToolErr("exact must be a boolean".into()),
+            },
+        };
+        let exact = exact || where_pred.is_some();
 
         let hits = {
             let g = db.read();
-            if let Some(ref keys) = mask_keys {
-                let node_mask = NodeMask::from_keys(&*g, keys.iter().map(String::as_str));
-                g.find_similar_vector_masked(field, label, &q, k, min, &node_mask)
-            } else {
-                g.find_similar_vector(field, label, &q, k, min)
+            let node_mask = mask_keys
+                .as_ref()
+                .map(|keys| NodeMask::from_keys(&*g, keys.iter().map(String::as_str)));
+            match g.find_similar_vector_filtered(
+                field,
+                label,
+                &q,
+                k,
+                min,
+                node_mask.as_ref(),
+                where_pred.as_ref(),
+                exact,
+            ) {
+                Ok(h) => h,
+                Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
             }
         };
         let results: Vec<Js> = hits
@@ -1018,6 +1040,19 @@ fn tool_rename_node(db: &SharedDb, args: &Js) -> CallOutcome {
         })),
         Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
     }
+}
+
+fn parse_where_arg(args: &Js) -> std::result::Result<Option<PropPredicate>, String> {
+    let Some(w) = args.get("where") else {
+        return Ok(None);
+    };
+    if w.is_null() {
+        return Ok(None);
+    }
+    let pred: PropPredicate =
+        serde_json::from_value(w.clone()).map_err(|e| format!("where: {e}"))?;
+    pred.validate_named("where")?;
+    Ok(Some(pred))
 }
 
 pub(crate) fn graph_err_msg(e: GraphError) -> String {
@@ -1325,7 +1360,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "find_similar",
-                "description": "What is most like this — two modes: (1) Vector search — provide `vector` (and optionally `field`, `label`, `k`, `min`) to find the k most similar nodes by cosine similarity using the HNSW index when available, brute-force otherwise. (2) Edge traversal — provide `key` (and optionally `edge_type`, `limit`) to return neighbors previously connected by a derived rule edge. Results from mode 2 come only from edges already derived by a VectorSimilar rule. In both modes, the optional `mask` array limits visibility: hidden nodes never appear in results, and a hidden query key in edge mode behaves identically to a nonexistent key.",
+                "description": "What is most like this — two modes: (1) Vector search — provide `vector` (and optionally `field`, `label`, `k`, `min`, `where`, `exact`) to find the k most similar nodes by cosine similarity using the HNSW index when available, brute-force otherwise. `where` is a property predicate (`{field, eq}` or `{field, in}`) and implies exact search. `exact` true skips HNSW. (2) Edge traversal — provide `key` (and optionally `edge_type`, `limit`) to return neighbors previously connected by a derived rule edge. Results from mode 2 come only from edges already derived by a VectorSimilar rule. Edge-traversal mode ignores `where` and `exact`. In both modes, the optional `mask` array limits visibility: hidden nodes never appear in results, and a hidden query key in edge mode behaves identically to a nonexistent key.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1342,6 +1377,14 @@ fn graph_tools() -> Vec<Js> {
                             "type": "array",
                             "items": { "type": "string" },
                             "description": "Optional node key allow-list for vector-search mode. When present, only nodes whose key appears in this list are eligible for results. Hidden nodes are excluded before k-truncation. The beam widens until it has k visible hits, then falls back to an exhaustive masked scan at the same cap an exact VectorSimilar rule uses, so the result is not short while more visible hits exist. Unknown keys are silently ignored."
+                        },
+                        "where": {
+                            "type": "object",
+                            "description": "Optional property predicate for vector-search mode, same shape as visible_where: {\"field\": \"...\", \"eq\": value} or {\"field\": \"...\", \"in\": [values]}. Implies exact search (skips HNSW). Invalid predicates are a tool error. Edge-traversal mode ignores this."
+                        },
+                        "exact": {
+                            "type": "boolean",
+                            "description": "When true, vector-search mode uses exact GEMM brute force and does not consult HNSW. Default false. Edge-traversal mode ignores this."
                         },
                         "key": { "type": "string", "description": "Source node key for edge-traversal mode." },
                         "edge_type": { "type": "string", "description": "Edge type to filter by in edge-traversal mode (default: SIMILAR)." },
@@ -2268,6 +2311,103 @@ mod tests {
         assert!(
             is_error(&resp),
             "non-string mask element must produce a tool error"
+        );
+    }
+
+    /// Vector-mode `where` eq filters to matching nodes. Default `min` stays 0.8.
+    #[test]
+    fn test_find_similar_vector_where_eq() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            g.insert_node(
+                "Document",
+                "in-scope",
+                vec![
+                    (
+                        "emb".into(),
+                        Value::List(vec![Value::Float(1.0), Value::Float(0.0)]),
+                    ),
+                    ("resource_scope_id".into(), Value::Str("a".into())),
+                ],
+            )
+            .unwrap();
+            g.insert_node(
+                "Document",
+                "out-scope",
+                vec![
+                    (
+                        "emb".into(),
+                        Value::List(vec![Value::Float(1.0), Value::Float(0.0)]),
+                    ),
+                    ("resource_scope_id".into(), Value::Str("b".into())),
+                ],
+            )
+            .unwrap();
+        }
+        let resp = tool_call(
+            &db,
+            1,
+            "find_similar",
+            json!({
+                "vector": [1.0, 0.0],
+                "field": "emb",
+                "label": "Document",
+                "k": 10,
+                "min": 0.0,
+                "where": { "field": "resource_scope_id", "eq": "a" }
+            }),
+        );
+        assert!(!is_error(&resp), "where eq must not error: {resp:?}");
+        let result = tool_text(&resp);
+        let keys: Vec<&str> = result["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .filter_map(|r| r["key"].as_str())
+            .collect();
+        assert_eq!(keys, vec!["in-scope"]);
+    }
+
+    #[test]
+    fn test_find_similar_vector_where_invalid_is_error() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        let resp = tool_call(
+            &db,
+            1,
+            "find_similar",
+            json!({
+                "vector": [1.0, 0.0],
+                "field": "emb",
+                "where": { "field": "resource_scope_id", "eq": "a", "in": ["b"] }
+            }),
+        );
+        assert!(is_error(&resp), "invalid where must be a tool error");
+        let msg = format!("{resp:?}");
+        assert!(
+            msg.contains("where"),
+            "tool error must name where, got {msg}"
+        );
+    }
+
+    /// Edge-traversal mode ignores `where` and `exact`.
+    #[test]
+    fn test_find_similar_edge_ignores_where_and_exact() {
+        let db = demo_db();
+        let resp = tool_call(
+            &db,
+            1,
+            "find_similar",
+            json!({
+                "key": "alice",
+                "edge_type": "SIMILAR",
+                "where": { "field": "x", "eq": "y", "in": ["z"] },
+                "exact": true
+            }),
+        );
+        assert!(
+            !is_error(&resp),
+            "edge mode must ignore invalid where: {resp:?}"
         );
     }
 

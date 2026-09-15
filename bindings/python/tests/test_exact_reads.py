@@ -1,4 +1,4 @@
-"""Exact-read binding tests: pairwise_similar (and later where=/degree)."""
+"""Exact-read binding tests: pairwise_similar and find_similar where=/exact=."""
 
 from __future__ import annotations
 
@@ -116,4 +116,83 @@ def test_pairwise_similar_naive_32(tmp_path):
         assert [d for d, _ in gneigh] == [d for d, _ in eneigh]
         for (_gd, gs), (_ed, es) in zip(gneigh, eneigh):
             assert abs(gs - es) <= 1e-9
+    db.close()
+
+
+def test_find_similar_where_eq_matches_mask(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Document", "d1", {"emb": [1.0, 0.0], "resource_scope_id": "a"})
+    db.insert_node("Document", "d2", {"emb": [0.9, 0.1], "resource_scope_id": "a"})
+    db.insert_node("Document", "d3", {"emb": [1.0, 0.0], "resource_scope_id": "b"})
+    q = [1.0, 0.0]
+    by_where = db.find_similar(
+        "emb",
+        q,
+        label="Document",
+        k=10,
+        min=0.0,
+        where={"field": "resource_scope_id", "eq": "a"},
+    )
+    by_mask = db.find_similar("emb", q, label="Document", k=10, min=0.0, mask=["d1", "d2"])
+    assert by_where == by_mask
+    assert [k for k, _ in by_where] == ["d1", "d2"]
+    db.close()
+
+
+def test_find_similar_where_empty_in(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Document", "d1", {"emb": [1.0, 0.0], "resource_scope_id": "a"})
+    hits = db.find_similar(
+        "emb",
+        [1.0, 0.0],
+        label="Document",
+        k=10,
+        min=0.0,
+        where={"field": "resource_scope_id", "in": []},
+    )
+    assert hits == []
+    db.close()
+
+
+def test_find_similar_where_missing_property(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Document", "kept", {"emb": [1.0, 0.0], "resource_scope_id": "a"})
+    db.insert_node("Document", "bare", {"emb": [1.0, 0.0]})
+    hits = db.find_similar(
+        "emb",
+        [1.0, 0.0],
+        label="Document",
+        k=10,
+        min=0.0,
+        where={"field": "resource_scope_id", "eq": "a"},
+    )
+    assert [k for k, _ in hits] == ["kept"]
+    db.close()
+
+
+def test_find_similar_where_invalid_raises_valueerror(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Document", "d1", {"emb": [1.0, 0.0], "resource_scope_id": "a"})
+    try:
+        db.find_similar(
+            "emb",
+            [1.0, 0.0],
+            label="Document",
+            where={"field": "resource_scope_id", "eq": "a", "in": ["b"]},
+        )
+    except ValueError as e:
+        assert "where" in str(e)
+        assert "both" in str(e)
+    else:
+        raise AssertionError("expected ValueError for both eq and in")
+    db.close()
+
+
+def test_find_similar_exact_true(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "a", {"emb": [1.0, 0.0]})
+    db.insert_node("Item", "b", {"emb": [0.9, 0.1]})
+    brute = db.find_similar("emb", [1.0, 0.0], label="Item", k=10, min=0.0, exact=True)
+    default = db.find_similar("emb", [1.0, 0.0], label="Item", k=10, min=0.0)
+    assert brute == default
     db.close()

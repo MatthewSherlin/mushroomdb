@@ -174,6 +174,8 @@ class GraphDb:
         k: int = 10,
         min: float = 0.0,
         mask: Sequence[str] | None = None,
+        where: dict | None = None,
+        exact: bool = False,
     ) -> list[tuple[str, float]]:
         """The `k` nearest nodes to `vector` by cosine similarity on `field`."""
 
