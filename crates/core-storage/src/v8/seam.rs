@@ -128,6 +128,26 @@ impl<'a> TopologyView<'a> {
         }
     }
 
+    /// Unique neighbour count for `(etype, dir, v)`.
+    ///
+    /// Uses archived CSR row length when the overlay has no delta for `v` and
+    /// there are no tombstones for that tuple (no neighbour-id copy). Otherwise
+    /// `|overlay ∪ base − tombstones|` — set subtract, not count-subtract.
+    pub fn degree(&self, etype: u32, dir: Direction, v: u32) -> usize {
+        match self.base {
+            None => self.overlay.degree(etype, dir, v),
+            Some(base) => {
+                if self.overlay.adj_is_empty(etype, dir, v)
+                    && self.overlay.tombstones_are_empty(etype, dir, v)
+                {
+                    archived_row_degree(base, etype, dir, v)
+                } else {
+                    self.neighbors(etype, dir, v).len()
+                }
+            }
+        }
+    }
+
     /// Edge-type ids present in overlay and/or base, sorted ascending.
     pub fn etypes(&self) -> std::vec::IntoIter<u32> {
         match self.base {
@@ -146,6 +166,41 @@ impl<'a> TopologyView<'a> {
     }
 }
 
+/// Look up the archived CSR row for `(etype, dir, v)`.
+fn archived_csr_row(
+    base: &ArchivedCsr,
+    etype: u32,
+    dir: Direction,
+    v: u32,
+) -> Option<&crate::v8::layout::ArchivedCsrRow> {
+    let et_pos = base
+        .etypes
+        .binary_search_by_key(&etype, |e| u32::from(e.etype))
+        .ok()?;
+    let et_entry = &base.etypes[et_pos];
+    let adj = match dir {
+        Direction::Out => &et_entry.out_adj,
+        Direction::In => &et_entry.in_adj,
+    };
+    let row_pos = adj
+        .rows
+        .binary_search_by_key(&v, |r| u32::from(r.vertex))
+        .ok()?;
+    Some(&adj.rows[row_pos])
+}
+
+/// Archived neighbour count without collecting ids.
+fn archived_row_degree(base: &ArchivedCsr, etype: u32, dir: Direction, v: u32) -> usize {
+    archived_csr_row(base, etype, dir, v)
+        .map(|row| row.neighbors.len())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+thread_local! {
+    static BASE_NEIGHBOR_COLLECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Look up neighbors in an archived CSR for `(etype, dir, v)`.
 /// Returns an empty Vec if not found.
 fn base_neighbors_from_archived(
@@ -154,29 +209,12 @@ fn base_neighbors_from_archived(
     dir: Direction,
     v: u32,
 ) -> Vec<u32> {
-    // Binary search for the etype (etypes are sorted by etype ascending).
-    let et_pos = base
-        .etypes
-        .binary_search_by_key(&etype, |e| u32::from(e.etype));
-    let et_entry = match et_pos {
-        Ok(i) => &base.etypes[i],
-        Err(_) => return Vec::new(),
-    };
-
-    let adj = match dir {
-        Direction::Out => &et_entry.out_adj,
-        Direction::In => &et_entry.in_adj,
-    };
-
-    // Binary search for the vertex (rows are sorted by vertex ascending).
-    let row_pos = adj.rows.binary_search_by_key(&v, |r| u32::from(r.vertex));
-    let row = match row_pos {
-        Ok(i) => &adj.rows[i],
-        Err(_) => return Vec::new(),
-    };
-
-    // Collect neighbor ids (stored as archived u32 LE values).
-    row.neighbors.iter().map(|n| u32::from(*n)).collect()
+    #[cfg(test)]
+    BASE_NEIGHBOR_COLLECTS.with(|c| c.set(c.get() + 1));
+    match archived_csr_row(base, etype, dir, v) {
+        None => Vec::new(),
+        Some(row) => row.neighbors.iter().map(|n| u32::from(*n)).collect(),
+    }
 }
 
 /// Merge two sorted-unique slices into a sorted-unique Vec.
@@ -419,6 +457,107 @@ mod tests {
             out_nbrs2.contains(&c),
             "C must still be visible (not tombstoned); got {out_nbrs2:?}"
         );
+    }
+
+    fn encode_csr(topo: &Topology, keys: &[&str]) -> (MappedBase, Topology) {
+        let mut ids = IdMap::new();
+        for k in keys {
+            ids.get_or_insert(k);
+        }
+        let mut snap = Vec::new();
+        encode_v8(
+            None,
+            None,
+            None,
+            None,
+            None,
+            topo,
+            &ColumnStore::new(),
+            &ids,
+            &Interner::new(),
+            &tiny_meta(),
+            &mut snap,
+        )
+        .expect("encode_v8");
+        let mapped = MappedBase::from_bytes(snap).expect("from_bytes");
+        (mapped, Topology::new())
+    }
+
+    /// Empty overlay + no tombstones: degree is archived row len, no id collect.
+    #[test]
+    fn degree_archived_csr_len_does_not_collect_ids() {
+        let etype = 7u32;
+        let a = 0u32;
+        let mut base_topo = Topology::new();
+        base_topo.add_edge(etype, a, 1);
+        base_topo.add_edge(etype, a, 2);
+        let (mapped, overlay) = encode_csr(&base_topo, &["A", "B", "C"]);
+        let view = TopologyView::with_base(&overlay, mapped.topology().expect("topology"));
+
+        BASE_NEIGHBOR_COLLECTS.with(|c| c.set(0));
+        assert_eq!(view.degree(etype, Direction::Out, a), 2);
+        assert_eq!(
+            BASE_NEIGHBOR_COLLECTS.with(|c| c.get()),
+            0,
+            "CSR degree path must not collect neighbour ids"
+        );
+        assert_eq!(view.neighbors(etype, Direction::Out, a).len(), 2);
+        assert!(
+            BASE_NEIGHBOR_COLLECTS.with(|c| c.get()) > 0,
+            "neighbors() still collects archived ids"
+        );
+    }
+
+    /// Overlay re-insert of a base neighbour must not double-count.
+    #[test]
+    fn degree_unique_union_does_not_double_count() {
+        let etype = 7u32;
+        let a = 0u32;
+        let mut base_topo = Topology::new();
+        base_topo.add_edge(etype, a, 1);
+        base_topo.add_edge(etype, a, 2);
+        let (mapped, mut overlay) = encode_csr(&base_topo, &["A", "B", "C", "D"]);
+        assert!(overlay.add_edge(etype, a, 1), "re-insert of base dest 1");
+        assert!(overlay.add_edge(etype, a, 3), "new overlay dest 3");
+        let view = TopologyView::with_base(&overlay, mapped.topology().expect("topology"));
+        assert_eq!(view.degree(etype, Direction::Out, a), 3);
+        assert_eq!(
+            view.neighbors(etype, Direction::Out, a).as_ref(),
+            &[1, 2, 3]
+        );
+    }
+
+    /// Tombstone of an id not in the CSR row must not undercount (set subtract).
+    #[test]
+    fn degree_tombstone_of_missing_nbr_does_not_undercount() {
+        let etype = 7u32;
+        let a = 0u32;
+        let mut base_topo = Topology::new();
+        base_topo.add_edge(etype, a, 1);
+        base_topo.add_edge(etype, a, 2);
+        let (mapped, mut overlay) = encode_csr(&base_topo, &["A", "B", "C"]);
+        overlay.remove_edge(etype, a, 99); // not in CSR
+        let view = TopologyView::with_base(&overlay, mapped.topology().expect("topology"));
+        assert_eq!(
+            view.degree(etype, Direction::Out, a),
+            2,
+            "count-subtract would yield 1; set subtract keeps both CSR neighbours"
+        );
+    }
+
+    #[test]
+    fn degree_overlay_only_matches_topology() {
+        let mut overlay = Topology::new();
+        overlay.add_edge(1, 0, 1);
+        overlay.add_edge(1, 0, 2);
+        let view = TopologyView::owned(&overlay);
+        assert_eq!(
+            view.degree(1, Direction::Out, 0),
+            overlay.degree(1, Direction::Out, 0)
+        );
+        assert_eq!(view.degree(1, Direction::Out, 0), 2);
+        assert_eq!(view.degree(1, Direction::In, 1), 1);
+        assert_eq!(view.degree(9, Direction::Out, 0), 0);
     }
 }
 

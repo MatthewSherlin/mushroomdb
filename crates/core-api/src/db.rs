@@ -9940,6 +9940,121 @@ impl<F: Fs> GraphDb<F> {
             .collect::<Result<Vec<_>>>()
     }
 
+    /// Unique directed degree of `key`. Unknown key → [`GraphError::KeyNotFound`].
+    /// Unknown `edge_type` → 0. [`crate::algo::AlgoDir::Both`] is out + in (sum).
+    pub fn degree(
+        &self,
+        key: &str,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+    ) -> Result<u64> {
+        let id = self
+            .ids
+            .get(key)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+        let topo = self.topo_view();
+        Ok(Self::unique_directed_degree(
+            &topo, &self.syms, id, edge_type, direction,
+        ))
+    }
+
+    /// Unique directed degree for a subset or a label scan.
+    ///
+    /// Unknown keys in `keys` are omitted (mask-like). `keys = Some(&[])` →
+    /// empty `Ok(vec![])`. `limit` is applied after sorting degree desc, key
+    /// asc, and only when `Some`. Invalid `where_` → `QueryError`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn degrees(
+        &self,
+        keys: Option<&[String]>,
+        label: Option<&str>,
+        where_: Option<&PropPredicate>,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, u64)>> {
+        if let Some(pred) = where_ {
+            pred.validate_named("where")
+                .map_err(|detail| GraphError::QueryError { detail })?;
+        }
+        if matches!(keys, Some(ks) if ks.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let view = self.view();
+        let ids: Vec<u32> = match keys {
+            Some(ks) => {
+                let mut seen = HashSet::new();
+                let mut out = Vec::new();
+                for k in ks {
+                    let Some(id) = view.ids.get(k) else {
+                        continue;
+                    };
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    if let Some(pred) = where_ {
+                        let holds = match view.prop(id, &pred.field) {
+                            None => pred.holds(None),
+                            Some(vr) => pred.holds(Some(vr.as_value())),
+                        };
+                        if !holds {
+                            continue;
+                        }
+                    }
+                    out.push(id);
+                }
+                out
+            }
+            None => Self::vector_candidates(&view, label, where_),
+        };
+        let mut out: Vec<(String, u64)> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let key = self.ids.key_of(id)?.to_string();
+                let deg =
+                    Self::unique_directed_degree(&view.topo, view.syms, id, edge_type, direction);
+                Some((key, deg))
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if let Some(lim) = limit {
+            out.truncate(lim);
+        }
+        Ok(out)
+    }
+
+    /// Unique neighbour count for `id` across `edge_type` (or all types) and
+    /// `direction`. Unknown `edge_type` → 0. `Both` sums out + in.
+    fn unique_directed_degree(
+        topo: &TopologyView<'_>,
+        syms: &Interner,
+        id: u32,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+    ) -> u64 {
+        let dirs: &[Direction] = match direction {
+            crate::algo::AlgoDir::Out => &[Direction::Out],
+            crate::algo::AlgoDir::In => &[Direction::In],
+            crate::algo::AlgoDir::Both => &[Direction::Out, Direction::In],
+        };
+        match edge_type {
+            Some(name) => {
+                let Some(et) = syms.get(name) else {
+                    return 0;
+                };
+                dirs.iter().map(|&d| topo.degree(et, d, id) as u64).sum()
+            }
+            None => topo
+                .etypes()
+                .map(|et| {
+                    dirs.iter()
+                        .map(|&d| topo.degree(et, d, id) as u64)
+                        .sum::<u64>()
+                })
+                .sum(),
+        }
+    }
+
     /// Return the last-change commit sequence for `key`, or `None` if the node
     /// does not exist or has never been mutated since the last V5-V7 snapshot
     /// (horizon-bounded for legacy stores).

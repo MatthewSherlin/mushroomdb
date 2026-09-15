@@ -1,5 +1,5 @@
 use core_api::{
-    default_max_edges, valid_namespace, Direction, EdgeAt, Explanation, GraphDb as CoreDb,
+    default_max_edges, valid_namespace, AlgoDir, Direction, EdgeAt, Explanation, GraphDb as CoreDb,
     GraphError, HistoryChange, HistoryEntry, NodeInfo, NodeMask, PredicateSummary, PropPredicate,
     ResultSet, RuleDef, Value, NS_MAX_LEN, NS_PROP,
 };
@@ -627,6 +627,70 @@ impl GraphDb {
         self.with_ref(|db| db.neighbors(key, edge_type, dir))
     }
 
+    /// Unique directed degree of `key`. `direction` is `"out"`, `"in"`, or
+    /// `"both"` (out + in sum). Unknown `edge_type` is 0. Unknown key raises.
+    #[allow(deprecated)]
+    #[pyo3(
+        signature = (key, edge_type = None, direction = "both"),
+        text_signature = "($self, key, edge_type=None, direction='both')"
+    )]
+    fn degree(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        edge_type: Option<&str>,
+        direction: &str,
+    ) -> PyResult<u64> {
+        let dir = parse_algo_dir(direction)?;
+        let key = key.to_owned();
+        let edge_type = edge_type.map(str::to_owned);
+        py.allow_threads(|| {
+            self.with_ref(|db| db.degree(&key, edge_type.as_deref(), dir))
+        })
+    }
+
+    /// Unique directed degree for a key subset or a label scan.
+    ///
+    /// Unknown keys are omitted. `keys=[]` returns `[]`. `where` is the same
+    /// dict shape as `find_similar`. `limit` applies after sorting degree
+    /// descending, key ascending.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
+    #[pyo3(
+        signature = (keys = None, label = None, r#where = None, edge_type = None, direction = "both", limit = None),
+        text_signature = "($self, keys=None, label=None, where=None, edge_type=None, direction='both', limit=None)"
+    )]
+    fn degrees(
+        &self,
+        py: Python<'_>,
+        keys: Option<Vec<String>>,
+        label: Option<&str>,
+        r#where: Option<Bound<'_, PyDict>>,
+        edge_type: Option<&str>,
+        direction: &str,
+        limit: Option<usize>,
+    ) -> PyResult<Vec<(String, u64)>> {
+        let dir = parse_algo_dir(direction)?;
+        let pred = match r#where {
+            Some(d) => Some(py_to_where(&d)?),
+            None => None,
+        };
+        let label = label.map(str::to_owned);
+        let edge_type = edge_type.map(str::to_owned);
+        py.allow_threads(|| {
+            self.with_ref(|db| {
+                db.degrees(
+                    keys.as_deref(),
+                    label.as_deref(),
+                    pred.as_ref(),
+                    edge_type.as_deref(),
+                    dir,
+                    limit,
+                )
+            })
+        })
+    }
+
     /// Unknown key: `None`, matching Rust `GraphDb::node_info` → `Option`.
     /// Contrast `node_edges`, which raises `RuntimeError` for the same miss
     /// because Rust returns `Result` (`GraphError::KeyNotFound`). Deliberate.
@@ -1172,6 +1236,17 @@ fn parse_dir(s: &str) -> PyResult<Direction> {
         "out" => Ok(Direction::Out),
         "in" => Ok(Direction::In),
         _ => Err(PyValueError::new_err("direction must be 'out' or 'in'")),
+    }
+}
+
+fn parse_algo_dir(s: &str) -> PyResult<AlgoDir> {
+    match s.to_ascii_lowercase().as_str() {
+        "out" => Ok(AlgoDir::Out),
+        "in" => Ok(AlgoDir::In),
+        "both" => Ok(AlgoDir::Both),
+        _ => Err(PyValueError::new_err(
+            "direction must be 'out', 'in', or 'both'",
+        )),
     }
 }
 

@@ -497,6 +497,8 @@ _DOCUMENTED = [
     "refresh",
     "close",
     "pairwise_similar",
+    "degree",
+    "degrees",
 ]
 
 

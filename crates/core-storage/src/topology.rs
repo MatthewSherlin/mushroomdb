@@ -61,6 +61,10 @@ impl AdjList {
         self.delta.clear();
     }
 
+    fn is_empty(&self) -> bool {
+        self.frozen.is_empty() && self.delta.is_empty()
+    }
+
     /// Return a sorted-unique merged view of frozen + delta.
     ///
     /// Borrows `frozen` directly when `delta` is empty (no allocation); allocates
@@ -199,6 +203,23 @@ impl Topology {
 
     pub fn degree(&self, etype: u32, dir: Direction, v: u32) -> usize {
         self.neighbors(etype, dir, v).as_ref().len()
+    }
+
+    /// Whether overlay adjacency for `(etype, dir, v)` has no neighbor ids.
+    ///
+    /// Used by [`crate::v8::seam::TopologyView::degree`] to take the archived
+    /// CSR-length fast path when this vertex has no overlay delta.
+    pub(crate) fn adj_is_empty(&self, etype: u32, dir: Direction, v: u32) -> bool {
+        self.adj_list(etype, dir, v).is_none_or(AdjList::is_empty)
+    }
+
+    /// Whether overlay tombstones for `(etype, dir, v)` are absent or empty.
+    pub(crate) fn tombstones_are_empty(&self, etype: u32, dir: Direction, v: u32) -> bool {
+        let set = match dir {
+            Direction::Out => self.out_tombstones_for(etype, v),
+            Direction::In => self.in_tombstones_for(etype, v),
+        };
+        set.is_none_or(|s| s.is_empty())
     }
 
     pub fn edge_count(&self) -> u64 {

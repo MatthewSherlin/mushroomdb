@@ -1,4 +1,4 @@
-"""Exact-read binding tests: pairwise_similar and find_similar where=/exact=."""
+"""Exact-read binding tests: pairwise_similar, find_similar where=/exact=, degree."""
 
 from __future__ import annotations
 
@@ -195,4 +195,88 @@ def test_find_similar_exact_true(tmp_path):
     brute = db.find_similar("emb", [1.0, 0.0], label="Item", k=10, min=0.0, exact=True)
     default = db.find_similar("emb", [1.0, 0.0], label="Item", k=10, min=0.0)
     assert brute == default
+    db.close()
+
+
+def test_degree_direction_both(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("N", "a", {})
+    db.insert_node("N", "b", {})
+    db.insert_edge("E", "a", "b")
+    db.insert_edge("E", "b", "a")
+    assert db.degree("a", direction="both") == 2
+    assert db.degree("a") == 2
+    assert db.degree("a", edge_type="E", direction="out") == 1
+    db.close()
+
+
+def test_neighbors_rejects_direction_both(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("N", "a", {})
+    try:
+        db.neighbors("a", "E", "both")
+    except ValueError as e:
+        assert "out" in str(e) or "in" in str(e)
+    else:
+        raise AssertionError("neighbors must still reject direction='both'")
+    db.close()
+
+
+def test_degree_duplicate_edge(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("N", "a", {})
+    db.insert_node("N", "b", {})
+    assert db.insert_edge("E", "a", "b") is True
+    assert db.degree("a", edge_type="E", direction="out") == 1
+    assert db.insert_edge("E", "a", "b") is False
+    assert db.degree("a", edge_type="E", direction="out") == 1
+    db.close()
+
+
+def test_degrees_empty_keys(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("N", "a", {})
+    assert db.degrees(keys=[]) == []
+    db.close()
+
+
+def test_degrees_omits_unknown(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("N", "a", {})
+    db.insert_node("N", "b", {})
+    db.insert_edge("E", "a", "b")
+    got = db.degrees(keys=["ghost", "a"], edge_type="E", direction="out")
+    assert got == [("a", 1)]
+    db.close()
+
+
+def test_degrees_where_limit(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    for k, n_out, scope in [("a", 3, "keep"), ("b", 3, "keep"), ("c", 1, "keep"), ("z", 9, "drop")]:
+        db.insert_node("Document", k, {"scope": scope})
+        for i in range(n_out):
+            dst = f"{k}-d{i}"
+            db.insert_node("Document", dst, {})
+            db.insert_edge("E", k, dst)
+    got = db.degrees(
+        label="Document",
+        where={"field": "scope", "eq": "keep"},
+        edge_type="E",
+        direction="out",
+        limit=2,
+    )
+    assert got == [("a", 3), ("b", 3)]
+    db.close()
+
+
+def test_degrees_where_invalid_raises_valueerror(tmp_path):
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("N", "a", {})
+    try:
+        db.degrees(where={"field": "scope", "eq": "a", "in": ["b"]})
+    except ValueError as e:
+        assert "where" in str(e)
+        assert "both" in str(e)
+    else:
+        raise AssertionError("expected ValueError for both eq and in")
     db.close()
