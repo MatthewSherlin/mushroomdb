@@ -249,7 +249,8 @@ pub enum AlgoDir {
     Out,
     /// Follow incoming edges only (in-degree / authority score).
     In,
-    /// Treat edges as undirected: Out ∪ In.
+    /// Sum of out-degree and in-degree (a reciprocal pair counts 2 per endpoint).
+    /// Not the neighbour-set union `|N_out ∪ N_in|`.
     Both,
 }
 

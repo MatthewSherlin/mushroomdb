@@ -1,5 +1,5 @@
 use crate::ingest::{IngestOptions, IngestReport};
-use crate::roles::{RoleDef, RolesFile, WriteScope};
+use crate::roles::{PropPredicate, RoleDef, RolesFile, WriteScope};
 use crate::subscription::{
     event_matches, DbEvent, SubEntry, SubFilter, SubInner, Subscription, DEFAULT_SUB_CAPACITY,
 };
@@ -35,7 +35,7 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Print a timing checkpoint when MUSHROOMDB_TRACE_OPEN is set.
@@ -8558,80 +8558,8 @@ impl<F: Fs> GraphDb<F> {
         k: usize,
         min: f64,
     ) -> Vec<(String, f64)> {
-        // Ensure any HNSW blobs retained from the snapshot are deserialized
-        // before the first ANN query on a clean-open (no-WAL) path.  The
-        // section read has to come first: on a clean open nothing else has
-        // called it, so without it `retained_hnsw_blobs` is empty,
-        // `ensure_hnsw_loaded` caches an empty map in its `OnceLock`, and every
-        // approximate query on the handle runs brute force — correct results,
-        // silently off the index.  Both calls are idempotent and cheap once hot.
-        self.ensure_v8_base_sections_loaded();
-        self.engine.ensure_hnsw_loaded();
-        // L2-normalise query for cosine via dot product.
-        let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm == 0.0 {
-            return vec![];
-        }
-        let q_unit: Vec<f64> = q.iter().map(|x| x / norm).collect();
-
-        // Try HNSW fast path.
-        // `None` label searches across all VectorSimilar rules covering `field`
-        // (merging their results); `Some(lbl)` restricts to rules whose
-        // dst_label matches.  Returns `None` when no populated HNSW index
-        // covers the request — the O(n) brute-force fallback handles that case.
-        let over_k = k.saturating_add(VECTOR_RESCORE_MARGIN);
-        let hnsw_hits = match label {
-            Some(lbl) => self.engine.hnsw_search_dst(field, lbl, &q_unit, over_k),
-            None => self.engine.hnsw_search_any_dst(field, &q_unit, over_k),
-        };
-        if let Some(hits) = hnsw_hits {
-            // Candidates only: the index's `f32` similarity is discarded and
-            // each hit is re-scored against the `f64` vectors.
-            let view = self.view();
-            let mut out: Vec<(String, f64)> = hits
-                .into_iter()
-                .filter_map(|(id, _)| {
-                    let sim = exact_vector_similarity(&view, id, field, &q_unit)?;
-                    if sim < min {
-                        return None;
-                    }
-                    Some((self.ids.key_of(id)?.to_string(), sim))
-                })
-                .collect();
-            out.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            out.truncate(k);
-            return out;
-        }
-
-        // Brute-force fallback: O(n) scan (only reached when no HNSW index
-        // covers the request).
-        let view = self.view();
-        let candidate_ids: Vec<u32> = match label {
-            Some(lbl) => view.nodes_with_label(lbl),
-            None => view.nodes_all(),
-        };
-        let mut scored: Vec<(String, f64)> = candidate_ids
-            .into_iter()
-            .filter_map(|id| {
-                let dot = exact_vector_similarity(&view, id, field, &q_unit)?;
-                if dot < min {
-                    return None;
-                }
-                let key = self.ids.key_of(id)?.to_string();
-                Some((key, dot))
-            })
-            .collect();
-        scored.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        scored.truncate(k);
-        scored
+        self.find_similar_vector_filtered(field, label, q, k, min, None, None, false)
+            .expect("find_similar_vector_filtered is infallible without where_")
     }
 
     /// Like [`find_similar_vector`] but restricts results to nodes visible in
@@ -8668,64 +8596,207 @@ impl<F: Fs> GraphDb<F> {
         min: f64,
         mask: &crate::mask::NodeMask,
     ) -> Vec<(String, f64)> {
-        // Section read before the blob decode — see `find_similar_vector`.
+        self.find_similar_vector_filtered(field, label, q, k, min, Some(mask), None, false)
+            .expect("find_similar_vector_filtered is infallible without where_")
+    }
+
+    /// Exact or ANN kNN with optional key-list `mask` and property `where_`.
+    ///
+    /// `where_` present and failing [`PropPredicate::validate_named`] `"where"`
+    /// → `QueryError`. `exact=true` or `where_=Some` skip HNSW and GEMM-brute
+    /// the candidate set (`label ∩ mask ∩ holds(where)`). `mask` alone still
+    /// uses HNSW when an index covers the field.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_similar_vector_filtered(
+        &self,
+        field: &str,
+        label: Option<&str>,
+        q: &[f64],
+        k: usize,
+        min: f64,
+        mask: Option<&crate::mask::NodeMask>,
+        where_: Option<&PropPredicate>,
+        exact: bool,
+    ) -> Result<Vec<(String, f64)>> {
+        if let Some(pred) = where_ {
+            pred.validate_named("where")
+                .map_err(|detail| GraphError::QueryError { detail })?;
+        }
+
+        // Ensure any HNSW blobs retained from the snapshot are deserialized
+        // before the first ANN query on a clean-open (no-WAL) path.  The
+        // section read has to come first: on a clean open nothing else has
+        // called it, so without it `retained_hnsw_blobs` is empty,
+        // `ensure_hnsw_loaded` caches an empty map in its `OnceLock`, and every
+        // approximate query on the handle runs brute force — correct results,
+        // silently off the index.  Both calls are idempotent and cheap once hot.
         self.ensure_v8_base_sections_loaded();
         self.engine.ensure_hnsw_loaded();
         let norm: f64 = q.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm == 0.0 || k == 0 || mask.is_empty() {
-            return vec![];
+        if norm == 0.0 {
+            return Ok(vec![]);
+        }
+        if let Some(m) = mask {
+            if k == 0 || m.is_empty() {
+                return Ok(vec![]);
+            }
         }
         let q_unit: Vec<f64> = q.iter().map(|x| x / norm).collect();
 
+        // `where` implies exact: a predicate must not ride a silent ANN.
+        let skip_hnsw = exact || where_.is_some();
+        if !skip_hnsw {
+            if let Some(mask) = mask {
+                if let Some(out) =
+                    self.find_similar_hnsw_masked(field, label, &q_unit, k, min, mask)
+                {
+                    return Ok(out);
+                }
+            } else if let Some(out) = self.find_similar_hnsw(field, label, &q_unit, k, min) {
+                return Ok(out);
+            }
+        }
+
+        let view = match mask {
+            Some(m) => self.view_masked(m),
+            None => self.view(),
+        };
+        let candidate_ids = Self::vector_candidates(&view, label, where_);
+        Ok(self.brute_vector_hits(&view, candidate_ids, field, &q_unit, k, min))
+    }
+
+    /// Unmasked HNSW path. `None` when no populated index covers the request.
+    fn find_similar_hnsw(
+        &self,
+        field: &str,
+        label: Option<&str>,
+        q_unit: &[f64],
+        k: usize,
+        min: f64,
+    ) -> Option<Vec<(String, f64)>> {
+        // Try HNSW fast path.
+        // `None` label searches across all VectorSimilar rules covering `field`
+        // (merging their results); `Some(lbl)` restricts to rules whose
+        // dst_label matches.  Returns `None` when no populated HNSW index
+        // covers the request — the O(n) brute-force fallback handles that case.
+        let over_k = k.saturating_add(VECTOR_RESCORE_MARGIN);
+        let hits = match label {
+            Some(lbl) => self.engine.hnsw_search_dst(field, lbl, q_unit, over_k)?,
+            None => self.engine.hnsw_search_any_dst(field, q_unit, over_k)?,
+        };
+        // Candidates only: the index's `f32` similarity is discarded and
+        // each hit is re-scored against the `f64` vectors.
+        let view = self.view();
+        let mut out: Vec<(String, f64)> = hits
+            .into_iter()
+            .filter_map(|(id, _)| {
+                let sim = exact_vector_similarity(&view, id, field, q_unit)?;
+                if sim < min {
+                    return None;
+                }
+                Some((self.ids.key_of(id)?.to_string(), sim))
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        out.truncate(k);
+        Some(out)
+    }
+
+    /// Masked HNSW widening beam. `None` when no index covers the request or
+    /// the beam cannot admit `k` visible hits (caller falls through to brute).
+    fn find_similar_hnsw_masked(
+        &self,
+        field: &str,
+        label: Option<&str>,
+        q_unit: &[f64],
+        k: usize,
+        min: f64,
+        mask: &crate::mask::NodeMask,
+    ) -> Option<Vec<(String, f64)>> {
         let index_len = match label {
             Some(lbl) => self.engine.hnsw_dst_len(field, lbl, q_unit.len()),
             None => self.engine.hnsw_any_dst_len(field, q_unit.len()),
         };
-        if let Some(n) = index_len {
-            // Same ceiling the exact-rule widening loop in `hnsw_candidates`
-            // consults — including the `with_ef_max` test hook.
-            let cap = ef_max();
-            let visible = mask.len();
-            let mut ef = k.saturating_add(VECTOR_RESCORE_MARGIN);
-            if visible > 0 && n > 0 {
-                let over = k
-                    .saturating_mul(n)
-                    .div_ceil(visible)
-                    .saturating_add(VECTOR_RESCORE_MARGIN);
-                ef = ef.max(over);
+        let n = index_len?;
+        // Same ceiling the exact-rule widening loop in `hnsw_candidates`
+        // consults — including the `with_ef_max` test hook.
+        let cap = ef_max();
+        let visible = mask.len();
+        let mut ef = k.saturating_add(VECTOR_RESCORE_MARGIN);
+        if visible > 0 && n > 0 {
+            let over = k
+                .saturating_mul(n)
+                .div_ceil(visible)
+                .saturating_add(VECTOR_RESCORE_MARGIN);
+            ef = ef.max(over);
+        }
+        loop {
+            let hits = match label {
+                Some(lbl) => self
+                    .engine
+                    .hnsw_search_dst_with_ef(field, lbl, q_unit, ef, ef),
+                None => self
+                    .engine
+                    .hnsw_search_any_dst_with_ef(field, q_unit, ef, ef),
+            };
+            let hits = hits?;
+            let full = hits.len() == ef;
+            let mut out = self.score_masked_hnsw_hits(&hits, field, q_unit, min, mask);
+            if out.len() >= k {
+                out.truncate(k);
+                return Some(out);
             }
-            loop {
-                let hits = match label {
-                    Some(lbl) => self
-                        .engine
-                        .hnsw_search_dst_with_ef(field, lbl, &q_unit, ef, ef),
-                    None => self
-                        .engine
-                        .hnsw_search_any_dst_with_ef(field, &q_unit, ef, ef),
-                };
-                let Some(hits) = hits else {
-                    break;
-                };
-                let full = hits.len() == ef;
-                let mut out = self.score_masked_hnsw_hits(&hits, field, &q_unit, min, mask);
-                if out.len() >= k {
-                    out.truncate(k);
-                    return out;
+            // Short of its width (frontier exhausted) or at the ceiling:
+            // a wider beam reaches nothing new, so the scan answers.
+            if !full || ef >= cap {
+                return None;
+            }
+            ef = ef.saturating_mul(2);
+        }
+    }
+
+    /// `label ∩ mask ∩ holds(where)`. Index fast path when `label` is `Some`
+    /// and `(label, where.field)` is enabled; otherwise scan with `visible()`.
+    fn vector_candidates(
+        view: &GraphView<'_>,
+        label: Option<&str>,
+        where_: Option<&PropPredicate>,
+    ) -> Vec<u32> {
+        if let (Some(lbl), Some(pred)) = (label, where_) {
+            let indexed = view
+                .prop_index
+                .is_some_and(|idx| idx.is_enabled(lbl, &pred.field));
+            if indexed {
+                match (&pred.eq, &pred.in_) {
+                    (Some(eq), None) => {
+                        if let Some(ids) = view.nodes_with_prop(lbl, &pred.field, eq) {
+                            return ids;
+                        }
+                    }
+                    (None, Some(allowed)) => {
+                        let mut seen = HashSet::new();
+                        let mut out = Vec::new();
+                        for v in allowed {
+                            if let Some(ids) = view.nodes_with_prop(lbl, &pred.field, v) {
+                                for id in ids {
+                                    if seen.insert(id) {
+                                        out.push(id);
+                                    }
+                                }
+                            }
+                        }
+                        return out;
+                    }
+                    _ => {}
                 }
-                // Short of its width (frontier exhausted) or at the ceiling:
-                // a wider beam reaches nothing new, so the scan answers.
-                if !full || ef >= cap {
-                    break;
-                }
-                ef = ef.saturating_mul(2);
             }
         }
 
-        // Brute-force fallback — masked view ensures only visible nodes are
-        // enumerated by nodes_all(); nodes_with_label() does not filter by
-        // mask so we apply view.visible() explicitly for the labeled case.
-        let view = self.view_masked(mask);
-        let candidate_ids: Vec<u32> = match label {
+        let mut ids: Vec<u32> = match label {
             Some(lbl) => view
                 .nodes_with_label(lbl)
                 .into_iter()
@@ -8733,15 +8804,43 @@ impl<F: Fs> GraphDb<F> {
                 .collect(),
             None => view.nodes_all(),
         };
-        let mut scored: Vec<(String, f64)> = candidate_ids
+        if let Some(pred) = where_ {
+            ids.retain(|&id| match view.prop(id, &pred.field) {
+                None => pred.holds(None),
+                Some(vr) => pred.holds(Some(vr.as_value())),
+            });
+        }
+        ids
+    }
+
+    /// Exact brute kNN: pack candidates at `q_unit`'s dim, GEMV, keep
+    /// `score >= min`, sort `(sim desc, key asc)`, truncate to `k`.
+    fn brute_vector_hits(
+        &self,
+        view: &GraphView<'_>,
+        candidate_ids: impl IntoIterator<Item = u32>,
+        field: &str,
+        q_unit: &[f64],
+        k: usize,
+        min: f64,
+    ) -> Vec<(String, f64)> {
+        let rows: Vec<(u32, std::borrow::Cow<'_, [f64]>)> = candidate_ids
             .into_iter()
-            .filter_map(|id| {
-                let dot = exact_vector_similarity(&view, id, field, &q_unit)?;
-                if dot < min {
+            .filter_map(|id| crate::exact_knn::vector_f64(view, id, field).map(|v| (id, v)))
+            .collect();
+        let packed =
+            crate::exact_knn::pack(rows.iter().map(|(id, v)| (*id, v.as_ref())), q_unit.len());
+        let scores = crate::exact_knn::gemv(&packed, q_unit);
+        let mut scored: Vec<(String, f64)> = packed
+            .ids
+            .iter()
+            .zip(scores.iter())
+            .filter_map(|(&id, &sim)| {
+                if sim < min {
                     return None;
                 }
                 let key = self.ids.key_of(id)?.to_string();
-                Some((key, dot))
+                Some((key, sim))
             })
             .collect();
         scored.sort_by(|a, b| {
@@ -8751,6 +8850,129 @@ impl<F: Fs> GraphDb<F> {
         });
         scored.truncate(k);
         scored
+    }
+
+    /// Exact cosine top-k for each key in `keys`, scored only against `keys`.
+    ///
+    /// `min` is cosine similarity in [-1, 1], inclusive (`score >= min`), the
+    /// same unit and inequality as `find_similar_vector`. Self-matches are
+    /// excluded. Unknown keys, keys with no `field`, zero-norm or wrong-dim
+    /// embeddings are omitted as both query and candidate. Duplicate keys are
+    /// collapsed, first-seen order. Empty `keys` → empty `Ok(vec![])`. Never
+    /// uses HNSW. `n > PAIRWISE_MAX_N` → `QueryError`.
+    #[allow(clippy::type_complexity)]
+    pub fn pairwise_similar(
+        &self,
+        keys: &[&str],
+        field: &str,
+        k: usize,
+        min: f64,
+    ) -> Result<Vec<(String, Vec<(String, f64)>)>> {
+        let mut seen = HashSet::new();
+        let mut unique_ids = Vec::new();
+        for key in keys {
+            let Some(id) = self.ids.get(key) else {
+                continue;
+            };
+            if seen.insert(id) {
+                unique_ids.push(id);
+            }
+        }
+        let max_n = crate::exact_knn::pairwise_max_n();
+        if unique_ids.len() > max_n {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "pairwise_similar: n={} exceeds PAIRWISE_MAX_N ({max_n})",
+                    unique_ids.len()
+                ),
+            });
+        }
+        if unique_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let view = self.view();
+        let mut rows: Vec<(u32, std::borrow::Cow<'_, [f64]>)> = Vec::new();
+        let mut counts: HashMap<usize, usize> = HashMap::new();
+        for id in unique_ids {
+            let Some(v) = crate::exact_knn::vector_f64(&view, id, field) else {
+                continue;
+            };
+            let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm == 0.0 {
+                continue;
+            }
+            *counts.entry(v.len()).or_default() += 1;
+            rows.push((id, v));
+        }
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dim = counts
+            .into_iter()
+            .max_by_key(|&(d, c)| (c, d))
+            .map(|(d, _)| d)
+            .expect("rows non-empty");
+        let packed = crate::exact_knn::pack(rows.iter().map(|(id, v)| (*id, v.as_ref())), dim);
+        let n = packed.ids.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let src_keys: Vec<String> = packed
+            .ids
+            .iter()
+            .map(|&id| self.ids.key_of(id).unwrap_or("").to_string())
+            .collect();
+
+        let mut out = Vec::with_capacity(n);
+        if n <= crate::exact_knn::pairwise_gram_max() {
+            let sims = crate::exact_knn::gram(&packed);
+            for i in 0..n {
+                out.push(Self::topk_from_row(
+                    &src_keys,
+                    i,
+                    &sims[i * n..(i + 1) * n],
+                    k,
+                    min,
+                ));
+            }
+        } else {
+            for i in 0..n {
+                let row = &packed.data[i * packed.dim..(i + 1) * packed.dim];
+                let scores = crate::exact_knn::gemv(&packed, row);
+                out.push(Self::topk_from_row(&src_keys, i, &scores, k, min));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Neighbours of packed row `i`: drop self, keep `score >= min`, sort
+    /// `(sim desc, key asc)`, truncate to `k`. Packed srcs with no survivors
+    /// still appear as `(src, [])`.
+    fn topk_from_row(
+        src_keys: &[String],
+        i: usize,
+        scores: &[f64],
+        k: usize,
+        min: f64,
+    ) -> (String, Vec<(String, f64)>) {
+        let mut neigh: Vec<(String, f64)> = scores
+            .iter()
+            .enumerate()
+            .filter_map(|(j, &sim)| {
+                if i == j || sim < min {
+                    return None;
+                }
+                Some((src_keys[j].clone(), sim))
+            })
+            .collect();
+        neigh.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        neigh.truncate(k);
+        (src_keys[i].clone(), neigh)
     }
 
     /// Re-score HNSW candidates from the `f64` vectors, drop hidden / below-`min`
@@ -9716,6 +9938,121 @@ impl<F: Fs> GraphDb<F> {
                     })
             })
             .collect::<Result<Vec<_>>>()
+    }
+
+    /// Unique directed degree of `key`. Unknown key → [`GraphError::KeyNotFound`].
+    /// Unknown `edge_type` → 0. [`crate::algo::AlgoDir::Both`] is out + in (sum).
+    pub fn degree(
+        &self,
+        key: &str,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+    ) -> Result<u64> {
+        let id = self
+            .ids
+            .get(key)
+            .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+        let topo = self.topo_view();
+        Ok(Self::unique_directed_degree(
+            &topo, &self.syms, id, edge_type, direction,
+        ))
+    }
+
+    /// Unique directed degree for a subset or a label scan.
+    ///
+    /// Unknown keys in `keys` are omitted (mask-like). `keys = Some(&[])` →
+    /// empty `Ok(vec![])`. `limit` is applied after sorting degree desc, key
+    /// asc, and only when `Some`. Invalid `where_` → `QueryError`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn degrees(
+        &self,
+        keys: Option<&[String]>,
+        label: Option<&str>,
+        where_: Option<&PropPredicate>,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+        limit: Option<usize>,
+    ) -> Result<Vec<(String, u64)>> {
+        if let Some(pred) = where_ {
+            pred.validate_named("where")
+                .map_err(|detail| GraphError::QueryError { detail })?;
+        }
+        if matches!(keys, Some(ks) if ks.is_empty()) {
+            return Ok(Vec::new());
+        }
+        let view = self.view();
+        let ids: Vec<u32> = match keys {
+            Some(ks) => {
+                let mut seen = HashSet::new();
+                let mut out = Vec::new();
+                for k in ks {
+                    let Some(id) = view.ids.get(k) else {
+                        continue;
+                    };
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    if let Some(pred) = where_ {
+                        let holds = match view.prop(id, &pred.field) {
+                            None => pred.holds(None),
+                            Some(vr) => pred.holds(Some(vr.as_value())),
+                        };
+                        if !holds {
+                            continue;
+                        }
+                    }
+                    out.push(id);
+                }
+                out
+            }
+            None => Self::vector_candidates(&view, label, where_),
+        };
+        let mut out: Vec<(String, u64)> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let key = self.ids.key_of(id)?.to_string();
+                let deg =
+                    Self::unique_directed_degree(&view.topo, view.syms, id, edge_type, direction);
+                Some((key, deg))
+            })
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        if let Some(lim) = limit {
+            out.truncate(lim);
+        }
+        Ok(out)
+    }
+
+    /// Unique neighbour count for `id` across `edge_type` (or all types) and
+    /// `direction`. Unknown `edge_type` → 0. `Both` sums out + in.
+    fn unique_directed_degree(
+        topo: &TopologyView<'_>,
+        syms: &Interner,
+        id: u32,
+        edge_type: Option<&str>,
+        direction: crate::algo::AlgoDir,
+    ) -> u64 {
+        let dirs: &[Direction] = match direction {
+            crate::algo::AlgoDir::Out => &[Direction::Out],
+            crate::algo::AlgoDir::In => &[Direction::In],
+            crate::algo::AlgoDir::Both => &[Direction::Out, Direction::In],
+        };
+        match edge_type {
+            Some(name) => {
+                let Some(et) = syms.get(name) else {
+                    return 0;
+                };
+                dirs.iter().map(|&d| topo.degree(et, d, id) as u64).sum()
+            }
+            None => topo
+                .etypes()
+                .map(|et| {
+                    dirs.iter()
+                        .map(|&d| topo.degree(et, d, id) as u64)
+                        .sum::<u64>()
+                })
+                .sum(),
+        }
     }
 
     /// Return the last-change commit sequence for `key`, or `None` if the node

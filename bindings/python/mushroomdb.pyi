@@ -174,8 +174,35 @@ class GraphDb:
         k: int = 10,
         min: float = 0.0,
         mask: Sequence[str] | None = None,
+        where: dict | None = None,
+        exact: bool = False,
     ) -> list[tuple[str, float]]:
         """The `k` nearest nodes to `vector` by cosine similarity on `field`."""
+
+    def pairwise_similar(
+        self,
+        keys: Sequence[str],
+        field: str,
+        k: int = 10,
+        min: float = 0.0,
+    ) -> list[tuple[str, list[tuple[str, float]]]]:
+        """Exact per-key cosine top-k among `keys`. Self excluded. No HNSW."""
+
+    def degree(
+        self, key: str, edge_type: str | None = None, direction: str = "both"
+    ) -> int:
+        """Unique directed degree of `key`. `direction` is out, in, or both (sum)."""
+
+    def degrees(
+        self,
+        keys: Sequence[str] | None = None,
+        label: str | None = None,
+        where: dict | None = None,
+        edge_type: str | None = None,
+        direction: str = "both",
+        limit: int | None = None,
+    ) -> list[tuple[str, int]]:
+        """Unique directed degree for a subset or label scan. Unknown keys omitted."""
 
     def search_hybrid(
         self,

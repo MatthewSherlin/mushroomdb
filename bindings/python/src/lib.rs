@@ -1,7 +1,7 @@
 use core_api::{
-    default_max_edges, valid_namespace, Direction, EdgeAt, Explanation, GraphDb as CoreDb,
-    GraphError, HistoryChange, HistoryEntry, NodeInfo, NodeMask, PredicateSummary, ResultSet,
-    RuleDef, Value, NS_MAX_LEN, NS_PROP,
+    default_max_edges, valid_namespace, AlgoDir, Direction, EdgeAt, Explanation, GraphDb as CoreDb,
+    GraphError, HistoryChange, HistoryEntry, NodeInfo, NodeMask, PredicateSummary, PropPredicate,
+    ResultSet, RuleDef, Value, NS_MAX_LEN, NS_PROP,
 };
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -395,6 +395,10 @@ impl GraphDb {
     /// results (hidden nodes are excluded before k-truncation).  `None` keeps
     /// the existing unmasked behaviour.
     ///
+    /// `where` is an optional property predicate (`{"field": ..., "eq": ...}`
+    /// or `{"field": ..., "in": [...]}`) and implies exact search. `exact=True`
+    /// skips HNSW and GEMM-brutes the candidate set.
+    ///
     /// Returns a list of `(node_key, similarity_score)` tuples sorted by
     /// score descending, filtered to `score >= min`.
     ///
@@ -404,25 +408,35 @@ impl GraphDb {
     /// hits = db.find_similar("embedding", query_vec, label="Document", k=10)
     /// # restrict to visible nodes:
     /// hits = db.find_similar("embedding", query_vec, mask=["alice", "bob"])
+    /// hits = db.find_similar("embedding", query_vec, where={"field": "scope", "eq": "a"})
     /// ```
     #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
     #[pyo3(
-        signature = (field, vector, label = None, k = 10, min = 0.0, mask = None),
-        text_signature = "($self, field, vector, label=None, k=10, min=0.0, mask=None)"
+        signature = (field, vector, label = None, k = 10, min = 0.0, mask = None, r#where = None, exact = false),
+        text_signature = "($self, field, vector, label=None, k=10, min=0.0, mask=None, where=None, exact=False)"
     )]
     fn find_similar(
         &self,
-        _py: Python<'_>,
+        py: Python<'_>,
         field: &str,
         vector: Bound<'_, PyList>,
         label: Option<&str>,
         k: usize,
         min: f64,
         mask: Option<Bound<'_, PyList>>,
+        r#where: Option<Bound<'_, PyDict>>,
+        exact: bool,
     ) -> PyResult<Vec<(String, f64)>> {
         let q = pylist_to_f64_vec(&vector)?;
-        if let Some(mask_list) = mask {
-            // Parse the mask key list (must be strings).
+        let field = field.to_owned();
+        let label = label.map(str::to_owned);
+        let pred = match r#where {
+            Some(d) => Some(py_to_where(&d)?),
+            None => None,
+        };
+        let exact = exact || pred.is_some();
+        let mask_keys = if let Some(mask_list) = mask {
             let mut keys: Vec<String> = Vec::with_capacity(mask_list.len());
             for item in mask_list.iter() {
                 if let Ok(s) = item.downcast::<PyString>() {
@@ -431,13 +445,58 @@ impl GraphDb {
                     return Err(PyTypeError::new_err("mask must be a list of strings"));
                 }
             }
-            self.with_ref(|db| {
-                let node_mask = NodeMask::from_keys(db, keys.iter().map(String::as_str));
-                Ok(db.find_similar_vector_masked(field, label, &q, k, min, &node_mask))
-            })
+            Some(keys)
         } else {
-            self.with_ref(|db| Ok(db.find_similar_vector(field, label, &q, k, min)))
-        }
+            None
+        };
+        py.allow_threads(|| {
+            self.with_ref(|db| {
+                let node_mask = mask_keys
+                    .as_ref()
+                    .map(|keys| NodeMask::from_keys(db, keys.iter().map(String::as_str)));
+                db.find_similar_vector_filtered(
+                    &field,
+                    label.as_deref(),
+                    &q,
+                    k,
+                    min,
+                    node_mask.as_ref(),
+                    pred.as_ref(),
+                    exact,
+                )
+            })
+        })
+    }
+
+    /// Exact per-key cosine top-k among `keys`. Self excluded. No HNSW.
+    ///
+    /// Unknown keys, missing embeddings, zero-norm and wrong-dim vectors are
+    /// skipped. Duplicate keys collapse to first-seen order. Empty `keys`
+    /// returns `[]`.
+    ///
+    /// ```python
+    /// hits = db.pairwise_similar(["a", "b", "c"], "embedding", k=5, min=0.0)
+    /// ```
+    #[allow(deprecated)]
+    #[pyo3(
+        signature = (keys, field, k = 10, min = 0.0),
+        text_signature = "($self, keys, field, k=10, min=0.0)"
+    )]
+    fn pairwise_similar(
+        &self,
+        py: Python<'_>,
+        keys: Vec<String>,
+        field: &str,
+        k: usize,
+        min: f64,
+    ) -> PyResult<Vec<(String, Vec<(String, f64)>)>> {
+        let field = field.to_owned();
+        py.allow_threads(|| {
+            self.with_ref(|db| {
+                let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+                db.pairwise_similar(&refs, &field, k, min)
+            })
+        })
     }
 
     /// Hybrid RRF search combining fulltext and vector similarity.
@@ -566,6 +625,70 @@ impl GraphDb {
     fn neighbors(&self, key: &str, edge_type: &str, direction: &str) -> PyResult<Vec<String>> {
         let dir = parse_dir(direction)?;
         self.with_ref(|db| db.neighbors(key, edge_type, dir))
+    }
+
+    /// Unique directed degree of `key`. `direction` is `"out"`, `"in"`, or
+    /// `"both"` (out + in sum). Unknown `edge_type` is 0. Unknown key raises.
+    #[allow(deprecated)]
+    #[pyo3(
+        signature = (key, edge_type = None, direction = "both"),
+        text_signature = "($self, key, edge_type=None, direction='both')"
+    )]
+    fn degree(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        edge_type: Option<&str>,
+        direction: &str,
+    ) -> PyResult<u64> {
+        let dir = parse_algo_dir(direction)?;
+        let key = key.to_owned();
+        let edge_type = edge_type.map(str::to_owned);
+        py.allow_threads(|| {
+            self.with_ref(|db| db.degree(&key, edge_type.as_deref(), dir))
+        })
+    }
+
+    /// Unique directed degree for a key subset or a label scan.
+    ///
+    /// Unknown keys are omitted. `keys=[]` returns `[]`. `where` is the same
+    /// dict shape as `find_similar`. `limit` applies after sorting degree
+    /// descending, key ascending.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
+    #[pyo3(
+        signature = (keys = None, label = None, r#where = None, edge_type = None, direction = "both", limit = None),
+        text_signature = "($self, keys=None, label=None, where=None, edge_type=None, direction='both', limit=None)"
+    )]
+    fn degrees(
+        &self,
+        py: Python<'_>,
+        keys: Option<Vec<String>>,
+        label: Option<&str>,
+        r#where: Option<Bound<'_, PyDict>>,
+        edge_type: Option<&str>,
+        direction: &str,
+        limit: Option<usize>,
+    ) -> PyResult<Vec<(String, u64)>> {
+        let dir = parse_algo_dir(direction)?;
+        let pred = match r#where {
+            Some(d) => Some(py_to_where(&d)?),
+            None => None,
+        };
+        let label = label.map(str::to_owned);
+        let edge_type = edge_type.map(str::to_owned);
+        py.allow_threads(|| {
+            self.with_ref(|db| {
+                db.degrees(
+                    keys.as_deref(),
+                    label.as_deref(),
+                    pred.as_ref(),
+                    edge_type.as_deref(),
+                    dir,
+                    limit,
+                )
+            })
+        })
     }
 
     /// Unknown key: `None`, matching Rust `GraphDb::node_info` → `Option`.
@@ -1114,6 +1237,46 @@ fn parse_dir(s: &str) -> PyResult<Direction> {
         "in" => Ok(Direction::In),
         _ => Err(PyValueError::new_err("direction must be 'out' or 'in'")),
     }
+}
+
+fn parse_algo_dir(s: &str) -> PyResult<AlgoDir> {
+    match s.to_ascii_lowercase().as_str() {
+        "out" => Ok(AlgoDir::Out),
+        "in" => Ok(AlgoDir::In),
+        "both" => Ok(AlgoDir::Both),
+        _ => Err(PyValueError::new_err(
+            "direction must be 'out', 'in', or 'both'",
+        )),
+    }
+}
+
+fn py_to_where(dict: &Bound<'_, PyDict>) -> PyResult<PropPredicate> {
+    let field = match dict.get_item("field")? {
+        Some(v) => v
+            .extract::<String>()
+            .map_err(|_| PyTypeError::new_err("where.field must be a string"))?,
+        None => String::new(),
+    };
+    let eq = match dict.get_item("eq")? {
+        Some(v) => Some(py_to_value(&v)?),
+        None => None,
+    };
+    let in_ = match dict.get_item("in")? {
+        Some(v) => {
+            let list = v
+                .downcast::<PyList>()
+                .map_err(|_| PyTypeError::new_err("where.in must be a list"))?;
+            let mut out = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                out.push(py_to_value(&item)?);
+            }
+            Some(out)
+        }
+        None => None,
+    };
+    let pred = PropPredicate { field, eq, in_ };
+    pred.validate_named("where").map_err(PyValueError::new_err)?;
+    Ok(pred)
 }
 
 fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {

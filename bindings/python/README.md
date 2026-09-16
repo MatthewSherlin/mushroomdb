@@ -49,6 +49,34 @@ db.query_write(
 A node's key is not a property, so `n.key` does not resolve. Use the `key(n)`
 scalar function to project or filter on it. `node_info` returns the key too.
 
+## Vector search
+
+Scores are cosine similarity in `[-1, 1]` (`score >= min`). A distance of
+`1 - sim` is the caller's conversion. Brute `find_similar` is exact GEMM; HNSW
+is still the approximate path; `exact=True` (and any `where=`) force GEMM.
+
+```python
+hits = db.find_similar("embedding", query_vec, k=10, min=0.0, exact=True)
+hits = db.find_similar(
+    "embedding",
+    query_vec,
+    label="Document",
+    where={"field": "status", "eq": "published"},
+)
+pairs = db.pairwise_similar(["a", "b", "c"], "embedding", k=5)
+# exact per-key top-k among `keys`; self excluded; no HNSW
+```
+
+## Degree
+
+Adjacency is a set; `degree` is unique-neighbour count (`"both"` is out+in
+sum). Distinct from `degree_centrality` and from Degree views.
+
+```python
+db.degree("alice", direction="both")
+db.degrees(keys=["alice", "bob"], limit=10)  # degree desc, key asc
+```
+
 ## Rules
 
 ```python

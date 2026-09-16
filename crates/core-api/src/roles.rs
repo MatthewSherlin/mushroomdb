@@ -185,21 +185,29 @@ impl PropPredicate {
     }
 
     /// Reject a predicate that does not name exactly one test of one field.
-    pub fn validate(&self) -> std::result::Result<(), String> {
+    ///
+    /// `what` is the argument name in the error (`"visible_where"` for roles,
+    /// `"where"` for query filters).
+    pub fn validate_named(&self, what: &str) -> std::result::Result<(), String> {
         if self.field.is_empty() {
-            return Err("visible_where.field must not be empty".into());
+            return Err(format!("{what}.field must not be empty"));
         }
         match (&self.eq, &self.in_) {
             (Some(_), None) | (None, Some(_)) => Ok(()),
             (None, None) => Err(format!(
-                "visible_where on field '{}' sets neither 'eq' nor 'in'",
+                "{what} on field '{}' sets neither 'eq' nor 'in'",
                 self.field
             )),
             (Some(_), Some(_)) => Err(format!(
-                "visible_where on field '{}' sets both 'eq' and 'in'; use one",
+                "{what} on field '{}' sets both 'eq' and 'in'; use one",
                 self.field
             )),
         }
+    }
+
+    /// Reject a predicate that does not name exactly one test of one field.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        self.validate_named("visible_where")
     }
 }
 

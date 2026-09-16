@@ -974,7 +974,7 @@ Response:
   "result": {
     "capabilities": {"tools": {}},
     "protocolVersion": "2024-11-05",
-    "serverInfo": {"name": "mushroomdb", "version": "0.6.7"}
+    "serverInfo": {"name": "mushroomdb", "version": "0.6.8"}
   }
 }
 ```
@@ -994,7 +994,7 @@ Sixteen tools:
 | `node_info` | Node info and props; params: `key` |
 | `node_edges` | Incident edges; params: `key` |
 | `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?`, `namespace?` (the namespace a created node lands in; on an existing node, the one it is already in is a no-op and another is refused). An update is atomic: every property is checked before any is written, so a refusal leaves the node unchanged. |
-| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?`; (2) edge traversal — `key`, `edge_type?`, `limit?`. Vector search under a mask (a role, or the MCP `mask` allow-list) widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist. |
+| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?` (default **0.8**), `where?`, `exact?`; (2) edge traversal — `key`, `edge_type?`, `limit?`. Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. `where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; `exact` true skips HNSW. Edge-traversal mode ignores both. Vector search under a mask (a role, or the MCP `mask` allow-list) widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist. |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
 | `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits, horizon}` |
@@ -1244,6 +1244,102 @@ neighbors = db.neighbors("alice", "KNOWS", "out")   # one hop, list of keys
 `node_info` returns `None` for an unknown key; `node_edges` raises
 `RuntimeError`. The asymmetry mirrors the Rust API (`Option` vs `Result`).
 
+### Vector search
+
+`find_similar(field, vector, label=None, k=10, min=0.0, mask=None, where=None, exact=False)`
+returns the `k` nearest nodes to `vector` by cosine similarity on `field`.
+
+Scores are cosine similarity in `[-1, 1]`. The engine keeps `score >= min`
+(inclusive). A distance of `1 - sim` is the caller's conversion — the engine
+does not speak distance. Convert after the call if you need a strict distance
+cut (`keep if 1 - sim < T`); do not bake `T` into `min`.
+
+```python
+hits = db.find_similar("embedding", query_vec, k=10, min=0.0)
+# [(key, similarity), ...]
+```
+
+Python `min` defaults to `0.0`. MCP vector mode defaults `min` to `0.8`; that
+default is unchanged.
+
+**Exact vs approximate.** When no approximate `VectorSimilar` rule covers
+`field`, brute `find_similar` is an exact GEMM. HNSW is still the approximate
+path — used when such a rule covers the field and `exact` is false.
+`exact=True` forces GEMM and does not consult HNSW. A `where=` predicate also
+implies exact. Brute results sort similarity descending, then key ascending;
+the HNSW sort is unchanged. A candidate whose embedding is missing, zero-norm,
+or a different length than the query is skipped. A zero-norm query returns `[]`.
+
+```python
+hits = db.find_similar("embedding", query_vec, exact=True)
+hits = db.find_similar(
+    "embedding", query_vec, label="Document",
+    where={"field": "status", "eq": "published"},
+)
+```
+
+`where` is the same shape as a role's `visible_where`: exactly one of `eq` or
+`in`. A missing property fails. An empty `in` matches nothing. Invalid `where`
+(both `eq` and `in`, empty `field`) raises `ValueError` and is never sent into
+the engine.
+
+```python
+{"field": "resource_scope_id", "eq": "scope-1"}
+{"field": "status", "in": ["published", "archived"]}
+```
+
+Candidates are `label ∩ mask ∩ where`. `mask` is still a list of keys; it
+intersects, never widens. `label` restricts as before. If `label` is set and
+`enable_index(label, where.field)` is on, `eq` / `in` use the property index;
+otherwise the labelled (or live) set is scanned. `where` is a query argument,
+not a role definition — see [masks.md](masks.md#narrowing-a-role-by-a-property)
+for the role-side predicate.
+
+`pairwise_similar(keys, field, k=10, min=0.0)` is exact cosine top-k for each
+key in `keys`, scored only against that same set. Self-matches are excluded.
+It never uses HNSW and does not write edges.
+
+```python
+pairs = db.pairwise_similar(["a", "b", "c"], "embedding", k=5, min=0.0)
+# [("a", [("b", 0.91), ...]), ("b", [...]), ("c", [])]
+```
+
+Treat the result as a map keyed by source: outer order is first-seen packed
+keys, not a zip with the input. A packed source with no neighbour above `min`
+still appears as `(src, [])`, so "present, nothing similar" is distinct from
+"omitted". Unknown keys, missing embeddings, zero-norm and wrong-dimension
+vectors are omitted as both query and candidate. Duplicate keys collapse to
+first-seen order. Empty `keys` returns `[]`. More than 8192 unique resolved
+keys raises. `min` is the same unit and inequality as `find_similar`.
+
+### Degree
+
+Adjacency is a set: a second `insert_edge` of the same `(edge_type, src, dst)`
+returns `False` and does not increase degree. `degree` is unique-neighbour
+count, not a stored counter and not a row-count of duplicate pairs.
+
+```python
+n = db.degree("alice", edge_type="KNOWS", direction="both")  # out + in sum
+ranked = db.degrees(label="Person", direction="both", limit=500)
+# [("alice", 12), ("bob", 12), ...]  degree desc, key asc
+```
+
+`direction` is `"out"`, `"in"`, or `"both"`. `"both"` is the sum of unique
+out-neighbours and unique in-neighbours (a reciprocal pair counts 2 at each
+endpoint), not the size of the undirected neighbour set.
+`neighbors(..., direction="both")` still raises `ValueError` — that API is one
+directed hop.
+
+`degree(key)` raises for an unknown key. `degrees` omits unknown keys;
+`degrees(keys=[])` returns `[]`. An unknown `edge_type` yields 0.
+
+`degrees` universe: `keys` if given; else `label`; else all live nodes. `where`
+intersects (same dict shape as `find_similar`). `limit` applies after the sort.
+
+This is the read-only subset API. It is not `degree_centrality` (full-graph
+ranking, time-budgeted, not bound in Python) and not a Degree materialized view
+(a write that maintains a property). See [algorithms.md](algorithms.md).
+
 ### Rename a node
 
 ```python
@@ -1461,7 +1557,8 @@ async interface. See [timetravel.md](timetravel.md) for the full semantics.
 
 The bindings expose: `insert_node`, `ingest_batch`, `batch_edges`,
 `create_rule`, `set_prop`, `query` (with `params`), `query_with_params` (alias),
-`explain`, `neighbors`, `node_edges`, `node_info`, `stats`, `snapshot`,
+`explain`, `neighbors`, `node_edges`, `node_info`, `find_similar`,
+`pairwise_similar`, `degree`, `degrees`, `stats`, `snapshot`,
 `refresh`, `rename_node`, `insert_edge_upsert`, plus the `MushroomBusy`
 exception.
 

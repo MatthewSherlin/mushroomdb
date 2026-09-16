@@ -134,9 +134,9 @@ fn an_exact_duplicate_is_found_at_min_one() {
     }
 }
 
-/// The index path and the brute-force path must report the same keys and the
-/// same scores, bit for bit. Same corpus, one database with an approximate rule
-/// and one with no rule at all.
+/// The index path re-scores from `f64` (so `min = 1.0` still finds a duplicate)
+/// and the brute path uses GEMM. Scores agree to 1e-9. A hit whose score sits
+/// within 1e-9 of `min` may appear on only one path (GEMM last bits vs scalar).
 #[test]
 fn index_and_brute_force_agree_on_scores() {
     let ann = seed(&tmp("vec-agree-ann"), Some(true), &[]);
@@ -165,19 +165,31 @@ fn index_and_brute_force_agree_on_scores() {
                 "fixture: the no-rule database used an index"
             );
 
-            assert_eq!(
-                a.iter().map(|(k, _)| k).collect::<Vec<_>>(),
-                b.iter().map(|(k, _)| k).collect::<Vec<_>>(),
-                "q={q:?} min={min}: the two paths returned different nodes"
-            );
-            for ((ka, sa), (_, sb)) in a.iter().zip(b.iter()) {
-                assert_eq!(
-                    sa.to_bits(),
-                    sb.to_bits(),
-                    "q={q:?} min={min}: {ka} scored {sa} through the index and \
-                     {sb} through the scan — the index's f32 similarity leaked \
-                     into the answer"
-                );
+            let a_map: std::collections::BTreeMap<&str, f64> =
+                a.iter().map(|(k, s)| (k.as_str(), *s)).collect();
+            let b_map: std::collections::BTreeMap<&str, f64> =
+                b.iter().map(|(k, s)| (k.as_str(), *s)).collect();
+            for (k, sa) in &a_map {
+                match b_map.get(k) {
+                    Some(sb) => assert!(
+                        (sa - sb).abs() <= 1e-9,
+                        "q={q:?} min={min}: {k} scored {sa} through the index and \
+                         {sb} through the scan — the index's f32 similarity leaked \
+                         into the answer"
+                    ),
+                    None => assert!(
+                        (sa - min).abs() <= 1e-9,
+                        "q={q:?} min={min}: index has {k} at {sa}, scan does not"
+                    ),
+                }
+            }
+            for (k, sb) in &b_map {
+                if !a_map.contains_key(k) {
+                    assert!(
+                        (sb - min).abs() <= 1e-9,
+                        "q={q:?} min={min}: scan has {k} at {sb}, index does not"
+                    );
+                }
             }
         }
     }
@@ -251,8 +263,9 @@ fn a_stray_dimension_later_still_derives_every_real_edge() {
     );
 }
 
-/// A query of the wrong dimension is not the index's to answer. It must reach
-/// the brute-force scan rather than come back empty.
+/// A query of the wrong dimension is not the index's to answer. The brute
+/// pack skips `len() != dim`, so the scan returns empty rather than a
+/// zip-truncated partial dot.
 #[test]
 fn a_wrong_dimension_query_falls_back_to_the_scan() {
     let db = seed(&tmp("vec-wrong-dim-query"), Some(true), &[]);
@@ -264,8 +277,8 @@ fn a_wrong_dimension_query_falls_back_to_the_scan() {
         "a 3-D query must not be put to a 2-D index"
     );
     assert!(
-        !hits.is_empty(),
-        "the scan compares what it can and answers; got {hits:?}"
+        hits.is_empty(),
+        "mixed-dim skip: a 3-d query does not score 2-d rows; got {hits:?}"
     );
 }
 
