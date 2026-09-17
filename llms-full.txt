@@ -3386,15 +3386,15 @@ an inline pattern filter, and after a grouping `WITH`:
 
 | Spelling | Gives |
 |---|---|
-| `n.key` / `n.id` | the node's key, as a string |
-| `n.label` | the node's label |
-| `key(n)` / `id(n)` | the same key, as a function call |
+| `n.key` / `n.id` | the node's key (a stored property of that name wins) |
+| `n.label` | the node's label (stored `label` wins) |
+| `key(n)` / `id(n)` | always the id-map key; `id(n)` aliases `key(n)` |
 | `labels(n)` | a one-element list holding the label |
 
 `n.key`, `n.id`, and `n.label` are a **fallback**: a stored property of that
 name always wins, so a graph that really has an `id` or `key` property keeps
-reading it. `id(n)` is the function alias of `key(n)` (one argument, same
-errors on a non-node).
+reading it. `key(n)` / `id(n)` always return the id-map key (`id(n)` is the
+function alias of `key(n)`: one argument, same errors on a non-node).
 
 `MATCH (n {id: 'alice'})` is **not** the property: it is a key selector
 (`ScanKey`) on MATCH/MERGE/CREATE. CREATE may still stamp a stored `id`
@@ -3960,8 +3960,8 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `toFloat(x)` | `Int`/`Float`/`String` | `Float` | parse; unparseable → null |
 | `toString(x)` | scalar | `String` | scalar to text |
 | `decay(base, age, halflife)` | `Int`/`Float` ×3 | `Float` | `base * 0.5^(age / halflife)`; error if `halflife <= 0` |
-| `key(n)` | node variable | `String` | the node's key; `n.key` reads the same value. Non-node argument is a named error |
-| `id(n)` | node variable | `String` | alias of `key(n)`; `n.id` falls back to the key (stored `id` wins) |
+| `key(n)` | node variable | `String` | always the id-map key. Non-node argument is a named error |
+| `id(n)` | node variable | `String` | alias of `key(n)` (always the id-map key). `n.id` is stored-wins property access |
 | `labels(n)` | node variable | `List` | a one-element list holding the node's label; `n.label` reads it as a scalar |
 
 Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
@@ -4035,7 +4035,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 |---|---|
 | `MATCH (n:Label)` | `MATCH (n:Person) RETURN n.name` |
 | `MATCH (n {key: val})` inline property filter | `MATCH (n:Person {city: 'Austin'}) RETURN n` |
-| `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)` — a stored property of that name wins |
+| `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)` — `n.key`/`n.id`/`n.label` stored-wins; `key(n)`/`id(n)` always the id-map key |
 | Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — identical to consecutive `MATCH` clauses; no shared variable is a product |
 | `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is false, not an error |
 | List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range / non-list / non-integer index → null |
@@ -4148,7 +4148,7 @@ unexpected-token parse error or other unspecified result.
 | Grouped aggregation | Supported (multiple keys and multiple aggregates allowed; group count capped at 1,000,000) |
 | WITH pipeline stages | Supported — projection, aliasing, WHERE (HAVING, and an alias the stage itself introduced), ORDER BY, LIMIT, and re-entry MATCH |
 | Multiple patterns in one MATCH | Supported, comma-separated — identical to consecutive MATCH clauses. Still a named error after CREATE |
-| `n.key` / `n.label` as index-scan keys | Not indexed — they resolve through a label scan plus a retain, so an equality filter on them is O(nodes of that label) |
+| `n.key` / `n.id` / `key(n)` / `id(n)` equality vs lit/`$param` | ScanKey (plus stored-wins). `n.label` / `labels(n)` are not this fold — they still scan the label |
 | UNWIND | Supported — list literals, list-valued properties, and scalar aliases from prior WITH; non-list → named error |
 | Variable-length paths: max hops | Capped at 10 |
 | shortestPath with unbound endpoints | Rejected at planning time |
@@ -5385,9 +5385,9 @@ db.query_write(
 )
 ```
 
-`n.key` / `n.id` / `key(n)` / `id(n)` all read the node key (a stored property
-of the same name wins). `key(n)` is available in both read queries and
-write-statement `RETURN` projections. See [query.md](query.md).
+`n.key` / `n.id` read the node key (a stored property of the same name wins).
+`key(n)` / `id(n)` always return the id-map key. `key(n)` is available in both
+read queries and write-statement `RETURN` projections. See [query.md](query.md).
 
 The dict keys in each row are the **RETURN aliases** from the query — `p`, `o`,
 and `score` in the example above. Bare `RETURN n` yields `{"n": ...}`; `RETURN

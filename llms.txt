@@ -296,12 +296,14 @@ Predicates compose via `All(...)` (AND, score = min) and `Any(...)` (OR, score =
 
 ## Cypher key idiom
 
-The node's key lives in the id map. `n.key` / `n.id` / `key(n)` / `id(n)` all
-read it (a stored property of that name wins). `n.label` / `labels(n)` read the
-label. They work in `WHERE`, `ORDER BY`, `RETURN`, an inline pattern filter,
-and after a grouping `WITH`. Pattern `{id: 'alice'}` is a key lookup (`ScanKey`).
-`WHERE n.key` / `n.id` / `key(n)` / `id(n)` against a literal or `$param` also
-plans as `ScanKey` (plus a stored-property filter so stored-wins still holds).
+The node's key lives in the id map. `n.key` / `n.id` read it (a stored property
+of that name wins). `key(n)` / `id(n)` always return the id-map key.
+`n.label` / `labels(n)` read the label. They work in `WHERE`, `ORDER BY`,
+`RETURN`, an inline pattern filter, and after a grouping `WITH`. Pattern
+`{id: 'alice'}` is a key lookup (`ScanKey`). `WHERE n.key` / `n.id` / `key(n)` /
+`id(n)` against a literal or `$param` also plans as `ScanKey` (plus a
+stored-property filter so stored-wins still holds). `n.label` / `labels(n)`
+are not this fold.
 
 - Filter by key: `WHERE n.id = 'alice'`, `WHERE n.key = 'alice'`, `WHERE key(n) = 'alice'`, or `WHERE n = 'alice'`
 - Read the key: `RETURN n.id`, `id(n)`, `n.key`, or bare `RETURN n` — the result

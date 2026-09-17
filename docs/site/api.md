@@ -1225,9 +1225,9 @@ db.query_write(
 )
 ```
 
-`n.key` / `n.id` / `key(n)` / `id(n)` all read the node key (a stored property
-of the same name wins). `key(n)` is available in both read queries and
-write-statement `RETURN` projections. See [query.md](query.md).
+`n.key` / `n.id` read the node key (a stored property of the same name wins).
+`key(n)` / `id(n)` always return the id-map key. `key(n)` is available in both
+read queries and write-statement `RETURN` projections. See [query.md](query.md).
 
 The dict keys in each row are the **RETURN aliases** from the query — `p`, `o`,
 and `score` in the example above. Bare `RETURN n` yields `{"n": ...}`; `RETURN

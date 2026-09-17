@@ -46,8 +46,8 @@ db.query_write(
 )
 ```
 
-`n.key` / `n.id` / `key(n)` / `id(n)` all read the node key (a stored property
-of the same name wins). `node_info` returns the key too.
+`n.key` / `n.id` read the node key (a stored property of the same name wins).
+`key(n)` / `id(n)` always return the id-map key. `node_info` returns the key too.
 
 ## Vector search
 
