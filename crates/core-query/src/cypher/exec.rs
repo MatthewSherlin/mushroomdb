@@ -8249,6 +8249,79 @@ LIMIT 10";
         assert_eq!(rows_of(&rs), vec![vec![Some(s("alice"))]]);
     }
 
+    /// `key(n)` is always the id-map key, never a stored property of that name.
+    /// A node carrying `key = 'K'` as a property must NOT match `key(n) = 'K'`
+    /// when its own key is something else — the identity-eq fold must not
+    /// apply the `n.key` stored-wins rule to the function form.
+    #[test]
+    fn where_key_func_ignores_a_stored_key_property() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("key", s("K"))]);
+        fx.add("N", "K", vec![]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:N) WHERE key(n) = 'K' RETURN key(n) AS k",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let got: Vec<Option<Value>> = col(&rs, "k");
+        assert_eq!(
+            got,
+            vec![Some(s("K"))],
+            "key(n) is the id-map key: only the node keyed K matches, not the \
+             node whose stored `key` property is K"
+        );
+    }
+
+    /// `id(n)` is always the id-map key, so a stored `id` property must not
+    /// hide a node from `WHERE id(n) = <its own key>`.
+    #[test]
+    fn where_id_func_ignores_a_stored_id_property() {
+        let mut fx = Fx::new();
+        fx.add("N", "k", vec![("id", s("other"))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:N) WHERE id(n) = 'k' RETURN id(n) AS k",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            col(&rs, "k"),
+            vec![Some(s("k"))],
+            "id(n) is the id-map key: a stored `id` property must not suppress \
+             the match"
+        );
+    }
+
+    /// The property form is stored-wins, and the fold answers with the union:
+    /// the node whose *stored* `id` is the value, plus the node whose *key* is
+    /// the value and which stores no `id`. Spec §5.2.
+    #[test]
+    fn where_n_id_respects_stored_wins() {
+        let mut fx = Fx::new();
+        fx.add("N", "k", vec![("id", s("other"))]);
+        fx.add("N", "other", vec![]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:N) WHERE n.id = 'other' RETURN key(n) AS k",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let mut got: Vec<String> = col(&rs, "k")
+            .into_iter()
+            .map(|v| match v {
+                Some(Value::Str(s)) => s,
+                other => panic!("expected a string key, got {other:?}"),
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["k".to_string(), "other".to_string()],
+            "stored-wins union: the stored-id node and the key-fallback node"
+        );
+    }
+
     /// `labels(n)` returns the node's label list; `n.label` is the scalar
     /// spelling. `labels()` used to be an unknown function.
     #[test]

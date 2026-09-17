@@ -864,7 +864,7 @@ pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
     // stored-wins. Other equalities stay residual so they are not mixed into
     // IndexIntersect (which would lose the point lookup).
     let mut terms = split_and(filter_expr);
-    if let Some((idx, field, value)) = find_identity_eq(&terms, &scan_var) {
+    if let Some((idx, form, value)) = find_identity_eq(&terms, &scan_var) {
         terms.remove(idx);
         if let Some((f, v)) = existing_eq {
             terms.push(Expr::Cmp {
@@ -876,11 +876,22 @@ pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
                 rhs: v,
             });
         }
-        ops[scan_pos] = PlanOp::IndexScan {
-            var: scan_var,
-            label: scan_label,
-            field,
-            value,
+        ops[scan_pos] = match form {
+            // Stored-wins: ScanKey the value, keep it only if stored identity
+            // agrees, then union nodes whose stored `field` is the value.
+            IdentityEqForm::Prop(field) => PlanOp::IndexScan {
+                var: scan_var,
+                label: scan_label,
+                field,
+                value,
+            },
+            // `key(n)` / `id(n)` is the id-map key and nothing else, which is
+            // exactly `ScanKey` — it already filters label and visibility.
+            IdentityEqForm::Func => PlanOp::ScanKey {
+                var: scan_var,
+                key: value,
+                label: scan_label,
+            },
         };
         match join_and(terms) {
             Some(residual) => ops[filter_pos] = PlanOp::Filter { expr: residual },
@@ -970,7 +981,22 @@ fn identity_func_field(name: &str) -> Option<&'static str> {
     }
 }
 
-fn identity_eq_term(term: &Expr, scan_var: &str) -> Option<(String, Operand)> {
+/// Which spelling of identity equality a term used.
+///
+/// The two are **not** interchangeable and must not share a plan op:
+/// `n.key` / `n.id` are stored-wins (a stored property of that name beats the
+/// id-map key), while `key(n)` / `id(n)` are always the id-map key. Folding the
+/// function form into the stored-wins `IndexScan` tag makes a node whose stored
+/// `key` property is `K` match `key(n) = 'K'`, and hides a node whose stored
+/// `id` differs from its key from `id(n) = <its key>`.
+enum IdentityEqForm {
+    /// `n.key` / `n.id` — tagged `IndexScan`: ScanKey plus stored-wins union.
+    Prop(String),
+    /// `key(n)` / `id(n)` — a plain `ScanKey` point lookup, nothing else.
+    Func,
+}
+
+fn identity_eq_term(term: &Expr, scan_var: &str) -> Option<(IdentityEqForm, Operand)> {
     let Expr::Cmp {
         lhs,
         op: CmpOp::Eq,
@@ -984,7 +1010,7 @@ fn identity_eq_term(term: &Expr, scan_var: &str) -> Option<(String, Operand)> {
     }
     match lhs {
         Operand::Prop { var, field } if var == scan_var && is_identity_eq_field(field) => {
-            Some((field.clone(), rhs.clone()))
+            Some((IdentityEqForm::Prop(field.clone()), rhs.clone()))
         }
         Operand::FuncCall { name, args } if args.len() == 1 => {
             let Operand::Var(v) = &args[0] else {
@@ -993,17 +1019,17 @@ fn identity_eq_term(term: &Expr, scan_var: &str) -> Option<(String, Operand)> {
             if v != scan_var {
                 return None;
             }
-            let field = identity_func_field(name)?;
-            Some((field.to_string(), rhs.clone()))
+            identity_func_field(name)?;
+            Some((IdentityEqForm::Func, rhs.clone()))
         }
         _ => None,
     }
 }
 
-fn find_identity_eq(terms: &[Expr], scan_var: &str) -> Option<(usize, String, Operand)> {
+fn find_identity_eq(terms: &[Expr], scan_var: &str) -> Option<(usize, IdentityEqForm, Operand)> {
     for (i, term) in terms.iter().enumerate() {
-        if let Some((field, value)) = identity_eq_term(term, scan_var) {
-            return Some((i, field, value));
+        if let Some((form, value)) = identity_eq_term(term, scan_var) {
+            return Some((i, form, value));
         }
     }
     None
