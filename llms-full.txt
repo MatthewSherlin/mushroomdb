@@ -6909,6 +6909,776 @@ let report = db.pagerank(&config);
 
 ---
 
+## docs/site/masks.md
+
+# Node masks and access control
+
+mushroomdb has two layered mechanisms for restricting what nodes a caller can see:
+**role-bound tokens** (coarse-grained, enforced server-side) and **client node masks**
+(fine-grained, per-request allow-lists). This page covers how they compose and how
+restricted nodes are presented to callers.
+
+---
+
+## Role-bound tokens
+
+A role token is a bearer credential tied to a named role whose label selectors are
+defined in `roles.json`. The server computes the role mask at request time and
+intersects it with any client mask — it can never widen the intersection.
+
+- Hidden nodes return 404 on node-info/edges/neighborhood endpoints (existence is
+  not disclosed).
+- Cypher rows referencing hidden nodes are filtered out entirely.
+- Roles without a declared write scope get 403 on all write and analytics endpoints.
+- Roles with a write scope may write within their declared scope — but only to nodes
+  currently in their read mask. See [api.md](api.md#write-scopes-for-role-bound-tokens)
+  for the full write-scope surface, error body shapes, and the threat model.
+- An unknown token or a role name not present in `roles.json` returns 401.
+
+**Never-widen invariant (read):** a client-supplied mask is always intersected with
+the role mask. A caller with a role token cannot supply a mask that expands their view.
+
+**Never-widen invariant (write):** no write a role performs may make data visible to
+itself or any other party that was not already visible before the write. A role token
+may only mutate nodes that are currently in its read mask. Hidden nodes are treated
+as non-existent in all write responses — no existence oracle.
+
+### Narrowing a role by a property
+
+A label is often too coarse: every document is a `Document`, but a reviewer should
+see only the published ones. A role may carry one **property test**, `visible_where`,
+beside its labels:
+
+```json
+{
+  "version": 3,
+  "roles": [
+    {
+      "name": "reader",
+      "keys": [],
+      "labels": ["Document"],
+      "visible_where": { "field": "status", "in": ["published", "archived"] },
+      "write": null
+    }
+  ]
+}
+```
+
+The resolved mask is:
+
+```
+visible = keys ∪ { n : label(n) ∈ labels ∧ predicate(n) }
+```
+
+- The predicate narrows the **labels leg only**. `keys` is an administrative grant
+  and is never narrowed by it.
+- **A missing property fails the predicate.** A `Document` with no `status` at all
+  is not visible to the role above. Absent is not a match — that is the deny-side
+  answer, and it is the one a narrowed role wants.
+- Resolution stays live. A node whose `status` changes to `published` is visible on
+  the next read; one edited out of the predicate is gone on the next read. No
+  re-apply of the schema is needed either way.
+- Write values as plain JSON scalars — `"published"`, `3`, `true`. The graph's own
+  tagged encoding (`{"Str": "published"}`, `{"Int": 3}`, `{"Bool": true}`) is accepted
+  too, including mixed within one `in` list, and means exactly the same thing; it is
+  what the server writes back when it rewrites the sidecar. Comparison is by value,
+  not by rendering.
+- A value that is neither — an object that is not a tagged value, say — is refused at
+  load, which poisons the roles state rather than dropping the narrowing.
+
+Only two operators exist:
+
+| Form | Meaning |
+|---|---|
+| `"eq": <value>` | the property equals this value |
+| `"in": [<value>, …]` | the property equals one of these values — an empty list matches nothing |
+
+Exactly one of the two must be set, and `field` must not be empty; `apply_schema`
+refuses anything else. There are no ranges, no negation, and no nesting, and that is
+deliberate: a mask that can express arbitrary predicates is a query language with a
+security boundary attached, and every operator added is another shape the resolver
+has to be right about, on the deny side, forever. A `visible_where` on a role that
+declares no labels is also refused — it would narrow nothing, and a name that reads
+like a restriction should never be one.
+
+**Version 3 is refused by an older binary.** A sidecar carrying a predicate is written
+as `{"version": 3, …}`, and a binary that predates predicates does not recognise the
+version, so it poisons its roles state and denies every role instead of loading the
+file and resolving the role to its whole label set. Denying is the safe direction;
+silently ignoring a narrowing is not. (Versions 1 and 2 still load, and a role without
+`visible_where` behaves exactly as it did before version 3 existed.)
+
+---
+
+## Namespaces
+
+A namespace is a **tenancy boundary**: a second visibility axis that crosses the
+label one. Where `labels` and `visible_where` answer "what kind of node, with what
+property", a namespace answers "whose data".
+
+A node's namespace is a reserved node property, `ns`:
+
+```json
+{ "label": "Document", "key": "d1", "props": { "ns": "tenant-a", "status": "published" } }
+```
+
+- **Absent `ns` means the namespace `default`.** Every node in a store that has
+  never named a namespace is in `default`, so nothing about such a store changes
+  when this version is installed.
+- **A store that already used `ns` for something else does change.** `ns` is
+  reserved from 0.6.6 on, and existing string values are read as namespace names
+  on the first open: those nodes leave `default`, `ns` becomes unwritable on
+  them, and a value outside the name rules above can be listed by `stats` where
+  no surface will accept it back. There is no migration — rename the property
+  before upgrading if it meant something else.
+- **Writing `ns: "default"` explicitly stores nothing.** A single-tenant store
+  carries no `ns` column at all and pays nothing for the feature.
+- **A name is 1–64 characters of `[A-Za-z0-9_.-]`.** `/` is excluded on purpose:
+  keys already contain it, and a namespace must never read as a key prefix. An
+  invalid name, or a non-string `ns`, is refused at insert.
+- **A node's props name `ns` once, or not at all.** Two `ns` entries in one insert
+  are refused (`ns is given more than once; a node has exactly one namespace`):
+  with two, "the node's namespace" stops being a single fact, and a write checked
+  against one entry could land under the other.
+- **Keys do not change.** A namespace is not a key prefix — `key(n)`, every history
+  body, every mask entry and every `KeyMatch` target keeps the exact value it has.
+  Keys stay globally unique across namespaces.
+
+### Set at insert, immutable after
+
+`insert_node`, `/ingest`, Cypher `CREATE` and every other create path accept `ns`
+like any other property. Changing it afterwards is refused — `set_prop`, Cypher
+`SET`, `MERGE`'s property merge and every upsert that merges props:
+
+```
+node d1 is in namespace tenant-a; a namespace is set at insert and cannot be
+changed to tenant-b — delete and re-insert the node instead
+```
+
+**Removing `ns` is changing it**, to `default` — the namespace an absent property
+names — so it is refused with the same error: `remove_prop`, a batched
+`RemoveProp`, and `DELETE /node/{key}/prop/ns` all return it. (The Cypher dialect
+has no `REMOVE`, so that spelling is a query error before it reaches this check.)
+
+Writing the namespace a node is already in is a no-op, not an error, and so is
+removing `ns` from a node already in `default`: neither changes a namespace, and
+neither takes a commit. `rename_node` changes the key, not the namespace. Moving a
+node between tenants is a deletion from one and a creation in the other, and saying
+so is more honest than a property edit that silently re-homes every edge the node
+carries.
+
+A materialized view may not own the `ns` column either: a `view_prop` of `"ns"` is
+refused when the view is created, because a view rewrites its column on every
+relevant change and that is exactly what immutability forbids.
+
+### A role binds to namespaces — `roles.json` version 4
+
+```json
+{
+  "version": 4,
+  "roles": [
+    {
+      "name": "tenant-a-reader",
+      "keys": [],
+      "labels": ["Document"],
+      "visible_where": { "field": "status", "in": ["published"] },
+      "namespaces": ["tenant-a"],
+      "write": null
+    }
+  ]
+}
+```
+
+The full resolution, all three legs:
+
+```
+visible = ( keys ∪ { n : label(n) ∈ labels ∧ visible_where(n) } )
+          ∩ { n : ns(n) ∈ namespaces }
+```
+
+- **Absent `namespaces` is unscoped** — exactly the behaviour every role had before
+  version 4, so no existing role changes meaning.
+- **The namespace leg intersects `keys` too**, unlike `visible_where`, which narrows
+  only the label leg. A namespace is a tenancy boundary, and an explicitly named key
+  in another tenant's namespace is a mistake rather than an administrative grant:
+  `apply_schema` refuses a role whose `keys` name a **live** node outside its
+  namespaces, naming both the key and its namespace. A key naming no live node is
+  still silently ignored, as it is today.
+- **`"namespaces": []` is refused.** A role that sees nothing is written by omitting
+  `keys` and `labels`, not by closing the namespace leg.
+- Resolution stays live, as the other two legs do: a node inserted into the role's
+  namespace is visible on the next read.
+
+**Version 4 is refused by an older binary**, for the same reason version 3 is: a
+binary that does not know `namespaces` would resolve a tenant-scoped role across
+every tenant. An unrecognised version poisons the roles state and denies every role.
+Versions 1–3 still load, and version 4 is written **only** when some role actually
+carries a `namespaces` binding — a store that uses no namespaces keeps the sidecar
+version it had.
+
+### A role writes only into its own namespaces
+
+A role bound to `namespaces` may only **create** a node inside them. The never-widen
+rule is about what a write makes visible to *any* party, not only to the writer: a
+node the role could never read back would be a write into somebody else's tenancy.
+The refusal is a 403 with
+
+```
+role-bound token: namespace '<ns>' not in the role's namespaces
+```
+
+and it covers `POST /nodes`, a batch, Cypher `CREATE`, and the node `MERGE` creates
+when the pattern names `ns`. A create without an `ns` is a create in `default`, so
+an `x`-bound role is refused there too — except a `MERGE` whose executing role is
+bound to exactly one namespace, which stamps that namespace on the create arm. A
+role with no `namespaces` binding is unchanged: it writes wherever its label
+scope allows.
+
+A placeholder endpoint `POST /edges/upsert` would auto-create is refused by the same
+rule — a placeholder carries no props, so it lands in `default` — but the message is
+the endpoint one, `role-bound token: edge endpoint not visible`, because that arm
+fires only for an endpoint which does **not** exist and the visibility arm only for one
+which does: two different strings there would be an existence oracle. Hidden ≡ absent,
+as everywhere else.
+
+Updates need no separate rule — a role can only mutate nodes already in its read
+mask, and the namespace leg has already narrowed that.
+
+**`MERGE` creates inside a single-namespace role's namespace.** A `MERGE` pattern
+carries its identifying property (`MERGE (n:Doc {id: 'x'})`). When the executing
+role is bound to exactly one namespace and the pattern does not name `ns`, the
+create arm stamps that namespace. A global (no-role) `MERGE` still lands in
+`default`. A role bound to two or more namespaces cannot `MERGE`-create unless
+the pattern names one `ns`; the refusal is
+
+```
+role-bound token: MERGE create requires the role to name one namespace
+```
+
+Naming `ns` in the pattern (`MERGE (n:Doc {id: 'x', ns: 'other'})`) is a create
+in that namespace, and a role that cannot write there is refused as any other
+cross-namespace create. `ON CREATE SET n.ns = …` is still a namespace change and
+is refused as one.
+
+- A role bound to exactly one namespace **can `MERGE`-create**: the node lands
+  in that namespace. A second `MERGE` of the same key matches it.
+- A role bound to two or more namespaces **must name one** with `ns`.
+- The `MERGE` **match** arm is unaffected — the node it matches is already in
+  the role's mask, and `ON MATCH SET` works as it always has.
+
+### No cross-namespace edges
+
+A user-written edge stays inside one namespace:
+
+```
+edge d1 → e1 crosses a namespace boundary (tenant-a → tenant-b);
+only a global rule may derive one
+```
+
+Every insert-edge path goes through the same check, single op or batch. Only a
+**global** rule — one with no `namespace` — may derive an edge across the boundary;
+see [rules.md](rules.md#namespace-scoping). On an existing store every node is in
+`default`, so nothing that works today stops working.
+
+### Time travel
+
+A role bound to a namespace resolves that binding against the commit being read, so
+an as-of read under a tenant-scoped role sees that tenant's nodes **as they were
+then**. The rule is the one as-of always follows: the graph is historical, the role
+definition is current. A node's namespace, unlike its label or its properties,
+cannot have changed — it is immutable — so there is no second case to explain.
+
+`stats` carries a `namespaces` list with the live node count per namespace, always
+including `default`.
+
+### Namespaces on every surface
+
+Every surface takes a `namespace`, and it means the same thing everywhere: **one more
+leg intersected into whatever restriction already applies.** It can only narrow.
+
+| Surface | How to pass it |
+|---|---|
+| MCP `query` | `"namespace": "tenant-a"` beside `role`, `mask` and `as_of` |
+| MCP `stats` | `"role"` and/or `"namespace"` narrow the `namespaces` roster |
+| MCP `upsert_entity`, `ingest_json` | `"namespace"` — the namespace a created node lands in |
+| MCP `create_rule` | `"namespace"` — scope the rule (see [rules.md](rules.md#namespace-scoping)) |
+| `POST /query` | `"namespace"` in the body |
+| `POST /nodes`, `POST /ingest` | `"namespace"` in the body, applied to every node created |
+| `POST /rules` | `"namespace"` in the `RuleDef` |
+| `GET /stats` | the `namespaces` roster (full-access tokens only — see below) |
+| CLI `query` | `--namespace <ns>`, optionally with `--role <name>` |
+| CLI `asof` | `--namespace <ns>` |
+| CLI `stats`, `doctor` | a `namespaces:` line / a `, N namespaces` clause, both omitted on a single-namespace store |
+| Python | `insert_node(..., namespace=)`, `query(..., role=, namespace=)`, `stats()["namespaces"]`, `create_rule({"namespace": …})` |
+
+The composition rules, which hold on all of them:
+
+- **Namespace alone** — the mask is that namespace's live nodes.
+- **Namespace with a role** — `mask_for_role(role) ∩ mask_for_namespace(ns)`. A role
+  bound to `tenant-a` asked for `tenant-b` answers with **nothing**. Never the union.
+- **Namespace with a client key mask** — the same intersection, so a namespace narrows
+  an allow-list and an allow-list narrows a namespace.
+- **A role bound to namespaces needs no argument at all.** Its binding is part of the
+  one resolver every read path calls, so `POST /query`, `GET /node/{key}`,
+  `/edges`, `/neighborhood` and the history routes narrow with nothing passed, and a
+  node in another namespace answers exactly as an absent key does (404, no stub).
+- **Namespace with `as_of`** — both legs resolve against the graph at that commit.
+- **Absent** — no namespace restriction at all. Not `default`: `"default"` is how you
+  ask for the nodes that name no namespace.
+- **An unused name is an empty mask**, never everything. An *invalid* name is refused
+  outright (`namespace "…" is not a valid namespace name — 1 to 64 characters of
+  [A-Za-z0-9_.-]`), because a typo that silently answers "nothing" reads like an empty
+  store.
+- **Either argument makes the call a read.** A restricted write is refused, as it
+  already was with `role` or `mask`.
+
+On the write surfaces `namespace` is the same write-once `ns` property, named on the
+call instead of buried in the props. A row or a `props` object that carries its own
+`ns` naming a *different* namespace is refused before anything is written — one node
+is created in one namespace. On `upsert_entity` over a node that already exists the
+namespace is written like any other property, so naming the one it is already in is a
+no-op and naming another is the `NamespaceImmutable` refusal above — and that
+refusal is atomic with the rest of the update: no sibling property is committed.
+
+### What `stats` discloses
+
+The `namespaces` roster is the one part of `stats` that is a list of *other tenants*.
+
+- `GET /stats` **denies role tokens entirely** (403,
+  `role-bound token: /stats requires a full-access token`), as it did before namespaces
+  existed, so no tenant-scoped HTTP client ever sees the roster.
+- MCP `stats` has no token — it is the local stdio surface, as trusted as the store
+  directory — so it answers in full by default and takes `role` / `namespace` to narrow
+  the roster for a caller that is answering as a tenant. The store-wide counts beside
+  it are unchanged: they were never per-namespace.
+- The CLI prints the whole roster; it is the operator's own shell.
+
+---
+
+## Client node masks
+
+Full-access callers can supply a `mask` allow-list to any read path (query, node-info,
+edges, neighborhood, MCP query). Nodes not in the mask are hidden. Default behavior
+when no mask is supplied is to show all nodes.
+
+---
+
+## Restricted-stub mode (`stub_hidden`)
+
+By default, hidden nodes are **omitted** from responses entirely — their existence is
+not disclosed. This is `MaskMode::Omit`, the default for all paths.
+
+`MaskMode::Stub` is an opt-in that discloses existence without leaking any data.
+When enabled, a hidden node appears as:
+
+```json
+{"key": "alice", "restricted": true}
+```
+
+No label, no properties, no other fields.
+
+**This is a deliberate existence disclosure.** Use it only when your application
+needs to indicate that a node exists but is not accessible to the requester. If you
+need to conceal both content and existence, use the default omit mode.
+
+### How to enable stub mode
+
+Add `stub_hidden=true` to HTTP query params or the POST /query body:
+
+```
+GET /node/alice?stub_hidden=true
+GET /node/alice/edges?stub_hidden=true&mask=alice,carol
+GET /node/alice/neighborhood?stub_hidden=true&mask=alice,carol
+POST /query   body: {"cypher": "...", "stub_hidden": true}
+```
+
+For the MCP `query` tool, pass `stub_hidden: true` in the tool arguments.
+
+### Behavior per endpoint
+
+| Endpoint | Omit mode (default) | Stub mode |
+|---|---|---|
+| `GET /node/{key}` | 404 if hidden | `{"key":…,"restricted":true}` |
+| `GET /node/{key}/edges` | hidden endpoint omitted from list | edge object kept; endpoint field is `{"key":…,"restricted":true}` |
+| `GET /node/{key}/neighborhood` | hidden direct neighbors omitted | hidden direct neighbors appear as stub rows (`label: null`); BFS does not expand through them |
+| `POST /query` | hidden nodes omitted from Cypher rows | Cypher rows: omit-only (same as Omit mode — see below) |
+| MCP `query` | hidden nodes omitted | Cypher rows: omit-only |
+
+### Cypher query results are always omit-only
+
+Cypher executes over the full graph topology and cannot partially reveal nodes as
+stubs mid-result. In both Omit and Stub mode, Cypher rows that reference hidden nodes
+are omitted from the result set entirely. The `stub_hidden` flag has no effect on
+Cypher result rows.
+
+### Edges to restricted endpoints
+
+When stub mode is active and an edge touches a restricted node, the edge object is
+included in the response but the restricted endpoint is rendered as a stub:
+
+```json
+{
+  "edges": [
+    {"edge_type": "KNOWS", "src_key": "alice", "dst_key": {"key": "bob", "restricted": true}, "derived": false}
+  ]
+}
+```
+
+The `edge_type` and `derived` fields are present on every edge object in stub mode.
+This is in-contract: an edge's existence and type are disclosed when the non-hidden
+endpoint is visible.
+
+### Role tokens never use stub mode
+
+Role paths always use `MaskMode::Omit`. The `stub_hidden` parameter is silently
+ignored on any request authenticated with a role token — except with `as_of`, where
+it is refused rather than ignored (`as_of (time-travel) does not compose with
+stub_hidden`; see [Composing with `as_of`](#composing-with-as_of)). A role caller
+never receives stub responses — hidden nodes are fully omitted.
+
+### MCP trust boundary
+
+The MCP interface (`mushroomdb mcp`) is a stdio JSON-RPC server for local trusted
+use; it operates without bearer-token authentication and is not subject to role
+enforcement. The `stub_hidden` arg on the MCP `query` tool applies the client mask
+in stub mode, but there is no role layer enforcing minimum visibility.
+
+The MCP `query` tool also takes a `role`, which resolves a name from `roles.json`
+to the same node mask the HTTP role path would compute — `visible_where` included —
+and applies it as a client mask. It is a convenience for asking "what would this role see", not a credential:
+any caller may name any role, and passing both `role` and `mask` is rejected. Real
+enforcement is the HTTP server's role tokens (`serve --role-token`).
+
+---
+
+## Composing masks
+
+When a full-access caller supplies both a role context (via the server config) and a
+client mask, the server intersects them. When a full-access caller supplies only a
+client mask, that mask is applied directly. When no mask is supplied, all nodes are
+visible.
+
+Summary of what each caller class sees:
+
+| Caller | Mask applied |
+|---|---|
+| No token (no auth endpoint) | n/a |
+| Full-access token, no mask | all nodes |
+| Full-access token + client mask | client mask |
+| Role token | role mask ∩ client mask (if any) |
+
+### Composing with `as_of`
+
+A mask composes with time travel. `POST /query` accepts `as_of` alongside a
+role token or a client `mask`, and the MCP `query` tool accepts `as_of`
+alongside `role` or `mask`. Every key and label is resolved against the graph
+**as it was at that commit**, so a key that did not exist yet resolves to
+nothing and a role that may see a label sees exactly the nodes that carried it
+then. The intersection rule is unchanged: a client mask can only narrow a
+role, never widen it. Writes are refused at any commit.
+
+The graph is historical; the role *definition* is not. `roles.json` is a
+sidecar and is never a WAL record, so there is no past version of it to read —
+an as-of read applies today's role definition to the graph as it was then. See
+[timetravel.md](timetravel.md).
+
+A `visible_where` predicate follows the same rule and is evaluated against the
+**property values at the commit being read**. A document that was a draft then
+and is published now is outside a `status in ["published"]` role at that past
+commit, and inside it today. Narrowing a role therefore takes effect at every
+commit at once, which is what makes it a revocation.
+
+**`stub_hidden` does not compose with `as_of`** — the pair is rejected with
+`as_of (time-travel) does not compose with stub_hidden`. Stub mode exists to
+disclose that a hidden node *exists*, and node existence at a past commit is
+exactly the question an as-of read is asking; answering it through a stub
+would leak the historical shape of the graph outside the mask. Drop
+`stub_hidden` or drop `as_of`.
+
+#### Deletion is not retroactive
+
+**Deleting a node does not remove it from a role's past.** A role that may see
+the `Public` label reads a now-deleted `Public` node — and the edges it had —
+at any retained commit where it was live. A role with `keys: ["k"]` reads `k`
+at a past commit even though `k` is gone today. `DELETE` changes the present;
+it does not rewrite the WAL. **To revoke history, prune the archives** (see
+[timetravel.md](timetravel.md) — WAL archives and retention) **or narrow the
+role**, which takes effect at every commit at once because the role definition
+is always the current one.
+
+#### Keys are not identities
+
+A role's `keys` name **whichever node held that key at the commit asked for**.
+Renaming a node frees its key, and a later node may take it. A role with
+`keys: ["alice"]` that reads at an old commit sees the node that was called
+`alice` *then* — not the one called `alice` now. Grant by label, or by a key
+you do not recycle, when that distinction matters.
+
+The same caveat reaches the history endpoints. `GET /node/{key}/history` under
+a role token filters out `EdgeAdded`/`EdgeRemoved` entries whose other
+endpoint the role cannot see — but that filter resolves the other endpoint's
+key against **today's** ids, not the ids as of the historical event. A key
+that was reused since the event can be let through, or held back, on the
+strength of who holds it now rather than who held it then.
+
+---
+
+## docs/site/service.md
+
+# Running it as a service
+
+`mushroomdb serve` is a single process holding one store directory. The graph is
+in RAM and on that directory, and nowhere else — there is no replica, no
+external log, and nothing reconstructs it from somewhere else. So the operator's
+job is small and entirely mechanical: mount the directory, bound the replay,
+copy it somewhere, and be able to put it back.
+
+This page is that runbook, end to end.
+
+---
+
+## 1. The volume
+
+A store is a directory. Mount it; everything below follows from that.
+
+| File | What it is | Losing it costs |
+|---|---|---|
+| `snapshot.bin` | the whole store as one memory-mappable image | a from-genesis WAL replay, or everything if there is no WAL |
+| `snapshot.bin.bak` | the pre-migration image, written before a format upgrade rewrites `snapshot.bin` | the pre-upgrade copy to fall back to |
+| `wal.bin` | every commit written since the last snapshot | those commits |
+| `wal.floor` | where the retained history starts | the horizon a pruned store reports |
+| `wal.genesis` | the marker that lets `asof` replay into the archives | `asof` reach below the last snapshot |
+| `roles.json` | role tokens and their masks | every configured role |
+| `wal.<N>.archive` | the folded WAL each snapshot left behind | `node_history`, `edge_history`, `was_linked` and `asof` reach into that span |
+| `LOCK` | always empty; carries the advisory cross-process write lock | cross-process coordination for handles opened afterwards |
+
+All of them matter. A backup that takes `snapshot.bin` alone is a store with no
+past and no roles.
+
+**One writer per directory.** `LOCK` is what enforces it across processes: every
+path that appends to the write-ahead log takes the advisory lock first, and a
+writer that cannot take it within `WRITE_LOCK_WAIT` gets `GraphError::Busy`
+rather than corrupting anything (CHANGELOG v0.6.0, **Multi-process safety**).
+Readers are unaffected — many of them can share the directory. Two `serve`
+processes on one volume is not a supported configuration; one serves, the rest
+read. See [Concurrency](concurrency.md).
+
+`LOCK` is not part of the on-disk format. A store copied without it works
+normally, which is why no backup carries one.
+
+---
+
+## 2. The snapshot interval
+
+```text
+mushroomdb serve /data --snapshot-every 300
+```
+
+`--snapshot-every <secs>` (in `mushroomdb serve`'s usage text, `crates/cli/src/lib.rs`)
+bounds one thing: how
+much WAL a **hard** crash leaves to replay on the next open. Without it, a store
+that has never snapshotted replays from genesis, which re-derives every rule's
+edges and rebuilds the ANN index for any `VectorSimilar` rule — minutes on a
+large store. See [Durability and crash recovery](durability.md).
+
+Three properties worth knowing:
+
+- **Graceful shutdown takes one too.** SIGINT and SIGTERM snapshot before
+  exiting, so a clean restart always recovers from an image. The interval is
+  insurance against the ungraceful case.
+- **A tick is skipped, never queued.** A snapshot replaces `wal.bin`, so it needs
+  the store's cross-process write lock; the timer waits `SNAPSHOT_LOCK_WAIT`
+  (`SNAPSHOT_LOCK_WAIT`, 500 ms, `crates/cli/src/lib.rs`) and, if a peer holds it, drops that
+  tick rather than piling up behind it. The next one is only a period away, and
+  a missed snapshot costs a longer replay, never data.
+- **Automatic snapshots keep every archive.** `AUTO_SNAPSHOT_RETENTION` is
+  `None` (`crates/cli/src/lib.rs`), so a `--snapshot-every` tick archives the
+  folded WAL as `wal.<N>.archive` and prunes nothing. History is what the
+  archives exist for. The consequence is disk: one new archive per snapshot that
+  had WAL to fold, indefinitely. `mushroomdb stats <db-dir>` prints a `history:`
+  line saying where the retained history starts, so growth is never a surprise,
+  and `mushroomdb snapshot <db-dir> --retention N` is how to bound it once that
+  trade is worth making. Pruning advances the history horizon — see
+  [How far back history reaches](timetravel.md#how-far-back-history-reaches) for
+  exactly what stops answering.
+
+Pick a period against your crash-replay budget, not against write volume. Five
+minutes is a reasonable default for a served store.
+
+---
+
+## 3. Backup
+
+```text
+mushroomdb backup /data /backups/2026-09-11T02-00Z
+```
+
+The command copies `snapshot.bin`, `snapshot.bin.bak`, `wal.bin`, `wal.floor`,
+`wal.genesis`, `roles.json` and every `wal.<N>.archive` into the destination,
+then **verifies**: it CRC-checks the copy and opens it. The printed report ends
+in `verified: true`, and a copy that does not verify is one you must not use.
+
+> **The CLI form is unsafe against a live `serve`.** It says so in the usage
+> text: the copies are not atomic across processes, so a backup taken while a
+> server is writing can catch a half-written file. Stop the server, or use the
+> HTTP endpoint.
+
+For a running server, `POST /backup` is the correct path. It holds the read lock
+for the full duration — copies plus verification — so writers block for that
+window and the copy is consistent. It is full-token only; role tokens get 403.
+See [POST /backup](api.md#post-backup).
+
+Backups are ordinary directories. A rolling scheme that writes one per run into
+a vault directory, optionally with a `latest` symlink or copy, is exactly the
+shape restore expects.
+
+---
+
+## 4. Restore
+
+```text
+mushroomdb serve /data --restore-from /backups
+```
+
+`--restore-from <dir>` seeds an **empty** store directory before the server
+opens it:
+
+- If `<dir>` itself holds a store — a `snapshot.bin`, or a non-empty `wal.bin`
+  for a store that has never snapshotted — that is the backup.
+- Otherwise `<dir>` is a directory *of* backups. An immediate subdirectory named
+  `latest` holding a store wins outright — so a symlink or a rolling copy can
+  name itself — and failing that, the newest by mtime wins.
+- The chosen backup's files are copied into a staging directory inside the store
+  directory and opened there, which runs the same CRC and replay checks any open
+  runs. Only a copy that opened is moved into place. A copy that does not open is
+  a hard failure naming both paths, and `serve` exits non-zero rather than
+  starting empty.
+
+It prints one line:
+
+```text
+restored from /backups/latest: 4 files, 2097152 bytes
+```
+
+Four rules make it safe to leave in a container command line forever:
+
+1. **It never overwrites a store.** If the directory already holds a store — by
+   the same `snapshot.bin`-or-non-empty-`wal.bin` test — it does nothing and says
+   `restore-from: <db-dir> already holds a store; not restoring` on stderr. This
+   is boot-time seeding for a fresh volume, not a rollback command — to roll
+   back deliberately, move the store directory aside first.
+2. **An empty vault is a warning, not an error.** A first boot against a backup
+   volume with nothing in it yet prints `restore-from: no backup found under
+   <path>` and starts empty, which is the only sensible behaviour for day one.
+3. **A failed restore changes nothing.** Because the copy is staged and only
+   moved in once it has opened, a corrupt or truncated backup leaves the store
+   directory exactly as it was — empty. Fix the backup, or point at a different
+   one, and the next boot restores; there is no half-written store to clear out
+   first, and no run that silently reports a store is already present. That
+   guarantee covers errors the restore itself detects; a crash between the two
+   renames that install the staged files (not a returned error, but the
+   process dying mid-restore) can still leave the directory holding one file
+   but not the other. The next boot sees that partial store as already
+   present and reports it rather than restoring over it — clear the directory
+   and restore again.
+4. **It runs before `--demo-if-empty`.** A restored store is never overwritten
+   by the demo seed, whichever order the flags appear in.
+
+The manual equivalent is exactly what the flag automates: with the server
+stopped, copy the backup directory's files into the store directory and start
+it. Nothing else is required — no import step, no rebuild.
+
+---
+
+## 5. What a restart without a volume costs
+
+Everything.
+
+Nodes, edges, every rule-derived edge, the rules themselves, the WAL, every
+archive, and all history. A container that writes its store to the container
+filesystem starts from zero on every restart, every redeploy and every
+reschedule, and nothing anywhere reports that as an error — the new store is a
+perfectly valid empty one.
+
+There is no second copy. The graph lives in RAM and on that directory. If the
+directory is ephemeral, so is the graph.
+
+This is the single most likely way to lose a mushroomdb deployment, and the fix
+is one line of configuration: mount the store directory on a volume that
+outlives the process, and point `--restore-from` at a backup location so a
+volume that *is* lost can be re-seeded on the next boot.
+
+---
+
+## 6. Commit numbers are per store lifetime
+
+`was_linked`, `edges_at`, `asof` and the `commit` field on every history event are
+indices into **this store's** write-ahead log, counted from its genesis. They are
+not timestamps and they are not portable. A store restored from a backup keeps its
+numbering, because the WAL and its archives come with it. A store recreated from
+scratch starts again at 0, and a commit number recorded against the old one means
+something different in the new one. If a commit index has to survive a rebuild,
+record a timestamp beside it.
+
+---
+
+## 7. A worked container command line
+
+```text
+docker run -d --name mushroomdb \
+  -p 8080:8080 \
+  -v /srv/mushroomdb/data:/data \
+  -v /srv/mushroomdb/backups:/backups \
+  -e MUSHROOMDB_TOKEN="$TOKEN" \
+  mushroomdb:local serve /data \
+    --addr 0.0.0.0:8080 \
+    --snapshot-every 300 \
+    --restore-from /backups
+```
+
+The image's `ENTRYPOINT` is the `mushroomdb` binary, so everything after the
+image name replaces the default `CMD` (which is
+`serve /data --addr 0.0.0.0:8080 --demo-if-empty`). What each piece is doing:
+
+- `-v …:/data` — the store directory on a volume that outlives the container.
+  This is the line §5 is about.
+- `-v …:/backups` — the vault `--restore-from` reads and `backup` writes. A
+  separate volume on purpose: a restore is only useful if it survives losing the
+  first one.
+- `MUSHROOMDB_TOKEN` — required, because `--addr 0.0.0.0:8080` is not loopback.
+  `serve` refuses to start on a non-loopback bind without a token. Passing it in
+  the environment keeps it out of the process's argument list. Terminate TLS at
+  a reverse proxy in front of this, or build with `--features tls` and pass
+  `--tls-cert`/`--tls-key` — see [Deployment](deployment.md).
+- `--snapshot-every 300` — caps crash replay at five minutes of WAL.
+- `--restore-from /backups` — a no-op on every boot where `/data` survived, and
+  the thing that saves the deployment on the boot where it did not.
+
+Take the backups themselves from outside the container against the running
+server, so the copy is consistent:
+
+```text
+curl -fsS -X POST http://127.0.0.1:8080/backup \
+  -H "Authorization: Bearer $MUSHROOMDB_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"dest":"/backups/2026-09-11T02-00Z"}'
+```
+
+Check `verified` in the response body on every run. A backup nobody verified is
+a backup nobody has.
+
+---
+
+## See also
+
+- [Durability and crash recovery](durability.md) — what recovery replays, what a
+  snapshot archives, and what retention costs
+- [Concurrency](concurrency.md) — many readers, one writer, and `Busy`
+- [Deployment](deployment.md) — TLS, reverse proxies, and the loopback default
+- [Time travel](timetravel.md) — `asof`, the horizon, and archive reachability
+
+---
+
 ## docs/site/suggest.md
 
 # Rule Suggestion
