@@ -55,6 +55,9 @@ pub fn cosine_unit(a: &[f64], b: &[f64]) -> f64 {
 
 /// Pack candidates whose `len() == dim` and whose L2 norm is non-zero.
 /// Other candidates are omitted (not scored).
+///
+/// A row whose L2² is within `PACK_UNIT_L2SQ_EPS` of 1 is already unit:
+/// copy it and skip the second L2 (the scale pass).
 pub fn pack<'a, I>(rows: I, dim: usize) -> PackedVectors
 where
     I: IntoIterator<Item = (u32, &'a [f64])>,
@@ -65,14 +68,47 @@ where
         if row.len() != dim {
             continue;
         }
-        let norm: f64 = row.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm == 0.0 {
+        let n2 = pack_l2sq(row);
+        if n2 == 0.0 {
             continue;
         }
         ids.push(id);
-        data.extend(row.iter().map(|x| x / norm));
+        if (n2 - 1.0).abs() <= PACK_UNIT_L2SQ_EPS {
+            data.extend_from_slice(row);
+        } else {
+            let norm = n2.sqrt();
+            pack_scale_unit(row, norm, &mut data);
+        }
     }
     PackedVectors { ids, dim, data }
+}
+
+/// |‖x‖² − 1| at or below this → already unit. Same domain as the zero-row
+/// check (`n2 == 0.0`): squared L2, not ‖x‖. Tight enough that the GEMM-vs-
+/// scalar pin (1e-9) is unaffected.
+const PACK_UNIT_L2SQ_EPS: f64 = 1e-12;
+
+#[cfg(test)]
+thread_local! {
+    static PACK_L2_CALLS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[inline]
+fn note_pack_l2() {
+    #[cfg(test)]
+    PACK_L2_CALLS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+#[inline]
+fn pack_l2sq(row: &[f64]) -> f64 {
+    note_pack_l2();
+    row.iter().map(|x| x * x).sum()
+}
+
+#[inline]
+fn pack_scale_unit(row: &[f64], norm: f64, data: &mut Vec<f64>) {
+    note_pack_l2();
+    data.extend(row.iter().map(|x| x / norm));
 }
 
 /// `out[i] = row(i) · q_unit`. `q_unit.len() == packed.dim`.
@@ -211,6 +247,58 @@ mod tests {
         assert!(g[1].abs() < 1e-12, "g01={}", g[1]);
         assert!(g[2].abs() < 1e-12, "g10={}", g[2]);
         assert!((g[3] - 1.0).abs() < 1e-12, "g11={}", g[3]);
+    }
+
+    fn ulps(a: f64, b: f64) -> u64 {
+        if a == b {
+            return 0;
+        }
+        let mut ai = a.to_bits() as i64;
+        let mut bi = b.to_bits() as i64;
+        if ai < 0 {
+            ai = i64::MIN - ai;
+        }
+        if bi < 0 {
+            bi = i64::MIN - bi;
+        }
+        ai.abs_diff(bi)
+    }
+
+    fn pack_l2_calls() -> u64 {
+        PACK_L2_CALLS.with(|c| c.get())
+    }
+
+    fn pack_l2_calls_reset() {
+        PACK_L2_CALLS.with(|c| c.set(0));
+    }
+
+    /// Already-unit rows must match the always-normalise pack within 1 ulp
+    /// and must not run the scale pass (second L2).
+    #[test]
+    fn pack_skips_second_l2_on_unit() {
+        let unit = [0.6_f64, 0.8];
+        let n2 = unit[0] * unit[0] + unit[1] * unit[1];
+        assert!(
+            (n2 - 1.0).abs() <= PACK_UNIT_L2SQ_EPS,
+            "fixture must be unit in the packer's epsilon, n2={n2}"
+        );
+
+        pack_l2_calls_reset();
+        let packed = pack([(7, unit.as_slice())], 2);
+        assert_eq!(packed.ids, vec![7]);
+        assert_eq!(packed.dim, 2);
+        assert_eq!(packed.data.len(), 2);
+
+        let norm = n2.sqrt();
+        let oracle = [unit[0] / norm, unit[1] / norm];
+        for (i, (&got, &expect)) in packed.data.iter().zip(oracle.iter()).enumerate() {
+            assert!(
+                ulps(got, expect) <= 1,
+                "unit[{i}]: packed {got} vs always-L2 {expect} ulps={}",
+                ulps(got, expect)
+            );
+        }
+        assert_eq!(pack_l2_calls(), 1, "already-unit row must not L2 twice");
     }
 
     #[test]

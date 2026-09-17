@@ -37,6 +37,7 @@
 //! (each still above the recall floor its own shape was gated at).
 
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
@@ -244,6 +245,7 @@ thread_local! {
     static HNSW_SEARCH_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static HNSW_DIST_EVALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static HNSW_DIST_EVALS_PAIRWISE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static HNSW_BEAM_SCRATCH_GROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Count one vector actually indexed. Called *after* the zero-vector early
@@ -308,6 +310,27 @@ pub fn hnsw_dist_evals_pairwise() -> u64 {
 pub fn hnsw_dist_evals_reset() {
     HNSW_DIST_EVALS.with(|c| c.set(0));
     HNSW_DIST_EVALS_PAIRWISE.with(|c| c.set(0));
+}
+
+/// Count one growth of the reused beam-search visited buffer.
+#[inline]
+fn note_beam_scratch_grow() {
+    #[cfg(any(test, feature = "test-hooks"))]
+    HNSW_BEAM_SCRATCH_GROWS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Times the beam-search visited buffer grew on this thread since the last reset.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_beam_scratch_grows() -> u64 {
+    HNSW_BEAM_SCRATCH_GROWS.with(|c| c.get())
+}
+
+/// Reset the beam-search visited-buffer growth counter to zero.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_beam_scratch_grows_reset() {
+    HNSW_BEAM_SCRATCH_GROWS.with(|c| c.set(0));
 }
 
 /// Count one query answered by the graph itself (past the empty-index guards).
@@ -597,10 +620,75 @@ fn slab_of_decoded(vectors: &[Vec<f64>]) -> (VecSlab, u64) {
 }
 
 /// The `f32` form of a unit `f64` vector — the query shape every search path
-/// uses, and bit-for-bit what [`VecSlab::put`] stored.
+/// uses, and bit-for-bit what [`VecSlab::put`] stored. Search/insert fill a
+/// thread-local buffer via [`as_f32_into`]; this owned helper remains for tests.
+#[cfg(test)]
 #[inline]
 fn as_f32(v: &[f64]) -> Vec<f32> {
-    v.iter().map(|&x| x as f32).collect()
+    let mut out = Vec::with_capacity(v.len());
+    as_f32_into(&mut out, v);
+    out
+}
+
+#[inline]
+fn as_f32_into(dst: &mut Vec<f32>, v: &[f64]) {
+    dst.clear();
+    dst.extend(v.iter().map(|&x| x as f32));
+}
+
+/// Reused beam-search buffers. Thread-local so `&self` search can share them
+/// without interior mutability on the index (cloned and serialized).
+struct BeamScratch {
+    visited: Vec<bool>,
+    c_heap: BinaryHeap<Reverse<(OrdF64, u32)>>,
+    w_heap: BinaryHeap<(OrdF64, u32)>,
+}
+
+impl BeamScratch {
+    const fn empty() -> Self {
+        Self {
+            visited: Vec::new(),
+            c_heap: BinaryHeap::new(),
+            w_heap: BinaryHeap::new(),
+        }
+    }
+
+    fn reset_beam(&mut self, n_slots: usize) {
+        if self.visited.len() == n_slots {
+            self.visited.fill(false);
+        } else {
+            if self.visited.capacity() < n_slots {
+                note_beam_scratch_grow();
+            }
+            self.visited.clear();
+            self.visited.resize(n_slots, false);
+        }
+        self.c_heap.clear();
+        self.w_heap.clear();
+    }
+}
+
+thread_local! {
+    static BEAM_SCRATCH: RefCell<BeamScratch> = const { RefCell::new(BeamScratch::empty()) };
+    static QUERY_F32: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+fn with_beam_scratch<R>(f: impl FnOnce(&mut BeamScratch) -> R) -> R {
+    BEAM_SCRATCH.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+fn take_query_f32(v: &[f64]) -> Vec<f32> {
+    QUERY_F32.with(|cell| {
+        let mut q = std::mem::take(&mut *cell.borrow_mut());
+        as_f32_into(&mut q, v);
+        q
+    })
+}
+
+fn stash_query_f32(q: Vec<f32>) {
+    QUERY_F32.with(|cell| {
+        *cell.borrow_mut() = q;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,63 +1195,77 @@ impl HnswIndex {
         layer: usize,
         ef: usize,
     ) -> Vec<(u32, f64)> {
-        // visited: avoid re-expanding a node. A `Vec<bool>` indexed by slot, not
-        // a `BTreeSet`: this is probed once per candidate edge — order 10⁴ times
-        // per insert — and each probe was an O(log V) chase through separately
-        // allocated tree nodes. One memset per call buys O(1) probes. It changes
-        // neither which nodes are expanded nor the order they are pushed in,
-        // which is what keeps the graph a function of the WAL.
-        let mut visited = vec![false; slots.len()];
-        if let Some(v) = visited.get_mut(ep as usize) {
-            *v = true;
-        }
-
-        let ep_dist = dist_to(slab, ep, q);
-
-        // c_heap: min-heap of (dist, slot) — candidates to expand
-        let mut c_heap: BinaryHeap<Reverse<(OrdF64, u32)>> = BinaryHeap::new();
-        c_heap.push(Reverse((OrdF64(ep_dist), ep)));
-
-        // w_heap: max-heap of (dist, slot) — ef-best results (worst on top for eviction)
-        let mut w_heap: BinaryHeap<(OrdF64, u32)> = BinaryHeap::new();
-        w_heap.push((OrdF64(ep_dist), ep));
-
-        while let Some(&Reverse((OrdF64(c_dist), c))) = c_heap.peek() {
-            // furthest in result set
-            let f_dist = w_heap.peek().map(|(OrdF64(d), _)| *d).unwrap_or(f64::MAX);
-            if c_dist > f_dist {
-                break; // all remaining candidates are farther than our worst result
+        with_beam_scratch(|scratch| {
+            // visited: avoid re-expanding a node. A `Vec<bool>` indexed by slot,
+            // not a `BTreeSet`: this is probed once per candidate edge — order
+            // 10⁴ times per insert — and each probe was an O(log V) chase
+            // through separately allocated tree nodes. One memset per call buys
+            // O(1) probes. It changes neither which nodes are expanded nor the
+            // order they are pushed in, which is what keeps the graph a
+            // function of the WAL. The buffer is thread-local and cleared per
+            // call so a search allocates once per thread, not once per beam.
+            scratch.reset_beam(slots.len());
+            if let Some(v) = scratch.visited.get_mut(ep as usize) {
+                *v = true;
             }
-            c_heap.pop();
 
-            let neighbors: &[u32] = slots
-                .get(c as usize)
-                .and_then(|n| n.layers.get(layer))
-                .map(|l| l.as_slice())
-                .unwrap_or_default();
+            let ep_dist = dist_to(slab, ep, q);
 
-            for &e in neighbors {
-                if visited.get(e as usize).copied().unwrap_or(true) {
-                    continue;
+            // c_heap: min-heap of (dist, slot) — candidates to expand
+            scratch.c_heap.push(Reverse((OrdF64(ep_dist), ep)));
+
+            // w_heap: max-heap of (dist, slot) — ef-best results (worst on top for eviction)
+            scratch.w_heap.push((OrdF64(ep_dist), ep));
+
+            while let Some(&Reverse((OrdF64(c_dist), c))) = scratch.c_heap.peek() {
+                // furthest in result set
+                let f_dist = scratch
+                    .w_heap
+                    .peek()
+                    .map(|(OrdF64(d), _)| *d)
+                    .unwrap_or(f64::MAX);
+                if c_dist > f_dist {
+                    break; // all remaining candidates are farther than our worst result
                 }
-                if !Self::is_live(id_of, e) {
-                    continue; // defensive: a freed slot is never a candidate
-                }
-                visited[e as usize] = true;
+                scratch.c_heap.pop();
 
-                let e_dist = dist_to(slab, e, q);
-                let f_dist = w_heap.peek().map(|(OrdF64(d), _)| *d).unwrap_or(f64::MAX);
-                if e_dist < f_dist || w_heap.len() < ef {
-                    c_heap.push(Reverse((OrdF64(e_dist), e)));
-                    w_heap.push((OrdF64(e_dist), e));
-                    if w_heap.len() > ef {
-                        w_heap.pop(); // evict furthest
+                let neighbors: &[u32] = slots
+                    .get(c as usize)
+                    .and_then(|n| n.layers.get(layer))
+                    .map(|l| l.as_slice())
+                    .unwrap_or_default();
+
+                for &e in neighbors {
+                    if scratch.visited.get(e as usize).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    if !Self::is_live(id_of, e) {
+                        continue; // defensive: a freed slot is never a candidate
+                    }
+                    scratch.visited[e as usize] = true;
+
+                    let e_dist = dist_to(slab, e, q);
+                    let f_dist = scratch
+                        .w_heap
+                        .peek()
+                        .map(|(OrdF64(d), _)| *d)
+                        .unwrap_or(f64::MAX);
+                    if e_dist < f_dist || scratch.w_heap.len() < ef {
+                        scratch.c_heap.push(Reverse((OrdF64(e_dist), e)));
+                        scratch.w_heap.push((OrdF64(e_dist), e));
+                        if scratch.w_heap.len() > ef {
+                            scratch.w_heap.pop(); // evict furthest
+                        }
                     }
                 }
             }
-        }
 
-        w_heap.into_iter().map(|(OrdF64(d), s)| (s, d)).collect()
+            scratch
+                .w_heap
+                .drain()
+                .map(|(OrdF64(d), s)| (s, d))
+                .collect()
+        })
     }
 
     /// The **first-rejection prune** — a short-cut of HNSW Algorithm 4, not
@@ -1432,18 +1534,19 @@ impl HnswIndex {
             &unit,
         );
 
-        // The query every distance on this insert path is taken against: the
-        // same `f32` values the slab now holds for `slot`, so a distance to the
-        // new node is exactly a distance between two slab rows. Owned rather
-        // than borrowed from the slab because the graph is mutated below.
-        let q = as_f32(&unit);
-
         let Some(ep) = self.entry_point else {
             // First node ever inserted.
             self.entry_point = Some(slot);
             self.max_level = level;
             return;
         };
+
+        // The query every distance on this insert path is taken against: the
+        // same `f32` values the slab now holds for `slot`, so a distance to the
+        // new node is exactly a distance between two slab rows. Filled into a
+        // thread-local buffer rather than borrowed from the slab because the
+        // graph is mutated below.
+        let q = take_query_f32(&unit);
 
         let params = hnsw_params();
         let prune = self.resolved_prune(&params);
@@ -1537,6 +1640,7 @@ impl HnswIndex {
             self.entry_point = Some(slot);
             self.max_level = level;
         }
+        stash_query_f32(q);
     }
 
     /// Remove node `id` from the index.
@@ -1668,8 +1772,8 @@ impl HnswIndex {
         // `hnsw_params()` width this function used before the width became a
         // parameter, so its behaviour is unchanged.
         let ef = ef.max(k);
+        let unit_q = take_query_f32(&unit_q);
         let mut curr_ep = ep;
-        let unit_q = as_f32(&unit_q);
 
         // Greedy descent from max_level to layer 1.
         for lc in (1..=self.max_level).rev() {
@@ -1695,6 +1799,7 @@ impl HnswIndex {
             .collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(k);
+        stash_query_f32(unit_q);
         results
     }
 
@@ -2200,6 +2305,44 @@ mod tests {
             hnsw_dist_evals_pairwise(),
             0,
             "a search compares the query against nodes, never two nodes"
+        );
+    }
+
+    /// Scratch reuse (visited bitset, heaps, query f32) must not change the
+    /// neighbour set, order, or distance-eval count on a fixed seed.
+    #[test]
+    fn beam_search_scratch_does_not_change_hits() {
+        let vecs = make_unit_vecs(80, 16, 0x5C12_A7C4);
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"scratch-hits"));
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert(i as u32, v);
+        }
+
+        let q = &vecs[13];
+        let k = 10;
+
+        hnsw_dist_evals_reset();
+        let baseline = idx.search(q, k);
+        let baseline_evals = hnsw_dist_evals();
+        assert_eq!(baseline.len(), k, "fixture must return k hits");
+
+        hnsw_dist_evals_reset();
+        hnsw_beam_scratch_grows_reset();
+        let again = idx.search(q, k);
+        let again_evals = hnsw_dist_evals();
+
+        assert_eq!(
+            again, baseline,
+            "scratch reuse must not change hits or order"
+        );
+        assert_eq!(
+            again_evals, baseline_evals,
+            "scratch reuse must not change dist-eval count"
+        );
+        assert_eq!(
+            hnsw_beam_scratch_grows(),
+            0,
+            "a second search on a warm index must reuse the beam visited buffer"
         );
     }
 
