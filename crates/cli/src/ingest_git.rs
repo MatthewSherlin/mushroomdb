@@ -102,7 +102,18 @@ pub struct IngestGitReport {
     pub files: usize,
     pub authors: usize,
     pub renamed: usize,
+    /// Nodes removed because the window deleted the file they named.
     pub deleted: usize,
+    /// Nodes removed because a rename destination did not survive the window:
+    /// the file was renamed, and the path it moved to was deleted later in the
+    /// same walk. The node goes with it, but no path this window deleted ever
+    /// named that node, so counting it as a delete overstated how much the
+    /// window removed.
+    ///
+    /// A rename whose destination is *excluded* is not this — it is classified
+    /// upstream as a plain delete of the source path (`walk.deleted`), and
+    /// lands in [`deleted`](Self::deleted).
+    pub evicted: usize,
     pub incremental: bool,
     pub rules_created: Vec<String>,
     /// Submodules walked as their own units.
@@ -1558,13 +1569,21 @@ fn ingest_unit(
             // moved into an excluded path, after this rename. The node goes
             // with it; renaming into a dead path would strand a phantom node
             // that no later phase refreshes.
+            //
+            // This is an eviction, not a delete: no path this window deleted
+            // ever named this node. Counting it as a delete overstated how much
+            // the window removed, which is what §5.12 splits.
             w.delete_node(from)?;
-            report.deleted += 1;
+            report.evicted += 1;
             continue;
         }
         if w.has_node(to) {
             // A pre-existing node already holds the destination path (deleted
             // earlier in this window, then claimed by this rename).
+            //
+            // Counted as a delete, deliberately: unlike the eviction above,
+            // this node's own path *was* removed in this window — the rename
+            // only decides who claims it next.
             w.delete_node(to)?;
             report.deleted += 1;
         }
@@ -1844,6 +1863,7 @@ pub fn format_sync_json(r: &SyncReport) -> String {
         "authors": g.authors,
         "renamed": g.renamed,
         "deleted": g.deleted,
+        "evicted": g.evicted,
         "incremental": g.incremental,
         "submodules": g.submodules,
         "prs": g.prs,
@@ -2005,8 +2025,11 @@ pub fn format_ingest_git(r: &IngestGitReport) -> String {
         r.authors,
         if r.incremental { " (incremental)" } else { "" }
     );
-    if r.renamed + r.deleted > 0 {
-        out.push_str(&format!("  renamed {}  deleted {}\n", r.renamed, r.deleted));
+    if r.renamed + r.deleted + r.evicted > 0 {
+        out.push_str(&format!(
+            "  renamed {}  deleted {}  evicted {}\n",
+            r.renamed, r.deleted, r.evicted
+        ));
     }
     if r.submodules + r.prs > 0 {
         out.push_str(&format!(

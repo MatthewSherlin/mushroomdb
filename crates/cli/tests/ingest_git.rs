@@ -367,7 +367,12 @@ fn rename_then_delete_in_one_window_leaves_no_phantom_node() {
     commit_all(&repo, "alice", "drop the moved api");
 
     let r = run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-    assert_eq!((r.commits, r.renamed, r.deleted), (2, 0, 1));
+    assert_eq!(
+        (r.commits, r.renamed, r.deleted, r.evicted),
+        (2, 0, 0, 1),
+        "the rename destination did not survive the window: the node is \
+         evicted, not deleted — no path this window deleted named it"
+    );
 
     let db = GraphDb::open(&db_dir).unwrap();
     assert!(!db.has_node("src/api.rs"), "the original path is gone");

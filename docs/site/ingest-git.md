@@ -378,9 +378,17 @@ first run, or a run whose recorded flags changed, scans the whole tree instead �
 which is how turning `--no-docs` back off fills in the prose it skipped.
 
 Only the path a file ends the window on decides its fate. A file renamed and
-then deleted in the same window is deleted, not moved onto a dead path; a rename
+then deleted in the same window is dropped, not moved onto a dead path; a rename
 onto a path another file just vacated replaces that file's node. Either way one
 `File` node exists per live path, and its `id` always equals its key.
+
+The summary counts those two removals separately, because they answer different
+questions. **`deleted`** is a node whose own path the window removed — including
+a rename *into* an excluded path, which is classified as a delete of the source.
+**`evicted`** is a node dropped because the path it was renamed *to* did not
+survive the window: nothing the window deleted ever named it. A run that reports
+`deleted 0  evicted 3` removed three nodes without deleting a single tracked
+file.
 
 A run with no new commits writes nothing at all: `commit_seq` does not move.
 That holds per unit — a run that only re-walks a submodule leaves the parent's
