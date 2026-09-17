@@ -57,7 +57,7 @@ class GraphDb:
     def upsert_node(
         self, label: str, key: str, props: dict[str, Scalar]
     ) -> Literal["inserted", "updated"]:
-        """Insert `key` if absent, else update only the provided changed fields."""
+        """Insert `key` if absent, else update changed fields in one WAL commit."""
 
     def insert_edge(self, edge_type: str, src: str, dst: str) -> bool:
         """Insert a user-owned edge; False if it already existed."""
@@ -100,8 +100,18 @@ class GraphDb:
     def query_write(self, cypher: str, params: Params = None) -> list[Row]:
         """Execute a Cypher write statement (CREATE / SET / DELETE / MERGE)."""
 
-    def query_at(self, commit: int, cypher: str, params: Params = None) -> list[Row]:
-        """Time-travel read: run `cypher` against the graph as of `commit`."""
+    def query_at(
+        self,
+        commit: int,
+        cypher: str,
+        params: Params = None,
+        role: str | None = None,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        """Time-travel read: run `cypher` against the graph as of `commit`.
+
+        `role` and `namespace` intersect the same way as live `query`.
+        """
 
     def rename_node(self, old: str, new: str) -> None:
         """Rename a node's key, preserving its edges and history."""

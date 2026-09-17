@@ -1,7 +1,7 @@
 use core_api::{
-    default_max_edges, valid_namespace, AlgoDir, Direction, EdgeAt, Explanation, GraphDb as CoreDb,
-    GraphError, HistoryChange, HistoryEntry, NodeInfo, NodeMask, PredicateSummary, PropPredicate,
-    ResultSet, RuleDef, Value, NS_MAX_LEN, NS_PROP,
+    default_max_edges, valid_namespace, AlgoDir, AsOfScope, Direction, EdgeAt, Explanation,
+    GraphDb as CoreDb, GraphError, HistoryChange, HistoryEntry, NodeInfo, NodeMask,
+    PredicateSummary, PropPredicate, ResultSet, RuleDef, Value, NS_MAX_LEN, NS_PROP,
 };
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
@@ -106,7 +106,9 @@ impl GraphDb {
     /// Returns `"inserted"` or `"updated"`.  On update, only the fields
     /// present in `props` whose value differs from the stored one are written
     /// — fields you do not pass are left untouched, and unchanged fields
-    /// produce no WAL record (so rules do not re-fire needlessly).
+    /// produce no WAL record (so rules do not re-fire needlessly). Changed
+    /// fields are one `set_props` call, so a mid-list refusal leaves the node
+    /// untouched.
     ///
     /// Raises `ValueError` if `key` already exists under a different label:
     /// relabelling a node is not an upsert, and silently ignoring the
@@ -131,12 +133,14 @@ impl GraphDb {
                 info.label
             )));
         }
+        let mut to_set: Vec<(String, Value)> = Vec::new();
         for (field, value) in mapped {
             if info.props.get(&field) == Some(&value) {
                 continue; // unchanged: no WAL record, no rule re-fire
             }
-            self.with_mut(|db| db.set_prop(key, &field, value.clone()))?;
+            to_set.push((field, value));
         }
+        self.with_mut(|db| db.set_props(key, to_set))?;
         Ok("updated".to_string())
     }
 
@@ -247,9 +251,9 @@ impl GraphDb {
             // read: a masked write raises.
             self.with_ref(|db| {
                 let mask = match (role, namespace) {
-                    (Some(role), Some(ns)) => {
-                        db.mask_for_role(role)?.intersect(&db.mask_for_namespace(ns))
-                    }
+                    (Some(role), Some(ns)) => db
+                        .mask_for_role(role)?
+                        .intersect(&db.mask_for_namespace(ns)),
                     (Some(role), None) => db.mask_for_role(role)?,
                     (None, Some(ns)) => db.mask_for_namespace(ns),
                     (None, None) => unreachable!("one of the two is Some in this branch"),
@@ -644,9 +648,7 @@ impl GraphDb {
         let dir = parse_algo_dir(direction)?;
         let key = key.to_owned();
         let edge_type = edge_type.map(str::to_owned);
-        py.allow_threads(|| {
-            self.with_ref(|db| db.degree(&key, edge_type.as_deref(), dir))
-        })
+        py.allow_threads(|| self.with_ref(|db| db.degree(&key, edge_type.as_deref(), dir)))
     }
 
     /// Unique directed degree for a key subset or a label scan.
@@ -754,9 +756,13 @@ impl GraphDb {
     /// Time-travel read: run `cypher` against the graph as it existed at
     /// `commit` (a 0-based WAL commit index). Read-only; the live store is
     /// unaffected. Returns a list of row dicts, like `query`.
+    ///
+    /// `role` and `namespace` intersect the same way as live `query`: a
+    /// namespace can only narrow what a role already allows. An unknown role
+    /// raises the same error live `query` raises.
     #[pyo3(
-        signature = (commit, cypher, params=None),
-        text_signature = "($self, commit, cypher, params=None)"
+        signature = (commit, cypher, params=None, role=None, namespace=None),
+        text_signature = "($self, commit, cypher, params=None, role=None, namespace=None)"
     )]
     fn query_at(
         &self,
@@ -764,9 +770,27 @@ impl GraphDb {
         commit: u64,
         cypher: &str,
         params: Option<Bound<'_, PyAny>>,
+        role: Option<&str>,
+        namespace: Option<&str>,
     ) -> PyResult<Vec<Py<PyDict>>> {
         let map = params_to_map(params)?;
-        let rs = self.with_ref(|db| db.query_at(commit, cypher, &map))?;
+        let namespace = check_namespace(namespace)?;
+        let rs = if role.is_some() || namespace.is_some() {
+            self.with_ref(|db| match (role, namespace) {
+                (Some(role), Some(ns)) => {
+                    db.query_at_scoped_in_namespace(commit, cypher, &map, AsOfScope::Role(role), ns)
+                }
+                (Some(role), None) => {
+                    db.query_at_scoped(commit, cypher, &map, AsOfScope::Role(role))
+                }
+                (None, Some(ns)) => {
+                    db.query_at_scoped(commit, cypher, &map, AsOfScope::Namespace(ns))
+                }
+                (None, None) => unreachable!("one of the two is Some in this branch"),
+            })?
+        } else {
+            self.with_ref(|db| db.query_at(commit, cypher, &map))?
+        };
         result_set_to_rows(py, &rs)
     }
 
@@ -1275,7 +1299,8 @@ fn py_to_where(dict: &Bound<'_, PyDict>) -> PyResult<PropPredicate> {
         None => None,
     };
     let pred = PropPredicate { field, eq, in_ };
-    pred.validate_named("where").map_err(PyValueError::new_err)?;
+    pred.validate_named("where")
+        .map_err(PyValueError::new_err)?;
     Ok(pred)
 }
 
