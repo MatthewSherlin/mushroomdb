@@ -9,47 +9,49 @@ variable-length paths and `shortestPath`.
 
 ## Key idiom — how to filter and read node keys
 
-**A node key is not stored as a property**, so there is no `id` property:
-`n.id` returns `null` (or `None` in Python), and `{id: 'alice'}` matches
-nothing. Four spellings reach the key and the label instead, and all four work
-anywhere a scalar does — `WHERE`, `ORDER BY`, `RETURN`, an inline pattern
-filter, and after a grouping `WITH`:
+The node's key lives in the id map, not as a stored property. These spellings
+read it (and the label) anywhere a scalar does — `WHERE`, `ORDER BY`, `RETURN`,
+an inline pattern filter, and after a grouping `WITH`:
 
 | Spelling | Gives |
 |---|---|
-| `n.key` | the node's key, as a string |
+| `n.key` / `n.id` | the node's key, as a string |
 | `n.label` | the node's label |
-| `key(n)` | the same key, as a function call |
+| `key(n)` / `id(n)` | the same key, as a function call |
 | `labels(n)` | a one-element list holding the label |
 
-`n.key` and `n.label` are a **fallback**: a stored property of either name
-always wins, so a graph that really has a `key` property keeps reading it.
+`n.key`, `n.id`, and `n.label` are a **fallback**: a stored property of that
+name always wins, so a graph that really has an `id` or `key` property keeps
+reading it. `id(n)` is the function alias of `key(n)` (one argument, same
+errors on a non-node).
+
+`MATCH (n {id: 'alice'})` is **not** the property: it is a key selector
+(`ScanKey`) on MATCH/MERGE/CREATE. CREATE may still stamp a stored `id`
+property; that node then reads `n.id` from the store, which equals the key.
 
 ```cypher
 -- filter by key
+MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, n.name
 MATCH (n:Person) WHERE n.key = 'alice' RETURN n.key, n.name
-MATCH (n:Person {key: 'alice'}) RETURN n.name
+MATCH (n:Person {id: 'alice'}) RETURN n.name
 MATCH (n:Person) WHERE n = 'alice' RETURN n        -- the older spelling, still correct
 
 -- read key and label
-MATCH (n:Person) RETURN key(n) AS id, n.label AS kind ORDER BY n.key
+MATCH (n:Person) RETURN n.id, id(n), n.key, n.label AS kind ORDER BY n.key
 
 -- and after a grouping WITH, which used to flatten `c` to a scalar
 MATCH (t:Talent)-[:FIT]->(c:Company)
 WITH c, count(DISTINCT t) AS n WHERE n >= 2
 RETURN key(c), n ORDER BY n DESC
-
--- WRONG: n.id is always null
-MATCH (n:Person) WHERE n.id = 'alice' RETURN n   -- returns nothing
 ```
 
 A bare `RETURN n` also works: the result row value for a node variable is the
 key string, not a node object. In Python, `row["n"]` is `"alice"`, not a dict.
 
-**Performance note.** `n.key` and `n.label` resolve through a label scan plus a
-retain, not an index lookup, so `WHERE c.key = 'x'` on a large store is O(nodes
-of that label). `MATCH (c {id: 'x'})` on a real indexed property still plans to
-a key scan.
+**Performance note.** `WHERE n.key` / `n.id` / `key(n)` / `id(n)` against a
+literal or `$param` plans as `ScanKey` (plus a stored-property filter so
+stored-wins still holds), not a label scan. `n.label` / `labels(n)` do not:
+those still scan the label. Pattern `{id: 'x'}` remains a key lookup.
 
 ---
 
@@ -71,9 +73,9 @@ LIMIT 10
 
 - `var` — optional binding name
 - `:Label` — optional label filter
-- `{key: 'value'}` — zero or more property equality filters. The names `key` and
-  `label` fall back to the node's own key and label when no stored property of
-  that name exists, so `(n {key: 'alice'})` does select by key (see Key idiom
+- `{key: 'value'}` — zero or more property equality filters. `{id: 'alice'}` is
+  a key lookup (`ScanKey`). The names `key` and `label` fall back to the node's
+  own key and label when no stored property of that name exists (see Key idiom
   above)
 
 ### Relationship patterns
@@ -588,6 +590,7 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `toString(x)` | scalar | `String` | scalar to text |
 | `decay(base, age, halflife)` | `Int`/`Float` ×3 | `Float` | `base * 0.5^(age / halflife)`; error if `halflife <= 0` |
 | `key(n)` | node variable | `String` | the node's key; `n.key` reads the same value. Non-node argument is a named error |
+| `id(n)` | node variable | `String` | alias of `key(n)`; `n.id` falls back to the key (stored `id` wins) |
 | `labels(n)` | node variable | `List` | a one-element list holding the node's label; `n.label` reads it as a scalar |
 
 Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
@@ -602,7 +605,7 @@ type alternation: `(a)-[:A|:B]->(b)`.
 Calling an unknown function name returns:
 
 ```
-unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key, labels
+unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key, id, labels
 ```
 
 ### Infix string predicates
@@ -661,7 +664,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 |---|---|
 | `MATCH (n:Label)` | `MATCH (n:Person) RETURN n.name` |
 | `MATCH (n {key: val})` inline property filter | `MATCH (n:Person {city: 'Austin'}) RETURN n` |
-| `n.key` / `n.label` / `key(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.key = 'alice' RETURN key(n), labels(n)` — a stored property of that name wins |
+| `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)` — a stored property of that name wins |
 | Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — identical to consecutive `MATCH` clauses; no shared variable is a product |
 | `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is false, not an error |
 | List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range / non-list / non-integer index → null |
@@ -735,7 +738,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | `UNWIND scalar` (non-list value) | `execute: UNWIND requires a list; got … value for …` |
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH (found …)` |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
-| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key, labels` |
+| Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key, id, labels` |
 | `STARTS` / `ENDS` without `WITH` | `expected WITH after STARTS` |
 | `count(DISTINCT *)` | named parse error — `DISTINCT` needs an expression, not `*` |
 | Unknown name in a `WITH … WHERE` | ``unbound variable `nope` in WHERE`` |

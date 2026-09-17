@@ -859,8 +859,39 @@ pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
         _ => unreachable!(),
     };
 
-    // Flatten the AND chain and collect ALL eligible equalities on the scan var.
+    // Flatten the AND chain. Identity equality (`n.key` / `n.id` / `key(n)` /
+    // `id(n)` vs lit/param) is a tagged IndexScan (`IdentityEq`): ScanKey plus
+    // stored-wins. Other equalities stay residual so they are not mixed into
+    // IndexIntersect (which would lose the point lookup).
     let mut terms = split_and(filter_expr);
+    if let Some((idx, field, value)) = find_identity_eq(&terms, &scan_var) {
+        terms.remove(idx);
+        if let Some((f, v)) = existing_eq {
+            terms.push(Expr::Cmp {
+                lhs: Operand::Prop {
+                    var: scan_var.clone(),
+                    field: f,
+                },
+                op: CmpOp::Eq,
+                rhs: v,
+            });
+        }
+        ops[scan_pos] = PlanOp::IndexScan {
+            var: scan_var,
+            label: scan_label,
+            field,
+            value,
+        };
+        match join_and(terms) {
+            Some(residual) => ops[filter_pos] = PlanOp::Filter { expr: residual },
+            None => {
+                ops.remove(filter_pos);
+            }
+        }
+        return ops;
+    }
+
+    // Flatten the AND chain and collect ALL eligible equalities on the scan var.
     let mut extracted: Vec<(String, Operand)> = Vec::new();
     let mut i = 0;
     while i < terms.len() {
@@ -923,6 +954,59 @@ pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
     }
 
     ops
+}
+
+/// `n.key` / `n.id` (and `key(n)` / `id(n)`) equality against a literal or
+/// `$param`. `n.label` / `labels(n)` are not identity-eq (not a key).
+fn is_identity_eq_field(field: &str) -> bool {
+    field == "key" || field == "id"
+}
+
+fn identity_func_field(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "key" => Some("key"),
+        "id" => Some("id"),
+        _ => None,
+    }
+}
+
+fn identity_eq_term(term: &Expr, scan_var: &str) -> Option<(String, Operand)> {
+    let Expr::Cmp {
+        lhs,
+        op: CmpOp::Eq,
+        rhs,
+    } = term
+    else {
+        return None;
+    };
+    if !matches!(rhs, Operand::Lit(_) | Operand::Param(_)) {
+        return None;
+    }
+    match lhs {
+        Operand::Prop { var, field } if var == scan_var && is_identity_eq_field(field) => {
+            Some((field.clone(), rhs.clone()))
+        }
+        Operand::FuncCall { name, args } if args.len() == 1 => {
+            let Operand::Var(v) = &args[0] else {
+                return None;
+            };
+            if v != scan_var {
+                return None;
+            }
+            let field = identity_func_field(name)?;
+            Some((field.to_string(), rhs.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn find_identity_eq(terms: &[Expr], scan_var: &str) -> Option<(usize, String, Operand)> {
+    for (i, term) in terms.iter().enumerate() {
+        if let Some((field, value)) = identity_eq_term(term, scan_var) {
+            return Some((i, field, value));
+        }
+    }
+    None
 }
 
 fn invert_dir(d: RelDir) -> RelDir {

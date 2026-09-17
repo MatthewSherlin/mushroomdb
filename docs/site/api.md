@@ -1225,8 +1225,8 @@ db.query_write(
 )
 ```
 
-A node's key is not a property, so `n.key` does not resolve. Project or filter
-on it with the `key(n)` scalar function, available in both read queries and
+`n.key` / `n.id` / `key(n)` / `id(n)` all read the node key (a stored property
+of the same name wins). `key(n)` is available in both read queries and
 write-statement `RETURN` projections. See [query.md](query.md).
 
 The dict keys in each row are the **RETURN aliases** from the query — `p`, `o`,

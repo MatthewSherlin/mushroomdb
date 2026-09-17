@@ -46,8 +46,8 @@ db.query_write(
 )
 ```
 
-A node's key is not a property, so `n.key` does not resolve. Use the `key(n)`
-scalar function to project or filter on it. `node_info` returns the key too.
+`n.key` / `n.id` / `key(n)` / `id(n)` all read the node key (a stored property
+of the same name wins). `node_info` returns the key too.
 
 ## Vector search
 
