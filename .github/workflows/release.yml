@@ -91,14 +91,60 @@ jobs:
           sh packaging/homebrew/render.sh "$VER" dist/SHA256SUMS dist/mushroomdb.rb
           echo "generated formula:"
           cat dist/mushroomdb.rb
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          files: |
-            dist/*.tar.gz
-            dist/SHA256SUMS
-            dist/mushroomdb.rb
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+      # Uploads one asset at a time through `gh` rather than
+      # softprops/action-gh-release.
+      #
+      # That action stages every asset into its own temporary directory and
+      # uploads all of them concurrently. On the v0.6.9 tag it failed three
+      # times in a row with `Error creating asset temp dir`: one upload loses
+      # the race to create its scratch directory, the step fail-fasts, and only
+      # whichever uploads had already finished survive. Retrying does not
+      # accumulate — the action deletes the previously uploaded assets first —
+      # so the release sat at three of five assets across every attempt and
+      # `trigger-publish`, which needs this job to succeed, never fired.
+      #
+      # `gh release upload` writes no staging directory, so there is no race to
+      # lose, and `--clobber` makes a re-run after a partial failure idempotent.
+      # The release is created as a draft and flipped at the end, so a failure
+      # leaves a visible draft rather than a half-populated published release.
+      - name: publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+
+          # Same intent as the old `fail_on_unmatched_files: true`: refuse to
+          # publish a release that is missing an asset, rather than shipping a
+          # partial one quietly.
+          shopt -s nullglob
+          TARBALLS=(dist/*.tar.gz)
+          if [ "${#TARBALLS[@]}" -eq 0 ]; then
+            echo "no dist/*.tar.gz to upload" >&2
+            exit 1
+          fi
+          for required in dist/SHA256SUMS dist/mushroomdb.rb; do
+            if [ ! -f "$required" ]; then
+              echo "missing required asset: $required" >&2
+              exit 1
+            fi
+          done
+          ASSETS=("${TARBALLS[@]}" dist/SHA256SUMS dist/mushroomdb.rb)
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists; re-uploading its assets"
+            gh release edit "$TAG" --draft
+          else
+            gh release create "$TAG" --draft --generate-notes --title "$TAG"
+          fi
+
+          for asset in "${ASSETS[@]}"; do
+            echo "uploading $asset"
+            gh release upload "$TAG" "$asset" --clobber
+          done
+
+          gh release edit "$TAG" --draft=false
+          echo "published $TAG with ${#ASSETS[@]} assets"
 
   docker:
     runs-on: ubuntu-latest
