@@ -183,6 +183,7 @@ fn tools_list_returns_all_tools_with_schemas() {
         "create_rule",
         "upsert_entity",
         "find_similar",
+        "pairwise_similar",
         "explain_association",
         "hybrid_search",
         "node_history",
@@ -192,7 +193,7 @@ fn tools_list_returns_all_tools_with_schemas() {
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 27);
+    assert_eq!(tools.len(), 28);
 
     let by_name = |n: &str| {
         tools
@@ -1061,8 +1062,8 @@ const TASK_TOOLS: [&str; 14] = [
     "sync",
 ];
 
-/// The thirteen graph tools, in their established order, after the task tools.
-const ADVANCED_TOOLS: [&str; 13] = [
+/// The fourteen graph tools, in their established order, after the task tools.
+const ADVANCED_TOOLS: [&str; 14] = [
     "query",
     "ingest_json",
     "create_rule",
@@ -1071,6 +1072,7 @@ const ADVANCED_TOOLS: [&str; 13] = [
     "node_info",
     "upsert_entity",
     "find_similar",
+    "pairwise_similar",
     "hybrid_search",
     "node_history",
     "edge_history",
@@ -1434,9 +1436,9 @@ fn one_task_call(db: SharedDb, name: &str, args: Js) -> Js {
     parse_lines(&out).remove(0)
 }
 
-/// The fifteen a memory store lists, in the order it lists them: the entity
+/// The sixteen a memory store lists, in the order it lists them: the entity
 /// questions first, the store's own counts last.
-const ASSOCIATION_TOOLS: [&str; 15] = [
+const ASSOCIATION_TOOLS: [&str; 16] = [
     "query",
     "explain_association",
     "neighborhood",
@@ -1448,6 +1450,7 @@ const ASSOCIATION_TOOLS: [&str; 15] = [
     "node_history",
     "edge_history",
     "find_similar",
+    "pairwise_similar",
     "hybrid_search",
     "remember",
     "recall",
@@ -1455,7 +1458,7 @@ const ASSOCIATION_TOOLS: [&str; 15] = [
 ];
 
 /// Binding: a store no repository was ingested into lists the association
-/// surface — the fifteen tools that answer a question about an entity graph,
+/// surface — the sixteen tools that answer a question about an entity graph,
 /// in that order — and none of the code-door task tools.
 #[test]
 fn a_memory_store_lists_the_association_surface() {
@@ -1472,7 +1475,7 @@ fn a_memory_store_lists_the_association_surface() {
         ASSOCIATION_TOOLS.to_vec(),
         "default tools/list on a memory store"
     );
-    assert_eq!(tools.len(), 15);
+    assert_eq!(tools.len(), 16);
     for hidden in [
         "explore", "map", "context", "impact", "owners", "why", "sync",
     ] {
@@ -3373,7 +3376,7 @@ fn what_if_with_an_edge_type_answers_in_partner_keys() {
 /// said what they *returned* rather than what they were *for*.
 #[test]
 fn every_association_tool_description_opens_with_its_question() {
-    const OPENERS: [(&str, &str); 15] = [
+    const OPENERS: [(&str, &str); 16] = [
         ("query", "Who may see this"),
         ("explain_association", "Why are A and B related"),
         ("neighborhood", "What is around K"),
@@ -3388,6 +3391,10 @@ fn every_association_tool_description_opens_with_its_question() {
         ("node_history", "What has happened to K"),
         ("edge_history", "When did A and B become linked"),
         ("find_similar", "What is most like this"),
+        (
+            "pairwise_similar",
+            "Which of these are most like each other",
+        ),
         ("hybrid_search", "What matches these words and this vector"),
         ("remember", "Remember this for next time"),
         ("recall", "What do I already know about this"),
@@ -3682,10 +3689,10 @@ fn an_unlisted_graph_tool_is_still_callable() {
     );
 }
 
-/// Binding: `--all-tools` lists 27, task tools first in their fixed order, and
-/// every one of the thirteen graph tools carries the `Advanced:` prefix.
+/// Binding: `--all-tools` lists 28, task tools first in their fixed order, and
+/// every one of the fourteen graph tools carries the `Advanced:` prefix.
 #[test]
-fn tools_list_has_27_tools_task_tools_first_and_advanced_prefix() {
+fn tools_list_has_28_tools_task_tools_first_and_advanced_prefix() {
     let (res, out) = exchange_all_tools(open("list-order"), &req(json!(1), "tools/list", None));
     assert!(res.is_ok(), "{res:?}");
     let replies = parse_lines(&out);
@@ -3701,7 +3708,7 @@ fn tools_list_has_27_tools_task_tools_first_and_advanced_prefix() {
         .copied()
         .collect();
     assert_eq!(names, expected, "tools/list order");
-    assert_eq!(tools.len(), 27);
+    assert_eq!(tools.len(), 28);
 
     for t in tools.iter().take(TASK_TOOLS.len()) {
         let d = t["description"].as_str().expect("description");

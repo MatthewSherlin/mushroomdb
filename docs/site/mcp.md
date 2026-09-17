@@ -453,7 +453,7 @@ re-invoking the binary the server is running from.
 
 ## Tool reference
 
-The thirteen tools below are the graph API itself. Their `tools/list`
+The fourteen tools below are the graph API itself. Their `tools/list`
 descriptions all begin `Advanced:`, which marks them as the lower-level surface
 beneath the repository tools above.
 
@@ -464,16 +464,16 @@ serves both kinds and neither has to be configured for:
 | Store | Default listing |
 |---|---|
 | Built by `ingest-git` (a code graph) | **three** — `explore`, `query`, `stats` |
-| Anything else (a memory store) | **fifteen** — the association surface: `query`, `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `edges_at`, `what_if`, `node_history`, `edge_history`, `find_similar`, `hybrid_search`, `remember`, `recall`, `stats` |
+| Anything else (a memory store) | **sixteen** — the association surface: `query`, `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `edges_at`, `what_if`, `node_history`, `edge_history`, `find_similar`, `pairwise_similar`, `hybrid_search`, `remember`, `recall`, `stats` |
 
-All 27 stay served on either surface: the surface decides what is listed, not
+All 28 stay served on either surface: the surface decides what is listed, not
 what the server answers. A session can only call what its client was shown,
 though — on a code-graph store that is `explore`, `query` and `stats`, so a
 note is written with `query` and the sync is the git `post-commit` hook's job.
 `mushroomdb mcp <db> --all-tools` lists the whole set with their schemas on
 either store. The default listing a session pays for before its first turn — the
 `tools` array of the `tools/list` reply, as compact JSON — is 1,942 bytes on a
-code-graph store against 11,963 on a memory store; the full 27 are 18,557.
+code-graph store against 18,647 on a memory store; the full 28 are 26,288.
 
 `ingest_json` is deliberately not on the code-graph surface: a store built by
 `ingest-git` is written by `sync` and `touch`, not by an assistant bulk-loading
@@ -484,7 +484,8 @@ rows into it.
 | `upsert_entity` | Insert or update a node by key. Creates if absent, updates props if present. An update is atomic: every property is checked before any is written, so a refusal leaves the node unchanged. Pass `namespace` for the namespace a created node lands in; on a node that already exists, naming the namespace it is in is a no-op and naming another is refused — a namespace is set at insert and cannot be changed. |
 | `ingest_json` | Batch-ingest an array of nodes of the same label from JSON. Pass `namespace` to put every node the call creates in one namespace; a row carrying a different `ns` is refused before anything is written. A field whose values point at two labels is skipped with `ambiguous target labels`; declare one `create_rule` KeyMatch rule per target label instead. |
 | `create_rule` | Declare a derivation rule; backfills existing nodes in the same commit, unless it has a vector index over more than 2,048 vectors, in which case the build is sliced and the edges arrive in a later commit (`stats` reports the progress). Pass `namespace` to scope it to one namespace — source, via hop and destination — so every edge it derives stays inside; omitted is a global rule, the only kind that may cross a boundary. Propose it and wait for approval — it is a store-wide write. |
-| `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity in `[-1, 1]` (`score >= min`; a distance of `1 - sim` is the caller's conversion). Brute `find_similar` is exact GEMM; HNSW is still the approximate path; `exact: true` forces GEMM. Optional `where` (`{field, eq}` or `{field, in}`) implies exact. Vector-mode `min` defaults to 0.8. (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). Edge-traversal mode ignores `where` and `exact`. Vector search under `mask` widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist. |
+| `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity in `[-1, 1]` (`score >= min`; a distance of `1 - sim` is the caller's conversion). Brute `find_similar` is exact GEMM; HNSW is still the approximate path; `exact: true` forces GEMM. Optional `where` (`{field, eq}` or `{field, in}`) implies exact. Vector-mode `min` defaults to 0.8 (HTTP and Python default to 0.0). (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). Edge-traversal mode ignores `where` and `exact`. Vector search under `mask` widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist. |
+| `pairwise_similar` | Exact cosine top-k among a caller `keys` set on `field`. Self excluded. Never uses HNSW. `k` defaults to 10; `min` defaults to 0.0. Unknown keys, missing embeddings, zero-norm and wrong-dimension vectors are skipped. |
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain` | The rules and scores that produced the edges between two nodes, as JSON. `explain_association` above is the same question answered in prose. |
 | `query` | Run a Cypher query (read or write). Pass `mask` as an allow-list of node keys (only these are visible; writes rejected while set) for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` — its keys and labels, narrowed by its `visible_where` property test if it declares one, resolved to that same allow-list. Pass one or the other, never both. Pass `namespace` to answer from one namespace only: it is a second leg **intersected** into whichever of the two is present, so it can only narrow — a role bound to `tenant-a` asked for `tenant-b` answers with nothing, never the union — and a role bound to namespaces honours them with no `namespace` argument at all. Omitting it is no namespace restriction; `"default"` names the nodes that name no namespace, and a name no node uses answers with nothing. Pass `as_of` — a 0-based WAL commit index — to answer from the graph as it was at that commit; it composes with `role` or with `mask` (not both, since the tool refuses that pair) and with `namespace`, and every leg is resolved against the graph as it was then. Writes and `stub_hidden` are refused with `as_of`. Deleting a node does not remove it from a role's past, and a role's `keys` resolve to whichever node held the key at that commit — see [masks.md](masks.md). See [Trust model](#trust-model) below. The dialect: `n.key` / `n.label` / `key(n)` / `labels(n)`, `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `IN`, list subscripts (`n.location[0]`), comma-separated patterns sharing variables in one `MATCH`, and `count(DISTINCT …)` after a `WITH`. Full reference: [`query.md`](query.md). |

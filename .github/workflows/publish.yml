@@ -350,7 +350,7 @@ jobs:
           esac
 
           # A fresh `--db`-less install resolves to an empty entity store at
-          # `--auto` (the memory surface, 15 tools), not a code graph — so the
+          # `--auto` (the memory surface, 16 tools), not a code graph — so the
           # handshake below expects that surface, not the code-door tools.
           OUT=$(node "$GITHUB_WORKSPACE/scripts/mcp-handshake/handshake.mjs" \
             --config .mcp.json --server mushroomdb \

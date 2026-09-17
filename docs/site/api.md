@@ -71,6 +71,7 @@ Role-token behavior per endpoint:
 | `GET /node/{key}` | 200 if visible; 404 if hidden or absent (indistinguishable) |
 | `GET /node/{key}/edges` | 200 if visible; 404 if hidden or absent |
 | `GET /node/{key}/neighborhood` | 200 if visible; 404 if hidden or absent |
+| `POST /find_similar` | 200 — vector search; client `mask` intersects role mask (never widens) |
 | `GET /stats` | 403 (counts leak graph size beyond the role's subgraph) |
 | `POST /rules` | 403 (administrative — all role tokens, including write-scoped) |
 | `GET /explain` | 403 (rule explanation reveals hidden-node linkage) |
@@ -227,6 +228,7 @@ authentication and is not subject to role enforcement.
 | `GET` | `/node/{key}` | Node info and properties |
 | `GET` | `/node/{key}/edges` | Incident edges (typed, with derived flag) |
 | `GET` | `/node/{key}/neighborhood` | Typed neighborhood expansion |
+| `POST` | `/find_similar` | Vector similarity search (role tokens allowed; not `/algo/*`) |
 | `POST` | `/nodes/{key}/rename` | Rename a node's key (full-token only) |
 | `POST` | `/edges/upsert` | Insert an edge, auto-creating missing endpoints (full-token only) |
 | `POST` | `/backup` | Consistent backup of the database to an admin-supplied path (full-token only) |
@@ -614,7 +616,7 @@ Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
 }
 ```
 
-Returns 404 with `{"error": "key not found: person-01"}` for unknown keys.
+Returns 404 with `{"error": "node key not found: person-01"}` for unknown keys.
 
 With `stub_hidden=true` and a client mask, a key that exists but is outside the mask
 returns `{"key": "person-01", "restricted": true}` rather than 404. A key that does
@@ -655,6 +657,39 @@ Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
 With `stub_hidden=true` and a client mask, hidden **direct** neighbors of visited nodes
 appear as stub rows (`label: null`). The BFS frontier is not expanded through hidden
 nodes — stub rows are terminal.
+
+Returns 404 with `{"error": "node key not found: …"}` for unknown keys, including under
+a client mask — the same body as `GET /node/{key}`.
+
+---
+
+### POST /find_similar
+
+Vector kNN. **Not** under `/algo/*`: role tokens are allowed, and a client `mask`
+intersects the role mask (never widens). Unknown keys in `mask` are skipped.
+
+Request body:
+
+```json
+{
+  "field": "embedding",
+  "vector": [0.1, 0.2, 0.3],
+  "k": 10,
+  "min": 0.0,
+  "label": "Person",
+  "mask": ["alice", "bob"],
+  "where": {"field": "status", "eq": "published"},
+  "exact": true
+}
+```
+
+`field` and `vector` are required. `k` defaults to 10. HTTP `min` defaults to **0.0**
+(the Python default). MCP vector-mode `find_similar` still defaults `min` to **0.8**.
+`where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; invalid
+`where` is 400. `exact: true` skips HNSW.
+
+Response: `{"hits": [[key, score], …]}` — the same `(key, similarity)` pairs Python
+`find_similar` returns. Scores are cosine similarity in `[-1, 1]`; `score >= min`.
 
 ---
 
@@ -981,7 +1016,7 @@ Response:
 
 ### Tools
 
-Sixteen tools:
+Seventeen tools:
 
 | Tool | Description |
 |---|---|
@@ -994,7 +1029,8 @@ Sixteen tools:
 | `node_info` | Node info and props; params: `key` |
 | `node_edges` | Incident edges; params: `key` |
 | `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?`, `namespace?` (the namespace a created node lands in; on an existing node, the one it is already in is a no-op and another is refused). An update is atomic: every property is checked before any is written, so a refusal leaves the node unchanged. |
-| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?` (default **0.8**), `where?`, `exact?`; (2) edge traversal — `key`, `edge_type?`, `limit?`. Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. `where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; `exact` true skips HNSW. Edge-traversal mode ignores both. Vector search under a mask (a role, or the MCP `mask` allow-list) widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist. |
+| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?` (default **0.8**), `where?`, `exact?`; (2) edge traversal — `key`, `edge_type?`, `limit?`. Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. `where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; `exact` true skips HNSW. Edge-traversal mode ignores both. Vector search under a mask (a role, or the MCP `mask` allow-list) widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist. HTTP `POST /find_similar` is vector-only and defaults `min` to **0.0**. |
+| `pairwise_similar` | Exact cosine top-k among `keys` on `field`; params: `keys`, `field`, `k?` (default 10), `min?` (default 0.0). Self excluded. Never HNSW. |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
 | `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits, horizon}` |
