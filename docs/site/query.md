@@ -598,7 +598,7 @@ row's value into a list, per group when grouping keys are present). `count` and
 `collect` accept `DISTINCT`.
 
 `CASE WHEN <cond> THEN <value> … [ELSE <value>] END` is supported anywhere a
-scalar expression is (RETURN/WITH/WHERE/SET). `UNION` and `UNION ALL` combine
+scalar expression is (read or write RETURN/WITH/WHERE/SET). `UNION` and `UNION ALL` combine
 read queries with matching column names. Relationship patterns accept
 type alternation: `(a)-[:A|:B]->(b)`.
 
@@ -634,7 +634,8 @@ MATCH (n:Place) WHERE n.tags[-1] = 'primary' RETURN key(n)
 
 Out of range, a non-list base and a non-integer index all evaluate to `null` —
 never an error, and never a match. An unaliased subscript names its own column
-(`n.location[0]`), so two subscripts of one list are two distinct columns.
+(`n.location[0]`), so two subscripts of one list are two distinct columns. A
+write-statement `RETURN` evaluates a subscript the same way a read `RETURN` does.
 
 ### Examples
 
@@ -702,19 +703,19 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `CREATE (a:L {id: 'x'})-[:T]->(b:L {id: 'y'})` | node-edge chain |
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
 | `MATCH … SET n.prop = $param` | `MATCH (n) WHERE n.id = $id SET n.score = $val` |
-| `MATCH … SET … RETURN` | `MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x` — write commits, then RETURN from post-write state |
+| `MATCH … SET … RETURN` | `MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x` — write commits, then RETURN from post-write state. `CASE` and list subscripts (`n.tags[0]`) evaluate the same as a read RETURN; `n.key` / `n.id` / `n.label` use identity fallback |
 | `MERGE … ON CREATE SET` / `ON MATCH SET` | `MERGE (n:L {id:'new'}) ON CREATE SET n.born = 1 ON MATCH SET n.hit = 1 RETURN n` |
 | `MATCH … DELETE r` (manual edge) | `MATCH (a)-[r:KNOWS]->(b) DELETE r` |
 | `MATCH … DETACH DELETE n` | `MATCH (n) WHERE n.id = 'x' DETACH DELETE n` |
 | `MATCH … DELETE n` (isolated node) | `MATCH (n:Tmp) WHERE n.id = 'x' DELETE n` |
 | `MERGE (n:L {id: 'x'})` (single-key upsert) | `MERGE (n:Person {id: 'alice'})` |
 | `MERGE (n:L {id: 'x'}) RETURN …` | `MERGE (n:Person {id: 'alice'}) RETURN n` — returns node whether created or matched |
-| `CREATE … RETURN …` | `CREATE (n:Person {id: 'alice'}) RETURN n.id AS id` — single-statement create + projection |
+| `CREATE … RETURN …` | `CREATE (n:Person {id: 'alice'}) RETURN n.id, id(n), n.key` — single-statement create + projection |
 | `WHERE … IS NULL / IS NOT NULL` | `WHERE n.score IS NULL`, `WHERE b IS NOT NULL` — null-check predicate; composes with AND/OR |
 | Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error |
 | Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, `key`, …) | `RETURN abs(n.score), toString(n.weight)` |
 | `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |
-| `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` |
+| `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` — also in `MATCH … SET … RETURN` |
 | `UNION` / `UNION ALL` | `MATCH (a:A) RETURN a.id AS id UNION MATCH (b:B) RETURN b.id AS id` |
 | Multi-relationship-type `[:A\|:B]` | `MATCH (a)-[:KNOWS\|:LIKES]->(b) RETURN b` |
 | View-maintained properties queryable like any property | `MATCH (c:City) WHERE c.pop > 1000 RETURN c.name` — `pop` is a degree view maintained incrementally; reads like a stored prop |
@@ -742,7 +743,6 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | `STARTS` / `ENDS` without `WITH` | `expected WITH after STARTS` |
 | `count(DISTINCT *)` | named parse error — `DISTINCT` needs an expression, not `*` |
 | Unknown name in a `WITH … WHERE` | ``unbound variable `nope` in WHERE`` |
-| A list subscript in a **write**-statement RETURN projection | `use a read query` — as `CASE` is already handled there |
 | `$param` referenced but not supplied | `execute: missing parameter …` |
 | `SET n.prop = n.other` (bare property-to-property copy) | `SET RHS: bare property/variable reference is not supported; use a literal, $parameter, or arithmetic expression` |
 | Integer division by zero | `execute: division by zero` |

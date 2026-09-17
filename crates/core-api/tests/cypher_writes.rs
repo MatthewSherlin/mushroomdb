@@ -1162,3 +1162,78 @@ fn merge_return_param_in_return_existing() {
     assert_eq!(rs.get(0, "tag"), Some(&Value::Str("rust".to_string())));
     assert_eq!(rs.get(0, "score"), Some(&Value::Int(20)));
 }
+
+// ─── Write RETURN CASE / subscript / identity (v0.6.9 §5.3) ──────────────────
+
+const WRITE_RETURN_CASE: &str =
+    "MATCH (n:Person) SET n.age = 30 RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END";
+
+#[test]
+fn write_return_case_agrees_with_read() {
+    let mut db = GraphDb::open(&tmp("wr-case")).unwrap();
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    let written = db.query_write(WRITE_RETURN_CASE, &no_params()).unwrap();
+    assert_eq!(written.len(), 1, "write RETURN CASE must return a row");
+    let read = db
+        .query(
+            "MATCH (n:Person) RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(read.len(), 1);
+    assert_eq!(
+        written.row(0),
+        read.row(0),
+        "write RETURN CASE must agree with a follow-up read of the same CASE"
+    );
+    assert_eq!(written.row(0)[0], Some(Value::Str("other".into())));
+}
+
+#[test]
+fn write_return_list_subscript_agrees_with_read() {
+    let mut db = GraphDb::open(&tmp("wr-sub")).unwrap();
+    db.insert_node("Person", "alice", vec![]).unwrap();
+    let written = db
+        .query_write(
+            "MATCH (n:Person) SET n.tags = ['rust', 'db'] RETURN n.tags[0]",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written.columns(), &["n.tags[0]"]);
+    let read = db
+        .query("MATCH (n:Person) RETURN n.tags[0]", &no_params())
+        .unwrap();
+    assert_eq!(written.row(0), read.row(0));
+    assert_eq!(written.row(0)[0], Some(Value::Str("rust".into())));
+}
+
+#[test]
+fn write_return_n_id_after_create() {
+    let mut db = GraphDb::open(&tmp("wr-nid")).unwrap();
+    let created = db
+        .query_write(
+            "CREATE (n:Person {id: 'alice'}) RETURN n.id, id(n), n.key",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(created.len(), 1);
+    let alice = Some(Value::Str("alice".into()));
+    assert_eq!(
+        created.row(0),
+        &[alice.clone(), alice.clone(), alice.clone()][..]
+    );
+
+    // SET RETURN uses eval_set_return_operand, not the read executor.
+    let after_set = db
+        .query_write(
+            "MATCH (n:Person) SET n.age = 1 RETURN n.id, id(n), n.key",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(
+        after_set.row(0),
+        &[alice.clone(), alice.clone(), alice][..],
+        "SET RETURN must apply identity fallback and write-path id()"
+    );
+}

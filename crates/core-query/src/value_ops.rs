@@ -97,6 +97,28 @@ pub fn cmp_optional(a: Option<&Value>, b: Option<&Value>, descending: bool) -> O
     }
 }
 
+/// One element of a list value, openCypher subscript semantics.
+///
+/// A negative index counts from the end. A non-list base, a non-integer
+/// index, or an out-of-range index all give null — a subscript reads like a
+/// property that is not there, never an error.
+pub fn index_list(base: Option<Value>, index: Option<Value>) -> Option<Value> {
+    let (Some(Value::List(items)), Some(idx)) = (base, index) else {
+        return None;
+    };
+    let i = match idx {
+        Value::Int(n) => n,
+        Value::Float(f) if f.fract() == 0.0 && f.is_finite() => f as i64,
+        _ => return None,
+    };
+    let len = i64::try_from(items.len()).ok()?;
+    let pos = if i < 0 { len.checked_add(i)? } else { i };
+    if pos < 0 || pos >= len {
+        return None;
+    }
+    items.into_iter().nth(pos as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{cmp_optional, cmp_values, values_equal};
