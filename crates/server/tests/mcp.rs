@@ -4788,21 +4788,17 @@ fn query_as_of_composes_with_a_namespace() {
     );
 }
 
-/// Binding: `stats` carries `namespaces`, and narrows the roster when the call
-/// names a role or a namespace — the whole-store counts beside it are
-/// unchanged.
+/// Binding: `stats` carries `namespaces` only when the call narrows — naming a
+/// role or a namespace. An unscoped call omits the roster; the whole-store
+/// counts beside it are unchanged either way.
 #[test]
 fn stats_carries_namespaces_and_narrows_under_a_role() {
     let db = ns_store("stats-namespaces");
 
     let all = content_json(&one_task_call(db.clone(), "stats", json!({})));
-    assert_eq!(
-        all["namespaces"],
-        json!([
-            {"name": "default", "nodes_live": 1},
-            {"name": "tenant-a", "nodes_live": 2},
-            {"name": "tenant-b", "nodes_live": 1},
-        ])
+    assert!(
+        all.get("namespaces").is_none(),
+        "an unscoped call is told the counts, not who the tenants are: {all}"
     );
 
     let scoped = content_json(&one_task_call(
@@ -4841,15 +4837,24 @@ fn stats_carries_namespaces_and_narrows_under_a_role() {
     assert!(unknown.contains("unknown role 'nobody'"), "{unknown}");
 }
 
-/// Binding: a store that names no namespace reports exactly one, and `stats` on
-/// it is what it always was.
+/// Binding: a store that names no namespace still has exactly one, `default`,
+/// and says so when a call asks for it. Unscoped, it says nothing about the
+/// roster at all — a store with no namespaces and a store with ten answer an
+/// unscoped `stats` identically.
 #[test]
 fn stats_on_a_store_without_namespaces_reports_one() {
     let db = open("stats-no-namespaces");
     seed_person(&db, "alice");
-    let s = content_json(&one_task_call(db, "stats", json!({})));
+
+    let unscoped = content_json(&one_task_call(db.clone(), "stats", json!({})));
+    assert!(
+        unscoped.get("namespaces").is_none(),
+        "unscoped stats omits the roster even when it holds one name: {unscoped}"
+    );
+
+    let scoped = content_json(&one_task_call(db, "stats", json!({"namespace": "default"})));
     assert_eq!(
-        s["namespaces"],
+        scoped["namespaces"],
         json!([{"name": "default", "nodes_live": 1}])
     );
 }

@@ -583,14 +583,29 @@ fn tool_stats(db: &SharedDb, args: &Js) -> CallOutcome {
         (g.stats(), def)
     };
     let mut snap = snap;
-    if role_def.is_some() || namespace.is_some() {
+    // Scoped on the ARGUMENTS, not on `role_def`: naming a role that resolved
+    // is a scoped call even in the window where the definition lookup misses,
+    // and the safe direction there is to omit the roster rather than send all
+    // of it.
+    let scoped = role.is_some() || namespace.is_some();
+    if scoped {
         snap.namespaces.retain(|n| {
             role_def.as_ref().is_none_or(|d| d.sees_namespace(&n.name))
                 && namespace.as_deref().is_none_or(|ns| ns == n.name)
         });
     }
     match serde_json::to_value(&snap) {
-        Ok(v) => CallOutcome::ToolOk(v),
+        Ok(mut v) => {
+            // An unscoped caller gets the store-wide counts without the roster.
+            // Omitted, not emptied: `"namespaces": []` still discloses that the
+            // roster exists and invites a guess at its size.
+            if !scoped {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.remove("namespaces");
+                }
+            }
+            CallOutcome::ToolOk(v)
+        }
         Err(e) => CallOutcome::ToolErr(e.to_string()),
     }
 }
@@ -1365,7 +1380,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "stats",
-                "description": "How big is this store — live node, edge and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned), and `namespaces`, every namespace with at least one live node and its count. Pass 'role' or 'namespace' to be told about those namespaces only.",
+                "description": "How big is this store — live node, edge and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned). Pass 'role' or 'namespace' to also get `namespaces`, the namespaces that argument may see with a live-node count each; without either argument the roster is omitted entirely.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1922,6 +1937,59 @@ mod tests {
         assert!(!is_error(&resp));
         let result = tool_text(&resp);
         assert_eq!(result["nodes_live"], 2);
+    }
+
+    /// Unscoped `stats` must not enumerate the store's namespaces. Asking with
+    /// neither `role` nor `namespace` gets the store-wide counts with the
+    /// roster key absent entirely — not an empty array, which would still
+    /// confirm the roster exists and invite a guess at its size.
+    #[test]
+    fn mcp_stats_unscoped_omits_namespace_roster() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            g.insert_node(
+                "Doc",
+                "a",
+                vec![("ns".into(), Value::Str("tenant-a".into()))],
+            )
+            .expect("insert a");
+            g.insert_node(
+                "Doc",
+                "b",
+                vec![("ns".into(), Value::Str("tenant-b".into()))],
+            )
+            .expect("insert b");
+        }
+
+        let unscoped = tool_text(&tool_call(&db, 1, "stats", json!({})));
+        assert!(
+            unscoped.get("namespaces").is_none(),
+            "unscoped stats must omit the roster entirely, not send an empty \
+             array: {unscoped}"
+        );
+        assert_eq!(
+            unscoped["nodes_live"], 2,
+            "the store-wide counts beside the roster are unchanged"
+        );
+
+        let scoped = tool_text(&tool_call(
+            &db,
+            2,
+            "stats",
+            json!({"namespace": "tenant-a"}),
+        ));
+        let names: Vec<&str> = scoped["namespaces"]
+            .as_array()
+            .expect("a scoped call still carries the roster it may see")
+            .iter()
+            .map(|n| n["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(
+            names,
+            ["tenant-a"],
+            "a call that names a namespace sees that one and no other"
+        );
     }
 
     /// A rule whose corpus is too large to index in one commit must not come
