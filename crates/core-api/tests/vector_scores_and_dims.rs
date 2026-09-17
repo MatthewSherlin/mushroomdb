@@ -349,13 +349,17 @@ fn two_strays_ahead_of_the_corpus_fall_back_to_the_scan() {
 
 /// A refused vector survives a snapshot and a reopen as a refusal.
 ///
-/// `dim_mismatches` is `#[serde(skip)]`, so the reopened index starts its
-/// counter at zero. What makes that safe is not the counter but the open-time
-/// node scan: it re-offers every id the adopted graph lacks, the stray is
-/// refused again, and the index declines the fast path exactly as it did before
-/// the snapshot. Nothing at the store level pinned that, so this test does —
-/// the eager path (a WAL to replay) and the clean-open path (a write after a
-/// snapshot with no WAL) both.
+/// Since blob v4 the refusal is *restored* rather than re-derived: the blob
+/// carries `dim_mismatches` and the refused ids, and the open-time scan skips
+/// re-offering them. Before v4 the scan was the mechanism — it re-offered every
+/// id the adopted graph lacked and the stray was refused again — and a v3 store
+/// still behaves that way, which `v3_blob_still_loads_and_reoffers` pins in
+/// `core-rules`.
+///
+/// What this test pins is the store-level outcome both routes owe: the index
+/// declines the fast path exactly as it did before the snapshot, on the eager
+/// path (a WAL to replay) and the clean-open path (a write after a snapshot
+/// with no WAL) alike.
 #[test]
 fn a_refused_vector_is_still_refused_after_a_reopen() {
     let dir = tmp("dims-reopen-refused");
@@ -407,11 +411,16 @@ fn a_refused_vector_is_still_refused_after_a_reopen() {
 
 /// A parked vector survives a snapshot and a reopen without losing an edge.
 ///
-/// `parked` is `#[serde(skip)]` too, and the order `[real, stray, real, …]` is
-/// the one that exercises it: the stray evicts `d0`, `d1` re-elects the real
-/// dimension and revives it. After a reopen the list is empty, so what has to
-/// hold is that the re-offered vectors rebuild the same state — the same edges,
-/// and `d0` still found at `min = 1.0`.
+/// The order `[real, stray, real, …]` is the one that exercises parking: the
+/// stray evicts `d0`, and `d1` re-elects the real dimension and revives it.
+///
+/// Since blob v4 the parked list is persisted and restored, and the open-time
+/// scan skips re-offering what it restored — re-offering a parked vector is
+/// what would destroy it, because `insert` supersedes the parked copy and then
+/// refuses the vector against the elected stride. Before v4 the list came back
+/// empty and the re-offered vectors rebuilt the same state. Either way the
+/// store-level outcome this pins is the same: the same edges, and `d0` still
+/// found at `min = 1.0`.
 #[test]
 fn a_parked_vector_survives_a_reopen() {
     let dir = tmp("dims-reopen-parked");

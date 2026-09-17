@@ -1654,7 +1654,13 @@ impl SideIndex {
             }
         }
         match &self.hnsw {
-            Some(h) => (h.node_ids(), true),
+            // `accounted_ids`, not `node_ids`: an adopted v4 graph carries the
+            // vectors it parked and the ids it refused, and re-offering either
+            // undoes the state the blob just restored — a parked vector is
+            // superseded and then refused, which loses it for good. On a pre-v4
+            // graph both sets are empty and this is `node_ids()` exactly, which
+            // is what keeps the older blobs re-deriving as they always did.
+            Some(h) => (h.accounted_ids(), true),
             None => {
                 self.init_hnsw(rule_name);
                 (BTreeSet::new(), false)

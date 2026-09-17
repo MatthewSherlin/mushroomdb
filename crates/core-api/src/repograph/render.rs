@@ -26,16 +26,40 @@ pub const MAX_TOOL_LINES: usize = 25;
 /// Separator between the items of a one-line list.
 pub const SEP: &str = " · ";
 
-/// Replace every ASCII control character (`0x00-0x1f` and `0x7f`, tabs and
-/// newlines included) with a space, so a value read out of the graph cannot
-/// forge a line break, a section header, or a terminal escape sequence.
+/// Replace every character that could forge the shape of a digest with a
+/// space, so a value read out of the graph cannot fake a line break, a section
+/// header, or a terminal escape sequence — and cannot reorder or hide what it
+/// sits next to when rendered.
 ///
-/// One byte in, one byte out, so a caller's size budget is unaffected.
+/// Three classes, and each is the class rather than the examples: neutralising
+/// only U+202E would leave U+202D, and only U+2028 would leave U+0085.
+///
+/// - **ASCII controls** `0x00-0x1f` and `0x7f`, tabs and newlines included.
+/// - **Line and paragraph separators** outside ASCII: U+0085, U+2028, U+2029.
+/// - **Bidi controls and zero-width characters**: U+200B-U+200F, U+202A-U+202E,
+///   U+2066-U+2069, U+FEFF. These reorder or conceal rendered text without
+///   changing the bytes a reader would diff.
+///
+/// One char in, one char out, so a caller's character budget is unaffected and
+/// the byte length can only shrink — never grow.
 #[must_use]
 pub fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_control() { ' ' } else { c })
+        .map(|c| if is_shape_forging(c) { ' ' } else { c })
         .collect()
+}
+
+/// Whether `c` belongs to one of the three classes [`sanitize`] neutralizes.
+fn is_shape_forging(c: char) -> bool {
+    c.is_ascii_control()
+        || matches!(c,
+            '\u{0085}'                      // NEL
+            | '\u{200b}'..='\u{200f}'       // ZWSP, ZWNJ, ZWJ, LRM, RLM
+            | '\u{2028}' | '\u{2029}'       // line / paragraph separator
+            | '\u{202a}'..='\u{202e}'       // bidi embeddings and overrides
+            | '\u{2066}'..='\u{2069}'       // bidi isolates
+            | '\u{feff}'                    // zero-width no-break space / BOM
+        )
 }
 
 /// `1204` → `1,204`. Groups of three, ASCII digits only.
@@ -1359,6 +1383,67 @@ mod tests {
         assert_eq!(clean.len(), forged.len(), "one byte in, one byte out");
         assert!(!clean.contains('\n') && !clean.contains('\t') && !clean.contains('\u{1b}'));
         assert_eq!(clean, "Ada mushroomdb map — 9 files  [31m");
+    }
+
+    /// The four code points §5.12 names, each pinned on its own.
+    #[test]
+    fn sanitize_neutralizes_bidi_zero_width_and_separators() {
+        for (cp, name) in [
+            ('\u{202e}', "U+202E RIGHT-TO-LEFT OVERRIDE"),
+            ('\u{200b}', "U+200B ZERO WIDTH SPACE"),
+            ('\u{2028}', "U+2028 LINE SEPARATOR"),
+            ('\u{2029}', "U+2029 PARAGRAPH SEPARATOR"),
+        ] {
+            let forged = format!("safe{cp}tail");
+            let clean = sanitize(&forged);
+            assert_eq!(clean, "safe tail", "{name} must render as one space");
+            assert_eq!(
+                clean.chars().count(),
+                forged.chars().count(),
+                "{name}: one char in, one char out"
+            );
+        }
+    }
+
+    /// Neutralising only the four named code points leaves trivial bypasses:
+    /// U+202D overrides just as U+202E does, U+2066-U+2069 are the isolate
+    /// spelling of the same attack, and U+0085 forges a line break the way
+    /// U+2028 does. The helper covers the class, not the examples.
+    #[test]
+    fn sanitize_covers_the_whole_class_not_just_the_named_four() {
+        for cp in [
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', // embeddings + LRO
+            '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', // isolates
+            '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', // ZWNJ/ZWJ, LRM/RLM
+            '\u{feff}', // BOM as zero-width no-break space
+            '\u{0085}', // NEL — a line break outside ASCII
+        ] {
+            let clean = sanitize(&format!("a{cp}b"));
+            assert_eq!(
+                clean, "a b",
+                "U+{:04X} is the same class as the four §5.12 names",
+                cp as u32
+            );
+        }
+    }
+
+    /// A caller's budget counts characters, so neutralising a 3-byte code
+    /// point must not grow the string. Shrinking is fine; growing is not.
+    #[test]
+    fn sanitize_never_grows_a_string() {
+        let forged = "subject\u{202e}\u{200b}\u{2028}\u{2029}tail";
+        let clean = sanitize(forged);
+        assert!(
+            clean.len() <= forged.len(),
+            "bytes must not grow: {} -> {}",
+            forged.len(),
+            clean.len()
+        );
+        assert_eq!(
+            clean.chars().count(),
+            forged.chars().count(),
+            "characters are one for one"
+        );
     }
 
     #[test]

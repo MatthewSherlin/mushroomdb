@@ -30,6 +30,8 @@ SITE_DOCS=(
     views.md
     fulltext.md
     algorithms.md
+    masks.md
+    service.md
     suggest.md
     testing.md
 )

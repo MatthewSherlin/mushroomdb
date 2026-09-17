@@ -108,7 +108,7 @@ At most 20 documents per run, 5 concepts per document.
 
 **The graph underneath.** One paragraph: that `tools/list` follows the store —
 three tools on a store built by `ingest-git` (`explore`, `query`, `stats`),
-fifteen on any other — that all 27 stay callable either way and
+sixteen on any other — that all 28 stay callable either way and
 `mushroomdb mcp <db> --all-tools` advertises the rest with the schemas
 documenting their arguments, that a `mask` is an allow-list, that the MCP
 server has no auth so a mask is never a security boundary, and the two honesty

@@ -2375,8 +2375,16 @@ impl RuleEngine {
             if !rule_sees(def, at, g) {
                 continue;
             }
-            let src_has = idx.src_side.hnsw_ref().is_some_and(|h| h.contains(at));
-            let dst_has = idx.dst_side.hnsw_ref().is_some_and(|h| h.contains(at));
+            // `accounts_for`, not `contains`: a slice resuming over a v4 blob
+            // meets ids the graph does not hold but the index has already
+            // judged — parked, or refused for a dimension disagreement.
+            // `contains` only sees the graph, so the slice would re-offer them:
+            // a parked vector is superseded and then refused (losing the one
+            // copy that made it recoverable), and a refusal is counted twice.
+            // `can_answer` is false while a build is incomplete either way, so
+            // nothing would have failed loudly.
+            let src_has = idx.src_side.hnsw_ref().is_some_and(|h| h.accounts_for(at));
+            let dst_has = idx.dst_side.hnsw_ref().is_some_and(|h| h.accounts_for(at));
             let get = |f: &str| g.props.get(at, f).map(|vr| vr.into_value());
             let mut any = false;
             if src_sym == Some(label_sym) && !src_has {
@@ -4294,7 +4302,12 @@ impl RuleEngine {
             let idx = self.indexes.get_mut(name).unwrap();
             match src_h {
                 Some(h) => {
-                    skip.0 = h.node_ids();
+                    // `accounted_ids`, for the reason the open path and the
+                    // sliced build use it: a carried graph keeps its parked and
+                    // refused state in memory, and re-offering a parked vector
+                    // destroys it — `insert` supersedes the parked copy and
+                    // then refuses the vector against the elected stride.
+                    skip.0 = h.accounted_ids();
                     idx.src_side.adopt_hnsw(h);
                 }
                 None => {
@@ -4304,7 +4317,8 @@ impl RuleEngine {
             }
             match dst_h {
                 Some(h) => {
-                    skip.1 = h.node_ids();
+                    // Same reason as the src side above.
+                    skip.1 = h.accounted_ids();
                     idx.dst_side.adopt_hnsw(h);
                 }
                 None => {

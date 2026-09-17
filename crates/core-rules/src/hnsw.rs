@@ -37,6 +37,7 @@
 //! (each still above the recall floor its own shape was gated at).
 
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
@@ -244,6 +245,7 @@ thread_local! {
     static HNSW_SEARCH_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static HNSW_DIST_EVALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static HNSW_DIST_EVALS_PAIRWISE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static HNSW_BEAM_SCRATCH_GROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Count one vector actually indexed. Called *after* the zero-vector early
@@ -308,6 +310,27 @@ pub fn hnsw_dist_evals_pairwise() -> u64 {
 pub fn hnsw_dist_evals_reset() {
     HNSW_DIST_EVALS.with(|c| c.set(0));
     HNSW_DIST_EVALS_PAIRWISE.with(|c| c.set(0));
+}
+
+/// Count one growth of the reused beam-search visited buffer.
+#[inline]
+fn note_beam_scratch_grow() {
+    #[cfg(any(test, feature = "test-hooks"))]
+    HNSW_BEAM_SCRATCH_GROWS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Times the beam-search visited buffer grew on this thread since the last reset.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_beam_scratch_grows() -> u64 {
+    HNSW_BEAM_SCRATCH_GROWS.with(|c| c.get())
+}
+
+/// Reset the beam-search visited-buffer growth counter to zero.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn hnsw_beam_scratch_grows_reset() {
+    HNSW_BEAM_SCRATCH_GROWS.with(|c| c.set(0));
 }
 
 /// Count one query answered by the graph itself (past the empty-index guards).
@@ -597,10 +620,75 @@ fn slab_of_decoded(vectors: &[Vec<f64>]) -> (VecSlab, u64) {
 }
 
 /// The `f32` form of a unit `f64` vector — the query shape every search path
-/// uses, and bit-for-bit what [`VecSlab::put`] stored.
+/// uses, and bit-for-bit what [`VecSlab::put`] stored. Search/insert fill a
+/// thread-local buffer via [`as_f32_into`]; this owned helper remains for tests.
+#[cfg(test)]
 #[inline]
 fn as_f32(v: &[f64]) -> Vec<f32> {
-    v.iter().map(|&x| x as f32).collect()
+    let mut out = Vec::with_capacity(v.len());
+    as_f32_into(&mut out, v);
+    out
+}
+
+#[inline]
+fn as_f32_into(dst: &mut Vec<f32>, v: &[f64]) {
+    dst.clear();
+    dst.extend(v.iter().map(|&x| x as f32));
+}
+
+/// Reused beam-search buffers. Thread-local so `&self` search can share them
+/// without interior mutability on the index (cloned and serialized).
+struct BeamScratch {
+    visited: Vec<bool>,
+    c_heap: BinaryHeap<Reverse<(OrdF64, u32)>>,
+    w_heap: BinaryHeap<(OrdF64, u32)>,
+}
+
+impl BeamScratch {
+    const fn empty() -> Self {
+        Self {
+            visited: Vec::new(),
+            c_heap: BinaryHeap::new(),
+            w_heap: BinaryHeap::new(),
+        }
+    }
+
+    fn reset_beam(&mut self, n_slots: usize) {
+        if self.visited.len() == n_slots {
+            self.visited.fill(false);
+        } else {
+            if self.visited.capacity() < n_slots {
+                note_beam_scratch_grow();
+            }
+            self.visited.clear();
+            self.visited.resize(n_slots, false);
+        }
+        self.c_heap.clear();
+        self.w_heap.clear();
+    }
+}
+
+thread_local! {
+    static BEAM_SCRATCH: RefCell<BeamScratch> = const { RefCell::new(BeamScratch::empty()) };
+    static QUERY_F32: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
+fn with_beam_scratch<R>(f: impl FnOnce(&mut BeamScratch) -> R) -> R {
+    BEAM_SCRATCH.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+fn take_query_f32(v: &[f64]) -> Vec<f32> {
+    QUERY_F32.with(|cell| {
+        let mut q = std::mem::take(&mut *cell.borrow_mut());
+        as_f32_into(&mut q, v);
+        q
+    })
+}
+
+fn stash_query_f32(q: Vec<f32>) {
+    QUERY_F32.with(|cell| {
+        *cell.borrow_mut() = q;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +758,21 @@ pub struct HnswIndex {
     /// wrong model cannot print a line per node.
     #[serde(skip)]
     dim_mismatches: u64,
+    /// The node ids behind [`Self::dim_mismatches`], so a reopen can skip
+    /// re-offering what it already knows it refuses.
+    ///
+    /// Not the same thing as the counter, and deliberately not derived from it:
+    /// the counter is monotone (a refusal never becomes un-counted, which keeps
+    /// [`Self::can_answer`] conservative), while this set is *maintained* — an
+    /// id leaves it the moment the index accepts or removes that node. A blob
+    /// may therefore carry a count larger than this set, and that is valid: an
+    /// upgraded v1/v2 index counts padded rows whose nodes are in the graph and
+    /// were never refused at all.
+    ///
+    /// Persisted from blob v4. Before v4 the open-time node scan re-derived it
+    /// by re-offering every vector and collecting the same refusals.
+    #[serde(skip)]
+    refused: BTreeSet<u32>,
     /// Vectors **evicted** by a stride re-election, kept `(id, unit vector)` so
     /// that a later re-election to their dimension can put them back.
     ///
@@ -873,6 +976,84 @@ impl HnswIndex {
     /// Returns all node ids currently in the index.
     pub fn node_ids(&self) -> BTreeSet<u32> {
         self.slot_of.keys().copied().collect()
+    }
+
+    /// Every id this index can account for: indexed, parked, or refused.
+    ///
+    /// This is what an open-time scan must skip re-offering. [`Self::node_ids`]
+    /// is the narrower "actually in the graph" answer and is still what the
+    /// exhaustive-fallback candidate set wants — re-offering a parked vector
+    /// destroys it (`insert` supersedes the parked copy, then refuses the
+    /// vector against the elected stride), and re-offering a refused one counts
+    /// the same mismatch twice.
+    ///
+    /// On a graph decoded from a blob older than v4 the parked and refused sets
+    /// are empty, so this equals `node_ids()` and the pre-v4 behaviour — scan,
+    /// re-offer, re-derive — is unchanged.
+    pub fn accounted_ids(&self) -> BTreeSet<u32> {
+        let mut out = self.node_ids();
+        out.extend(self.parked.iter().map(|(id, _)| *id));
+        out.extend(self.refused.iter().copied());
+        out
+    }
+
+    /// True when [`Self::accounted_ids`] holds `id`, without building the set.
+    pub fn accounts_for(&self, id: u32) -> bool {
+        self.slot_of.contains_key(&id)
+            || self.refused.contains(&id)
+            || self.parked.iter().any(|(pid, _)| *pid == id)
+    }
+
+    /// The refusal count [`Self::can_answer`] consults.
+    #[doc(hidden)]
+    pub fn dim_mismatches(&self) -> u64 {
+        self.dim_mismatches
+    }
+
+    /// The ids this index refused for a dimension disagreement.
+    #[doc(hidden)]
+    pub fn refused_ids(&self) -> BTreeSet<u32> {
+        self.refused.clone()
+    }
+
+    /// Parked entries in the slab's unit, which is what the blob persists.
+    ///
+    /// Narrowing to `f32` is lossless here and not by luck of the values: the
+    /// only site that parks a vector reads it back out of the `f32` slab and
+    /// widens it, so every `f64` in `parked` already has an exact `f32`
+    /// preimage. A future park that stored a caller's raw `f64` would break
+    /// that, and the round trip would start perturbing the low mantissa bits.
+    fn parked_rows_f32(&self) -> Vec<(u32, Vec<f32>)> {
+        self.parked
+            .iter()
+            .map(|(id, v)| (*id, v.iter().map(|&x| x as f32).collect()))
+            .collect()
+    }
+
+    /// Restore the state blob v4 carries. Pre-v4 blobs leave it all default.
+    fn restore_side_state(
+        &mut self,
+        dim_mismatches: u64,
+        refused: BTreeSet<u32>,
+        parked: Vec<(u32, Vec<f32>)>,
+    ) {
+        self.dim_mismatches = dim_mismatches;
+        // A blob claiming an id is both indexed and refused is inconsistent;
+        // trusting it would make the scan skip a node the graph does not hold.
+        self.refused = refused
+            .into_iter()
+            .filter(|id| !self.slot_of.contains_key(id))
+            .collect();
+        // A parked vector whose length is the elected stride would have been
+        // revived rather than parked, so the blob disagrees with itself. Drop
+        // it and let the scan re-offer that id.
+        self.parked = parked
+            .into_iter()
+            .filter(|(id, v)| {
+                !self.slot_of.contains_key(id) && (self.slab.dim == 0 || v.len() != self.slab.dim)
+            })
+            .map(|(id, v)| (id, v.into_iter().map(f64::from).collect()))
+            .collect();
     }
 
     // -----------------------------------------------------------------------
@@ -1107,63 +1288,77 @@ impl HnswIndex {
         layer: usize,
         ef: usize,
     ) -> Vec<(u32, f64)> {
-        // visited: avoid re-expanding a node. A `Vec<bool>` indexed by slot, not
-        // a `BTreeSet`: this is probed once per candidate edge — order 10⁴ times
-        // per insert — and each probe was an O(log V) chase through separately
-        // allocated tree nodes. One memset per call buys O(1) probes. It changes
-        // neither which nodes are expanded nor the order they are pushed in,
-        // which is what keeps the graph a function of the WAL.
-        let mut visited = vec![false; slots.len()];
-        if let Some(v) = visited.get_mut(ep as usize) {
-            *v = true;
-        }
-
-        let ep_dist = dist_to(slab, ep, q);
-
-        // c_heap: min-heap of (dist, slot) — candidates to expand
-        let mut c_heap: BinaryHeap<Reverse<(OrdF64, u32)>> = BinaryHeap::new();
-        c_heap.push(Reverse((OrdF64(ep_dist), ep)));
-
-        // w_heap: max-heap of (dist, slot) — ef-best results (worst on top for eviction)
-        let mut w_heap: BinaryHeap<(OrdF64, u32)> = BinaryHeap::new();
-        w_heap.push((OrdF64(ep_dist), ep));
-
-        while let Some(&Reverse((OrdF64(c_dist), c))) = c_heap.peek() {
-            // furthest in result set
-            let f_dist = w_heap.peek().map(|(OrdF64(d), _)| *d).unwrap_or(f64::MAX);
-            if c_dist > f_dist {
-                break; // all remaining candidates are farther than our worst result
+        with_beam_scratch(|scratch| {
+            // visited: avoid re-expanding a node. A `Vec<bool>` indexed by slot,
+            // not a `BTreeSet`: this is probed once per candidate edge — order
+            // 10⁴ times per insert — and each probe was an O(log V) chase
+            // through separately allocated tree nodes. One memset per call buys
+            // O(1) probes. It changes neither which nodes are expanded nor the
+            // order they are pushed in, which is what keeps the graph a
+            // function of the WAL. The buffer is thread-local and cleared per
+            // call so a search allocates once per thread, not once per beam.
+            scratch.reset_beam(slots.len());
+            if let Some(v) = scratch.visited.get_mut(ep as usize) {
+                *v = true;
             }
-            c_heap.pop();
 
-            let neighbors: &[u32] = slots
-                .get(c as usize)
-                .and_then(|n| n.layers.get(layer))
-                .map(|l| l.as_slice())
-                .unwrap_or_default();
+            let ep_dist = dist_to(slab, ep, q);
 
-            for &e in neighbors {
-                if visited.get(e as usize).copied().unwrap_or(true) {
-                    continue;
+            // c_heap: min-heap of (dist, slot) — candidates to expand
+            scratch.c_heap.push(Reverse((OrdF64(ep_dist), ep)));
+
+            // w_heap: max-heap of (dist, slot) — ef-best results (worst on top for eviction)
+            scratch.w_heap.push((OrdF64(ep_dist), ep));
+
+            while let Some(&Reverse((OrdF64(c_dist), c))) = scratch.c_heap.peek() {
+                // furthest in result set
+                let f_dist = scratch
+                    .w_heap
+                    .peek()
+                    .map(|(OrdF64(d), _)| *d)
+                    .unwrap_or(f64::MAX);
+                if c_dist > f_dist {
+                    break; // all remaining candidates are farther than our worst result
                 }
-                if !Self::is_live(id_of, e) {
-                    continue; // defensive: a freed slot is never a candidate
-                }
-                visited[e as usize] = true;
+                scratch.c_heap.pop();
 
-                let e_dist = dist_to(slab, e, q);
-                let f_dist = w_heap.peek().map(|(OrdF64(d), _)| *d).unwrap_or(f64::MAX);
-                if e_dist < f_dist || w_heap.len() < ef {
-                    c_heap.push(Reverse((OrdF64(e_dist), e)));
-                    w_heap.push((OrdF64(e_dist), e));
-                    if w_heap.len() > ef {
-                        w_heap.pop(); // evict furthest
+                let neighbors: &[u32] = slots
+                    .get(c as usize)
+                    .and_then(|n| n.layers.get(layer))
+                    .map(|l| l.as_slice())
+                    .unwrap_or_default();
+
+                for &e in neighbors {
+                    if scratch.visited.get(e as usize).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    if !Self::is_live(id_of, e) {
+                        continue; // defensive: a freed slot is never a candidate
+                    }
+                    scratch.visited[e as usize] = true;
+
+                    let e_dist = dist_to(slab, e, q);
+                    let f_dist = scratch
+                        .w_heap
+                        .peek()
+                        .map(|(OrdF64(d), _)| *d)
+                        .unwrap_or(f64::MAX);
+                    if e_dist < f_dist || scratch.w_heap.len() < ef {
+                        scratch.c_heap.push(Reverse((OrdF64(e_dist), e)));
+                        scratch.w_heap.push((OrdF64(e_dist), e));
+                        if scratch.w_heap.len() > ef {
+                            scratch.w_heap.pop(); // evict furthest
+                        }
                     }
                 }
             }
-        }
 
-        w_heap.into_iter().map(|(OrdF64(d), s)| (s, d)).collect()
+            scratch
+                .w_heap
+                .drain()
+                .map(|(OrdF64(d), s)| (s, d))
+                .collect()
+        })
     }
 
     /// The **first-rejection prune** — a short-cut of HNSW Algorithm 4, not
@@ -1343,6 +1538,12 @@ impl HnswIndex {
         // never be revived over it — including when the new vector is the zero
         // vector the index will not hold.
         self.parked.retain(|(pid, _)| *pid != id);
+        // The caller is naming this node's vector, so whatever this index
+        // refused for it before is no longer what it holds. Clearing here (and
+        // in `remove`, and on revival) is what keeps the skip set from
+        // suppressing a legitimate re-offer forever. `dim_mismatches` stays
+        // where it is: the counter is monotone on purpose.
+        self.refused.remove(&id);
         let Some(unit) = l2_normalize(v) else {
             return; // zero vector — skip, and do not count it as indexed
         };
@@ -1373,6 +1574,13 @@ impl HnswIndex {
                 }
                 self.slab = VecSlab::default();
                 self.slab.dim = unit.len();
+                // The stride moved, so every earlier refusal was judged against
+                // a dimension this index no longer holds. Their vectors are
+                // gone — a refusal discards them — so the most this can do is
+                // stop skipping them, and let the next scan offer them again.
+                // `dim_mismatches` stays put: `can_answer` must not recover on
+                // its own.
+                self.refused.clear();
                 // Whatever was parked at this dimension belongs in the index
                 // again. Their own inserts cannot re-enter this branch — their
                 // length is the stride — so the recursion is one level deep.
@@ -1397,6 +1605,7 @@ impl HnswIndex {
                     self.remove(id);
                 }
                 self.dim_mismatches += 1;
+                self.refused.insert(id);
                 if self.dim_mismatches == 1 {
                     eprintln!(
                         "mushroomdb: HNSW skipped node {id}: its embedding has {} dimensions \
@@ -1432,18 +1641,19 @@ impl HnswIndex {
             &unit,
         );
 
-        // The query every distance on this insert path is taken against: the
-        // same `f32` values the slab now holds for `slot`, so a distance to the
-        // new node is exactly a distance between two slab rows. Owned rather
-        // than borrowed from the slab because the graph is mutated below.
-        let q = as_f32(&unit);
-
         let Some(ep) = self.entry_point else {
             // First node ever inserted.
             self.entry_point = Some(slot);
             self.max_level = level;
             return;
         };
+
+        // The query every distance on this insert path is taken against: the
+        // same `f32` values the slab now holds for `slot`, so a distance to the
+        // new node is exactly a distance between two slab rows. Filled into a
+        // thread-local buffer rather than borrowed from the slab because the
+        // graph is mutated below.
+        let q = take_query_f32(&unit);
 
         let params = hnsw_params();
         let prune = self.resolved_prune(&params);
@@ -1537,6 +1747,7 @@ impl HnswIndex {
             self.entry_point = Some(slot);
             self.max_level = level;
         }
+        stash_query_f32(q);
     }
 
     /// Remove node `id` from the index.
@@ -1551,6 +1762,10 @@ impl HnswIndex {
         // Done before the early return, because the node may be parked rather
         // than indexed — which is exactly the state a removal has to clear.
         self.parked.retain(|(pid, _)| *pid != id);
+        // Same reason, for the same early return: a refused node is not in
+        // `slot_of`, so a removal that stopped at the return below would leave
+        // its id in the skip set and a later re-offer would never be tried.
+        self.refused.remove(&id);
         let Some(slot) = self.slot_of.get(&id).copied() else {
             return;
         };
@@ -1668,8 +1883,8 @@ impl HnswIndex {
         // `hnsw_params()` width this function used before the width became a
         // parameter, so its behaviour is unchanged.
         let ef = ef.max(k);
+        let unit_q = take_query_f32(&unit_q);
         let mut curr_ep = ep;
-        let unit_q = as_f32(&unit_q);
 
         // Greedy descent from max_level to layer 1.
         for lc in (1..=self.max_level).rev() {
@@ -1695,6 +1910,7 @@ impl HnswIndex {
             .collect();
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(k);
+        stash_query_f32(unit_q);
         results
     }
 
@@ -1777,7 +1993,12 @@ pub const HNSW_BLOB_MAGIC: [u8; 4] = *b"MHNS";
 /// still decode, with no vector re-inserted and no distance computed. A reader
 /// older than this one meeting a v3 blob fails its version check and leaves the
 /// side on its `hnsw_tracked` full scan — slower, never wrong.
-pub const HNSW_BLOB_VERSION: u16 = 3;
+/// Version 4 (0.6.9) appends the state `HnswIndex` does not serialize —
+/// the refusal count, the refused ids, and the parked vectors — so a reopen
+/// restores them instead of re-deriving them by re-offering every vector. The
+/// index body inside is byte-identical to v3's, and `complete` stays the last
+/// field so [`hnsw_blob_complete`] can still peek it without decoding.
+pub const HNSW_BLOB_VERSION: u16 = 4;
 
 /// Bytes of the wrapper's header: `magic` (4 raw bytes) then `version` (a
 /// little-endian `u16`) under bincode's fixed-int encoding. Read directly rather
@@ -1800,6 +2021,14 @@ pub struct HnswBlob {
     pub magic: [u8; 4],
     pub version: u16,
     pub index: HnswIndex,
+    /// `HnswIndex::dim_mismatches`, which the index itself does not serialize.
+    pub dim_mismatches: u64,
+    /// The ids behind that count. May be shorter than the count — see the field
+    /// doc on `HnswIndex::refused`.
+    pub refused: BTreeSet<u32>,
+    /// `HnswIndex::parked`, in the slab's `f32` unit rather than a second `f64`
+    /// copy.
+    pub parked: Vec<(u32, Vec<f32>)>,
     /// False when the rule's sliced build had not finished when this blob was
     /// written, so the graph inside holds a prefix of the corpus.
     ///
@@ -1816,11 +2045,32 @@ pub struct HnswBlob {
 }
 
 /// Serialize-only twin of [`HnswBlob`] so encoding never clones the index.
+///
+/// bincode is positional: this must stay field-for-field in lockstep with
+/// [`HnswBlob`], and `complete` must stay last.
 #[derive(Serialize)]
 struct HnswBlobRef<'a> {
     magic: [u8; 4],
     version: u16,
     index: &'a HnswIndex,
+    dim_mismatches: u64,
+    refused: BTreeSet<u32>,
+    parked: Vec<(u32, Vec<f32>)>,
+    complete: bool,
+}
+
+/// The v3 wrapper: the same index body with no side state after it.
+///
+/// Read-only — nothing writes it any more. Keeping it as its own struct is what
+/// lets the v4 body append fields without giving v3 a second index shape to
+/// decode.
+#[derive(Deserialize)]
+struct HnswBlobV3 {
+    #[allow(dead_code)]
+    magic: [u8; 4],
+    #[allow(dead_code)]
+    version: u16,
+    index: HnswIndex,
     complete: bool,
 }
 
@@ -1887,6 +2137,9 @@ pub fn encode_hnsw_blob(index: &HnswIndex, complete: bool) -> Option<Vec<u8>> {
         magic: HNSW_BLOB_MAGIC,
         version: HNSW_BLOB_VERSION,
         index,
+        dim_mismatches: index.dim_mismatches(),
+        refused: index.refused_ids(),
+        parked: index.parked_rows_f32(),
         complete,
     })
     .ok()
@@ -1904,7 +2157,12 @@ pub fn hnsw_blob_complete(blob: &[u8]) -> Option<bool> {
     if blob.len() >= HNSW_BLOB_HEADER_LEN && blob[..4] == HNSW_BLOB_MAGIC {
         let version = u16::from_le_bytes([blob[4], blob[5]]);
         return match version {
-            3 => {
+            // v4 appends its side state *before* `complete`, so `complete` is
+            // still the last byte and this peek is unchanged. Leaving v4 out of
+            // this arm would return `None`, which the open path reads as
+            // "complete" — a mid-build blob would silently stop registering its
+            // pending build and nothing would fail loudly.
+            3 | 4 => {
                 if blob.len() < HNSW_BLOB_HEADER_LEN + 1 {
                     return None;
                 }
@@ -1941,6 +2199,43 @@ pub fn hnsw_blob_complete(blob: &[u8]) -> Option<bool> {
 /// whose magic matches but whose version this build does not know is rejected
 /// exactly as a corrupt one is — the caller leaves the side on its
 /// `hnsw_tracked` full-scan fallback rather than risk misreading it.
+/// The checks and repairs every wrapper version owes its decoded index.
+///
+/// Shared by the v3 and v4 arms so the two cannot drift: a guard added for one
+/// version and forgotten in the other is exactly how a truncated blob would
+/// reach `dot_f32`.
+fn finish_decoded_index(
+    mut index: HnswIndex,
+    complete: bool,
+    version: u16,
+) -> Result<HnswIndex, String> {
+    // bincode will happily decode a `Vec<f32>` shorter than the slots claim —
+    // it reads the length prefix it is given. A short slab then hands `dot_f32`
+    // two slices of unequal length, which is a `debug_assert` in a debug build
+    // and a garbage distance in a release one. Refuse instead: the caller keeps
+    // its `hnsw_tracked` scan.
+    if index.slab.dim != 0 && index.slab.data.len() < index.slots.len() * index.slab.dim {
+        return Err(format!(
+            "HNSW v{version} blob is truncated: the slab holds {} floats, {} slots \
+             of {} dimensions need {}",
+            index.slab.data.len(),
+            index.slots.len(),
+            index.slab.dim,
+            index.slots.len() * index.slab.dim
+        ));
+    }
+    if index.id_of.len() != index.slots.len() {
+        return Err(format!(
+            "HNSW v{version} blob is inconsistent: {} slots against {} id entries",
+            index.slots.len(),
+            index.id_of.len()
+        ));
+    }
+    index.rebuild_back_refs();
+    index.incomplete = !complete;
+    Ok(index)
+}
+
 pub fn decode_hnsw_blob(blob: &[u8]) -> Result<HnswIndex, String> {
     if blob.is_empty() {
         return Err("empty blob".to_string());
@@ -1948,39 +2243,19 @@ pub fn decode_hnsw_blob(blob: &[u8]) -> Result<HnswIndex, String> {
     if blob.len() >= HNSW_BLOB_HEADER_LEN && blob[..4] == HNSW_BLOB_MAGIC {
         let version = u16::from_le_bytes([blob[4], blob[5]]);
         return match version {
-            3 => bincode::deserialize::<HnswBlob>(blob)
-                .map_err(|e| format!("HNSW v3 blob did not decode ({e})"))
+            4 => bincode::deserialize::<HnswBlob>(blob)
+                .map_err(|e| format!("HNSW v4 blob did not decode ({e})"))
                 .and_then(|b| {
-                    let mut index = b.index;
-                    // bincode will happily decode a `Vec<f32>` shorter than the
-                    // slots claim — it reads the length prefix it is given. A
-                    // short slab then hands `dot_f32` two slices of unequal
-                    // length, which is a `debug_assert` in a debug build and a
-                    // garbage distance in a release one. Refuse instead: the
-                    // caller keeps its `hnsw_tracked` scan.
-                    if index.slab.dim != 0
-                        && index.slab.data.len() < index.slots.len() * index.slab.dim
-                    {
-                        return Err(format!(
-                            "HNSW v3 blob is truncated: the slab holds {} floats, {} slots \
-                             of {} dimensions need {}",
-                            index.slab.data.len(),
-                            index.slots.len(),
-                            index.slab.dim,
-                            index.slots.len() * index.slab.dim
-                        ));
-                    }
-                    if index.id_of.len() != index.slots.len() {
-                        return Err(format!(
-                            "HNSW v3 blob is inconsistent: {} slots against {} id entries",
-                            index.slots.len(),
-                            index.id_of.len()
-                        ));
-                    }
-                    index.rebuild_back_refs();
-                    index.incomplete = !b.complete;
+                    let mut index = finish_decoded_index(b.index, b.complete, 4)?;
+                    index.restore_side_state(b.dim_mismatches, b.refused, b.parked);
                     Ok(index)
                 }),
+            3 => bincode::deserialize::<HnswBlobV3>(blob)
+                .map_err(|e| format!("HNSW v3 blob did not decode ({e})"))
+                // No side state on the wire: parked and refused stay empty and
+                // the counter stays zero, so the open-time scan re-offers every
+                // vector and re-derives them exactly as it did before v4.
+                .and_then(|b| finish_decoded_index(b.index, b.complete, 3)),
             2 => bincode::deserialize::<HnswBlobV2>(blob)
                 .map_err(|e| format!("HNSW v2 blob did not decode ({e})"))
                 .map(|b| HnswIndex::from_v2(b.index)),
@@ -2200,6 +2475,72 @@ mod tests {
             hnsw_dist_evals_pairwise(),
             0,
             "a search compares the query against nodes, never two nodes"
+        );
+    }
+
+    /// Scratch reuse (visited bitset, heaps, query f32) must not change the
+    /// neighbour set, order, or distance-eval count on a fixed seed.
+    #[test]
+    fn beam_search_scratch_does_not_change_hits() {
+        let vecs = make_unit_vecs(80, 16, 0x5C12_A7C4);
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"scratch-hits"));
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert(i as u32, v);
+        }
+
+        let q = &vecs[13];
+        let k = 10;
+
+        hnsw_dist_evals_reset();
+        let baseline = idx.search(q, k);
+        let baseline_evals = hnsw_dist_evals();
+        assert_eq!(baseline.len(), k, "fixture must return k hits");
+
+        hnsw_dist_evals_reset();
+        hnsw_beam_scratch_grows_reset();
+        let again = idx.search(q, k);
+        let again_evals = hnsw_dist_evals();
+
+        assert_eq!(
+            again, baseline,
+            "scratch reuse must not change hits or order"
+        );
+        assert_eq!(
+            again_evals, baseline_evals,
+            "scratch reuse must not change dist-eval count"
+        );
+        assert_eq!(
+            hnsw_beam_scratch_grows(),
+            0,
+            "a second search on a warm index must reuse the beam visited buffer"
+        );
+
+        // Comparing the implementation with itself proves it is deterministic,
+        // not that it is right: a scratch buffer that leaked state between
+        // queries would corrupt both runs identically and satisfy every
+        // assertion above. Anchor it to an answer computed without the index at
+        // all. At this size the beam visits the whole graph, so the approximate
+        // path owes the exact one its ids in order.
+        let mut exact: Vec<(u32, f64)> = vecs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let dot: f64 = v.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                (i as u32, dot)
+            })
+            .collect();
+        exact.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let want: Vec<u32> = exact.iter().take(k).map(|(id, _)| *id).collect();
+        let got: Vec<u32> = baseline.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            got, want,
+            "the beam must return the exact top-k for a graph this small; a \
+             scratch buffer carrying state between queries would show up here \
+             and nowhere above"
         );
     }
 
@@ -3408,6 +3749,25 @@ mod tests {
         .unwrap()
     }
 
+    /// The v3 wrapper as 0.6.6b-0.6.8 wrote it: this build's index body with
+    /// `complete` straight after it and no side state.
+    fn as_v3_blob(idx: &HnswIndex, complete: bool) -> Vec<u8> {
+        #[derive(Serialize)]
+        struct V3Ref<'a> {
+            magic: [u8; 4],
+            version: u16,
+            index: &'a HnswIndex,
+            complete: bool,
+        }
+        bincode::serialize(&V3Ref {
+            magic: HNSW_BLOB_MAGIC,
+            version: 3,
+            index: idx,
+            complete,
+        })
+        .expect("v3 encode")
+    }
+
     fn blob_fixture() -> (Vec<Vec<f64>>, HnswIndex) {
         let vecs = make_unit_vecs(120, 24, 0x0B10_B0B0);
         let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"blob-rt"));
@@ -3621,9 +3981,9 @@ mod tests {
         }
     }
 
-    /// This build's wrapper round-trips, and it is version 3.
+    /// This build's wrapper round-trips, and it is version 4.
     #[test]
-    fn a_v3_blob_round_trips() {
+    fn a_v4_blob_round_trips() {
         let (vecs, idx) = blob_fixture();
         let blob = encode_hnsw_blob(&idx, true).expect("encode");
         assert_eq!(
@@ -3633,17 +3993,117 @@ mod tests {
         );
         assert_eq!(
             u16::from_le_bytes([blob[4], blob[5]]),
-            3,
-            "the slab shape is blob version 3"
+            4,
+            "this build writes blob version 4"
         );
 
         hnsw_insert_count_reset();
-        let loaded = decode_hnsw_blob(&blob).expect("a v3 blob must load");
+        let loaded = decode_hnsw_blob(&blob).expect("a v4 blob must load");
         assert_eq!(hnsw_insert_count(), 0, "a load must not re-insert vectors");
         assert_matches(&loaded, &idx, &vecs[3]);
         assert_eq!(
             loaded.slab.dim, idx.slab.dim,
             "the slab's stride must survive the round trip"
+        );
+    }
+
+    /// A v3 blob — this build's own index body with no side state after it —
+    /// still loads, and comes back with nothing restored, so the open-time scan
+    /// re-offers every vector and re-derives the refusals exactly as before v4.
+    #[test]
+    fn v3_blob_still_loads_and_reoffers() {
+        let (vecs, idx) = blob_fixture();
+        let blob = as_v3_blob(&idx, true);
+        assert_eq!(
+            u16::from_le_bytes([blob[4], blob[5]]),
+            3,
+            "the fixture must actually be a v3 blob"
+        );
+
+        hnsw_insert_count_reset();
+        let loaded = decode_hnsw_blob(&blob).expect("a v3 blob must still load");
+        assert_eq!(hnsw_insert_count(), 0, "a load must not re-insert vectors");
+        assert_matches(&loaded, &idx, &vecs[3]);
+        assert_eq!(
+            loaded.accounted_ids(),
+            loaded.node_ids(),
+            "a v3 blob carries no parked or refused state, so the scan's skip \
+             set is exactly the graph — the pre-v4 behaviour"
+        );
+        assert_eq!(loaded.dim_mismatches(), 0);
+        assert!(loaded.refused_ids().is_empty());
+    }
+
+    /// v4 carries the refusal count, the refused ids and the parked vectors, so
+    /// a reopen restores them instead of re-deriving them — and the ids it
+    /// restored are the ids the open-time scan must skip.
+    #[test]
+    fn a_v4_blob_restores_parked_and_refused() {
+        // Stride 2 elected by the corpus, then one 3-D stray refused, and a
+        // re-election that parks a vector at the old stride.
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"v4-state"));
+        idx.insert(1, &[1.0, 0.0]);
+        idx.insert(2, &[0.0, 1.0]);
+        idx.insert(3, &[1.0, 1.0, 1.0]); // refused: stride is 2, len > 1
+        assert_eq!(idx.dim_mismatches(), 1, "the stray must be refused");
+        assert_eq!(idx.refused_ids(), BTreeSet::from([3]));
+
+        let blob = encode_hnsw_blob(&idx, true).expect("encode");
+        hnsw_insert_count_reset();
+        let loaded = decode_hnsw_blob(&blob).expect("decode");
+        assert_eq!(hnsw_insert_count(), 0, "a load must not re-insert vectors");
+
+        assert_eq!(
+            loaded.dim_mismatches(),
+            idx.dim_mismatches(),
+            "the refusal count survives the round trip rather than starting at zero"
+        );
+        assert_eq!(
+            loaded.refused_ids(),
+            idx.refused_ids(),
+            "and so do the ids behind it"
+        );
+        assert!(
+            loaded.accounts_for(3),
+            "the refused id is accounted for, so the open-time scan skips it \
+             instead of refusing it a second time"
+        );
+        assert!(
+            !loaded.node_ids().contains(&3),
+            "accounted for is not the same as in the graph"
+        );
+    }
+
+    /// A parked vector comes back parked, and is not re-offered. Re-offering it
+    /// is what would destroy it: `insert` supersedes the parked copy and then
+    /// refuses the vector against the elected stride, so the one copy that made
+    /// it recoverable is gone.
+    #[test]
+    fn a_v4_blob_restores_a_parked_vector() {
+        // `[stray, real, real]`: the first vector elects its own dimension and
+        // is parked by the re-election the second one triggers.
+        let mut idx = HnswIndex::new(crate::index::fnv1a_u64(b"v4-parked"));
+        idx.insert(7, &[1.0, 1.0, 1.0]);
+        idx.insert(1, &[1.0, 0.0]);
+        idx.insert(2, &[0.0, 1.0]);
+        assert!(
+            idx.accounts_for(7) && !idx.node_ids().contains(&7),
+            "node 7 must be parked, not indexed"
+        );
+
+        let blob = encode_hnsw_blob(&idx, true).expect("encode");
+        let loaded = decode_hnsw_blob(&blob).expect("decode");
+        assert!(
+            loaded.accounts_for(7),
+            "the parked entry survives the round trip"
+        );
+        assert!(
+            !loaded.node_ids().contains(&7),
+            "and is still parked rather than indexed"
+        );
+        assert!(
+            loaded.accounted_ids().contains(&7),
+            "so the open-time scan skips it"
         );
     }
 

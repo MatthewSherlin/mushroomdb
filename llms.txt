@@ -296,19 +296,21 @@ Predicates compose via `All(...)` (AND, score = min) and `Any(...)` (OR, score =
 
 ## Cypher key idiom
 
-Node keys are NOT stored as a property. `n.id` is always null — but
-`key(n)` and `n.key` both read the key, and `labels(n)` and `n.label` read the
-label (a stored property of either name still wins). They work in `WHERE`, in
-`ORDER BY`, in an inline pattern filter (`MATCH (c {key: 'c3'})`) and after a
-grouping `WITH`.
+The node's key lives in the id map. `n.key` / `n.id` read it (a stored property
+of that name wins). `key(n)` / `id(n)` always return the id-map key.
+`n.label` / `labels(n)` read the label. They work in `WHERE`, `ORDER BY`,
+`RETURN`, an inline pattern filter, and after a grouping `WITH`. Pattern
+`{id: 'alice'}` is a key lookup (`ScanKey`). `WHERE n.key` / `n.id` / `key(n)` /
+`id(n)` against a literal or `$param` also plans as `ScanKey` (plus a
+stored-property filter so stored-wins still holds). `n.label` / `labels(n)`
+are not this fold.
 
-- Filter by key: `WHERE n = 'alice'`, `WHERE key(n) = 'alice'` or `WHERE n.key = 'alice'`
-- Read the key: `RETURN key(n)`, or bare `RETURN n` — the result value for a node
-  variable is the key string
+- Filter by key: `WHERE n.id = 'alice'`, `WHERE n.key = 'alice'`, `WHERE key(n) = 'alice'`, or `WHERE n = 'alice'`
+- Read the key: `RETURN n.id`, `id(n)`, `n.key`, or bare `RETURN n` — the result
+  value for a node variable is the key string
 
 ```cypher
-MATCH (n:Person) WHERE n = 'alice' RETURN key(n)  -- correct
-MATCH (n:Person) WHERE n.id = 'alice' RETURN n    -- WRONG: n.id is null
+MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), n.key
 ```
 
 In Python, `row["n"]` gives the key string `"alice"`, not a dict.
@@ -325,7 +327,7 @@ is the intersection of both), relationship type alternation (`(a)-[:A|:B]->(b)`)
 aggregations (COUNT/SUM/AVG/MIN/MAX/collect, grouped, with DISTINCT — `count(DISTINCT r)` on a
 relationship counts distinct edges), query parameters ($name), and scalar functions (toLower,
 toUpper, size, coalesce, type(r), abs, round, textMatches, contains, startsWith, endsWith,
-toInteger, toFloat, toString, decay, key, labels).
+toInteger, toFloat, toString, decay, key, id, labels).
 
 Not supported: subqueries, multi-statement BEGIN/COMMIT transactions.
 

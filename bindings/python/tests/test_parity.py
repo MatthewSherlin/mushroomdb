@@ -191,6 +191,29 @@ def test_upsert_node_empty_props_on_existing_is_a_noop(tmp_path):
     db.close()
 
 
+def test_upsert_node_update_is_one_commit(tmp_path):
+    """Two changed fields are one WAL commit; a mid-list ns refusal lands none."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Person", "alice", {"team": "red", "age": 30})
+    before = db.wal_total_commits()
+    assert db.upsert_node("Person", "alice", {"team": "blue", "age": 31}) == "updated"
+    assert db.wal_total_commits() == before + 1
+    info = db.node_info("alice")["props"]
+    assert info["team"] == "blue"
+    assert info["age"] == 31
+
+    # `city` is first so a per-field loop would commit it, then refuse `ns`.
+    before = db.wal_total_commits()
+    with pytest.raises(RuntimeError, match="set at insert and cannot be changed"):
+        db.upsert_node("Person", "alice", {"city": "NYC", "ns": "other"})
+    assert db.wal_total_commits() == before
+    info = db.node_info("alice")["props"]
+    assert "city" not in info
+    assert info["team"] == "blue"
+    assert info["age"] == 31
+    db.close()
+
+
 # ---------------------------------------------------------------------------
 # 4. remove_prop / set_prop(..., None)
 # ---------------------------------------------------------------------------
@@ -652,6 +675,39 @@ def test_query_takes_a_role_and_a_namespace(tmp_path):
             db.query("CREATE (n:Doc {id: 'z1'})", **kw)
         assert "read-only" in str(e.value), kw
         assert db.node_info("z1") is None, kw
+    db.close()
+
+
+def test_query_at_role_and_namespace(tmp_path):
+    """query_at(role=/namespace=) agrees with live query at that commit."""
+    db = _ns_store(tmp_path / "db")
+    q = "MATCH (n) RETURN n.id AS id ORDER BY n.id"
+    commit = db.wal_total_commits() - 1
+
+    live_role = [r["id"] for r in db.query(q, role="a-reader")]
+    asof_role = [r["id"] for r in db.query_at(commit, q, role="a-reader")]
+    assert live_role == asof_role == ["a1", "a2"]
+
+    live_ns = [r["id"] for r in db.query(q, namespace="tenant-a")]
+    asof_ns = [r["id"] for r in db.query_at(commit, q, namespace="tenant-a")]
+    assert live_ns == asof_ns == ["a1", "a2"]
+
+    live_both = [r["id"] for r in db.query(q, role="a-reader", namespace="tenant-b")]
+    asof_both = [r["id"] for r in db.query_at(commit, q, role="a-reader", namespace="tenant-b")]
+    assert live_both == asof_both == []
+
+    db.insert_node("Doc", "a3", {"id": "a3"}, namespace="tenant-a")
+    assert [r["id"] for r in db.query(q, role="a-reader")] == ["a1", "a2", "a3"]
+    assert [r["id"] for r in db.query_at(commit, q, role="a-reader")] == ["a1", "a2"]
+
+    with pytest.raises(RuntimeError) as live:
+        db.query(q, role="nobody")
+    with pytest.raises(RuntimeError) as asof:
+        db.query_at(commit, q, role="nobody")
+    assert str(live.value) == str(asof.value)
+
+    with pytest.raises(ValueError):
+        db.query_at(commit, q, namespace="no spaces")
     db.close()
 
 

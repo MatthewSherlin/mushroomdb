@@ -35,7 +35,7 @@ One call per question, on the store's own keys. The `SessionStart` brief printed
 | how many | a counting Cypher over the labels the brief listed |
 | a durable fact | `remember` — the `text` and the existing keys it is `about`; say the `note:` key back |
 
-Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `hybrid_search`.
+Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`.
 <!-- /mcp -->
 <!-- cli -->
 
@@ -71,7 +71,7 @@ The `concept_sources` rule links each concept to its sources with `DESCRIBED_IN`
 ## Advanced
 <!-- mcp -->
 
-`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the fifteen above. All are served either way; `{{BIN}} mcp <db> --all-tools` lists the rest with schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
+`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the sixteen above. All are served either way; `{{BIN}} mcp <db> --all-tools` lists the rest with schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
 <!-- /mcp -->
 
 Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`{{BIN}} serve '{{DB_PATH}}'`), and `doctor` checks the install.

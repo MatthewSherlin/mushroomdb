@@ -192,7 +192,13 @@ re-snapshot before upgrading.
 
 To opt out of automatic migration use:
 ```rust
-GraphDb::open_with_options(dir, OpenOptions { auto_migrate: false })
+GraphDb::open_with_options(
+    dir,
+    OpenOptions {
+        auto_migrate: false,
+        ..Default::default()
+    },
+)
 ```
 
 ---

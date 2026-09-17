@@ -6,10 +6,10 @@ use crate::subscription::{
 use core_query::cypher::ast::{ret_val_label, ArithOp};
 use core_query::cypher::{
     execute, execute_union, is_subscribable, is_write_tokens, lex, parse, parse_read, parse_write,
-    plan, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem, RetVal,
-    WriteStatement,
+    plan, Expr, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem,
+    RetVal, WriteStatement,
 };
-use core_query::{eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
+use core_query::{eval_cmp, eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
 use core_rules::{
     decode_rule_def, ef_max, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView,
     Predicate, RuleDef, RuleEngine, ViewDef, ViewStore,
@@ -804,7 +804,18 @@ fn eval_set_return_operand<F: Fs>(
             let Some(Value::Str(key)) = match_rs.get(row, var) else {
                 return Ok(None);
             };
-            Ok(db.get_prop(key, field))
+            if let Some(v) = db.get_prop(key, field) {
+                return Ok(Some(v));
+            }
+            // Same stored-wins identity fallback as the read path:
+            // n.key / n.id / n.label, not only get_prop.
+            Ok(match field.as_str() {
+                "key" | "id" => Some(Value::Str(key.clone())),
+                "label" => db
+                    .node_ref(key)
+                    .map(|n| Value::Str(n.label().to_owned())),
+                _ => None,
+            })
         }
         Operand::FuncCall { name, args } => {
             eval_set_return_func(db, match_rs, row, rel_vars, name, args, params)
@@ -814,20 +825,110 @@ fn eval_set_return_operand<F: Fs>(
             let rv = eval_set_return_operand(db, match_rs, row, rel_vars, right, params)?;
             eval_set_return_arith(op, lv, rv)
         }
-        // CASE is supported in read-query RETURN; in a write-statement RETURN
-        // projection (CREATE/MERGE/SET … RETURN) it is not yet wired.
-        Operand::Case { .. } => Err(GraphError::QueryError {
-            detail: "CASE is not supported in a write-statement RETURN projection; \
-                     use a read query"
-                .into(),
-        }),
-        // Same as CASE: a list subscript is supported in a read-query RETURN
-        // but not yet in a write-statement RETURN projection.
-        Operand::Index { .. } => Err(GraphError::QueryError {
-            detail: "a list subscript is not supported in a write-statement RETURN \
-                     projection; use a read query"
-                .into(),
-        }),
+        Operand::Case { branches, default } => {
+            for (cond, value) in branches {
+                if eval_set_return_expr(db, match_rs, row, rel_vars, cond, params, 0)? {
+                    return eval_set_return_operand(db, match_rs, row, rel_vars, value, params);
+                }
+            }
+            match default {
+                Some(d) => eval_set_return_operand(db, match_rs, row, rel_vars, d, params),
+                None => Ok(None),
+            }
+        }
+        Operand::Index { base, index } => {
+            let base_val = eval_set_return_operand(db, match_rs, row, rel_vars, base, params)?;
+            let idx_val = eval_set_return_operand(db, match_rs, row, rel_vars, index, params)?;
+            Ok(core_query::value_ops::index_list(base_val, idx_val))
+        }
+    }
+}
+
+fn eval_set_return_expr<F: Fs>(
+    db: &GraphDb<F>,
+    match_rs: &ResultSet,
+    row: usize,
+    rel_vars: &[String],
+    expr: &Expr,
+    params: &BTreeMap<String, Value>,
+    depth: u32,
+) -> Result<bool> {
+    if depth > 256 {
+        return Err(GraphError::QueryError {
+            detail: "expression nesting too deep".into(),
+        });
+    }
+    match expr {
+        Expr::And(lhs, rhs) => {
+            let l = eval_set_return_expr(db, match_rs, row, rel_vars, lhs, params, depth + 1)?;
+            let r = eval_set_return_expr(db, match_rs, row, rel_vars, rhs, params, depth + 1)?;
+            Ok(l && r)
+        }
+        Expr::Or(lhs, rhs) => {
+            let l = eval_set_return_expr(db, match_rs, row, rel_vars, lhs, params, depth + 1)?;
+            let r = eval_set_return_expr(db, match_rs, row, rel_vars, rhs, params, depth + 1)?;
+            Ok(l || r)
+        }
+        Expr::Not(inner) => Ok(!eval_set_return_expr(
+            db,
+            match_rs,
+            row,
+            rel_vars,
+            inner,
+            params,
+            depth + 1,
+        )?),
+        Expr::Cmp { lhs, op, rhs } => {
+            let l = eval_set_return_operand(db, match_rs, row, rel_vars, lhs, params)?;
+            let r = eval_set_return_operand(db, match_rs, row, rel_vars, rhs, params)?;
+            match (l, r) {
+                (Some(a), Some(b)) => Ok(eval_cmp(op, &a, &b)),
+                _ => Ok(false),
+            }
+        }
+        Expr::Truthy(op) => {
+            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
+            Ok(match val {
+                None => false,
+                Some(Value::Bool(b)) => b,
+                Some(Value::Int(n)) => n != 0,
+                Some(Value::Float(f)) => f != 0.0,
+                Some(Value::Str(s)) => !s.is_empty(),
+                Some(Value::List(v)) => !v.is_empty(),
+                Some(Value::Map(m)) => !m.is_empty(),
+            })
+        }
+        Expr::IsNull(op) => {
+            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
+            Ok(val.is_none())
+        }
+        Expr::IsNotNull(op) => {
+            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
+            Ok(val.is_some())
+        }
+        Expr::In { expr, list } => {
+            let Some(needle) = eval_set_return_operand(db, match_rs, row, rel_vars, expr, params)?
+            else {
+                return Ok(false);
+            };
+            for item_op in list {
+                match eval_set_return_operand(db, match_rs, row, rel_vars, item_op, params)? {
+                    None => {}
+                    Some(Value::List(items)) => {
+                        for item in items {
+                            if eval_cmp(&core_query::CmpOp::Eq, &needle, &item) {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    Some(item) if eval_cmp(&core_query::CmpOp::Eq, &needle, &item) => {
+                        return Ok(true);
+                    }
+                    Some(_) => {}
+                }
+            }
+            Ok(false)
+        }
     }
 }
 
@@ -914,24 +1015,25 @@ fn eval_set_return_func<F: Fs>(
         };
         return Ok(match_rs.get(row, &rel_type_alias(rel)).cloned());
     }
-    if norm == "key" {
+    if norm == "key" || norm == "id" {
+        let fname = if norm == "id" { "id" } else { "key" };
         if args.len() != 1 {
             return Err(GraphError::QueryError {
-                detail: format!("key() requires exactly 1 argument, got {}", args.len()),
+                detail: format!("{fname}() requires exactly 1 argument, got {}", args.len()),
             });
         }
         let Operand::Var(var) = &args[0] else {
             return Err(GraphError::QueryError {
-                detail: "key() argument must be a node variable (e.g. key(n))".into(),
+                detail: format!("{fname}() argument must be a node variable (e.g. {fname}(n))"),
             });
         };
         if rel_vars.iter().any(|r| r == var) {
             return Err(GraphError::QueryError {
-                detail: format!("key() argument `{var}` is a relationship, not a node"),
+                detail: format!("{fname}() argument `{var}` is a relationship, not a node"),
             });
         }
         // MATCH rows bind node variables to their key string, so the column
-        // value *is* the key.
+        // value *is* the key. `id()` aliases `key()`.
         return Ok(match_rs.get(row, var).cloned());
     }
     let mut vals = Vec::with_capacity(args.len());
@@ -1016,7 +1118,7 @@ fn eval_set_return_func<F: Fs>(
         }
         _ => Err(GraphError::QueryError {
             detail: format!(
-                "unknown function `{name}`; supported: toLower, toUpper, size, coalesce, type, abs, round, decay, key"
+                "unknown function `{name}`; supported: toLower, toUpper, size, coalesce, type, abs, round, decay, key, id"
             ),
         }),
     }

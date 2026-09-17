@@ -922,18 +922,109 @@ async fn node_edges_unknown_key_is_404() {
     assert_eq!(v, json!({"error": "node key not found: ghost"}));
 }
 
-/// Binding: unknown neighborhood key is 400.
+/// Binding: unknown neighborhood key is 404 {"error":"node key not found: ..."}.
+/// The masked twin maps KeyNotFound the same way — not graph_err's 400.
 #[tokio::test]
-async fn neighborhood_unknown_key_is_400() {
+async fn neighborhood_unknown_key_is_404() {
     let (app, _) = open("nbhd-miss");
-    let (status, body, _) = send(app, get("/node/ghost/neighborhood")).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body, _) = send(app.clone(), get("/node/ghost/neighborhood")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let v = parse_json(&body);
-    let err = v["error"].as_str().expect("error string");
+    assert_eq!(v, json!({"error": "node key not found: ghost"}));
+
+    let (status, body, _) = send(app, get("/node/ghost/neighborhood?mask=alice")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let v = parse_json(&body);
+    assert_eq!(v, json!({"error": "node key not found: ghost"}));
+}
+
+fn seed_emb(db: &SharedDb, label: &str, key: &str, x: f64, y: f64) {
+    db.write()
+        .insert_node(
+            label,
+            key,
+            vec![(
+                "emb".into(),
+                Value::List(vec![Value::Float(x), Value::Float(y)]),
+            )],
+        )
+        .unwrap();
+}
+
+/// Binding: POST /find_similar exact hits equal GraphDb::find_similar_vector_filtered
+/// on the same store (Python tuple shape: [[key, score], ...]). HTTP min defaults to 0.0.
+#[tokio::test]
+async fn http_find_similar_exact_agrees_with_python_shape() {
+    let (app, db) = open("http-find-similar-exact");
+    seed_emb(&db, "Item", "close", 1.0, 0.0);
+    seed_emb(&db, "Item", "far", 0.0, 1.0);
+
+    let expected = {
+        let g = db.read();
+        g.find_similar_vector_filtered("emb", Some("Item"), &[1.0, 0.0], 10, 0.0, None, None, true)
+            .unwrap()
+    };
     assert!(
-        err.contains("ghost"),
-        "expected unknown key in detail, got {err}"
+        expected.iter().any(|(k, _)| k == "far"),
+        "engine min=0.0 must keep the orthogonal hit so HTTP default min is pinned: {expected:?}"
     );
+
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/find_similar",
+            json!({
+                "field": "emb",
+                "vector": [1.0, 0.0],
+                "k": 10,
+                "label": "Item",
+                "exact": true
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(v["hits"], serde_json::to_value(&expected).unwrap());
+}
+
+/// Binding: a role token on POST /find_similar intersects a client mask
+/// (never widens). Hidden keys in the mask are skipped.
+#[tokio::test]
+async fn http_find_similar_role_intersects_mask() {
+    let (app, db) = open_rbac(
+        "http-find-similar-role",
+        &[("analyst", &["Person"], &[])],
+        Some("admin"),
+        &[("role-tok", "analyst")],
+    );
+    seed_emb(&db, "Person", "alice", 1.0, 0.0);
+    seed_emb(&db, "Person", "bob", 1.0, 0.0);
+    seed_emb(&db, "Secret", "secret", 1.0, 0.0);
+
+    let req = authed_json_req(
+        "POST",
+        "/find_similar",
+        "role-tok",
+        json!({
+            "field": "emb",
+            "vector": [1.0, 0.0],
+            "k": 10,
+            "min": 0.0,
+            "exact": true,
+            "mask": ["bob", "secret"]
+        }),
+    );
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    let hits = v["hits"].as_array().expect("hits array");
+    let keys: Vec<&str> = hits
+        .iter()
+        .filter_map(|h| h.as_array()?.first()?.as_str())
+        .collect();
+    assert_eq!(keys, vec!["bob"], "role ∩ mask must be bob only, got {v}");
 }
 
 /// Binding: ServeDir is the fallback; `/stats` stays JSON.

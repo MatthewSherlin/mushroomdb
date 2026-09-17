@@ -11,11 +11,11 @@
 //! - `notifications/initialized` — ignored
 //! - `tools/list` — the default listing follows the store the server opened
 //!   (see [`Surface`]): a store a repository was ingested into lists three —
-//!   `explore`, `query`, `stats` — and any other store lists the fifteen of
+//!   `explore`, `query`, `stats` — and any other store lists the sixteen of
 //!   [`ASSOCIATION_TOOLS`], the tools that answer a question about an entity
 //!   graph, in that order. Graph-tool descriptions carry the
 //!   prefix `Advanced: ` so a host ranking tools by description puts the task
-//!   tools in front. `mushroomdb mcp --all-tools` lists all twenty-seven; the
+//!   tools in front. `mushroomdb mcp --all-tools` lists all twenty-eight; the
 //!   rest are callable either way, just not advertised
 //! - `tools/call` — dispatch; success for a graph tool is
 //!   `{content:[{type:"text", text:<json string>}]}`, and for a task tool one
@@ -79,7 +79,7 @@ pub fn run_mcp_stdio(
 /// [`run_mcp_stdio`], with the tool list chosen by the caller.
 ///
 /// `all_tools` false lists what the store's [`Surface`] names — three on a
-/// code graph, fifteen on a memory store; true lists all twenty-seven. Either
+/// code graph, sixteen on a memory store; true lists all twenty-eight. Either
 /// way every tool remains callable — the flag decides what is advertised, not
 /// what is served.
 ///
@@ -227,6 +227,7 @@ fn dispatch_call(db: &SharedDb, db_dir: Option<&Path>, params: Option<&Js>) -> C
         "node_info" => tool_node_info(db, args),
         "upsert_entity" => tool_upsert_entity(db, args),
         "find_similar" => tool_find_similar(db, args),
+        "pairwise_similar" => tool_pairwise_similar(db, args),
         "hybrid_search" => tool_hybrid_search(db, args),
         "node_history" => tool_node_history(db, args),
         "edge_history" => tool_edge_history(db, args),
@@ -582,14 +583,29 @@ fn tool_stats(db: &SharedDb, args: &Js) -> CallOutcome {
         (g.stats(), def)
     };
     let mut snap = snap;
-    if role_def.is_some() || namespace.is_some() {
+    // Scoped on the ARGUMENTS, not on `role_def`: naming a role that resolved
+    // is a scoped call even in the window where the definition lookup misses,
+    // and the safe direction there is to omit the roster rather than send all
+    // of it.
+    let scoped = role.is_some() || namespace.is_some();
+    if scoped {
         snap.namespaces.retain(|n| {
             role_def.as_ref().is_none_or(|d| d.sees_namespace(&n.name))
                 && namespace.as_deref().is_none_or(|ns| ns == n.name)
         });
     }
     match serde_json::to_value(&snap) {
-        Ok(v) => CallOutcome::ToolOk(v),
+        Ok(mut v) => {
+            // An unscoped caller gets the store-wide counts without the roster.
+            // Omitted, not emptied: `"namespaces": []` still discloses that the
+            // roster exists and invites a guess at its size.
+            if !scoped {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.remove("namespaces");
+                }
+            }
+            CallOutcome::ToolOk(v)
+        }
         Err(e) => CallOutcome::ToolErr(e.to_string()),
     }
 }
@@ -916,6 +932,57 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
     }
 }
 
+/// Exact cosine top-k among a caller key set. Self excluded. Never HNSW.
+fn tool_pairwise_similar(db: &SharedDb, args: &Js) -> CallOutcome {
+    let Some(keys_js) = args.get("keys").and_then(Js::as_array) else {
+        return CallOutcome::ToolErr("missing required field: keys".into());
+    };
+    let mut keys: Vec<String> = Vec::with_capacity(keys_js.len());
+    for v in keys_js {
+        match v.as_str() {
+            Some(s) => keys.push(s.to_string()),
+            None => return CallOutcome::ToolErr("keys must be an array of strings".into()),
+        }
+    }
+    let Some(field) = args.get("field").and_then(Js::as_str) else {
+        return CallOutcome::ToolErr("missing required field: field".into());
+    };
+    let k = args
+        .get("k")
+        .and_then(Js::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(10);
+    let min = args.get("min").and_then(Js::as_f64).unwrap_or(0.0);
+    let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let out = {
+        let g = db.read();
+        g.pairwise_similar(&refs, field, k, min)
+    };
+    match out {
+        Ok(pairs) => {
+            let results: Vec<Js> = pairs
+                .into_iter()
+                .map(|(key, neighbors)| {
+                    json!({
+                        "key": key,
+                        "neighbors": neighbors
+                            .into_iter()
+                            .map(|(n, score)| json!({ "key": n, "score": score }))
+                            .collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            CallOutcome::ToolOk(json!({
+                "field": field,
+                "k": k,
+                "min": min,
+                "results": results
+            }))
+        }
+        Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
+    }
+}
+
 fn tool_hybrid_search(db: &SharedDb, args: &Js) -> CallOutcome {
     let Some(query_text) = args.get("query_text").and_then(Js::as_str) else {
         return CallOutcome::ToolErr("missing required field: query_text".into());
@@ -1086,7 +1153,7 @@ const ADVANCED_PREFIX: &str = "Advanced: ";
 /// listing.
 pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 
-/// The fifteen a memory store advertises, in the order it lists them.
+/// The sixteen a memory store advertises, in the order it lists them.
 ///
 /// A store with no repository in it used to be handed the code door's own task
 /// tools — `map`, `context`, `impact`, `owners`, `why`, `sync` — which answer
@@ -1110,7 +1177,7 @@ pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 /// The code task tools stay served on a memory store, as these stay served on
 /// a code-graph one — [`tools_list`] decides what is *advertised*, never what
 /// is answered.
-pub const ASSOCIATION_TOOLS: [&str; 15] = [
+pub const ASSOCIATION_TOOLS: [&str; 16] = [
     "query",
     "explain_association",
     "neighborhood",
@@ -1122,6 +1189,7 @@ pub const ASSOCIATION_TOOLS: [&str; 15] = [
     "node_history",
     "edge_history",
     "find_similar",
+    "pairwise_similar",
     "hybrid_search",
     "remember",
     "recall",
@@ -1138,7 +1206,7 @@ pub(crate) enum Surface {
     /// A repository was ingested into this store: the `GitSync` marker is
     /// there, and `explore` has a code graph to explore.
     CodeGraph,
-    /// Any other store, including an empty one: the fifteen-tool association
+    /// Any other store, including an empty one: the sixteen-tool association
     /// surface, where `explore` would have nothing to answer from.
     Memory,
 }
@@ -1172,13 +1240,13 @@ fn surface_of(db: &SharedDb) -> Surface {
 /// graph tools with their descriptions prefixed.
 ///
 /// `all` false — the default — lists what `surface` names, **in the order that
-/// surface names it**: three on a code graph, fifteen on a memory store. The
+/// surface names it**: three on a code graph, sixteen on a memory store. The
 /// order is the point. A host that defers tool schemas makes a model search
 /// for them, and the list it searches is read top-down, so each surface ranks
 /// its own tools rather than inheriting the task-tools-then-graph-tools order
 /// that only the code door has a reason for.
 ///
-/// `all` true lists all twenty-seven in that established order whichever store
+/// `all` true lists all twenty-eight in that established order whichever store
 /// this is, which is what `mushroomdb mcp --all-tools` runs and what the
 /// published server card documents: a caller that asked for everything asked
 /// for the whole surface, not for one door's ranking of it.
@@ -1212,7 +1280,7 @@ fn tools_list(all: bool, surface: Surface) -> Js {
     json!({ "tools": tools })
 }
 
-/// The thirteen graph tools, in the order they have always been listed, with
+/// The fourteen graph tools, in the order they have always been listed, with
 /// their descriptions unprefixed. [`tools_list`] adds the prefix.
 fn graph_tools() -> Vec<Js> {
     let Js::Array(tools) = json!([
@@ -1312,7 +1380,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "stats",
-                "description": "How big is this store — live node, edge and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned), and `namespaces`, every namespace with at least one live node and its count. Pass 'role' or 'namespace' to be told about those namespaces only.",
+                "description": "How big is this store — live node, edge and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned). Pass 'role' or 'namespace' to also get `namespaces`, the namespaces that argument may see with a live-node count each; without either argument the roster is omitted entirely.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1390,6 +1458,24 @@ fn graph_tools() -> Vec<Js> {
                         "edge_type": { "type": "string", "description": "Edge type to filter by in edge-traversal mode (default: SIMILAR)." },
                         "limit": { "type": "integer", "description": "Maximum neighbors to return in edge-traversal mode (default: 10)." }
                     }
+                }
+            },
+            {
+                "name": "pairwise_similar",
+                "description": "Which of these are most like each other — exact cosine top-k among a caller key set. Self excluded. Never uses HNSW. Unknown keys, missing embeddings, zero-norm and wrong-dimension vectors are skipped. Duplicate keys collapse to first-seen order. Empty keys returns nothing. n above PAIRWISE_MAX_N is a tool error.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "keys": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Node keys to score against each other."
+                        },
+                        "field": { "type": "string", "description": "Property field holding the embedding vectors." },
+                        "k": { "type": "integer", "description": "Maximum neighbors per key (default: 10)." },
+                        "min": { "type": "number", "description": "Minimum cosine similarity threshold (default: 0.0)." }
+                    },
+                    "required": ["keys", "field"]
                 }
             },
             {
@@ -1680,7 +1766,7 @@ mod tests {
             "recall",
             "remember",
             "sync",
-            // The thirteen graph tools.
+            // The fourteen graph tools.
             "query",
             "ingest_json",
             "create_rule",
@@ -1689,6 +1775,7 @@ mod tests {
             "node_info",
             "upsert_entity",
             "find_similar",
+            "pairwise_similar",
             "hybrid_search",
             "node_history",
             "edge_history",
@@ -1699,8 +1786,8 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            27,
-            "expected exactly 27 tools, got {}",
+            28,
+            "expected exactly 28 tools, got {}",
             names.len()
         );
         assert_eq!(
@@ -1727,10 +1814,10 @@ mod tests {
     }
 
     /// Binding: on a store no repository was ingested into, the default
-    /// listing is the fifteen association tools, in [`ASSOCIATION_TOOLS`]
+    /// listing is the sixteen association tools, in [`ASSOCIATION_TOOLS`]
     /// order, and nothing else.
     #[test]
-    fn tools_list_defaults_to_fifteen_on_a_memory_store() {
+    fn tools_list_defaults_to_sixteen_on_a_memory_store() {
         let db = demo_db();
         let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let names: Vec<&str> = resp["result"]["tools"]
@@ -1740,6 +1827,45 @@ mod tests {
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
         assert_eq!(names, ASSOCIATION_TOOLS.to_vec());
+    }
+
+    /// Binding: `pairwise_similar` is advertised on the memory surface
+    /// immediately after `find_similar`. Listing length is 16.
+    #[test]
+    fn association_listing_includes_pairwise_similar_after_find_similar() {
+        let db = demo_db();
+        let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("name"))
+            .collect();
+        const EXPECTED: [&str; 16] = [
+            "query",
+            "explain_association",
+            "neighborhood",
+            "node_info",
+            "node_edges",
+            "was_linked",
+            "edges_at",
+            "what_if",
+            "node_history",
+            "edge_history",
+            "find_similar",
+            "pairwise_similar",
+            "hybrid_search",
+            "remember",
+            "recall",
+            "stats",
+        ];
+        assert_eq!(names, EXPECTED.to_vec());
+        assert_eq!(ASSOCIATION_TOOLS.as_slice(), EXPECTED.as_slice());
+        let find = names
+            .iter()
+            .position(|&n| n == "find_similar")
+            .expect("find_similar listed");
+        assert_eq!(names[find + 1], "pairwise_similar");
     }
 
     /// Binding: [`ASSOCIATION_TOOLS`] is a surface of its own, not the code
@@ -1811,6 +1937,59 @@ mod tests {
         assert!(!is_error(&resp));
         let result = tool_text(&resp);
         assert_eq!(result["nodes_live"], 2);
+    }
+
+    /// Unscoped `stats` must not enumerate the store's namespaces. Asking with
+    /// neither `role` nor `namespace` gets the store-wide counts with the
+    /// roster key absent entirely — not an empty array, which would still
+    /// confirm the roster exists and invite a guess at its size.
+    #[test]
+    fn mcp_stats_unscoped_omits_namespace_roster() {
+        let db = SharedDb::open(&tmp_dir()).expect("open");
+        {
+            let mut g = db.write();
+            g.insert_node(
+                "Doc",
+                "a",
+                vec![("ns".into(), Value::Str("tenant-a".into()))],
+            )
+            .expect("insert a");
+            g.insert_node(
+                "Doc",
+                "b",
+                vec![("ns".into(), Value::Str("tenant-b".into()))],
+            )
+            .expect("insert b");
+        }
+
+        let unscoped = tool_text(&tool_call(&db, 1, "stats", json!({})));
+        assert!(
+            unscoped.get("namespaces").is_none(),
+            "unscoped stats must omit the roster entirely, not send an empty \
+             array: {unscoped}"
+        );
+        assert_eq!(
+            unscoped["nodes_live"], 2,
+            "the store-wide counts beside the roster are unchanged"
+        );
+
+        let scoped = tool_text(&tool_call(
+            &db,
+            2,
+            "stats",
+            json!({"namespace": "tenant-a"}),
+        ));
+        let names: Vec<&str> = scoped["namespaces"]
+            .as_array()
+            .expect("a scoped call still carries the roster it may see")
+            .iter()
+            .map(|n| n["name"].as_str().expect("name"))
+            .collect();
+        assert_eq!(
+            names,
+            ["tenant-a"],
+            "a call that names a namespace sees that one and no other"
+        );
     }
 
     /// A rule whose corpus is too large to index in one commit must not come
@@ -2145,6 +2324,38 @@ mod tests {
             json!({ "key": "new-node", "props": { "x": 1 } }),
         );
         assert!(is_error(&resp), "should error without label for new node");
+    }
+
+    #[test]
+    fn test_pairwise_similar_excludes_self() {
+        let db = demo_db();
+        let resp = tool_call(
+            &db,
+            1,
+            "pairwise_similar",
+            json!({
+                "keys": ["alice", "bob"],
+                "field": "emb",
+                "k": 10,
+                "min": 0.0
+            }),
+        );
+        assert!(
+            !is_error(&resp),
+            "pairwise_similar must not error: {resp:?}"
+        );
+        let result = tool_text(&resp);
+        let results = result["results"].as_array().expect("results");
+        assert_eq!(results.len(), 2);
+        for row in results {
+            let key = row["key"].as_str().expect("key");
+            let neighbors = row["neighbors"].as_array().expect("neighbors");
+            assert!(
+                neighbors.iter().all(|n| n["key"].as_str() != Some(key)),
+                "self must be excluded: {row}"
+            );
+            assert!(!neighbors.is_empty(), "alice/bob are identical: {row}");
+        }
     }
 
     #[test]

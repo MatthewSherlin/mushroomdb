@@ -1428,6 +1428,9 @@ fn index_scan_ids(
     value: &Operand,
     params: &Params,
 ) -> Result<Vec<u32>, String> {
+    if is_identity_eq_field(field) {
+        return identity_eq_ids(view, vars, row, label, field, value, params);
+    }
     let resolved = resolve_operand(view, vars, row, value, params)?;
     if let (Some(label_str), Some(val)) = (label, resolved.as_ref()) {
         if let Some(ids) = view.nodes_with_prop(label_str, field, val) {
@@ -1445,6 +1448,64 @@ fn index_scan_ids(
         }
     }
     Ok(out)
+}
+
+/// Tagged `IndexScan` mode for `field ∈ {key, id}` (`IdentityEq`).
+///
+/// ScanKey the resolved string, keep the node only if stored-wins identity
+/// equals the value, then union any other node whose stored `field` equals
+/// the value (property index when declared, else a label/property filter).
+#[allow(clippy::too_many_arguments)]
+fn identity_eq_ids(
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    label: Option<&str>,
+    field: &str,
+    value: &Operand,
+    params: &Params,
+) -> Result<Vec<u32>, String> {
+    let resolved = resolve_operand(view, vars, row, value, params)?;
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(id) = resolve_scan_key_id(view, vars, row, value, label, params)? {
+        let props = [(field.to_string(), value.clone())];
+        if node_matches(view, vars, row, id, None, &props, params)? {
+            seen.insert(id);
+            out.push(id);
+        }
+    }
+    if let Some(val) = resolved.as_ref() {
+        for id in stored_identity_hits(view, label, field, val) {
+            if seen.insert(id) {
+                out.push(id);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Nodes whose *stored* `field` equals `val` (no identity fallback).
+fn stored_identity_hits(
+    view: &GraphView,
+    label: Option<&str>,
+    field: &str,
+    val: &Value,
+) -> Vec<u32> {
+    if let Some(label_str) = label {
+        if let Some(ids) = view.nodes_with_prop(label_str, field, val) {
+            return ids;
+        }
+    }
+    let mut out = Vec::new();
+    for id in scan_ids(view, label) {
+        if let Some(got) = view.prop(id, field).map(|vr| vr.into_value()) {
+            if values_equal(&got, val) {
+                out.push(id);
+            }
+        }
+    }
+    out
 }
 
 /// Execute an `IndexScan`: seed rows from nodes of `label` whose scalar
@@ -1640,6 +1701,7 @@ const SCALAR_FUNCS: &[&str] = &[
     "toString",
     "decay",
     "key",
+    "id",
     "labels",
 ];
 
@@ -1763,28 +1825,29 @@ fn eval_func(
                 None => Ok(None), // null binding → null (optional match scenario)
             }
         }
-        "key" => {
+        "key" | "id" => {
+            let fname = if norm == "id" { "id" } else { "key" };
             if args.len() != 1 {
                 return Err(format!(
-                    "key() requires exactly 1 argument, got {}",
+                    "{fname}() requires exactly 1 argument, got {}",
                     args.len()
                 ));
             }
-            // Argument must be a node variable (Cell::Node) — the node's key
-            // string is not a property, so `n.key` cannot express it.
             let Operand::Var(var_name) = &args[0] else {
-                return Err("key() argument must be a node variable (e.g. key(n))".to_string());
+                return Err(format!(
+                    "{fname}() argument must be a node variable (e.g. {fname}(n))"
+                ));
             };
             let slot = vars
                 .slot(var_name)
-                .ok_or_else(|| format!("unbound variable `{var_name}` in key()"))?;
+                .ok_or_else(|| format!("unbound variable `{var_name}` in {fname}()"))?;
             match row.get(slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Node(id)) => Ok(Some(Value::Str(view.key_of(*id).to_owned()))),
                 Some(Cell::Rel(_)) => Err(format!(
-                    "key() argument `{var_name}` is a relationship, not a node"
+                    "{fname}() argument `{var_name}` is a relationship, not a node"
                 )),
                 Some(Cell::Scalar(_) | Cell::Path(_)) => {
-                    Err(format!("key() argument `{var_name}` is not a node"))
+                    Err(format!("{fname}() argument `{var_name}` is not a node"))
                 }
                 None => Ok(None), // null binding → null (optional match scenario)
             }
@@ -2025,7 +2088,7 @@ fn resolve_operand(
         Operand::Index { base, index } => {
             let base_val = resolve_operand(view, vars, row, base, params)?;
             let idx_val = resolve_operand(view, vars, row, index, params)?;
-            Ok(index_list(base_val, idx_val))
+            Ok(crate::value_ops::index_list(base_val, idx_val))
         }
         Operand::Case { branches, default } => {
             for (cond, value) in branches {
@@ -2087,43 +2150,27 @@ fn resolve_operand(
     }
 }
 
-/// One element of a list value, openCypher subscript semantics.
-///
-/// A negative index counts from the end. A non-list base, a non-integer
-/// index, or an out-of-range index all give null — a subscript reads like a
-/// property that is not there, never an error.
-fn index_list(base: Option<Value>, index: Option<Value>) -> Option<Value> {
-    let (Some(Value::List(items)), Some(idx)) = (base, index) else {
-        return None;
-    };
-    let i = match idx {
-        Value::Int(n) => n,
-        Value::Float(f) if f.fract() == 0.0 && f.is_finite() => f as i64,
-        _ => return None,
-    };
-    let len = i64::try_from(items.len()).ok()?;
-    let pos = if i < 0 { len.checked_add(i)? } else { i };
-    if pos < 0 || pos >= len {
-        return None;
-    }
-    items.into_iter().nth(pos as usize)
-}
-
-/// True for the two field names that read node identity rather than a stored
+/// True for field names that read node identity rather than a stored
 /// property. See [`node_identity_prop`].
 fn is_identity_field(field: &str) -> bool {
-    field == "key" || field == "label"
+    field == "key" || field == "id" || field == "label"
 }
 
-/// Node identity exposed as a property: `n.key` and `n.label`.
+/// Identity equality fields that plan as a tagged `IndexScan` (`IdentityEq`):
+/// `n.key` / `n.id` / `key(n)` / `id(n)`. `n.label` is not a key lookup.
+fn is_identity_eq_field(field: &str) -> bool {
+    field == "key" || field == "id"
+}
+
+/// Node identity exposed as a property: `n.key`, `n.id`, and `n.label`.
 ///
-/// Neither is stored in the column store — the key lives in the id map and
-/// the label in the interner — so `n.key` used to read as null while
-/// `key(n)` worked. A property of the same name always wins, so a graph that
-/// really does store a `key` field keeps it.
+/// The key lives in the id map and the label in the interner — so `n.id`
+/// used to read as null while `{id:}` already did a key lookup. A property
+/// of the same name always wins, so a graph that really does store an `id`
+/// or `key` field keeps it. `n.id` is an alias of `n.key`.
 fn node_identity_prop(view: &GraphView, id: u32, field: &str) -> Option<Value> {
     match field {
-        "key" => view.ids.key_of(id).map(|k| Value::Str(k.to_owned())),
+        "key" | "id" => view.ids.key_of(id).map(|k| Value::Str(k.to_owned())),
         "label" => view.label_of(id).map(|l| Value::Str(l.to_owned())),
         _ => None,
     }
@@ -3826,9 +3873,9 @@ fn pull_rows(
                 None
             });
 
-            // `n.key` / `n.label` are not columns, so the fused path would
-            // see an empty column and drop every row. Fall through to the
-            // generic path, which goes through `resolve_prop`.
+            // `n.key` / `n.id` / `n.label` are not columns, so the fused path
+            // would see an empty column and drop every row. Fall through to
+            // the generic path, which goes through `resolve_prop`.
             let fused_filter = fused_filter.filter(|(f, _, _)| !is_identity_field(f));
             if let Some((field, cmp_op_ref, lit)) = fused_filter {
                 // Fused scan+filter: column resolved once, comparison done
@@ -8094,6 +8141,217 @@ LIMIT 10";
         fx.add("N", "a", vec![("key", s("stored"))]);
         let rs = run(&fx.view(), "MATCH (n:N) RETURN n.key", &BTreeMap::new()).unwrap();
         assert_eq!(rows_of(&rs), vec![vec![Some(s("stored"))]]);
+    }
+
+    /// `n.id` / `id(n)` fall back to the id-map key when no stored `id` exists.
+    #[test]
+    fn n_id_falls_back_to_key_when_unstored() {
+        let mut fx = Fx::new();
+        fx.add("Person", "alice", vec![]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), n.key",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&rs),
+            vec![vec![Some(s("alice")), Some(s("alice")), Some(s("alice"))]]
+        );
+    }
+
+    /// A stored `id` property wins over the node's key, including in WHERE.
+    ///
+    /// Every assertion here also held before `n.id` resolved at all — an
+    /// unstored `n.id` was null, so `WHERE n.id = 'k'` was empty for the wrong
+    /// reason. What gives the test its teeth is the second node: `fallback`
+    /// stores no `id`, so it is reachable only once `n.id` falls back to the
+    /// key, and it must *not* be dragged in by the stored-wins hit.
+    #[test]
+    fn stored_id_property_wins_over_key() {
+        let mut fx = Fx::new();
+        fx.add("N", "k", vec![("id", s("other"))]);
+        fx.add("N", "fallback", vec![]);
+        let v = fx.view();
+        let by_key = run(
+            &v,
+            "MATCH (n:N) WHERE n.id = 'fallback' RETURN key(n) AS k",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            col(&by_key, "k"),
+            vec![Some(s("fallback"))],
+            "a node with no stored id is found by its key, and the stored-id \
+             node is not swept in with it"
+        );
+        let miss = run(
+            &v,
+            "MATCH (n:N) WHERE n.id = 'k' RETURN n.id",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert!(
+            miss.is_empty(),
+            "stored id must win: WHERE n.id = key is empty"
+        );
+        let hit = run(
+            &v,
+            "MATCH (n:N) WHERE n.id = 'other' RETURN n.id",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rows_of(&hit), vec![vec![Some(s("other"))]]);
+        let projected = run(&v, "MATCH (n:N) RETURN n.id AS i", &BTreeMap::new()).unwrap();
+        let mut got: Vec<String> = col(&projected, "i")
+            .into_iter()
+            .map(|v| match v {
+                Some(Value::Str(s)) => s,
+                other => panic!("expected a string, got {other:?}"),
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["fallback".to_string(), "other".to_string()],
+            "projection is stored-wins per node: the stored id for one, the \
+             key fallback for the other"
+        );
+    }
+
+    /// `id()` on a non-node is a named error of the same class as `key()`.
+    #[test]
+    fn id_function_rejects_non_node() {
+        let (fx, _, _) = single_edge();
+        let v = fx.view();
+        let key_err = run(&v, "MATCH (a)-[r:T]->(b) RETURN key(r)", &BTreeMap::new())
+            .expect_err("key() on a relationship must error");
+        let id_err = run(&v, "MATCH (a)-[r:T]->(b) RETURN id(r)", &BTreeMap::new())
+            .expect_err("id() on a relationship must error");
+        assert!(
+            key_err.contains("not a node"),
+            "key() error class: {key_err}"
+        );
+        assert!(id_err.contains("not a node"), "id() error class: {id_err}");
+        assert!(
+            id_err.contains("id()"),
+            "id() error must name itself: {id_err}"
+        );
+    }
+
+    /// `WHERE n.id = lit` on an unstored id is a ScanKey, not a label scan.
+    #[test]
+    fn where_n_id_eq_literal_uses_scan_key() {
+        let mut fx = Fx::new();
+        fx.add("Person", "alice", vec![]);
+        let fires_before = super::SCAN_KEY_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:Person) WHERE n.id = 'alice' RETURN n",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let fires_after = super::SCAN_KEY_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fires_after > fires_before,
+            "SCAN_KEY_FIRES must increment; before={fires_before} after={fires_after}"
+        );
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("alice"))]]);
+    }
+
+    /// `WHERE n.key = $k` uses ScanKey.
+    #[test]
+    fn where_n_key_eq_param_uses_scan_key() {
+        let mut fx = Fx::new();
+        fx.add("Person", "alice", vec![]);
+        let mut params = BTreeMap::new();
+        params.insert("k".to_string(), s("alice"));
+        let fires_before = super::SCAN_KEY_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:Person) WHERE n.key = $k RETURN n",
+            &params,
+        )
+        .unwrap();
+        let fires_after = super::SCAN_KEY_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fires_after > fires_before,
+            "SCAN_KEY_FIRES must increment; before={fires_before} after={fires_after}"
+        );
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("alice"))]]);
+    }
+
+    /// `key(n)` is always the id-map key, never a stored property of that name.
+    /// A node carrying `key = 'K'` as a property must NOT match `key(n) = 'K'`
+    /// when its own key is something else — the identity-eq fold must not
+    /// apply the `n.key` stored-wins rule to the function form.
+    #[test]
+    fn where_key_func_ignores_a_stored_key_property() {
+        let mut fx = Fx::new();
+        fx.add("N", "a", vec![("key", s("K"))]);
+        fx.add("N", "K", vec![]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:N) WHERE key(n) = 'K' RETURN key(n) AS k",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let got: Vec<Option<Value>> = col(&rs, "k");
+        assert_eq!(
+            got,
+            vec![Some(s("K"))],
+            "key(n) is the id-map key: only the node keyed K matches, not the \
+             node whose stored `key` property is K"
+        );
+    }
+
+    /// `id(n)` is always the id-map key, so a stored `id` property must not
+    /// hide a node from `WHERE id(n) = <its own key>`.
+    #[test]
+    fn where_id_func_ignores_a_stored_id_property() {
+        let mut fx = Fx::new();
+        fx.add("N", "k", vec![("id", s("other"))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:N) WHERE id(n) = 'k' RETURN id(n) AS k",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            col(&rs, "k"),
+            vec![Some(s("k"))],
+            "id(n) is the id-map key: a stored `id` property must not suppress \
+             the match"
+        );
+    }
+
+    /// The property form is stored-wins, and the fold answers with the union:
+    /// the node whose *stored* `id` is the value, plus the node whose *key* is
+    /// the value and which stores no `id`. Spec §5.2.
+    #[test]
+    fn where_n_id_respects_stored_wins() {
+        let mut fx = Fx::new();
+        fx.add("N", "k", vec![("id", s("other"))]);
+        fx.add("N", "other", vec![]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:N) WHERE n.id = 'other' RETURN key(n) AS k",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let mut got: Vec<String> = col(&rs, "k")
+            .into_iter()
+            .map(|v| match v {
+                Some(Value::Str(s)) => s,
+                other => panic!("expected a string key, got {other:?}"),
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["k".to_string(), "other".to_string()],
+            "stored-wins union: the stored-id node and the key-fallback node"
+        );
     }
 
     /// `labels(n)` returns the node's label list; `n.label` is the scalar

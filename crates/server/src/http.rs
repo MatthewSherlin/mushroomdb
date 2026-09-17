@@ -25,8 +25,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use core_api::{
     is_write_query, json_to_rows, json_to_value, AsOfScope, AutoFk, BackupReport, BatchOp,
-    DegreeConfig, Dir, GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig, ResultSet,
-    SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
+    DegreeConfig, Dir, GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig,
+    PropPredicate, ResultSet, SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -378,6 +378,7 @@ fn build_app(
         .route("/rules", post(create_rule))
         .route("/suggest", get(suggest))
         .route("/explain", get(explain))
+        .route("/find_similar", post(find_similar))
         .route("/node/{key}", get(node_info))
         .route("/node/{key}", axum::routing::delete(delete_node))
         .route("/node/{key}/edges", get(node_edges))
@@ -1573,7 +1574,7 @@ async fn neighborhood(
         };
         return match g.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &mask) {
             Some(rs) => json_ok(result_set_json(&rs)),
-            None => graph_err(GraphError::KeyNotFound { key: key.clone() }),
+            None => key_not_found(key),
         };
     }
 
@@ -1587,7 +1588,97 @@ async fn neighborhood(
     };
     match rs {
         Ok(rs) => json_ok(result_set_json(&rs)),
+        Err(GraphError::KeyNotFound { key }) => key_not_found(key),
         Err(e) => graph_err(e),
+    }
+}
+
+/// `POST /find_similar` — vector kNN. First-class read, not `/algo/*`, so a
+/// role token is allowed and a client `mask` intersects the role (never widens).
+/// Default `min` is **0.0** (Python), not MCP vector-mode 0.8.
+async fn find_similar(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+    Json(body): Json<Js>,
+) -> Response {
+    let field = match body.get("field").and_then(Js::as_str) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return err_response("missing field"),
+    };
+    let vector = match parse_find_similar_vector(body.get("vector")) {
+        Ok(v) => v,
+        Err(e) => return err_response(e),
+    };
+    let k = match body.get("k") {
+        None | Some(Js::Null) => 10usize,
+        Some(v) => match v.as_u64() {
+            Some(n) => n as usize,
+            None => return err_response("k must be a non-negative integer"),
+        },
+    };
+    let min = match body.get("min") {
+        None | Some(Js::Null) => 0.0,
+        Some(v) => match v.as_f64() {
+            Some(n) => n,
+            None => return err_response("min must be a number"),
+        },
+    };
+    let label = match body.get("label").and_then(Js::as_str) {
+        None | Some("") => None,
+        Some(s) => Some(s.to_string()),
+    };
+    let mask_keys = match parse_mask_keys(body.get("mask")) {
+        Ok(m) => m,
+        Err(e) => return err_response(e),
+    };
+    let where_pred = match parse_where_body(body.get("where")) {
+        Ok(p) => p,
+        Err(detail) => return graph_err(GraphError::QueryError { detail }),
+    };
+    let exact = match body.get("exact") {
+        None | Some(Js::Null) => false,
+        Some(v) => match v.as_bool() {
+            Some(b) => b,
+            None => return err_response("exact must be a boolean"),
+        },
+    };
+    let exact = exact || where_pred.is_some();
+    let role_name = match identity {
+        AuthIdentity::Role(r) => Some(r),
+        AuthIdentity::Full => None,
+    };
+    let db = state.db.clone();
+    match tokio::task::spawn_blocking(move || {
+        let g = db.read();
+        let role_mask = match role_name.as_deref() {
+            Some(role) => Some(g.mask_for_role(role)?),
+            None => None,
+        };
+        let client_mask = mask_keys
+            .as_ref()
+            .map(|keys| NodeMask::from_keys(&*g, keys.iter().map(String::as_str)));
+        let effective = match (role_mask, client_mask) {
+            (Some(role), Some(client)) => Some(role.intersect(&client)),
+            (Some(role), None) => Some(role),
+            (None, Some(client)) => Some(client),
+            (None, None) => None,
+        };
+        g.find_similar_vector_filtered(
+            &field,
+            label.as_deref(),
+            &vector,
+            k,
+            min,
+            effective.as_ref(),
+            where_pred.as_ref(),
+            exact,
+        )
+    })
+    .await
+    {
+        Ok(Ok(hits)) => json_ok(json!({ "hits": hits })),
+        Ok(Err(e)) => role_mask_err(e),
+        Err(_) => err_response("find_similar task panicked"),
     }
 }
 
@@ -2234,6 +2325,55 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// `depth=4294967295` would otherwise traverse the whole graph under the read
 /// guard, starving writers).
 const MAX_NEIGHBORHOOD_DEPTH: u32 = 64;
+
+/// Parse `POST /find_similar` `vector` — a non-empty array of numbers.
+fn parse_find_similar_vector(v: Option<&Js>) -> Result<Vec<f64>, String> {
+    let Some(arr) = v.and_then(Js::as_array) else {
+        return Err("missing vector".into());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        match item.as_f64() {
+            Some(n) => out.push(n),
+            None => return Err("vector must be an array of numbers".into()),
+        }
+    }
+    if out.is_empty() {
+        return Err("vector must be a non-empty array of numbers".into());
+    }
+    Ok(out)
+}
+
+/// Parse an optional JSON `mask` array of node keys.
+fn parse_mask_keys(v: Option<&Js>) -> Result<Option<Vec<String>>, String> {
+    match v {
+        None | Some(Js::Null) => Ok(None),
+        Some(Js::Array(arr)) => {
+            let mut keys = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item.as_str() {
+                    Some(s) => keys.push(s.to_string()),
+                    None => return Err("mask must be an array of strings".into()),
+                }
+            }
+            Ok(Some(keys))
+        }
+        Some(_) => Err("mask must be an array of strings".into()),
+    }
+}
+
+/// Parse optional `where` as a `PropPredicate`. Invalid predicates are QueryError.
+fn parse_where_body(v: Option<&Js>) -> Result<Option<PropPredicate>, String> {
+    match v {
+        None | Some(Js::Null) => Ok(None),
+        Some(w) => {
+            let pred: PropPredicate =
+                serde_json::from_value(w.clone()).map_err(|e| format!("where: {e}"))?;
+            pred.validate_named("where")?;
+            Ok(Some(pred))
+        }
+    }
+}
 
 /// Parse and bound the neighborhood `depth` query parameter.
 fn resolve_neighborhood_depth(raw: Option<&str>) -> Result<u32, String> {
