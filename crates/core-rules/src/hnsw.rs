@@ -2514,6 +2514,34 @@ mod tests {
             0,
             "a second search on a warm index must reuse the beam visited buffer"
         );
+
+        // Comparing the implementation with itself proves it is deterministic,
+        // not that it is right: a scratch buffer that leaked state between
+        // queries would corrupt both runs identically and satisfy every
+        // assertion above. Anchor it to an answer computed without the index at
+        // all. At this size the beam visits the whole graph, so the approximate
+        // path owes the exact one its ids in order.
+        let mut exact: Vec<(u32, f64)> = vecs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let dot: f64 = v.iter().zip(q.iter()).map(|(a, b)| a * b).sum();
+                (i as u32, dot)
+            })
+            .collect();
+        exact.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        let want: Vec<u32> = exact.iter().take(k).map(|(id, _)| *id).collect();
+        let got: Vec<u32> = baseline.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            got, want,
+            "the beam must return the exact top-k for a graph this small; a \
+             scratch buffer carrying state between queries would show up here \
+             and nowhere above"
+        );
     }
 
     #[test]

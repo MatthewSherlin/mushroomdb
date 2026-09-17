@@ -1,5 +1,102 @@
 # Changelog
 
+## v0.6.9 — engine polish
+
+Surfaces that told the truth about themselves, mostly. Cypher's identity fields
+resolve and plan as point lookups instead of label scans; a write statement's
+`RETURN` evaluates what a read's does; the MCP and HTTP surfaces gained the two
+exact-read entry points 0.6.8 left out; and the vector index now persists the
+judgements it makes about vectors it cannot hold, instead of re-deriving them on
+every open. No snapshot-format change: stores stay V9 and upgrade in place.
+
+#### Added
+
+- **`n.id` and `id(n)` read the node key**, with the same stored-wins rule
+  `n.key` / `key(n)` already had: a stored property of that name beats the key
+  for the property form, and the function form is always the id-map key.
+- **Identity equality is a point lookup.** `WHERE n.key` / `n.id` / `key(n)` /
+  `id(n)` against a literal or `$param` plans as `ScanKey` rather than a label
+  scan. The property form keeps stored-wins by filtering the key hit and
+  unioning nodes whose stored field matches; the function form is the key
+  lookup alone.
+- **Write-statement `RETURN` evaluates `CASE` and list subscripts**, and
+  identity fields, the same way a read `RETURN` does.
+- **Python `query_at` takes `role=` and `namespace=`** like live `query`, and
+  **`upsert_node`'s update is one commit** rather than one per property.
+- **`POST /find_similar`** over HTTP, taking `field`, `vector`, `k`, `min`,
+  `label`, `mask`, `where` and `exact`. A role token's mask intersects a
+  caller-supplied one; it never widens.
+- **MCP `pairwise_similar`**, listed immediately after `find_similar`.
+- **MHNS blob version 4 persists parked vectors and refusals.** The blob now
+  carries `dim_mismatches`, the refused node ids and the parked rows (in the
+  slab's `f32` unit), so a reopen restores them instead of re-deriving them by
+  re-offering every vector. The open-time scan and the sliced build both skip
+  ids the index already accounts for. `complete` is still the blob's last field,
+  so the completeness check reads it without decoding. **A 0.6.8 binary meeting a
+  v4 blob fails its version check and falls back to the exhaustive scan —
+  slower, never wrong**, the same contract v3 already had. Snapshot `VERSION`
+  is unchanged at 9.
+- **`ingest-git` reports `evicted` beside `deleted`.** A node dropped because
+  the path it was renamed *to* did not survive the window is an eviction: no
+  path the window deleted ever named it. A rename into an excluded path stays a
+  delete. Both print in the summary and both appear in the JSON.
+
+#### Changed
+
+- **The association listing is sixteen tools**, `pairwise_similar` added after
+  `find_similar`.
+- **Unscoped MCP `stats` omits `namespaces` entirely.** Passing `role` or
+  `namespace` still returns the roster that argument may see. Omitted rather
+  than emptied: `"namespaces": []` still discloses that a roster exists.
+- **HTTP `neighborhood` answers 404 for an absent key**, body
+  `node key not found: {key}`, matching the other node routes.
+- **`sanitize` covers bidi and zero-width characters**, not only ASCII
+  controls: U+0085, U+2028, U+2029, U+200B–U+200F, U+202A–U+202E, U+2066–U+2069
+  and U+FEFF. One char in, one char out, so a character budget is unaffected and
+  the byte length can only shrink. Neutralising only the four code points that
+  prompted this would have left U+202D and U+0085 as bypasses.
+- **`masks.md` and `service.md` join the docs bundle**, closing a 0.6.5/0.6.6
+  known limit.
+- **Kernel scratch is reused** across beam searches, and GEMM `pack` skips a
+  second L2 on a vector that is already unit. Hits, order and
+  distance-evaluation counts are unchanged on a fixed seed.
+
+#### Fixed
+
+- **`WHERE key(n) = 'x'` and `WHERE id(n) = 'x'` returned the wrong rows.** The
+  identity fold tagged the function form with the same field name as the
+  property form, so the stored-wins rule was applied to it: a node whose stored
+  `key` property was `'K'` matched `key(n) = 'K'` though its own key was not,
+  and a node whose stored `id` differed from its key was hidden from
+  `id(n) = <its key>`. Found in review before release; the function form now
+  plans as a plain `ScanKey`.
+- **The docs claimed `n.id` is always null and `n.key` does not resolve.** Both
+  were true before this release and are not now.
+- **The `OpenOptions` snippet in the format-stability page compiles.**
+
+#### Known limits
+
+- **The scale benchmark's two growth assertions stay red.** The build grows
+  15.48× from 2,000 to 10,000 vectors against a ceiling of 8×, and 50,000
+  vectors take 1,018.05 s against a ceiling of 300 s. Those are the figures
+  committed in
+  [`benchmarks/results/hnsw-scale-0.6.6.md`](benchmarks/results/hnsw-scale-0.6.6.md);
+  nothing here re-measures them, and closing either means cutting the
+  distance-evaluation count itself.
+- **Degree is unique-neighbour, and multiplicity is not in this release.**
+  Topology stores a set, so a duplicate insert does not raise the count, and
+  unresolved NULL targets stay outside the readout. A persisted per-pair insert
+  count needs a write-ahead-log record that does not exist yet, and adding one
+  would make a store written here unreadable by 0.6.8 — too much for a polish
+  patch, so it moves to the next one.
+- **HNSW search is still approximate unless you ask otherwise.** `exact=True`
+  or a `where=` predicate force the exact GEMM path; `mask=` alone rides the
+  widening beam. Approximate `VectorSimilar` rules still go through the index.
+- **The MCP surface is still cooperative, with no auth.** Omitting the
+  namespace roster from an unscoped `stats` removes a disclosure; it is not an
+  access boundary. Real enforcement is the HTTP server's role tokens, where
+  `GET /stats` is closed to them outright.
+
 ## v0.6.8 — sidecar exact reads
 
 #### Added

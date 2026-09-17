@@ -4302,7 +4302,12 @@ impl RuleEngine {
             let idx = self.indexes.get_mut(name).unwrap();
             match src_h {
                 Some(h) => {
-                    skip.0 = h.node_ids();
+                    // `accounted_ids`, for the reason the open path and the
+                    // sliced build use it: a carried graph keeps its parked and
+                    // refused state in memory, and re-offering a parked vector
+                    // destroys it — `insert` supersedes the parked copy and
+                    // then refuses the vector against the elected stride.
+                    skip.0 = h.accounted_ids();
                     idx.src_side.adopt_hnsw(h);
                 }
                 None => {
@@ -4312,7 +4317,8 @@ impl RuleEngine {
             }
             match dst_h {
                 Some(h) => {
-                    skip.1 = h.node_ids();
+                    // Same reason as the src side above.
+                    skip.1 = h.accounted_ids();
                     idx.dst_side.adopt_hnsw(h);
                 }
                 None => {

@@ -7,12 +7,12 @@
     "source": "github",
     "id": "1334631677"
   },
-  "version": "0.6.8",
+  "version": "0.6.9",
   "packages": [
     {
       "registryType": "cargo",
       "identifier": "mushroomdb-cli",
-      "version": "0.6.8",
+      "version": "0.6.9",
       "runtimeHint": "cargo",
       "transport": {
         "type": "stdio"

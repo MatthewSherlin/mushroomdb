@@ -8161,11 +8161,30 @@ LIMIT 10";
     }
 
     /// A stored `id` property wins over the node's key, including in WHERE.
+    ///
+    /// Every assertion here also held before `n.id` resolved at all — an
+    /// unstored `n.id` was null, so `WHERE n.id = 'k'` was empty for the wrong
+    /// reason. What gives the test its teeth is the second node: `fallback`
+    /// stores no `id`, so it is reachable only once `n.id` falls back to the
+    /// key, and it must *not* be dragged in by the stored-wins hit.
     #[test]
     fn stored_id_property_wins_over_key() {
         let mut fx = Fx::new();
         fx.add("N", "k", vec![("id", s("other"))]);
+        fx.add("N", "fallback", vec![]);
         let v = fx.view();
+        let by_key = run(
+            &v,
+            "MATCH (n:N) WHERE n.id = 'fallback' RETURN key(n) AS k",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            col(&by_key, "k"),
+            vec![Some(s("fallback"))],
+            "a node with no stored id is found by its key, and the stored-id \
+             node is not swept in with it"
+        );
         let miss = run(
             &v,
             "MATCH (n:N) WHERE n.id = 'k' RETURN n.id",
@@ -8183,8 +8202,21 @@ LIMIT 10";
         )
         .unwrap();
         assert_eq!(rows_of(&hit), vec![vec![Some(s("other"))]]);
-        let projected = run(&v, "MATCH (n:N) RETURN n.id", &BTreeMap::new()).unwrap();
-        assert_eq!(rows_of(&projected), vec![vec![Some(s("other"))]]);
+        let projected = run(&v, "MATCH (n:N) RETURN n.id AS i", &BTreeMap::new()).unwrap();
+        let mut got: Vec<String> = col(&projected, "i")
+            .into_iter()
+            .map(|v| match v {
+                Some(Value::Str(s)) => s,
+                other => panic!("expected a string, got {other:?}"),
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["fallback".to_string(), "other".to_string()],
+            "projection is stored-wins per node: the stored id for one, the \
+             key fallback for the other"
+        );
     }
 
     /// `id()` on a non-node is a named error of the same class as `key()`.
