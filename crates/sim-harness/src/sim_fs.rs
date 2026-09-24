@@ -60,6 +60,7 @@ fn name(f: FileId) -> &'static str {
         FileId::Snapshot => "snapshot",
         FileId::SnapshotBak => "snapshot_bak",
         FileId::Roles => "roles",
+        FileId::CommitTimes => "commit_times",
     }
 }
 

@@ -102,6 +102,26 @@ pub enum GraphError {
     /// statement (CREATE / MERGE / MATCH…SET / DELETE). The HTTP layer maps
     /// this to 400 Bad Request with body `{"error":"masked queries are read-only"}`.
     MaskedReadOnly,
+    /// A date was given to a history surface on a store that records no commit
+    /// times.
+    ///
+    /// Written by a release before v0.6.11, or its `commit_times.bin` sidecar
+    /// was removed. The store is intact and every commit-indexed read still
+    /// works; only date resolution is unavailable. Pass a commit index instead.
+    ///
+    /// This is deliberately not a `Corrupt`: an unreadable sidecar degrades the
+    /// date surface, it does not damage the store.
+    NoRecordedTime,
+    /// A date predates the oldest commit time the store still records.
+    ///
+    /// `floor_commit` is the oldest commit the map describes and `floor_ms` is
+    /// its recorded time. The shape follows [`GraphError::CommitOutOfRange`]
+    /// deliberately: name the range that can be answered rather than guessing a
+    /// commit. Retrying with an earlier instant will fail the same way.
+    TimeBeforeFloor {
+        floor_ms: i64,
+        floor_commit: u64,
+    },
     /// A role-scoped write was denied by the authz decision table (§3, §4.3).
     ///
     /// `reason` carries the verbatim §4.3 error body text (without the JSON
@@ -206,6 +226,19 @@ impl std::fmt::Display for GraphError {
             GraphError::QueryError { detail } => write!(f, "query error: {detail}"),
             GraphError::IngestError { detail } => write!(f, "ingest error: {detail}"),
             GraphError::ReadOnly => write!(f, "as-of instances are read-only"),
+            GraphError::NoRecordedTime => write!(
+                f,
+                "this store records no commit times; pass a commit index instead \
+                 of a date"
+            ),
+            GraphError::TimeBeforeFloor {
+                floor_ms,
+                floor_commit,
+            } => write!(
+                f,
+                "no commit time is recorded that early; the oldest is commit \
+                 {floor_commit} at {floor_ms} ms"
+            ),
             GraphError::CommitOutOfRange {
                 commit,
                 total,
