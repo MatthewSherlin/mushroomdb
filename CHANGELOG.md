@@ -241,12 +241,21 @@ limits**.
 
 #### Known limits
 
-- **The scale benchmark's two growth assertions stay red.** The build grows
-  15.48× from 2,000 to 10,000 vectors against a ceiling of 8×, and 50,000 vectors
-  take 1,018.05 s against a ceiling of 300 s. Those are the figures committed in
-  [`benchmarks/results/hnsw-scale-0.6.6.md`](benchmarks/results/hnsw-scale-0.6.6.md);
-  nothing here re-measures them, and closing either means cutting the
-  distance-evaluation count itself.
+- **The scale benchmark's growth assertions stay red — and there are three of
+  them, not two.** The build grows 15.48× from 2,000 to 10,000 vectors against a
+  ceiling of 8×; 50,000 vectors take 1,018.05 s against a ceiling of 300 s; and
+  one re-embed at 50,000 costs **5.92×** what it costs at 2,000, against a
+  ceiling of 3×. That third one had never been reported: all six assertions sat
+  in a single test, the build-growth one panicked first, and an assertion that
+  fails ends its test — so the other two red ones never executed, and the count
+  was taken from the printed table instead. It is also the tightest of the three
+  and measures what a production store does most, since a changed embedding is a
+  remove plus an insert. Those are the figures committed in
+  [`benchmarks/results/hnsw-scale-0.6.6.md`](benchmarks/results/hnsw-scale-0.6.6.md),
+  and a re-run after the split confirms them within machine noise — 16.19×,
+  1,017.14 s and 5.85× — so nothing regressed and nothing was fixed: the third
+  failure was always there and nothing could report it. Closing any of them
+  means cutting the distance-evaluation count itself.
 - **`enable_multiplicity()` is not atomic, and an exception does not undo it.**
   The declaration record can already be in the log with only its fsync having
   failed, and the V10 snapshot alone can be enough for the next open to finish the
