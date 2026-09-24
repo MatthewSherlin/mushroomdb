@@ -1549,6 +1549,20 @@ pub struct GraphDb<F: Fs> {
     /// call increments this once; all events emitted from that call share the same
     /// `commit_seq` value.
     commit_seq: u64,
+    /// Commit → wall-clock map, loaded from the `commit_times.bin` sidecar at
+    /// open and appended to by `log_then_apply_with` — the one place a commit
+    /// is born. Replay does **not** stamp: `apply_frames` re-applies commits
+    /// that already happened, and `SystemTime::now()` there would record replay
+    /// time as commit time. Empty on a store written before v0.6.11, which
+    /// makes every date query answer `NoRecordedTime` rather than guess.
+    commit_times: core_storage::commit_times::CommitTimes,
+    /// `true` when `commit_times.bin` was present but would not decode.
+    ///
+    /// Mirrors `roles: None`: a damaged map must not read as "this store
+    /// records no times", because that is also what an honest pre-v0.6.11 store
+    /// says. Date queries answer `Corrupt` instead, and nothing is appended to
+    /// a file already known to be damaged.
+    commit_times_poisoned: bool,
     /// RBAC role definitions loaded from `roles.json` at open.
     ///
     /// `Some(roles)` — loaded successfully (may be empty when no roles are defined).
@@ -2270,6 +2284,8 @@ impl<F: Fs> GraphDb<F> {
             event_sink: None,
             fsync: FsyncPolicy::Strict,
             commit_seq: 0,
+            commit_times: core_storage::commit_times::CommitTimes::default(),
+            commit_times_poisoned: false,
             roles: Some(vec![]),
             role_masks: Arc::new(crate::mask::RoleMaskCache::new()),
             store_id: crate::mask::StoreId::next(),
@@ -2337,6 +2353,8 @@ impl<F: Fs> GraphDb<F> {
         // WAL, and the opt-in comes back from it or not at all.
         self.multiplicity = false;
         self.commit_seq = 0;
+        self.commit_times = core_storage::commit_times::CommitTimes::default();
+        self.commit_times_poisoned = false;
         self.roles = Some(vec![]);
         // A fresh cache, not a cleared one: any reader snapshot still holding
         // the old `Arc` keeps it to itself, so nothing it memoised against the
@@ -2591,6 +2609,17 @@ impl<F: Fs> GraphDb<F> {
         // Load roles sidecar. Missing file = no roles (Some(vec![])).
         // Corrupt/unparseable = poisoned (None); mask_for_role will fail-loud.
         db.roles = Self::load_roles_from_fs(&db.fs)?;
+        // The time sidecar. Absent is the normal case for any store written
+        // before v0.6.11 and is not an error; unreadable is recorded so date
+        // queries can say "damaged" rather than "none recorded".
+        match db.fs.read(FileId::CommitTimes) {
+            Ok(bytes) if bytes.is_empty() => {}
+            Ok(bytes) => match core_storage::commit_times::decode(&bytes) {
+                Ok(t) => db.commit_times = t,
+                Err(_) => db.commit_times_poisoned = true,
+            },
+            Err(_) => {}
+        }
         // Capture the initial MVCC fold so reader() is ready immediately.
         db.fold_now();
         trace_open!("open_with complete", _t0);
@@ -4814,6 +4843,96 @@ impl<F: Fs> GraphDb<F> {
 
     /// Durable write, then notify the event sink. Replay (`apply` during
     /// `open`) never enters this function, so it is the replay-silent seam.
+    /// Record that `seq` happened now, and append those 16 bytes to the
+    /// sidecar.
+    ///
+    /// Called from exactly one place — `log_then_apply_with`, immediately after
+    /// `commit_seq` is incremented. Every write path in the engine funnels
+    /// through that function, and replay deliberately does not: `apply_frames`
+    /// re-applies commits that already happened, so stamping there would record
+    /// replay time as commit time.
+    ///
+    /// **This is the engine's only wall-clock read.** Everything else uses
+    /// `Instant`, which is monotonic and not a date.
+    ///
+    /// Failure is swallowed on purpose. The sidecar is not part of the WAL or
+    /// the snapshot, so a failed append must not fail a commit that is already
+    /// durable — it costs a date, not data. The map is marked poisoned so the
+    /// gap is reported rather than resolved across.
+    fn stamp_commit_time(&mut self, seq: u64) {
+        if self.commit_times_poisoned {
+            return;
+        }
+        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            // A clock before 1970. Refuse to invent a timestamp.
+            self.commit_times_poisoned = true;
+            return;
+        };
+        let unix_ms = now.as_millis() as i64;
+        let first = self.commit_times.is_empty();
+        self.commit_times.push(seq, unix_ms);
+
+        let wrote = if first {
+            self.fs.write_atomic(
+                FileId::CommitTimes,
+                &core_storage::commit_times::encode(&self.commit_times),
+            )
+        } else {
+            self.fs.append(
+                FileId::CommitTimes,
+                &core_storage::commit_times::encode_entry(seq, unix_ms),
+            )
+        };
+        if wrote.is_err() {
+            self.commit_times_poisoned = true;
+        }
+    }
+
+    /// Rewrite the sidecar from memory. Used after truncation, which is the one
+    /// operation that cannot be expressed as an append.
+    fn rewrite_commit_times(&mut self) {
+        if self.commit_times_poisoned {
+            return;
+        }
+        if self
+            .fs
+            .write_atomic(
+                FileId::CommitTimes,
+                &core_storage::commit_times::encode(&self.commit_times),
+            )
+            .is_err()
+        {
+            self.commit_times_poisoned = true;
+        }
+    }
+
+    /// The greatest commit whose recorded time is at or before `unix_ms`.
+    ///
+    /// Errors name what they can answer instead of guessing a commit:
+    /// `Corrupt` when the sidecar would not decode, `NoRecordedTime` when the
+    /// store records none, `TimeBeforeFloor` when the instant predates the
+    /// oldest entry, and `CommitOutOfRange` when the answer falls below the WAL
+    /// horizon and so cannot be replayed.
+    pub fn resolve_instant(&self, unix_ms: i64) -> Result<u64> {
+        if self.commit_times_poisoned {
+            return Err(GraphError::Corrupt {
+                detail: "commit_times.bin will not decode; date queries are \
+                         unavailable on this store"
+                    .into(),
+            });
+        }
+        self.commit_times
+            .resolve_instant(unix_ms, self.wal_horizon_floor)
+    }
+
+    /// The recorded wall-clock time of `commit`, when the sidecar holds one.
+    pub fn commit_time_ms(&self, commit: u64) -> Option<i64> {
+        if self.commit_times_poisoned {
+            return None;
+        }
+        self.commit_times.time_of(commit)
+    }
+
     fn log_then_apply(&mut self, rec: WalRecord) -> Result<()> {
         self.log_then_apply_with(rec, None, self.fsync)
     }
@@ -4966,6 +5085,7 @@ impl<F: Fs> GraphDb<F> {
         }
         self.commit_seq += 1;
         let seq = self.commit_seq;
+        self.stamp_commit_time(seq);
         // Update per-node last-change map for the committed record.
         // Must happen after commit_seq is incremented so the seq is correct.
         self.update_last_change_from_rec(&rec, seq);
@@ -13484,6 +13604,12 @@ impl<F: Fs> GraphDb<F> {
                         // Step 2: advance and persist floor FIRST.
                         self.wal_horizon_floor += pruned_frames;
                         self.fs.write_horizon_floor(self.wal_horizon_floor)?;
+                        // The time map must not outlive the commits it
+                        // describes: an entry below the new floor would resolve
+                        // a date to a commit the engine can no longer replay,
+                        // which is worse than having no entry at all.
+                        self.commit_times.truncate_below(self.wal_horizon_floor);
+                        self.rewrite_commit_times();
                         // Step 3: delete genesis marker (floor > 0 already
                         // blocks open_at; this is belt-and-suspenders cleanup).
                         if pruned_frames > 0 && self.archive_genesis_chain {

@@ -38,10 +38,16 @@ pub const COMMIT_TIMES_MAGIC: [u8; 4] = *b"MTMS";
 /// versions, because this file is part of neither.
 pub const COMMIT_TIMES_VERSION: u16 = 1;
 
-/// Header: magic(4) + version(2) + floor_commit(8) + count(8).
-const HEADER_LEN: usize = 4 + 2 + 8 + 8;
+/// Header: magic(4) + version(2) + floor_commit(8).
+///
+/// Deliberately carries **no entry count**. The count is derived from the file
+/// length, which is what lets a commit append its own 16 bytes with
+/// [`crate::fs::Fs::append`] instead of rewriting the map. A counted header
+/// would make every commit O(entries) — unacceptable on the write path of a
+/// store that runs for weeks.
+pub const HEADER_LEN: usize = 4 + 2 + 8;
 /// One entry: commit(8) + unix_ms(8).
-const ENTRY_LEN: usize = 8 + 8;
+pub const ENTRY_LEN: usize = 8 + 8;
 
 /// A commit → wall-clock map, sorted by commit and append-only in practice.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -78,6 +84,14 @@ impl CommitTimes {
     /// Whether the map describes no commits at all.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// The recorded time of `commit`, when the map holds one.
+    pub fn time_of(&self, commit: u64) -> Option<i64> {
+        self.entries
+            .binary_search_by_key(&commit, |&(c, _)| c)
+            .ok()
+            .map(|i| self.entries[i].1)
     }
 
     /// Record `commit` as having happened at `unix_ms`.
@@ -123,11 +137,7 @@ impl CommitTimes {
     ///   records no times at all.
     /// - [`GraphError::TimeBeforeFloor`] — `unix_ms` predates the oldest entry.
     /// - [`GraphError::CommitOutOfRange`] — resolved below the WAL horizon.
-    pub fn resolve_instant(
-        &self,
-        unix_ms: i64,
-        wal_horizon_floor: u64,
-    ) -> Result<u64, GraphError> {
+    pub fn resolve_instant(&self, unix_ms: i64, wal_horizon_floor: u64) -> Result<u64, GraphError> {
         let Some(&(_, first_ms)) = self.entries.first() else {
             return Err(GraphError::NoRecordedTime);
         };
@@ -157,18 +167,29 @@ impl CommitTimes {
     }
 }
 
-/// Serialise to the sidecar's on-disk bytes.
+/// Serialise the whole map. Used on first write and after truncation; a plain
+/// commit appends [`encode_entry`] instead.
 pub fn encode(t: &CommitTimes) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + t.entries.len() * ENTRY_LEN);
     out.extend_from_slice(&COMMIT_TIMES_MAGIC);
     out.extend_from_slice(&COMMIT_TIMES_VERSION.to_le_bytes());
     out.extend_from_slice(&t.floor_commit.to_le_bytes());
-    out.extend_from_slice(&(t.entries.len() as u64).to_le_bytes());
     for &(commit, ms) in &t.entries {
-        out.extend_from_slice(&commit.to_le_bytes());
-        out.extend_from_slice(&ms.to_le_bytes());
+        out.extend_from_slice(&encode_entry(commit, ms));
     }
     out
+}
+
+/// One entry's 16 bytes, for appending to an existing sidecar.
+///
+/// Appending is what keeps stamping O(1) per commit. A torn append leaves a
+/// partial trailing entry, which [`decode`] refuses as `Corrupt` — degrading
+/// the date surface, never the store.
+pub fn encode_entry(commit: u64, unix_ms: i64) -> [u8; ENTRY_LEN] {
+    let mut buf = [0u8; ENTRY_LEN];
+    buf[..8].copy_from_slice(&commit.to_le_bytes());
+    buf[8..].copy_from_slice(&unix_ms.to_le_bytes());
+    buf
 }
 
 /// Parse the sidecar's on-disk bytes.
@@ -203,22 +224,20 @@ pub fn decode(bytes: &[u8]) -> Result<CommitTimes, GraphError> {
             .try_into()
             .map_err(|_| corrupt("commit_times: truncated floor".into()))?,
     );
-    let count = u64::from_le_bytes(
-        bytes[14..22]
-            .try_into()
-            .map_err(|_| corrupt("commit_times: truncated count".into()))?,
-    ) as usize;
 
+    // The count is the body length, not a header field — see HEADER_LEN. A
+    // partial trailing entry means a torn append and is refused rather than
+    // silently dropped: a half-written commit time would resolve dates to the
+    // wrong commit.
     let body = &bytes[HEADER_LEN..];
-    let want = count
-        .checked_mul(ENTRY_LEN)
-        .ok_or_else(|| corrupt(format!("commit_times: entry count {count} overflows")))?;
-    if body.len() != want {
+    if !body.len().is_multiple_of(ENTRY_LEN) {
         return Err(corrupt(format!(
-            "commit_times: header declares {count} entries ({want} bytes), body has {}",
+            "commit_times: body is {} bytes, not a whole number of {ENTRY_LEN}-byte \
+             entries — a torn append",
             body.len()
         )));
     }
+    let count = body.len() / ENTRY_LEN;
 
     let mut entries = Vec::with_capacity(count);
     let mut prev: Option<u64> = None;
@@ -342,12 +361,43 @@ mod tests {
         bytes.extend_from_slice(&COMMIT_TIMES_MAGIC);
         bytes.extend_from_slice(&COMMIT_TIMES_VERSION.to_le_bytes());
         bytes.extend_from_slice(&1u64.to_le_bytes());
-        bytes.extend_from_slice(&2u64.to_le_bytes());
-        bytes.extend_from_slice(&5u64.to_le_bytes());
-        bytes.extend_from_slice(&1_000i64.to_le_bytes());
-        bytes.extend_from_slice(&3u64.to_le_bytes());
-        bytes.extend_from_slice(&2_000i64.to_le_bytes());
+        bytes.extend_from_slice(&encode_entry(5, 1_000));
+        bytes.extend_from_slice(&encode_entry(3, 2_000));
         assert!(matches!(decode(&bytes), Err(GraphError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn an_appended_entry_decodes_as_if_the_map_were_rewritten() {
+        // This is the property that lets stamping be O(1) per commit: the
+        // writer appends 16 bytes rather than rewriting the file.
+        let mut t = CommitTimes::default();
+        t.push(1, 1_000);
+        let mut on_disk = encode(&t);
+        on_disk.extend_from_slice(&encode_entry(2, 2_000));
+
+        let mut rewritten = CommitTimes::default();
+        rewritten.push(1, 1_000);
+        rewritten.push(2, 2_000);
+
+        assert_eq!(decode(&on_disk).expect("decode"), rewritten);
+    }
+
+    #[test]
+    fn a_torn_append_is_refused_not_silently_dropped() {
+        // A half-written trailing entry must not be discarded: the map would
+        // then resolve dates to the wrong commit and never say so.
+        let mut t = CommitTimes::default();
+        t.push(1, 1_000);
+        let mut on_disk = encode(&t);
+        on_disk.extend_from_slice(&encode_entry(2, 2_000)[..9]);
+        assert!(matches!(decode(&on_disk), Err(GraphError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn a_header_only_file_decodes_as_empty() {
+        let bytes = encode(&CommitTimes::default());
+        assert_eq!(bytes.len(), HEADER_LEN);
+        assert!(decode(&bytes).expect("decode").is_empty());
     }
 
     fn fixture() -> CommitTimes {

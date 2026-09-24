@@ -53,9 +53,7 @@ fn build_measurements() -> Option<ScaleMeasurements> {
         // Not a pass. `--ignored` already keeps these out of a normal run, and
         // anyone who sweeps `--ignored` without meaning to spend twenty minutes
         // should see why nothing happened rather than a green tick.
-        println!(
-            "SKIPPED hnsw scale fixture: set MUSHROOMDB_BENCH_HNSW=1 to run it (~20 min)"
-        );
+        println!("SKIPPED hnsw scale fixture: set MUSHROOMDB_BENCH_HNSW=1 to run it (~20 min)");
         return None;
     }
     let mut build = [Duration::ZERO; 3];
