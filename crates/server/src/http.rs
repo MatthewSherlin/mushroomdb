@@ -689,6 +689,18 @@ fn graph_err(e: GraphError) -> Response {
         // §4.3: role-scoped write denials map to 403 with the verbatim reason
         // string (Display delegates to reason, so .to_string() == reason).
         GraphError::RoleWriteDenied { reason } => forbidden(&reason),
+        // Ledger row 12. `role_mask_err` already answered 500 for `Corrupt`
+        // while this catch-all answered 400, so one damaged store answered
+        // differently depending on whether the role-mask memo was warm. A
+        // corrupt store is a server-side condition: 400 tells a caller to change
+        // an input, and no input they can send will help. The message is
+        // deliberately `to_string()` — identical to what the catch-all produced
+        // — so only the status moves.
+        corrupt @ GraphError::Corrupt { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": corrupt.to_string() })),
+        )
+            .into_response(),
         GraphError::QueryError { detail } | GraphError::IngestError { detail } => {
             err_response(detail)
         }
