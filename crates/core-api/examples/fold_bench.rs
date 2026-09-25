@@ -21,7 +21,9 @@ fn main() {
     println!("seeding {n} nodes...");
     let t0 = Instant::now();
     for i in 0..n {
-        db.write().insert_node("N", &format!("n{i}"), vec![]).unwrap();
+        db.write()
+            .insert_node("N", &format!("n{i}"), vec![])
+            .unwrap();
     }
     println!("  seeded in {:?}", t0.elapsed());
 

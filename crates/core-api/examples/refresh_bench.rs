@@ -50,7 +50,10 @@ fn main() {
         let t = Instant::now();
         let applied = r.refresh().unwrap();
         total += t.elapsed();
-        assert!(applied >= 1, "refresh {i} applied nothing — the bench is wrong");
+        assert!(
+            applied >= 1,
+            "refresh {i} applied nothing — the bench is wrong"
+        );
     }
     println!(
         "{refreshes} refreshes, each applying >=1 peer commit and folding: \
