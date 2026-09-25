@@ -468,3 +468,234 @@ mod tests {
         assert_eq!(t.resolve_instant(1_500, 0).unwrap(), 20);
     }
 }
+
+// ─── RFC 3339 → unix milliseconds ────────────────────────────────────────────
+//
+// Hand-rolled on purpose. The workspace has no date crate — `ingest-git` stores
+// a git commit time as a plain `Int` and the only other time handling in the
+// tree is `duration_since(UNIX_EPOCH)` — and adding one to parse a timestamp
+// would be a runtime dependency for sixty lines of arithmetic. The civil-date
+// conversion below is the standard days-from-civil algorithm: closed form, no
+// tables, no leap seconds, and deterministic on every platform.
+
+/// Days since 1970-01-01 for a proleptic-Gregorian civil date.
+///
+/// `m` is 1–12 and `d` is 1–31; callers validate the ranges. Correct for any
+/// year the `i64` holds, negative ones included.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn digits(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<i64>().ok()
+}
+
+/// Parse an RFC 3339 instant, or a bare `YYYY-MM-DD`, to unix milliseconds.
+///
+/// Accepted:
+/// - `2026-06-19` — midnight UTC, which is what a caller asking "on that day"
+///   means
+/// - `2026-06-19T12:34:56Z`
+/// - `2026-06-19T12:34:56.789Z` — fractional seconds, truncated to ms
+/// - `2026-06-19T12:34:56+01:00` / `-05:00` — offsets are applied
+/// - a space instead of `T`
+///
+/// Returns `None` on anything else. A caller that cannot parse a date must say
+/// so rather than guess an instant — the whole point of this module is that a
+/// guessed time becomes a confidently wrong graph.
+pub fn parse_rfc3339_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, rest) = match s.find(['T', 't', ' ']) {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+
+    let mut dp = date.split('-');
+    let (y, mo, d) = (dp.next()?, dp.next()?, dp.next()?);
+    if dp.next().is_some() {
+        return None;
+    }
+    let (y, mo, d) = (digits(y)?, digits(mo)?, digits(d)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || y < 1 {
+        return None;
+    }
+    let days = days_from_civil(y, mo, d);
+
+    let Some(rest) = rest else {
+        return Some(days * 86_400_000);
+    };
+
+    // Split the offset off the time-of-day.
+    let (time, offset_ms) = if let Some(t) = rest.strip_suffix('Z').or(rest.strip_suffix('z')) {
+        (t, 0i64)
+    } else if let Some(i) = rest.rfind(['+', '-']) {
+        let (t, off) = rest.split_at(i);
+        let sign = if off.starts_with('-') { -1 } else { 1 };
+        let off = &off[1..];
+        let (oh, om) = match off.split_once(':') {
+            Some((a, b)) => (digits(a)?, digits(b)?),
+            None if off.len() == 4 => (digits(&off[..2])?, digits(&off[2..])?),
+            _ => return None,
+        };
+        if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+            return None;
+        }
+        (t, sign * (oh * 3_600_000 + om * 60_000))
+    } else {
+        // No zone. RFC 3339 requires one; treating a naked time as UTC is the
+        // forgiving reading and the one an agent writing "2026-06-19T12:00:00"
+        // means.
+        (rest, 0i64)
+    };
+
+    let mut tp = time.split(':');
+    let h = digits(tp.next()?)?;
+    let mi = digits(tp.next()?)?;
+    let (sec, frac_ms) = match tp.next() {
+        None => (0i64, 0i64),
+        Some(sec_field) => match sec_field.split_once('.') {
+            None => (digits(sec_field)?, 0),
+            Some((whole, frac)) => {
+                if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                // Truncate rather than round: the resolver takes the last commit
+                // at or before the instant, so rounding up could step past one.
+                let mut ms = 0i64;
+                for (i, b) in frac.bytes().take(3).enumerate() {
+                    ms += (b - b'0') as i64 * 10i64.pow(2 - i as u32);
+                }
+                (digits(whole)?, ms)
+            }
+        },
+    };
+    if tp.next().is_some() {
+        return None;
+    }
+    // 60 allows a leap second, which we fold into the following second.
+    if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0..=60).contains(&sec) {
+        return None;
+    }
+
+    Some(days * 86_400_000 + h * 3_600_000 + mi * 60_000 + sec * 1_000 + frac_ms - offset_ms)
+}
+
+#[cfg(test)]
+mod rfc3339_tests {
+    use super::*;
+
+    #[test]
+    fn the_epoch_is_zero() {
+        assert_eq!(parse_rfc3339_ms("1970-01-01"), Some(0));
+        assert_eq!(parse_rfc3339_ms("1970-01-01T00:00:00Z"), Some(0));
+    }
+
+    #[test]
+    fn a_bare_date_is_midnight_utc() {
+        // 2026-06-19 is the date the association benchmark's first time-travel
+        // task asks about.
+        let d = parse_rfc3339_ms("2026-06-19").expect("parse");
+        assert_eq!(d % 86_400_000, 0, "a bare date must land on midnight");
+        assert_eq!(parse_rfc3339_ms("2026-06-19T00:00:00Z"), Some(d));
+    }
+
+    #[test]
+    fn a_leap_day_parses() {
+        let feb29 = parse_rfc3339_ms("2024-02-29").expect("2024 is a leap year");
+        let mar01 = parse_rfc3339_ms("2024-03-01").expect("parse");
+        assert_eq!(mar01 - feb29, 86_400_000);
+    }
+
+    #[test]
+    fn a_century_non_leap_year_is_handled() {
+        // 1900 was not a leap year; 2000 was. The closed form must get both.
+        let a = parse_rfc3339_ms("1900-03-01").expect("parse");
+        let b = parse_rfc3339_ms("1900-02-28").expect("parse");
+        assert_eq!(a - b, 86_400_000, "1900 had no Feb 29");
+        let c = parse_rfc3339_ms("2000-03-01").expect("parse");
+        let d = parse_rfc3339_ms("2000-02-28").expect("parse");
+        assert_eq!(c - d, 2 * 86_400_000, "2000 did have Feb 29");
+    }
+
+    #[test]
+    fn time_of_day_adds_up() {
+        let base = parse_rfc3339_ms("2026-06-19").unwrap();
+        assert_eq!(
+            parse_rfc3339_ms("2026-06-19T01:02:03Z").unwrap() - base,
+            3_600_000 + 2 * 60_000 + 3_000
+        );
+    }
+
+    #[test]
+    fn fractional_seconds_truncate_to_milliseconds() {
+        let base = parse_rfc3339_ms("2026-06-19T00:00:00Z").unwrap();
+        assert_eq!(
+            parse_rfc3339_ms("2026-06-19T00:00:00.5Z").unwrap() - base,
+            500
+        );
+        assert_eq!(
+            parse_rfc3339_ms("2026-06-19T00:00:00.789Z").unwrap() - base,
+            789
+        );
+        // Truncate, never round up: rounding could step past a commit.
+        assert_eq!(
+            parse_rfc3339_ms("2026-06-19T00:00:00.9999Z").unwrap() - base,
+            999
+        );
+    }
+
+    #[test]
+    fn offsets_are_applied_in_the_right_direction() {
+        let utc = parse_rfc3339_ms("2026-06-19T12:00:00Z").unwrap();
+        // Noon in +01:00 is 11:00 UTC — an hour *earlier* in absolute time.
+        assert_eq!(
+            parse_rfc3339_ms("2026-06-19T12:00:00+01:00").unwrap(),
+            utc - 3_600_000
+        );
+        assert_eq!(
+            parse_rfc3339_ms("2026-06-19T12:00:00-05:00").unwrap(),
+            utc + 5 * 3_600_000
+        );
+        assert_eq!(
+            parse_rfc3339_ms("2026-06-19T12:00:00+0100").unwrap(),
+            utc - 3_600_000
+        );
+    }
+
+    #[test]
+    fn a_space_separator_is_accepted() {
+        assert_eq!(
+            parse_rfc3339_ms("2026-06-19 12:00:00Z"),
+            parse_rfc3339_ms("2026-06-19T12:00:00Z")
+        );
+    }
+
+    #[test]
+    fn rubbish_is_refused_rather_than_guessed() {
+        for bad in [
+            "",
+            "not a date",
+            "2026",
+            "2026-06",
+            "2026-13-01",
+            "2026-06-32",
+            "2026-06-19T25:00:00Z",
+            "2026-06-19T12:60:00Z",
+            "2026-06-19T12:00:00+99:00",
+            "2026-06-19T12:00:00.Z",
+            "2026-06-19-01",
+            "0000-01-01",
+        ] {
+            assert_eq!(parse_rfc3339_ms(bad), None, "{bad:?} must not parse");
+        }
+    }
+}

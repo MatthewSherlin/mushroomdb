@@ -2009,6 +2009,14 @@ fn graph_err(e: GraphError) -> PyErr {
                 v.setattr("dst", dst.as_str())?;
                 v.setattr("dst_ns", dst_ns.as_str())
             }),
+            GraphError::NoRecordedTime => NoRecordedTime::new_err(msg),
+            GraphError::TimeBeforeFloor {
+                floor_ms,
+                floor_commit,
+            } => err_with(py, TimeBeforeFloor::new_err(msg), |v| {
+                v.setattr("floor_ms", *floor_ms)?;
+                v.setattr("floor_commit", *floor_commit)
+            }),
         }
     })
 }
@@ -2469,6 +2477,8 @@ engine_errors! {
     MushroomBusy, "busy", "Another process holds the store's write lock.\n\nNothing was written, so retrying later is always safe. Raised only by write calls: opening read-only and reading never take the lock. Carries `.holder`, the holding process id when the platform makes it cheaply knowable and `None` otherwise — a diagnostic hint, never something to branch on.";
     NamespaceImmutable, "namespace_immutable", "A namespace is set at insert and fixed for the node's lifetime. Carries `.key`, `.from_` (spelled with a trailing underscore: `from` is a Python keyword) and `.to`.";
     CrossNamespace, "cross_namespace", "A hand-written edge would cross a namespace boundary. Carries `.src`, `.src_ns`, `.dst`, `.dst_ns`.";
+    NoRecordedTime, "no_recorded_time", "A date was given to a history call on a store that records no commit times.\n\nWritten by a release before 0.6.11, or its `commit_times.bin` sidecar was removed. The store is intact and every commit-indexed read still works; only date resolution is unavailable. Pass a commit index instead. Deliberately distinct from `Corrupt`: an absent map is not a damaged one.";
+    TimeBeforeFloor, "time_before_floor", "The date predates the oldest commit time the store still records. Carries `.floor_ms` and `.floor_commit`, the oldest entry the map can answer from. Retrying with an earlier instant fails the same way.";
 }
 
 #[pymodule]

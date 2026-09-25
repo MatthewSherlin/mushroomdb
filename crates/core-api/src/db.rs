@@ -4863,6 +4863,14 @@ impl<F: Fs> GraphDb<F> {
         if self.commit_times_poisoned {
             return;
         }
+        // `seq` is the 1-based CAS counter. Every date consumer — `edges_at`,
+        // `was_linked`, the history events — addresses history by **0-based
+        // frame index**, and `docs/site/timetravel.md:83` names these as
+        // different counters and says outright not to pass one for the other.
+        // The map records the frame index, because that is the space a resolved
+        // date is handed to. Recording `seq` shifts every date by one commit,
+        // silently, which is the exact failure this module exists to remove.
+        let frame_index = seq.saturating_sub(1);
         let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
             // A clock before 1970. Refuse to invent a timestamp.
             self.commit_times_poisoned = true;
@@ -4870,7 +4878,7 @@ impl<F: Fs> GraphDb<F> {
         };
         let unix_ms = now.as_millis() as i64;
         let first = self.commit_times.is_empty();
-        self.commit_times.push(seq, unix_ms);
+        self.commit_times.push(frame_index, unix_ms);
 
         let wrote = if first {
             self.fs.write_atomic(
@@ -4880,7 +4888,7 @@ impl<F: Fs> GraphDb<F> {
         } else {
             self.fs.append(
                 FileId::CommitTimes,
-                &core_storage::commit_times::encode_entry(seq, unix_ms),
+                &core_storage::commit_times::encode_entry(frame_index, unix_ms),
             )
         };
         if wrote.is_err() {
@@ -4913,6 +4921,9 @@ impl<F: Fs> GraphDb<F> {
     /// store records none, `TimeBeforeFloor` when the instant predates the
     /// oldest entry, and `CommitOutOfRange` when the answer falls below the WAL
     /// horizon and so cannot be replayed.
+    ///
+    /// The answer is a **0-based frame index**, ready to hand to `edges_at` or
+    /// `was_linked` without adjustment.
     pub fn resolve_instant(&self, unix_ms: i64) -> Result<u64> {
         if self.commit_times_poisoned {
             return Err(GraphError::Corrupt {
@@ -4925,7 +4936,48 @@ impl<F: Fs> GraphDb<F> {
             .resolve_instant(unix_ms, self.wal_horizon_floor)
     }
 
+    /// [`Self::edges_at`] addressed by an instant rather than a commit index.
+    ///
+    /// Resolves through [`Self::resolve_instant`] — the last commit at or
+    /// before the instant — then answers exactly as the commit-indexed call
+    /// does. A store that records no times refuses by name; it never guesses.
+    pub fn edges_at_instant(&self, key: &str, unix_ms: i64) -> Result<Vec<EdgeAt>> {
+        let commit = self.resolve_instant(unix_ms)?;
+        self.edges_at(key, commit)
+    }
+
+    /// [`Self::was_linked`] addressed by an instant rather than a commit index.
+    pub fn was_linked_at_instant(
+        &self,
+        a: &str,
+        b: &str,
+        edge_type: &str,
+        unix_ms: i64,
+    ) -> Result<bool> {
+        let commit = self.resolve_instant(unix_ms)?;
+        self.was_linked(a, b, edge_type, commit)
+    }
+
+    /// Parse an RFC 3339 instant (or a bare `YYYY-MM-DD`) and resolve it.
+    ///
+    /// The one place every caller-facing surface converts a date string, so
+    /// HTTP, MCP, Python and the CLI cannot drift in what they accept.
+    pub fn resolve_date(&self, s: &str) -> Result<u64> {
+        let ms = core_storage::commit_times::parse_rfc3339_ms(s).ok_or_else(|| {
+            GraphError::QueryError {
+                detail: format!(
+                    "could not parse {s:?} as a date; expected RFC 3339 \
+                     (2026-06-19, or 2026-06-19T12:00:00Z)"
+                ),
+            }
+        })?;
+        self.resolve_instant(ms)
+    }
+
     /// The recorded wall-clock time of `commit`, when the sidecar holds one.
+    ///
+    /// `commit` is a **0-based frame index** — the space `edges_at`,
+    /// `was_linked` and the history events use, not the 1-based `commit_seq`.
     pub fn commit_time_ms(&self, commit: u64) -> Option<i64> {
         if self.commit_times_poisoned {
             return None;
