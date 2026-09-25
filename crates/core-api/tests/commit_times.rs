@@ -396,3 +396,55 @@ fn a_read_only_handle_refuses_to_assert_a_time() {
         Err(GraphError::ReadOnly)
     ));
 }
+
+/// Asking for a date must include what happened **on** that date.
+///
+/// The bug this pins: a bare date resolved to the midnight that *starts* the
+/// day, so an edge written at 09:00 on the 14th was invisible to a caller asking
+/// for "2026-07-14". A date denotes a day, not its first instant.
+#[test]
+fn a_bare_date_includes_that_days_own_writes() {
+    let dir = tmp("day-inclusive");
+    let mut db = GraphDb::open(&dir).expect("open");
+
+    db.record_commits_at(Some(ms("2026-07-13"))).expect("13th");
+    db.insert_node("N", "a", vec![]).expect("insert");
+    db.insert_node("N", "b", vec![]).expect("insert");
+
+    // Mid-morning on the 14th.
+    let nine_am =
+        core_storage::commit_times::parse_rfc3339_ms("2026-07-14T09:00:00Z").expect("parse");
+    db.record_commits_at(Some(nine_am)).expect("14th 09:00");
+    db.insert_edge("KNOWS", "a", "b").expect("edge");
+
+    assert!(
+        db.was_linked(
+            "a",
+            "b",
+            "KNOWS",
+            db.resolve_date("2026-07-14").expect("resolve")
+        )
+        .expect("was_linked"),
+        "an edge written at 09:00 on the 14th must be visible when asking for \
+         \"2026-07-14\" — a date is a day, not the midnight that starts it"
+    );
+
+    // And the day before still excludes it.
+    assert!(
+        !db.was_linked(
+            "a",
+            "b",
+            "KNOWS",
+            db.resolve_date("2026-07-13").expect("resolve")
+        )
+        .expect("was_linked"),
+        "the edge is dated the 14th and must not be visible on the 13th"
+    );
+
+    // A named instant still means exactly itself: 08:00 is before the edge.
+    let eight = db.resolve_date("2026-07-14T08:00:00Z").expect("resolve");
+    assert!(
+        !db.was_linked("a", "b", "KNOWS", eight).expect("was_linked"),
+        "08:00 precedes the 09:00 edge"
+    );
+}

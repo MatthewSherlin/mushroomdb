@@ -600,9 +600,53 @@ pub fn parse_rfc3339_ms(s: &str) -> Option<i64> {
     Some(days * 86_400_000 + h * 3_600_000 + mi * 60_000 + sec * 1_000 + frac_ms - offset_ms)
 }
 
+/// The **inclusive end** of the instant a string denotes.
+///
+/// A bare `YYYY-MM-DD` denotes a *day*, not the midnight that starts it, so its
+/// end is `23:59:59.999` — otherwise asking for a date excludes everything that
+/// happened on that date, which is never what the question means. A string that
+/// names a time denotes that instant exactly, and its end is itself.
+///
+/// This is what date resolution wants: "the last commit at or before the end of
+/// what you named".
+pub fn parse_rfc3339_end_ms(s: &str) -> Option<i64> {
+    let t = s.trim();
+    let ms = parse_rfc3339_ms(t)?;
+    // Date-only when there is no time separator at all.
+    let date_only = !t.contains(['T', 't']) && !t.contains(' ');
+    Some(if date_only { ms + 86_400_000 - 1 } else { ms })
+}
+
 #[cfg(test)]
 mod rfc3339_tests {
     use super::*;
+
+    #[test]
+    fn a_bare_date_denotes_the_whole_day() {
+        // The bug this exists to stop: a bare date resolving to the midnight
+        // that *starts* the day excludes everything that happened on it.
+        let start = parse_rfc3339_ms("2026-07-14").unwrap();
+        let end = parse_rfc3339_end_ms("2026-07-14").unwrap();
+        assert_eq!(end - start, 86_400_000 - 1, "a date must cover its own day");
+        // Something that happened at 09:00 that day falls inside it.
+        let nine = parse_rfc3339_ms("2026-07-14T09:00:00Z").unwrap();
+        assert!(nine > start && nine < end, "09:00 must fall within the day");
+    }
+
+    #[test]
+    fn a_named_instant_denotes_only_itself() {
+        for s in [
+            "2026-07-14T12:00:00Z",
+            "2026-07-14T12:00:00+01:00",
+            "2026-07-14 12:00:00Z",
+        ] {
+            assert_eq!(
+                parse_rfc3339_end_ms(s),
+                parse_rfc3339_ms(s),
+                "{s} names a time, so its end is itself"
+            );
+        }
+    }
 
     #[test]
     fn the_epoch_is_zero() {

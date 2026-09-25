@@ -5100,7 +5100,11 @@ impl<F: Fs> GraphDb<F> {
     /// The one place every caller-facing surface converts a date string, so
     /// HTTP, MCP, Python and the CLI cannot drift in what they accept.
     pub fn resolve_date(&self, s: &str) -> Result<u64> {
-        let ms = core_storage::commit_times::parse_rfc3339_ms(s).ok_or_else(|| {
+        // The **end** of what the string denotes. A bare date is a day, so it
+        // resolves to the last commit at or before that day's end — resolving to
+        // the midnight that starts it would exclude everything that happened on
+        // the date the caller asked about.
+        let ms = core_storage::commit_times::parse_rfc3339_end_ms(s).ok_or_else(|| {
             GraphError::QueryError {
                 detail: format!(
                     "could not parse {s:?} as a date; expected RFC 3339 \
