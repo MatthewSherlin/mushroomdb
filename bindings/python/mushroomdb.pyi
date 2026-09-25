@@ -182,6 +182,32 @@ class CrossNamespace(MushroomError):
     dst: str
     dst_ns: str
 
+class NoRecordedTime(MushroomError):
+    """A date was given to a history call on a store that records no commit times.
+
+    Written by a release before 0.6.11, or its `commit_times.bin` sidecar was
+    removed. The store is intact and every index-addressed read still works;
+    only date resolution is unavailable, so pass a frame index instead.
+
+    Deliberately distinct from `Corrupt`: an absent map is not a damaged one,
+    and collapsing the two would make "your times are broken" read as "this
+    store never had any".
+    """
+
+    code: str
+
+class TimeBeforeFloor(MushroomError):
+    """The date predates the oldest commit time the store still records.
+
+    `floor_commit` is the oldest frame the map describes and `floor_ms` is its
+    recorded time. Retrying with an earlier instant fails the same way — the
+    entries below it were dropped when the WAL horizon moved.
+    """
+
+    code: str
+    floor_ms: int
+    floor_commit: int
+
 class GraphDb:
     """An embedded mushroomdb store.
 
@@ -449,14 +475,46 @@ class GraphDb:
         retained — events before it were pruned and are not in `events`.
         """
 
-    def was_linked(self, a: str, b: str, edge_type: str, at_commit: int) -> bool:
-        """Whether `a` and `b` were linked by `edge_type` at or before `at_commit`."""
+    def was_linked(
+        self, a: str, b: str, edge_type: str, at_commit: int | str
+    ) -> bool:
+        """Whether `a` and `b` were linked by `edge_type` at or before `at_commit`.
 
-    def edges_at(self, key: str, commit: int) -> list[Row]:
+        `at_commit` takes a 0-based frame index, or an RFC 3339 date string —
+        `"2026-06-19"`, `"2026-06-19T12:00:00Z"`, offsets accepted — which
+        resolves to the last commit at or before that instant. A `bool` is
+        rejected rather than read as `int`. Raises `NoRecordedTime` when the
+        store records no times and `TimeBeforeFloor` when the date predates the
+        oldest it has.
+        """
+
+    def edges_at(self, key: str, commit: int | str) -> list[Row]:
         """Every edge incident on `key` at WAL `commit`, from one WAL scan.
 
         Returns `{edge_type, src, dst, derived, rule}` dicts sorted by
         `(edge_type, src, dst)`. Raises for a commit outside the horizon.
+
+        `commit` takes a 0-based frame index, or an RFC 3339 date string —
+        `"2026-06-19"`, `"2026-06-19T12:00:00Z"` — which resolves to the last
+        commit at or before that instant. Prefer the date when the question
+        names one: guessing an index for a date is how a plausible wrong graph
+        gets returned.
+        """
+
+    def resolve_date(self, date: str) -> int:
+        """The 0-based frame index a date resolves to.
+
+        The last commit at or before `date`, ready to hand to `edges_at` or
+        `was_linked`. Raises `ValueError`-shaped `QueryError` when `date` will
+        not parse, `NoRecordedTime` on a store that records none, and
+        `TimeBeforeFloor` when it predates the oldest recorded.
+        """
+
+    def commit_time_ms(self, commit: int) -> int | None:
+        """The recorded wall-clock time of a 0-based frame index, in unix ms.
+
+        `None` when the store records no time for it — a pre-0.6.11 store, a
+        frame below the horizon, or a damaged sidecar.
         """
 
     def what_if_set_prop(self, key: str, field: str, value: Any) -> dict[str, list[Row]]:

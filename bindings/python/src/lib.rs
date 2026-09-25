@@ -1007,9 +1007,38 @@ impl GraphDb {
         self.with_ref(|db| Ok(db.is_multiplicity_enabled()))
     }
 
+    /// The 0-based frame index a date resolves to.
+    ///
+    /// The last commit at or before `date`, ready to hand to `edges_at` or
+    /// `was_linked`.
+    #[pyo3(text_signature = "($self, date)")]
+    fn resolve_date(&self, date: &str) -> PyResult<u64> {
+        self.with_scope(|db, _| db.resolve_date(date))
+    }
+
+    /// The recorded wall-clock time of a 0-based frame index, in unix ms.
+    ///
+    /// `None` when the store records no time for it — a store written before
+    /// 0.6.11, a frame below the horizon, or a damaged sidecar.
+    #[pyo3(text_signature = "($self, commit)")]
+    fn commit_time_ms(&self, commit: u64) -> PyResult<Option<i64>> {
+        self.with_scope(|db, _| Ok(db.commit_time_ms(commit)))
+    }
+
     /// Whether `a` and `b` were linked by `edge_type` at or before `at_commit`.
+    ///
+    /// `at_commit` takes a 0-based frame index, or an RFC 3339 date string
+    /// (`"2026-06-19"`, `"2026-06-19T12:00:00Z"`) which resolves to the last
+    /// commit at or before that instant.
     #[pyo3(text_signature = "($self, a, b, edge_type, at_commit)")]
-    fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> PyResult<bool> {
+    fn was_linked(
+        &self,
+        a: &str,
+        b: &str,
+        edge_type: &str,
+        at_commit: Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        let at_commit = self.resolve_when(&at_commit, "at_commit")?;
         self.with_scope(|db, mask| {
             // The real call runs first so an out-of-range `at_commit` raises
             // for a hidden pair exactly as it does for an unknown one; only
@@ -1181,7 +1210,13 @@ impl GraphDb {
     /// `commit` outside `[0, wal_total_commits())` raises `RuntimeError`. An
     /// unknown key is not an error — it simply had no edges.
     #[pyo3(text_signature = "($self, key, commit)")]
-    fn edges_at(&self, py: Python<'_>, key: &str, commit: u64) -> PyResult<Vec<Py<PyDict>>> {
+    fn edges_at(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        commit: Bound<'_, PyAny>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        let commit = self.resolve_when(&commit, "commit")?;
         let edges = self.with_scope(|db, mask| {
             // Run first so an out-of-range `commit` raises for a hidden key as
             // it does for an unknown one.
@@ -1775,6 +1810,34 @@ impl GraphDb {
     /// read therefore share one `map_err` *after* the drop, rather than the
     /// resolve arm keeping an early return of its own that the next edit could
     /// forget to move.
+    /// Resolve a "when" argument that may be a frame index or a date string.
+    ///
+    /// One helper so `edges_at` and `was_linked` cannot drift in what they
+    /// accept. An `int` is a 0-based frame index and passes through; a `str` is
+    /// parsed as RFC 3339 and resolved to the last commit at or before it.
+    /// Anything else is a `ValueError` — never a guessed commit, which is the
+    /// failure mode the whole date surface exists to remove.
+    ///
+    /// A `bool` is rejected deliberately: Python's `bool` is an `int`, so
+    /// `edges_at(k, True)` would otherwise silently mean frame 1.
+    fn resolve_when(&self, at: &Bound<'_, PyAny>, arg: &str) -> PyResult<u64> {
+        if at.is_instance_of::<pyo3::types::PyBool>() {
+            return Err(PyValueError::new_err(format!(
+                "{arg} must be a frame index or an RFC 3339 date string, not a bool"
+            )));
+        }
+        if let Ok(n) = at.extract::<u64>() {
+            return Ok(n);
+        }
+        if let Ok(s) = at.extract::<String>() {
+            return self.with_scope(|db, _| db.resolve_date(&s));
+        }
+        Err(PyValueError::new_err(format!(
+            "{arg} must be a 0-based frame index (int) or an RFC 3339 date string \
+             (\"2026-06-19\", \"2026-06-19T12:00:00Z\")"
+        )))
+    }
+
     fn with_scope<T, F>(&self, f: F) -> PyResult<T>
     where
         F: FnOnce(&Db, Option<&NodeMask>) -> core_api::Result<T>,
