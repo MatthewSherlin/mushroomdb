@@ -18,7 +18,7 @@ the values that produced it. An agent reaches it over MCP — sixteen tools on a
 you embed it as a Rust library, a Python module, or a sidecar beside your own service. Four
 questions are what it exists for: **why are these two related** (`explain_association`, answered
 with the evidence rather than an assertion), **what did that look like then** (`edges_at`, the edges
-a node had at any past commit), **what would this change do** (`what_if`, computed without writing
+a node had on any past date or commit), **what would this change do** (`what_if`, computed without writing
 anything), and **who may see it** (`query` with a `role`, so one graph answers differently per
 caller). Local-first: a directory on disk, no account, no endpoint, no model call in the write path
 unless you enable embeddings.
@@ -62,9 +62,11 @@ Full tool reference: [`docs/site/mcp.md`](docs/site/mcp.md).
   instead of a guess.
 - **Knows who's allowed to see it.** Pass a `role` or a `mask` with a query and the same graph
   answers differently per caller; write statements are rejected on masked queries.
-- **Answers what it said last week.** `edges_at` returns the edges a node had at a past commit;
-  `mushroomdb asof ./db --commit 5 --query "…"` replays the WAL to that commit, derived edges
-  included.
+- **Answers what it said last week — by date.** `edges_at("talent-1", "2026-06-19")` returns the
+  edges a node had on that day; a 0-based commit index works too, and
+  `mushroomdb asof ./db --at 2026-06-19 --query "…"` replays the WAL to the last commit at or
+  before it, derived edges included. A store that records no times says so by name rather than
+  guessing a commit.
 
 ## Where it fits
 

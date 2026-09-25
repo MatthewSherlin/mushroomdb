@@ -86,6 +86,15 @@ specific WAL commit.
 > counter. Do not pass `last_changed(key)` directly as `at_commit`; to probe
 > "at the moment of the last change", use the commit values reported by
 > `edge_history`/`node_history` events instead.
+>
+> **Or pass a date and let the engine do it.** As of v0.6.11 `at_commit` also
+> takes an RFC 3339 string — `"2026-06-19"`, `"2026-06-19T12:00:00Z"` — and
+> resolves it to the last commit at or before that instant, in the 0-based space,
+> so the two counters cannot be confused. `resolve_date()` exposes the same
+> resolution on its own, and `commit_time_ms(frame)` reads a frame's recorded
+> time back. Times live in a `commit_times.bin` sidecar that is part of neither
+> the WAL nor the snapshot, so a store written before v0.6.11 has none and says
+> `no_recorded_time` rather than guessing a commit.
 
 **MCP:** `was_linked(a, b, edge_type, at_commit)` → `{linked}` or error when
 outside horizon

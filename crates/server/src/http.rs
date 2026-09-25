@@ -2218,10 +2218,17 @@ async fn was_linked_handler(
         Some(s) => s.clone(),
         None => return err_response("missing query param edge_type"),
     };
+    // `at_commit` takes a 0-based frame index or an RFC 3339 date. A caller
+    // asking "were they linked on 2026-06-19" should not have to find the frame
+    // themselves — and a guessed index is how a plausible wrong answer is
+    // returned.
     let at_commit: u64 = match qs.get("at_commit") {
-        Some(s) => match s.parse() {
+        Some(s) => match s.parse::<u64>() {
             Ok(n) => n,
-            Err(_) => return err_response("at_commit must be a non-negative integer"),
+            Err(_) => match state.db.read().resolve_date(s) {
+                Ok(n) => n,
+                Err(e) => return graph_err(e),
+            },
         },
         None => return err_response("missing query param at_commit"),
     };

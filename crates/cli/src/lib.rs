@@ -251,7 +251,15 @@ pub enum Command {
     AsOf {
         db_dir: PathBuf,
         /// 0-based WAL commit index to replay up to (inclusive).
-        commit: u64,
+        ///
+        /// Exactly one of `commit` and `at` is set — the parser refuses both and
+        /// refuses neither, because a precedence rule between them is how a
+        /// caller ends up believing it asked for a date while the engine
+        /// answered a commit.
+        commit: Option<u64>,
+        /// RFC 3339 date to replay up to, resolved against the store's recorded
+        /// commit times once it is open.
+        at: Option<String>,
         /// Optional Cypher read query to execute against the as-of view.
         query: Option<String>,
         /// Read only this namespace, as it was at that commit.
@@ -572,7 +580,10 @@ Usage:
                                    hook body: reads a PostToolUse Grep payload on stdin; prints what
                                    the graph knows about the symbols it matched, else nothing
   mushroomdb suggest <db-dir>
-  mushroomdb asof <db-dir> --commit N [--query \"MATCH ...\"] [--namespace <ns>]
+  mushroomdb asof <db-dir> --commit N|--at <date> [--query \"MATCH ...\"] [--namespace <ns>]
+                     --at takes an RFC 3339 date (2026-06-19, or 2026-06-19T12:00:00Z)
+                     and resolves to the last commit at or before it; exactly one of
+                     --commit and --at
   mushroomdb query <db-dir> [--query \"MATCH ...\"] [--role <name>] [--namespace <ns>] <cypher…>
                      --role answers as one of the store's roles and --namespace from one
                      namespace; together they intersect, so neither ever widens the other
@@ -1162,12 +1173,23 @@ pub fn validate_ui_dir(dir: &Path) -> Result<PathBuf, String> {
 fn parse_asof(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut commit: Option<u64> = None;
+    let mut at: Option<String> = None;
     let mut query: Option<String> = None;
     let mut namespace: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--commit" {
+        if a == "--at" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --at".to_string())?;
+            at = Some(val.to_string());
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--at=") {
+            at = Some(val.to_string());
+            i += 1;
+        } else if a == "--commit" {
             let val = args
                 .get(i + 1)
                 .copied()
@@ -1213,10 +1235,24 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
         }
     }
     let db_dir = db_dir.ok_or_else(|| "asof requires <db-dir>".to_string())?;
-    let commit = commit.ok_or_else(|| "asof requires --commit N".to_string())?;
+    match (commit.is_some(), at.is_some()) {
+        (false, false) => {
+            return Err("asof requires --commit N or --at <date>".to_string());
+        }
+        (true, true) => {
+            return Err(
+                "asof takes --commit or --at, not both: a precedence rule between a \
+                 commit index and a date is how a caller ends up believing it asked \
+                 for one and got the other"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
     Ok(Command::AsOf {
         db_dir,
         commit,
+        at,
         query,
         namespace,
     })
@@ -1229,11 +1265,24 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
 /// are in it. A name no node uses answers with nothing, never with everything.
 pub fn run_asof(
     db_dir: &Path,
-    commit: u64,
+    commit: Option<u64>,
+    at: Option<&str>,
     query: Option<&str>,
     namespace: Option<&str>,
 ) -> Result<String, CliError> {
     let namespace = check_namespace(namespace)?;
+    // A date has to be resolved against the store's recorded commit times, and
+    // `open_at` needs the commit before it opens — so a dated call costs one
+    // ordinary open first. The parser guarantees exactly one of the two is set.
+    let commit = match (commit, at) {
+        (Some(c), _) => c,
+        (None, Some(date)) => GraphDb::open(db_dir)?.resolve_date(date)?,
+        (None, None) => {
+            return Err(CliError(
+                "asof requires --commit N or --at <date>".to_string(),
+            ))
+        }
+    };
     // Counts come off the opened handle: it knows the archives the live WAL no
     // longer holds, and where history now starts.
     let db = GraphDb::open_at(db_dir, commit)?;
@@ -4293,7 +4342,7 @@ mod tests {
         };
         assert!(floor > 0, "the retention must have pruned something");
 
-        let out = run_asof(&dir, total - 1, None, None).expect("asof");
+        let out = run_asof(&dir, Some(total - 1), None, None, None).expect("asof");
         assert_eq!(
             out.trim(),
             format!(
@@ -4311,7 +4360,9 @@ mod tests {
             db.insert_node("Person", "a", vec![]).expect("insert");
         }
         assert_eq!(
-            run_asof(&clean, 0, None, None).expect("asof").trim(),
+            run_asof(&clean, Some(0), None, None, None)
+                .expect("asof")
+                .trim(),
             "as-of commit 0 of 1"
         );
         let _ = std::fs::remove_dir_all(&clean);
@@ -5939,7 +5990,7 @@ mod tests {
             .expect("insert");
         }
         let q = "MATCH (n) RETURN n.id AS id ORDER BY n.id";
-        let then = run_asof(&dir, at, Some(q), Some("tenant-a")).expect("asof");
+        let then = run_asof(&dir, Some(at), None, Some(q), Some("tenant-a")).expect("asof");
         assert!(
             then.contains("id=a1") && then.contains("id=a2"),
             "got {then}"
@@ -5948,7 +5999,7 @@ mod tests {
             !then.contains("id=a3") && !then.contains("id=b1"),
             "a3 did not exist then and b1 is another namespace: {then}"
         );
-        let now = run_asof(&dir, at + 1, Some(q), Some("tenant-a")).expect("asof");
+        let now = run_asof(&dir, Some(at + 1), None, Some(q), Some("tenant-a")).expect("asof");
         assert!(now.contains("id=a3"), "got {now}");
         let _ = std::fs::remove_dir_all(&dir);
     }

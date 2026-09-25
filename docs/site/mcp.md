@@ -326,10 +326,23 @@ company-000042, company-000066, company-000138, company-000246, company-000354, 
 
 ### The graph as it was — `edges_at`
 
-`edges_at(key, at)` returns the edges the node had at commit `at` — a 0-based WAL
-commit index — replayed from the WAL and its archives in one scan, each edge
-carrying the rule that had derived it. Use `node_history` or `edge_history` first
-to find the commit you want, then read this instead of replaying either by hand.
+`edges_at(key, at)` returns the edges the node had at `at` — **either an RFC 3339
+date or a 0-based WAL commit index** — replayed from the WAL and its archives in
+one scan, each edge carrying the rule that had derived it.
+
+**Pass the date when the question names one.** `edges_at(key, "2026-06-19")`
+resolves to the last commit at or before midnight UTC on that day; a bare date, a
+full instant (`2026-06-19T12:00:00Z`) and an offset (`+01:00`) all work. Before
+v0.6.11 there was no way to express a date, and an agent asked "what did this
+look like on the 19th" had to reconstruct a date→commit map by hand — a guess that
+returns a plausible wrong graph rather than an error. Do not probe commits to
+find a date.
+
+A store that cannot answer a date says so by name rather than guessing:
+`no_recorded_time` when the store records none — written by a release before
+v0.6.11 — and `time_before_floor`, carrying the oldest commit and time it does
+have, when the date predates them. A commit index still works exactly as before,
+and `node_history` / `edge_history` remain the way to find one.
 
 It takes the same `edge_type`, `all_of`, `label`, `direction` and `limit`
 arguments as `node_edges`, so "who was linked by all three of these on that day"
@@ -382,7 +395,7 @@ to probe Cypher to learn the schema:
 ```
   why: explain_association person:ada project:apollo — returns each relationship's rule and the values the two share, so there is no need to fetch raw lists to compare by hand
   relationships: node_edges person:ada all_of: [ASSIGNED_TO] label: Project — or edge_type: ASSIGNED_TO for one type's partner keys
-  as of: edges_at person:ada 8 all_of: [ASSIGNED_TO] label: Project — commits carry no dates: take `at` from node_history/edge_history commit numbers or the dataset's date→commit map
+  as of: edges_at person:ada 2026-06-19 all_of: [ASSIGNED_TO] label: Project — `at` takes a date directly; a 0-based commit index also works, from node_history/edge_history
   what if: what_if person:ada project_id <value> edge_type: ASSIGNED_TO — the partners that would be lost or gained under that type
   linked by all of: MATCH (a:Person)-[:ASSIGNED_TO]->(b:Project) WITH b, count(DISTINCT a) AS n WHERE n >= 1 RETURN key(b), n ORDER BY n DESC LIMIT 20
 ```
