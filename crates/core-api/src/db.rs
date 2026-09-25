@@ -1502,11 +1502,11 @@ pub enum Precondition {
 
 pub struct GraphDb<F: Fs> {
     fs: F,
-    ids: IdMap,
-    syms: Interner,
-    topo: Topology,
-    props: ColumnStore,
-    labels: Vec<u32>, // node id -> label symbol
+    ids: Arc<IdMap>,
+    syms: Arc<Interner>,
+    topo: Arc<Topology>,
+    props: Arc<ColumnStore>,
+    labels: Arc<Vec<u32>>, // node id -> label symbol
     /// Namespace names by index; index [`NS_DEFAULT_IDX`] is always
     /// [`NS_DEFAULT`]. Derived beside [`Self::node_ns`], never persisted.
     ///
@@ -1524,12 +1524,12 @@ pub struct GraphDb<F: Fs> {
     /// mirrors already is. A namespace cannot change, so no other record shape
     /// can move a node between namespaces.
     node_ns: Vec<u32>,
-    edge_props: EdgeProps,
+    edge_props: Arc<EdgeProps>,
     engine: RuleEngine,
     view_store: ViewStore,
     /// Incremental inverted index for full-text-lite search.
     /// Rebuild-on-open: populated from WAL replay + rebuild_all at open end.
-    fulltext: FulltextIndex,
+    fulltext: Arc<FulltextIndex>,
     /// Opt-in equality index over scalar node properties.
     /// Rebuild-on-open: declarations replay from the WAL, postings rebuild at
     /// open end (mirrors `fulltext`).
@@ -2268,17 +2268,17 @@ impl<F: Fs> GraphDb<F> {
     fn new_empty(fs: F, opts: OpenOptions) -> Self {
         Self {
             fs,
-            ids: IdMap::new(),
-            syms: Interner::new(),
-            topo: Topology::new(),
-            props: ColumnStore::new(),
-            labels: Vec::new(),
+            ids: Arc::new(IdMap::new()),
+            syms: Arc::new(Interner::new()),
+            topo: Arc::new(Topology::new()),
+            props: Arc::new(ColumnStore::new()),
+            labels: Arc::new(Vec::new()),
             ns_names: vec![NS_DEFAULT.to_string()],
             node_ns: Vec::new(),
-            edge_props: EdgeProps::new(),
+            edge_props: Arc::new(EdgeProps::new()),
             engine: RuleEngine::new(),
             view_store: ViewStore::new(),
-            fulltext: FulltextIndex::new(),
+            fulltext: Arc::new(FulltextIndex::new()),
             prop_index: PropertyIndex::new(),
             multiplicity: false,
             event_sink: None,
@@ -2337,17 +2337,17 @@ impl<F: Fs> GraphDb<F> {
     /// slow-query configuration and log. A caller that registered a sink or a
     /// subscription keeps it across a reload.
     fn reset_for_reload(&mut self) {
-        self.ids = IdMap::new();
-        self.syms = Interner::new();
-        self.topo = Topology::new();
-        self.props = ColumnStore::new();
-        self.labels = Vec::new();
+        self.ids = Arc::new(IdMap::new());
+        self.syms = Arc::new(Interner::new());
+        self.topo = Arc::new(Topology::new());
+        self.props = Arc::new(ColumnStore::new());
+        self.labels = Arc::new(Vec::new());
         self.ns_names = vec![NS_DEFAULT.to_string()];
         self.node_ns = Vec::new();
-        self.edge_props = EdgeProps::new();
+        self.edge_props = Arc::new(EdgeProps::new());
         self.engine = RuleEngine::new();
         self.view_store = ViewStore::new();
-        self.fulltext = FulltextIndex::new();
+        self.fulltext = Arc::new(FulltextIndex::new());
         self.prop_index = PropertyIndex::new();
         // Cleared like every other declaration: a reload replays the store's own
         // WAL, and the opt-in comes back from it or not at all.
@@ -2581,12 +2581,17 @@ impl<F: Fs> GraphDb<F> {
         // base value).
         if db.base.is_none() {
             let topo_view = TopologyView::owned(&db.topo);
-            db.view_store
-                .rebuild_all(&mut db.props, &topo_view, &db.ids, &db.syms, &db.labels);
+            db.view_store.rebuild_all(
+                Arc::make_mut(&mut db.props),
+                &topo_view,
+                &db.ids,
+                &db.syms,
+                &db.labels,
+            );
         }
         // Rebuild full-text index after WAL replay.  Corrects drift from
         // per-record incremental apply during replay.
-        db.fulltext.rebuild_all(
+        Arc::make_mut(&mut db.fulltext).rebuild_all(
             &db.ids,
             &db.labels,
             &db.syms,
@@ -2887,12 +2892,12 @@ impl<F: Fs> GraphDb<F> {
         &mut self,
         state: core_storage::snapshot::SnapshotState,
     ) -> Result<()> {
-        self.ids = state.ids;
-        self.syms = state.syms;
-        self.topo = state.topo;
-        self.props = state.props;
-        self.labels = state.labels;
-        self.edge_props = state.edge_props;
+        self.ids = Arc::new(state.ids);
+        self.syms = Arc::new(state.syms);
+        self.topo = Arc::new(state.topo);
+        self.props = Arc::new(state.props);
+        self.labels = Arc::new(state.labels);
+        self.edge_props = Arc::new(state.edge_props);
         // Cross-section label integrity for V5/V7 snapshots: same invariants as
         // restore_v8_base.  A crafted bincode snapshot with a short `labels` vec,
         // out-of-range sym ids, or a sentinel label on a live node would otherwise
@@ -2987,12 +2992,16 @@ impl<F: Fs> GraphDb<F> {
     /// `self.props` IS fully materialised from the base so that HNSW/IVF blob
     /// deserialization and view rebuild have access to all column data.
     fn restore_v8_base(&mut self, mapped: Arc<core_storage::v8::MappedBase>) -> Result<()> {
-        self.ids = archived_to_idmap(mapped.ids().map_err(|e| GraphError::Corrupt {
-            detail: format!("v8: ids section: {e:?}"),
-        })?);
-        self.syms = archived_to_interner(mapped.syms().map_err(|e| GraphError::Corrupt {
-            detail: format!("v8: syms section: {e:?}"),
-        })?);
+        self.ids = Arc::new(archived_to_idmap(mapped.ids().map_err(|e| {
+            GraphError::Corrupt {
+                detail: format!("v8: ids section: {e:?}"),
+            }
+        })?));
+        self.syms = Arc::new(archived_to_interner(mapped.syms().map_err(|e| {
+            GraphError::Corrupt {
+                detail: format!("v8: syms section: {e:?}"),
+            }
+        })?));
 
         // C1: self.props is left as an empty overlay. Column reads go through
         // props_view() (ColumnsView::with_base), which consults the archived base
@@ -3006,7 +3015,7 @@ impl<F: Fs> GraphDb<F> {
         .map_err(|e| GraphError::Corrupt {
             detail: format!("v8: meta decode: {e:?}"),
         })?;
-        self.labels = meta.labels;
+        self.labels = Arc::new(meta.labels);
         // Cross-section label integrity: labels must cover every id slot (live
         // and tombstoned), every non-sentinel sym must be within the interner's
         // bound, and no live (non-tombstoned) node may carry the u32::MAX
@@ -3367,11 +3376,16 @@ impl<F: Fs> GraphDb<F> {
                                           // base), so topo_view is always owned.
         {
             let topo_view = TopologyView::owned(&db.topo);
-            db.view_store
-                .rebuild_all(&mut db.props, &topo_view, &db.ids, &db.syms, &db.labels);
+            db.view_store.rebuild_all(
+                Arc::make_mut(&mut db.props),
+                &topo_view,
+                &db.ids,
+                &db.syms,
+                &db.labels,
+            );
         }
         // Rebuild full-text index for as-of view (mirrors open_with pattern).
-        db.fulltext.rebuild_all(
+        Arc::make_mut(&mut db.fulltext).rebuild_all(
             &db.ids,
             &db.labels,
             &db.syms,
@@ -3406,15 +3420,26 @@ impl<F: Fs> GraphDb<F> {
     /// the delta tail. Called automatically every `FOLD_EVERY_K` commits and at
     /// the end of `open_with` / `open_at_with` to prime the reader.
     fn fold_now(&mut self) {
+        // Eight `Arc::clone`s — refcount bumps, O(1). This used to deep-copy the
+        // whole overlay: `IdMap` alone is a `HashMap<String, u32>` plus a
+        // `Vec<String>`, so every node key was copied twice, on every open,
+        // after every snapshot, every FOLD_EVERY_K commits on the write path,
+        // and — with no commit threshold — on every `refresh()` that applied a
+        // peer commit. A refreshing reader now pays nothing for a fold.
+        //
+        // `props` and `topo` were already cheap for a different reason: on a
+        // snapshotted store `restore_v8_base` leaves them as empty overlays over
+        // the zero-copy mmap. `ids`, `syms` and `fulltext` were not, and that
+        // inconsistency was the defect.
         let frozen = crate::reader::FrozenOverlay {
-            ids: self.ids.clone(),
-            syms: self.syms.clone(),
-            topo: self.topo.clone(),
-            props: self.props.clone(),
-            labels: self.labels.clone(),
-            edge_props: self.edge_props.clone(),
-            roles: self.roles.clone(),
-            fulltext: self.fulltext.clone(),
+            ids: std::sync::Arc::clone(&self.ids),
+            syms: std::sync::Arc::clone(&self.syms),
+            topo: std::sync::Arc::clone(&self.topo),
+            props: std::sync::Arc::clone(&self.props),
+            labels: std::sync::Arc::clone(&self.labels),
+            edge_props: std::sync::Arc::clone(&self.edge_props),
+            roles: self.roles.clone().map(std::sync::Arc::new),
+            fulltext: std::sync::Arc::clone(&self.fulltext),
         };
         self.fold_overlay = Some(Arc::new(frozen));
         self.delta_tail.clear();
@@ -3500,37 +3525,41 @@ impl<F: Fs> GraphDb<F> {
         self.populate_indexes_before_write();
         match rec {
             WalRecord::InsertNode { label, key, props } => {
-                let id = self.ids.try_insert(key)?;
-                let sym = self.syms.intern(label);
+                let id = Arc::make_mut(&mut self.ids).try_insert(key)?;
+                let sym = Arc::make_mut(&mut self.syms).intern(label);
                 if self.labels.len() <= id as usize {
                     // gap slots are sentinels, never valid label symbols
-                    self.labels.resize(id as usize + 1, u32::MAX);
+                    Arc::make_mut(&mut self.labels).resize(id as usize + 1, u32::MAX);
                 }
-                self.labels[id as usize] = sym;
+                Arc::make_mut(&mut self.labels)[id as usize] = sym;
                 let mut ns_name = NS_DEFAULT.to_string();
                 for (field, value) in props {
                     if field == NS_PROP {
                         ns_name = namespace_of_value(Some(value)).to_string();
                     }
-                    self.props.set(id, field, value.clone());
+                    Arc::make_mut(&mut self.props).set(id, field, value.clone());
                 }
                 self.set_node_ns(id, &ns_name);
                 // Initialize view values for the new node before the engine runs so
                 // delta-based increments start from a known zero baseline.
-                self.view_store
-                    .init_node_views(id, &mut self.props, &self.syms, &self.labels);
+                self.view_store.init_node_views(
+                    id,
+                    Arc::make_mut(&mut self.props),
+                    &self.syms,
+                    &self.labels,
+                );
                 // Fire rules for the newly inserted node.
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        &mut self.syms,
+                        Arc::make_mut(&mut self.syms),
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        &mut self.topo,
+                        Arc::make_mut(&mut self.topo),
                         &self.base,
-                        &mut self.edge_props,
+                        Arc::make_mut(&mut self.edge_props),
                     );
                     eng.on_node_changed(id, None, &mut gm);
                 }
@@ -3547,7 +3576,7 @@ impl<F: Fs> GraphDb<F> {
                             d.src_id,
                             d.dst_id,
                             d.fired,
-                            &mut self.props,
+                            Arc::make_mut(&mut self.props),
                             &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
@@ -3560,7 +3589,7 @@ impl<F: Fs> GraphDb<F> {
                 if self.fulltext.has_label(label) {
                     for (field, value) in props {
                         if self.fulltext.is_enabled(label, field) {
-                            self.fulltext.add_tokens(id, field, value);
+                            Arc::make_mut(&mut self.fulltext).add_tokens(id, field, value);
                         }
                     }
                 }
@@ -3582,7 +3611,7 @@ impl<F: Fs> GraphDb<F> {
                 let dst = self.ids.get(dst_key).ok_or_else(|| GraphError::Corrupt {
                     detail: format!("wal replay references unknown key {dst_key}"),
                 })?;
-                let etype = self.syms.intern(edge_type);
+                let etype = Arc::make_mut(&mut self.syms).intern(edge_type);
                 // Skip if the edge is already visible in the merged base+overlay
                 // view.  This keeps WAL replay idempotent when the WAL contains
                 // pre-snapshot records that are already encoded in a V8 base
@@ -3595,14 +3624,14 @@ impl<F: Fs> GraphDb<F> {
                 {
                     return Ok(());
                 }
-                self.topo.add_edge(etype, src, dst);
+                Arc::make_mut(&mut self.topo).add_edge(etype, src, dst);
                 // View maintenance for manual edge insert.
                 self.view_store.on_edge_changed(
                     etype,
                     src,
                     dst,
                     true,
-                    &mut self.props,
+                    Arc::make_mut(&mut self.props),
                     &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
@@ -3615,12 +3644,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        &mut self.syms,
+                        Arc::make_mut(&mut self.syms),
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        &mut self.topo,
+                        Arc::make_mut(&mut self.topo),
                         &self.base,
-                        &mut self.edge_props,
+                        Arc::make_mut(&mut self.edge_props),
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
                 }
@@ -3633,7 +3662,7 @@ impl<F: Fs> GraphDb<F> {
                             d.src_id,
                             d.dst_id,
                             d.fired,
-                            &mut self.props,
+                            Arc::make_mut(&mut self.props),
                             &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
@@ -3650,19 +3679,19 @@ impl<F: Fs> GraphDb<F> {
                 let old_value = build_props_view(&self.props, &self.base)
                     .get(id, field)
                     .map(|vr| vr.into_value());
-                self.props.set(id, field, value.clone());
+                Arc::make_mut(&mut self.props).set(id, field, value.clone());
                 // Fire rules for the changed field.
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        &mut self.syms,
+                        Arc::make_mut(&mut self.syms),
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        &mut self.topo,
+                        Arc::make_mut(&mut self.topo),
                         &self.base,
-                        &mut self.edge_props,
+                        Arc::make_mut(&mut self.edge_props),
                     );
                     eng.on_node_changed(id, Some((field, old_value)), &mut gm);
                 }
@@ -3678,7 +3707,7 @@ impl<F: Fs> GraphDb<F> {
                             d.src_id,
                             d.dst_id,
                             d.fired,
-                            &mut self.props,
+                            Arc::make_mut(&mut self.props),
                             &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
@@ -3691,7 +3720,7 @@ impl<F: Fs> GraphDb<F> {
                 self.view_store.on_prop_changed(
                     id,
                     field,
-                    &mut self.props,
+                    Arc::make_mut(&mut self.props),
                     &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
@@ -3709,8 +3738,8 @@ impl<F: Fs> GraphDb<F> {
                     });
                     if let Some(label) = label_opt {
                         if self.fulltext.is_enabled(label, field) {
-                            self.fulltext.remove_node_field(id, field);
-                            self.fulltext.add_tokens(id, field, value);
+                            Arc::make_mut(&mut self.fulltext).remove_node_field(id, field);
+                            Arc::make_mut(&mut self.fulltext).add_tokens(id, field, value);
                         }
                     }
                 }
@@ -3738,7 +3767,7 @@ impl<F: Fs> GraphDb<F> {
                         });
                     }
                 } else {
-                    let got = self.syms.intern(text);
+                    let got = Arc::make_mut(&mut self.syms).intern(text);
                     if got != *id {
                         return Err(GraphError::Corrupt {
                             detail: format!(
@@ -3749,11 +3778,11 @@ impl<F: Fs> GraphDb<F> {
                 }
             }
             WalRecord::InsertNodeId { label, key, props } => {
-                let id = self.ids.try_insert(key)?;
+                let id = Arc::make_mut(&mut self.ids).try_insert(key)?;
                 if self.labels.len() <= id as usize {
-                    self.labels.resize(id as usize + 1, u32::MAX);
+                    Arc::make_mut(&mut self.labels).resize(id as usize + 1, u32::MAX);
                 }
-                self.labels[id as usize] = *label;
+                Arc::make_mut(&mut self.labels)[id as usize] = *label;
                 let label_str = self
                     .syms
                     .resolve(*label)
@@ -3774,22 +3803,26 @@ impl<F: Fs> GraphDb<F> {
                     if field == NS_PROP {
                         ns_name = namespace_of_value(Some(value)).to_string();
                     }
-                    self.props.set(id, field, value.clone());
+                    Arc::make_mut(&mut self.props).set(id, field, value.clone());
                 }
                 self.set_node_ns(id, &ns_name);
-                self.view_store
-                    .init_node_views(id, &mut self.props, &self.syms, &self.labels);
+                self.view_store.init_node_views(
+                    id,
+                    Arc::make_mut(&mut self.props),
+                    &self.syms,
+                    &self.labels,
+                );
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        &mut self.syms,
+                        Arc::make_mut(&mut self.syms),
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        &mut self.topo,
+                        Arc::make_mut(&mut self.topo),
                         &self.base,
-                        &mut self.edge_props,
+                        Arc::make_mut(&mut self.edge_props),
                     );
                     eng.on_node_changed(id, None, &mut gm);
                 }
@@ -3804,7 +3837,7 @@ impl<F: Fs> GraphDb<F> {
                             d.src_id,
                             d.dst_id,
                             d.fired,
-                            &mut self.props,
+                            Arc::make_mut(&mut self.props),
                             &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
@@ -3819,7 +3852,7 @@ impl<F: Fs> GraphDb<F> {
                             continue;
                         };
                         if self.fulltext.is_enabled(&label_str, field) {
-                            self.fulltext.add_tokens(id, field, value);
+                            Arc::make_mut(&mut self.fulltext).add_tokens(id, field, value);
                         }
                     }
                 }
@@ -3854,13 +3887,13 @@ impl<F: Fs> GraphDb<F> {
                 {
                     return Ok(());
                 }
-                self.topo.add_edge(*etype, *src, *dst);
+                Arc::make_mut(&mut self.topo).add_edge(*etype, *src, *dst);
                 self.view_store.on_edge_changed(
                     *etype,
                     *src,
                     *dst,
                     true,
-                    &mut self.props,
+                    Arc::make_mut(&mut self.props),
                     &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
@@ -3875,12 +3908,12 @@ impl<F: Fs> GraphDb<F> {
                     {
                         let mut gm = make_graph_mut(
                             &self.ids,
-                            &mut self.syms,
+                            Arc::make_mut(&mut self.syms),
                             &self.labels,
                             build_props_view(&self.props, &self.base),
-                            &mut self.topo,
+                            Arc::make_mut(&mut self.topo),
                             &self.base,
-                            &mut self.edge_props,
+                            Arc::make_mut(&mut self.edge_props),
                         );
                         eng.on_edge_changed(&etype_str, *src, *dst, &mut gm);
                     }
@@ -3893,7 +3926,7 @@ impl<F: Fs> GraphDb<F> {
                                 d.src_id,
                                 d.dst_id,
                                 d.fired,
-                                &mut self.props,
+                                Arc::make_mut(&mut self.props),
                                 &build_topo_view(&self.topo, &self.base),
                                 &self.ids,
                                 &self.syms,
@@ -3918,18 +3951,18 @@ impl<F: Fs> GraphDb<F> {
                 let old_value = build_props_view(&self.props, &self.base)
                     .get(*id, &field_str)
                     .map(|vr| vr.into_value());
-                self.props.set(*id, &field_str, value.clone());
+                Arc::make_mut(&mut self.props).set(*id, &field_str, value.clone());
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        &mut self.syms,
+                        Arc::make_mut(&mut self.syms),
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        &mut self.topo,
+                        Arc::make_mut(&mut self.topo),
                         &self.base,
-                        &mut self.edge_props,
+                        Arc::make_mut(&mut self.edge_props),
                     );
                     eng.on_node_changed(*id, Some((field_str.as_str(), old_value)), &mut gm);
                 }
@@ -3944,7 +3977,7 @@ impl<F: Fs> GraphDb<F> {
                             d.src_id,
                             d.dst_id,
                             d.fired,
-                            &mut self.props,
+                            Arc::make_mut(&mut self.props),
                             &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
@@ -3956,7 +3989,7 @@ impl<F: Fs> GraphDb<F> {
                 self.view_store.on_prop_changed(
                     *id,
                     &field_str,
-                    &mut self.props,
+                    Arc::make_mut(&mut self.props),
                     &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
@@ -3973,8 +4006,8 @@ impl<F: Fs> GraphDb<F> {
                     });
                     if let Some(label) = label_opt {
                         if self.fulltext.is_enabled(label, &field_str) {
-                            self.fulltext.remove_node_field(*id, &field_str);
-                            self.fulltext.add_tokens(*id, &field_str, value);
+                            Arc::make_mut(&mut self.fulltext).remove_node_field(*id, &field_str);
+                            Arc::make_mut(&mut self.fulltext).add_tokens(*id, &field_str, value);
                         }
                     }
                 }
@@ -4007,12 +4040,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        &mut self.syms,
+                        Arc::make_mut(&mut self.syms),
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        &mut self.topo,
+                        Arc::make_mut(&mut self.topo),
                         &self.base,
-                        &mut self.edge_props,
+                        Arc::make_mut(&mut self.edge_props),
                     );
                     eng.create_rule(def, &mut gm)
                 };
@@ -4030,7 +4063,7 @@ impl<F: Fs> GraphDb<F> {
                             d.src_id,
                             d.dst_id,
                             d.fired,
-                            &mut self.props,
+                            Arc::make_mut(&mut self.props),
                             &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
@@ -4053,12 +4086,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        &mut self.syms,
+                        Arc::make_mut(&mut self.syms),
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        &mut self.topo,
+                        Arc::make_mut(&mut self.topo),
                         &self.base,
-                        &mut self.edge_props,
+                        Arc::make_mut(&mut self.edge_props),
                     );
                     eng.delete_rule(name, &mut gm)
                 };
@@ -4075,7 +4108,7 @@ impl<F: Fs> GraphDb<F> {
                             d.src_id,
                             d.dst_id,
                             d.fired,
-                            &mut self.props,
+                            Arc::make_mut(&mut self.props),
                             &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
@@ -4096,7 +4129,7 @@ impl<F: Fs> GraphDb<F> {
                 let old = build_props_view(&self.props, &self.base)
                     .get(id, field)
                     .map(|vr| vr.into_value());
-                self.props.remove(id, field);
+                Arc::make_mut(&mut self.props).remove(id, field);
                 // If the base still supplies the value after the overlay removal,
                 // record a tombstone so ColumnsView::get does not resurrect it.
                 // This covers both the base-only case AND the both-resident case:
@@ -4110,19 +4143,19 @@ impl<F: Fs> GraphDb<F> {
                     .get(id, field)
                     .is_some()
                 {
-                    self.props.record_prop_tombstone(id, field);
+                    Arc::make_mut(&mut self.props).record_prop_tombstone(id, field);
                 }
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        &mut self.syms,
+                        Arc::make_mut(&mut self.syms),
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        &mut self.topo,
+                        Arc::make_mut(&mut self.topo),
                         &self.base,
-                        &mut self.edge_props,
+                        Arc::make_mut(&mut self.edge_props),
                     );
                     eng.on_node_changed(id, Some((field, old)), &mut gm);
                 }
@@ -4138,7 +4171,7 @@ impl<F: Fs> GraphDb<F> {
                             d.src_id,
                             d.dst_id,
                             d.fired,
-                            &mut self.props,
+                            Arc::make_mut(&mut self.props),
                             &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
@@ -4151,7 +4184,7 @@ impl<F: Fs> GraphDb<F> {
                 self.view_store.on_prop_changed(
                     id,
                     field,
-                    &mut self.props,
+                    Arc::make_mut(&mut self.props),
                     &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
@@ -4160,7 +4193,7 @@ impl<F: Fs> GraphDb<F> {
                 );
                 // Full-text index maintenance: remove tokens for this field.
                 if self.fulltext.field_indexed(field) {
-                    self.fulltext.remove_node_field(id, field);
+                    Arc::make_mut(&mut self.fulltext).remove_node_field(id, field);
                 }
                 // Property (equality) index maintenance: drop this node's entry.
                 if self.prop_index.field_indexed(field) {
@@ -4200,15 +4233,15 @@ impl<F: Fs> GraphDb<F> {
                 {
                     return Ok(());
                 }
-                self.topo.remove_edge(etype, src, dst);
-                self.edge_props.remove_edge(etype, src, dst);
+                Arc::make_mut(&mut self.topo).remove_edge(etype, src, dst);
+                Arc::make_mut(&mut self.edge_props).remove_edge(etype, src, dst);
                 // View maintenance for manual edge delete (topo already updated above).
                 self.view_store.on_edge_changed(
                     etype,
                     src,
                     dst,
                     false,
-                    &mut self.props,
+                    Arc::make_mut(&mut self.props),
                     &build_topo_view(&self.topo, &self.base),
                     &self.ids,
                     &self.syms,
@@ -4221,12 +4254,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        &mut self.syms,
+                        Arc::make_mut(&mut self.syms),
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        &mut self.topo,
+                        Arc::make_mut(&mut self.topo),
                         &self.base,
-                        &mut self.edge_props,
+                        Arc::make_mut(&mut self.edge_props),
                     );
                     eng.on_edge_changed(edge_type, src, dst, &mut gm);
                 }
@@ -4239,7 +4272,7 @@ impl<F: Fs> GraphDb<F> {
                             d.src_id,
                             d.dst_id,
                             d.fired,
-                            &mut self.props,
+                            Arc::make_mut(&mut self.props),
                             &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
@@ -4268,12 +4301,12 @@ impl<F: Fs> GraphDb<F> {
                 {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        &mut self.syms,
+                        Arc::make_mut(&mut self.syms),
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        &mut self.topo,
+                        Arc::make_mut(&mut self.topo),
                         &self.base,
-                        &mut self.edge_props,
+                        Arc::make_mut(&mut self.edge_props),
                     );
                     eng.on_node_removed(n, &mut gm);
                 }
@@ -4289,7 +4322,7 @@ impl<F: Fs> GraphDb<F> {
                             d.src_id,
                             d.dst_id,
                             d.fired,
-                            &mut self.props,
+                            Arc::make_mut(&mut self.props),
                             &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
@@ -4319,8 +4352,8 @@ impl<F: Fs> GraphDb<F> {
                     }
                 }
                 for (et, s, d) in doomed {
-                    self.topo.remove_edge(et, s, d);
-                    self.edge_props.remove_edge(et, s, d);
+                    Arc::make_mut(&mut self.topo).remove_edge(et, s, d);
+                    Arc::make_mut(&mut self.edge_props).remove_edge(et, s, d);
                     // View maintenance: n's own view values will be cleared by
                     // remove_all below; only update surviving neighbors.
                     self.view_store.on_edge_changed(
@@ -4328,7 +4361,7 @@ impl<F: Fs> GraphDb<F> {
                         s,
                         d,
                         false,
-                        &mut self.props,
+                        Arc::make_mut(&mut self.props),
                         &build_topo_view(&self.topo, &self.base),
                         &self.ids,
                         &self.syms,
@@ -4338,15 +4371,15 @@ impl<F: Fs> GraphDb<F> {
                 }
 
                 // (3) Drop every remaining prop (`ColumnStore::remove_all`).
-                self.props.remove_all(n);
+                Arc::make_mut(&mut self.props).remove_all(n);
                 // Full-text index maintenance: remove all tokens for this node.
-                self.fulltext.remove_node(n);
+                Arc::make_mut(&mut self.fulltext).remove_node(n);
                 // Property (equality) index maintenance: drop all entries for n.
                 self.prop_index.remove_node_all(n);
 
                 // (4) Retire the dense id and stamp the label sentinel.
-                self.ids.delete(key);
-                if let Some(slot) = self.labels.get_mut(n as usize) {
+                Arc::make_mut(&mut self.ids).delete(key);
+                if let Some(slot) = Arc::make_mut(&mut self.labels).get_mut(n as usize) {
                     *slot = u32::MAX;
                 }
             }
@@ -4368,12 +4401,12 @@ impl<F: Fs> GraphDb<F> {
                 let result = {
                     let mut gm = make_graph_mut(
                         &self.ids,
-                        &mut self.syms,
+                        Arc::make_mut(&mut self.syms),
                         &self.labels,
                         build_props_view(&self.props, &self.base),
-                        &mut self.topo,
+                        Arc::make_mut(&mut self.topo),
                         &self.base,
-                        &mut self.edge_props,
+                        Arc::make_mut(&mut self.edge_props),
                     );
                     eng.rebuild(name, &mut gm)
                 };
@@ -4390,7 +4423,7 @@ impl<F: Fs> GraphDb<F> {
                             d.src_id,
                             d.dst_id,
                             d.fired,
-                            &mut self.props,
+                            Arc::make_mut(&mut self.props),
                             &build_topo_view(&self.topo, &self.base),
                             &self.ids,
                             &self.syms,
@@ -4412,7 +4445,7 @@ impl<F: Fs> GraphDb<F> {
                 self.view_store
                     .create_view(
                         def,
-                        &mut self.props,
+                        Arc::make_mut(&mut self.props),
                         &build_topo_view(&self.topo, &self.base),
                         &self.ids,
                         &self.syms,
@@ -4426,7 +4459,13 @@ impl<F: Fs> GraphDb<F> {
                     return Ok(());
                 }
                 self.view_store
-                    .delete_view(name, &mut self.props, &self.ids, &self.labels, &self.syms)
+                    .delete_view(
+                        name,
+                        Arc::make_mut(&mut self.props),
+                        &self.ids,
+                        &self.labels,
+                        &self.syms,
+                    )
                     .map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
             }
             WalRecord::EnableFulltext { label, field } => {
@@ -4434,7 +4473,7 @@ impl<F: Fs> GraphDb<F> {
                 if self.fulltext.is_enabled(label, field) {
                     return Ok(());
                 }
-                self.fulltext.enable(label, field);
+                Arc::make_mut(&mut self.fulltext).enable(label, field);
                 // Backfill: index all live nodes of this label that have the field.
                 let n = self.ids.len() as u32;
                 for id in 0..n {
@@ -4454,7 +4493,7 @@ impl<F: Fs> GraphDb<F> {
                         .get(id, field)
                         .map(|vr| vr.into_value())
                     {
-                        self.fulltext.add_tokens(id, field, &value);
+                        Arc::make_mut(&mut self.fulltext).add_tokens(id, field, &value);
                     }
                 }
             }
@@ -4471,12 +4510,13 @@ impl<F: Fs> GraphDb<F> {
                     if let Some(label_sym) = self.syms.get(label) {
                         for (node_id, &lsym) in self.labels.iter().enumerate() {
                             if lsym == label_sym {
-                                self.fulltext.remove_node_field(node_id as u32, field);
+                                Arc::make_mut(&mut self.fulltext)
+                                    .remove_node_field(node_id as u32, field);
                             }
                         }
                     }
                 }
-                self.fulltext.disable(label, field);
+                Arc::make_mut(&mut self.fulltext).disable(label, field);
             }
             WalRecord::EnableIndex { label, field } => {
                 // Replay-over-snapshot idempotency: already enabled → skip.
@@ -4527,7 +4567,7 @@ impl<F: Fs> GraphDb<F> {
                 if rec.is_multiplicity_decl() {
                     self.multiplicity = true;
                 } else {
-                    self.edge_props.set(
+                    Arc::make_mut(&mut self.edge_props).set(
                         *etype,
                         *src,
                         *dst,
@@ -4549,7 +4589,7 @@ impl<F: Fs> GraphDb<F> {
                 // The rename only updates the key-table; the dense id, all
                 // topo edges, props, labels, and rule state are id-indexed and
                 // require no change.
-                self.ids
+                Arc::make_mut(&mut self.ids)
                     .rename(old_key, new_key)
                     .map_err(|e| GraphError::Corrupt {
                         detail: format!("wal replay RenameNode {old_key}→{new_key}: {e}"),
@@ -4567,7 +4607,7 @@ impl<F: Fs> GraphDb<F> {
         let id = if let Some(id) = self.syms.get(s) {
             id
         } else {
-            self.syms.intern(s)
+            Arc::make_mut(&mut self.syms).intern(s)
         };
         (
             id,
@@ -4594,7 +4634,7 @@ impl<F: Fs> GraphDb<F> {
         let syms_checkpoint = self.syms.len();
         let result = self.rewrite_wal_dense_inner(recs);
         if result.is_err() {
-            self.syms.truncate(syms_checkpoint);
+            Arc::make_mut(&mut self.syms).truncate(syms_checkpoint);
         }
         result
     }
@@ -5900,7 +5940,7 @@ impl<F: Fs> GraphDb<F> {
         let inner = SubInner::new(self.sub_capacity());
         // Derive the scan-label sym for the commit-skip fast-path.  Any Expand op
         // or unrecognized leading scan → None (always re-execute).
-        let scan_label = extract_scan_label(&ops, &mut self.syms);
+        let scan_label = extract_scan_label(&ops, Arc::make_mut(&mut self.syms));
         self.query_subscriptions.push(QuerySubEntry {
             ops,
             columns,
@@ -6796,12 +6836,12 @@ impl<F: Fs> GraphDb<F> {
         {
             let gm = make_graph_mut(
                 &self.ids,
-                &mut self.syms,
+                Arc::make_mut(&mut self.syms),
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                &mut self.topo,
+                Arc::make_mut(&mut self.topo),
                 &self.base,
-                &mut self.edge_props,
+                Arc::make_mut(&mut self.edge_props),
             );
             eng.populate_indexes(&gm);
         }
@@ -6826,12 +6866,12 @@ impl<F: Fs> GraphDb<F> {
         let finished = {
             let mut gm = make_graph_mut(
                 &self.ids,
-                &mut self.syms,
+                Arc::make_mut(&mut self.syms),
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                &mut self.topo,
+                Arc::make_mut(&mut self.topo),
                 &self.base,
-                &mut self.edge_props,
+                Arc::make_mut(&mut self.edge_props),
             );
             eng.pump_index_build(&mut gm)
         };
@@ -6853,12 +6893,12 @@ impl<F: Fs> GraphDb<F> {
         {
             let gm = make_graph_mut(
                 &self.ids,
-                &mut self.syms,
+                Arc::make_mut(&mut self.syms),
                 &self.labels,
                 build_props_view(&self.props, &self.base),
-                &mut self.topo,
+                Arc::make_mut(&mut self.topo),
                 &self.base,
-                &mut self.edge_props,
+                Arc::make_mut(&mut self.edge_props),
             );
             eng.register_incomplete_hnsw_builds(&extra, &gm);
         }
@@ -13050,10 +13090,14 @@ impl<F: Fs> GraphDb<F> {
         }
 
         // --- Clone every piece of state the re-derivation writes to. ---
-        let mut props = self.props.clone();
-        let mut topo = self.topo.clone();
-        let mut syms = self.syms.clone();
-        let mut edge_props = self.edge_props.clone();
+        // `what_if` mutates its own throwaway copies and writes nothing, so it
+        // takes owned clones rather than sharing the `Arc`s. Deref-clone, not
+        // `Arc::clone`: sharing here would make `make_mut` copy on first touch
+        // anyway, and an owned local keeps the rest of this function unchanged.
+        let mut props = (*self.props).clone();
+        let mut topo = (*self.topo).clone();
+        let mut syms = (*self.syms).clone();
+        let mut edge_props = (*self.edge_props).clone();
 
         let mut tripped: BTreeMap<String, bool> = BTreeMap::new();
         let mut fires: BTreeMap<String, u64> = BTreeMap::new();
@@ -13361,8 +13405,8 @@ impl<F: Fs> GraphDb<F> {
             // V8 merge-snapshot path: encode base+overlay into a new V8 snapshot,
             // write it atomically, remap it as the new base, then clear the overlay.
             let meta = V8Meta {
-                labels: self.labels.clone(),
-                edge_props: self.edge_props.clone(),
+                labels: (*self.labels).clone(),
+                edge_props: (*self.edge_props).clone(),
                 rule_defs,
                 provenance,
                 rule_tripped,
@@ -13441,8 +13485,8 @@ impl<F: Fs> GraphDb<F> {
             })?;
             self.base = Some(Arc::new(new_base));
             // Clear the overlay and prop tombstones — all data is now in the new base.
-            self.topo = Topology::new();
-            self.props = core_storage::columns::ColumnStore::new();
+            self.topo = Arc::new(Topology::new());
+            self.props = Arc::new(core_storage::columns::ColumnStore::new());
         } else {
             // Legacy path (V5–V7 stores without a V8 base).
             //
@@ -13457,12 +13501,12 @@ impl<F: Fs> GraphDb<F> {
             //   • self.props.clone()     (~column-store footprint)
             //   • encode_v8_from_state V8Meta secondary clones (labels, edge_props, …)
             let meta = V8Meta {
-                labels: self.labels.clone(),
+                labels: (*self.labels).clone(),
                 wal_truncated: !opts.keep_wal,
                 // Move edge_props out so the large overlay is freed when meta
                 // drops at end of this block (self.edge_props is now empty; reads
                 // after base assignment go through the mmap'd base section).
-                edge_props: std::mem::take(&mut self.edge_props),
+                edge_props: std::mem::take(Arc::make_mut(&mut self.edge_props)),
                 rule_defs,
                 provenance,
                 rule_tripped,
@@ -13507,8 +13551,8 @@ impl<F: Fs> GraphDb<F> {
             // Free the large heap-allocated decoded state — all data is now in the
             // mmap'd base.  Mirrors the V8 merge-snapshot path (see above).
             // self.edge_props was already moved into meta and is effectively empty.
-            self.topo = Topology::new();
-            self.props = core_storage::columns::ColumnStore::new();
+            self.topo = Arc::new(Topology::new());
+            self.props = Arc::new(core_storage::columns::ColumnStore::new());
         }
 
         if opts.archive_wal {

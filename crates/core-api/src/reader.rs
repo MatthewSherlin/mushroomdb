@@ -50,14 +50,14 @@ pub struct CommitDelta {
 /// The V8 mmap base is not cloned here; it is `Arc`-shared in `ReaderSnapshot`.
 #[derive(Clone)]
 pub struct FrozenOverlay {
-    pub ids: IdMap,
-    pub syms: Interner,
-    pub topo: Topology,
-    pub props: ColumnStore,
-    pub labels: Vec<u32>,
-    pub edge_props: EdgeProps,
-    pub roles: Option<Vec<RoleDef>>,
-    pub fulltext: FulltextIndex,
+    pub ids: Arc<IdMap>,
+    pub syms: Arc<Interner>,
+    pub topo: Arc<Topology>,
+    pub props: Arc<ColumnStore>,
+    pub labels: Arc<Vec<u32>>,
+    pub edge_props: Arc<EdgeProps>,
+    pub roles: Option<Arc<Vec<RoleDef>>>,
+    pub fulltext: Arc<FulltextIndex>,
 }
 
 /// Lock-free reader snapshot: frozen overlay + optional V8 base + pending delta tail.
@@ -467,32 +467,42 @@ impl ReaderSnapshot {
     /// Returns the frozen state (cloned) with delta changes applied, including
     /// rule-derived edge inserts/retracts and a rebuilt full-text index.
     fn materialize(&self) -> Result<FrozenOverlay> {
+        // Cloning the struct now clones eight `Arc`s — refcount bumps, not data.
+        // Each `Arc::make_mut` below copies exactly one structure, once, and only
+        // because this snapshot is about to mutate its own working copy. The
+        // fold this came from keeps its allocation, which is what preserves the
+        // isolation `tests/reader_isolation.rs` pins.
+        //
+        // Before the fields were `Arc`, this deep-copied all eight every time a
+        // snapshot with a non-empty delta tail was read. Now it copies only what
+        // the deltas actually touch.
         let mut w = (*self.frozen).clone();
         for delta in &self.deltas {
             for rec in &delta.records {
                 apply_one(
-                    &mut w.ids,
-                    &mut w.syms,
-                    &mut w.topo,
-                    &mut w.props,
-                    &mut w.edge_props,
-                    &mut w.labels,
-                    &mut w.fulltext,
+                    Arc::make_mut(&mut w.ids),
+                    Arc::make_mut(&mut w.syms),
+                    Arc::make_mut(&mut w.topo),
+                    Arc::make_mut(&mut w.props),
+                    Arc::make_mut(&mut w.edge_props),
+                    Arc::make_mut(&mut w.labels),
+                    Arc::make_mut(&mut w.fulltext),
                     rec,
                 )?;
             }
             for &(etype, src, dst) in &delta.derived_inserts {
-                w.topo.add_edge(etype, src, dst);
+                Arc::make_mut(&mut w.topo).add_edge(etype, src, dst);
             }
             for &(etype, src, dst) in &delta.derived_deletes {
-                w.topo.remove_edge(etype, src, dst);
+                Arc::make_mut(&mut w.topo).remove_edge(etype, src, dst);
             }
         }
         if !self.deltas.is_empty() {
             // Rebuild full-text to correct incremental drift accumulated during
             // delta application (add_tokens is imprecise for multi-field/deletion paths).
             let cv = build_cv(&w.props, &self.base);
-            w.fulltext.rebuild_all(&w.ids, &w.labels, &w.syms, cv);
+            let (ids, labels, syms) = (w.ids.clone(), w.labels.clone(), w.syms.clone());
+            Arc::make_mut(&mut w.fulltext).rebuild_all(&ids, &labels, &syms, cv);
         }
         Ok(w)
     }
