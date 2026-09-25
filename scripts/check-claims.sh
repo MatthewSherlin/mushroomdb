@@ -114,7 +114,7 @@ if [[ -n "$WORKSPACE_VERSION" ]]; then
              --include='*.md' --include='*.txt' --include='*.json' --include='*.sh' \
              "$ROOT" 2>/dev/null \
            | grep -v "mushroomdb@${WORKSPACE_VERSION}" \
-           | grep -vE "/(target|target-[^/]*)/|/CHANGELOG\.md:|/docs/roadmap/" || true)"
+           | grep -vE "/(target|target-[^/]*)/|/\.venv/|/CHANGELOG\.md:|/docs/roadmap/" || true)"
   if [[ -n "$stale" ]]; then
     echo "check-claims.sh: install pins naming a version other than ${WORKSPACE_VERSION}:" >&2
     printf '%s\n' "$stale" >&2

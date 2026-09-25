@@ -1,6 +1,6 @@
 [package]
 name = "mushroomdb-python"
-version = "0.6.10"
+version = "0.6.11"
 edition = "2021"
 license = "Apache-2.0"
 description = "Python bindings for mushroomdb"

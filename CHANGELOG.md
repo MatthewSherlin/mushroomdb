@@ -1,5 +1,149 @@
 # Changelog
 
+## v0.6.11 — time in the graph
+
+A date becomes a first-class way to address history. `edges_at(key, "2026-06-19")`
+answers what a node's relationships looked like on that day, and so do
+`was_linked`, the two history readouts and `mushroomdb asof --at` — each resolving
+to the last commit at or before the instant. Until now the engine recorded **no
+wall-clock time at all**: every history surface took a 0-based commit index, and
+`docs/site/mcp.md` told callers outright that "commits carry no dates: take `at`
+from node_history/edge_history commit numbers or the dataset's date→commit map."
+A caller asking a question in calendar time had to build that map by hand, and a
+wrong guess came back as a plausible wrong graph rather than an error.
+
+Alongside that: opening a store with full-text enabled costs half what it did, a
+scale gate that had never been able to report itself now reports, and a corrupt
+store answers one HTTP status instead of two.
+
+Nothing an existing caller does changes behaviour. **No WAL record is added, no
+WAL discriminant is consumed, and no snapshot version moves** — a store written by
+0.6.10 opens and reads exactly as it did, and one written by this release opens
+unchanged under 0.6.10.
+
+#### Added
+
+- **A date wherever a commit index went.** `edges_at`, `was_linked`, `asof` and
+  the Python binding accept an RFC 3339 string — `"2026-06-19"`,
+  `"2026-06-19T12:00:00Z"`, offsets applied, fractional seconds truncated to
+  milliseconds — or the 0-based frame index they always took. `resolve_date()`
+  exposes the resolution on its own and `commit_time_ms(frame)` reads a frame's
+  recorded time back. **No MCP tool was added**: `at` and `at_commit` simply take
+  a string now, so the association surface stays at sixteen tools.
+- **Resolution is defined on commit order, not on time order.** The map is scanned
+  ascending by frame, and the answer is the last frame whose recorded time is at or
+  before the target. A clock that steps backwards — an NTP correction, a restored
+  VM — therefore cannot make a date ambiguous, and a sample lower than its
+  predecessor is stored as observed rather than rejected or reordered.
+- **A store that cannot answer says which kind of "cannot".** `NoRecordedTime`
+  when the store records none — every store written before this release —
+  `TimeBeforeFloor` carrying the oldest frame and time it does have, and
+  `CommitOutOfRange` when a resolved frame falls below the WAL horizon and so
+  cannot be replayed. Both new classes are `MushroomError` subclasses with stable
+  `.code`s (`no_recorded_time`, `time_before_floor`), and `TimeBeforeFloor` carries
+  `.floor_ms` and `.floor_commit`. **A date is never resolved to a guessed frame.**
+- **Times live in a `commit_times.bin` sidecar that is part of neither format.**
+  The precedent is `roles.json`: written atomically beside the store, loaded at
+  open, and never in the WAL or the snapshot. A release that does not know the file
+  does not read it. That choice is not stylistic — a new WAL discriminant is
+  permitted by `docs/format-stability.md:120`, but `decode_all` treats any frame it
+  cannot deserialise as a corrupt tail and `repair_wal` defaults to `true`, so an
+  older binary would **persist that truncation**; `format-stability.md:140` records
+  exactly that outcome for discriminant 23. An unknown file has none of that
+  failure mode, and it keeps this release to zero format changes.
+- **Stamping is O(1) per commit.** The sidecar's header carries no entry count —
+  the count is the file length — so a commit appends its own 16 bytes rather than
+  rewriting the map. A torn append leaves a partial trailing entry, which is
+  refused as `Corrupt` rather than silently dropped: a half-written time would
+  resolve dates to the wrong frame forever.
+
+#### Changed
+
+- **The full-text index is built once per open, not twice: 476 ms → 227 ms** on a
+  30,000-entity store with three indexed text fields, median of five opens, against
+  3.8 ms for the identical store with no pair enabled. Replaying an
+  `EnableFulltext` record backfills its pair with a full `0..ids.len()`
+  tokenise-and-stem scan, and every snapshot re-emits one such record per enabled
+  pair — then `load_from_disk` calls `rebuild_all`, which clears every posting and
+  does the whole thing again. The backfill is now skipped **on the open path only**.
+  `refresh()` also replays frames but is followed by a fold rather than a rebuild,
+  so its backfill is the only thing that indexes a peer's frames and is untouched.
+  The 40 tests in `core-api/tests/fulltext.rs` pass unchanged.
+- **The MVCC fold shares the overlay instead of copying it.** `FrozenOverlay`'s
+  eight fields are `Arc`, so a fold is eight refcount bumps where it used to
+  deep-clone `ids`, `syms`, `fulltext` and the accrued overlay — `IdMap` alone is a
+  `HashMap<String, u32>` plus a `Vec<String>`, so every node key was copied twice,
+  at every open, after every snapshot, every 64 commits on the write path, and on
+  every `refresh()` that applied a peer commit. Mutation goes through
+  `Arc::make_mut`, so a writer copies only the structure it touches and only while
+  a reader still holds the old one. **No speedup is claimed and none is
+  measurable**: at 10k–30k nodes the copy is about a megabyte, the write-path fold
+  amortises over 64 commits, and two harnesses over three runs each put before and
+  after inside each other's spread (`examples/fold_bench.rs`,
+  `examples/refresh_bench.rs`). The change is asymptotic — O(nodes) to O(1) — and
+  it bites at the 10M-node design target, not at 30,000. A reader applying deltas
+  did improve for free: `materialize()` now copies only the structures those deltas
+  touch rather than all eight.
+- **`edges_at`'s MCP description leads with the date.** It opened with "at commit
+  C", which is the framing that had an agent reconstruct a date→commit map by hand
+  and guess wrong.
+
+#### Fixed
+
+- **A corrupt store answers 500 on every path.** `graph_err` had no `Corrupt` arm
+  and fell through a catch-all to 400 while `role_mask_err` answered 500, so the
+  same damaged store answered one or the other depending on whether the role-mask
+  memo was warm. 500, because a corrupt store is a server-side condition and 400
+  tells a caller to change an input that cannot help. The body is unchanged — only
+  the status moved — and of 370 server tests exactly one assertion needed editing:
+  the one that had pinned the old value, whose own comment already called it
+  provisional. Closes the last row deferred from the 0.6.10 ledger.
+- **Three scale assertions are red, not two, and the third had never executed.**
+  All six assertions in `hnsw_insert_cost_is_sublinear_per_vector` shared one test,
+  and an assertion that fails ends its test — so the 2k→10k build-growth failure
+  panicked first and the 50,000-second wall clock **and both update assertions
+  never ran at all**. `benchmarks/results/hnsw-scale-0.6.6.md` had counted red
+  assertions by reading the printed table and reported two. The test is now six
+  tests over one shared fixture, and the re-run reports
+  **16.19× / 1,017.14 s / 5.85×** against ceilings of 8× / 300 s / **3×**. The
+  missed one is the tightest of the three and measures what a production store does
+  most, since a changed embedding is a remove plus an insert.
+
+#### Known limits
+
+- **The three scale gates stay red.** Closing them means cutting the
+  distance-evaluation count, and the distance kernel is already at the hardware
+  ceiling — 116.6 ns/eval cache-resident, ~26 GFLOP/s, about 3.3 four-wide FMA
+  issues per cycle. The remaining lever is touching fewer bytes, and int8 rows were
+  spiked for this release and **cut**: recall is payable (the clustered gate needs
+  an 8×K full-precision rerank; at 4×K it misses the mean floor by 0.0025), but the
+  speedup is not there. Best int8 result against the shipped f32 slab, both
+  streaming one contiguous allocation, was **0.92× — slower**, because an
+  i8-to-f32 widening per element costs about what the saved bandwidth buys. A real
+  SQ8 kernel needs integer SIMD, which scalar source will not autovectorise into.
+  `crates/core-rules/examples/sq8_spike.rs` is the committed measurement.
+- **At the deployment's size the vector index is slow to build.** Measured at
+  30,000 × 1,536-D: **625 s (10.4 min)** for a full build, 20.845 ms per insert and
+  **15.188 ms** per re-embed. Per-insert at 30k is already at the 50k figure, so the
+  curve is steeper than the 10k and 50k points suggest between them.
+- **Open cost is halved, not solved.** The surviving `rebuild_all` pass is still a
+  full tokenise-and-stem over the corpus at every open, because the full-text index
+  has no snapshot section and is never persisted. Giving it one is a format change
+  and is deliberately not in this release. Ledger row 36 stays open with the
+  measurement recorded.
+- **A commit time is not covered by WAL CRC or snapshot integrity.** The sidecar is
+  neither, so a torn or deleted `commit_times.bin` degrades the date surface —
+  `Corrupt` when it will not decode, `NoRecordedTime` when it is gone — and damages
+  nothing else. That is the intended failure direction; the two are deliberately
+  distinguished, because a damaged map must not read as "this store never had
+  times".
+- **A date and a frame index are mutually exclusive**, and passing both raises
+  rather than taking one. A precedence rule between them is how a caller ends up
+  believing it asked for one and got the other.
+- **`find_similar`'s `min` still defaults differently by surface** — 0.8 on MCP,
+  0.0 in Python and HTTP. Still proposed for 0.7, where a breaking note is
+  affordable. Pass `min` explicitly.
+
 ## v0.6.10 — scoped reads and stable errors
 
 A scope stops being an argument you have to remember on every call and becomes a
