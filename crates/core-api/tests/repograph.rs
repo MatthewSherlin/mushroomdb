@@ -1061,13 +1061,15 @@ fn brief_on_a_memory_store_works_one_call_per_question_kind() {
             // `the_as_of_recipe_names_a_commit_edges_at_accepts`.
             (
                 "as of",
-                // The note names where `at` comes from: two time-travel cells
-                // were lost to an agent picking an arbitrary late commit for a
-                // date, and no commit carries one.
+                // The note names where `at` comes from. Two time-travel cells were
+                // lost to an agent picking an arbitrary late commit for a date;
+                // v0.6.11 lets `at` take the date, so the note points there rather
+                // than sending the agent off to derive a commit.
                 &*format!(
-                    "edges_at person:ada {} edge_type: ASSIGNED_TO — commits carry no \
-                     dates: take `at` from node_history/edge_history commit numbers or \
-                     the dataset's date→commit map",
+                    "edges_at person:ada {} edge_type: ASSIGNED_TO — or pass a date \
+                     in place of the number: `2026-06-19`, `2026-06-19T12:00:00Z`. \
+                     It resolves to the last commit at or before that instant, so \
+                     there is no commit to go and find",
                     s.commits.expect("counted") - 1
                 ),
             ),

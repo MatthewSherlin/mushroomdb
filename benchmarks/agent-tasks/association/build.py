@@ -250,6 +250,17 @@ def _one_change(op: str, day: int, rng: random.Random, live: dict[str, dict],
     return _change(day, "set_prop", key, field=field, value=value)
 
 
+def _day_ms(day: int) -> int:
+    """Midnight UTC on the simulated date for `day`, in unix milliseconds.
+
+    The store records when a commit happened; this world's commits are meant to
+    have happened on `day_date(day)`, so that is what is asserted.
+    """
+    import datetime as _dt
+    d = _dt.datetime.strptime(day_date(day), "%Y-%m-%d").replace(tzinfo=_dt.timezone.utc)
+    return int(d.timestamp() * 1000)
+
+
 def _change(day: int, op: str, key: str, field: str | None = None,
             value: Any = None, node: dict | None = None) -> dict[str, Any]:
     return {"day": day, "date": day_date(day), "op": op, "key": key,
@@ -648,15 +659,30 @@ def write_store(w: dict[str, Any], directory: str | Path,
     days: dict[int, int] = {}
     db = GraphDb.open(str(store))
     try:
+        # Stamp each commit with the day it represents, not the wall clock.
+        #
+        # The world's history is backdated fiction: `changes.jsonl` spans
+        # 2026-06 onward while the store is written today. Left alone, every
+        # commit is stamped "now", so `edges_at(key, "2026-07-14")` answers
+        # `TimeBeforeFloor` — correctly, because no commit ever happened then —
+        # and the graph arm cannot answer a time-travel question at all without
+        # going to `days.json` on disk. Asserting the day is what makes the
+        # store's own history match the history the tasks ask about.
+        #
+        # `record_commits_at` is sticky, and the days ascend, so one call per
+        # day covers every commit that day produces.
+        db.record_commits_at(_day_ms(0))
         scale_run.ingest_nodes(db, w["nodes"])
         scale_run.declare_rules(db, store_rules())
         days[0] = db.wal_total_commits() - 1
         for day in range(1, N_DAYS):
+            db.record_commits_at(_day_ms(day))
             for change in by_day.get(day, ()):
                 _apply(db, change)
             # A day with no change repeats the previous day's commit: the
             # state on that date genuinely is the previous day's state.
             days[day] = db.wal_total_commits() - 1
+        db.record_commits_at(None)
     finally:
         db.close()
 

@@ -248,3 +248,151 @@ fn a_date_before_the_first_commit_names_the_floor() {
         other => panic!("expected TimeBeforeFloor, got {other:?}"),
     }
 }
+
+// ─── backfilled history: caller-asserted commit times ───────────────────────
+//
+// The live clock is right for a live store and wrong for an import. A mirror
+// replaying a year of rows stamps every one of them "now", so the data is there
+// and no date reaches it — every query answers `TimeBeforeFloor`. These cover
+// asserting the instant instead.
+
+fn ms(date: &str) -> i64 {
+    core_storage::commit_times::parse_rfc3339_ms(date).expect("parse")
+}
+
+#[test]
+fn an_asserted_time_is_recorded_instead_of_the_clock() {
+    let dir = tmp("asserted");
+    let mut db = GraphDb::open(&dir).expect("open");
+    db.record_commits_at(Some(ms("2026-06-02")))
+        .expect("assert");
+    db.insert_node("N", "a", vec![]).expect("insert");
+
+    let t = db.commit_time_ms(0).expect("frame 0 stamped");
+    assert_eq!(
+        t,
+        ms("2026-06-02"),
+        "the clock was used instead of the assertion"
+    );
+}
+
+#[test]
+fn the_override_is_sticky_until_changed_or_cleared() {
+    let dir = tmp("sticky");
+    let mut db = GraphDb::open(&dir).expect("open");
+    db.record_commits_at(Some(ms("2026-06-02")))
+        .expect("assert");
+    for i in 0..3 {
+        db.insert_node("N", &format!("a{i}"), vec![])
+            .expect("insert");
+    }
+    for f in 0..3 {
+        assert_eq!(db.commit_time_ms(f), Some(ms("2026-06-02")), "frame {f}");
+    }
+
+    db.record_commits_at(Some(ms("2026-06-03")))
+        .expect("advance");
+    db.insert_node("N", "b", vec![]).expect("insert");
+    assert_eq!(db.commit_time_ms(3), Some(ms("2026-06-03")));
+
+    // Cleared, the clock comes back — and "now" is far later than 2026-06.
+    db.record_commits_at(None).expect("clear");
+    db.insert_node("N", "c", vec![]).expect("insert");
+    let live = db.commit_time_ms(4).expect("stamped");
+    assert!(
+        live > ms("2026-06-03"),
+        "the clock did not come back: {live}"
+    );
+}
+
+#[test]
+fn going_backwards_is_refused_by_name() {
+    let dir = tmp("backwards");
+    let mut db = GraphDb::open(&dir).expect("open");
+    db.record_commits_at(Some(ms("2026-06-10")))
+        .expect("assert");
+    db.insert_node("N", "a", vec![]).expect("insert");
+
+    match db.record_commits_at(Some(ms("2026-06-02"))) {
+        Err(GraphError::CommitTimeNotMonotonic {
+            supplied_ms,
+            newest_ms,
+        }) => {
+            assert_eq!(supplied_ms, ms("2026-06-02"));
+            assert_eq!(newest_ms, ms("2026-06-10"));
+        }
+        other => panic!("expected CommitTimeNotMonotonic, got {other:?}"),
+    }
+}
+
+#[test]
+fn the_same_instant_again_is_allowed() {
+    // A day of backfilled rows shares one instant; equal is not backwards.
+    let dir = tmp("equal");
+    let mut db = GraphDb::open(&dir).expect("open");
+    db.record_commits_at(Some(ms("2026-06-02")))
+        .expect("assert");
+    db.insert_node("N", "a", vec![]).expect("insert");
+    db.record_commits_at(Some(ms("2026-06-02")))
+        .expect("the same instant must be allowed");
+}
+
+#[test]
+fn a_backfilled_history_answers_the_dates_it_was_given() {
+    // The shape a mirror actually performs, and the thing the association
+    // benchmark's world needs: replay a month in order, then ask what the graph
+    // looked like mid-month.
+    let dir = tmp("backfill");
+    let mut db = GraphDb::open(&dir).expect("open");
+
+    db.record_commits_at(Some(ms("2026-06-01"))).expect("day 1");
+    db.insert_node("N", "a", vec![]).expect("insert");
+    db.insert_node("N", "b", vec![]).expect("insert");
+
+    db.record_commits_at(Some(ms("2026-06-15")))
+        .expect("day 15");
+    db.insert_edge("KNOWS", "a", "b").expect("edge");
+
+    db.record_commits_at(Some(ms("2026-06-30")))
+        .expect("day 30");
+    db.insert_node("N", "c", vec![]).expect("insert");
+
+    // Before the edge existed.
+    let early = db.resolve_date("2026-06-10").expect("resolve");
+    assert!(
+        !db.was_linked("a", "b", "KNOWS", early).expect("was_linked"),
+        "the edge is dated 2026-06-15 and must not exist on the 10th"
+    );
+    // After it.
+    let late = db.resolve_date("2026-06-20").expect("resolve");
+    assert!(
+        db.was_linked("a", "b", "KNOWS", late).expect("was_linked"),
+        "the edge is dated 2026-06-15 and must exist on the 20th"
+    );
+    // And a date before the backfill starts is refused, not guessed.
+    assert!(matches!(
+        db.resolve_date("2026-05-01"),
+        Err(GraphError::TimeBeforeFloor { .. })
+    ));
+}
+
+#[test]
+fn a_read_only_handle_refuses_to_assert_a_time() {
+    let dir = tmp("ro-assert");
+    {
+        let mut db = GraphDb::open(&dir).expect("open");
+        db.insert_node("N", "a", vec![]).expect("insert");
+    }
+    let mut ro = GraphDb::open_with_options(
+        &dir,
+        core_api::OpenOptions {
+            read_only: true,
+            ..Default::default()
+        },
+    )
+    .expect("open read-only");
+    assert!(matches!(
+        ro.record_commits_at(Some(ms("2026-06-02"))),
+        Err(GraphError::ReadOnly)
+    ));
+}

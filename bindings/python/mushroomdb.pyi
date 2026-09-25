@@ -182,6 +182,22 @@ class CrossNamespace(MushroomError):
     dst: str
     dst_ns: str
 
+class CommitTimeNotMonotonic(MushroomError):
+    """An asserted commit time would move the store's recorded history backwards.
+
+    Raised by `record_commits_at` only. The live clock is never held to this, so
+    an NTP step backwards still commits — a caller asserting "this happened at T"
+    is stating a fact and can be held to it, and a clock cannot.
+
+    Backfill in chronological order: resolution walks commit order, so a later
+    commit carrying an earlier instant would silently widen every answer after
+    it. Equal instants are allowed — that is what a shared day means.
+    """
+
+    code: str
+    supplied_ms: int
+    newest_ms: int
+
 class NoRecordedTime(MushroomError):
     """A date was given to a history call on a store that records no commit times.
 
@@ -499,6 +515,26 @@ class GraphDb:
         commit at or before that instant. Prefer the date when the question
         names one: guessing an index for a date is how a plausible wrong graph
         gets returned.
+        """
+
+    def record_commits_at(self, unix_ms: int | None) -> None:
+        """Record subsequent commits as having happened at `unix_ms`.
+
+        `None` goes back to the system clock. For **backfilled history**: a
+        mirror importing rows that already carry their own timestamps, or a
+        replay of events from months ago. Without this every imported commit is
+        stamped "now", so a store holding a year of history answers every date
+        question with `TimeBeforeFloor` — the data is there and no date reaches
+        it.
+
+        Sticky until changed or cleared, because a day of backfilled rows
+        genuinely shares one instant. Import in chronological order: an instant
+        earlier than anything already recorded raises
+        `CommitTimeNotMonotonic`.
+
+        Not available over HTTP or MCP. Asserting when a commit happened
+        rewrites the store's apparent history, which is not something a role
+        token models.
         """
 
     def resolve_date(self, date: str) -> int:

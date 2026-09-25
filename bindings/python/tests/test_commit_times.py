@@ -75,3 +75,52 @@ def test_the_new_classes_are_mushroom_errors_and_runtime_errors():
         assert issubclass(cls, RuntimeError)
     assert mushroomdb.NoRecordedTime.code == "no_recorded_time"
     assert mushroomdb.TimeBeforeFloor.code == "time_before_floor"
+
+
+# ── backfilled history ──────────────────────────────────────────────────────
+
+def _ms(date):
+    import datetime as dt
+    d = dt.datetime.strptime(date, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+    return int(d.timestamp() * 1000)
+
+
+def test_record_commits_at_backdates_a_commit(tmp_path):
+    db = mushroomdb.GraphDb.open(str(tmp_path / "s"))
+    db.record_commits_at(_ms("2026-06-02"))
+    db.insert_node("N", "a", {})
+    assert db.commit_time_ms(0) == _ms("2026-06-02")
+
+
+def test_it_is_sticky_and_clears_back_to_the_clock(tmp_path):
+    db = mushroomdb.GraphDb.open(str(tmp_path / "s"))
+    db.record_commits_at(_ms("2026-06-02"))
+    db.insert_node("N", "a", {})
+    db.insert_node("N", "b", {})
+    assert db.commit_time_ms(0) == db.commit_time_ms(1) == _ms("2026-06-02")
+    db.record_commits_at(None)
+    db.insert_node("N", "c", {})
+    assert db.commit_time_ms(2) > _ms("2026-06-02")
+
+
+def test_going_backwards_raises_with_both_instants(tmp_path):
+    db = mushroomdb.GraphDb.open(str(tmp_path / "s"))
+    db.record_commits_at(_ms("2026-06-10"))
+    db.insert_node("N", "a", {})
+    with pytest.raises(mushroomdb.CommitTimeNotMonotonic) as e:
+        db.record_commits_at(_ms("2026-06-02"))
+    assert e.value.supplied_ms == _ms("2026-06-02")
+    assert e.value.newest_ms == _ms("2026-06-10")
+    assert e.value.code == "commit_time_not_monotonic"
+
+
+def test_a_backfilled_month_answers_its_own_dates(tmp_path):
+    db = mushroomdb.GraphDb.open(str(tmp_path / "s"))
+    db.record_commits_at(_ms("2026-06-01"))
+    db.insert_node("N", "a", {})
+    db.insert_node("N", "b", {})
+    db.record_commits_at(_ms("2026-06-15"))
+    db.insert_edge("KNOWS", "a", "b")
+
+    assert db.was_linked("a", "b", "KNOWS", "2026-06-10") is False
+    assert db.was_linked("a", "b", "KNOWS", "2026-06-20") is True

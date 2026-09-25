@@ -1556,6 +1556,17 @@ pub struct GraphDb<F: Fs> {
     /// time as commit time. Empty on a store written before v0.6.11, which
     /// makes every date query answer `NoRecordedTime` rather than guess.
     commit_times: core_storage::commit_times::CommitTimes,
+    /// When set, subsequent commits are recorded at this instant instead of the
+    /// system clock.
+    ///
+    /// Sticky on purpose. A backfill replays history that happened over months,
+    /// and a day's worth of rows genuinely share one instant — a one-shot flag
+    /// would mean setting it before every row of a bulk load, and forgetting one
+    /// would stamp that row "now" in the middle of 2026-06. Sticky makes the
+    /// failure visible instead: forget to move it and every commit carries the
+    /// same timestamp, which a date query answers oddly and an inspection shows
+    /// at once.
+    commit_time_override: Option<i64>,
     /// `true` only while the open path is replaying, where `load_from_disk`
     /// calls `fulltext.rebuild_all` unconditionally afterwards.
     ///
@@ -2298,6 +2309,7 @@ impl<F: Fs> GraphDb<F> {
             commit_times: core_storage::commit_times::CommitTimes::default(),
             commit_times_poisoned: false,
             fulltext_rebuild_follows: false,
+            commit_time_override: None,
             roles: Some(vec![]),
             role_masks: Arc::new(crate::mask::RoleMaskCache::new()),
             store_id: crate::mask::StoreId::next(),
@@ -2368,6 +2380,7 @@ impl<F: Fs> GraphDb<F> {
         self.commit_times = core_storage::commit_times::CommitTimes::default();
         self.commit_times_poisoned = false;
         self.fulltext_rebuild_follows = false;
+        self.commit_time_override = None;
         self.roles = Some(vec![]);
         // A fresh cache, not a cleared one: any reader snapshot still holding
         // the old `Arc` keeps it to itself, so nothing it memoised against the
@@ -4937,12 +4950,18 @@ impl<F: Fs> GraphDb<F> {
         // date is handed to. Recording `seq` shifts every date by one commit,
         // silently, which is the exact failure this module exists to remove.
         let frame_index = seq.saturating_sub(1);
-        let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
-            // A clock before 1970. Refuse to invent a timestamp.
-            self.commit_times_poisoned = true;
-            return;
+        let unix_ms = match self.commit_time_override {
+            Some(ms) => ms,
+            None => {
+                let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                else {
+                    // A clock before 1970. Refuse to invent a timestamp.
+                    self.commit_times_poisoned = true;
+                    return;
+                };
+                now.as_millis() as i64
+            }
         };
-        let unix_ms = now.as_millis() as i64;
         let first = self.commit_times.is_empty();
         self.commit_times.push(frame_index, unix_ms);
 
@@ -5000,6 +5019,58 @@ impl<F: Fs> GraphDb<F> {
         }
         self.commit_times
             .resolve_instant(unix_ms, self.wal_horizon_floor)
+    }
+
+    /// Record subsequent commits as having happened at `unix_ms`, or pass
+    /// `None` to go back to the system clock.
+    ///
+    /// For **backfilled history**: a mirror importing rows that already carry
+    /// their own timestamps, or a replay of events that happened months ago.
+    /// Without this every such commit is stamped "now", so a store holding a
+    /// year of imported history answers every date question with
+    /// `TimeBeforeFloor` — the data is there and no date reaches it.
+    ///
+    /// Sticky until changed or cleared, because a day of backfilled rows
+    /// genuinely shares one instant.
+    ///
+    /// **Import in chronological order.** A supplied instant earlier than
+    /// anything already recorded is refused with
+    /// [`GraphError::CommitTimeNotMonotonic`], because resolution walks commit
+    /// order: a later commit carrying an earlier time would silently widen every
+    /// answer after it. Equal is allowed — that is what a shared day means. The
+    /// live clock is never held to this, so an NTP step backwards still commits.
+    ///
+    /// Deliberately **not** exposed over HTTP or MCP: asserting when a commit
+    /// happened rewrites the store's apparent history, which is not something a
+    /// role token models. It is an embedding-caller's operation.
+    pub fn record_commits_at(&mut self, unix_ms: Option<i64>) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if let Some(ms) = unix_ms {
+            if self.commit_times_poisoned {
+                return Err(GraphError::Corrupt {
+                    detail: "commit_times.bin will not decode; this store cannot \
+                             record an asserted commit time"
+                        .into(),
+                });
+            }
+            if let Some(newest) = self.commit_times.max_ms() {
+                if ms < newest {
+                    return Err(GraphError::CommitTimeNotMonotonic {
+                        supplied_ms: ms,
+                        newest_ms: newest,
+                    });
+                }
+            }
+        }
+        self.commit_time_override = unix_ms;
+        Ok(())
+    }
+
+    /// The instant subsequent commits are being recorded at, when one is set.
+    pub fn commit_time_override(&self) -> Option<i64> {
+        self.commit_time_override
     }
 
     /// [`Self::edges_at`] addressed by an instant rather than a commit index.

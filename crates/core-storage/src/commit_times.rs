@@ -86,6 +86,17 @@ impl CommitTimes {
         self.entries.is_empty()
     }
 
+    /// The greatest time any entry records.
+    ///
+    /// Not the newest commit's time: a live clock can step backwards, so the
+    /// newest commit may carry a lower instant than one before it. An asserted
+    /// time is checked against this rather than against the last entry, because
+    /// the question is "does this go backwards against anything already
+    /// recorded", not "against the most recent".
+    pub fn max_ms(&self) -> Option<i64> {
+        self.entries.iter().map(|&(_, ms)| ms).max()
+    }
+
     /// The recorded time of `commit`, when the map holds one.
     pub fn time_of(&self, commit: u64) -> Option<i64> {
         self.entries

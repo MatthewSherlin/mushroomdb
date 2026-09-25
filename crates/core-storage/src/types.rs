@@ -102,6 +102,20 @@ pub enum GraphError {
     /// statement (CREATE / MERGE / MATCH…SET / DELETE). The HTTP layer maps
     /// this to 400 Bad Request with body `{"error":"masked queries are read-only"}`.
     MaskedReadOnly,
+    /// An asserted commit time would move the recorded history backwards.
+    ///
+    /// Raised by `record_commits_at`, never by the live clock. A caller that
+    /// says "this commit happened at T" is asserting a fact and can be held to
+    /// it; the system clock cannot, so an NTP step backwards is stored as
+    /// observed and never fails a write.
+    ///
+    /// Backfilling out of chronological order would make date resolution
+    /// meaningless: resolution walks commit order, so a later commit carrying an
+    /// earlier instant silently widens every answer after it.
+    CommitTimeNotMonotonic {
+        supplied_ms: i64,
+        newest_ms: i64,
+    },
     /// A date was given to a history surface on a store that records no commit
     /// times.
     ///
@@ -226,6 +240,15 @@ impl std::fmt::Display for GraphError {
             GraphError::QueryError { detail } => write!(f, "query error: {detail}"),
             GraphError::IngestError { detail } => write!(f, "ingest error: {detail}"),
             GraphError::ReadOnly => write!(f, "as-of instances are read-only"),
+            GraphError::CommitTimeNotMonotonic {
+                supplied_ms,
+                newest_ms,
+            } => write!(
+                f,
+                "commit time {supplied_ms} ms is earlier than {newest_ms} ms, \
+                 which this store already records; backfill in chronological \
+                 order"
+            ),
             GraphError::NoRecordedTime => write!(
                 f,
                 "this store records no commit times; pass a commit index instead \

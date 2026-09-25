@@ -653,6 +653,9 @@ _WRITES_KEYLESS = {
     "disable_index": lambda s: s.disable_index("Person", "team"),
     "enable_multiplicity": lambda s: s.enable_multiplicity(),
     "snapshot": lambda s: s.snapshot(),
+    # Asserting when a commit happened rewrites the store's apparent history,
+    # which is a write in the sense that matters: a scoped handle never does it.
+    "record_commits_at": lambda s: s.record_commits_at(1_800_000_000_000),
 }
 
 
@@ -720,6 +723,7 @@ COVERED = {
     "ingest_batch": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "batch_edges": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "create_rule": "test_a_keyless_write_refuses_with_the_scoped_message",
+    "record_commits_at": "test_a_keyless_write_refuses_with_the_scoped_message",
     "enable_index": "test_a_keyless_write_refuses_with_the_scoped_message",
     "disable_index": "test_a_keyless_write_refuses_with_the_scoped_message",
     "enable_multiplicity": "test_a_keyless_write_refuses_with_the_scoped_message",

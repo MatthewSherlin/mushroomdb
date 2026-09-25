@@ -827,13 +827,16 @@ fn relationships_call(key: &str, intersection: &Option<(Vec<String>, String)>) -
 /// agent had the right data and still answered from an arbitrary late commit,
 /// because the question named a *date* and `at` is a commit index. Nothing in
 /// a commit carries a date, so guessing one from the end of the WAL is the
-/// failure this note exists to stop — the two history tools are where a date
-/// turns into a commit number. That is worth more here than the `all_of`
-/// explanation the note used to carry, which `relationships_call` already
-/// gives on the line above.
+/// failure this note exists to stop — an agent asked a question in calendar time
+/// going off to *derive* a commit number, by probing `node_history`, or `stats`,
+/// or a date map sitting next to the store. As of v0.6.11 `at` takes the date
+/// itself, so the note points at that instead. It is worth more here than the
+/// `all_of` explanation the note used to carry, which `relationships_call`
+/// already gives on the line above.
 fn as_of_call(key: &str, at: u64, intersection: &Option<(Vec<String>, String)>) -> String {
-    let note = "— commits carry no dates: take `at` from node_history/edge_history \
-                commit numbers or the dataset's date→commit map";
+    let note = "— or pass a date in place of the number: `2026-06-19`, \
+                `2026-06-19T12:00:00Z`. It resolves to the last commit at or \
+                before that instant, so there is no commit to go and find";
     match intersection {
         Some((types, dst)) if types.len() >= 2 => format!(
             "edges_at {key} {at} all_of: [{}] label: {dst} {note}",
