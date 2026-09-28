@@ -1732,6 +1732,27 @@ pub struct GraphDb<F: Fs> {
     /// drain thread truncates a failed group. Compared against the WAL's
     /// on-disk length to decide staleness.
     wal_consumed: u64,
+    /// The **global 0-based frame index the next appended WAL frame will
+    /// occupy** — `wal_horizon_floor` plus every frame currently reachable
+    /// through archives and the live WAL.
+    ///
+    /// This is the space every history surface addresses: `edges_at`,
+    /// `was_linked`, both history readouts and `open_at` all index the sequence
+    /// [`all_frames`](GraphDb::all_frames) returns, and
+    /// [`wal_total_commits`](GraphDb::wal_total_commits) counts it.
+    ///
+    /// It exists because **a commit is not a frame**. `commit_seq` counts
+    /// commits; a commit whose rules fire appends a *second* frame — the
+    /// derived-edge history marker — that no counter of commits ever sees. The
+    /// two diverge by one frame per rule-firing commit, cumulatively, so
+    /// deriving a frame index from `commit_seq` under-reports by more and more
+    /// as history grows and resolves every date to an earlier graph. Silently:
+    /// an older graph is a plausible answer, not an error.
+    ///
+    /// Maintained in lockstep with [`wal_consumed`](GraphDb::wal_consumed) —
+    /// the same appends advance both, one in frames and one in bytes — so the
+    /// two are seeded and rewound at exactly the same places. Keep it that way.
+    wal_frames_written: u64,
     /// Identity of the snapshot this handle's base state came from, as
     /// `(len, mtime_nanos)`. A different value means another process replaced
     /// the snapshot and the WAL no longer continues our state: refresh reloads.
@@ -2345,6 +2366,7 @@ impl<F: Fs> GraphDb<F> {
             warned_ambiguous_exactness: std::sync::Mutex::new(HashSet::new()),
             started_at: std::time::Instant::now(),
             wal_consumed: 0,
+            wal_frames_written: 0,
             snapshot_ident: None,
             open_opts: opts,
             holds_lifetime_lock: false,
@@ -2407,6 +2429,7 @@ impl<F: Fs> GraphDb<F> {
         self.snapshot_preserved_history = false;
         self.pending_write_authz = None;
         self.wal_consumed = 0;
+        self.wal_frames_written = 0;
         self.snapshot_ident = None;
     }
 
@@ -2536,6 +2559,9 @@ impl<F: Fs> GraphDb<F> {
         // Scoped to this call: `refresh()` also replays frames and is *not*
         // followed by a rebuild, so its backfill must still run.
         db.fulltext_rebuild_follows = true;
+        // Every decoded frame occupies an index, replayed or not: markers
+        // are state no-ops but they are not index no-ops.
+        let decoded_frames = records.len() as u64;
         let replayed = db.apply_frames(records);
         db.fulltext_rebuild_follows = false;
         let replayed = replayed?;
@@ -2601,6 +2627,12 @@ impl<F: Fs> GraphDb<F> {
         // file: a torn or still-being-written tail is unconsumed by definition
         // and stays visible to `is_stale` until it decodes.
         db.wal_consumed = valid_len as u64;
+        // The frame cursor counts the same sequence `all_frames` returns:
+        // surviving archives first, then the live WAL, offset by the floor.
+        // Counting the archives separately rather than calling
+        // `wal_total_commits` keeps the live WAL from being decoded twice on
+        // every open, and costs nothing on a store that has never archived.
+        db.wal_frames_written = db.wal_horizon_floor + db.archive_frame_count()? + decoded_frames;
         db.snapshot_ident = db.fs.snapshot_ident().map_err(GraphError::Io)?;
         trace_open!("wal replay done", _t0);
         // Rebuild view values after WAL replay only when there is no V8 base.
@@ -2648,14 +2680,7 @@ impl<F: Fs> GraphDb<F> {
         // The time sidecar. Absent is the normal case for any store written
         // before v0.6.11 and is not an error; unreadable is recorded so date
         // queries can say "damaged" rather than "none recorded".
-        match db.fs.read(FileId::CommitTimes) {
-            Ok(bytes) if bytes.is_empty() => {}
-            Ok(bytes) => match core_storage::commit_times::decode(&bytes) {
-                Ok(t) => db.commit_times = t,
-                Err(_) => db.commit_times_poisoned = true,
-            },
-            Err(_) => {}
-        }
+        db.load_commit_times_from_fs();
         // Capture the initial MVCC fold so reader() is ready immediately.
         db.fold_now();
         trace_open!("open_with complete", _t0);
@@ -2798,6 +2823,7 @@ impl<F: Fs> GraphDb<F> {
             .read_range(FileId::Wal, self.wal_consumed)
             .map_err(GraphError::Io)?;
         let (records, valid_len) = decode_all(&tail);
+        let decoded_frames = records.len() as u64;
         let applied = match self.apply_frames(records) {
             Ok(n) => n,
             Err(e) => {
@@ -2812,6 +2838,14 @@ impl<F: Fs> GraphDb<F> {
         // Advance by the bytes actually decoded, never by the file length: an
         // incomplete trailing frame stays unconsumed for the next refresh.
         self.wal_consumed += valid_len as u64;
+        self.wal_frames_written += decoded_frames;
+        // The peer that wrote those frames also stamped them. Absorbing the
+        // frames without the stamps leaves this handle resolving dates from a
+        // prefix of the store's history, and — while our own map is still
+        // empty — one commit away from rewriting the peer's file out of
+        // existence (`first` below decides on the map, and the map is what we
+        // just brought up to date).
+        self.load_commit_times_from_fs();
         if applied > 0 {
             // Peer commits must reach `reader()` snapshots taken from here on.
             // A full fold is what open does; refresh does not build per-commit
@@ -4922,8 +4956,20 @@ impl<F: Fs> GraphDb<F> {
 
     /// Durable write, then notify the event sink. Replay (`apply` during
     /// `open`) never enters this function, so it is the replay-silent seam.
-    /// Record that `seq` happened now, and append those 16 bytes to the
-    /// sidecar.
+    /// Record that the commit occupying `frame_index` happened now, and append
+    /// those 16 bytes to the sidecar.
+    ///
+    /// `frame_index` is the **global 0-based WAL frame index** of the commit's
+    /// own record — the space every history surface addresses — taken from
+    /// [`wal_frames_written`](GraphDb::wal_frames_written) before the append
+    /// that puts the record there.
+    ///
+    /// **It is deliberately not derived from `commit_seq`.** A commit is not a
+    /// frame: one whose rules fire appends a second frame for the derived-edge
+    /// history marker, so `commit_seq - 1` falls one frame further behind per
+    /// rule-firing commit and every date resolves to an ever-earlier graph.
+    /// That was the shipped behaviour through v0.6.11 and it failed silently,
+    /// because an older graph is a plausible answer rather than an error.
     ///
     /// Called from exactly one place — `log_then_apply_with`, immediately after
     /// `commit_seq` is incremented. Every write path in the engine funnels
@@ -4938,18 +4984,10 @@ impl<F: Fs> GraphDb<F> {
     /// the snapshot, so a failed append must not fail a commit that is already
     /// durable — it costs a date, not data. The map is marked poisoned so the
     /// gap is reported rather than resolved across.
-    fn stamp_commit_time(&mut self, seq: u64) {
+    fn stamp_commit_time(&mut self, frame_index: u64) {
         if self.commit_times_poisoned {
             return;
         }
-        // `seq` is the 1-based CAS counter. Every date consumer — `edges_at`,
-        // `was_linked`, the history events — addresses history by **0-based
-        // frame index**, and `docs/site/timetravel.md:83` names these as
-        // different counters and says outright not to pass one for the other.
-        // The map records the frame index, because that is the space a resolved
-        // date is handed to. Recording `seq` shifts every date by one commit,
-        // silently, which is the exact failure this module exists to remove.
-        let frame_index = seq.saturating_sub(1);
         let unix_ms = match self.commit_time_override {
             Some(ms) => ms,
             None => {
@@ -4978,6 +5016,42 @@ impl<F: Fs> GraphDb<F> {
         };
         if wrote.is_err() {
             self.commit_times_poisoned = true;
+        }
+    }
+
+    /// Read the time sidecar from disk into this handle.
+    ///
+    /// Absent is the normal case for any store written before v0.6.11 and is
+    /// not an error; unreadable is recorded so date queries can say "damaged"
+    /// rather than "none recorded".
+    ///
+    /// Called at open **and** by `refresh` when a peer's frames are absorbed.
+    /// Both, because the map is a file another process appends to: a handle
+    /// that raises its frame cursor to include a peer's commits while holding a
+    /// stale map would answer dates from a prefix of the truth — and, if its
+    /// own map were still empty, would rewrite the whole file with one entry
+    /// and destroy the peer's.
+    fn load_commit_times_from_fs(&mut self) {
+        match self.fs.read(FileId::CommitTimes) {
+            Ok(bytes) if bytes.is_empty() => {}
+            Ok(bytes) => {
+                // A map from an older format version is discarded, not
+                // reported as damage and not reinterpreted. Its entries were
+                // written correctly against a different meaning of the number
+                // — see `COMMIT_TIMES_VERSION` — and reading them in this
+                // build's space would resolve dates onto unrelated commits.
+                // Leaving the map empty makes the store answer
+                // `NoRecordedTime`, which is the truth: it records no times
+                // this build can use, and the next commit starts a usable map.
+                if core_storage::commit_times::superseded_version(&bytes).is_some() {
+                    return;
+                }
+                match core_storage::commit_times::decode(&bytes) {
+                    Ok(t) => self.commit_times = t,
+                    Err(_) => self.commit_times_poisoned = true,
+                }
+            }
+            Err(_) => {}
         }
     }
 
@@ -5242,6 +5316,7 @@ impl<F: Fs> GraphDb<F> {
         // The cursor advances by exactly the bytes appended: these frames are
         // ours and already applied, so a later refresh must not replay them.
         self.wal_consumed += frame.len() as u64;
+        self.wal_frames_written += 1;
         if Self::wal_needs_sync(policy, &rec) {
             self.fs.sync(FileId::Wal)?;
         }
@@ -5294,7 +5369,6 @@ impl<F: Fs> GraphDb<F> {
         }
         self.commit_seq += 1;
         let seq = self.commit_seq;
-        self.stamp_commit_time(seq);
         // Update per-node last-change map for the committed record.
         // Must happen after commit_seq is incremented so the seq is correct.
         self.update_last_change_from_rec(&rec, seq);
@@ -5340,8 +5414,26 @@ impl<F: Fs> GraphDb<F> {
             let marker_bytes = encode_record(&marker_frame);
             if self.fs.append(FileId::Wal, &marker_bytes).is_ok() {
                 self.wal_consumed += marker_bytes.len() as u64;
+                // A marker is a state no-op during replay but it is not an
+                // index no-op: it occupies a frame that every history surface
+                // counts. Missing this increment is the whole of defect 1.
+                self.wal_frames_written += 1;
             }
         }
+
+        // Stamp the commit against the **last** frame it wrote.
+        //
+        // `edges_at` and `was_linked` reconstruct derived edges by reading the
+        // history markers out of the WAL, not by re-running rules over a
+        // prefix. A commit's complete state — its record *and* the edges its
+        // rules derived — is therefore only reached at its marker frame, so
+        // that is the frame a date naming this commit must resolve to. Stamping
+        // the record's own frame would answer every date with the graph as it
+        // was one derivation short.
+        //
+        // This runs after the marker append for that reason, and it is still
+        // the single stamping site: one commit, one entry.
+        self.stamp_commit_time(self.wal_frames_written - 1);
 
         // Record MVCC CommitDelta for the epoch reader.  The WAL record is
         // stored as-is (including any nested Batch / Intern records); the
@@ -12205,6 +12297,22 @@ impl<F: Fs> GraphDb<F> {
     /// Commit indices into the returned list are LOCAL (0 = first frame of
     /// oldest surviving archive).  To obtain the GLOBAL index add
     /// `self.wal_horizon_floor`.
+    /// How many frames the surviving archives hold, without materialising them.
+    ///
+    /// The same count `all_frames` puts at the front of its list. Used to seed
+    /// [`wal_frames_written`](GraphDb::wal_frames_written) at open without
+    /// decoding the live WAL a second time; free on a store with no archives,
+    /// which is most of them.
+    fn archive_frame_count(&self) -> Result<u64> {
+        let mut n = 0u64;
+        for a in self.fs.list_archives()? {
+            let bytes = self.fs.read_archive(a)?;
+            let (frames, _) = decode_all(&bytes);
+            n += frames.len() as u64;
+        }
+        Ok(n)
+    }
+
     fn all_frames(&self) -> Result<(Vec<WalRecord>, u64)> {
         let archive_ns = self.fs.list_archives()?;
         let mut all: Vec<WalRecord> = Vec::new();
@@ -13891,6 +13999,19 @@ impl<F: Fs> GraphDb<F> {
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
             self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
+            // This branch discards history rather than archiving it: the frames
+            // the map describes are gone and the replacement WAL renumbers from
+            // the floor, so every surviving entry now names a different frame.
+            // Keeping them would resolve a date onto an unrelated commit — and
+            // the stamps written after this point would sit far above the
+            // store's own frame count, which is how the date surface came to
+            // refuse commits the index path served perfectly well.
+            //
+            // A store that cannot answer a date says so by name
+            // (`NoRecordedTime`). That is the honest state after discarding the
+            // history the dates addressed.
+            self.commit_times = core_storage::commit_times::CommitTimes::default();
+            self.rewrite_commit_times();
         }
         // After snapshot the overlay may have changed (V8 merge path clears
         // self.topo and self.props). Refresh the MVCC fold so future readers
@@ -13902,6 +14023,13 @@ impl<F: Fs> GraphDb<F> {
         // like a peer's on the next staleness check and force a needless
         // reload.
         self.wal_consumed = self.fs.wal_len().map_err(GraphError::Io)?;
+        // A snapshot can replace the live WAL with a baseline, which renumbers
+        // every frame after it. Re-derive the frame cursor from what the store
+        // now actually holds rather than carrying the pre-snapshot count
+        // forward — `wal_total_commits` is the same sequence the history
+        // surfaces index, and the snapshot has already paid a far larger cost
+        // than one decode.
+        self.wal_frames_written = self.wal_total_commits()?;
         self.snapshot_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
         Ok(())
     }
