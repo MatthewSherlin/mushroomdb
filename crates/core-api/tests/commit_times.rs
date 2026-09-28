@@ -448,3 +448,63 @@ fn a_bare_date_includes_that_days_own_writes() {
         "08:00 precedes the 09:00 edge"
     );
 }
+
+/// A date and a commit index reach exactly as far as each other — no further,
+/// and no less far.
+///
+/// This exists because of a mistake worth not repeating. A truncating snapshot
+/// folds the WAL and discards it, so *all* history becomes unreachable; a date
+/// query then answers `CommitOutOfRange`, which reads alarmingly like the date
+/// surface having broken. It has not: the commit-index call refuses identically,
+/// because the history is genuinely gone. Pinning the two together means nobody
+/// has to re-derive that from a confusing error, and a future change that makes
+/// the date path reach further than the index path — which would mean it is
+/// answering from something the engine cannot replay — fails here.
+#[test]
+fn a_date_reaches_exactly_as_far_as_a_commit_index() {
+    let dir = tmp("reach-parity");
+    let mut db = GraphDb::open(&dir).expect("open");
+    db.record_commits_at(Some(ms("2026-06-01"))).expect("day 1");
+    db.insert_node("N", "a", vec![]).expect("insert");
+    db.insert_node("N", "b", vec![]).expect("insert");
+    db.record_commits_at(Some(ms("2026-06-15")))
+        .expect("day 15");
+    db.insert_edge("KNOWS", "a", "b").expect("edge");
+
+    // Before any snapshot both paths agree, and both answer.
+    let by_date = db.resolve_date("2026-06-20").expect("resolve");
+    assert!(db.was_linked("a", "b", "KNOWS", by_date).expect("by date"));
+    assert!(db
+        .was_linked(
+            "a",
+            "b",
+            "KNOWS",
+            db.wal_total_commits().expect("total") - 1
+        )
+        .expect("by index"));
+
+    // A truncating snapshot discards the WAL: nothing historical is reachable.
+    db.snapshot().expect("snapshot");
+    assert_eq!(
+        db.wal_total_commits().expect("total"),
+        0,
+        "a truncating snapshot leaves no reachable commits"
+    );
+
+    let index_err = db.was_linked("a", "b", "KNOWS", 0).unwrap_err();
+    let date_err = db.resolve_date("2026-06-20").unwrap_err();
+    assert!(
+        matches!(index_err, GraphError::CommitOutOfRange { .. }),
+        "a commit index must refuse once history is discarded, got {index_err:?}"
+    );
+    assert!(
+        matches!(
+            date_err,
+            GraphError::CommitOutOfRange { .. } | GraphError::TimeBeforeFloor { .. }
+        ),
+        "a date must refuse exactly where an index does, got {date_err:?}"
+    );
+
+    // The store itself is intact — only its history went.
+    assert!(db.node_info("a").is_some(), "the snapshot kept the data");
+}

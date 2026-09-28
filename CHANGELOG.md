@@ -12,6 +12,25 @@ from node_history/edge_history commit numbers or the dataset's date→commit map
 A caller asking a question in calendar time had to build that map by hand, and a
 wrong guess came back as a plausible wrong graph rather than an error.
 
+**Measured, on the suite that exists to measure this.** The association
+benchmark's four time-travel tasks were the release's target: in the committed
+run they took 6-10 MCP calls and 450,000-640,000 tokens each, carrying ~67% of
+the graph arm's cost and all of its variance. They now take **one call and about
+50,000 tokens**. Against the sqlite baseline, paired over 20 tasks with every
+interval excluding zero: **cost -41.2%**, tokens **-26.8%**, turns **-25.6%**.
+The 95% cost interval — the leg the pre-registered gate calls the discriminator,
+and the leg that failed before — is now `[-0.0353, -0.0124]`, **entirely below
+zero**.
+
+**The gate still reports FAILED**, on correctness, by **one key on one task**
+(-0.006 paired). `assoc-timetravel-4` answers 7 of its 8 keys with zero false
+positives, reproducibly across three reps, because one pair's derived edge lands
+in a commit the world stamps a day later than the day the task asks about. That
+is a disagreement between the generator's model and the engine's incremental
+derivation, not a date-resolution defect: the resolved commit is the correct one
+for the date. 180 cells, 0 dropped, 0 timeouts, 0 errors —
+[`results/20260925T200950Z`](benchmarks/agent-tasks/results/20260925T200950Z/summary.md).
+
 Alongside that: opening a store with full-text enabled costs half what it did, a
 scale gate that had never been able to report itself now reports, and a corrupt
 store answers one HTTP status instead of two.
@@ -51,6 +70,19 @@ unchanged under 0.6.10.
   older binary would **persist that truncation**; `format-stability.md:140` records
   exactly that outcome for discriminant 23. An unknown file has none of that
   failure mode, and it keeps this release to zero format changes.
+- **`record_commits_at(unix_ms)` — backfilled history addressable by its own
+  dates.** The engine records when a commit *happened*, which is right for a live
+  store and useless for an import: a mirror replaying a year of rows stamps all of
+  them "now", so the data is there and no date reaches it. This says "record
+  subsequent commits at this instant" instead. Sticky until changed or cleared,
+  because a day of backfilled rows genuinely shares one instant. **Import in
+  chronological order** — an instant earlier than anything already recorded raises
+  `CommitTimeNotMonotonic` carrying both, because resolution walks commit order
+  and a later commit holding an earlier time would silently widen every answer
+  after it. Equal instants are allowed. The live clock is never held to this, so an
+  NTP step backwards still commits. Deliberately **not** exposed over HTTP or MCP:
+  asserting when a commit happened rewrites the store's apparent history, which is
+  not something a role token models.
 - **Stamping is O(1) per commit.** The sidecar's header carries no entry count —
   the count is the file length — so a commit appends its own 16 bytes rather than
   rewriting the map. A torn append leaves a partial trailing entry, which is
@@ -98,6 +130,14 @@ unchanged under 0.6.10.
   the status moved — and of 370 server tests exactly one assertion needed editing:
   the one that had pinned the old value, whose own comment already called it
   provisional. Closes the last row deferred from the 0.6.10 ledger.
+- **A bare date denotes its whole day.** `edges_at(key, "2026-07-14")` resolved to
+  the *midnight that starts* the day, so asking for a date excluded everything that
+  happened on it — an edge written at 09:00 on the 14th was invisible to a caller
+  asking for the 14th. A date is a day; a named instant still means exactly itself.
+- **`resolve_date` refuses an index it cannot hand back.** It checked the retention
+  floor but not the ceiling, so after a truncating snapshot — which folds the WAL
+  and discards it — it returned a commit the caller's next call would reject. One
+  refusal is better than two, and `resolve_date` is public.
 - **Three scale assertions are red, not two, and the third had never executed.**
   All six assertions in `hnsw_insert_cost_is_sublinear_per_vector` shared one test,
   and an assertion that fails ends its test — so the 2k→10k build-growth failure

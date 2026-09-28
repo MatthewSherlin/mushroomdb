@@ -5017,8 +5017,24 @@ impl<F: Fs> GraphDb<F> {
                     .into(),
             });
         }
-        self.commit_times
-            .resolve_instant(unix_ms, self.wal_horizon_floor)
+        let at = self
+            .commit_times
+            .resolve_instant(unix_ms, self.wal_horizon_floor)?;
+        // The map outlives the history it describes. A truncating snapshot folds
+        // the WAL and discards it, so entries can name commits the engine can no
+        // longer replay — the floor check above catches pruning, and this catches
+        // discarding. Returning an index the caller's next call will reject is a
+        // two-step error where one will do, and `resolve_date` is public: it
+        // either hands back a usable index or refuses.
+        let total = self.wal_total_commits()?;
+        if at >= total {
+            return Err(GraphError::CommitOutOfRange {
+                commit: at,
+                total,
+                floor: self.wal_horizon_floor,
+            });
+        }
+        Ok(at)
     }
 
     /// Record subsequent commits as having happened at `unix_ms`, or pass
