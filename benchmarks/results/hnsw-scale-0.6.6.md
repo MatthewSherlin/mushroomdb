@@ -59,15 +59,61 @@ The 227 s is recorded in `.github/workflows/ci.yml` at tag `v0.6.5`
 49.4 s is this release's run of the same gate. Wall clocks move a few percent between runs and
 between machines; the recall figures are deterministic.
 
-## The two assertions that stay red
+## The three assertions that stay red
 
-`hnsw_scale.rs` asserts a sub-quadratic build and a 50,000-vector build under five minutes.
-Both fail, deliberately and unedited:
+> **CORRECTION, 2026-09-24 (v0.6.11 Task 1).** This section said **two** for three releases.
+> It is **three**. The count was taken by reading the printed table rather than by watching the
+> assertions execute — and at the time this was written they could not all execute. All six
+> assertions lived in one `#[test] fn hnsw_insert_cost_is_sublinear_per_vector`, and an assertion
+> that fails ends its test, so the 2,000→10,000 build-growth assertion panicked first and the
+> 50,000-second wall clock, the update-cost ratio and the update absolute **never ran at all**.
+> The 50,000 s figure below was therefore also reported from the table rather than from a
+> failure; the one genuinely-executing red assertion was the build ratio.
+>
+> The missed one is the **update-cost ratio**, and it is the tightest of the three: a 1.97×
+> overshoot for 25× the vectors, against the build ratio's 1.94× for 5×. It also measures the
+> operation a production store performs most — a changed embedding is a remove plus an insert.
+>
+> `hnsw_scale.rs` now splits those six assertions into six `#[test]` functions over one shared
+> fixture, so no assertion can hide behind another's panic again. The CHANGELOG's v0.6.10
+> "Known limits" entry is corrected to match; the v0.6.6, v0.6.8 and v0.6.9 entries are left as
+> the historical record of what was believed at those releases.
+>
+> **The split was then run, and all three reds reported separately for the first time.**
+> Apple M4 Pro, macOS 15.7.3, arm64, release profile, `--test-threads=1`, 1,219.71 s total:
+>
+> ```
+> n=  2000  build      9.01s  per-insert   4.503ms  update   2.530ms  total 6657.3 B/node
+> n= 10000  build    145.77s  per-insert  14.577ms  update   6.897ms  total 6662.6 B/node
+> n= 50000  build   1017.14s  per-insert  20.343ms  update  14.793ms  total 6663.0 B/node
+>
+> test result: FAILED. 4 passed; 3 failed
+>   build_growth_2k_to_10k_is_under_8x   16.19x  (ceiling 8x)     FAILED
+>   build_50k_is_under_300s            1017.14s  (ceiling 300 s)  FAILED  ← first execution
+>   update_cost_2k_to_50k_is_under_3x     5.85x  (ceiling 3x)     FAILED  ← first execution
+>   build_growth_10k_to_50k_is_under_8x   6.98x                   ok
+>   update_50k_is_under_25ms           14.793ms                   ok
+>   memory_per_node_is_within_the_ceiling                         ok
+> ```
+>
+> These land within machine noise of the 0.6.6 figures below (16.19× against 15.48×, 5.85×
+> against 5.92×, 1,017.14 s against 1,018.05 s), which is the point: **nothing regressed and
+> nothing was fixed — the third failure was always there and nothing could report it.** The
+> table below stays as the 0.6.6 record; these are confirmation, not a replacement.
+
+`hnsw_scale.rs` asserts a sub-quadratic build, a 50,000-vector build under five minutes, and a
+re-embed cost that does not grow with the index. Three fail, deliberately and unedited:
 
 | Assertion | Ceiling | Measured |
 |---|---|---|
 | build growth per 5× the vectors | 8× | **15.48×** (2,000 → 10,000) |
 | 50,000-vector build | 300 s | **1,018.05 s** |
+| **update cost, 2,000 → 50,000** | **3×** | **5.92×** (14.280 ms ÷ 2.412 ms) |
+
+Two assertions from the same test do pass and are worth naming so the red ones are not read as
+the whole picture: the second build step (10,000 → 50,000) grows **7.71×**, inside the same 8×
+ceiling, and one 50,000-vector update takes **14.280 ms** against a 25 ms ceiling. The build
+ratio fails on the *first* step, not the second.
 
 A constant-factor kernel cancels out of a ratio, so the kernel could not move the first one and
 was never expected to; the slab helps the smaller point more, because 12.3 MB of `f32` vectors

@@ -351,6 +351,31 @@ def test_schema_facts_stay_unscoped(store):
     assert s.is_multiplicity_enabled() is True
 
 
+def test_commit_time_facts_stay_unscoped(store):
+    """A commit's wall-clock time is not node data.
+
+    `resolve_date` and `commit_time_ms` answer questions about the store's
+    *history of commits*, not about which nodes are in it. Neither names a node,
+    neither can be narrowed by a scope, and neither discloses anything a scoped
+    caller could not already learn from `wal_total_commits`, which is likewise
+    store-wide. They therefore answer unscoped, exactly as `has_vector_rule` and
+    `is_index_enabled` do.
+
+    The alternative — refusing them on a scoped handle, as `roles()` is refused
+    — would be wrong for the opposite reason to `roles()`: a role definition is
+    made of node keys, and a commit timestamp is made of nothing but a clock.
+    """
+    db, s = store
+    total = db.wal_total_commits()
+    assert s.wal_total_commits() == total
+
+    for frame in range(total):
+        assert s.commit_time_ms(frame) == db.commit_time_ms(frame)
+
+    # And a date resolves to the same frame through either handle.
+    assert s.resolve_date("2099-01-01") == db.resolve_date("2099-01-01")
+
+
 def test_roles_is_refused_on_a_scoped_handle(store):
     """The role list is the one schema fact made of node data.
 
@@ -628,6 +653,9 @@ _WRITES_KEYLESS = {
     "disable_index": lambda s: s.disable_index("Person", "team"),
     "enable_multiplicity": lambda s: s.enable_multiplicity(),
     "snapshot": lambda s: s.snapshot(),
+    # Asserting when a commit happened rewrites the store's apparent history,
+    # which is a write in the sense that matters: a scoped handle never does it.
+    "record_commits_at": lambda s: s.record_commits_at(1_800_000_000_000),
 }
 
 
@@ -668,6 +696,9 @@ COVERED = {
     # deliberately unscoped, and each says why
     "has_vector_rule": "test_schema_facts_stay_unscoped",
     "is_index_enabled": "test_schema_facts_stay_unscoped",
+    # A commit time is made of a clock, not of node data — see the test.
+    "resolve_date": "test_commit_time_facts_stay_unscoped",
+    "commit_time_ms": "test_commit_time_facts_stay_unscoped",
     "is_multiplicity_enabled": "test_schema_facts_stay_unscoped",
     "wal_total_commits": "test_wal_total_commits_is_a_store_fact",
     # refused outright: schema made of node data, with no honest narrowing
@@ -692,6 +723,7 @@ COVERED = {
     "ingest_batch": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "batch_edges": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "create_rule": "test_a_keyless_write_refuses_with_the_scoped_message",
+    "record_commits_at": "test_a_keyless_write_refuses_with_the_scoped_message",
     "enable_index": "test_a_keyless_write_refuses_with_the_scoped_message",
     "disable_index": "test_a_keyless_write_refuses_with_the_scoped_message",
     "enable_multiplicity": "test_a_keyless_write_refuses_with_the_scoped_message",

@@ -284,9 +284,16 @@ fn main() -> ExitCode {
         Ok(Command::AsOf {
             db_dir,
             commit,
+            at,
             query,
             namespace,
-        }) => match run_asof(&db_dir, commit, query.as_deref(), namespace.as_deref()) {
+        }) => match run_asof(
+            &db_dir,
+            commit,
+            at.as_deref(),
+            query.as_deref(),
+            namespace.as_deref(),
+        ) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS

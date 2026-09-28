@@ -29,20 +29,20 @@ One call per question, on the store's own keys. The `SessionStart` brief printed
 |---|---|
 | why are these two related | `explain_association a b` — the rule, the score and the values the two share |
 | what is it related to | `node_edges a` — grouped by type, rule and score; `all_of: [T, U]` for the partners carrying every named type; `label:` narrows them |
-| what did it look like then | `edges_at a <commit>` |
+| what did it look like then | `edges_at a <date>` — pass the date itself, `2026-06-19` or `2026-06-19T12:00:00Z`; it resolves to the last commit at or before it. A 0-based commit index also works. **Do not hunt for a commit**: not `node_history`, not `stats`, not a file on disk. A store that records no times says so by name |
 | what would this change do | `what_if a <field> <value>` — lost and gained, nothing written |
 | who may see | `query` with a `role` from the store's `roles.json` |
 | how many | a counting Cypher over the labels the brief listed |
 | a durable fact | `remember` — the `text` and the existing keys it is `about`; say the `note:` key back |
 
-Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`.
+Since when → `node_history`, `edge_history`, `was_linked` (its `at_commit` takes a date too); around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`.
 <!-- /mcp -->
 <!-- cli -->
 
 | The question | The command |
 |---|---|
 | why are these two related | `{{BIN}} why '{{DB_PATH}}' <a> <b>` — what links two keys, with the evidence |
-| what did it look like then | `{{BIN}} asof '{{DB_PATH}}' --commit N --query '<cypher>'` |
+| what did it look like then | `{{BIN}} asof '{{DB_PATH}}' --at <date> --query '<cypher>'` — a date, e.g. `2026-06-19`; `--commit N` still takes an index, and exactly one of the two |
 | anything else, including a durable fact | `{{BIN}} query '{{DB_PATH}}' '<cypher>'` — any Cypher, read or write; a fact is a `CREATE (n:Note {id: "note:…", text: "…"})`, and say the key back |
 
 `explain_association`, `node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked` and `neighborhood` have no subcommand here, `query` takes no `role`, and there is no `remember` subcommand. The rest need `--delivery mcp`.

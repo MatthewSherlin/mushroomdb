@@ -2253,9 +2253,13 @@ async fn a_corrupt_overlay_is_reported_before_the_role_mask_resolves() {
 /// tail. This is the exact state defect #5 describes: the old branches answered
 /// **404**, the `*_scoped` methods propagate the `Corrupt`.
 ///
-/// The status is the one `graph_err` gives `Corrupt` today — 400, not 5xx as
-/// the ledger assumed. The assertion that matters, and the reason the new
-/// behaviour was kept, is the one below it: the body names the damage.
+/// The status is **500**, and as of v0.6.11 it is 500 on every path. It was 400
+/// here and 500 under `role_mask_err`, so the same damaged store answered
+/// differently depending on whether the role-mask memo happened to be warm —
+/// ledger row 12. A corrupt store is a server-side condition; 400 told the
+/// caller to change an input that could not help. The message is unchanged; only
+/// the status moved. The assertion below it still matters just as much: the body
+/// names the damage rather than blaming the key.
 #[tokio::test]
 async fn a_corrupt_overlay_under_a_warm_role_mask_is_not_a_404() {
     let (app, db) = open_rbac(
@@ -2297,7 +2301,7 @@ async fn a_corrupt_overlay_under_a_warm_role_mask_is_not_a_404() {
             StatusCode::NOT_FOUND,
             "{uri} answered 404 for a corrupt store — the pre-Task-2 behaviour: {err}"
         );
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {err}");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}: {err}");
         assert!(
             err.contains("mvcc delta intern mismatch"),
             "{uri} must name the corruption: {err}"

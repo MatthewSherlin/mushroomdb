@@ -3384,8 +3384,12 @@ fn every_association_tool_description_opens_with_its_question() {
         ("node_edges", "What is K related to"),
         ("was_linked", "Were A and B linked at commit C"),
         (
+            // Broadened in v0.6.11: `at` takes a date as well as a commit
+            // index, and the description must lead with the date. Opening with
+            // "at commit C" is the framing that made an agent reconstruct a
+            // date->commit map by hand and guess wrong.
             "edges_at",
-            "What did K's relationships look like at commit C",
+            "What did K's relationships look like on DATE (or at commit C)",
         ),
         ("what_if", "What changes if K's FIELD became VALUE"),
         ("node_history", "What has happened to K"),

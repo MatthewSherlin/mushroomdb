@@ -68,7 +68,7 @@
 //! lines under it as data before it reads any of them. The renderers already
 //! sanitize each line; the framing is what says whose words they are.
 
-use crate::mcp::CallOutcome;
+use crate::mcp::{graph_err_msg, CallOutcome};
 use core_api::repograph::{
     self, ContextOptions, ImpactOptions, MapOptions, RememberInput, DEFAULT_EXCLUDES,
     MAX_OUTPUT_BYTES, NOTE_KINDS, UNTRUSTED_FRAMING,
@@ -2015,11 +2015,26 @@ fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Ok(k) => k,
         Err(e) => return CallOutcome::ToolErr(e),
     };
+    // `at` takes a commit index or a date. A date is what a caller actually
+    // asks — "on 2026-06-19" — and before v0.6.11 there was no way to express
+    // it, so an agent had to reconstruct a date→commit map by hand and a wrong
+    // guess returned a plausible wrong graph. A string that will not parse is a
+    // tool error, never a guessed commit.
     let at = match args.get("at") {
         None | Some(Js::Null) => return CallOutcome::ToolErr("missing at".into()),
+        Some(Js::String(date)) => match db.read().resolve_date(date) {
+            Ok(c) => c,
+            Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+        },
         Some(v) => match v.as_u64() {
             Some(n) => n,
-            None => return CallOutcome::ToolErr("at must be a non-negative integer".into()),
+            None => {
+                return CallOutcome::ToolErr(
+                    "at must be a non-negative commit index or an RFC 3339 date \
+                     (\"2026-06-19\", \"2026-06-19T12:00:00Z\")"
+                        .into(),
+                )
+            }
         },
     };
     let edge_type = match opt_str_arg(args, "edge_type") {
@@ -2808,15 +2823,17 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "edges_at",
-            "description": "What did K's relationships look like at commit C — the edges that were live at one point in the store's history, with the rule that had derived each. `at` is a 0-based WAL commit index; use node_history or edge_history first to find the commit you want, then read this instead of replaying either by hand. Which partners were linked by all of these types on that day? pass all_of and the reply is just their keys; pass one edge_type for that type's partner keys with the rule named once. label narrows partners. With json:true the report carries `listed` and `total`, so a reply that was cut still says how much there was.",
+            "description": "What did K's relationships look like on DATE (or at commit C) — the edges that were live at one point in the store's history, with the rule that had derived each. `at` takes EITHER an RFC 3339 date (\"2026-06-19\", or \"2026-06-19T12:00:00Z\") OR a 0-based WAL commit index. Pass the date directly: it resolves to the last commit at or before that instant. Do NOT guess a commit index for a date, and do not go probing commits to find one — a store that cannot answer a date says so by name. Which partners were linked by all of these types on that day? pass all_of and the reply is just their keys; pass one edge_type for that type's partner keys with the rule named once. label narrows partners. With json:true the report carries `listed` and `total`, so a reply that was cut still says how much there was.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "key": { "type": "string", "minLength": 1, "description": "Node key." },
                     "at": {
-                        "type": "integer",
-                        "minimum": 0,
-                        "description": "0-based WAL commit index to read the edges at."
+                        "description": "When to read the edges. Either an RFC 3339 date string — \"2026-06-19\", \"2026-06-19T12:00:00Z\", offsets accepted — which resolves to the last commit at or before that instant, or a 0-based WAL commit index. Prefer the date when the question names one.",
+                        "anyOf": [
+                            { "type": "string", "minLength": 1 },
+                            { "type": "integer", "minimum": 0 }
+                        ]
                     },
                     "edge_type": {
                         "type": "string",

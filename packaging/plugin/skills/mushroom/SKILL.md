@@ -25,15 +25,15 @@ One call per question, on the store's own keys. The `SessionStart` brief printed
 |---|---|
 | why are these two related | `explain_association a b` — the rule, the score and the values the two share |
 | what is it related to | `node_edges a` — grouped by type, rule and score; `all_of: [T, U]` for the partners carrying every named type; `label:` narrows them |
-| what did it look like then | `edges_at a <commit>` |
+| what did it look like then | `edges_at a <date>` — pass the date itself, `2026-06-19` or `2026-06-19T12:00:00Z`; it resolves to the last commit at or before it. A 0-based commit index also works. **Do not hunt for a commit**: not `node_history`, not `stats`, not a file on disk. A store that records no times says so by name |
 | what would this change do | `what_if a <field> <value>` — lost and gained, nothing written |
 | who may see | `query` with a `role` from the store's `roles.json` |
 | how many | a counting Cypher over the labels the brief listed |
 | a durable fact | `remember` — the `text` and the existing keys it is `about`; say the `note:` key back |
 
-Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`.
+Since when → `node_history`, `edge_history`, `was_linked` (its `at_commit` takes a date too); around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`.
 
-**Deprecated, removed in 0.7.** A store built by `npx -y mushroomdb@0.6.10 ingest-git './mushroom-memory' . --prs --ensure-gitignore` is a repository as entities — commits, pull requests, files, authors — and lists `explore`, `query` and `stats` instead. The code tools `map`, `context`, `impact`, `owners`, `why` and `sync` stay served behind `--all-tools`. Use the repository as a data source; do not reach for it ahead of a search.
+**Deprecated, removed in 0.7.** A store built by `npx -y mushroomdb@0.6.11 ingest-git './mushroom-memory' . --prs --ensure-gitignore` is a repository as entities — commits, pull requests, files, authors — and lists `explore`, `query` and `stats` instead. The code tools `map`, `context`, `impact`, `owners`, `why` and `sync` stay served behind `--all-tools`. Use the repository as a data source; do not reach for it ahead of a search.
 
 ### What runs without you
 
@@ -47,8 +47,8 @@ The `concept_sources` rule links each concept to its sources with `DESCRIBED_IN`
 
 ## Advanced
 
-`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the sixteen above. All are served either way; `npx -y mushroomdb@0.6.10 mcp <db> --all-tools` lists the rest with schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
+`tools/list` follows the store: one built by `ingest-git` shows three — `explore`, `query` (Cypher, read or write) and `stats` — any other store shows the sixteen above. All are served either way; `npx -y mushroomdb@0.6.11 mcp <db> --all-tools` lists the rest with schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive, and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
 
-Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`npx -y mushroomdb@0.6.10 serve './mushroom-memory'`), and `doctor` checks the install.
+Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`npx -y mushroomdb@0.6.11 serve './mushroom-memory'`), and `doctor` checks the install.
 
 More: [docs](https://github.com/MatthewSherlin/mushroomdb/tree/main/docs/site)

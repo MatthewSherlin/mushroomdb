@@ -689,6 +689,18 @@ fn graph_err(e: GraphError) -> Response {
         // §4.3: role-scoped write denials map to 403 with the verbatim reason
         // string (Display delegates to reason, so .to_string() == reason).
         GraphError::RoleWriteDenied { reason } => forbidden(&reason),
+        // Ledger row 12. `role_mask_err` already answered 500 for `Corrupt`
+        // while this catch-all answered 400, so one damaged store answered
+        // differently depending on whether the role-mask memo was warm. A
+        // corrupt store is a server-side condition: 400 tells a caller to change
+        // an input, and no input they can send will help. The message is
+        // deliberately `to_string()` — identical to what the catch-all produced
+        // — so only the status moves.
+        corrupt @ GraphError::Corrupt { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": corrupt.to_string() })),
+        )
+            .into_response(),
         GraphError::QueryError { detail } | GraphError::IngestError { detail } => {
             err_response(detail)
         }
@@ -2206,10 +2218,17 @@ async fn was_linked_handler(
         Some(s) => s.clone(),
         None => return err_response("missing query param edge_type"),
     };
+    // `at_commit` takes a 0-based frame index or an RFC 3339 date. A caller
+    // asking "were they linked on 2026-06-19" should not have to find the frame
+    // themselves — and a guessed index is how a plausible wrong answer is
+    // returned.
     let at_commit: u64 = match qs.get("at_commit") {
-        Some(s) => match s.parse() {
+        Some(s) => match s.parse::<u64>() {
             Ok(n) => n,
-            Err(_) => return err_response("at_commit must be a non-negative integer"),
+            Err(_) => match state.db.read().resolve_date(s) {
+                Ok(n) => n,
+                Err(e) => return graph_err(e),
+            },
         },
         None => return err_response("missing query param at_commit"),
     };

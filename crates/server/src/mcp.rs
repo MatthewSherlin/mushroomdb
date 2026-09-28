@@ -1071,8 +1071,22 @@ fn tool_was_linked(db: &SharedDb, args: &Js) -> CallOutcome {
     else {
         return CallOutcome::ToolErr("missing edge_type".into());
     };
-    let at_commit = match args.get("at_commit").and_then(Js::as_u64) {
-        Some(n) => n,
+    // Like `edges_at`, `at_commit` takes a date as well as an index. A caller
+    // asking "were they linked on 2026-06-19" should not have to find the
+    // commit themselves.
+    let at_commit = match args.get("at_commit") {
+        Some(Js::String(date)) => match db.read().resolve_date(date) {
+            Ok(c) => c,
+            Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+        },
+        Some(v) => match v.as_u64() {
+            Some(n) => n,
+            None => {
+                return CallOutcome::ToolErr(
+                    "at_commit must be a non-negative commit index or an RFC 3339 date".into(),
+                )
+            }
+        },
         None => return CallOutcome::ToolErr("missing or invalid at_commit".into()),
     };
     let result = {

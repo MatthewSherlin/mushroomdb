@@ -13,6 +13,12 @@ pub enum FileId {
     /// RBAC role definitions sidecar. Written atomically by `apply_schema`
     /// when roles change; loaded at open. Never part of WAL/snapshot format.
     Roles,
+    /// Commit → wall-clock sidecar. Written atomically as commits land; loaded
+    /// at open. **Never part of WAL/snapshot format**, exactly as `Roles` is
+    /// not — a release that does not know this file does not read it, and opens
+    /// the store as it always did. See [`crate::commit_times`] for why the map
+    /// is not a WAL record.
+    CommitTimes,
 }
 
 impl FileId {
@@ -22,6 +28,7 @@ impl FileId {
             FileId::Snapshot => "snapshot.bin",
             FileId::SnapshotBak => "snapshot.bin.bak",
             FileId::Roles => "roles.json",
+            FileId::CommitTimes => "commit_times.bin",
         }
     }
 }

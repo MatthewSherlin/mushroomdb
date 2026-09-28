@@ -1007,9 +1007,51 @@ impl GraphDb {
         self.with_ref(|db| Ok(db.is_multiplicity_enabled()))
     }
 
+    /// Record subsequent commits as having happened at `unix_ms`, or `None` to
+    /// go back to the system clock.
+    ///
+    /// For backfilled history: a mirror importing rows that carry their own
+    /// timestamps. Without it every imported commit is stamped "now", so a store
+    /// holding a year of history answers every date question with
+    /// `TimeBeforeFloor`. Sticky until changed or cleared. Import in
+    /// chronological order — going backwards raises `CommitTimeNotMonotonic`.
+    #[pyo3(text_signature = "($self, unix_ms)")]
+    fn record_commits_at(&self, unix_ms: Option<i64>) -> PyResult<()> {
+        self.with_mut(|db| db.record_commits_at(unix_ms))
+    }
+
+    /// The 0-based frame index a date resolves to.
+    ///
+    /// The last commit at or before `date`, ready to hand to `edges_at` or
+    /// `was_linked`.
+    #[pyo3(text_signature = "($self, date)")]
+    fn resolve_date(&self, date: &str) -> PyResult<u64> {
+        self.with_scope(|db, _| db.resolve_date(date))
+    }
+
+    /// The recorded wall-clock time of a 0-based frame index, in unix ms.
+    ///
+    /// `None` when the store records no time for it — a store written before
+    /// 0.6.11, a frame below the horizon, or a damaged sidecar.
+    #[pyo3(text_signature = "($self, commit)")]
+    fn commit_time_ms(&self, commit: u64) -> PyResult<Option<i64>> {
+        self.with_scope(|db, _| Ok(db.commit_time_ms(commit)))
+    }
+
     /// Whether `a` and `b` were linked by `edge_type` at or before `at_commit`.
+    ///
+    /// `at_commit` takes a 0-based frame index, or an RFC 3339 date string
+    /// (`"2026-06-19"`, `"2026-06-19T12:00:00Z"`) which resolves to the last
+    /// commit at or before that instant.
     #[pyo3(text_signature = "($self, a, b, edge_type, at_commit)")]
-    fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> PyResult<bool> {
+    fn was_linked(
+        &self,
+        a: &str,
+        b: &str,
+        edge_type: &str,
+        at_commit: Bound<'_, PyAny>,
+    ) -> PyResult<bool> {
+        let at_commit = self.resolve_when(&at_commit, "at_commit")?;
         self.with_scope(|db, mask| {
             // The real call runs first so an out-of-range `at_commit` raises
             // for a hidden pair exactly as it does for an unknown one; only
@@ -1181,7 +1223,13 @@ impl GraphDb {
     /// `commit` outside `[0, wal_total_commits())` raises `RuntimeError`. An
     /// unknown key is not an error — it simply had no edges.
     #[pyo3(text_signature = "($self, key, commit)")]
-    fn edges_at(&self, py: Python<'_>, key: &str, commit: u64) -> PyResult<Vec<Py<PyDict>>> {
+    fn edges_at(
+        &self,
+        py: Python<'_>,
+        key: &str,
+        commit: Bound<'_, PyAny>,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        let commit = self.resolve_when(&commit, "commit")?;
         let edges = self.with_scope(|db, mask| {
             // Run first so an out-of-range `commit` raises for a hidden key as
             // it does for an unknown one.
@@ -1775,6 +1823,34 @@ impl GraphDb {
     /// read therefore share one `map_err` *after* the drop, rather than the
     /// resolve arm keeping an early return of its own that the next edit could
     /// forget to move.
+    /// Resolve a "when" argument that may be a frame index or a date string.
+    ///
+    /// One helper so `edges_at` and `was_linked` cannot drift in what they
+    /// accept. An `int` is a 0-based frame index and passes through; a `str` is
+    /// parsed as RFC 3339 and resolved to the last commit at or before it.
+    /// Anything else is a `ValueError` — never a guessed commit, which is the
+    /// failure mode the whole date surface exists to remove.
+    ///
+    /// A `bool` is rejected deliberately: Python's `bool` is an `int`, so
+    /// `edges_at(k, True)` would otherwise silently mean frame 1.
+    fn resolve_when(&self, at: &Bound<'_, PyAny>, arg: &str) -> PyResult<u64> {
+        if at.is_instance_of::<pyo3::types::PyBool>() {
+            return Err(PyValueError::new_err(format!(
+                "{arg} must be a frame index or an RFC 3339 date string, not a bool"
+            )));
+        }
+        if let Ok(n) = at.extract::<u64>() {
+            return Ok(n);
+        }
+        if let Ok(s) = at.extract::<String>() {
+            return self.with_scope(|db, _| db.resolve_date(&s));
+        }
+        Err(PyValueError::new_err(format!(
+            "{arg} must be a 0-based frame index (int) or an RFC 3339 date string \
+             (\"2026-06-19\", \"2026-06-19T12:00:00Z\")"
+        )))
+    }
+
     fn with_scope<T, F>(&self, f: F) -> PyResult<T>
     where
         F: FnOnce(&Db, Option<&NodeMask>) -> core_api::Result<T>,
@@ -2008,6 +2084,21 @@ fn graph_err(e: GraphError) -> PyErr {
                 v.setattr("src_ns", src_ns.as_str())?;
                 v.setattr("dst", dst.as_str())?;
                 v.setattr("dst_ns", dst_ns.as_str())
+            }),
+            GraphError::CommitTimeNotMonotonic {
+                supplied_ms,
+                newest_ms,
+            } => err_with(py, CommitTimeNotMonotonic::new_err(msg), |v| {
+                v.setattr("supplied_ms", *supplied_ms)?;
+                v.setattr("newest_ms", *newest_ms)
+            }),
+            GraphError::NoRecordedTime => NoRecordedTime::new_err(msg),
+            GraphError::TimeBeforeFloor {
+                floor_ms,
+                floor_commit,
+            } => err_with(py, TimeBeforeFloor::new_err(msg), |v| {
+                v.setattr("floor_ms", *floor_ms)?;
+                v.setattr("floor_commit", *floor_commit)
             }),
         }
     })
@@ -2469,6 +2560,9 @@ engine_errors! {
     MushroomBusy, "busy", "Another process holds the store's write lock.\n\nNothing was written, so retrying later is always safe. Raised only by write calls: opening read-only and reading never take the lock. Carries `.holder`, the holding process id when the platform makes it cheaply knowable and `None` otherwise — a diagnostic hint, never something to branch on.";
     NamespaceImmutable, "namespace_immutable", "A namespace is set at insert and fixed for the node's lifetime. Carries `.key`, `.from_` (spelled with a trailing underscore: `from` is a Python keyword) and `.to`.";
     CrossNamespace, "cross_namespace", "A hand-written edge would cross a namespace boundary. Carries `.src`, `.src_ns`, `.dst`, `.dst_ns`.";
+    CommitTimeNotMonotonic, "commit_time_not_monotonic", "An asserted commit time would move the store's recorded history backwards. Carries `.supplied_ms` and `.newest_ms`. Raised by `record_commits_at` only — the live clock is never held to this, so an NTP step backwards still commits. Backfill in chronological order.";
+    NoRecordedTime, "no_recorded_time", "A date was given to a history call on a store that records no commit times.\n\nWritten by a release before 0.6.11, or its `commit_times.bin` sidecar was removed. The store is intact and every commit-indexed read still works; only date resolution is unavailable. Pass a commit index instead. Deliberately distinct from `Corrupt`: an absent map is not a damaged one.";
+    TimeBeforeFloor, "time_before_floor", "The date predates the oldest commit time the store still records. Carries `.floor_ms` and `.floor_commit`, the oldest entry the map can answer from. Retrying with an earlier instant fails the same way.";
 }
 
 #[pymodule]

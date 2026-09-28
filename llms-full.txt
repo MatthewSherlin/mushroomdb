@@ -27,7 +27,7 @@ the values that produced it. An agent reaches it over MCP — sixteen tools on a
 you embed it as a Rust library, a Python module, or a sidecar beside your own service. Four
 questions are what it exists for: **why are these two related** (`explain_association`, answered
 with the evidence rather than an assertion), **what did that look like then** (`edges_at`, the edges
-a node had at any past commit), **what would this change do** (`what_if`, computed without writing
+a node had on any past date or commit), **what would this change do** (`what_if`, computed without writing
 anything), and **who may see it** (`query` with a `role`, so one graph answers differently per
 caller). Local-first: a directory on disk, no account, no endpoint, no model call in the write path
 unless you enable embeddings.
@@ -71,9 +71,11 @@ Full tool reference: [`docs/site/mcp.md`](docs/site/mcp.md).
   instead of a guess.
 - **Knows who's allowed to see it.** Pass a `role` or a `mask` with a query and the same graph
   answers differently per caller; write statements are rejected on masked queries.
-- **Answers what it said last week.** `edges_at` returns the edges a node had at a past commit;
-  `mushroomdb asof ./db --commit 5 --query "…"` replays the WAL to that commit, derived edges
-  included.
+- **Answers what it said last week — by date.** `edges_at("talent-1", "2026-06-19")` returns the
+  edges a node had on that day; a 0-based commit index works too, and
+  `mushroomdb asof ./db --at 2026-06-19 --query "…"` replays the WAL to the last commit at or
+  before it, derived edges included. A store that records no times says so by name rather than
+  guessing a commit.
 
 ## Where it fits
 
@@ -1336,7 +1338,7 @@ key files (by centrality):
 key symbols (most called):
   crates/core-api/tests/algo.rs#insert_node — fn insert_node(db: &mut GraphDb<core_storage::fs::RealFs>, label: &str, key: &str)
   crates/core-api/tests/algo.rs#insert_edge — fn insert_edge(db: &mut GraphDb<core_storage::fs::RealFs>, etype: &str, src: &str, dst: &str)
-reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.10 explore './mushroom-memory' <target>
+reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.11 explore './mushroom-memory' <target>
 ```
 
 The first line is the untrusted-data marker every digest rendered out of a store
@@ -2967,7 +2969,7 @@ Claude Desktop has no installer path, so add mushroomdb by hand in
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.6.10", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.6.11", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -3266,10 +3268,23 @@ company-000042, company-000066, company-000138, company-000246, company-000354, 
 
 ### The graph as it was — `edges_at`
 
-`edges_at(key, at)` returns the edges the node had at commit `at` — a 0-based WAL
-commit index — replayed from the WAL and its archives in one scan, each edge
-carrying the rule that had derived it. Use `node_history` or `edge_history` first
-to find the commit you want, then read this instead of replaying either by hand.
+`edges_at(key, at)` returns the edges the node had at `at` — **either an RFC 3339
+date or a 0-based WAL commit index** — replayed from the WAL and its archives in
+one scan, each edge carrying the rule that had derived it.
+
+**Pass the date when the question names one.** `edges_at(key, "2026-06-19")`
+resolves to the last commit at or before midnight UTC on that day; a bare date, a
+full instant (`2026-06-19T12:00:00Z`) and an offset (`+01:00`) all work. Before
+v0.6.11 there was no way to express a date, and an agent asked "what did this
+look like on the 19th" had to reconstruct a date→commit map by hand — a guess that
+returns a plausible wrong graph rather than an error. Do not probe commits to
+find a date.
+
+A store that cannot answer a date says so by name rather than guessing:
+`no_recorded_time` when the store records none — written by a release before
+v0.6.11 — and `time_before_floor`, carrying the oldest commit and time it does
+have, when the date predates them. A commit index still works exactly as before,
+and `node_history` / `edge_history` remain the way to find one.
 
 It takes the same `edge_type`, `all_of`, `label`, `direction` and `limit`
 arguments as `node_edges`, so "who was linked by all three of these on that day"
@@ -3322,7 +3337,7 @@ to probe Cypher to learn the schema:
 ```
   why: explain_association person:ada project:apollo — returns each relationship's rule and the values the two share, so there is no need to fetch raw lists to compare by hand
   relationships: node_edges person:ada all_of: [ASSIGNED_TO] label: Project — or edge_type: ASSIGNED_TO for one type's partner keys
-  as of: edges_at person:ada 8 all_of: [ASSIGNED_TO] label: Project — commits carry no dates: take `at` from node_history/edge_history commit numbers or the dataset's date→commit map
+  as of: edges_at person:ada 2026-06-19 all_of: [ASSIGNED_TO] label: Project — `at` takes a date directly; a 0-based commit index also works, from node_history/edge_history
   what if: what_if person:ada project_id <value> edge_type: ASSIGNED_TO — the partners that would be lost or gained under that type
   linked by all of: MATCH (a:Person)-[:ASSIGNED_TO]->(b:Project) WITH b, count(DISTINCT a) AS n WHERE n >= 1 RETURN key(b), n ORDER BY n DESC LIMIT 20
 ```
@@ -6369,6 +6384,15 @@ specific WAL commit.
 > counter. Do not pass `last_changed(key)` directly as `at_commit`; to probe
 > "at the moment of the last change", use the commit values reported by
 > `edge_history`/`node_history` events instead.
+>
+> **Or pass a date and let the engine do it.** As of v0.6.11 `at_commit` also
+> takes an RFC 3339 string — `"2026-06-19"`, `"2026-06-19T12:00:00Z"` — and
+> resolves it to the last commit at or before that instant, in the 0-based space,
+> so the two counters cannot be confused. `resolve_date()` exposes the same
+> resolution on its own, and `commit_time_ms(frame)` reads a frame's recorded
+> time back. Times live in a `commit_times.bin` sidecar that is part of neither
+> the WAL nor the snapshot, so a store written before v0.6.11 has none and says
+> `no_recorded_time` rather than guessing a commit.
 
 **MCP:** `was_linked(a, b, edge_type, at_commit)` → `{linked}` or error when
 outside horizon
