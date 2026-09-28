@@ -494,7 +494,7 @@ serves both kinds and neither has to be configured for:
 | Store | Default listing |
 |---|---|
 | Built by `ingest-git` (a code graph) | **three** — `explore`, `query`, `stats` |
-| Anything else (a memory store) | **sixteen** — the association surface: `query`, `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `edges_at`, `what_if`, `node_history`, `edge_history`, `find_similar`, `pairwise_similar`, `hybrid_search`, `remember`, `recall`, `stats` |
+| Anything else (a memory store) | **nineteen** — the association surface: `query`, `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `edges_at`, `what_if`, `node_history`, `edge_history`, `find_similar`, `pairwise_similar`, `hybrid_search`, `remember`, `recall`, `upsert_entity`, `ingest_json`, `create_rule`, `stats` |
 
 All 28 stay served on either surface: the surface decides what is listed, not
 what the server answers. A session can only call what its client was shown,

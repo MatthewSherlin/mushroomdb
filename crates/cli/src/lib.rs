@@ -236,7 +236,7 @@ pub enum Command {
         auto: bool,
         /// `--all-tools`: advertise all twenty-eight tools in `tools/list`
         /// rather than the surface the store chose — three on a store
-        /// `ingest-git` built, sixteen on any other. The rest are callable
+        /// `ingest-git` built, nineteen on any other. The rest are callable
         /// either way; the flag decides what is listed, and what every session
         /// pays for before its first turn.
         all_tools: bool,

@@ -6,9 +6,39 @@
 //! time, and a hole does not announce itself — it resolves a date to the wrong
 //! commit and returns a plausible graph.
 
-use core_api::GraphDb;
+use core_api::{GraphDb, Predicate, RuleDef, Value};
 use core_storage::types::GraphError;
 use std::path::PathBuf;
+
+/// A rule that fires on every pair of `T` nodes sharing a `tag`.
+///
+/// Every test above the rule-firing ones writes to a store with no rules, where
+/// one commit is exactly one WAL frame. That is the configuration in which the
+/// map's arithmetic cannot go wrong — and it is not the configuration this
+/// engine exists for.
+fn linking_rule() -> RuleDef {
+    RuleDef {
+        name: "link".into(),
+        src_label: "T".into(),
+        dst_label: "T".into(),
+        predicate: Predicate::FieldEqual {
+            field: "tag".into(),
+        },
+        edge_type: "LINKED".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    }
+}
+
+fn tagged<F: core_storage::fs::Fs>(db: &mut GraphDb<F>, key: &str) {
+    db.insert_node("T", key, vec![("tag".into(), Value::Str("same".into()))])
+        .expect("insert");
+}
 
 fn tmp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mdb-commit-times-{name}"));
@@ -497,14 +527,260 @@ fn a_date_reaches_exactly_as_far_as_a_commit_index() {
         matches!(index_err, GraphError::CommitOutOfRange { .. }),
         "a commit index must refuse once history is discarded, got {index_err:?}"
     );
+    // `NoRecordedTime` joined this list when the truncating snapshot began
+    // clearing the map along with the history it describes. It has to: the
+    // replacement WAL renumbers from the floor, so every surviving entry would
+    // name a frame belonging to some other record — a date resolving onto an
+    // unrelated commit is exactly the silent wrong answer this module exists to
+    // prevent. All three are refusals, which is what this test is about.
     assert!(
         matches!(
             date_err,
-            GraphError::CommitOutOfRange { .. } | GraphError::TimeBeforeFloor { .. }
+            GraphError::CommitOutOfRange { .. }
+                | GraphError::TimeBeforeFloor { .. }
+                | GraphError::NoRecordedTime
         ),
         "a date must refuse exactly where an index does, got {date_err:?}"
     );
 
     // The store itself is intact — only its history went.
     assert!(db.node_info("a").is_some(), "the snapshot kept the data");
+}
+
+// ---------------------------------------------------------------------------
+// Rule-firing stores: the configuration the engine exists for.
+//
+// A rule-firing commit appends a SECOND WAL frame — the derived-edge history
+// marker — with no commit-sequence increment and no stamp. Deriving a frame
+// index from the commit counter therefore under-reports by one frame per
+// rule-firing commit, cumulatively, and every date resolves earlier than the
+// day it names. It fails silently and always toward a staler graph.
+// ---------------------------------------------------------------------------
+
+/// A store written moments ago must be able to see itself by date.
+///
+/// This is the whole defect in one assertion: ask a live store for *now* and it
+/// must answer with what it currently holds, not with a prefix of it.
+#[test]
+fn a_date_of_now_reaches_the_newest_commit_when_rules_fire() {
+    let dir = tmp("now-with-rules");
+    let mut db = GraphDb::open(&dir).expect("open");
+    db.create_rule(linking_rule()).expect("rule");
+    for i in 0..12 {
+        tagged(&mut db, &format!("n{i}"));
+    }
+
+    // `edges_at` reports both directions, so the live comparison must too.
+    let live = db
+        .neighbors("n0", "LINKED", core_api::Direction::Out)
+        .expect("out")
+        .len()
+        + db.neighbors("n0", "LINKED", core_api::Direction::In)
+            .expect("in")
+            .len();
+    assert!(live > 0, "the rule must actually derive edges");
+
+    let resolved = db
+        .resolve_date("2999-01-01")
+        .expect("a date after every commit must resolve");
+
+    // The assertion is about state, not about an index. The newest frame is
+    // the last commit's history marker, which is legitimately unstamped; what
+    // must hold is that a date later than everything sees everything.
+    let at_date = db.edges_at("n0", resolved).expect("edges_at by date").len();
+    assert_eq!(
+        at_date,
+        live,
+        "the store holds {live} edges on n0 but a date later than every commit \
+         sees only {at_date} of them (resolved to frame {resolved} of {}). A \
+         date must reach the store's current state.",
+        db.wal_total_commits().expect("total")
+    );
+
+    // And the very last node written must be reachable by that date.
+    assert!(
+        db.was_linked("n0", "n11", "LINKED", resolved)
+            .expect("was_linked"),
+        "the edge derived by the newest commit is invisible by date"
+    );
+}
+
+/// The index a date resolves to is the index the history surfaces consume.
+///
+/// `resolve_date` documents its answer as "a 0-based frame index, ready to hand
+/// to `edges_at` or `was_linked` without adjustment". This pins that sentence.
+#[test]
+fn a_resolved_date_indexes_the_same_space_the_history_surfaces_do() {
+    let dir = tmp("one-space");
+    let mut db = GraphDb::open(&dir).expect("open");
+    // The override goes on before anything commits: `create_rule` is itself a
+    // commit, and a later asserted instant may not predate an earlier one.
+    db.record_commits_at(Some(ms("2026-06-01"))).expect("june");
+    db.create_rule(linking_rule()).expect("rule");
+
+    tagged(&mut db, "a");
+    tagged(&mut db, "b");
+
+    db.record_commits_at(Some(ms("2026-07-01"))).expect("july");
+    tagged(&mut db, "c");
+
+    // On 2026-07-02 every node exists, so `c` is linked to `a`.
+    let by_date = db.resolve_date("2026-07-02").expect("resolve");
+    assert!(
+        db.was_linked("a", "c", "LINKED", by_date)
+            .expect("was_linked by date"),
+        "on 2026-07-02 the rule has already linked a and c; the date resolved \
+         to frame {by_date} of {}",
+        db.wal_total_commits().expect("total")
+    );
+
+    // And in June it does not, because `c` did not exist yet.
+    let june = db.resolve_date("2026-06-15").expect("resolve");
+    assert!(
+        !db.was_linked("a", "c", "LINKED", june)
+            .expect("was_linked by date"),
+        "c is not written until July"
+    );
+}
+
+/// Every frame a date can resolve to is a frame the store actually has.
+///
+/// The map records frame indices. If it records anything else, an index in it
+/// eventually exceeds the WAL and the date surface starts refusing commits the
+/// store can serve perfectly well by index.
+#[test]
+fn no_recorded_index_exceeds_the_stores_own_frame_count() {
+    let dir = tmp("in-range");
+    let mut db = GraphDb::open(&dir).expect("open");
+    db.create_rule(linking_rule()).expect("rule");
+    for i in 0..15 {
+        tagged(&mut db, &format!("n{i}"));
+    }
+
+    let total = db.wal_total_commits().expect("total");
+    let by_date = db
+        .resolve_date("2999-01-01")
+        .expect("a date after every commit must resolve");
+    let by_index = total - 1;
+
+    let a = db.edges_at("n0", by_date).expect("by date");
+    let b = db.edges_at("n0", by_index).expect("by index");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "a far-future date resolved to frame {by_date} and saw {} edges, while \
+         the newest frame {by_index} sees {} — the date surface is reaching \
+         less far than the index surface addressing the same history",
+        a.len(),
+        b.len()
+    );
+}
+
+/// A truncating snapshot renumbers the WAL from zero; the map must not keep
+/// describing the frames it discarded.
+///
+/// Before this was fixed the map kept entries `0..N-1` for frames that no
+/// longer existed while the new WAL restarted at 0, and the next write stamped
+/// an index far beyond the store's own frame count — so the date surface
+/// refused every query on a store whose history was perfectly readable by
+/// index.
+#[test]
+fn dates_still_work_after_a_truncating_snapshot() {
+    let dir = tmp("after-truncate");
+    let mut db = GraphDb::open(&dir).expect("open");
+    db.create_rule(linking_rule()).expect("rule");
+    for i in 0..8 {
+        tagged(&mut db, &format!("old{i}"));
+    }
+
+    db.snapshot().expect("snapshot");
+
+    // Write again after the truncation. These commits are the store's history
+    // now, and they must be addressable by date.
+    for i in 0..6 {
+        tagged(&mut db, &format!("new{i}"));
+    }
+
+    let total = db.wal_total_commits().expect("total");
+    assert!(total > 0, "the post-snapshot writes are reachable by index");
+
+    let resolved = db
+        .resolve_date("2999-01-01")
+        .expect("a date after every post-snapshot commit must resolve");
+    assert!(
+        resolved < total,
+        "a date resolved to frame {resolved}, which is outside the {total} \
+         frames the store has after truncation"
+    );
+    assert!(
+        db.was_linked("new0", "new5", "LINKED", resolved)
+            .expect("was_linked"),
+        "the newest post-snapshot state must be visible by date"
+    );
+}
+
+/// A sidecar written by an older release is discarded, not believed and not
+/// reported as damage.
+///
+/// v1 recorded `commit_seq - 1`, which drifts from the frame index by one per
+/// rule-firing commit. The drift depends on which commits fired, which the file
+/// does not record, so it cannot be repaired in place. Reading it anyway would
+/// resolve dates onto unrelated commits — the precise failure the version bump
+/// exists to stop.
+#[test]
+fn a_sidecar_from_an_older_format_is_discarded_rather_than_believed() {
+    let dir = tmp("superseded");
+    {
+        let mut db = GraphDb::open(&dir).expect("open");
+        db.create_rule(linking_rule()).expect("rule");
+        for i in 0..6 {
+            tagged(&mut db, &format!("n{i}"));
+        }
+    }
+
+    // Rewrite the header's version word as 1, leaving the entries intact —
+    // byte-for-byte the shape v0.6.11 left on disk.
+    let path = dir.join("commit_times.bin");
+    let mut bytes = std::fs::read(&path).expect("read sidecar");
+    assert!(bytes.len() > 6, "the sidecar has a header");
+    bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+    std::fs::write(&path, &bytes).expect("write v1 sidecar");
+
+    let db = GraphDb::open(&dir).expect("a superseded sidecar must not fail the open");
+    assert!(db.node_info("n0").is_some(), "the store still reads");
+
+    // Not damage — absence. A caller told "damaged" would go looking for a
+    // broken store; there isn't one.
+    match db.resolve_instant(1_700_000_000_000) {
+        Err(GraphError::NoRecordedTime) => {}
+        other => panic!("expected NoRecordedTime for a superseded map, got {other:?}"),
+    }
+}
+
+/// Writing after a superseded map was discarded starts a usable v2 map.
+#[test]
+fn a_discarded_map_is_replaced_by_the_next_commit() {
+    let dir = tmp("superseded-rewrite");
+    {
+        let mut db = GraphDb::open(&dir).expect("open");
+        db.create_rule(linking_rule()).expect("rule");
+        tagged(&mut db, "a");
+    }
+    let path = dir.join("commit_times.bin");
+    let mut bytes = std::fs::read(&path).expect("read");
+    bytes[4..6].copy_from_slice(&1u16.to_le_bytes());
+    std::fs::write(&path, &bytes).expect("write v1");
+
+    let mut db = GraphDb::open(&dir).expect("reopen");
+    tagged(&mut db, "b");
+    tagged(&mut db, "c");
+
+    let resolved = db
+        .resolve_date("2999-01-01")
+        .expect("the post-upgrade commits are addressable by date");
+    assert!(
+        db.was_linked("b", "c", "LINKED", resolved)
+            .expect("was_linked"),
+        "an edge derived after the upgrade must be visible by date"
+    );
 }

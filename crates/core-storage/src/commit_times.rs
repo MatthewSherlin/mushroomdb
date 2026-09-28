@@ -36,7 +36,40 @@ pub const COMMIT_TIMES_MAGIC: [u8; 4] = *b"MTMS";
 
 /// Format version of the sidecar itself. Independent of the snapshot and WAL
 /// versions, because this file is part of neither.
-pub const COMMIT_TIMES_VERSION: u16 = 1;
+///
+/// **v1 → v2 (v0.6.12).** The entries are unchanged in shape and changed in
+/// meaning. v1 recorded `commit_seq - 1`, which is a WAL frame index only on a
+/// store whose rules never fire: a rule-firing commit appends a second frame
+/// for its history marker, so v1 entries fall one frame further behind per such
+/// commit and resolve every date to an ever-earlier graph. v2 records the
+/// global frame index of the last frame the commit wrote, which is the space
+/// `edges_at`, `was_linked` and the history readouts actually address.
+///
+/// A v1 file cannot be repaired in place — the drift depends on which commits
+/// fired rules, which the file does not record — so it is discarded on open
+/// rather than reinterpreted. See [`superseded_version`].
+pub const COMMIT_TIMES_VERSION: u16 = 2;
+
+/// Versions this build recognises, cannot use, and must not mistake for damage.
+///
+/// A file at one of these versions was written correctly by an older release;
+/// it is superseded, not corrupt. The difference matters to a caller: damage
+/// warrants investigating the store, while a superseded map simply means dates
+/// start again from the next commit.
+pub const COMMIT_TIMES_SUPERSEDED_VERSIONS: &[u16] = &[1];
+
+/// `Some(version)` when `bytes` is a well-formed sidecar this build recognises
+/// but can no longer read, so the caller can discard it instead of reporting
+/// the store as damaged.
+pub fn superseded_version(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < HEADER_LEN || bytes[..4] != COMMIT_TIMES_MAGIC {
+        return None;
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    COMMIT_TIMES_SUPERSEDED_VERSIONS
+        .contains(&version)
+        .then_some(version)
+}
 
 /// Header: magic(4) + version(2) + floor_commit(8).
 ///

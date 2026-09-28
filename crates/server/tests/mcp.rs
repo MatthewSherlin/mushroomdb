@@ -1436,9 +1436,9 @@ fn one_task_call(db: SharedDb, name: &str, args: Js) -> Js {
     parse_lines(&out).remove(0)
 }
 
-/// The sixteen a memory store lists, in the order it lists them: the entity
-/// questions first, the store's own counts last.
-const ASSOCIATION_TOOLS: [&str; 16] = [
+/// The nineteen a memory store lists, in the order it lists them: the entity
+/// questions first, then the three that fill a store, then its own counts.
+const ASSOCIATION_TOOLS: [&str; 19] = [
     "query",
     "explain_association",
     "neighborhood",
@@ -1454,12 +1454,15 @@ const ASSOCIATION_TOOLS: [&str; 16] = [
     "hybrid_search",
     "remember",
     "recall",
+    "upsert_entity",
+    "ingest_json",
+    "create_rule",
     "stats",
 ];
 
 /// Binding: a store no repository was ingested into lists the association
-/// surface — the sixteen tools that answer a question about an entity graph,
-/// in that order — and none of the code-door task tools.
+/// surface — the nineteen tools that answer a question about an entity graph
+/// or fill one, in that order — and none of the code-door task tools.
 #[test]
 fn a_memory_store_lists_the_association_surface() {
     let (res, out) = exchange(open("list-default"), &req(json!(1), "tools/list", None));
@@ -1475,7 +1478,7 @@ fn a_memory_store_lists_the_association_surface() {
         ASSOCIATION_TOOLS.to_vec(),
         "default tools/list on a memory store"
     );
-    assert_eq!(tools.len(), 16);
+    assert_eq!(tools.len(), 19);
     for hidden in [
         "explore", "map", "context", "impact", "owners", "why", "sync",
     ] {
@@ -3376,7 +3379,7 @@ fn what_if_with_an_edge_type_answers_in_partner_keys() {
 /// said what they *returned* rather than what they were *for*.
 #[test]
 fn every_association_tool_description_opens_with_its_question() {
-    const OPENERS: [(&str, &str); 16] = [
+    const OPENERS: [(&str, &str); 19] = [
         ("query", "Who may see this"),
         ("explain_association", "Why are A and B related"),
         ("neighborhood", "What is around K"),
@@ -3402,6 +3405,12 @@ fn every_association_tool_description_opens_with_its_question() {
         ("hybrid_search", "What matches these words and this vector"),
         ("remember", "Remember this for next time"),
         ("recall", "What do I already know about this"),
+        ("upsert_entity", "Record what is now true about K"),
+        ("ingest_json", "Fill the store from a batch"),
+        (
+            "create_rule",
+            "How should this kind of relationship be derived from now on",
+        ),
         ("stats", "How big is this store"),
     ];
 
@@ -3828,6 +3837,23 @@ fn server_card_lists_the_same_tools_in_the_same_order() {
         .collect();
 
     assert_eq!(listed, served, "{} is out of date", card_path.display());
+}
+
+/// Binding: the server card's `version` matches the crate version the tests were
+/// compiled against.
+#[test]
+fn server_card_version_matches_crate_version() {
+    let card_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.well-known/mcp/server-card.json");
+    let card: Js = serde_json::from_str(&std::fs::read_to_string(&card_path).expect("server card"))
+        .expect("server card json");
+    let card_version = card["version"].as_str().expect("card version string");
+    assert_eq!(
+        card_version,
+        env!("CARGO_PKG_VERSION"),
+        "server-card.json version is {card_version} but crate is {}",
+        env!("CARGO_PKG_VERSION"),
+    );
 }
 
 /// Binding: `map` on a store with nothing in it names the command that fills it.
@@ -5285,5 +5311,83 @@ fn stats_with_a_role_on_a_corrupt_roles_file_says_so() {
     assert_eq!(
         from_stats, from_query,
         "and `stats` says exactly the same thing"
+    );
+}
+
+/// Binding: every tool the shipped skill tells an agent to call is a tool the
+/// default listing advertises.
+///
+/// This is the test that was missing. Through v0.6.11 `SKILL.md`'s very first
+/// instruction — what to do with an empty store, which is every new install —
+/// named `ingest_json` and `upsert_entity`, and the memory surface advertised
+/// neither. The server served them, so every handshake assertion passed; but a
+/// host builds its tool set from `tools/list`, so the model could not call
+/// them. The first thing a new user was told to do was the one thing that
+/// could not be done.
+///
+/// The skill is compiled into the CLI with `include_str!`, so it is the same
+/// bytes that ship. Names are read out of backticks, and only names the server
+/// actually serves are considered — prose mentions of `mcp`, `role` or a
+/// property name are not tool calls.
+#[test]
+fn every_tool_the_skill_names_is_advertised() {
+    let skill_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../cli/skills/mushroom/SKILL.md");
+    let skill = std::fs::read_to_string(&skill_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", skill_path.display()));
+
+    // Everything the server can serve, so prose in backticks that happens not
+    // to be a tool name is ignored.
+    let names_from = |out: &[u8]| -> Vec<String> {
+        parse_lines(out)[0]["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .map(|t| t["name"].as_str().expect("name").to_string())
+            .collect()
+    };
+
+    // Everything the server can serve, so prose in backticks that happens not
+    // to be a tool name is ignored.
+    let (res, out) = exchange_all_tools(open("skill-served"), &req(json!(1), "tools/list", None));
+    assert!(res.is_ok(), "{res:?}");
+    let served = names_from(&out);
+
+    // What a memory store actually advertises — read from a real `tools/list`,
+    // not from this file's copy of the list. Comparing the skill against a
+    // constant the test itself declares would pass even if the server
+    // advertised nothing.
+    let (res, out) = exchange(open("skill-listed"), &req(json!(1), "tools/list", None));
+    assert!(res.is_ok(), "{res:?}");
+    let advertised = names_from(&out);
+
+    // The code-door tools are deprecated and deliberately unlisted on a memory
+    // store; the skill names them in the paragraph that says so.
+    const DEPRECATED: [&str; 7] = [
+        "explore", "map", "context", "impact", "owners", "why", "sync",
+    ];
+
+    let mut named: Vec<String> = Vec::new();
+    for chunk in skill.split('`').skip(1).step_by(2) {
+        let name = chunk.trim();
+        if served.iter().any(|s| s == name)
+            && !DEPRECATED.contains(&name)
+            && !named.iter().any(|n| n == name)
+        {
+            named.push(name.to_string());
+        }
+    }
+    assert!(
+        !named.is_empty(),
+        "the skill names no tools at all — this test has stopped testing anything"
+    );
+
+    let missing: Vec<&String> = named.iter().filter(|n| !advertised.contains(n)).collect();
+    assert!(
+        missing.is_empty(),
+        "the skill tells an agent to call {missing:?}, which a memory store's \
+         tools/list does not advertise. A host builds its tool set from that \
+         listing, so the model cannot reach them however well the server \
+         serves them. Either advertise them or stop naming them."
     );
 }

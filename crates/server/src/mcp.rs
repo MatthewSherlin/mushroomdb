@@ -11,7 +11,7 @@
 //! - `notifications/initialized` — ignored
 //! - `tools/list` — the default listing follows the store the server opened
 //!   (see [`Surface`]): a store a repository was ingested into lists three —
-//!   `explore`, `query`, `stats` — and any other store lists the sixteen of
+//!   `explore`, `query`, `stats` — and any other store lists the nineteen of
 //!   [`ASSOCIATION_TOOLS`], the tools that answer a question about an entity
 //!   graph, in that order. Graph-tool descriptions carry the
 //!   prefix `Advanced: ` so a host ranking tools by description puts the task
@@ -79,7 +79,7 @@ pub fn run_mcp_stdio(
 /// [`run_mcp_stdio`], with the tool list chosen by the caller.
 ///
 /// `all_tools` false lists what the store's [`Surface`] names — three on a
-/// code graph, sixteen on a memory store; true lists all twenty-eight. Either
+/// code graph, nineteen on a memory store; true lists all twenty-eight. Either
 /// way every tool remains callable — the flag decides what is advertised, not
 /// what is served.
 ///
@@ -1167,7 +1167,7 @@ const ADVANCED_PREFIX: &str = "Advanced: ";
 /// listing.
 pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 
-/// The sixteen a memory store advertises, in the order it lists them.
+/// The nineteen a memory store advertises, in the order it lists them.
 ///
 /// A store with no repository in it used to be handed the code door's own task
 /// tools — `map`, `context`, `impact`, `owners`, `why`, `sync` — which answer
@@ -1191,7 +1191,20 @@ pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 /// The code task tools stay served on a memory store, as these stay served on
 /// a code-graph one — [`tools_list`] decides what is *advertised*, never what
 /// is answered.
-pub const ASSOCIATION_TOOLS: [&str; 16] = [
+///
+/// `upsert_entity`, `ingest_json` and `create_rule` were added in 0.6.12, and
+/// the reason is the shape of a first session. A new install opens on an empty
+/// store; the skill's first instruction is to offer to fill it, naming
+/// `ingest_json` for a batch and `upsert_entity` for one; and the README sells
+/// `upsert_entity -> create_rule -> find_similar -> explain_association` as the
+/// minimal workflow. Two of those four were served and not advertised — and a
+/// host builds its tool set from `tools/list`, so "served" did not help. The
+/// listing described a store you could question but never populate.
+///
+/// They sit after the readers deliberately. Listing order is ranking and the
+/// questions remain the point; writing is what a session does once, at the
+/// start, before it has anything to ask.
+pub const ASSOCIATION_TOOLS: [&str; 19] = [
     "query",
     "explain_association",
     "neighborhood",
@@ -1207,6 +1220,9 @@ pub const ASSOCIATION_TOOLS: [&str; 16] = [
     "hybrid_search",
     "remember",
     "recall",
+    "upsert_entity",
+    "ingest_json",
+    "create_rule",
     "stats",
 ];
 
@@ -1220,7 +1236,7 @@ pub(crate) enum Surface {
     /// A repository was ingested into this store: the `GitSync` marker is
     /// there, and `explore` has a code graph to explore.
     CodeGraph,
-    /// Any other store, including an empty one: the sixteen-tool association
+    /// Any other store, including an empty one: the nineteen-tool association
     /// surface, where `explore` would have nothing to answer from.
     Memory,
 }
@@ -1254,7 +1270,7 @@ fn surface_of(db: &SharedDb) -> Surface {
 /// graph tools with their descriptions prefixed.
 ///
 /// `all` false — the default — lists what `surface` names, **in the order that
-/// surface names it**: three on a code graph, sixteen on a memory store. The
+/// surface names it**: three on a code graph, nineteen on a memory store. The
 /// order is the point. A host that defers tool schemas makes a model search
 /// for them, and the list it searches is read top-down, so each surface ranks
 /// its own tools rather than inheriting the task-tools-then-graph-tools order
@@ -1333,7 +1349,7 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "ingest_json",
-                "description": "Ingest a JSON array of objects as nodes of one label.",
+                "description": "Fill the store from a batch — ingest a JSON array of objects as nodes of one label. Each object becomes a node; declare the rules that should link them with 'create_rule'.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1828,10 +1844,10 @@ mod tests {
     }
 
     /// Binding: on a store no repository was ingested into, the default
-    /// listing is the sixteen association tools, in [`ASSOCIATION_TOOLS`]
+    /// listing is the nineteen association tools, in [`ASSOCIATION_TOOLS`]
     /// order, and nothing else.
     #[test]
-    fn tools_list_defaults_to_sixteen_on_a_memory_store() {
+    fn tools_list_defaults_to_nineteen_on_a_memory_store() {
         let db = demo_db();
         let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let names: Vec<&str> = resp["result"]["tools"]
@@ -1844,7 +1860,7 @@ mod tests {
     }
 
     /// Binding: `pairwise_similar` is advertised on the memory surface
-    /// immediately after `find_similar`. Listing length is 16.
+    /// immediately after `find_similar`. Listing length is 19.
     #[test]
     fn association_listing_includes_pairwise_similar_after_find_similar() {
         let db = demo_db();
@@ -1855,7 +1871,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
-        const EXPECTED: [&str; 16] = [
+        const EXPECTED: [&str; 19] = [
             "query",
             "explain_association",
             "neighborhood",
@@ -1871,6 +1887,9 @@ mod tests {
             "hybrid_search",
             "remember",
             "recall",
+            "upsert_entity",
+            "ingest_json",
+            "create_rule",
             "stats",
         ];
         assert_eq!(names, EXPECTED.to_vec());

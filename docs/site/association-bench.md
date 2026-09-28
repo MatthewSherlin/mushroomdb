@@ -139,7 +139,14 @@ association tools in [`mcp.md`](mcp.md) are what that run's failures turned into
 
 The run after those fixes is committed at
 [`benchmarks/agent-tasks/results/20260911T065400Z/summary.md`](../../benchmarks/agent-tasks/results/20260911T065400Z/summary.md).
-It still **failed**, on two of the five legs:
+It still **failed**, on two of the five legs: correctness −0.007 vs arm Q, and the cost
+interval [−0.0581, +0.0115] not entirely below zero. The graph arm moved from 0.795 to 0.967
+on correctness and from $0.5089 to $0.0923 on cost — a tie with the relational baseline on
+correctness and cheaper in mean cost, turns and wall time, but not the gate.
+
+The next run is committed at
+[`benchmarks/agent-tasks/results/20260925T200950Z/summary.md`](../../benchmarks/agent-tasks/results/20260925T200950Z/summary.md).
+It still **failed**, now on correctness only:
 
 | | |
 |---|---|
@@ -150,24 +157,31 @@ It still **failed**, on two of the five legs:
 
 Why it failed:
 
-- R: correctness -0.007 vs arm Q, paired over 20 task(s)
-- R: correctness -0.007 is below arm(s) P (+0.026)
-- R: cost interval [-0.0581, +0.0115] vs arm Q is not entirely below zero
+- R: correctness −0.006 vs arm Q, paired over 20 task(s)
+- R: correctness −0.006 is below arm(s) P (+0.000)
 
 Arm R against arm Q, paired by task:
 
 | metric | arm mean | arm Q mean | delta | 95% CI | tasks |
 |---|---|---|---|---|---|
-| score | 0.967 | 0.974 | -0.0070 | [-0.0711, 0.0483] | 20 |
-| cost $ | 0.0923 | 0.1158 | -0.02355 | [-0.05815, 0.01148] | 20 |
-| total tokens | 186215 | 221063 | -34848.5 | [-96315.1, 33715.3] | 20 |
-| turns | 5.07 | 7.38 | -2.317 | [-4.000, -0.483] | 20 |
-| cache hit ratio | 0.945 | 0.955 | -0.0096 | [-0.0275, 0.0056] | 20 |
+| score | 0.994 | 1.000 | −0.0063 | [−0.0187, 0.0000] | 20 |
+| cost $ | 0.0357 | 0.0608 | −0.02501 | [−0.03528, −0.01242] | 20 |
+| total tokens | 73578 | 100506 | −26928.2 | [−42234.8, −9714.0] | 20 |
+| turns | 3.53 | 4.75 | −1.217 | [−1.900, −0.500] | 20 |
+| cache hit ratio | 0.943 | 0.923 | +0.0200 | [−0.0121, +0.0467] | 20 |
 
-The graph arm moved from 0.795 to 0.967 on correctness and from $0.5089 to
-$0.0923 on cost, with its eight max-turns cells gone — a tie with the relational
-baseline on correctness and cheaper in mean cost, turns and wall time, but not
-the gate, which wants the cost interval entirely below zero.
+180 cells, 0 dropped, 0 timeouts, 0 errors. The cost leg passes for the first time: the 95%
+CI [−0.0353, −0.0124] lies entirely below zero. The gate fails on correctness alone: one task
+(`assoc-timetravel-4`) scored 0.88 across all three reps, one key missed in each.
+
+**What that key was.** A date-resolution defect in the engine, found on 2026-09-28 and fixed in
+0.6.12: the commit-times sidecar recorded a commit counter rather than a WAL frame index, and the
+two diverge by one frame per rule-firing commit. On this world that is 588 frames against 311
+stamps, so `2026-07-14` resolved to frame 167 — the state 23 simulated days earlier — and the task
+lost the one key whose edge is derived inside that window. Probed at the day's real frame the
+engine returns all eight keys, so the derivation was never wrong; only the date-to-frame step was.
+The run above was produced by a binary carrying that defect. **It has not been re-run on the fix**,
+and until it is, this page reports the failing result rather than a projected one.
 
 ---
 

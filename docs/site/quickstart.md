@@ -30,7 +30,7 @@ mushroomdb install --db ./memory --delivery mcp
 ```
 
 `--db` pins the store; `--delivery mcp` writes the MCP server entry and the
-`/mushroom` skill. A pinned entity store lists the sixteen-tool association
+`/mushroom` skill. A pinned entity store lists the nineteen-tool association
 surface, and pinning is also what marks the entry `alwaysLoad`, so those tools
 are in context before the session's first question rather than deferred.
 
@@ -428,7 +428,7 @@ second reads the graph back as one screen.
 From there: `context`, `impact`, `owners`, `why`, `recall` and `remember`, over
 the CLI or as MCP tools — every one of them deprecated except `recall` and
 `remember`. A store built this way lists three tools (`explore`, `query`,
-`stats`) rather than the sixteen above; the rest stay served and reachable
+`stats`) rather than the nineteen above; the rest stay served and reachable
 through `mushroomdb mcp <db> --all-tools`. `query` answers the same facts as
 Cypher and is not going anywhere.
 

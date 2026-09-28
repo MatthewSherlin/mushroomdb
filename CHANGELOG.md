@@ -1,5 +1,93 @@
 # Changelog
 
+## Unreleased — v0.6.12
+
+### Added
+
+- **A memory store advertises nineteen tools, not sixteen:** `upsert_entity`,
+  `ingest_json` and `create_rule` join the association surface, after the
+  readers and before `stats`.
+
+  They were always *served*; they were never *listed*, and a host builds its tool
+  set from `tools/list`. So the skill's first instruction on an empty store —
+  offer to fill it, with `ingest_json` for a batch or `upsert_entity` for one —
+  named two tools the model could not call, and the README's own minimal
+  workflow, `upsert_entity → create_rule → find_similar → explain_association`,
+  had two of its four steps unreachable. A new install opens on an empty store,
+  so this was the first thing a new user was told to do and the first thing that
+  did not work.
+
+  A test now binds the two together: **every tool name the shipped `SKILL.md`
+  mentions must appear in the listing a memory store actually returns.** It reads
+  the real `tools/list` rather than a constant the test declares, so it cannot
+  pass by agreeing with itself. `ingest_json`'s description gained an opening
+  clause naming what it is for, which the surface's other eighteen already had.
+
+### Fixed
+
+- **A date resolved to the wrong frame on every store whose rules fire.** This is
+  a correctness defect in v0.6.11's headline feature, and it failed silently:
+  every dated read answered with a real but **staler** graph, never an error.
+
+  In one command, against v0.6.11:
+
+  ```
+  $ mushroomdb demo /tmp/demo          # 60 nodes, 334 edges, 7 rules
+  $ mushroomdb asof /tmp/demo --at <today> --query "MATCH (a)-[r]->(b) RETURN count(r)"
+  as-of commit 9 of 16
+    COUNT(r)=220                       # the store holds 334
+  ```
+
+  A commit is not a frame. A commit whose rules fire appends a **second** WAL
+  frame — the derived-edge history marker — and the sidecar recorded
+  `commit_seq - 1`, which counts commits. The two agree until the first rule
+  fires and then diverge by one frame per rule-firing commit, cumulatively, so
+  the error grew with history and always resolved backwards. A store with no
+  rules was never affected, which is why every existing test passed: they all
+  used one.
+
+  The map now records the global index of the **last frame the commit wrote**,
+  so a date reaches that commit's derived edges as well as its record. Affected
+  surfaces were `edges_at`, `was_linked`, `node_history`, `edge_history`,
+  `mushroomdb asof --at`, HTTP `at_commit`, the Python binding and the MCP tools.
+  **No history was ever stored wrongly** — every commit index addressed exactly
+  what it always did, and still does.
+
+- **`commit_times.bin` is now v2, and v1 files are discarded on open.** v1
+  entries mean something this build cannot use, and the drift depends on which
+  commits fired rules — which the file does not record — so it cannot be
+  repaired in place. A v1 map is dropped rather than reinterpreted, and the store
+  answers `no_recorded_time` until its next commit starts a usable one. That is
+  recognised as *superseded*, not reported as damage: nothing about the store is
+  broken, and the graph, the WAL and every commit index are untouched.
+
+- **A peer's commit times survive `refresh()`.** The incremental refresh branch
+  raised the frame cursor to include another process's commits without reloading
+  the sidecar, so a handle answered dates from a prefix of the store's history —
+  and, while its own map was still empty, its next commit rewrote the whole file
+  with a single entry and destroyed the peer's. Refresh now reloads the map with
+  the frames.
+
+- **A truncating snapshot no longer leaves the time map describing frames that
+  are gone.** `snapshot()` without `keep_wal` replaces the WAL with a baseline
+  and renumbers from the floor; the map kept its old entries, which then named
+  unrelated records, and stamps written afterwards landed beyond the store's own
+  frame count — so the date surface refused queries the index path served
+  perfectly well. The map is now cleared with the history it described, and the
+  store says `no_recorded_time`. A date and a commit index still refuse in
+  exactly the same places.
+
+- **The full-text open figure in v0.6.11's notes read 476 ms.** Every measurement
+  record says **456 ms**. Corrected below.
+
+### Changed
+
+- `resolve_date` on a store whose history was discarded by a truncating snapshot
+  now answers `NoRecordedTime` where it previously answered `CommitOutOfRange`.
+  Both are refusals and the reach-parity contract with commit indices is
+  unchanged; the new answer is the accurate one, because the map is genuinely
+  empty rather than pointing past the end.
+
 ## v0.6.11 — time in the graph
 
 A date becomes a first-class way to address history. `edges_at(key, "2026-06-19")`
@@ -24,11 +112,19 @@ zero**.
 
 **The gate still reports FAILED**, on correctness, by **one key on one task**
 (-0.006 paired). `assoc-timetravel-4` answers 7 of its 8 keys with zero false
-positives, reproducibly across three reps, because one pair's derived edge lands
-in a commit the world stamps a day later than the day the task asks about. That
-is a disagreement between the generator's model and the engine's incremental
-derivation, not a date-resolution defect: the resolved commit is the correct one
-for the date. 180 cells, 0 dropped, 0 timeouts, 0 errors —
+positives, reproducibly across three reps.
+
+> **Retracted, 2026-09-28.** This entry originally attributed that key to "a
+> disagreement between the generator's model and the engine's incremental
+> derivation, not a date-resolution defect", and stated that "the resolved commit
+> is the correct one for the date". **Both halves were wrong.** It was a
+> date-resolution defect in this release, and the resolved commit was 150 frames
+> — 23 simulated days — before the day the task asked about. The engine and the
+> generator agree at every frame probed; the derivation was never in question.
+> See v0.6.12 below. The explanation was written from the run summary three days
+> after the run, without re-opening the store; the numbers above are unaffected.
+
+180 cells, 0 dropped, 0 timeouts, 0 errors —
 [`results/20260925T200950Z`](benchmarks/agent-tasks/results/20260925T200950Z/summary.md).
 
 Alongside that: opening a store with full-text enabled costs half what it did, a
@@ -91,7 +187,7 @@ unchanged under 0.6.10.
 
 #### Changed
 
-- **The full-text index is built once per open, not twice: 476 ms → 227 ms** on a
+- **The full-text index is built once per open, not twice: 456 ms → 227 ms** on a
   30,000-entity store with three indexed text fields, median of five opens, against
   3.8 ms for the identical store with no pair enabled. Replaying an
   `EnableFulltext` record backfills its pair with a full `0..ids.len()`

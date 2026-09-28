@@ -638,3 +638,63 @@ fn read_sees_a_peer_commit_that_lands_microseconds_later() {
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+// ── 13. A peer's recorded commit times survive this handle's first write ──────
+
+/// `refresh()`'s incremental branch raises the frame cursor to include a peer's
+/// commits. It used not to reload the commit-times sidecar with them, which left
+/// the handle resolving dates from a prefix of the store's history — and, while
+/// its own map was still empty, its next commit took the "first write" path and
+/// rewrote the whole file with a single entry, destroying every stamp the peer
+/// had written. Nothing reported it, and no test covered the multi-process
+/// shape the sidecar lives in.
+#[test]
+fn a_peers_commit_times_survive_this_handles_first_write() {
+    let d = tmp("peer-times");
+    std::fs::create_dir_all(&d).unwrap();
+
+    // This handle opens while the store has no sidecar at all — the state in
+    // which it believes it is the one creating the file.
+    let db = SharedDb::open(&d).unwrap();
+    assert_eq!(db.read().node_count(), 0);
+
+    // A real peer process writes, and stamps every commit it makes.
+    let (code, _) = run_worker(&d, &["write", "peer", "40"]);
+    assert_eq!(code, 0, "peer writer must succeed");
+
+    let sidecar = d.join("commit_times.bin");
+    let peer_len = std::fs::metadata(&sidecar)
+        .expect("the peer wrote a sidecar")
+        .len();
+    assert!(peer_len > 0, "the peer recorded commit times");
+
+    // Absorb the peer's frames, then commit through this handle.
+    assert_eq!(db.read().node_count(), 40);
+    db.write().insert_node("Person", "ours", vec![]).unwrap();
+
+    let after = std::fs::metadata(&sidecar)
+        .expect("sidecar still present")
+        .len();
+    assert!(
+        after > peer_len,
+        "the sidecar shrank from {peer_len} to {after} bytes when this handle \
+         committed: its write replaced the peer's entries instead of appending \
+         to them"
+    );
+
+    // And a date still reaches across both processes' history.
+    let fresh = GraphDb::open(&d).unwrap();
+    let total = fresh.wal_total_commits().unwrap();
+    let resolved = fresh.resolve_date("2999-01-01").expect("resolve");
+    assert!(
+        resolved < total,
+        "a date resolved to frame {resolved}, outside the store's {total} frames"
+    );
+    assert!(
+        fresh.node_info("ours").is_some() && fresh.node_info("peer-0").is_some(),
+        "both processes' writes are in the store"
+    );
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}

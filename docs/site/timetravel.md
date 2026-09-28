@@ -95,6 +95,21 @@ specific WAL commit.
 > time back. Times live in a `commit_times.bin` sidecar that is part of neither
 > the WAL nor the snapshot, so a store written before v0.6.11 has none and says
 > `no_recorded_time` rather than guessing a commit.
+>
+> **Which frame a date lands on.** A commit whose rules fire writes two frames:
+> its own record, and a history marker carrying the rule attribution the edge
+> readouts report. A date resolves to the **last** frame the commit wrote, so it
+> sees that commit's derived edges as well as its record — asking for a date is
+> asking for the graph as of that commit, complete.
+>
+> **Sidecars written before v0.6.12 are discarded on open.** Through v0.6.11 the
+> map recorded a commit counter rather than a frame index. The two agree only on
+> a store whose rules never fire, and diverge by one frame per rule-firing commit
+> thereafter, so those entries resolve dates to an ever-earlier graph. The drift
+> depends on which commits fired rules, which the file does not record, so it
+> cannot be repaired: the map is dropped and the store answers `no_recorded_time`
+> until its next commit starts a usable one. History itself is untouched — every
+> commit index keeps addressing exactly what it did.
 
 **MCP:** `was_linked(a, b, edge_type, at_commit)` → `{linked}` or error when
 outside horizon

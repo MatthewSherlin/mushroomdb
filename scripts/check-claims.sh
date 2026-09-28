@@ -110,11 +110,28 @@ WORKSPACE_VERSION="$(awk -F'"' '/^version = "/{print $2; exit}' "$ROOT/Cargo.tom
 if [[ -n "$WORKSPACE_VERSION" ]]; then
   # A complete version only. `mushroomdb@0.6.x` is a deliberate *series*
   # reference in the deprecation table, not a pin anyone copy-pastes.
-  stale="$(grep -rnE "mushroomdb@[0-9]+\.[0-9]+\.[0-9]+" \
-             --include='*.md' --include='*.txt' --include='*.json' --include='*.sh' \
-             "$ROOT" 2>/dev/null \
-           | grep -v "mushroomdb@${WORKSPACE_VERSION}" \
-           | grep -vE "/(target|target-[^/]*)/|/\.venv/|/CHANGELOG\.md:|/docs/roadmap/" || true)"
+  # Tracked files only. The question is what a *reader* copy-pastes, and a
+  # reader gets the repository — not a local build directory, a virtualenv, or
+  # a gitignored scratch tree. Walking the whole working copy made this fail on
+  # any machine that had done SDD work, whose session ledgers quote the version
+  # that was current when they were written, while CI saw a clean checkout and
+  # passed. A gate that only fires locally, on files nobody ships, teaches
+  # people to ignore it.
+  if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    mapfile -d '' -t _scan < <(git -C "$ROOT" ls-files -z -- \
+      '*.md' '*.txt' '*.json' '*.sh' 2>/dev/null)
+  else
+    # Outside a checkout (a source tarball): fall back to walking the tree.
+    mapfile -d '' -t _scan < <(find "$ROOT" \
+      \( -name target -o -name 'target-*' -o -name .venv -o -name node_modules \) -prune -o \
+      \( -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.sh' \) -print0)
+  fi
+  stale=""
+  if [[ ${#_scan[@]} -gt 0 ]]; then
+    stale="$( (cd "$ROOT" && grep -nE "mushroomdb@[0-9]+\.[0-9]+\.[0-9]+" "${_scan[@]}" 2>/dev/null) \
+             | grep -v "mushroomdb@${WORKSPACE_VERSION}" \
+             | grep -vE "(^|/)CHANGELOG\.md:|(^|/)docs/roadmap/" || true)"
+  fi
   if [[ -n "$stale" ]]; then
     echo "check-claims.sh: install pins naming a version other than ${WORKSPACE_VERSION}:" >&2
     printf '%s\n' "$stale" >&2
