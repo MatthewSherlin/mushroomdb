@@ -25,13 +25,13 @@ One call per question, on the store's own keys. The `SessionStart` brief printed
 |---|---|
 | why are these two related | `explain_association a b` — the rule, the score and the values the two share |
 | what is it related to | `node_edges a` — grouped by type, rule and score; `all_of: [T, U]` for the partners carrying every named type; `label:` narrows them |
-| what did it look like then | `edges_at a <commit>` |
+| what did it look like then | `edges_at a <date>` — pass the date itself, `2026-06-19` or `2026-06-19T12:00:00Z`; it resolves to the last commit at or before it. A 0-based commit index also works. **Do not hunt for a commit**: not `node_history`, not `stats`, not a file on disk. A store that records no times says so by name |
 | what would this change do | `what_if a <field> <value>` — lost and gained, nothing written |
 | who may see | `query` with a `role` from the store's `roles.json` |
 | how many | a counting Cypher over the labels the brief listed |
 | a durable fact | `remember` — the `text` and the existing keys it is `about`; say the `note:` key back |
 
-Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`.
+Since when → `node_history`, `edge_history`, `was_linked` (its `at_commit` takes a date too); around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`.
 
 **Deprecated, removed in 0.7.** A store built by `npx -y mushroomdb@0.6.11 ingest-git './mushroom-memory' . --prs --ensure-gitignore` is a repository as entities — commits, pull requests, files, authors — and lists `explore`, `query` and `stats` instead. The code tools `map`, `context`, `impact`, `owners`, `why` and `sync` stay served behind `--all-tools`. Use the repository as a data source; do not reach for it ahead of a search.
 
