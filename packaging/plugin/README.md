@@ -1,6 +1,6 @@
 # mushroom — Claude Code plugin
 
-Graph memory for agents, wired into Claude Code as an MCP server, a `/mushroom:mushroom` skill, and three hooks: `SessionStart` (the session brief), `UserPromptSubmit` (recall) and `PostToolUse` (re-extract what you just edited). On an entity store the session gets the sixteen-tool association surface — query, explain, time travel, visibility — and a brief that prints the store's own schema with one worked call per question kind. Every file under this directory *except this README* is rendered by `scripts/render-plugin.sh` from `crates/cli/skills/mushroom/SKILL.md` and the templates in `scripts/plugin-templates/` — do not hand-edit those, or `.claude-plugin/marketplace.json`; re-run the script instead.
+Graph memory for agents, wired into Claude Code as an MCP server, a `/mushroom:mushroom` skill, and three hooks: `SessionStart` (the session brief), `UserPromptSubmit` (recall) and `PostToolUse` (re-extract what you just edited). On an entity store the session gets the nineteen-tool association surface — query, explain, time travel, visibility — and a brief that prints the store's own schema with one worked call per question kind. Every file under this directory *except this README* is rendered by `scripts/render-plugin.sh` from `crates/cli/skills/mushroom/SKILL.md` and the templates in `scripts/plugin-templates/` — do not hand-edit those, or `.claude-plugin/marketplace.json`; re-run the script instead.
 
 ## Install
 
