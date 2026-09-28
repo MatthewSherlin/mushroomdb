@@ -14,7 +14,7 @@
 mushroomdb is the data layer for agents that reason over entities. It is an embedded Rust graph
 database in which a relationship is a schema declaration: write a rule once, and every write
 derives, maintains and **retracts** the matching edges, each one carrying the rule, the score and
-the values that produced it. An agent reaches it over MCP — sixteen tools on an entity store — or
+the values that produced it. An agent reaches it over MCP — nineteen tools on an entity store — or
 you embed it as a Rust library, a Python module, or a sidecar beside your own service. Four
 questions are what it exists for: **why are these two related** (`explain_association`, answered
 with the evidence rather than an assertion), **what did that look like then** (`edges_at`, the edges
@@ -43,7 +43,7 @@ than a script.
 npx mushroomdb install --db ./memory
 ```
 
-One command writes the `/mushroom` skill, an MCP server listing the sixteen-tool association
+One command writes the `/mushroom` skill, an MCP server listing the nineteen-tool association
 surface, and the session hooks. Then a worked flow, four tool calls:
 
 ```text
@@ -73,7 +73,7 @@ Full tool reference: [`docs/site/mcp.md`](docs/site/mcp.md).
 **What it is**
 
 - An embedded, single-binary graph database with a rule engine that maintains edges for you.
-- A 28-tool MCP server — sixteen listed on an entity store, three on a store built by
+- A 28-tool MCP server — nineteen listed on an entity store, three on a store built by
   `ingest-git` — plus a `/mushroom` skill and a Claude Code plugin.
 - Safe for several processes at once: one writer at a time behind an advisory `LOCK` file, any
   number of readers, and every handle picks up a peer's commits by `refresh()` rather than
@@ -261,10 +261,10 @@ the rendered digest.
 **The fourteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
 in `tools/list`, so an assistant knows which surface is the front door. The default listing follows
 the store: a store built by `ingest-git` lists three tools in all — `explore`, `query` and `stats` —
-and any other store lists sixteen, the association surface: `query` (with an optional `role`),
+and any other store lists nineteen, the association surface: `query` (with an optional `role`),
 `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `edges_at`,
 `what_if`, `node_history`, `edge_history`, `find_similar`, `pairwise_similar`, `hybrid_search`,
-`remember`, `recall` and `stats`. All 28 stay served either way — the listing decides what a
+`remember`, `recall`, `upsert_entity`, `ingest_json`, `create_rule` and `stats`. All 28 stay served either way — the listing decides what a
 session can call, not what the server answers — and `mushroomdb mcp <db> --all-tools` lists the
 whole set:
 
@@ -441,11 +441,14 @@ Full methodology and honesty notes:
 `claude -p` sessions against executable truth. The association suite (`--suite association`) asks
 twenty relationship questions of one generated world written three ways — as JSON files, as a
 single relational file, and as a mushroomdb store. The graph arm moved from 0.795 at $0.5089
-([`20260911T005749Z`](benchmarks/agent-tasks/results/20260911T005749Z/summary.md)) to 0.967 at
-$0.0923 ([`20260911T065400Z`](benchmarks/agent-tasks/results/20260911T065400Z/summary.md)) against
-the relational baseline's 0.974 at $0.1158 — a correctness tie at a lower mean cost, and still
-behind files + grep (1.000 at $0.0949) on a 2,000-entity world; the gate failed on the cost
-interval. The code suite (`--suite code`) is retired; its committed summaries stay as the record.
+([`20260911T005749Z`](benchmarks/agent-tasks/results/20260911T005749Z/summary.md)) to 0.994 at
+$0.0357 ([`20260925T200950Z`](benchmarks/agent-tasks/results/20260925T200950Z/summary.md)) against
+the relational baseline's 1.000 at $0.0608 — cost -41.2%, tokens -26.8%, turns -25.6%, and the cost
+leg passes for the first time with its 95% interval `[-0.0353, -0.0124]` entirely below zero. On a
+2,000-entity world **the gate still fails**, now on correctness alone: -0.006 paired, one key on
+one task (`assoc-timetravel-4`), reproducibly across three reps. That key was the date-resolution
+defect fixed in 0.6.12, not a limit of the engine; the run will be repeated on the fix rather than
+restated. The code suite (`--suite code`) is retired; its committed summaries stay as the record.
 [`docs/site/association-bench.md`](docs/site/association-bench.md) describes the suite and how to
 rebuild the world.
 
