@@ -23,6 +23,16 @@ embed-ui = ["server/embed-ui"]
 tls = ["server/tls"]
 
 [dependencies]
+# The subscriber lives in the binary. `env-filter` gives MUSHROOMDB_LOG, and
+# `fmt` is the human-readable writer; JSON output is deliberately not wired
+# until someone needs to ship these somewhere that wants it.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "std",
+    "fmt",
+    "env-filter",
+    "ansi",
+] }
 core-api = { package = "mushroomdb", path = "../core-api", version = "0.6.11" }
 code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.6.11" }
 server = { package = "mushroomdb-server", path = "../server", version = "0.6.11" }

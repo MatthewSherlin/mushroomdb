@@ -207,7 +207,16 @@ pub async fn serve(
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
     token: Option<String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::None, token, HashMap::new()).await
+    serve_inner(
+        db,
+        addr,
+        ready,
+        UiFallback::None,
+        token,
+        HashMap::new(),
+        None,
+    )
+    .await
 }
 
 /// [`serve`] with role-bound tokens in addition to the optional full-access token.
@@ -221,7 +230,7 @@ pub async fn serve_with_role_tokens(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::None, token, role_tokens).await
+    serve_inner(db, addr, ready, UiFallback::None, token, role_tokens, None).await
 }
 
 /// [`serve`] plus a UI dist directory mounted behind the API routes.
@@ -247,6 +256,7 @@ pub async fn serve_with_ui(
         UiFallback::Dir(ui_dir),
         token,
         HashMap::new(),
+        None,
     )
     .await
 }
@@ -260,7 +270,16 @@ pub async fn serve_with_ui_and_role_tokens(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::Dir(ui_dir), token, role_tokens).await
+    serve_inner(
+        db,
+        addr,
+        ready,
+        UiFallback::Dir(ui_dir),
+        token,
+        role_tokens,
+        None,
+    )
+    .await
 }
 
 /// [`serve`] plus the compiled-in UI (no-op fallback if `embed-ui` is off).
@@ -275,7 +294,113 @@ pub async fn serve_with_embedded_ui(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::Embedded, token, role_tokens).await
+    serve_inner(
+        db,
+        addr,
+        ready,
+        UiFallback::Embedded,
+        token,
+        role_tokens,
+        None,
+    )
+    .await
+}
+
+/// The graceful-shutdown variants, added in 0.6.12.
+///
+/// Each mirrors the entry point above it and takes one extra argument: a
+/// receiver that, when it fires **or is dropped**, stops the server accepting
+/// new connections and lets every request already in flight finish. Without
+/// one, the only way to stop a server was to abort the task running it, which
+/// severs in-flight responses and live `/watch` and `/subscribe` subscribers
+/// mid-stream.
+///
+/// These are additive on purpose. The four originals keep their signatures and
+/// their behaviour, so nothing embedding this crate has to change; they simply
+/// pass no signal. The cost is eight entry points where four would do, and that
+/// was the trade chosen over a breaking parameter.
+pub async fn serve_with_shutdown(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    serve_inner(
+        db,
+        addr,
+        ready,
+        UiFallback::None,
+        token,
+        HashMap::new(),
+        Some(shutdown),
+    )
+    .await
+}
+
+/// [`serve_with_role_tokens`] that stops gracefully. See [`serve_with_shutdown`].
+pub async fn serve_with_role_tokens_and_shutdown(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    serve_inner(
+        db,
+        addr,
+        ready,
+        UiFallback::None,
+        token,
+        role_tokens,
+        Some(shutdown),
+    )
+    .await
+}
+
+/// [`serve_with_ui_and_role_tokens`] that stops gracefully. See [`serve_with_shutdown`].
+pub async fn serve_with_ui_and_role_tokens_and_shutdown(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    ui_dir: PathBuf,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    serve_inner(
+        db,
+        addr,
+        ready,
+        UiFallback::Dir(ui_dir),
+        token,
+        role_tokens,
+        Some(shutdown),
+    )
+    .await
+}
+
+/// [`serve_with_embedded_ui`] that stops gracefully. See [`serve_with_shutdown`].
+#[cfg(feature = "embed-ui")]
+pub async fn serve_with_embedded_ui_and_shutdown(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    serve_inner(
+        db,
+        addr,
+        ready,
+        UiFallback::Embedded,
+        token,
+        role_tokens,
+        Some(shutdown),
+    )
+    .await
 }
 
 enum UiFallback {
@@ -292,6 +417,7 @@ async fn serve_inner(
     ui: UiFallback,
     token: Option<String>,
     role_tokens: HashMap<String, String>,
+    shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -300,7 +426,19 @@ async fn serve_inner(
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
     let app = build_app(db, token, role_tokens, ui, local, false);
-    axum::serve(listener, app).await
+    match shutdown {
+        None => axum::serve(listener, app).await,
+        // Stop accepting, then let every request already in flight finish.
+        // Dropping the sender counts as the signal, so a caller that goes away
+        // shuts the server down rather than stranding it.
+        Some(rx) => {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await
+        }
+    }
 }
 
 /// Serve over TLS (requires the `tls` cargo feature).
@@ -334,6 +472,53 @@ pub async fn serve_tls(
         .serve(app.into_make_service())
         .await
 }
+
+/// [`serve_tls`] that stops gracefully. See [`serve_with_shutdown`].
+///
+/// `axum_server` has its own shutdown mechanism — a [`axum_server::Handle`] —
+/// rather than axum's `with_graceful_shutdown`, so the signal is bridged onto
+/// one here. In-flight requests get [`TLS_GRACE`] to finish before the
+/// listener is closed regardless; an unbounded grace period would let one
+/// stuck request hold a restart open forever.
+#[cfg(feature = "tls")]
+pub async fn serve_tls_with_shutdown(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    let local = listener.local_addr()?;
+    if ready.send(local).is_err() {
+        eprintln!("serve_tls: readiness receiver dropped before bind notify");
+    }
+    let app = build_app(db, token, role_tokens, UiFallback::None, local, true);
+    let handle = axum_server::Handle::new();
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            let _ = shutdown.await;
+            handle.graceful_shutdown(Some(TLS_GRACE));
+        }
+    });
+    axum_server::from_tcp_rustls(listener, config)?
+        .handle(handle)
+        .serve(app.into_make_service())
+        .await
+}
+
+/// How long a TLS server lets in-flight requests finish after a shutdown
+/// signal before closing anyway.
+#[cfg(feature = "tls")]
+const TLS_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn default_advertise_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 8080))
@@ -461,6 +646,9 @@ fn build_app(
         UiFallback::Embedded => app.fallback(embedded_fallback),
     };
     app.layer(middleware::from_fn_with_state(state, auth_middleware))
+        // Outside auth, so a 401 is logged too — an unauthenticated flood is
+        // exactly the thing an operator needs to see.
+        .layer(middleware::from_fn(log_middleware))
         // Cap request bodies (default axum limit is only 2 MiB; we allow larger
         // ingest batches but reject multi-GB bodies that would OOM the collector
         // before any handler runs).
@@ -470,6 +658,81 @@ fn build_app(
 /// Maximum accepted HTTP request body size (64 MiB). Large enough for batched
 /// `/ingest` payloads, small enough to prevent a single request from
 /// exhausting memory. Clients with larger imports should chunk.
+/// Per-request logging, with a policy chosen so the log stays readable.
+///
+/// A line per request at one level is what makes a server log unreadable: the
+/// 200s bury the 500s, and nobody reads it after the first week. So the level
+/// follows what happened:
+///
+/// | Outcome | Level | Visible by default |
+/// |---|---|---|
+/// | 5xx | `error` | yes — always worth a look |
+/// | slower than [`SLOW_REQUEST`] | `warn` | yes — the request that will time out next |
+/// | 4xx | `info` | yes — one line, the caller's mistake or a probe |
+/// | everything else | `debug` | no |
+///
+/// A healthy server is therefore quiet, and turning `debug` on for one module
+/// gives the full trace without recompiling.
+///
+/// Every response carries `x-request-id`, echoed from the caller's header when
+/// it sent one and generated otherwise, so an error someone reports can be
+/// found in the log. Before 0.6.12 there was no `tracing`, no access log and no
+/// request id anywhere in the tree: a 500 in production could not be tied to
+/// the request that caused it.
+async fn log_middleware(req: Request, next: Next) -> Response {
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty() && v.len() <= 128 && v.is_ascii())
+        .map(str::to_owned)
+        .unwrap_or_else(new_request_id);
+
+    let method = req.method().clone();
+    // The path only. A query string can carry `?token=`, and a log is exactly
+    // the wrong place for a credential.
+    let path = req.uri().path().to_owned();
+    let started = std::time::Instant::now();
+
+    let mut res = next.run(req).await;
+    let status = res.status();
+    let ms = started.elapsed().as_millis();
+
+    if status.is_server_error() {
+        tracing::error!(%request_id, %method, %path, status = status.as_u16(), ms, "request failed");
+    } else if started.elapsed() >= SLOW_REQUEST {
+        tracing::warn!(%request_id, %method, %path, status = status.as_u16(), ms, "slow request");
+    } else if status.is_client_error() {
+        tracing::info!(%request_id, %method, %path, status = status.as_u16(), ms, "request refused");
+    } else {
+        tracing::debug!(%request_id, %method, %path, status = status.as_u16(), ms, "request");
+    }
+
+    if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
+        res.headers_mut().insert("x-request-id", v);
+    }
+    res
+}
+
+/// A request id with no dependency on a uuid crate: the process id, a
+/// monotonic counter, and the low bits of a nanosecond clock. Unique enough to
+/// correlate a report with a log line, which is all it is for.
+fn new_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    format!("{:x}-{:x}-{:x}", std::process::id(), n, nanos)
+}
+
+/// A request slower than this is logged at `warn` whatever its status. Well
+/// under [`REQUEST_TIMEOUT`], so the log names the requests heading for a
+/// timeout before one happens.
+const SLOW_REQUEST: std::time::Duration = std::time::Duration::from_secs(5);
+
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// How long any one non-streaming request may take before the server answers

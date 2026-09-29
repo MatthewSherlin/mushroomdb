@@ -11,6 +11,15 @@ use core_api::{MutationEvent, SharedDb};
 
 pub use mcp::{run_mcp_stdio, run_mcp_stdio_with, ASSOCIATION_TOOLS, CODE_GRAPH_TOOLS};
 
+/// The root this crate's `tracing` events are filtered by.
+///
+/// It is the **lib** name, which is not the package name — `server`, not
+/// `mushroomdb-server`. A log filter naming the package matches nothing, and a
+/// filter that matches nothing looks exactly like a server with nothing to
+/// report. Exported so the binary's default filter can be checked against it
+/// rather than against a guess.
+pub const LOG_TARGET_ROOT: &str = module_path!();
+
 /// Resolved authentication identity for a single request.
 ///
 /// Injected into request extensions by `auth_middleware` before any handler
@@ -51,12 +60,15 @@ struct AppState {
     started_at: std::time::Instant,
 }
 
-#[cfg(feature = "tls")]
-pub use http::serve_tls;
 #[allow(deprecated)]
 pub use http::{
     router, router_with_auth, router_with_role_tokens, router_with_ui, router_with_ui_tls, serve,
-    serve_with_role_tokens, serve_with_ui, serve_with_ui_and_role_tokens,
+    serve_with_role_tokens, serve_with_role_tokens_and_shutdown, serve_with_shutdown,
+    serve_with_ui, serve_with_ui_and_role_tokens, serve_with_ui_and_role_tokens_and_shutdown,
 };
 #[cfg(feature = "embed-ui")]
-pub use http::{router_with_embedded_ui, serve_with_embedded_ui};
+pub use http::{
+    router_with_embedded_ui, serve_with_embedded_ui, serve_with_embedded_ui_and_shutdown,
+};
+#[cfg(feature = "tls")]
+pub use http::{serve_tls, serve_tls_with_shutdown};
