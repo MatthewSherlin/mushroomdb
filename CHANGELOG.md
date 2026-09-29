@@ -27,6 +27,40 @@ correctly by the graph arm in the same rep —
 
 ### Security
 
+- **SIGTERM drains instead of severing.** `serve` stopped by aborting the task
+  running it, which dropped in-flight responses and live `/watch` and
+  `/subscribe` subscribers mid-stream. It now stops accepting, lets what is
+  already running finish, and then takes the shutdown snapshot. Nothing was
+  ever lost — the WAL holds every commit — but a rolling restart cut off work
+  it did not need to. A TLS server gets 30 seconds of grace before closing
+  regardless, so one stuck request cannot hold a restart open.
+
+  Five new entry points carry the signal — `serve_with_shutdown`,
+  `serve_with_role_tokens_and_shutdown`,
+  `serve_with_ui_and_role_tokens_and_shutdown`,
+  `serve_with_embedded_ui_and_shutdown` and `serve_tls_with_shutdown` — each
+  taking a `oneshot::Receiver<()>` that shuts the server down when it fires
+  **or is dropped**. **The existing entry points are unchanged**, in signature
+  and in behaviour, so nothing embedding this crate has to move. The cost is
+  twice the entry points, chosen deliberately over a breaking parameter.
+
+- **A log that is quiet when the server is healthy.** There was no `tracing`,
+  no access log and no request id anywhere in the tree: a 500 in production
+  could not be tied to the request that caused it.
+
+  A line per request at one level is what makes a server log unreadable, so the
+  level follows the outcome — `error` for 5xx, `warn` for anything slower than
+  5s, `info` for 4xx, `debug` for everything else, which is off by default.
+  Measured on the built binary: twenty successful requests write nothing, one
+  404 writes one line. Every response carries `x-request-id`, echoed from the
+  caller when it sent one, so a reported error can be found. The query string
+  is never logged: it can carry `?token=`.
+
+  `MUSHROOMDB_LOG` overrides the default filter, so `MUSHROOMDB_LOG=server=debug`
+  gives a line per request without a rebuild. Logs go to stderr; the
+  `listening on http://…` line stays on stdout.
+
+
 - **`GET /health` no longer hands the graph's shape to an uncredentialed
   caller.** It returned `nodes_live`, `edges` and the bind address to anyone,
   while `/stats` and `/metrics` refused the same counters to an *authenticated*

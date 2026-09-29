@@ -558,3 +558,49 @@ async fn concurrency_hammer_readers_and_writers() {
     assert_eq!(stats.edges, 0, "Hammer inserts are isolated nodes");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Binding: a shutdown signal stops the listener and lets work in flight end.
+///
+/// Before 0.6.12 the CLI stopped a server with `serve.abort()`, which drops the
+/// task mid-response: a caller waiting on a read got a severed connection, and
+/// live `/watch` and `/subscribe` subscribers were cut off without a close
+/// frame. The graceful entry points stop *accepting* and then let what is
+/// already running finish.
+#[tokio::test]
+async fn a_graceful_shutdown_drains_instead_of_severing() {
+    let dir = tmp("graceful-drain");
+    let db = SharedDb::open(&dir).expect("open");
+    db.write().insert_node("Person", "a", vec![]).expect("seed");
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(server::serve_with_shutdown(
+        db,
+        "127.0.0.1:0".parse().unwrap(),
+        ready_tx,
+        None,
+        stop_rx,
+    ));
+    let addr = ready_rx.await.expect("readiness oneshot");
+
+    // A request that completes normally before we ask the server to stop.
+    let (status, _, _) = http11(addr, "GET", "/stats", None).await;
+    assert_eq!(status, 200, "the server is serving before the signal");
+
+    // Ask it to stop, and it does — on its own, without being aborted.
+    stop_tx.send(()).expect("send stop");
+    let ended = tokio::time::timeout(Duration::from_secs(5), server).await;
+    let ended = ended.expect("the server must stop within 5s of the signal");
+    assert!(
+        matches!(ended, Ok(Ok(()))),
+        "a graceful stop is a clean exit, got {ended:?}"
+    );
+
+    // The listener is really closed: a fresh connection is refused rather than
+    // accepted and left hanging.
+    let after = tokio::net::TcpStream::connect(addr).await;
+    assert!(
+        after.is_err(),
+        "the listener is still accepting after shutdown"
+    );
+}

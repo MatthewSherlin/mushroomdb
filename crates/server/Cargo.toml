@@ -38,6 +38,9 @@ tower = { version = "0.5", default-features = false, features = [
     "limit",
     "load-shed",
 ] }
+# Structured events. The subscriber is installed by the binary, not here: a
+# library that configures global logging steals the decision from its embedder.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 include_dir = { version = "0.7", optional = true }
 # RSS memory metric — already in the transitive tree at 0.2.189; direct dep
 # so the cfg(target_os) blocks compile without an indirect version pin.

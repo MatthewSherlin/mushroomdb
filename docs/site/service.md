@@ -195,7 +195,48 @@ record a timestamp beside it.
 
 ---
 
-## 7. A worked container command line
+## 7. Stopping it, and what it writes to the log
+
+**SIGTERM drains.** The server stops accepting new connections, lets every
+request already in flight finish, closes live `/watch` and `/subscribe`
+subscribers, and only then takes the shutdown snapshot. Before v0.6.12 it was
+aborted outright, which severed in-flight responses and subscriptions
+mid-stream. Nothing was ever lost — the WAL holds every commit and the next
+open replays it — but a rolling restart cut off work it did not need to.
+
+A TLS server gets 30 seconds of grace before the listener closes regardless, so
+one stuck request cannot hold a restart open indefinitely.
+
+**The log is quiet when the server is healthy.** A line per request is what
+makes a server log unreadable, so the level follows what happened:
+
+| Outcome | Level | On by default |
+|---|---|---|
+| 5xx | `error` | yes |
+| slower than 5s | `warn` | yes |
+| 4xx | `info` | yes |
+| everything else | `debug` | no |
+
+Twenty successful requests write nothing. A single 404 writes one line. The
+effect is that anything in the log is there because it is worth reading.
+
+Every response carries `x-request-id` — echoed from the caller's header when it
+sent one, generated otherwise — so an error someone reports can be found in the
+log:
+
+```
+INFO request refused request_id=ba2e-14-26634158 method=GET path=/nope status=404 ms=0
+```
+
+The query string is never logged: it can carry `?token=`, and a log is the
+wrong place for a credential.
+
+`MUSHROOMDB_LOG` overrides the default with the usual filter syntax, so
+`MUSHROOMDB_LOG=server=debug` gives a line per request while someone is
+debugging, with no rebuild. Logs go to **stderr**; the `listening on http://…`
+line stays on stdout, where it has always been.
+
+## 8. A worked container command line
 
 ```text
 docker run -d --name mushroomdb \

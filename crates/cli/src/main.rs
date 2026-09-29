@@ -14,6 +14,42 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
+/// The default log filter.
+///
+/// The targets are the **lib names** — `server` and `cli` — not the package
+/// names. Filtering on `mushroomdb_server` matches nothing at all, and a filter
+/// that matches nothing is indistinguishable from a server with nothing to say;
+/// `default_filter_enables_the_crates_that_log` exists because that is exactly
+/// the mistake this line shipped with for an afternoon.
+const DEFAULT_LOG_FILTER: &str = "mushroomdb=info,server=info,cli=info,warn";
+
+/// Install the log subscriber for a long-running `serve`.
+///
+/// **Default: `mushroomdb=info,warn`.** A healthy server is quiet — one line
+/// when it binds, one when it stops, and then nothing until something is
+/// actually wrong. Successful requests log at `debug` and are therefore off;
+/// failures, refusals and slow requests are on. This is the difference between
+/// a log someone reads and a log that fills a disk.
+///
+/// `MUSHROOMDB_LOG` overrides it with the usual filter syntax, so
+/// `MUSHROOMDB_LOG=mushroomdb_server=debug` gives a line per request when
+/// someone is actually debugging, with no rebuild.
+///
+/// Only `serve` installs this. The one-shot commands print their results to
+/// stdout and have nothing to log.
+fn init_logging() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_env("MUSHROOMDB_LOG")
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    // `try_init` rather than `init`: a second call must not panic the server,
+    // and an embedder that already installed a subscriber keeps theirs.
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&raw) {
@@ -675,18 +711,33 @@ fn run_serve(
                 }
             });
         }
+        init_logging();
         let db_serve = db.clone();
+        // The graceful-stop channel. Firing it — or dropping the sender — makes
+        // the server stop accepting and let in-flight requests and subscribers
+        // finish. Before 0.6.12 shutdown was `serve.abort()`, which severed
+        // them mid-response.
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let mut serve = tokio::spawn(async move {
             // TLS path: both --tls-cert and --tls-key were supplied.
             if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
                 #[cfg(feature = "tls")]
                 {
-                    return server::serve_tls(db_serve, addr, tx, cert, key, token, role_tokens)
-                        .await;
+                    return server::serve_tls_with_shutdown(
+                        db_serve,
+                        addr,
+                        tx,
+                        cert,
+                        key,
+                        token,
+                        role_tokens,
+                        stop_rx,
+                    )
+                    .await;
                 }
                 #[cfg(not(feature = "tls"))]
                 {
-                    let _ = (cert, key, db_serve, addr, tx, token, role_tokens);
+                    let _ = (cert, key, db_serve, addr, tx, token, role_tokens, stop_rx);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
                         "this binary was built without TLS support; \
@@ -697,33 +748,63 @@ fn run_serve(
             }
             match ui {
                 ServeUi::Filesystem(dir) => {
-                    server::serve_with_ui_and_role_tokens(
+                    server::serve_with_ui_and_role_tokens_and_shutdown(
                         db_serve,
                         addr,
                         tx,
                         dir,
                         token,
                         role_tokens,
+                        stop_rx,
                     )
                     .await
                 }
                 ServeUi::None => {
-                    server::serve_with_role_tokens(db_serve, addr, tx, token, role_tokens).await
+                    server::serve_with_role_tokens_and_shutdown(
+                        db_serve,
+                        addr,
+                        tx,
+                        token,
+                        role_tokens,
+                        stop_rx,
+                    )
+                    .await
                 }
                 ServeUi::Embedded => {
                     #[cfg(feature = "embed-ui")]
                     {
-                        server::serve_with_embedded_ui(db_serve, addr, tx, token, role_tokens).await
+                        server::serve_with_embedded_ui_and_shutdown(
+                            db_serve,
+                            addr,
+                            tx,
+                            token,
+                            role_tokens,
+                            stop_rx,
+                        )
+                        .await
                     }
                     #[cfg(not(feature = "embed-ui"))]
                     {
-                        server::serve_with_role_tokens(db_serve, addr, tx, token, role_tokens).await
+                        server::serve_with_role_tokens_and_shutdown(
+                            db_serve,
+                            addr,
+                            tx,
+                            token,
+                            role_tokens,
+                            stop_rx,
+                        )
+                        .await
                     }
                 }
             }
         });
         match rx.await {
-            Ok(bound) => println!("listening on http://{bound}"),
+            Ok(bound) => {
+                // stdout stays exactly as it was: the docs, the tests and
+                // `install` all read this line.
+                println!("listening on http://{bound}");
+                tracing::info!(addr = %bound, "listening");
+            }
             Err(_) => {
                 return match serve.await {
                     Ok(Ok(())) => Err("server exited before readiness".into()),
@@ -739,8 +820,15 @@ fn run_serve(
                 Err(e) => Err(e.to_string()),
             },
             _ = shutdown_signal() => {
-                serve.abort();
-                let _ = serve.await;
+                // Ask the server to stop, then wait for it. In-flight requests
+                // and live subscribers finish; `serve.abort()` cut them off.
+                tracing::info!("shutdown signal received; draining in-flight requests");
+                let _ = stop_tx.send(());
+                match (&mut serve).await {
+                    Ok(Ok(())) => tracing::info!("drained; stopped"),
+                    Ok(Err(e)) => tracing::error!(error = %e, "server exited with an error"),
+                    Err(e) => tracing::error!(error = %e, "server task failed"),
+                }
                 // Same rule as the periodic snapshot: it needs the store's
                 // write lock. Shutting down without one is fine — the WAL holds
                 // every commit, and the next open replays it.
@@ -799,4 +887,34 @@ fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_LOG_FILTER;
+
+    /// Binding: the default filter names the target this crate's server
+    /// actually logs under.
+    ///
+    /// A typo here is silent — the server simply says nothing, which looks
+    /// like health. This shipped wrong for an afternoon: the filter named
+    /// `mushroomdb_server`, the events are emitted under `server`, and the
+    /// result was a 404 that logged at INFO and appeared nowhere.
+    #[test]
+    fn default_filter_names_the_servers_real_log_target() {
+        let root = server::LOG_TARGET_ROOT;
+        assert!(
+            DEFAULT_LOG_FILTER.contains(&format!("{root}=")),
+            "the default filter {DEFAULT_LOG_FILTER:?} does not name the \
+             server's log target {root:?}, so nothing it logs would appear"
+        );
+    }
+
+    /// The filter parses. An unparseable default falls back to silence.
+    #[test]
+    fn default_filter_parses() {
+        use tracing_subscriber::EnvFilter;
+        let parsed = EnvFilter::builder().parse(DEFAULT_LOG_FILTER);
+        assert!(parsed.is_ok(), "default filter does not parse: {parsed:?}");
+    }
 }

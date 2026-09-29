@@ -532,7 +532,7 @@ Usage:
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
   mushroomdb mcp <db-dir>|--auto [--all-tools]
                      --all-tools lists all 28 tools; the default follows the store — 3 on a
-                     store `ingest-git` built (explore, query, stats), 16 on any other
+                     store `ingest-git` built (explore, query, stats), 19 on any other
                      (the rest stay callable, just unlisted)
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
