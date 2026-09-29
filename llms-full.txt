@@ -449,15 +449,30 @@ Full methodology and honesty notes:
 **Agent benchmarks** measure the entity engine directly. `benchmarks/agent-tasks/` runs real
 `claude -p` sessions against executable truth. The association suite (`--suite association`) asks
 twenty relationship questions of one generated world written three ways — as JSON files, as a
-single relational file, and as a mushroomdb store. The graph arm moved from 0.795 at $0.5089
-([`20260911T005749Z`](benchmarks/agent-tasks/results/20260911T005749Z/summary.md)) to 0.994 at
-$0.0357 ([`20260925T200950Z`](benchmarks/agent-tasks/results/20260925T200950Z/summary.md)) against
-the relational baseline's 1.000 at $0.0608 — cost -41.2%, tokens -26.8%, turns -25.6%, and the cost
-leg passes for the first time with its 95% interval `[-0.0353, -0.0124]` entirely below zero. On a
-2,000-entity world **the gate still fails**, now on correctness alone: -0.006 paired, one key on
-one task (`assoc-timetravel-4`), reproducibly across three reps. That key was the date-resolution
-defect fixed in 0.6.12, not a limit of the engine; the run will be repeated on the fix rather than
-restated. The code suite (`--suite code`) is retired; its committed summaries stay as the record.
+single relational file, and as a mushroomdb store. **The pre-registered gate passes** as of
+[`20260928T195302Z`](benchmarks/agent-tasks/results/20260928T195302Z/summary.md), on a
+2,000-entity world — the first run in which it has. The graph arm scored **1.000 on all twenty
+tasks and all sixty cells** against the relational baseline's 0.990, at **$0.0614 against
+$0.1127**:
+
+| | graph (R) | sqlite (Q) | delta | 95% interval |
+|---|---|---|---|---|
+| score | **1.000** | 0.990 | +0.0101 | `[0.0005, 0.0229]` |
+| cost $ | **0.0614** | 0.1127 | -45.6% | `[-0.06875, -0.03147]` |
+| total tokens | **155,397** | 211,487 | -26.5% | `[-95482, -8268]` |
+| turns | **3.93** | 7.07 | -44.3% | `[-4.017, -2.133]` |
+
+180 cells, 0 timeouts, 0 errors, 0 dropped. Correctness had been amended on 2026-09-11 to pass on
+a tie, because the sqlite arm saturated at 1.00 and the original wording — exceed both baselines,
+interval excluding zero — was judged unpassable; **this run passes the original wording.** Every
+one of the six sub-1.0 cells belongs to a baseline, and each key they missed was named correctly by
+the graph arm in the same rep:
+[`classification.md`](benchmarks/agent-tasks/results/20260928T195302Z/classification.md).
+
+The run before it ([`20260925T200950Z`](benchmarks/agent-tasks/results/20260925T200950Z/summary.md))
+failed on correctness by one key on one task. That key was a date-resolution defect in the engine,
+not a limit of the surface, and it is fixed in 0.6.12. The code suite (`--suite code`) is retired;
+its committed summaries stay as the record.
 [`docs/site/association-bench.md`](docs/site/association-bench.md) describes the suite and how to
 rebuild the world.
 
@@ -3682,8 +3697,49 @@ two diverge by one frame per rule-firing commit. On this world that is 588 frame
 stamps, so `2026-07-14` resolved to frame 167 — the state 23 simulated days earlier — and the task
 lost the one key whose edge is derived inside that window. Probed at the day's real frame the
 engine returns all eight keys, so the derivation was never wrong; only the date-to-frame step was.
-The run above was produced by a binary carrying that defect. **It has not been re-run on the fix**,
-and until it is, this page reports the failing result rather than a projected one.
+The run above was produced by a binary carrying that defect.
+
+## The run on the fix — 20260928T195302Z — PASSED
+
+Committed at
+[`benchmarks/agent-tasks/results/20260928T195302Z/summary.md`](../../benchmarks/agent-tasks/results/20260928T195302Z/summary.md),
+same world digest `f2b689ba52c80241`, same model and settings, so it is directly comparable.
+
+| | |
+|---|---|
+| verdict | **PASSED** |
+| best arm | R |
+| arms under the gate | R |
+| cells with no cost recorded | 0 of 180 |
+
+Arm R against arm Q, paired by task:
+
+| metric | arm mean | arm Q mean | delta | 95% CI | tasks |
+|---|---|---|---|---|---|
+| score | 1.000 | 0.990 | +0.0101 | [0.0005, 0.0229] | 20 |
+| cost $ | 0.0614 | 0.1127 | −0.05136 | [−0.06875, −0.03147] | 20 |
+| total tokens | 155397 | 211487 | −56089.8 | [−95482.2, −8268.4] | 20 |
+| turns | 3.93 | 7.07 | −3.133 | [−4.017, −2.133] | 20 |
+| cache hit ratio | 0.964 | 0.953 | +0.0112 | [−0.0054, 0.0225] | 20 |
+
+180 cells, 0 dropped, 0 timeouts, 0 errors. **Arm R scored 1.000 on every task and every one of
+its 60 cells** — the first run in which it did. All four time-travel tasks answer in a single MCP
+call at ~77.6k tokens, against 4–9 tool calls and 131k–308k tokens for the baselines.
+
+Two things are worth stating precisely, because they are easy to overclaim:
+
+- **The correctness leg was amended on 2026-09-11** to pass on a tie, on the grounds that arm Q had
+  saturated at 1.00 and the original wording — correctness must exceed both baselines with its
+  interval excluding zero — could not be passed by any arm. This run passes the **original**
+  wording: +0.0101 against arm Q with `[0.0005, 0.0229]` excluding zero, and above arm P's 0.983.
+- **Absolute costs are higher than the 25 Sep run in every arm** (R $0.0614 vs $0.0357, Q $0.1127
+  vs $0.0608). Same model, same max-turns, same world; a different day. The gate measures the
+  paired difference, which is what the interval above reports.
+
+Six cells scored below 1.0 and **all six belong to a baseline** — five arm Q, one arm P. Every key
+they missed was named correctly by arm R in the same rep, so none is a grader fault, and arm R lost
+no cell to classify. Per-cell evidence:
+[`classification.md`](../../benchmarks/agent-tasks/results/20260928T195302Z/classification.md).
 
 ---
 

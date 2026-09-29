@@ -2,6 +2,29 @@
 
 ## Unreleased — v0.6.12
 
+**The pre-registered association gate passes**, for the first time since it was
+written. Run
+[`20260928T195302Z`](benchmarks/agent-tasks/results/20260928T195302Z/summary.md),
+same 2,000-entity world digest as the two before it: the graph arm scores
+**1.000 on all twenty tasks and all sixty cells** against the sqlite baseline's
+0.990, at **$0.0614 against $0.1127** — cost **-45.6%** with its 95% interval
+`[-0.06875, -0.03147]`, tokens **-26.5%**, turns **-44.3%**, every interval
+excluding zero. 180 cells, 0 timeouts, 0 errors, 0 dropped.
+
+Correctness had been amended on 2026-09-11 to pass on a tie, because the sqlite
+arm saturated at 1.00 and the original wording — exceed both baselines with the
+interval excluding zero — was judged unpassable by any arm. **This run passes
+the original wording**: +0.0101 against arm Q with `[0.0005, 0.0229]`, and above
+arm P's 0.983.
+
+What changed between the failing run and this one is the defect below. The 25
+Sep run lost one key on one task, reproducibly across three reps; that key was a
+date resolving 23 simulated days early. All four time-travel tasks now answer
+correctly in every rep, each in a single MCP call. Every one of this run's six
+sub-1.0 cells belongs to a baseline, and each key they missed was named
+correctly by the graph arm in the same rep —
+[`classification.md`](benchmarks/agent-tasks/results/20260928T195302Z/classification.md).
+
 ### Added
 
 - **A memory store advertises nineteen tools, not sixteen:** `upsert_entity`,

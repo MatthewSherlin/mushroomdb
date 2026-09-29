@@ -440,15 +440,30 @@ Full methodology and honesty notes:
 **Agent benchmarks** measure the entity engine directly. `benchmarks/agent-tasks/` runs real
 `claude -p` sessions against executable truth. The association suite (`--suite association`) asks
 twenty relationship questions of one generated world written three ways — as JSON files, as a
-single relational file, and as a mushroomdb store. The graph arm moved from 0.795 at $0.5089
-([`20260911T005749Z`](benchmarks/agent-tasks/results/20260911T005749Z/summary.md)) to 0.994 at
-$0.0357 ([`20260925T200950Z`](benchmarks/agent-tasks/results/20260925T200950Z/summary.md)) against
-the relational baseline's 1.000 at $0.0608 — cost -41.2%, tokens -26.8%, turns -25.6%, and the cost
-leg passes for the first time with its 95% interval `[-0.0353, -0.0124]` entirely below zero. On a
-2,000-entity world **the gate still fails**, now on correctness alone: -0.006 paired, one key on
-one task (`assoc-timetravel-4`), reproducibly across three reps. That key was the date-resolution
-defect fixed in 0.6.12, not a limit of the engine; the run will be repeated on the fix rather than
-restated. The code suite (`--suite code`) is retired; its committed summaries stay as the record.
+single relational file, and as a mushroomdb store. **The pre-registered gate passes** as of
+[`20260928T195302Z`](benchmarks/agent-tasks/results/20260928T195302Z/summary.md), on a
+2,000-entity world — the first run in which it has. The graph arm scored **1.000 on all twenty
+tasks and all sixty cells** against the relational baseline's 0.990, at **$0.0614 against
+$0.1127**:
+
+| | graph (R) | sqlite (Q) | delta | 95% interval |
+|---|---|---|---|---|
+| score | **1.000** | 0.990 | +0.0101 | `[0.0005, 0.0229]` |
+| cost $ | **0.0614** | 0.1127 | -45.6% | `[-0.06875, -0.03147]` |
+| total tokens | **155,397** | 211,487 | -26.5% | `[-95482, -8268]` |
+| turns | **3.93** | 7.07 | -44.3% | `[-4.017, -2.133]` |
+
+180 cells, 0 timeouts, 0 errors, 0 dropped. Correctness had been amended on 2026-09-11 to pass on
+a tie, because the sqlite arm saturated at 1.00 and the original wording — exceed both baselines,
+interval excluding zero — was judged unpassable; **this run passes the original wording.** Every
+one of the six sub-1.0 cells belongs to a baseline, and each key they missed was named correctly by
+the graph arm in the same rep:
+[`classification.md`](benchmarks/agent-tasks/results/20260928T195302Z/classification.md).
+
+The run before it ([`20260925T200950Z`](benchmarks/agent-tasks/results/20260925T200950Z/summary.md))
+failed on correctness by one key on one task. That key was a date-resolution defect in the engine,
+not a limit of the surface, and it is fixed in 0.6.12. The code suite (`--suite code`) is retired;
+its committed summaries stay as the record.
 [`docs/site/association-bench.md`](docs/site/association-bench.md) describes the suite and how to
 rebuild the world.
 

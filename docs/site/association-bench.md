@@ -180,8 +180,49 @@ two diverge by one frame per rule-firing commit. On this world that is 588 frame
 stamps, so `2026-07-14` resolved to frame 167 — the state 23 simulated days earlier — and the task
 lost the one key whose edge is derived inside that window. Probed at the day's real frame the
 engine returns all eight keys, so the derivation was never wrong; only the date-to-frame step was.
-The run above was produced by a binary carrying that defect. **It has not been re-run on the fix**,
-and until it is, this page reports the failing result rather than a projected one.
+The run above was produced by a binary carrying that defect.
+
+## The run on the fix — 20260928T195302Z — PASSED
+
+Committed at
+[`benchmarks/agent-tasks/results/20260928T195302Z/summary.md`](../../benchmarks/agent-tasks/results/20260928T195302Z/summary.md),
+same world digest `f2b689ba52c80241`, same model and settings, so it is directly comparable.
+
+| | |
+|---|---|
+| verdict | **PASSED** |
+| best arm | R |
+| arms under the gate | R |
+| cells with no cost recorded | 0 of 180 |
+
+Arm R against arm Q, paired by task:
+
+| metric | arm mean | arm Q mean | delta | 95% CI | tasks |
+|---|---|---|---|---|---|
+| score | 1.000 | 0.990 | +0.0101 | [0.0005, 0.0229] | 20 |
+| cost $ | 0.0614 | 0.1127 | −0.05136 | [−0.06875, −0.03147] | 20 |
+| total tokens | 155397 | 211487 | −56089.8 | [−95482.2, −8268.4] | 20 |
+| turns | 3.93 | 7.07 | −3.133 | [−4.017, −2.133] | 20 |
+| cache hit ratio | 0.964 | 0.953 | +0.0112 | [−0.0054, 0.0225] | 20 |
+
+180 cells, 0 dropped, 0 timeouts, 0 errors. **Arm R scored 1.000 on every task and every one of
+its 60 cells** — the first run in which it did. All four time-travel tasks answer in a single MCP
+call at ~77.6k tokens, against 4–9 tool calls and 131k–308k tokens for the baselines.
+
+Two things are worth stating precisely, because they are easy to overclaim:
+
+- **The correctness leg was amended on 2026-09-11** to pass on a tie, on the grounds that arm Q had
+  saturated at 1.00 and the original wording — correctness must exceed both baselines with its
+  interval excluding zero — could not be passed by any arm. This run passes the **original**
+  wording: +0.0101 against arm Q with `[0.0005, 0.0229]` excluding zero, and above arm P's 0.983.
+- **Absolute costs are higher than the 25 Sep run in every arm** (R $0.0614 vs $0.0357, Q $0.1127
+  vs $0.0608). Same model, same max-turns, same world; a different day. The gate measures the
+  paired difference, which is what the interval above reports.
+
+Six cells scored below 1.0 and **all six belong to a baseline** — five arm Q, one arm P. Every key
+they missed was named correctly by arm R in the same rep, so none is a grader fault, and arm R lost
+no cell to classify. Per-cell evidence:
+[`classification.md`](../../benchmarks/agent-tasks/results/20260928T195302Z/classification.md).
 
 ---
 
