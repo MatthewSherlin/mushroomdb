@@ -18,8 +18,8 @@ embed-ui = ["dep:include_dir"]
 tls = ["dep:axum-server"]
 
 [dependencies]
-core-api = { package = "mushroomdb", path = "../core-api", version = "0.6.11" }
-arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.6.11" }
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.6.12" }
+arrow-bridge = { package = "mushroomdb-arrow", path = "../arrow-bridge", version = "0.6.12" }
 # ws enabled now so Task 5 can add GET /watch without a dep bump.
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
@@ -51,7 +51,7 @@ libc = { version = "0.2", default-features = false }
 # `tests/http.rs` uses to reach the `Corrupt` arm of the scoped reader on both
 # HTTP role branches. The hook corrupts every snapshot the handle hands out, so
 # it is gated out of the published crate and turned on here only.
-core-api = { package = "mushroomdb", path = "../core-api", version = "0.6.11", features = [
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.6.12", features = [
     "test-hooks",
 ] }
 # oneshot ServiceExt — axum re-exports tower types but not the util trait.

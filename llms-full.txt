@@ -1356,7 +1356,7 @@ key files (by centrality):
 key symbols (most called):
   crates/core-api/tests/algo.rs#insert_node — fn insert_node(db: &mut GraphDb<core_storage::fs::RealFs>, label: &str, key: &str)
   crates/core-api/tests/algo.rs#insert_edge — fn insert_edge(db: &mut GraphDb<core_storage::fs::RealFs>, etype: &str, src: &str, dst: &str)
-reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.11 explore './mushroom-memory' <target>
+reach the graph: explore <target> (MCP tool) · or: npx -y mushroomdb@0.6.12 explore './mushroom-memory' <target>
 ```
 
 The first line is the untrusted-data marker every digest rendered out of a store
@@ -2987,7 +2987,7 @@ Claude Desktop has no installer path, so add mushroomdb by hand in
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.6.11", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.6.12", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -4609,7 +4609,7 @@ Role-token behavior per endpoint:
 
 | Endpoint | Role-token response |
 |---|---|
-| `GET /health` | 200 (unauthenticated — no identity needed) |
+| `GET /health` | 200 `{"ok":true}` — reachable without a credential, and discloses nothing beyond liveness to anyone but a full-access token |
 | `POST /query` (read) | 200 — rows filtered to visible nodes; client `mask` intersects role mask (never widens) |
 | `POST /query` (write: `CREATE`/`SET`/`DELETE`/`MERGE`) | 200 if in write scope + target visible; 403 with reason otherwise |
 | `POST /nodes` | 200 if `label` in `create_labels`; 403 with scope reason otherwise |
@@ -4771,7 +4771,7 @@ authentication and is not subject to role enforcement.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Liveness + counts `{"ok":true,"nodes":N,"edges":N,"addr":"..."}` (no auth) |
+| `GET` | `/health` | Liveness, no auth needed: `{"ok":true}`. With the full-access token — or on a server with no auth configured — it also carries `nodes`, `edges` and `addr`. A role-bound token gets liveness only, matching `/stats` and `/metrics`, which refuse it counters because they leak graph size |
 | `POST` | `/query` | Run a Cypher query |
 | `GET` | `/stats` | Database statistics |
 | `POST` | `/ingest` | Ingest nodes and/or edges |
@@ -8187,7 +8187,48 @@ record a timestamp beside it.
 
 ---
 
-## 7. A worked container command line
+## 7. Stopping it, and what it writes to the log
+
+**SIGTERM drains.** The server stops accepting new connections, lets every
+request already in flight finish, closes live `/watch` and `/subscribe`
+subscribers, and only then takes the shutdown snapshot. Before v0.6.12 it was
+aborted outright, which severed in-flight responses and subscriptions
+mid-stream. Nothing was ever lost — the WAL holds every commit and the next
+open replays it — but a rolling restart cut off work it did not need to.
+
+A TLS server gets 30 seconds of grace before the listener closes regardless, so
+one stuck request cannot hold a restart open indefinitely.
+
+**The log is quiet when the server is healthy.** A line per request is what
+makes a server log unreadable, so the level follows what happened:
+
+| Outcome | Level | On by default |
+|---|---|---|
+| 5xx | `error` | yes |
+| slower than 5s | `warn` | yes |
+| 4xx | `info` | yes |
+| everything else | `debug` | no |
+
+Twenty successful requests write nothing. A single 404 writes one line. The
+effect is that anything in the log is there because it is worth reading.
+
+Every response carries `x-request-id` — echoed from the caller's header when it
+sent one, generated otherwise — so an error someone reports can be found in the
+log:
+
+```
+INFO request refused request_id=ba2e-14-26634158 method=GET path=/nope status=404 ms=0
+```
+
+The query string is never logged: it can carry `?token=`, and a log is the
+wrong place for a credential.
+
+`MUSHROOMDB_LOG` overrides the default with the usual filter syntax, so
+`MUSHROOMDB_LOG=server=debug` gives a line per request while someone is
+debugging, with no rebuild. Logs go to **stderr**; the `listening on http://…`
+line stays on stdout, where it has always been.
+
+## 8. A worked container command line
 
 ```text
 docker run -d --name mushroomdb \

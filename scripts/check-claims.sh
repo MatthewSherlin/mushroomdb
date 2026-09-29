@@ -132,6 +132,23 @@ if [[ -n "$WORKSPACE_VERSION" ]]; then
              | grep -v "mushroomdb@${WORKSPACE_VERSION}" \
              | grep -vE "(^|/)CHANGELOG\.md:|(^|/)docs/roadmap/" || true)"
   fi
+  # A pin the rewriter mangled: `mushroomdb` immediately followed by a version
+  # with no `@`. This exists because the bump script once produced exactly that
+  # — perl interpolated `@0` away — and this scan passed it, because the
+  # wreckage no longer matched the pattern above. A gate satisfied by text it
+  # cannot see is worse than no gate.
+  mangled=""
+  if [[ ${#_scan[@]} -gt 0 ]]; then
+    # `scripts/` is excluded: the bump script's own comment describes this
+    # exact wreckage, and a pin inside a script is not reader-facing copy.
+    mangled="$( (cd "$ROOT" && grep -nE "mushroomdb\.[0-9]+\.[0-9]+" "${_scan[@]}" 2>/dev/null) \
+               | grep -vE "(^|/)CHANGELOG\.md:|(^|/)docs/roadmap/|(^|/)scripts/" || true)"
+  fi
+  if [[ -n "$mangled" ]]; then
+    echo "check-claims.sh: install pins with the '@' missing — a mangled rewrite:" >&2
+    printf '%s\n' "$mangled" >&2
+    fail=1
+  fi
   if [[ -n "$stale" ]]; then
     echo "check-claims.sh: install pins naming a version other than ${WORKSPACE_VERSION}:" >&2
     printf '%s\n' "$stale" >&2

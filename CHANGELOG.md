@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased — v0.6.12
+## v0.6.12 — a date that lands where it says, and a server you can run
+
+**v0.6.11 was never published.** It was merged, and the release was stopped when
+its headline feature turned out to resolve every date to an ever-earlier graph
+on exactly the stores this engine exists for. The defect never reached a
+release, a registry or a user: the last published version is 0.6.10, and this is
+the next one. The `v0.6.11` section below stays as the record of what landed and
+what it claimed — including a retraction it earned — and everything in it ships
+here.
+
+Upgrading from 0.6.10 therefore brings both releases at once.
+
 
 **The pre-registered association gate passes**, for the first time since it was
 written. Run
@@ -176,7 +187,14 @@ correctly by the graph arm in the same rep —
   unchanged; the new answer is the accurate one, because the map is genuinely
   empty rather than pointing past the end.
 
-## v0.6.11 — time in the graph
+## v0.6.11 — time in the graph (merged, never published — shipped in 0.6.12)
+
+> This version was never tagged. Its date surface resolved to the wrong WAL
+> frame whenever a commit fired a rule, which is the defect 0.6.12 opens with;
+> the release was stopped rather than published. Everything described below is
+> in 0.6.12, with that defect fixed. Kept in full because the claims it made —
+> and the one it retracted — are part of the record.
+
 
 A date becomes a first-class way to address history. `edges_at(key, "2026-06-19")`
 answers what a node's relationships looked like on that day, and so do

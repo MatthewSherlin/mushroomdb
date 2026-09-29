@@ -118,6 +118,28 @@ if [[ $CHECK -eq 1 ]]; then
   exit 0
 fi
 
+# 5. Install pins a reader copy-pastes: `npx -y mushroomdb@X.Y.Z …` in the
+#    hand-maintained docs. `check-claims.sh` already fails the build when one
+#    of these lags — it was added because 0.6.9 shipped telling readers to
+#    install 0.6.8 — so the bump has to move them or every release trips its
+#    own gate. CHANGELOG and docs/roadmap are exempt for the same reason
+#    check-claims exempts them: they are history, and history keeps its pins.
+if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  while IFS= read -r -d '' f; do
+    case "$f" in
+      CHANGELOG.md|docs/roadmap/*) continue ;;
+    esac
+    if grep -qE "mushroomdb@[0-9]+\.[0-9]+\.[0-9]+" "$ROOT/$f" 2>/dev/null; then
+      # The `@` must be escaped on BOTH sides: unescaped in the replacement,
+      # perl reads `@0` as an array and interpolates it away, turning
+      # `mushroomdb@0.6.12` into `mushroomdb.6.12` — which `check-claims.sh`
+      # then passes, because the wreckage no longer matches the pattern it
+      # scans for. A gate satisfied by text it cannot see is worse than none.
+      perl -0pi -e 's/mushroomdb\@[0-9]+\.[0-9]+\.[0-9]+/mushroomdb\@'"$NEW"'/g' "$ROOT/$f"
+    fi
+  done < <(git -C "$ROOT" ls-files -z -- '*.md' '*.txt' '*.json' '*.sh')
+fi
+
 # Regenerate what is derived from the version rather than editing it.
 cargo metadata --format-version 1 --offline >/dev/null 2>&1 || cargo metadata --format-version 1 >/dev/null
 (cd bindings/python && cargo metadata --format-version 1 >/dev/null 2>&1 || true)
