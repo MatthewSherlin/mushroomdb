@@ -220,6 +220,14 @@ def write_summary(outdir: Path, rows: list[dict], meta: dict,
     lines.append(f"- baseline arm: {baseline} ({ARM_LABEL.get(baseline, baseline)})")
     if suite == "association":
         lines.append(f"- world digest: `{meta.get('world_digest', '-')}`")
+        eng = meta.get("engine") or {}
+        if eng:
+            dirty = eng.get("dirty", "unknown")
+            warn = ("  **the working tree was dirty: this run is not "
+                    "reproducible from a commit**" if dirty == "yes" else "")
+            lines.append(f"- engine under test: `{eng.get('version', '-')}` "
+                         f"built from `{eng.get('sha', '-')}`, "
+                         f"tree dirty: {dirty}.{warn}")
     else:
         lines.append(f"- subject HEAD: `{meta.get('head_short', '-')}`")
     lines.append(f"- model: sonnet, max-turns {meta.get('max_turns', DEFAULT_MAX_TURNS)}, "

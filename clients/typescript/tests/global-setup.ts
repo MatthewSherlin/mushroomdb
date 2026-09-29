@@ -192,13 +192,27 @@ function startServer(dbDir: string): Promise<{ port: number; proc: ChildProcess 
 // ---------------------------------------------------------------------------
 
 export default async function setup({ provide }: GlobalSetupContext) {
+  // Skipping is right on a contributor's machine without a Rust toolchain and
+  // wrong in CI, where a skip is indistinguishable from a pass. This package is
+  // published on every release; until 0.6.12 no workflow ran its tests at all,
+  // and the suite skips rather than fails when it cannot build a server — so
+  // simply adding a job would have gone green without exercising anything.
+  //
+  // Set MUSHROOMDB_REQUIRE_SERVER=1 to turn every skip below into a failure.
+  const required = process.env.MUSHROOMDB_REQUIRE_SERVER === "1";
+  const refuse = (reason: string): never => {
+    throw new Error(
+      `MUSHROOMDB_REQUIRE_SERVER=1 but the test server could not start: ${reason}`,
+    );
+  };
+
   // 1. Resolve cargo.
   const cargo = resolveCargo();
   if (!cargo) {
-    provide(
-      "skipReason",
-      "cargo not found. Set CARGO=/path/to/cargo or ensure cargo is on PATH.",
-    );
+    const reason =
+      "cargo not found. Set CARGO=/path/to/cargo or ensure cargo is on PATH.";
+    if (required) refuse(reason);
+    provide("skipReason", reason);
     provide("baseUrl", "");
     provide("wsUrl", "");
     return;
@@ -207,6 +221,7 @@ export default async function setup({ provide }: GlobalSetupContext) {
   // 2. Build (or verify existing) binary.
   const buildResult = tryBuild(cargo);
   if (!buildResult.ok) {
+    if (required) refuse(buildResult.reason);
     provide("skipReason", buildResult.reason);
     provide("baseUrl", "");
     provide("wsUrl", "");
@@ -217,6 +232,7 @@ export default async function setup({ provide }: GlobalSetupContext) {
   tmpDbDir = mkdtempSync(join(tmpdir(), "mushroomdb-ts-test-"));
   const demoResult = runDemo(tmpDbDir);
   if (!demoResult.ok) {
+    if (required) refuse(demoResult.reason);
     provide("skipReason", demoResult.reason);
     provide("baseUrl", "");
     provide("wsUrl", "");

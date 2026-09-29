@@ -221,6 +221,36 @@ def sh(cmd: list[str], cwd: Path | None = None, timeout: int = 900) -> str:
     return p.stdout
 
 
+def engine_provenance() -> dict[str, str]:
+    """What built the binary under test, recorded with the run.
+
+    The association suite records the world digest and, until 0.6.12, nothing
+    at all about the engine. That is how run `20260925T200950Z` came to be
+    quoted: its summary was committed three days later by the same commit that
+    changed date resolution, and the run itself predated two engine fixes. The
+    numbers described a binary two commits behind what shipped, and nothing in
+    the repository said so — the failing key was then explained from the
+    summary, wrongly, without re-opening the store.
+
+    `dirty` is the half that matters most in practice. A clean SHA can be
+    checked out again; a dirty tree cannot, so a run made from one is not
+    reproducible and the summary should say which kind it was.
+    """
+    out = {"sha": "-", "dirty": "unknown", "version": "-"}
+    try:
+        out["sha"] = sh(["git", "rev-parse", "--short=12", "HEAD"], cwd=REPO).strip()
+        changed = sh(["git", "status", "--porcelain", "--untracked-files=no"],
+                     cwd=REPO).strip()
+        out["dirty"] = "yes" if changed else "no"
+    except Exception:
+        pass
+    try:
+        out["version"] = sh([str(MUSHROOMDB), "--version"]).strip()
+    except Exception:
+        pass
+    return out
+
+
 def ensure_binary() -> None:
     if MUSHROOMDB.exists():
         return

@@ -111,6 +111,49 @@ jobs:
       # the same store under the per-column tables was 36,784,616 B (9.82x).
       - run: cargo test --release -p mushroomdb --test snapshot -- snapshot_size_is_near_the_property_payload --ignored --nocapture
 
+  # The TypeScript client is published by publish.yml on every release and,
+  # until 0.6.12, was tested by no workflow at all — a broken build would have
+  # been found at release time, after github-release had already gone green.
+  # Its suite skips rather than fails when it cannot build a server, so
+  # MUSHROOMDB_REQUIRE_SERVER=1 turns those skips into failures here: a job that
+  # can skip everything is a job that proves nothing.
+  ts-client:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      # Build the server the suite drives, so a Rust break fails here and not
+      # inside a vitest global-setup message.
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb
+        working-directory: .
+      - run: npm test
+        env:
+          MUSHROOMDB_REQUIRE_SERVER: "1"
+          CARGO: cargo
+
+  # packaging/tests/run.sh is the only test of install.sh and the npm launcher
+  # — the two paths most users actually arrive through — and it ran in no
+  # workflow. It serves a fake release over localhost and drives both installers
+  # against it, so it needs node, python3, curl and tar, but no Rust build.
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - run: bash packaging/tests/run.sh
+
   ui:
     runs-on: ubuntu-latest
     defaults:
@@ -391,3 +434,9 @@ jobs:
       # product-facing file, and no skill telling an agent to call the graph
       # ahead of a search. See scripts/check-claims.sh for why.
       - run: bash scripts/check-claims.sh
+      # One version, twenty-four places. Catches the two shapes that have both
+      # already shipped: a package manifest left behind (0.6.9 told readers to
+      # install 0.6.8; a v0.6.11 tag would have published a wheel labelled
+      # 0.6.10), and an inter-crate pin left behind, which resolves under caret
+      # until the minor bumps and then fails every publish in the sequence.
+      - run: bash scripts/bump-version.sh --check

@@ -45,6 +45,7 @@ sys.path.insert(0, str(HERE))
 from ground_truth import grade, unit_passed                      # noqa: E402
 from report import write_summary                                 # noqa: E402
 from subjects import (ARM_DISALLOWED, ASSOC_ARMS, ASSOC_SUBJECTS,  # noqa: E402
+                      engine_provenance,
                       BASE_TOOLS, CELL_TIMEOUT_S,
                       DEFAULT_MAX_TURNS, EMPTY_MCP, MCP_TOOL, SUBJECT_A,
                       SUBJECT_B, SUBJECT_D, SUBJECT_E, SUBJECT_F, SUBJECT_H,
@@ -665,6 +666,9 @@ def main() -> int:
             "max_turns": a.max_turns, **cfg["gate"]}
     if a.suite == "association":
         meta["world_digest"] = data["world_digest"]
+        # What built the engine these cells questioned. The world digest pins
+        # the data; this pins the thing under test.
+        meta["engine"] = engine_provenance()
     else:
         meta["head_short"] = data["head_short"]
     path = write_summary(outdir, rows, meta)
