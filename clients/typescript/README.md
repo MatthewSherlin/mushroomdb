@@ -3,7 +3,7 @@
 TypeScript client for the [mushroomdb](https://github.com/MatthewSherlin/mushroomdb) graph database.
 Wraps the HTTP and WebSocket API exposed by `mushroomdb serve`.
 
-> **Not yet published to npm.** Install from the repo path (see below).
+> Published to npm as [`mushroomdb-client`](https://www.npmjs.com/package/mushroomdb-client) on every release. Installing from the repo path (see below) is for working against an unreleased server.
 
 ---
 

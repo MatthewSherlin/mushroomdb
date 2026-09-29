@@ -23,9 +23,9 @@ embed-ui = ["server/embed-ui"]
 tls = ["server/tls"]
 
 [dependencies]
-core-api = { package = "mushroomdb", path = "../core-api", version = "0.6.10" }
-code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.6.10" }
-server = { package = "mushroomdb-server", path = "../server", version = "0.6.10" }
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.6.11" }
+code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.6.11" }
+server = { package = "mushroomdb-server", path = "../server", version = "0.6.11" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }

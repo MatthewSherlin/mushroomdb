@@ -136,8 +136,10 @@ CI mirrors it exactly.
 The user-facing install paths live in `README.md`. The paths below are for
 contributors building or publishing the artifacts themselves.
 
-Tags `v0.4.1`, `v0.4.2`, `v0.4.3`, `v0.4.4`, `v0.4.5`, `v0.5.0`, `v0.5.1`, and `v0.5.2` are published; `npx mushroomdb`,
-the `curl install.sh`, and `ghcr.io/matthewsherlin/mushroomdb` are all live today.
+Every `v*` tag from `v0.4.1` onward is published — the current release is listed on the
+[releases page](https://github.com/MatthewSherlin/mushroomdb/releases), and `npx mushroomdb`,
+the `curl install.sh`, and `ghcr.io/matthewsherlin/mushroomdb` are all live today. (This line
+named a fixed list through v0.5.2 and went stale the moment 0.6.0 shipped; it now names none.)
 
 ### Build the embedded-UI binary from source
 
@@ -202,7 +204,7 @@ npx mushroomdb --help
 ### TypeScript client (install from repo)
 
 The `mushroomdb-client` package wraps the HTTP + WebSocket API with full TypeScript types.
-It is not yet published to npm. Install from the repository:
+It is published to npm as `mushroomdb-client` on every release. To work against an unreleased server, install from the repository instead:
 
 ```sh
 npm install /path/to/graph-db/clients/typescript
