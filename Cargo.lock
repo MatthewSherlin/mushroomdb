@@ -499,7 +499,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-bench"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "criterion",
  "mushroomdb",
@@ -1297,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "bincode",
  "matrixmultiply",
@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-arrow"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-cli"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -1338,7 +1338,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-extract"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "blake3",
  "tree-sitter",
@@ -1351,7 +1351,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-query"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "mushroomdb-storage",
  "proptest",
@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-rules"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "bincode",
  "mushroomdb-storage",
@@ -1370,7 +1370,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-server"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -1397,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-storage"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -2179,7 +2179,7 @@ dependencies = [
 
 [[package]]
 name = "sim-harness"
-version = "0.6.11"
+version = "0.6.12"
 dependencies = [
  "mushroomdb",
  "mushroomdb-rules",
