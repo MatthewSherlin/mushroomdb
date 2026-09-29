@@ -409,9 +409,51 @@ fn build_app(
         .route("/algo/wcc", post(algo_wcc))
         .route("/algo/degree", post(algo_degree))
         .route("/backup", post(backup))
+        .with_state(state.clone());
+
+    // The two WebSocket routes are built separately and merged unlayered: a
+    // request timeout applied to them would sever a healthy subscription at
+    // the deadline, and a subscription is meant to outlive any request.
+    let streaming = Router::new()
         .route("/watch", get(crate::ws::watch))
         .route("/subscribe", get(crate::subscribe::subscribe))
         .with_state(state.clone());
+
+    // Everything else gets a deadline and a ceiling.
+    //
+    // `RequestBodyTimeoutLayer` is deliberately not what is wanted here: the
+    // risk is a handler that never finishes, not only a client that never
+    // finishes sending. `TimeoutLayer` bounds the whole exchange and answers
+    // 408 when it expires.
+    //
+    // The concurrency limit sheds rather than queues. An unbounded queue in
+    // front of a single-writer engine converts overload into latency that
+    // never recovers; 503 is the honest answer, and the one a load balancer
+    // can act on.
+    let app = app
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
+        .layer(
+            tower::ServiceBuilder::new()
+                // Load shedding surfaces as a `BoxError`, and a Router's stack
+                // must be infallible, so the overload is mapped to a response
+                // here rather than escaping as an error.
+                .layer(axum::error_handling::HandleErrorLayer::new(
+                    |_: tower::BoxError| async {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({
+                                "error": "server at its concurrency limit; retry"
+                            })),
+                        )
+                    },
+                ))
+                .load_shed()
+                .concurrency_limit(MAX_CONCURRENT_REQUESTS),
+        );
+    let app = app.merge(streaming);
     let app = match ui {
         UiFallback::None => app,
         UiFallback::Dir(dir) => app.fallback_service(ServeDir::new(dir)),
@@ -430,7 +472,37 @@ fn build_app(
 /// exhausting memory. Clients with larger imports should chunk.
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
-async fn health(State(state): State<AppState>) -> Response {
+/// How long any one non-streaming request may take before the server answers
+/// `408 Request Timeout` and drops it.
+///
+/// Sized for the slowest legitimate handler rather than the typical one: a
+/// `/query` against a large store, a `/backup`, or a `/suggest` that profiles
+/// the graph can all take tens of seconds. The point is not to make slow
+/// requests fast — it is that a handler which will never finish stops holding
+/// a connection, a permit and a read guard forever.
+///
+/// The WebSocket routes are exempt; see `build_app`.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How many non-streaming requests may be in flight at once before the server
+/// sheds load with `503 Service Unavailable`.
+///
+/// The engine is single-writer and many-reader, so the ceiling exists to bound
+/// memory and the blocking pool, not to serialise work. Chosen well above any
+/// plausible operator workload and well below what would exhaust the process.
+const MAX_CONCURRENT_REQUESTS: usize = 256;
+
+async fn health(
+    State(state): State<AppState>,
+    Extension(identity): Extension<AuthIdentity>,
+) -> Response {
+    // Liveness is for everyone; the graph's shape is not. `/stats` and
+    // `/metrics` already refuse a role-bound token because counters leak graph
+    // size, and an endpoint that hands the same counters to a caller with no
+    // token at all makes that refusal decorative.
+    if !matches!(identity, AuthIdentity::Full) {
+        return json_ok(json!({ "ok": true }));
+    }
     let (nodes, edges) = {
         let g = state.db.read();
         let s = g.stats();
@@ -467,13 +539,32 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
         return next.run(req).await;
     }
 
-    // Health is always open regardless of token configuration.
+    let presented = request_token(&req);
+
+    // Health stays reachable without a credential — a load balancer has none —
+    // but reaching it is not the same as being trusted by it. A caller whose
+    // token does not resolve to full access is `Anonymous` here, and the
+    // handler discloses liveness only.
+    //
+    // Before 0.6.12 this inserted `Full` unconditionally, so an unauthenticated
+    // caller read `nodes_live` and `edges` from `/health` while a role-bound
+    // token was refused the same counters by `/metrics` and `/stats` on the
+    // stated grounds that counters leak graph size. Two endpoints, one
+    // disclosure, opposite policies.
     if req.method() == Method::GET && req.uri().path() == "/health" {
-        req.extensions_mut().insert(AuthIdentity::Full);
+        let full = state
+            .token
+            .clone()
+            .filter(|s| !s.is_empty())
+            .zip(presented.as_deref())
+            .is_some_and(|(tok, p)| constant_time_eq(p.as_bytes(), tok.as_bytes()));
+        req.extensions_mut().insert(if full {
+            AuthIdentity::Full
+        } else {
+            AuthIdentity::Anonymous
+        });
         return next.run(req).await;
     }
-
-    let presented = request_token(&req);
 
     // Check full-access token first.
     if let Some(ref full_tok) = state.token.clone().filter(|s| !s.is_empty()) {
@@ -1633,6 +1724,13 @@ async fn find_similar(
     let role_name = match identity {
         AuthIdentity::Role(r) => Some(r),
         AuthIdentity::Full => None,
+        // Unreachable on this route — `Anonymous` is only ever inserted for
+        // `GET /health` — but treated as the narrowest identity rather than
+        // the widest, so a future open endpoint cannot inherit full access by
+        // omission.
+        AuthIdentity::Anonymous => {
+            return forbidden("this endpoint requires a token");
+        }
     };
     let db = state.db.clone();
     match tokio::task::spawn_blocking(move || {

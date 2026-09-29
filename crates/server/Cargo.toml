@@ -26,7 +26,18 @@ axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tower-http = { version = "0.6", default-features = false, features = ["fs"] }
+# `fs` serves the embedded UI. `timeout` and `limit` are the 0.6.12 hardening:
+# before it the server had no request timeout, no concurrency limit and no rate
+# limit of any kind — the only backstop was a 64 MiB body cap.
+tower-http = { version = "0.6", default-features = false, features = ["fs", "timeout", "limit"] }
+# Concurrency limiting and load shedding live in `tower`, not `tower-http`.
+# It was already here as a dev-dependency for the oneshot `ServiceExt`; 0.6.12
+# needs it in the shipped build.
+tower = { version = "0.5", default-features = false, features = [
+    "util",
+    "limit",
+    "load-shed",
+] }
 include_dir = { version = "0.7", optional = true }
 # RSS memory metric — already in the transitive tree at 0.2.189; direct dep
 # so the cfg(target_os) blocks compile without an indirect version pin.

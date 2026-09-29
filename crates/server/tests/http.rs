@@ -73,18 +73,74 @@ fn parse_json(bytes: &[u8]) -> Json {
         .unwrap_or_else(|e| panic!("json: {e}: {}", String::from_utf8_lossy(bytes)))
 }
 
+/// Binding: `/health` answers without a credential, and tells an
+/// uncredentialed caller nothing but that the server is alive.
+///
+/// Through v0.6.11 it returned `nodes_live`, `edges` and the bind address to
+/// anyone, while `/stats` and `/metrics` refused the same counters to a
+/// role-bound token because "counters leak graph size". One disclosure, two
+/// opposite policies, and the unauthenticated side was the generous one.
 #[tokio::test]
-async fn health_is_unauthenticated() {
-    // boot with token Some("t"); GET /health must 200 without Authorization
+async fn health_is_reachable_without_a_token_and_discloses_nothing() {
     let db = SharedDb::open(&tmp("health-unauth")).unwrap();
     let app = router_with_auth(db, Some("t".into()));
     let (status, body, _) = send(app, get("/health")).await;
+    assert_eq!(status, StatusCode::OK, "a load balancer has no credential");
+    let v = parse_json(&body);
+    assert_eq!(v["ok"], json!(true));
+    for leaked in ["nodes", "edges", "addr"] {
+        assert!(
+            v.get(leaked).is_none(),
+            "/health disclosed {leaked} to a caller with no token: {v}"
+        );
+    }
+}
+
+/// Binding: the same endpoint, with the full-access token, still reports what
+/// an operator uses it for.
+#[tokio::test]
+async fn health_reports_counts_to_a_full_token() {
+    let db = SharedDb::open(&tmp("health-full")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let req = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header(axum::http::header::AUTHORIZATION, "Bearer t")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body, _) = send(app, req).await;
     assert_eq!(status, StatusCode::OK);
     let v = parse_json(&body);
     assert_eq!(v["ok"], json!(true));
     assert_eq!(v["nodes"], json!(0));
     assert_eq!(v["edges"], json!(0));
     assert_eq!(v["addr"], json!("127.0.0.1:8080"));
+}
+
+/// Binding: a role-bound token is not a full token here either. It reaches
+/// `/health` — nothing rejects it — and learns only that the server is up,
+/// which is exactly what `/metrics` already tells it.
+#[tokio::test]
+async fn health_discloses_nothing_to_a_role_token() {
+    let db = SharedDb::open(&tmp("health-role")).unwrap();
+    let rtoks = [("r".to_string(), "reader".to_string())]
+        .into_iter()
+        .collect();
+    let app = router_with_role_tokens(db, Some("t".into()), rtoks);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/health")
+        .header(axum::http::header::AUTHORIZATION, "Bearer r")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = parse_json(&body);
+    assert_eq!(v["ok"], json!(true));
+    assert!(
+        v.get("nodes").is_none(),
+        "a role token is refused counters by /metrics; /health must agree: {v}"
+    );
 }
 
 #[tokio::test]
