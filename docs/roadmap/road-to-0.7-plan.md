@@ -12,6 +12,11 @@
 > warnings` clean on both feature sets, `fmt` clean, and `check-claims`,
 > `check-defect-ledger`, `check-pyi` and `render-plugin --check` all OK. A real
 > stdio handshake against an empty store returns all nineteen.
+>
+> **Item 12 is DONE: the gate passed on 2026-09-28**, run
+> `20260928T195302Z` — arm R 1.000 on all 60 cells, cost -45.6%, every interval
+> excluding zero. Item 13 (re-run at `--scale 30000`) is still open; this run is
+> the 2,000-entity world.
 
 **Written 2026-09-28.** Every `file:line` below was read at `0aee864`. Where a claim
 rests on a probe rather than on source, it says so.
@@ -311,6 +316,12 @@ early — their answer sets happen not to change across the offset.
 **Confirmed end-to-end** with the shipped 0.6.11 binary: `asof --at 2026-07-14`
 resolves to commit 167 of 588 and returns 7 keys; `--commit 317` returns all 8.
 See item 1.
+
+**Done 2026-09-28.** The fix landed and the suite was re-run on it:
+`20260928T195302Z` **PASSED** every leg. Arm R scored 1.000 on all twenty tasks
+and all sixty cells; all four time-travel tasks answer in a single MCP call. On
+the rebuilt world `2026-07-14` resolves to frame 317. Every sub-1.0 cell in the
+run belongs to a baseline.
 
 Note also that `CHANGELOG.md:26-31` attributes the failure to "a disagreement
 between the generator's model and the engine's incremental derivation", and says
