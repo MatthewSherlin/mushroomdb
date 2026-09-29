@@ -11,7 +11,12 @@ configured, every HTTP request except `GET /health` must present
 `Authorization: Bearer <token>`, `?token=`, or `Cookie: mushroomdb_token=`
 (WebSocket `/watch` and `/subscribe` take `?token=`). Open the explorer at
 `http://host:8080/?token=…` so the UI can attach that token to API fetches
-and WebSockets; HTML responses set the cookie so `/assets/*` load. The
+and WebSockets; HTML responses set the cookie so `/assets/*` load. `GET
+/health` stays reachable without a credential so a load balancer can probe
+it, and answers `{"ok": true}` alone unless the caller presents the
+full-access token — before v0.6.12 it disclosed live node and edge counts to
+anyone, which `/stats` and `/metrics` refuse even to an authenticated
+role-bound token. The
 process refuses to start if `--addr` is not loopback and no token is set.
 
 For TLS options — terminating at a reverse proxy (recommended) or using the

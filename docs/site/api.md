@@ -57,7 +57,7 @@ Role-token behavior per endpoint:
 
 | Endpoint | Role-token response |
 |---|---|
-| `GET /health` | 200 (unauthenticated — no identity needed) |
+| `GET /health` | 200 `{"ok":true}` — reachable without a credential, and discloses nothing beyond liveness to anyone but a full-access token |
 | `POST /query` (read) | 200 — rows filtered to visible nodes; client `mask` intersects role mask (never widens) |
 | `POST /query` (write: `CREATE`/`SET`/`DELETE`/`MERGE`) | 200 if in write scope + target visible; 403 with reason otherwise |
 | `POST /nodes` | 200 if `label` in `create_labels`; 403 with scope reason otherwise |
@@ -219,7 +219,7 @@ authentication and is not subject to role enforcement.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/health` | Liveness + counts `{"ok":true,"nodes":N,"edges":N,"addr":"..."}` (no auth) |
+| `GET` | `/health` | Liveness, no auth needed: `{"ok":true}`. With the full-access token — or on a server with no auth configured — it also carries `nodes`, `edges` and `addr`. A role-bound token gets liveness only, matching `/stats` and `/metrics`, which refuse it counters because they leak graph size |
 | `POST` | `/query` | Run a Cypher query |
 | `GET` | `/stats` | Database statistics |
 | `POST` | `/ingest` | Ingest nodes and/or edges |

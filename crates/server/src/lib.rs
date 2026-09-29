@@ -22,6 +22,14 @@ pub(crate) enum AuthIdentity {
     Full,
     /// Role-bound token; the inner string is the role name.
     Role(String),
+    /// Reached an endpoint that is open by design without presenting a token
+    /// that resolves to anything — today only `GET /health`, which a load
+    /// balancer must be able to call before it has a credential.
+    ///
+    /// Distinct from [`Full`](AuthIdentity::Full) because the difference is
+    /// what may be disclosed: an anonymous caller gets liveness and nothing
+    /// that describes the graph.
+    Anonymous,
 }
 
 /// Router state: the database plus the watch broadcast fan-out.

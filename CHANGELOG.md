@@ -25,6 +25,37 @@ sub-1.0 cells belongs to a baseline, and each key they missed was named
 correctly by the graph arm in the same rep —
 [`classification.md`](benchmarks/agent-tasks/results/20260928T195302Z/classification.md).
 
+### Security
+
+- **`GET /health` no longer hands the graph's shape to an uncredentialed
+  caller.** It returned `nodes_live`, `edges` and the bind address to anyone,
+  while `/stats` and `/metrics` refused the same counters to an *authenticated*
+  role-bound token because "counters leak graph size" — one disclosure, two
+  opposite policies, and the unauthenticated side was the generous one.
+
+  It stays reachable without a credential, because a load balancer has none, and
+  now answers `{"ok": true}` alone unless the caller holds the full-access
+  token. A server with no auth configured still reports counts: there is no
+  boundary to leak across. Every probe still gets 200.
+
+- **A request deadline and a concurrency ceiling.** There was neither, and no
+  rate limit; the only backstop was a 64 MiB body cap, so a handler that never
+  finished held its connection, its permit and its read guard indefinitely, and
+  nothing bounded how many could do so at once. Requests now end in
+  **408** after 120 s, and beyond **256** concurrent non-streaming requests the
+  server answers **503** rather than queueing.
+
+  It sheds rather than queues on purpose: an unbounded queue in front of a
+  single-writer engine turns overload into latency that never recovers. The
+  WebSocket routes are exempt — a timeout applied to `/watch` or `/subscribe`
+  would sever a healthy subscription at the deadline, and a subscription is
+  meant to outlive any request.
+
+  **Not a rate limit.** A per-client limit needs a definition of "client", and
+  behind a reverse proxy every request arrives from the same peer address, so
+  the obvious implementation limits the proxy. The ceiling bounds the resource
+  that actually runs out.
+
 ### Added
 
 - **A memory store advertises nineteen tools, not sixteen:** `upsert_entity`,
