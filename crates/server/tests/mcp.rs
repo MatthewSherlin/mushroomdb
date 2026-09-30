@@ -1157,9 +1157,8 @@ fn code_rules() -> Vec<core_api::RuleDef> {
             "TOP_AUTHOR",
         ),
     ];
-    for label in core_api::repograph::rules::ABOUT_LABELS {
-        out.push(core_api::repograph::rules::about_rule(label));
-    }
+    // No `about_*` rules: ingest-git stopped declaring them in 0.7, because
+    // `remember` inserts its own ABOUT edges and a rule would own them.
     let co = core_api::Predicate::Overlap {
         field: "commits".into(),
         min: 0.25,

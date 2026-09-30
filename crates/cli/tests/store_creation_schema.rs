@@ -14,12 +14,19 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
+/// Distinguishes two directories made in the same clock tick by parallel tests.
+static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn tmp(name: &str) -> PathBuf {
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("mdb-screate-{name}-{}-{nanos}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "mdb-screate-{name}-{}-{nanos}-{seq}",
+        std::process::id()
+    ))
 }
 
 fn mushroomdb(args: &[&str]) -> Output {
@@ -300,6 +307,92 @@ fn ingest_git_declares_its_structure_rules_on_a_store_mcp_created() {
         !again.contains("rules:"),
         "a re-run declared rules: {again}"
     );
+}
+
+/// Rule names on a store that start `about_`.
+fn about_rules(db: &Path) -> Vec<String> {
+    open_read_only(db)
+        .rules()
+        .into_iter()
+        .map(|r| r.name)
+        .filter(|n| n.starts_with("about_"))
+        .collect()
+}
+
+/// One `remember` call through `mushroomdb mcp`, returning whether it errored
+/// and its text.
+fn remember_over_mcp(db: &Path, text: &str, about: &str) -> (bool, String) {
+    let lines = [
+        serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{
+            "protocolVersion":"2024-11-05","capabilities":{},
+            "clientInfo":{"name":"store-creation","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"remember","arguments":{
+                "text": text, "about": [about], "ts": 1_759_000_000}}}),
+    ]
+    .map(|l| l.to_string())
+    .join("\n");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .args(["mcp", &db.to_string_lossy()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mcp");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(format!("{lines}\n").as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("mcp exited");
+    let reply = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["id"] == 1)
+        .expect("a reply to the remember call");
+    let is_error = reply["result"]["isError"].as_bool().unwrap_or(false);
+    (is_error, reply.to_string())
+}
+
+#[test]
+fn remembering_twice_about_an_ingested_file_succeeds() {
+    // install, `mcp` creates the store, `ingest-git` writes a repository into
+    // it, then the same note about one of its files is remembered twice.
+    let db = tmp("remember-twice");
+    ok(mushroomdb(&[
+        "schema",
+        "apply",
+        &db.to_string_lossy(),
+        "--memory-defaults",
+    ]));
+    ingest_git(&db, &scratch_repo());
+    for call in ["first", "second"] {
+        let (is_error, reply) =
+            remember_over_mcp(&db, "the zanzibar router lives here", "src/zanzibar.rs");
+        assert!(!is_error, "{call} remember failed: {reply}");
+    }
+}
+
+#[test]
+fn ingest_git_declares_no_about_rule_on_a_new_or_an_existing_store() {
+    // `remember` writes its own ABOUT edges; a rule deriving the same edges
+    // would own them and refuse the next write.
+    let fresh = tmp("about-new");
+    ingest_git(&fresh, &scratch_repo());
+    assert_eq!(about_rules(&fresh), Vec::<String>::new());
+
+    let existing = tmp("about-existing");
+    ok(mushroomdb(&[
+        "schema",
+        "apply",
+        &existing.to_string_lossy(),
+        "--memory-defaults",
+    ]));
+    ingest_git(&existing, &scratch_repo());
+    assert_eq!(about_rules(&existing), Vec::<String>::new());
 }
 
 #[test]

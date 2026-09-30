@@ -363,3 +363,52 @@ fn the_caller_owns_the_timestamp() {
         "a fact imported from a transcript must not be stamped with import time"
     );
 }
+
+/// A store ingest-git wrote before 0.7 carries `about_<label>` rules: KeyMatch
+/// on `Note.about`, deriving the `ABOUT` edges `remember` also writes itself.
+/// Built here with the rule's own shape rather than from `repograph::rules`.
+fn about_file_rule() -> core_api::RuleDef {
+    let predicate = core_api::Predicate::KeyMatch {
+        field: "about".into(),
+    };
+    core_api::RuleDef {
+        name: "about_file".into(),
+        src_label: "Note".into(),
+        dst_label: "File".into(),
+        max_edges: Some(core_api::default_max_edges(&predicate)),
+        predicate,
+        edge_type: "ABOUT".into(),
+        weight_prop: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    }
+}
+
+#[test]
+fn remembering_the_same_note_twice_about_a_rule_linked_node_succeeds() {
+    let mut db = store("about-rule");
+    db.insert_node("File", "src/zanzibar.rs", vec![]).unwrap();
+    db.create_rule(about_file_rule()).unwrap();
+    let about = vec!["src/zanzibar.rs".to_string()];
+
+    let first = remember(&mut db, &input("the router lives here", &about)).expect("first");
+    // Content-addressed: the same text and ts is the same note, and its ABOUT
+    // edge is now the rule's. Saying it again must not be an error.
+    let second = remember(&mut db, &input("the router lives here", &about)).expect("second");
+    assert_eq!(first.note, second.note);
+
+    let about_edges: Vec<_> = db
+        .node_edges(&first.note)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.edge_type == "ABOUT")
+        .collect();
+    assert_eq!(about_edges.len(), 1, "{about_edges:?}");
+    assert!(about_edges[0].derived, "the rule owns the edge");
+    // `derived` counts what this commit's rules produced on the note: the
+    // first call's rule derived the edge, the second derived nothing.
+    assert_eq!((first.derived, second.derived), (1, 0));
+}

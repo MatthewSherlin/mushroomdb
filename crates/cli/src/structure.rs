@@ -55,7 +55,7 @@ use code_extract::{
     call_lookup_names, extract, indexed_under, resolve_call, resolve_import, resolve_mention,
     CallScope, FileFacts, SymbolIndex, MAX_FILE_BYTES,
 };
-use core_api::repograph::rules::{about_rule, concept_sources_rule, ABOUT_LABELS};
+use core_api::repograph::rules::concept_sources_rule;
 use core_api::{default_max_edges, BatchOp, Predicate, RuleDef, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -121,24 +121,23 @@ pub struct StructureReport {
 ///
 /// Exported so a test — or a store built some other way — can recreate exactly
 /// the rule set these props expect; [`ingest_git_schema`] declares all of them
-/// on the store `ingest-git` creates. The `about_<label>` and
-/// `concept_sources` definitions themselves come from
-/// [`core_api::repograph::rules`], which `remember` also builds them from —
-/// one definition, so a note written by `remember` and one backfilled by a
-/// sync agree on exactly the same rule.
+/// on the store `ingest-git` creates. The `concept_sources` definition comes
+/// from [`core_api::repograph::rules`]; nothing in 0.7 writes the
+/// `Concept.source_files` it matches, so it derives no edge.
+///
+/// No `about_<label>` rule. `remember` writes `Note.about` *and* inserts the
+/// `ABOUT` edges itself; a rule deriving the same edges would own them, and the
+/// next `remember` of the same note would be refused as writing a rule-owned
+/// edge.
 #[must_use]
 pub fn rules() -> Vec<RuleDef> {
-    let mut out = vec![
+    vec![
         key_rule(DEFINES_RULE, "Symbol", "File", "file_id", "DEFINES"),
         key_rule("imports", "File", "File", "imports", "IMPORTS"),
         key_rule("calls", "Symbol", "Symbol", "calls_to", "CALLS"),
         key_rule("mentions", "File", "File", "mentions", "MENTIONS"),
         concept_sources_rule(),
-    ];
-    for label in ABOUT_LABELS {
-        out.push(about_rule(label));
-    }
-    out
+    ]
 }
 
 /// A `KeyMatch` rule with the engine's default fan-out for the predicate,
@@ -164,8 +163,8 @@ fn key_rule(name: &str, src: &str, dst: &str, field: &str, edge: &str) -> RuleDe
     }
 }
 
-/// The schema a store `ingest-git` creates is declared with: the structure,
-/// `about_*` and `concept_sources` rules, the text fields the repository graph
+/// The schema a store `ingest-git` creates is declared with: the structure
+/// and `concept_sources` rules, the text fields the repository graph
 /// carries, and the memory defaults on top — a repository-as-entities store is
 /// an ordinary memory store in 0.7 and `recall` has to work on it.
 ///
@@ -822,14 +821,15 @@ mod tests {
             "calls",
             "mentions",
             "concept_sources",
-            "about_author",
-            "about_concept",
-            "about_file",
-            "about_note",
-            "about_symbol",
         ] {
             assert!(names.contains(&want.to_string()), "missing rule {want}");
         }
+        // `remember` inserts its own ABOUT edges; a rule owning them would
+        // refuse the next `remember` of the same note.
+        assert!(
+            !names.iter().any(|n| n.starts_with("about_")),
+            "ingest-git must declare no about_* rule: {names:?}"
+        );
         for def in rules() {
             assert_eq!(
                 def.max_edges,

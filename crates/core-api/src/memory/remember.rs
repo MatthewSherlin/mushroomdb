@@ -148,7 +148,10 @@ pub struct RememberReport {
     /// for the foreseeable future even once `SAME_AS` exists: that rule is
     /// Person→Person, never incident on a note, so nothing it derives is
     /// counted here. This field only moves once a rule exists whose
-    /// predicate can match the note itself.
+    /// predicate can match the note itself — such as an `about_<label>` rule
+    /// `ingest-git` declared before 0.7, which derives the note's `ABOUT`
+    /// edge (counted here, on the commit that derived it) in place of the
+    /// insert this call would otherwise make.
     pub derived: usize,
     /// `about` keys and fact endpoints that had to be stubbed, in the order
     /// each was first seen (`about` before `facts`).
@@ -321,6 +324,22 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         })
         .collect();
     let note_existed = db.has_node(&key);
+    // The note's edges as they stand, for two answers below: which `about`
+    // links already exist (step 4), and how many derived edges were there
+    // before this commit (so `derived` counts only what it produced).
+    let (already_about, derived_before): (BTreeSet<String>, usize) = if note_existed {
+        let edges = db.node_edges(&key)?;
+        (
+            edges
+                .iter()
+                .filter(|e| e.edge_type == ABOUT_EDGE && e.src_key == key)
+                .map(|e| e.dst_key.clone())
+                .collect(),
+            edges.iter().filter(|e| e.derived).count(),
+        )
+    } else {
+        (BTreeSet::new(), 0)
+    };
 
     // Facts' endpoints not already named in `entities` or `about`: existence
     // is checked now, before the batch, same as above. One not seen anywhere
@@ -436,10 +455,13 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
 
     // 4. ABOUT edges, note -> each about key that actually exists. A key the
     //    cap refused (step 2) is skipped — its node was never created, so
-    //    the edge can't be either — and a duplicate (the note already
-    //    existed and named the same `about` before) is a silent no-op.
+    //    the edge can't be either — and a link that already exists is left
+    //    alone. That covers the duplicate (the note already existed and
+    //    named the same `about` before) and, on a store carrying a 0.6
+    //    `about_*` rule, an edge that rule derived and owns: inserting it
+    //    again would be refused as a write to a rule-owned edge.
     for k in &about {
-        if capped.contains(k) {
+        if capped.contains(k) || already_about.contains(k) {
             continue;
         }
         batch.insert_edge(ABOUT_EDGE, &key, k);
@@ -488,11 +510,12 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
     // `commit()`'s own (nodes, edges) counts are the ops this call queued,
     // not what any live rule derived from them — read the note's edges back
     // and ask the engine which ones it owns.
-    report.derived = db
+    let derived_after = db
         .node_edges(&key)?
         .into_iter()
         .filter(|e| e.derived)
         .count();
+    report.derived = derived_after.saturating_sub(derived_before);
 
     Ok(report)
 }
