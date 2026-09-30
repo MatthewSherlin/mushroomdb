@@ -15,9 +15,10 @@ nothing changes for anyone who does not deliberately upgrade.
 - **Four install hooks**: the three opt-in ones (`--intercept-grep`,
   `--impact-before-edit`, `--enrich-grep`, now rejected with a message) and
   the `PostToolUse` `touch` hook, which was written on every install and
-  re-extracted edited files into the code graph. **An install or uninstall on
-  0.7 removes all four from a settings file that still has them**, so an
-  upgraded machine is not left invoking a subcommand that no longer exists.
+  re-extracted edited files into the code graph. **An install, uninstall or
+  enable on 0.7 removes all four from a settings file that still has them**,
+  so an upgraded machine is not left invoking a subcommand that no longer
+  exists.
   The Claude Code plugin's own `PostToolUse` `touch` hook is gone too.
 - **The `sync` git hooks.** 0.7 writes no git hooks. `install`, `uninstall`
   and `enable` remove the `sync` block a 0.6 install put in `post-commit`,

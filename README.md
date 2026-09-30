@@ -76,8 +76,8 @@ Full tool reference: [`docs/site/mcp.md`](docs/site/mcp.md).
   included — plus a `/mushroom` skill and a Claude Code plugin.
 - Safe for several processes at once: one writer at a time behind an advisory `LOCK` file, any
   number of readers, and every handle picks up a peer's commits by `refresh()` rather than
-  reopening — so a running `serve`, an editor hook, a git hook and a CLI command can share one
-  store. [`docs/site/concurrency.md`](docs/site/concurrency.md)
+  reopening — so a running `serve`, the session hooks, an `ingest-git` run and other CLI
+  commands can share one store. [`docs/site/concurrency.md`](docs/site/concurrency.md)
 - Local-first: your data stays on disk, no cloud service, no model call in the write path unless
   you enable embeddings.
 

@@ -447,7 +447,7 @@ heading or a line break in an agent's context.
 | `edges_at` | `key`, `at`, `edge_type?`, `all_of?`, `label?`, `direction?`, `limit?` | The edges the node had at one 0-based WAL commit — the graph as it was then, replayed from the WAL and its archives in one scan. Renames are followed, so a node's current key finds edges written under an earlier name. Takes `node_edges`' filters, so the intersection question is one call at a past commit too. |
 | `what_if` | `key`, `field`, `value`, `edge_type?`, `label?`, `limit?` | The derived edges a property change would retract and derive, computed without writing anything: the rule engine runs the same re-derivation a real `set_prop` would, against a clone. `edge_type` prints both sides as partner keys. |
 | `recall` | `topic` | What the store already knows about a topic: ranked nodes matching free text across every indexed text field, one line each. Every line says how many of the topic's terms it matched — `(2/3 terms)` — and hits rank by that first. A question in ordinary words is enough. |
-| `remember` | `text`, `about?`, `kind?` | Writes a note into the graph and returns its key. Every key in `about` must already exist. |
+| `remember` | `text`, `about?`, `kind?`, `entities?`, `facts?` | Writes a note into the graph and returns its key. A key in `about` that does not exist yet is created as a provisional entity — label `Entity`, marked `provisional` — rather than refused; so is an unknown `facts` endpoint. At most 20 stubs per call; keys past that are reported as capped and not written, and the rest of the call still commits. |
 
 Each of the seven also accepts `json` (boolean, default false), which swaps
 the rendered digest for the report.

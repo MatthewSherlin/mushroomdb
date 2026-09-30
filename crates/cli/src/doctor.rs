@@ -110,7 +110,8 @@ impl Check {
         }
     }
     fn render(&self) -> String {
-        // 11 is the longest check name (`impact-hook`, `always-load`), so the
+        // 11 is the longest check name — `always-load`, and `impact-hook`, the
+        // warn a retired 0.6 hook still in a settings file gets — so the
         // message column lines up for every row rather than for most of them.
         let mut line = format!(
             "{:<4} {:<11} {}",
