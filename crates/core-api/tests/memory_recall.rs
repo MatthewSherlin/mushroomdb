@@ -103,3 +103,55 @@ fn an_unrelated_topic_sharing_one_word_is_not_a_confident_hit() {
         }
     }
 }
+
+#[test]
+fn terms_scattered_one_per_node_do_not_add_up_to_a_hit() {
+    // A corpus-wide coverage check ("does this word appear somewhere") passes
+    // here: "apple", "banana" and "cherry" are each present in the store. But
+    // no single node is about more than one of the topic's words — the
+    // coverage that matters is per node, not per corpus.
+    let mut db = store("scattered");
+    for (key, text) in [
+        ("apple-note", "apple orchard pie recipe"),
+        ("banana-note", "banana bread recipe notes"),
+        ("cherry-note", "cherry blossom festival photos"),
+    ] {
+        db.insert_node("Note", key, vec![]).unwrap();
+        db.set_prop(key, "text", Value::Str(text.into())).unwrap();
+    }
+    match recall_digest(&db, "apple banana cherry", "store", 4000) {
+        RecallOutcome::NoMatch => {}
+        other => panic!(
+            "one word per node across three unrelated nodes must not add up to a hit, got {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn terms_scattered_across_two_nodes_do_not_clear_the_majority() {
+    // The two-word variant of the same shape: "apple banana" needs both words
+    // in the *same* node. Splitting one word to each of two unrelated nodes
+    // is a 50/50 split for each candidate, which the majority rule (more than
+    // half) rejects.
+    let mut db = store("scattered-two");
+    db.insert_node("Note", "apple-note", vec![]).unwrap();
+    db.set_prop(
+        "apple-note",
+        "text",
+        Value::Str("apple orchard pie recipe".into()),
+    )
+    .unwrap();
+    db.insert_node("Note", "banana-note", vec![]).unwrap();
+    db.set_prop(
+        "banana-note",
+        "text",
+        Value::Str("banana bread recipe notes".into()),
+    )
+    .unwrap();
+    match recall_digest(&db, "apple banana", "store", 4000) {
+        RecallOutcome::NoMatch => {}
+        other => panic!(
+            "one word per node across two unrelated nodes must not clear the majority, got {other:?}"
+        ),
+    }
+}

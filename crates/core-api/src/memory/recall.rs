@@ -8,7 +8,7 @@
 
 use crate::GraphDb;
 use core_storage::fs::Fs;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// How many hits the digest will name.
 const MAX_HITS: usize = 6;
@@ -247,38 +247,6 @@ pub fn recall_digest<F: Fs>(
         terms.join(" OR ")
     };
 
-    // Relevance floor. An OR query returns something the moment any one of
-    // its terms matches anywhere, and the fused score that comes back from
-    // `search_hybrid` cannot be used to tell a real hit from an accident: RRF
-    // replaces every BM25 score with `1/(60 + rank)`, so the top hit of any
-    // non-empty query scores exactly 1/61 whether it satisfied one word of a
-    // five-word topic or all five. A topic on a subject the store has never
-    // heard of ("banana republic economic collapse history") can still share
-    // one incidental word with an unrelated node ("banana bread recipe") and
-    // come back indistinguishable in shape from a genuine answer.
-    //
-    // An absolute BM25 score cutoff (the approach `repograph::recall` used)
-    // does not fix this: BM25's idf term grows as a word gets rarer *in this
-    // store*, and a young memory store is small, so a word that occurs in
-    // exactly one node — coincidence or not — already scores high there. The
-    // fix has to be corpus-size-independent, so it asks a different question:
-    // not "how strong is the best match" but "how much of what the caller
-    // actually named is present at all". More than half of the topic's own
-    // words must occur *somewhere* in an indexed field before the digest
-    // prints. A one- or two-word topic therefore has to be present whole (a
-    // 50/50 split is not a majority); a longer one tolerates a minority of
-    // its words being absent — a paraphrase, a typo, a word this store never
-    // saw — without demanding the whole sentence appear verbatim.
-    if terms.len() > 1 {
-        let present = terms
-            .iter()
-            .filter(|t| fields.iter().any(|f| !db.search_top(f, t, 1).is_empty()))
-            .count();
-        if present * 2 <= terms.len() {
-            return RecallOutcome::NoMatch;
-        }
-    }
-
     let mut best: BTreeMap<String, f64> = BTreeMap::new();
     for field in &fields {
         for (key, score) in db.search_hybrid(field, &query, "embedding", &[], None, MAX_HITS) {
@@ -287,6 +255,58 @@ pub fn recall_digest<F: Fs>(
                 *slot = score;
             }
         }
+    }
+
+    // Relevance floor. An OR query returns something the moment any one of
+    // its terms matches anywhere, and the fused score `search_hybrid` returns
+    // cannot be used to tell a real hit from an accident: RRF replaces every
+    // BM25 score with `1/(60 + rank)`, so the top hit of any non-empty query
+    // scores exactly 1/61 whether it satisfied one word of a five-word topic
+    // or all five.
+    //
+    // An absolute BM25 score cutoff (the approach `repograph::recall` used,
+    // `MIN_HIT_SCORE`) does not fix this. The operative fact is not that a
+    // young memory store is small — it is that BM25's idf term grows with the
+    // *corpus size* for any term that occurs in only one document, at any N:
+    // `repograph`'s own floor test, three documents and a term in one of
+    // them, scores idf≈0.981, about twenty times its own 0.05 floor. A
+    // coincidental single-document match clears an absolute floor whether the
+    // corpus has three documents or three million, so no fixed number closes
+    // this off.
+    //
+    // Nor is it enough to ask "does this word appear anywhere in the store",
+    // checked once for the whole corpus: a three-node store where one node
+    // holds only "apple", another only "banana", another only "cherry" would
+    // pass a corpus-wide check on the topic "apple banana cherry" — every
+    // word is present *somewhere* — while no single node answers more than a
+    // third of it. Coverage has to be asked of the same thing relevance is
+    // asked of: one candidate node, not the corpus. So each term's presence
+    // is checked field by field (still the per-term, pre-fusion probe;
+    // `search_top` is never asked about the fused query), but kept as the set
+    // of nodes carrying that term rather than collapsed to a single yes/no,
+    // and a candidate survives only when more than half of the topic's own
+    // terms are in *its own* set. A one-word topic is 1 of 1 — full coverage,
+    // not a special case — so every topic is held to the same rule. A one- or
+    // two-word topic has to be present whole in the one node it names (a 50/50
+    // split is not a majority); a longer one tolerates a minority of its words
+    // being absent from any single node — a paraphrase, a typo, a word that
+    // node never used — without demanding the whole sentence appear verbatim
+    // in it.
+    if !terms.is_empty() {
+        let term_hits: Vec<HashSet<String>> = terms
+            .iter()
+            .map(|term| {
+                let mut hit = HashSet::new();
+                for field in &fields {
+                    hit.extend(db.search_top(field, term, 0).into_iter().map(|(k, _)| k));
+                }
+                hit
+            })
+            .collect();
+        best.retain(|key, _| {
+            let present = term_hits.iter().filter(|hit| hit.contains(key)).count();
+            present * 2 > terms.len()
+        });
     }
     if best.is_empty() {
         return RecallOutcome::NoMatch;
