@@ -16,9 +16,6 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --workspace --examples
       - run: cargo test --workspace
-      # The first minute on a new store, against the built binary. Every
-      # assertion in it failed on v0.6.12; none may fail again silently.
-      - run: cargo test -p mushroomdb-cli --test first_run
       # Informational, never a failure: prints how many #[ignore]d tests exist
       # against how many any workflow actually names. Added because 20 of 28
       # ran nowhere, including every memory-ceiling and scale-growth assertion.
@@ -30,6 +27,11 @@ jobs:
       - run: cargo clippy -p mushroomdb --all-targets --features mp-test -- -D warnings
       # Compile-only: CI runners are too noisy for timing gates.
       - run: cargo bench --no-run
+      # The first minute on a new store, against the built binary. Every
+      # assertion in it failed on v0.6.12; none may fail again silently. Kept
+      # last in this job on purpose: a failure here must not strand the
+      # multiprocess suite above, which has no other coverage.
+      - run: cargo test -p mushroomdb-cli --test first_run
       # TODO: add a Miri job for crates/core-storage (MappedBase::topology/columns/
       # edge_props_section access_unchecked seams). These seams have no proptest
       # hostile-bytes coverage; Miri is the appropriate defence against corrupt
