@@ -2,6 +2,7 @@ pub mod algo;
 mod db;
 pub mod digest;
 mod exact_knn;
+pub mod explain_digest;
 pub mod history;
 mod ingest;
 pub mod mask;
