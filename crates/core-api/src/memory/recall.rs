@@ -6,6 +6,7 @@
 //! topic, including a bare human name, while the note containing the word sat
 //! indexed and reachable by Cypher. There is no identifier gate here.
 
+use crate::digest::sanitize;
 use crate::GraphDb;
 use core_storage::fs::Fs;
 use core_storage::fulltext::{stem, value_tokens_stemmed_with_positions};
@@ -377,9 +378,12 @@ pub fn recall_digest<F: Fs>(
     });
     ranked.truncate(MAX_HITS);
 
+    // The label is a caller-supplied path, and it lands in the same context
+    // as the hits, so it is held to the same rule.
     let mut out = format!(
-        "mushroomdb recall ({} related nodes in {store_label}):\n",
-        ranked.len()
+        "mushroomdb recall ({} related nodes in {}):\n",
+        ranked.len(),
+        sanitize(store_label)
     );
     for (key, present, _) in &ranked {
         // The all-stopword fallback searched the raw topic as one AND-group,
@@ -391,9 +395,13 @@ pub fn recall_digest<F: Fs>(
         } else {
             format!(" ({present}/{total} terms)")
         };
+        // Keys and summaries are stored content, read back into an
+        // assistant's context: a newline or an escape sequence in one must
+        // not be able to split this line or forge a header.
+        let shown = sanitize(key);
         let line = match db.node_summary_line(key) {
-            Some(summary) => format!("  {key} — {summary}{cover}\n"),
-            None => format!("  {key}{cover}\n"),
+            Some(summary) => format!("  {shown} — {}{cover}\n", sanitize(&summary)),
+            None => format!("  {shown}{cover}\n"),
         };
         if out.len() + line.len() > max_bytes {
             break;

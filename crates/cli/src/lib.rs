@@ -2149,7 +2149,28 @@ pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
         return Ok(repograph::render_brief(&report, &reach));
     }
     let b = core_api::memory::brief::brief(&db, &core_api::memory::brief::BriefOptions::default());
-    Ok(core_api::memory::brief::render(&b, &reach))
+    let mut text = core_api::memory::brief::render(&b, &reach);
+    // Said here because a brief is computed once per session and cached,
+    // where the prompt hook fires every turn. A 0.6.x store upgraded to 0.7
+    // has no text index until someone asks for one, and a user who never
+    // calls the `recall` *tool* would otherwise never learn why the hook went
+    // quiet.
+    //
+    // Placed above the reach line rather than after it: a brief ends with how
+    // to reach the graph, and the tests holding that line read it as the last.
+    // An empty store's brief has no reach line, so there it simply ends.
+    if db.fulltext_pairs().is_empty() {
+        let notice = format!(
+            "no text index: recall cannot match anything here. \
+             Run: mushroomdb schema apply {} --memory-defaults\n",
+            db_dir.display()
+        );
+        let at = text
+            .rfind("\nreach the graph: ")
+            .map_or(text.len(), |i| i + 1);
+        text.insert_str(at, &notice);
+    }
+    Ok(text)
 }
 
 /// The brief's last line: how to reach the graph from this session.
