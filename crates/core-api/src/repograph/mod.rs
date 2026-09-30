@@ -53,6 +53,12 @@ pub mod render;
 pub mod rules;
 mod why;
 
+// The digest primitives now live in `crate::digest`; re-exported here so this
+// module's own callers — and `crates/server` — keep compiling until they are
+// repointed in Task 9.
+pub use crate::digest::{
+    cap_lines, sanitize, MAX_MAP_LINES, MAX_OUTPUT_BYTES, MAX_TOOL_LINES, SEP, UNTRUSTED_FRAMING,
+};
 pub use brief::{brief, BriefOptions, BriefReport, EdgeTypeBrief, LabelBrief, Recipe, SchemaBrief};
 pub use concepts::stale_concepts;
 pub use context::{
@@ -68,13 +74,11 @@ pub use map::{repo_map, MapCommunity, MapOptions, RepoMap, SyncInfo};
 pub use owners::{owners, OwnersReport, QUARTERS};
 pub use path::{shortest_path, MAX_HOPS, PATH_EDGES};
 pub use recall::{
-    identifier_terms, or_query, recall_digest, HINT, MAX_HITS, MAX_OUTPUT_BYTES, MAX_QUERY_TERMS,
-    MIN_HIT_SCORE, UNTRUSTED_FRAMING,
+    identifier_terms, or_query, recall_digest, HINT, MAX_HITS, MAX_QUERY_TERMS, MIN_HIT_SCORE,
 };
 pub use remember::{remember, RememberInput, NOTE_KINDS};
 pub use render::{
-    cap_lines, render_brief, render_context, render_explore, render_impact, render_map,
-    render_owners, render_why, sanitize, DEFAULT_EXPLORE_BYTES, EMPTY_BRIEF, MAX_BRIEF_BYTES,
-    MAX_CONTEXT_LINES, MAX_MAP_LINES, MAX_TOOL_LINES,
+    render_brief, render_context, render_explore, render_impact, render_map, render_owners,
+    render_why, DEFAULT_EXPLORE_BYTES, EMPTY_BRIEF, MAX_BRIEF_BYTES, MAX_CONTEXT_LINES,
 };
 pub use why::{why, SharedCommits, WhyLink, WhyReport};

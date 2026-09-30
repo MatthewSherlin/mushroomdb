@@ -1,5 +1,6 @@
 pub mod algo;
 mod db;
+pub mod digest;
 mod exact_knn;
 pub mod history;
 mod ingest;

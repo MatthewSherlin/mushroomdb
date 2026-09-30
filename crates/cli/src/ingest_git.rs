@@ -36,13 +36,19 @@ use std::process::Command;
 /// cost of the jaccard overlap the `co_changed` rule runs over that list.
 pub const DEFAULT_MAX_COMMITS_PER_FILE: usize = 200;
 
-/// Applied when the user names no `--exclude` pattern of their own.
+/// The paths a repository carries that are not its source: build output,
+/// vendored dependencies, generated bundles, and lockfiles nobody reads.
 ///
-/// Defined in core-api because the `impact` MCP tool builds its default file
-/// list straight off a working tree and has to leave out exactly what this
-/// ingest leaves out; two lists would let the tool ask about files no store was
-/// ever going to hold.
-pub use core_api::repograph::DEFAULT_EXCLUDES;
+/// Applied when the user names no `--exclude` pattern of their own, which keeps
+/// them out of the history graph *and* out of the working-tree pass.
+pub const DEFAULT_EXCLUDES: [&str; 6] = [
+    "target/",
+    "node_modules/",
+    "dist/",
+    ".git/",
+    "*.lock",
+    "*.min.js",
+];
 
 /// Minimum jaccard overlap of two files' `commits` lists for `CO_CHANGED`.
 const CO_CHANGE_MIN: f64 = 0.25;
@@ -168,13 +174,26 @@ struct GitCommit {
     changes: Vec<Change>,
 }
 
-/// Simple, dependency-free path matcher. Documented in `docs/site/ingest-git.md`.
+/// Whether `path` matches any of `patterns`. Documented in `docs/site/ingest-git.md`.
 ///
-/// The matcher itself is `core_api::repograph::path_excluded`, next to
-/// [`DEFAULT_EXCLUDES`], because the `impact` MCP tool filters a working tree
-/// with the same patterns and must read them the same way.
-fn excluded(path: &str, patterns: &[String]) -> bool {
-    core_api::repograph::path_excluded(path, patterns)
+/// A `foo/` pattern is a *directory prefix*. A `*.` pattern is a **file-name
+/// suffix**, not a single extension: `*.min.js` matches `ui/bundle.min.js` the
+/// same way `*.lock` matches `Cargo.lock`. Matching only the last dot segment
+/// would leave every compound suffix inert, and a compound suffix is exactly
+/// how generated files announce themselves. Anything else is a substring.
+#[must_use]
+pub fn path_excluded(path: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|p| {
+        if let Some(prefix) = p.strip_suffix('/') {
+            path.starts_with(&format!("{prefix}/"))
+        } else if let Some(suffix) = p.strip_prefix('*').filter(|s| s.starts_with('.')) {
+            // The suffix must follow something, so `*.lock` does not claim a
+            // path that is nothing but the suffix itself.
+            path.len() > suffix.len() && path.ends_with(suffix)
+        } else {
+            path.contains(p.as_str())
+        }
+    })
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, CliError> {
@@ -1441,7 +1460,7 @@ fn ingest_unit(
         for ch in &c.changes {
             match ch {
                 Change::Added(p) | Change::Modified(p) => {
-                    if excluded(p, &opts.exclude) {
+                    if path_excluded(p, &opts.exclude) {
                         continue;
                     }
                     walk.deleted.remove(p);
@@ -1455,7 +1474,7 @@ fn ingest_unit(
                         .push(("TOUCHED".into(), c.sha.clone(), p.clone()));
                 }
                 Change::Deleted(p) => {
-                    if excluded(p, &opts.exclude) {
+                    if path_excluded(p, &opts.exclude) {
                         continue;
                     }
                     walk.files.remove(p);
@@ -1463,7 +1482,7 @@ fn ingest_unit(
                     walk.deleted.insert(p.clone());
                 }
                 Change::Renamed { from, to } => {
-                    if excluded(to, &opts.exclude) {
+                    if path_excluded(to, &opts.exclude) {
                         // Moved out of scope: drop the old node, keep no alias
                         // so its TOUCHED edges are filtered out below.
                         walk.files.remove(from);
@@ -1779,7 +1798,7 @@ fn dirty_paths(repo: &Path, exclude: &[String]) -> Result<Vec<String>, CliError>
             continue;
         }
         for path in String::from_utf8_lossy(&o.stdout).split('\0') {
-            if path.is_empty() || excluded(path, exclude) {
+            if path.is_empty() || path_excluded(path, exclude) {
                 continue;
             }
             out.insert(path.to_string());
@@ -1936,7 +1955,7 @@ pub fn run_touch(
         let Some(rel) = repo_relative(&repo, &cwd, path) else {
             continue;
         };
-        if !excluded(&rel, &exclude) {
+        if !path_excluded(&rel, &exclude) {
             paths.insert(rel);
         }
     }
@@ -2070,16 +2089,16 @@ mod tests {
             "*.lock".into(),
             "node_modules".into(),
         ];
-        assert!(excluded("target/debug/foo.rs", &pats));
+        assert!(path_excluded("target/debug/foo.rs", &pats));
         assert!(
-            !excluded("targeted/foo.rs", &pats),
+            !path_excluded("targeted/foo.rs", &pats),
             "prefix needs the slash"
         );
-        assert!(excluded("Cargo.lock", &pats));
-        assert!(!excluded("Cargo.toml", &pats));
-        assert!(excluded("ui/node_modules/x/y.js", &pats));
-        assert!(!excluded("src/lib.rs", &pats));
-        assert!(!excluded("anything", &[]));
+        assert!(path_excluded("Cargo.lock", &pats));
+        assert!(!path_excluded("Cargo.toml", &pats));
+        assert!(path_excluded("ui/node_modules/x/y.js", &pats));
+        assert!(!path_excluded("src/lib.rs", &pats));
+        assert!(!path_excluded("anything", &[]));
     }
 
     /// A `*.` pattern is a file-name suffix, so a compound one works. Reading
@@ -2090,18 +2109,18 @@ mod tests {
     fn a_compound_suffix_pattern_matches() {
         let defaults: Vec<String> = DEFAULT_EXCLUDES.iter().map(|p| (*p).to_string()).collect();
         // Not under `dist/`, so only the suffix rule can match it.
-        assert!(excluded("ui/build/bundle.min.js", &defaults));
-        assert!(excluded("bundle.min.js", &defaults));
+        assert!(path_excluded("ui/build/bundle.min.js", &defaults));
+        assert!(path_excluded("bundle.min.js", &defaults));
         assert!(
-            !excluded("ui/src/app.js", &defaults),
+            !path_excluded("ui/src/app.js", &defaults),
             "an ordinary source file is not a bundle"
         );
-        assert!(!excluded("ui/src/minify.js", &defaults));
+        assert!(!path_excluded("ui/src/minify.js", &defaults));
         // The single-extension form is unchanged, and a bare suffix is not a
         // match: `*.lock` means something *dot* lock.
-        assert!(excluded("Cargo.lock", &defaults));
-        assert!(!excluded(".lock", &defaults));
-        assert!(!excluded("src/lib.rs", &defaults));
+        assert!(path_excluded("Cargo.lock", &defaults));
+        assert!(!path_excluded(".lock", &defaults));
+        assert!(!path_excluded("src/lib.rs", &defaults));
     }
 
     #[test]

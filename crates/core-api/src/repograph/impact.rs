@@ -43,6 +43,10 @@ const MAX_SYMBOLS: usize = 6;
 /// The paths a repository carries that are not its source: build output,
 /// vendored dependencies, generated bundles, and lockfiles nobody reads.
 ///
+/// The live definition is `cli::ingest_git::DEFAULT_EXCLUDES`; this copy stays
+/// only for the MCP `impact` tool and the recall nudge, which go with this
+/// module.
+///
 /// Applied when the user names no `--exclude` pattern of their own, which keeps
 /// them out of the history graph *and* out of the working-tree pass. It lives
 /// here, rather than only in the ingest, because a caller that builds a file
@@ -59,6 +63,9 @@ pub const DEFAULT_EXCLUDES: [&str; 6] = [
 ];
 
 /// Whether `path` matches any of `patterns`.
+///
+/// The live definition is `cli::ingest_git::path_excluded`; see
+/// [`DEFAULT_EXCLUDES`].
 ///
 /// A `foo/` pattern is a *directory prefix*. A `*.` pattern is a **file-name
 /// suffix**, not a single extension: `*.min.js` matches `ui/bundle.min.js` the
