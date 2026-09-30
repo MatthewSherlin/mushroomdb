@@ -123,7 +123,7 @@ fn doctor_passes_on_fresh_project_install() {
     assert!(handshake.starts_with("ok"), "handshake check: {handshake}");
     // The nineteen a default `mushroomdb mcp` advertises on a memory store —
     // which is what a fresh install points at: the association surface. The
-    // other nine stay callable, and `--all-tools` lists all twenty-eight.
+    // other two stay callable, and `--all-tools` lists all twenty-one.
     assert!(
         handshake.contains("19 tools"),
         "expected the handshake to report 19 tools: {handshake}"

@@ -47,7 +47,8 @@ The code-graph door and its acceptance script went in 0.7. The one leg of that
 script that was not about code graphs, twenty concurrent writers against a live
 server followed by `verify`, is now `crates/cli/tests/mcp_concurrency.rs` and
 runs in `cargo test --workspace`. `bash scripts/check-claims.sh` fails if the
-`repograph` module is referenced again.
+`repograph` module is referenced again, or if a product-facing file names one of
+the three retired install flags.
 
 ### Plugin gate (commits touching `packaging/plugin/`, `scripts/plugin-templates/`, or the skill)
 

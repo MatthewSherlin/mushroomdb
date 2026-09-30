@@ -5,8 +5,8 @@ The association suite asks the question a graph is supposed to be best at —
 day* — and measures the graph against the two things a developer would otherwise
 reach for: a directory of JSON files, and a single relational database file.
 
-It lives in `benchmarks/agent-tasks/`, beside the code suite, and shares its
-harness: one `claude -p` session per cell, captured as stream-json, so tool
+It lives in `benchmarks/agent-tasks/`, where the retired code suite ran, and
+uses the same harness: one `claude -p` session per cell, captured as stream-json, so tool
 calls are counted and the final `result` event supplies usage, cost, turns and
 duration. What differs is where the tasks come from, which arms run, which arm
 everything is measured against, and which gate variant applies.

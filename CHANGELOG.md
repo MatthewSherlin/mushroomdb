@@ -1,5 +1,93 @@
 # Changelog
 
+## v0.7.0 (unreleased) — the code graph door is closed
+
+**This is the first breaking release.** Under Cargo semver the minor slot is
+the breaking position for `0.x`, so `^0.6.x` does not match `0.7.0` and
+nothing changes for anyone who does not deliberately upgrade.
+
+### Removed — the code-graph door
+
+- **Seven MCP tools**: `explore`, `map`, `context`, `impact`, `owners`, `why`,
+  `sync`. There is now one tool surface: every store advertises the same
+  nineteen, a store built by `ingest-git` included. `--all-tools` lists all
+  twenty-one.
+- **Four install hooks**: the three opt-in ones (`--intercept-grep`,
+  `--impact-before-edit`, `--enrich-grep`, now rejected with a message) and
+  the `PostToolUse` `touch` hook, which was written on every install and
+  re-extracted edited files into the code graph. **An install or uninstall on
+  0.7 removes all four from a settings file that still has them**, so an
+  upgraded machine is not left invoking a subcommand that no longer exists.
+  The Claude Code plugin's own `PostToolUse` `touch` hook is gone too.
+- **The `sync` git hooks.** 0.7 writes no git hooks. `install`, `uninstall`
+  and `enable` remove the `sync` block a 0.6 install put in `post-commit`,
+  `post-checkout` and `post-merge` for this store, and `doctor` warns about one
+  left behind. `install --no-git-hooks` is still accepted, as a no-op.
+- **Ten CLI subcommands**: `sync`, `touch`, `intercept`, `impact-hook`,
+  `enrich`, `map`, `explore`, `context`, `impact`, `owners`.
+- **The `UserPromptSubmit` hook's dirty-tree nudge** — what the changed files
+  reach, who owns them, which learned concept just went stale. It read
+  `CO_CHANGED`, `IMPORTS` and `DESCRIBED_IN` edges only `ingest-git` writes.
+- **The code-graph benchmark suite.** It measured the door this release
+  removes. Its committed results stay as the record of the measurement that
+  deprecated the door. The harness files stay too, because the association
+  suite runs through them: `benchmarks/agent-tasks/run.py` now defaults to
+  `--suite association` and refuses `--suite code`.
+
+To keep any of it: pin `mushroomdb@0.6.x`.
+
+Every retired hook, in a settings file or a git hook, is recognised as ours
+only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
+`/mushroomdb`, or `node …/mushroomdb.js`. A hook of your own is never touched.
+
+### Kept, and changed
+
+- **`ingest-git` stays**, positioned as a data source. Its store is now an
+  ordinary memory store — the same nineteen tools, the same brief — and it
+  declares its schema through `apply_schema`, so re-ingesting is idempotent.
+  Into an existing store it declares its own missing rules and full-text pairs,
+  as 0.6 did, and never the memory defaults.
+- **`ingest-git` no longer declares the `about_*` rules.** `remember` writes a
+  note's `ABOUT` edges itself, and those rules took ownership of the edges,
+  which made re-remembering a note fail. A store that already carries them
+  from 0.6 keeps them, and `remember` works alongside them.
+- **`mushroomdb why <db> <a> <b>` stays and answers a different question**:
+  every rule edge between two keys with the evidence that derived it, from the
+  association engine. It is the shell form of `explain_association`, which had
+  no CLI door before. The code-graph `why` answered from `CALLS`, `IMPORTS`
+  and co-change. It prints each edge once per direction, so a symmetric rule
+  shows two lines for one pair: that is the engine's existing behaviour, now
+  visible in the CLI.
+- **The prompt hook answers ordinary language.** It used to say nothing unless
+  the prompt named a path, a `mod::name`, a snake_case word or something in
+  backticks — so on a memory store it was silent on every prompt. The MCP
+  `recall` tool was fixed in this release's first half; this is the automatic
+  path. It prepends the untrusted-content framing line to what it prints.
+- **The prompt hook is silent on a store with no text index.** `mushroomdb
+  brief` says so instead, once per session, with the
+  `schema apply … --memory-defaults` command that fixes it.
+- **`recall` says how much of the topic each hit matched** — `(2/3 terms)` —
+  and ranks by it, and no longer drops a hit for covering exactly half. The
+  entity a two-word question is about holds one of the two words, which is all
+  an entity node ever holds, and it was being dropped from the answer to it.
+  The header counts the lines actually printed, and a `…` line marks a cut
+  when the byte budget drops hits.
+- **`recall` sanitizes what it prints.** Keys, summaries and the store label
+  now have their control characters stripped. Before this the MCP `recall`
+  tool printed stored text raw, control characters included.
+- **Every path that creates a store declares a schema on it.** Four paths
+  create one — `mcp`, `serve`, `demo` and `ingest-git` — and `ingest-git` was
+  the one without a schema. `install` creates no store; it now prints a line
+  when its target store does not exist yet, naming the commands that will
+  create it with the memory schema. A general-purpose command such as `query`
+  still creates a bare store on a fresh path; the schema there is opt-in, via
+  `schema apply`.
+- **The concurrency check is a Rust test.** The step of
+  `scripts/acceptance-0.6.sh` that ran twenty concurrent writers against a
+  live server is now `crates/cli/tests/mcp_concurrency.rs`: 20 HTTP writers
+  against one `serve`, plus 20 separate `mcp` processes writing while `serve`
+  holds the store. It runs in `cargo test --workspace`.
+
 ## v0.6.12 — a date that lands where it says, and a server you can run
 
 **v0.6.11 was never published.** It was merged, and the release was stopped when

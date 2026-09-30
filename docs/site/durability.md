@@ -25,12 +25,11 @@ On open, the store is reconstructed as **snapshot (if present) + WAL tail**:
 The tooling already bounds WAL-only-from-genesis exposure:
 
 - **`ingest-git` snapshots itself.** A first ingest always writes one before it
-  returns; a later `ingest-git` or `sync` writes one when the store has no
+  returns; a later `ingest-git` writes one when the store has no
   snapshot at all, or when the WAL has grown past 4 MiB since the last one.
   Measured on a 435-file repository, that is the difference between a 288 ms
   open and a 173 ms one — paid on every hook, every MCP start and every CLI
-  call until something snapshots. `touch` never snapshots: it runs on every edit
-  and a snapshot would not fit in that budget.
+  call until something snapshots.
 - The server **snapshots on graceful shutdown** (SIGINT/SIGTERM), so a clean
   restart always recovers from an image.
 - `mushroomdb serve … --snapshot-every <secs>` snapshots periodically, so even
@@ -83,7 +82,7 @@ So retention is opt-in, not automatic — nothing prunes unless a caller asks:
 
 | Snapshot | Archives kept |
 |---|---|
-| automatic — the ingest's, `sync`, a `--snapshot-every` tick, shutdown | all of them |
+| automatic — the ingest's, a `--snapshot-every` tick, shutdown | all of them |
 | `mushroomdb snapshot <db>` | all of them |
 | `mushroomdb snapshot <db> --retention N` | the newest N |
 

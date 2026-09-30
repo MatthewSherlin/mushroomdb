@@ -230,11 +230,10 @@ pub enum Command {
         /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
         db_dir: Option<PathBuf>,
         auto: bool,
-        /// `--all-tools`: advertise all twenty-eight tools in `tools/list`
-        /// rather than the surface the store chose — three on a store
-        /// `ingest-git` built, nineteen on any other. The rest are callable
-        /// either way; the flag decides what is listed, and what every session
-        /// pays for before its first turn.
+        /// `--all-tools`: advertise all twenty-one tools in `tools/list`
+        /// rather than the nineteen every store lists by default. The rest are
+        /// callable either way; the flag decides what is listed, and what every
+        /// session pays for before its first turn.
         all_tools: bool,
     },
     Stats {
@@ -438,15 +437,14 @@ Usage:
                      --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
   mushroomdb mcp <db-dir>|--auto [--all-tools]
-                     --all-tools lists all 28 tools; the default follows the store — 3 on a
-                     store `ingest-git` built (explore, query, stats), 19 on any other
-                     (the rest stay callable, just unlisted)
+                     --all-tools lists all 21 tools; the default lists 19 on every store,
+                     a store `ingest-git` built included (the rest stay callable, just unlisted)
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
   mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
-  mushroomdb brief <db-dir>|--auto    hook body: the repository in one block — size, synced sha, the most
-                                      central files and the most called symbols; byte-stable, so a
-                                      session host caches it once
+  mushroomdb brief <db-dir>|--auto    hook body: the store's schema in one block — labels,
+                                      edge types, history depth, roles and one worked call per
+                                      question kind; byte-stable, so a session host caches it once
   mushroomdb why <db-dir> <a> <b>
                                    every rule edge between two keys with the evidence that
                                    derived it, or a note that there is none
@@ -3447,6 +3445,37 @@ mod tests {
             text.contains("snapshot"),
             "usage should mention snapshot, got:\n{text}"
         );
+    }
+
+    /// Binding: the help describes the tree 0.7 ships. One tool surface of
+    /// twenty-one, nineteen listed on every store, and one brief — the memory
+    /// schema's. The code-graph listing and the repository brief are gone.
+    #[test]
+    fn usage_describes_one_surface_and_the_memory_brief() {
+        let text = usage();
+        assert!(
+            text.contains(
+                "--all-tools lists all 21 tools; the default lists 19 on every store,\n\
+                 \x20                    a store `ingest-git` built included"
+            ),
+            "mcp help line, got:\n{text}"
+        );
+        assert!(
+            text.contains(
+                "mushroomdb brief <db-dir>|--auto    hook body: the store's schema in one block — labels,\n\
+                 \x20                                     edge types, history depth, roles and one worked call per\n\
+                 \x20                                     question kind; byte-stable, so a session host caches it once"
+            ),
+            "brief help line, got:\n{text}"
+        );
+        for stale in [
+            "28 tools",
+            "explore, query, stats",
+            "most called symbols",
+            "synced sha",
+        ] {
+            assert!(!text.contains(stale), "usage still says {stale:?}");
+        }
     }
 
     #[test]

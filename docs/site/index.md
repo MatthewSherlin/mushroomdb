@@ -44,11 +44,6 @@ several processes can share one store — see [Concurrency](concurrency.md).
 entities with rule-derived relationships, which is what makes a ticket↔commit link a rule rather
 than a script.
 
-**Deprecated in 0.6.4:** the code-graph door — the `explore`, `map`, `context`, `impact`, `owners`,
-`why` and `sync` tools, the three grep/edit hooks, and the plugin's coding-assistant positioning. It
-still works and is still tested; it is **removed in 0.7**. See
-[Deprecations](../../README.md#deprecations).
-
 The roadmap and the benchmark numbers are in [README.md](../../README.md). The
 full design spec is at [docs/design.md](../design.md).
 
@@ -63,8 +58,7 @@ v0.6.10 is the current release. The shortest way in is the Claude Code plugin �
 `claude marketplace add MatthewSherlin/mushroomdb` then `claude plugin install
 mushroom@mushroomdb`, and type `/mushroom:mushroom` in a repository. Or run
 `npx mushroomdb install`, which writes the `/mushroom` skill, the MCP server
-entry, the prompt and post-edit hooks, and the git hooks for Claude Code or
-Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`)
+entry, and the session-start and prompt hooks for Claude Code or Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`)
 and PyPI (`pip install mushroomdb`) packages are live at the same version.
 Docker, `install.sh`, and the build-from-source path are in
 [CONTRIBUTING.md](../../CONTRIBUTING.md).
@@ -78,9 +72,8 @@ Docker, `install.sh`, and the build-from-source path are in
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
 - [Codebase graph](ingest-git.md) — `ingest-git`, its rules, submodules, pull requests, incremental sync
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
-- [MCP tools](mcp.md) — the fourteen task tools, the fourteen graph tools, and the listing each store gets
+- [MCP tools](mcp.md) — the seven task tools, the fourteen graph tools, and the nineteen every store lists
 - [The association benchmark](association-bench.md) — one world in three forms, the twenty questions, and the gate
-- [The live code graph](code-graph.md) — **deprecated in 0.6.4, removed in 0.7**: what the repository graph guarantees, measured
 - [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
 - [Running it as a service](service.md) — the volume, the snapshot interval, backup, restore, and what a restart costs

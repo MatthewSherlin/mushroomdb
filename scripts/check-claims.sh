@@ -11,7 +11,8 @@
 #   2. No skill or rules file tells an agent to reach for the graph before or
 #      instead of a search. That instruction is what the benchmark measured and
 #      it is not worth what it cost.
-#   3. The code-graph door removed in 0.7 is not referenced again from source.
+#   3. The code-graph door removed in 0.7 is not referenced again from source,
+#      and no product-facing file names one of its three retired install flags.
 #
 # The claim scan covers every product-facing surface: the README, the llms
 # files, the plugin manifests and their templates, every page under docs/site
@@ -119,6 +120,22 @@ for pat in "${RETIRED_SOURCE[@]}"; do
     printf '%s\n' "$hits" >&2
     fail=1
   fi
+done
+
+# Rule 3, the flag half: the three opt-in hooks `install` wrote in 0.6 are
+# rejected in 0.7, so no product-facing file may tell a reader to pass one.
+# CHANGELOG.md is not a claim file and is not scanned: its v0.7.0 section
+# names the flags on purpose, as the record of what was removed.
+RETIRED_FLAGS=(--intercept-grep --impact-before-edit --enrich-grep)
+for f in "${CLAIM_FILES[@]}"; do
+  [[ -f "$f" ]] || continue
+  for pat in "${RETIRED_FLAGS[@]}"; do
+    if hits="$(grep -n -- "$pat" "$f")"; then
+      echo "check-claims.sh: $f names the retired flag $pat:" >&2
+      printf '%s\n' "$hits" | sed "s|^|  $f:|" >&2
+      fail=1
+    fi
+  done
 done
 
 # The stub-docstring drift check. Separate script, one gate: a caller reading a

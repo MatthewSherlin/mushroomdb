@@ -3,7 +3,7 @@
 #
 # `npx -y mushroomdb@<version> …` costs about half a second before it does any
 # work — a cache check, a version resolve and a Node process of its own — and
-# the hooks that call it fire on every prompt and every file edit. This script
+# the hooks that call it fire on every prompt and every session start. This script
 # pays that once, writes down where the package put its native binary, and
 # execs that binary from then on.
 #

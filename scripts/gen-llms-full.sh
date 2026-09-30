@@ -18,7 +18,6 @@ README="$REPO_ROOT/README.md"
 SITE_DOCS=(
     index.md
     quickstart.md
-    code-graph.md
     concurrency.md
     multiprocess.md
     rules.md

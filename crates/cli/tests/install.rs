@@ -2528,10 +2528,11 @@ fn a_default_install_prints_no_deprecation_line() {
 // ---------------------------------------------------------------------------
 
 /// The code door's task tools, written the way the text writes them so a bare
-/// word inside another word cannot pass. They are deprecated in 0.6.4 and
-/// removed in 0.7, and the skill still has to name them — an assistant on a
-/// code-graph store needs to know what it is looking at.
-const DEPRECATED_TOOL_MENTIONS: &[&str] = &[
+/// word inside another word cannot match. They were removed in 0.7, and a
+/// skill that still names one sends an assistant after a tool no server
+/// serves. The CLI `why` subcommand lives on, but the skill writes it as a
+/// shell form, never as the backticked tool name.
+const REMOVED_TOOL_MENTIONS: &[&str] = &[
     "`explore`",
     "`map`",
     "`context`",
@@ -2615,19 +2616,18 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
             text.contains("ingest-git"),
             "{name}: ingest-git bootstrap undocumented"
         );
-        for tool in DEPRECATED_TOOL_MENTIONS
-            .iter()
-            .chain(ASSOCIATION_TOOL_MENTIONS)
-        {
+        for tool in ASSOCIATION_TOOL_MENTIONS {
             assert!(
                 text.contains(tool),
                 "{name}: {tool} is never named — the assistant has no cue to call it"
             );
         }
-        assert!(
-            text.contains("removed in 0.7"),
-            "{name}: the deprecated code tools must be named as deprecated, not as the first thing to call"
-        );
+        for tool in REMOVED_TOOL_MENTIONS {
+            assert!(
+                !text.contains(tool),
+                "{name}: names {tool}, a tool 0.7 no longer serves"
+            );
+        }
         for banned in ["before `Grep`", "before any `Grep`", "instead of `Grep`"] {
             assert!(
                 !text.contains(banned),
@@ -2637,8 +2637,8 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
     }
     // The skill is re-read every turn, so its size is a per-turn cost. It was
     // 17,148 bytes, 62% of that worked examples and a table restating what
-    // `tools/list` already carries; the examples now live in
-    // docs/site/code-graph.md. The budget is on the *template*, since the
+    // `tools/list` already carries; the examples were dropped rather than
+    // re-read every turn. The budget is on the *template*, since the
     // rendered copy also carries whatever `{{BIN}}` expanded to.
     let template = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills/mushroom/SKILL.md"),
@@ -2693,13 +2693,16 @@ fn every_delivery_variant_names_every_tool_and_fits_the_budget() {
             delivery,
         )
         .expect("the committed template's regions are well formed");
-        for tool in DEPRECATED_TOOL_MENTIONS
-            .iter()
-            .chain(ASSOCIATION_TOOL_MENTIONS)
-        {
+        for tool in ASSOCIATION_TOOL_MENTIONS {
             assert!(
                 skill.contains(tool),
                 "{label}: {tool} is never named — the assistant has no cue to call it"
+            );
+        }
+        for tool in REMOVED_TOOL_MENTIONS {
+            assert!(
+                !skill.contains(tool),
+                "{label}: names {tool}, a tool 0.7 no longer serves"
             );
         }
         // A `--delivery cli` install registers no server, so an MCP-only call
@@ -2827,8 +2830,8 @@ fn delivery_cli_writes_skill_and_hooks_but_no_mcp_entry() {
 
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
     assert!(
-        skill.contains("explore '") && skill.contains("--depth context|impact|history|all"),
-        "the cli skill must teach the shell form:\n{skill}"
+        skill.contains(" why '") && skill.contains(" asof '") && skill.contains(" query '"),
+        "the cli skill must teach the shell forms:\n{skill}"
     );
     assert!(
         !skill.contains("MCP tool") && !skill.contains("tools/list"),
@@ -2872,7 +2875,7 @@ fn delivery_mcp_writes_the_entry_and_the_tool_skill() {
         "the mcp skill must still teach the served surface:\n{skill}"
     );
     assert!(
-        !skill.contains("--depth context|impact|history|all"),
+        !skill.contains(" why '"),
         "the mcp skill must not carry the cli invocation:\n{skill}"
     );
 }
@@ -3140,7 +3143,7 @@ fn reinstalling_as_cli_removes_the_server_the_earlier_install_registered() {
     );
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
     assert!(
-        skill.contains("--depth context|impact|history|all"),
+        skill.contains(" why '"),
         "the skill must have been rewritten for the new door:\n{skill}"
     );
 }

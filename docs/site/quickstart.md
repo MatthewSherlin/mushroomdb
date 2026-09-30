@@ -1,7 +1,7 @@
 # Quickstart
 
 Two commands put a populated store behind an assistant. Four calls are what the
-store is for. The repository door is at the bottom of this page, deprecated.
+store is for. Graphing a repository is at the bottom of this page.
 
 ---
 
@@ -257,11 +257,11 @@ claude plugin install mushroom@mushroomdb
 Then type `/mushroom:mushroom` — Claude Code namespaces plugin-provided skills
 as `/<plugin>:<skill>`. The MCP server starts through `npx -y mushroomdb@<version>`;
 the hooks go through the plugin's `hooks/run.sh`, which resolves that package to
-its native binary once and caches the path, so a session start, a prompt or an
-edit never waits on `npx`.
+its native binary once and caches the path, so a session start or a prompt
+never waits on `npx`.
 
-The plugin writes no git hooks. To get those, or to install for Cursor or Codex,
-use the CLI instead:
+To install for Cursor or Codex, or to pin a store with `--db`, use the CLI
+instead:
 
 ```text
 mushroomdb install
@@ -272,11 +272,11 @@ A skill installed this way is invoked bare as `/mushroom`.
 With no flags it detects the assistant (Claude Code, Cursor, or both), picks
 project scope inside a git checkout and user scope anywhere else, and prints
 which it chose. Project scope writes the MCP entry to `.mcp.json`, the
-`/mushroom` skill to `.claude/skills/mushroom/`, three hooks to
-`.claude/settings.json` — `SessionStart` (the brief), `UserPromptSubmit`
-(recall) and `PostToolUse` (touch) — an ignore line for the store, and a
-backgrounded `sync` into the `post-commit`, `post-checkout` and `post-merge` git
-hooks (deprecated in 0.6.4, removed in 0.7; `--no-git-hooks` skips them).
+`/mushroom` skill to `.claude/skills/mushroom/`, two hooks to
+`.claude/settings.json` — `SessionStart` (the brief) and `UserPromptSubmit`
+(recall) — and an ignore line for the store. It writes no git hooks, and an
+install over a 0.6 one removes the `sync` git hook blocks and the settings hooks
+0.7 no longer ships.
 
 Inside a git checkout, none of those name the store by path: they say `--auto`,
 and the store is resolved when they run. Those files are in the repository and
@@ -309,16 +309,17 @@ current directory, so the entry that gets written names an absolute path. A
 bare name (`--command mushroomdb`) is a `PATH` lookup and is written as given.
 
 Other flags: `--user`, `--platform codex` (registers through the Codex CLI, and
-needs `uninstall --platform codex` to undo), `--db <path>`, `--no-git-hooks`,
+needs `uninstall --platform codex` to undo), `--db <path>` and
 `--delivery cli|mcp|both` (with `cli` the skill teaches the binary and no MCP
-server is registered) and the deprecated, experimental `--intercept-grep`.
+server is registered).
 `mushroomdb uninstall` removes exactly what was written. Full reference:
 [`skill.md`](skill.md).
 
 ### Turning it off
 
 `mushroomdb disable` turns mushroomdb off in a project without uninstalling
-it — the MCP entry, the hooks and the git hook blocks come out; the skill,
+it — the MCP entry, the hooks and any git hook block a 0.6 install wrote come
+out; the skill,
 the store and the `.gitignore` line stay. `mushroomdb enable` turns it back
 on, re-resolving the command rather than replaying whatever `disable` took
 out. `mushroomdb install` also re-enables a disabled install. `doctor` reports
@@ -404,33 +405,24 @@ To serve over HTTPS — via a reverse proxy (nginx, Caddy) or the built-in
 
 ## Graph a repository
 
-> **Deprecated in 0.6.4:** the code-graph door — the `explore`, `map`, `context`, `impact`,
-> `owners`, `why` and `sync` tools, the three grep/edit hooks, and the plugin's coding-assistant
-> positioning. It still works and is still tested; it is **removed in 0.7**. See
-> [Deprecations](../../README.md#deprecations).
-
-`ingest-git` itself stays supported as a **data source**: commits, pull requests,
+`ingest-git` stays supported as a **data source**: commits, pull requests,
 files and authors become entities with rule-derived relationships, which is what
-makes a ticket↔commit link a rule rather than a script. What is deprecated is
-the door that reads those entities back as a *code graph*.
+makes a ticket↔commit link a rule rather than a script.
 
 ```text
 mushroomdb ingest-git ./mushroom-memory . --prs --ensure-gitignore
-mushroomdb map ./mushroom-memory
+mushroomdb brief ./mushroom-memory
 ```
 
 The first walks the git history and the working tree — authors, commits, files,
 symbols, imports, calls and merged pull requests become nodes, and
 `CO_CHANGED` / `KNOWS` / `IMPORTS` / `CALLS` / `MENTIONS` edges are derived by
 rule. On this repository (431 files, 652 commits) it takes about 2.5 s. The
-second reads the graph back as one screen.
+second prints the store's schema — its labels, its edge types and one worked
+call per question kind.
 
-From there: `context`, `impact`, `owners`, `why`, `recall` and `remember`, over
-the CLI or as MCP tools — every one of them deprecated except `recall` and
-`remember`. A store built this way lists three tools (`explore`, `query`,
-`stats`) rather than the nineteen above; the rest stay served and reachable
-through `mushroomdb mcp <db> --all-tools`. `query` answers the same facts as
-Cypher and is not going anywhere.
-
-What the graph guarantees, and what it does not: [The live code
-graph](code-graph.md).
+A store built this way is an ordinary memory store: it lists the same nineteen
+tools as any other, and `query` and `recall` answer over the repository as
+entities. The tools that read it back as a *code graph* were removed in 0.7; to
+keep them, pin `mushroomdb@0.6.x`. The rules, the flags and incremental
+re-ingest are in [Codebase graph](ingest-git.md).

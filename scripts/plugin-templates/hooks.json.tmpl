@@ -11,19 +11,6 @@
         ]
       }
     ],
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" touch --auto",
-            "timeout": 30,
-            "async": true
-          }
-        ]
-      }
-    ],
     "SessionStart": [
       {
         "hooks": [
