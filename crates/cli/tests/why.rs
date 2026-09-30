@@ -86,4 +86,24 @@ fn why_on_two_unrelated_keys_says_so_rather_than_erroring() {
     let (ok, out) = run(&["why", &db, "ada", "lone"]);
     assert!(ok, "an honest 'nothing links these' is not an error: {out}");
     assert!(!out.contains("shared_skill"), "{out}");
+    assert!(
+        out.lines()
+            .any(|l| l == "mushroomdb explain — ada ↔ lone: 0 relationship(s)"),
+        "no zero-relationship header: {out}"
+    );
+    assert!(
+        out.lines().any(|l| l == "  none"),
+        "no honest 'none' note: {out}"
+    );
+}
+
+#[test]
+fn why_on_an_unknown_key_fails_and_names_it() {
+    let db = store("unknown");
+    let (ok, out) = run(&["why", &db, "ada", "nobody"]);
+    assert!(!ok, "an unknown key must exit non-zero: {out}");
+    assert!(
+        out.contains("nobody"),
+        "the missing key is not named: {out}"
+    );
 }

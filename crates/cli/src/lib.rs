@@ -2297,6 +2297,8 @@ pub fn run_owners(db_dir: &Path, path: &str) -> Result<String, CliError> {
 
 /// Body of `mushroomdb why <db> <a> <b>`: every rule edge between two keys
 /// with the evidence that derived it, or an honest note that there is none.
+/// A key the store does not hold is an error (`node key not found: <key>`),
+/// not an empty answer.
 ///
 /// The reply is what the `explain_association` tool sends, framing line
 /// included: the rule names and matched values are graph content.
@@ -2305,7 +2307,7 @@ pub fn run_why(db_dir: &Path, a: &str, b: &str) -> Result<String, CliError> {
     let explained = core_api::explain_digest::explain_with_evidence(&db, a, b)?;
     Ok(format!(
         "{}{}",
-        repograph::UNTRUSTED_FRAMING,
+        core_api::digest::UNTRUSTED_FRAMING,
         core_api::explain_digest::render_explain(a, b, &explained)
     ))
 }

@@ -584,8 +584,8 @@ fn tool_explain_association(db: &SharedDb, args: &Js, json_out: bool) -> CallOut
         Ok(v) => v.to_string(),
         Err(e) => return CallOutcome::ToolErr(e),
     };
-    // Unlike `why`, a key the graph does not hold is an error here rather than
-    // an `unknown:` line: `explain` resolves both keys to dense ids before it
+    // A key the graph does not hold is an error here, not an empty answer:
+    // `explain` resolves both keys to dense ids before it
     // looks at a single edge, and that is the engine's answer to give.
     let report = {
         let g = db.read();
