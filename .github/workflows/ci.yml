@@ -16,6 +16,9 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --workspace --examples
       - run: cargo test --workspace
+      # The first minute on a new store, against the built binary. Every
+      # assertion in it failed on v0.6.12; none may fail again silently.
+      - run: cargo test -p mushroomdb-cli --test first_run
       # Informational, never a failure: prints how many #[ignore]d tests exist
       # against how many any workflow actually names. Added because 20 of 28
       # ran nowhere, including every memory-ceiling and scale-growth assertion.
