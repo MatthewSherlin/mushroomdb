@@ -188,6 +188,33 @@ pub fn ingest_git_schema() -> core_api::schema::Schema {
     schema
 }
 
+/// What a store `ingest-git` did *not* create still lacks of ingest-git's own
+/// declarations: the [`rules`] whose names it does not hold and the
+/// [`FULLTEXT`] pairs it does not declare. Never the memory defaults.
+///
+/// Writing a repository into a store is an explicit act, and the structure
+/// props it writes derive no edge without these rules — the ordinary order is
+/// `mcp` creating the store first, then `ingest-git`. Filtered by absent name
+/// rather than handed whole to `apply_schema`, which deletes and recreates a
+/// live rule whose definition differs.
+#[must_use]
+pub fn missing_structure_schema(w: &Db) -> core_api::schema::Schema {
+    let live: BTreeSet<String> = w.rules().into_iter().map(|r| r.name).collect();
+    let declared = w.fulltext_pairs();
+    core_api::schema::Schema {
+        rules: rules()
+            .into_iter()
+            .filter(|r| !live.contains(&r.name))
+            .collect(),
+        fulltext: FULLTEXT
+            .iter()
+            .map(|(l, f)| ((*l).to_string(), (*f).to_string()))
+            .filter(|pair| !declared.contains(pair))
+            .collect(),
+        ..Default::default()
+    }
+}
+
 /// The `File` keys under a key prefix. `""` is the whole graph, `"vendor/lib/"`
 /// one submodule; keys are repository-relative with `/` separators, which is
 /// exactly what `code-extract` resolves against.

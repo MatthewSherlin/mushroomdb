@@ -621,9 +621,9 @@ fn describe_missing_stores(stores: &[(Platform, StoreRef)]) -> String {
         .filter(|p| !core_api::restore::holds_a_store(p))
         .map(|p| {
             format!(
-                "  note   no store at {} yet — `mushroomdb mcp`, `serve` and `ingest-git` create it \
-                 with the memory schema; to create it now: mushroomdb schema apply {} \
-                 --memory-defaults\n",
+                "  note   no store at {} yet — the first `mushroomdb mcp`, `serve` or \
+                 `ingest-git` run that writes to it creates it with the memory schema; to \
+                 create it now: mushroomdb schema apply {} --memory-defaults\n",
                 p.display(),
                 sh_quote(&p.to_string_lossy())
             )

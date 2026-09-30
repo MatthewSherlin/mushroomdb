@@ -52,7 +52,32 @@ fn hook_digest(db: &Path, prompt: &str) -> String {
         .write_all(payload.as_bytes())
         .expect("write payload");
     let out = child.wait_with_output().expect("wait");
+    // An empty digest is only evidence when the hook ran cleanly: a crash
+    // prints nothing too.
+    assert!(out.status.success(), "recall hook failed: {out:?}");
+    assert!(out.stderr.is_empty(), "recall hook wrote stderr: {out:?}");
     String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// The full-text pairs `ingest-git` declares for its own data.
+fn own_fulltext() -> Vec<(String, String)> {
+    cli::structure::FULLTEXT
+        .iter()
+        .map(|(l, f)| ((*l).to_string(), (*f).to_string()))
+        .collect()
+}
+
+/// A store opened read-only, for asking what it declares.
+fn open_read_only(db: &Path) -> cli::structure::Db {
+    core_api::GraphDb::open_with_options(
+        db,
+        core_api::OpenOptions {
+            auto_migrate: false,
+            repair_wal: false,
+            read_only: true,
+        },
+    )
+    .expect("open read-only")
 }
 
 /// Whether a store can answer `recall` about `term`, something it holds.
@@ -195,18 +220,85 @@ fn reingesting_into_an_existing_store_succeeds_and_declares_nothing() {
 }
 
 #[test]
-fn ingest_git_never_upgrades_a_store_it_did_not_create() {
-    // An existing store is schema-upgraded only by an explicit
-    // `schema apply` (the 227 ms index rebuild, ledger row 36). One that
-    // `query` created bare stays bare after an ingest into it.
+fn ingest_git_never_applies_the_memory_defaults_to_a_store_it_did_not_create() {
+    // The memory defaults reach an existing store only through an explicit
+    // `schema apply` (the 227 ms index rebuild, ledger row 36). ingest-git
+    // still declares what its own data needs there; this checks exactly the
+    // pairs and indexes the memory defaults add that ingest-git never does.
     let db = tmp("existing");
     add_person(&db, "Quillfeather");
     assert!(core_api::restore::holds_a_store(&db));
     ingest_git(&db, &scratch_repo());
+
+    let store = open_read_only(&db);
+    let pairs = store.fulltext_pairs();
+    let defaults = core_api::memory_schema::memory_defaults();
+    let own = own_fulltext();
+    let memory_only: Vec<&(String, String)> = defaults
+        .fulltext
+        .iter()
+        .filter(|p| !own.contains(p))
+        .collect();
+    assert!(!memory_only.is_empty(), "nothing to check");
+    for pair in memory_only {
+        assert!(
+            !pairs.contains(pair),
+            "ingest-git declared memory-default full-text {pair:?}: {pairs:?}"
+        );
+    }
+    for (label, field) in &defaults.indexes {
+        assert!(
+            !store.is_index_enabled(label, field),
+            "ingest-git declared memory-default index {label}.{field}"
+        );
+    }
+    drop(store);
     assert_eq!(
         hook_digest(&db, "Quillfeather").trim(),
         "",
-        "ingest-git declared the memory schema on a store it did not create"
+        "Person.name became searchable on a store ingest-git did not create"
+    );
+}
+
+#[test]
+fn ingest_git_declares_its_structure_rules_on_a_store_mcp_created() {
+    // The ordinary order: install, then `mcp` creates the store with the
+    // memory defaults, then `ingest-git` writes a repository into it. The
+    // structure props are useless without the rules that derive edges from
+    // them, so ingest-git declares those — and only those — on a store it
+    // did not create, as 0.6 did.
+    let db = tmp("mcp-first");
+    ok(mushroomdb(&[
+        "schema",
+        "apply",
+        &db.to_string_lossy(),
+        "--memory-defaults",
+    ]));
+    let repo = scratch_repo();
+    let first = ingest_git(&db, &repo);
+    assert!(first.contains("auto_fk_symbol_file_id"), "{first}");
+
+    let defines = ok(mushroomdb(&[
+        "query",
+        &db.to_string_lossy(),
+        "MATCH (s:Symbol)-[:DEFINES]->(f:File) RETURN f.id AS file",
+    ]));
+    assert!(
+        defines.contains("src/zanzibar.rs"),
+        "no DEFINES edge derived: {defines}"
+    );
+    let store = open_read_only(&db);
+    for pair in own_fulltext() {
+        assert!(store.fulltext_pairs().contains(&pair), "missing {pair:?}");
+    }
+    drop(store);
+
+    // A second run declares nothing and does not fail on what is there.
+    commit_file(&repo, "src/zanzibar.rs", "pub fn route() { }\n", "tidy");
+    let again = ingest_git(&db, &repo);
+    assert!(
+        !again.contains("rules:"),
+        "a re-run declared rules: {again}"
     );
 }
 
@@ -310,9 +402,10 @@ fn test_module_end(lines: &[&str], i: usize) -> Option<usize> {
     Some(end)
 }
 
-/// The nearest enclosing `fn` above line `i`: its name and the index of its
-/// closing brace (again at the `fn` line's own indentation, per rustfmt).
-fn enclosing_fn(lines: &[&str], i: usize) -> (String, usize) {
+/// The nearest enclosing `fn` above line `i`: its name, the index of its
+/// `fn` line, and the index of its closing brace (again at the `fn` line's own
+/// indentation, per rustfmt).
+fn enclosing_fn(lines: &[&str], i: usize) -> (String, usize, usize) {
     for start in (0..=i).rev() {
         let line = lines[start];
         let trimmed = line.trim_start();
@@ -336,7 +429,7 @@ fn enclosing_fn(lines: &[&str], i: usize) -> (String, usize) {
             .find(|&j| lines[j] == close)
             .unwrap_or(lines.len() - 1);
         if end >= i {
-            return (name, end);
+            return (name, start, end);
         }
     }
     panic!("no enclosing fn for line {}", i + 1);
@@ -395,8 +488,10 @@ fn census() -> (Vec<Site>, Vec<String>) {
             }
             let is_code = !trimmed.starts_with("//");
             if is_code && OPENS.iter().any(|o| line.contains(o)) {
-                let (function, end) = enclosing_fn(&lines, i);
-                let from = i.saturating_sub(20);
+                let (function, start, end) = enclosing_fn(&lines, i);
+                // Never reaches above the function's own `fn` line: an
+                // `apply_schema` in the function before is not this one's.
+                let from = i.saturating_sub(20).max(start);
                 let applies = lines[from..=end].iter().any(|l| {
                     let t = l.trim_start();
                     !t.starts_with("//") && t.contains("apply_schema(")
@@ -426,8 +521,9 @@ fn census() -> (Vec<Site>, Vec<String>) {
 ///
 /// A source scan, not a runtime one, because the failure mode is a *new* call
 /// site added later by someone who did not read this file. A read-write open
-/// must either be followed by an `apply_schema` in the same function (the
-/// 20 lines before it count too), or sit in a function on [`ALLOWLIST`].
+/// must either be followed by an `apply_schema` in the same function (up to
+/// 20 lines before it count too, never above the `fn` line), or sit in a
+/// function on [`ALLOWLIST`].
 ///
 /// **Every constructor is scanned.** The first draft of this test looked for
 /// `GraphDb::open` alone and would have reported the tree clean while missing

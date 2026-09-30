@@ -448,8 +448,9 @@ fn explicit_db_pins_the_store() {
 /// The notice `install` prints for a store that does not exist yet.
 fn no_store_notice(db: &Path) -> String {
     format!(
-        "note   no store at {} yet — `mushroomdb mcp`, `serve` and `ingest-git` create it \
-         with the memory schema; to create it now: mushroomdb schema apply '{}' --memory-defaults",
+        "note   no store at {} yet — the first `mushroomdb mcp`, `serve` or `ingest-git` run \
+         that writes to it creates it with the memory schema; to create it now: \
+         mushroomdb schema apply '{}' --memory-defaults",
         db.display(),
         db.display()
     )

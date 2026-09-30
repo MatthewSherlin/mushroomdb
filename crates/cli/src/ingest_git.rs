@@ -1324,8 +1324,8 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     }
 
     // The working tree, on top of the history. It runs after the commit walk
-    // so every `File` node it reads exists. Its rules came with the store's
-    // schema, declared before the first write.
+    // so every `File` node it reads exists. On a store this run created, its
+    // rules came with the schema declared before the first write.
     if opts.structure {
         // A first run has nothing to be incremental against, and a run whose
         // flags changed (structure or docs just turned on) has to revisit
@@ -1344,6 +1344,21 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
             let paths: Vec<String> = paths.into_iter().collect();
             structure::refresh_files(&mut w, &repo, "", &paths, opts.docs)?
         };
+        // A store this run did not create — `mcp` made it, or an older run
+        // with `--no-structure` did — gets ingest-git's own rules and text
+        // fields, declared after the props so each rule backfills once. Only
+        // what is absent, so a re-run declares nothing; never the memory
+        // defaults, which reach an existing store only through `schema apply`.
+        if !is_new_store {
+            let missing = structure::missing_structure_schema(&w);
+            let diff = w.apply_schema(&missing)?;
+            report.rules_created.extend(
+                diff.created
+                    .iter()
+                    .filter_map(|entry| entry.strip_prefix("rule:"))
+                    .map(str::to_string),
+            );
+        }
     }
 
     // Every commit this run could link is in the graph by now.
