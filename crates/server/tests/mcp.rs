@@ -4239,12 +4239,14 @@ fn recall_returns_digest() {
         text.contains("src/core.rs"),
         "the digest must name the matching node: {text}"
     );
-    // `text` here is the digest with its framing line stripped by `task_reply`,
-    // so putting it back must give exactly what core-api produced.
+    // `text` here is the digest with its framing line stripped by `task_reply`.
+    // `recall_digest` itself never carries that line — the framing is stamped
+    // by the text wrapper, not by core-api's digest — so the json reply's own
+    // `digest` field is the same body, unframed either way.
     assert_eq!(
         structured["digest"],
-        json!(format!("{UNTRUSTED_FRAMING}{text}")),
-        "the reply shows the digest unaltered"
+        json!(text),
+        "the json reply's digest is the same body the framed text carries"
     );
 }
 
@@ -4471,13 +4473,22 @@ fn a_json_reply_is_unframed_and_sanitized() {
 #[test]
 fn a_json_reply_keeps_the_newlines_of_a_multi_line_value() {
     let db = code_store("json-multiline");
-    let report = task_report(db, "recall", json!({"topic": "src/core.rs"}));
+    let report = task_report(db.clone(), "recall", json!({"topic": "src/core.rs"}));
     let digest = report["digest"].as_str().expect("digest");
     assert!(
         digest.lines().count() > 2,
         "the rendered digest must survive as a document, not one flat line: {digest:?}"
     );
-    assert!(digest.starts_with(UNTRUSTED_FRAMING), "{digest:?}");
+    // The framing line is a transport concern the text wrapper owns now, not
+    // core-api's digest — a json reply never carries it (see
+    // `a_json_reply_is_unframed_and_sanitized`), so it is the plain-text reply
+    // of the same call that must open with it.
+    let text = task_text(&one_task_call(
+        db,
+        "recall",
+        json!({"topic": "src/core.rs"}),
+    ));
+    assert!(text.starts_with(UNTRUSTED_FRAMING), "{text:?}");
 }
 
 /// Every string value in a JSON reply, at any depth.
@@ -4498,19 +4509,22 @@ fn a_wrong_typed_json_argument_is_a_tool_error() {
     assert!(error_text(&reply).contains("json must be a boolean"));
 }
 
-/// Binding: `recall` carries the framing line its own digest already emits, and
-/// does not gain a second one.
+/// Binding: `recall`'s reply carries the framing line exactly once. The digest
+/// itself never carries it — only the text wrapper stamps it — so double
+/// framing is structurally impossible rather than merely untested.
 #[test]
 fn recall_is_framed_once_not_twice() {
     let db = code_store("recall-framing");
     let reply = one_task_call(db.clone(), "recall", json!({"topic": "src/core.rs"}));
     let full = task_text(&reply);
     assert_eq!(full.matches(UNTRUSTED_FRAMING).count(), 1, "{full}");
-    // The digest core-api produced is what was shown, unaltered.
+    // What is left after stripping the one framing line is exactly the json
+    // reply's own digest — the same body, whichever way it was asked for.
+    let body = task_reply(&reply);
     assert_eq!(
         task_report(db, "recall", json!({"topic": "src/core.rs"}))["digest"],
-        json!(full),
-        "recall's own digest already opens with the framing line"
+        json!(body),
+        "the framed text and the json digest carry the same body"
     );
 }
 
