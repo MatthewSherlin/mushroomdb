@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """Run the agent benchmark. Two suites, one harness.
 
-- **code** (default): stock Claude Code (arm A) against arms that carry
-  mushroomdb, over two repositories. Each cell is one `claude -p` session in a
-  subject clone; change-and-pass cells run in a worktree of that clone and are
-  graded on what they edited and whether the task's own tests pass afterwards.
-  **Retired as of v0.6.4** — still runnable, no further runs committed; see
-  `README.md` in this directory.
-- **association** (the association spec §3): one generated world in three forms — files (P),
+- **code**: stock Claude Code (arm A) against arms that carry mushroomdb,
+  over two repositories. **Retired in 0.7** with the code-graph door it
+  measured: `--suite code` is refused. See `README.md` in this directory.
+- **association** (the default; the association spec §3): one generated world in three forms — files (P),
   SQLite (Q), a mushroomdb store (R) — asked relationship questions no form
   answers without work. There is no repository: a cell is a fresh copy of its
   arm's subject directory, and the baseline everything is measured against is
@@ -20,7 +17,6 @@ and the final `result` event supplies usage/cost/turns/duration.
 
 Usage:
   python3 run.py --setup-only
-  python3 run.py --pilot
   python3 run.py --tasks 1,2 --reps 1
   python3 run.py --suite association --setup-only
   python3 run.py --suite association --pilot
@@ -589,9 +585,17 @@ def pilot(max_turns: int, only: list[int] | None = None,
 # --------------------------------------------------------------------------
 
 
-def main() -> int:
+CODE_SUITE_RETIRED = (
+    "run.py: the code suite was retired in 0.7 with the code-graph door it "
+    "measured; there is no door left to measure. Its committed summaries are "
+    "the record: see benchmarks/agent-tasks/README.md (`--suite code` — "
+    "retired). Run `--suite association` instead."
+)
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--suite", default="code", choices=sorted(SUITES))
+    ap.add_argument("--suite", default="association", choices=sorted(SUITES))
     ap.add_argument("--tasks", default="all")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--arms", default=None,
@@ -606,7 +610,11 @@ def main() -> int:
     ap.add_argument("--pilot", action="store_true",
                     help="the baseline arm only, one rep, to size the tasks "
                          "(§3.2)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+
+    if a.suite == "code":
+        print(CODE_SUITE_RETIRED, file=sys.stderr)
+        return 2
 
     cfg = SUITES[a.suite]
     asked = ([x.strip() for x in a.arms.split(",") if x.strip()]
