@@ -13,6 +13,7 @@
 //! regression in surface selection, tool listing or install wiring fails here
 //! too. It must never assert against a list this file declares: the 0.6.12
 //! version of that idea passed with its bug reintroduced.
+use core_api::GraphDb;
 use serde_json::Value as Js;
 use std::io::Write;
 use std::path::PathBuf;
@@ -180,10 +181,22 @@ fn remembering_about_an_unknown_subject_succeeds() {
 
 #[test]
 fn a_store_with_no_text_index_says_so_rather_than_saying_no_match() {
-    // An empty store has no declared text index. "nothing matches" and "this
-    // store cannot search" are different answers and a caller has to be able
-    // to tell them apart — on 0.6.12 both printed "nothing indexed matches".
+    // A *brand-new* store gets the memory schema for free (see
+    // `an_mcp_created_store_can_find_the_entity_it_was_told_about`), so this
+    // scenario can no longer be reached by pointing `mcp` at an empty
+    // directory. It is still real: a store built through some other path
+    // that declares no schema of its own — e.g. a pre-0.7 store, or any
+    // store `mcp` did not create — and existing stores are never silently
+    // upgraded (ledger row 36: declaring full-text on a populated store
+    // rebuilds the index at open, 227 ms vs. 3.8 ms with none). Write
+    // one node directly through core-api, bypassing both `demo` and `mcp`, so
+    // the directory already holds a store — and no schema — before `mcp`
+    // ever opens it.
     let dir = tmp("noindex");
+    {
+        let mut db = GraphDb::open(&dir).expect("create a store directly, no schema applied");
+        db.insert_node("Widget", "w1", vec![]).expect("insert");
+    }
     let r = mcp(
         &dir,
         &[
@@ -195,5 +208,37 @@ fn a_store_with_no_text_index_says_so_rather_than_saying_no_match() {
     assert!(
         out.contains("schema apply"),
         "a store with no text index must name the fix.\ngot: {out}"
+    );
+}
+
+#[test]
+fn an_mcp_created_store_can_find_the_entity_it_was_told_about() {
+    // The gate this whole task exists to close: a fresh `mcp <dir>` store
+    // must be able to find the *entity* `upsert_entity` created, by its own
+    // name — not merely the note text `remember` happens to self-index. On
+    // 0.6.12 (and on this branch before the memory schema was applied at
+    // `mcp`-store creation) `Note.text` was the only field ever indexed, so a
+    // recall for the entity's own name found nothing.
+    let dir = tmp("entity-recall");
+    let r = mcp(
+        &dir,
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"upsert_entity","arguments":{
+                    "key":"matthew","label":"Person",
+                    "props":{"name":"Matthew Sherlin","role":"founder"}}}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"recall","arguments":{"topic":"Matthew Sherlin"}}}),
+        ],
+    );
+    assert!(
+        !is_error(&r[&1]),
+        "upsert_entity failed: {}",
+        text_of(&r[&1])
+    );
+    let recalled = text_of(&r[&2]);
+    assert!(
+        recalled.contains("matthew"),
+        "recall for the entity's own name did not return the entity's key.\ngot: {recalled}"
     );
 }
