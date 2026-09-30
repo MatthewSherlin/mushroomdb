@@ -1,9 +1,8 @@
-//! The memory surface, independent of `repograph`.
+//! The memory surface: `remember`, `recall` and the session brief.
 //!
-//! `remember`, `recall` and the session brief were implemented inside
-//! `repograph` — the code-graph module 0.7 deletes. They are the memory
-//! product's core, so they move here first and the old module is removed
-//! afterwards.
+//! All three were first implemented inside `repograph`, the code-graph module
+//! 0.7 deleted. They are the memory product's core, so they moved here before
+//! that module was removed.
 pub mod brief;
 pub mod recall;
 pub mod remember;

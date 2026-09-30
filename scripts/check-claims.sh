@@ -110,7 +110,7 @@ scan_grep_files
 # The seven tool names are not scanned for: `map`, `why`, `context`, `owners`,
 # `explore` and `sync` are ordinary words and `why` is a live CLI subcommand.
 # The MCP handshake test pins the tool listing instead.
-RETIRED_SOURCE=(repograph code_extract::repograph)
+RETIRED_SOURCE=(repograph)
 for pat in "${RETIRED_SOURCE[@]}"; do
   hits="$(git grep -n -- "$pat" -- 'crates/*' ':!crates/code-extract/tests/*' 2>/dev/null \
           | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"

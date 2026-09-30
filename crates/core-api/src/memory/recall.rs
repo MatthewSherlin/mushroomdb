@@ -35,10 +35,9 @@ pub const MAX_QUERY_TERMS: usize = 24;
 /// before the terms are OR'd together is what lets a question find the
 /// content word rather than demanding the whole sentence.
 ///
-/// Duplicated from `repograph::recall::STOPWORDS` rather than shared with it:
-/// this module exists precisely so `repograph` can be deleted whole later,
-/// and importing from it here would grow back the dependency this move is
-/// undoing.
+/// Copied from the code-graph `recall`'s list when this module moved out of
+/// `repograph` in 0.7; that module has since been deleted, so this is now the
+/// only copy.
 const STOPWORDS: [&str; 146] = [
     "a",
     "about",
