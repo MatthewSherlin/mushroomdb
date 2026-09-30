@@ -6,15 +6,20 @@
 //! anything has described that subject. A missing key is stubbed as a
 //! provisional entity (`memory_schema::PROVISIONAL_LABEL`,
 //! `memory_schema::PROVISIONAL_PROP`) rather than refusing the whole call —
-//! the store learns the shape of what it does not yet know.
+//! the store learns the shape of what it does not yet know. `facts[]`
+//! endpoints get the identical stub, not a bare `insert_edge_upsert`
+//! auto-create: an unnamed, unmarked node from a typo'd `object` would be
+//! unfindable by the same `provisional` query that surfaces every other
+//! guess this module makes (fix round 1, 0.7).
 //!
 //! Everything one call writes — the entities the caller recognised, the note,
 //! the `ABOUT` edges linking the note to `about`, and the facts among those
 //! entities — goes through one [`GraphDb::batch`] commit, in that order: an
-//! `about` key that is also named in `entities` is created as the real
-//! entity the caller described, not a provisional stub, because the entity
-//! ops are queued (and their keys become visible to the batch's own
-//! validation) before the `about` keys are resolved.
+//! `about` key or a fact endpoint that is also named in `entities` (or, for a
+//! fact endpoint, also in `about`) is created as the real entity the caller
+//! described, not a provisional stub, because the entity ops are queued (and
+//! their keys become visible to the batch's own validation) before the
+//! `about` keys and the facts' own endpoints are resolved.
 //!
 //! Deliberately independent of `repograph` — no import from it — the same
 //! choice [`super::recall`] makes, so `repograph` can be deleted whole once
@@ -101,9 +106,16 @@ pub struct RememberReport {
     pub created: usize,
     /// `about` keys and entities that already existed.
     pub matched: usize,
-    /// Derived edges the rules produced for this commit.
+    /// Derived edges the rules produced for this commit — edges the engine's
+    /// rule provenance attributes to a rule, never one this call inserted
+    /// itself (`ABOUT`, a fact's own edge, or a provisional stub have no
+    /// rule and never count here). `memory_defaults()` ships with zero
+    /// rules (`SAME_AS` arrives in a later plan), so this is always `0`
+    /// against a plain memory store today; it becomes meaningful once a
+    /// rule exists that could fire on this commit's writes.
     pub derived: usize,
-    /// `about` keys that had to be stubbed, in the order given.
+    /// `about` keys and fact endpoints that had to be stubbed, in the order
+    /// each was first seen (`about` before `facts`).
     pub provisional: Vec<String>,
 }
 
@@ -222,6 +234,30 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         .collect();
     let note_existed = db.has_node(&key);
 
+    // Facts' endpoints not already named in `entities` or `about`: existence
+    // is checked now, before the batch, same as above. One not seen anywhere
+    // gets exactly the `about` path's provisional treatment — a stub with a
+    // `name` and `provisional: true`, reported in `provisional` — rather than
+    // the bare, unmarked node `insert_edge_upsert`'s own auto-create would
+    // otherwise leave behind with no signal anywhere that it was guessed.
+    let known: BTreeSet<&str> = entity_keys
+        .iter()
+        .copied()
+        .chain(about.iter().map(String::as_str))
+        .collect();
+    let mut fact_endpoints: Vec<&str> = Vec::new();
+    {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for fact in input.facts {
+            for k in [fact.subject.as_str(), fact.object.as_str()] {
+                if !known.contains(k) && seen.insert(k) {
+                    fact_endpoints.push(k);
+                }
+            }
+        }
+    }
+    let fact_endpoint_existed: Vec<bool> = fact_endpoints.iter().map(|k| db.has_node(k)).collect();
+
     let mut report = RememberReport {
         note: key.clone(),
         ..Default::default()
@@ -296,16 +332,28 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         batch.insert_edge(ABOUT_EDGE, &key, k);
     }
 
-    // 5. Facts. An endpoint not already named above is created provisional
-    //    rather than failing the whole commit — the same "a fact may arrive
-    //    before its subject" treatment `about` gets.
+    // 5. Provisional stubs for fact endpoints `entities`/`about` did not
+    //    already cover — same shape as step 2, so a typo'd `facts[].object`
+    //    is as visible and as findable as an unknown `about` key, not a
+    //    nameless, unmarked node with no report entry anywhere.
+    for (k, existed) in fact_endpoints.iter().zip(&fact_endpoint_existed) {
+        if !*existed {
+            batch.insert_node(
+                PROVISIONAL_LABEL,
+                k,
+                vec![
+                    (NAME_FIELD.to_string(), Value::Str((*k).to_string())),
+                    (PROVISIONAL_PROP.to_string(), Value::Bool(true)),
+                ],
+            );
+            report.provisional.push((*k).to_string());
+        }
+    }
+
+    // 6. Facts. Every endpoint now exists — described above, already in the
+    //    store, or just stubbed — so a plain edge insert is enough.
     for fact in input.facts {
-        batch.insert_edge_upsert(
-            &fact.predicate,
-            &fact.subject,
-            &fact.object,
-            PROVISIONAL_LABEL,
-        );
+        batch.insert_edge(&fact.predicate, &fact.subject, &fact.object);
     }
 
     batch.commit()?;
