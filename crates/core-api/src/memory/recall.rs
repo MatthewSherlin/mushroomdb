@@ -179,14 +179,13 @@ fn is_stopword(term: &str) -> bool {
     STOPWORDS.binary_search(&term).is_ok()
 }
 
-/// Rewrite free-form `topic` as an OR query over its non-glue words.
-///
-/// Splitting on every non-alphanumeric run — not just whitespace — is what
-/// lets a compound identifier like `graph_db` still match: the index tokenizes
-/// the same way at write time, so the document holds `graph` and `db` as two
-/// separate tokens, and an unquoted term that kept the underscore (`graphdb`)
-/// would match neither. `None` when nothing searchable is left.
-fn or_query(topic: &str) -> Option<String> {
+/// `topic` split into its non-glue words: lowercase, split on every
+/// non-alphanumeric run — not just whitespace — so a compound identifier like
+/// `graph_db` still matches. The index tokenizes the same way at write time,
+/// so the document holds `graph` and `db` as two separate tokens, and an
+/// unquoted term that kept the underscore (`graphdb`) would match neither.
+/// Stopwords and repeats are dropped; order of first appearance is kept.
+fn search_terms(topic: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     for word in topic.split(|c: char| !c.is_alphanumeric()) {
         if word.is_empty() {
@@ -198,10 +197,7 @@ fn or_query(topic: &str) -> Option<String> {
         }
         terms.push(term);
     }
-    if terms.is_empty() {
-        return None;
-    }
-    Some(terms.join(" OR "))
+    terms
 }
 
 /// Why `recall` had nothing to say — the two reasons are different advice.
@@ -222,26 +218,67 @@ pub fn recall_digest<F: Fs>(
     store_label: &str,
     max_bytes: usize,
 ) -> RecallOutcome {
+    let mut fields: Vec<String> = db.fulltext_pairs().into_iter().map(|(_, f)| f).collect();
+    fields.sort();
+    fields.dedup();
+    // Checked before the topic itself: a store that cannot search at all
+    // owes the caller that answer regardless of what they typed, including
+    // an empty topic — "no text index" is the fix either way, "no match" is
+    // not.
+    if fields.is_empty() {
+        return RecallOutcome::NoIndex;
+    }
     let topic = topic.trim();
     if topic.is_empty() {
         return RecallOutcome::NoMatch;
     }
 
-    let mut fields: Vec<String> = db.fulltext_pairs().into_iter().map(|(_, f)| f).collect();
-    fields.sort();
-    fields.dedup();
-    if fields.is_empty() {
-        return RecallOutcome::NoIndex;
-    }
-
     // Space-separated terms are ANDed by the index's query grammar, so the
     // topic as typed ("who is Matthew Sherlin?") would require the document
-    // to contain "who" and "is" too. `or_query` drops the glue words and OR's
-    // the rest, so a question or a name finds the content word that matches.
-    // Fall back to the trimmed topic itself when nothing survives the
-    // filter, so an all-stopword topic still probes the index rather than
-    // silently skipping the search.
-    let query = or_query(topic).unwrap_or_else(|| topic.to_string());
+    // to contain "who" and "is" too. `search_terms` drops the glue words, and
+    // the query ORs the rest, so a question or a name finds the content word
+    // that matches. Fall back to the trimmed topic itself when nothing
+    // survives the filter, so an all-stopword topic still probes the index
+    // rather than silently skipping the search.
+    let terms = search_terms(topic);
+    let query = if terms.is_empty() {
+        topic.to_string()
+    } else {
+        terms.join(" OR ")
+    };
+
+    // Relevance floor. An OR query returns something the moment any one of
+    // its terms matches anywhere, and the fused score that comes back from
+    // `search_hybrid` cannot be used to tell a real hit from an accident: RRF
+    // replaces every BM25 score with `1/(60 + rank)`, so the top hit of any
+    // non-empty query scores exactly 1/61 whether it satisfied one word of a
+    // five-word topic or all five. A topic on a subject the store has never
+    // heard of ("banana republic economic collapse history") can still share
+    // one incidental word with an unrelated node ("banana bread recipe") and
+    // come back indistinguishable in shape from a genuine answer.
+    //
+    // An absolute BM25 score cutoff (the approach `repograph::recall` used)
+    // does not fix this: BM25's idf term grows as a word gets rarer *in this
+    // store*, and a young memory store is small, so a word that occurs in
+    // exactly one node — coincidence or not — already scores high there. The
+    // fix has to be corpus-size-independent, so it asks a different question:
+    // not "how strong is the best match" but "how much of what the caller
+    // actually named is present at all". More than half of the topic's own
+    // words must occur *somewhere* in an indexed field before the digest
+    // prints. A one- or two-word topic therefore has to be present whole (a
+    // 50/50 split is not a majority); a longer one tolerates a minority of
+    // its words being absent — a paraphrase, a typo, a word this store never
+    // saw — without demanding the whole sentence appear verbatim.
+    if terms.len() > 1 {
+        let present = terms
+            .iter()
+            .filter(|t| fields.iter().any(|f| !db.search_top(f, t, 1).is_empty()))
+            .count();
+        if present * 2 <= terms.len() {
+            return RecallOutcome::NoMatch;
+        }
+    }
+
     let mut best: BTreeMap<String, f64> = BTreeMap::new();
     for field in &fields {
         for (key, score) in db.search_hybrid(field, &query, "embedding", &[], None, MAX_HITS) {

@@ -74,3 +74,32 @@ fn an_identifier_still_works() {
         other => panic!("expected hits for an identifier, got {other:?}"),
     }
 }
+
+#[test]
+fn an_unrelated_topic_sharing_one_word_is_not_a_confident_hit() {
+    // A topic can OR-match a node on one incidental word while being about
+    // something else entirely. Without a relevance floor this printed a
+    // digest with no way to tell it apart from a real hit — the same shape
+    // of bug the identifier gate's removal was supposed to fix, with the
+    // sign flipped: instead of a real topic finding nothing, an unrelated
+    // one finds something.
+    let mut db = store("banana");
+    db.insert_node("Note", "banana-note", vec![]).unwrap();
+    db.set_prop(
+        "banana-note",
+        "text",
+        Value::Str("banana bread recipe notes from grandma".into()),
+    )
+    .unwrap();
+    match recall_digest(
+        &db,
+        "banana republic economic collapse history",
+        "store",
+        4000,
+    ) {
+        RecallOutcome::NoMatch => {}
+        other => {
+            panic!("an unrelated topic sharing one word must not read as a hit, got {other:?}")
+        }
+    }
+}
