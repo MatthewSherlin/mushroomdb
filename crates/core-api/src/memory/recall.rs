@@ -14,6 +14,17 @@ use std::collections::{BTreeMap, HashSet};
 /// How many hits the digest will name.
 const MAX_HITS: usize = 6;
 
+/// Terms a topic contributes to the query, at most.
+///
+/// `repograph::recall` capped at the same 24 and this module shipped without
+/// one, which was harmless only while the caller was an MCP `recall` argument
+/// a person had typed. The `UserPromptSubmit` hook passes a whole prompt, and
+/// the query the index receives is every surviving term OR'd together — so
+/// without a cap a long prompt is a long query, once per turn, for a digest
+/// bounded to six lines. The first 24 in order of appearance: a prompt's
+/// subject is at its start far more often than at its end.
+pub const MAX_QUERY_TERMS: usize = 24;
+
 /// Glue words dropped from a topic before it becomes a query.
 ///
 /// The index's query grammar ANDs space-separated terms within one group —
@@ -197,6 +208,9 @@ fn search_terms(topic: &str) -> Vec<String> {
             continue;
         }
         terms.push(term);
+        if terms.len() == MAX_QUERY_TERMS {
+            break;
+        }
     }
     terms
 }
@@ -282,13 +296,23 @@ pub fn recall_digest<F: Fs>(
     // word is present *somewhere* — while no single node answers more than a
     // third of it. Coverage has to be asked of the same thing relevance is
     // asked of: one candidate node, not the corpus, and a candidate survives
-    // only when more than half of the topic's own terms are in *its own*
+    // only when at least half of the topic's own terms are in *its own*
     // set. A one-word topic is 1 of 1 — full coverage, not a special case —
-    // so every topic is held to the same rule. A one- or two-word topic has
-    // to be present whole in the one node it names (a 50/50 split is not a
-    // majority); a longer one tolerates a minority of its words being absent
-    // from any single node — a paraphrase, a typo, a word that node never
-    // used — without demanding the whole sentence appear verbatim in it.
+    // so every topic is held to the same rule.
+    //
+    // The bar is *half* the topic's terms, not more than half. A strict
+    // majority reads well and refuses the shape this product is made of: an
+    // entity node holds a name and a note holds the fact, so a two-word topic
+    // naming a person and an action has one word in each, and the entity the
+    // question is about scored 1 of 2 and was dropped from the answer to it.
+    // Half still refuses a *minority* — one word of three, one of five — which
+    // is what the false-positive cases actually are.
+    //
+    // And the count survives the filter, because a digest that shows it does
+    // not have to be believed: `reid — reid (1/3 terms)` is a hit a reader can
+    // discount, where an unannotated line cannot be told from a full match.
+    // RRF flattens every field's top hit to 1/(60+1), so the fused score
+    // carries almost no ranking information; coverage carries it instead.
     //
     // Asked of the candidate's own text, not the index: `best` already holds
     // every candidate this call will ever consider (at most
@@ -304,6 +328,7 @@ pub fn recall_digest<F: Fs>(
     // full-text for a caller-supplied `entities[].label` (`remember`, fix
     // round 2) grows `fields` without bound, so this was the one thing bounded
     // to be able to say yes to that at all. `search_top` is never called here.
+    let mut covered: BTreeMap<String, usize> = BTreeMap::new();
     if !terms.is_empty() {
         let stemmed_terms: Vec<String> = terms.iter().map(|t| stem(t)).collect();
         best.retain(|key, _| {
@@ -321,27 +346,54 @@ pub fn recall_digest<F: Fs>(
                 .iter()
                 .filter(|t| candidate_tokens.contains(*t))
                 .count();
-            present * 2 > terms.len()
+            if present * 2 >= terms.len() {
+                covered.insert(key.clone(), present);
+                true
+            } else {
+                false
+            }
         });
     }
     if best.is_empty() {
         return RecallOutcome::NoMatch;
     }
 
-    // Deterministic: score descending, then key ascending, matching every
-    // other tie-break in this engine.
-    let mut ranked: Vec<(String, f64)> = best.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // Deterministic: coverage descending, then score descending, then key
+    // ascending. Coverage leads because it is the measurement that means
+    // something — see the floor above — and the key breaks the last tie the
+    // way every other tie in this engine breaks.
+    let total = terms.len();
+    let mut ranked: Vec<(String, usize, f64)> = best
+        .into_iter()
+        .map(|(key, score)| {
+            let present = covered.get(&key).copied().unwrap_or(total);
+            (key, present, score)
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| b.2.total_cmp(&a.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
     ranked.truncate(MAX_HITS);
 
     let mut out = format!(
         "mushroomdb recall ({} related nodes in {store_label}):\n",
         ranked.len()
     );
-    for (key, _) in &ranked {
+    for (key, present, _) in &ranked {
+        // The all-stopword fallback searched the raw topic as one AND-group,
+        // which required every word in one document — 100% coverage, a
+        // stricter gate than the half rule, not a missing one — so there
+        // are no per-term counts to report and none are printed.
+        let cover = if total == 0 {
+            String::new()
+        } else {
+            format!(" ({present}/{total} terms)")
+        };
         let line = match db.node_summary_line(key) {
-            Some(summary) => format!("  {key} — {summary}\n"),
-            None => format!("  {key}\n"),
+            Some(summary) => format!("  {key} — {summary}{cover}\n"),
+            None => format!("  {key}{cover}\n"),
         };
         if out.len() + line.len() > max_bytes {
             break;

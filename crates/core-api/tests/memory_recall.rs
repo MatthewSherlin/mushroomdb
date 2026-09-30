@@ -128,11 +128,14 @@ fn terms_scattered_one_per_node_do_not_add_up_to_a_hit() {
 }
 
 #[test]
-fn terms_scattered_across_two_nodes_do_not_clear_the_majority() {
-    // The two-word variant of the same shape: "apple banana" needs both words
-    // in the *same* node. Splitting one word to each of two unrelated nodes
-    // is a 50/50 split for each candidate, which the majority rule (more than
-    // half) rejects.
+fn terms_split_one_per_node_across_two_nodes_each_cover_half() {
+    // Restated in 0.7 plan 2. This used to require NoMatch under a *strict*
+    // majority. Half is now enough, because the shape that rule was really
+    // rejecting is the shape the product is made of: an entity node holding a
+    // name and a note holding the fact, where the topic's two words never
+    // co-occur. A store asked for "apple banana" that holds an apple note and
+    // a banana note has two honest answers; returning nothing was the worse
+    // of the two. The minority cases below still refuse.
     let mut db = store("scattered-two");
     db.insert_node("Note", "apple-note", vec![]).unwrap();
     db.set_prop(
@@ -149,9 +152,66 @@ fn terms_scattered_across_two_nodes_do_not_clear_the_majority() {
     )
     .unwrap();
     match recall_digest(&db, "apple banana", "store", 4000) {
-        RecallOutcome::NoMatch => {}
-        other => panic!(
-            "one word per node across two unrelated nodes must not clear the majority, got {other:?}"
-        ),
+        RecallOutcome::Hits(d) => {
+            assert!(d.contains("apple-note") && d.contains("banana-note"), "{d}");
+            assert_eq!(
+                d.matches("(1/2 terms)").count(),
+                2,
+                "both are half-covered: {d}"
+            );
+        }
+        other => panic!("half coverage is a hit, shown as such, got {other:?}"),
     }
+}
+
+#[test]
+fn the_entity_a_question_is_about_is_not_dropped_for_holding_only_its_name() {
+    // The defect this task exists for. "What does Matthew prefer?" is two
+    // terms after the stopwords go: matthew, prefer. The note holds both.
+    // The Person node holds one, which is all a Person node ever holds, and
+    // under a strict majority the subject of the question was dropped from
+    // the answer to it.
+    let mut db = store("subject");
+    db.insert_node("Note", "note-1", vec![]).unwrap();
+    db.set_prop(
+        "note-1",
+        "text",
+        Value::Str("Matthew prefers concise summaries".into()),
+    )
+    .unwrap();
+    match recall_digest(&db, "What does Matthew prefer?", "store", 4000) {
+        RecallOutcome::Hits(d) => {
+            assert!(d.contains("note-1"), "the fact must be there: {d}");
+            assert!(d.contains("matthew"), "the subject must be there too: {d}");
+            let note_first = d.find("note-1").unwrap() < d.find("  matthew").unwrap();
+            assert!(note_first, "the fuller match ranks first: {d}");
+        }
+        other => panic!("expected the note and its subject, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_digest_says_how_much_of_the_topic_each_hit_covered() {
+    let db = store("shown");
+    match recall_digest(&db, "Matthew Sherlin", "store", 4000) {
+        RecallOutcome::Hits(d) => assert!(d.contains("(2/2 terms)"), "coverage unshown: {d}"),
+        other => panic!("expected hits, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_long_prompt_is_capped_before_it_becomes_a_query() {
+    // The prompt hook feeds whole prompts through this path from plan 2 Task
+    // 4 onward. Without a cap a two-hundred-word prompt becomes a
+    // two-hundred-clause OR query on every turn. `repograph::recall` capped
+    // at 24; this had no cap at all.
+    let db = store("capped");
+    let long: String = (0..200).map(|i| format!("tok{i} ")).collect();
+    // 200 unique non-stopwords, none of them in the store: the call must
+    // return rather than hang, and must not error.
+    assert!(matches!(
+        recall_digest(&db, &format!("{long} matthew"), "store", 4000),
+        RecallOutcome::NoMatch | RecallOutcome::Hits(_)
+    ));
+    assert_eq!(core_api::memory::recall::MAX_QUERY_TERMS, 24);
 }
