@@ -701,23 +701,21 @@ fn brief_lists_only_files_something_imports_or_calls() {
     assert!(all.key_files.iter().all(|(k, _)| k != asset));
 }
 
-/// A store with a graph in it but no `GitSync` marker — anything ingested by
-/// hand — has no repository name and no sha, and is described as the memory
-/// store its own MCP surface says it is.
+/// The memory brief of a code graph whose `GitSync` marker is gone: it still
+/// has 30 `File` nodes, and the schema says so — as a label, which is what it
+/// is to a session that cannot call `explore`. It has no repository name and
+/// no sha, and the header leaves no empty separators where they would have
+/// been.
 ///
-/// The marker is the one test `Surface` splits on, so a store whose session is
-/// offered `explain_association` and `query` rather than `explore` must be
-/// briefed with a schema rather than with two rankings it cannot act on. It
-/// still has 30 `File` nodes, and the schema says so — as a label, which is
-/// what it is to a session that cannot call `explore`.
+/// Which brief a marker-less store gets is `run_brief`'s dispatch, pinned by
+/// `the_brief_of_a_store_with_no_git_sync_marker_is_the_schema` in
+/// `crates/cli/tests/ingest_git.rs`; this test only reads the schema.
 #[test]
-fn brief_without_a_sync_marker_is_briefed_as_a_memory_store() {
+fn the_memory_brief_of_a_marker_less_code_graph_lists_its_labels() {
     let dir = tmp("brief-no-marker");
     let mut db = synthetic_repo_store(&dir);
     db.delete_node("__mushroomdb_git_sync__").expect("drop it");
 
-    // Which brief a store gets is `run_brief`'s dispatch on the marker; this
-    // is the memory brief it dispatches to.
     let s = core_api::memory::brief::brief(&db, &core_api::memory::brief::BriefOptions::default());
     let files = s.labels.iter().find(|l| l.label == "File").map(|l| l.nodes);
     assert_eq!(files, Some(30), "the graph itself is untouched");

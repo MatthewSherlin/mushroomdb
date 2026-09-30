@@ -59,6 +59,18 @@ fn a_memory_store_brief_names_its_labels_and_its_edge_count() {
         assert!(text.contains(want), "brief missing {want}: {text}");
     }
     assert_eq!(b.nodes, 3, "three nodes: {b:?}");
+    assert_eq!(b.edges, 1, "one edge: {b:?}");
+    // The header joins the counts with `SEP`: nodes, edges, labels.
+    assert!(
+        text.lines()
+            .any(|l| l == "mushroomdb brief — 3 nodes · 1 edge · 3 labels"),
+        "the header must print the edge count: {text}"
+    );
+    assert!(
+        text.lines()
+            .any(|l| l == "  WORKS_ON (1) — Person → Project"),
+        "the edge type line carries its count: {text}"
+    );
 }
 
 #[test]

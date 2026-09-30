@@ -1812,6 +1812,26 @@ fn memory_store(name: &str) -> PathBuf {
     db_dir
 }
 
+/// Binding: `run_brief` briefs a store with no `GitSync` marker with its
+/// schema, not the code graph's two rankings.
+///
+/// The reach-line tests below cannot pin this: the reach line is computed
+/// before the dispatch, so a memory store sent to the code-graph renderer
+/// would still end on the right line.
+#[test]
+fn the_brief_of_a_store_with_no_git_sync_marker_is_the_schema() {
+    let db_dir = memory_store("brief-memory-dispatch");
+    let text = cli::run_brief(&db_dir).expect("brief");
+    assert!(
+        text.contains("labels:\n"),
+        "a memory store gets its schema: {text}"
+    );
+    assert!(
+        !text.contains("key files"),
+        "and not the code graph's rankings: {text}"
+    );
+}
+
 /// The brief's last line, without its `reach the graph: ` label.
 fn reach_line_of(db_dir: &Path) -> String {
     let text = cli::run_brief(db_dir).expect("brief");
