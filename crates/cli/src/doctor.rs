@@ -18,9 +18,9 @@
 use crate::install::{
     claude_mcp_file, cursor_mcp_file, default_db, entry_db, expand_platform, git_hooks_dir,
     has_our_server, hook_block_lines, installed_shape, is_disabled, is_our_hook_command,
-    line_runs_for_store, opt_ins, resolve_platform, resolve_scope, Externals, Platform, Scope,
-    StoreRef, AUTO_ARG, BRIEF_EVENT, GIT_HOOKS, HOOK_EVENT, RETIRED_GIT_HOOK_SUBCOMMAND,
-    RETIRED_HOOK_SUBCOMMANDS, SERVER_NAME,
+    is_retired_hook_of_ours, line_runs_for_store, opt_ins, resolve_platform, resolve_scope,
+    Externals, Platform, Scope, StoreRef, AUTO_ARG, BRIEF_EVENT, GIT_HOOKS, HOOK_EVENT,
+    RETIRED_GIT_HOOK_SUBCOMMAND, RETIRED_HOOK_SUBCOMMANDS, SERVER_NAME,
 };
 use crate::CliError;
 use core_api::{GraphDb, GraphError, OpenOptions};
@@ -768,7 +768,9 @@ fn check_retired_hooks(
     let root = read_json(&settings_file).unwrap_or(Js::Null);
     RETIRED_HOOK_SUBCOMMANDS
         .iter()
-        .filter(|(event, sub)| has_hook_matching(&root, event, sub, store))
+        .filter(|(event, sub)| {
+            has_hook_where(&root, event, |c| is_retired_hook_of_ours(c, sub, store))
+        })
         .map(|&(event, sub)| {
             Check::warn(
                 sub,
@@ -776,26 +778,25 @@ fn check_retired_hooks(
                     "retired {event} hook still in {} — 0.7 has no `{sub}`",
                     settings_file.display()
                 ),
-                Some("mushroomdb install --platform claude-code".to_string()),
+                Some(install_fix_for_scope(scope)),
             )
         })
         .collect()
 }
 
 fn has_hook_matching(root: &Js, event: &str, sub: &str, store: &StoreRef) -> bool {
+    has_hook_where(root, event, |c| is_our_hook_command(c, sub, store))
+}
+
+/// Whether any command hook under `event` satisfies `pred`.
+fn has_hook_where(root: &Js, event: &str, pred: impl Fn(&str) -> bool) -> bool {
     root["hooks"][event]
         .as_array()
         .map(|groups| {
             groups.iter().any(|g| {
                 g["hooks"]
                     .as_array()
-                    .map(|hs| {
-                        hs.iter().any(|h| {
-                            h["command"]
-                                .as_str()
-                                .is_some_and(|c| is_our_hook_command(c, sub, store))
-                        })
-                    })
+                    .map(|hs| hs.iter().any(|h| h["command"].as_str().is_some_and(&pred)))
                     .unwrap_or(false)
             })
         })

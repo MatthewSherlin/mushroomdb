@@ -3766,3 +3766,93 @@ fn uninstalling_a_0_6_install_leaves_no_retired_hook_behind() {
     assert!(!hooks.join("post-checkout").exists());
     assert!(!hooks.join("post-merge").exists());
 }
+
+/// The retired prune takes out ours and nothing else. A user's own tool-call
+/// hooks sit beside the 0.6.12 ones under the same events: one whose command
+/// merely *mentions* a retired word, and one that ends in exactly the tail a
+/// retired hook of ours ends in but runs a different program. Both survive
+/// the install and the uninstall.
+#[test]
+fn a_users_own_hooks_survive_the_retired_prune() {
+    let env = fake_home("foreign-hooks");
+    seed_settings_0_6_12(&env);
+    let prettier = r#"prettier --write "$FILE" && echo touch"#;
+    let othertool = "othertool enrich --auto";
+    let path = env.root.join(".claude/settings.json");
+    let mut s: serde_json::Value = serde_json::from_str(SETTINGS_0_6_12).unwrap();
+    s["hooks"]["PostToolUse"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            serde_json::json!({"matcher": "Edit", "hooks": [{"type": "command", "command": prettier}]}),
+            serde_json::json!({"matcher": "Grep", "hooks": [{"type": "command", "command": othertool}]}),
+        ]);
+    fs::write(&path, serde_json::to_string_pretty(&s).unwrap()).unwrap();
+
+    install_ok(&env, &["--delivery", "mcp"]);
+    let commands = hook_commands_written(&env);
+    for foreign in [prettier, othertool] {
+        assert!(
+            commands.iter().any(|c| c == foreign),
+            "install took the user's {foreign:?}: {commands:?}"
+        );
+    }
+    for retired in [" touch --auto", " intercept --auto", " impact-hook --auto"] {
+        assert!(
+            !commands.iter().any(|c| c.ends_with(retired)),
+            "{retired} survived: {commands:?}"
+        );
+    }
+    assert!(
+        !commands
+            .iter()
+            .any(|c| c.contains("mushroomdb@0.6.12 enrich")),
+        "{commands:?}"
+    );
+
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+    run_uninstall_with(&env.root, &env.home, &opts, &no_externals()).expect("uninstall");
+    let commands = hook_commands_written(&env);
+    assert_eq!(
+        commands,
+        vec![prettier.to_string(), othertool.to_string()],
+        "uninstall leaves exactly the user's two hooks"
+    );
+}
+
+/// A 0.6 `sync` block naming a *different* store is not this install's to
+/// take out, so the cleanup leaves it — and the manifest keeps owning it, or
+/// `uninstall` could never find it again.
+#[test]
+fn a_git_hook_block_for_another_store_survives_and_stays_owned() {
+    let env = fake_home("foreign-block");
+    install_ok(&env, &["--delivery", "mcp"]);
+    let hook = env.root.join(".git/hooks/post-commit");
+    let other = temp_dir("elsewhere").join("memory");
+    let text = format!(
+        "#!/bin/sh\n\n# >>> mushroomdb >>>\n( npx -y mushroomdb@0.6.12 sync '{}' >/dev/null 2>&1 & )\n# <<< mushroomdb <<<\n",
+        other.display()
+    );
+    fs::write(&hook, &text).unwrap();
+    seed_manifest_json(
+        &env,
+        &serde_json::json!({ "git_hooks": [hook] }).to_string(),
+    );
+
+    let out = install_ok(&env, &["--delivery", "mcp"]);
+    assert_eq!(fs::read_to_string(&hook).unwrap(), text, "{out}");
+    let m: serde_json::Value = serde_json::from_str(&read(
+        &env.root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(
+        m["git_hooks"],
+        serde_json::json!([hook]),
+        "the block is still on disk, so the manifest still owns it"
+    );
+}

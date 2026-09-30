@@ -1320,9 +1320,29 @@ fn remove_stale_hooks(
 fn remove_retired_hooks(settings_file: &Path, store: &StoreRef) -> Result<bool, CliError> {
     let mut changed = false;
     for (event, sub) in RETIRED_HOOK_SUBCOMMANDS {
-        changed |= drop_hooks(settings_file, event, |c| is_our_hook_command(c, sub, store))?;
+        changed |= drop_hooks(settings_file, event, |c| {
+            is_retired_hook_of_ours(c, sub, store)
+        })?;
     }
     Ok(changed)
+}
+
+/// Whether `command` is the retired hook `sub` of ours for `store`.
+///
+/// Stricter than [`is_our_hook_command`]: the tail alone would claim any
+/// command ending in ` enrich --auto`, whatever program it runs, and this
+/// test decides what gets *deleted* from a file the user owns. So the part
+/// before the tail — the program and its leading arguments — must also name
+/// mushroomdb. Every spelling a 0.5/0.6 install wrote does: `npx -y
+/// mushroomdb@x.y.z`, `'<…>/mushroomdb'` (a resolved binary, a 0.5 copy, or
+/// a `--command` build path), `node '<…>/mushroomdb/…'`, bare `mushroomdb`.
+/// `othertool enrich --auto` does not, and survives.
+pub(crate) fn is_retired_hook_of_ours(command: &str, sub: &str, store: &StoreRef) -> bool {
+    store.hook_tails(sub).iter().any(|tail| {
+        command
+            .strip_suffix(tail.as_str())
+            .is_some_and(|program| program.contains(BIN_NAME))
+    })
 }
 
 /// Whether `command` is a retired hook of ours for any of `stores`.
@@ -1333,8 +1353,18 @@ fn is_retired_hook_command<'a>(
     stores.any(|store| {
         RETIRED_HOOK_SUBCOMMANDS
             .iter()
-            .any(|(_, sub)| is_our_hook_command(command, sub, store))
+            .any(|(_, sub)| is_retired_hook_of_ours(command, sub, store))
     })
+}
+
+/// Whether the git hook at `path` still holds a mushroomdb marked block.
+///
+/// What decides whether a manifest keeps a 0.6 `git_hooks` entry: the
+/// cleanup takes out only the blocks that run `sync` for this install's
+/// store, so a block naming a different store stays on disk — and stays in
+/// the manifest, or `uninstall` could never find it again.
+fn still_holds_hook_block(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| text.lines().any(|l| l.trim_end() == HOOK_BEGIN))
 }
 
 /// Drop every hook under `event` whose command satisfies `drop_it`, pruning
@@ -1643,8 +1673,9 @@ pub fn run_install_with(
             .hooks
             .retain(|h| !is_retired_hook_command(&h.command, stores.iter().map(|(_, s)| s)));
         // No version from 0.7 on writes a git hook; any the manifest lists
-        // were 0.6 `sync` blocks, and the cleanup has just taken ours out.
-        merged.git_hooks.clear();
+        // were 0.6 `sync` blocks. The ones the cleanup took out go; one it
+        // left, because it names another store, stays owned.
+        merged.git_hooks.retain(|f| still_holds_hook_block(f));
         write_manifest(&manifest_path, &merged)?;
     }
 
@@ -2368,7 +2399,7 @@ pub fn run_enable_with(
     manifest
         .hooks
         .retain(|h| !is_retired_hook_command(&h.command, stores.iter().map(|(_, s)| s)));
-    manifest.git_hooks.clear();
+    manifest.git_hooks.retain(|f| still_holds_hook_block(f));
     manifest.codex |= fresh.codex;
     for f in &fresh.files {
         if !manifest.files.contains(f) {

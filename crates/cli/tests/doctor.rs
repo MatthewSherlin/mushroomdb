@@ -481,6 +481,10 @@ fn doctor_reports_each_retired_hook_still_on_disk() {
         let line = find_check(&report.output, sub);
         assert!(line.starts_with("warn"), "{line}");
         assert!(line.contains("retired"), "{line}");
+        assert!(
+            line.contains("fix: mushroomdb install --project"),
+            "the fix names this install's scope: {line}"
+        );
     }
     for absent in ["impact-hook", "enrich"] {
         assert!(

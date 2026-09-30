@@ -774,8 +774,9 @@ fn run_mcp(db_dir: PathBuf, all_tools: bool) -> Result<(), String> {
     }
     let stdin = io::stdin();
     let stdout = io::stdout();
-    // The store's path, not just a handle: the `sync` tool re-runs this binary
-    // against the directory, and cannot infer it from an open database.
+    // The store's path, not just a handle: the `recall` tool names the store
+    // by that path when it tells the caller how to fix an unindexed one, and
+    // an open database cannot say where it lives.
     server::run_mcp_stdio_with(db, Some(db_dir), all_tools, stdin.lock(), stdout.lock())
         .map_err(|e| e.to_string())
 }
