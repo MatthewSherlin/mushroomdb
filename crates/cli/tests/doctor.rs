@@ -138,13 +138,9 @@ fn doctor_passes_on_fresh_project_install() {
     );
 }
 
-/// Binding: the handshake passes on a store `ingest-git` built, whose default
-/// listing is three tools and does *not* include `map`.
-///
-/// The check proves the repository task path is served, not that one
-/// particular name is listed; a code-graph store serves it through `explore`.
-/// Requiring `map` would fail `doctor` on exactly the stores this surface
-/// exists for.
+/// Binding: the handshake passes on a store `ingest-git` built, which is served
+/// the same nineteen as any other store and proves the task path through
+/// `explain_association`.
 #[test]
 fn doctor_handshake_passes_on_a_code_graph_store() {
     let root = temp_dir("code-graph-handshake");
@@ -163,7 +159,7 @@ fn doctor_handshake_passes_on_a_code_graph_store() {
     )
     .expect("install failed");
 
-    // The marker `ingest-git` writes is what makes this a code graph.
+    // The marker `ingest-git` writes, which no longer changes the listing.
     let out = std::process::Command::new(&bin)
         .arg("query")
         .arg(&db)
@@ -180,7 +176,7 @@ fn doctor_handshake_passes_on_a_code_graph_store() {
         "a code-graph store must pass the handshake: {handshake}"
     );
     assert!(
-        handshake.contains("3 tools") && handshake.contains("explore present"),
+        handshake.contains("19 tools") && handshake.contains("explain_association present"),
         "the handshake names the task tool it found: {handshake}"
     );
 }

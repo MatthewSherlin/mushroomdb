@@ -9,14 +9,13 @@
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
 //!   `serverInfo.name` `"mushroomdb"`, `serverInfo.version` (crate version)
 //! - `notifications/initialized` — ignored
-//! - `tools/list` — the default listing follows the store the server opened
-//!   (see [`Surface`]): a store a repository was ingested into lists three —
-//!   `explore`, `query`, `stats` — and any other store lists the nineteen of
+//! - `tools/list` — the default listing is the nineteen of
 //!   [`ASSOCIATION_TOOLS`], the tools that answer a question about an entity
-//!   graph, in that order. Graph-tool descriptions carry the
-//!   prefix `Advanced: ` so a host ranking tools by description puts the task
-//!   tools in front. `mushroomdb mcp --all-tools` lists all twenty-eight; the
-//!   rest are callable either way, just not advertised
+//!   graph, in that order, whatever store the server opened. Graph-tool
+//!   descriptions carry the prefix `Advanced: ` so a host ranking tools by
+//!   description puts the task tools in front. `mushroomdb mcp --all-tools`
+//!   lists all twenty-one; the rest are callable either way, just not
+//!   advertised
 //! - `tools/call` — dispatch; success for a graph tool is
 //!   `{content:[{type:"text", text:<json string>}]}`, and for a task tool one
 //!   text block holding the rendered digest — or, with `json: true`, the
@@ -64,9 +63,7 @@ use std::path::{Path, PathBuf};
 /// Run the MCP loop until `reader` hits EOF.
 ///
 /// `db_dir` is where the store lives on disk. `mushroomdb mcp <db>` passes it;
-/// a caller that has only a handle passes `None`, and the one tool that needs a
-/// path — `sync`, which re-runs this binary against the store — reports that it
-/// cannot run rather than guessing one.
+/// a caller that has only a handle passes `None`.
 pub fn run_mcp_stdio(
     db: SharedDb,
     db_dir: Option<PathBuf>,
@@ -78,15 +75,9 @@ pub fn run_mcp_stdio(
 
 /// [`run_mcp_stdio`], with the tool list chosen by the caller.
 ///
-/// `all_tools` false lists what the store's [`Surface`] names — three on a
-/// code graph, nineteen on a memory store; true lists all twenty-eight. Either
-/// way every tool remains callable — the flag decides what is advertised, not
-/// what is served.
-///
-/// The surface is read once, here, rather than per `tools/list`: a store does
-/// not become a code graph half way through a session, and a listing that
-/// changed under a host that caches it would be worse than one that is merely
-/// stale.
+/// `all_tools` false lists the nineteen of [`ASSOCIATION_TOOLS`]; true lists
+/// all twenty-one. Either way every tool remains callable — the flag decides
+/// what is advertised, not what is served.
 pub fn run_mcp_stdio_with(
     db: SharedDb,
     db_dir: Option<PathBuf>,
@@ -94,7 +85,6 @@ pub fn run_mcp_stdio_with(
     mut reader: impl BufRead,
     mut writer: impl Write,
 ) -> io::Result<()> {
-    let surface = surface_of(&db);
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -104,14 +94,7 @@ pub fn run_mcp_stdio_with(
         }
         match std::str::from_utf8(&buf) {
             Ok(s) if s.trim().is_empty() => continue,
-            Ok(s) => handle_line(
-                &db,
-                db_dir.as_deref(),
-                all_tools,
-                surface,
-                s.trim(),
-                &mut writer,
-            )?,
+            Ok(s) => handle_line(&db, db_dir.as_deref(), all_tools, s.trim(), &mut writer)?,
             Err(_) => write_error(&mut writer, None, -32700, "Parse error")?,
         }
     }
@@ -121,7 +104,6 @@ fn handle_line(
     db: &SharedDb,
     db_dir: Option<&Path>,
     all_tools: bool,
-    surface: Surface,
     line: &str,
     writer: &mut impl Write,
 ) -> io::Result<()> {
@@ -156,7 +138,7 @@ fn handle_line(
         }
         "tools/list" => {
             if is_request {
-                write_result(writer, id, tools_list(all_tools, surface))?;
+                write_result(writer, id, tools_list(all_tools))?;
             }
         }
         "tools/call" => {
@@ -214,7 +196,7 @@ fn dispatch_call(db: &SharedDb, db_dir: Option<&Path>, params: Option<&Js>) -> C
         Some(a) if a.is_object() => a,
         Some(_) => return protocol_invalid(),
     };
-    // The repository task tools first, in the order `tools/list` advertises.
+    // The task tools first, in the order `tools/list` advertises.
     if let Some(outcome) = crate::mcp_tasks::dispatch(db, db_dir, name, args) {
         return outcome;
     }
@@ -1194,26 +1176,16 @@ fn initialize_result() -> Js {
 /// The prefix every graph tool's description carries.
 ///
 /// A host that ranks tools by their description now has one signal that the
-/// repository task tools are the ones to reach for first, and that everything
+/// task tools are the ones to reach for first, and that everything
 /// under this prefix is the lower-level surface beneath them.
 const ADVANCED_PREFIX: &str = "Advanced: ";
 
-/// The three a code-graph store advertises: one tool to find, one to ask an
-/// arbitrary question, one to size the store.
-///
-/// `ingest_json` is not among them. A store built by `ingest-git` is written by
-/// `sync` and `touch`, not by an assistant bulk-loading rows into it, and the
-/// tool that is never the right one on this surface is the one worth not
-/// listing.
-pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
-
-/// The nineteen a memory store advertises, in the order it lists them.
+/// The nineteen every store advertises, in the order it lists them.
 ///
 /// A store with no repository in it used to be handed the code door's own task
-/// tools — `map`, `context`, `impact`, `owners`, `why`, `sync` — which answer
-/// from a code graph there is none of, plus `ingest_json`. Six of the eleven
-/// names an assistant found answered from a repository the store did not
-/// hold. These are
+/// tools, which answered from a code graph there was none of. Those tools are
+/// gone, and a store `ingest-git` built is an entity store like any other, so
+/// it is served this same listing. These are
 /// the questions an entity graph *can* answer: what is there (`query` — now
 /// with a `role`), why two things are associated, what is around a node, what
 /// it is and what it is joined to, whether a link held at a commit and when it
@@ -1228,9 +1200,8 @@ pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 /// it, and had no way at all to ask what a change would do. They sit after
 /// `was_linked`, which is the narrowest form of the same time question.
 ///
-/// The code task tools stay served on a memory store, as these stay served on
-/// a code-graph one — [`tools_list`] decides what is *advertised*, never what
-/// is answered.
+/// [`tools_list`] decides what is *advertised*, never what is answered: the
+/// two served tools this leaves out, `explain` and `rename_node`, stay callable.
 ///
 /// `upsert_entity`, `ingest_json` and `create_rule` were added in 0.6.12, and
 /// the reason is the shape of a first session. A new install opens on an empty
@@ -1266,64 +1237,20 @@ pub const ASSOCIATION_TOOLS: [&str; 19] = [
     "stats",
 ];
 
-/// Which door a store is: which default tool list it gets.
-///
-/// Decided from the store the server opened, once, at startup — not from an
-/// install flag — so one `.mcp.json` serves both and neither has to be
-/// configured for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Surface {
-    /// A repository was ingested into this store: the `GitSync` marker is
-    /// there, and `explore` has a code graph to explore.
-    CodeGraph,
-    /// Any other store, including an empty one: the nineteen-tool association
-    /// surface, where `explore` would have nothing to answer from.
-    Memory,
-}
-
-impl Surface {
-    /// The tools a default `tools/list` on this surface advertises, in the
-    /// order it advertises them.
-    fn listing(self) -> &'static [&'static str] {
-        match self {
-            Surface::CodeGraph => &CODE_GRAPH_TOOLS,
-            Surface::Memory => &ASSOCIATION_TOOLS,
-        }
-    }
-}
-
-/// The surface the store `db` holds: [`Surface::CodeGraph`] when it carries the
-/// `GitSync` marker `ingest-git` writes, [`Surface::Memory`] otherwise.
-fn surface_of(db: &SharedDb) -> Surface {
-    let ingested = {
-        let g = db.read();
-        g.has_node(crate::mcp_tasks::SYNC_KEY)
-    };
-    if ingested {
-        Surface::CodeGraph
-    } else {
-        Surface::Memory
-    }
-}
-
-/// The tools `tools/list` advertises: the fourteen task tools, then the
+/// The tools `tools/list` advertises: the seven task tools, then the
 /// graph tools with their descriptions prefixed.
 ///
-/// `all` false — the default — lists what `surface` names, **in the order that
-/// surface names it**: three on a code graph, nineteen on a memory store. The
-/// order is the point. A host that defers tool schemas makes a model search
-/// for them, and the list it searches is read top-down, so each surface ranks
-/// its own tools rather than inheriting the task-tools-then-graph-tools order
-/// that only the code door has a reason for.
+/// `all` false — the default — lists [`ASSOCIATION_TOOLS`], **in the order it
+/// names them**. The order is the point. A host that defers tool schemas makes
+/// a model search for them, and the list it searches is read top-down.
 ///
-/// `all` true lists all twenty-eight in that established order whichever store
-/// this is, which is what `mushroomdb mcp --all-tools` runs and what the
-/// published server card documents: a caller that asked for everything asked
-/// for the whole surface, not for one door's ranking of it.
+/// `all` true lists all twenty-one in the established task-tools-then-graph-
+/// tools order, which is what `mushroomdb mcp --all-tools` runs and what the
+/// published server card documents.
 ///
-/// Either way every tool stays callable: the flag and the surface decide what
-/// is advertised, not what is served.
-fn tools_list(all: bool, surface: Surface) -> Js {
+/// Either way every tool stays callable: the flag decides what is advertised,
+/// not what is served.
+fn tools_list(all: bool) -> Js {
     let mut served: Vec<Js> = crate::mcp_tasks::task_tools();
     for mut tool in graph_tools() {
         if let Some(d) = tool.get("description").and_then(Js::as_str) {
@@ -1335,14 +1262,13 @@ fn tools_list(all: bool, surface: Surface) -> Js {
     if all {
         return json!({ "tools": served });
     }
-    let listing = surface.listing();
-    let mut tools: Vec<Js> = Vec::with_capacity(listing.len());
-    for name in listing {
+    let mut tools: Vec<Js> = Vec::with_capacity(ASSOCIATION_TOOLS.len());
+    for name in ASSOCIATION_TOOLS {
         let Some(tool) = served
             .iter()
-            .find(|t| t.get("name").and_then(Js::as_str) == Some(*name))
+            .find(|t| t.get("name").and_then(Js::as_str) == Some(name))
         else {
-            debug_assert!(false, "{surface:?} lists {name}, which is not served");
+            debug_assert!(false, "ASSOCIATION_TOOLS lists {name}, which is not served");
             continue;
         };
         tools.push(tool.clone());
@@ -1821,13 +1747,7 @@ mod tests {
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
         for expected in &[
-            // The fourteen task tools, first and in order.
-            "explore",
-            "map",
-            "context",
-            "impact",
-            "owners",
-            "why",
+            // The seven task tools, first and in order.
             "explain_association",
             "node_edges",
             "neighborhood",
@@ -1835,7 +1755,6 @@ mod tests {
             "what_if",
             "recall",
             "remember",
-            "sync",
             // The fourteen graph tools.
             "query",
             "ingest_json",
@@ -1856,19 +1775,13 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            28,
-            "expected exactly 28 tools, got {}",
+            21,
+            "expected exactly 21 tools, got {}",
             names.len()
         );
         assert_eq!(
-            &names[..14],
+            &names[..7],
             [
-                "explore",
-                "map",
-                "context",
-                "impact",
-                "owners",
-                "why",
                 "explain_association",
                 "node_edges",
                 "neighborhood",
@@ -1876,15 +1789,13 @@ mod tests {
                 "what_if",
                 "recall",
                 "remember",
-                "sync"
             ],
             "the task tools come first, in order"
         );
-        assert_eq!(names[14], "query", "the graph tools follow them");
+        assert_eq!(names[7], "query", "the graph tools follow them");
     }
 
-    /// Binding: on a store no repository was ingested into, the default
-    /// listing is the nineteen association tools, in [`ASSOCIATION_TOOLS`]
+    /// Binding: the default listing is the nineteen association tools, in [`ASSOCIATION_TOOLS`]
     /// order, and nothing else.
     #[test]
     fn tools_list_defaults_to_nineteen_on_a_memory_store() {
@@ -1941,26 +1852,15 @@ mod tests {
         assert_eq!(names[find + 1], "pairwise_similar");
     }
 
-    /// Binding: [`ASSOCIATION_TOOLS`] is a surface of its own, not the code
-    /// door's list with a name changed.
-    ///
-    /// It keeps the two task tools an entity store can answer with — the notes
-    /// it wrote and the notes it kept — and none of the seven that read a code
-    /// graph there is none of. Every name in it is served.
+    /// Binding: [`ASSOCIATION_TOOLS`] keeps the task tools an entity store can
+    /// answer with — the notes it wrote and the notes it kept — and every name
+    /// in it is served.
     #[test]
     fn the_association_surface_is_entity_tools_only() {
         for kept in ["remember", "recall", "explain_association"] {
             assert!(
                 ASSOCIATION_TOOLS.contains(&kept),
                 "{kept} answers on an entity graph and must be listed"
-            );
-        }
-        for code_only in [
-            "explore", "map", "context", "impact", "owners", "why", "sync",
-        ] {
-            assert!(
-                !ASSOCIATION_TOOLS.contains(&code_only),
-                "{code_only} reads a code graph and must not be listed on a memory store"
             );
         }
         let served: Vec<String> = crate::mcp_tasks::task_tools()
@@ -1975,32 +1875,6 @@ mod tests {
                 "{name} is listed but not served"
             );
         }
-        assert!(
-            CODE_GRAPH_TOOLS.contains(&"explore"),
-            "and `explore` is the task tool the other surface lists"
-        );
-    }
-
-    /// Binding: the same server on a store carrying the `GitSync` marker lists
-    /// three. One tool to find, one to query, one to size the store.
-    #[test]
-    fn tools_list_is_three_tools_on_a_code_graph_store() {
-        let db = demo_db();
-        db.write()
-            .insert_node(
-                "GitSync",
-                crate::mcp_tasks::SYNC_KEY,
-                vec![("id".into(), Value::Str(crate::mcp_tasks::SYNC_KEY.into()))],
-            )
-            .expect("marker");
-        let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
-        let names: Vec<&str> = resp["result"]["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .map(|t| t["name"].as_str().expect("name"))
-            .collect();
-        assert_eq!(names, ["explore", "query", "stats"]);
     }
 
     #[test]

@@ -1757,16 +1757,17 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
     );
     assert!(!header.contains("ago"), "{header}");
     assert!(text.contains("src/core.rs"), "{text}");
-    // The last line names both doors, and the CLI one is runnable: `explore`
+    // The last line names both doors, and the CLI one is runnable: `query`
     // takes a store, so the line has to carry one. This store was built by
-    // `ingest-git`, so the door it names is the code graph's one tool.
+    // `ingest-git`, and it is served the same listing as any other store, so
+    // the door it names is the association one.
     let reach = text.lines().next_back().unwrap();
     assert!(
-        reach.starts_with("reach the graph: explore <target> (MCP tool)"),
+        reach.starts_with("reach the graph: explain_association <a> <b>"),
         "{reach}"
     );
     assert!(
-        reach.ends_with(&format!(" explore '{}' <target>", db_dir.display())),
+        reach.ends_with(&format!(" query '{}' '<cypher>'", db_dir.display())),
         "{reach}"
     );
 
@@ -1847,11 +1848,9 @@ fn reach_line_of(db_dir: &Path) -> String {
 /// names the association door — `explain_association` and `query`, with the
 /// `role` and `namespace` arguments — and not one code-graph tool.
 ///
-/// The two lines track the two MCP surfaces. A store with no `GitSync` marker
-/// lists neither `explore` nor `context`, so naming either would send a
-/// session at a tool it cannot see. The shell half names `query`, the one of
-/// the two that has a CLI subcommand, and it is introduced with the same
-/// `SEP`-then-`or:` the code-graph line uses.
+/// No server serves `explore` or `context` any more, so naming either would
+/// send a session at a tool it cannot call. The shell half names `query`, the
+/// one of the two that has a CLI subcommand, introduced with `SEP`-then-`or:`.
 #[test]
 fn the_reach_line_names_the_association_door_on_a_store_with_no_git_sync_marker() {
     let db_dir = memory_store("brief-memory-db");
@@ -1875,14 +1874,15 @@ fn the_reach_line_names_the_association_door_on_a_store_with_no_git_sync_marker(
     }
 }
 
-/// Binding: every MCP tool the reach line names is one the store's own
-/// `tools/list` advertises — on both surfaces.
+/// Binding: every MCP tool the reach line names is one `tools/list`
+/// advertises — on a store `ingest-git` built and on a memory store alike.
 ///
 /// This is the guard on the class of break the thirteen-tool listing caused:
 /// the line named `context`, which stayed *served* on a memory store but
-/// stopped being *listed*, and nothing failed. The lists come from the server
-/// crate itself ([`server::ASSOCIATION_TOOLS`], [`server::CODE_GRAPH_TOOLS`]),
-/// so a surface that drops a tool this line names cannot pass silently again.
+/// stopped being *listed*, and nothing failed. The list comes from the server
+/// crate itself ([`server::ASSOCIATION_TOOLS`]), so a listing that drops a
+/// tool this line names cannot pass silently again. Both store shapes are
+/// kept because `run_brief` still dispatches on the `GitSync` marker.
 #[test]
 fn the_reach_line_names_only_tools_its_surface_lists() {
     // The first word of each ` · `-separated clause of the MCP half — the half
@@ -1912,10 +1912,8 @@ fn the_reach_line_names_only_tools_its_surface_lists() {
     run_ingest_git(&code_db, &opts(&repo)).unwrap();
     let memory_db = memory_store("reach-surface-memory");
 
-    for (label, db_dir, listed) in [
-        ("code graph", code_db, server::CODE_GRAPH_TOOLS.to_vec()),
-        ("memory", memory_db, server::ASSOCIATION_TOOLS.to_vec()),
-    ] {
+    let listed = server::ASSOCIATION_TOOLS.to_vec();
+    for (label, db_dir) in [("ingested", code_db), ("memory", memory_db)] {
         let reach = reach_line_of(&db_dir);
         assert!(
             reach.contains("(MCP tool"),

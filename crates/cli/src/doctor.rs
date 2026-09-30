@@ -969,7 +969,7 @@ fn handshake_deadline(store_opened_in: Option<Duration>) -> Duration {
 struct HandshakeOk {
     version: String,
     tool_count: usize,
-    /// The repository task tool the listing carried — see [`TASK_PATH_TOOLS`].
+    /// The task tool the listing carried — see [`TASK_PATH_TOOLS`].
     task_tool: String,
 }
 
@@ -1127,15 +1127,12 @@ fn self_handshake(
     })
 }
 
-/// The tool names that prove the repository task path is served rather than the
-/// graph API alone.
+/// The tool names that prove the task path is served rather than the graph API
+/// alone.
 ///
-/// Either is enough, because which one is listed follows the store: a store
-/// `ingest-git` built advertises `explore` and hides the rest, and any other
-/// store advertises `explain_association` among its nineteen. Requiring one
-/// particular name would fail `doctor` on exactly the stores the other surface
-/// exists for.
-const TASK_PATH_TOOLS: [&str; 2] = ["explore", "explain_association"];
+/// Every store, one `ingest-git` built included, advertises the same nineteen,
+/// and `explain_association` is among them.
+const TASK_PATH_TOOLS: [&str; 1] = ["explain_association"];
 
 #[cfg(test)]
 mod tests {

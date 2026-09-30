@@ -2142,7 +2142,7 @@ pub fn run_map(db_dir: &Path, json: bool) -> Result<String, CliError> {
 pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
     let db = open_for_reading(db_dir)?;
     let code_graph = db.has_node(ingest_git::SYNC_KEY);
-    let reach = reach_line(db_dir, code_graph);
+    let reach = reach_line(db_dir);
     if code_graph {
         // Still the code graph's own two rankings, until Task 9 deletes them.
         let report = repograph::brief(&db, &repograph::BriefOptions::default());
@@ -2181,37 +2181,28 @@ pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
 /// hooks themselves were written with, and it names the store, because both
 /// tools take one.
 ///
-/// **Every MCP name here has to be one the store's surface actually lists.**
-/// A session can only call what its client was shown, so naming a tool it
+/// **Every MCP name here has to be one `tools/list` actually lists.** A
+/// session can only call what its client was shown, so naming a tool it
 /// cannot see would be worse than naming none — which is also why a `cli`
-/// install, registering no server at all, gets the shell form alone. The two
-/// surfaces are [`server::CODE_GRAPH_TOOLS`] and [`server::ASSOCIATION_TOOLS`]:
-/// a store a repository was ingested into is reached through `explore`, and
-/// any other store through `explain_association` and `query`, which is where
-/// its entities are. `the_reach_line_names_only_tools_its_surface_lists` holds
-/// this line and those two lists in step.
+/// install, registering no server at all, gets the shell form alone. Every
+/// store is served [`server::ASSOCIATION_TOOLS`], one written by `ingest-git`
+/// included, so every store is reached through `explain_association` and
+/// `query`, which is where its entities are.
+/// `the_reach_line_names_only_tools_its_surface_lists` holds this line and
+/// that list in step.
 ///
-/// The shell half names `query` on a memory store rather than the MCP pair:
+/// The shell half names `query` rather than the MCP pair:
 /// `explain_association` has no CLI subcommand, and `query` — which does —
 /// answers the same question a Cypher read away.
-fn reach_line(db_dir: &Path, code_graph: bool) -> String {
+fn reach_line(db_dir: &Path) -> String {
     let bin = install::detect_mcp_command(None).shell();
     let db = install::sh_quote(&db_dir.to_string_lossy());
-    let (tools, shell) = if code_graph {
-        (
-            format!("explore <target> (MCP tool){}or:", repograph::render::SEP),
-            format!("{bin} explore {db} <target>"),
-        )
-    } else {
-        (
-            format!(
-                "explain_association <a> <b>{sep}query '<cypher>' (MCP tools; add role: <name> \
-                 or namespace: <ns> to narrow what it sees){sep}or:",
-                sep = repograph::render::SEP
-            ),
-            format!("{bin} query {db} '<cypher>'"),
-        )
-    };
+    let tools = format!(
+        "explain_association <a> <b>{sep}query '<cypher>' (MCP tools; add role: <name> \
+         or namespace: <ns> to narrow what it sees){sep}or:",
+        sep = repograph::render::SEP
+    );
+    let shell = format!("{bin} query {db} '<cypher>'");
     match install::delivery_for_store(db_dir) {
         install::Delivery::Cli => shell,
         _ => format!("{tools} {shell}"),

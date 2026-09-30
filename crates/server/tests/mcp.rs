@@ -42,7 +42,7 @@ fn exchange(db: SharedDb, stdin: &str) -> (std::io::Result<()>, Vec<u8>) {
 }
 
 /// Like [`exchange`], but tells the loop where the store is on disk — what
-/// `mushroomdb mcp <db>` passes and what the `sync` tool needs.
+/// `mushroomdb mcp <db>` passes.
 fn exchange_at(
     db: SharedDb,
     db_dir: Option<PathBuf>,
@@ -193,7 +193,7 @@ fn tools_list_returns_all_tools_with_schemas() {
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 28);
+    assert_eq!(tools.len(), 21);
 
     let by_name = |n: &str| {
         tools
@@ -1034,24 +1034,18 @@ fn hybrid_search_text_only_and_missing_field_errors() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Task tools: explore, map, context, impact, owners, why, recall, remember,
-// sync
+// Task tools: explain_association, node_edges, neighborhood, edges_at,
+// what_if, recall, remember
 //
-// These nine answer a question about a graphed repository rather than about
-// the graph API, so they come first in `tools/list` and the graph tools listed
-// beside them are prefixed `Advanced:`. Each returns the rendered digest as
-// its text content and nothing else; a caller that wants the report passes
-// `json: true` and gets it *as* the text.
+// These seven answer a question in prose rather than in JSON, so they come
+// first in `--all-tools` and the graph tools listed beside them are prefixed
+// `Advanced:`. Each returns the rendered digest as its text content and
+// nothing else; a caller that wants the report passes `json: true` and gets
+// it *as* the text.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The ten task tools, in the order `tools/list` must list them.
-const TASK_TOOLS: [&str; 14] = [
-    "explore",
-    "map",
-    "context",
-    "impact",
-    "owners",
-    "why",
+/// The seven task tools, in the order `tools/list` must list them.
+const TASK_TOOLS: [&str; 7] = [
     "explain_association",
     "node_edges",
     "neighborhood",
@@ -1059,7 +1053,6 @@ const TASK_TOOLS: [&str; 14] = [
     "what_if",
     "recall",
     "remember",
-    "sync",
 ];
 
 /// The fourteen graph tools, in their established order, after the task tools.
@@ -1460,9 +1453,9 @@ const ASSOCIATION_TOOLS: [&str; 19] = [
     "stats",
 ];
 
-/// Binding: a store no repository was ingested into lists the association
-/// surface — the nineteen tools that answer a question about an entity graph
-/// or fill one, in that order — and none of the code-door task tools.
+/// Binding: a memory store lists the association surface — the nineteen tools
+/// that answer a question about an entity graph or fill one, in that order —
+/// and none of the removed code-graph tools.
 #[test]
 fn a_memory_store_lists_the_association_surface() {
     let (res, out) = exchange(open("list-default"), &req(json!(1), "tools/list", None));
@@ -1484,9 +1477,101 @@ fn a_memory_store_lists_the_association_surface() {
     ] {
         assert!(
             !names.contains(&hidden),
-            "{hidden} answers from a code graph there is none of, so it must not be listed"
+            "{hidden} was removed in 0.7 and must not be listed"
         );
     }
+}
+
+/// A store of one of the two shapes a server can be started on: `"memory"`,
+/// empty, or `"ingested"`, carrying the `GitSync` marker `ingest-git` writes.
+/// The marker is all that ever told the two apart, so it is all this needs.
+fn store_of_shape(shape: &str, name: &str) -> SharedDb {
+    let db = open(&format!("{name}-{shape}"));
+    match shape {
+        "memory" => {}
+        "ingested" => {
+            db.write()
+                .insert_node(
+                    "GitSync",
+                    "__mushroomdb_git_sync__",
+                    vec![("id".into(), s("__mushroomdb_git_sync__"))],
+                )
+                .expect("marker");
+        }
+        other => panic!("no store shape {other}"),
+    }
+    db
+}
+
+/// The names a real `tools/list` advertises, default or `--all-tools`.
+fn list_tool_names(db: &SharedDb, all_tools: bool) -> Vec<String> {
+    let stdin = req(json!(1), "tools/list", None);
+    let (res, out) = if all_tools {
+        exchange_all_tools(db.clone(), &stdin)
+    } else {
+        exchange(db.clone(), &stdin)
+    };
+    assert!(res.is_ok(), "{res:?}");
+    parse_lines(&out)[0]["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["name"].as_str().expect("name").to_string())
+        .collect()
+}
+
+/// One `tools/call` against a server started with or without `--all-tools`.
+fn call_tool(db: &SharedDb, all_tools: bool, name: &str, arguments: &Js) -> Js {
+    let stdin = call(1, name, arguments.clone());
+    let (res, out) = if all_tools {
+        exchange_all_tools(db.clone(), &stdin)
+    } else {
+        exchange(db.clone(), &stdin)
+    };
+    assert!(res.is_ok(), "{res:?}");
+    parse_lines(&out).remove(0)
+}
+
+/// The seven code-graph tools are gone from both listings and from the served
+/// set, on both shapes of store.
+///
+/// Asserted against a real `tools/list` rather than against a constant this
+/// file declares. The 0.6.12 version of exactly this test compared against
+/// its own copy of the tool list and passed with the bug reintroduced
+/// (`docs/roadmap/road-to-0.7-plan.md:186-193`).
+#[test]
+fn the_code_graph_tools_are_absent_from_every_listing() {
+    const GONE: [&str; 7] = [
+        "explore", "map", "context", "impact", "owners", "why", "sync",
+    ];
+
+    for all_tools in [false, true] {
+        for store_shape in ["memory", "ingested"] {
+            let db = store_of_shape(store_shape, &format!("gone-{all_tools}"));
+            let listed = list_tool_names(&db, all_tools);
+            for name in GONE {
+                assert!(
+                    !listed.contains(&name.to_string()),
+                    "{name} still listed (all_tools={all_tools}, store={store_shape}): {listed:?}"
+                );
+            }
+            // And a call must be refused, not merely unlisted: "served but
+            // hidden" is what these were before.
+            let reply = call_tool(&db, all_tools, "explore", &json!({"target": "x"}));
+            assert!(
+                reply.get("error").is_some() || reply["result"]["isError"].as_bool() == Some(true),
+                "explore is still answering (all_tools={all_tools}): {reply}"
+            );
+        }
+    }
+}
+
+/// An `ingest-git` store now gets the same nineteen as any other. There is one
+/// surface in 0.7.
+#[test]
+fn an_ingested_store_is_served_the_association_listing() {
+    let db = store_of_shape("ingested", "one-surface");
+    assert_eq!(list_tool_names(&db, false), ASSOCIATION_TOOLS.to_vec());
 }
 
 /// A memory store holding one `Person`, one `Org`, and the `works_at` rule
@@ -3641,71 +3726,27 @@ fn query_as_of_composes_with_a_role_and_a_mask() {
     assert!(far.contains("out of range"), "{far}");
 }
 
-/// Binding: a store carrying the `GitSync` marker — a repository was ingested
-/// into it — lists three tools and nothing else. A host defers MCP schemas and
-/// makes the model search for them, so what is listed is what gets found.
-#[test]
-fn a_code_graph_store_lists_three_tools_by_default() {
-    let (res, out) = exchange(
-        code_store("surface-code"),
-        &req(json!(1), "tools/list", None),
-    );
-    assert!(res.is_ok(), "{res:?}");
-    let replies = parse_lines(&out);
-    let names: Vec<&str> = replies[0]["result"]["tools"]
-        .as_array()
-        .expect("tools")
-        .iter()
-        .map(|t| t["name"].as_str().expect("name"))
-        .collect();
-    assert_eq!(names, vec!["explore", "query", "stats"]);
-}
-
-/// Binding: the surface decides what is *listed*, never what is served. Every
-/// tool the memory surface advertises is still callable on a code-graph store,
-/// and `explore` is still callable on a memory store.
-#[test]
-fn a_hidden_tool_is_still_callable_on_either_surface() {
-    let map = task_reply(&one_task_call(
-        code_store("surface-hidden"),
-        "map",
-        json!({}),
-    ));
-    assert!(
-        map.starts_with("mushroomdb map —"),
-        "map is unlisted on a code graph but must still answer: {map}"
-    );
-    let explore = task_reply(&one_task_call(
-        open("surface-memory-explore"),
-        "explore",
-        json!({"target": "x"}),
-    ));
-    assert!(
-        explore.contains("unknown: x"),
-        "explore is unlisted on a memory store but must still answer: {explore}"
-    );
-}
-
 /// Binding: an unlisted tool is still served. The flag decides what is
-/// advertised, not what a caller that knows the name can reach.
+/// advertised, not what a caller that knows the name can reach. `explain` is
+/// one of the two served tools the default listing leaves out.
 #[test]
 fn an_unlisted_graph_tool_is_still_callable() {
     let (res, out) = exchange(
-        code_store("list-unlisted"),
-        &call(1, "node_info", json!({"key": "src/core.rs"})),
+        association_store("list-unlisted"),
+        &call(1, "explain", json!({"a": "p1", "b": "acme"})),
     );
     assert!(res.is_ok(), "{res:?}");
     let reply = parse_lines(&out).remove(0);
     assert!(
         !reply["result"]["isError"].as_bool().unwrap_or(false),
-        "node_info is unlisted by default but must still answer: {reply}"
+        "explain is unlisted by default but must still answer: {reply}"
     );
 }
 
-/// Binding: `--all-tools` lists 28, task tools first in their fixed order, and
+/// Binding: `--all-tools` lists 21, task tools first in their fixed order, and
 /// every one of the fourteen graph tools carries the `Advanced:` prefix.
 #[test]
-fn tools_list_has_28_tools_task_tools_first_and_advanced_prefix() {
+fn tools_list_has_21_tools_task_tools_first_and_advanced_prefix() {
     let (res, out) = exchange_all_tools(open("list-order"), &req(json!(1), "tools/list", None));
     assert!(res.is_ok(), "{res:?}");
     let replies = parse_lines(&out);
@@ -3721,7 +3762,7 @@ fn tools_list_has_28_tools_task_tools_first_and_advanced_prefix() {
         .copied()
         .collect();
     assert_eq!(names, expected, "tools/list order");
-    assert_eq!(tools.len(), 28);
+    assert_eq!(tools.len(), 21);
 
     for t in tools.iter().take(TASK_TOOLS.len()) {
         let d = t["description"].as_str().expect("description");
@@ -3761,37 +3802,6 @@ fn tools_list_has_28_tools_task_tools_first_and_advanced_prefix() {
         );
     }
     assert_eq!(
-        by_name("map")["inputSchema"]["properties"]
-            .as_object()
-            .map(serde_json::Map::len),
-        Some(1),
-        "map takes nothing but json"
-    );
-    assert_eq!(
-        by_name("sync")["inputSchema"]["properties"]
-            .as_object()
-            .map(serde_json::Map::len),
-        Some(1),
-        "sync takes nothing but json"
-    );
-    assert_eq!(
-        by_name("context")["inputSchema"]["required"],
-        json!(["target"])
-    );
-    assert_eq!(
-        by_name("explore")["inputSchema"]["required"],
-        json!(["target"])
-    );
-    assert_eq!(
-        by_name("explore")["inputSchema"]["properties"]["depth"]["enum"],
-        json!(["context", "impact", "history", "all"])
-    );
-    assert_eq!(
-        by_name("owners")["inputSchema"]["required"],
-        json!(["path"])
-    );
-    assert_eq!(by_name("why")["inputSchema"]["required"], json!(["a", "b"]));
-    assert_eq!(
         by_name("recall")["inputSchema"]["required"],
         json!(["topic"])
     );
@@ -3799,7 +3809,6 @@ fn tools_list_has_28_tools_task_tools_first_and_advanced_prefix() {
         by_name("remember")["inputSchema"]["required"],
         json!(["text"])
     );
-    assert!(by_name("impact")["inputSchema"].get("required").is_none());
     assert_eq!(
         by_name("remember")["inputSchema"]["properties"]["kind"]["enum"],
         json!(["note", "decision", "todo"])
@@ -3811,7 +3820,7 @@ fn tools_list_has_28_tools_task_tools_first_and_advanced_prefix() {
 ///
 /// The card is the whole surface, not the default listing: it says what
 /// `mushroomdb mcp --all-tools` advertises and what every name in it can be
-/// called as, so it is compared against that list rather than the thirteen a
+/// called as, so it is compared against that list rather than the nineteen a
 /// default session sees.
 #[test]
 fn server_card_lists_the_same_tools_in_the_same_order() {
@@ -3853,375 +3862,6 @@ fn server_card_version_matches_crate_version() {
         env!("CARGO_PKG_VERSION"),
         "server-card.json version is {card_version} but crate is {}",
         env!("CARGO_PKG_VERSION"),
-    );
-}
-
-/// Binding: `map` on a store with nothing in it names the command that fills it.
-#[test]
-fn map_on_empty_store_is_helpful() {
-    let (text, structured) = task_both(open("map-empty"), "map", json!({}));
-    assert!(
-        text.contains("empty store") && text.contains("ingest-git"),
-        "empty map must say what to run: {text}"
-    );
-    assert_eq!(structured["files"], json!(0));
-    assert_eq!(structured["symbols"], json!(0));
-}
-
-/// Binding: `map` counts what the graph holds and renders the same numbers.
-#[test]
-fn map_reports_the_graphed_repository() {
-    let (text, structured) = task_both(code_store("map-full"), "map", json!({}));
-    assert_eq!(structured["files"], json!(3));
-    assert_eq!(structured["symbols"], json!(2));
-    assert_eq!(structured["commits"], json!(4));
-    assert_eq!(structured["authors"], json!(2));
-    assert!(text.starts_with("mushroomdb map — 3 files"), "{text}");
-    assert!(
-        text.lines().count() <= 40,
-        "map must stay within its line budget: {text}"
-    );
-}
-
-/// Binding: a `map` served from a handle another handle wrote through is
-/// current without the server being restarted.
-#[test]
-fn map_reflects_writes_made_by_another_handle() {
-    let dir = tmp("map-follows");
-    let db = SharedDb::open(&dir).expect("open");
-    seed_code_graph(&db);
-
-    let before = task_report(db.clone(), "map", json!({}));
-    assert_eq!(before["files"], json!(3));
-
-    // A second handle on the same directory — what a git hook is — inserts a
-    // fourth file and exits, releasing the store's write lock.
-    {
-        let mut other = core_api::GraphDb::open(&dir).expect("second handle");
-        other
-            .insert_node(
-                "File",
-                "src/extra.rs",
-                vec![
-                    ("id".into(), s("src/extra.rs")),
-                    ("path".into(), s("src/extra.rs")),
-                    ("dir".into(), s("src")),
-                    ("lang".into(), s("rust")),
-                    ("lines".into(), Value::Int(9)),
-                ],
-            )
-            .expect("insert through second handle");
-    }
-    // No wait: the read path checks the store on every read, so the very next
-    // call sees the other handle's commit.
-    let (text, after) = task_both(db.clone(), "map", json!({}));
-    assert_eq!(
-        after["files"],
-        json!(4),
-        "the server must follow the other handle's write: {text}"
-    );
-    drop(db);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Binding: `context` on a bare symbol name resolves it and reports its file,
-/// its signature and what calls it.
-#[test]
-fn context_on_symbol() {
-    let (text, structured) = task_both(
-        code_store("context-symbol"),
-        "context",
-        json!({"target": "core::init"}),
-    );
-    assert_eq!(
-        structured["target"]["symbol"]["key"],
-        json!("src/core.rs#core::init")
-    );
-    assert_eq!(structured["file"], json!("src/core.rs"));
-    assert_eq!(structured["signature"], json!("fn core::init()"));
-    // Callers come back as call sites grouped by the file they sit in.
-    let callers: Vec<(&str, Vec<&str>)> = structured["callers"]
-        .as_array()
-        .expect("callers")
-        .iter()
-        .map(|c| {
-            (
-                c["file"].as_str().expect("caller file"),
-                c["symbols"]
-                    .as_array()
-                    .expect("caller symbols")
-                    .iter()
-                    .map(|s| s.as_str().expect("caller key"))
-                    .collect(),
-            )
-        })
-        .collect();
-    assert_eq!(callers, vec![("src/web.rs", vec!["src/web.rs#web::serve"])]);
-    assert!(text.contains("core::init"), "{text}");
-    assert!(
-        text.lines().count() <= 60,
-        "context must stay within its line budget: {text}"
-    );
-}
-
-/// Binding: a default `context` answers with a pointer and the graph's facts,
-/// inside the reply budget; `full: true` quotes the body from the working tree.
-#[test]
-fn context_answers_with_pointers_by_default_and_bodies_on_full() {
-    let db = code_store("context-pointers");
-    // The seed's marker names a working tree that is not there, so `full`
-    // would have nothing to quote. Point it at a real one.
-    let repo = tmp("context-pointers-tree");
-    std::fs::create_dir_all(repo.join("src")).expect("mkdir");
-    let body: String = (1..=30).map(|n| format!("// line {n}\n")).collect();
-    std::fs::write(repo.join("src/core.rs"), body).expect("write source");
-    db.write()
-        .set_prop(
-            "__mushroomdb_git_sync__",
-            "repo",
-            s(&repo.to_string_lossy()),
-        )
-        .expect("repo");
-
-    let (text, structured) = task_both(db.clone(), "context", json!({"target": "core::init"}));
-    assert!(
-        structured["source"].is_null(),
-        "no body by default: {structured}"
-    );
-    assert!(
-        text.contains("src/core.rs:10-20"),
-        "pointer line present: {text}"
-    );
-    assert!(!text.contains("// line 10"), "no body by default: {text}");
-    assert!(
-        text.len() <= 4_800,
-        "default context reply within budget: {}",
-        text.len()
-    );
-
-    let (full, structured_full) =
-        task_both(db, "context", json!({"target": "core::init", "full": true}));
-    assert!(
-        structured_full["source"].is_string(),
-        "full quotes the working tree: {structured_full}"
-    );
-    assert!(full.contains("// line 10"), "the body is quoted: {full}");
-    assert!(
-        full.len() > text.len(),
-        "the default is the shorter answer: {} vs {}",
-        text.len(),
-        full.len()
-    );
-}
-
-/// Binding: `context` on a target the graph does not know says so rather than
-/// failing.
-#[test]
-fn context_on_unknown_target_is_not_an_error() {
-    let (text, structured) = task_both(
-        code_store("context-unknown"),
-        "context",
-        json!({"target": "nope"}),
-    );
-    assert_eq!(structured["target"]["unknown"]["target"], json!("nope"));
-    assert!(!text.is_empty());
-}
-
-/// Binding: `context` without a target is a tool error.
-#[test]
-fn context_without_target_is_a_tool_error() {
-    let reply = one_task_call(code_store("context-no-target"), "context", json!({}));
-    assert!(error_text(&reply).contains("target"));
-}
-
-/// Binding: `explore` at `all` is one call for the three answers — the
-/// context, the blast radius, and who owns it — inside the default budget.
-#[test]
-fn explore_all_composes_context_impact_and_history_within_budget() {
-    let (text, structured) = task_both(
-        code_store("explore-all"),
-        "explore",
-        json!({"target": "core::init", "depth": "all"}),
-    );
-    assert_eq!(
-        structured["context"]["target"]["symbol"]["key"],
-        json!("src/core.rs#core::init")
-    );
-    assert_eq!(structured["depth"], json!("all"));
-    assert!(
-        structured["impact"].is_object() && structured["owners"].is_object(),
-        "all carries the blast radius and the ownership: {structured}"
-    );
-    assert!(text.len() <= 4_800, "{} bytes:\n{text}", text.len());
-    for want in ["callers", "impact:", "owner:"] {
-        assert!(text.contains(want), "the digest is missing {want}:\n{text}");
-    }
-    // The partners reach a caller through the report; the digest names them
-    // once, on the context section's own `co-change` line.
-    assert!(
-        structured["partners"].is_array(),
-        "the report carries the co-change partners: {structured}"
-    );
-    assert!(
-        !text.contains("changes with"),
-        "and the digest does not repeat them:\n{text}"
-    );
-}
-
-/// Binding: the default depth is `context`, and it costs neither the blast
-/// radius nor the history.
-#[test]
-fn explore_defaults_to_context_depth() {
-    let (text, structured) = task_both(
-        code_store("explore-default"),
-        "explore",
-        json!({"target": "core::init"}),
-    );
-    assert_eq!(structured["depth"], json!("context"));
-    assert!(structured["impact"].is_null() && structured["owners"].is_null());
-    assert!(!text.contains("impact:"), "{text}");
-}
-
-/// Binding: `budget` is in tokens and caps the whole reply, framing included.
-#[test]
-fn explore_budget_caps_the_reply() {
-    let reply = one_task_call(
-        code_store("explore-budget"),
-        "explore",
-        json!({"target": "core::init", "depth": "all", "budget": 200}),
-    );
-    let text = task_reply(&reply);
-    assert!(
-        text.len() <= 200 * 4,
-        "a 200-token budget is 800 bytes, got {}:\n{text}",
-        text.len()
-    );
-    assert!(!text.is_empty(), "the header survives any budget");
-}
-
-/// Binding: a depth that is not one of the four is a tool error naming them.
-#[test]
-fn explore_with_an_unknown_depth_is_a_tool_error() {
-    let reply = one_task_call(
-        code_store("explore-depth"),
-        "explore",
-        json!({"target": "core::init", "depth": "everything"}),
-    );
-    let msg = error_text(&reply);
-    assert!(msg.contains("depth") && msg.contains("history"), "{msg}");
-}
-
-/// Binding: `impact` on an explicit file list marks the partners that are
-/// themselves in that list.
-#[test]
-fn impact_explicit_files_marks_modified() {
-    let (text, structured) = task_both(
-        code_store("impact-explicit"),
-        "impact",
-        json!({"files": ["src/core.rs", "src/web.rs"]}),
-    );
-    let files = structured["files"].as_array().expect("files");
-    assert_eq!(files.len(), 2);
-    assert_eq!(files[0]["path"], json!("src/core.rs"));
-
-    let partners = files[0]["partners"].as_array().expect("partners");
-    let web = partners
-        .iter()
-        .find(|p| p["path"] == "src/web.rs")
-        .expect("src/web.rs is a co-change partner of src/core.rs");
-    assert_eq!(web["modified"], json!(true), "it is in the changed set");
-    let util = partners.iter().find(|p| p["path"] == "src/util.rs");
-    if let Some(util) = util {
-        assert_eq!(
-            util["modified"],
-            json!(false),
-            "it is not in the changed set"
-        );
-    }
-    assert!(text.contains("src/web.rs 1.00 modified"), "{text}");
-    assert!(
-        text.lines().count() <= 25,
-        "impact must stay within its line budget: {text}"
-    );
-}
-
-/// Binding: `impact` reports a path the graph has never seen as unknown.
-#[test]
-fn impact_reports_unknown_paths() {
-    let (text, structured) = task_both(
-        code_store("impact-unknown"),
-        "impact",
-        json!({"files": ["src/core.rs", "no/such.rs"]}),
-    );
-    assert_eq!(structured["unknown"], json!(["no/such.rs"]));
-    assert!(text.contains("unknown: no/such.rs"), "{text}");
-}
-
-// The default `impact` file list — where the diff comes from, how it is
-// filtered, and what happens with no checkout — is decided before the graph is
-// touched, and is covered by the unit tests in `crates/server/src/mcp_tasks.rs`.
-// They take `$CLAUDE_PROJECT_DIR` as an argument; asserting it here would mean
-// setting a process-global variable in a binary whose other tests read the
-// environment concurrently.
-
-/// Binding: `owners` names the top author once, with the key in parentheses.
-#[test]
-fn owners_reports_the_top_author() {
-    let (text, structured) = task_both(
-        code_store("owners-ok"),
-        "owners",
-        json!({"path": "src/core.rs"}),
-    );
-    assert_eq!(structured["path"], json!("src/core.rs"));
-    assert!(text.contains("Ada Example (a@example.test)"), "{text}");
-    assert!(
-        text.lines().count() <= 25,
-        "owners must stay within its line budget: {text}"
-    );
-}
-
-/// Binding: `owners` on a path the store holds no file for is a tool error.
-#[test]
-fn owners_unknown_path_error() {
-    let reply = one_task_call(
-        code_store("owners-unknown"),
-        "owners",
-        json!({"path": "no/such.rs"}),
-    );
-    let msg = error_text(&reply);
-    assert!(msg.contains("no/such.rs"), "{msg}");
-}
-
-/// Binding: `why` names both unknown keys rather than only the first.
-#[test]
-fn why_unknown_keys_say_unknown() {
-    let (text, structured) = task_both(
-        code_store("why-unknown"),
-        "why",
-        json!({"a": "nope", "b": "zzz"}),
-    );
-    assert!(text.contains("unknown:"), "{text}");
-    assert_eq!(structured["unknown"], json!(["nope", "zzz"]));
-}
-
-/// Binding: `why` between two co-changed files reports the link and its
-/// evidence.
-#[test]
-fn why_reports_the_link_between_two_files() {
-    let (text, structured) = task_both(
-        code_store("why-link"),
-        "why",
-        json!({"a": "src/core.rs", "b": "src/web.rs"}),
-    );
-    let links = structured["links"].as_array().expect("links");
-    assert!(
-        links.iter().any(|l| l["edge_type"] == "CO_CHANGED"),
-        "expected a CO_CHANGED link: {structured}"
-    );
-    assert!(text.contains("CO_CHANGED"), "{text}");
-    assert!(
-        text.lines().count() <= 25,
-        "why must stay within its line budget: {text}"
     );
 }
 
@@ -4325,32 +3965,6 @@ fn remember_rejects_an_unknown_kind() {
     assert!(error_text(&reply).contains("kind"));
 }
 
-/// Binding: `sync` cannot run without knowing where the store is, and says so.
-#[test]
-fn sync_without_db_dir_is_a_tool_error() {
-    let reply = one_task_call(code_store("sync-no-dir"), "sync", json!({}));
-    let msg = error_text(&reply);
-    assert!(msg.contains("store path unknown"), "{msg}");
-}
-
-/// Binding: with a store path, `sync` runs this binary and reports what it
-/// could not do rather than panicking.
-#[test]
-fn sync_with_db_dir_reports_the_child_failure() {
-    let dir = tmp("sync-with-dir");
-    let db = SharedDb::open(&dir).expect("open");
-    let (res, out) = exchange_at(db.clone(), Some(dir.clone()), &call(1, "sync", json!({})));
-    assert!(res.is_ok(), "{res:?}");
-    let reply = parse_lines(&out).remove(0);
-    // `current_exe()` under `cargo test` is this test binary, not the CLI, so
-    // the run cannot produce a sync report. What matters is that the tool
-    // reports that as an error instead of hanging or panicking.
-    let msg = error_text(&reply);
-    assert!(msg.contains("sync"), "{msg}");
-    drop(db);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Binding: every task tool stamps its text with the untrusted-data framing
 /// line, exactly once, before any repository content.
 ///
@@ -4361,10 +3975,7 @@ fn sync_with_db_dir_reports_the_child_failure() {
 fn every_task_tool_frames_its_text_as_untrusted() {
     let db = code_store("framing");
     let args = |tool: &str| match tool {
-        "explore" | "context" => json!({"target": "core::init"}),
-        "impact" => json!({"files": ["src/core.rs"]}),
-        "owners" => json!({"path": "src/core.rs"}),
-        "why" | "explain_association" => json!({"a": "src/core.rs", "b": "src/web.rs"}),
+        "explain_association" => json!({"a": "src/core.rs", "b": "src/web.rs"}),
         "recall" => json!({"topic": "src/core.rs"}),
         "remember" => json!({"text": "framing check", "about": ["src/core.rs"]}),
         "node_edges" | "neighborhood" => json!({"key": "src/core.rs"}),
@@ -4373,18 +3984,6 @@ fn every_task_tool_frames_its_text_as_untrusted() {
         _ => json!({}),
     };
     for tool in TASK_TOOLS {
-        // `sync` is the one tool left that answers with an error here: it
-        // needs the store path this transcript does not pass. A tool error is
-        // a message to the caller, not graph content, and carries no framing
-        // by design.
-        if tool == "sync" {
-            let reply = one_task_call(db.clone(), tool, args(tool));
-            assert!(
-                !error_text(&reply).starts_with(UNTRUSTED_FRAMING),
-                "a tool error is not graph content"
-            );
-            continue;
-        }
         let reply = one_task_call(db.clone(), tool, args(tool));
         let full = reply["result"]["content"][0]["text"]
             .as_str()
@@ -4412,9 +4011,9 @@ fn every_task_tool_frames_its_text_as_untrusted() {
 #[test]
 fn json_true_answers_with_the_report_as_the_text() {
     let db = code_store("json-arg");
-    let (digest, report) = task_both(db, "impact", json!({"files": ["src/core.rs"]}));
-    assert!(digest.starts_with("mushroomdb impact"), "{digest}");
-    assert_eq!(report["files"][0]["path"], json!("src/core.rs"));
+    let (digest, report) = task_both(db, "node_edges", json!({"key": "src/core.rs"}));
+    assert!(digest.contains("src/core.rs"), "{digest}");
+    assert_eq!(report["key"], json!("src/core.rs"));
     assert!(
         report.get("text").is_none(),
         "the report must not carry a copy of the digest: {report}"
@@ -4514,7 +4113,11 @@ fn collect_strings(value: &Js, out: &mut Vec<String>) {
 /// so rather than served a digest it did not ask for.
 #[test]
 fn a_wrong_typed_json_argument_is_a_tool_error() {
-    let reply = one_task_call(code_store("json-bad"), "map", json!({"json": "yes"}));
+    let reply = one_task_call(
+        code_store("json-bad"),
+        "recall",
+        json!({"topic": "src/core.rs", "json": "yes"}),
+    );
     assert!(error_text(&reply).contains("json must be a boolean"));
 }
 
@@ -5506,19 +5109,10 @@ fn every_tool_the_skill_names_is_advertised() {
     assert!(res.is_ok(), "{res:?}");
     let advertised = names_from(&out);
 
-    // The code-door tools are deprecated and deliberately unlisted on a memory
-    // store; the skill names them in the paragraph that says so.
-    const DEPRECATED: [&str; 7] = [
-        "explore", "map", "context", "impact", "owners", "why", "sync",
-    ];
-
     let mut named: Vec<String> = Vec::new();
     for chunk in skill.split('`').skip(1).step_by(2) {
         let name = chunk.trim();
-        if served.iter().any(|s| s == name)
-            && !DEPRECATED.contains(&name)
-            && !named.iter().any(|n| n == name)
-        {
+        if served.iter().any(|s| s == name) && !named.iter().any(|n| n == name) {
             named.push(name.to_string());
         }
     }
