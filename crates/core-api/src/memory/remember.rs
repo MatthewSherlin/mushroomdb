@@ -45,6 +45,13 @@ const ABOUT_EDGE: &str = "ABOUT";
 /// The `source` a note is stamped with when the caller supplies none.
 const DEFAULT_SOURCE: &str = "agent";
 
+/// Ceiling on the store's total declared full-text surface — the defaults
+/// `memory_defaults()` ships (8: the five entity labels, `Note.text`,
+/// `Concept.summary`, `Entity.name`) plus whatever `remember` self-declares
+/// for an `entities[].label` outside those. See the self-declare comment in
+/// [`remember`] for why this is bounded rather than unlimited.
+const MAX_FULLTEXT_PAIRS: usize = 32;
+
 /// One entity the caller recognised in the text.
 ///
 /// Create-or-update, same as [`describe_entity`]: a `key` already in the
@@ -196,11 +203,46 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         });
     }
 
-    if !db
-        .fulltext_pairs()
-        .contains(&("Note".to_string(), "text".to_string()))
-    {
+    let mut fulltext = db.fulltext_pairs();
+    if !fulltext.contains(&("Note".to_string(), "text".to_string())) {
         db.enable_fulltext("Note", "text")?;
+        fulltext.push(("Note".to_string(), "text".to_string()));
+    }
+
+    // Self-declare full-text for an `entities[].label` full-text has never
+    // seen — the same fix `Note.text` gets above, extended to entities.
+    // `memory_defaults()` declares `(label, "name")` for exactly the five
+    // built-in labels (`Person`, `Org`, `Project`, `Concept`, `Event`) plus
+    // the provisional label; `entities[].label` is free-form (the spec's own
+    // worked example, `{key:"v0.7", label:"Release"}`, uses a sixth), so an
+    // entity under any other label landed with a `name` no `recall` could
+    // ever reach — spec §1.1(b)'s defect, reproduced through this release's
+    // own new feature (fix round 2, 0.7).
+    //
+    // Bounded by `MAX_FULLTEXT_PAIRS`: `enable_fulltext`'s declaration is
+    // rebuilt from scratch on every re-open (227 ms measured against 3.8 ms
+    // with none, at a small declared surface — `memory_schema`'s module
+    // doc), and `entities[].label` is a caller-supplied string with no
+    // schema behind it — a well-behaved caller uses a handful of distinct
+    // labels, but nothing stops a run of calls from feeding a fresh one each
+    // time and growing the declared surface, and every future open's cost,
+    // without bound. Past the cap a new label's entity is still written and
+    // reported exactly as any other — only made not full-text-searchable
+    // yet, a bounded-cost degradation rather than a refusal.
+    {
+        let mut declared_this_call: BTreeSet<&str> = BTreeSet::new();
+        for entity in input.entities {
+            let label = entity.label.as_str();
+            if !declared_this_call.insert(label) {
+                continue;
+            }
+            let pair = (label.to_string(), NAME_FIELD.to_string());
+            if fulltext.contains(&pair) || fulltext.len() >= MAX_FULLTEXT_PAIRS {
+                continue;
+            }
+            db.enable_fulltext(label, NAME_FIELD)?;
+            fulltext.push(pair);
+        }
     }
 
     let source = input.source.unwrap_or(DEFAULT_SOURCE).to_string();

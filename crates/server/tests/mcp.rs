@@ -5311,6 +5311,74 @@ fn upsert_entity_does_not_count_a_no_op_namespace() {
     assert_eq!(db.read().namespace_of("a1").as_deref(), Some("tenant-a"));
 }
 
+/// Binding: a provisional entity `remember` creates is stuck at its
+/// creation-time label forever — the engine has no label-mutation path at
+/// all — so `upsert_entity` naming a different label on that key must say so
+/// loudly rather than silently accepting and dropping it. Fix round 2, 0.7:
+/// on a clean binary, `remember{about:["matthew"]}` then
+/// `upsert_entity{key:"matthew", label:"Person", ...}` reported
+/// `{"ok":true,"created":false}` and left the node permanently `Entity`,
+/// invisible to `MATCH (n:Person)`.
+#[test]
+fn upsert_entity_on_an_existing_key_reports_a_label_mismatch_rather_than_silently_dropping_it() {
+    let db = open("upsert-label-mismatch");
+
+    // An unknown `about` key is created provisional, label `Entity`.
+    let remembered = one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matthew reviewed it", "about": ["matthew"]}),
+    );
+    task_reply(&remembered); // panics if `remember` errored
+    assert_eq!(
+        db.read().node_info("matthew").map(|n| n.label),
+        Some("Entity".to_string())
+    );
+
+    let updated = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew", "label": "Person", "props": {"name": "Matthew Sherlin"}}),
+    ));
+    assert_eq!(updated["created"], json!(false), "{updated}");
+    assert_eq!(
+        updated["label"],
+        json!("Entity"),
+        "the reply must name the label actually stored, not the one requested: {updated}"
+    );
+    let mismatch = updated["label_mismatch"].as_str().unwrap_or_else(|| {
+        panic!("a label that could not be applied must be unmissable in the reply: {updated}")
+    });
+    assert!(
+        mismatch.contains("Person") && mismatch.contains("Entity"),
+        "{mismatch}"
+    );
+
+    // Still there, still queryable — under the label it actually has, and
+    // the props that could be written were.
+    let g = db.read();
+    assert_eq!(
+        g.node_info("matthew").map(|n| n.label),
+        Some("Entity".to_string())
+    );
+    assert_eq!(
+        g.get_prop("matthew", "name"),
+        Some(Value::Str("Matthew Sherlin".into())),
+        "props must still be written even though the label could not change"
+    );
+    drop(g);
+    let count = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n:Entity) RETURN count(n) AS c"}),
+    ));
+    assert_eq!(
+        count["rows"],
+        json!([[1]]),
+        "the node must still be reachable by its real label: {count}"
+    );
+}
+
 /// Binding: `stats` with a `role` on a store whose `roles.json` was corrupt at
 /// open says what `query` with a `role` says — the cause, not "unknown role".
 #[test]

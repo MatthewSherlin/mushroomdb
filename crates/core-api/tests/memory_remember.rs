@@ -1,5 +1,6 @@
 //! remember: a fact may arrive before its subject, and the caller is told
 //! what the store did with it.
+use core_api::memory::recall::{recall_digest, RecallOutcome};
 use core_api::memory::remember::{describe_entity, remember, EntityIn, FactIn, RememberInput};
 use core_api::memory_schema::{memory_defaults, NAME_FIELD, PROVISIONAL_PROP};
 use core_api::{GraphDb, Value};
@@ -198,6 +199,96 @@ fn an_unnamed_fact_endpoint_becomes_provisional_too() {
         None,
         "an entity explicitly described must never be marked provisional"
     );
+}
+
+/// Fix round 2: `entities[].label` is free-form — `memory_defaults()` only
+/// declares full-text for `name` on the five built-in labels — so an entity
+/// under any other label (the spec's own worked example is `Release`)
+/// landed with a `name` `recall` could never reach: spec §1.1(b)'s defect,
+/// reproduced through this release's own new feature. `remember` must
+/// self-declare it, the same way it already does for `Note.text`.
+#[test]
+fn an_unseen_entity_label_becomes_searchable() {
+    let mut db = store("unseen-label");
+    let mut props = BTreeMap::new();
+    props.insert("name".to_string(), Value::Str("v0.7".into()));
+    let entities = vec![EntityIn {
+        key: "v0.7".into(),
+        label: "Release".into(),
+        props,
+    }];
+    remember(
+        &mut db,
+        &RememberInput {
+            text: "Matthew wants 0.7 to focus on the write path",
+            about: &[],
+            kind: "note",
+            ts: 1_759_000_002,
+            source: None,
+            entities: &entities,
+            facts: &[],
+        },
+    )
+    .expect("remember");
+
+    assert!(
+        db.fulltext_pairs()
+            .contains(&("Release".to_string(), NAME_FIELD.to_string())),
+        "an unseen entity label must be self-declared for full-text: {:?}",
+        db.fulltext_pairs()
+    );
+
+    match recall_digest(&db, "v0.7", "test", 4_000) {
+        RecallOutcome::Hits(digest) => assert!(
+            digest.contains("v0.7"),
+            "recall must find the entity it was just told about: {digest}"
+        ),
+        other => panic!("expected a hit, got {other:?}"),
+    }
+}
+
+/// The self-declare above is bounded: past `MAX_FULLTEXT_PAIRS` distinct
+/// declared pairs, a new `entities[].label` is written normally but is not
+/// made searchable, rather than growing the store's declared full-text
+/// surface — and so every future re-open's rebuild cost — without limit on
+/// caller-supplied strings.
+#[test]
+fn self_declaring_full_text_for_new_labels_is_bounded() {
+    let mut db = store("many-labels");
+    // Drive the declared surface past any reasonable cap with distinct
+    // single-entity calls, each under its own throwaway label.
+    for i in 0..64 {
+        let mut props = BTreeMap::new();
+        props.insert("name".to_string(), Value::Str(format!("thing-{i}")));
+        let entities = vec![EntityIn {
+            key: format!("thing-{i}"),
+            label: format!("Kind{i}"),
+            props,
+        }];
+        remember(
+            &mut db,
+            &RememberInput {
+                text: &format!("a note about thing {i}"),
+                about: &[],
+                kind: "note",
+                ts: 1_759_100_000 + i,
+                source: None,
+                entities: &entities,
+                facts: &[],
+            },
+        )
+        .unwrap_or_else(|e| panic!("remember {i}: {e}"));
+    }
+    let pairs = db.fulltext_pairs();
+    assert!(
+        pairs.len() < 64 + 8,
+        "the declared full-text surface must stay bounded, not grow with every \
+         distinct caller-supplied label: {} pairs",
+        pairs.len()
+    );
+    // Every entity was still written, whether or not it ended up searchable.
+    assert!(db.has_node("thing-0"));
+    assert!(db.has_node("thing-63"));
 }
 
 #[test]

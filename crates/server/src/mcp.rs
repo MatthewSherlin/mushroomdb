@@ -652,7 +652,18 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
 /// `set_prop`, which could leave a stored `id` disagreeing with the key the node
 /// is reached by, while the create path had always ignored it.
 ///
-/// Returns `{ok, key, created, updated_fields?}`.
+/// A node's **label never changes on an update** — the engine has no
+/// label-mutation path at all, `describe_entity` uses `label` only on create,
+/// and this tool always returns the label actually stored, not the one asked
+/// for. A `label` that names something else on an existing `key` used to be
+/// silently accepted and dropped (a provisional entity from `remember`,
+/// always created `Entity`, could never actually become the `Person`
+/// `upsert_entity` was asked to make it); it is now `label_mismatch` in the
+/// reply, unmissable beside `"ok": true`, and the props are still written —
+/// real label mutation stays out of scope, this only stops the response from
+/// lying about it.
+///
+/// Returns `{ok, key, label, created, updated_fields?, label_mismatch?}`.
 fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
     let Some(key) = args.get("key").and_then(Js::as_str) else {
         return CallOutcome::ToolErr("missing key".into());
@@ -712,12 +723,30 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
         if let Err(e) = memory::remember::describe_entity(&mut g, key, None, &to_set) {
             return CallOutcome::ToolErr(graph_err_msg(e));
         }
-        CallOutcome::ToolOk(json!({
+        // The label actually stored — an update never changes it, whatever
+        // `label` this call named (see the doc comment above).
+        let stored_label = g
+            .node_ref(key)
+            .map(|n| n.label().to_string())
+            .unwrap_or_default();
+        let mut out = json!({
             "ok": true,
             "key": key,
+            "label": stored_label,
             "created": false,
             "updated_fields": count
-        }))
+        });
+        if let Some(requested) = label_opt {
+            if requested != stored_label {
+                out["label_mismatch"] = json!(format!(
+                    "requested label {requested:?} was NOT applied — '{key}' already exists \
+                     as {stored_label:?} and a label cannot change after creation (no \
+                     label-mutation path exists). The other props were still written. To \
+                     get {requested:?}, delete and re-insert the node under that label."
+                ));
+            }
+        }
+        CallOutcome::ToolOk(out)
     } else {
         let Some(label) = label_opt else {
             return CallOutcome::ToolErr("label required when creating a new entity".into());
@@ -726,7 +755,12 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
         let props: Vec<(String, Value)> = row.into_iter().collect();
         let mut g = db.write();
         match memory::remember::describe_entity(&mut g, key, Some(label), &props) {
-            Ok(_) => CallOutcome::ToolOk(json!({ "ok": true, "key": key, "created": true })),
+            Ok(_) => CallOutcome::ToolOk(json!({
+                "ok": true,
+                "key": key,
+                "label": label,
+                "created": true
+            })),
             Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
         }
     }
