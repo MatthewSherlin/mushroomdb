@@ -1,16 +1,15 @@
 //! `remember` — write a `Note` the graph can later `recall`.
 //!
-//! Unlike [`repograph::remember`](crate::repograph::remember::remember),
-//! which this module supersedes for the memory surface, an `about` key here
-//! is not required to already exist: a fact may name its subject before
-//! anything has described that subject. A missing key is stubbed as a
-//! provisional entity (`memory_schema::PROVISIONAL_LABEL`,
-//! `memory_schema::PROVISIONAL_PROP`) rather than refusing the whole call —
-//! the store learns the shape of what it does not yet know. `facts[]`
-//! endpoints get the identical stub, not a bare `insert_edge_upsert`
-//! auto-create: an unnamed, unmarked node from a typo'd `object` would be
-//! unfindable by the same `provisional` query that surfaces every other
-//! guess this module makes (fix round 1, 0.7).
+//! Unlike the code-graph `remember` this module superseded, deleted in 0.7 with
+//! the rest of that module, an `about` key here is not required to already
+//! exist: a fact may name its subject before anything has described that
+//! subject. A missing key is stubbed as a provisional entity
+//! (`memory_schema::PROVISIONAL_LABEL`, `memory_schema::PROVISIONAL_PROP`)
+//! rather than refusing the whole call — the store learns the shape of what it
+//! does not yet know. `facts[]` endpoints get the identical stub, not a bare
+//! `insert_edge_upsert` auto-create: an unnamed, unmarked node from a typo'd
+//! `object` would be unfindable by the same `provisional` query that surfaces
+//! every other guess this module makes (fix round 1, 0.7).
 //!
 //! Everything one call writes — the entities the caller recognised, the note,
 //! the `ABOUT` edges linking the note to `about`, and the facts among those
@@ -20,10 +19,6 @@
 //! described, not a provisional stub, because the entity ops are queued (and
 //! their keys become visible to the batch's own validation) before the
 //! `about` keys and the facts' own endpoints are resolved.
-//!
-//! Deliberately independent of `repograph` — no import from it — the same
-//! choice [`super::recall`] makes, so `repograph` can be deleted whole once
-//! the plan that replaces it lands.
 
 use crate::memory_schema::{NAME_FIELD, PROVISIONAL_LABEL, PROVISIONAL_PROP};
 use crate::GraphDb;
@@ -215,9 +210,9 @@ pub fn describe_entity<F: Fs>(
 ///
 /// Validated before anything is written: `text` must be
 /// [`MIN_TEXT_CHARS`]..=[`MAX_TEXT_CHARS`] characters after trimming, and
-/// `kind` must be one of [`NOTE_KINDS`]. Unlike
-/// [`repograph::remember`](crate::repograph::remember::remember), an
-/// unknown `about` key is never an error — see the module docs.
+/// `kind` must be one of [`NOTE_KINDS`]. Unlike the code-graph `remember`
+/// 0.7 deleted, an unknown `about` key is never an error — see the module
+/// docs.
 ///
 /// The note's key is `"note:"` followed by 16 hex characters of a stable
 /// 64-bit hash of `ts` and `text` (see [`note_key`]), so remembering the
@@ -523,10 +518,9 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
 /// The key one `remember` call writes to: `"note:"` followed by 16 hex
 /// characters of a 64-bit FNV-1a hash of `ts` and `text`.
 ///
-/// Same construction as
-/// [`repograph::remember::note_key`](crate::repograph::remember), duplicated
-/// rather than imported — see the module docs — so the two are byte-for-byte
-/// identical rather than merely similar. FNV-1a rather than `blake3` for the
+/// Same construction as the code-graph `note_key` 0.7 deleted, so a note
+/// written by 0.6 and the same `ts` and `text` remembered by 0.7 share one
+/// key. FNV-1a rather than `blake3` for the
 /// same dependency reason: `blake3` is confined to `crates/code-extract`,
 /// which `core-api` cannot depend on.
 fn note_key(ts: i64, text: &str) -> String {

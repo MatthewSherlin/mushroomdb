@@ -1022,10 +1022,9 @@ fn legacy_store_recovers_the_majority_name_on_first_sync() {
 
 /// The `co_changed` rule scores on jaccard similarity, which is a ratio, so a
 /// file that changes with this one often and *also* changes a lot on its own
-/// falls under the floor and gets no edge. `impact` must still name it, by how
-/// many commits the two share, and label it as a count rather than a score.
+/// falls under the floor and gets no edge.
 #[test]
-fn impact_includes_partners_by_shared_commit_count() {
+fn co_changed_writes_no_edge_for_a_partner_under_the_similarity_floor() {
     let repo = tmp("repo");
     git(&repo, &["init", "-q", "-b", "main"]);
 
@@ -1076,41 +1075,12 @@ fn impact_includes_partners_by_shared_commit_count() {
             .unwrap(),
     );
     assert!(
+        edges.contains(&"src/pair.rs".to_string()),
+        "the partner that rarely changes apart scores over the floor: {edges:?}"
+    );
+    assert!(
         !edges.contains(&"src/busy.rs".to_string()),
         "the rule writes no edge for the busy file: {edges:?}"
-    );
-
-    let r = core_api::repograph::impact(
-        &db,
-        &["src/api.rs".to_string()],
-        &std::collections::BTreeSet::new(),
-        &core_api::repograph::ImpactOptions::default(),
-    );
-    let named: Vec<(&str, Option<usize>)> = r.files[0]
-        .partners
-        .iter()
-        .map(|p| (p.path.as_str(), p.shared_commits))
-        .collect();
-    assert_eq!(
-        named,
-        vec![("src/pair.rs", None), ("src/busy.rs", Some(4))],
-        "the scored partner first, then the one only the commit counts see"
-    );
-
-    let text = core_api::repograph::render_impact(&r);
-    assert!(
-        text.contains("src/busy.rs (4 shared commits)"),
-        "the digest labels it a count, not a score:\n{text}"
-    );
-
-    // `why` says the same thing when asked about the pair the rule skipped.
-    let w = core_api::repograph::why(&db, "src/api.rs", "src/busy.rs");
-    assert!(w.links.is_empty(), "no rule edge to report");
-    assert_eq!(w.shared.as_ref().map(|s| s.count), Some(4));
-    assert!(
-        core_api::repograph::render_why(&w).contains("4 shared commits"),
-        "{}",
-        core_api::repograph::render_why(&w)
     );
 }
 
@@ -1740,23 +1710,16 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
         text.starts_with(core_api::digest::UNTRUSTED_FRAMING),
         "{text}"
     );
-    // The header names the repository, its size and the sha it is at — and no
-    // age, which is what would move between two prompts of one session.
+    // Since 0.7 an ingested store gets the same brief as any memory store: a
+    // header counting what is there, then the schema. No age, which is what
+    // would move between two prompts of one session.
     let header = text.lines().nth(1).unwrap();
-    let name = repo.file_name().unwrap().to_str().unwrap();
-    let sha = marker(&db_dir, "__mushroomdb_git_sync__").expect("a sync marker");
+    assert_eq!(header, "mushroomdb brief — 9 nodes · 21 edges · 5 labels");
+    assert!(!text.contains("ago"), "{text}");
     assert!(
-        header.starts_with(&format!(
-            "mushroomdb brief — {name} · 3 files · 3 symbols · "
-        )),
-        "{header}"
+        text.contains("\nlabels:\n  File (3) — "),
+        "the schema, led by the label with the most nodes: {text}"
     );
-    assert!(
-        header.ends_with(&format!("· synced {}", &sha[..7])),
-        "{header}"
-    );
-    assert!(!header.contains("ago"), "{header}");
-    assert!(text.contains("src/core.rs"), "{text}");
     // The last line names both doors, and the CLI one is runnable: `query`
     // takes a store, so the line has to carry one. This store was built by
     // `ingest-git`, and it is served the same listing as any other store, so
@@ -1816,9 +1779,8 @@ fn memory_store(name: &str) -> PathBuf {
 /// Binding: `run_brief` briefs a store with no `GitSync` marker with its
 /// schema, not the code graph's two rankings.
 ///
-/// The reach-line tests below cannot pin this: the reach line is computed
-/// before the dispatch, so a memory store sent to the code-graph renderer
-/// would still end on the right line.
+/// The reach-line tests below cannot pin this: the reach line is the same
+/// whichever renderer produced the text above it.
 #[test]
 fn the_brief_of_a_store_with_no_git_sync_marker_is_the_schema() {
     let db_dir = memory_store("brief-memory-dispatch");
@@ -1882,7 +1844,7 @@ fn the_reach_line_names_the_association_door_on_a_store_with_no_git_sync_marker(
 /// stopped being *listed*, and nothing failed. The list comes from the server
 /// crate itself ([`server::ASSOCIATION_TOOLS`]), so a listing that drops a
 /// tool this line names cannot pass silently again. Both store shapes are
-/// kept because `run_brief` still dispatches on the `GitSync` marker.
+/// kept so an ingested store is shown to get the same line as a memory one.
 #[test]
 fn the_reach_line_names_only_tools_its_surface_lists() {
     // The first word of each ` · `-separated clause of the MCP half — the half
@@ -1891,7 +1853,7 @@ fn the_reach_line_names_only_tools_its_surface_lists() {
     fn tools_named_in(reach: &str) -> Vec<String> {
         let mcp_half = reach.split(" or: ").next().expect("split yields one part");
         mcp_half
-            .split(core_api::repograph::render::SEP)
+            .split(core_api::digest::SEP)
             .filter_map(|clause| clause.split_whitespace().next())
             .filter(|word| {
                 !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase() || c == '_')

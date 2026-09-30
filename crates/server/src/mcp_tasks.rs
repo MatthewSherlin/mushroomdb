@@ -41,15 +41,15 @@
 //! whatever its writers put there: an `ingest-git` store carries author names,
 //! paths, commit subjects and doc comments, and a memory store carries notes.
 //! [`ok`] therefore stamps every reply with
-//! [`repograph::UNTRUSTED_FRAMING`], the same marker
+//! [`core_api::digest::UNTRUSTED_FRAMING`], the same marker
 //! `recall_digest` puts on its own digest, so an assistant is told to read the
 //! lines under it as data before it reads any of them. The renderers already
 //! sanitize each line; the framing is what says whose words they are.
 
 use crate::mcp::{graph_err_msg, CallOutcome};
+use core_api::digest::{self, MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING};
 use core_api::explain_digest::{explain_with_evidence, predicate_summary, render_explain};
 use core_api::memory::remember::{remember, EntityIn, FactIn, RememberInput, NOTE_KINDS};
-use core_api::repograph::{self, MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING};
 use core_api::{json_to_value, Dir, Explanation, GraphError, SharedDb, Value};
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, BTreeSet};
@@ -154,7 +154,7 @@ fn ok<T: serde::Serialize>(
 /// two of them.
 ///
 /// Newline and tab survive; every other control character does not. That is
-/// the one place this differs from [`repograph::sanitize`], and the reason is
+/// the one place this differs from [`digest::sanitize`], and the reason is
 /// what the two channels are. A digest is line-structured, so a newline inside
 /// a value could forge a heading or an extra hit and has to go. A JSON value is
 /// delimited by the grammar, so a newline inside one cannot escape it — and
@@ -282,12 +282,12 @@ const DEFAULT_EDGE_LIMIT: usize = 10;
 /// partners; a reply is a screen, not a dump.
 const MAX_EDGE_LIMIT: usize = 100;
 
-/// Longest edge digest, in lines. Wider than [`repograph::MAX_TOOL_LINES`]
+/// Longest edge digest, in lines. Wider than [`digest::MAX_TOOL_LINES`]
 /// because this listing is the reply an assistant reads instead of calling
 /// `query` twenty times, and a default `limit` over four edge types already
 /// runs past twenty-five lines. The header counts every edge whatever is
 /// printed, so a capped digest still says how much it is not showing.
-const MAX_EDGE_LINES: usize = repograph::MAX_MAP_LINES;
+const MAX_EDGE_LINES: usize = digest::MAX_MAP_LINES;
 
 /// Cap a grouped digest at [`MAX_EDGE_LINES`], saying so when it cuts.
 ///
@@ -299,7 +299,7 @@ fn cap_grouped(out: &str) -> String {
     if out.lines().count() <= MAX_EDGE_LINES {
         return out.to_string();
     }
-    let mut capped = repograph::cap_lines(out, MAX_EDGE_LINES);
+    let mut capped = digest::cap_lines(out, MAX_EDGE_LINES);
     capped.push_str(&format!(
         "… listing capped at {MAX_EDGE_LINES} lines; pass edge_type or all_of for the whole set\n"
     ));
@@ -458,12 +458,12 @@ fn node_edge_groups(
 /// predicate.
 ///
 /// Edge types, partner keys, rule names and predicate fields are all graph
-/// content, so every one of them goes through [`repograph::sanitize`] before
+/// content, so every one of them goes through [`digest::sanitize`] before
 /// it reaches a line-structured digest.
 fn render_edge_groups(key: &str, total: usize, groups: &[EdgeGroup]) -> String {
     let mut out = format!(
         "mushroomdb edges — {}: {total} edge(s) over {} type(s)\n",
-        repograph::sanitize(key),
+        digest::sanitize(key),
         groups.len()
     );
     if groups.is_empty() {
@@ -473,14 +473,14 @@ fn render_edge_groups(key: &str, total: usize, groups: &[EdgeGroup]) -> String {
     for g in groups {
         out.push_str(&format!(
             "{} ({})\n",
-            repograph::sanitize(&g.edge_type),
+            digest::sanitize(&g.edge_type),
             g.count
         ));
         for e in &g.listed {
             let arrow = if e.outgoing { "→" } else { "←" };
-            out.push_str(&format!("  {arrow} {}", repograph::sanitize(&e.other)));
+            out.push_str(&format!("  {arrow} {}", digest::sanitize(&e.other)));
             if let Some(rule) = &e.rule {
-                out.push_str(&format!("  rule {}", repograph::sanitize(rule)));
+                out.push_str(&format!("  rule {}", digest::sanitize(rule)));
             }
             if let Some(score) = e.score {
                 out.push_str(&format!("  score {score:.2}"));
@@ -610,7 +610,7 @@ fn unknown_edge_type(db: &SharedDb, named: &[String]) -> Option<String> {
     let listed: Vec<String> = known
         .iter()
         .take(MAX_KNOWN_EDGE_TYPES)
-        .map(|t| repograph::sanitize(t))
+        .map(|t| digest::sanitize(t))
         .collect();
     let rest = known.len().saturating_sub(listed.len());
     let more = if rest > 0 {
@@ -620,7 +620,7 @@ fn unknown_edge_type(db: &SharedDb, named: &[String]) -> Option<String> {
     };
     let names = missing
         .iter()
-        .map(|t| repograph::sanitize(t))
+        .map(|t| digest::sanitize(t))
         .collect::<Vec<_>>()
         .join(", ");
     Some(if known.is_empty() {
@@ -723,7 +723,7 @@ fn partner_dir_arg(args: &Js) -> Result<Dir, String> {
             Some(s) if s.eq_ignore_ascii_case("any") || s.eq_ignore_ascii_case("both") => {
                 Ok(Dir::Both)
             }
-            Some(other) => Err(format!("unknown direction: {}", repograph::sanitize(other))),
+            Some(other) => Err(format!("unknown direction: {}", digest::sanitize(other))),
             None => Err("direction must be a string".into()),
         },
     }
@@ -783,13 +783,13 @@ fn partners_of_type(rows: &[PartnerEdge], edge_type: &str, dir: Dir) -> (usize, 
 /// Append `keys` as `a, b, c`, continuing `lead` and wrapping at
 /// [`KEY_WRAP_COLUMNS`].
 ///
-/// Every key goes through [`repograph::sanitize`] — a key is graph content,
+/// Every key goes through [`digest::sanitize`] — a key is graph content,
 /// and these lines are line-structured digests like any other.
 fn push_key_list(out: &mut String, lead: &str, keys: &[String]) {
     let mut line = lead.to_string();
     let mut empty = line.is_empty();
     for (i, k) in keys.iter().enumerate() {
-        let k = repograph::sanitize(k);
+        let k = digest::sanitize(k);
         let comma = usize::from(i + 1 < keys.len());
         if !empty && line.len() + 1 + k.len() + comma > KEY_WRAP_COLUMNS {
             out.push_str(&line);
@@ -836,13 +836,13 @@ fn render_all_of(
 ) -> String {
     let types = all_of
         .iter()
-        .map(|t| repograph::sanitize(t))
+        .map(|t| digest::sanitize(t))
         .collect::<Vec<_>>()
         .join(", ");
     let when = at.map_or_else(String::new, |a| format!(" as of commit {a}"));
     let mut out = format!(
         "mushroomdb {tool} — {}{when} — partners linked by all of {types}: {}\n",
-        repograph::sanitize(key),
+        digest::sanitize(key),
         partners.len()
     );
     if partners.is_empty() {
@@ -896,10 +896,8 @@ fn render_type_partners(
         out.push_str("  none\n");
         return out;
     }
-    let rule = rule.map_or_else(String::new, |r| {
-        format!(", rule {}", repograph::sanitize(r))
-    });
-    let lead = format!("{} ({edges}{rule}):", repograph::sanitize(edge_type));
+    let rule = rule.map_or_else(String::new, |r| format!(", rule {}", digest::sanitize(r)));
+    let lead = format!("{} ({edges}{rule}):", digest::sanitize(edge_type));
     push_partner_block(&mut out, &lead, partners, limit);
     out
 }
@@ -1017,7 +1015,7 @@ fn tool_node_edges(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         return ok(json_out, &report, |_| {
             let header = format!(
                 "mushroomdb edges — {}: {count} edge(s) over {} type(s)\n",
-                repograph::sanitize(key),
+                digest::sanitize(key),
                 usize::from(count > 0)
             );
             render_type_partners(header, edge_type, count, rule.as_deref(), &partners, limit)
@@ -1228,7 +1226,7 @@ fn edges_at_groups(
 fn render_edges_at(key: &str, at: u64, total: usize, groups: &[EdgeAtGroup]) -> String {
     let mut out = format!(
         "mushroomdb edges_at — {} as of commit {at}: {total} edge(s)\n",
-        repograph::sanitize(key)
+        digest::sanitize(key)
     );
     if groups.is_empty() {
         out.push_str("  none\n");
@@ -1237,14 +1235,14 @@ fn render_edges_at(key: &str, at: u64, total: usize, groups: &[EdgeAtGroup]) -> 
     for g in groups {
         out.push_str(&format!(
             "{} ({})\n",
-            repograph::sanitize(&g.edge_type),
+            digest::sanitize(&g.edge_type),
             g.count
         ));
         for e in &g.listed {
             let arrow = if e.outgoing { "→" } else { "←" };
-            out.push_str(&format!("  {arrow} {}", repograph::sanitize(&e.other)));
+            out.push_str(&format!("  {arrow} {}", digest::sanitize(&e.other)));
             if let Some(rule) = &e.rule {
-                out.push_str(&format!("  rule {}", repograph::sanitize(rule)));
+                out.push_str(&format!("  rule {}", digest::sanitize(rule)));
             }
             out.push('\n');
         }
@@ -1396,7 +1394,7 @@ fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         return ok(json_out, &report, |_| {
             let header = format!(
                 "mushroomdb edges_at — {} as of commit {at}: {count} edge(s)\n",
-                repograph::sanitize(&self_key)
+                digest::sanitize(&self_key)
             );
             render_type_partners(header, edge_type, count, rule.as_deref(), &partners, limit)
         });
@@ -1512,23 +1510,23 @@ fn render_what_if_groups(out: &mut String, groups: &[WhatIfGroup], limit: usize)
     for g in groups {
         out.push_str(&format!(
             "  {} ({})\n",
-            repograph::sanitize(&g.edge_type),
+            digest::sanitize(&g.edge_type),
             g.count
         ));
         for l in g.lines.iter().take(limit) {
             if l.incident {
                 let arrow = if l.outgoing { "→" } else { "←" };
                 let other = if l.outgoing { &l.dst } else { &l.src };
-                out.push_str(&format!("    {arrow} {}", repograph::sanitize(other)));
+                out.push_str(&format!("    {arrow} {}", digest::sanitize(other)));
             } else {
                 out.push_str(&format!(
                     "    {} → {}",
-                    repograph::sanitize(&l.src),
-                    repograph::sanitize(&l.dst)
+                    digest::sanitize(&l.src),
+                    digest::sanitize(&l.dst)
                 ));
             }
             if let Some(rule) = &l.rule {
-                out.push_str(&format!("  rule {}", repograph::sanitize(rule)));
+                out.push_str(&format!("  rule {}", digest::sanitize(rule)));
             }
             out.push('\n');
         }
@@ -1570,9 +1568,9 @@ fn what_if_header(
 ) -> String {
     format!(
         "mushroomdb what_if — {}.{} = {}: would lose {lost_total}, would gain {gained_total}\n",
-        repograph::sanitize(key),
-        repograph::sanitize(field),
-        repograph::sanitize(&value.to_string()),
+        digest::sanitize(key),
+        digest::sanitize(field),
+        digest::sanitize(&value.to_string()),
     )
 }
 
@@ -1618,10 +1616,8 @@ fn render_what_if_keys_only(
         let rule = side
             .iter()
             .find_map(|e| e.rule.as_deref())
-            .map_or_else(String::new, |r| {
-                format!(", rule {}", repograph::sanitize(r))
-            });
-        let lead = format!("{} ({}{rule}):", repograph::sanitize(edge_type), side.len());
+            .map_or_else(String::new, |r| format!(", rule {}", digest::sanitize(r)));
+        let lead = format!("{} ({}{rule}):", digest::sanitize(edge_type), side.len());
         push_partner_block(&mut out, &lead, &partners, limit);
     }
     out
@@ -1646,7 +1642,7 @@ fn tool_what_if(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let Some(value) = json_to_value(raw.clone()) else {
         return CallOutcome::ToolErr(format!(
             "value is not a supported value type: {}",
-            repograph::sanitize(&raw.to_string())
+            digest::sanitize(&raw.to_string())
         ));
     };
 
@@ -1745,7 +1741,7 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
             String::new(),
             format!(
                 "mushroomdb recall — nothing matches {}\n",
-                repograph::sanitize(&topic)
+                digest::sanitize(&topic)
             ),
         ),
         // Not the same answer as "no match": nothing here can ever match, and
@@ -1906,7 +1902,7 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     };
     match result {
         Ok(report) => {
-            let mut rendered = format!("remembered {}\n", repograph::sanitize(&report.note));
+            let mut rendered = format!("remembered {}\n", digest::sanitize(&report.note));
             if report.created > 0 || report.matched > 0 {
                 rendered.push_str(&format!(
                     "entities  {} created, {} matched\n",
@@ -1922,7 +1918,7 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                     report
                         .provisional
                         .iter()
-                        .map(|k| repograph::sanitize(k))
+                        .map(|k| digest::sanitize(k))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
@@ -1934,7 +1930,7 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                     report
                         .provisional_capped
                         .iter()
-                        .map(|k| repograph::sanitize(k))
+                        .map(|k| digest::sanitize(k))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));

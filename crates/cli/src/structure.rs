@@ -55,7 +55,6 @@ use code_extract::{
     call_lookup_names, extract, indexed_under, resolve_call, resolve_import, resolve_mention,
     CallScope, FileFacts, SymbolIndex, MAX_FILE_BYTES,
 };
-use core_api::repograph::rules::concept_sources_rule;
 use core_api::{default_max_edges, BatchOp, Predicate, RuleDef, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -121,9 +120,9 @@ pub struct StructureReport {
 ///
 /// Exported so a test — or a store built some other way — can recreate exactly
 /// the rule set these props expect; [`ingest_git_schema`] declares all of them
-/// on the store `ingest-git` creates. The `concept_sources` definition comes
-/// from [`core_api::repograph::rules`]; nothing in 0.7 writes the
-/// `Concept.source_files` it matches, so it derives no edge.
+/// on the store `ingest-git` creates. Nothing in 0.7 writes the
+/// `Concept.source_files` that [`concept_sources_rule`] matches, so it derives
+/// no edge.
 ///
 /// No `about_<label>` rule. `remember` writes `Note.about` *and* inserts the
 /// `ABOUT` edges itself; a rule deriving the same edges would own them, and the
@@ -138,6 +137,23 @@ pub fn rules() -> Vec<RuleDef> {
         key_rule("mentions", "File", "File", "mentions", "MENTIONS"),
         concept_sources_rule(),
     ]
+}
+
+// The `concept_sources` rule definition, moved here in 0.7 when `repograph`
+// was deleted. It was shared because `repograph::remember` declared the rules
+// it sat beside; that no longer exists, and `ingest-git` is the only writer
+// left, so it lives next to it.
+
+/// `Concept.source_files` → `DESCRIBED_IN` edges to `File`.
+#[must_use]
+pub fn concept_sources_rule() -> RuleDef {
+    key_rule(
+        "concept_sources",
+        "Concept",
+        "File",
+        "source_files",
+        "DESCRIBED_IN",
+    )
 }
 
 /// A `KeyMatch` rule with the engine's default fan-out for the predicate,
@@ -838,6 +854,15 @@ mod tests {
                 def.name
             );
         }
+    }
+
+    #[test]
+    fn concept_sources_rule_is_concept_to_file() {
+        let r = concept_sources_rule();
+        assert_eq!(r.name, "concept_sources");
+        assert_eq!(r.src_label, "Concept");
+        assert_eq!(r.dst_label, "File");
+        assert_eq!(r.edge_type, "DESCRIBED_IN");
     }
 
     #[test]

@@ -11,7 +11,6 @@ pub mod install;
 pub mod recall;
 pub mod structure;
 
-use core_api::repograph;
 #[cfg(test)]
 use core_api::restore::holds_a_store;
 /// Re-exported where it has always been named: `cli::RestoreOutcome`.
@@ -1963,13 +1962,7 @@ fn parse_algo_dir(val: &str) -> Result<AlgoDir, String> {
 /// the repository is. Opened read-only like every other question.
 pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
     let db = open_for_reading(db_dir)?;
-    let code_graph = db.has_node(ingest_git::SYNC_KEY);
     let reach = reach_line(db_dir);
-    if code_graph {
-        // Still the code graph's own two rankings, until Task 9 deletes them.
-        let report = repograph::brief(&db, &repograph::BriefOptions::default());
-        return Ok(repograph::render_brief(&report, &reach));
-    }
     let b = core_api::memory::brief::brief(&db, &core_api::memory::brief::BriefOptions::default());
     let mut text = core_api::memory::brief::render(&b, &reach);
     // Said here because a brief is computed once per session and cached,
@@ -2022,7 +2015,7 @@ fn reach_line(db_dir: &Path) -> String {
     let tools = format!(
         "explain_association <a> <b>{sep}query '<cypher>' (MCP tools; add role: <name> \
          or namespace: <ns> to narrow what it sees){sep}or:",
-        sep = repograph::render::SEP
+        sep = core_api::digest::SEP
     );
     let shell = format!("{bin} query {db} '<cypher>'");
     match install::delivery_for_store(db_dir) {

@@ -19,7 +19,7 @@
 //! `arguments`, and every `GraphError` from core-api (bad Cypher, ingest
 //! shape, unknown key, …).
 
-use core_api::repograph::UNTRUSTED_FRAMING;
+use core_api::digest::UNTRUSTED_FRAMING;
 use core_api::{Direction, SharedDb, Value, ViewDef, ViewSource};
 use serde_json::{json, Value as Js};
 use server::run_mcp_stdio;

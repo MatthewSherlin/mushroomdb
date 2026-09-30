@@ -16,9 +16,10 @@
 //! ```
 //!
 //! Figures quoted in the 0.6.10 changelog came from this harness on an Apple
-//! Silicon laptop. They are a ratio between three predicates measured in one
-//! process, not a portable number: re-run it rather than trusting the absolute
-//! microseconds, and expect the *ordering* to hold while the magnitudes move.
+//! Silicon laptop. They are a ratio between three predicates and the shipped
+//! function, measured in one process, not a portable number: re-run it rather
+//! than trusting the absolute microseconds, and expect the *ordering* to hold
+//! while the magnitudes move.
 
 use core_api::digest::sanitize;
 use std::time::Instant;

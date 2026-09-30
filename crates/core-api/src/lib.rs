@@ -9,7 +9,6 @@ pub mod mask;
 pub mod memory;
 pub mod memory_schema;
 pub mod reader;
-pub mod repograph;
 pub mod restore;
 pub mod roles;
 pub mod schema;

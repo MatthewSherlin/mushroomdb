@@ -27,3 +27,9 @@ further runs will be committed, because the question it asks has been answered:
 
 The committed summaries are the record. The code-graph door they measured is deprecated in v0.6.4
 and removed in 0.7.
+
+**0.7: the code suite is retired with the door it measured.** The run that deprecated the door is
+[`20260910T000418Z`](results/20260910T000418Z/summary.md). `--suite code` has no door left to measure
+and is not run again; its summaries stay as the record. The harness files it shares with
+`--suite association` (`run.py`, `subjects.py`, `report.py`, `ground_truth.py`) stay, because that
+suite still runs through them.

@@ -58,7 +58,7 @@ const HIDDEN_PROPS: [&str; 1] = ["embedding"];
 /// lower bounds, and a partial brief is worth more at the start of a session
 /// than none.
 ///
-/// Both surfaces are budgeted, and the memory one needs it more: its work is
+/// It needs the budget: its work is
 /// [`GraphDb::wal_total_commits`], which re-reads the WAL — seconds on a store
 /// nobody has snapshotted — plus two passes whose length is the store's.
 pub(crate) const RANK_BUDGET: Duration = Duration::from_secs(3);
@@ -726,10 +726,8 @@ fn what_if_call(key: &str, field: &str, intersection: &Option<(Vec<String>, Stri
 pub const MAX_BRIEF_BYTES: usize = 4_000;
 
 /// The one line a store with nothing in it at all gets as a session opens:
-/// what is missing, and the command that fixes it. The same answer
-/// [`EMPTY_MAP`](crate::repograph::render::EMPTY_MAP) gives, for the same
-/// reason — there is nothing to be central *in*, and no point naming a way to
-/// reach an empty graph.
+/// what is missing, and the command that fixes it. There is nothing to be
+/// central *in*, and no point naming a way to reach an empty graph.
 ///
 /// Not marked with [`UNTRUSTED_FRAMING`], unlike every brief with a graph
 /// behind it: not one byte of this line came out of a store, so there is

@@ -11,6 +11,7 @@
 #   2. No skill or rules file tells an agent to reach for the graph before or
 #      instead of a search. That instruction is what the benchmark measured and
 #      it is not worth what it cost.
+#   3. The code-graph door removed in 0.7 is not referenced again from source.
 #
 # The claim scan covers every product-facing surface: the README, the llms
 # files, the plugin manifests and their templates, every page under docs/site
@@ -93,6 +94,32 @@ scan_grep_files() {
 
 scan_claim_files
 scan_grep_files
+
+# Rule 3: the code-graph door was removed in 0.7 and does not come back by
+# accident. A deprecated feature that still ships is a feature that still has
+# to work, which is why this runs instead of a comment asking people to
+# remember.
+#
+# Comment lines are skipped: surviving doc comments say what moved out of
+# `repograph` in 0.7, and a gate that fires on history is a gate someone
+# disables. A declaration (`pub mod repograph;`) or a path (`repograph::`) in
+# code is not a comment and is caught. `crates/code-extract/tests/` is skipped
+# because its fixtures hold `repograph::render::sanitize` as a parser input,
+# not a reference to anything.
+#
+# The seven tool names are not scanned for: `map`, `why`, `context`, `owners`,
+# `explore` and `sync` are ordinary words and `why` is a live CLI subcommand.
+# The MCP handshake test pins the tool listing instead.
+RETIRED_SOURCE=(repograph code_extract::repograph)
+for pat in "${RETIRED_SOURCE[@]}"; do
+  hits="$(git grep -n -- "$pat" -- 'crates/*' ':!crates/code-extract/tests/*' 2>/dev/null \
+          | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+  if [[ -n "$hits" ]]; then
+    echo "check-claims.sh: '$pat' was removed in 0.7 and is referenced again:" >&2
+    printf '%s\n' "$hits" >&2
+    fail=1
+  fi
+done
 
 # The stub-docstring drift check. Separate script, one gate: a caller reading a
 # thinner contract than the binding carries is the same class of defect as a

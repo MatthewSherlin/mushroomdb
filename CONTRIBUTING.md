@@ -41,31 +41,13 @@ walks no directory and touches no database, so everything it knows about the
 surrounding tree arrives through caller-supplied closures. Keep it that way; the
 filesystem side lives in `crates/cli/src/structure.rs`.
 
-### Code-graph gate (commits touching `crates/code-extract`, `crates/cli`, or the repograph tools)
+### Code-graph gate — retired in 0.7
 
-```text
-cargo build --release -p mushroomdb-cli
-MUSHROOMDB=target/release/mushroomdb bash scripts/acceptance-0.6.sh
-```
-
-Seven steps in a throwaway `git worktree`, so no tracked file in your checkout is
-ever modified: ingest floors read back with Cypher, `map` under 40 lines, two
-independent ingests exporting identical JSONL, an added import producing a direct
-`IMPORTS` edge with its line number and a reverted import retracting it, the
-dirty-tree nudge, 20 concurrent `touch` processes against a live MCP server
-followed by `verify`, and a timing table.
-
-A debug binary works and is the default, but its timings are 6x the release
-build's, so the two latency assertions print `SKIP` instead of asserting unless
-the binary path contains `/target/release/` or `MUSHROOMDB_RELEASE=1` is set. The
-`code-graph` CI job runs the release form with `TOUCH_BUDGET_MS: 600` and
-`MAP_BUDGET_MS: 3000` — 3x the local targets, because a shared runner is too
-noisy to gate on the real figure.
-
-`bash scripts/bench-code-graph.sh` produces the published table. It needs the
-network for its second row (a shallow clone) and skips that row with a note when
-offline. `BENCH_REPOS` adds further clone URLs; `CLONE_DEPTH` overrides the depth.
-Both scripts need `python3` and are bash 3.2 clean.
+The code-graph door and its acceptance script went in 0.7. The one leg of that
+script that was not about code graphs, twenty concurrent writers against a live
+server followed by `verify`, is now `crates/cli/tests/mcp_concurrency.rs` and
+runs in `cargo test --workspace`. `bash scripts/check-claims.sh` fails if the
+`repograph` module is referenced again.
 
 ### Plugin gate (commits touching `packaging/plugin/`, `scripts/plugin-templates/`, or the skill)
 

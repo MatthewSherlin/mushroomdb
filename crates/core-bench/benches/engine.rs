@@ -364,12 +364,12 @@ fn engine_benches(c: &mut Criterion) {
 
 // ── Store open ───────────────────────────────────────────────────────────────
 //
-// Hook bodies (`touch`, `recall`) open the store on every prompt and every
-// edit, so open time is latency the user feels rather than a startup cost
+// Hook bodies (`recall`, `brief`) open the store on every prompt and every
+// session, so open time is latency the user feels rather than a startup cost
 // amortised over a long-lived process. Both benches build the same store; they
 // differ only in whether a snapshot stands in for the log.
 
-/// A store shaped like a code graph: ~20k nodes, ~13k edges, 400 nodes carrying
+/// A store shaped like an `ingest-git` one: ~20k nodes, ~13k edges, 400 nodes carrying
 /// a 4 KB body, and five rules — two of them over the list-valued property that
 /// the co-change and authorship rules key on.
 fn open_shaped_store(dir: &std::path::Path) {
