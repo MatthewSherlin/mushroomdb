@@ -2141,12 +2141,15 @@ pub fn run_map(db_dir: &Path, json: bool) -> Result<String, CliError> {
 /// the repository is. Opened read-only like every other question.
 pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
     let db = open_for_reading(db_dir)?;
-    let report = repograph::brief(&db, &repograph::BriefOptions::default());
     let code_graph = db.has_node(ingest_git::SYNC_KEY);
-    Ok(repograph::render_brief(
-        &report,
-        &reach_line(db_dir, code_graph),
-    ))
+    let reach = reach_line(db_dir, code_graph);
+    if code_graph {
+        // Still the code graph's own two rankings, until Task 9 deletes them.
+        let report = repograph::brief(&db, &repograph::BriefOptions::default());
+        return Ok(repograph::render_brief(&report, &reach));
+    }
+    let b = core_api::memory::brief::brief(&db, &core_api::memory::brief::BriefOptions::default());
+    Ok(core_api::memory::brief::render(&b, &reach))
 }
 
 /// The brief's last line: how to reach the graph from this session.

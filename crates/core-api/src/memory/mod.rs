@@ -4,5 +4,6 @@
 //! `repograph` — the code-graph module 0.7 deletes. They are the memory
 //! product's core, so they move here first and the old module is removed
 //! afterwards.
+pub mod brief;
 pub mod recall;
 pub mod remember;

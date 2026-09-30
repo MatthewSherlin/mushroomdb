@@ -59,7 +59,7 @@ mod why;
 pub use crate::digest::{
     cap_lines, sanitize, MAX_MAP_LINES, MAX_OUTPUT_BYTES, MAX_TOOL_LINES, SEP, UNTRUSTED_FRAMING,
 };
-pub use brief::{brief, BriefOptions, BriefReport, EdgeTypeBrief, LabelBrief, Recipe, SchemaBrief};
+pub use brief::{brief, BriefOptions, BriefReport};
 pub use concepts::stale_concepts;
 pub use context::{
     context, context_with, named_symbols, CallSites, ContextOptions, ContextReport, Target,

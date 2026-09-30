@@ -1729,7 +1729,7 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
     let text = cli::run_brief(&db_dir).expect("brief");
     assert_eq!(text, cli::run_brief(&db_dir).expect("brief"));
     assert!(
-        text.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        text.len() <= core_api::memory::brief::MAX_BRIEF_BYTES,
         "{} bytes",
         text.len()
     );
@@ -1737,7 +1737,7 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
     // with the marker every digest rendered out of a store opens with — inside
     // the budget asserted above, not on top of it.
     assert!(
-        text.starts_with(core_api::repograph::UNTRUSTED_FRAMING),
+        text.starts_with(core_api::digest::UNTRUSTED_FRAMING),
         "{text}"
     );
     // The header names the repository, its size and the sha it is at — and no
