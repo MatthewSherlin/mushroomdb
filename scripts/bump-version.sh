@@ -89,7 +89,7 @@ while IFS= read -r f; do
     if [[ $CHECK -eq 1 ]]; then report "$f" "an inter-crate pin" "$cur"; else :; fi
   done < <(perl -ne 'print "$1\n" if /path = "\.\.\/[^"]*", version = "([^"]*)"/' "$f")
   [[ $CHECK -eq 1 ]] || perl -0pi -e 's/(path = "\.\.\/[^"]*", version = ")[^"]*(")/${1}'"$NEW"'${2}/g' "$f"
-done < <(ls crates/*/Cargo.toml)
+done < <(ls crates/*/Cargo.toml bindings/*/Cargo.toml)
 
 # 3. `"version": "X"` in a JSON manifest. `server.json` carries two.
 for f in "${json_manifests[@]}"; do

@@ -440,3 +440,7 @@ jobs:
       # 0.6.10), and an inter-crate pin left behind, which resolves under caret
       # until the minor bumps and then fails every publish in the sequence.
       - run: bash scripts/bump-version.sh --check
+      # The gate's own blind spot: until 0.7 it enumerated crates/*/Cargo.toml
+      # only, so the 0.6.10 pins in bindings/python were invisible and --check
+      # reported OK on a tree that could not publish 0.7.0.
+      - run: bash scripts/tests/test-bump-version-scope.sh
