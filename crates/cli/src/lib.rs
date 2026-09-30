@@ -310,10 +310,13 @@ pub enum Command {
         /// Build only this rule; `None` builds every pending one.
         rule: Option<String>,
     },
-    /// Apply a JSON schema file idempotently (`schema apply <db-dir> <schema.json>`).
+    /// Apply a JSON schema file idempotently (`schema apply <db-dir> <schema.json>`),
+    /// or the built-in memory schema (`schema apply <db-dir> --memory-defaults`).
     SchemaApply {
         db_dir: PathBuf,
-        schema_file: PathBuf,
+        /// `None` when `--memory-defaults` was given instead.
+        schema_file: Option<PathBuf>,
+        memory_defaults: bool,
     },
     /// Migrate an old-format snapshot to the current version and keep `.bak`.
     Migrate {
@@ -615,6 +618,9 @@ Usage:
                                    --ensure-gitignore adds the database directory to the repo's .gitignore
                                    with no --exclude the defaults apply: target/ node_modules/ dist/ .git/ *.lock *.min.js
   mushroomdb schema apply <db-dir> <schema.json>
+  mushroomdb schema apply <db-dir> --memory-defaults
+                                   applies the built-in memory schema to an existing store;
+                                   full-text on a populated store rebuilds the index at every open from here on
   mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
   mushroomdb algo wcc <db-dir> [--top N]
   mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
@@ -1743,11 +1749,13 @@ fn parse_schema(args: &[&str]) -> Result<Command, String> {
 fn parse_schema_apply(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut schema_file = None;
+    let mut memory_defaults = false;
     for a in args {
-        if a.starts_with('-') {
+        if *a == "--memory-defaults" {
+            memory_defaults = true;
+        } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
-        }
-        if db_dir.is_none() {
+        } else if db_dir.is_none() {
             db_dir = Some(PathBuf::from(*a));
         } else if schema_file.is_none() {
             schema_file = Some(PathBuf::from(*a));
@@ -1756,11 +1764,22 @@ fn parse_schema_apply(args: &[&str]) -> Result<Command, String> {
         }
     }
     let db_dir = db_dir.ok_or_else(|| "schema apply requires <db-dir>".to_string())?;
+    if memory_defaults {
+        if schema_file.is_some() {
+            return Err("schema apply --memory-defaults takes no schema file argument".to_string());
+        }
+        return Ok(Command::SchemaApply {
+            db_dir,
+            schema_file: None,
+            memory_defaults: true,
+        });
+    }
     let schema_file =
         schema_file.ok_or_else(|| "schema apply requires <schema.json>".to_string())?;
     Ok(Command::SchemaApply {
         db_dir,
-        schema_file,
+        schema_file: Some(schema_file),
+        memory_defaults: false,
     })
 }
 
@@ -1790,6 +1809,40 @@ pub fn run_schema_apply(db_dir: &Path, schema_file: &Path) -> Result<String, Cli
     if diff.created.is_empty() && diff.updated.is_empty() && diff.unchanged.is_empty() {
         let _ = writeln!(out, "schema applied: nothing to do (empty schema)");
     }
+    Ok(out)
+}
+
+/// `mushroomdb schema apply <db> --memory-defaults`
+///
+/// Applies `core_api::memory_schema::memory_defaults()`. Kept separate from
+/// `run_schema_apply` because it takes no schema file, and separate from
+/// `open` because declaring full-text on a populated store rebuilds the index
+/// at open — the caller is told what it will cost before it happens.
+pub fn run_schema_apply_memory_defaults(db_dir: &Path) -> Result<String, CliError> {
+    let mut db = GraphDb::open(db_dir)?;
+    let before = db.stats();
+    let diff = db.apply_schema(&core_api::memory_schema::memory_defaults())?;
+    let mut out = String::new();
+    if diff.created.is_empty() && diff.updated.is_empty() {
+        let _ = writeln!(out, "schema apply: already current, nothing to do");
+        return Ok(out);
+    }
+    let _ = writeln!(
+        out,
+        "schema apply: {} created, {} updated, {} unchanged",
+        diff.created.len(),
+        diff.updated.len(),
+        diff.unchanged.len()
+    );
+    for name in diff.created.iter().chain(diff.updated.iter()) {
+        let _ = writeln!(out, "  {name}");
+    }
+    let _ = writeln!(
+        out,
+        "note: {} live nodes are now full-text indexed; the index rebuilds at \
+         every open from here on.",
+        before.nodes_live
+    );
     Ok(out)
 }
 
@@ -2642,6 +2695,9 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
 
     {
         let mut w = db.write();
+        // A demo store is the first store most readers open. Declare the
+        // memory schema before the first write so `recall` can answer on it.
+        w.apply_schema(&core_api::memory_schema::memory_defaults())?;
         for (label, json) in [
             ("Org", org_json()),
             ("Project", project_json()),
@@ -2732,10 +2788,6 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
             via_dir: None,
             namespace: None,
         })?;
-        // Name lookup for `mushroomdb recall`. Adds no nodes or edges.
-        for (label, field) in [("Org", "name"), ("Project", "name"), ("Person", "name")] {
-            w.enable_fulltext(label, field)?;
-        }
     }
 
     let r = db.read();
@@ -3970,11 +4022,18 @@ mod tests {
             ]
         );
 
-        // `recall` needs a name index; enabling it adds no nodes, edges or rules.
+        // `recall` needs a name index; the memory schema applied at store
+        // creation adds it, plus every other memory-entity label — no nodes,
+        // edges or rules.
         let db = SharedDb::open(&dir).expect("reopen demo");
         assert_eq!(
             db.read().fulltext_pairs(),
             vec![
+                ("Concept".to_string(), "name".to_string()),
+                ("Concept".to_string(), "summary".to_string()),
+                ("Entity".to_string(), "name".to_string()),
+                ("Event".to_string(), "name".to_string()),
+                ("Note".to_string(), "text".to_string()),
                 ("Org".to_string(), "name".to_string()),
                 ("Person".to_string(), "name".to_string()),
                 ("Project".to_string(), "name".to_string()),
