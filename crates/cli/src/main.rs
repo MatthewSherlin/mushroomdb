@@ -643,7 +643,23 @@ fn run_serve(
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async {
+        // Same guard as `run_mcp`: checked before `open` creates the
+        // directory's files, so it tells a brand-new store from one this
+        // invocation is merely reopening (or one `--demo-if-empty` /
+        // `--restore-from` already populated above, in which case this is
+        // already `true` and nothing here re-declares anything). Declaring
+        // full-text on a populated store rebuilds the index at open (227 ms
+        // vs. 3.8 ms with none, ledger row 36), so an existing store is never
+        // touched here.
+        let is_new_store = !core_api::restore::holds_a_store(&db_dir);
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
+        if is_new_store {
+            // The first store most HTTP callers open. Declare the memory
+            // schema before the first write so `recall` can answer on it.
+            db.write()
+                .apply_schema(&core_api::memory_schema::memory_defaults())
+                .map_err(|e| e.to_string())?;
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Some(period) = snapshot_every {
             let db_snap = db.clone();

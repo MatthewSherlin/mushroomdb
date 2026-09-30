@@ -106,13 +106,16 @@ pub struct RememberReport {
     pub created: usize,
     /// `about` keys and entities that already existed.
     pub matched: usize,
-    /// Derived edges the rules produced for this commit — edges the engine's
-    /// rule provenance attributes to a rule, never one this call inserted
-    /// itself (`ABOUT`, a fact's own edge, or a provisional stub have no
-    /// rule and never count here). `memory_defaults()` ships with zero
-    /// rules (`SAME_AS` arrives in a later plan), so this is always `0`
-    /// against a plain memory store today; it becomes meaningful once a
-    /// rule exists that could fire on this commit's writes.
+    /// Derived edges the rules produced for this commit, incident on the
+    /// *note* — edges the engine's rule provenance attributes to a rule,
+    /// never one this call inserted itself (`ABOUT`, a fact's own edge, or a
+    /// provisional stub have no rule and never count here). `memory_defaults()`
+    /// ships with zero rules (`SAME_AS` arrives in a later plan), so this is
+    /// `0` against a plain memory store today — and it stays structurally `0`
+    /// for the foreseeable future even once `SAME_AS` exists: that rule is
+    /// Person→Person, never incident on a note, so nothing it derives is
+    /// counted here. This field only moves once a rule exists whose
+    /// predicate can match the note itself.
     pub derived: usize,
     /// `about` keys and fact endpoints that had to be stubbed, in the order
     /// each was first seen (`about` before `facts`).

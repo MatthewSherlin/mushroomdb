@@ -334,3 +334,39 @@ pub fn recall_digest<F: Fs>(
     }
     RecallOutcome::Hits(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{is_stopword, STOPWORDS};
+
+    /// Binding: the list stays sorted and duplicate-free, because
+    /// [`is_stopword`] binary-searches it. An out-of-order insert would
+    /// silently stop matching that word — and every other word past it —
+    /// with nothing else in the suite noticing.
+    ///
+    /// Ported from `repograph::recall`'s `the_stopword_lists_are_sorted_and_unique`:
+    /// the list came across the split (see the doc comment on [`STOPWORDS`]),
+    /// but this binding test did not, leaving the copy's own sortedness
+    /// invariant unguarded.
+    #[test]
+    fn the_stopword_list_is_sorted_and_unique() {
+        for pair in STOPWORDS.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "STOPWORDS must be sorted and duplicate-free: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // And every word in it is actually found by the lookup that
+        // searches it.
+        for word in STOPWORDS {
+            assert!(is_stopword(word), "STOPWORDS: {word:?} is not matched");
+        }
+        assert!(
+            !is_stopword("matthew"),
+            "a subject word must stay searchable"
+        );
+        assert!(!is_stopword("recall"));
+    }
+}
