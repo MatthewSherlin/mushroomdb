@@ -366,7 +366,7 @@ pub fn recall_digest<F: Fs>(
     let mut ranked: Vec<(String, usize, f64)> = best
         .into_iter()
         .map(|(key, score)| {
-            let present = covered.get(&key).copied().unwrap_or(total);
+            let present = covered.get(&key).copied().unwrap_or(0);
             (key, present, score)
         })
         .collect();
@@ -405,7 +405,19 @@ pub fn recall_digest<F: Fs>(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stopword, STOPWORDS};
+    use super::{is_stopword, search_terms, MAX_QUERY_TERMS, STOPWORDS};
+
+    /// The cap is enforced where the terms are built, so it is pinned there:
+    /// an integration test that only checks the call returns cannot fail if
+    /// the `break` is removed.
+    #[test]
+    fn search_terms_stops_at_the_cap_and_keeps_the_earliest() {
+        let long: String = (0..200).map(|i| format!("tok{i} ")).collect();
+        let terms = search_terms(&format!("{long} matthew"));
+        assert_eq!(terms.len(), MAX_QUERY_TERMS);
+        assert_eq!(terms[0], "tok0");
+        assert!(!terms.contains(&"matthew".to_string()), "{terms:?}");
+    }
 
     /// Binding: the list stays sorted and duplicate-free, because
     /// [`is_stopword`] binary-searches it. An out-of-order insert would

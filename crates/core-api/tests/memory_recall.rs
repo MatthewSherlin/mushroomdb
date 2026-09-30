@@ -183,7 +183,7 @@ fn the_entity_a_question_is_about_is_not_dropped_for_holding_only_its_name() {
         RecallOutcome::Hits(d) => {
             assert!(d.contains("note-1"), "the fact must be there: {d}");
             assert!(d.contains("matthew"), "the subject must be there too: {d}");
-            let note_first = d.find("note-1").unwrap() < d.find("  matthew").unwrap();
+            let note_first = d.find("  note-1").unwrap() < d.find("  matthew").unwrap();
             assert!(note_first, "the fuller match ranks first: {d}");
         }
         other => panic!("expected the note and its subject, got {other:?}"),
@@ -194,7 +194,12 @@ fn the_entity_a_question_is_about_is_not_dropped_for_holding_only_its_name() {
 fn a_digest_says_how_much_of_the_topic_each_hit_covered() {
     let db = store("shown");
     match recall_digest(&db, "Matthew Sherlin", "store", 4000) {
-        RecallOutcome::Hits(d) => assert!(d.contains("(2/2 terms)"), "coverage unshown: {d}"),
+        RecallOutcome::Hits(d) => {
+            assert!(
+                d.contains("\n  matthew — Matthew Sherlin (2/2 terms)\n"),
+                "line shape: {d:?}"
+            )
+        }
         other => panic!("expected hits, got {other:?}"),
     }
 }
