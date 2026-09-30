@@ -452,3 +452,7 @@ jobs:
       # only, so the 0.6.10 pins in bindings/python were invisible and --check
       # reported OK on a tree that could not publish 0.7.0.
       - run: bash scripts/tests/test-bump-version-scope.sh
+      # Ran in no workflow until 0.7 — invoked by hand as "Task 12" of a
+      # release plan. It also now refuses a DEFERRED row whose target release
+      # has already shipped, which row 36 had done for two tags.
+      - run: bash scripts/check-defect-ledger.sh
