@@ -8158,6 +8158,20 @@ impl<F: Fs> GraphDb<F> {
         self.ids.get(key).is_some()
     }
 
+    /// One human line for a node: the first of `text`, `summary` or `name` it
+    /// carries, truncated. Used by the recall digest.
+    pub fn node_summary_line(&self, key: &str) -> Option<String> {
+        for field in ["text", "summary", "name"] {
+            if let Some(Value::Str(s)) = self.get_prop(key, field) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return Some(s.chars().take(120).collect());
+                }
+            }
+        }
+        None
+    }
+
     /// Borrow the raw id map. Used by `NodeMask::from_keys` to resolve keys.
     pub(crate) fn ids(&self) -> &IdMap {
         &self.ids

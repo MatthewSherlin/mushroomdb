@@ -2450,20 +2450,27 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
         Err(e) => return CallOutcome::ToolErr(e),
     };
     let label = db_dir.map_or_else(|| "store".to_string(), |d| d.display().to_string());
-    // The topic goes in as the caller wrote it: `recall_digest` searches the
-    // identifiers in it, and it is the same call the `recall` hook makes, so
-    // the two cannot disagree about what a topic means.
-    let digest = {
+    let outcome = {
         let g = db.read();
-        repograph::recall_digest(&*g, &topic, &label, MAX_OUTPUT_BYTES)
+        core_api::memory::recall::recall_digest(&*g, &topic, &label, MAX_OUTPUT_BYTES)
     };
-    let text = if digest.is_empty() {
-        format!(
-            "mushroomdb recall — nothing indexed matches {}\n",
-            repograph::sanitize(&topic)
-        )
-    } else {
-        digest.clone()
+    let (digest, text) = match outcome {
+        core_api::memory::recall::RecallOutcome::Hits(d) => (d.clone(), d),
+        core_api::memory::recall::RecallOutcome::NoMatch => (
+            String::new(),
+            format!(
+                "mushroomdb recall — nothing matches {}\n",
+                repograph::sanitize(&topic)
+            ),
+        ),
+        // Not the same answer as "no match": nothing here can ever match, and
+        // the caller can fix that.
+        core_api::memory::recall::RecallOutcome::NoIndex => (
+            String::new(),
+            "mushroomdb recall — this store has no text index, so no topic can \
+             match. Run `mushroomdb schema apply <db> --memory-defaults`.\n"
+                .to_string(),
+        ),
     };
     ok(
         json_out,
@@ -2899,14 +2906,14 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "recall",
-            "description": "What do I already know about this — where the graph says a topic lives: one pointer per hit, path:line, the symbol, and the first line of its doc, across notes, concepts, files, symbols and people.",
+            "description": "What do I already know about this — ranked nodes matching a free-text topic across every indexed text field, with one line each.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "topic": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Free-form text. The identifiers in it — a path, a `mod::name`, a snake_case word, or any word in backticks — are searched as phrases; a topic naming none of those matches nothing."
+                        "description": "Free-form text. A question, a name, or a phrase."
                     }
                 },
                 "required": ["topic"]

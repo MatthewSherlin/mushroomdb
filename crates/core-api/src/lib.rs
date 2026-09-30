@@ -4,6 +4,7 @@ mod exact_knn;
 pub mod history;
 mod ingest;
 pub mod mask;
+pub mod memory;
 pub mod memory_schema;
 pub mod reader;
 pub mod repograph;
