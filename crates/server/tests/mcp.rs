@@ -4262,9 +4262,9 @@ fn recall_on_an_unsearchable_topic_says_nothing_matched() {
 }
 
 /// Binding: `remember` writes a note and returns its key; unknown `about`
-/// keys are all named, and nothing is written.
+/// keys are created as provisional entities rather than refusing the call.
 #[test]
-fn remember_writes_note_and_rejects_unknown_about() {
+fn remember_writes_note_and_stubs_unknown_about() {
     let db = code_store("remember");
 
     let reply = one_task_call(
@@ -4283,19 +4283,28 @@ fn remember_writes_note_and_rejects_unknown_about() {
     assert_eq!(key.len(), "note:".len() + 16, "{key}");
     assert!(db.read().has_node(&key), "the note must be in the store");
 
-    // Two unknown keys: both are named, sorted, and nothing is written.
-    let before = db.read().node_count();
+    // Two unknown keys: both are named as provisional and written, not refused.
     let reply = one_task_call(
         db.clone(),
         "remember",
-        json!({"text": "about nothing that exists", "about": ["zzz.rs", "no/such.rs"]}),
+        json!({"text": "about nothing that exists yet", "about": ["zzz.rs", "no/such.rs"]}),
     );
-    let msg = error_text(&reply);
+    let text = task_reply(&reply);
     assert!(
-        msg.contains("no/such.rs") && msg.contains("zzz.rs"),
-        "{msg}"
+        text.contains("zzz.rs") && text.contains("no/such.rs") && text.contains("provisional"),
+        "{text}"
     );
-    assert_eq!(db.read().node_count(), before, "nothing may be written");
+    let g = db.read();
+    assert_eq!(
+        g.get_prop("zzz.rs", core_api::memory_schema::PROVISIONAL_PROP),
+        Some(Value::Bool(true)),
+        "an unknown about key must land as a provisional entity"
+    );
+    assert_eq!(
+        g.get_prop("no/such.rs", core_api::memory_schema::PROVISIONAL_PROP),
+        Some(Value::Bool(true)),
+        "an unknown about key must land as a provisional entity"
+    );
 }
 
 /// Binding: `remember` needs text.

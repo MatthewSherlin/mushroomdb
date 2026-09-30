@@ -53,8 +53,8 @@ use crate::json::{
     parse_ingest_edges, result_set_json, rule_def_from_json, stamp_namespace, stamp_namespace_row,
 };
 use core_api::{
-    json_to_rows, json_to_value, AsOfScope, AutoFk, GraphError, IngestOptions, MaskMode, NodeMask,
-    PropPredicate, SharedDb, Value, NS_PROP,
+    json_to_rows, json_to_value, memory, AsOfScope, AutoFk, GraphError, IngestOptions, MaskMode,
+    NodeMask, PropPredicate, SharedDb, Value, NS_PROP,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -628,11 +628,15 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
 
 /// Insert a new node or update an existing node's properties, keyed by `key`.
 ///
+/// The write itself is [`memory::remember::describe_entity`] — the one upsert
+/// implementation every surface calls, which also clears a provisional mark
+/// (`memory_schema::PROVISIONAL_PROP`) on `key` if it had one, whoever set it.
+///
 /// If the node exists: every supplied property is checked (reserved names, the
 /// `ns` rule, a view-owned field, type) and then all of them are written in one
 /// engine commit — a refusal leaves the node unchanged. If the node does not
-/// exist: `label` is required; the node is ingested with `key_field = "id"` and
-/// the supplied props.
+/// exist: `label` is required; the node is created and then given the
+/// supplied props, `id` among them.
 ///
 /// `namespace` is the namespace a node this call **creates** is created in. On a
 /// node that already exists it is written like any other property, which is what
@@ -642,12 +646,11 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
 /// `updated_fields`, because nothing was updated.
 ///
 /// `id` in `props` is **dropped on both paths**: it is the node's key. The create
-/// path stores `id` from `key` (it ingests with `key_field: "id"`), and
-/// `rename_node` is the only way to change it. One row builder now serves the
-/// create and the update path, so the rule is the same on both — before v0.6.6 the
-/// update path wrote `props.id` straight through `set_prop`, which could leave a
-/// stored `id` disagreeing with the key the node is reached by, while the create
-/// path had always ignored it.
+/// path stores `id` from `key`, and `rename_node` is the only way to change it.
+/// One row builder now serves the create and the update path, so the rule is the
+/// same on both — before v0.6.6 the update path wrote `props.id` straight through
+/// `set_prop`, which could leave a stored `id` disagreeing with the key the node
+/// is reached by, while the create path had always ignored it.
 ///
 /// Returns `{ok, key, created, updated_fields?}`.
 fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
@@ -706,7 +709,7 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
             to_set.push((field, v));
         }
         let count = to_set.len();
-        if let Err(e) = g.set_props(key, to_set) {
+        if let Err(e) = memory::remember::describe_entity(&mut g, key, None, &to_set) {
             return CallOutcome::ToolErr(graph_err_msg(e));
         }
         CallOutcome::ToolOk(json!({
@@ -720,12 +723,9 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
             return CallOutcome::ToolErr("label required when creating a new entity".into());
         };
         row.insert("id".to_string(), Value::Str(key.to_string()));
-        let opts = IngestOptions {
-            key_field: "id".to_string(),
-            auto_fk: AutoFk::Off,
-        };
+        let props: Vec<(String, Value)> = row.into_iter().collect();
         let mut g = db.write();
-        match g.ingest(label, vec![row], &opts) {
+        match memory::remember::describe_entity(&mut g, key, Some(label), &props) {
             Ok(_) => CallOutcome::ToolOk(json!({ "ok": true, "key": key, "created": true })),
             Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
         }

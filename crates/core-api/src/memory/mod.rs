@@ -5,3 +5,4 @@
 //! product's core, so they move here first and the old module is removed
 //! afterwards.
 pub mod recall;
+pub mod remember;

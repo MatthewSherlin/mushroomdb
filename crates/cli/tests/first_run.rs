@@ -156,7 +156,13 @@ fn remembering_about_an_unknown_subject_succeeds() {
                     "text":"Reid reviewed the launch copy","about":["reid"]}}}),
             serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
                 "name":"query","arguments":{
-                    "cypher":"MATCH (n) WHERE n.provisional = true RETURN count(n) AS c"}}}),
+                    // `WHERE n.provisional` (truthy), not `= true`: the
+                    // engine's Cypher has no boolean-literal comparison (an
+                    // unrelated, pre-existing gap — `n.flag = true` is an
+                    // "unbound variable `true`" error), and a standalone
+                    // boolean predicate is the documented way to ask this
+                    // (`core-query/src/cypher/parser.rs`, `Expr::Truthy`).
+                    "cypher":"MATCH (n) WHERE n.provisional RETURN count(n) AS c"}}}),
         ],
     );
     assert!(
@@ -164,10 +170,11 @@ fn remembering_about_an_unknown_subject_succeeds() {
         "remember about an unknown subject errored: {}",
         text_of(&r[&1])
     );
-    let counted = text_of(&r[&2]);
-    assert!(
-        counted.contains("1"),
-        "no provisional node was created.\ngot: {counted}"
+    let counted: Js = serde_json::from_str(&text_of(&r[&2])).expect("query reply is JSON");
+    assert_eq!(
+        counted["rows"],
+        serde_json::json!([[1]]),
+        "exactly one provisional node must exist.\ngot: {counted}"
     );
 }
 

@@ -69,9 +69,10 @@
 //! sanitize each line; the framing is what says whose words they are.
 
 use crate::mcp::{graph_err_msg, CallOutcome};
+use core_api::memory::remember::{remember, EntityIn, FactIn, RememberInput, NOTE_KINDS};
 use core_api::repograph::{
-    self, ContextOptions, ImpactOptions, MapOptions, RememberInput, DEFAULT_EXCLUDES,
-    MAX_OUTPUT_BYTES, NOTE_KINDS, UNTRUSTED_FRAMING,
+    self, ContextOptions, ImpactOptions, MapOptions, DEFAULT_EXCLUDES, MAX_OUTPUT_BYTES,
+    UNTRUSTED_FRAMING,
 };
 use core_api::{
     json_to_value, Dir, Explanation, GraphError, NodeInfo, PredicateSummary, SharedDb, Value,
@@ -2481,6 +2482,78 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
 
 // ── remember ─────────────────────────────────────────────────────────────────
 
+/// Parse `args.entities` into [`EntityIn`]s. Absent/null is an empty list;
+/// anything else must be an array of `{key, label, props?}` objects.
+fn entities_arg(args: &Js) -> Result<Vec<EntityIn>, String> {
+    let items = match args.get("entities") {
+        None | Some(Js::Null) => return Ok(Vec::new()),
+        Some(Js::Array(items)) => items,
+        Some(_) => return Err("entities must be an array".into()),
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            return Err("entities[] must be objects".into());
+        };
+        let Some(key) = obj.get("key").and_then(Js::as_str) else {
+            return Err("entities[].key is required".into());
+        };
+        let Some(label) = obj.get("label").and_then(Js::as_str) else {
+            return Err("entities[].label is required".into());
+        };
+        let mut props = BTreeMap::new();
+        if let Some(props_obj) = obj.get("props").and_then(Js::as_object) {
+            for (field, json_val) in props_obj {
+                match json_to_value(json_val.clone()) {
+                    Some(v) => {
+                        props.insert(field.clone(), v);
+                    }
+                    None => {
+                        return Err(format!(
+                            "entities[].props.{field} is not a supported value type"
+                        ))
+                    }
+                }
+            }
+        }
+        out.push(EntityIn {
+            key: key.to_string(),
+            label: label.to_string(),
+            props,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse `args.facts` into [`FactIn`]s. Absent/null is an empty list; anything
+/// else must be an array of `{subject, predicate, object}` objects.
+fn facts_arg(args: &Js) -> Result<Vec<FactIn>, String> {
+    let items = match args.get("facts") {
+        None | Some(Js::Null) => return Ok(Vec::new()),
+        Some(Js::Array(items)) => items,
+        Some(_) => return Err("facts must be an array".into()),
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            return Err("facts[] must be objects".into());
+        };
+        let (Some(subject), Some(predicate), Some(object)) = (
+            obj.get("subject").and_then(Js::as_str),
+            obj.get("predicate").and_then(Js::as_str),
+            obj.get("object").and_then(Js::as_str),
+        ) else {
+            return Err("facts[] requires subject, predicate, and object".into());
+        };
+        out.push(FactIn {
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+        });
+    }
+    Ok(out)
+}
+
 fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let text = match str_arg(args, "text") {
         Ok(t) => t.to_string(),
@@ -2490,8 +2563,11 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Ok(a) => a,
         Err(e) => return CallOutcome::ToolErr(e),
     };
-    about.sort();
-    about.dedup();
+    // Deduped, order kept — the order `remember` reports `provisional` keys in.
+    {
+        let mut seen = BTreeSet::new();
+        about.retain(|k| seen.insert(k.clone()));
+    }
     let kind = match args.get("kind") {
         None | Some(Js::Null) => "note".to_string(),
         Some(Js::String(k)) => k.clone(),
@@ -2503,46 +2579,58 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             NOTE_KINDS.join(", ")
         ));
     }
-
-    // The engine names the first missing key, which makes a caller with three
-    // bad ones retry three times. Check them all here and name them all at
-    // once, before anything is written.
-    let missing: Vec<String> = {
-        let g = db.read();
-        about
-            .iter()
-            .filter(|k| !g.has_node(k))
-            .map(|k| repograph::sanitize(k))
-            .collect()
+    let source = match opt_str_arg(args, "source") {
+        Ok(s) => s,
+        Err(e) => return CallOutcome::ToolErr(e),
     };
-    if !missing.is_empty() {
-        return CallOutcome::ToolErr(format!(
-            "unknown about {}: {}",
-            if missing.len() == 1 { "key" } else { "keys" },
-            missing.join(", ")
-        ));
-    }
+    let ts = match args.get("ts") {
+        None | Some(Js::Null) => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64),
+        Some(v) => match v.as_i64() {
+            Some(n) => n,
+            None => return CallOutcome::ToolErr("ts must be an integer".into()),
+        },
+    };
+    let entities = match entities_arg(args) {
+        Ok(e) => e,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let facts = match facts_arg(args) {
+        Ok(f) => f,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
     let input = RememberInput {
         text: &text,
         about: &about,
         kind: &kind,
         ts,
+        source,
+        entities: &entities,
+        facts: &facts,
     };
-    let key = {
+    let result = {
         let mut g = db.write();
-        repograph::remember(&mut *g, &input)
+        remember(&mut *g, &input)
     };
-    match key {
-        Ok(key) => {
-            let mut rendered = format!("remembered {}\n", repograph::sanitize(&key));
-            if !about.is_empty() {
+    match result {
+        Ok(report) => {
+            let mut rendered = format!("remembered {}\n", repograph::sanitize(&report.note));
+            if report.created > 0 || report.matched > 0 {
                 rendered.push_str(&format!(
-                    "about  {}\n",
-                    about
+                    "entities  {} created, {} matched\n",
+                    report.created, report.matched
+                ));
+            }
+            if report.derived > 0 {
+                rendered.push_str(&format!("derived   {} edge(s)\n", report.derived));
+            }
+            if !report.provisional.is_empty() {
+                rendered.push_str(&format!(
+                    "provisional  {} — named but not yet described\n",
+                    report
+                        .provisional
                         .iter()
                         .map(|k| repograph::sanitize(k))
                         .collect::<Vec<_>>()
@@ -2551,7 +2639,15 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             }
             ok(
                 json_out,
-                &json!({ "key": key, "kind": kind, "about": about }),
+                &json!({
+                    "key": report.note,
+                    "kind": kind,
+                    "about": about,
+                    "created": report.created,
+                    "matched": report.matched,
+                    "derived": report.derived,
+                    "provisional": report.provisional,
+                }),
                 |_| rendered,
             )
         }
@@ -2921,7 +3017,10 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "remember",
-            "description": "Remember this for next time — write a note into the graph and return its key. Keys listed in 'about' are linked to the note, and every one of them must already exist.",
+            "description": "Remember this for next time — write a note into the graph and return what it \
+        did. Keys in 'about' are linked to the note; one that does not exist yet is created as a \
+        provisional entity rather than refused. Pass 'entities' and 'facts' to store the structure you \
+        extracted in the same commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2933,12 +3032,46 @@ fn task_tool_schemas() -> Vec<Js> {
                     "about": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Existing node keys the note is about: files, symbols, authors, concepts, other notes."
+                        "description": "Node keys the note is about: files, symbols, authors, concepts, other notes. A key that does not exist yet is created as a provisional entity."
                     },
                     "kind": {
                         "type": "string",
                         "enum": ["note", "decision", "todo"],
                         "description": "What kind of note this is (default: note)."
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Where this came from — a session id, a file, a person. Defaults to \"agent\"."
+                    },
+                    "ts": {
+                        "type": "integer",
+                        "description": "Unix seconds the fact dates from. Defaults to now. Pass it when importing."
+                    },
+                    "entities": {
+                        "type": "array",
+                        "description": "Entities you recognised in the text.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key":   { "type": "string" },
+                                "label": { "type": "string" },
+                                "props": { "type": "object" }
+                            },
+                            "required": ["key", "label"]
+                        }
+                    },
+                    "facts": {
+                        "type": "array",
+                        "description": "Relationships you recognised, between keys named above.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "subject":   { "type": "string" },
+                                "predicate": { "type": "string" },
+                                "object":    { "type": "string" }
+                            },
+                            "required": ["subject", "predicate", "object"]
+                        }
                     }
                 },
                 "required": ["text"]
