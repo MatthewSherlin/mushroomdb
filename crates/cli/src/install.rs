@@ -1331,18 +1331,89 @@ fn remove_retired_hooks(settings_file: &Path, store: &StoreRef) -> Result<bool, 
 ///
 /// Stricter than [`is_our_hook_command`]: the tail alone would claim any
 /// command ending in ` enrich --auto`, whatever program it runs, and this
-/// test decides what gets *deleted* from a file the user owns. So the part
-/// before the tail — the program and its leading arguments — must also name
-/// mushroomdb. Every spelling a 0.5/0.6 install wrote does: `npx -y
-/// mushroomdb@x.y.z`, `'<…>/mushroomdb'` (a resolved binary, a 0.5 copy, or
-/// a `--command` build path), `node '<…>/mushroomdb/…'`, bare `mushroomdb`.
-/// `othertool enrich --auto` does not, and survives.
+/// test decides what gets *deleted* from a file the user owns. So the
+/// command's program must also be mushroomdb — see [`runs_mushroomdb`].
+/// `othertool enrich --auto` and `echo mushroomdb && othertool touch --auto`
+/// both survive.
 pub(crate) fn is_retired_hook_of_ours(command: &str, sub: &str, store: &StoreRef) -> bool {
     store.hook_tails(sub).iter().any(|tail| {
         command
             .strip_suffix(tail.as_str())
-            .is_some_and(|program| program.contains(BIN_NAME))
+            .is_some_and(runs_mushroomdb)
     })
+}
+
+/// Whether the program a hook command line starts with is mushroomdb, in
+/// one of the spellings [`McpCommand::shell`] has written since 0.5:
+///
+/// - bare `mushroomdb` (on PATH, and a `--command mushroomdb`);
+/// - `npx -y mushroomdb@x.y.z` (and `npx mushroomdb@…` without the `-y`);
+/// - a path ending in `/mushroomdb`, single-quoted or not — the resolved
+///   native binary (`…/vendor/mushroomdb`), a 0.5.x copy
+///   (`~/.mushroomdb/bin/mushroomdb`), a `--command` build path;
+/// - `node '<…>/mushroomdb.js'` — the resolved npm launcher, the package's
+///   `bin` script.
+///
+/// Only the leading program token counts: a later word that merely reads
+/// `mushroomdb`, as in `echo mushroomdb && …`, does not make a command ours.
+fn runs_mushroomdb(prefix: &str) -> bool {
+    let words = shell_words(prefix);
+    let mut words = words.iter().map(String::as_str);
+    let is_bin = |w: &str| w == BIN_NAME || w.ends_with(&format!("/{BIN_NAME}"));
+    match words.next() {
+        Some("npx") => {
+            let next = match words.next() {
+                Some("-y") => words.next(),
+                other => other,
+            };
+            next.is_some_and(|w| w.starts_with(&format!("{NPM_PACKAGE}@")))
+        }
+        Some(NODE_BIN) => words
+            .next()
+            .is_some_and(|w| w.ends_with(&format!("/{BIN_NAME}.js"))),
+        Some(first) => is_bin(first) || first.starts_with(&format!("{NPM_PACKAGE}@")),
+        None => false,
+    }
+}
+
+/// Split a POSIX command line into words, the way [`sh_quote`]'s output
+/// reads back: single quotes are literal, a backslash outside them escapes
+/// the next character, whitespace outside them separates. Enough for the
+/// command prefixes this installer writes; not a general shell parser.
+fn shell_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quoted = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                quoted = !quoted;
+                in_word = true;
+            }
+            '\\' if !quoted => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+                in_word = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
 }
 
 /// Whether `command` is a retired hook of ours for any of `stores`.

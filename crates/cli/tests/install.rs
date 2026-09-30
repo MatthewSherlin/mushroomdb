@@ -3778,6 +3778,7 @@ fn a_users_own_hooks_survive_the_retired_prune() {
     seed_settings_0_6_12(&env);
     let prettier = r#"prettier --write "$FILE" && echo touch"#;
     let othertool = "othertool enrich --auto";
+    let mentions = "echo mushroomdb && othertool touch --auto";
     let path = env.root.join(".claude/settings.json");
     let mut s: serde_json::Value = serde_json::from_str(SETTINGS_0_6_12).unwrap();
     s["hooks"]["PostToolUse"]
@@ -3786,12 +3787,13 @@ fn a_users_own_hooks_survive_the_retired_prune() {
         .extend([
             serde_json::json!({"matcher": "Edit", "hooks": [{"type": "command", "command": prettier}]}),
             serde_json::json!({"matcher": "Grep", "hooks": [{"type": "command", "command": othertool}]}),
+            serde_json::json!({"matcher": "Write", "hooks": [{"type": "command", "command": mentions}]}),
         ]);
     fs::write(&path, serde_json::to_string_pretty(&s).unwrap()).unwrap();
 
     install_ok(&env, &["--delivery", "mcp"]);
     let commands = hook_commands_written(&env);
-    for foreign in [prettier, othertool] {
+    for foreign in [prettier, othertool, mentions] {
         assert!(
             commands.iter().any(|c| c == foreign),
             "install took the user's {foreign:?}: {commands:?}"
@@ -3799,7 +3801,9 @@ fn a_users_own_hooks_survive_the_retired_prune() {
     }
     for retired in [" touch --auto", " intercept --auto", " impact-hook --auto"] {
         assert!(
-            !commands.iter().any(|c| c.ends_with(retired)),
+            !commands
+                .iter()
+                .any(|c| c.ends_with(retired) && c.starts_with("npx -y mushroomdb@")),
             "{retired} survived: {commands:?}"
         );
     }
@@ -3819,8 +3823,12 @@ fn a_users_own_hooks_survive_the_retired_prune() {
     let commands = hook_commands_written(&env);
     assert_eq!(
         commands,
-        vec![prettier.to_string(), othertool.to_string()],
-        "uninstall leaves exactly the user's two hooks"
+        vec![
+            prettier.to_string(),
+            othertool.to_string(),
+            mentions.to_string()
+        ],
+        "uninstall leaves exactly the user's three hooks"
     );
 }
 
@@ -3854,5 +3862,46 @@ fn a_git_hook_block_for_another_store_survives_and_stays_owned() {
         m["git_hooks"],
         serde_json::json!([hook]),
         "the block is still on disk, so the manifest still owns it"
+    );
+}
+
+/// Every program spelling a 0.5/0.6 install wrote in front of a retired
+/// subcommand is recognised as ours, and taken out: bare, `npx` with and
+/// without `-y`, a quoted absolute path (spaces included), and the resolved
+/// npm launcher run by `node`. The launcher's file is the package's `bin`
+/// script, `bin/mushroomdb.js` (`packaging/npm/package.json`).
+#[test]
+fn every_0_6_program_spelling_of_a_retired_hook_is_pruned() {
+    let env = fake_home("spellings");
+    let spellings = [
+        "mushroomdb touch --auto".to_string(),
+        "npx -y mushroomdb@0.6.12 intercept --auto".to_string(),
+        "npx mushroomdb@0.6.3 enrich --auto".to_string(),
+        "'/opt/my tools/node_modules/mushroomdb/vendor/mushroomdb' impact-hook --auto".to_string(),
+        "node '/opt/my tools/node_modules/mushroomdb/bin/mushroomdb.js' touch --auto".to_string(),
+    ];
+    let group = |c: &str| serde_json::json!({"hooks": [{"type": "command", "command": c}]});
+    let settings = serde_json::json!({"hooks": {
+        "PostToolUse": [group(&spellings[0]), group(&spellings[2]), group(&spellings[4])],
+        "PreToolUse": [group(&spellings[1]), group(&spellings[3])],
+    }});
+    fs::create_dir_all(env.root.join(".claude")).unwrap();
+    fs::write(
+        env.root.join(".claude/settings.json"),
+        serde_json::to_string_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+
+    install_ok(&env, &["--delivery", "mcp"]);
+    let commands = hook_commands_written(&env);
+    for spelling in &spellings {
+        assert!(
+            !commands.contains(spelling),
+            "{spelling} survived: {commands:?}"
+        );
+    }
+    assert_eq!(
+        hook_events_written(&env),
+        ["SessionStart", "UserPromptSubmit"]
     );
 }
