@@ -150,8 +150,8 @@ fn ok<T: serde::Serialize>(
 /// Graph content reaches a JSON reply in the **values**: paths, author names,
 /// commit subjects, note text. The keys are the report's own field names,
 /// fixed in the Rust types the reports serialise from, so they carry nothing
-/// an outsider wrote
-/// and are left alone — rewriting a key could silently merge two of them.
+/// an outsider wrote and are left alone — rewriting a key could silently merge
+/// two of them.
 ///
 /// Newline and tab survive; every other control character does not. That is
 /// the one place this differs from [`repograph::sanitize`], and the reason is
@@ -159,9 +159,10 @@ fn ok<T: serde::Serialize>(
 /// a value could forge a heading or an extra hit and has to go. A JSON value is
 /// delimited by the grammar, so a newline inside one cannot escape it — and
 /// some of these values *are* multi-line documents: `recall`'s report carries
-/// the whole rendered digest. Flattening that would corrupt the report to defend against nothing. What is still
-/// removed is everything that acts on a reader whatever contains it: escape
-/// sequences, carriage returns that overwrite a line, backspace, `DEL`.
+/// the whole rendered digest. Flattening that would corrupt the report to
+/// defend against nothing. What is still removed is everything that acts on a
+/// reader whatever contains it: escape sequences, carriage returns that
+/// overwrite a line, backspace, `DEL`.
 fn sanitize_json(value: &mut Js) {
     match value {
         Js::String(s) => {

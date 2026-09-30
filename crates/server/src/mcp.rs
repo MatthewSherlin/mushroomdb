@@ -63,7 +63,10 @@ use std::path::{Path, PathBuf};
 /// Run the MCP loop until `reader` hits EOF.
 ///
 /// `db_dir` is where the store lives on disk. `mushroomdb mcp <db>` passes it;
-/// a caller that has only a handle passes `None`.
+/// a caller that has only a handle passes `None`. Its one consumer is
+/// `recall`, which names the store by this path in its digest header and in
+/// the `schema apply` command it suggests when there is no text index; with
+/// `None` it says "store" instead.
 pub fn run_mcp_stdio(
     db: SharedDb,
     db_dir: Option<PathBuf>,
@@ -1244,9 +1247,9 @@ pub const ASSOCIATION_TOOLS: [&str; 19] = [
 /// names them**. The order is the point. A host that defers tool schemas makes
 /// a model search for them, and the list it searches is read top-down.
 ///
-/// `all` true lists all twenty-one in the established task-tools-then-graph-
-/// tools order, which is what `mushroomdb mcp --all-tools` runs and what the
-/// published server card documents.
+/// `all` true lists all twenty-one, task tools first and graph tools after,
+/// which is what `mushroomdb mcp --all-tools` runs and what the published
+/// server card documents.
 ///
 /// Either way every tool stays callable: the flag decides what is advertised,
 /// not what is served.

@@ -1316,8 +1316,8 @@ fn seed_code_graph(db: &SharedDb) {
             ("id".into(), s("__mushroomdb_git_sync__")),
             ("sha".into(), s(&code_sha(CODE_COMMITS - 1))),
             ("synced_at".into(), Value::Int(CODE_T0 + 4 * 86_400)),
-            // Deliberately not a real path: `context` must still answer from
-            // the graph when the working tree it names is not there.
+            // Deliberately not a real path: nothing here reads the working
+            // tree, so every tool must answer from the graph alone.
             ("repo".into(), s("/nonexistent/mushroomdb-test-repo")),
             ("recurse".into(), Value::Bool(false)),
             ("prs".into(), Value::Bool(false)),
@@ -1429,30 +1429,6 @@ fn one_task_call(db: SharedDb, name: &str, args: Js) -> Js {
     parse_lines(&out).remove(0)
 }
 
-/// The nineteen a memory store lists, in the order it lists them: the entity
-/// questions first, then the three that fill a store, then its own counts.
-const ASSOCIATION_TOOLS: [&str; 19] = [
-    "query",
-    "explain_association",
-    "neighborhood",
-    "node_info",
-    "node_edges",
-    "was_linked",
-    "edges_at",
-    "what_if",
-    "node_history",
-    "edge_history",
-    "find_similar",
-    "pairwise_similar",
-    "hybrid_search",
-    "remember",
-    "recall",
-    "upsert_entity",
-    "ingest_json",
-    "create_rule",
-    "stats",
-];
-
 /// Binding: a memory store lists the association surface — the nineteen tools
 /// that answer a question about an entity graph or fill one, in that order —
 /// and none of the removed code-graph tools.
@@ -1468,7 +1444,7 @@ fn a_memory_store_lists_the_association_surface() {
         .collect();
     assert_eq!(
         names,
-        ASSOCIATION_TOOLS.to_vec(),
+        server::ASSOCIATION_TOOLS.to_vec(),
         "default tools/list on a memory store"
     );
     assert_eq!(tools.len(), 19);
@@ -1560,7 +1536,7 @@ fn the_code_graph_tools_are_absent_from_every_listing() {
             let reply = call_tool(&db, all_tools, "explore", &json!({"target": "x"}));
             assert!(
                 reply.get("error").is_some() || reply["result"]["isError"].as_bool() == Some(true),
-                "explore is still answering (all_tools={all_tools}): {reply}"
+                "explore is still answering (all_tools={all_tools}, store={store_shape}): {reply}"
             );
         }
     }
@@ -1571,7 +1547,10 @@ fn the_code_graph_tools_are_absent_from_every_listing() {
 #[test]
 fn an_ingested_store_is_served_the_association_listing() {
     let db = store_of_shape("ingested", "one-surface");
-    assert_eq!(list_tool_names(&db, false), ASSOCIATION_TOOLS.to_vec());
+    assert_eq!(
+        list_tool_names(&db, false),
+        server::ASSOCIATION_TOOLS.to_vec()
+    );
 }
 
 /// A memory store holding one `Person`, one `Org`, and the `works_at` rule
@@ -3179,7 +3158,7 @@ fn what_if_refuses_an_unknown_key_and_an_unsupported_value() {
     assert!(error_text(&reply).contains("missing value"), "{reply}");
 
     // There is no store to copy any more, so no store path is required: the
-    // same call succeeds without one, unlike `sync`.
+    // same call succeeds without one.
     let reply = one_task_call(
         db.clone(),
         "what_if",
@@ -3525,7 +3504,7 @@ fn every_association_tool_description_opens_with_its_question() {
     }
     assert_eq!(
         OPENERS.map(|(n, _)| n).to_vec(),
-        ASSOCIATION_TOOLS.to_vec(),
+        server::ASSOCIATION_TOOLS.to_vec(),
         "the openers cover the whole surface, in its order"
     );
 
@@ -4073,11 +4052,10 @@ fn a_json_reply_is_unframed_and_sanitized() {
 /// Binding: the one control character a JSON value keeps is the newline, and
 /// keeping it is what makes the report faithful.
 ///
-/// `recall`'s report carries the whole rendered digest under `digest`, and
-/// `context` carries quoted source. Those newlines are the document's own
-/// structure, not something a contributor injected — a JSON value is delimited
-/// by the grammar, so nothing inside one can forge a line the way it could in
-/// a line-structured digest.
+/// `recall`'s report carries the whole rendered digest under `digest`. Those
+/// newlines are the document's own structure, not something a contributor
+/// injected — a JSON value is delimited by the grammar, so nothing inside one
+/// can forge a line the way it could in a line-structured digest.
 #[test]
 fn a_json_reply_keeps_the_newlines_of_a_multi_line_value() {
     let db = code_store("json-multiline");
