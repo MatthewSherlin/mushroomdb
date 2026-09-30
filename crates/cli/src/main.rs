@@ -88,107 +88,7 @@ fn main() -> ExitCode {
             let _ = stdout.flush();
             ExitCode::SUCCESS
         }
-        Ok(Command::Intercept { db_dir, auto }) => {
-            // Claude Code reads exit 2 as "block this tool call, and give the
-            // model what stderr said"; every other outcome — no opinion, a
-            // store that will not open, a payload that will not parse, a panic
-            // — is exit 0 and not one byte written, so a hook of ours can
-            // never be why a search did not run.
-            let mut raw = String::new();
-            let _ = io::stdin().read_to_string(&mut raw);
-            match silently(|| cli::intercept::run_intercept(&resolve_db(db_dir, auto), &raw))
-                .flatten()
-            {
-                Some(message) => {
-                    let mut stderr = io::stderr();
-                    let _ = writeln!(stderr, "{message}");
-                    let _ = stderr.flush();
-                    ExitCode::from(2)
-                }
-                None => ExitCode::SUCCESS,
-            }
-        }
-        Ok(Command::ImpactHook { db_dir, auto }) => {
-            // Claude Code reads one `hookSpecificOutput` object on stdout as
-            // context to add to the turn; exit 0 lets the edit proceed either
-            // way. Nothing to say is nothing written, like every other hook
-            // this binary provides.
-            let mut raw = String::new();
-            let _ = io::stdin().read_to_string(&mut raw);
-            let text =
-                silently(|| cli::impact_hook::run(&resolve_db(db_dir, auto), &raw)).flatten();
-            print_hook_context("PreToolUse", text.as_deref());
-            ExitCode::SUCCESS
-        }
-        Ok(Command::Enrich { db_dir, auto }) => {
-            let mut raw = String::new();
-            let _ = io::stdin().read_to_string(&mut raw);
-            let text = silently(|| cli::enrich::run(&resolve_db(db_dir, auto), &raw)).flatten();
-            print_hook_context("PostToolUse", text.as_deref());
-            ExitCode::SUCCESS
-        }
-        Ok(Command::Map { db_dir, json }) => match cli::run_map(&db_dir, json) {
-            Ok(out) => {
-                print!("{out}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(&e.to_string()),
-        },
-        Ok(Command::Explore {
-            db_dir,
-            target,
-            depth,
-            full,
-        }) => print_or_fail(cli::run_explore(&db_dir, &target, depth, full)),
-        Ok(Command::Context {
-            db_dir,
-            target,
-            full,
-        }) => print_or_fail(cli::run_context(&db_dir, &target, full)),
-        Ok(Command::Impact { db_dir, files }) => print_or_fail(cli::run_impact(&db_dir, &files)),
-        Ok(Command::Owners { db_dir, path }) => print_or_fail(cli::run_owners(&db_dir, &path)),
         Ok(Command::Why { db_dir, a, b }) => print_or_fail(cli::run_why(&db_dir, &a, &b)),
-        Ok(Command::Sync { db_dir, auto, json }) => {
-            match cli::ingest_git::run_sync(&resolve_db(db_dir, auto)) {
-                Ok(report) => {
-                    if json {
-                        print!("{}", cli::ingest_git::format_sync_json(&report));
-                    } else {
-                        print!("{}", cli::ingest_git::format_sync(&report));
-                    }
-                    ExitCode::SUCCESS
-                }
-                Err(e) => busy_aware(&e),
-            }
-        }
-        Ok(Command::Touch {
-            db_dir,
-            auto,
-            files,
-        }) => {
-            // Only read stdin when there is nothing on the command line: a hook
-            // pipes a payload, a person does not, and blocking a person's
-            // terminal on a read that will never end is the worse failure.
-            let payload = if files.is_empty() {
-                let mut raw = String::new();
-                let _ = io::stdin().read_to_string(&mut raw);
-                Some(raw)
-            } else {
-                None
-            };
-            if files.is_empty() || auto {
-                silent_touch(db_dir, auto, &files, payload.as_deref());
-                return ExitCode::SUCCESS;
-            }
-            match cli::ingest_git::run_touch(&resolve_db(db_dir, auto), &files, payload.as_deref())
-            {
-                Ok(report) => {
-                    print!("{}", cli::ingest_git::format_touch(&report));
-                    ExitCode::SUCCESS
-                }
-                Err(e) => busy_aware(&e),
-            }
-        }
         Ok(Command::Version) => {
             println!("{}", cli::version_string());
             ExitCode::SUCCESS
@@ -561,58 +461,13 @@ fn busy_aware(e: &cli::CliError) -> ExitCode {
 /// The panic hook is replaced for the duration: an unwind would otherwise print
 /// a message and a backtrace to stderr and exit 101, which for a hook body is
 /// the noisiest possible outcome and the one a user can do least about. Both
-/// hook bodies (`recall`, and `touch` in hook mode) go through this.
+/// hook bodies (`recall` and `brief`) go through this.
 fn silently<T>(f: impl FnOnce() -> T) -> Option<T> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     std::panic::set_hook(previous);
     outcome.ok()
-}
-
-/// Run `touch` as a hook body: say nothing, whatever happens, and let the
-/// caller exit 0.
-///
-/// A `PostToolUse` hook fires on every edit the assistant makes, and everything
-/// it writes to either stream lands in the user's session. Almost everything
-/// this command can fail on is *routine* there rather than exceptional — a
-/// payload for a file in some other project, a database that was never built
-/// from a repository, a peer process holding the write lock — and none of it is
-/// the user's problem to read about on every keystroke. So the outcome is
-/// discarded, including the successful report: a line per edit is the loudest
-/// noise of the lot.
-///
-/// Naming files on the command line opts out of all of it: see the `Touch` arm.
-fn silent_touch(db_dir: Option<PathBuf>, auto: bool, files: &[PathBuf], payload: Option<&str>) {
-    let _ = silently(|| {
-        let db = resolve_db(db_dir, auto);
-        cli::ingest_git::run_touch(&db, files, payload)
-    });
-}
-
-/// Print one hook result object on stdout, or nothing at all for `None`.
-///
-/// The shape is Claude Code's documented `hookSpecificOutput`: an object
-/// carrying the event's own name and `additionalContext`, the field both
-/// `PreToolUse` and `PostToolUse` read as "add this to the turn". Nothing else
-/// goes in it — no `permissionDecision`, no `decision` — because neither of
-/// these hooks has an opinion about whether the tool call should happen.
-///
-/// Not `print!`: that panics on EPIPE (exit 101) if the hook runner closes the
-/// pipe, and a hook body must never be why anything fails.
-fn print_hook_context(event: &str, text: Option<&str>) {
-    let Some(text) = text.filter(|t| !t.is_empty()) else {
-        return;
-    };
-    let out = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": event,
-            "additionalContext": text,
-        }
-    });
-    let mut stdout = io::stdout();
-    let _ = stdout.write_all(out.to_string().as_bytes());
-    let _ = stdout.flush();
 }
 
 /// The database a `<db-dir>`-or-`--auto` command should use.

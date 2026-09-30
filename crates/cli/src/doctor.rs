@@ -17,10 +17,10 @@
 
 use crate::install::{
     claude_mcp_file, cursor_mcp_file, default_db, entry_db, expand_platform, git_hooks_dir,
-    has_our_server, installed_shape, is_disabled, is_our_hook_command, line_runs_for_store,
-    opt_ins, resolve_platform, resolve_scope, Externals, Platform, Scope, StoreRef, AUTO_ARG,
-    BRIEF_EVENT, ENRICH_EVENT, GIT_HOOKS, HOOK_BEGIN, HOOK_EVENT, IMPACT_EVENT, INTERCEPT_EVENT,
-    SERVER_NAME, TOUCH_EVENT,
+    has_our_server, hook_block_lines, installed_shape, is_disabled, is_our_hook_command,
+    line_runs_for_store, opt_ins, resolve_platform, resolve_scope, Externals, Platform, Scope,
+    StoreRef, AUTO_ARG, BRIEF_EVENT, GIT_HOOKS, HOOK_EVENT, RETIRED_GIT_HOOK_SUBCOMMAND,
+    RETIRED_HOOK_SUBCOMMANDS, SERVER_NAME,
 };
 use crate::CliError;
 use core_api::{GraphDb, GraphError, OpenOptions};
@@ -258,47 +258,10 @@ pub fn run_doctor_with(
     if platforms.contains(&Platform::ClaudeCode) {
         if let Some(store) = &store {
             checks.push(check_hooks(project_root, home, scope, store));
-            // The opt-in hooks each earn a line only where the manifest says
-            // this install asked for one. Reporting them otherwise would say
-            // something about every install that is true of none.
+            // A hook a 0.6 install wrote and 0.7 retired earns a line only
+            // where it is still on disk: one per hook, naming it.
+            checks.extend(check_retired_hooks(project_root, home, scope, store));
             let opted = opt_ins(project_root, home, scope, &platforms);
-            let settings_file = settings_file(project_root, home, scope);
-            let settings = read_json(&settings_file).unwrap_or(Js::Null);
-            for (asked, sub, event, matcher, flag) in [
-                (
-                    opted.intercept_grep,
-                    "intercept",
-                    INTERCEPT_EVENT,
-                    "Grep",
-                    "--intercept-grep",
-                ),
-                (
-                    opted.impact_before_edit,
-                    "impact-hook",
-                    IMPACT_EVENT,
-                    "Edit|Write|MultiEdit",
-                    "--impact-before-edit",
-                ),
-                (
-                    opted.enrich_grep,
-                    "enrich",
-                    ENRICH_EVENT,
-                    "Grep",
-                    "--enrich-grep",
-                ),
-            ] {
-                if asked {
-                    checks.push(check_opt_in_hook(
-                        sub,
-                        event,
-                        matcher,
-                        flag,
-                        &settings_file,
-                        &settings,
-                        store,
-                    ));
-                }
-            }
             if opted.always_load {
                 checks.push(check_always_load(project_root, home, scope));
             }
@@ -306,16 +269,15 @@ pub fn run_doctor_with(
     }
 
     // 5. git hooks — project scope, and only for the platforms whose install
-    //    wires the repository (matches `install::write_everything`).
+    //    wires the repository (matches `install::write_everything`). 0.7
+    //    writes none, so the only finding is a 0.6 `sync` block left behind.
     if scope == Scope::Project
         && platforms
             .iter()
             .any(|p| matches!(p, Platform::ClaudeCode | Platform::Cursor))
     {
         if let Some(store) = &store {
-            if let Some(check) = check_git_hooks(project_root, store) {
-                checks.push(check);
-            }
+            checks.extend(check_retired_git_hooks(project_root, store));
         }
     }
 
@@ -723,13 +685,12 @@ fn check_hooks(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef)
     };
     let root = read_json(&settings_file).unwrap_or(Js::Null);
     let has_recall = has_hook_matching(&root, HOOK_EVENT, "recall", store);
-    let has_touch = has_hook_matching(&root, TOUCH_EVENT, "touch", store);
     let has_brief = has_hook_matching(&root, BRIEF_EVENT, "brief", store);
-    if has_recall && has_touch && has_brief {
+    if has_recall && has_brief {
         Check::ok(
             "hooks",
             format!(
-                "{HOOK_EVENT} + {TOUCH_EVENT} + {BRIEF_EVENT} present in {}",
+                "{HOOK_EVENT} + {BRIEF_EVENT} present in {}",
                 settings_file.display()
             ),
         )
@@ -737,9 +698,6 @@ fn check_hooks(project_root: &Path, home: &Path, scope: Scope, store: &StoreRef)
         let mut missing = Vec::new();
         if !has_recall {
             missing.push(HOOK_EVENT);
-        }
-        if !has_touch {
-            missing.push(TOUCH_EVENT);
         }
         if !has_brief {
             missing.push(BRIEF_EVENT);
@@ -794,32 +752,34 @@ fn settings_file(project_root: &Path, home: &Path, scope: Scope) -> PathBuf {
     }
 }
 
-/// One experimental hook, for an install whose manifest asked for it.
+/// One `warn` per retired hook of ours still in the settings file, named by
+/// its subcommand; nothing at all when there are none.
 ///
-/// `sub` is the subcommand word, which is what tells two hooks sharing an
-/// event apart; `matcher` and `flag` only ever reach the reported text. The
-/// parsed settings arrive from the caller so three checks cost one read.
-fn check_opt_in_hook(
-    sub: &'static str,
-    event: &str,
-    matcher: &str,
-    flag: &str,
-    settings_file: &Path,
-    root: &Js,
+/// Each one runs a subcommand 0.7 does not have, on every event it matches —
+/// `touch` on every edit — so it is worth a line, and re-running `install` is
+/// the fix: it takes them out.
+fn check_retired_hooks(
+    project_root: &Path,
+    home: &Path,
+    scope: Scope,
     store: &StoreRef,
-) -> Check {
-    if has_hook_matching(root, event, sub, store) {
-        Check::ok(
-            sub,
-            format!("{event} ({matcher}) present in {}", settings_file.display()),
-        )
-    } else {
-        Check::warn(
-            sub,
-            format!("missing {event} in {}", settings_file.display()),
-            Some(format!("mushroomdb install --platform claude-code {flag}")),
-        )
-    }
+) -> Vec<Check> {
+    let settings_file = settings_file(project_root, home, scope);
+    let root = read_json(&settings_file).unwrap_or(Js::Null);
+    RETIRED_HOOK_SUBCOMMANDS
+        .iter()
+        .filter(|(event, sub)| has_hook_matching(&root, event, sub, store))
+        .map(|&(event, sub)| {
+            Check::warn(
+                sub,
+                format!(
+                    "retired {event} hook still in {} — 0.7 has no `{sub}`",
+                    settings_file.display()
+                ),
+                Some("mushroomdb install --platform claude-code".to_string()),
+            )
+        })
+        .collect()
 }
 
 fn has_hook_matching(root: &Js, event: &str, sub: &str, store: &StoreRef) -> bool {
@@ -846,34 +806,34 @@ fn has_hook_matching(root: &Js, event: &str, sub: &str, store: &StoreRef) -> boo
 // git hooks
 // ---------------------------------------------------------------------------
 
-fn check_git_hooks(project_root: &Path, store: &StoreRef) -> Option<Check> {
-    let dir = git_hooks_dir(project_root)?;
-    // The block belongs to this store if it names it either way. An `--auto`
-    // block in a checkout whose store is the default is the same store, and
-    // that is the shape every project install now writes.
-    let missing: Vec<&str> = GIT_HOOKS
+/// One `warn` per git hook still carrying the `sync` block a 0.6 install
+/// wrote for this store; nothing when there is none, or no checkout.
+///
+/// The block belongs to this store if it names it either way — an `--auto`
+/// block in a checkout whose store is the default is the same store.
+fn check_retired_git_hooks(project_root: &Path, store: &StoreRef) -> Vec<Check> {
+    let Some(dir) = git_hooks_dir(project_root) else {
+        return Vec::new();
+    };
+    GIT_HOOKS
         .iter()
         .filter(|name| {
-            let content = std::fs::read_to_string(dir.join(name)).unwrap_or_default();
-            let names_store = content
-                .lines()
-                .any(|l| line_runs_for_store(l, "sync", store));
-            !(content.contains(HOOK_BEGIN) && names_store)
+            std::fs::read_to_string(dir.join(name)).is_ok_and(|content| {
+                hook_block_lines(&content)
+                    .any(|l| line_runs_for_store(l, RETIRED_GIT_HOOK_SUBCOMMAND, store))
+            })
         })
-        .copied()
-        .collect();
-    Some(if missing.is_empty() {
-        Check::ok(
-            "git-hooks",
-            format!("{} present in {}", GIT_HOOKS.join("/"), dir.display()),
-        )
-    } else {
-        Check::warn(
-            "git-hooks",
-            format!("missing in {}: {}", dir.display(), missing.join(", ")),
-            Some("mushroomdb install --project (omit --no-git-hooks)".to_string()),
-        )
-    })
+        .map(|name| {
+            Check::warn(
+                "git-hooks",
+                format!(
+                    "retired {RETIRED_GIT_HOOK_SUBCOMMAND} block still in {} — 0.7 has no `{RETIRED_GIT_HOOK_SUBCOMMAND}`",
+                    dir.join(name).display()
+                ),
+                Some("mushroomdb install --project".to_string()),
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

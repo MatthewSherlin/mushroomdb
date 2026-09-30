@@ -4,13 +4,10 @@
 //! prints what the lib functions return.
 
 pub mod doctor;
-pub mod enrich;
 pub mod export;
 pub(crate) mod hook;
-pub mod impact_hook;
 pub mod ingest_git;
 pub mod install;
-pub mod intercept;
 pub mod recall;
 pub mod structure;
 
@@ -27,7 +24,7 @@ use core_api::{
     WriteGuard, NS_MAX_LEN,
 };
 use export::ExportFormat;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -367,87 +364,6 @@ pub enum Command {
         db_dir: Option<PathBuf>,
         auto: bool,
     },
-    /// Bring the store up to date with the repository the `GitSync` marker
-    /// names: the commits since the marker, then the dirty working tree.
-    Sync {
-        /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
-        /// The git hooks `install` writes use that form, so a `git worktree`
-        /// of the repository syncs its own store rather than the one belonging
-        /// to the checkout the install was typed in.
-        db_dir: Option<PathBuf>,
-        auto: bool,
-        /// Print the report as one JSON object instead of the plain digest.
-        /// The MCP `sync` tool runs this binary and reads that object, so the
-        /// counts reach an assistant without being parsed back out of prose.
-        json: bool,
-    },
-    /// Body of the optional `PreToolUse` hook: reads a `Grep` tool call on
-    /// stdin and exits 2 with a message when the pattern names a symbol the
-    /// graph holds, so the search becomes an `explore`. Off unless
-    /// `install --intercept-grep` wired it.
-    Intercept {
-        db_dir: Option<PathBuf>,
-        auto: bool,
-    },
-    /// Body of the optional `PreToolUse` hook on the editing tools: reads the
-    /// tool call on stdin and prints the edited file's blast radius as
-    /// `additionalContext`, so the model knows what the change reaches before
-    /// it makes it. Off unless `install --impact-before-edit` wired it.
-    ImpactHook {
-        db_dir: Option<PathBuf>,
-        auto: bool,
-    },
-    /// Body of the optional `PostToolUse` hook on `Grep`: reads the finished
-    /// tool call on stdin and prints what the graph knows about the symbols it
-    /// matched as `additionalContext`. Off unless `install --enrich-grep`
-    /// wired it.
-    Enrich {
-        db_dir: Option<PathBuf>,
-        auto: bool,
-    },
-    /// Re-extract named files only. Body of the PostToolUse hook, which reads
-    /// the paths off a payload on stdin when none are given on the command line.
-    Touch {
-        db_dir: Option<PathBuf>,
-        auto: bool,
-        files: Vec<PathBuf>,
-    },
-    /// Summarise the repository the store was built from: clusters, key
-    /// files, owners, what is hot, and what is worth asking about.
-    Map {
-        db_dir: PathBuf,
-        /// Print the [`core_api::repograph::RepoMap`] as JSON instead of the
-        /// rendered digest.
-        json: bool,
-    },
-    /// One target from as many sides as the depth asks for: the graph's
-    /// `context`, `impact` and `owners` answers behind one command.
-    Explore {
-        db_dir: PathBuf,
-        target: String,
-        depth: repograph::Depth,
-        /// Quote the body from the working tree, as `context --full` does.
-        full: bool,
-    },
-    /// Everything the graph knows about one file or symbol.
-    Context {
-        db_dir: PathBuf,
-        target: String,
-        /// Quote the body from the working tree. Without it the answer names
-        /// where the body is and leaves the reading to the caller.
-        full: bool,
-    },
-    /// What else the named files reach: co-change partners, importers, and the
-    /// symbols other files call.
-    Impact {
-        db_dir: PathBuf,
-        files: Vec<String>,
-    },
-    /// Who has written a file, and when.
-    Owners {
-        db_dir: PathBuf,
-        path: String,
-    },
     /// What links two nodes, with the evidence behind each link.
     Why {
         db_dir: PathBuf,
@@ -501,35 +417,24 @@ mushroomdb — embedded graph database
 
 Usage:
   mushroomdb install [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
-                     [--command <path>] [--no-git-hooks] [--no-prewarm]
-                     [--delivery cli|mcp|both] [--intercept-grep]
-                     [--impact-before-edit] [--enrich-grep]
+                     [--command <path>] [--no-prewarm] [--delivery cli|mcp|both]
                      [--always-load|--no-always-load]
                      --delivery cli writes the skill and the hooks and registers no MCP
                      server: the skill teaches `mushroomdb <command>` instead (claude-code
                      only; cursor and codex are always registered as MCP servers)
-                     --intercept-grep (deprecated, removed in 0.7) adds an experimental
-                     PreToolUse hook (matcher Grep) that redirects a search for a known
-                     symbol name to `explore`
-                     --impact-before-edit (deprecated, removed in 0.7) adds an experimental
-                     PreToolUse hook (matcher Edit|Write|MultiEdit) that injects the file's
-                     blast radius before the edit
-                     --enrich-grep (deprecated, removed in 0.7) adds an experimental
-                     PostToolUse hook (matcher Grep) that appends what the graph knows
-                     about the symbols the search matched
                      --always-load marks the registered MCP server alwaysLoad, so the host
                      keeps its tools in context instead of deferring them; already the
                      default when --db names a store and a server is registered
                      (--delivery mcp|both) — --no-always-load opts out
   mushroomdb uninstall [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
   mushroomdb disable [--platform claude-code|cursor|codex|all] [--project|--user]
-                     turn an install off without removing it: hooks, MCP entry and git hook
-                     blocks are removed; the skill, the store and .gitignore stay
+                     turn an install off without removing it: hooks and MCP entry are
+                     removed; the skill, the store and .gitignore stay
   mushroomdb enable [--platform claude-code|cursor|codex|all] [--project|--user]
                      turn a disabled install back on
   mushroomdb doctor [--project|--user] [--platform claude-code|cursor|codex|all]
-                     verify an install: config entry, store, hooks, git hooks, and a real
-                     stdio handshake with the configured MCP command; exits 1 on any `fail`
+                     verify an install: config entry, store, hooks, and a real stdio
+                     handshake with the configured MCP command; exits 1 on any `fail`
   mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>]
                      --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
@@ -543,45 +448,9 @@ Usage:
   mushroomdb brief <db-dir>|--auto    hook body: the repository in one block — size, synced sha, the most
                                       central files and the most called symbols; byte-stable, so a
                                       session host caches it once
-  mushroomdb sync <db-dir>|--auto [--json]   (deprecated, removed in 0.7)
-                                   re-sync the repo the store was built from: new commits, then the
-                                   dirty working tree (git hook body)
-  mushroomdb map <db-dir> [--json] (deprecated, removed in 0.7)
-                                   summarise the graphed repository: clusters, key files, owners, hot files
-                                   --json prints the computed map instead of the rendered digest
-  mushroomdb explore <db-dir> <target> [--depth context|impact|history|all] [--full]
-                                   (deprecated, removed in 0.7)
-                                   one target from as many sides as asked for: the definition and
-                                   its callers (context), the blast radius (impact), the owner and
-                                   what it changes with (history), or all three
-                                   <target> is a file path, a symbol key, or a bare symbol name
-                                   --full also quotes the body from the working tree
-  mushroomdb context <db-dir> <target> [--full]   (deprecated, removed in 0.7)
-                                   one file or symbol from every side: where it is, signature, callers,
-                                   callees, importers, co-change partners, commits, notes
-                                   <target> is a file path, a symbol key, or a bare symbol name
-                                   --full also quotes the body from the working tree
-  mushroomdb impact <db-dir> <file>...   (deprecated, removed in 0.7)
-                                   what changing these files reaches: partners, importers,
-                                   and the symbols other files call
-  mushroomdb owners <db-dir> <path>      (deprecated, removed in 0.7)
-                                   top author and share, who else knows it, last touch, last 4 quarters
-  mushroomdb why <db-dir> <a> <b>        (deprecated, removed in 0.7)
-                                   every rule edge between two nodes with its evidence, or the
-                                   shortest path between them
-  mushroomdb touch <db-dir>|--auto [<file>...]
-                                   re-extract just these files; with no <file> reads them from a
-                                   PostToolUse payload on stdin (hook body)
-  mushroomdb intercept <db-dir>|--auto
-                                   hook body: reads a PreToolUse Grep payload on stdin; exits 2
-                                   with a one-line pointer to `explore` when the pattern names a
-                                   symbol the graph holds, else exits 0 in silence
-  mushroomdb impact-hook <db-dir>|--auto
-                                   hook body: reads a PreToolUse edit payload on stdin; prints the
-                                   edited file's blast radius as additionalContext, else nothing
-  mushroomdb enrich <db-dir>|--auto
-                                   hook body: reads a PostToolUse Grep payload on stdin; prints what
-                                   the graph knows about the symbols it matched, else nothing
+  mushroomdb why <db-dir> <a> <b>
+                                   every rule edge between two keys with the evidence that
+                                   derived it, or a note that there is none
   mushroomdb suggest <db-dir>
   mushroomdb asof <db-dir> --commit N|--at <date> [--query \"MATCH ...\"] [--namespace <ns>]
                      --at takes an RFC 3339 date (2026-06-19, or 2026-06-19T12:00:00Z)
@@ -632,9 +501,9 @@ Default serve address is 127.0.0.1:8080. Non-loopback --addr requires --token or
 install defaults: --platform auto-detect; scope auto (project inside a git checkout, else user);
 the MCP entry runs `npx -y mushroomdb@<version>` unless a `mushroomdb` on PATH is this binary, or
 --command names one (a relative --command or --db is anchored to the current directory).
---no-git-hooks skips the post-commit/checkout/merge sync hooks. --no-prewarm means no network and no
-resolution: neither the one-off package fetch nor locating the package's binary, so every hook keeps
-the slower `npx` form.
+--no-prewarm means no network and no resolution: neither the one-off package fetch nor locating the
+package's binary, so every hook keeps the slower `npx` form.
+install and uninstall take out the code-graph hooks and git hook blocks a 0.6 install wrote.
 uninstall resolves the same scope and falls back to the other one when the inferred scope has no
 manifest; undoing a Codex install needs --platform codex.
 A project install inside a git checkout writes --auto rather than a store path, so each `git
@@ -650,12 +519,8 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
     let mut scope: Option<install::Scope> = None;
     let mut db: Option<PathBuf> = None;
     let mut command: Option<PathBuf> = None;
-    let mut git_hooks = true;
     let mut prewarm = true;
     let mut delivery = install::Delivery::default();
-    let mut intercept_grep = false;
-    let mut impact_before_edit = false;
-    let mut enrich_grep = false;
     // Tri-state on purpose: `None` is "the user said nothing", which is the
     // only case the default below is allowed to decide.
     let mut always_load: Option<bool> = None;
@@ -696,17 +561,15 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
             scope = Some(want);
             i += 1;
         } else if a == "--no-git-hooks" {
-            git_hooks = false;
+            // Accepted and ignored: 0.7 writes no git hooks, so "none" is
+            // already what every install gets. Refusing it would break every
+            // script that passed it to a 0.6 install for the same result.
             i += 1;
-        } else if a == "--intercept-grep" {
-            intercept_grep = true;
-            i += 1;
-        } else if a == "--impact-before-edit" {
-            impact_before_edit = true;
-            i += 1;
-        } else if a == "--enrich-grep" {
-            enrich_grep = true;
-            i += 1;
+        } else if a == "--intercept-grep" || a == "--impact-before-edit" || a == "--enrich-grep" {
+            return Err(format!(
+                "{a} was removed in 0.7 along with the code graph it fed. \
+                 Nothing replaces it. Pin `mushroomdb@0.6.x` to keep it."
+            ));
         } else if a == "--always-load" {
             always_load = Some(true);
             i += 1;
@@ -760,12 +623,8 @@ fn parse_install_cmd(args: &[&str]) -> Result<install::InstallOpts, String> {
         scope,
         db,
         command,
-        git_hooks,
         prewarm,
         delivery,
-        intercept_grep,
-        impact_before_edit,
-        enrich_grep,
         always_load,
     })
 }
@@ -960,31 +819,11 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
             .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
         "brief" => parse_dir_or_auto("brief", &args[1..])
             .map(|(db_dir, auto)| Command::Brief { db_dir, auto }),
-        "intercept" => parse_dir_or_auto("intercept", &args[1..])
-            .map(|(db_dir, auto)| Command::Intercept { db_dir, auto }),
-        "impact-hook" => parse_dir_or_auto("impact-hook", &args[1..])
-            .map(|(db_dir, auto)| Command::ImpactHook { db_dir, auto }),
-        "enrich" => parse_dir_or_auto("enrich", &args[1..])
-            .map(|(db_dir, auto)| Command::Enrich { db_dir, auto }),
-        "sync" => parse_sync(&args[1..]),
-        "map" => parse_dir_with_json("map", &args[1..])
-            .map(|(db_dir, json)| Command::Map { db_dir, json }),
-        "explore" => parse_explore(&args[1..]),
-        "context" => parse_context(&args[1..]),
-        "impact" => parse_positional("impact", &args[1..], 1, usize::MAX)
-            .map(|(db_dir, files)| Command::Impact { db_dir, files }),
-        "owners" => {
-            parse_positional("owners", &args[1..], 1, 1).map(|(db_dir, rest)| Command::Owners {
-                db_dir,
-                path: rest[0].clone(),
-            })
-        }
         "why" => parse_positional("why", &args[1..], 2, 2).map(|(db_dir, rest)| Command::Why {
             db_dir,
             a: rest[0].clone(),
             b: rest[1].clone(),
         }),
-        "touch" => parse_touch(&args[1..]),
         "ingest-git" => parse_ingest_git(&args[1..]),
         "install" => parse_install_cmd(&args[1..]).map(Command::Install),
         "uninstall" => parse_install_cmd(&args[1..]).map(Command::Uninstall),
@@ -2117,23 +1956,6 @@ fn parse_algo_dir(val: &str) -> Result<AlgoDir, String> {
     }
 }
 
-/// Body of `mushroomdb map <db-dir> [--json]`.
-///
-/// Opens read-only, with both write paths off: a map is a question, and asking
-/// it must never migrate a snapshot, rewrite a torn WAL tail, or make a writer
-/// wait on the cross-process lock.
-pub fn run_map(db_dir: &Path, json: bool) -> Result<String, CliError> {
-    let db = open_for_reading(db_dir)?;
-    let map = repograph::repo_map(&db, &repograph::MapOptions::default());
-    if json {
-        let mut out = serde_json::to_string_pretty(&map)
-            .map_err(|e| CliError(format!("serialise map: {e}")))?;
-        out.push('\n');
-        return Ok(out);
-    }
-    Ok(repograph::render_map(&map))
-}
-
 /// Body of `mushroomdb brief <db-dir>|--auto`, the `SessionStart` hook.
 ///
 /// Byte-stable for a given store: the host caches this output for the whole
@@ -2216,8 +2038,8 @@ fn reach_line(db_dir: &Path) -> String {
 /// A directory that is not there is an error rather than an empty store:
 /// `RealFs::new` runs `create_dir_all`, so without this guard a `brief` hook
 /// left behind by an uninstall — or any read of a mistyped path — would create
-/// the very store it then reports as empty. The same guard `run_recall` and
-/// `run_intercept` open behind.
+/// the very store it then reports as empty. The same guard `run_recall` opens
+/// behind.
 fn open_for_reading(db_dir: &Path) -> Result<structure::Db, CliError> {
     if !db_dir.exists() {
         return Err(CliError(format!("no store at {}", db_dir.display())));
@@ -2230,60 +2052,6 @@ fn open_for_reading(db_dir: &Path) -> Result<structure::Db, CliError> {
             read_only: true,
         },
     )?)
-}
-
-/// Body of `mushroomdb explore <db-dir> <target> [--depth …] [--full]`.
-///
-/// The same composition the MCP `explore` tool serves, rendered within the same
-/// default budget, so a session driving the CLI reads what a session driving
-/// the tool reads.
-pub fn run_explore(
-    db_dir: &Path,
-    target: &str,
-    depth: repograph::Depth,
-    full: bool,
-) -> Result<String, CliError> {
-    let db = open_for_reading(db_dir)?;
-    let report = repograph::explore(&db, None, target, depth, full);
-    Ok(repograph::render_explore(
-        &report,
-        repograph::DEFAULT_EXPLORE_BYTES,
-    ))
-}
-
-/// Body of `mushroomdb context <db-dir> <target> [--full]`.
-///
-/// With `full` the source is quoted from the repository the `GitSync` marker
-/// names, which is the checkout the store was built from. Without it the answer
-/// points at those lines rather than printing them.
-pub fn run_context(db_dir: &Path, target: &str, full: bool) -> Result<String, CliError> {
-    let db = open_for_reading(db_dir)?;
-    Ok(repograph::render_context(&repograph::context_with(
-        &db,
-        None,
-        target,
-        &repograph::ContextOptions { source: full },
-    )))
-}
-
-/// Body of `mushroomdb impact <db-dir> <file>...`.
-///
-/// The files named are taken to be the change, so each is reported and every
-/// partner that is one of them is marked `modified`.
-pub fn run_impact(db_dir: &Path, files: &[String]) -> Result<String, CliError> {
-    let db = open_for_reading(db_dir)?;
-    let modified: BTreeSet<String> = files.iter().cloned().collect();
-    let report = repograph::impact(&db, files, &modified, &repograph::ImpactOptions::default());
-    Ok(repograph::render_impact(&report))
-}
-
-/// Body of `mushroomdb owners <db-dir> <path>`.
-pub fn run_owners(db_dir: &Path, path: &str) -> Result<String, CliError> {
-    let db = open_for_reading(db_dir)?;
-    match repograph::owners(&db, path, None) {
-        Some(report) => Ok(repograph::render_owners(&report)),
-        None => Err(CliError(format!("no file in the store at {path}"))),
-    }
 }
 
 /// Body of `mushroomdb why <db> <a> <b>`: every rule edge between two keys
@@ -2471,46 +2239,6 @@ fn parse_mcp(args: &[&str]) -> Result<Command, String> {
     })
 }
 
-/// `sync <db-dir>|--auto [--json]`. `--auto` is what the git hooks `install`
-/// writes use: git runs a hook with the working tree it acted on as the
-/// working directory, so the store resolves to that tree's own and a second
-/// worktree never syncs the first one's graph.
-fn parse_sync(args: &[&str]) -> Result<Command, String> {
-    let json = args.contains(&"--json");
-    let rest: Vec<&str> = args.iter().copied().filter(|a| *a != "--json").collect();
-    parse_dir_or_auto("sync", &rest).map(|(db_dir, auto)| Command::Sync { db_dir, auto, json })
-}
-
-/// `touch [<db-dir>|--auto] [<file>...]`. The first positional is the database
-/// unless `--auto` already named it, in which case every positional is a file.
-fn parse_touch(args: &[&str]) -> Result<Command, String> {
-    let mut db_dir = None;
-    let mut auto = false;
-    let mut files = Vec::new();
-    for a in args {
-        if *a == "--auto" {
-            auto = true;
-        } else if a.starts_with('-') {
-            return Err(format!("unexpected flag: {a}"));
-        } else if db_dir.is_none() && !auto {
-            db_dir = Some(PathBuf::from(*a));
-        } else {
-            files.push(PathBuf::from(*a));
-        }
-    }
-    if db_dir.is_none() && !auto {
-        return Err("touch requires <db-dir> or --auto".into());
-    }
-    if db_dir.is_some() && auto {
-        return Err("touch: --auto takes no <db-dir>".into());
-    }
-    Ok(Command::Touch {
-        db_dir,
-        auto,
-        files,
-    })
-}
-
 /// `<db-dir>` followed by between `min` and `max` further arguments, none of
 /// which may look like a flag.
 ///
@@ -2545,104 +2273,6 @@ fn parse_positional(
         return Err(format!("unexpected extra argument: {}", rest[max]));
     }
     Ok((db_dir, rest))
-}
-
-/// `explore <db-dir> <target> [--depth context|impact|history|all] [--full]`.
-///
-/// The depth names are the same four the MCP tool enumerates, parsed by the
-/// same function, so the two doors cannot disagree about what a depth is.
-fn parse_explore(args: &[&str]) -> Result<Command, String> {
-    let mut rest: Vec<String> = Vec::new();
-    let mut db_dir: Option<PathBuf> = None;
-    let mut depth = repograph::Depth::Context;
-    let mut full = false;
-    let mut want_depth = false;
-    for a in args {
-        if want_depth {
-            depth = repograph::Depth::parse(a).ok_or_else(|| {
-                format!(
-                    "--depth must be one of {}, got {a}",
-                    repograph::Depth::NAMES.join(" | ")
-                )
-            })?;
-            want_depth = false;
-        } else if *a == "--depth" {
-            want_depth = true;
-        } else if *a == "--full" {
-            full = true;
-        } else if a.starts_with('-') {
-            return Err(format!("unexpected flag: {a}"));
-        } else if db_dir.is_none() {
-            db_dir = Some(PathBuf::from(*a));
-        } else {
-            rest.push((*a).to_string());
-        }
-    }
-    if want_depth {
-        return Err("--depth requires a value".to_string());
-    }
-    let db_dir = db_dir.ok_or_else(|| "explore requires <db-dir>".to_string())?;
-    match rest.len() {
-        0 => Err("explore requires <db-dir> and 1 more argument".to_string()),
-        1 => Ok(Command::Explore {
-            db_dir,
-            target: rest.remove(0),
-            depth,
-            full,
-        }),
-        _ => Err(format!("unexpected extra argument: {}", rest[1])),
-    }
-}
-
-/// `context <db-dir> <target> [--full]`.
-///
-/// Its own parser rather than [`parse_positional`], which rejects every flag:
-/// `--full` is the one thing `context` takes beyond its two positionals, and
-/// anything else that looks like a flag is still an error.
-fn parse_context(args: &[&str]) -> Result<Command, String> {
-    let mut rest: Vec<String> = Vec::new();
-    let mut db_dir: Option<PathBuf> = None;
-    let mut full = false;
-    for a in args {
-        if *a == "--full" {
-            full = true;
-        } else if a.starts_with('-') {
-            return Err(format!("unexpected flag: {a}"));
-        } else if db_dir.is_none() {
-            db_dir = Some(PathBuf::from(*a));
-        } else {
-            rest.push((*a).to_string());
-        }
-    }
-    let db_dir = db_dir.ok_or_else(|| "context requires <db-dir>".to_string())?;
-    match rest.len() {
-        0 => Err("context requires <db-dir> and 1 more argument".to_string()),
-        1 => Ok(Command::Context {
-            db_dir,
-            target: rest.remove(0),
-            full,
-        }),
-        _ => Err(format!("unexpected extra argument: {}", rest[1])),
-    }
-}
-
-/// `<cmd> <db-dir> [--json]`, shared by `map` and `sync`.
-fn parse_dir_with_json(cmd: &str, args: &[&str]) -> Result<(PathBuf, bool), String> {
-    let mut db_dir = None;
-    let mut json = false;
-    for a in args {
-        if *a == "--json" {
-            json = true;
-        } else if a.starts_with('-') {
-            return Err(format!("unexpected flag: {a}"));
-        } else if db_dir.is_some() {
-            return Err(format!("unexpected extra argument: {a}"));
-        } else {
-            db_dir = Some(PathBuf::from(*a));
-        }
-    }
-    let db_dir = db_dir.ok_or_else(|| format!("{cmd} requires <db-dir>"))?;
-    Ok((db_dir, json))
 }
 
 fn parse_one_dir(cmd: &str, args: &[&str]) -> Result<PathBuf, String> {
@@ -3362,48 +2992,6 @@ mod tests {
                 },
             },
             Case {
-                args: &["context", "db", "x"],
-                check: |r| match r {
-                    Ok(Command::Context {
-                        db_dir,
-                        target,
-                        full,
-                    }) => {
-                        assert_eq!(db_dir, PathBuf::from("db"));
-                        assert_eq!(target, "x");
-                        assert!(!full, "the default answer is a pointer, not a body");
-                    }
-                    other => panic!("context <dir> <target>, got {other:?}"),
-                },
-            },
-            Case {
-                args: &["context", "db", "x", "--full"],
-                check: |r| {
-                    assert_eq!(
-                        r.unwrap(),
-                        Command::Context {
-                            db_dir: PathBuf::from("db"),
-                            target: "x".into(),
-                            full: true,
-                        }
-                    );
-                },
-            },
-            Case {
-                args: &["explore", "db", "x", "--depth", "impact"],
-                check: |r| {
-                    assert_eq!(
-                        r.unwrap(),
-                        Command::Explore {
-                            db_dir: PathBuf::from("db"),
-                            target: "x".into(),
-                            depth: repograph::Depth::Impact,
-                            full: false,
-                        }
-                    );
-                },
-            },
-            Case {
                 args: &["serve"],
                 check: |r| {
                     let e = r.expect_err("serve without dir");
@@ -3604,26 +3192,19 @@ mod tests {
                 },
             },
             Case {
-                args: &["install", "--intercept-grep"],
+                args: &["install", "--always-load"],
                 check: |r| match r {
-                    Ok(Command::Install(opts)) => assert!(opts.intercept_grep),
-                    other => panic!("install --intercept-grep, got {other:?}"),
+                    Ok(Command::Install(opts)) => assert!(opts.always_load),
+                    other => panic!("install --always-load, got {other:?}"),
                 },
             },
             Case {
-                args: &[
-                    "install",
-                    "--impact-before-edit",
-                    "--enrich-grep",
-                    "--always-load",
-                ],
+                // 0.7 writes no git hooks, so `--no-git-hooks` asks for what
+                // every install already gets: accepted, not refused.
+                args: &["install", "--no-git-hooks"],
                 check: |r| match r {
-                    Ok(Command::Install(opts)) => {
-                        assert!(opts.impact_before_edit);
-                        assert!(opts.enrich_grep);
-                        assert!(opts.always_load);
-                    }
-                    other => panic!("install with the code-door flags, got {other:?}"),
+                    Ok(Command::Install(_)) => {}
+                    other => panic!("install --no-git-hooks, got {other:?}"),
                 },
             },
             Case {
@@ -3680,75 +3261,45 @@ mod tests {
                 },
             },
             Case {
-                // Every experiment is off unless it is asked for by name.
+                // The one experiment left is off unless it is asked for.
                 args: &["install"],
                 check: |r| match r {
-                    Ok(Command::Install(opts)) => {
-                        assert!(!opts.intercept_grep);
-                        assert!(!opts.impact_before_edit);
-                        assert!(!opts.enrich_grep);
-                        assert!(!opts.always_load);
-                    }
+                    Ok(Command::Install(opts)) => assert!(!opts.always_load),
                     other => panic!("install, got {other:?}"),
-                },
-            },
-            Case {
-                args: &["impact-hook", "--auto"],
-                check: |r| match r {
-                    Ok(Command::ImpactHook { db_dir, auto }) => {
-                        assert!(db_dir.is_none() && auto);
-                    }
-                    other => panic!("impact-hook --auto, got {other:?}"),
-                },
-            },
-            Case {
-                args: &["enrich", "/tmp/db"],
-                check: |r| match r {
-                    Ok(Command::Enrich { db_dir, auto }) => {
-                        assert_eq!(db_dir.as_deref(), Some(Path::new("/tmp/db")));
-                        assert!(!auto);
-                    }
-                    other => panic!("enrich /tmp/db, got {other:?}"),
-                },
-            },
-            Case {
-                args: &["enrich"],
-                check: |r| match r {
-                    Err(e) => assert!(e.contains("enrich requires <db-dir> or --auto"), "{e}"),
-                    other => panic!("enrich with no store, got {other:?}"),
-                },
-            },
-            Case {
-                args: &["intercept", "--auto"],
-                check: |r| match r {
-                    Ok(Command::Intercept { db_dir, auto }) => {
-                        assert_eq!(db_dir, None);
-                        assert!(auto);
-                    }
-                    other => panic!("intercept --auto, got {other:?}"),
-                },
-            },
-            Case {
-                args: &["intercept", "/tmp/db"],
-                check: |r| match r {
-                    Ok(Command::Intercept { db_dir, auto }) => {
-                        assert_eq!(db_dir, Some(PathBuf::from("/tmp/db")));
-                        assert!(!auto);
-                    }
-                    other => panic!("intercept /tmp/db, got {other:?}"),
-                },
-            },
-            Case {
-                args: &["intercept"],
-                check: |r| match r {
-                    Err(e) => assert!(e.contains("intercept requires <db-dir> or --auto"), "{e}"),
-                    other => panic!("intercept with no store, got {other:?}"),
                 },
             },
         ];
 
         for case in &cases {
             (case.check)(parse_args(case.args));
+        }
+    }
+
+    /// The ten code-graph subcommands left in 0.7. Each is an unknown command
+    /// now — not a stub that prints a deprecation — and the help text names
+    /// none of them.
+    #[test]
+    fn the_retired_code_graph_subcommands_are_unknown() {
+        for sub in [
+            "sync",
+            "intercept",
+            "impact-hook",
+            "enrich",
+            "touch",
+            "map",
+            "explore",
+            "context",
+            "impact",
+            "owners",
+        ] {
+            match parse_args(&[sub, "/tmp/db"]) {
+                Err(e) => assert_eq!(e, format!("unknown command: {sub}")),
+                other => panic!("{sub} still parses: {other:?}"),
+            }
+            assert!(
+                !usage().contains(&format!("mushroomdb {sub} ")),
+                "the help still names {sub}"
+            );
         }
     }
 
@@ -5533,70 +5084,7 @@ mod tests {
     }
 
     #[test]
-    fn map_parses_a_dir_and_an_optional_json_flag() {
-        assert_eq!(
-            parse_args(&["map", "/tmp/db"]).unwrap(),
-            Command::Map {
-                db_dir: PathBuf::from("/tmp/db"),
-                json: false,
-            }
-        );
-        // The flag may come before or after the directory.
-        let want = Command::Map {
-            db_dir: PathBuf::from("/tmp/db"),
-            json: true,
-        };
-        assert_eq!(parse_args(&["map", "/tmp/db", "--json"]).unwrap(), want);
-        assert_eq!(parse_args(&["map", "--json", "/tmp/db"]).unwrap(), want);
-        assert!(parse_args(&["map"]).is_err(), "<db-dir> is required");
-        assert!(parse_args(&["map", "/tmp/db", "/tmp/other"]).is_err());
-        assert!(parse_args(&["map", "/tmp/db", "--nope"]).is_err());
-        assert!(usage().contains("mushroomdb map <db-dir> [--json]"));
-    }
-
-    #[test]
-    fn the_graph_tools_take_a_dir_and_their_keys() {
-        assert_eq!(
-            parse_args(&["context", "/tmp/db", "src/db.rs#open"]).unwrap(),
-            Command::Context {
-                db_dir: PathBuf::from("/tmp/db"),
-                target: "src/db.rs#open".to_string(),
-                full: false,
-            }
-        );
-        assert_eq!(
-            parse_args(&["explore", "/tmp/db", "open"]).unwrap(),
-            Command::Explore {
-                db_dir: PathBuf::from("/tmp/db"),
-                target: "open".to_string(),
-                depth: repograph::Depth::Context,
-                full: false,
-            },
-            "the default depth is the cheapest one"
-        );
-        assert_eq!(
-            parse_args(&["explore", "/tmp/db", "open", "--depth", "all", "--full"]).unwrap(),
-            Command::Explore {
-                db_dir: PathBuf::from("/tmp/db"),
-                target: "open".to_string(),
-                depth: repograph::Depth::All,
-                full: true,
-            }
-        );
-        assert_eq!(
-            parse_args(&["impact", "/tmp/db", "a.rs", "b.rs"]).unwrap(),
-            Command::Impact {
-                db_dir: PathBuf::from("/tmp/db"),
-                files: vec!["a.rs".to_string(), "b.rs".to_string()],
-            }
-        );
-        assert_eq!(
-            parse_args(&["owners", "/tmp/db", "a.rs"]).unwrap(),
-            Command::Owners {
-                db_dir: PathBuf::from("/tmp/db"),
-                path: "a.rs".to_string(),
-            }
-        );
+    fn why_takes_a_dir_and_two_keys() {
         assert_eq!(
             parse_args(&["why", "/tmp/db", "a.rs", "b.rs"]).unwrap(),
             Command::Why {
@@ -5608,60 +5096,13 @@ mod tests {
 
         // Too few arguments, too many, and a key that looks like a flag.
         for args in [
-            vec!["context", "/tmp/db"],
-            vec!["context", "/tmp/db", "a", "b"],
-            vec!["impact", "/tmp/db"],
-            vec!["owners", "/tmp/db"],
             vec!["why", "/tmp/db", "a"],
             vec!["why", "/tmp/db", "a", "b", "c"],
             vec!["why", "/tmp/db", "-a", "b"],
-            vec!["context"],
-            vec!["explore"],
-            vec!["explore", "/tmp/db"],
-            vec!["explore", "/tmp/db", "a", "b"],
-            vec!["explore", "/tmp/db", "a", "--depth"],
-            vec!["explore", "/tmp/db", "a", "--depth", "everything"],
-            vec!["explore", "/tmp/db", "a", "--nope"],
         ] {
             assert!(parse_args(&args).is_err(), "{args:?} must not parse");
         }
-        for line in [
-            "mushroomdb explore <db-dir> <target>",
-            "mushroomdb context <db-dir> <target>",
-            "mushroomdb impact <db-dir> <file>...",
-            "mushroomdb owners <db-dir> <path>",
-            "mushroomdb why <db-dir> <a> <b>",
-        ] {
-            assert!(usage().contains(line), "usage is missing {line:?}");
-        }
-    }
-
-    /// The seven code-graph subcommands are deprecated in 0.6.4 and removed in
-    /// 0.7, and `--help` has to say so — the same marker the three hook flags
-    /// carry. Each entry below is the usage line's prefix; the marker must
-    /// appear inside that command's block, before the next one starts.
-    #[test]
-    fn usage_marks_the_deprecated_subcommands() {
-        let text = usage();
-        for prefix in [
-            "mushroomdb explore <db-dir> <target>",
-            "mushroomdb map <db-dir> [--json]",
-            "mushroomdb context <db-dir> <target>",
-            "mushroomdb impact <db-dir> <file>...",
-            "mushroomdb owners <db-dir> <path>",
-            "mushroomdb why <db-dir> <a> <b>",
-            "mushroomdb sync <db-dir>|--auto",
-        ] {
-            let start = text
-                .find(prefix)
-                .unwrap_or_else(|| panic!("usage is missing {prefix:?}"));
-            let rest = &text[start..];
-            let block_end = rest.find("\n  mushroomdb ").unwrap_or(rest.len());
-            assert!(
-                rest[..block_end].contains("(deprecated, removed in 0.7)"),
-                "usage does not mark {prefix:?} deprecated"
-            );
-        }
+        assert!(usage().contains("mushroomdb why <db-dir> <a> <b>"));
     }
 
     /// Every hook-driven command takes either a path or `--auto`, never both
@@ -5697,7 +5138,7 @@ mod tests {
                 auto: false
             }
         );
-        for cmd in ["mcp", "recall", "touch", "brief"] {
+        for cmd in ["mcp", "recall", "brief"] {
             assert!(parse_args(&[cmd]).is_err(), "{cmd} with no target");
             assert!(
                 parse_args(&[cmd, "/tmp/db", "--auto"]).is_err(),
@@ -5737,82 +5178,6 @@ mod tests {
         assert!(parse_args(&["mcp", "/tmp/db", "--nope"]).is_err());
         assert!(parse_args(&["recall", "/tmp/db", "--all-tools"]).is_err());
         assert!(usage().contains("--all-tools"));
-    }
-
-    #[test]
-    fn sync_and_touch_parse() {
-        assert_eq!(
-            parse_args(&["sync", "/tmp/db"]).unwrap(),
-            Command::Sync {
-                db_dir: Some(PathBuf::from("/tmp/db")),
-                auto: false,
-                json: false,
-            }
-        );
-        assert_eq!(
-            parse_args(&["sync", "/tmp/db", "--json"]).unwrap(),
-            Command::Sync {
-                db_dir: Some(PathBuf::from("/tmp/db")),
-                auto: false,
-                json: true,
-            }
-        );
-        // The git hooks `install` writes use `--auto`, so each worktree of a
-        // repository syncs its own store.
-        assert_eq!(
-            parse_args(&["sync", "--auto"]).unwrap(),
-            Command::Sync {
-                db_dir: None,
-                auto: true,
-                json: false,
-            }
-        );
-        assert_eq!(
-            parse_args(&["sync", "--auto", "--json"]).unwrap(),
-            Command::Sync {
-                db_dir: None,
-                auto: true,
-                json: true,
-            }
-        );
-        assert!(
-            parse_args(&["sync"]).is_err(),
-            "one of <db-dir> or --auto is required"
-        );
-        assert!(
-            parse_args(&["sync", "/tmp/db", "--auto"]).is_err(),
-            "--auto and a path contradict each other"
-        );
-
-        // Positional form: the first path is the database, the rest are files.
-        assert_eq!(
-            parse_args(&["touch", "/tmp/db", "src/a.rs", "src/b.rs"]).unwrap(),
-            Command::Touch {
-                db_dir: Some(PathBuf::from("/tmp/db")),
-                auto: false,
-                files: vec![PathBuf::from("src/a.rs"), PathBuf::from("src/b.rs")],
-            }
-        );
-        // With --auto every positional is a file.
-        assert_eq!(
-            parse_args(&["touch", "--auto", "src/a.rs"]).unwrap(),
-            Command::Touch {
-                db_dir: None,
-                auto: true,
-                files: vec![PathBuf::from("src/a.rs")],
-            }
-        );
-        // No files at all is the hook form: the paths arrive on stdin.
-        assert_eq!(
-            parse_args(&["touch", "--auto"]).unwrap(),
-            Command::Touch {
-                db_dir: None,
-                auto: true,
-                files: vec![],
-            }
-        );
-        assert!(usage().contains("mushroomdb sync <db-dir>"));
-        assert!(usage().contains("mushroomdb touch"));
     }
 
     #[test]
