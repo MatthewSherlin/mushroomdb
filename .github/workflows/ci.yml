@@ -16,6 +16,10 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --workspace --examples
       - run: cargo test --workspace
+      # Informational, never a failure: prints how many #[ignore]d tests exist
+      # against how many any workflow actually names. Added because 20 of 28
+      # ran nowhere, including every memory-ceiling and scale-growth assertion.
+      - run: bash scripts/ignored-test-census.sh
       # Multi-process suite: spawns the `mp_worker` helper binary, which only
       # exists behind the `mp-test` feature (so a plain workspace test run never
       # builds it). Cross-process locking has no other coverage.
@@ -75,13 +79,17 @@ jobs:
       # edges at all and scores 0.0000, which is how it sat dark through 0.6.6's Task 2.
       # At prune=own this gate fails at 0.8581; see docs/site/rules.md.
       - run: cargo test --release -p sim-harness -- approximate_recall_5k_timing --ignored --nocapture
-      # dist_evals_per_insert_is_bounded: counts distance evaluations per insert at
-      # 1k and 5k (dimension 32 — the count is a property of the graph, not of the
-      # dimension). A count, not a wall clock, so it holds on any machine: this is
-      # the gate that notices the insert path doing more work per vector as the
-      # index grows, which no timing-free test did before. Measured 12,739.5 at 1k
-      # and 23,901.7 at 5k, ratio 1.876, against ceilings of 36,000 and 2.8x. ~2 s.
-      - run: cargo test --release -p mushroomdb-rules --features test-hooks -- dist_evals_per_insert_is_bounded --ignored --nocapture
+      # dist_evals_5k_is_under_36000 / dist_evals_ratio_1k_to_5k_is_under_2_8x: counts
+      # distance evaluations per insert at 1k and 5k (dimension 32 — the count is a
+      # property of the graph, not of the dimension). A count, not a wall clock, so
+      # it holds on any machine: this is the gate that notices the insert path doing
+      # more work per vector as the index grows, which no timing-free test did
+      # before. Split from one test (dist_evals_per_insert_is_bounded) into two so
+      # a red absolute-ceiling assertion cannot hide the ratio assertion behind it —
+      # named separately here so `cargo test`'s substring filter still runs both.
+      # Measured 12,739.5 at 1k and 23,901.7 at 5k, ratio 1.876, against ceilings of
+      # 36,000 and 2.8x. ~2 s.
+      - run: cargo test --release -p mushroomdb-rules --features test-hooks -- dist_evals_5k_is_under_36000 dist_evals_ratio_1k_to_5k_is_under_2_8x --ignored --nocapture
       # exact_vector_rule_recall_5k: an exact VectorSimilar rule over the same
       # 5k × 1536-D corpus; asserts recall >= 0.98 against the same O(n^2)
       # ground truth the approximate gate uses. From 0.6.6 an exact rule finds its
