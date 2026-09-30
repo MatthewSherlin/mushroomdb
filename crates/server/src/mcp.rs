@@ -628,8 +628,9 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
 
 /// Insert a new node or update an existing node's properties, keyed by `key`.
 ///
-/// The write itself is [`memory::remember::describe_entity`] — the one upsert
-/// implementation every surface calls, which also clears a provisional mark
+/// The write itself is [`memory::remember::describe_entity`] — the shared
+/// upsert implementation for the MCP surface (HTTP and Python have no
+/// upsert of their own yet), which also clears a provisional mark
 /// (`memory_schema::PROVISIONAL_PROP`) on `key` if it had one, whoever set it.
 ///
 /// If the node exists: every supplied property is checked (reserved names, the
@@ -653,17 +654,21 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
 /// is reached by, while the create path had always ignored it.
 ///
 /// A node's **label never changes on an update** — the engine has no
-/// label-mutation path at all, `describe_entity` uses `label` only on create,
-/// and this tool always returns the label actually stored, not the one asked
-/// for. A `label` that names something else on an existing `key` used to be
-/// silently accepted and dropped (a provisional entity from `remember`,
-/// always created `Entity`, could never actually become the `Person`
-/// `upsert_entity` was asked to make it); it is now `label_mismatch` in the
-/// reply, unmissable beside `"ok": true`, and the props are still written —
-/// real label mutation stays out of scope, this only stops the response from
-/// lying about it.
+/// label-mutation path at all, and `describe_entity` uses `label` only on
+/// create. A `label` that names something else on an existing `key` is a
+/// refusal, checked before anything is written: nothing in `props` is
+/// touched either, matching every other pre-write check this tool makes (a
+/// namespace mismatch, a view-owned field). Before fix round 2 this was
+/// silently accepted and dropped — every update, not only a provisional
+/// stub's — which is worse than it sounds for the one case the feature
+/// exists for: a provisional entity `remember` created is *always* `Entity`,
+/// permanently, and `{"created":false,"ok":true}` beside a quietly-ignored
+/// `label` is not a signal an agent acts on. There is a working path instead
+/// — `remember`'s `entities`, at first mention, produces a correctly
+/// labelled, non-provisional node with its `ABOUT` edge intact — so refusing
+/// costs nothing a caller could not already avoid.
 ///
-/// Returns `{ok, key, label, created, updated_fields?, label_mismatch?}`.
+/// Returns `{ok, key, label, created, updated_fields?}`.
 fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
     let Some(key) = args.get("key").and_then(Js::as_str) else {
         return CallOutcome::ToolErr("missing key".into());
@@ -707,6 +712,24 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
 
     if exists {
         let mut g = db.write();
+        // The label actually stored — an update never changes it. Checked,
+        // and refused, before anything else: a `label` that disagrees is not
+        // a request this call can honor at all, so it does not partially
+        // apply the rest of `props` either (see the doc comment above).
+        let stored_label = g
+            .node_ref(key)
+            .map(|n| n.label().to_string())
+            .unwrap_or_default();
+        if let Some(requested) = label_opt {
+            if requested != stored_label {
+                return CallOutcome::ToolErr(format!(
+                    "'{key}' exists as {stored_label:?}, not {requested:?}; this release \
+                     cannot relabel a node. Pass the label in remember's 'entities' when you \
+                     know it (at first mention, before it goes provisional), or use a \
+                     different key."
+                ));
+            }
+        }
         let mut to_set: Vec<(String, Value)> = Vec::new();
         for (field, v) in row {
             // The namespace a node is already in is the engine's no-op: it
@@ -723,30 +746,13 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
         if let Err(e) = memory::remember::describe_entity(&mut g, key, None, &to_set) {
             return CallOutcome::ToolErr(graph_err_msg(e));
         }
-        // The label actually stored — an update never changes it, whatever
-        // `label` this call named (see the doc comment above).
-        let stored_label = g
-            .node_ref(key)
-            .map(|n| n.label().to_string())
-            .unwrap_or_default();
-        let mut out = json!({
+        CallOutcome::ToolOk(json!({
             "ok": true,
             "key": key,
             "label": stored_label,
             "created": false,
             "updated_fields": count
-        });
-        if let Some(requested) = label_opt {
-            if requested != stored_label {
-                out["label_mismatch"] = json!(format!(
-                    "requested label {requested:?} was NOT applied — '{key}' already exists \
-                     as {stored_label:?} and a label cannot change after creation (no \
-                     label-mutation path exists). The other props were still written. To \
-                     get {requested:?}, delete and re-insert the node under that label."
-                ));
-            }
-        }
-        CallOutcome::ToolOk(out)
+        }))
     } else {
         let Some(label) = label_opt else {
             return CallOutcome::ToolErr("label required when creating a new entity".into());

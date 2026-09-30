@@ -291,6 +291,68 @@ fn self_declaring_full_text_for_new_labels_is_bounded() {
     assert!(db.has_node("thing-63"));
 }
 
+/// Fix round 3 / finding 4: spec §3.2 promises "a cap per commit, so a
+/// malformed batch cannot flood the graph" — there was none. A batch right
+/// at the cap (20, `MAX_PROVISIONAL_PER_COMMIT`) must be entirely unaffected
+/// by it: every key stubbed, none refused.
+#[test]
+fn a_batch_at_the_provisional_cap_is_unaffected() {
+    let mut db = store("cap-exact");
+    let about: Vec<String> = (0..20).map(|i| format!("k{i}")).collect();
+    let report = remember(&mut db, &input("twenty unknown subjects", &about)).unwrap();
+    assert_eq!(report.provisional.len(), 20, "{report:?}");
+    assert!(
+        report.provisional_capped.is_empty(),
+        "a batch exactly at the cap must not be capped: {report:?}"
+    );
+    for k in &about {
+        assert_eq!(
+            db.get_prop(k, PROVISIONAL_PROP),
+            Some(Value::Bool(true)),
+            "{k} must be stubbed"
+        );
+        assert!(
+            db.node_edges(k)
+                .unwrap()
+                .iter()
+                .any(|e| e.edge_type == "ABOUT"),
+            "{k} must have its ABOUT edge"
+        );
+    }
+}
+
+/// A batch over the cap: the excess is refused, reported, and never gets a
+/// node or an edge — but the note and every key under the cap still commit.
+/// This is the exact defect fix round 3 closes: on the pre-fix binary, 40
+/// stubs landed in one call with no cap, no warning, and no report field
+/// naming any of them.
+#[test]
+fn a_batch_over_the_provisional_cap_refuses_and_reports_the_excess() {
+    let mut db = store("cap-exceeded");
+    let about: Vec<String> = (0..25).map(|i| format!("k{i}")).collect();
+    let report = remember(&mut db, &input("twenty-five unknown subjects", &about)).unwrap();
+
+    assert_eq!(report.provisional.len(), 20, "{report:?}");
+    assert_eq!(report.provisional_capped.len(), 5, "{report:?}");
+    assert_eq!(
+        report.provisional_capped,
+        about[20..].to_vec(),
+        "the capped keys must be named, not just counted: {report:?}"
+    );
+
+    // Everything under the cap committed normally.
+    for k in &about[..20] {
+        assert_eq!(db.get_prop(k, PROVISIONAL_PROP), Some(Value::Bool(true)));
+    }
+    // Nothing over the cap was written at all — no node, hence no edge.
+    for k in &about[20..] {
+        assert!(!db.has_node(k), "{k} must not have been created");
+    }
+    // The note itself, and every key under the cap, still committed — one
+    // caller mistake does not cost the whole write.
+    assert!(db.has_node(&report.note), "the note must still be written");
+}
+
 #[test]
 fn the_caller_owns_the_timestamp() {
     let mut db = store("ts");

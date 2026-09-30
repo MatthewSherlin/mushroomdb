@@ -5313,14 +5313,18 @@ fn upsert_entity_does_not_count_a_no_op_namespace() {
 
 /// Binding: a provisional entity `remember` creates is stuck at its
 /// creation-time label forever — the engine has no label-mutation path at
-/// all — so `upsert_entity` naming a different label on that key must say so
-/// loudly rather than silently accepting and dropping it. Fix round 2, 0.7:
-/// on a clean binary, `remember{about:["matthew"]}` then
-/// `upsert_entity{key:"matthew", label:"Person", ...}` reported
-/// `{"ok":true,"created":false}` and left the node permanently `Entity`,
+/// all — so `upsert_entity` naming a different label on an existing key is a
+/// refusal, not a silent accept-and-drop. Fix round 3, 0.7 (corrected from
+/// fix round 2's weaker "disclose it" call): a supplied `label` was
+/// previously ignored on *every* update, not only a provisional stub's, and
+/// `{"ok":true,"created":false}` beside a dropped field is not a signal an
+/// agent acts on for a mistake this permanent. On a clean binary,
+/// `remember{about:["matthew"]}` then
+/// `upsert_entity{key:"matthew", label:"Person", ...}` used to report
+/// `{"ok":true,"created":false}` and leave the node permanently `Entity`,
 /// invisible to `MATCH (n:Person)`.
 #[test]
-fn upsert_entity_on_an_existing_key_reports_a_label_mismatch_rather_than_silently_dropping_it() {
+fn upsert_entity_on_an_existing_key_with_a_different_label_is_refused() {
     let db = open("upsert-label-mismatch");
 
     // An unknown `about` key is created provisional, label `Entity`.
@@ -5335,27 +5339,19 @@ fn upsert_entity_on_an_existing_key_reports_a_label_mismatch_rather_than_silentl
         Some("Entity".to_string())
     );
 
-    let updated = content_json(&one_task_call(
+    let refused = one_task_call(
         db.clone(),
         "upsert_entity",
         json!({"key": "matthew", "label": "Person", "props": {"name": "Matthew Sherlin"}}),
-    ));
-    assert_eq!(updated["created"], json!(false), "{updated}");
-    assert_eq!(
-        updated["label"],
-        json!("Entity"),
-        "the reply must name the label actually stored, not the one requested: {updated}"
     );
-    let mismatch = updated["label_mismatch"].as_str().unwrap_or_else(|| {
-        panic!("a label that could not be applied must be unmissable in the reply: {updated}")
-    });
+    let msg = error_text(&refused);
     assert!(
-        mismatch.contains("Person") && mismatch.contains("Entity"),
-        "{mismatch}"
+        msg.contains("Person") && msg.contains("Entity"),
+        "the refusal must name both the requested and the stored label: {msg}"
     );
 
-    // Still there, still queryable — under the label it actually has, and
-    // the props that could be written were.
+    // All-or-nothing, like every other pre-write refusal this tool makes: the
+    // label could not be honoured, so none of `props` was written either.
     let g = db.read();
     assert_eq!(
         g.node_info("matthew").map(|n| n.label),
@@ -5363,8 +5359,9 @@ fn upsert_entity_on_an_existing_key_reports_a_label_mismatch_rather_than_silentl
     );
     assert_eq!(
         g.get_prop("matthew", "name"),
-        Some(Value::Str("Matthew Sherlin".into())),
-        "props must still be written even though the label could not change"
+        Some(Value::Str("matthew".into())),
+        "a refused label change must not leave props partially written — \
+         `name` must still be the provisional stub's own key, not \"Matthew Sherlin\""
     );
     drop(g);
     let count = content_json(&one_task_call(
@@ -5376,6 +5373,63 @@ fn upsert_entity_on_an_existing_key_reports_a_label_mismatch_rather_than_silentl
         count["rows"],
         json!([[1]]),
         "the node must still be reachable by its real label: {count}"
+    );
+
+    // Naming the label the node already has still works — only a *different*
+    // label is refused.
+    let same = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew", "label": "Entity", "props": {"name": "Matthew Sherlin"}}),
+    ));
+    assert_eq!(same["ok"], json!(true), "{same}");
+    assert_eq!(same["label"], json!("Entity"), "{same}");
+}
+
+/// Binding: the correct path — naming the label in `remember`'s `entities` at
+/// first mention — produces a correctly labelled, non-provisional node with
+/// its `ABOUT` edge intact, and `recall` finds it. This is the escape the
+/// refusal above points callers to.
+#[test]
+fn remember_entities_names_the_label_correctly_the_first_time() {
+    let db = open("remember-entities-label");
+    let remembered = one_task_call(
+        db.clone(),
+        "remember",
+        json!({
+            "text": "Matthew reviewed the launch copy",
+            "about": ["matthew"],
+            "entities": [{"key": "matthew", "label": "Person", "props": {"name": "Matthew Sherlin"}}]
+        }),
+    );
+    task_reply(&remembered);
+
+    let g = db.read();
+    assert_eq!(
+        g.node_info("matthew").map(|n| n.label),
+        Some("Person".to_string()),
+        "an entity named at first mention must be created under the label given, not `Entity`"
+    );
+    assert_eq!(
+        g.get_prop("matthew", core_api::memory_schema::PROVISIONAL_PROP),
+        None,
+        "a described entity must never be marked provisional"
+    );
+    let edges = g.node_edges("matthew").expect("node_edges");
+    assert!(
+        edges.iter().any(|e| e.edge_type == "ABOUT"),
+        "the ABOUT edge must still land: {edges:?}"
+    );
+    drop(g);
+
+    let recalled = task_reply(&one_task_call(
+        db,
+        "recall",
+        json!({"topic": "Matthew Sherlin"}),
+    ));
+    assert!(
+        recalled.contains("matthew"),
+        "recall must find the correctly-labelled entity: {recalled}"
     );
 }
 

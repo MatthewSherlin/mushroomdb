@@ -2465,12 +2465,18 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
             ),
         ),
         // Not the same answer as "no match": nothing here can ever match, and
-        // the caller can fix that.
+        // the caller can fix that. Names the real store path — `db_dir` is
+        // already in hand as `label` above — rather than a literal `<db>`
+        // placeholder the caller has to translate themselves; `label` falls
+        // back to the word "store" on the one path with no directory to
+        // name (the in-process `SharedDb` case, `db_dir: None`), where that
+        // really is the best available answer.
         core_api::memory::recall::RecallOutcome::NoIndex => (
             String::new(),
-            "mushroomdb recall — this store has no text index, so no topic can \
-             match. Run `mushroomdb schema apply <db> --memory-defaults`.\n"
-                .to_string(),
+            format!(
+                "mushroomdb recall — this store has no text index, so no topic can \
+                 match. Run `mushroomdb schema apply {label} --memory-defaults`.\n"
+            ),
         ),
     };
     ok(
@@ -2637,6 +2643,24 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                         .join(", ")
                 ));
             }
+            if !report.provisional_capped.is_empty() {
+                rendered.push_str(&format!(
+                    "REFUSED  {} — the per-commit provisional cap was already spent; \
+                     these were NOT created and have no edge in this note\n",
+                    report
+                        .provisional_capped
+                        .iter()
+                        .map(|k| repograph::sanitize(k))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !report.fulltext_declared.is_empty() {
+                rendered.push_str(&format!(
+                    "indexed  {} — full-text search enabled for the first time\n",
+                    report.fulltext_declared.join(", ")
+                ));
+            }
             ok(
                 json_out,
                 &json!({
@@ -2647,6 +2671,8 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                     "matched": report.matched,
                     "derived": report.derived,
                     "provisional": report.provisional,
+                    "provisional_capped": report.provisional_capped,
+                    "fulltext_declared": report.fulltext_declared,
                 }),
                 |_| rendered,
             )
@@ -3018,9 +3044,14 @@ fn task_tool_schemas() -> Vec<Js> {
         json!({
             "name": "remember",
             "description": "Remember this for next time — write a note into the graph and return what it \
-        did. Keys in 'about' are linked to the note; one that does not exist yet is created as a \
-        provisional entity rather than refused. Pass 'entities' and 'facts' to store the structure you \
-        extracted in the same commit.",
+        did. Use 'about' for a subject whose type you don't know yet — an unknown key there is \
+        created as a provisional entity (label 'Entity'), not refused, and stays that label \
+        permanently until it is named through 'entities' instead. Use 'entities' for a subject \
+        whose type you DO know: it is created (or described, if it already exists) under the \
+        label you give it, correctly labelled the first time — the label can never be changed \
+        afterward, not even by upsert_entity, so name it here when you can rather than leaving it \
+        for 'about' to guess at. Pass 'facts' for the relationships you recognised, between keys \
+        named in 'entities' or 'about', in the same commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3032,7 +3063,7 @@ fn task_tool_schemas() -> Vec<Js> {
                     "about": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Node keys the note is about: files, symbols, authors, concepts, other notes. A key that does not exist yet is created as a provisional entity."
+                        "description": "Node keys the note is about, when you don't know their type. A key that does not exist yet is created as a provisional entity (label 'Entity') — permanently: prefer 'entities' when you know the label, since a provisional node's label can never change later."
                     },
                     "kind": {
                         "type": "string",

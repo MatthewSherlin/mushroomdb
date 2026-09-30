@@ -8,6 +8,7 @@
 
 use crate::GraphDb;
 use core_storage::fs::Fs;
+use core_storage::fulltext::{stem, value_tokens_stemmed_with_positions};
 use std::collections::{BTreeMap, HashSet};
 
 /// How many hits the digest will name.
@@ -280,31 +281,46 @@ pub fn recall_digest<F: Fs>(
     // pass a corpus-wide check on the topic "apple banana cherry" — every
     // word is present *somewhere* — while no single node answers more than a
     // third of it. Coverage has to be asked of the same thing relevance is
-    // asked of: one candidate node, not the corpus. So each term's presence
-    // is checked field by field (still the per-term, pre-fusion probe;
-    // `search_top` is never asked about the fused query), but kept as the set
-    // of nodes carrying that term rather than collapsed to a single yes/no,
-    // and a candidate survives only when more than half of the topic's own
-    // terms are in *its own* set. A one-word topic is 1 of 1 — full coverage,
-    // not a special case — so every topic is held to the same rule. A one- or
-    // two-word topic has to be present whole in the one node it names (a 50/50
-    // split is not a majority); a longer one tolerates a minority of its words
-    // being absent from any single node — a paraphrase, a typo, a word that
-    // node never used — without demanding the whole sentence appear verbatim
-    // in it.
+    // asked of: one candidate node, not the corpus, and a candidate survives
+    // only when more than half of the topic's own terms are in *its own*
+    // set. A one-word topic is 1 of 1 — full coverage, not a special case —
+    // so every topic is held to the same rule. A one- or two-word topic has
+    // to be present whole in the one node it names (a 50/50 split is not a
+    // majority); a longer one tolerates a minority of its words being absent
+    // from any single node — a paraphrase, a typo, a word that node never
+    // used — without demanding the whole sentence appear verbatim in it.
+    //
+    // Asked of the candidate's own text, not the index: `best` already holds
+    // every candidate this call will ever consider (at most
+    // `fields.len() * MAX_HITS`, ranked by `search_hybrid` above), so coverage
+    // for each is answered by tokenizing *that node's own* declared-field
+    // values with the index's own tokenizer
+    // (`value_tokens_stemmed_with_positions`, stemmed exactly as indexing
+    // stems, so "orchards" in the text matches a topic term "orchard") and
+    // checking membership directly — O(candidates × fields × terms) reading
+    // props already in hand, not O(corpus × fields × terms) re-querying the
+    // index per term. Before this, one `recall` call ran `fields.len()` full,
+    // untruncated (`k == 0`) posting-list scans per topic term — self-declaring
+    // full-text for a caller-supplied `entities[].label` (`remember`, fix
+    // round 2) grows `fields` without bound, so this was the one thing bounded
+    // to be able to say yes to that at all. `search_top` is never called here.
     if !terms.is_empty() {
-        let term_hits: Vec<HashSet<String>> = terms
-            .iter()
-            .map(|term| {
-                let mut hit = HashSet::new();
-                for field in &fields {
-                    hit.extend(db.search_top(field, term, 0).into_iter().map(|(k, _)| k));
-                }
-                hit
-            })
-            .collect();
+        let stemmed_terms: Vec<String> = terms.iter().map(|t| stem(t)).collect();
         best.retain(|key, _| {
-            let present = term_hits.iter().filter(|hit| hit.contains(key)).count();
+            let mut candidate_tokens: HashSet<String> = HashSet::new();
+            for field in &fields {
+                if let Some(value) = db.get_prop(key, field) {
+                    candidate_tokens.extend(
+                        value_tokens_stemmed_with_positions(&value)
+                            .into_iter()
+                            .map(|(tok, _)| tok),
+                    );
+                }
+            }
+            let present = stemmed_terms
+                .iter()
+                .filter(|t| candidate_tokens.contains(*t))
+                .count();
             present * 2 > terms.len()
         });
     }

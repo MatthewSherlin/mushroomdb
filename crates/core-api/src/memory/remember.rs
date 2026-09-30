@@ -52,6 +52,32 @@ const DEFAULT_SOURCE: &str = "agent";
 /// [`remember`] for why this is bounded rather than unlimited.
 const MAX_FULLTEXT_PAIRS: usize = 32;
 
+/// Ceiling on provisional stubs one `remember` call may create — `about`
+/// keys and `facts[]` endpoints combined, counted in resolution order
+/// (`about` before `facts`). Spec §3.2's own guard: "a cap per commit, so a
+/// malformed batch cannot flood the graph."
+///
+/// A real extraction from one conversation turn names at most a handful of
+/// unknown subjects — `about` typically carries one to a few keys, and
+/// `facts[]` rarely introduces more than a couple more that `entities`
+/// didn't already cover — so this is generous against that shape and tight
+/// against the shape of a bug: a loop that built `facts` from a cross
+/// product, or a caller that fed a whole document's worth of names into
+/// `about` at once. 20 is comfortably above any single legitimate call and
+/// well short of "the graph is now full of typos."
+///
+/// Past the cap, the note and everything else valid in the call still
+/// commits — a caller's one bad key should not cost the whole write, the
+/// same reasoning that makes an unknown key provisional instead of a refusal
+/// in the first place — but a key that would have been stubbed is not: no
+/// node is created for it, and no edge (`ABOUT` or a fact's own) names it
+/// either, since that edge's endpoint would not exist. It is listed in
+/// [`RememberReport::provisional_capped`], so the caller is told plainly
+/// rather than discovering a silently short digest later — the same
+/// "unmistakable, not a quiet field" standard the label-mismatch fix in
+/// `upsert_entity` was held to.
+const MAX_PROVISIONAL_PER_COMMIT: usize = 20;
+
 /// One entity the caller recognised in the text.
 ///
 /// Create-or-update, same as [`describe_entity`]: a `key` already in the
@@ -127,13 +153,28 @@ pub struct RememberReport {
     /// `about` keys and fact endpoints that had to be stubbed, in the order
     /// each was first seen (`about` before `facts`).
     pub provisional: Vec<String>,
+    /// `about` keys and fact endpoints that would have been stubbed but were
+    /// refused instead — [`MAX_PROVISIONAL_PER_COMMIT`] was already spent by
+    /// the time this call reached them. Neither the node nor any edge naming
+    /// it exists; everything else in the call still committed. Empty on
+    /// every call this cap does not bind.
+    pub provisional_capped: Vec<String>,
+    /// Entity labels full-text search had never seen before this call, now
+    /// declared on `(label, "name")` so `recall` can reach them — the same
+    /// self-declare `Note.text` gets, extended to `entities[].label`. Empty
+    /// on every call that named no unseen label, or that found
+    /// [`MAX_FULLTEXT_PAIRS`] already spent.
+    pub fulltext_declared: Vec<String>,
 }
 
 /// Create-or-update one entity, clearing any provisional mark.
 ///
 /// Upsert semantics lived only in `tool_upsert_entity` before 0.7, so HTTP
-/// and Python had no upsert and could not clear a provisional mark. One
-/// implementation, every surface.
+/// and Python had no upsert and could not clear a provisional mark. This is
+/// the one implementation **`tool_upsert_entity` (the MCP surface) calls** —
+/// HTTP and Python are untouched by this branch and still have no upsert of
+/// their own at all. Binding parity, so a later plan's HTTP/Python surface
+/// calls this same function instead of growing a third copy, is future work.
 ///
 /// `label` is used only when `key` does not already exist — an update never
 /// changes a node's label. A subject stops being provisional the moment
@@ -229,6 +270,7 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
     // without bound. Past the cap a new label's entity is still written and
     // reported exactly as any other — only made not full-text-searchable
     // yet, a bounded-cost degradation rather than a refusal.
+    let mut fulltext_declared: Vec<String> = Vec::new();
     {
         let mut declared_this_call: BTreeSet<&str> = BTreeSet::new();
         for entity in input.entities {
@@ -242,6 +284,7 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
             }
             db.enable_fulltext(label, NAME_FIELD)?;
             fulltext.push(pair);
+            fulltext_declared.push(label.to_string());
         }
     }
 
@@ -305,10 +348,18 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
 
     let mut report = RememberReport {
         note: key.clone(),
+        fulltext_declared,
         ..Default::default()
     };
 
     let mut batch = db.batch();
+
+    // Shared across steps 2 and 5: one `MAX_PROVISIONAL_PER_COMMIT` budget
+    // for `about` and `facts[]` combined, `about` spent first. `capped`
+    // collects a key the budget ran out on so steps 4 and 6 can skip the
+    // edge that would otherwise name a node this call never created.
+    let mut provisional_count = 0usize;
+    let mut capped: BTreeSet<String> = BTreeSet::new();
 
     // 1. Entities first, so an `about` key also named here lands as the real
     //    entity rather than a provisional stub.
@@ -334,26 +385,38 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         batch.remove_prop(&entity.key, PROVISIONAL_PROP);
     }
 
-    // 2. Provisional stubs for `about` keys `entities` did not already cover.
+    // 2. Provisional stubs for `about` keys `entities` did not already cover
+    //    — bounded by `MAX_PROVISIONAL_PER_COMMIT` (see its doc comment).
     for (k, status) in about.iter().zip(&about_existed) {
         match status {
             None => {}
             Some(true) => report.matched += 1,
             Some(false) => {
-                batch.insert_node(
-                    PROVISIONAL_LABEL,
-                    k,
-                    vec![
-                        (NAME_FIELD.to_string(), Value::Str(k.clone())),
-                        (PROVISIONAL_PROP.to_string(), Value::Bool(true)),
-                    ],
-                );
-                report.provisional.push(k.clone());
+                if provisional_count < MAX_PROVISIONAL_PER_COMMIT {
+                    batch.insert_node(
+                        PROVISIONAL_LABEL,
+                        k,
+                        vec![
+                            (NAME_FIELD.to_string(), Value::Str(k.clone())),
+                            (PROVISIONAL_PROP.to_string(), Value::Bool(true)),
+                        ],
+                    );
+                    report.provisional.push(k.clone());
+                    provisional_count += 1;
+                } else {
+                    report.provisional_capped.push(k.clone());
+                    capped.insert(k.clone());
+                }
             }
         }
     }
 
-    // 3. The note.
+    // 3. The note. `about` here is the caller's full, literal claim — a key
+    //    the cap refused stays listed, even though its edge (step 4) is not
+    //    written: the note is a record of what it was told, not only of what
+    //    could be linked, matching this store's audit-trail default (spec
+    //    §3.2, O-4). `report.provisional_capped` is the place that tells the
+    //    caller which of these has no edge.
     if !note_existed {
         let mut props: Vec<(String, Value)> = vec![
             ("id".into(), Value::Str(key.clone())),
@@ -371,18 +434,28 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         batch.insert_node("Note", &key, props);
     }
 
-    // 4. ABOUT edges, note -> each about key. A duplicate (the note already
+    // 4. ABOUT edges, note -> each about key that actually exists. A key the
+    //    cap refused (step 2) is skipped — its node was never created, so
+    //    the edge can't be either — and a duplicate (the note already
     //    existed and named the same `about` before) is a silent no-op.
     for k in &about {
+        if capped.contains(k) {
+            continue;
+        }
         batch.insert_edge(ABOUT_EDGE, &key, k);
     }
 
     // 5. Provisional stubs for fact endpoints `entities`/`about` did not
-    //    already cover — same shape as step 2, so a typo'd `facts[].object`
-    //    is as visible and as findable as an unknown `about` key, not a
-    //    nameless, unmarked node with no report entry anywhere.
+    //    already cover — same shape as step 2, same shared
+    //    `MAX_PROVISIONAL_PER_COMMIT` budget (`about` already spent its
+    //    share above), so a typo'd `facts[].object` is as visible and as
+    //    findable as an unknown `about` key, not a nameless, unmarked node
+    //    with no report entry anywhere — up to the same per-commit cap.
     for (k, existed) in fact_endpoints.iter().zip(&fact_endpoint_existed) {
-        if !*existed {
+        if *existed {
+            continue;
+        }
+        if provisional_count < MAX_PROVISIONAL_PER_COMMIT {
             batch.insert_node(
                 PROVISIONAL_LABEL,
                 k,
@@ -392,12 +465,21 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
                 ],
             );
             report.provisional.push((*k).to_string());
+            provisional_count += 1;
+        } else {
+            report.provisional_capped.push((*k).to_string());
+            capped.insert((*k).to_string());
         }
     }
 
-    // 6. Facts. Every endpoint now exists — described above, already in the
-    //    store, or just stubbed — so a plain edge insert is enough.
+    // 6. Facts whose endpoints all exist — described above, already in the
+    //    store, or just stubbed. A fact naming an endpoint the cap refused
+    //    (step 5) is skipped whole: that endpoint does not exist, so the
+    //    edge can't either.
     for fact in input.facts {
+        if capped.contains(&fact.subject) || capped.contains(&fact.object) {
+            continue;
+        }
         batch.insert_edge(&fact.predicate, &fact.subject, &fact.object);
     }
 
