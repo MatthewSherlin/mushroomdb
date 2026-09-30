@@ -115,7 +115,13 @@ fn recall_drops_trailing_nodes_rather_than_blow_the_size_budget() {
         }
     }
     let out = run_recall(&dir, r#"{"prompt":"`alpha`"}"#);
-    let hits: Vec<&str> = out.lines().skip(2).collect();
+    assert!(
+        out.ends_with("\n  …\n"),
+        "expected an elision marker: {out}"
+    );
+    // Pointers sit between the header and the marker.
+    let lines: Vec<&str> = out.lines().collect();
+    let hits = &lines[2..lines.len() - 1];
     assert!(
         !hits.is_empty() && hits.len() < 6,
         "budget must drop nodes, printed {}: {out}",
@@ -129,13 +135,17 @@ fn recall_drops_trailing_nodes_rather_than_blow_the_size_budget() {
             "{out}"
         );
     }
-    // The header counts what matched, not what printed.
+    // The header counts what printed, not what matched.
     assert_eq!(
-        out.lines().nth(1),
-        Some(format!("mushroomdb recall (6 related nodes in {}):", dir.display()).as_str()),
+        lines[1],
+        format!(
+            "mushroomdb recall ({} related nodes in {}):",
+            hits.len(),
+            dir.display()
+        ),
         "{out}"
     );
-    // Framing and header are charged against the same budget.
+    // Framing, header and elision marker are charged against the same budget.
     assert!(
         out.len() <= 1200,
         "whole digest must fit the budget: {} bytes",

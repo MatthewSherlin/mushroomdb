@@ -380,11 +380,20 @@ pub fn recall_digest<F: Fs>(
 
     // The label is a caller-supplied path, and it lands in the same context
     // as the hits, so it is held to the same rule.
-    let mut out = format!(
-        "mushroomdb recall ({} related nodes in {}):\n",
-        ranked.len(),
-        sanitize(store_label)
-    );
+    let label = sanitize(store_label);
+
+    // Pointers are rendered first so the header can count what actually
+    // printed. The header and the elision marker are charged up front, so
+    // `max_bytes` bounds the whole digest rather than only the pointers. The
+    // reservation uses `ranked.len()`, an upper bound on the count the header
+    // ends up printing. The same budgeting the 0.6 code-graph digest used.
+    let reserved = header(ranked.len(), &label).len() + ELISION.len();
+    let Some(mut budget) = max_bytes.checked_sub(reserved) else {
+        // A pathologically long store label: nothing useful fits.
+        return RecallOutcome::NoMatch;
+    };
+    let mut lines: Vec<String> = Vec::new();
+    let mut truncated = false;
     for (key, present, _) in &ranked {
         // The all-stopword fallback searched the raw topic as one AND-group,
         // which required every word in one document — 100% coverage, a
@@ -403,12 +412,36 @@ pub fn recall_digest<F: Fs>(
             Some(summary) => format!("  {shown} — {}{cover}\n", sanitize(&summary)),
             None => format!("  {shown}{cover}\n"),
         };
-        if out.len() + line.len() > max_bytes {
+        if line.len() > budget {
+            truncated = true;
             break;
         }
-        out.push_str(&line);
+        budget -= line.len();
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        // Not one pointer fits the budget: a header announcing hits it cannot
+        // show would be noise, so this answers as the 0.6 digest did.
+        return RecallOutcome::NoMatch;
+    }
+
+    let mut out = header(lines.len(), &label);
+    for line in &lines {
+        out.push_str(line);
+    }
+    if truncated {
+        out.push_str(ELISION);
     }
     RecallOutcome::Hits(out)
+}
+
+/// The line a digest ends with when the byte budget dropped hits from it.
+const ELISION: &str = "  …\n";
+
+/// The digest's first line. `count` is the number of hits printed under it,
+/// never the number that matched.
+fn header(count: usize, label: &str) -> String {
+    format!("mushroomdb recall ({count} related nodes in {label}):\n")
 }
 
 #[cfg(test)]
