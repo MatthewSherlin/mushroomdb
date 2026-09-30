@@ -442,6 +442,63 @@ fn explicit_db_pins_the_store() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: install creates no store, and says who does when there is none yet
+// ---------------------------------------------------------------------------
+
+/// The notice `install` prints for a store that does not exist yet.
+fn no_store_notice(db: &Path) -> String {
+    format!(
+        "note   no store at {} yet — `mushroomdb mcp`, `serve` and `ingest-git` create it \
+         with the memory schema; to create it now: mushroomdb schema apply '{}' --memory-defaults",
+        db.display(),
+        db.display()
+    )
+}
+
+#[test]
+fn install_names_who_creates_a_store_that_does_not_exist_yet() {
+    // Every delivery, because the sentence must be true in each: a `cli`
+    // install registers no `mcp` server, so the notice names the commands
+    // that create a store with a schema rather than promising one will run.
+    for delivery in [Delivery::Cli, Delivery::Mcp, Delivery::Both] {
+        let root = temp_dir("notice");
+        let home = temp_dir("notice-home");
+        let db = root.join("not-yet").join("memory");
+        let opts = InstallOpts {
+            delivery,
+            ..claude_project_opts(&db)
+        };
+        let out = install_on_path(&root, &home, &opts).expect("install failed");
+        let notice = no_store_notice(&db);
+        assert_eq!(out.matches(&notice).count(), 1, "{delivery:?}: {out}");
+        assert!(
+            !db.exists(),
+            "{delivery:?}: install must not create the store"
+        );
+        assert!(
+            out.trim_end().ends_with(&format!(
+                "next: restart Claude Code in {}, then type /mushroom",
+                root.display()
+            )),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn install_says_nothing_about_a_store_that_exists() {
+    let root = temp_dir("notice-exists");
+    let home = temp_dir("notice-exists-home");
+    let db = root.join("memory");
+    {
+        let mut store = core_api::GraphDb::open(&db).expect("create store");
+        store.insert_node("Person", "p1", vec![]).expect("write");
+    }
+    let out = install_on_path(&root, &home, &claude_project_opts(&db)).expect("install failed");
+    assert!(!out.contains("no store at"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
 // Test: upgrading a 0.6.0 install rewrites its absolute paths to `--auto`
 //       rather than refusing, and leaves no stale hook behind
 // ---------------------------------------------------------------------------

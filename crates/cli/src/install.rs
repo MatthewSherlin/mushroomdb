@@ -604,6 +604,33 @@ fn describe_stores(stores: &[(Platform, StoreRef)]) -> String {
     }
 }
 
+/// One line per named store that does not exist yet, saying what creates it.
+///
+/// Install creates no store; the commands that do declare the memory schema
+/// when they create one. Without this line a user meets that gap as a brief
+/// saying "no text index" — most likely under `--delivery cli`, whose first
+/// write can come from a `query` that declares nothing. Worded to be true in
+/// every delivery: it names the commands, not a server this install may not
+/// have registered.
+fn describe_missing_stores(stores: &[(Platform, StoreRef)]) -> String {
+    let mut paths: Vec<&Path> = stores.iter().map(|(_, s)| s.path()).collect();
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter(|p| !core_api::restore::holds_a_store(p))
+        .map(|p| {
+            format!(
+                "  note   no store at {} yet — `mushroomdb mcp`, `serve` and `ingest-git` create it \
+                 with the memory schema; to create it now: mushroomdb schema apply {} \
+                 --memory-defaults\n",
+                p.display(),
+                sh_quote(&p.to_string_lossy())
+            )
+        })
+        .collect()
+}
+
 /// The store the *repository* wiring names: the `.gitignore` line, and the
 /// store whose retired git hook blocks install takes back out.
 ///
@@ -1794,6 +1821,7 @@ pub fn run_install_with(
     } else {
         out.push_str("  (already installed — no changes)\n");
     }
+    out.push_str(&describe_missing_stores(&stores));
     for n in &notes {
         out.push_str(&format!("  {n}\n"));
     }

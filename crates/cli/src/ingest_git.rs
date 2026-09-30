@@ -1158,6 +1158,11 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
         .filter(|p| !p.is_empty())
         .collect();
 
+    // The same gate `serve` and `mcp` use, read before `open` creates the
+    // directory's files: after the open it would always answer "existing".
+    // A run that finds nothing to write leaves the WAL empty, which this
+    // still reads as new, so the schema lands with the first run that writes.
+    let is_new_store = !core_api::restore::holds_a_store(db_dir);
     let db = SharedDb::open(db_dir)?;
     let mut report = IngestGitReport {
         submodules: units.len() - 1,
@@ -1233,6 +1238,20 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     })?;
     let ingest = IngestOptions::default(); // key `id`, auto-FK suffix `_id`
 
+    // A store this run is creating is declared on before its first write, so a
+    // failure part-way through still leaves it searchable. An existing store
+    // is never re-declared on: declaring full-text rebuilds its index at every
+    // later open (ledger row 36), and only `schema apply` may ask for that.
+    if is_new_store {
+        let diff = w.apply_schema(&structure::ingest_git_schema())?;
+        report.rules_created.extend(
+            diff.created
+                .iter()
+                .filter_map(|entry| entry.strip_prefix("rule:"))
+                .map(str::to_string),
+        );
+    }
+
     // Pull requests first: their nodes are what `Commit.pr_id` resolves to.
     if !prs.is_empty() {
         ingest_prs(&mut w, &prs, &ingest, &mut report)?;
@@ -1305,8 +1324,8 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     }
 
     // The working tree, on top of the history. It runs after the commit walk
-    // so every `File` node it reads exists, and its rules are declared after
-    // its props so each one backfills exactly once.
+    // so every `File` node it reads exists. Its rules came with the store's
+    // schema, declared before the first write.
     if opts.structure {
         // A first run has nothing to be incremental against, and a run whose
         // flags changed (structure or docs just turned on) has to revisit
@@ -1325,9 +1344,6 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
             let paths: Vec<String> = paths.into_iter().collect();
             structure::refresh_files(&mut w, &repo, "", &paths, opts.docs)?
         };
-        report
-            .rules_created
-            .extend(structure::ensure_rules_and_fulltext(&mut w)?);
     }
 
     // Every commit this run could link is in the graph by now.

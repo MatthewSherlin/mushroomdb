@@ -79,12 +79,12 @@ const BATCH_FILES: usize = 500;
 /// `FILE` that inference would derive from the field name.
 pub const DEFINES_RULE: &str = "auto_fk_symbol_file_id";
 
-/// `(label, field)` pairs this module indexes for full-text search.
+/// `(label, field)` pairs this module indexes for full-text search, declared
+/// through [`ingest_git_schema`] on the store `ingest-git` creates.
 ///
-/// `Note` and `Concept` are indexed here rather than where they are written
-/// (`remember` and the semantic-pass `ingest_json`) because a store synced
-/// after either wrote is still expected to gain the index — `remember` also
-/// ensures its own `Note.text` pair, in case it is the very first write.
+/// `Note` and `Concept` appear here as well as in the memory defaults; the
+/// schema deduplicates them — `remember` also ensures its own `Note.text`
+/// pair, in case it is the very first write.
 pub const FULLTEXT: [(&str, &str); 8] = [
     ("Concept", "name"),
     ("Concept", "summary"),
@@ -120,9 +120,8 @@ pub struct StructureReport {
 /// Every rule this module declares, in creation order.
 ///
 /// Exported so a test — or a store built some other way — can recreate exactly
-/// the rule set these props expect. [`ensure_rules_and_fulltext`] creates an
-/// `about_<label>` rule only when its destination label is present in the
-/// graph; every other rule here is unconditional. The `about_<label>` and
+/// the rule set these props expect; [`ingest_git_schema`] declares all of them
+/// on the store `ingest-git` creates. The `about_<label>` and
 /// `concept_sources` definitions themselves come from
 /// [`core_api::repograph::rules`], which `remember` also builds them from —
 /// one definition, so a note written by `remember` and one backfilled by a
@@ -165,48 +164,28 @@ fn key_rule(name: &str, src: &str, dst: &str, field: &str, edge: &str) -> RuleDe
     }
 }
 
-/// Declare the structure rules and full-text fields that are missing, and
-/// return the names of the rules created.
+/// The schema a store `ingest-git` creates is declared with: the structure,
+/// `about_*` and `concept_sources` rules, the text fields the repository graph
+/// carries, and the memory defaults on top — a repository-as-entities store is
+/// an ordinary memory store in 0.7 and `recall` has to work on it.
 ///
-/// Idempotent: existence is checked against `rules()` and `fulltext_pairs()`,
-/// so a second call writes nothing. Call it *after* the props are written — a
-/// rule backfills once, on creation, and by then both the `Symbol` label and
-/// the lists it matches on exist.
-pub fn ensure_rules_and_fulltext(w: &mut Db) -> Result<Vec<String>, CliError> {
-    let existing: BTreeSet<String> = w.rules().into_iter().map(|r| r.name).collect();
-    let mut created = Vec::new();
-    for def in rules() {
-        if existing.contains(&def.name) {
-            continue;
-        }
-        // An `about_<label>` rule is only worth declaring once something can
-        // be on the receiving end of it.
-        if def.src_label == "Note" && !label_present(w, &def.dst_label)? {
-            continue;
-        }
-        let name = def.name.clone();
-        w.create_rule(def)?;
-        created.push(name);
-    }
+/// A `Schema` rather than a sequence of `enable_fulltext` calls because
+/// `enable_fulltext` is not idempotent — `Err(RuleInvalid)` on a pair already
+/// declared — while `apply_schema` applies full-text idempotently. It is
+/// applied once, to a store `ingest-git` is creating; an existing store is
+/// never re-declared on.
+#[must_use]
+pub fn ingest_git_schema() -> core_api::schema::Schema {
+    let mut schema = core_api::memory_schema::memory_defaults();
+    schema.rules.extend(rules());
     for (label, field) in FULLTEXT {
-        if !w
-            .fulltext_pairs()
-            .contains(&(label.to_string(), field.to_string()))
-        {
-            w.enable_fulltext(label, field)?;
-        }
+        schema
+            .fulltext
+            .push(((*label).to_string(), (*field).to_string()));
     }
-    Ok(created)
-}
-
-/// Whether the graph holds at least one node of `label`. `label` is always one
-/// of [`ABOUT_LABELS`], so it is never user input.
-fn label_present(w: &Db, label: &str) -> Result<bool, CliError> {
-    let rs = w.query(
-        &format!("MATCH (n:{label}) RETURN n.id AS id LIMIT 1"),
-        &BTreeMap::new(),
-    )?;
-    Ok(!rs.is_empty())
+    schema.fulltext.sort();
+    schema.fulltext.dedup();
+    schema
 }
 
 /// The `File` keys under a key prefix. `""` is the whole graph, `"vendor/lib/"`
