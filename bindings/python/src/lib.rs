@@ -324,6 +324,11 @@ impl GraphDb {
     /// to a different namespace, refuses the whole call. Keep a call under
     /// about 10,000 rows — it is one frame and one fsync.
     ///
+    /// **This is a raw property write, like `set_prop`.** On an entity node,
+    /// `name` and the two alias lists are maintained by `upsert_entity` and
+    /// `remember`: a `name` written here is not reflected in `aliases` until
+    /// the next describing write.
+    ///
     /// ```python
     /// db.set_props_many([("alice", {"score": 3}), ("bob", {"score": 5, "old": None})])
     /// # {"nodes": 2, "props_set": 2, "props_removed": 1}
@@ -388,6 +393,12 @@ impl GraphDb {
         // changed and the write that applies it. `&mut Db` reborrows
         // immutably for the reads.
         let (nodes, set, removed) = self.with_mut(|db| {
+            // Before any read, as `set_prop` refuses: otherwise a read-only
+            // handle would answer zeros for an unchanged row and
+            // `KeyNotFound` for an unknown key, and only refuse a real change.
+            if db.is_read_only() {
+                return Err(GraphError::ReadOnly);
+            }
             let mut ops: Vec<Op<'_>> = Vec::new();
             let mut nodes = 0usize;
             for (key, fields) in &parsed {

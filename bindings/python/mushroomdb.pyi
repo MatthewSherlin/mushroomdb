@@ -396,6 +396,11 @@ class GraphDb:
         to a different namespace, refuses the whole call. Keep a call under
         about 10,000 rows — it is one frame and one fsync.
 
+        **This is a raw property write, like `set_prop`.** On an entity node,
+        `name` and the two alias lists are maintained by `upsert_entity` and
+        `remember`: a `name` written here is not reflected in `aliases` until
+        the next describing write.
+
         ```python
         db.set_props_many([("alice", {"score": 3}), ("bob", {"score": 5, "old": None})])
         # {"nodes": 2, "props_set": 2, "props_removed": 1}

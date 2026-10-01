@@ -41,6 +41,10 @@ It is one commit: unchanged values write nothing, an unknown key raises
 that commit. `wal_total_commits()` moves by one frame, or by two when a rule
 derived or retracted an edge — never by the number of nodes.
 
+It is a raw property write, like `set_prop`. On an entity node, `name` and the
+two alias lists are maintained by `upsert_entity` and `remember`: a `name`
+written here is not reflected in `aliases` until the next describing write.
+
 ## Querying
 
 `query` and `query_write` both accept parameters as a `dict`, as a list of

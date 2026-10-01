@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from mushroomdb import GraphDb, KeyNotFound, NamespaceImmutable
+from mushroomdb import GraphDb, KeyNotFound, NamespaceImmutable, ReadOnly
 
 _SAME_TEAM = "MATCH (a)-[:SAME_TEAM]->(b) RETURN key(a) AS a, key(b) AS b ORDER BY a, b"
 
@@ -189,3 +189,38 @@ def test_a_thousand_nodes_are_one_frame(db):
     out = db.set_props_many([(f"k{i}", {"v": 1}) for i in range(1000)])
     assert out == {"nodes": 1000, "props_set": 1000, "props_removed": 0}
     assert db.wal_total_commits() == before + 1
+
+
+def test_a_read_only_handle_refuses_every_call_as_set_prop_does(tmp_path):
+    """Whatever the rows say: a call that would change nothing and a call that
+    names an unknown key are refused the same way, before the store is read."""
+    path = str(tmp_path / "db")
+    writer = GraphDb.open(path)
+    writer.insert_node("Person", "a", {"n": 1})
+    writer.close()
+
+    reader = GraphDb.open(path, read_only=True)
+    with pytest.raises(ReadOnly) as by_one:
+        reader.set_prop("a", "n", 1)
+    for rows in ([("a", {"n": 2})], [("a", {"n": 1})], [("nobody", {"n": 1})], [("a", {})], []):
+        with pytest.raises(ReadOnly) as err:
+            reader.set_props_many(rows)
+        assert str(err.value) == str(by_one.value), rows
+    assert reader.node_info("a")["props"]["n"] == 1
+    reader.close()
+
+
+def test_it_is_a_raw_write_and_does_not_maintain_an_entitys_aliases(db):
+    """A pin of today's behaviour, which `set_prop` shares: `aliases` is
+    derived by `upsert_entity` and `remember`, not by a property write."""
+    db.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person")
+    assert db.node_info("ada")["props"]["aliases"] == ["ada", "ada lovelace", "lovelace"]
+
+    db.set_props_many([("ada", {"name": "Ada King"})])
+    props = db.node_info("ada")["props"]
+    assert props["name"] == "Ada King"
+    assert props["aliases"] == ["ada", "ada lovelace", "lovelace"], "stale: still the old name"
+
+    # The next describing write recomputes them from the name as it stands.
+    db.upsert_entity("ada", {})
+    assert db.node_info("ada")["props"]["aliases"] == ["ada", "ada king", "king"]
