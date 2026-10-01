@@ -372,20 +372,28 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 mushroomdb's own numbers. Each row names the committed file it comes from, and each file records
 its machine, date and command. Embedded: no figure includes a network round-trip.
 
-| Workload | Result | Measured |
-|---|---|---|
-| Bulk ingest, 10,000 nodes | 1.076 s | 0.7 pre-release, 2026-10-01 |
-| Neighborhood depth-1 (p50 / p95) | 0.4 µs / 2.4 µs | 0.7 pre-release, 2026-10-01 |
-| Neighborhood depth-2 (p50) | 0.2 µs | 0.7 pre-release, 2026-10-01 |
-| Cypher scan-filter-project (1,400 rows) | 1.02 ms | 0.7 pre-release, 2026-10-01 |
-| Cypher two-hop join (200 rows) | 421.0 µs | 0.7 pre-release, 2026-10-01 |
-| Rule backfill, 2 rules | 8.781 s | 0.7 pre-release, 2026-10-01 |
-| Open from a snapshot, 100,000 nodes / ~10M derived edges | 0.02 s at 31–41 MiB RSS | v0.2, 2026-08-28 |
-| Open from the WAL alone, same store | 8.16 min | v0.1.1, 2026-08-24 |
+| Workload | Result | Measured | Earlier committed figure |
+|---|---|---|---|
+| Bulk ingest, 10,000 nodes | 1.076 s | 0.7 pre-release, 2026-10-01 | 784 ms (2026-08-21) |
+| Neighborhood depth-1 (p50 / p95) | 0.4 µs / 2.4 µs | 0.7 pre-release, 2026-10-01 | — |
+| Neighborhood depth-2 (p50) | 0.2 µs | 0.7 pre-release, 2026-10-01 | — |
+| Cypher scan-filter-project (1,400 rows) | 1.02 ms | 0.7 pre-release, 2026-10-01 | — |
+| Cypher two-hop join (200 rows), single pass | 421.0 µs | 0.7 pre-release, 2026-10-01 | 261.6 µs, the median of 10 runs after 3 warmups over 5.81M derived edges (2026-08-21); earlier single passes ran 186–326 µs (2026-08-21, 2026-08-24) |
+| Rule backfill, 2 rules | 8.781 s — under investigation; see the result file | 0.7 pre-release, 2026-10-01 | 2.85–3.51 s for the same two rules (2026-08-21, 2026-08-24) |
+| Open from a snapshot, 100,000 nodes / ~10M derived edges | 0.02 s at 31–41 MiB RSS | v0.2, 2026-08-28 | — |
+| Open from the WAL alone, same store | 8.16 min | v0.1.1, 2026-08-24 | — |
 
 Rows 1–6: [`benchmarks/results/mushroomdb-10k-0.7.md`](benchmarks/results/mushroomdb-10k-0.7.md),
-Apple M4 Pro, one run. Rows 7–8: [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md), warm
-file cache, cold process; cold-cache was not measured.
+Apple M4 Pro, one run, each workload timed once; machine load was not recorded. Rows 7–8:
+[`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md), warm file cache, cold process;
+cold-cache was not measured.
+
+The rule backfill figure is about two and a half times the earlier ones and is **under
+investigation as a possible regression**; see the result file. The two-hop figure is one pass and
+is not comparable with the earlier warmup-median. Earlier figures:
+[`head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md),
+[`regression-v0.1-20260821.md`](benchmarks/results/regression-v0.1-20260821.md),
+[`regression-v0.1.1-20260824.md`](benchmarks/results/regression-v0.1.1-20260824.md).
 
 Rule engine against hand-rolled maintenance (10,000 nodes, 1,000 specialty updates, drift 0 for
 all three): per-operation hand-written **64.93 min**, batched hand-written **24.98 s**, rule

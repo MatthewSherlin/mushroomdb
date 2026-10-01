@@ -55,3 +55,27 @@ what it reads. This is the cost of declaring the rules over the loaded graph.
   - `bench_industry_tc` (INDUSTRY_ALIGNMENT): 1.675 s
   - `bench_specialty_tc` (SPECIALTY_MATCH): 7.106 s
 
+## Annotations (added 2026-10-01, after the run)
+
+Nothing above this heading was changed; these lines record what the run did not.
+
+- **Command:** `bindings/python/.venv/bin/python benchmarks/run.py --scale 10000 --out benchmarks/results/mushroomdb-10k-0.7.md`,
+  from the repository root, straight after
+  `(cd bindings/python && CARGO_NET_OFFLINE=true PIP_NO_INDEX=1 .venv/bin/maturin develop --release)`.
+- **Load:** load not recorded; other sessions were active on this machine. The only reading is
+  one taken about eight minutes after the run (16:14): load averages 3.66 / 4.66 / 5.22 over 1, 5
+  and 15 minutes, on 12 cores. The 15-minute window covers the run and the release build before it.
+- **Method:** one run, each workload timed once, no warmup and no repeats. The two-hop join is a
+  single pass (`benchmarks/adapters/ours.py:164-167`); the edge count behind it was not recorded.
+
+Earlier committed figures for the rows that moved:
+
+| workload | this run | earlier | where |
+| --- | --- | --- | --- |
+| bulk_ingest | 1.076 s | 784 ms (2026-08-21, single shot); other single passes 797.75 ms (2026-08-24), 931.07 ms and 989.73 ms (2026-08-21) | `head-to-head-10k-v2.md:565`; `regression-v0.1.1-20260824.md`, `regression-v0.1-20260821.md` |
+| cypher two-hop join | 421.0 µs, single pass | 261.6 µs, median of 10 after 3 warmups over 5,810,000 edges (2026-08-21); single passes 185.8 µs (2026-08-24), 206.7 µs and 325.6 µs (2026-08-21) | `head-to-head-10k-v2.md:343-352`; the two regression files |
+| rule_derive (total) | 8.781 s | 2.849 s, 2.929 s, 3.149 s, 3.493 s, 3.514 s (2026-08-21 and 2026-08-24) | `regression-v0.1-20260821.md:36` and its note; `regression-v0.1.1-20260824.md:38` |
+
+**rule_derive is under investigation as a possible regression.** The earlier runs of the same two
+rules took 2.85–3.51 s, and `regression-v0.1-20260821.md` calls that workload stable to 0.6% within
+a binary. This run took about two and a half times as long. No cause has been established.
