@@ -6237,6 +6237,231 @@ fn forgetting_a_claimed_same_as_fact_names_the_claim_rule() {
     assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 1);
 }
 
+/// Two same-named people, linked at 3/5 — exactly the floor.
+fn linked_pair_store(name: &str) -> SharedDb {
+    let db = identity_store(name);
+    for key in ["matthew-sherlin", "msherlin"] {
+        one_task_call(
+            db.clone(),
+            "upsert_entity",
+            json!({"key": key, "label": "Person", "props": {"name": "Matthew Sherlin"}}),
+        );
+    }
+    assert_eq!(
+        db.read().weighted_edges("SAME_AS", None).len(),
+        2,
+        "precondition: linked, both directions"
+    );
+    db
+}
+
+/// Controller ruling: the reply is the contract. Declaring an alias on one of
+/// two linked entities takes their overlap from 3/5 to 3/6 and the link is
+/// retracted; `remember` says so, in the text and in the json.
+#[test]
+fn remember_reports_the_same_as_link_a_declared_alias_costs() {
+    let args = json!({"text": "Matthew goes by Matt",
+                      "entities": [{"key": "matthew-sherlin", "label": "Person",
+                                    "aliases": ["matt"]}]});
+    let text = task_reply(&one_task_call(
+        linked_pair_store("lost-text"),
+        "remember",
+        args.clone(),
+    ));
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("unlinked"))
+        .unwrap_or_else(|| panic!("no unlinked line: {text}"));
+    assert!(
+        line.starts_with(
+            "unlinked  1 same-as link(s) this write retracted: matthew-sherlin ~ msherlin (was 0.60) — "
+        ),
+        "{line}"
+    );
+    assert!(
+        line.contains("declare the same aliases on every entity that is the same thing"),
+        "the remedy: {line}"
+    );
+    assert_eq!(text.matches("unlinked").count(), 1, "one line: {text}");
+
+    let db = linked_pair_store("lost-json");
+    let report = task_report(db.clone(), "remember", args);
+    assert_eq!(
+        report["same_as_lost"],
+        json!([{"a": "matthew-sherlin", "b": "msherlin", "score": 0.6}]),
+        "{report}"
+    );
+    assert_eq!(report["same_as_lost_total"], json!(1), "{report}");
+    assert_eq!(
+        db.read().weighted_edges("SAME_AS", None).len(),
+        0,
+        "the reply is true"
+    );
+}
+
+/// `upsert_entity` retracts the same way and says so the same way: a stub
+/// spelling the full name loses its link when the entity declares a nickname.
+#[test]
+fn upsert_entity_reports_the_full_name_stub_a_declared_alias_unlinks() {
+    let db = identity_store("lost-upsert-stub");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "named first", "about": ["Matthew_Sherlin"]}),
+    );
+    let reply = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "label": "Person",
+               "props": {"name": "Matthew Sherlin"}}),
+    ));
+    assert!(
+        reply.get("same_as_lost").is_none(),
+        "a create loses nothing: {reply}"
+    );
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 1);
+
+    let reply = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "props": {}, "aliases": ["matt"]}),
+    ));
+    assert_eq!(
+        reply["same_as_lost"],
+        json!([{"a": "Matthew_Sherlin", "b": "matthew-sherlin", "score": 0.6}]),
+        "{reply}"
+    );
+    assert_eq!(reply["same_as_lost_total"], json!(1), "{reply}");
+    assert!(
+        reply["same_as_lost_note"]
+            .as_str()
+            .is_some_and(|n| n.contains("declare the same aliases on every entity")
+                && n.contains("full-name stub's key")),
+        "{reply}"
+    );
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 0);
+}
+
+/// A write that retracts nothing says nothing about it: no text line, an
+/// empty list from `remember`, and no field at all from `upsert_entity`.
+#[test]
+fn a_write_that_loses_no_link_reports_none() {
+    let db = linked_pair_store("lost-none");
+    let (text, report) = task_both(
+        db.clone(),
+        "remember",
+        json!({"text": "both go by Matt",
+               "entities": [{"key": "matthew-sherlin", "label": "Person", "aliases": ["matt"]},
+                            {"key": "msherlin", "label": "Person", "aliases": ["matt"]}]}),
+    );
+    assert!(!text.contains("unlinked"), "{text}");
+    assert_eq!(report["same_as_lost"], json!([]), "{report}");
+    assert_eq!(report["same_as_lost_total"], json!(0), "{report}");
+    let reply = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "msherlin", "props": {"role": "owner"}}),
+    ));
+    assert_eq!(
+        reply,
+        json!({"ok": true, "key": "msherlin", "label": "Person",
+               "created": false, "updated_fields": 1}),
+        "unchanged when nothing is lost"
+    );
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 2);
+}
+
+/// The lost list is bounded: ten pairs, and a count of the rest.
+#[test]
+fn the_lost_links_are_listed_up_to_ten_and_counted() {
+    let store = |name: &str| {
+        let db = identity_store(name);
+        for i in 0..12 {
+            one_task_call(
+                db.clone(),
+                "upsert_entity",
+                json!({"key": format!("k{i:02}"), "label": "Person",
+                       "props": {"name": "Matthew Sherlin"}}),
+            );
+        }
+        db
+    };
+    let args = json!({"text": "k00 goes by Matt",
+                      "entities": [{"key": "k00", "label": "Person", "aliases": ["matt"]}]});
+    let report = task_report(store("lost-cap-json"), "remember", args.clone());
+    assert_eq!(report["same_as_lost_total"], json!(11), "{report}");
+    assert_eq!(report["same_as_lost"].as_array().map(Vec::len), Some(10));
+    let text = task_reply(&one_task_call(store("lost-cap-text"), "remember", args));
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("unlinked"))
+        .expect("line");
+    assert!(
+        line.starts_with(
+            "unlinked  11 same-as link(s) this write retracted: k00 ~ k01 (was 0.60), "
+        ),
+        "{line}"
+    );
+    assert_eq!(line.matches(" ~ ").count(), 10, "{line}");
+    assert!(line.contains("k00 ~ k10 (was 0.60) (+1 more) — "), "{line}");
+
+    let reply = content_json(&one_task_call(
+        store("lost-cap-upsert"),
+        "upsert_entity",
+        json!({"key": "k00", "props": {}, "aliases": ["matt"]}),
+    ));
+    assert_eq!(reply["same_as_lost_total"], json!(11), "{reply}");
+    assert_eq!(reply["same_as_lost"].as_array().map(Vec::len), Some(10));
+}
+
+/// Important 1, at the tool surface. A subject named by `about` before it was
+/// described is an `Entity` for life: `upsert_entity` refuses to relabel it,
+/// `remember`'s `entities` describes it without relabelling, and either way
+/// the alias it declares is stored and links nothing — the claim rules run
+/// from the five entity labels. An `Entity→Entity` rule is the owner's call.
+#[test]
+fn a_subject_named_before_it_was_described_cannot_claim_a_stub() {
+    let db = identity_store("ex-stub-cannot-claim");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "named first", "about": ["matthew-sherlin"]}),
+    );
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "label": "Person",
+               "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]}),
+    ));
+    assert!(
+        err.contains("exists as \"Entity\", not \"Person\""),
+        "{err}"
+    );
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "described", "entities": [{"key": "matthew-sherlin", "label": "Person",
+               "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]}]}),
+    );
+    assert_eq!(
+        db.read()
+            .node_ref("matthew-sherlin")
+            .map(|n| n.label().to_string()),
+        Some("Entity".to_string())
+    );
+    assert_eq!(
+        alias_keys_in(&db, "matthew-sherlin"),
+        Some(str_list(&["matt"]))
+    );
+    let report = task_report(
+        db.clone(),
+        "remember",
+        json!({"text": "the nickname", "about": ["matt"]}),
+    );
+    assert_eq!(report["same_as"], json!([]), "{report}");
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 0);
+}
+
 /// `alias_keys` is bookkeeping. Twelve people who all declare one alias give
 /// the engine a list field with a sampled Jaccard of 1.0 — exactly what it
 /// proposes an `Overlap` rule over — and the reply must not relay it.

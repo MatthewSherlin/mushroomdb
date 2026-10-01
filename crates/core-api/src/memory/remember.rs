@@ -21,8 +21,8 @@
 //! `about` keys and the facts' own endpoints are resolved.
 
 use crate::memory::identity::{
-    aliases_value, derive_aliases, identity_props_after_write, same_as_pairs, SameAsPair,
-    ALIASES_FIELD,
+    aliases_value, derive_aliases, identity_props_after_write, same_as_lost, same_as_pairs,
+    SameAsPair, ALIASES_FIELD,
 };
 use crate::memory_schema::{NAME_FIELD, PROVISIONAL_LABEL, PROVISIONAL_PROP};
 use crate::GraphDb;
@@ -177,6 +177,13 @@ pub struct RememberReport {
     /// (`memory_schema::memory_identity`). This is what tells the caller its
     /// extraction agreed with something the store already held.
     pub same_as: Vec<SameAsPair>,
+    /// `SAME_AS` claims this call retracted: pairs that linked an entity it
+    /// wrote before the commit and do not after it, each with the score it
+    /// had. A full-name link sits exactly on the floor, 3/5, so one alias
+    /// declared on one side and not the other makes it 3/6 and the rule lets
+    /// go. Reported so a write that costs an identity says so, rather than
+    /// only naming what it gained.
+    pub same_as_lost: Vec<SameAsPair>,
 }
 
 /// Create-or-update one entity, clearing any provisional mark.
@@ -415,8 +422,8 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
     let fact_endpoint_existed: Vec<bool> = fact_endpoints.iter().map(|k| db.has_node(k)).collect();
 
     // `SAME_AS` claims already touching what this call writes, so the report
-    // names only the ones this commit made. Stubs are new by definition, so
-    // only the entities can have any yet.
+    // names only the ones this commit made — and the ones it retracted. Stubs
+    // are new by definition, so only the entities can have any yet.
     let entity_key_list: Vec<String> = input.entities.iter().map(|e| e.key.clone()).collect();
     let same_as_before = same_as_pairs(db, &entity_key_list);
 
@@ -569,7 +576,9 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
 
     let mut touched = entity_key_list;
     touched.extend(report.provisional.iter().cloned());
-    report.same_as = same_as_pairs(db, &touched)
+    let same_as_after = same_as_pairs(db, &touched);
+    report.same_as_lost = same_as_lost(&same_as_before, &same_as_after);
+    report.same_as = same_as_after
         .into_iter()
         .filter(|p| !same_as_before.iter().any(|b| b.a == p.a && b.b == p.b))
         .collect();

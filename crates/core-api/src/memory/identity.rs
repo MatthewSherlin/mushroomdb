@@ -94,6 +94,20 @@ pub fn same_as_pairs<F: Fs>(db: &GraphDb<F>, keys: &[String]) -> Vec<SameAsPair>
         .collect()
 }
 
+/// The claims in `before` that `after` no longer holds, each with the score it
+/// had: the identity links a write retracted.
+///
+/// Both lists are [`same_as_pairs`] answers for the same keys, either side of
+/// one write. A pair whose score only changed is still held, and is not here.
+#[must_use]
+pub fn same_as_lost(before: &[SameAsPair], after: &[SameAsPair]) -> Vec<SameAsPair> {
+    before
+        .iter()
+        .filter(|b| !after.iter().any(|p| p.a == b.a && p.b == b.b))
+        .cloned()
+        .collect()
+}
+
 /// Most aliases one node may carry.
 ///
 /// A real entity carries its key, its full name, that name's two to four
@@ -333,13 +347,12 @@ pub fn merge_alias_keys(
     existing: Option<&Value>,
     declared: &[String],
 ) -> Result<Vec<String>> {
-    let foreign = || {
-        GraphError::IngestError {
+    let foreign = || GraphError::IngestError {
         detail: format!(
-            "'{key}' already carries an '{ALIAS_KEYS_FIELD}' property that is not a string              or a list of strings; clear it with forget {{key: \"{key}\", prop: \
+            "'{key}' already carries an '{ALIAS_KEYS_FIELD}' property that is not a string \
+             or a list of strings; clear it with forget {{key: \"{key}\", prop: \
              \"{ALIAS_KEYS_FIELD}\"}} first"
         ),
-    }
     };
     let mut held: Vec<String> = Vec::new();
     match existing {

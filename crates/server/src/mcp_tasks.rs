@@ -1962,6 +1962,9 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                     pair.score
                 ));
             }
+            if let Some(line) = same_as_lost_line(&report.same_as_lost) {
+                rendered.push_str(&line);
+            }
             if !report.fulltext_declared.is_empty() {
                 rendered.push_str(&format!(
                     "indexed  {} — full-text search enabled for the first time\n",
@@ -1991,6 +1994,8 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                             "score": round_to(p.score, 2),
                         }))
                         .collect::<Vec<_>>(),
+                    "same_as_lost": same_as_lost_json(&report.same_as_lost),
+                    "same_as_lost_total": report.same_as_lost.len(),
                 }),
                 |_| rendered,
             )
@@ -2000,6 +2005,62 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             other => other.to_string(),
         }),
     }
+}
+
+/// Retracted `SAME_AS` links one reply lists; the rest are counted.
+///
+/// A write retracts at most the links its entities held, and a rule keeps at
+/// most 32 per node, so the list is small in practice. Ten keeps a reply that
+/// has gone wrong on one line an assistant can still read.
+pub(crate) const SAME_AS_LOST_LIST: usize = 10;
+
+/// Why a write retracts an identity link, and what restores it. One sentence,
+/// shared by `remember`'s text line and `upsert_entity`'s json reply.
+pub(crate) const SAME_AS_LOST_REMEDY: &str =
+    "an alias only one side declares counts against their overlap; declare the same \
+     aliases on every entity that is the same thing, and a full-name stub's key too";
+
+/// The `SAME_AS` links a write retracted, for a json reply: the first
+/// [`SAME_AS_LOST_LIST`], scores at the precision the text prints.
+pub(crate) fn same_as_lost_json(lost: &[core_api::memory::identity::SameAsPair]) -> Js {
+    Js::Array(
+        lost.iter()
+            .take(SAME_AS_LOST_LIST)
+            .map(|p| json!({"a": p.a, "b": p.b, "score": round_to(p.score, 2)}))
+            .collect(),
+    )
+}
+
+/// The one line `remember` prints when its write retracted `SAME_AS` links:
+/// how many, the first [`SAME_AS_LOST_LIST`] with the score each had, and the
+/// remedy. `None` when nothing was lost.
+fn same_as_lost_line(lost: &[core_api::memory::identity::SameAsPair]) -> Option<String> {
+    if lost.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = lost
+        .iter()
+        .take(SAME_AS_LOST_LIST)
+        .map(|p| {
+            format!(
+                "{} ~ {} (was {:.2})",
+                digest::sanitize(&p.a),
+                digest::sanitize(&p.b),
+                p.score
+            )
+        })
+        .collect();
+    let more = lost.len() - listed.len();
+    Some(format!(
+        "unlinked  {} same-as link(s) this write retracted: {}{} — {SAME_AS_LOST_REMEDY}\n",
+        lost.len(),
+        listed.join(", "),
+        if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        }
+    ))
 }
 
 // ── schema ───────────────────────────────────────────────────────────────────
@@ -2632,7 +2693,7 @@ fn top_arg(args: &Js) -> Result<usize, String> {
 
 /// `x` rounded to `places` decimals: a json reply's floats at the precision
 /// its text prints them, so the two agree and a re-run is byte-identical.
-fn round_to(x: f64, places: i32) -> f64 {
+pub(crate) fn round_to(x: f64, places: i32) -> f64 {
     let scale = 10f64.powi(places);
     (x * scale).round() / scale
 }

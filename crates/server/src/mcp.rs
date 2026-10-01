@@ -740,18 +740,40 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
             to_set.push((field, v));
         }
         let count = to_set.len();
+        // The node's `SAME_AS` claims either side of the write, under the one
+        // write guard, so the reply can name the links this update retracted:
+        // a declared alias the other node lacks takes a full-name link below
+        // the floor.
+        let keys = [key.to_string()];
+        let same_as_before = memory::identity::same_as_pairs(&g, &keys);
         if let Err(e) =
             memory::remember::describe_entity_with_aliases(&mut g, key, None, &to_set, &aliases)
         {
             return CallOutcome::ToolErr(graph_err_msg(e));
         }
-        CallOutcome::ToolOk(json!({
+        let lost = memory::identity::same_as_lost(
+            &same_as_before,
+            &memory::identity::same_as_pairs(&g, &keys),
+        );
+        let mut reply = json!({
             "ok": true,
             "key": key,
             "label": stored_label,
             "created": false,
             "updated_fields": count
-        }))
+        });
+        // Absent when nothing was lost, so an ordinary update's reply is
+        // unchanged.
+        if !lost.is_empty() {
+            reply["same_as_lost"] = crate::mcp_tasks::same_as_lost_json(&lost);
+            reply["same_as_lost_total"] = json!(lost.len());
+            reply["same_as_lost_note"] = json!(format!(
+                "this write retracted {} SAME_AS link(s): {}",
+                lost.len(),
+                crate::mcp_tasks::SAME_AS_LOST_REMEDY
+            ));
+        }
+        CallOutcome::ToolOk(reply)
     } else {
         let Some(label) = label_opt else {
             return CallOutcome::ToolErr("label required when creating a new entity".into());

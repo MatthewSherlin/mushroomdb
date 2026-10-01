@@ -81,7 +81,9 @@ pub fn memory_defaults() -> Schema {
 ///   a stub keyed `matt` holds one alias against the entity's five. It reads
 ///   `alias_keys`, not `aliases`, because `aliases` also holds derived name
 ///   words, and an entity merely named "Alex" must not claim a stub keyed
-///   `alex`.
+///   `alex`. The rules key on labels, and a node `about` created keeps
+///   `Entity` for life: a stub that was later described can still be claimed,
+///   and cannot itself claim.
 ///
 /// The `KeyMatch` rules stand alone rather than under an `Any` beside the
 /// `Overlap`: `Any` is never `KeyMatch`-rooted, so it would lose the engine's

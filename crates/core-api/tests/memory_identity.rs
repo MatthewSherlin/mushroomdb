@@ -982,10 +982,11 @@ fn a_claim_matches_the_stubs_key_exactly_so_case_differs_do_not_link() {
     assert!(same_as_edges(&db).is_empty());
 }
 
-/// The limitation's other half: a claim links a stub (`Entity`), never two
-/// described entities, even when one declares the other's key.
+/// The limitation's other half: the claim's target must carry label `Entity`.
+/// Two nodes that both carry an entity label are never linked by claim, even
+/// when one declares the other's key.
 #[test]
-fn a_claim_does_not_link_two_described_entities() {
+fn a_claim_does_not_link_two_nodes_under_entity_labels() {
     let mut db = identity_store("claim-described");
     let report = remember_people(
         &mut db,
@@ -1376,5 +1377,187 @@ fn a_padded_keys_alias_list_settles_after_one_more_write() {
         core_api::memory::identity::aliases_after_write(&db, " Matt ", &[], &[]).unwrap(),
         None,
         "stable from here"
+    );
+}
+
+// ── a described ex-stub: claimable, and unable to claim ─────────────────────
+
+fn label_of(db: &GraphDb<core_storage::fs::RealFs>, key: &str) -> String {
+    db.node_ref(key).expect("node").label().to_string()
+}
+
+/// A node `about` created keeps label `Entity` for life, described or not. The
+/// claim rules key on that label, so a stub that was later described is still
+/// claimed by a Person's declared alias — in either order.
+#[test]
+fn a_described_ex_stub_is_still_linked_by_a_declared_alias() {
+    let described = vec![("name".to_string(), Value::Str("Matt S".into()))];
+
+    // Described before the claim arrives.
+    let mut db = identity_store("ex-stub-claimed-after");
+    let about = strings(&["matt"]);
+    remember(&mut db, &note("named first", &about, &[])).unwrap();
+    describe_entity(&mut db, "matt", Some("Person"), &described).unwrap();
+    assert_eq!(db.get_prop("matt", "provisional"), None, "it is described");
+    assert_eq!(label_of(&db, "matt"), "Entity", "and still an Entity");
+    let report = remember_people(
+        &mut db,
+        "the claim",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])],
+    );
+    assert_eq!(report.same_as, the_claim());
+
+    // Claimed first, described afterwards: the link stays.
+    let mut db = identity_store("ex-stub-claimed-before");
+    let entities = vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])];
+    remember(&mut db, &note("both", &about, &entities)).unwrap();
+    describe_entity(&mut db, "matt", Some("Person"), &described).unwrap();
+    assert_eq!(label_of(&db, "matt"), "Entity");
+    assert_eq!(
+        same_as_pairs(&db, &strings(&["matt"])),
+        the_claim(),
+        "describing the stub does not retract the claim on it"
+    );
+}
+
+/// The other half, pinned as it is today: a described ex-stub cannot itself
+/// claim. `matthew-sherlin` was named by `about` before it was described, so
+/// it is an `Entity`, and the claim rules run from the five entity labels
+/// only. The alias it declares is stored and no rule reads it.
+///
+/// An `Entity→Entity` claim rule would close this. It is an owner decision
+/// (plan 3, "Owner decisions — answered 2026-10-01", Q2), not taken here.
+#[test]
+fn a_described_ex_stub_cannot_itself_claim() {
+    let mut db = identity_store("ex-stub-cannot-claim");
+    let about = strings(&["matthew-sherlin"]);
+    remember(&mut db, &note("named first", &about, &[])).unwrap();
+    describe_entity_with_aliases(
+        &mut db,
+        "matthew-sherlin",
+        Some("Person"),
+        &[("name".to_string(), Value::Str("Matthew Sherlin".into()))],
+        &strings(&["matt"]),
+    )
+    .unwrap();
+    assert_eq!(label_of(&db, "matthew-sherlin"), "Entity");
+    assert_eq!(
+        alias_keys_of(&db, "matthew-sherlin"),
+        Some(strings(&["matt"])),
+        "the declaration is kept"
+    );
+    let about = strings(&["matt"]);
+    let report = remember(&mut db, &note("the nickname", &about, &[])).unwrap();
+    assert!(report.same_as.is_empty(), "{:?}", report.same_as);
+    assert!(same_as_edges(&db).is_empty());
+}
+
+// ── a write that retracts identity links says so ────────────────────────────
+
+/// Every full-name link sits exactly on the floor, 3/5. A declared alias the
+/// other node lacks makes it 3/6, and the link is retracted — the report
+/// names it, with the score it had.
+#[test]
+fn declaring_an_alias_reports_the_link_it_costs() {
+    let mut db = identity_store("lost-pair");
+    let report = remember_people(
+        &mut db,
+        "two keys, one name",
+        vec![
+            person("matthew-sherlin", "Matthew Sherlin", &[]),
+            person("msherlin", "Matthew Sherlin", &[]),
+        ],
+    );
+    assert_eq!(report.same_as.len(), 1);
+    assert!(report.same_as_lost.is_empty(), "{:?}", report.same_as_lost);
+
+    let report = remember_people(
+        &mut db,
+        "one declares a nickname",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])],
+    );
+    assert!(report.same_as.is_empty(), "{:?}", report.same_as);
+    assert_eq!(
+        report.same_as_lost,
+        vec![SameAsPair {
+            a: "matthew-sherlin".into(),
+            b: "msherlin".into(),
+            score: 0.6
+        }]
+    );
+    assert!(same_as_edges(&db).is_empty(), "and the edges are gone");
+}
+
+/// The same loss against a stub that spells the full name — four aliases
+/// against five becomes 3/6 — which a stub cannot declare its way out of.
+#[test]
+fn declaring_an_alias_reports_the_full_name_stub_it_unlinks() {
+    let mut db = identity_store("lost-stub");
+    let about = strings(&["Matthew_Sherlin"]);
+    remember(&mut db, &note("named first", &about, &[])).unwrap();
+    remember_people(
+        &mut db,
+        "described",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &[])],
+    );
+    let about = strings(&["matt"]);
+    let entities = vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])];
+    let report = remember(&mut db, &note("a nickname", &about, &entities)).unwrap();
+    assert_eq!(report.same_as, the_claim(), "one link gained");
+    assert_eq!(
+        report.same_as_lost,
+        vec![SameAsPair {
+            a: "Matthew_Sherlin".into(),
+            b: "matthew-sherlin".into(),
+            score: 0.6
+        }],
+        "and one lost"
+    );
+}
+
+/// A write that keeps every link — the same aliases declared on both sides,
+/// 4/6 — reports nothing lost; nor does a repeat of it.
+#[test]
+fn a_write_that_retracts_nothing_reports_nothing_lost() {
+    let mut db = identity_store("lost-nothing");
+    let both = || {
+        vec![
+            person("matthew-sherlin", "Matthew Sherlin", &["matt"]),
+            person("msherlin", "Matthew Sherlin", &["matt"]),
+        ]
+    };
+    remember_people(
+        &mut db,
+        "plain",
+        vec![
+            person("matthew-sherlin", "Matthew Sherlin", &[]),
+            person("msherlin", "Matthew Sherlin", &[]),
+        ],
+    );
+    let report = remember_people(&mut db, "both declare", both());
+    assert!(report.same_as_lost.is_empty(), "{:?}", report.same_as_lost);
+    assert_eq!(same_as_pairs(&db, &strings(&["msherlin"])).len(), 1);
+    let report = remember_people(&mut db, "again", both());
+    assert!(report.same_as_lost.is_empty(), "{:?}", report.same_as_lost);
+}
+
+/// The foreign-value refusal, word for word: one sentence, no run of spaces.
+#[test]
+fn the_alias_keys_foreign_value_refusal_reads_as_one_sentence() {
+    let mut db = store("alias-keys-foreign-text");
+    db.insert_node(
+        "Person",
+        "as-int",
+        vec![(ALIAS_KEYS_FIELD.to_string(), Value::Int(3))],
+    )
+    .unwrap();
+    let err = set_role(&mut db, "as-int").unwrap_err();
+    let core_api::GraphError::IngestError { detail } = err else {
+        panic!("expected an ingest error, got {err:?}");
+    };
+    assert_eq!(
+        detail,
+        "'as-int' already carries an 'alias_keys' property that is not a string or a list \
+         of strings; clear it with forget {key: \"as-int\", prop: \"alias_keys\"} first"
     );
 }
