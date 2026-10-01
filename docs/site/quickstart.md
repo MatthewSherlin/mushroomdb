@@ -30,7 +30,7 @@ mushroomdb install --db ./memory --delivery mcp
 ```
 
 `--db` pins the store; `--delivery mcp` writes the MCP server entry and the
-`/mushroom` skill. A pinned entity store lists the nineteen-tool association
+`/mushroom` skill. A pinned entity store lists the twenty-three-tool association
 surface, and pinning is also what marks the entry `alwaysLoad`, so those tools
 are in context before the session's first question rather than deferred.
 
@@ -421,7 +421,7 @@ rule. On this repository (431 files, 652 commits) it takes about 2.5 s. The
 second prints the store's schema — its labels, its edge types and one worked
 call per question kind.
 
-A store built this way is an ordinary memory store: it lists the same nineteen
+A store built this way is an ordinary memory store: it lists the same twenty-three
 tools as any other, and `query` and `recall` answer over the repository as
 entities. The tools that read it back as a *code graph* were removed in 0.7; to
 keep them, pin `mushroomdb@0.6.x`. The rules, the flags and incremental

@@ -72,7 +72,7 @@ Docker, `install.sh`, and the build-from-source path are in
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
 - [Codebase graph](ingest-git.md) — `ingest-git`, its rules, submodules, pull requests, incremental sync
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
-- [MCP tools](mcp.md) — the seven task tools, the fourteen graph tools, and the nineteen every store lists
+- [MCP tools](mcp.md) — the eleven task tools, the fourteen graph tools, and the twenty-three every store lists
 - [The association benchmark](association-bench.md) — one world in three forms, the twenty questions, and the gate
 - [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode

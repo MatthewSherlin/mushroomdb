@@ -10,8 +10,8 @@ nothing changes for anyone who does not deliberately upgrade.
 
 - **Seven MCP tools**: `explore`, `map`, `context`, `impact`, `owners`, `why`,
   `sync`. There is now one tool surface: every store advertises the same
-  nineteen, a store built by `ingest-git` included. `--all-tools` lists all
-  twenty-one.
+  twenty-three, a store built by `ingest-git` included. `--all-tools` lists all
+  twenty-five.
 - **Four install hooks**: the three opt-in ones (`--intercept-grep`,
   `--impact-before-edit`, `--enrich-grep`, now rejected with a message) and
   the `PostToolUse` `touch` hook, which was written on every install and
@@ -49,7 +49,7 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 ### Kept, and changed
 
 - **`ingest-git` stays**, positioned as a data source. Its store is now an
-  ordinary memory store — the same nineteen tools, the same brief — and it
+  ordinary memory store — the same twenty-three tools, the same brief — and it
   declares its schema through `apply_schema`, so re-ingesting is idempotent.
   Into an existing store it declares its own missing rules and full-text pairs,
   as 0.6 did, and never the memory defaults.
@@ -96,6 +96,73 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   live server is now `crates/cli/tests/mcp_concurrency.rs`: 20 HTTP writers
   against one `serve`, plus 20 separate `mcp` processes writing while `serve`
   holds the store. It runs in `cargo test --workspace`.
+
+### Added — identity, and four tools for the store as a whole
+
+- **`schema`** answers "what's in here": labels with their fields, edge types
+  and what derives them, every rule with its predicate, the full-text fields
+  `recall` searches, the equality indexes, and the provisional nodes
+  `remember` created. A host with no session hook had no way to learn a
+  store's shape but guessing Cypher.
+- **`forget`** tombstones a node, removes one property — the first way to
+  remove a property over MCP — or retracts one fact. It refuses an edge a rule
+  derived and names the rule, reports the derived edges a property removal
+  retracts because a rule read that property, lists the notes that still state
+  what was forgotten, and says plainly that history keeps it until the log is
+  pruned. It is not redaction, and it has no role check.
+- **`suggest_rules`** relays the store's own rule proposals with arguments
+  `create_rule` accepts unchanged. It never proposes a field the store writes
+  for itself, and it creates nothing.
+- **`analyze`** ranks and groups: `central`, `degree`, `components`,
+  `clusters` and `identities`, over the whole store, at most 50 rows, the same
+  answer every time.
+- **Every entity carries a normalised `aliases` list** — its key, its name in
+  lowercase with punctuation folded, that name's words, and any `aliases` the
+  caller passes to `remember`'s `entities` or to `upsert_entity`.
+- **`mushroomdb schema apply <db> --memory-identity`** adds the identity
+  preset: eleven global `SAME_AS` rules over `aliases` at Jaccard ≥ 0.6,
+  covering provisional stubs. It says what it will backfill before it writes.
+  New stores do not get it; rules are never created silently. With it on,
+  `remember` reports the `same as` links each write created, and `analyze`
+  resolves them into identities in which every pair is linked, oldest node
+  first.
+- **The default tool listing is 23 tools and 26,924 bytes**, from 19 and
+  23,548 (`scripts/measure-tool-listing.py`; all 25 tools are 27,725 bytes).
+- **The fragmentation probe (spec §8.2) says LARGE**: at the reference cell,
+  25% of Talent split into 3 aliases, recall of the edges the canonical alias
+  holds is 0.8324 over every rule, a loss of 0.1676 against the pre-registered
+  0.05 — so, as pre-registered, the canonical node is 0.8's headline
+  (`benchmarks/fragmentation/results/20261001T060009Z/summary.md`).
+- **The `SAME_AS` quality gate (spec §8.3) PASSED**: 9 true positives, 1 false
+  positive, 9 false negatives — precision 0.900, exactly the floor, and recall
+  0.500 — for both the pairwise links and the resolved identities
+  (`benchmarks/identity/results/20261001T061131Z/summary.md`).
+
+### Fixed
+
+- **A rule created on its own no longer breaks lock-free readers.** Creating
+  a rule whose edge type the store had not seen left every reader snapshot one
+  symbol behind the writer until the next fold, up to 63 commits: the next new
+  field or label made every read fail with "mvcc delta intern mismatch", and
+  before that a read of the new rule's edges silently returned none. HTTP
+  reads go through these readers. Batched rule creation was never affected.
+
+### Known limits
+
+- **A nickname stub never links.** A bare `matt` stub holds one alias and
+  cannot reach Jaccard 0.6 against an entity holding five, even one that
+  declares `matt` among them. Formal names and legal suffixes miss the same
+  way; they are the gate's nine false negatives.
+- **Two strangers with one full name link.** `john-smith-nyc` and
+  `john-smith-sf` score 3/5. The link is visible in `remember`'s reply and
+  explainable with `explain_association`, but it is wrong — the gate's one
+  false positive, and why its precision has no margin.
+- **A name in decomposed Unicode (NFD) may not match its composed (NFC)
+  form.** Aliases are not normalised to NFC, so an accent typed as a combining
+  mark splits the word.
+- **`analyze` and `suggest_rules` read the whole store, with no role or
+  mask.** Filtering their rows would be unsound, because a visible node's score
+  is computed over hidden topology.
 
 ## v0.6.12 — a date that lands where it says, and a server you can run
 

@@ -12,7 +12,7 @@ behind.
 authors become entities with rule-derived relationships, which is what makes a
 ticket↔commit link a rule rather than a script.
 
-In 0.7 an `ingest-git` store is an ordinary memory store: the same nineteen
+In 0.7 an `ingest-git` store is an ordinary memory store: the same twenty-three
 tools, the same `SessionStart` brief, and `query` and `recall` over the
 repository as entities. The ingest declares its schema through `apply_schema`,
 so re-running it is idempotent. The tools that read the result back as a *code

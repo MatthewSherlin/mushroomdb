@@ -14,7 +14,7 @@
 mushroomdb is the data layer for agents that reason over entities. It is an embedded Rust graph
 database in which a relationship is a schema declaration: write a rule once, and every write
 derives, maintains and **retracts** the matching edges, each one carrying the rule, the score and
-the values that produced it. An agent reaches it over MCP — nineteen tools on an entity store — or
+the values that produced it. An agent reaches it over MCP — twenty-three tools on an entity store — or
 you embed it as a Rust library, a Python module, or a sidecar beside your own service. Four
 questions are what it exists for: **why are these two related** (`explain_association`, answered
 with the evidence rather than an assertion), **what did that look like then** (`edges_at`, the edges
@@ -42,7 +42,7 @@ than a script.
 npx mushroomdb install --db ./memory
 ```
 
-One command writes the `/mushroom` skill, an MCP server listing the nineteen-tool association
+One command writes the `/mushroom` skill, an MCP server listing the twenty-three-tool association
 surface, and the session hooks. Then a worked flow, four tool calls:
 
 ```text
@@ -72,7 +72,7 @@ Full tool reference: [`docs/site/mcp.md`](docs/site/mcp.md).
 **What it is**
 
 - An embedded, single-binary graph database with a rule engine that maintains edges for you.
-- A 21-tool MCP server — nineteen listed on every store, a store built by `ingest-git`
+- A 25-tool MCP server — twenty-three listed on every store, a store built by `ingest-git`
   included — plus a `/mushroom` skill and a Claude Code plugin.
 - Safe for several processes at once: one writer at a time behind an advisory `LOCK` file, any
   number of readers, and every handle picks up a peer's commits by `refresh()` rather than
@@ -207,7 +207,7 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
-**Seven task tools** answer a question in prose in one call, on any store. They are what the
+**Eleven task tools** answer a question in prose in one call, on any store. They are what the
 skill reaches for, and what `tools/list` shows first:
 
 | Tool | Purpose |
@@ -219,16 +219,20 @@ skill reaches for, and what `tools/list` shows first:
 | `what_if` | The derived edges a property change would lose and gain, computed without writing anything. `edge_type` prints both sides as partner keys |
 | `recall` | What the store already knows about a topic: ranked nodes matching free text across every indexed text field, one line each with how many of the topic's terms it matched |
 | `remember` | Write a note into the graph and return its key |
+| `schema` | The store's labels with their fields, its edge types and what derives them, every rule with its predicate, the full-text fields `recall` searches, the equality indexes, and how many provisional nodes `remember` created. |
+| `analyze` | `central` (PageRank), `degree`, `components` (connected groups with sizes), `clusters` (communities of two or more; singletons counted, not listed) or `identities` (`SAME_AS` links resolved by complete linkage, oldest node canonical). The whole store with no role or mask; at most 50 rows; the same store always gets the same answer. |
+| `suggest_rules` | Rules the store proposes from its own values, each with an estimate, examples and `create_rule_args` to pass to `create_rule` unchanged. Fields the store writes for itself — `ns`, `kind`, `ts`, `source`, `provisional`, `id`, `aliases` — are never proposed, and every proposal is global. It creates nothing. On a store with entities and no `SAME_AS` rule it names the `schema apply --memory-identity` command. |
+| `forget` | Tombstone a node, remove one property — the only property removal on MCP, since this Cypher has no `REMOVE` — or retract one fact edge. A rule-derived edge is refused with the rule named. The notes that still state what was forgotten are listed, not deleted. The reply says history keeps it until `mushroomdb migrate`, `snapshot --truncate` or `--retention` prunes the log. No role check. |
 
-Each of the seven also takes `json: true`, which answers with the raw report instead of
+Each of the eleven also takes `json: true`, which answers with the raw report instead of
 the rendered digest.
 
 **The fourteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
 in `tools/list`, so an assistant knows which surface is the front door. Every store lists the same
-nineteen, a store built by `ingest-git` included — the association surface: `query` (with an optional `role`),
+twenty-three, a store built by `ingest-git` included — the association surface: `query` (with an optional `role`),
 `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `edges_at`,
 `what_if`, `node_history`, `edge_history`, `find_similar`, `pairwise_similar`, `hybrid_search`,
-`remember`, `recall`, `upsert_entity`, `ingest_json`, `create_rule` and `stats`. All 21 stay served either way — the listing decides what a
+`remember`, `recall`, `upsert_entity`, `ingest_json`, `create_rule`, `stats`, `schema`, `analyze`, `suggest_rules` and `forget`. All 25 stay served either way — the listing decides what a
 session can call, not what the server answers — and `mushroomdb mcp <db> --all-tools` lists the
 whole set:
 

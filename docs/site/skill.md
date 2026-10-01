@@ -96,7 +96,7 @@ stops matching, the concept is stale, and the skill re-learns only those.
 At most 20 documents per run, 5 concepts per document.
 
 **The graph underneath.** One paragraph: that `tools/list` shows the same
-nineteen on every store, a store built by `ingest-git` included, that
+twenty-three on every store, a store built by `ingest-git` included, that
 `mushroomdb mcp <db> --all-tools` advertises the other two with the schemas
 documenting their arguments, that a `mask` is an allow-list, that the MCP
 server has no auth so a mask is never a security boundary, and the two honesty

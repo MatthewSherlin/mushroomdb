@@ -23,7 +23,7 @@
 mushroomdb is the data layer for agents that reason over entities. It is an embedded Rust graph
 database in which a relationship is a schema declaration: write a rule once, and every write
 derives, maintains and **retracts** the matching edges, each one carrying the rule, the score and
-the values that produced it. An agent reaches it over MCP — nineteen tools on an entity store — or
+the values that produced it. An agent reaches it over MCP — twenty-three tools on an entity store — or
 you embed it as a Rust library, a Python module, or a sidecar beside your own service. Four
 questions are what it exists for: **why are these two related** (`explain_association`, answered
 with the evidence rather than an assertion), **what did that look like then** (`edges_at`, the edges
@@ -51,7 +51,7 @@ than a script.
 npx mushroomdb install --db ./memory
 ```
 
-One command writes the `/mushroom` skill, an MCP server listing the nineteen-tool association
+One command writes the `/mushroom` skill, an MCP server listing the twenty-three-tool association
 surface, and the session hooks. Then a worked flow, four tool calls:
 
 ```text
@@ -81,7 +81,7 @@ Full tool reference: [`docs/site/mcp.md`](docs/site/mcp.md).
 **What it is**
 
 - An embedded, single-binary graph database with a rule engine that maintains edges for you.
-- A 21-tool MCP server — nineteen listed on every store, a store built by `ingest-git`
+- A 25-tool MCP server — twenty-three listed on every store, a store built by `ingest-git`
   included — plus a `/mushroom` skill and a Claude Code plugin.
 - Safe for several processes at once: one writer at a time behind an advisory `LOCK` file, any
   number of readers, and every handle picks up a peer's commits by `refresh()` rather than
@@ -216,7 +216,7 @@ upsert_entity  →  create_rule  →  find_similar  →  explain_association
   (store)           (link)           (recall)          (explain)
 ```
 
-**Seven task tools** answer a question in prose in one call, on any store. They are what the
+**Eleven task tools** answer a question in prose in one call, on any store. They are what the
 skill reaches for, and what `tools/list` shows first:
 
 | Tool | Purpose |
@@ -228,16 +228,20 @@ skill reaches for, and what `tools/list` shows first:
 | `what_if` | The derived edges a property change would lose and gain, computed without writing anything. `edge_type` prints both sides as partner keys |
 | `recall` | What the store already knows about a topic: ranked nodes matching free text across every indexed text field, one line each with how many of the topic's terms it matched |
 | `remember` | Write a note into the graph and return its key |
+| `schema` | The store's labels with their fields, its edge types and what derives them, every rule with its predicate, the full-text fields `recall` searches, the equality indexes, and how many provisional nodes `remember` created. |
+| `analyze` | `central` (PageRank), `degree`, `components` (connected groups with sizes), `clusters` (communities of two or more; singletons counted, not listed) or `identities` (`SAME_AS` links resolved by complete linkage, oldest node canonical). The whole store with no role or mask; at most 50 rows; the same store always gets the same answer. |
+| `suggest_rules` | Rules the store proposes from its own values, each with an estimate, examples and `create_rule_args` to pass to `create_rule` unchanged. Fields the store writes for itself — `ns`, `kind`, `ts`, `source`, `provisional`, `id`, `aliases` — are never proposed, and every proposal is global. It creates nothing. On a store with entities and no `SAME_AS` rule it names the `schema apply --memory-identity` command. |
+| `forget` | Tombstone a node, remove one property — the only property removal on MCP, since this Cypher has no `REMOVE` — or retract one fact edge. A rule-derived edge is refused with the rule named. The notes that still state what was forgotten are listed, not deleted. The reply says history keeps it until `mushroomdb migrate`, `snapshot --truncate` or `--retention` prunes the log. No role check. |
 
-Each of the seven also takes `json: true`, which answers with the raw report instead of
+Each of the eleven also takes `json: true`, which answers with the raw report instead of
 the rendered digest.
 
 **The fourteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
 in `tools/list`, so an assistant knows which surface is the front door. Every store lists the same
-nineteen, a store built by `ingest-git` included — the association surface: `query` (with an optional `role`),
+twenty-three, a store built by `ingest-git` included — the association surface: `query` (with an optional `role`),
 `explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `edges_at`,
 `what_if`, `node_history`, `edge_history`, `find_similar`, `pairwise_similar`, `hybrid_search`,
-`remember`, `recall`, `upsert_entity`, `ingest_json`, `create_rule` and `stats`. All 21 stay served either way — the listing decides what a
+`remember`, `recall`, `upsert_entity`, `ingest_json`, `create_rule`, `stats`, `schema`, `analyze`, `suggest_rules` and `forget`. All 25 stay served either way — the listing decides what a
 session can call, not what the server answers — and `mushroomdb mcp <db> --all-tools` lists the
 whole set:
 
@@ -579,7 +583,7 @@ Docker, `install.sh`, and the build-from-source path are in
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
 - [Codebase graph](ingest-git.md) — `ingest-git`, its rules, submodules, pull requests, incremental sync
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
-- [MCP tools](mcp.md) — the seven task tools, the fourteen graph tools, and the nineteen every store lists
+- [MCP tools](mcp.md) — the eleven task tools, the fourteen graph tools, and the twenty-three every store lists
 - [The association benchmark](association-bench.md) — one world in three forms, the twenty questions, and the gate
 - [Concurrency](concurrency.md) — many readers, one writer; the write lock, `Busy`, and `refresh`
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
@@ -622,7 +626,7 @@ mushroomdb install --db ./memory --delivery mcp
 ```
 
 `--db` pins the store; `--delivery mcp` writes the MCP server entry and the
-`/mushroom` skill. A pinned entity store lists the nineteen-tool association
+`/mushroom` skill. A pinned entity store lists the twenty-three-tool association
 surface, and pinning is also what marks the entry `alwaysLoad`, so those tools
 are in context before the session's first question rather than deferred.
 
@@ -1013,7 +1017,7 @@ rule. On this repository (431 files, 652 commits) it takes about 2.5 s. The
 second prints the store's schema — its labels, its edge types and one worked
 call per question kind.
 
-A store built this way is an ordinary memory store: it lists the same nineteen
+A store built this way is an ordinary memory store: it lists the same twenty-three
 tools as any other, and `query` and `recall` answer over the repository as
 entities. The tools that read it back as a *code graph* were removed in 0.7; to
 keep them, pin `mushroomdb@0.6.x`. The rules, the flags and incremental
@@ -2808,7 +2812,7 @@ where there is no intersection to take.
 
 ## Task tools
 
-Seven task tools answer a question in one call rather than exposing the graph
+Eleven task tools answer a question in one call rather than exposing the graph
 API, on any store. They are listed first in `tools/list`, and each returns a short rendered
 digest as its text content — one text block, and nothing else.
 
@@ -2841,9 +2845,13 @@ heading or a line break in an agent's context.
 | `edges_at` | `key`, `at`, `edge_type?`, `all_of?`, `label?`, `direction?`, `limit?` | The edges the node had at one 0-based WAL commit — the graph as it was then, replayed from the WAL and its archives in one scan. Renames are followed, so a node's current key finds edges written under an earlier name. Takes `node_edges`' filters, so the intersection question is one call at a past commit too. |
 | `what_if` | `key`, `field`, `value`, `edge_type?`, `label?`, `limit?` | The derived edges a property change would retract and derive, computed without writing anything: the rule engine runs the same re-derivation a real `set_prop` would, against a clone. `edge_type` prints both sides as partner keys. |
 | `recall` | `topic` | What the store already knows about a topic: ranked nodes matching free text across every indexed text field, one line each. Every line says how many of the topic's terms it matched — `(2/3 terms)` — and hits rank by that first. A question in ordinary words is enough. |
-| `remember` | `text`, `about?`, `kind?`, `entities?`, `facts?` | Writes a note into the graph and returns its key. A key in `about` that does not exist yet is created as a provisional entity — label `Entity`, marked `provisional` — rather than refused; so is an unknown `facts` endpoint. At most 20 stubs per call; keys past that are reported as capped and not written, and the rest of the call still commits. |
+| `remember` | `text`, `about?`, `kind?`, `entities?`, `facts?` | Writes a note into the graph and returns its key. A key in `about` that does not exist yet is created as a provisional entity — label `Entity`, marked `provisional` — rather than refused; so is an unknown `facts` endpoint. At most 20 stubs per call; keys past that are reported as capped and not written, and the rest of the call still commits. Each `entities[]` item takes `aliases`; the store keeps a normalised `aliases` list on every entity it writes. With the identity preset applied (`mushroomdb schema apply <db> --memory-identity`), the reply lists the `same as` links the write created. |
+| `schema` | — | The store's labels with their fields, its edge types and what derives them, every rule with its predicate, the full-text fields `recall` searches, the equality indexes, and how many provisional nodes `remember` created. |
+| `analyze` | `kind`, `top?`, `edge_type?` | `central` (PageRank), `degree`, `components` (connected groups with sizes), `clusters` (communities of two or more; singletons counted, not listed) or `identities` (`SAME_AS` links resolved by complete linkage, oldest node canonical). The whole store with no role or mask; at most 50 rows; the same store always gets the same answer. |
+| `suggest_rules` | — | Rules the store proposes from its own values, each with an estimate, examples and `create_rule_args` to pass to `create_rule` unchanged. Fields the store writes for itself — `ns`, `kind`, `ts`, `source`, `provisional`, `id`, `aliases` — are never proposed, and every proposal is global. It creates nothing. On a store with entities and no `SAME_AS` rule it names the `schema apply --memory-identity` command. |
+| `forget` | `key`, or `key` and `prop`, or `fact` | Tombstone a node, remove one property — the only property removal on MCP, since this Cypher has no `REMOVE` — or retract one fact edge. A rule-derived edge is refused with the rule named. The notes that still state what was forgotten are listed, not deleted. The reply says history keeps it until `mushroomdb migrate`, `snapshot --truncate` or `--retention` prunes the log. No role check. |
 
-Each of the seven also accepts `json` (boolean, default false), which swaps
+Each of the eleven also accepts `json` (boolean, default false), which swaps
 the rendered digest for the report.
 
 ---
@@ -2854,24 +2862,27 @@ The fourteen tools below are the graph API itself. Their `tools/list`
 descriptions all begin `Advanced:`, which marks them as the lower-level surface
 beneath the task tools above.
 
-**Every store lists the same nineteen by default**, a store built by
+**Every store lists the same twenty-three by default**, a store built by
 `ingest-git` included — the association surface: `query`,
 `explain_association`, `neighborhood`, `node_info`, `node_edges`,
 `was_linked`, `edges_at`, `what_if`, `node_history`, `edge_history`,
 `find_similar`, `pairwise_similar`, `hybrid_search`, `remember`, `recall`,
-`upsert_entity`, `ingest_json`, `create_rule`, `stats`.
+`upsert_entity`, `ingest_json`, `create_rule`, `stats`, `schema`, `analyze`,
+`suggest_rules`, `forget`.
 
-All 21 stay served: the listing decides what is advertised, not what the server
+All 25 stay served: the listing decides what is advertised, not what the server
 answers. A session can only call what its client was shown, though, so the two
 unlisted tools — `explain` and `rename_node` — are reached by starting the
 server with `mushroomdb mcp <db> --all-tools`, which lists the whole set with
 their schemas. The default listing a session pays for before its first turn —
-the `tools` array of the `tools/list` reply, as compact JSON — is 23,548 bytes;
-all 21 are 24,349.
+the `tools` array of the `tools/list` reply, as compact JSON — is 26,924 bytes;
+all 25 are 27,725. Before this release added `schema`, `analyze`,
+`suggest_rules` and `forget` it was 23,548 and 24,349;
+`scripts/measure-tool-listing.py` takes both.
 
 | Tool | Purpose |
 |---|---|
-| `upsert_entity` | Insert or update a node by key. Creates if absent, updates props if present. An update is atomic: every property is checked before any is written, so a refusal leaves the node unchanged. Pass `namespace` for the namespace a created node lands in; on a node that already exists, naming the namespace it is in is a no-op and naming another is refused — a namespace is set at insert and cannot be changed. |
+| `upsert_entity` | Insert or update a node by key. Creates if absent, updates props if present. An update is atomic: every property is checked before any is written, so a refusal leaves the node unchanged. Pass `namespace` for the namespace a created node lands in; on a node that already exists, naming the namespace it is in is a no-op and naming another is refused — a namespace is set at insert and cannot be changed. Takes `aliases`, other names the entity goes by, kept in a normalised `aliases` list with its key and name; `aliases` itself is refused as a property. |
 | `ingest_json` | Batch-ingest an array of nodes of the same label from JSON. Pass `namespace` to put every node the call creates in one namespace; a row carrying a different `ns` is refused before anything is written. A field whose values point at two labels is skipped with `ambiguous target labels`; declare one `create_rule` KeyMatch rule per target label instead. |
 | `create_rule` | Declare a derivation rule; backfills existing nodes in the same commit, unless it has a vector index over more than 2,048 vectors, in which case the build is sliced and the edges arrive in a later commit (`stats` reports the progress). Pass `namespace` to scope it to one namespace — source, via hop and destination — so every edge it derives stays inside; omitted is a global rule, the only kind that may cross a boundary. Propose it and wait for approval — it is a store-wide write. |
 | `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity in `[-1, 1]` (`score >= min`; a distance of `1 - sim` is the caller's conversion). Brute `find_similar` is exact GEMM; HNSW is still the approximate path; `exact: true` forces GEMM. Optional `where` (`{field, eq}` or `{field, in}`) implies exact, and uses the property index only when `label` accompanies it and `(label, where.field)` is index-enabled — without a label it is a correct-but-slower scan. Vector-mode `min` defaults to 0.8 here; **Python and HTTP default it to 0.0**, so a call ported between surfaces without an explicit `min` changes its results silently. (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). Edge-traversal mode ignores `where` and `exact`. **A `mask` alone is the approximate path**: vector search under `mask` widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist, and it is still not guaranteed to have found the true top `k` — pass `exact` or a `where` alongside the mask for an exhaustive answer over the same visible set. |
