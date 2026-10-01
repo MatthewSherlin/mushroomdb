@@ -2007,9 +2007,14 @@ struct ForgetReport {
     target: String,
     /// False when there was nothing to forget, and nothing was written.
     changed: bool,
-    /// Edges removed with a node: written by hand, and derived by rules.
+    /// Edges removed with a node: written by hand, and derived by rules. For a
+    /// property, `derived_edges` counts the rule-derived edges on the node that
+    /// the removal retracted, because a rule read that property.
     manual_edges: u64,
     derived_edges: u64,
+    /// The property removed, in `prop` mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prop: Option<String>,
     /// Notes with an `ABOUT` edge to the node, or to both ends of the fact.
     /// Listed, never deleted: their text still says what was forgotten.
     notes: Vec<String>,
@@ -2045,6 +2050,21 @@ fn notes_about(g: &core_api::GraphDb<core_api::RealFs>, keys: &[&str]) -> Vec<St
     common.unwrap_or_default().into_iter().collect()
 }
 
+/// An edge as `(edge_type, src_key, dst_key)`.
+type EdgeTriple = (String, String, String);
+
+/// The rule-derived edges incident on `key`, both directions, each once.
+fn derived_edges_on(
+    g: &core_api::GraphDb<core_api::RealFs>,
+    key: &str,
+) -> Result<BTreeSet<EdgeTriple>, GraphError> {
+    Ok(g.node_edges(key)?
+        .into_iter()
+        .filter(|e| e.derived)
+        .map(|e| (e.edge_type, e.src_key, e.dst_key))
+        .collect())
+}
+
 /// The history sentence every successful `forget` ends with. A tombstone is
 /// not a redaction, and the caller is told so in the same reply.
 fn history_line(floor: u64) -> String {
@@ -2062,7 +2082,17 @@ fn render_forget(r: &ForgetReport) -> String {
             "forgot {target} — {} edge(s) removed, {} derived edge(s) retracted\n",
             r.manual_edges, r.derived_edges
         ),
-        ("prop", true) => format!("forgot {target}\n"),
+        ("prop", true) => {
+            let mut line = format!("forgot {target}\n");
+            if r.derived_edges > 0 {
+                line.push_str(&format!(
+                    "{} derived edge(s) retracted because a rule read {}\n",
+                    r.derived_edges,
+                    digest::sanitize(r.prop.as_deref().unwrap_or_default())
+                ));
+            }
+            line
+        }
         ("prop", false) => format!("{target} is not set; nothing to forget\n"),
         (_, true) => format!("retracted {target}\n"),
         (_, false) => format!("no edge {target}; nothing to retract\n"),
@@ -2140,22 +2170,37 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 changed: true,
                 manual_edges: deleted.manual_edges,
                 derived_edges: deleted.derived_edges,
+                prop: None,
                 notes_total: notes.len(),
                 notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
                 history_floor: g.stats().history_floor,
             }
         }
         (Some(key), Some(prop), None) => {
+            // Removing a property re-runs rule retraction, so a rule that read
+            // it drops the edges it derived. Compare the node's derived edges
+            // either side of the write to say how many went.
+            let before = match derived_edges_on(&g, &key) {
+                Ok(e) => e,
+                Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+            };
             let changed = match g.remove_prop(&key, &prop) {
                 Ok(c) => c,
                 Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+            };
+            let retracted = if changed {
+                let after = derived_edges_on(&g, &key).unwrap_or_default();
+                before.difference(&after).count() as u64
+            } else {
+                0
             };
             ForgetReport {
                 mode: "prop",
                 target: format!("{key}.{prop}"),
                 changed,
                 manual_edges: 0,
-                derived_edges: 0,
+                derived_edges: retracted,
+                prop: Some(prop),
                 notes: Vec::new(),
                 notes_total: 0,
                 history_floor: g.stats().history_floor,
@@ -2183,6 +2228,7 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 changed,
                 manual_edges: 0,
                 derived_edges: 0,
+                prop: None,
                 notes_total: notes.len(),
                 notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
                 history_floor: g.stats().history_floor,

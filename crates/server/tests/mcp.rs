@@ -5378,3 +5378,116 @@ fn forget_takes_exactly_one_shape_and_names_an_unknown_key() {
     let err = error_text(&one_task_call(db, "forget", json!({"key": "nobody"})));
     assert!(err.contains("nobody"), "{err}");
 }
+
+/// Binding: removing a property a rule reads retracts the edges that rule
+/// derived from it, and the reply says so rather than only "forgot k.name".
+#[test]
+fn forgetting_a_property_a_rule_reads_reports_the_derived_edges_it_retracts() {
+    let db = memory_store("forget-prop-derived");
+    db.write().create_rule(same_name_rule()).unwrap();
+    for key in ["a", "b"] {
+        db.write()
+            .insert_node("Person", key, vec![("name".into(), Value::Str("X".into()))])
+            .unwrap();
+    }
+    assert_eq!(
+        db.read()
+            .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+            .unwrap(),
+        vec!["b".to_string()],
+        "precondition: the rule linked them"
+    );
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "a", "prop": "name"}),
+    ));
+    assert!(text.starts_with("forgot a.name"), "{text}");
+    assert!(
+        text.contains("derived edge(s) retracted because a rule read name"),
+        "{text}"
+    );
+    assert!(!text.contains("0 derived edge(s) retracted"), "{text}");
+    let g = db.read();
+    assert!(g
+        .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+        .unwrap()
+        .is_empty());
+    assert!(g
+        .neighbors("b", "SAME_NAME", core_api::Direction::Out)
+        .unwrap()
+        .is_empty());
+}
+
+/// Binding: a property no rule reads retracts nothing, and the reply does not
+/// claim it did.
+#[test]
+fn forgetting_a_property_no_rule_reads_reports_no_derived_edges() {
+    let db = memory_store("forget-prop-plain");
+    db.write().create_rule(same_name_rule()).unwrap();
+    for key in ["a", "b"] {
+        db.write()
+            .insert_node(
+                "Person",
+                key,
+                vec![
+                    ("name".into(), Value::Str("X".into())),
+                    ("email".into(), Value::Str(format!("{key}@example.com"))),
+                ],
+            )
+            .unwrap();
+    }
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "a", "prop": "email"}),
+    ));
+    assert!(!text.contains("derived edge(s) retracted"), "{text}");
+    assert_eq!(
+        db.read()
+            .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+            .unwrap(),
+        vec!["b".to_string()]
+    );
+}
+
+/// Binding: a fact naming a key the store does not have is refused with the
+/// key named, and nothing is written.
+#[test]
+fn forgetting_a_fact_with_an_unknown_subject_names_it_and_writes_nothing() {
+    let db = memory_store("forget-fact-unknown");
+    seed_person(&db, "a");
+    let (nodes, edges, seq) = {
+        let g = db.read();
+        (g.stats().nodes_live, g.stats().edges, g.commit_seq())
+    };
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"fact": {"subject": "ghost", "predicate": "KNOWS", "object": "a"}}),
+    ));
+    assert!(err.contains("ghost"), "{err}");
+    let g = db.read();
+    assert_eq!(g.stats().nodes_live, nodes);
+    assert_eq!(g.stats().edges, edges);
+    assert_eq!(g.commit_seq(), seq, "nothing was committed");
+}
+
+/// Binding: a fact whose ends exist but are not linked retracts nothing, says
+/// so, and does not warn about history it did not write.
+#[test]
+fn forgetting_an_absent_fact_says_nothing_to_retract() {
+    let db = memory_store("forget-fact-absent");
+    seed_person(&db, "a");
+    seed_person(&db, "b");
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"fact": {"subject": "a", "predicate": "KNOWS", "object": "b"}}),
+    ));
+    assert!(
+        text.contains("no edge KNOWS a → b; nothing to retract"),
+        "{text}"
+    );
+    assert!(!text.contains("history still holds it"), "{text}");
+}
