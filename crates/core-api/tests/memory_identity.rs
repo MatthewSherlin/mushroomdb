@@ -1325,3 +1325,56 @@ fn a_decomposed_and_a_composed_name_link() {
         "the name itself is stored as written; only the aliases are normalised"
     );
 }
+
+// ── limits the changelog states, pinned ─────────────────────────────────────
+
+/// A declared alias is one more entry in `aliases`, so it counts against
+/// `Overlap`: two same-named entities link at 3/5, and at 3/6 — under the
+/// floor — once one of them declares a nickname the other does not.
+#[test]
+fn a_declared_alias_counts_against_overlap() {
+    let mut db = identity_store("claim-dilutes");
+    let report = remember_people(
+        &mut db,
+        "one declares a nickname",
+        vec![
+            person("matthew-sherlin", "Matthew Sherlin", &["matt"]),
+            person("msherlin", "Matthew Sherlin", &[]),
+        ],
+    );
+    assert!(report.same_as.is_empty(), "3/6 = 0.5: {:?}", report.same_as);
+}
+
+/// The claim rules run from the five entity labels. An entity under any other
+/// label declares its aliases all the same, but no rule reads them.
+#[test]
+fn a_claim_from_a_label_outside_the_five_does_not_link() {
+    let mut db = identity_store("claim-other-label");
+    let about = strings(&["seven"]);
+    let entities = vec![EntityIn {
+        key: "v0.7".into(),
+        label: "Release".into(),
+        props: BTreeMap::new(),
+        aliases: strings(&["seven"]),
+    }];
+    let report = remember(&mut db, &note("a release", &about, &entities)).unwrap();
+    assert_eq!(alias_keys_of(&db, "v0.7"), Some(strings(&["seven"])));
+    assert!(report.same_as.is_empty(), "{:?}", report.same_as);
+}
+
+/// The byte-identity exception the doc comments state: a key with padding
+/// keeps its untrimmed lowercase alias, gains the canonical one on the next
+/// write, and is stable after that.
+#[test]
+fn a_padded_keys_alias_list_settles_after_one_more_write() {
+    let mut db = store("padded-key");
+    describe_entity(&mut db, " Matt ", Some("Person"), &[]).unwrap();
+    assert_eq!(aliases_of(&db, " Matt "), strings(&[" matt "]));
+    set_role(&mut db, " Matt ").unwrap();
+    assert_eq!(aliases_of(&db, " Matt "), strings(&[" matt ", "matt"]));
+    assert_eq!(
+        core_api::memory::identity::aliases_after_write(&db, " Matt ", &[], &[]).unwrap(),
+        None,
+        "stable from here"
+    );
+}
