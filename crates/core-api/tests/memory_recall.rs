@@ -1,6 +1,6 @@
 //! recall matches language. The 0.6.12 implementation matched identifiers, so
 //! a human name — the commonest subject in a memory store — was unreachable.
-use core_api::memory::recall::{recall_digest, RecallOutcome};
+use core_api::memory::recall::{recall_digest, recall_rows, RecallOutcome};
 use core_api::memory_schema::memory_defaults;
 use core_api::{GraphDb, Value};
 
@@ -408,4 +408,83 @@ fn the_store_label_cannot_forge_a_line_and_a_clean_one_is_unchanged() {
         ),
         other => panic!("expected the hit, got {other:?}"),
     }
+}
+
+/// A topic's hits as data: the same ranking the digest prints, one row each.
+#[test]
+fn recall_rows_are_the_digest_s_hits_in_the_digest_s_order() {
+    let mut db = store("rows");
+    db.insert_node(
+        "Note",
+        "note:orchard",
+        vec![(
+            "text".into(),
+            Value::Str("Matthew planted an orchard".into()),
+        )],
+    )
+    .unwrap();
+
+    let rows = recall_rows(&db, "matthew orchard");
+
+    assert!(rows.indexed);
+    assert_eq!(rows.terms, 2, "two content words, neither a stopword");
+    let got: Vec<(&str, &str, usize)> = rows
+        .hits
+        .iter()
+        .map(|h| (h.key.as_str(), h.label.as_str(), h.covered))
+        .collect();
+    assert_eq!(
+        got,
+        vec![("note:orchard", "Note", 2), ("matthew", "Person", 1)],
+        "coverage leads: the note holds both words, the person one of two — half, which is kept"
+    );
+    assert_eq!(
+        rows.hits[0].summary.as_deref(),
+        Some("Matthew planted an orchard")
+    );
+    assert_eq!(rows.hits[1].summary.as_deref(), Some("Matthew Sherlin"));
+
+    // The digest is these rows, rendered: one line per hit under one header.
+    match recall_digest(&db, "matthew orchard", "store", 4000) {
+        RecallOutcome::Hits(d) => {
+            let lines: Vec<&str> = d.lines().collect();
+            assert_eq!(lines.len(), 1 + rows.hits.len(), "{d}");
+            assert!(
+                lines[1].contains("note:orchard") && lines[1].contains("(2/2 terms)"),
+                "{d}"
+            );
+            assert!(
+                lines[2].contains("matthew") && lines[2].contains("(1/2 terms)"),
+                "{d}"
+            );
+        }
+        other => panic!("expected hits, got {other:?}"),
+    }
+}
+
+#[test]
+fn recall_rows_say_no_index_apart_from_no_match() {
+    let bare = GraphDb::open(&tmp("rows-bare")).unwrap();
+    let rows = recall_rows(&bare, "matthew");
+    assert!(!rows.indexed, "nothing declares full-text here");
+    assert!(rows.hits.is_empty());
+
+    let db = store("rows-nomatch");
+    let rows = recall_rows(&db, "zebra");
+    assert!(rows.indexed);
+    assert!(rows.hits.is_empty(), "{rows:?}");
+    let rows = recall_rows(&db, "   ");
+    assert!(rows.indexed && rows.hits.is_empty() && rows.terms == 0);
+}
+
+#[test]
+fn recall_rows_serialise_with_the_names_a_caller_reads() {
+    let db = store("rows-json");
+    let v = serde_json::to_value(recall_rows(&db, "Matthew")).unwrap();
+    assert_eq!(v["indexed"], true);
+    assert_eq!(v["terms"], 1);
+    assert_eq!(v["hits"][0]["key"], "matthew");
+    assert_eq!(v["hits"][0]["label"], "Person");
+    assert_eq!(v["hits"][0]["covered"], 1);
+    assert!(v["hits"][0]["score"].as_f64().unwrap() > 0.0);
 }

@@ -261,6 +261,36 @@ fn topic_query(topic: &str) -> (Vec<String>, String) {
     (terms, query)
 }
 
+/// One node a topic matched.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RecallHit {
+    pub key: String,
+    /// The node's label, or empty if it vanished between the search and here.
+    pub label: String,
+    /// The first of `text`, `summary` or `name` the node carries, as
+    /// [`GraphDb::node_summary_line`] cuts it.
+    pub summary: Option<String>,
+    /// How many of the topic's terms this node's own text holds. `0` when
+    /// the topic was all stopwords and its words were searched as one
+    /// AND-group, where every hit holds all of them.
+    pub covered: usize,
+    /// The fused score. Rank-derived, so nearly flat across hits: order by
+    /// `covered` first, as this list already is.
+    pub score: f64,
+}
+
+/// A topic's hits, ranked: coverage descending, then score, then key.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RecallRows {
+    /// False when the store declares no full-text index, so no topic can
+    /// match — a different answer from "this topic matched nothing".
+    pub indexed: bool,
+    /// The topic's search terms after stopwords and repeats are dropped.
+    pub terms: usize,
+    /// At most [`MAX_HITS`], best first.
+    pub hits: Vec<RecallHit>,
+}
+
 /// Why `recall` had nothing to say — the two reasons are different advice.
 #[derive(Debug)]
 pub enum RecallOutcome {
@@ -272,13 +302,14 @@ pub enum RecallOutcome {
     Hits(String),
 }
 
-/// Rank nodes against a free-text topic over every declared text field.
-pub fn recall_digest<F: Fs>(
-    db: &GraphDb<F>,
-    topic: &str,
-    store_label: &str,
-    max_bytes: usize,
-) -> RecallOutcome {
+/// Rank nodes against a free-text topic over every declared text field, and
+/// return the hits as data. [`recall_digest`] renders exactly these rows.
+pub fn recall_rows<F: Fs>(db: &GraphDb<F>, topic: &str) -> RecallRows {
+    let none = |indexed: bool| RecallRows {
+        indexed,
+        terms: 0,
+        hits: Vec::new(),
+    };
     let mut fields: Vec<String> = db.fulltext_pairs().into_iter().map(|(_, f)| f).collect();
     fields.sort();
     fields.dedup();
@@ -287,16 +318,16 @@ pub fn recall_digest<F: Fs>(
     // an empty topic — "no text index" is the fix either way, "no match" is
     // not.
     if fields.is_empty() {
-        return RecallOutcome::NoIndex;
+        return none(false);
     }
     let topic = topic.trim();
     if topic.is_empty() {
-        return RecallOutcome::NoMatch;
+        return none(true);
     }
 
     let (terms, query) = topic_query(topic);
     if query.is_empty() {
-        return RecallOutcome::NoMatch;
+        return none(true);
     }
 
     let mut best: BTreeMap<String, f64> = BTreeMap::new();
@@ -391,15 +422,11 @@ pub fn recall_digest<F: Fs>(
             }
         });
     }
-    if best.is_empty() {
-        return RecallOutcome::NoMatch;
-    }
 
     // Deterministic: coverage descending, then score descending, then key
     // ascending. Coverage leads because it is the measurement that means
     // something — see the floor above — and the key breaks the last tie the
     // way every other tie in this engine breaks.
-    let total = terms.len();
     let mut ranked: Vec<(String, usize, f64)> = best
         .into_iter()
         .map(|(key, score)| {
@@ -414,6 +441,42 @@ pub fn recall_digest<F: Fs>(
     });
     ranked.truncate(MAX_HITS);
 
+    RecallRows {
+        indexed: true,
+        terms: terms.len(),
+        hits: ranked
+            .into_iter()
+            .map(|(key, covered, score)| RecallHit {
+                label: db
+                    .node_ref(&key)
+                    .map(|n| n.label().to_string())
+                    .unwrap_or_default(),
+                summary: db.node_summary_line(&key),
+                key,
+                covered,
+                score,
+            })
+            .collect(),
+    }
+}
+
+/// [`recall_rows`], rendered as the digest an assistant reads: one header,
+/// one line per hit, inside `max_bytes`.
+pub fn recall_digest<F: Fs>(
+    db: &GraphDb<F>,
+    topic: &str,
+    store_label: &str,
+    max_bytes: usize,
+) -> RecallOutcome {
+    let rows = recall_rows(db, topic);
+    if !rows.indexed {
+        return RecallOutcome::NoIndex;
+    }
+    if rows.hits.is_empty() {
+        return RecallOutcome::NoMatch;
+    }
+    let total = rows.terms;
+
     // The label is a caller-supplied path, and it lands in the same context
     // as the hits, so it is held to the same rule.
     let label = sanitize(store_label);
@@ -423,14 +486,14 @@ pub fn recall_digest<F: Fs>(
     // `max_bytes` bounds the whole digest rather than only the pointers. The
     // reservation uses `ranked.len()`, an upper bound on the count the header
     // ends up printing. The same budgeting the 0.6 code-graph digest used.
-    let reserved = header(ranked.len(), &label).len() + ELISION.len();
+    let reserved = header(rows.hits.len(), &label).len() + ELISION.len();
     let Some(mut budget) = max_bytes.checked_sub(reserved) else {
         // A pathologically long store label: nothing useful fits.
         return RecallOutcome::NoMatch;
     };
     let mut lines: Vec<String> = Vec::new();
     let mut truncated = false;
-    for (key, present, _) in &ranked {
+    for hit in &rows.hits {
         // The all-stopword fallback searched the topic's words as one AND-group,
         // which required every word in one document — 100% coverage, a
         // stricter gate than the half rule, not a missing one — so there
@@ -438,14 +501,14 @@ pub fn recall_digest<F: Fs>(
         let cover = if total == 0 {
             String::new()
         } else {
-            format!(" ({present}/{total} terms)")
+            format!(" ({}/{total} terms)", hit.covered)
         };
         // Keys and summaries are stored content, read back into an
         // assistant's context: a newline or an escape sequence in one must
         // not be able to split this line or forge a header.
-        let shown = sanitize(key);
-        let line = match db.node_summary_line(key) {
-            Some(summary) => format!("  {shown} — {}{cover}\n", sanitize(&summary)),
+        let shown = sanitize(&hit.key);
+        let line = match &hit.summary {
+            Some(summary) => format!("  {shown} — {}{cover}\n", sanitize(summary)),
             None => format!("  {shown}{cover}\n"),
         };
         if line.len() > budget {
