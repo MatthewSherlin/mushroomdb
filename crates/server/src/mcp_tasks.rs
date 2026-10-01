@@ -63,7 +63,7 @@ use std::path::Path;
 /// they are the same question widened: every relationship of one node rather
 /// than of one pair, that listing at a past commit, and that listing under a
 /// change that has not been made.
-pub(crate) const TASK_TOOLS: [&str; 9] = [
+pub(crate) const TASK_TOOLS: [&str; 10] = [
     "explain_association",
     "node_edges",
     "neighborhood",
@@ -72,6 +72,7 @@ pub(crate) const TASK_TOOLS: [&str; 9] = [
     "recall",
     "remember",
     "schema",
+    "suggest_rules",
     "forget",
 ];
 
@@ -102,6 +103,7 @@ pub(crate) fn dispatch(
         "recall" => tool_recall(db, db_dir, args, json_out),
         "remember" => tool_remember(db, args, json_out),
         "schema" => tool_schema(db, json_out),
+        "suggest_rules" => tool_suggest_rules(db, json_out),
         "forget" => tool_forget(db, args, json_out),
         _ => unreachable!("TASK_TOOLS and this match list the same names"),
     })
@@ -2282,6 +2284,168 @@ fn rule_owned_refusal(
     )
 }
 
+// ── suggest_rules ────────────────────────────────────────────────────────────
+
+/// Proposals one reply lists.
+///
+/// Every one is relayed to a person for approval with its estimate, its
+/// examples and the exact `create_rule` arguments; five is what one message
+/// can carry with all of that, and the reply counts the rest.
+const MAX_SUGGESTIONS: usize = 5;
+
+/// Fields the store writes for its own bookkeeping, never proposed as a rule.
+///
+/// On a memory store these are the whole of what the engine would otherwise
+/// propose: measured on a 100,000-node store `remember` filled, every proposal
+/// was `kind`, `source` or `ts` — clique rules that link every note to 32
+/// others for sharing a default value. `ns` is the namespace every namespaced
+/// node carries, `id` repeats the key, `provisional` is `remember`'s stub mark
+/// and `aliases` is the list `remember` maintains for identity matching.
+const BOOKKEEPING_FIELDS: [&str; 7] =
+    ["ns", "kind", "ts", "source", "provisional", "id", "aliases"];
+
+/// One proposal, with the arguments that create it.
+#[derive(serde::Serialize)]
+struct SuggestionOut {
+    name: String,
+    src_label: String,
+    dst_label: String,
+    edge_type: String,
+    predicate: String,
+    est_edges: u64,
+    examples: Vec<(String, String, f64)>,
+    rationale: String,
+    /// Pass this object to `create_rule` as its arguments, unchanged.
+    create_rule_args: Js,
+}
+
+#[derive(serde::Serialize)]
+struct SuggestOut {
+    suggestions: Vec<SuggestionOut>,
+    /// Proposals after the bookkeeping filter, before the cap.
+    total: usize,
+    /// Proposals dropped because they read a bookkeeping field.
+    bookkeeping_hidden: usize,
+    /// The engine's time budget ran out; a second call may find more.
+    truncated: bool,
+}
+
+/// `def` as `create_rule` arguments: no nulls, `approximate` only when set,
+/// and `weight_prop` explicit — `create_rule` would default a missing one to
+/// `"weight"`, so it is written out to make what is shown what is created.
+fn create_rule_args(def: &core_api::RuleDef) -> Js {
+    let mut v = serde_json::to_value(def).unwrap_or(Js::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.retain(|_, x| !x.is_null());
+        if obj.get("approximate") == Some(&Js::Bool(false)) {
+            obj.remove("approximate");
+        }
+        obj.entry("weight_prop").or_insert_with(|| json!("weight"));
+    }
+    v
+}
+
+fn render_suggestions(r: &SuggestOut) -> String {
+    let mut out = if r.suggestions.is_empty() {
+        "mushroomdb suggest_rules — nothing to propose: no pattern a rule does not \
+         already cover\n"
+            .to_string()
+    } else {
+        format!(
+            "mushroomdb suggest_rules — {} proposal(s); nothing is created until \
+             create_rule is called with the arguments shown\n",
+            r.total
+        )
+    };
+    for (i, s) in r.suggestions.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {}: {} → {} derives {} — {} · ~{} edge(s) · global: links across namespaces\n",
+            i + 1,
+            digest::sanitize(&s.name),
+            digest::sanitize(&s.src_label),
+            digest::sanitize(&s.dst_label),
+            digest::sanitize(&s.edge_type),
+            s.predicate,
+            s.est_edges
+        ));
+        out.push_str(&format!("   why: {}\n", digest::sanitize(&s.rationale)));
+        if !s.examples.is_empty() {
+            let eg: Vec<String> = s
+                .examples
+                .iter()
+                .map(|(a, b, score)| {
+                    format!(
+                        "{} → {} {score:.2}",
+                        digest::sanitize(a),
+                        digest::sanitize(b)
+                    )
+                })
+                .collect();
+            out.push_str(&format!("   e.g. {}\n", eg.join("; ")));
+        }
+        out.push_str(&format!(
+            "   create_rule {}\n",
+            digest::sanitize(&s.create_rule_args.to_string())
+        ));
+    }
+    if r.total > r.suggestions.len() {
+        out.push_str(&format!("… and {} more\n", r.total - r.suggestions.len()));
+    }
+    if r.bookkeeping_hidden > 0 {
+        out.push_str(&format!(
+            "({} proposal(s) on bookkeeping fields — {} — not shown)\n",
+            r.bookkeeping_hidden,
+            BOOKKEEPING_FIELDS.join(", ")
+        ));
+    }
+    if r.truncated {
+        out.push_str("(the time budget ran out; a second call may find more)\n");
+    }
+    out
+}
+
+fn tool_suggest_rules(db: &SharedDb, json_out: bool) -> CallOutcome {
+    let report = {
+        let g = db.read();
+        g.suggest_rules_with_config(
+            &core_api::SuggestConfig::default(),
+            core_api::SUGGEST_DEFAULT_SEED,
+        )
+    };
+    let mut kept: Vec<SuggestionOut> = Vec::new();
+    let mut hidden = 0usize;
+    for s in report.suggestions {
+        let summary = core_api::PredicateSummary::from(&s.def.predicate);
+        if predicate_fields(&summary)
+            .iter()
+            .any(|f| BOOKKEEPING_FIELDS.contains(&f.as_str()))
+        {
+            hidden += 1;
+            continue;
+        }
+        kept.push(SuggestionOut {
+            create_rule_args: create_rule_args(&s.def),
+            predicate: predicate_summary(&summary),
+            name: s.def.name,
+            src_label: s.def.src_label,
+            dst_label: s.def.dst_label,
+            edge_type: s.def.edge_type,
+            est_edges: s.est_edges,
+            examples: s.examples,
+            rationale: s.rationale,
+        });
+    }
+    let total = kept.len();
+    kept.truncate(MAX_SUGGESTIONS);
+    let out = SuggestOut {
+        suggestions: kept,
+        total,
+        bookkeeping_hidden: hidden,
+        truncated: report.truncated,
+    };
+    ok(json_out, &out, render_suggestions)
+}
+
 // ── tools/list ───────────────────────────────────────────────────────────────
 
 /// The `json` argument every task tool takes, added to every task tool's schema
@@ -2555,6 +2719,11 @@ fn task_tool_schemas() -> Vec<Js> {
         json!({
             "name": "schema",
             "description": "What's in here — the store's labels with their property names, its edge types and what derives them, every rule with its predicate, the full-text fields recall searches, the equality indexes, and how many provisional nodes remember created. Call it before writing Cypher against a store you have not seen.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "suggest_rules",
+            "description": "What relationships are in my data — rules the store proposes from its own values, each with an estimate, examples and the exact create_rule arguments. Nothing is created: show the proposal and wait for approval before calling create_rule. Fields the store writes for bookkeeping are never proposed. Every proposal is global and links across namespaces.",
             "inputSchema": { "type": "object", "properties": {} }
         }),
         json!({

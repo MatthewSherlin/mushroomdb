@@ -193,7 +193,7 @@ fn tools_list_returns_all_tools_with_schemas() {
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 23);
+    assert_eq!(tools.len(), 24);
 
     let by_name = |n: &str| {
         tools
@@ -1044,7 +1044,7 @@ fn hybrid_search_text_only_and_missing_field_errors() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The task tools, in the order `tools/list` must list them.
-const TASK_TOOLS: [&str; 9] = [
+const TASK_TOOLS: [&str; 10] = [
     "explain_association",
     "node_edges",
     "neighborhood",
@@ -1053,6 +1053,7 @@ const TASK_TOOLS: [&str; 9] = [
     "recall",
     "remember",
     "schema",
+    "suggest_rules",
     "forget",
 ];
 
@@ -1447,7 +1448,7 @@ fn a_memory_store_lists_the_association_surface() {
         server::ASSOCIATION_TOOLS.to_vec(),
         "default tools/list on a memory store"
     );
-    assert_eq!(tools.len(), 21);
+    assert_eq!(tools.len(), 22);
     for hidden in [
         "explore", "map", "context", "impact", "owners", "why", "sync",
     ] {
@@ -3443,7 +3444,7 @@ fn what_if_with_an_edge_type_answers_in_partner_keys() {
 /// said what they *returned* rather than what they were *for*.
 #[test]
 fn every_association_tool_description_opens_with_its_question() {
-    const OPENERS: [(&str, &str); 21] = [
+    const OPENERS: [(&str, &str); 22] = [
         ("query", "Who may see this"),
         ("explain_association", "Why are A and B related"),
         ("neighborhood", "What is around K"),
@@ -3477,6 +3478,7 @@ fn every_association_tool_description_opens_with_its_question() {
         ),
         ("stats", "How big is this store"),
         ("schema", "What's in here"),
+        ("suggest_rules", "What relationships are in my data"),
         ("forget", "Forget that"),
     ];
 
@@ -3743,7 +3745,7 @@ fn tools_list_has_every_tool_task_tools_first_and_advanced_prefix() {
         .copied()
         .collect();
     assert_eq!(names, expected, "tools/list order");
-    assert_eq!(tools.len(), 23);
+    assert_eq!(tools.len(), 24);
 
     for t in tools.iter().take(TASK_TOOLS.len()) {
         let d = t["description"].as_str().expect("description");
@@ -5490,4 +5492,135 @@ fn forgetting_an_absent_fact_says_nothing_to_retract() {
         "{text}"
     );
     assert!(!text.contains("history still holds it"), "{text}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// suggest_rules — "what relationships are in my data?"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A memory store the way `remember` fills one — notes with kinds, sources
+/// and timestamps — plus people with a field worth a rule.
+fn suggest_store(name: &str) -> SharedDb {
+    let db = memory_store(name);
+    for i in 0..30 {
+        let kind = ["note", "decision", "todo"][i % 3];
+        let source = ["session-a", "session-b"][i % 2];
+        one_task_call(
+            db.clone(),
+            "remember",
+            json!({
+                "text": format!("note {i} about the release"),
+                "kind": kind,
+                "source": source,
+                "ts": 1_759_000_000 + i as i64,
+            }),
+        );
+    }
+    for i in 0..12 {
+        let team = ["infra", "ui"][i % 2];
+        one_task_call(
+            db.clone(),
+            "upsert_entity",
+            json!({"key": format!("p{i}"), "label": "Person",
+                   "props": {"name": format!("Person {i}"), "team": team}}),
+        );
+    }
+    db
+}
+
+/// Binding (R5): on a store `remember` filled, nothing is proposed over a
+/// field the store writes for itself — and the filter is shown to have fired.
+#[test]
+fn suggest_rules_never_proposes_a_bookkeeping_field() {
+    let report = task_report(suggest_store("suggest-noise"), "suggest_rules", json!({}));
+    let bookkeeping = ["ns", "kind", "ts", "source", "provisional", "id", "aliases"];
+    for s in report["suggestions"].as_array().expect("suggestions") {
+        let args = s["create_rule_args"].to_string();
+        for f in bookkeeping {
+            assert!(
+                !args.contains(&format!("\"field\":\"{f}\"")),
+                "proposed a rule over bookkeeping field {f}: {s}"
+            );
+        }
+    }
+    assert!(
+        report["bookkeeping_hidden"].as_u64().unwrap() > 0,
+        "this store's notes share kind, source and ts; the filter must have dropped those: {report}"
+    );
+    assert!(
+        report["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["edge_type"] == "SAME_TEAM"),
+        "the one real pattern survives: {report}"
+    );
+}
+
+/// Binding (R5): a proposal's arguments are what `create_rule` takes — no
+/// nulls, `weight_prop` written out — and passing them unchanged creates
+/// exactly the rule proposed. The tool itself creates nothing.
+#[test]
+fn a_proposal_is_accepted_by_create_rule_unchanged() {
+    let db = suggest_store("suggest-roundtrip");
+    let rules_before = db.read().rules().len();
+    let report = task_report(db.clone(), "suggest_rules", json!({}));
+    assert_eq!(
+        db.read().rules().len(),
+        rules_before,
+        "suggest_rules created a rule"
+    );
+
+    let s = report["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["edge_type"] == "SAME_TEAM")
+        .expect("SAME_TEAM proposed")
+        .clone();
+    let args = s["create_rule_args"].clone();
+    let obj = args.as_object().unwrap();
+    assert!(obj.values().all(|v| !v.is_null()), "a null in {args}");
+    assert!(obj.contains_key("weight_prop"), "{args}");
+    assert!(!obj.contains_key("namespace"), "{args}");
+
+    let (res, out) = exchange(db.clone(), &call(1, "create_rule", args.clone()));
+    assert!(res.is_ok(), "{res:?}");
+    let reply = parse_lines(&out).remove(0);
+    assert_eq!(content_json(&reply)["ok"], json!(true), "{reply}");
+    let created = db
+        .read()
+        .rules()
+        .into_iter()
+        .find(|r| r.name == s["name"].as_str().unwrap())
+        .expect("the proposed rule now exists");
+    assert_eq!(
+        serde_json::to_value(&created.predicate).unwrap(),
+        args["predicate"]
+    );
+}
+
+/// Binding: every proposal says it is global, and the listing is bounded.
+#[test]
+fn proposals_say_they_are_global_and_stop_at_five() {
+    let db = memory_store("suggest-many");
+    for (i, label) in ["Red", "Green", "Blue"].iter().cycle().take(18).enumerate() {
+        db.write()
+            .insert_node(
+                label,
+                &format!("n{i}"),
+                vec![("colour".into(), Value::Str(["warm", "cool"][i % 2].into()))],
+            )
+            .unwrap();
+    }
+    let (text, report) = task_both(db, "suggest_rules", json!({}));
+    let listed = report["suggestions"].as_array().unwrap().len();
+    assert_eq!(listed, 5, "{report}");
+    assert!(report["total"].as_u64().unwrap() > 5, "{report}");
+    assert_eq!(
+        text.matches("global: links across namespaces").count(),
+        5,
+        "{text}"
+    );
+    assert!(text.contains("… and "), "the rest are counted: {text}");
 }

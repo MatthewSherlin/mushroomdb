@@ -1218,7 +1218,7 @@ const ADVANCED_PREFIX: &str = "Advanced: ";
 /// They sit after the readers deliberately. Listing order is ranking and the
 /// questions remain the point; writing is what a session does once, at the
 /// start, before it has anything to ask.
-pub const ASSOCIATION_TOOLS: [&str; 21] = [
+pub const ASSOCIATION_TOOLS: [&str; 22] = [
     "query",
     "explain_association",
     "neighborhood",
@@ -1239,6 +1239,7 @@ pub const ASSOCIATION_TOOLS: [&str; 21] = [
     "create_rule",
     "stats",
     "schema",
+    "suggest_rules",
     "forget",
 ];
 
@@ -1761,6 +1762,7 @@ mod tests {
             "recall",
             "remember",
             "schema",
+            "suggest_rules",
             "forget",
             // The fourteen graph tools.
             "query",
@@ -1782,12 +1784,12 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            23,
-            "expected exactly 23 tools, got {}",
+            24,
+            "expected exactly 24 tools, got {}",
             names.len()
         );
         assert_eq!(
-            &names[..9],
+            &names[..10],
             [
                 "explain_association",
                 "node_edges",
@@ -1797,11 +1799,12 @@ mod tests {
                 "recall",
                 "remember",
                 "schema",
+                "suggest_rules",
                 "forget",
             ],
             "the task tools come first, in order"
         );
-        assert_eq!(names[9], "query", "the graph tools follow them");
+        assert_eq!(names[10], "query", "the graph tools follow them");
     }
 
     /// Binding: the default listing is the association tools, in [`ASSOCIATION_TOOLS`]
@@ -1831,7 +1834,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
-        const EXPECTED: [&str; 21] = [
+        const EXPECTED: [&str; 22] = [
             "query",
             "explain_association",
             "neighborhood",
@@ -1852,6 +1855,7 @@ mod tests {
             "create_rule",
             "stats",
             "schema",
+            "suggest_rules",
             "forget",
         ];
         assert_eq!(names, EXPECTED.to_vec());
