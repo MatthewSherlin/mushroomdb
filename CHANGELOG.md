@@ -119,6 +119,12 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **Every entity carries a normalised `aliases` list** — its key, its name in
   lowercase with punctuation folded, that name's words, and any `aliases` the
   caller passes to `remember`'s `entities` or to `upsert_entity`.
+- **`aliases` is now maintained by the store.** A caller supplies extra
+  aliases through the `aliases` argument; an `aliases` key inside `props` is
+  refused. A value an older store already holds is taken in on the next write
+  to that entity — a string as one alias, a list with each item normalised —
+  and any other type is refused with the node named, to clear with
+  `forget {key, prop: "aliases"}`, rather than overwritten.
 - **`mushroomdb schema apply <db> --memory-identity`** adds the identity
   preset: eleven global `SAME_AS` rules over `aliases` at Jaccard ≥ 0.6,
   covering provisional stubs. It says what it will backfill before it writes.
@@ -151,8 +157,11 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 
 - **A nickname stub never links.** A bare `matt` stub holds one alias and
   cannot reach Jaccard 0.6 against an entity holding five, even one that
-  declares `matt` among them. Formal names and legal suffixes miss the same
-  way; they are the gate's nine false negatives.
+  declares `matt` among them. That is three of the gate's nine false
+  negatives. The other six miss the same way, on unequal alias sets: a formal
+  name with a declared alias (`countess-lovelace`, twice), a longer full name
+  (`amazing-grace`, twice), a nickname pair with no stub (`chris-lee` and
+  `christopher-lee`), and a legal suffix (`anthropic` and `anthropic-pbc`).
 - **Two strangers with one full name link.** `john-smith-nyc` and
   `john-smith-sf` score 3/5. The link is visible in `remember`'s reply and
   explainable with `explain_association`, but it is wrong — the gate's one
@@ -160,6 +169,14 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **A name in decomposed Unicode (NFD) may not match its composed (NFC)
   form.** Aliases are not normalised to NFC, so an accent typed as a combining
   mark splits the word.
+- **Identity is global.** The preset's rules carry no namespace, so
+  same-named entities in different namespaces link, and `remember`'s `same as`
+  line can name keys from other namespaces.
+- **`forget` has no role check.** Like every other MCP write tool, it is not
+  an authorisation boundary.
+- **A forgotten `name` stays in `aliases`.** `forget {key, prop: "name"}` says
+  so: the name's words keep matching identity rules, and later writes keep
+  them, until `forget {key, prop: "aliases"}` clears the list.
 - **`analyze` and `suggest_rules` read the whole store, with no role or
   mask.** Filtering their rows would be unsound, because a visible node's score
   is computed over hidden topology.
