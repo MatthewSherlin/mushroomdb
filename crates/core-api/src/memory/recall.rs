@@ -262,6 +262,10 @@ fn topic_query(topic: &str) -> (Vec<String>, String) {
 }
 
 /// One node a topic matched.
+///
+/// `key`, `label` and `summary` are stored content, unsanitized: only
+/// [`recall_digest`] passes them through [`sanitize`]. A caller rendering
+/// them into an assistant's context owes `core_api::digest::sanitize`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct RecallHit {
     pub key: String,
@@ -285,9 +289,12 @@ pub struct RecallRows {
     /// False when the store declares no full-text index, so no topic can
     /// match — a different answer from "this topic matched nothing".
     pub indexed: bool,
-    /// The topic's search terms after stopwords and repeats are dropped.
+    /// The topic's search terms after stopwords and repeats are dropped, at
+    /// most [`MAX_QUERY_TERMS`] (24). `0` with hits present means the topic
+    /// was all stopwords and the fallback ran, where every hit's `covered`
+    /// is `0`.
     pub terms: usize,
-    /// At most [`MAX_HITS`], best first.
+    /// At most six, best first.
     pub hits: Vec<RecallHit>,
 }
 
@@ -484,7 +491,7 @@ pub fn recall_digest<F: Fs>(
     // Pointers are rendered first so the header can count what actually
     // printed. The header and the elision marker are charged up front, so
     // `max_bytes` bounds the whole digest rather than only the pointers. The
-    // reservation uses `ranked.len()`, an upper bound on the count the header
+    // reservation uses `rows.hits.len()`, an upper bound on the count the header
     // ends up printing. The same budgeting the 0.6 code-graph digest used.
     let reserved = header(rows.hits.len(), &label).len() + ELISION.len();
     let Some(mut budget) = max_bytes.checked_sub(reserved) else {

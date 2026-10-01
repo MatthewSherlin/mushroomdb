@@ -488,3 +488,24 @@ fn recall_rows_serialise_with_the_names_a_caller_reads() {
     assert_eq!(v["hits"][0]["covered"], 1);
     assert!(v["hits"][0]["score"].as_f64().unwrap() > 0.0);
 }
+
+/// An all-stopword topic is searched as one AND-group, so there are no
+/// per-term counts: `terms` is 0 and so is every hit's `covered`.
+#[test]
+fn recall_rows_from_the_all_stopword_fallback_carry_no_term_counts() {
+    let mut db = store("rows-fallback");
+    db.insert_node("Note", "note-1", vec![]).unwrap();
+    db.set_prop("note-1", "text", Value::Str("keep this".into()))
+        .unwrap();
+
+    let rows = recall_rows(&db, "this");
+
+    assert!(rows.indexed);
+    assert_eq!(rows.terms, 0, "every word of the topic is a stopword");
+    let got: Vec<(&str, usize)> = rows
+        .hits
+        .iter()
+        .map(|h| (h.key.as_str(), h.covered))
+        .collect();
+    assert_eq!(got, vec![("note-1", 0)], "{rows:?}");
+}
