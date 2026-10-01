@@ -61,3 +61,62 @@ fn it_declares_fulltext_the_engine_then_reports() {
         "fulltext_pairs() must report Person after apply: {pairs:?}"
     );
 }
+
+#[test]
+fn index_pairs_lists_every_equality_index_sorted() {
+    let mut db = GraphDb::open(&tmp("index-pairs")).unwrap();
+    assert!(db.index_pairs().is_empty(), "a bare store has none");
+    db.apply_schema(&memory_defaults()).unwrap();
+    let pairs = db.index_pairs();
+    let mut sorted = pairs.clone();
+    sorted.sort();
+    assert_eq!(pairs, sorted, "sorted, so the schema tool is byte-stable");
+    for label in MEMORY_ENTITY_LABELS {
+        assert!(
+            pairs.contains(&((*label).to_string(), "name".to_string())),
+            "{label}.name missing from {pairs:?}"
+        );
+        assert!(db.is_index_enabled(label, "name"));
+    }
+}
+
+/// The report counts what `stats` never did, and its renderer leaves the
+/// framing line to the one caller that stamps it.
+#[test]
+fn the_schema_report_counts_provisional_nodes_and_is_unframed() {
+    use core_api::memory::brief::BriefOptions;
+    use core_api::memory::remember::{remember, RememberInput};
+    use core_api::memory::schema::{provisional_keys, render_schema, schema_report};
+
+    let mut db = GraphDb::open(&tmp("report")).unwrap();
+    db.apply_schema(&memory_defaults()).unwrap();
+    let about = vec!["reid".to_string(), "ada".to_string()];
+    remember(
+        &mut db,
+        &RememberInput {
+            text: "two unknowns",
+            about: &about,
+            kind: "note",
+            ts: 1_759_000_000,
+            source: None,
+            entities: &[],
+            facts: &[],
+        },
+    )
+    .unwrap();
+    // An `Entity` that is not provisional is not counted.
+    db.insert_node("Entity", "deliberate", vec![]).unwrap();
+
+    assert_eq!(provisional_keys(&db), vec!["ada", "reid"]);
+    let report = schema_report(&db, &BriefOptions::default());
+    assert_eq!(report.provisional, 2);
+    let text = render_schema(&report);
+    assert!(
+        text.contains("provisional: 2 — named but not yet described: ada, reid"),
+        "{text}"
+    );
+    assert!(
+        !text.contains(core_api::digest::UNTRUSTED_FRAMING),
+        "render_schema must not frame: {text}"
+    );
+}

@@ -6,3 +6,4 @@
 pub mod brief;
 pub mod recall;
 pub mod remember;
+pub mod schema;

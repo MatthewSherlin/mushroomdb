@@ -9,12 +9,12 @@
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
 //!   `serverInfo.name` `"mushroomdb"`, `serverInfo.version` (crate version)
 //! - `notifications/initialized` — ignored
-//! - `tools/list` — the default listing is the nineteen of
+//! - `tools/list` — the default listing is
 //!   [`ASSOCIATION_TOOLS`], the tools that answer a question about an entity
 //!   graph, in that order, whatever store the server opened. Graph-tool
 //!   descriptions carry the prefix `Advanced: ` so a host ranking tools by
 //!   description puts the task tools in front. `mushroomdb mcp --all-tools`
-//!   lists all twenty-one; the rest are callable either way, just not
+//!   lists every served tool; the rest are callable either way, just not
 //!   advertised
 //! - `tools/call` — dispatch; success for a graph tool is
 //!   `{content:[{type:"text", text:<json string>}]}`, and for a task tool one
@@ -78,8 +78,8 @@ pub fn run_mcp_stdio(
 
 /// [`run_mcp_stdio`], with the tool list chosen by the caller.
 ///
-/// `all_tools` false lists the nineteen of [`ASSOCIATION_TOOLS`]; true lists
-/// all twenty-one. Either way every tool remains callable — the flag decides
+/// `all_tools` false lists [`ASSOCIATION_TOOLS`]; true lists every served
+/// tool. Either way every tool remains callable — the flag decides
 /// what is advertised, not what is served.
 pub fn run_mcp_stdio_with(
     db: SharedDb,
@@ -1183,7 +1183,7 @@ fn initialize_result() -> Js {
 /// under this prefix is the lower-level surface beneath them.
 const ADVANCED_PREFIX: &str = "Advanced: ";
 
-/// The nineteen every store advertises, in the order it lists them.
+/// The tools every store advertises, in the order it lists them.
 ///
 /// A store with no repository in it used to be handed the code door's own task
 /// tools, which answered from a code graph there was none of. Those tools are
@@ -1218,7 +1218,7 @@ const ADVANCED_PREFIX: &str = "Advanced: ";
 /// They sit after the readers deliberately. Listing order is ranking and the
 /// questions remain the point; writing is what a session does once, at the
 /// start, before it has anything to ask.
-pub const ASSOCIATION_TOOLS: [&str; 19] = [
+pub const ASSOCIATION_TOOLS: [&str; 20] = [
     "query",
     "explain_association",
     "neighborhood",
@@ -1238,16 +1238,17 @@ pub const ASSOCIATION_TOOLS: [&str; 19] = [
     "ingest_json",
     "create_rule",
     "stats",
+    "schema",
 ];
 
-/// The tools `tools/list` advertises: the seven task tools, then the
+/// The tools `tools/list` advertises: the task tools, then the
 /// graph tools with their descriptions prefixed.
 ///
 /// `all` false — the default — lists [`ASSOCIATION_TOOLS`], **in the order it
 /// names them**. The order is the point. A host that defers tool schemas makes
 /// a model search for them, and the list it searches is read top-down.
 ///
-/// `all` true lists all twenty-one, task tools first and graph tools after,
+/// `all` true lists every served tool, task tools first and graph tools after,
 /// which is what `mushroomdb mcp --all-tools` runs and what the published
 /// server card documents.
 ///
@@ -1750,7 +1751,7 @@ mod tests {
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
         for expected in &[
-            // The seven task tools, first and in order.
+            // The task tools, first and in order.
             "explain_association",
             "node_edges",
             "neighborhood",
@@ -1758,6 +1759,7 @@ mod tests {
             "what_if",
             "recall",
             "remember",
+            "schema",
             // The fourteen graph tools.
             "query",
             "ingest_json",
@@ -1778,12 +1780,12 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            21,
-            "expected exactly 21 tools, got {}",
+            22,
+            "expected exactly 22 tools, got {}",
             names.len()
         );
         assert_eq!(
-            &names[..7],
+            &names[..8],
             [
                 "explain_association",
                 "node_edges",
@@ -1792,16 +1794,17 @@ mod tests {
                 "what_if",
                 "recall",
                 "remember",
+                "schema",
             ],
             "the task tools come first, in order"
         );
-        assert_eq!(names[7], "query", "the graph tools follow them");
+        assert_eq!(names[8], "query", "the graph tools follow them");
     }
 
-    /// Binding: the default listing is the nineteen association tools, in [`ASSOCIATION_TOOLS`]
+    /// Binding: the default listing is the association tools, in [`ASSOCIATION_TOOLS`]
     /// order, and nothing else.
     #[test]
-    fn tools_list_defaults_to_nineteen_on_a_memory_store() {
+    fn tools_list_defaults_to_the_association_tools_on_a_memory_store() {
         let db = demo_db();
         let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let names: Vec<&str> = resp["result"]["tools"]
@@ -1814,7 +1817,7 @@ mod tests {
     }
 
     /// Binding: `pairwise_similar` is advertised on the memory surface
-    /// immediately after `find_similar`. Listing length is 19.
+    /// immediately after `find_similar`, and the listing is exactly `EXPECTED`.
     #[test]
     fn association_listing_includes_pairwise_similar_after_find_similar() {
         let db = demo_db();
@@ -1825,7 +1828,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
-        const EXPECTED: [&str; 19] = [
+        const EXPECTED: [&str; 20] = [
             "query",
             "explain_association",
             "neighborhood",
@@ -1845,6 +1848,7 @@ mod tests {
             "ingest_json",
             "create_rule",
             "stats",
+            "schema",
         ];
         assert_eq!(names, EXPECTED.to_vec());
         assert_eq!(ASSOCIATION_TOOLS.as_slice(), EXPECTED.as_slice());

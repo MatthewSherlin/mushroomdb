@@ -347,7 +347,7 @@ jobs:
             --threshold 0.15
 
   # SDK-level MCP handshake: speaks to a real `mushroomdb mcp <db>` process
-  # on an empty store — a memory store, so the nineteen association tools —
+  # on an empty store — a memory store, so the association tools —
   # over stdio using the official @modelcontextprotocol/sdk client, not a
   # hand-rolled JSON-RPC probe, so a break in the wire protocol or the tool
   # list fails the same way it would for a real assistant host.
@@ -370,7 +370,7 @@ jobs:
             --command ../../target/debug/mushroomdb \
             --db "$(mktemp -d)" \
             --expect-version "$(cargo pkgid -p mushroomdb-cli | sed 's/.*[#@]//')" \
-            --expect-tools query,explain_association,neighborhood,node_info,node_edges,was_linked,edges_at,what_if,node_history,edge_history,find_similar,pairwise_similar,hybrid_search,remember,recall,upsert_entity,ingest_json,create_rule,stats
+            --expect-tools query,explain_association,neighborhood,node_info,node_edges,was_linked,edges_at,what_if,node_history,edge_history,find_similar,pairwise_similar,hybrid_search,remember,recall,upsert_entity,ingest_json,create_rule,stats,schema
         working-directory: scripts/mcp-handshake
 
   plugin-validate:

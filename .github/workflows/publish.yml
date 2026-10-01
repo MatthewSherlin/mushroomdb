@@ -350,7 +350,7 @@ jobs:
           esac
 
           # A fresh `--db`-less install resolves to an empty store at `--auto`,
-          # which lists the nineteen-tool association surface every store
+          # which lists the association surface every store
           # lists — so the handshake below expects those tools.
           OUT=$(node "$GITHUB_WORKSPACE/scripts/mcp-handshake/handshake.mjs" \
             --config .mcp.json --server mushroomdb \

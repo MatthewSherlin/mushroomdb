@@ -1092,7 +1092,7 @@ fn self_handshake(
 /// The tool names that prove the task path is served rather than the graph API
 /// alone.
 ///
-/// Every store, one `ingest-git` built included, advertises the same nineteen,
+/// Every store, one `ingest-git` built included, advertises the same association tools,
 /// and `explain_association` is among them.
 const TASK_PATH_TOOLS: [&str; 1] = ["explain_association"];
 

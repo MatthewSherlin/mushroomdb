@@ -1,4 +1,4 @@
-//! The seven MCP tools that answer a question in prose rather than in JSON.
+//! The MCP tools that answer a question in prose rather than in JSON.
 //!
 //! They sit in front of the fourteen graph tools in `mcp::tools_list`.
 //! `explain_association` answers why two entities are associated, with the
@@ -55,7 +55,7 @@ use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-/// The seven names this module answers to. Listed once, so the `json`
+/// The names this module answers to. Listed once, so the `json`
 /// argument below is read for exactly the tools that declare it.
 ///
 /// `explain_association` comes first: what links these two, with the evidence
@@ -63,7 +63,7 @@ use std::path::Path;
 /// they are the same question widened: every relationship of one node rather
 /// than of one pair, that listing at a past commit, and that listing under a
 /// change that has not been made.
-pub(crate) const TASK_TOOLS: [&str; 7] = [
+pub(crate) const TASK_TOOLS: [&str; 8] = [
     "explain_association",
     "node_edges",
     "neighborhood",
@@ -71,9 +71,10 @@ pub(crate) const TASK_TOOLS: [&str; 7] = [
     "what_if",
     "recall",
     "remember",
+    "schema",
 ];
 
-/// Route a task tool. `None` when `name` is not one of the seven.
+/// Route a task tool. `None` when `name` is not one of [`TASK_TOOLS`].
 pub(crate) fn dispatch(
     db: &SharedDb,
     db_dir: Option<&Path>,
@@ -84,7 +85,7 @@ pub(crate) fn dispatch(
         return None;
     }
     // Every task tool takes the same optional `json`, so it is read and
-    // type-checked once here rather than seven times — and before any work, so
+    // type-checked once here rather than once per tool — and before any work, so
     // a caller that mistyped it is told so rather than served a digest it did
     // not ask for.
     let json_out = match bool_arg(args, "json") {
@@ -99,7 +100,8 @@ pub(crate) fn dispatch(
         "what_if" => tool_what_if(db, args, json_out),
         "recall" => tool_recall(db, db_dir, args, json_out),
         "remember" => tool_remember(db, args, json_out),
-        _ => unreachable!("TASK_TOOLS and this match list the same seven names"),
+        "schema" => tool_schema(db, json_out),
+        _ => unreachable!("TASK_TOOLS and this match list the same names"),
     })
 }
 
@@ -1960,10 +1962,34 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     }
 }
 
+// ── schema ───────────────────────────────────────────────────────────────────
+
+/// How long `schema` may spend counting.
+///
+/// The brief's own default is three seconds because it re-reads the WAL, and
+/// this call holds a read guard for that long, so a writer in the same process
+/// waits behind it. One second is a third of that and, measured on a
+/// 100,000-node store in a release build, five times what the whole report
+/// takes (188 ms). A spent budget is reported, never silent.
+const SCHEMA_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn tool_schema(db: &SharedDb, json_out: bool) -> CallOutcome {
+    let report = {
+        let g = db.read();
+        core_api::memory::schema::schema_report(
+            &g,
+            &core_api::memory::brief::BriefOptions {
+                budget: SCHEMA_BUDGET,
+            },
+        )
+    };
+    ok(json_out, &report, core_api::memory::schema::render_schema)
+}
+
 // ── tools/list ───────────────────────────────────────────────────────────────
 
-/// The `json` argument every task tool takes, added to all seven schemas by
-/// [`task_tools`] rather than written out seven times.
+/// The `json` argument every task tool takes, added to every task tool's schema
+/// by [`task_tools`] rather than written out in each.
 fn json_arg() -> Js {
     json!({
         "type": "boolean",
@@ -1971,7 +1997,7 @@ fn json_arg() -> Js {
     })
 }
 
-/// The seven task tools, in the order `tools/list` puts them: the question an
+/// The task tools, in the order `tools/list` puts them: the question an
 /// assistant asks first comes first.
 pub(crate) fn task_tools() -> Vec<Js> {
     let mut tools = task_tool_schemas();
@@ -2229,6 +2255,11 @@ fn task_tool_schemas() -> Vec<Js> {
                 },
                 "required": ["text"]
             }
+        }),
+        json!({
+            "name": "schema",
+            "description": "What's in here — the store's labels with their property names, its edge types and what derives them, every rule with its predicate, the full-text fields recall searches, the equality indexes, and how many provisional nodes remember created. Call it before writing Cypher against a store you have not seen.",
+            "inputSchema": { "type": "object", "properties": {} }
         }),
     ]
 }

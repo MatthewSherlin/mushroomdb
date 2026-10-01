@@ -238,8 +238,8 @@ pub enum Command {
         /// `None` with `auto` set: resolved by [`resolve_auto_db`] at run time.
         db_dir: Option<PathBuf>,
         auto: bool,
-        /// `--all-tools`: advertise all twenty-one tools in `tools/list`
-        /// rather than the nineteen every store lists by default. The rest are
+        /// `--all-tools`: advertise every served tool in `tools/list`
+        /// rather than the association tools every store lists by default. The rest are
         /// callable either way; the flag decides what is listed, and what every
         /// session pays for before its first turn.
         all_tools: bool,
@@ -445,7 +445,7 @@ Usage:
                      --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
   mushroomdb mcp <db-dir>|--auto [--all-tools]
-                     --all-tools lists all 21 tools; the default lists 19 on every store,
+                     --all-tools lists every served tool; the default lists the association tools on every store,
                      a store `ingest-git` built included (the rest stay callable, just unlisted)
   mushroomdb stats <db-dir>
   mushroomdb demo <db-dir>
@@ -3482,15 +3482,15 @@ mod tests {
         );
     }
 
-    /// Binding: the help describes the tree 0.7 ships. One tool surface of
-    /// twenty-one, nineteen listed on every store, and one brief — the memory
+    /// Binding: the help describes the tree 0.7 ships. One tool surface, the
+    /// association tools listed on every store, and one brief — the memory
     /// schema's. The code-graph listing and the repository brief are gone.
     #[test]
     fn usage_describes_one_surface_and_the_memory_brief() {
         let text = usage();
         assert!(
             text.contains(
-                "--all-tools lists all 21 tools; the default lists 19 on every store,\n\
+                "--all-tools lists every served tool; the default lists the association tools on every store,\n\
                  \x20                    a store `ingest-git` built included"
             ),
             "mcp help line, got:\n{text}"

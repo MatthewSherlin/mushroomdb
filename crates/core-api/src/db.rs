@@ -7442,6 +7442,15 @@ impl<F: Fs> GraphDb<F> {
         self.prop_index.is_enabled(label, field)
     }
 
+    /// Every `(label, field)` pair with a live equality index, sorted.
+    ///
+    /// The enumerator [`is_index_enabled`](Self::is_index_enabled) never had:
+    /// the MCP `schema` tool lists a store's indexes rather than probing them
+    /// one guess at a time.
+    pub fn index_pairs(&self) -> Vec<(String, String)> {
+        self.prop_index.enabled_pairs().cloned().collect()
+    }
+
     /// Start recording insert-count multiplicity on this store (§5.13).
     ///
     /// Adjacency stays a set and nothing about an existing read changes: a

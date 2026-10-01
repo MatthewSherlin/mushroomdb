@@ -193,7 +193,7 @@ fn tools_list_returns_all_tools_with_schemas() {
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 21);
+    assert_eq!(tools.len(), 22);
 
     let by_name = |n: &str| {
         tools
@@ -1034,18 +1034,17 @@ fn hybrid_search_text_only_and_missing_field_errors() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Task tools: explain_association, node_edges, neighborhood, edges_at,
-// what_if, recall, remember
+// Task tools — the names in `TASK_TOOLS` below.
 //
-// These seven answer a question in prose rather than in JSON, so they come
+// These answer a question in prose rather than in JSON, so they come
 // first in `--all-tools` and the graph tools listed beside them are prefixed
 // `Advanced:`. Each returns the rendered digest as its text content and
 // nothing else; a caller that wants the report passes `json: true` and gets
 // it *as* the text.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The seven task tools, in the order `tools/list` must list them.
-const TASK_TOOLS: [&str; 7] = [
+/// The task tools, in the order `tools/list` must list them.
+const TASK_TOOLS: [&str; 8] = [
     "explain_association",
     "node_edges",
     "neighborhood",
@@ -1053,6 +1052,7 @@ const TASK_TOOLS: [&str; 7] = [
     "what_if",
     "recall",
     "remember",
+    "schema",
 ];
 
 /// The fourteen graph tools, in their established order, after the task tools.
@@ -1428,7 +1428,7 @@ fn one_task_call(db: SharedDb, name: &str, args: Js) -> Js {
     parse_lines(&out).remove(0)
 }
 
-/// Binding: a memory store lists the association surface — the nineteen tools
+/// Binding: a memory store lists the association surface — the tools
 /// that answer a question about an entity graph or fill one, in that order —
 /// and none of the removed code-graph tools.
 #[test]
@@ -1446,7 +1446,7 @@ fn a_memory_store_lists_the_association_surface() {
         server::ASSOCIATION_TOOLS.to_vec(),
         "default tools/list on a memory store"
     );
-    assert_eq!(tools.len(), 19);
+    assert_eq!(tools.len(), 20);
     for hidden in [
         "explore", "map", "context", "impact", "owners", "why", "sync",
     ] {
@@ -1541,7 +1541,7 @@ fn the_code_graph_tools_are_absent_from_every_listing() {
     }
 }
 
-/// An `ingest-git` store now gets the same nineteen as any other. There is one
+/// An `ingest-git` store now gets the same listing as any other. There is one
 /// surface in 0.7.
 #[test]
 fn an_ingested_store_is_served_the_association_listing() {
@@ -3442,7 +3442,7 @@ fn what_if_with_an_edge_type_answers_in_partner_keys() {
 /// said what they *returned* rather than what they were *for*.
 #[test]
 fn every_association_tool_description_opens_with_its_question() {
-    const OPENERS: [(&str, &str); 19] = [
+    const OPENERS: [(&str, &str); 20] = [
         ("query", "Who may see this"),
         ("explain_association", "Why are A and B related"),
         ("neighborhood", "What is around K"),
@@ -3475,6 +3475,7 @@ fn every_association_tool_description_opens_with_its_question() {
             "How should this kind of relationship be derived from now on",
         ),
         ("stats", "How big is this store"),
+        ("schema", "What's in here"),
     ];
 
     let (res, out) = exchange(open("descriptions"), &req(json!(1), "tools/list", None));
@@ -3721,10 +3722,10 @@ fn an_unlisted_graph_tool_is_still_callable() {
     );
 }
 
-/// Binding: `--all-tools` lists 21, task tools first in their fixed order, and
+/// Binding: `--all-tools` lists every served tool, task tools first in their fixed order, and
 /// every one of the fourteen graph tools carries the `Advanced:` prefix.
 #[test]
-fn tools_list_has_21_tools_task_tools_first_and_advanced_prefix() {
+fn tools_list_has_every_tool_task_tools_first_and_advanced_prefix() {
     let (res, out) = exchange_all_tools(open("list-order"), &req(json!(1), "tools/list", None));
     assert!(res.is_ok(), "{res:?}");
     let replies = parse_lines(&out);
@@ -3740,7 +3741,7 @@ fn tools_list_has_21_tools_task_tools_first_and_advanced_prefix() {
         .copied()
         .collect();
     assert_eq!(names, expected, "tools/list order");
-    assert_eq!(tools.len(), 21);
+    assert_eq!(tools.len(), 22);
 
     for t in tools.iter().take(TASK_TOOLS.len()) {
         let d = t["description"].as_str().expect("description");
@@ -3798,8 +3799,8 @@ fn tools_list_has_21_tools_task_tools_first_and_advanced_prefix() {
 ///
 /// The card is the whole surface, not the default listing: it says what
 /// `mushroomdb mcp --all-tools` advertises and what every name in it can be
-/// called as, so it is compared against that list rather than the nineteen a
-/// default session sees.
+/// called as, so it is compared against that list rather than the association
+/// listing a default session sees.
 #[test]
 fn server_card_lists_the_same_tools_in_the_same_order() {
     let card_path =
@@ -5115,5 +5116,115 @@ fn every_tool_the_skill_names_is_advertised() {
          tools/list does not advertise. A host builds its tool set from that \
          listing, so the model cannot reach them however well the server \
          serves them. Either advertise them or stop naming them."
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// schema — "what's in here?"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A store created the way `mushroomdb mcp` creates one: the memory schema
+/// applied, nothing written.
+fn memory_store(name: &str) -> SharedDb {
+    let db = open(name);
+    db.write()
+        .apply_schema(&core_api::memory_schema::memory_defaults())
+        .unwrap();
+    db
+}
+
+/// A rule over `name`, written straight to the store as a test fixture.
+fn same_name_rule() -> core_api::RuleDef {
+    core_api::RuleDef {
+        name: "same_name".into(),
+        src_label: "Person".into(),
+        dst_label: "Person".into(),
+        predicate: core_api::Predicate::FieldEqual {
+            field: "name".into(),
+        },
+        edge_type: "SAME_NAME".into(),
+        weight_prop: Some("weight".into()),
+        max_edges: Some(32),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    }
+}
+
+/// Binding: `schema` answers with what `stats` never carried — labels with
+/// their fields, edge types, every rule with its predicate, the full-text and
+/// equality declarations, and the provisional nodes `remember` stubbed.
+#[test]
+fn schema_names_labels_rules_indexes_and_provisional_nodes() {
+    let db = memory_store("schema-full");
+    db.write().create_rule(same_name_rule()).unwrap();
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Reid reviewed the copy", "about": ["reid"]}),
+    );
+    seed_person(&db, "matthew");
+
+    let text = task_reply(&one_task_call(db.clone(), "schema", json!({})));
+    for want in [
+        "labels:",
+        "Person (1)",
+        "Entity (1)",
+        "rules:",
+        "same_name: Person → Person derives SAME_NAME — field_equal on name (global)",
+        "full-text (recall searches these):",
+        "Note.text",
+        "equality indexes:",
+        "Person.name",
+        "provisional: 1 — named but not yet described: reid",
+    ] {
+        assert!(text.contains(want), "schema missing {want:?}:\n{text}");
+    }
+}
+
+/// Binding: the report behind it, for a program — counts, not prose.
+#[test]
+fn schema_json_carries_every_declaration() {
+    let db = memory_store("schema-json");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "two unknowns", "about": ["reid", "ada"]}),
+    );
+    let report = task_report(db, "schema", json!({}));
+    assert_eq!(report["provisional"], json!(2));
+    assert_eq!(report["provisional_sample"], json!(["ada", "reid"]));
+    assert!(
+        report["indexes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(["Person", "name"])),
+        "{report}"
+    );
+    assert!(
+        report["fulltext"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(["Note", "text"])),
+        "{report}"
+    );
+}
+
+/// Binding: a store with nothing in it still answers, and says what it has
+/// declared — a memory store is created with its indexes before any node.
+#[test]
+fn schema_on_an_empty_memory_store_lists_its_declarations() {
+    let text = task_reply(&one_task_call(
+        memory_store("schema-empty"),
+        "schema",
+        json!({}),
+    ));
+    assert!(text.contains("0 node(s)"), "{text}");
+    assert!(text.contains("Person.name"), "{text}");
+    assert!(
+        !text.contains("provisional:"),
+        "nothing provisional: {text}"
     );
 }
