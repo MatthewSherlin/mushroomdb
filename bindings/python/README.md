@@ -64,6 +64,13 @@ and refuses every write. Legs intersect, so `scoped()` on a scoped handle
 narrows further and can never widen; an unknown `role` raises at `scoped()`,
 not on the first read. `refresh()` is allowed: it writes nothing.
 
+A read that answers about the whole store takes no mask, so a scoped handle
+**refuses** it with `ValueError` rather than narrow it: `pagerank`,
+`connected_components`, `degree_centrality`, `communities`, `search`,
+`fulltext_pairs`, `rules`, `suggest_rules`, `recall`, `schema_report`,
+`identity_clusters` and `roles`. `is_fulltext_enabled` answers: it is a schema
+fact about a pair you named.
+
 Every read obeys one contract: **the subject is checked first, so a key outside
 the scope is indistinguishable from a key that does not exist.** `node_info`
 answers `None`, `node_edges` raises `KeyNotFound`, `degree` counts only visible
@@ -236,6 +243,51 @@ name, which can be scoped and filtered.
 `fulltext_pairs`, `rules` and `suggest_rules` answer about the whole store and
 take no mask, so each raises `ValueError` there rather than return an answer
 computed over nodes the scope hides.
+
+## Memory
+
+The MCP memory tools, as data. Each calls the function the tool calls and
+returns its report as a dict rather than a rendered digest.
+
+```python
+r = db.remember(
+    "Matthew is driving the 0.7 release",
+    about=["matthew"],                                   # unknown → a provisional stub
+    entities=[{"key": "v0.7", "label": "Release", "props": {"name": "v0.7"}}],
+    facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}],
+)
+r["note"], r["provisional"]           # "note:…", ["matthew"]
+
+db.recall("who is driving the release")["hits"]          # ranked rows, not text
+db.upsert_entity("matthew", {"name": "Matthew Sherlin"}, label=None, aliases=["Matt"])
+db.schema_report()["provisional"]                        # 0 — it has been described
+db.forget(key="v0.7")["notes"]                           # the notes that still say it
+db.identity_clusters()["clusters"]                       # which keys are one entity
+```
+
+- `upsert_entity` is not `upsert_node`: it keeps `aliases` (derived from the
+  current key and name, recomputed each time) and `alias_keys` (the aliases
+  you declare, as written, accumulating), sets `id`, clears a `provisional`
+  mark, and refuses to change a label. Its `same_as_lost` names an identity
+  link the update retracted.
+- The memory module's refusals raise `IngestError`; `.detail` is the sentence,
+  and the message carries an `ingest error: ` prefix in front of it.
+- `remember`'s report names the note under `note`, not `key`.
+- **`recall` returns raw stored content.** `key`, `label` and `summary` are
+  unsanitized; only the MCP tool's rendered digest replaces control
+  characters, line separators and bidi or zero-width characters. Rendering a
+  row into an assistant's context makes that sanitisation yours to do, and
+  this binding exposes no helper for it. `recall` does not offer the digest.
+- `forget` is a tombstone, not a redaction: history still reads it. A fact a
+  rule derived raises `RuleOwned`, whose message is the whole refusal — which
+  rule owns the edge and the fields it reads.
+- A store this binding creates has no memory schema. `remember` declares the
+  text fields it needs as it goes; the identity preset is applied from the
+  command line — `mushroomdb schema apply <db> --memory-identity` — with the
+  handle closed.
+- `recall`, `schema_report` and `identity_clusters` raise `ValueError` on a
+  `scoped()` handle; `remember`, `upsert_entity` and `forget` are writes and
+  raise `ReadOnly` there.
 
 ## Concurrency
 

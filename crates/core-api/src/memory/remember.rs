@@ -154,7 +154,7 @@ pub struct RememberInput<'a> {
 }
 
 /// Everything one `remember` call writes.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct RememberReport {
     /// The note's key.
     pub note: String,

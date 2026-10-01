@@ -537,6 +537,12 @@ _DOCUMENTED = [
     "delete_rule",
     "rebuild_rule",
     "suggest_rules",
+    "remember",
+    "recall",
+    "upsert_entity",
+    "schema_report",
+    "forget",
+    "identity_clusters",
 ]
 
 

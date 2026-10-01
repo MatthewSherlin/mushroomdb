@@ -282,6 +282,13 @@ class GraphDb:
         stale. `refresh()` is permitted. `has_vector_rule` and
         `is_index_enabled` answer unscoped: they are schema, not node data.
 
+        A read that answers about the whole store takes no mask, so it is
+        **refused** on a scoped handle with `ValueError` rather than narrowed:
+        `pagerank`, `connected_components`, `degree_centrality`, `communities`,
+        `search`, `fulltext_pairs`, `rules`, `suggest_rules`, `recall`,
+        `schema_report`, `identity_clusters` and `roles`. `is_fulltext_enabled`
+        answers: it is a schema fact about a pair you named.
+
         ```python
         s = db.scoped(role="reader-a")
         t = db.scoped(namespace="tenant-a", keys=visible_ids)
@@ -1047,6 +1054,200 @@ class GraphDb:
         budget ran out and a second call may find more.
 
         Every proposal is a global rule: it links across namespaces.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def remember(
+        self,
+        text: str,
+        about: Sequence[str] | None = None,
+        kind: Literal["note", "decision", "todo"] | None = None,
+        ts: int | None = None,
+        source: str | None = None,
+        entities: Sequence[dict[str, Any]] | None = None,
+        facts: Sequence[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Write a note the store can later `recall`, and whatever it names.
+
+        `about` is the keys the note is about. A key that does not exist is
+        created as a provisional `Entity` rather than refusing the call, and
+        listed under `provisional` in the report.
+
+        `entities` is a list of `{"key", "label", "props"?, "aliases"?}`
+        dicts — entities you recognised in the text, created or updated in the
+        same commit. `facts` is a list of `{"subject", "predicate", "object"}`
+        dicts — relationships among them, written as edges.
+
+        `kind` is `"note"` (the default), `"decision"` or `"todo"`. `ts` is
+        Unix seconds and defaults to now; it is part of the note's key, so the
+        same text at the same `ts` is the same note. `source` defaults to
+        `"agent"`.
+
+        Returns the report as a dict: `note` (the note's key — **not** `key`,
+        which is what the MCP tool's JSON reply calls it), `created`,
+        `matched`, `derived`, `provisional`, `provisional_capped` (keys past
+        the per-call cap of 20, **not** created), `fulltext_declared`,
+        `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
+        the identity links this call made, and the ones it retracted).
+
+        Raises `IngestError` when the text is empty or over 4,000 characters,
+        the `kind` is unknown, or an entity's `props` carry `aliases` or
+        `alias_keys`; nothing is written. Its `.detail` is the bare sentence;
+        the message carries an `ingest error: ` prefix in front of it.
+
+        A store this binding creates has no memory schema. `remember`
+        declares full-text on `Note.text` and on each new entity label's
+        `name` itself, so `recall` works after the first call.
+
+        ```python
+        r = db.remember("Matthew is driving 0.7", about=["matthew"],
+                        entities=[{"key": "v0.7", "label": "Release"}],
+                        facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}])
+        r["note"]         # "note:…"
+        r["provisional"]  # ["matthew"]
+        ```
+        """
+
+    def recall(self, topic: str) -> dict[str, Any]:
+        """What the store holds about a topic, as rows.
+
+        Returns `{"indexed": bool, "terms": int, "hits": [...]}`. Each hit is
+        `{"key", "label", "summary", "covered", "score"}`, best first:
+        `covered` is how many of the topic's `terms` the node's own text
+        holds, and it leads the ranking — the fused `score` is nearly flat.
+        A hit covers at least half the terms. At most six hits. `terms == 0`
+        with hits present means the topic was all stopwords: its words were
+        searched together and every hit's `covered` is `0`. `summary` is
+        the first 120 characters of the node's `text`, `summary` or `name`,
+        or `None` when it has none of them.
+
+        `indexed` is `False` when the store declares no full-text index at
+        all, so no topic can match — a different answer from an empty `hits`.
+        `remember` declares `Note.text` on its first call.
+
+        This is the MCP `recall` tool's ranking, as data; the tool renders the
+        same rows as a digest, and this method does not offer the digest.
+
+        **The rows are raw stored content.** `key`, `label` and `summary` are
+        unsanitized: only the digest renderer replaces control characters,
+        line separators and bidi or zero-width characters with spaces. If you
+        render a row into an assistant's context, that sanitisation is yours
+        to do — a stored line break can otherwise forge a line of your
+        prompt. This binding exposes no helper for it.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def upsert_entity(
+        self,
+        key: str,
+        props: dict[str, Scalar],
+        label: str | None = None,
+        aliases: Sequence[str] | None = None,
+        namespace: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or update one entity by key, the way the memory tools do.
+
+        Unlike `upsert_node`, this maintains the entity's two identity lists:
+        `aliases`, which the store derives from the current key and `name` and
+        recomputes on every call — never accumulated, never yours to set — and
+        `alias_keys`, the `aliases` you pass, kept as written and accumulating.
+        It also sets `id` to the key and clears a `provisional` mark
+        `remember` left.
+
+        `label` is required to create and optional to update. **An update
+        never changes a label**: one that differs from the stored label
+        raises `IngestError` and nothing in `props` is written.
+
+        `namespace` is the namespace a created node lands in. On an existing
+        node its own namespace is a no-op and another raises
+        `NamespaceImmutable`. A `props["ns"]` that disagrees with `namespace`
+        is a `ValueError`.
+
+        Returns `{"key", "label", "created", "updated_fields",
+        "same_as_lost"}`. `same_as_lost` lists the identity links this update
+        retracted, as `{"a", "b", "score"}`: a changed `name` can take a
+        full-name link below the floor.
+
+        `aliases` or `alias_keys` inside `props` raise `IngestError`: the
+        store maintains both. An `IngestError`'s `.detail` is the bare
+        sentence; its message carries an `ingest error: ` prefix.
+
+        ```python
+        db.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
+        ```
+        """
+
+    def schema_report(self, budget_ms: int = 1000) -> dict[str, Any]:
+        """What the store holds and how it is wired.
+
+        Returns a dict: `brief` (`nodes` and `edges` counts, `labels` each
+        with its fields, `edge_types` each with its endpoints, `commits`,
+        `roles`, `recipes`, `partial`), `rules` (each with its predicate in
+        one clause and its namespace), `fulltext` and `indexes` (`[label,
+        field]` lists), `provisional` (how many nodes `remember` named and
+        nothing has described) and `provisional_sample` (the first ten keys).
+
+        `budget_ms` bounds the counting; a spent budget sets
+        `brief["partial"]` and the counts are then lower bounds.
+
+        The MCP `schema` tool renders this same report. The names under
+        `rules`, `fulltext`, `indexes` and `provisional_sample` are raw stored
+        content, unsanitized, as `recall`'s rows are.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def forget(
+        self,
+        key: str | None = None,
+        prop: str | None = None,
+        fact: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Forget a node, one property, or one fact — exactly one of the three.
+
+        - `forget(key=k)` tombstones the node and every edge on it.
+        - `forget(key=k, prop=p)` removes one property.
+        - `forget(fact={"subject", "predicate", "object"})` retracts one
+          hand-written edge.
+
+        Returns the report as a dict: `mode` (`"node"`, `"prop"` or
+        `"fact"`), `target`, `changed` (`False` when there was nothing to
+        forget), `manual_edges`, `derived_edges`, `notes` and `notes_total`
+        (notes that still say it — **listed, never deleted**), `history_floor`,
+        `prop` in prop mode, `aliases_rewritten` (a forgotten `name` took its
+        words out of `aliases` in the same commit) and `alias_keys_remain`
+        (forgotten `aliases` left declared aliases behind in `alias_keys`).
+
+        **This is a tombstone, not a redaction.** `node_history`,
+        `edge_history`, `edges_at` and `was_linked` still read what was
+        forgotten, from `history_floor` on, until the log is pruned.
+
+        Raises `ValueError` for any other combination of arguments,
+        `KeyNotFound` for an unknown key or fact endpoint, and `RuleOwned` for
+        a fact a rule derived. That refusal's message and its `.detail` are
+        the same whole sentence — which rule owns the edge and the fields it
+        reads — with no `edge is rule-owned: ` prefix in front of it. Nothing
+        is written in any of the three.
+        """
+
+    def identity_clusters(self, floor: float = 0.6) -> dict[str, Any]:
+        """Which keys are one entity: `SAME_AS` links resolved into identities.
+
+        Returns `{"clusters": [...], "linked": int, "claims": int, "floor":
+        float}`. Each cluster is `{"canonical", "members", "weakest"}`: every
+        pair of `members` is linked at `floor` or above, `canonical` is the
+        oldest member and `members[0]`, and `weakest` is the lowest pairwise
+        score inside it. `claims` counts unordered pairs — both directions of
+        a link are one claim.
+
+        Empty on a store with no `SAME_AS` edges. The identity preset that
+        derives them is applied with `mushroomdb schema apply <db>
+        --memory-identity`, on the command line, with this handle closed; a
+        `SAME_AS` rule made with `create_rule` is the other way.
+
+        Raises `ValueError` for a `floor` that is not a finite number.
 
         Refused on a `scoped()` handle with `ValueError`.
         """

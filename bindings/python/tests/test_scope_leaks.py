@@ -417,6 +417,9 @@ _REFUSED_READS = {
     "fulltext_pairs": lambda h: h.fulltext_pairs(),
     "rules": lambda h: h.rules(),
     "suggest_rules": lambda h: h.suggest_rules(),
+    "recall": lambda h: h.recall("alpha"),
+    "schema_report": lambda h: h.schema_report(),
+    "identity_clusters": lambda h: h.identity_clusters(),
 }
 
 # The ones whose unscoped answer names every node in the fixture — a row per
@@ -651,6 +654,21 @@ _WRITES_BY_KEY = {
     ("batch_edges", "dst"): lambda s, k: s.batch_edges(
         [{"edge_type": "LINKS", "src": "vis_a", "dst": k}]
     ),
+    # A *mismatching* label on purpose, as the `upsert_node` row has: the
+    # relabel refusal reads the stored label, and on a scoped handle that read
+    # must never be reached.
+    ("upsert_entity", "key"): lambda s, k: s.upsert_entity(k, {"t": 1}, label="__probe_label__"),
+    ("remember", "about"): lambda s, k: s.remember("probe", about=[k], ts=1),
+    ("remember", "entity"): lambda s, k: s.remember(
+        "probe", ts=1, entities=[{"key": k, "label": "__probe_label__", "props": {"t": 1}}]
+    ),
+    ("forget", "key"): lambda s, k: s.forget(key=k),
+    ("forget", "subject"): lambda s, k: s.forget(
+        fact={"subject": k, "predicate": "LINKS", "object": "vis_b"}
+    ),
+    ("forget", "object"): lambda s, k: s.forget(
+        fact={"subject": "vis_a", "predicate": "LINKS", "object": k}
+    ),
 }
 
 
@@ -766,6 +784,9 @@ COVERED = {
     "fulltext_pairs": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
     "rules": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
     "suggest_rules": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "recall": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "schema_report": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "identity_clusters": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
     "is_fulltext_enabled": "test_schema_facts_stay_unscoped",
     "enable_fulltext": "test_a_keyless_write_refuses_with_the_scoped_message",
     "disable_fulltext": "test_a_keyless_write_refuses_with_the_scoped_message",
@@ -790,6 +811,9 @@ COVERED = {
     "query_write": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "ingest_batch": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "batch_edges": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "remember": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "upsert_entity": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "forget": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "create_rule": "test_a_keyless_write_refuses_with_the_scoped_message",
     "record_commits_at": "test_a_keyless_write_refuses_with_the_scoped_message",
     "enable_index": "test_a_keyless_write_refuses_with_the_scoped_message",

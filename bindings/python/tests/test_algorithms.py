@@ -7,6 +7,8 @@ either existing name would change what a working call returns.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from mushroomdb import GraphDb
@@ -80,3 +82,16 @@ def test_communities_finds_two_triangles(tmp_path):
 def test_a_bad_direction_is_a_value_error_before_the_store_is_read(star):
     with pytest.raises(ValueError, match="direction"):
         star.pagerank(direction="sideways")
+
+
+@pytest.mark.parametrize(
+    "name", ["pagerank", "connected_components", "degree_centrality", "communities"]
+)
+def test_budget_ms_defaults_to_no_time_limit(name):
+    """`budget_ms=0` is what makes an algorithm's answer repeatable.
+
+    The signature a caller reads — `help()`, an IDE, `inspect.signature` — has
+    to say the default the method really has.
+    """
+    default = inspect.signature(getattr(GraphDb, name)).parameters["budget_ms"].default
+    assert default == 0, f"{name}(budget_ms={default!r}): a wall-clock default is not repeatable"
