@@ -355,6 +355,25 @@ fn json_scalar_text(v: &Js) -> String {
     }
 }
 
+/// Characters of evidence one digest line carries before it is cut with `…`.
+///
+/// The bracket lists the values two nodes share, and two nodes can share a
+/// long list: sixty shared values printed about a kilobyte on one line, twice,
+/// because a symmetric rule explains each direction. 240 is three terminal
+/// lines — enough to show what kind of thing matched and roughly how much of
+/// it. The report a caller gets with `json: true` is not cut.
+pub const MAX_EVIDENCE_CHARS: usize = 240;
+
+/// `s`, or its first `max` characters and an ellipsis.
+fn cut_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut cut: String = s.chars().take(max).collect();
+    cut.push('…');
+    cut
+}
+
 /// One header, then one line per rule-derived edge, capped like every other
 /// task digest.
 ///
@@ -390,7 +409,10 @@ pub fn render_explain(a: &str, b: &str, found: &[ExplainedEdge]) -> String {
         // residential]". This is the line that stops an assistant fetching
         // both nodes' raw lists and reading out everything either one holds.
         if let Some(ev) = evidence {
-            out.push_str(&format!(" [{}]", evidence_summary(ev)));
+            out.push_str(&format!(
+                " [{}]",
+                cut_chars(&evidence_summary(ev), MAX_EVIDENCE_CHARS)
+            ));
         }
         out.push('\n');
     }

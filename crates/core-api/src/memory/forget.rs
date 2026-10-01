@@ -144,8 +144,9 @@ fn derived_edges_on<F: Fs>(db: &GraphDb<F>, key: &str) -> Result<BTreeSet<EdgeTr
 /// - [`GraphError::KeyNotFound`] for a node or a fact endpoint that does not
 ///   exist. Nothing is written.
 /// - [`GraphError::RuleOwned`] for a fact a rule derived. `detail` is the
-///   whole refusal — which rule owns the edge and the fields it reads
-///   ([`rule_owned_refusal`]) — and nothing is written.
+///   whole refusal ([`rule_owned_refusal`]): the owning rule and the fields
+///   it reads, or, when no rule can be named, the engine's own detail,
+///   sanitized. Nothing is written.
 /// - Any other engine refusal, as it came.
 pub fn forget<F: Fs>(db: &mut GraphDb<F>, target: &ForgetTarget) -> Result<ForgetReport> {
     match target {
@@ -256,8 +257,14 @@ pub fn forget<F: Fs>(db: &mut GraphDb<F>, target: &ForgetTarget) -> Result<Forge
     }
 }
 
-/// Why a fact edge cannot be retracted: which rule owns it, and the only two
-/// ways it can change.
+/// Why a fact edge cannot be retracted: the rule that derived it — from the
+/// engine's own provenance — and the only two ways it can change.
+///
+/// An edge a rule derived is in provenance, and the refusal names exactly the
+/// rules [`GraphDb::explain`] attributes it to. An edge written by hand that a
+/// live rule would re-derive is refused too and is in no provenance; for that
+/// one the refusal names every rule of the same edge type and endpoint labels.
+/// When neither finds a rule, the engine's own `detail` is returned, sanitized.
 pub fn rule_owned_refusal<F: Fs>(
     db: &GraphDb<F>,
     predicate: &str,
@@ -267,13 +274,29 @@ pub fn rule_owned_refusal<F: Fs>(
 ) -> String {
     let label = |k: &str| db.node_ref(k).map(|n| n.label().to_string());
     let (src, dst) = (label(subject), label(object));
+    // Which rule derived this edge is something the engine knows: `explain`
+    // answers from provenance, one entry per derived edge between the two
+    // keys. Matching on edge type and labels alone names every look-alike —
+    // every rule of the identity preset derives `SAME_AS` — so that is
+    // only the fallback, for an edge `explain` has nothing to say about.
+    let by_provenance: BTreeSet<String> = db
+        .explain(subject, object)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.edge_type == predicate && e.src_key == subject && e.dst_key == object)
+        .map(|e| e.rule)
+        .collect();
     let owners: Vec<RuleDef> = db
         .rules()
         .into_iter()
         .filter(|r| {
-            r.edge_type == predicate
-                && Some(&r.src_label) == src.as_ref()
-                && Some(&r.dst_label) == dst.as_ref()
+            if by_provenance.is_empty() {
+                r.edge_type == predicate
+                    && Some(&r.src_label) == src.as_ref()
+                    && Some(&r.dst_label) == dst.as_ref()
+            } else {
+                by_provenance.contains(&r.name)
+            }
         })
         .collect();
     if owners.is_empty() {

@@ -236,3 +236,63 @@ fn a_hand_written_fact_is_retracted_once_and_the_shapes_are_exclusive() {
     );
     assert_eq!(ForgetTarget::from_parts(s("a"), None, triple), None);
 }
+
+/// Two rules derive the same edge type between the same labels; only one of
+/// them derived this edge. The refusal names that one — from the engine's
+/// provenance — not both.
+///
+/// Two rules sharing `(src_label, dst_label, edge_type)` is the shape ledger
+/// row 37 says the engine mis-retracts. This test never retracts — it only
+/// asks who owns an edge that exists — so it holds. Do not extend it with a
+/// property change.
+#[test]
+fn the_refusal_names_the_rule_that_derived_the_edge_not_every_look_alike() {
+    let mut db = store("provenance");
+    db.insert_node(
+        "Person",
+        "a",
+        vec![
+            ("team".into(), Value::Str("red".into())),
+            ("city".into(), Value::Str("Oslo".into())),
+        ],
+    )
+    .unwrap();
+    db.insert_node(
+        "Person",
+        "b",
+        vec![
+            ("team".into(), Value::Str("red".into())),
+            ("city".into(), Value::Str("Lima".into())),
+        ],
+    )
+    .unwrap();
+    let mut by_team = same_team_rule();
+    by_team.edge_type = "LINKED".into();
+    let mut by_city = same_team_rule();
+    by_city.name = "same_city".into();
+    by_city.predicate = Predicate::FieldEqual {
+        field: "city".into(),
+    };
+    by_city.edge_type = "LINKED".into();
+    db.create_rule(by_team).unwrap();
+    db.create_rule(by_city).unwrap();
+
+    let refused = forget(
+        &mut db,
+        &ForgetTarget::Fact {
+            subject: "a".into(),
+            predicate: "LINKED".into(),
+            object: "b".into(),
+        },
+    );
+    match refused {
+        Err(GraphError::RuleOwned { detail }) => assert_eq!(
+            detail,
+            "refused: LINKED a → b is derived by rule same_team. It changes only when \
+             the fields that rule reads change (team), or when the rule is deleted. \
+             Nothing was written.",
+            "same_city reads `city`, which these two do not share"
+        ),
+        other => panic!("expected a RuleOwned refusal, got {other:?}"),
+    }
+}

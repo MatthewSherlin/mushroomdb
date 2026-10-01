@@ -25,6 +25,38 @@ pub const SCHEMA_LIST_CAP: usize = 20;
 /// Provisional keys named by the report; the rest are counted.
 pub const PROVISIONAL_SAMPLE: usize = 10;
 
+/// The most bytes [`render_schema`] returns.
+///
+/// Every section is capped in lines, which bounds the text only while names
+/// are short: twenty labels of 700 characters render 14 KB. Three times the
+/// session brief's cap, for a report that carries the brief's two listings
+/// and adds the rules and both index lists; an ordinary store — twenty
+/// labels, twenty edge types, the identity preset's rules — renders
+/// about half of it. The `json: true` report is not capped: a program that
+/// asked for the whole report gets it.
+pub const SCHEMA_MAX_BYTES: usize = 12_000;
+
+/// Keep whole lines of `out` inside [`SCHEMA_MAX_BYTES`], and say so on a
+/// last line when any were dropped.
+fn cap_schema(out: String) -> String {
+    if out.len() <= SCHEMA_MAX_BYTES {
+        return out;
+    }
+    let note = format!(
+        "(schema truncated at {SCHEMA_MAX_BYTES} bytes; json: true returns the whole report)\n"
+    );
+    let mut kept = String::new();
+    for line in out.lines() {
+        if kept.len() + line.len() + 1 + note.len() > SCHEMA_MAX_BYTES {
+            break;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    kept.push_str(&note);
+    kept
+}
+
 /// One rule, as the schema names it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RuleBrief {
@@ -218,5 +250,5 @@ pub fn render_schema(r: &SchemaReport) -> String {
     if b.partial {
         out.push_str("(partial: the time budget ran out; counts are lower bounds)\n");
     }
-    out
+    cap_schema(out)
 }

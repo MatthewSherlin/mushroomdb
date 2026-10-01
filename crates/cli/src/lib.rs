@@ -2091,6 +2091,13 @@ pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
     let reach = reach_line(db_dir);
     let b = core_api::memory::brief::brief(&db, &core_api::memory::brief::BriefOptions::default());
     let mut text = core_api::memory::brief::render(&b, &reach);
+    // An empty store's line names how to fill it, and `render` cannot know
+    // which doors this install opened. A cli-only install gets the shell form.
+    if text == core_api::memory::brief::EMPTY_BRIEF
+        && matches!(install::delivery_for_store(db_dir), install::Delivery::Cli)
+    {
+        text = empty_brief_cli(db_dir);
+    }
     // Said here because a brief is computed once per session and cached,
     // where the prompt hook fires every turn. A 0.6.x store upgraded to 0.7
     // has no text index until someone asks for one, and a user who never
@@ -2153,6 +2160,29 @@ fn reach_line(db_dir: &Path) -> String {
         install::Delivery::Cli => shell,
         _ => format!("{tools} {shell}"),
     }
+}
+
+/// An empty store's brief for an install that registered no MCP server.
+///
+/// [`core_api::memory::brief::EMPTY_BRIEF`] offers `remember`,
+/// `upsert_entity` and `ingest_json`, which are MCP tools; a `--delivery cli`
+/// session has a shell and nothing else. This is the same offer in the one
+/// form that session can act on — a `query` with a `CREATE`, the write the
+/// skill's CLI table names, with the `id:` property a `CREATE` needs.
+///
+/// The statement is in double quotes for the shell because the engine's
+/// Cypher takes single-quoted strings only: the line has to run as printed,
+/// and `an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool`
+/// runs it.
+fn empty_brief_cli(db_dir: &Path) -> String {
+    // Sanitized as the reach line is: `render` returned a constant for this
+    // store, so nothing downstream sanitizes what is built here.
+    let bin = core_api::digest::sanitize(&install::detect_mcp_command(None).shell());
+    let db = core_api::digest::sanitize(&install::sh_quote(&db_dir.to_string_lossy()));
+    format!(
+        "mushroomdb brief — empty store; offer to fill it: {bin} query {db} \
+         \"CREATE (n:Note {{id: 'note:1', text: '…'}})\" writes a fact\n"
+    )
 }
 
 /// Open a store the way every question about it is asked: read-only, with both

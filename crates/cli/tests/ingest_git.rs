@@ -1946,3 +1946,105 @@ fn the_reach_line_on_a_cli_delivery_install_names_only_the_binary() {
         "{reach}"
     );
 }
+
+/// Binding: an empty store's brief on a `--delivery cli` install offers the
+/// shell, not three MCP tools the session has no server to call.
+///
+/// `EMPTY_BRIEF` names `remember`, `upsert_entity` and `ingest_json`. The
+/// reach line already branches on delivery; the empty line did not.
+#[test]
+fn an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool() {
+    let root = tmp("brief-cli-empty");
+    let home = tmp("brief-cli-empty-home");
+    let db_dir = root.join("mushroom-memory");
+    std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+
+    cli::install::run_install_with(
+        &root,
+        &home,
+        &cli::install::InstallOpts {
+            platform: Some(cli::install::Platform::ClaudeCode),
+            scope: Some(cli::install::Scope::Project),
+            db: Some(db_dir.clone()),
+            command: None,
+            prewarm: false,
+            delivery: cli::install::Delivery::Cli,
+            always_load: false,
+        },
+        &cli::install::McpCommand::OnPath,
+        &cli::install::Externals::with_path(None),
+    )
+    .expect("install");
+
+    // A read that creates the store and puts nothing in it.
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&db_dir)
+        .arg("MATCH (n) RETURN count(n) AS c")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let text = cli::run_brief(&db_dir).expect("brief");
+    let first = text.lines().next().unwrap();
+    assert!(first.contains("empty store"), "{first}");
+    for tool in ["`remember`", "`upsert_entity`", "`ingest_json`"] {
+        assert!(
+            !first.contains(tool),
+            "a cli install has no server to call {tool} on: {first}"
+        );
+    }
+    assert!(
+        first.contains(&format!(" query '{}' ", db_dir.display()))
+            && first.contains("CREATE (n:Note {id:"),
+        "it offers the one write a shell has, with the `id:` a CREATE needs: {first}"
+    );
+    // The offer has to run as printed. The engine's Cypher takes single-quoted
+    // strings only, so the statement is the line's one double-quoted shell
+    // argument; hand exactly that to `query` and read the note back.
+    let cypher = first
+        .split('"')
+        .nth(1)
+        .unwrap_or_else(|| panic!("no double-quoted statement in: {first}"));
+    assert!(
+        first.split('"').count() == 3 && !cypher.contains(['$', '`', '\\']),
+        "one double-quoted argument a shell passes through unchanged: {first}"
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&db_dir)
+        .arg(cypher)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the statement the brief offers does not run: {cypher}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&db_dir)
+        .arg("MATCH (n:Note) RETURN n.id AS id")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("note:1"),
+        "{out:?}"
+    );
+
+    // No install beside the store means both doors, and the line is the
+    // MCP one, unchanged.
+    let bare = tmp("brief-no-install").join("db");
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&bare)
+        .arg("MATCH (n) RETURN count(n) AS c")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let text = cli::run_brief(&bare).expect("brief");
+    assert!(
+        text.starts_with(core_api::memory::brief::EMPTY_BRIEF),
+        "{text}"
+    );
+}

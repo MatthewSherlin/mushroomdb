@@ -120,3 +120,36 @@ fn the_schema_report_counts_provisional_nodes_and_is_unframed() {
         "render_schema must not frame: {text}"
     );
 }
+
+/// The rendered schema is bounded in bytes, not only in lines per section: a
+/// store whose names are long would otherwise render without limit.
+#[test]
+fn the_rendered_schema_is_capped_in_bytes_and_says_so() {
+    use core_api::memory::brief::BriefOptions;
+    use core_api::memory::schema::{render_schema, schema_report, SCHEMA_MAX_BYTES};
+
+    let mut db = GraphDb::open(&tmp("schema-cap")).unwrap();
+    // Twenty labels of 700 characters each: 14 KB of label lines alone.
+    for i in 0..20 {
+        let label = format!("L{i:02}{}", "x".repeat(700));
+        db.insert_node(&label, &format!("n{i}"), vec![]).unwrap();
+    }
+    let text = render_schema(&schema_report(&db, &BriefOptions::default()));
+    assert!(
+        text.len() <= SCHEMA_MAX_BYTES,
+        "{} bytes rendered against a cap of {SCHEMA_MAX_BYTES}",
+        text.len()
+    );
+    let last = text.lines().next_back().unwrap_or_default();
+    assert!(
+        last.contains("truncated") && last.contains("json: true"),
+        "the cut is announced, with the way to get the rest: {last}"
+    );
+    assert!(text.ends_with('\n'), "cut on a whole line");
+
+    // An ordinary store is untouched.
+    let mut small = GraphDb::open(&tmp("schema-small")).unwrap();
+    small.insert_node("Person", "ada", vec![]).unwrap();
+    let text = render_schema(&schema_report(&small, &BriefOptions::default()));
+    assert!(!text.contains("truncated"), "{text}");
+}
