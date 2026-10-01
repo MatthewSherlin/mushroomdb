@@ -5,7 +5,9 @@ Written 2026-10-01 from an investigation run that day. It was started because th
 2026-08-24 had shown 2.85–3.51 s.
 
 **Conclusion: no 0.7 regression.** The released v0.6.12 and the 0.7 branch are indistinguishable on
-every workload below. The backfill figure is real, is already in v0.6.12, and has been there since
+every workload below, with one exception: the first, cold execution of the two-hop query is about
+0.15 ms slower on the 0.7 branch (1.23× in the pooled table), and its cause was not established —
+see "What was not established" at the end. The warm two-hop is flat. The backfill figure is real, is already in v0.6.12, and has been there since
 v0.2.0: the benchmark's rules have derived a different, complete edge set since then.
 
 ## Machine / date
@@ -27,9 +29,19 @@ v0.2.0: the benchmark's rules have derived a different, complete edge set since 
   The v0.6.12 binding has every call that harness makes. The backfill timer wraps
   `db.create_rule(rule)` per rule and the loop in total; backfill is synchronous inside
   `create_rule` for these rules.
-- Most runs used a driver that calls the same adapter functions in the same order as `run_ours()`,
-  then records, outside every timer, `db.stats()`, the WAL size, and a two-hop median of 10 after
-  3 warmups. The unmodified harness was also run three times per side:
+- Most runs used a driver, committed as `benchmarks/ab_driver.py`, that calls the same adapter
+  functions in the same order as `run_ours()`, then records, outside every timer, `db.stats()`,
+  the WAL size, and a two-hop median of 10 after 3 warmups. Every "median of 10" figure in this
+  file, and every edge count, comes from it; `benchmarks/run.py` reports the single pass only.
+  Each side's own virtualenv python ran it against the 0.7 branch's `benchmarks/` directory:
+
+  ```
+  <venv python> benchmarks/ab_driver.py benchmarks <label> <out.json> 10000
+  ```
+
+  The `"max_edges": None` control further down ran the same command with `RULE_MAX_EDGES=none` in
+  the environment.
+- The unmodified harness was also run three times per side:
 
   ```
   bindings/python/.venv/bin/python benchmarks/run.py --scale 10000 --out <file>

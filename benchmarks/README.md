@@ -54,6 +54,13 @@ tests and is not in the results table; the open-time figures the README quotes c
 written by hand against the same store — per operation, and batched. It is a comparison of two
 ways to use mushroomdb, and its result is `benchmarks/results/handrolled-vs-rules.md`.
 
+## A/B against another build
+
+`ab_driver.py` runs the same workload sequence under the same timers and also records what
+`run.py` does not: derived-edge counts, WAL sizes, the machine's load, and a warm two-hop median
+of 10 after 3 warmups. It measures whichever `mushroomdb` its interpreter has installed, so an A/B
+is one virtualenv per build. `benchmarks/results/mushroomdb-10k-0.7-ab.md` was made with it.
+
 ## Older results
 
 `benchmarks/results/` keeps earlier runs as they were committed. Where an older file compared

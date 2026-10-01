@@ -80,6 +80,7 @@ Earlier committed figures for the rows that moved:
 `mushroomdb-10k-0.7-ab.md`. The released v0.6.12 takes 8.611 s for the same backfill and derives the
 same 448,000 edges. The 2.85–3.51 s runs were a different workload: before v0.2.0 a rule without an
 explicit `max_edges` stopped at a 1,000,000-edge global cap per rule, and since v0.2.0 it keeps the
-top 32 per source, so the backfill evaluates every source. The two-hop figure above is a cold first
+top 32 per source when declared through the Python binding, as this harness does, so the backfill
+evaluates every source. The two-hop figure above is a cold first
 execution; the warm median on this tree is 192.1 µs. An earlier annotation here, made before the
 A/B, said the backfill was under investigation as a possible regression; this replaces it.
