@@ -14590,6 +14590,9 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     /// `(edge_type, src, dst)` from current overlay-visible props/labels.
     /// CreateRule names in `extra_rules` are ignored — same documented
     /// same-batch rule-window as [`Self::is_rule_owned`].
+    ///
+    /// Mirrored by `guard_matches` in `memory/forget.rs`, which names the
+    /// rules this refused for: change the two together (ledger row 67).
     fn would_derive(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
         if src_key == dst_key {
             return false;

@@ -5592,6 +5592,43 @@ fn forgetting_an_absent_fact_says_nothing_to_retract() {
     assert!(!text.contains("history still holds it"), "{text}");
 }
 
+/// Binding: an absent fact is nothing to retract even when a rule's predicate
+/// matches the pair. The engine's delete guard refuses before it looks for
+/// the edge (ledger row 67); the reply is the absent-fact reply, byte for
+/// byte, not a refusal about an edge "written by hand".
+#[test]
+fn forgetting_an_absent_fact_a_rule_matches_says_nothing_to_retract() {
+    let reply = |name: &str, with_rule: bool| {
+        let db = memory_store(name);
+        for key in ["a", "b"] {
+            db.write()
+                .insert_node("Person", key, vec![("name".into(), Value::Str("X".into()))])
+                .unwrap();
+        }
+        if with_rule {
+            // A via-hop rule with no via node: it derives nothing.
+            let mut rule = same_name_rule();
+            rule.via_label = Some("Team".into());
+            rule.via_edge = Some("MEMBER_OF".into());
+            db.write().create_rule(rule).unwrap();
+        }
+        let seq = db.read().commit_seq();
+        let text = task_reply(&one_task_call(
+            db.clone(),
+            "forget",
+            json!({"fact": {"subject": "a", "predicate": "SAME_NAME", "object": "b"}}),
+        ));
+        assert_eq!(db.read().commit_seq(), seq, "nothing was committed");
+        text
+    };
+    let text = reply("forget-absent-rule", true);
+    assert!(
+        text.contains("no edge SAME_NAME a → b; nothing to retract"),
+        "{text}"
+    );
+    assert_eq!(text, reply("forget-absent-no-rule", false));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // suggest_rules — "what relationships are in my data?"
 // ─────────────────────────────────────────────────────────────────────────────

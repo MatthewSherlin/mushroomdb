@@ -361,3 +361,174 @@ fn a_hand_written_fact_a_rule_would_rederive_is_refused_without_a_false_owner() 
         "nothing was written"
     );
 }
+
+/// Two `Person` nodes on team red, and nothing else.
+fn two_reds(db: &mut Db) {
+    for key in ["a", "b"] {
+        db.insert_node(
+            "Person",
+            key,
+            vec![("team".into(), Value::Str("red".into()))],
+        )
+        .unwrap();
+    }
+}
+
+/// `same_team` deriving `LINKED`, through a `Team` node one `MEMBER_OF` hop
+/// from the source.
+fn via_team_rule() -> RuleDef {
+    let mut rule = same_team_rule();
+    rule.name = "via_team".into();
+    rule.edge_type = "LINKED".into();
+    rule.via_label = Some("Team".into());
+    rule.via_edge = Some("MEMBER_OF".into());
+    rule
+}
+
+fn linked_a_b() -> ForgetTarget {
+    ForgetTarget::Fact {
+        subject: "a".into(),
+        predicate: "LINKED".into(),
+        object: "b".into(),
+    }
+}
+
+fn refusal(db: &mut Db) -> String {
+    match forget(db, &linked_a_b()) {
+        Err(GraphError::RuleOwned { detail }) => detail,
+        other => panic!("expected a RuleOwned refusal, got {other:?}"),
+    }
+}
+
+/// The engine's delete guard refuses before it looks for the edge (ledger row
+/// 67), so a fact that was never stated can come back `RuleOwned`. `forget`
+/// answers what it answers for any absent fact: nothing to retract, nothing
+/// written — not a refusal that says the edge was written by hand.
+#[test]
+fn a_fact_that_does_not_exist_is_nothing_to_retract_even_when_a_rule_matches_the_pair() {
+    let mut db = store("absent-rule");
+    two_reds(&mut db);
+    db.create_rule(via_team_rule()).unwrap();
+    assert!(
+        db.neighbors("a", "LINKED", Direction::Out)
+            .unwrap()
+            .is_empty(),
+        "fixture: no Team node, so the rule derived nothing"
+    );
+    let commits = db.commit_seq();
+
+    let report = forget(&mut db, &linked_a_b()).expect("absent, not refused");
+    assert!(!report.changed, "{report:?}");
+    assert_eq!(report.mode, "fact");
+    assert_eq!(report.target, "LINKED a → b");
+    assert_eq!(report.notes_total, 0);
+    assert_eq!(db.commit_seq(), commits, "nothing was written");
+
+    // Exactly the report an absent fact gets in a store with no rule at all.
+    let mut plain = store("absent-plain");
+    two_reds(&mut plain);
+    let expected = forget(&mut plain, &linked_a_b()).unwrap();
+    assert_eq!(report, expected);
+}
+
+/// A via-hop rule with no via node would not derive the edge. The engine's
+/// guard refuses all the same — it evaluates the predicate on the pair and
+/// never looks at the hop — so the refusal names the rule as the reason
+/// without saying it would derive anything.
+#[test]
+fn a_via_rule_with_no_via_node_is_not_said_to_derive_the_hand_written_fact() {
+    let mut db = store("via-missing");
+    two_reds(&mut db);
+    db.insert_edge("LINKED", "a", "b").unwrap();
+    db.create_rule(via_team_rule()).unwrap();
+
+    assert_eq!(
+        refusal(&mut db),
+        "refused: LINKED a → b was written by hand and no rule derived it, but rule \
+         via_team matches these two nodes' properties and may derive it again, so the \
+         delete is refused. It can be deleted once the fields that rule reads (team) no \
+         longer match, or once the rule is deleted. Nothing was written."
+    );
+}
+
+/// The same rule with its hop in place — a `Team` node the source belongs to,
+/// satisfying the predicate against the destination — would derive the edge,
+/// and the refusal says so.
+#[test]
+fn a_via_rule_whose_hop_holds_is_said_to_derive_the_hand_written_fact() {
+    let mut db = store("via-present");
+    two_reds(&mut db);
+    db.insert_edge("LINKED", "a", "b").unwrap();
+    db.insert_node("Team", "t", vec![("team".into(), Value::Str("red".into()))])
+        .unwrap();
+    db.insert_edge("MEMBER_OF", "a", "t").unwrap();
+    db.create_rule(via_team_rule()).unwrap();
+    assert!(
+        db.explain("a", "b").unwrap().is_empty(),
+        "fixture: the edge was there first, so it is in no provenance"
+    );
+
+    assert_eq!(
+        refusal(&mut db),
+        "refused: LINKED a → b was written by hand and no rule derived it, but rule \
+         via_team would derive it again, so the delete is refused. It can be deleted \
+         once the fields that rule reads (team) no longer match, or once the rule is \
+         deleted. Nothing was written."
+    );
+}
+
+/// A rule scoped to a namespace sees neither node outside it and derives
+/// nothing between them; the guard does not look at the namespace either.
+#[test]
+fn a_rule_scoped_to_another_namespace_is_not_said_to_derive_the_hand_written_fact() {
+    let mut db = store("other-namespace");
+    two_reds(&mut db);
+    db.insert_edge("LINKED", "a", "b").unwrap();
+    let mut scoped = same_team_rule();
+    scoped.edge_type = "LINKED".into();
+    scoped.namespace = Some("tenant".into());
+    db.create_rule(scoped).unwrap();
+
+    let detail = refusal(&mut db);
+    assert!(
+        detail.contains("rule same_team matches these two nodes' properties and may derive it")
+            && !detail.contains("would derive"),
+        "{detail}"
+    );
+}
+
+/// A rule keeps its best `max_edges` targets per source. With more candidates
+/// than that, whether this pair is among them is not something the predicate
+/// answers, so the refusal does not say the rule would derive it.
+#[test]
+fn a_rule_whose_per_source_cap_could_bind_is_not_said_to_derive_the_hand_written_fact() {
+    let mut db = store("cap-binds");
+    two_reds(&mut db);
+    db.insert_edge("LINKED", "a", "b").unwrap();
+    for key in ["c", "d"] {
+        db.insert_node(
+            "Person",
+            key,
+            vec![("team".into(), Value::Str("blue".into()))],
+        )
+        .unwrap();
+    }
+    let mut capped = same_team_rule();
+    capped.edge_type = "LINKED".into();
+    capped.max_edges = Some(1);
+    db.create_rule(capped).unwrap();
+    assert!(
+        db.explain("a", "b")
+            .unwrap()
+            .iter()
+            .all(|e| e.src_key != "a"),
+        "fixture: a → b was there first, so it is in no provenance"
+    );
+
+    let detail = refusal(&mut db);
+    assert!(
+        detail.contains("rule same_team matches these two nodes' properties and may derive it")
+            && !detail.contains("would derive"),
+        "{detail}"
+    );
+}

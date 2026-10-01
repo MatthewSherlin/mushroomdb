@@ -16,9 +16,10 @@ use crate::memory::identity::{
 };
 use crate::memory_schema::NAME_FIELD;
 use crate::{GraphDb, PredicateSummary, RuleDef};
+use core_rules::engine::DEFAULT_MAX_EDGES;
 use core_rules::{evaluate, NodeView};
 use core_storage::fs::Fs;
-use core_storage::{Direction, GraphError, Result};
+use core_storage::{namespace_of_value, Direction, GraphError, Result, NS_PROP};
 use std::collections::BTreeSet;
 
 /// Notes a report names when what it forgot was written about; the rest are
@@ -144,10 +145,13 @@ fn derived_edges_on<F: Fs>(db: &GraphDb<F>, key: &str) -> Result<BTreeSet<EdgeTr
 /// # Errors
 /// - [`GraphError::KeyNotFound`] for a node or a fact endpoint that does not
 ///   exist. Nothing is written.
-/// - [`GraphError::RuleOwned`] for a fact a rule derived. `detail` is the
-///   whole refusal ([`rule_owned_refusal`]): the owning rule and the fields
-///   it reads, or, when no rule can be named, the engine's own detail,
-///   sanitized. Nothing is written.
+/// - [`GraphError::RuleOwned`] for a fact that is in the store and that the
+///   engine will not delete: a rule derived it, or it was written by hand
+///   and a rule matches the pair. `detail` is the whole refusal
+///   ([`rule_owned_refusal`]): which of the two, the rule and the fields it
+///   reads, or, when no rule can be named, the engine's own detail,
+///   sanitized. Nothing is written. A fact that is not in the store is never
+///   this error: it is `changed: false`, whatever a rule says of the pair.
 /// - Any other engine refusal, as it came.
 pub fn forget<F: Fs>(db: &mut GraphDb<F>, target: &ForgetTarget) -> Result<ForgetReport> {
     match target {
@@ -229,6 +233,13 @@ pub fn forget<F: Fs>(db: &mut GraphDb<F>, target: &ForgetTarget) -> Result<Forge
         } => {
             let changed = match db.delete_edge(predicate, subject, object) {
                 Ok(c) => c,
+                // The engine's guard refuses before it looks for the edge
+                // (ledger row 67), so a fact nobody stated can come back
+                // `RuleOwned`. An edge that is not there is nothing to
+                // retract, whatever a rule says about the pair.
+                Err(GraphError::RuleOwned { .. }) if !has_edge(db, predicate, subject, object) => {
+                    false
+                }
                 Err(GraphError::RuleOwned { detail }) => {
                     return Err(GraphError::RuleOwned {
                         detail: rule_owned_refusal(db, predicate, subject, object, &detail),
@@ -258,21 +269,33 @@ pub fn forget<F: Fs>(db: &mut GraphDb<F>, target: &ForgetTarget) -> Result<Forge
     }
 }
 
-/// Why a fact edge cannot be retracted, in one of two true sentences.
+/// Whether the edge `(predicate, subject, object)` is in the store.
+fn has_edge<F: Fs>(db: &GraphDb<F>, predicate: &str, subject: &str, object: &str) -> bool {
+    db.neighbors(subject, predicate, Direction::Out)
+        .is_ok_and(|keys| keys.iter().any(|k| k == object))
+}
+
+/// Why a fact edge that exists cannot be retracted, in a sentence that is
+/// true of this edge.
 ///
 /// The engine refuses the delete in two cases, and they are not the same
 /// fact:
 ///
 /// - **A rule derived the edge.** It is in provenance, and the refusal names
 ///   exactly the rules [`GraphDb::explain`] attributes it to.
-/// - **The edge was written by hand and a live rule would derive it again.**
-///   It is in no provenance, so no rule is said to have derived it. The
-///   refusal names the rules whose predicate holds for this pair now — the
-///   engine's own test, `would_derive` below — and not every rule that shares
-///   the edge type and the endpoint labels.
+/// - **The edge was written by hand and a rule matches the pair.** It is in
+///   no provenance, so no rule is said to have derived it. The refusal names
+///   the rules the engine's guard refused for — `guard_matches` below, the
+///   same test — and not every rule that shares the edge type and the
+///   endpoint labels. It says those rules *would derive it again* only when
+///   every one of them would (`would_derive`); the guard asks less than
+///   that, so otherwise it says they match the two nodes' properties and may.
 ///
 /// When neither names a rule, the engine's own `detail` is returned,
 /// sanitized.
+///
+/// [`forget`] calls this only for an edge that is in the store: an absent one
+/// is nothing to retract, and "was written by hand" would be false of it.
 pub fn rule_owned_refusal<F: Fs>(
     db: &GraphDb<F>,
     predicate: &str,
@@ -306,19 +329,27 @@ pub fn rule_owned_refusal<F: Fs>(
             sanitize(object),
         );
     }
-    let would: Vec<&RuleDef> = rules
+    let matching: Vec<&RuleDef> = rules
         .iter()
-        .filter(|r| would_derive(db, r, predicate, subject, object))
+        .filter(|r| guard_matches(db, r, predicate, subject, object))
         .collect();
-    if would.is_empty() {
+    if matching.is_empty() {
         return sanitize(detail);
     }
-    let (names, fields) = names_and_fields(&would);
+    let (names, fields) = names_and_fields(&matching);
+    // One claim for the whole list, so it has to hold for every rule in it.
+    let claim = if matching
+        .iter()
+        .all(|r| would_derive(db, r, subject, object))
+    {
+        "would derive it again"
+    } else {
+        "matches these two nodes' properties and may derive it again"
+    };
     format!(
         "refused: {} {} → {} was written by hand and no rule derived it, but rule {names} \
-         would derive it again, so the delete is refused. It can be deleted once the fields \
-         that rule reads ({fields}) no longer match, or once the rule is deleted. Nothing was \
-         written.",
+         {claim}, so the delete is refused. It can be deleted once the fields that rule reads \
+         ({fields}) no longer match, or once the rule is deleted. Nothing was written.",
         sanitize(predicate),
         sanitize(subject),
         sanitize(object),
@@ -337,13 +368,34 @@ fn names_and_fields(rules: &[&RuleDef]) -> (String, String) {
     (names.join(", "), fields.join(", "))
 }
 
-/// Whether `rule` would derive `(predicate, subject, object)` from what the
-/// two nodes hold now.
+/// Whether `rule`'s predicate holds between the nodes `a` and `b`.
+fn predicate_holds<F: Fs>(db: &GraphDb<F>, rule: &RuleDef, a: &str, b: &str) -> bool {
+    let a_props = |field: &str| db.get_prop(a, field);
+    let b_props = |field: &str| db.get_prop(b, field);
+    evaluate(
+        &rule.predicate,
+        &NodeView {
+            key: a,
+            props: &a_props,
+        },
+        &NodeView {
+            key: b,
+            props: &b_props,
+        },
+    )
+    .is_some()
+}
+
+/// Whether the engine's delete guard refuses `(predicate, subject, object)`
+/// on account of `rule`.
 ///
-/// The same test the engine's delete guard makes before it refuses a
-/// hand-written edge (`would_derive` in `db.rs`): the rule's edge type and
-/// endpoint labels, then its predicate evaluated on the pair.
-fn would_derive<F: Fs>(
+/// A mirror of the private `would_derive` in `db.rs`, which is why a
+/// hand-written edge comes back `RuleOwned`: the rule's edge type and
+/// endpoint labels, then its predicate evaluated on the pair. It is all the
+/// guard asks. It does not look at the rule's via hop, its namespace or its
+/// per-source cap (ledger row 67), so a rule can match here and still not be
+/// one that would derive the edge — see [`would_derive`].
+fn guard_matches<F: Fs>(
     db: &GraphDb<F>,
     rule: &RuleDef,
     predicate: &str,
@@ -354,21 +406,55 @@ fn would_derive<F: Fs>(
         return false;
     }
     let label_is = |key: &str, label: &str| db.node_ref(key).is_some_and(|n| n.label() == label);
-    if !label_is(subject, &rule.src_label) || !label_is(object, &rule.dst_label) {
+    label_is(subject, &rule.src_label)
+        && label_is(object, &rule.dst_label)
+        && predicate_holds(db, rule, subject, object)
+}
+
+/// Whether `rule`, which [`guard_matches`] for this pair, would in fact
+/// derive `subject → object` from what the store holds now.
+///
+/// What the guard leaves out, as the rule engine applies it:
+///
+/// - **Namespace.** A scoped rule sees a node only in its own namespace, and
+///   that goes for the via node as well as the two ends.
+/// - **The via hop.** A via-hop rule evaluates its predicate between a via
+///   node and the destination, not between the two ends: some node of
+///   `via_label`, one `via_edge` hop from the source in `via_dir`, has to
+///   satisfy it.
+/// - **The cap.** A rule with `max_edges: Some(k)` keeps its best `k`
+///   targets per source; without one, the rule stops at a global budget.
+///   Ranking the candidates is the engine's business, so this answers yes
+///   only when the cap cannot bind: no more candidates than the cap admits.
+///   Past that the answer is no, which errs toward the weaker claim.
+fn would_derive<F: Fs>(db: &GraphDb<F>, rule: &RuleDef, subject: &str, object: &str) -> bool {
+    let sees = |key: &str| match rule.namespace.as_deref() {
+        None => true,
+        Some(ns) => namespace_of_value(db.get_prop(key, NS_PROP).as_ref()) == ns,
+    };
+    if !sees(subject) || !sees(object) {
         return false;
     }
-    let src_props = |field: &str| db.get_prop(subject, field);
-    let dst_props = |field: &str| db.get_prop(object, field);
-    evaluate(
-        &rule.predicate,
-        &NodeView {
-            key: subject,
-            props: &src_props,
-        },
-        &NodeView {
-            key: object,
-            props: &dst_props,
-        },
-    )
-    .is_some()
+    let sources = db.nodes_with_label(&rule.src_label).len() as u64;
+    let targets = db.nodes_with_label(&rule.dst_label).len() as u64;
+    let cap_cannot_bind = match rule.max_edges {
+        Some(k) => targets <= k,
+        None => sources.saturating_mul(targets) <= DEFAULT_MAX_EDGES,
+    };
+    if !cap_cannot_bind {
+        return false;
+    }
+    let (Some(via_label), Some(via_edge)) = (rule.via_label.as_deref(), rule.via_edge.as_deref())
+    else {
+        // A plain rule: the guard already evaluated its predicate on the pair.
+        return true;
+    };
+    db.neighbors(subject, via_edge, rule.via_dir.unwrap_or(Direction::Out))
+        .unwrap_or_default()
+        .iter()
+        .any(|via| {
+            db.node_ref(via).is_some_and(|n| n.label() == via_label)
+                && sees(via)
+                && predicate_holds(db, rule, via, object)
+        })
 }
