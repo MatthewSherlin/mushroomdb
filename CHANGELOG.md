@@ -130,7 +130,9 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   in `aliases` is its owner's data and is kept: on the next describing write
   to that entity, or when the identity preset's backfill runs, every item the
   key and the name do not imply moves to `alias_keys` as written — trimmed,
-  not normalised. Only a blank item is let go. Any value that is not a string
+  not normalised. Only a blank item is let go. A list the store itself
+  derived from an earlier name is not such a value: it is replaced, and
+  nothing moves (see the known limits). Any value that is not a string
   or a list of strings is refused with the node named, to clear with
   `forget {key, prop: "aliases"}`, rather than overwritten.
 - **A declared alias does not count toward `Overlap`** (owner decision,
@@ -224,7 +226,8 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 
 - **A nickname stub links only when the alias is declared.** A bare `matt`
   stub holds one alias and cannot reach Jaccard 0.6 against an entity named
-  Matthew Sherlin, which holds four and none of them `matt`. An entity that declares `aliases: ["matt"]` now links it by claim; one
+  Matthew Sherlin, which holds four and none of them `matt`. An entity that
+  declares `aliases: ["matt"]` now links it by claim; one
   that does not declare it still does not, and neither does a second entity
   with the same name that never made the claim. That is three of the gate's
   nine false negatives, whose labelled set declares no such alias. The other
@@ -243,12 +246,21 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **A shared declared alias links nothing by itself.** Two entities that both
   declare `the boss` gain no overlap from it; declared aliases act only as
   claims on a provisional stub's key.
-- **The store tells a derived alias from a kept one by the name it finds.** A
-  name changed by a raw write — `query`, not `remember` or `upsert_entity` —
-  leaves its old words in `aliases`, and the next describing write keeps them
-  as declared aliases in `alias_keys`, where one equal to a stub's key links
-  that stub. So does a former key left by `rename_node`. Change a name
-  through `upsert_entity` or `remember`, or `forget` it, and nothing is left;
+- **A name changed by a raw write leaves `aliases` stale until the next
+  describing write.** `query`, `ingest_json`, HTTP and the Python binding do
+  not maintain the list; `remember`, `upsert_entity` and
+  `schema apply --memory-identity` do. Until one of those runs, the old
+  name's words keep matching identity rules. When it runs, the list is
+  replaced and the old words are dropped: they never become declared aliases.
+- **The store recognises its own `aliases` list by its shape**: the node's
+  lowercased key, one name and that name's words, sorted. Two things follow.
+  A list an owner wrote before 0.7 that has exactly that shape — key `bob`,
+  `aliases: ["bob", "bobby"]` — is read as the store's, and `bobby` is
+  dropped rather than kept in `alias_keys`. And after `rename_node` the list
+  was derived from another key, so it does not have the shape: the next
+  describing write keeps the former key, lowercased, as a declared alias,
+  where it links a provisional stub keyed exactly so, and keeps the old
+  name's words too if the name was also changed by a raw write in between.
   `forget {key, prop: "alias_keys"}` clears what was kept.
 - **A subject named before it was described cannot claim a stub.** It is an
   `Entity` for life, and the claim rules run from the five entity labels.
