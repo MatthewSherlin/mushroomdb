@@ -69,6 +69,9 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   backticks — so on a memory store it was silent on every prompt. The MCP
   `recall` tool was fixed in this release's first half; this is the automatic
   path. It prepends the untrusted-content framing line to what it prints.
+- **On a store built by `ingest-git`, the prompt hook now answers every
+  prompt**, matching commits, files and symbols too, and opens the store on
+  every turn. In 0.6 a prompt naming no identifier returned before opening it.
 - **The prompt hook is silent on a store with no text index.** `mushroomdb
   brief` says so instead, once per session, with the
   `schema apply … --memory-defaults` command that fixes it.

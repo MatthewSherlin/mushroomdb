@@ -624,6 +624,16 @@ fn census() -> (Vec<Site>, Vec<String>) {
 /// `SharedDb::open`. A census that cannot see the thing it guards is the
 /// failure this project keeps finding — this is its fifth appearance — and
 /// scanning one spelling of "open a store" is exactly that shape.
+///
+/// **Known blind spots.** The tree is clean of each today; none is guarded:
+///
+/// - It reads only the top-level `crates/cli/src/*.rs` files. A nested module
+///   (`src/foo/bar.rs`) is not scanned.
+/// - It matches the spellings in [`OPENS`] by text, so it does not see an open
+///   through an alias (`type Db = GraphDb<…>; Db::open(…)`) or through a
+///   turbofish (`GraphDb::<F>::open`).
+/// - It sees the CLI crate alone. A store created outside it — the Python
+///   binding's, for one — is not counted.
 #[test]
 fn every_store_creating_call_site_applies_a_schema() {
     let (sites, functions) = census();

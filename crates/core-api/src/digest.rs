@@ -68,7 +68,7 @@ pub fn sanitize(s: &str) -> String {
 /// cannot possibly hit.
 ///
 /// 0.6.9 widened this from a bare `is_ascii_control()` to the full class and
-/// paid for it, and `touch` renders digests. Measured by
+/// paid for it, and the prompt hook renders a digest on every prompt. Measured by
 /// `cargo run --release -p mushroomdb --example sanitize_bench` over ~400 KB of
 /// representative digest text, median of three on an Apple Silicon laptop:
 ///

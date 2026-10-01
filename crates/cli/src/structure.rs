@@ -120,9 +120,10 @@ pub struct StructureReport {
 ///
 /// Exported so a test — or a store built some other way — can recreate exactly
 /// the rule set these props expect; [`ingest_git_schema`] declares all of them
-/// on the store `ingest-git` creates. Nothing in 0.7 writes the
-/// `Concept.source_files` that [`concept_sources_rule`] matches, so it derives
-/// no edge.
+/// on the store `ingest-git` creates. `ingest-git` itself writes no `Concept`:
+/// the skill's `learn` pass writes `Concept.source_files` through
+/// `ingest_json`, and [`concept_sources_rule`] links each concept to those
+/// files with `DESCRIBED_IN`, which is how the skill tells a stale concept.
 ///
 /// No `about_<label>` rule. `remember` writes `Note.about` *and* inserts the
 /// `ABOUT` edges itself; a rule deriving the same edges would own them, and the

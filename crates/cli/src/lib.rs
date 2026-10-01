@@ -2023,9 +2023,10 @@ pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
 /// `the_reach_line_names_only_tools_its_surface_lists` holds this line and
 /// that list in step.
 ///
-/// The shell half names `query` rather than the MCP pair:
-/// `explain_association` has no CLI subcommand, and `query` — which does —
-/// answers the same question a Cypher read away.
+/// The shell half names `query` alone. `mushroomdb why <db> <a> <b>` is
+/// `explain_association`'s shell door, but it answers one pair, and `query`
+/// answers that question and every other the brief's recipes ask, a Cypher
+/// read away.
 fn reach_line(db_dir: &Path) -> String {
     let bin = install::detect_mcp_command(None).shell();
     let db = install::sh_quote(&db_dir.to_string_lossy());
