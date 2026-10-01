@@ -20,6 +20,7 @@
 //! their keys become visible to the batch's own validation) before the
 //! `about` keys and the facts' own endpoints are resolved.
 
+use crate::memory::identity::{aliases_after_write, aliases_value, derive_aliases, ALIASES_FIELD};
 use crate::memory_schema::{NAME_FIELD, PROVISIONAL_LABEL, PROVISIONAL_PROP};
 use crate::GraphDb;
 use core_storage::fs::Fs;
@@ -83,6 +84,10 @@ pub struct EntityIn {
     pub key: String,
     pub label: String,
     pub props: BTreeMap<String, Value>,
+    /// Other names the caller knows this entity by. Normalised into the
+    /// node's `aliases` list alongside its key and name; see
+    /// [`crate::memory::identity`].
+    pub aliases: Vec<String>,
 }
 
 /// One relationship the caller recognised, between keys named in `entities`
@@ -193,14 +198,34 @@ pub fn describe_entity<F: Fs>(
     label: Option<&str>,
     props: &[(String, Value)],
 ) -> Result<bool> {
+    describe_entity_with_aliases(db, key, label, props, &[])
+}
+
+/// [`describe_entity`], with aliases the caller knows the entity by.
+///
+/// Either way the node's `aliases` list is brought up to date from its key,
+/// its name and `aliases` ([`crate::memory::identity`]), and left untouched
+/// when it already says exactly that. A `props` entry named `aliases` is
+/// refused before anything is written.
+pub fn describe_entity_with_aliases<F: Fs>(
+    db: &mut GraphDb<F>,
+    key: &str,
+    label: Option<&str>,
+    props: &[(String, Value)],
+    aliases: &[String],
+) -> Result<bool> {
+    let mut props = props.to_vec();
+    if let Some(list) = aliases_after_write(db, key, &props, aliases)? {
+        props.push((ALIASES_FIELD.to_string(), aliases_value(&list)));
+    }
     if db.has_node(key) {
         if !props.is_empty() {
-            db.set_props(key, props.to_vec())?;
+            db.set_props(key, props)?;
         }
         let _ = db.remove_prop(key, PROVISIONAL_PROP)?;
         Ok(false)
     } else {
-        db.insert_node(label.unwrap_or(PROVISIONAL_LABEL), key, props.to_vec())?;
+        db.insert_node(label.unwrap_or(PROVISIONAL_LABEL), key, props)?;
         let _ = db.remove_prop(key, PROVISIONAL_PROP)?;
         Ok(true)
     }
@@ -307,6 +332,21 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
     // frame, not the live store, so "does this already exist" has to be
     // asked of the store now.
     let entity_existed: Vec<bool> = input.entities.iter().map(|e| db.has_node(&e.key)).collect();
+    // Each entity's `aliases` after this call, computed now for the same
+    // reason: it unites what the node already holds with what this call
+    // names, and `None` means the stored list is already exactly that.
+    let entity_aliases: Vec<Option<Vec<String>>> = input
+        .entities
+        .iter()
+        .map(|e| {
+            let props: Vec<(String, Value)> = e
+                .props
+                .iter()
+                .map(|(f, v)| (f.clone(), v.clone()))
+                .collect();
+            aliases_after_write(db, &e.key, &props, &e.aliases)
+        })
+        .collect::<Result<_>>()?;
     let about_existed: Vec<Option<bool>> = about
         .iter()
         .map(|k| {
@@ -377,10 +417,18 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
 
     // 1. Entities first, so an `about` key also named here lands as the real
     //    entity rather than a provisional stub.
-    for (entity, existed) in input.entities.iter().zip(&entity_existed) {
+    for ((entity, existed), aliases) in input
+        .entities
+        .iter()
+        .zip(&entity_existed)
+        .zip(&entity_aliases)
+    {
         if *existed {
             for (field, value) in &entity.props {
                 batch.set_prop(&entity.key, field, value.clone());
+            }
+            if let Some(list) = aliases {
+                batch.set_prop(&entity.key, ALIASES_FIELD, aliases_value(list));
             }
             report.matched += 1;
         } else {
@@ -388,11 +436,14 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
             // `set_props` — see `describe_entity`'s doc comment for why an
             // insert-time-only field (a namespace) would otherwise be
             // refused rather than accepted.
-            let props: Vec<(String, Value)> = entity
+            let mut props: Vec<(String, Value)> = entity
                 .props
                 .iter()
                 .map(|(f, v)| (f.clone(), v.clone()))
                 .collect();
+            if let Some(list) = aliases {
+                props.push((ALIASES_FIELD.to_string(), aliases_value(list)));
+            }
             batch.insert_node(&entity.label, &entity.key, props);
             report.created += 1;
         }
@@ -407,14 +458,7 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
             Some(true) => report.matched += 1,
             Some(false) => {
                 if provisional_count < MAX_PROVISIONAL_PER_COMMIT {
-                    batch.insert_node(
-                        PROVISIONAL_LABEL,
-                        k,
-                        vec![
-                            (NAME_FIELD.to_string(), Value::Str(k.clone())),
-                            (PROVISIONAL_PROP.to_string(), Value::Bool(true)),
-                        ],
-                    );
+                    batch.insert_node(PROVISIONAL_LABEL, k, stub_props(k));
                     report.provisional.push(k.clone());
                     provisional_count += 1;
                 } else {
@@ -473,14 +517,7 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
             continue;
         }
         if provisional_count < MAX_PROVISIONAL_PER_COMMIT {
-            batch.insert_node(
-                PROVISIONAL_LABEL,
-                k,
-                vec![
-                    (NAME_FIELD.to_string(), Value::Str((*k).to_string())),
-                    (PROVISIONAL_PROP.to_string(), Value::Bool(true)),
-                ],
-            );
+            batch.insert_node(PROVISIONAL_LABEL, k, stub_props(k));
             report.provisional.push((*k).to_string());
             provisional_count += 1;
         } else {
@@ -513,6 +550,19 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
     report.derived = derived_after.saturating_sub(derived_before);
 
     Ok(report)
+}
+
+/// A provisional stub's properties: its key as its `name`, the
+/// `provisional` mark, and the aliases that name implies.
+fn stub_props(key: &str) -> Vec<(String, Value)> {
+    vec![
+        (NAME_FIELD.to_string(), Value::Str(key.to_string())),
+        (PROVISIONAL_PROP.to_string(), Value::Bool(true)),
+        (
+            ALIASES_FIELD.to_string(),
+            aliases_value(&derive_aliases(key, Some(key), &[])),
+        ),
+    ]
 }
 
 /// The key one `remember` call writes to: `"note:"` followed by 16 hex

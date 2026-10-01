@@ -1806,10 +1806,25 @@ fn entities_arg(args: &Js) -> Result<Vec<EntityIn>, String> {
                 }
             }
         }
+        let aliases = match obj.get("aliases") {
+            None | Some(Js::Null) => Vec::new(),
+            Some(Js::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item.as_str() {
+                        Some(a) => out.push(a.to_string()),
+                        None => return Err("entities[].aliases must be an array of strings".into()),
+                    }
+                }
+                out
+            }
+            Some(_) => return Err("entities[].aliases must be an array of strings".into()),
+        };
         out.push(EntityIn {
             key: key.to_string(),
             label: label.to_string(),
             props,
+            aliases,
         });
     }
     Ok(out)
@@ -2946,7 +2961,12 @@ fn task_tool_schemas() -> Vec<Js> {
                             "properties": {
                                 "key":   { "type": "string" },
                                 "label": { "type": "string" },
-                                "props": { "type": "object" }
+                                "props": { "type": "object" },
+                                "aliases": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Other names this entity goes by; the store normalises them into its 'aliases' list."
+                                }
                             },
                             "required": ["key", "label"]
                         }

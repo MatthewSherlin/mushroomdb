@@ -90,11 +90,13 @@ fn entities_and_facts_land_in_one_commit() {
             key: "matthew".into(),
             label: "Person".into(),
             props: BTreeMap::new(),
+            aliases: Vec::new(),
         },
         EntityIn {
             key: "v0.7".into(),
             label: "Release".into(),
             props: BTreeMap::new(),
+            aliases: Vec::new(),
         },
     ];
     let facts = vec![FactIn {
@@ -138,6 +140,7 @@ fn an_unnamed_fact_endpoint_becomes_provisional_too() {
         key: "matthew".into(),
         label: "Person".into(),
         props: BTreeMap::new(),
+        aliases: Vec::new(),
     }];
     let facts = vec![FactIn {
         subject: "matthew".into(),
@@ -216,6 +219,7 @@ fn an_unseen_entity_label_becomes_searchable() {
         key: "v0.7".into(),
         label: "Release".into(),
         props,
+        aliases: Vec::new(),
     }];
     remember(
         &mut db,
@@ -264,6 +268,7 @@ fn self_declaring_full_text_for_new_labels_is_bounded() {
             key: format!("thing-{i}"),
             label: format!("Kind{i}"),
             props,
+            aliases: Vec::new(),
         }];
         remember(
             &mut db,

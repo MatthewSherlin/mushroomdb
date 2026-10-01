@@ -5803,3 +5803,82 @@ fn analyze_and_suggest_stay_bounded_on_a_100k_node_store() {
     assert!(took.as_secs() < 10, "suggest_rules took {took:?}");
     eprintln!("suggest_rules: {took:?}, {} bytes", text.len());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// identity — aliases, the preset's report, and resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn aliases_in(db: &SharedDb, key: &str) -> Vec<String> {
+    match db.read().get_prop(key, "aliases") {
+        Some(Value::List(items)) => items
+            .into_iter()
+            .filter_map(|v| match v {
+                Value::Str(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("{key} has no aliases list: {other:?}"),
+    }
+}
+
+/// Binding (OD-1): `upsert_entity` keeps the normalised list, takes caller
+/// aliases as an argument, and refuses them as a property.
+#[test]
+fn upsert_entity_keeps_a_normalised_alias_list() {
+    let db = memory_store("upsert-aliases");
+    one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "label": "Person",
+               "props": {"name": "Matthew Sherlin"}, "aliases": ["Matt"]}),
+    );
+    assert_eq!(
+        aliases_in(&db, "matthew-sherlin"),
+        vec![
+            "matt",
+            "matthew",
+            "matthew sherlin",
+            "matthew-sherlin",
+            "sherlin"
+        ]
+    );
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "props": {"aliases": ["m"]}}),
+    ));
+    assert!(err.contains("maintained by the store"), "{err}");
+    let err = error_text(&one_task_call(
+        db,
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "props": {}, "aliases": "Matt"}),
+    ));
+    assert!(err.contains("aliases must be an array of strings"), "{err}");
+}
+
+/// Binding (OD-1): `remember`'s entities take aliases too, and stubs get the
+/// list their key implies.
+#[test]
+fn remember_entities_and_stubs_carry_aliases() {
+    let db = memory_store("remember-aliases");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({
+            "text": "Matt and Reid met",
+            "about": ["reid"],
+            "entities": [{"key": "matthew", "label": "Person", "aliases": ["Matt"]}]
+        }),
+    );
+    assert_eq!(aliases_in(&db, "matthew"), vec!["matt", "matthew"]);
+    assert_eq!(aliases_in(&db, "reid"), vec!["reid"]);
+    let err = error_text(&one_task_call(
+        db,
+        "remember",
+        json!({"text": "x", "entities": [{"key": "k", "label": "Person", "aliases": 3}]}),
+    ));
+    assert!(
+        err.contains("entities[].aliases must be an array of strings"),
+        "{err}"
+    );
+}

@@ -666,6 +666,18 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
         Ok(n) => n,
         Err(e) => return CallOutcome::ToolErr(e),
     };
+    let aliases: Vec<String> = match args.get("aliases") {
+        None | Some(Js::Null) => Vec::new(),
+        Some(Js::Array(items)) => match items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(a) => a,
+            None => return CallOutcome::ToolErr("aliases must be an array of strings".into()),
+        },
+        Some(_) => return CallOutcome::ToolErr("aliases must be an array of strings".into()),
+    };
 
     // One row, stamped with the namespace, whichever path takes it: the
     // conflict rule between an explicit `props.ns` and `namespace` is then the
@@ -728,7 +740,9 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
             to_set.push((field, v));
         }
         let count = to_set.len();
-        if let Err(e) = memory::remember::describe_entity(&mut g, key, None, &to_set) {
+        if let Err(e) =
+            memory::remember::describe_entity_with_aliases(&mut g, key, None, &to_set, &aliases)
+        {
             return CallOutcome::ToolErr(graph_err_msg(e));
         }
         CallOutcome::ToolOk(json!({
@@ -745,7 +759,13 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
         row.insert("id".to_string(), Value::Str(key.to_string()));
         let props: Vec<(String, Value)> = row.into_iter().collect();
         let mut g = db.write();
-        match memory::remember::describe_entity(&mut g, key, Some(label), &props) {
+        match memory::remember::describe_entity_with_aliases(
+            &mut g,
+            key,
+            Some(label),
+            &props,
+            &aliases,
+        ) {
             Ok(_) => CallOutcome::ToolOk(json!({
                 "ok": true,
                 "key": key,
@@ -1424,6 +1444,11 @@ fn graph_tools() -> Vec<Js> {
                         "namespace": {
                             "type": "string",
                             "description": "Namespace for a node this call creates. Omitted means the 'default' namespace. On a node that already exists, naming the namespace it is in is a no-op and naming another one is refused — a namespace is set at insert and cannot be changed."
+                        },
+                        "aliases": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Other names this entity goes by. The store keeps a normalised 'aliases' list from these, the key and the name; do not set 'aliases' in props."
                         }
                     },
                     "required": ["key", "props"]
