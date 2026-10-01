@@ -91,7 +91,7 @@ def _answers(db: GraphDb) -> dict:
         "similar": db.query(
             "MATCH (a)-[:SIMILAR]->(b) RETURN key(a) AS a, key(b) AS b ORDER BY a, b"
         ),
-        "find_similar": db.find_similar("emb", VECTORS["a"], k=10, exact=True),
+        "find_similar": db.find_similar("emb", VECTORS["a"], k=10, min=0.0, exact=True),
         "degree": {k: db.degree(k) for k in ("a", "b", "c", "d")},
         "degree_links_out": {k: db.degree(k, edge_type="LINKS", direction="out") for k in "abcd"},
         "stats": stats,

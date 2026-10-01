@@ -2474,6 +2474,35 @@ mod tests {
             json!(core_api::FIND_SIMILAR_DEFAULT_MIN),
             "the reply echoes the floor it applied"
         );
+
+        // Naming it still reaches everything, in score order: the argument is
+        // read, not replaced by the default.
+        let resp = tool_call(
+            &db,
+            2,
+            "find_similar",
+            json!({
+                "vector": [1.0, 0.0],
+                "field": "emb",
+                "label": "Item",
+                "k": 10,
+                "min": 0.0
+            }),
+        );
+        assert!(!is_error(&resp), "vector search must not error");
+        let result = tool_text(&resp);
+        let results = result["results"].as_array().expect("results array");
+        let keys: Vec<&str> = results.iter().filter_map(|r| r["key"].as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["close", "mid", "far"],
+            "an explicit min of 0.0 keeps the hits the default drops"
+        );
+        assert_eq!(
+            result["min"],
+            json!(0.0),
+            "the reply echoes the named floor"
+        );
     }
 
     /// `find_similar` with `mask` must exclude hidden node keys from results.
