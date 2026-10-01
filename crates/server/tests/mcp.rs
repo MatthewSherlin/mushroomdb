@@ -5308,6 +5308,37 @@ fn forgetting_a_property_removes_only_that_property() {
     );
 }
 
+/// A forgotten name's words stay in the store-maintained `aliases`; the reply
+/// says so, and how to clear them. Forgetting any other property does not.
+#[test]
+fn forgetting_a_name_says_its_words_remain_in_aliases() {
+    let db = memory_store("forget-name");
+    one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "jane", "label": "Person",
+               "props": {"name": "Jane Q Public", "email": "j@example.com"}}),
+    );
+    let email = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "jane", "prop": "email"}),
+    ));
+    assert!(!email.contains("aliases"), "{email}");
+
+    let name = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "jane", "prop": "name"}),
+    ));
+    assert!(name.starts_with("forgot jane.name"), "{name}");
+    assert!(
+        name.contains("its words remain in `aliases`")
+            && name.contains("forget {key: \"jane\", prop: \"aliases\"}"),
+        "{name}"
+    );
+}
+
 /// Binding: retracting a fact removes the edge and names the notes whose text
 /// still states it.
 #[test]
@@ -5702,6 +5733,38 @@ fn analyze_clusters_drops_singletons_and_says_how_many() {
     assert_eq!(report["singletons"], json!(4), "{report}");
     for row in report["rows"].as_array().unwrap() {
         assert!(row["size"].as_u64().unwrap() > 1, "{row}");
+    }
+}
+
+/// Floats at fixed precision: the json reply rounds as the text does — 3
+/// places for modularity, 2 for cohesion. Two triangles joined by one edge
+/// score modularity 6/7 - 1/2 = 0.357142…, which has no exact decimal form.
+#[test]
+fn analyze_clusters_json_rounds_its_floats_as_the_text_does() {
+    let db = memory_store("analyze-rounding");
+    {
+        let mut g = db.write();
+        for key in ["a", "b", "c", "d", "e", "f"] {
+            g.insert_node("Person", key, vec![("name".into(), Value::Str(key.into()))])
+                .unwrap();
+        }
+        for (s, d) in [
+            ("a", "b"),
+            ("b", "c"),
+            ("a", "c"),
+            ("d", "e"),
+            ("e", "f"),
+            ("d", "f"),
+            ("c", "d"),
+        ] {
+            g.insert_edge("KNOWS", s, d).unwrap();
+        }
+    }
+    let report = task_report(db, "analyze", json!({"kind": "clusters"}));
+    assert_eq!(report["modularity"], json!(0.357), "{report}");
+    for row in report["rows"].as_array().unwrap() {
+        let c = row["cohesion"].as_f64().unwrap();
+        assert_eq!(c, (c * 100.0).round() / 100.0, "{row}");
     }
 }
 

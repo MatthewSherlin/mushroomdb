@@ -1988,7 +1988,7 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                         .map(|p| json!({
                             "a": p.a,
                             "b": p.b,
-                            "score": (p.score * 100.0).round() / 100.0,
+                            "score": round_to(p.score, 2),
                         }))
                         .collect::<Vec<_>>(),
                 }),
@@ -2059,6 +2059,9 @@ struct ForgetReport {
     notes_total: usize,
     /// The first commit history still answers from.
     history_floor: u64,
+    /// `prop` mode removed `name` from a node that still carries `aliases`,
+    /// which hold that name's words.
+    name_in_aliases: bool,
 }
 
 /// Every field a predicate reads, its parts' included, sorted and deduped.
@@ -2113,6 +2116,18 @@ fn history_line(floor: u64) -> String {
     )
 }
 
+/// What a forgotten `name` leaves behind. The store keeps `aliases` by
+/// accumulation: a later write unites the old list with what the key and the
+/// current name imply, so the words stay until `aliases` itself is forgotten,
+/// after which the next write rebuilds it from the key and current name.
+fn name_in_aliases_line(target: &str) -> String {
+    let key = digest::sanitize(target.strip_suffix(".name").unwrap_or(target));
+    format!(
+        "its words remain in `aliases` and keep matching identity rules; later writes \
+         keep them — forget {{key: \"{key}\", prop: \"aliases\"}} clears them\n"
+    )
+}
+
 fn render_forget(r: &ForgetReport) -> String {
     let target = digest::sanitize(&r.target);
     let mut out = match (r.mode, r.changed) {
@@ -2128,6 +2143,9 @@ fn render_forget(r: &ForgetReport) -> String {
                     r.derived_edges,
                     digest::sanitize(r.prop.as_deref().unwrap_or_default())
                 ));
+            }
+            if r.name_in_aliases {
+                line.push_str(&name_in_aliases_line(&r.target));
             }
             line
         }
@@ -2212,6 +2230,7 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 notes_total: notes.len(),
                 notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
                 history_floor: g.stats().history_floor,
+                name_in_aliases: false,
             }
         }
         (Some(key), Some(prop), None) => {
@@ -2226,6 +2245,10 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 Ok(c) => c,
                 Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
             };
+            let name_in_aliases = changed
+                && prop == core_api::memory_schema::NAME_FIELD
+                && g.get_prop(&key, core_api::memory::identity::ALIASES_FIELD)
+                    .is_some();
             let retracted = if changed {
                 let after = derived_edges_on(&g, &key).unwrap_or_default();
                 before.difference(&after).count() as u64
@@ -2242,6 +2265,7 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 notes: Vec::new(),
                 notes_total: 0,
                 history_floor: g.stats().history_floor,
+                name_in_aliases,
             }
         }
         (None, None, Some((subject, predicate, object))) => {
@@ -2270,6 +2294,7 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 notes_total: notes.len(),
                 notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
                 history_floor: g.stats().history_floor,
+                name_in_aliases: false,
             }
         }
         _ => return CallOutcome::ToolErr(FORGET_SHAPE.into()),
@@ -2528,7 +2553,7 @@ fn tool_suggest_rules(db: &SharedDb, db_dir: Option<&Path>, json_out: bool) -> C
             examples: s
                 .examples
                 .into_iter()
-                .map(|(a, b, score)| (a, b, (score * 100.0).round() / 100.0))
+                .map(|(a, b, score)| (a, b, round_to(score, 2)))
                 .collect(),
             rationale: s.rationale,
         });
@@ -2570,6 +2595,13 @@ fn top_arg(args: &Js) -> Result<usize, String> {
                 .min(ANALYZE_MAX_TOP)),
         },
     }
+}
+
+/// `x` rounded to `places` decimals: a json reply's floats at the precision
+/// its text prints them, so the two agree and a re-run is byte-identical.
+fn round_to(x: f64, places: i32) -> f64 {
+    let scale = 10f64.powi(places);
+    (x * scale).round() / scale
 }
 
 /// A key as `analyze` prints it: sanitized and cut at [`ANALYZE_KEY_CHARS`].
@@ -2779,7 +2811,7 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 rows.push(json!({
                     "canonical": c.canonical,
                     "size": c.members.len(),
-                    "weakest": (c.weakest * 100.0).round() / 100.0,
+                    "weakest": round_to(c.weakest, 2),
                     "members": c.members.iter().take(ANALYZE_SAMPLE_MEMBERS).collect::<Vec<_>>()
                 }));
             }
@@ -2818,7 +2850,7 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 ));
                 rows.push(json!({
                     "size": c.members.len(),
-                    "cohesion": c.cohesion,
+                    "cohesion": round_to(c.cohesion, 2),
                     "members": c.members.iter().take(ANALYZE_SAMPLE_MEMBERS).collect::<Vec<_>>()
                 }));
             }
@@ -2826,7 +2858,7 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 text,
                 json!({
                     "kind": kind, "nodes": nodes, "clusters": multi.len(),
-                    "singletons": single.len(), "modularity": r.modularity,
+                    "singletons": single.len(), "modularity": round_to(r.modularity, 3),
                     "listed": rows.len(), "rows": rows
                 }),
             )
