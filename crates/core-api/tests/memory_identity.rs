@@ -176,6 +176,113 @@ fn an_aliases_property_is_refused_with_the_argument_named() {
     assert!(!db.has_node("matthew"), "a refusal writes nothing");
 }
 
+// ── an `aliases` property a 0.6 store already carries ──────────────────────
+
+/// A node as a 0.6 store holds it: written raw, with its own `aliases`.
+fn upgraded_node(name: &str, key: &str, aliases: Value) -> GraphDb<core_storage::fs::RealFs> {
+    let mut db = store(name);
+    db.insert_node(
+        "Person",
+        key,
+        vec![
+            ("name".to_string(), Value::Str("Matthew Sherlin".into())),
+            (ALIASES_FIELD.to_string(), aliases),
+        ],
+    )
+    .unwrap();
+    db
+}
+
+fn set_role(db: &mut GraphDb<core_storage::fs::RealFs>, key: &str) -> core_api::Result<()> {
+    describe_entity(
+        db,
+        key,
+        None,
+        &[("role".to_string(), Value::Str("owner".into()))],
+    )
+    .map(|_| ())
+}
+
+#[test]
+fn an_existing_string_alias_is_kept_in_canonical_form() {
+    let mut db = upgraded_node("str-alias", "matthew-sherlin", Value::Str("Matt S".into()));
+    set_role(&mut db, "matthew-sherlin").unwrap();
+    assert_eq!(
+        aliases_of(&db, "matthew-sherlin"),
+        strings(&[
+            "matt s",
+            "matthew",
+            "matthew sherlin",
+            "matthew-sherlin",
+            "sherlin"
+        ]),
+        "the caller's string must survive as one alias"
+    );
+}
+
+#[test]
+fn an_existing_mixed_case_list_is_normalised() {
+    let mut db = upgraded_node(
+        "list-alias",
+        "matthew-sherlin",
+        Value::List(vec![
+            Value::Str("Countess".into()),
+            Value::Str("Ada".into()),
+        ]),
+    );
+    set_role(&mut db, "matthew-sherlin").unwrap();
+    let aliases = aliases_of(&db, "matthew-sherlin");
+    for want in ["countess", "ada"] {
+        assert!(aliases.contains(&want.to_string()), "{want}: {aliases:?}");
+    }
+    for gone in ["Countess", "Ada"] {
+        assert!(!aliases.contains(&gone.to_string()), "{gone}: {aliases:?}");
+    }
+}
+
+#[test]
+fn an_existing_aliases_of_another_type_is_refused_and_nothing_is_written() {
+    let mut db = upgraded_node("int-alias", "matthew-sherlin", Value::Int(3));
+    let err = set_role(&mut db, "matthew-sherlin")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("matthew-sherlin") && err.contains("forget") && err.contains("aliases"),
+        "{err}"
+    );
+    assert_eq!(
+        db.get_prop("matthew-sherlin", "role"),
+        None,
+        "nothing written"
+    );
+    assert_eq!(
+        db.get_prop("matthew-sherlin", ALIASES_FIELD),
+        Some(Value::Int(3)),
+        "the value is not overwritten"
+    );
+}
+
+/// The lowercased key is the one item the store writes that is not in
+/// canonical form; folding it would rewrite every list on the next write.
+#[test]
+fn a_list_the_store_wrote_is_left_byte_identical() {
+    let mut db = store("store-written");
+    describe_entity(
+        &mut db,
+        "Matthew-Sherlin",
+        Some("Person"),
+        &[("name".to_string(), Value::Str("Matthew Sherlin".into()))],
+    )
+    .unwrap();
+    let first = aliases_of(&db, "Matthew-Sherlin");
+    assert!(first.contains(&"matthew-sherlin".to_string()), "{first:?}");
+    assert_eq!(
+        core_api::memory::identity::aliases_after_write(&db, "Matthew-Sherlin", &[], &[]).unwrap(),
+        None,
+        "nothing to rewrite"
+    );
+}
+
 #[test]
 fn more_aliases_than_the_cap_is_refused_before_anything_is_written() {
     let mut db = store("cap");

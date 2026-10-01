@@ -152,18 +152,43 @@ pub fn derive_aliases(key: &str, name: Option<&str>, caller: &[String]) -> Vec<S
 /// is what an identity rule should compare. `forget` with `prop: "aliases"`
 /// clears them. Refused, naming the node, when the union would exceed
 /// [`MAX_ALIASES`].
+///
+/// An `existing` value written before 0.7 is taken in, not overwritten: a
+/// string is one alias in [`canonical`] form, and each list item is folded
+/// through it, keeping a store-written list byte-identical.
+/// Any other value — a number, a map, a list holding one — is refused, naming
+/// the node, rather than silently replaced.
 pub fn merge_aliases(
     key: &str,
     existing: Option<&Value>,
     derived: &[String],
 ) -> Result<Vec<String>> {
     let mut out: BTreeSet<String> = derived.iter().cloned().collect();
-    if let Some(Value::List(items)) = existing {
-        for item in items {
-            if let Value::Str(s) = item {
-                out.insert(s.clone());
+    let foreign = || GraphError::IngestError {
+        detail: format!(
+            "'{key}' already carries an '{ALIASES_FIELD}' property that is not a string or \
+             a list of strings; clear it with forget {{key: \"{key}\", prop: \
+             \"{ALIASES_FIELD}\"}} first"
+        ),
+    };
+    match existing {
+        None => {}
+        // The store never writes a bare string, so it is a caller's: canonical.
+        Some(Value::Str(s)) => {
+            let c = canonical(s);
+            if !c.is_empty() {
+                out.insert(c);
             }
         }
+        Some(Value::List(items)) => {
+            for item in items {
+                match item {
+                    Value::Str(s) => insert_folded(&mut out, s),
+                    _ => return Err(foreign()),
+                }
+            }
+        }
+        Some(_) => return Err(foreign()),
     }
     if out.len() > MAX_ALIASES {
         return Err(GraphError::IngestError {
@@ -175,6 +200,23 @@ pub fn merge_aliases(
         });
     }
     Ok(out.into_iter().collect())
+}
+
+/// Add one existing alias to `out`, folded through [`canonical`].
+///
+/// An item already lowercase and trimmed is kept verbatim: that is the form of
+/// every item the store writes, including the lowercased key (current, or a
+/// former one a rename left behind), which is deliberately not tokenised. So a
+/// list the store wrote passes through byte-identical.
+fn insert_folded(out: &mut BTreeSet<String>, alias: &str) {
+    let folded = if alias == alias.to_lowercase() && alias == alias.trim() {
+        alias.to_string()
+    } else {
+        canonical(alias)
+    };
+    if !folded.is_empty() {
+        out.insert(folded);
+    }
 }
 
 /// The list as a stored value.
