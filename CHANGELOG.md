@@ -206,7 +206,10 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   change, gave the same numbers
   (`benchmarks/identity/results/20261001T143503Z/summary.md`): the frozen set
   declares no alias equal to a stub's key, so the gate cannot show the claim
-  rules' gain, and tests do.
+  rules' gain, and tests do. Those two runs were measured while declared
+  aliases still counted toward `Overlap`. A third run after they stopped,
+  pre-registered as expecting no pair to change side, gave the same numbers
+  again (`benchmarks/identity/results/20261001T161603Z/summary.md`).
 
 ### Fixed
 
@@ -250,7 +253,15 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **A subject named before it was described cannot claim a stub.** It is an
   `Entity` for life, and the claim rules run from the five entity labels.
   `upsert_entity` refuses to relabel it; `remember`'s `entities` describes it
-  without relabelling.
+  without relabelling. An `Entity`-to-`Entity` claim rule that would close
+  this is held pending an engine fix: the engine gives a derived edge one
+  owner, so that rule and the existing `Entity` overlap rule would lose each
+  other's links on retraction.
+- **Two rules that share a label pair and an edge type can lose each other's
+  edges.** When both derive the same directed edge, one owns it; when the
+  owner's predicate stops holding, the edge is removed although the other
+  rule still wants it, until that rule is rebuilt or one of its own fields is
+  written. No rule this release ships collides. Deferred to 0.8.
 - **Two strangers with one full name link.** `john-smith-nyc` and
   `john-smith-sf` score 3/5. The link is visible in `remember`'s reply and
   explainable with `explain_association`, but it is wrong — the gate's one
