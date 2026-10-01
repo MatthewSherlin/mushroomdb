@@ -5060,6 +5060,75 @@ mod tests {
         }
     }
 
+    /// Defect ledger row 37 (`docs/roadmap/v0.6.10-defects.md`), deferred to
+    /// 0.8. Two rules share `(src_label, dst_label, edge_type)` and both
+    /// desire `a→b`. An edge has one owner, the rule that added it; the other
+    /// records nothing. When the owner's predicate stops holding it removes
+    /// the edge without asking whether another rule still desires it, and the
+    /// other rule is not fired, because no field it watches changed. The edge
+    /// stays gone until that rule is rebuilt or one of its own fields is
+    /// written. `delete_rule` already handles the same collision with a
+    /// survivor rebuild (`coowned_edge_type_survives_first_delete_gone_after_second`);
+    /// incremental retraction has no equivalent.
+    ///
+    /// This asserts what should be true, so it fails today.
+    #[test]
+    #[ignore = "defect ledger row 37: incremental retraction removes an edge another rule \
+                with the same label pair and edge type still desires; deferred to 0.8"]
+    fn an_edge_two_rules_desire_survives_the_owners_retraction() {
+        let rule = |name: &str, predicate: Predicate| RuleDef {
+            name: name.into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate,
+            edge_type: "SAME".into(),
+            weight_prop: Some("weight".into()),
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        };
+        let mut fx = Fx::new();
+        let a = fx.add("A", "a", vec![("tags", tags(&["x", "y"]))]);
+        let b = fx.add("A", "b", vec![("tags", tags(&["x", "y"]))]);
+        let et = fx.syms.intern("SAME");
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            let overlap = Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.6,
+            };
+            eng.create_rule(rule("overlap", overlap), &mut g).unwrap();
+            let claim = Predicate::KeyMatch { field: "fk".into() };
+            eng.create_rule(rule("claim", claim), &mut g).unwrap();
+            assert!(g.topo.neighbors(et, Direction::Out, a).contains(&b));
+        }
+        // `a` now names `b` by key: the claim rule desires a→b too.
+        fx.props.set(a, "fk", Value::Str("b".into()));
+        {
+            let mut g = fx.g();
+            eng.on_node_changed(a, Some(("fk", None)), &mut g);
+            assert!(g.topo.neighbors(et, Direction::Out, a).contains(&b));
+        }
+        // `a`'s tags change: the overlap no longer holds, the claim still does.
+        let old = fx.props.get(a, "tags").cloned();
+        fx.props.set(a, "tags", tags(&["q"]));
+        let mut g = fx.g();
+        eng.on_node_changed(a, Some(("tags", old)), &mut g);
+        assert!(
+            g.topo.neighbors(et, Direction::Out, a).contains(&b),
+            "a→b is still desired by the claim rule and must survive the overlap rule's retraction"
+        );
+        assert_eq!(
+            g.edge_props.get(et, a, b, "weight"),
+            Some(&Value::Float(1.0)),
+            "and it is the claim's edge now, at the claim's weight"
+        );
+    }
+
     /// Helper: FieldEqual rule with top-k per-source cap.
     fn topk_eq_rule(k: u64) -> RuleDef {
         RuleDef {
