@@ -245,7 +245,7 @@ Not v1: general editing/admin UI, dashboards, saved queries.
 | Metric | Target |
 |---|---|
 | Point lookup + depth-2 typed neighborhood, 10k-node graph | < 100 µs engine-side |
-| Same, 10M-node graph | < 10 ms *(never measured; the largest store run is 100,000 nodes)* |
+| Same, 10M-node graph | < 10 ms *(Correction, 2026-10: never measured; the largest store run is 100,000 nodes)* |
 | Insert with 5 active rules, 100k-node graph | < 1 ms |
 | DB open (5 GB snapshot) | Target < 100 ms (mmap/rkyv; deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md`). Current V6 zstd-bincode open is ~8.88 s at 100k nodes |
 | UI: click-to-rendered neighborhood (500 nodes, end-to-end) | < 100 ms |

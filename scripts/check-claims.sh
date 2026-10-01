@@ -60,7 +60,7 @@ CLAIM_PATTERNS=(
   '(beats|outperforms)[[:space:]]+(a[[:space:]]+)?stock'
   # A scale that was never run. 100,000 nodes is the largest store measured;
   # "10M nodes" was a design intent stated as a target (spec section 6.4).
-  '10[[:space:]]?M[[:space:]-]+nodes?|10[[:space:]]million[[:space:]]nodes'
+  '(^|[^0-9A-Za-z,])(10[[:space:]]?M\+?|10,000,000|10[[:space:]]million)[[:space:]-]+nodes?'
 )
 
 GREP_PATTERNS=(
