@@ -443,9 +443,10 @@ Usage:
   mushroomdb doctor [--project|--user] [--platform claude-code|cursor|codex|all]
                      verify an install: config entry, store, hooks, and a real stdio
                      handshake with the configured MCP command; exits 1 on any `fail`
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>]
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
                      --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
+                     --tls-cert and --tls-key go together and need a build with the `tls` feature
   mushroomdb mcp <db-dir>|--auto [--all-tools]
                      --all-tools lists every served tool; the default lists the association tools on every store,
                      a store `ingest-git` built included (the rest stay callable, just unlisted)
@@ -3692,6 +3693,8 @@ mod tests {
             "--demo-if-empty",
             "--token",
             "--role-token TOKEN:ROLE",
+            "--tls-cert <pem> --tls-key <pem>",
+            "a build with the `tls` feature",
             "--snapshot-every",
         ] {
             assert!(
