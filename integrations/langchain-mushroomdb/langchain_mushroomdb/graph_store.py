@@ -108,7 +108,7 @@ class MushroomDBGraphStore(GraphStore):
     def get_structured_schema(self) -> Dict[str, Any]:
         """Return the current schema as a structured dict.
 
-        Shape (mirrors Neo4jGraph convention)::
+        Shape (the usual graph-store convention)::
 
             {
                 "node_props": {"Person": ["age", "name"], "Movie": ["title"]},
@@ -187,7 +187,7 @@ class MushroomDBGraphStore(GraphStore):
                         "end": dst_info["label"],
                     })
 
-        # Structured schema dict (mirrors Neo4jGraph convention).
+        # Structured schema dict (the usual graph-store convention).
         self._structured_schema = {
             "node_props": {lbl: sorted(props) for lbl, props in node_props.items()},
             "rel_props": {},

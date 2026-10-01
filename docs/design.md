@@ -19,13 +19,13 @@ One-line positioning: *"The embedded graph database that builds itself."*
 
 ### Market rationale (validated 2026-08)
 
-- Kuzu (the "SQLite for graphs") was archived Oct 2025 after Apple acquired it;
+- system B (the "a named system for graphs") was archived Oct 2025 after Apple acquired it;
   community forks are thin. There is a live vacuum for a truly open-source embedded
   graph engine.
 - No shipping engine offers declarative, incrementally maintained linking rules as a
-  native primitive. Closest prior art: TigerGraph ER solution patterns (build-it-
-  yourself, enterprise), Neo4j GDS similarity (batch, not incremental), RDF reasoners
-  (SPARQL land), Materialize/differential dataflow (not a graph DB). The underlying
+  native primitive. Closest prior art: a named system ER solution patterns (build-it-
+  yourself, enterprise), system A GDS similarity (batch, not incremental), RDF reasoners
+  (SPARQL land), a named system/differential dataflow (not a graph DB). The underlying
   CS is de-risked; the product does not exist.
 - GQL became an ISO standard (April 2024); openCypher compatibility inherits the
   ecosystem. A custom query language is explicitly rejected.
@@ -50,7 +50,7 @@ ingestion posture.
 
 | Decision | Choice |
 |---|---|
-| Deployment shape | Embedded Rust core + optional thin server + bundled UI (DuckDB playbook); `mushroomdb serve <db-dir>` serves the UI locally |
+| Deployment shape | Embedded Rust core + optional thin server + bundled UI (a named system playbook); `mushroomdb serve <db-dir>` serves the UI locally |
 | Query surface | Programmatic traversal API (primary) + openCypher subset (compat). No custom language, ever |
 | Auto-linking | Layered: zero-config key/FK inference by default + declared incremental rules. LLM extraction is a possible later optional plugin, never core |
 | Storage model | Memory-first HashMap topology + HashMap columns; CRC WAL + zstd-compressed bincode snapshots (V6). Sortledton adjacency and mmap'd snapshots deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
@@ -59,7 +59,7 @@ ingestion posture.
 | Results format | Apache Arrow for query results (IPC over HTTP; pandas/polars in Python). JSON is used for `?format=json`, `/watch`, `/subscribe`, and MCP |
 | UI rendering | cosmos.gl (GPU force layout + rendering; OpenJS Foundation) |
 | Bindings | Python (PyO3) and Rust at launch; TypeScript via HTTP `mushroomdb-client`. napi-rs deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
-| Testing | Deterministic simulation testing (FoundationDB-style) from day one + model-based oracle testing + rule-equivalence invariant. Differential Cypher testing vs Neo4j deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
+| Testing | Deterministic simulation testing (a named system-style) from day one + model-based oracle testing + rule-equivalence invariant. Differential Cypher testing vs system A deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
 | Scale target | Design for 10M nodes in RAM (~5–15 GB with properties); document the RAM ceiling honestly. Real initial workloads are ~10k nodes |
 
 ### Explicit non-goals (v1)
@@ -228,13 +228,13 @@ Not v1: general editing/admin UI, dashboards, saved queries.
    a deliberately naive in-memory oracle; exact-match required.
 3. **Rule-equivalence invariant:** after any op sequence, incremental edges ==
    from-scratch `rebuild`. Shrunken repro on failure.
-4. **Differential Cypher testing vs Neo4j** is deferred; see
+4. **Differential Cypher testing vs system A** is deferred; see
    `docs/superpowers/specs/2026-08-25-best-graph-db.md`. cargo-fuzz on parser and
    WAL/snapshot readers ships.
 5. **Cross-binding conformance:** one shared corpus (queries + expected Arrow
    results) through Rust/Python/TS in the CI matrix.
 6. **Performance:** criterion microbenchmarks with CI regression gates; public
-   reproducible benchmark harness vs Neo4j, Kuzu 0.11.3, Memgraph (LDBC-SNB-style
+   reproducible benchmark harness vs system A, system B 0.11.3, system C (LDBC-SNB-style
    interactive + typed-neighborhood workload); numbers, hardware, and rerun scripts
    in-repo.
 7. **UI:** automated Playwright frame-rate tests (500 / 5k / 50k nodes) asserting
@@ -250,7 +250,7 @@ Not v1: general editing/admin UI, dashboards, saved queries.
 | DB open (5 GB snapshot) | Target < 100 ms (mmap/rkyv; deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md`). Current V6 zstd-bincode open is ~8.88 s at 100k nodes |
 | UI: click-to-rendered neighborhood (500 nodes, end-to-end) | < 100 ms |
 | UI: smooth interaction | 50k+ nodes without frame collapse |
-| Replaces talent-backend Neo4j usage | current 5+ s queries < 50 ms end-to-end |
+| Replaces talent-backend system A usage | current 5+ s queries < 50 ms end-to-end |
 
 ## 11. Open Items
 

@@ -308,6 +308,5 @@ cargo test -p sim-harness -- --nocapture 2>&1 | grep -E "crash points|recall|tes
   facade). Race conditions between writers are excluded by the architecture, not tested.
 - **Network-layer correctness** — the HTTP and WebSocket layers have golden-shape tests
   in `crates/server/tests/`; they do not yet have fault-injection or load tests.
-- **Differential Cypher testing against Neo4j** — the harness in `benchmarks/test_harness.py`
-  runs against a live Neo4j instance; it is not part of `cargo test --workspace`. Known
-  Cypher gaps are documented in [`docs/site/query.md`](query.md).
+- **Cypher coverage** — the supported subset and its known gaps are documented in
+  [`docs/site/query.md`](query.md).

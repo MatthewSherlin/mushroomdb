@@ -251,13 +251,12 @@ checked continuously in the property-test suite
 (`crates/sim-harness/tests/oracle_equivalence.rs`). Any rule predicate
 addition must extend the oracle path first.
 
-### Differential Cypher testing
+### Cypher coverage
 
-The Cypher executor is continuously tested against Neo4j on the supported
-subset (see `benchmarks/test_harness.py` for the harness). New query
-features must add a differential case. Known gaps (no LIMIT pushdown in
-join materialization) are documented in `README.md` and may not be silently
-introduced — surface new limitations explicitly.
+A new query feature adds a case to `crates/core-api/tests/query.rs` and a row to the coverage
+table in `docs/site/query.md`. Known gaps (no LIMIT pushdown in join materialization) are
+documented in `README.md` and may not be silently introduced — surface new limitations
+explicitly.
 
 ---
 

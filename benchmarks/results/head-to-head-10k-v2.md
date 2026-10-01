@@ -1,9 +1,9 @@
-# Head-to-head benchmark v2 — mushroomdb vs. Neo4j / KùzuDB / Memgraph
+# Head-to-head benchmark v2 — mushroomdb vs. system A / system B / system C
 
 > **Supersedes** `benchmarks/results/head-to-head-10k.md` (v1, 2026-08-20).
-> v1 had: mushroomdb two-hop ERROR (pull executor not yet landed), memgraph
+> v1 had: mushroomdb two-hop ERROR (pull executor not yet landed), system C
 > scan-filter semantically broken (stores key only), same-port contamination
-> for the memgraph run.  All three are resolved here.
+> for the system C run.  All three are resolved here.
 
 ## Machine / date / versions
 
@@ -17,30 +17,30 @@
 | Engine | Version |
 |---|---|
 | mushroomdb | 0.1.0 (embedded Rust, Python bindings; pull executor + V4 snapshot) |
-| neo4j | 5-community (image: `neo4j:5-community`; driver: `neo4j` 6.2.0) |
-| kuzu | 0.11.3 (pip, embedded) |
-| memgraph | latest (image: `memgraph/memgraph:latest`; driver: `neo4j` 6.2.0 via bolt) |
+| system A | 5-community (image: `system A:5-community`; driver: `system A` 6.2.0) |
+| system B | 0.11.3 (pip, embedded) |
+| system C | latest (image: `system C/system C:latest`; driver: `system A` 6.2.0 via bolt) |
 
 ---
 
 ## Honesty notes
 
 - **mushroomdb** numbers are **embedded Rust** (no network RTT, no serialization overhead).
-  KùzuDB is also embedded — its numbers are directly comparable to mushroomdb's.
-  Neo4j and Memgraph numbers go over bolt/localhost (~0.1–1 ms round-trip per query).
+  system B is also embedded — its numbers are directly comparable to mushroomdb's.
+  system A and system C numbers go over bolt/localhost (~0.1–1 ms round-trip per query).
 - **rule_derive** is mushroomdb-only — competitors have no auto-derivation equivalent.
   It is excluded from the cross-engine table. See `benchmarks/README.md`.
-- **Sequential runs required** (contamination guard): Neo4j and Memgraph both default to
+- **Sequential runs required** (contamination guard): system A and system C both default to
   `bolt://localhost:7687`. They were run strictly sequentially:
-  - Run A (neo4j only): dai-neo4j stopped; `bench-neo4j` (`neo4j:5-community`,
-    `NEO4J_AUTH=none`) on `:7687`; ours and kuzu run simultaneously (embedded).
-  - Run B (memgraph only): `bench-neo4j` stopped; `bench-memgraph`
-    (`memgraph/memgraph:latest`) on `:7687`. Port free verified with `docker ps`
+  - Run A (system A only): dai-system A stopped; `bench-system A` (`system A:5-community`,
+    `system A_AUTH=none`) on `:7687`; ours and system B run simultaneously (embedded).
+  - Run B (system C only): `bench-system A` stopped; `bench-system C`
+    (`system C/system C:latest`) on `:7687`. Port free verified with `docker ps`
     before each run.
-- **memgraph adapter fix (v2):** the memgraph adapter previously stored only the `key`
+- **system C adapter fix (v2):** the system C adapter previously stored only the `key`
   field (`CREATE (n:{label} {key: row.key})`). Fixed to `SET n = row` which stores all
   fields (key + props). `cypher_scan_filter` now correctly returns 1,400 rows (same as
-  neo4j/mushroomdb) instead of 0. `bulk_ingest` time increased from 46 ms to 19.9 s
+  system A/mushroomdb) instead of 0. `bulk_ingest` time increased from 46 ms to 19.9 s
   because full property serialization now occurs.
 - **cypher_two_hop (I1 fix — fair comparison):** mushroomdb derives INDUSTRY_ALIGNMENT edges
   automatically via the `bench_industry_tc` rule (FieldEqual on `industry`). For a fair
@@ -48,24 +48,24 @@
   engine as ordinary edges (pre-materialization). All four engines then ran the same query:
   `MATCH (t:Talent)-[:INDUSTRY_ALIGNMENT]->(c:Company)<-[:INDUSTRY_ALIGNMENT]-(t2:Talent)
   RETURN t.key, c.key, t2.key LIMIT 200` — all return **200 rows**.
-  **Edge pre-materialization times (one-time cost):** neo4j 10.8 s, kuzu 0.17 s (COPY FROM CSV),
-  memgraph 8.0 s. mushroomdb derives the edges in 0.924 s automatically on rule declaration.
+  **Edge pre-materialization times (one-time cost):** system A 10.8 s, system B 0.17 s (COPY FROM CSV),
+  system C 8.0 s. mushroomdb derives the edges in 0.924 s automatically on rule declaration.
   Competitors required manual ETL; mushroomdb's rule engine replaces this step entirely.
-- **kuzu cypher_scan_filter (I2 fix):** KùzuDB adapter updated to store `size_bucket INT64`
+- **system B cypher_scan_filter (I2 fix):** system B adapter updated to store `size_bucket INT64`
   (full props). Scan-filter now uses `WHERE n.size_bucket = 3` — returns 1,400 rows
-  (identical to neo4j/mushroomdb/memgraph). Previous workaround (`STARTS WITH 'talent'`,
+  (identical to system A/mushroomdb/system C). Previous workaround (`STARTS WITH 'talent'`,
   7,000 rows) is retired.
 - **cold_start asymmetry:** mushroomdb `cold_start` measures `GraphDb::open()` + first
-  `node_edges()` call (full process cost). Neo4j / Memgraph `cold_start` measures
+  `node_edges()` call (full process cost). system A / system C `cold_start` measures
   connect+first query with the server **already running** — their server boot cost is
-  reported separately as `boot_to_ready`. KùzuDB (embedded) measures database open + query,
+  reported separately as `boot_to_ready`. system B (embedded) measures database open + query,
   directly comparable to mushroomdb.
 
 ---
 
 ## Cross-engine comparison (wall time)
 
-| workload | mushroomdb | neo4j | kuzu | memgraph |
+| workload | mushroomdb | system A | system B | system C |
 |---|---|---|---|---|
 | bulk_ingest | 0.874 s | 13.227 s | 1.19 min | 19.924 s † |
 | neighborhood_depth1 (p50) | 0.4 µs | 1.81 ms | 101 µs | 3.00 ms |
@@ -77,23 +77,23 @@
 | cold_start (snapshot V4) | **1.01 s** | — | — | — |
 | server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
 
-† memgraph `bulk_ingest`: v2 fix stores full props (`SET n = row`); time reflects real
+† system C `bulk_ingest`: v2 fix stores full props (`SET n = row`); time reflects real
   property serialization. v1 was 46 ms (key only — semantically incomplete).
 
-‡ kuzu `cypher_scan_filter`: I2 fix — adapter now stores `size_bucket INT64`; uses
+‡ system B `cypher_scan_filter`: I2 fix — adapter now stores `size_bucket INT64`; uses
   `WHERE n.size_bucket = 3` returning 1,400 rows (was `STARTS WITH 'talent'` → 7,000 rows).
-  0.37 ms is best-of-5; same predicate semantics as neo4j/mushroomdb/memgraph.
+  0.37 ms is best-of-5; same predicate semantics as system A/mushroomdb/system C.
 
-★ neo4j / kuzu / memgraph `cypher_two_hop` (I1 fix): all return **200 rows** after
+★ system A / system B / system C `cypher_two_hop` (I1 fix): all return **200 rows** after
   1,000,000 INDUSTRY_ALIGNMENT edges were bulk-loaded as ordinary edges (pre-materialization).
-  One-time pre-mat cost: neo4j 10.8 s, kuzu 0.17 s (COPY FROM CSV), memgraph 8.0 s.
+  One-time pre-mat cost: system A 10.8 s, system B 0.17 s (COPY FROM CSV), system C 8.0 s.
   mushroomdb derives the same edges automatically in 0.924 s on rule declaration — no manual
   ETL required. v1 entries showed 0 rows (empty scan); those have been superseded by this run.
   mushroomdb v1 row was ERROR; fixed by the pull executor with LIMIT pushdown.
 
-▲ neo4j / memgraph `cold_start`: server already running; measures connect + first query
+▲ system A / system C `cold_start`: server already running; measures connect + first query
   only. `boot-to-ready` row reports the actual container-start-to-first-query-answered time
-  (neo4j: 6.6 s, memgraph: 4.3 s). mushroomdb and kuzu are embedded — there is no server;
+  (system A: 6.6 s, system C: 4.3 s). mushroomdb and system B are embedded — there is no server;
   `cold_start` IS the full startup cost.
 
 ---
@@ -125,16 +125,16 @@
 |---|---|---|
 | mushroomdb WAL-only (100k) | **8.86 min** | WAL replay re-fires all 12 rules; IVF-Flat dominates (~8.37 min). Same bottleneck as the earlier 7.91 min measurement (non-semantic rules faster now via T1). |
 | mushroomdb snapshot V4 (100k) | **11.15 s** | V4 snapshot loads derived edges + IVF centroids; no rule re-fire. **47.7× faster** than WAL-only. snapshot() write cost was 36.1 s (one-time, paid at graceful shutdown). |
-| neo4j connect-only (10k scale) | 18.54 ms | Server already running; boot-to-ready = 6.6 s |
-| kuzu open+query (10k) | 23.41 ms | Embedded; no rules to replay |
-| memgraph connect-only (10k scale) | 0.42 ms | Server already running; boot-to-ready = 4.3 s |
+| system A connect-only (10k scale) | 18.54 ms | Server already running; boot-to-ready = 6.6 s |
+| system B open+query (10k) | 23.41 ms | Embedded; no rules to replay |
+| system C connect-only (10k scale) | 0.42 ms | Server already running; boot-to-ready = 4.3 s |
 
 **Key finding:** V4 snapshot  reduces 100k cold-start from 8.86 min to 11 s —
 a 47.7× improvement. The honest embedded-vs-server comparison:
 - mushroomdb (embedded): 11 s from V4 snapshot, or 8.86 min from WAL-only
-- neo4j (server): 6.6 s to boot the process; connect+query adds 18.5 ms after boot
-- memgraph (server): 4.3 s to boot; connect+query adds 0.42 ms after boot
-- kuzu (embedded, no rules): 23 ms open+query
+- system A (server): 6.6 s to boot the process; connect+query adds 18.5 ms after boot
+- system C (server): 4.3 s to boot; connect+query adds 0.42 ms after boot
+- system B (embedded, no rules): 23 ms open+query
 
 mushroomdb V4 snapshot open (11 s) is slower than server boot (4–7 s) but eliminates
 the 8.86-min rule-re-fire penalty entirely. Once booted, embedded mushroomdb has zero
@@ -146,13 +146,13 @@ network RTT vs bolt latency per query.
 
 | Engine | Source | Server state | Valid? |
 |---|---|---|---|
-| mushroomdb | Run A (bench-neo4j up) | embedded, unaffected by bolt servers | YES |
-| neo4j | Run A | `bench-neo4j` (`neo4j:5-community`, `NEO4J_AUTH=none`) on `:7687`; port 7687 verified free before start | YES |
-| kuzu | Run A | embedded, unaffected by bolt servers | YES |
-| memgraph | Run B | `bench-memgraph` (`memgraph/memgraph:latest`) on `:7687`; `bench-neo4j` stopped and removed before start; port 7687 verified free | YES |
+| mushroomdb | Run A (bench-system A up) | embedded, unaffected by bolt servers | YES |
+| system A | Run A | `bench-system A` (`system A:5-community`, `system A_AUTH=none`) on `:7687`; port 7687 verified free before start | YES |
+| system B | Run A | embedded, unaffected by bolt servers | YES |
+| system C | Run B | `bench-system C` (`system C/system C:latest`) on `:7687`; `bench-system A` stopped and removed before start; port 7687 verified free | YES |
 
-**Contamination check:** `docker ps` run before each bolt server start. `bench-neo4j` stopped
-and removed before memgraph start. No cross-contamination in v2 runs.
+**Contamination check:** `docker ps` run before each bolt server start. `bench-system A` stopped
+and removed before system C start. No cross-contamination in v2 runs.
 
 ---
 
@@ -203,7 +203,7 @@ for node/edge records are unchanged, so the v2 WAL-only number remains indicativ
 
 ### Cross-engine — 10k (v2.1)
 
-| workload | mushroomdb | neo4j | kuzu | memgraph |
+| workload | mushroomdb | system A | system B | system C |
 |---|---|---|---|---|
 | bulk_ingest | 862 ms | 13.2 s | 1.21 min | 12.5 s |
 | neighborhood_depth1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
@@ -213,8 +213,8 @@ for node/edge records are unchanged, so the v2 WAL-only number remains indicativ
 | cold_start (WAL-only / connect) | 3.24 s ⊕ | 18.54 ms ⊕ | 23.41 ms ⊕ | 0.42 ms ⊕ |
 | cold_start (snapshot V4) | 1.01 s ⊕ | — | — | — |
 
-★ **v2.1 consolidated-pass values retracted**: cross-engine contamination confirmed — memgraph cell was
-  neo4j on a warm container; neo4j and kuzu v2.1 values also unreliable (warmup/ordering artifacts from
+★ **v2.1 consolidated-pass values retracted**: cross-engine contamination confirmed — system C cell was
+  system A on a warm container; system A and system B v2.1 values also unreliable (warmup/ordering artifacts from
   single-pass run). **Current row = v2.2 corrected four-engine benchmark** (same dataset, same warmup policy):
   5,810,000 INDUSTRY_ALIGNMENT edges, fresh process/container, 3 warmup + median of 10 measured runs.
   v2 mushroomdb 307 µs retired (was on old 1M-edge global-budget graph).
@@ -288,25 +288,25 @@ backfill after eviction, (4) weight_prop staleness. The rule engine handles all 
 | engine | container | port | state before run |
 |---|---|---|---|
 | mushroomdb | embedded | n/a | n/a |
-| neo4j | bench-neo4j (neo4j:5-community, NEO4J_AUTH=none) | 7687 | dai-neo4j stopped before start |
-| kuzu | embedded | n/a | n/a |
-| memgraph | bench-memgraph (memgraph/memgraph:latest) | 7687 | bench-neo4j also present (no conflict; memgraph ran in same process as neo4j) |
+| system A | bench-system A (system A:5-community, system A_AUTH=none) | 7687 | dai-system A stopped before start |
+| system B | embedded | n/a | n/a |
+| system C | bench-system C (system C/system C:latest) | 7687 | bench-system A also present (no conflict; system C ran in same process as system A) |
 
-**Note:** memgraph was run in the same benchmark pass as neo4j (both bolt, but run.py
-runs them sequentially; memgraph connects after neo4j has finished). All engines
-report correct results. dai-neo4j was restored after the run.
+**Note:** system C was run in the same benchmark pass as system A (both bolt, but run.py
+runs them sequentially; system C connects after system A has finished). All engines
+report correct results. dai-system A was restored after the run.
 
-### Contamination finding — v2.1 memgraph result was bench-neo4j (found during the v2.2 correction pass)
+### Contamination finding — v2.1 system C result was bench-system A (found during the v2.2 correction pass)
 
-**Post-v2.1 investigation found contamination in the memgraph two-hop result.**
+**Post-v2.1 investigation found contamination in the system C two-hop result.**
 
-`bench-memgraph` was never started in the v2.1 single-pass run. The memgraph adapter
-tried to import `mgclient` (ImportError), then fell back to the neo4j Python driver at
-`bolt://localhost:7687` — which connected to `bench-neo4j` (still running from the earlier
-neo4j pass). The v2.1 "memgraph" two-hop value of **2.57 ms** is actually a neo4j result.
+`bench-system C` was never started in the v2.1 single-pass run. The system C adapter
+tried to import `a named system` (ImportError), then fell back to the system A Python driver at
+`bolt://localhost:7687` — which connected to `bench-system A` (still running from the earlier
+system A pass). The v2.1 "system C" two-hop value of **2.57 ms** is actually a system A result.
 
-This also explains the neo4j v2→v2.1 improvement (5.68 ms → 2.88 ms): neo4j was measured
-twice (once as "neo4j", once as "memgraph") on the same warm container. Second measurement
+This also explains the system A v2→v2.1 improvement (5.68 ms → 2.88 ms): system A was measured
+twice (once as "system A", once as "system C") on the same warm container. Second measurement
 benefited from page cache warmup.
 
 **Isolated rerun** (v2.2 correction pass): each engine run in its own isolated pass with explicit
@@ -315,11 +315,11 @@ See `benchmarks/results/isolated-twohop-*.md` for the full isolation log.
 
 | engine | v2 | v2.1 (contaminated) | isolated rerun | delta vs v2 |
 |---|---|---|---|---|
-| neo4j | 5.68 ms | 2.88 ms ⚠ | **105.79 ms** | +1763% |
-| kuzu | 1.58 ms | 2.22 ms | **10.41 ms** | +559% |
-| memgraph | 2.17 ms | 2.57 ms ⚠ (was neo4j) | **5.46 ms** | +152% |
+| system A | 5.68 ms | 2.88 ms ⚠ | **105.79 ms** | +1763% |
+| system B | 1.58 ms | 2.22 ms | **10.41 ms** | +559% |
+| system C | 2.17 ms | 2.57 ms ⚠ (was system A) | **5.46 ms** | +152% |
 
-⚠ v2.1 neo4j = warm second measurement; v2.1 "memgraph" = neo4j under different label.
+⚠ v2.1 system A = warm second measurement; v2.1 "system C" = system A under different label.
 
 **Why the isolated rerun numbers differ from v2 baseline — two confounds:**
 
@@ -345,17 +345,17 @@ Full isolation log (single-shot cold runs, superseded by v2.2): `benchmarks/resu
 **Date:** 2026-08-21T04:41:00  
 **Dataset:** 5,810,000 INDUSTRY_ALIGNMENT edges (FieldEqual on `industry`, uncapped per-source)  
 **Policy:** fresh process/container → ingest + preload → 3 warmup → median of 10 measured runs  
-**Contamination:** Run A (bench-neo4j only) then Run B (bench-memgraph only); port :7687 exclusively held.
+**Contamination:** Run A (bench-system A only) then Run B (bench-system C only); port :7687 exclusively held.
 
 | engine | rows | median | embed? |
 |---|---|---|---|
 | mushroomdb | 200 | **261.6 µs** | yes (embedded, no bolt RTT) |
-| neo4j | 200 | **3.99 ms** | no (bolt/localhost) |
-| kuzu | 200 | **1.59 ms** | yes (embedded, no bolt RTT) |
-| memgraph | 200 | **1.96 ms** | no (bolt/localhost) |
+| system A | 200 | **3.99 ms** | no (bolt/localhost) |
+| system B | 200 | **1.59 ms** | yes (embedded, no bolt RTT) |
+| system C | 200 | **1.96 ms** | no (bolt/localhost) |
 
 mushroomdb derives INDUSTRY_ALIGNMENT automatically via `create_rule` (no ETL).
-Competitors pre-loaded via UNWIND MERGE (neo4j, memgraph) or COPY FROM CSV (kuzu).
+Competitors pre-loaded via UNWIND MERGE (system A, system C) or COPY FROM CSV (system B).
 Full log: `benchmarks/results/four-way-twohop-20260821-044100.md`.
 
 ---
@@ -425,7 +425,7 @@ mushroomdb workloads are embedded and unaffected by bolt servers. Run.py was not
 for competitor engines (numbers unchanged from v2.2). The v2.3 mushroomdb-only run was
 executed with:
 - `docker ps | grep bench-` → no bench-* containers present before start (verified)
-- dai-neo4j: present and not touched (unrelated container; no port conflict for embedded mushroomdb)
+- dai-system A: present and not touched (unrelated container; no port conflict for embedded mushroomdb)
 
 ---
 
@@ -560,7 +560,7 @@ Source: `crates/server/tests/sub_latency.rs` (added in this release).
 Competitor workloads not re-run; numbers unchanged from v2.2 corrected benchmark.
 mushroomdb non-two-hop numbers updated to v2.4 single-shot values.
 
-| workload | mushroomdb | neo4j | kuzu | memgraph |
+| workload | mushroomdb | system A | system B | system C |
 |---|---|---|---|---|
 | bulk_ingest | **784 ms** | 13.2 s | 1.21 min | 12.5 s |
 | neighborhood_depth1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
@@ -578,8 +578,8 @@ mushroomdb non-two-hop numbers updated to v2.4 single-shot values.
 mushroomdb workloads are embedded and unaffected by bolt servers.
 Competitor engines not re-run (numbers unchanged from v2.2). The v2.4 run:
 - `docker ps | grep bench-` → no bench-* containers before start (verified)
-- `dai-neo4j` present on port 7687 with non-standard auth; neo4j adapter failed
-  connectivity check (`_AUTH = ("neo4j", "neo4j")` rejected by production container)
+- `dai-system A` present on port 7687 with non-standard auth; system A adapter failed
+  connectivity check (`_AUTH = ("system A", "system A")` rejected by production container)
   and was skipped — no contamination of mushroomdb results
 - mushroomdb is embedded; bolt port state is irrelevant
 

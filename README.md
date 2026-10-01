@@ -85,7 +85,7 @@ Full tool reference: [`docs/site/mcp.md`](docs/site/mcp.md).
 
 - Not a hosted memory service — there is no account, no endpoint, nothing to sign up for.
 - Not a vector database. Vector predicates and HNSW are built in; bring your own embeddings.
-- Not a Postgres replacement. Single writer, no interactive transactions, memory-first storage.
+- Not a transactional relational database. Single writer, no interactive transactions, memory-first storage.
 
 ---
 
@@ -360,42 +360,28 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 
 ## Benchmarks
 
-10,000-node graph (Apple M4 Pro, macOS 15.7.3, arm64), mushroomdb v0.1.1 release build, 2026-08-24.
-Full methodology and honesty notes:
-[`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md).
+mushroomdb's own numbers. Each row names the committed file it comes from, and each file records
+its machine, date and command. Embedded: no figure includes a network round-trip.
 
-| Workload | mushroomdb | Neo4j | KùzuDB | Memgraph |
-|---|---|---|---|---|
-| Bulk ingest | 784 ms | 13.2 s | 1.21 min | 12.5 s |
-| Neighborhood depth-1 (p50) | 0.4 µs | 1.22 ms | 99.6 µs | 1.34 ms |
-| Neighborhood depth-1 (p95) | 2.2 µs | 1.46 ms | 519 µs | 2.14 ms |
-| Neighborhood depth-2 (p50) | 0.2 µs | 7.18 ms | 1.08 ms | 9.22 ms |
-| Cypher scan-filter-project (1.4k rows) | 1.22 ms | 93.7 ms | 3.95 ms | 83.7 ms |
-| Cypher two-hop join (200 rows) | 261.6 µs ★ | 3.99 ms ★ | 1.59 ms ★ | 1.96 ms ★ |
-| Cold-start: V8 snapshot open | 0.02 s ▽ | — | — | — |
-| Cold-start: WAL-only open | 8.16 min ▽ | — | — | — |
-| Server boot-to-ready | n/a (embedded) | 6.6 s | n/a (embedded) | 4.3 s |
+| Workload | Result | Measured |
+|---|---|---|
+| Bulk ingest, 10,000 nodes | 784 ms | v0.1.1, 2026-08-24 |
+| Neighborhood depth-1 (p50 / p95) | 0.4 µs / 2.2 µs | v0.1.1, 2026-08-24 |
+| Neighborhood depth-2 (p50) | 0.2 µs | v0.1.1, 2026-08-24 |
+| Cypher scan-filter-project (1.4k rows) | 1.22 ms | v0.1.1, 2026-08-24 |
+| Cypher two-hop join (200 rows, 5.8M derived edges) | 261.6 µs | v0.1.1, 2026-08-24 |
+| Open from a snapshot, 100,000 nodes / ~10M derived edges | 0.02 s at 31–41 MiB RSS | v0.2, 2026-08-28 |
+| Open from the WAL alone, same store | 8.16 min | v0.1.1, 2026-08-24 |
 
-**Honesty notes:**
+Rows 1–5: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md),
+Apple M4 Pro. Rows 6–7: [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md), warm
+file cache, cold process; cold-cache was not measured.
 
-- mushroomdb numbers are **embedded** — no network round-trip, no serialization overhead. KùzuDB
-  is also embedded, so its numbers are directly comparable. Neo4j and Memgraph go over
-  bolt/localhost (~0.1–1 ms round-trip per query).
-- ★ Two-hop join: same dataset, same warmup policy, all four engines on **5,810,000
-  INDUSTRY_ALIGNMENT edges**. Fresh process → ingest + preload → 3 discarded warmups → median of 10
-  runs. mushroomdb derives the edges via `create_rule`; competitors were pre-loaded via UNWIND MERGE
-  or COPY FROM CSV. All engines return 200 rows.
-- ★ Earlier v2.1 two-hop values were **retracted** for cross-engine contamination; the v2
-  mushroomdb 307 µs figure was **retired** (measured on a smaller 1M-edge graph). Both are
-  documented in the methodology file rather than quietly dropped.
-- ▽ 100k cold-start measured 2026-08-28, warm file cache, cold process, `/usr/bin/time -l`:
-  V8 snapshot open 0.02 s at 31–41 MiB RSS; snapshot size 1.8 GiB; snapshot write ~35 s. Cold-cache
-  was not measured. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md).
-- Rule engine vs hand-rolled maintenance (10k nodes, 1,000 specialty updates, drift = 0 for all
-  three): per-op expert-written **64.93 min**, batched expert-written **24.98 s**, rule engine
-  **17.58 s**. Both hand-rolled variants were written by the engine team with full knowledge of
-  retraction semantics — drift = 0 is a property of that, not of hand-rolling in general.
-  [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-vs-rules.md)
+Rule engine against hand-rolled maintenance (10,000 nodes, 1,000 specialty updates, drift 0 for
+all three): per-operation hand-written **64.93 min**, batched hand-written **24.98 s**, rule
+engine **17.58 s**. Both hand-rolled variants were written by the engine team with full
+knowledge of retraction semantics — drift 0 is a property of that, not of hand-rolling in
+general. [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handrolled-vs-rules.md)
 
 **Agent benchmarks** measure the entity engine directly. `benchmarks/agent-tasks/` runs real
 `claude -p` sessions against executable truth. The association suite (`--suite association`) asks
@@ -406,7 +392,7 @@ single relational file, and as a mushroomdb store. **The pre-registered gate pas
 tasks and all sixty cells** against the relational baseline's 0.990, at **$0.0614 against
 $0.1127**:
 
-| | graph (R) | sqlite (Q) | delta | 95% interval |
+| | graph (R) | relational (Q) | delta | 95% interval |
 |---|---|---|---|---|
 | score | **1.000** | 0.990 | +0.0101 | `[0.0005, 0.0229]` |
 | cost $ | **0.0614** | 0.1127 | -45.6% | `[-0.06875, -0.03147]` |
@@ -414,7 +400,7 @@ $0.1127**:
 | turns | **3.93** | 7.07 | -44.3% | `[-4.017, -2.133]` |
 
 180 cells, 0 timeouts, 0 errors, 0 dropped. Correctness had been amended on 2026-09-11 to pass on
-a tie, because the sqlite arm saturated at 1.00 and the original wording — exceed both baselines,
+a tie, because the relational arm saturated at 1.00 and the original wording — exceed both baselines,
 interval excluding zero — was judged unpassable; **this run passes the original wording.** Every
 one of the six sub-1.0 cells belongs to a baseline, and each key they missed was named correctly by
 the graph arm in the same rep:

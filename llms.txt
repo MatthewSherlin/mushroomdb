@@ -509,12 +509,12 @@ https://github.com/MatthewSherlin/mushroomdb
 - Materialized views: docs/site/views.md
 - Full-text search: docs/site/fulltext.md
 - Algorithms: docs/site/algorithms.md
-- Benchmarks: benchmarks/results/head-to-head-10k-v2.md
+- Benchmarks: benchmarks/README.md
 
 ## Limitations (be honest)
 
 - RAM-bound (mmap is read-only for the snapshot base; in-flight writes are in-memory)
-- Single writer (no multi-writer, no clustering, no Neo4j parity)
+- Single writer (no multi-writer, no clustering)
 - No differential dataflow
 - Dense patterns >1M intermediate rows require LIMIT
 - No multi-statement interactive transactions in v1

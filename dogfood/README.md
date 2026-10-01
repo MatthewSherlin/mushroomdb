@@ -36,7 +36,7 @@ and `MATCHES_DESIGN_STYLE` produce empty edge sets (honest).
   strings like `10-50` / `50-200`)
 - `embedding` (Talent/Company only): synthetic 1536-dim unit vector, seeded
   hash of industry + small per-key jitter. Documented as synthetic — fixtures
-  have no Meili/OpenAI vectors. Same-industry pairs cosine ≫ 0.85.
+  have no production vectors. Same-industry pairs cosine ≫ 0.85.
 
 ## Rules (`rules.SIX_RULES`, 10 instances)
 

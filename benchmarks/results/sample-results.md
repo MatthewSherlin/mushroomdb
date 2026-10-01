@@ -20,7 +20,7 @@ the cross-engine table.
 
 ## Cross-engine comparison (wall time)
 
-| workload | mushroomdb | neo4j | kuzu | memgraph |
+| workload | mushroomdb | system A | system B | system C |
 | --- | --- | --- | --- | --- |
 | bulk_ingest | 8.647 s | not installed — skipped | not installed — skipped | not installed — skipped |
 | neighborhood_depth1 (p50) | 1.0 µs | not installed — skipped | not installed — skipped | not installed — skipped |
@@ -63,10 +63,10 @@ the cross-engine table.
 
 ## Competitors
 
-- **neo4j:** not installed — skipped  
-  _Neo4j adapter: 'neo4j' Python driver not installed — install with 'pip install neo4j' to enable Neo4j benchmarks._
-- **kuzu:** not installed — skipped  
-  _'kuzu' not installed — pip install kuzu (No module named 'kuzu')_
-- **memgraph:** not installed — skipped  
-  _Memgraph adapter: no bolt driver installed — install with 'pip install mgclient' or 'pip install neo4j' to enable Memgraph benchmarks._
+- **system A:** not installed — skipped  
+  _system A adapter: 'system A' Python driver not installed — install with 'pip install system A' to enable system A benchmarks._
+- **system B:** not installed — skipped  
+  _'system B' not installed — pip install system B (No module named 'system B')_
+- **system C:** not installed — skipped  
+  _system C adapter: no bolt driver installed — install with 'pip install a named system' or 'pip install system A' to enable system C benchmarks._
 

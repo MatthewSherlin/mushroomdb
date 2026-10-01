@@ -1,10 +1,7 @@
-"""Comparative benchmark orchestrator.
+"""Benchmark orchestrator.
 
-Runs all workloads at --scale (default 10k) for every available engine and
+Runs every workload at --scale (default 10k) against the embedded engine and
 writes a Markdown results table to benchmarks/results/<run-id>.md.
-
-Competitor adapters are skipped automatically when the required driver/server
-is not present — zero manual configuration needed.
 
 Usage (from repo root, using the bindings venv)::
 
@@ -12,8 +9,8 @@ Usage (from repo root, using the bindings venv)::
     bindings/python/.venv/bin/python benchmarks/run.py --scale 2000
     bindings/python/.venv/bin/python benchmarks/run.py --scale 10000 --out benchmarks/results/my-run.md
 
-The ours engine always runs.  Competitor engines that are absent produce a
-'not installed — skipped' row in the output table.
+For a result worth quoting, build the binding in release first:
+`(cd bindings/python && .venv/bin/maturin develop --release)`.
 """
 
 from __future__ import annotations
@@ -177,87 +174,10 @@ def run_ours(nodes: list[dict], scale: int, seed: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Competitor runners (skip-safe wrappers)
-# ---------------------------------------------------------------------------
-
-def _skipped_result(engine: str, reason: str) -> dict[str, Any]:
-    return {"engine": engine, "skipped": True, "reason": reason}
-
-
-def run_neo4j(nodes: list[dict]) -> dict[str, Any]:
-    try:
-        from adapters.neo4j import _driver
-        drv = _driver()
-        drv.close()
-    except ImportError as e:
-        return _skipped_result("neo4j", str(e))
-    except RuntimeError as e:
-        return _skipped_result("neo4j", str(e))
-    # Server is available — run workloads.
-    from adapters import neo4j as a
-    talent_keys = [n["key"] for n in nodes if n["label"] == "Talent"]
-    sample = talent_keys[:SAMPLE_KEYS_COUNT]
-    out: dict[str, Any] = {"engine": "neo4j"}
-    out["bulk_ingest"] = a.bulk_ingest(nodes)
-    out["neighborhood_depth1"] = a.neighborhood_depth1(sample)
-    out["neighborhood_depth2"] = a.neighborhood_depth2(sample)
-    out["cypher_scan_filter"] = a.cypher_scan_filter()
-    out["cypher_two_hop"] = a.cypher_two_hop()
-    return out
-
-
-def run_kuzu(nodes: list[dict]) -> dict[str, Any]:
-    try:
-        import kuzu  # type: ignore[import]  # noqa: F401
-    except ImportError as e:
-        return _skipped_result("kuzu", f"'kuzu' not installed — pip install kuzu ({e})")
-    from adapters import kuzu as a
-    talent_keys = [n["key"] for n in nodes if n["label"] == "Talent"]
-    sample = talent_keys[:SAMPLE_KEYS_COUNT]
-    with tempfile.TemporaryDirectory(prefix="bench-kuzu-") as tmp:
-        db_dir = Path(tmp) / "kuzu_db"
-        out: dict[str, Any] = {"engine": "kuzu"}
-        out["bulk_ingest"] = a.bulk_ingest(nodes, db_dir)
-        try:
-            import kuzu  # type: ignore[import]
-            db = kuzu.Database(str(db_dir))
-            conn = kuzu.Connection(db)
-            out["neighborhood_depth1"] = a.neighborhood_depth1(conn, sample)
-            out["neighborhood_depth2"] = a.neighborhood_depth2(conn, sample)
-            out["cypher_scan_filter"] = a.cypher_scan_filter(conn)
-            out["cypher_two_hop"] = a.cypher_two_hop(conn)
-        except Exception as e:
-            out["error"] = str(e)
-    return out
-
-
-def run_memgraph(nodes: list[dict]) -> dict[str, Any]:
-    from adapters.memgraph import _driver, _SKIP_MSG_NO_DRIVER, _SKIP_MSG_NO_SERVER
-    try:
-        _driver()
-    except ImportError as e:
-        return _skipped_result("memgraph", str(e))
-    except RuntimeError as e:
-        return _skipped_result("memgraph", str(e))
-    from adapters import memgraph as a
-    talent_keys = [n["key"] for n in nodes if n["label"] == "Talent"]
-    sample = talent_keys[:SAMPLE_KEYS_COUNT]
-    out: dict[str, Any] = {"engine": "memgraph"}
-    out["bulk_ingest"] = a.bulk_ingest(nodes)
-    out["neighborhood_depth1"] = a.neighborhood_depth1(sample)
-    out["neighborhood_depth2"] = a.neighborhood_depth2(sample)
-    out["cypher_scan_filter"] = a.cypher_scan_filter()
-    out["cypher_two_hop"] = a.cypher_two_hop()
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Markdown report
 # ---------------------------------------------------------------------------
 
 def _cell(engine_result: dict, workload: str, field: str = "wall_s", fmt: Any = _fmt_s) -> str:
-    if engine_result.get("skipped"):
-        return "not installed — skipped"
     w = engine_result.get(workload)
     if w is None:
         return "n/a"
@@ -272,7 +192,6 @@ def write_markdown(
     scale: int,
     seed: int,
     ours: dict[str, Any],
-    competitors: list[dict[str, Any]],
     out_path: Path,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -280,7 +199,7 @@ def write_markdown(
     a = lines.append
 
     ram = _fmt_bytes(mh.get("ram_bytes"))
-    a("# Comparative benchmark — mushroomdb")
+    a("# Benchmark — mushroomdb")
     a("")
     a("## Machine / date")
     a("")
@@ -292,49 +211,46 @@ def write_markdown(
     a(f"- **Python:** {mh['python']}")
     a(f"- **Scale:** {scale:,} nodes (seed={seed}, 70/20/10 Talent/Company/Job split)")
     a("")
-    a("## Honesty note")
+    a("## What these numbers are")
     a("")
-    a("See `benchmarks/README.md` for the full honesty section.")
-    a("Short version: mushroomdb numbers are **embedded Rust** (no network RTT);")
-    a("competitor numbers are over bolt/localhost. `rule_derive` is ours-only —")
-    a("competitors have no auto-derivation equivalent, so it is excluded from")
-    a("the cross-engine table.")
+    a("Embedded: the engine runs in this process, so there is no network round-trip and")
+    a("no serialization in any figure. One run on one machine; see `benchmarks/README.md`")
+    a("for the workloads and how to reproduce it.")
     a("")
 
-    all_engines = [ours] + competitors
-    headers = ["workload"] + [e["engine"] for e in all_engines]
+    headers = ["workload", ours["engine"]]
 
     def row(label: str, *cells: str) -> str:
         return "| " + " | ".join([label] + list(cells)) + " |"
 
     sep = "| " + " | ".join(["---"] * len(headers)) + " |"
-    a("## Cross-engine comparison (wall time)")
+    a("## Workloads (wall time)")
     a("")
     a(row(*headers))
     a(sep)
     a(row(
         "bulk_ingest",
-        *[_cell(e, "bulk_ingest") for e in all_engines],
+        _cell(ours, "bulk_ingest"),
     ))
     a(row(
         "neighborhood_depth1 (p50)",
-        *[_cell(e, "neighborhood_depth1", "p50_s") for e in all_engines],
+        _cell(ours, "neighborhood_depth1", "p50_s"),
     ))
     a(row(
         "neighborhood_depth1 (p95)",
-        *[_cell(e, "neighborhood_depth1", "p95_s") for e in all_engines],
+        _cell(ours, "neighborhood_depth1", "p95_s"),
     ))
     a(row(
         "neighborhood_depth2 (p50)",
-        *[_cell(e, "neighborhood_depth2", "p50_s") for e in all_engines],
+        _cell(ours, "neighborhood_depth2", "p50_s"),
     ))
     a(row(
         "cypher scan-filter-project",
-        *[_cell(e, "cypher_scan_filter") for e in all_engines],
+        _cell(ours, "cypher_scan_filter"),
     ))
     a(row(
         "cypher two-hop join",
-        *[_cell(e, "cypher_two_hop") for e in all_engines],
+        _cell(ours, "cypher_two_hop"),
     ))
     a("")
     a("## mushroomdb — bulk ingest throughput")
@@ -368,26 +284,14 @@ def write_markdown(
     a("")
     a("## mushroomdb — rule_derive (ours-only)")
     a("")
-    a("> **Auto-derivation has no competitor equivalent.**")
-    a("> Edges are derived automatically when rules are declared and on every")
-    a("> subsequent ingest/update. Competitors require manual ETL / triggers.")
-    a("> This workload is intentionally excluded from the cross-engine table.")
-    a("> See `benchmarks/README.md` for the full explanation.")
+    a("Edges are derived when a rule is declared and on every later write that changes")
+    a("what it reads. This is the cost of declaring the rules over the loaded graph.")
     a("")
     rd = ours.get("rule_derive", {})
     a(f"- **Rules declared:** {rd.get('n_rules', 0)}")
     a(f"- **Total backfill wall:** {_fmt_s(rd.get('total_wall_s', float('nan')))}")
     for pr in rd.get("per_rule", []):
         a(f"  - `{pr['name']}` ({pr['edge_type']}): {_fmt_s(pr['wall_s'])}")
-    a("")
-    a("## Competitors")
-    a("")
-    for e in competitors:
-        if e.get("skipped"):
-            a(f"- **{e['engine']}:** not installed — skipped  ")
-            a(f"  _{e.get('reason', '')}_")
-        else:
-            a(f"- **{e['engine']}:** ran successfully")
     a("")
     out_path.write_text("\n".join(lines) + "\n")
     print(f"wrote {out_path}", flush=True)
@@ -398,7 +302,7 @@ def write_markdown(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="mushroomdb comparative benchmark")
+    p = argparse.ArgumentParser(description="mushroomdb benchmark")
     p.add_argument("--scale", type=int, default=DEFAULT_SCALE)
     p.add_argument("--seed", type=int, default=DEFAULT_SEED)
     p.add_argument("--out", default=None)
@@ -420,24 +324,7 @@ def main() -> None:
     print("[ours]", flush=True)
     ours = run_ours(nodes, args.scale, args.seed)
 
-    competitors: list[dict[str, Any]] = []
-
-    print("[neo4j]", flush=True)
-    competitors.append(run_neo4j(nodes))
-
-    print("[kuzu]", flush=True)
-    competitors.append(run_kuzu(nodes))
-
-    print("[memgraph]", flush=True)
-    competitors.append(run_memgraph(nodes))
-
-    for e in competitors:
-        if e.get("skipped"):
-            print(f"  {e['engine']}: skipped — {e.get('reason', '')[:80]}", flush=True)
-        else:
-            print(f"  {e['engine']}: done", flush=True)
-
-    write_markdown(mh, args.scale, args.seed, ours, competitors, out_path)
+    write_markdown(mh, args.scale, args.seed, ours, out_path)
 
 
 if __name__ == "__main__":

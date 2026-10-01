@@ -389,6 +389,8 @@ jobs:
       # product-facing file, and no skill telling an agent to call the graph
       # ahead of a search. See scripts/check-claims.sh for why.
       - run: bash scripts/check-claims.sh
+      # The names gate, shown failing on what it guards and never printing it.
+      - run: bash scripts/tests/test-check-names.sh
       # One version, twenty-four places. Catches the two shapes that have both
       # already shipped: a package manifest left behind (0.6.9 told readers to
       # install 0.6.8; a v0.6.11 tag would have published a wheel labelled

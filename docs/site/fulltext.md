@@ -125,8 +125,8 @@ the `stub_hidden` setting.
 
 ## What this is not
 
-mushroomdb full-text is not a replacement for PostgreSQL FTS, Elasticsearch, or
-Typesense. It has no field boosting, no distributed sharding, and no custom
+mushroomdb full-text is not a replacement for a dedicated search engine.
+It has no field boosting, no distributed sharding, and no custom
 tokenizer pipeline beyond Snowball EN. It is a lightweight inverted index for
 graph-native search: zero external runtime dependencies, incrementally maintained
 alongside graph mutations.

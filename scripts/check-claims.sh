@@ -145,6 +145,12 @@ if ! bash "$ROOT/scripts/check-pyi.sh"; then
   fail=1
 fi
 
+# The names gate: nothing tracked names another system. Separate script, one
+# gate, for the reason check-pyi.sh is: CI already runs this one.
+if ! python3 "$ROOT/scripts/check-names.py"; then
+  fail=1
+fi
+
 # Install pins that name a version. `llms.txt` carries a copy-pasteable Claude
 # Desktop config; it was bumped in every release commit through 0.6.8, then
 # silently skipped by 0.6.9's and 0.6.10's, so 0.6.9 shipped telling readers to
