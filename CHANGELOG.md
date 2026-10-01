@@ -122,18 +122,41 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **`aliases` is now maintained by the store.** A caller supplies extra
   aliases through the `aliases` argument; an `aliases` key inside `props` is
   refused. A value an older store already holds is taken in on the next write
-  to that entity — a string as one alias, a list with each item normalised —
-  and any other type is refused with the node named, to clear with
+  to that entity — a string as one alias, a list with each mixed-case or
+  padded item normalised; an item already lowercase is kept as is — and any
+  other type is refused with the node named, to clear with
   `forget {key, prop: "aliases"}`, rather than overwritten.
+- **Aliases are normalised to Unicode NFC.** A name typed with combining
+  marks — `E` followed by U+0301 — yields the same aliases as its precomposed
+  form, `É`, so the two link. The stored `name` is left as written. This adds
+  one dependency to the core crate, `unicode-normalization` 0.1.
 - **`mushroomdb schema apply <db> --memory-identity`** adds the identity
-  preset: eleven global `SAME_AS` rules over `aliases` at Jaccard ≥ 0.6,
-  covering provisional stubs. It says what it will backfill before it writes.
-  New stores do not get it; rules are never created silently. With it on,
-  `remember` reports the `same as` links each write created, and `analyze`
-  resolves them into identities in which every pair is linked, oldest node
-  first.
-- **The default tool listing is 23 tools and 26,924 bytes**, from 19 and
-  23,548 (`scripts/measure-tool-listing.py`; all 25 tools are 27,725 bytes).
+  preset: sixteen global `SAME_AS` rules. Eleven compare `aliases` at Jaccard
+  ≥ 0.6, covering provisional stubs; five link a stub an entity explicitly
+  claims (below). It says what it will backfill before it writes. New stores
+  do not get it; rules are never created silently. With it on, `remember`
+  reports the `same as` links each write created, and `analyze` resolves them
+  into identities in which every pair is linked, oldest node first.
+- **An explicit alias claim links a stub.** An entity that declares an alias
+  equal to a provisional stub's key links that stub, at 1.00:
+  `remember {about: ["matt"]}` and an entity written with `aliases: ["matt"]`
+  are linked, in either order. Jaccard could not do this — the stub holds one
+  alias against the entity's five. Three limits: the match is on the stub's
+  key exactly and keys are case-sensitive, so `aliases: ["Matt"]` does not
+  link a stub keyed `matt`; it links stubs (`Entity`) only, never two
+  described entities; and the claiming entity must be a `Person`, `Org`,
+  `Project`, `Concept` or `Event`.
+- **`alias_keys` is a second store-maintained list**: the aliases a caller
+  declared, trimmed and otherwise as written, which is what the claim rules
+  read. Derived name words never go in — an entity merely named "Alex" does
+  not claim a stub keyed `alex`. It accumulates like `aliases`, holds at most
+  32, is refused as a key inside `props`, is never proposed by
+  `suggest_rules`, and is cleared by `forget {key, prop: "alias_keys"}`. A
+  store that already took the preset gains the five claim rules by running
+  `schema apply --memory-identity` again; there is no `alias_keys` backfill,
+  because an older store kept no record of which aliases were declared.
+- **The default tool listing is 23 tools and 27,174 bytes**, from 19 and
+  23,548 (`scripts/measure-tool-listing.py`; all 25 tools are 27,975 bytes).
 - **The fragmentation probe (spec §8.2) says LARGE**: at the reference cell,
   25% of Talent split into 3 aliases, recall of the edges the canonical alias
   holds is 0.8324 over every rule, a loss of 0.1676 against the pre-registered
@@ -142,7 +165,12 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **The `SAME_AS` quality gate (spec §8.3) PASSED**: 9 true positives, 1 false
   positive, 9 false negatives — precision 0.900, exactly the floor, and recall
   0.500 — for both the pairwise links and the resolved identities
-  (`benchmarks/identity/results/20261001T061131Z/summary.md`).
+  (`benchmarks/identity/results/20261001T061131Z/summary.md`). A second run
+  after the claim rules and NFC were added, pre-registered as expecting no
+  change, gave the same numbers
+  (`benchmarks/identity/results/20261001T143503Z/summary.md`): the frozen set
+  declares no alias equal to a stub's key, so the gate cannot show the claim
+  rules' gain, and tests do.
 
 ### Fixed
 
@@ -155,20 +183,27 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 
 ### Known limits
 
-- **A nickname stub never links.** A bare `matt` stub holds one alias and
-  cannot reach Jaccard 0.6 against an entity holding five, even one that
-  declares `matt` among them. That is three of the gate's nine false
-  negatives. The other six miss the same way, on unequal alias sets: a formal
-  name with a declared alias (`countess-lovelace`, twice), a longer full name
-  (`amazing-grace`, twice), a nickname pair with no stub (`chris-lee` and
-  `christopher-lee`), and a legal suffix (`anthropic` and `anthropic-pbc`).
+- **A nickname stub links only when the alias is declared.** A bare `matt`
+  stub holds one alias and cannot reach Jaccard 0.6 against an entity holding
+  five. An entity that declares `aliases: ["matt"]` now links it by claim; one
+  that does not declare it still does not, and neither does a second entity
+  with the same name that never made the claim. That is three of the gate's
+  nine false negatives, whose labelled set declares no such alias. The other
+  six miss on unequal alias sets: a formal name with a declared alias
+  (`countess-lovelace`, twice), a longer full name (`amazing-grace`, twice), a
+  nickname pair with no stub (`chris-lee` and `christopher-lee`), and a legal
+  suffix (`anthropic` and `anthropic-pbc`).
+- **A claimed stub joins an identity only when every member claims it.**
+  `analyze`'s identities are complete-linkage: a stub one of two linked
+  entities claims is linked to that one and is not a member of the pair's
+  identity.
+- **A declared alias counts against `Overlap`.** It is one more entry in that
+  entity's `aliases`, so declaring `matt` on one of two same-named entities
+  takes their score from 3/5 to 3/6, under the floor.
 - **Two strangers with one full name link.** `john-smith-nyc` and
   `john-smith-sf` score 3/5. The link is visible in `remember`'s reply and
   explainable with `explain_association`, but it is wrong — the gate's one
   false positive, and why its precision has no margin.
-- **A name in decomposed Unicode (NFD) may not match its composed (NFC)
-  form.** Aliases are not normalised to NFC, so an accent typed as a combining
-  mark splits the word.
 - **Identity is global.** The preset's rules carry no namespace, so
   same-named entities in different namespaces link, and `remember`'s `same as`
   line can name keys from other namespaces.
@@ -177,6 +212,10 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **A forgotten `name` stays in `aliases`.** `forget {key, prop: "name"}` says
   so: the name's words keep matching identity rules, and later writes keep
   them, until `forget {key, prop: "aliases"}` clears the list.
+- **Forgotten `aliases` leave `alias_keys`.** The two lists are cleared
+  separately. `forget {key, prop: "aliases"}` says so when declared aliases
+  remain: they keep linking a stub keyed so until
+  `forget {key, prop: "alias_keys"}` clears them.
 - **`analyze` and `suggest_rules` read the whole store, with no role or
   mask.** Filtering their rows would be unsound, because a visible node's score
   is computed over hidden topology.

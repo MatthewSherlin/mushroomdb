@@ -178,8 +178,11 @@ pub fn derive_aliases(key: &str, name: Option<&str>, caller: &[String]) -> Vec<S
 /// [`MAX_ALIASES`].
 ///
 /// An `existing` value written before 0.7 is taken in, not overwritten: a
-/// string is one alias in [`canonical`] form, and each list item is folded
-/// through it, keeping a store-written list byte-identical.
+/// string is one alias in [`canonical`] form, and each list item that is not
+/// already lowercase and trimmed is folded through it. A list the store wrote
+/// passes through byte-identical, with one exception: the alias of a key with
+/// leading or trailing whitespace is the key lowercased, untrimmed, so the
+/// next write folds it and adds its canonical form beside it — once.
 /// Any other value — a number, a map, a list holding one — is refused, naming
 /// the node, rather than silently replaced.
 pub fn merge_aliases(
@@ -229,9 +232,12 @@ pub fn merge_aliases(
 /// Add one existing alias to `out`, folded through [`canonical`].
 ///
 /// An item already lowercase and trimmed is kept verbatim: that is the form of
-/// every item the store writes, including the lowercased key (current, or a
+/// the items the store writes, including the lowercased key (current, or a
 /// former one a rename left behind), which is deliberately not tokenised. So a
-/// list the store wrote passes through byte-identical.
+/// list the store wrote passes through byte-identical — unless a key carries
+/// leading or trailing whitespace. Such a key's alias is lowercased but not
+/// trimmed, so it is not "already trimmed" here: it is folded, and its
+/// canonical form joins the list beside the untrimmed one.
 fn insert_folded(out: &mut BTreeSet<String>, alias: &str) {
     let folded = if alias == alias.to_lowercase() && alias == alias.trim() {
         alias.to_string()
