@@ -221,6 +221,52 @@ fn a_long_prompt_is_capped_before_it_becomes_a_query() {
     assert_eq!(core_api::memory::recall::MAX_QUERY_TERMS, 24);
 }
 
+#[test]
+fn a_long_all_stopword_prompt_with_query_grammar_is_answered() {
+    // Every word a stopword, so the fallback runs, wrapped in every character
+    // the index's query parser reads as grammar. It must answer, not error.
+    let db = store("stopword-grammar");
+    let prompt = "-what* \"is OR this\" AND (the) or -that* ".repeat(200);
+    assert!(matches!(
+        recall_digest(&db, &prompt, "store", 4000),
+        RecallOutcome::NoMatch | RecallOutcome::Hits(_)
+    ));
+}
+
+#[test]
+fn an_all_stopword_topic_is_one_and_group_even_when_it_says_or() {
+    // "or" is a stopword and also the parser's OR keyword. Passed through raw,
+    // "this or that" asked for either word; the fallback asks for both.
+    let mut db = store("stopword-or");
+    db.insert_node("Note", "note-1", vec![]).unwrap();
+    db.set_prop("note-1", "text", Value::Str("keep this".into()))
+        .unwrap();
+    assert!(
+        matches!(
+            recall_digest(&db, "this or that", "store", 4000),
+            RecallOutcome::NoMatch
+        ),
+        "a note holding one of the two words is not a match for both"
+    );
+}
+
+#[test]
+fn a_repeated_word_counts_once_toward_coverage() {
+    // "bug" and "bugs" stem alike. Counted as two terms, a note holding only
+    // "bug" covered 2 of 4 and passed the half floor; it covers 1 of 3.
+    let mut db = store("stem-dedup");
+    db.insert_node("Note", "note-1", vec![]).unwrap();
+    db.set_prop("note-1", "text", Value::Str("found a bug".into()))
+        .unwrap();
+    assert!(
+        matches!(
+            recall_digest(&db, "bug bugs crash parser", "store", 4000),
+            RecallOutcome::NoMatch
+        ),
+        "one word of three is a minority"
+    );
+}
+
 /// Binding: a stored value cannot forge the digest's shape. Keys and
 /// summaries go back into an assistant's context, through both the prompt
 /// hook and the MCP `recall` tool, so a newline or an escape sequence in one

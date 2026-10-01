@@ -197,14 +197,19 @@ fn is_stopword(term: &str) -> bool {
 /// so the document holds `graph` and `db` as two separate tokens, and an
 /// unquoted term that kept the underscore (`graphdb`) would match neither.
 /// Stopwords and repeats are dropped; order of first appearance is kept.
+///
+/// A repeat is a word that *stems* like an earlier one — "bugs" after "bug" —
+/// because coverage is counted on stems: kept as two terms, a node holding
+/// the one word would count twice toward its coverage.
 fn search_terms(topic: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
+    let mut stems: HashSet<String> = HashSet::new();
     for word in topic.split(|c: char| !c.is_alphanumeric()) {
         if word.is_empty() {
             continue;
         }
         let term = word.to_lowercase();
-        if is_stopword(&term) || terms.contains(&term) {
+        if is_stopword(&term) || !stems.insert(stem(&term)) {
             continue;
         }
         terms.push(term);
@@ -213,6 +218,47 @@ fn search_terms(topic: &str) -> Vec<String> {
         }
     }
     terms
+}
+
+/// The words of an all-stopword topic, for the fallback's one AND-group:
+/// split and lowercased as [`search_terms`] splits, so no `"`, `-` or `*` the
+/// index's parser reads as grammar survives, and without `or` and `and`,
+/// which it reads as keywords and so could never match as words anyway.
+/// Repeats dropped, capped at [`MAX_QUERY_TERMS`] like the ordinary query.
+fn fallback_words(topic: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for word in topic.split(|c: char| !c.is_alphanumeric()) {
+        let word = word.to_lowercase();
+        if word.is_empty() || word == "or" || word == "and" || words.contains(&word) {
+            continue;
+        }
+        words.push(word);
+        if words.len() == MAX_QUERY_TERMS {
+            break;
+        }
+    }
+    words
+}
+
+/// The topic's search terms and the query the index is asked.
+///
+/// Space-separated terms are ANDed by the index's query grammar, so the
+/// topic as typed ("who is Matthew Sherlin?") would require the document
+/// to contain "who" and "is" too. [`search_terms`] drops the glue words, and
+/// the query ORs the rest, so a question or a name finds the content word
+/// that matches. Fall back to the topic's own words, ANDed, when nothing
+/// survives the filter, so an all-stopword topic still probes the index
+/// rather than silently skipping the search; see [`fallback_words`]. The
+/// terms are empty exactly when the fallback ran, and the query is empty
+/// only when the topic held no searchable word at all.
+fn topic_query(topic: &str) -> (Vec<String>, String) {
+    let terms = search_terms(topic);
+    let query = if terms.is_empty() {
+        fallback_words(topic).join(" ")
+    } else {
+        terms.join(" OR ")
+    };
+    (terms, query)
 }
 
 /// Why `recall` had nothing to say — the two reasons are different advice.
@@ -248,19 +294,10 @@ pub fn recall_digest<F: Fs>(
         return RecallOutcome::NoMatch;
     }
 
-    // Space-separated terms are ANDed by the index's query grammar, so the
-    // topic as typed ("who is Matthew Sherlin?") would require the document
-    // to contain "who" and "is" too. `search_terms` drops the glue words, and
-    // the query ORs the rest, so a question or a name finds the content word
-    // that matches. Fall back to the trimmed topic itself when nothing
-    // survives the filter, so an all-stopword topic still probes the index
-    // rather than silently skipping the search.
-    let terms = search_terms(topic);
-    let query = if terms.is_empty() {
-        topic.to_string()
-    } else {
-        terms.join(" OR ")
-    };
+    let (terms, query) = topic_query(topic);
+    if query.is_empty() {
+        return RecallOutcome::NoMatch;
+    }
 
     let mut best: BTreeMap<String, f64> = BTreeMap::new();
     for field in &fields {
@@ -394,7 +431,7 @@ pub fn recall_digest<F: Fs>(
     let mut lines: Vec<String> = Vec::new();
     let mut truncated = false;
     for (key, present, _) in &ranked {
-        // The all-stopword fallback searched the raw topic as one AND-group,
+        // The all-stopword fallback searched the topic's words as one AND-group,
         // which required every word in one document — 100% coverage, a
         // stricter gate than the half rule, not a missing one — so there
         // are no per-term counts to report and none are printed.
@@ -445,7 +482,47 @@ fn header(count: usize, label: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stopword, search_terms, MAX_QUERY_TERMS, STOPWORDS};
+    use super::{is_stopword, search_terms, topic_query, MAX_QUERY_TERMS, STOPWORDS};
+    use core_storage::fulltext::parse_query;
+
+    /// The all-stopword fallback is held to the same cap as the ordinary
+    /// query, and carries none of the grammar the index's parser reads: a
+    /// `"` phrase, a leading `-` negation, a trailing `*` prefix, or an
+    /// `OR`/`AND` keyword. It stays one AND-group of plain terms however the
+    /// prompt was written.
+    #[test]
+    fn the_all_stopword_fallback_is_capped_and_carries_no_grammar() {
+        let prompt: String = STOPWORDS
+            .iter()
+            .map(|w| format!("-{w}* \"{w} OR {w}\" AND {w}* ({w}) or "))
+            .collect();
+        let (terms, query) = topic_query(&prompt);
+        assert!(terms.is_empty(), "the prompt is all stopwords: {terms:?}");
+        let words: Vec<&str> = query.split(' ').collect();
+        assert!(
+            !query.is_empty() && words.len() <= MAX_QUERY_TERMS,
+            "{} words: {query:?}",
+            words.len()
+        );
+        assert!(
+            !query.contains(['"', '-', '*', '(', ')']),
+            "grammar characters reached the query: {query:?}"
+        );
+        let groups = parse_query(&query);
+        assert_eq!(groups.len(), 1, "one AND-group, no OR: {query:?}");
+        assert_eq!(groups[0].len(), words.len(), "no word read as a keyword");
+        assert!(
+            groups[0].iter().all(|t| !t.negated && !t.prefix),
+            "{query:?}"
+        );
+    }
+
+    /// A topic term and its plural are one term: they stem alike, so a node
+    /// holding the word would otherwise count twice toward its coverage.
+    #[test]
+    fn search_terms_drops_a_word_that_stems_like_an_earlier_one() {
+        assert_eq!(search_terms("bug bugs Bugs crash"), vec!["bug", "crash"]);
+    }
 
     /// The cap is enforced where the terms are built, so it is pinned there:
     /// an integration test that only checks the call returns cannot fail if

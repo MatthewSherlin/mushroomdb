@@ -124,12 +124,28 @@ fn a_spent_budget_reports_lower_bounds_rather_than_wrong_totals() {
     );
 }
 
+/// An empty store is every new user's first session, and its one line is read
+/// as guidance, not data: it points at the memory write tools, the same ones
+/// the skill offers for an empty store, and not at ingesting a repository.
+/// Pinned by its bytes, because the host caches it.
+#[test]
+fn an_empty_store_brief_points_at_the_memory_write_tools() {
+    let dir = tmp("empty");
+    let db = open(&dir);
+    let b = brief(&db, &BriefOptions::default());
+    assert_eq!(
+        render(&b, "query '<cypher>'"),
+        "mushroomdb brief — empty store; offer to fill it: `remember` for a fact, \
+         `upsert_entity` for one entity, `ingest_json` for a batch of rows\n"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Moved from `tests/repograph.rs` with the code they test.
 // ---------------------------------------------------------------------------
 
 /// A store with no files but plenty in it — a memory graph — is not an empty
-/// store, and gets a header and a way in rather than "run ingest-git".
+/// store, and gets a header and a way in rather than the empty-store line.
 #[test]
 fn brief_on_a_store_with_no_files_still_says_how_to_reach_it() {
     let dir = tmp("brief-memory-only");

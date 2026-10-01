@@ -726,14 +726,16 @@ fn what_if_call(key: &str, field: &str, intersection: &Option<(Vec<String>, Stri
 pub const MAX_BRIEF_BYTES: usize = 4_000;
 
 /// The one line a store with nothing in it at all gets as a session opens:
-/// what is missing, and the command that fixes it. There is nothing to be
-/// central *in*, and no point naming a way to reach an empty graph.
+/// what is missing, and the memory write tools that fill it — the same offer
+/// the skill makes for an empty store. There is nothing to be central *in*,
+/// and no point naming a way to reach an empty graph.
 ///
 /// Not marked with [`UNTRUSTED_FRAMING`], unlike every brief with a graph
 /// behind it: not one byte of this line came out of a store, so there is
 /// nothing here to mark as data.
 pub const EMPTY_BRIEF: &str =
-    "mushroomdb brief — empty store; run: mushroomdb ingest-git <db> <repo>\n";
+    "mushroomdb brief — empty store; offer to fill it: `remember` for a fact, \
+     `upsert_entity` for one entity, `ingest_json` for a batch of rows\n";
 
 /// Headings a memory store's schema sits under.
 const BRIEF_LABELS_HEADING: &str = "labels:\n";
