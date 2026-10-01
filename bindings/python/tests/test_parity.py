@@ -524,6 +524,19 @@ _DOCUMENTED = [
     "pairwise_similar",
     "degree",
     "degrees",
+    "pagerank",
+    "connected_components",
+    "degree_centrality",
+    "communities",
+    "enable_fulltext",
+    "disable_fulltext",
+    "is_fulltext_enabled",
+    "fulltext_pairs",
+    "search",
+    "rules",
+    "delete_rule",
+    "rebuild_rule",
+    "suggest_rules",
 ]
 
 

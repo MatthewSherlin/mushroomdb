@@ -116,6 +116,11 @@ def store(tmp_path):
     db.insert_edge("LINKS", "vis_a", "vis_b")
     db.insert_edge("LINKS", "vis_a", "hidden_x")
     db.insert_edge("LINKS", "vis_b", "hidden_x")
+    # Declared last, so no earlier frame index moves. With the pair enabled,
+    # `enable_fulltext(..., if_not_exists=True)` has an early `False` to return
+    # — the path a scoped handle must be refused in front of — and `search`
+    # has hidden rows to leak.
+    db.enable_fulltext("Person", "bio")
     yield db, db.scoped(keys=list(VISIBLE))
     db.close()
 
@@ -349,6 +354,8 @@ def test_schema_facts_stay_unscoped(store):
     assert s.is_multiplicity_enabled() == db.is_multiplicity_enabled()
     db.enable_multiplicity()
     assert s.is_multiplicity_enabled() is True
+    # A yes/no about a pair the caller named — the twin of `is_index_enabled`.
+    assert s.is_fulltext_enabled("Person", "bio") == db.is_fulltext_enabled("Person", "bio")
 
 
 def test_commit_time_facts_stay_unscoped(store):
@@ -397,14 +404,55 @@ def test_roles_is_refused_on_a_scoped_handle(store):
     assert "scoped" in str(err.value)
 
 
-def test_the_roles_refusal_is_a_plain_value_error_and_both_docs_say_so(store):
-    """Defect F7. `roles()` is the one refusal here that is not a typed engine
-    error, and until now neither doc named the class.
+# Reads that answer about the whole store and take no mask. No algorithm or
+# index reader in the engine can be narrowed, and filtering the rows after the
+# fact is unsound — a visible node's score is computed over hidden topology —
+# so each is refused outright on a scoped handle, the way `roles()` is.
+_REFUSED_READS = {
+    "pagerank": lambda h: h.pagerank(),
+    "connected_components": lambda h: h.connected_components(),
+    "degree_centrality": lambda h: h.degree_centrality(),
+    "communities": lambda h: h.communities(),
+    "search": lambda h: h.search("bio", "alpha"),
+    "fulltext_pairs": lambda h: h.fulltext_pairs(),
+    "rules": lambda h: h.rules(),
+    "suggest_rules": lambda h: h.suggest_rules(),
+}
 
-    The choice is deliberate. `ReadOnly` — what every other scoped refusal
-    raises — means *a scoped handle never writes*; it is raised only from
-    `refuse_if_scoped`, which only the write path reaches. `roles()` is a read,
-    and the only read refused outright, so it has no `ReadOnly` precedent to be
+# The ones whose unscoped answer names every node in the fixture — a row per
+# node from the algorithms, a hit per `bio` from `search` — so the fixture is
+# known to hold something to leak.
+_NAMES_EVERY_NODE = (
+    "pagerank",
+    "connected_components",
+    "degree_centrality",
+    "communities",
+    "search",
+)
+
+
+@pytest.mark.parametrize("name", sorted(_REFUSED_READS))
+def test_a_whole_store_read_is_refused_on_a_scoped_handle(store, name):
+    db, s = store
+    call = _REFUSED_READS[name]
+    if name in _NAMES_EVERY_NODE:
+        assert _mentions_hidden(call(db)), f"fixture: unscoped {name}() names the hidden nodes"
+    with pytest.raises(ValueError) as err:
+        call(s)
+    _assert_clean(f"{name} refusal", str(err.value))
+    assert "scoped" in str(err.value)
+    assert name in str(err.value), "the refusal names the method"
+
+
+def test_the_roles_refusal_is_a_plain_value_error_and_both_docs_say_so(store):
+    """Defect F7. `roles()` was the first refusal here that is not a typed
+    engine error, and until now neither doc named the class.
+
+    The choice is deliberate. `ReadOnly` — what every refused write raises —
+    means *a scoped handle never writes*; it is raised only from
+    `refuse_if_scoped`, which only the write path reaches. `roles()` is a read
+    refused outright (the whole-store reads above follow it), so it has no
+    `ReadOnly` precedent to be
     inconsistent with, and raising one would make that class mean two things.
 
     The cost is real: a sidecar catching `MushroomError` around a boot-time
@@ -656,6 +704,12 @@ _WRITES_KEYLESS = {
     # Asserting when a commit happened rewrites the store's apparent history,
     # which is a write in the sense that matters: a scoped handle never does it.
     "record_commits_at": lambda s: s.record_commits_at(1_800_000_000_000),
+    # `if_not_exists=True` reads before it writes, so it needs the refusal in
+    # front of the read — the shape `create_rule` has.
+    "enable_fulltext": lambda s: s.enable_fulltext("Person", "bio", if_not_exists=True),
+    "disable_fulltext": lambda s: s.disable_fulltext("Person", "bio"),
+    "delete_rule": lambda s: s.delete_rule("same_team"),
+    "rebuild_rule": lambda s: s.rebuild_rule("same_team"),
 }
 
 
@@ -703,6 +757,20 @@ COVERED = {
     "wal_total_commits": "test_wal_total_commits_is_a_store_fact",
     # refused outright: schema made of node data, with no honest narrowing
     "roles": "test_roles_is_refused_on_a_scoped_handle",
+    # whole-store reads — refused outright, like `roles`
+    "pagerank": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "connected_components": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "degree_centrality": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "communities": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "search": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "fulltext_pairs": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "rules": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "suggest_rules": "test_a_whole_store_read_is_refused_on_a_scoped_handle",
+    "is_fulltext_enabled": "test_schema_facts_stay_unscoped",
+    "enable_fulltext": "test_a_keyless_write_refuses_with_the_scoped_message",
+    "disable_fulltext": "test_a_keyless_write_refuses_with_the_scoped_message",
+    "delete_rule": "test_a_keyless_write_refuses_with_the_scoped_message",
+    "rebuild_rule": "test_a_keyless_write_refuses_with_the_scoped_message",
     # permitted non-writes
     "refresh": "test_refresh_is_permitted_and_names_nothing",
     "scoped": "test_scoped_narrows_and_never_widens",

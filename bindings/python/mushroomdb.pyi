@@ -845,6 +845,212 @@ class GraphDb:
         Returns `{"edges_inserted": N, "edges_deleted": M}`.
         """
 
+    def pagerank(
+        self,
+        damping: float = 0.85,
+        max_iters: int = 50,
+        tol: float = 1e-06,
+        edge_type: str | None = None,
+        direction: Literal["out", "in", "both"] = "out",
+        budget_ms: int = 0,
+        weight_prop: str | None = None,
+        min_weight: float | None = None,
+    ) -> dict[str, Any]:
+        """PageRank over the whole store.
+
+        Returns `{"scores": [(key, score), …], "converged": bool}`, one row
+        per live node, highest first, ties by key.
+
+        `direction` is `"out"` (rank flows along each edge, the default),
+        `"in"` or `"both"`. `edge_type=None` follows every edge type.
+        `weight_prop` names an edge property to weight by, and `min_weight`
+        drops edges below it.
+
+        **`budget_ms` defaults to `0` — no time limit.** The engine's own
+        default is a 5-second wall-clock budget, under which a loaded machine
+        returns a different answer for the same store; `0` means the same
+        store always gives the same scores. Pass a budget to bound the call,
+        and read `converged`.
+
+        Refused on a `scoped()` handle with `ValueError`: no algorithm takes a
+        mask, and a visible node's score would be computed over hidden edges.
+
+            top = db.pagerank(edge_type="CITES")["scores"][:10]
+        """
+
+    def connected_components(
+        self,
+        edge_type: str | None = None,
+        budget_ms: int = 0,
+        weight_prop: str | None = None,
+        min_weight: float | None = None,
+    ) -> dict[str, Any]:
+        """Weakly connected components.
+
+        Returns `{"components": [(key, component), …], "truncated": bool}`,
+        one row per live node. `component` is an identifier shared by every
+        node in the same component; compare them, do not parse them.
+
+        `edge_type=None` follows every edge type; direction is ignored.
+        `budget_ms` defaults to `0` (no limit) — see `pagerank`.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def degree_centrality(
+        self,
+        edge_type: str | None = None,
+        direction: Literal["out", "in", "both"] = "both",
+        budget_ms: int = 0,
+        weight_prop: str | None = None,
+        min_weight: float | None = None,
+    ) -> dict[str, Any]:
+        """Degree centrality: every node's degree, highest first.
+
+        Returns `{"scores": [(key, degree), …], "truncated": bool}`.
+
+        **Not `degree()` or `degrees()`.** Those answer for the keys you name
+        and can be scoped, masked and filtered; this ranks the whole store.
+        `direction` is `"both"` (the default), `"out"` or `"in"`.
+        `budget_ms` defaults to `0` (no limit) — see `pagerank`.
+
+        Refused on a `scoped()` handle with `ValueError`; `degrees()` is the
+        scoped way to ask.
+        """
+
+    def communities(
+        self,
+        edge_types: Sequence[str] | None = None,
+        weight_prop: str | None = None,
+        min_weight: float | None = None,
+        resolution: float = 1.0,
+        max_passes: int = 10,
+        max_sweeps: int = 20,
+        budget_ms: int = 0,
+        node_label: str | None = None,
+    ) -> dict[str, Any]:
+        """Communities by modularity (Louvain).
+
+        Returns `{"communities": [{"id", "members", "internal_weight",
+        "cohesion"}, …], "modularity": float, "truncated": bool}`.
+
+        `edge_types` is a **list** — unlike the other three algorithms, which
+        take one `edge_type` — and `None` or `[]` follows every edge type.
+        `node_label` restricts the pass to one label. `resolution` above 1.0
+        favours smaller communities. `budget_ms` defaults to `0` (no limit) —
+        see `pagerank`.
+
+        Modularity is global: adding unrelated nodes can move an existing
+        community. For "which keys are one entity", use `identity_clusters`.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def enable_fulltext(self, label: str, field: str, if_not_exists: bool = False) -> bool:
+        """Declare a full-text index on `(label, field)`. Returns `True` when it
+        was newly enabled.
+
+        The engine's call is not idempotent: enabling a pair that is already
+        enabled raises `RuleInvalid`. With `if_not_exists=True` it returns
+        `False` instead, so a caller that declares its schema at boot can call
+        this every time.
+
+        The declaration is logged; the index itself is rebuilt on every open,
+        so each declared pair adds to how long the store takes to open.
+
+            db.enable_fulltext("Doc", "body", if_not_exists=True)
+        """
+
+    def disable_fulltext(self, label: str, field: str) -> None:
+        """Drop the full-text index on `(label, field)` and its postings.
+
+        Raises `RuleNotFound` when the pair is not enabled; its `.name` is
+        `"fulltext(label,field)"`.
+        """
+
+    def is_fulltext_enabled(self, label: str, field: str) -> bool:
+        """Whether `(label, field)` has a full-text index.
+
+        A schema fact about a pair you named, so it answers on a `scoped()`
+        handle too, as `is_index_enabled` does.
+        """
+
+    def fulltext_pairs(self) -> list[tuple[str, str]]:
+        """Every `(label, field)` pair with a full-text index, sorted.
+
+        Refused on a `scoped()` handle with `ValueError`: it enumerates labels
+        the scope may hide. `is_fulltext_enabled` answers about one pair.
+        """
+
+    def search(self, field: str, query: str, k: int = 0) -> list[tuple[str, float]]:
+        """Full-text search on `field`. Returns `[(key, score), …]`, BM25,
+        highest first, ties by key.
+
+        The query grammar: space-separated terms are ANDed; `OR` between
+        terms; `"a phrase"`; `-term` excludes; `prefix*` matches a prefix.
+
+        **Keyed by field alone.** If two labels are indexed on the same field
+        name, both are searched; filter the keys yourself.
+
+        `k=0` (the default) returns every hit; a positive `k` stops at the
+        best `k`.
+
+        Refused on a `scoped()` handle with `ValueError`: the index takes no
+        mask. `search_hybrid` is the scoped way to search text.
+        """
+
+    def rules(self) -> list[dict[str, Any]]:
+        """Every rule the store holds, as a list of dicts sorted by name.
+
+        Each dict is a rule definition in the shape `create_rule` accepts —
+        `name`, `src_label`, `dst_label`, `predicate` (the externally-tagged
+        form, `{"FieldEqual": {"field": "team"}}`), `edge_type`,
+        `weight_prop`, `max_edges`, `approximate`, `via_label`, `via_edge`,
+        `via_dir`, `namespace` — so a listed rule can be deleted and
+        recreated from its own listing. Unset fields are `None`.
+
+        Refused on a `scoped()` handle with `ValueError`: a rule names labels,
+        fields and a namespace the scope may hide. `has_vector_rule` answers
+        about one field.
+        """
+
+    def delete_rule(self, name: str) -> None:
+        """Delete a rule and retract every edge it derived.
+
+        Raises `RuleNotFound` (with `.name`) when no rule has that name.
+        """
+
+    def rebuild_rule(self, name: str) -> None:
+        """Re-derive every edge of one rule from the store as it is now.
+
+        The only way out of a tripped rule: `stats()` reports `tripped` when a
+        rule hit its `max_edges` cap and stopped deriving.
+
+        Raises `RuleNotFound` (with `.name`) when no rule has that name.
+        """
+
+    def suggest_rules(self) -> dict[str, Any]:
+        """What rules the store's own data suggests. Creates nothing.
+
+        Returns `{"suggestions": [...], "total": int, "bookkeeping_hidden":
+        int, "truncated": bool}`. Each suggestion has `name`, `src_label`,
+        `dst_label`, `edge_type`, `predicate` (one clause of text),
+        `est_edges`, `examples` (`[src, dst, score]` lists), `rationale`, and
+        **`create_rule_args`: pass that dict to `create_rule` unchanged.** It
+        carries an explicit `weight_prop`, so the rule it creates here is the
+        rule the MCP `create_rule` tool creates from the same suggestion.
+
+        Proposals over fields the store writes for itself — `ns`, `kind`,
+        `ts`, `source`, `provisional`, `id`, `aliases`, `alias_keys` — are
+        dropped and counted in `bookkeeping_hidden`. The list is not capped
+        (the MCP tool shows five); `truncated` means the engine's 5-second
+        budget ran out and a second call may find more.
+
+        Every proposal is a global rule: it links across namespaces.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
     def stats(self) -> dict[str, Any]:
         """Node and edge counts, `history_floor`, `namespaces`, and per-rule figures.
 
@@ -868,8 +1074,10 @@ class GraphDb:
         on a `scoped()` handle: a role definition names node keys, namespaces
         and the other roles in the store.
 
-        That refusal is a plain **`ValueError`**, not a `MushroomError` — the
-        one refusal here that is not a typed engine error. `ReadOnly` means *a
+        That refusal is a plain **`ValueError`**, not a `MushroomError` — a
+        refused read is the one kind of refusal here that is not a typed engine
+        error, and the whole-store reads (`pagerank`, `search`, `rules` and the
+        others that say so) raise the same. `ReadOnly` means *a
         scoped handle never writes*, and `roles()` is a read; calling it on a
         scoped handle is caller misuse, the same kind of thing as `scoped()`'s
         empty-scope `ValueError`. So a sidecar wrapping its boot-time role

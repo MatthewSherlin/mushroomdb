@@ -1520,6 +1520,351 @@ impl GraphDb {
         Ok(d.unbind())
     }
 
+    /// PageRank over the whole store.
+    ///
+    /// Returns `{"scores": [(key, score), …], "converged": bool}`, one row
+    /// per live node, highest first, ties by key.
+    ///
+    /// `direction` is `"out"` (rank flows along each edge, the default),
+    /// `"in"` or `"both"`. `edge_type=None` follows every edge type.
+    /// `weight_prop` names an edge property to weight by, and `min_weight`
+    /// drops edges below it.
+    ///
+    /// **`budget_ms` defaults to `0` — no time limit.** The engine's own
+    /// default is a 5-second wall-clock budget, under which a loaded machine
+    /// returns a different answer for the same store; `0` means the same
+    /// store always gives the same scores. Pass a budget to bound the call,
+    /// and read `converged`.
+    ///
+    /// Refused on a `scoped()` handle with `ValueError`: no algorithm takes a
+    /// mask, and a visible node's score would be computed over hidden edges.
+    ///
+    /// ```python
+    /// top = db.pagerank(edge_type="CITES")["scores"][:10]
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
+    #[pyo3(
+        signature = (damping = 0.85, max_iters = 50, tol = 1e-6, edge_type = None, direction = "out", budget_ms = 0, weight_prop = None, min_weight = None),
+        text_signature = "($self, damping=0.85, max_iters=50, tol=1e-06, edge_type=None, direction='out', budget_ms=0, weight_prop=None, min_weight=None)"
+    )]
+    fn pagerank(
+        &self,
+        py: Python<'_>,
+        damping: f64,
+        max_iters: u32,
+        tol: f64,
+        edge_type: Option<String>,
+        direction: &str,
+        budget_ms: u64,
+        weight_prop: Option<String>,
+        min_weight: Option<f64>,
+    ) -> PyResult<Py<PyDict>> {
+        self.refuse_read_if_scoped("pagerank")?;
+        let config = core_api::PageRankConfig {
+            damping,
+            max_iters,
+            tol,
+            edge_type,
+            direction: parse_algo_dir(direction)?,
+            budget_ms,
+            weight_prop,
+            min_weight,
+        };
+        let report = py.allow_threads(|| self.with_ref(|db| Ok(db.pagerank(&config))))?;
+        let d = PyDict::new(py);
+        d.set_item("scores", report.scores)?;
+        d.set_item("converged", report.converged)?;
+        Ok(d.unbind())
+    }
+
+    /// Weakly connected components.
+    ///
+    /// Returns `{"components": [(key, component), …], "truncated": bool}`,
+    /// one row per live node. `component` is an identifier shared by every
+    /// node in the same component; compare them, do not parse them.
+    ///
+    /// `edge_type=None` follows every edge type; direction is ignored.
+    /// `budget_ms` defaults to `0` (no limit) — see `pagerank`.
+    ///
+    /// Refused on a `scoped()` handle with `ValueError`.
+    #[allow(deprecated)]
+    #[pyo3(
+        signature = (edge_type = None, budget_ms = 0, weight_prop = None, min_weight = None),
+        text_signature = "($self, edge_type=None, budget_ms=0, weight_prop=None, min_weight=None)"
+    )]
+    fn connected_components(
+        &self,
+        py: Python<'_>,
+        edge_type: Option<String>,
+        budget_ms: u64,
+        weight_prop: Option<String>,
+        min_weight: Option<f64>,
+    ) -> PyResult<Py<PyDict>> {
+        self.refuse_read_if_scoped("connected_components")?;
+        let config = core_api::WccConfig {
+            edge_type,
+            budget_ms,
+            weight_prop,
+            min_weight,
+        };
+        let report =
+            py.allow_threads(|| self.with_ref(|db| Ok(db.connected_components(&config))))?;
+        let d = PyDict::new(py);
+        d.set_item("components", report.components)?;
+        d.set_item("truncated", report.truncated)?;
+        Ok(d.unbind())
+    }
+
+    /// Degree centrality: every node's degree, highest first.
+    ///
+    /// Returns `{"scores": [(key, degree), …], "truncated": bool}`.
+    ///
+    /// **Not `degree()` or `degrees()`.** Those answer for the keys you name
+    /// and can be scoped, masked and filtered; this ranks the whole store.
+    /// `direction` is `"both"` (the default), `"out"` or `"in"`.
+    /// `budget_ms` defaults to `0` (no limit) — see `pagerank`.
+    ///
+    /// Refused on a `scoped()` handle with `ValueError`; `degrees()` is the
+    /// scoped way to ask.
+    #[allow(deprecated)]
+    #[pyo3(
+        signature = (edge_type = None, direction = "both", budget_ms = 0, weight_prop = None, min_weight = None),
+        text_signature = "($self, edge_type=None, direction='both', budget_ms=0, weight_prop=None, min_weight=None)"
+    )]
+    fn degree_centrality(
+        &self,
+        py: Python<'_>,
+        edge_type: Option<String>,
+        direction: &str,
+        budget_ms: u64,
+        weight_prop: Option<String>,
+        min_weight: Option<f64>,
+    ) -> PyResult<Py<PyDict>> {
+        self.refuse_read_if_scoped("degree_centrality")?;
+        let config = core_api::DegreeConfig {
+            edge_type,
+            direction: parse_algo_dir(direction)?,
+            budget_ms,
+            weight_prop,
+            min_weight,
+        };
+        let report = py.allow_threads(|| self.with_ref(|db| Ok(db.degree_centrality(&config))))?;
+        let d = PyDict::new(py);
+        d.set_item("scores", report.scores)?;
+        d.set_item("truncated", report.truncated)?;
+        Ok(d.unbind())
+    }
+
+    /// Communities by modularity (Louvain).
+    ///
+    /// Returns `{"communities": [{"id", "members", "internal_weight",
+    /// "cohesion"}, …], "modularity": float, "truncated": bool}`.
+    ///
+    /// `edge_types` is a **list** — unlike the other three algorithms, which
+    /// take one `edge_type` — and `None` or `[]` follows every edge type.
+    /// `node_label` restricts the pass to one label. `resolution` above 1.0
+    /// favours smaller communities. `budget_ms` defaults to `0` (no limit) —
+    /// see `pagerank`.
+    ///
+    /// Modularity is global: adding unrelated nodes can move an existing
+    /// community. For "which keys are one entity", use `identity_clusters`.
+    ///
+    /// Refused on a `scoped()` handle with `ValueError`.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(deprecated)]
+    #[pyo3(
+        signature = (edge_types = None, weight_prop = None, min_weight = None, resolution = 1.0, max_passes = 10, max_sweeps = 20, budget_ms = 0, node_label = None),
+        text_signature = "($self, edge_types=None, weight_prop=None, min_weight=None, resolution=1.0, max_passes=10, max_sweeps=20, budget_ms=0, node_label=None)"
+    )]
+    fn communities(
+        &self,
+        py: Python<'_>,
+        edge_types: Option<Vec<String>>,
+        weight_prop: Option<String>,
+        min_weight: Option<f64>,
+        resolution: f64,
+        max_passes: u32,
+        max_sweeps: u32,
+        budget_ms: u64,
+        node_label: Option<String>,
+    ) -> PyResult<Py<PyDict>> {
+        self.refuse_read_if_scoped("communities")?;
+        let config = core_api::LouvainConfig {
+            edge_types: edge_types.unwrap_or_default(),
+            weight_prop,
+            min_weight,
+            resolution,
+            max_passes,
+            max_sweeps,
+            budget_ms,
+            node_label,
+        };
+        let report = py.allow_threads(|| self.with_ref(|db| Ok(db.communities(&config))))?;
+        let list = PyList::empty(py);
+        for c in &report.communities {
+            let cd = PyDict::new(py);
+            cd.set_item("id", c.id)?;
+            cd.set_item("members", c.members.clone())?;
+            cd.set_item("internal_weight", c.internal_weight)?;
+            cd.set_item("cohesion", c.cohesion)?;
+            list.append(cd)?;
+        }
+        let d = PyDict::new(py);
+        d.set_item("communities", list)?;
+        d.set_item("modularity", report.modularity)?;
+        d.set_item("truncated", report.truncated)?;
+        Ok(d.unbind())
+    }
+
+    /// Declare a full-text index on `(label, field)`. Returns `True` when it
+    /// was newly enabled.
+    ///
+    /// The engine's call is not idempotent: enabling a pair that is already
+    /// enabled raises `RuleInvalid`. With `if_not_exists=True` it returns
+    /// `False` instead, so a caller that declares its schema at boot can call
+    /// this every time.
+    ///
+    /// The declaration is logged; the index itself is rebuilt on every open,
+    /// so each declared pair adds to how long the store takes to open.
+    ///
+    /// ```python
+    /// db.enable_fulltext("Doc", "body", if_not_exists=True)
+    /// ```
+    #[pyo3(
+        signature = (label, field, if_not_exists = false),
+        text_signature = "($self, label, field, if_not_exists=False)"
+    )]
+    fn enable_fulltext(&self, label: &str, field: &str, if_not_exists: bool) -> PyResult<bool> {
+        // `if_not_exists` reads before it writes, so the refusal has to come
+        // first, exactly as `create_rule`'s does.
+        self.refuse_if_scoped()?;
+        if if_not_exists && self.with_ref(|db| Ok(db.is_fulltext_enabled(label, field)))? {
+            return Ok(false);
+        }
+        self.with_mut(|db| db.enable_fulltext(label, field))?;
+        Ok(true)
+    }
+
+    /// Drop the full-text index on `(label, field)` and its postings.
+    ///
+    /// Raises `RuleNotFound` when the pair is not enabled; its `.name` is
+    /// `"fulltext(label,field)"`.
+    #[pyo3(text_signature = "($self, label, field)")]
+    fn disable_fulltext(&self, label: &str, field: &str) -> PyResult<()> {
+        self.with_mut(|db| db.disable_fulltext(label, field))
+    }
+
+    /// Whether `(label, field)` has a full-text index.
+    ///
+    /// A schema fact about a pair you named, so it answers on a `scoped()`
+    /// handle too, as `is_index_enabled` does.
+    #[pyo3(text_signature = "($self, label, field)")]
+    fn is_fulltext_enabled(&self, label: &str, field: &str) -> PyResult<bool> {
+        self.with_ref(|db| Ok(db.is_fulltext_enabled(label, field)))
+    }
+
+    /// Every `(label, field)` pair with a full-text index, sorted.
+    ///
+    /// Refused on a `scoped()` handle with `ValueError`: it enumerates labels
+    /// the scope may hide. `is_fulltext_enabled` answers about one pair.
+    #[pyo3(text_signature = "($self)")]
+    fn fulltext_pairs(&self) -> PyResult<Vec<(String, String)>> {
+        self.refuse_read_if_scoped("fulltext_pairs")?;
+        self.with_ref(|db| Ok(db.fulltext_pairs()))
+    }
+
+    /// Full-text search on `field`. Returns `[(key, score), …]`, BM25,
+    /// highest first, ties by key.
+    ///
+    /// The query grammar: space-separated terms are ANDed; `OR` between
+    /// terms; `"a phrase"`; `-term` excludes; `prefix*` matches a prefix.
+    ///
+    /// **Keyed by field alone.** If two labels are indexed on the same field
+    /// name, both are searched; filter the keys yourself.
+    ///
+    /// `k=0` (the default) returns every hit; a positive `k` stops at the
+    /// best `k`.
+    ///
+    /// Refused on a `scoped()` handle with `ValueError`: the index takes no
+    /// mask. `search_hybrid` is the scoped way to search text.
+    #[pyo3(
+        signature = (field, query, k = 0),
+        text_signature = "($self, field, query, k=0)"
+    )]
+    fn search(&self, field: &str, query: &str, k: usize) -> PyResult<Vec<(String, f64)>> {
+        self.refuse_read_if_scoped("search")?;
+        self.with_ref(|db| Ok(db.search_top(field, query, k)))
+    }
+
+    /// Every rule the store holds, as a list of dicts sorted by name.
+    ///
+    /// Each dict is a rule definition in the shape `create_rule` accepts —
+    /// `name`, `src_label`, `dst_label`, `predicate` (the externally-tagged
+    /// form, `{"FieldEqual": {"field": "team"}}`), `edge_type`,
+    /// `weight_prop`, `max_edges`, `approximate`, `via_label`, `via_edge`,
+    /// `via_dir`, `namespace` — so a listed rule can be deleted and
+    /// recreated from its own listing. Unset fields are `None`.
+    ///
+    /// Refused on a `scoped()` handle with `ValueError`: a rule names labels,
+    /// fields and a namespace the scope may hide. `has_vector_rule` answers
+    /// about one field.
+    #[pyo3(text_signature = "($self)")]
+    fn rules(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.refuse_read_if_scoped("rules")?;
+        let mut defs = self.with_ref(|db| Ok(db.rules()))?;
+        defs.sort_by(|a, b| a.name.cmp(&b.name));
+        report_to_py(py, serde_json::to_value(&defs))
+    }
+
+    /// Delete a rule and retract every edge it derived.
+    ///
+    /// Raises `RuleNotFound` (with `.name`) when no rule has that name.
+    #[pyo3(text_signature = "($self, name)")]
+    fn delete_rule(&self, name: &str) -> PyResult<()> {
+        self.with_mut(|db| db.delete_rule(name))
+    }
+
+    /// Re-derive every edge of one rule from the store as it is now.
+    ///
+    /// The only way out of a tripped rule: `stats()` reports `tripped` when a
+    /// rule hit its `max_edges` cap and stopped deriving.
+    ///
+    /// Raises `RuleNotFound` (with `.name`) when no rule has that name.
+    #[pyo3(text_signature = "($self, name)")]
+    fn rebuild_rule(&self, name: &str) -> PyResult<()> {
+        self.with_mut(|db| db.rebuild_rule(name))
+    }
+
+    /// What rules the store's own data suggests. Creates nothing.
+    ///
+    /// Returns `{"suggestions": [...], "total": int, "bookkeeping_hidden":
+    /// int, "truncated": bool}`. Each suggestion has `name`, `src_label`,
+    /// `dst_label`, `edge_type`, `predicate` (one clause of text),
+    /// `est_edges`, `examples` (`[src, dst, score]` lists), `rationale`, and
+    /// **`create_rule_args`: pass that dict to `create_rule` unchanged.** It
+    /// carries an explicit `weight_prop`, so the rule it creates here is the
+    /// rule the MCP `create_rule` tool creates from the same suggestion.
+    ///
+    /// Proposals over fields the store writes for itself — `ns`, `kind`,
+    /// `ts`, `source`, `provisional`, `id`, `aliases`, `alias_keys` — are
+    /// dropped and counted in `bookkeeping_hidden`. The list is not capped
+    /// (the MCP tool shows five); `truncated` means the engine's 5-second
+    /// budget ran out and a second call may find more.
+    ///
+    /// Every proposal is a global rule: it links across namespaces.
+    ///
+    /// Refused on a `scoped()` handle with `ValueError`.
+    #[allow(deprecated)]
+    #[pyo3(text_signature = "($self)")]
+    fn suggest_rules(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.refuse_read_if_scoped("suggest_rules")?;
+        let found = py.allow_threads(|| {
+            self.with_ref(|db| Ok(core_api::memory::suggest::filtered_suggestions(db)))
+        })?;
+        report_to_py(py, serde_json::to_value(&found))
+    }
+
     /// Return database statistics: node/edge counts, `namespaces` (every
     /// namespace with at least one live node and its count), plus per-rule
     /// provenance size, trip latch, and fire counter.  Shape matches the HTTP
@@ -1598,12 +1943,13 @@ impl GraphDb {
     /// Refused on a scoped handle — see the note on `scoped()` — and the
     /// refusal is a plain **`ValueError`**, not a `MushroomError`.
     ///
-    /// That is deliberate, and it is the one refusal in this binding that is
-    /// not a typed engine error, so it is worth saying why. `ReadOnly` — the
-    /// `MushroomError` subclass the other scoped refusals raise — means *a
-    /// scoped handle never writes*: `refuse_if_scoped` is reached only from
-    /// the write path. `roles()` is a read, and the only read refused
-    /// outright, so it has no `ReadOnly` precedent to follow; raising one here
+    /// That is deliberate, and a refused read is the one kind of refusal in
+    /// this binding that is not a typed engine error, so it is worth saying
+    /// why. `ReadOnly` — the `MushroomError` subclass a refused write raises
+    /// — means *a scoped handle never writes*: `refuse_if_scoped` is reached
+    /// only from the write path. `roles()` is a read refused outright, as the
+    /// whole-store reads are (`pagerank`, `search`, `rules` and the others
+    /// that say so), so it has no `ReadOnly` precedent to follow; raising one here
     /// would make that class mean two different things. Calling `roles()` on a
     /// scoped handle is caller misuse with no engine condition behind it — the
     /// same kind of thing as `scoped()`'s empty-scope refusal, which is a
@@ -1790,6 +2136,26 @@ impl GraphDb {
                 "this handle is scoped, and a scoped handle never writes; call this on the \
                  handle scoped() was called on",
             ));
+        }
+        Ok(())
+    }
+
+    /// Refuse a read that answers about the whole store.
+    ///
+    /// No algorithm, index search, suggestion or memory report in the engine
+    /// takes a mask, and filtering their rows afterwards is unsound: a visible
+    /// node's score is computed over hidden topology, and an enumeration
+    /// names labels a scoped caller may not see. So each is refused outright
+    /// on a handle from `scoped()`.
+    ///
+    /// A plain `ValueError`, as `roles()` raises and for its reason:
+    /// `ReadOnly` means "a scoped handle never writes", and these are reads.
+    fn refuse_read_if_scoped(&self, what: &str) -> PyResult<()> {
+        if self.scope.is_some() {
+            return Err(PyValueError::new_err(format!(
+                "{what}() is refused on a scoped handle: it answers about the whole store and \
+                 no scope can narrow it honestly; call it on the handle scoped() was called on"
+            )));
         }
         Ok(())
     }
@@ -2242,6 +2608,52 @@ fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
             Ok(dict.into_any())
         }
     }
+}
+
+/// A `serde_json::Value` as the object Python's `json.loads` would build:
+/// `None`, `bool`, `int`, `float`, `str`, `list`, `dict`.
+///
+/// For reports that are `Serialize` in `core-api` — a rule definition, a
+/// schema report, an identity report. A JSON array is a `list`, so a Rust
+/// tuple inside such a report arrives as a two- or three-item list.
+fn json_to_py<'py>(py: Python<'py>, v: &serde_json::Value) -> PyResult<Bound<'py, PyAny>> {
+    use serde_json::Value as J;
+    Ok(match v {
+        J::Null => py.None().into_bound(py),
+        J::Bool(b) => PyBool::new(py, *b).to_owned().into_any(),
+        J::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i.into_pyobject(py)?.into_any()
+            } else if let Some(u) = n.as_u64() {
+                u.into_pyobject(py)?.into_any()
+            } else {
+                n.as_f64().unwrap_or(f64::NAN).into_pyobject(py)?.into_any()
+            }
+        }
+        J::String(s) => s.into_pyobject(py)?.into_any(),
+        J::Array(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(json_to_py(py, item)?)?;
+            }
+            list.into_any()
+        }
+        J::Object(map) => {
+            let dict = PyDict::new(py);
+            for (k, item) in map {
+                dict.set_item(k, json_to_py(py, item)?)?;
+            }
+            dict.into_any()
+        }
+    })
+}
+
+/// A serialised `core-api` report as a Python object. Takes the result of
+/// `serde_json::to_value` so no call site needs to name a serde trait — the
+/// binding depends on `serde_json`, not on `serde`.
+fn report_to_py(py: Python<'_>, v: serde_json::Result<serde_json::Value>) -> PyResult<Py<PyAny>> {
+    let v = v.map_err(|e| PyRuntimeError::new_err(format!("could not serialise report: {e}")))?;
+    Ok(json_to_py(py, &v)?.unbind())
 }
 
 /// Convert an optional Python params argument to a `BTreeMap`.

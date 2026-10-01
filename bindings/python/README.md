@@ -190,6 +190,53 @@ The Rust-native externally-tagged form is still accepted:
 `if_not_exists=True` to get `False` instead of an exception when a rule of that
 name is already registered.
 
+### Listing, deleting, rebuilding, proposing
+
+```python
+db.rules()                    # every rule, as dicts create_rule accepts
+db.delete_rule("same_team")   # and every edge it derived
+db.rebuild_rule("same_team")  # the way out of a tripped rule
+for s in db.suggest_rules()["suggestions"]:
+    print(s["name"], s["est_edges"], s["rationale"])
+    # db.create_rule(s["create_rule_args"])  — nothing is created until you do
+```
+
+`suggest_rules()` never proposes a rule over a field the store writes for
+itself, and each proposal's `create_rule_args` creates the same rule here as
+it does through the MCP `create_rule` tool.
+
+## Full-text search
+
+```python
+db.enable_fulltext("Doc", "body", if_not_exists=True)
+db.search("body", 'graph OR "property index"', k=10)   # [(key, score), ...]
+db.fulltext_pairs()                                    # [("Doc", "body")]
+db.is_fulltext_enabled("Doc", "body")                  # True
+db.disable_fulltext("Doc", "body")                     # the index and its postings
+```
+
+`search` is keyed by field alone: two labels indexed on the same field name
+are searched together. Every declared pair is rebuilt when the store opens.
+
+## Graph algorithms
+
+```python
+db.pagerank(edge_type="CITES")["scores"][:10]
+db.connected_components()["components"]         # [(key, component), ...]
+db.degree_centrality(direction="in")["scores"]  # not degree() / degrees()
+db.communities(edge_types=["CITES"])["communities"]
+```
+
+`budget_ms` defaults to `0` — no time limit — so the same store gives the
+same answer; pass one to bound a call and read `converged` / `truncated`.
+`degree()` and `degrees()` are a different thing: the degree of the keys you
+name, which can be scoped and filtered.
+
+**None of these runs on a `scoped()` handle.** The algorithms, `search`,
+`fulltext_pairs`, `rules` and `suggest_rules` answer about the whole store and
+take no mask, so each raises `ValueError` there rather than return an answer
+computed over nodes the scope hides.
+
 ## Concurrency
 
 **One writer at a time across processes; readers see commits after `refresh()`.**
