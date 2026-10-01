@@ -7,6 +7,8 @@
 #   - in prose, in any letter case;
 #   - glued to a suffix inside an identifier, and as a FILE NAME — the three
 #     benchmark adapters were exactly this, and a whole-word check passes them;
+#   - glued on BOTH sides, in the middle of an identifier — three test class
+#     names were exactly this, and a prefix-and-suffix check passes them;
 #   - spelled with a diacritic;
 #   - and the output must never print the name it found.
 #
@@ -45,6 +47,9 @@ expect "a name in prose, in capitals, fails" 1 "$d"
 d="$TMP/glued"; mkdir -p "$d"; echo "class ExampleGraphAdapter: pass" > "$d/a.py"
 expect "a name glued to a suffix in an identifier fails" 1 "$d"
 
+d="$TMP/middle"; mkdir -p "$d"; echo "class TestExampleGraphSkipPath: pass" > "$d/a.py"
+expect "a name glued on both sides, in the middle of an identifier, fails" 1 "$d"
+
 d="$TMP/path"; mkdir -p "$d/adapters"; echo "pass" > "$d/adapters/otherstore.py"
 expect "a name that is only a file name fails" 1 "$d"
 
@@ -58,6 +63,25 @@ if printf 'abc\tx\n' | python3 "$GATE" --list "$TMP/short.sha256" --add >/dev/nu
   echo "FAIL: --add accepted a three-character name"; fails=1
 else
   echo "ok: --add refuses a name too short to match safely"
+fi
+
+# --explain is the local diagnostic: it needs the plain list, which is never
+# tracked, and it must still not print the name — only where in the token it is
+# and which line of the plain list matched.
+PLAIN="$TMP/plain.txt"
+printf 'ExampleGraph\tsystem A\nOtherStore\tsystem B\n' > "$PLAIN"
+out="$(python3 "$GATE" --list "$LIST" --root "$TMP/middle" --plain "$PLAIN" --explain a.py:1 2>&1)" || true
+if echo "$out" | grep -qi -E 'examplegraph|otherstore'; then
+  echo "FAIL: --explain printed the name it found"; fails=1
+elif ! echo "$out" | grep -q -F 'test[blocked]skippath' || ! echo "$out" | grep -q -E 'line 1\b'; then
+  echo "FAIL: --explain did not show the masked token and the list line"; echo "$out" | sed 's/^/    /'; fails=1
+else
+  echo "ok: --explain shows the masked token and the list line, never the name"
+fi
+if python3 "$GATE" --list "$LIST" --root "$TMP/middle" --plain "$TMP/absent.txt" --explain a.py:1 >/dev/null 2>&1; then
+  echo "FAIL: --explain ran without the plain list"; fails=1
+else
+  echo "ok: --explain refuses to run without the local plain list"
 fi
 
 [[ "$fails" -eq 0 ]] || { echo "test-check-names.sh: FAILED"; exit 1; }

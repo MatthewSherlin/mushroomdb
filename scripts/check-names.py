@@ -12,19 +12,28 @@ exemption for its own list.
 What is checked, for every tracked file and for its path:
 
   each word (letters and digits, lowercased, accents folded), and every
-  prefix and suffix of it at least MIN_LEN characters long.
+  run of MIN_LEN to MAX_LEN characters inside it.
 
-So a name glued to a suffix — an identifier, a package, a file name — is
-found. A name written as two words, or split by a hyphen, is not: joining
-adjacent words would make an ordinary phrase match. A name that is also an
-ordinary word cannot be listed at all.
+So a name matches wherever it occurs inside a word or a path component: glued
+to a suffix, to a prefix, or to both — an identifier, a package, a file name, a
+class name with the name in the middle. A name written as two words, or split
+by a hyphen, is not found: joining adjacent words would make an ordinary phrase
+match. A name that is also an ordinary word cannot be listed at all, and a
+listed name that happens to sit inside an ordinary word will fail that word.
 
     python3 scripts/check-names.py                 check the repository
     python3 scripts/check-names.py --add < names   add names (first tab-separated
                                                    field of each line) to the list
+    python3 scripts/check-names.py --explain path:line
+                                                   local only: why that line fails
 
-Prints `path:line` for every hit and never the name: a path component that is
-itself a name is printed as `[blocked]`. Exits 1 on any hit.
+Prints `path:line` for every hit and never the name: a path component that
+holds a name is printed as `[blocked]`. Exits 1 on any hit.
+
+`--explain` needs the plain list, which is gitignored and exists only on a
+machine that built it (default .superpowers/blocked-names.txt, or --plain). It
+prints each offending token with the matched run replaced by `[blocked]`, and
+the line of the plain list that matched — still never the name.
 """
 
 from __future__ import annotations
@@ -39,9 +48,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LIST = ROOT / "scripts" / "blocked-names.sha256"
+DEFAULT_PLAIN = ROOT / ".superpowers" / "blocked-names.txt"
 
 WORD = re.compile(r"[a-z0-9]+")
 MIN_LEN = 4
+# The longest name the list may hold. It bounds the work per word: a tracked
+# file can hold a "word" thousands of characters long (a digest, a blob).
+MAX_LEN = 32
 
 # Content that is not text. The path of such a file is still checked.
 BINARY_SUFFIXES = (
@@ -63,11 +76,15 @@ def digest(piece: str) -> str:
 
 
 def pieces(word: str):
-    """The word, and each prefix and suffix of it at least MIN_LEN long."""
-    yield word
-    for n in range(MIN_LEN, len(word)):
-        yield word[:n]
-        yield word[-n:]
+    """Every run of MIN_LEN..MAX_LEN characters inside the word."""
+    for n in range(MIN_LEN, min(len(word), MAX_LEN) + 1):
+        for start in range(len(word) - n + 1):
+            yield word[start:start + n]
+
+
+def normal(name: str) -> str:
+    """A name as it is hashed: folded, letters and digits only."""
+    return "".join(WORD.findall(fold(name)))
 
 
 def load(path: Path) -> set[str]:
@@ -117,15 +134,22 @@ def add(list_path: Path) -> int:
         name = raw.split("\t", 1)[0].strip()
         if not name or name.startswith("#"):
             continue
-        normal = "".join(WORD.findall(fold(name)))
-        if len(normal) < MIN_LEN:
+        folded = normal(name)
+        if len(folded) < MIN_LEN:
             print(
-                f"check-names.py: a name of {len(normal)} characters is too short to match "
+                f"check-names.py: a name of {len(folded)} characters is too short to match "
                 f"safely (minimum {MIN_LEN}); nothing was added",
                 file=sys.stderr,
             )
             return 2
-        d = digest(normal)
+        if len(folded) > MAX_LEN:
+            print(
+                f"check-names.py: a name of {len(folded)} characters is longer than the gate "
+                f"looks for (maximum {MAX_LEN}); nothing was added",
+                file=sys.stderr,
+            )
+            return 2
+        d = digest(folded)
         if d not in have:
             have.add(d)
             added += 1
@@ -144,17 +168,60 @@ def add(list_path: Path) -> int:
     return 0
 
 
+def explain(root: Path, plain_path: Path, blocked: set[str], target: str) -> int:
+    """Why `path:line` (or a bare `path`) fails. Local only; never prints a name."""
+    if not plain_path.is_file():
+        print(
+            f"check-names.py: --explain needs the plain list at {plain_path}, which is "
+            "gitignored and is not on this machine",
+            file=sys.stderr,
+        )
+        return 2
+    entries: list[tuple[int, str]] = []
+    for lineno, raw in enumerate(plain_path.read_text(encoding="utf-8").splitlines(), 1):
+        name = raw.split("\t", 1)[0].strip()
+        if name and not name.startswith("#") and digest(normal(name)) in blocked:
+            entries.append((lineno, normal(name)))
+    rel, _, line_part = target.rpartition(":")
+    if not rel or not line_part.isdigit():
+        rel, line_part = target, ""
+    if line_part:
+        try:
+            lines = (root / rel).read_text(encoding="utf-8").splitlines()
+            text = lines[int(line_part) - 1]
+        except (OSError, UnicodeDecodeError, IndexError):
+            print(f"check-names.py: cannot read line {line_part} of that path", file=sys.stderr)
+            return 2
+        where = f"line {line_part}"
+    else:
+        text, where = rel, "the path itself"
+    found = 0
+    for word in sorted(set(WORD.findall(fold(text)))):
+        for lineno, name in entries:
+            if name in word:
+                print(f"{where}: token `{word.replace(name, '[blocked]')}` holds the name "
+                      f"on line {lineno} of the plain list")
+                found += 1
+    if not found:
+        print(f"{where}: no listed name found")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="No tracked file names a blocked system.")
     ap.add_argument("--list", type=Path, default=DEFAULT_LIST)
     ap.add_argument("--root", type=Path, default=ROOT)
     ap.add_argument("--add", action="store_true")
+    ap.add_argument("--plain", type=Path, default=DEFAULT_PLAIN)
+    ap.add_argument("--explain", metavar="PATH[:LINE]")
     a = ap.parse_args()
 
     if a.add:
         return add(a.list)
 
     blocked = load(a.list)
+    if a.explain:
+        return explain(a.root, a.plain, blocked, a.explain)
     if not blocked:
         print(f"check-names.py: no digests in {a.list}; nothing to check", file=sys.stderr)
         return 1
@@ -163,7 +230,7 @@ def main() -> int:
     for rel in tracked(a.root):
         if Path(rel).name in EXEMPT_NAMES:
             continue
-        # A path that is itself a name must not be printed: the path would be
+        # A path that holds a name must not be printed: the path would be
         # the name. Each component that hits is shown as `[blocked]`, here and
         # in every `path:line` below.
         shown = "/".join(
