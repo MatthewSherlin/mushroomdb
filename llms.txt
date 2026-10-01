@@ -478,12 +478,13 @@ genesis chains → CommitOutOfRange for archive-resident commits (never wrong da
 ## Storage
 
 - Dense-id WAL with per-commit fsync; configurable FsyncPolicy (strict/batched/relaxed)
-- V8 mmap snapshot (v0.2+): 12 rkyv sections (TOPOLOGY, COLUMNS, IDS, SYMS, META,
-  EDGE_PROPS, HNSW, PROVENANCE, RULES_META, VIEWS, IVF_STATE, LAST_CHANGE); zero-copy
-  open via mmap; no heap allocation for section data; O(1) per-query section access
-- V5/V6/V7 snapshots auto-migrated to V8 on open; V3/V4 rejected
+- mmap snapshot, rkyv sections (V8 since v0.2; V9 is current, V10 when insert-count
+  multiplicity is enabled): zero-copy open, no heap allocation for section data
+- V5–V8 snapshots are migrated on open; V3/V4 are rejected
 - Single writer, many readers (RwLock-backed SharedDb)
-- RAM-bound; design target 10M nodes (~5–15 GiB with properties)
+- RAM-bound. Measured to 100,000 nodes (~10M derived edges) on a 24 GiB machine: 4.72 GiB
+  peak while building. Nothing larger has been run; ten million nodes was a design intent,
+  not a measurement
 - 100k nodes (~10M derived edges), V8 snapshot open: **0.02 s, 31–41 MiB RSS**
   (warm file cache, cold process; measured 2026-08-28, Apple M4 Pro, release build)
 - 100k nodes, WAL-only open: ~8.16 min (HNSW re-fitting dominates; measured 2026-08-24)

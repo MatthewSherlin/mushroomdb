@@ -345,10 +345,10 @@ Full HTTP endpoint reference: [`docs/site/api.md`](docs/site/api.md).
 
 | Limitation | Detail |
 |---|---|
-| Memory-first | The in-memory store is RAM-bound. Design target is 10M nodes (~5–15 GB with properties). mmap-backed storage is deferred. |
+| Memory-first | The working graph lives in RAM. **Measured to 100,000 nodes and about 10 million derived edges**, on a 24 GiB machine: 4.72 GiB peak while building it, 8.09 GiB to replay the WAL with no snapshot, and 0.02 s at 31–41 MiB to reopen from a snapshot, which is memory-mapped rather than loaded. Nothing larger has been run. Ten million nodes was the original design intent and is not a measurement; the next step toward it is a run at one million, which has not been made. Every rule is capped at 1,000,000 derived edges. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
 | Single writer, no interactive transactions | One writer at a time, many readers — within a process via `RwLock`, across processes via the advisory `LOCK` file. `write_batch` commits all ops in one WAL frame (all-or-nothing on crash replay) but is **not isolated**: readers may observe intermediate states while a committed batch is applied in memory. Multi-statement `BEGIN`/`COMMIT` is not supported, and there are no cross-process transactions. |
 | Peer writes do not notify subscribers | Commits another process made are picked up by `refresh()` and are there on the next read, but they fire no `EdgeFired`/`EdgeRetracted` event, so `/watch` and `/subscribe` see only writes made through this process. Poll if you need to react to a hook's writes. |
-| Cold start without a snapshot re-fires all rules | Snapshots persist derived edges, ANN state, and view definitions. At 100k nodes / ~10M derived edges: **0.02 s** from a V8 snapshot vs **8.16 min** WAL-only (ANN re-fit dominates). Call `snapshot()` before close. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
+| Cold start without a snapshot re-fires all rules | Snapshots persist derived edges, ANN state, and view definitions. At 100k nodes / ~10M derived edges: **0.02 s** from a snapshot (measured on V8; the format is V9 now, V10 with multiplicity) vs **8.16 min** WAL-only (ANN re-fit dominates). Call `snapshot()` before close. See [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md). |
 | Two-hop Cypher joins at scale | Dense patterns producing >1,000,000 intermediate rows error without `LIMIT`. Add `LIMIT n` — the pull-based executor stops early and never materializes the full binding table. |
 | Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE, MATCH…DETACH DELETE, and MERGE (single-key, with `ON CREATE SET` / `ON MATCH SET`) are supported. Derived edges cannot be deleted manually. Variable-length paths are hard-capped at 10 hops; unbounded `*min..` is rejected at parse time. Full coverage table: [`docs/site/query.md`](docs/site/query.md). |
 | Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection. Per-query recall floors min 0.90 / mean 0.95, measured 1.0 / 1.0 at 5k / dim 1536 (fixed-seed probe). Review the trade-off before using it in completeness-critical workloads. |
@@ -472,7 +472,7 @@ Phases 1–4 and Plan 18 all landed. What remains:
 
 | Priority | Item |
 |---|---|
-| Medium | mmap snapshots; lock-free epoch readers |
+| Medium | A measured run at 1,000,000 nodes; persisting the full-text index in the snapshot, so opening a store does not rebuild it |
 | Medium | v1.0 format stability (snapshot + WAL semver guarantee) |
 | Low | `CASE` in a write-statement `RETURN`; subqueries; napi-rs; WASM |
 | Low | Multi-statement `BEGIN/COMMIT` interactive transactions |

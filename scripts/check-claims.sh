@@ -58,6 +58,9 @@ CLAIM_PATTERNS=(
   'token[[:space:]]+savings'
   'cheaper[[:space:]]+(sessions?|turns?|coding|agents?)'
   '(beats|outperforms)[[:space:]]+(a[[:space:]]+)?stock'
+  # A scale that was never run. 100,000 nodes is the largest store measured;
+  # "10M nodes" was a design intent stated as a target (spec section 6.4).
+  '10[[:space:]]?M[[:space:]-]+nodes?|10[[:space:]]million[[:space:]]nodes'
 )
 
 GREP_PATTERNS=(

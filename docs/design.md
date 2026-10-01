@@ -60,7 +60,7 @@ ingestion posture.
 | UI rendering | cosmos.gl (GPU force layout + rendering; OpenJS Foundation) |
 | Bindings | Python (PyO3) and Rust at launch; TypeScript via HTTP `mushroomdb-client`. napi-rs deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
 | Testing | Deterministic simulation testing (a named system-style) from day one + model-based oracle testing + rule-equivalence invariant. Differential Cypher testing vs system A deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
-| Scale target | Design for 10M nodes in RAM (~5–15 GB with properties); document the RAM ceiling honestly. Real initial workloads are ~10k nodes |
+| Scale target | Design for 10M nodes in RAM (~5–15 GB with properties); document the RAM ceiling honestly. Real initial workloads are ~10k nodes *(Correction, 2026-10: never measured above 100,000 nodes — 4.72 GiB peak while building. See README, Known limitations.)* |
 
 ### Explicit non-goals (v1)
 
@@ -245,7 +245,7 @@ Not v1: general editing/admin UI, dashboards, saved queries.
 | Metric | Target |
 |---|---|
 | Point lookup + depth-2 typed neighborhood, 10k-node graph | < 100 µs engine-side |
-| Same, 10M-node graph | < 10 ms |
+| Same, 10M-node graph | < 10 ms *(never measured; the largest store run is 100,000 nodes)* |
 | Insert with 5 active rules, 100k-node graph | < 1 ms |
 | DB open (5 GB snapshot) | Target < 100 ms (mmap/rkyv; deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md`). Current V6 zstd-bincode open is ~8.88 s at 100k nodes |
 | UI: click-to-rendered neighborhood (500 nodes, end-to-end) | < 100 ms |
