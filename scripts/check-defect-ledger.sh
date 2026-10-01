@@ -17,7 +17,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-LEDGER="${1:-docs/roadmap/v0.6.10-defects.md}"
+LEDGER="${1:-$ROOT/docs/roadmap/v0.6.10-defects.md}"
 [ -f "$LEDGER" ] || { echo "check-defect-ledger.sh: no ledger at $LEDGER" >&2; exit 1; }
 
 grep -q 'DEFECT-INDEX:BEGIN' "$LEDGER" && grep -q 'DEFECT-INDEX:END' "$LEDGER" || {
