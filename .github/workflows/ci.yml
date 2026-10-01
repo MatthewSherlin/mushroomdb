@@ -391,6 +391,13 @@ jobs:
       - run: bash scripts/check-claims.sh
       # The names gate, shown failing on what it guards and never printing it.
       - run: bash scripts/tests/test-check-names.sh
+      # Every relative link and anchor in the hand-written docs resolves, and
+      # every page under docs/site is reachable from its index.
+      - run: python3 scripts/check-links.py
+      # llms-full.txt is generated from the README and docs/site. Until 0.7 it
+      # was regenerated only by a version bump, so it drifted between releases
+      # with nothing to say so.
+      - run: bash scripts/gen-llms-full.sh --check
       # One version, twenty-four places. Catches the two shapes that have both
       # already shipped: a package manifest left behind (0.6.9 told readers to
       # install 0.6.8; a v0.6.11 tag would have published a wheel labelled
