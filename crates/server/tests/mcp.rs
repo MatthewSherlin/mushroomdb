@@ -4098,14 +4098,24 @@ fn a_wrong_typed_json_argument_is_a_tool_error() {
     assert!(error_text(&reply).contains("json must be a boolean"));
 }
 
-/// Binding: `recall`'s reply carries the framing line exactly once. The digest
-/// itself never carries it — only the text wrapper stamps it — so double
-/// framing is structurally impossible rather than merely untested.
+/// Binding: `recall`'s reply carries the framing line exactly once, first,
+/// whether the topic matched or not. The digest itself never carries it — only
+/// the text wrapper stamps it, and the wrapper no longer checks for a copy
+/// already there — so this test is what keeps a second stamp from appearing.
 #[test]
 fn recall_is_framed_once_not_twice() {
     let db = code_store("recall-framing");
+    let no_match = task_text(&one_task_call(
+        db.clone(),
+        "recall",
+        json!({"topic": "zzqx-nothing-matches-this"}),
+    ));
+    assert!(no_match.starts_with(UNTRUSTED_FRAMING), "{no_match}");
+    assert_eq!(no_match.matches(UNTRUSTED_FRAMING).count(), 1, "{no_match}");
+
     let reply = one_task_call(db.clone(), "recall", json!({"topic": "src/core.rs"}));
     let full = task_text(&reply);
+    assert!(full.starts_with(UNTRUSTED_FRAMING), "{full}");
     assert_eq!(full.matches(UNTRUSTED_FRAMING).count(), 1, "{full}");
     // What is left after stripping the one framing line is exactly the json
     // reply's own digest — the same body, whichever way it was asked for.

@@ -1987,11 +1987,15 @@ pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
     // Placed above the reach line rather than after it: a brief ends with how
     // to reach the graph, and the tests holding that line read it as the last.
     // An empty store's brief has no reach line, so there it simply ends.
+    //
+    // The path is quoted and sanitized as the reach line's is: quoted so a
+    // space or a quote in it stays one argument, sanitized because this line
+    // is inserted after `render` sanitized everything else.
     if db.fulltext_pairs().is_empty() {
         let notice = format!(
             "no text index: recall cannot match anything here. \
              Run: mushroomdb schema apply {} --memory-defaults\n",
-            db_dir.display()
+            core_api::digest::sanitize(&install::sh_quote(&db_dir.to_string_lossy()))
         );
         let at = text
             .rfind("\nreach the graph: ")

@@ -144,7 +144,7 @@ fn the_brief_of_a_store_with_no_text_index_names_the_fix() {
     let out = brief(&db);
     let expected = format!(
         "no text index: recall cannot match anything here. \
-         Run: mushroomdb schema apply {} --memory-defaults",
+         Run: mushroomdb schema apply '{}' --memory-defaults",
         db.display()
     );
     let lines: Vec<&str> = out.lines().collect();
@@ -161,6 +161,29 @@ fn the_brief_of_a_store_with_no_text_index_names_the_fix() {
         "{out:?}"
     );
     assert_eq!(out.matches("no text index").count(), 1, "{out:?}");
+}
+
+/// The notice names the store the way the reach line under it does: shell
+/// quoted, so a path with a space or a quote in it is still one argument, and
+/// sanitized, so a control character in the path cannot forge a line of the
+/// brief.
+#[test]
+fn the_no_index_notice_quotes_and_sanitizes_the_store_path() {
+    let db = store_without_an_index("brief noindex 'q'\u{1b}[31m");
+    let out = brief(&db);
+    let quoted =
+        format!("'{}'", db.to_string_lossy().replace('\'', r"'\''")).replace('\u{1b}', " ");
+    let expected = format!(
+        "no text index: recall cannot match anything here. \
+         Run: mushroomdb schema apply {quoted} --memory-defaults"
+    );
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines.len().checked_sub(2).map(|i| lines[i]),
+        Some(expected.as_str()),
+        "{out:?}"
+    );
+    assert!(!out.contains('\u{1b}'), "{out:?}");
 }
 
 #[test]

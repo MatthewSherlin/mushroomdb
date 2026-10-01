@@ -41,8 +41,8 @@
 //! whatever its writers put there: an `ingest-git` store carries author names,
 //! paths, commit subjects and doc comments, and a memory store carries notes.
 //! [`ok`] therefore stamps every reply with
-//! [`core_api::digest::UNTRUSTED_FRAMING`], the same marker
-//! `recall_digest` puts on its own digest, so an assistant is told to read the
+//! [`core_api::digest::UNTRUSTED_FRAMING`], the same marker the prompt hook
+//! and the session brief put on theirs, so an assistant is told to read the
 //! lines under it as data before it reads any of them. The renderers already
 //! sanitize each line; the framing is what says whose words they are.
 
@@ -107,8 +107,8 @@ pub(crate) fn dispatch(
 ///
 /// With `json_out` clear — the default — it is the rendered digest under the
 /// untrusted-data framing line, and nothing else: no `structuredContent`, no
-/// second copy of the same text. `recall_digest` emits the framing itself, so
-/// a digest that already carries it is left alone rather than marked twice.
+/// second copy of the same text. No renderer here frames its own output —
+/// `recall_digest` included — so this is the one place the line is stamped.
 ///
 /// With `json_out` set it is the serialised report as the text content, for a
 /// program that wants the numbers. The report is never rendered in that case,
@@ -136,13 +136,9 @@ fn ok<T: serde::Serialize>(
             Err(e) => CallOutcome::ToolErr(format!("serialise report: {e}")),
         };
     }
-    let text = render(report);
-    let text = if text.starts_with(UNTRUSTED_FRAMING) {
-        text
-    } else {
-        format!("{UNTRUSTED_FRAMING}{text}")
-    };
-    CallOutcome::TaskOk { text }
+    CallOutcome::TaskOk {
+        text: format!("{UNTRUSTED_FRAMING}{}", render(report)),
+    }
 }
 
 /// Replace the control characters in every string of `value` with spaces.
