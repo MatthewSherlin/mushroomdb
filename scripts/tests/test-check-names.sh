@@ -78,6 +78,46 @@ elif ! echo "$out" | grep -q -F 'test[blocked]skippath' || ! echo "$out" | grep 
 else
   echo "ok: --explain shows the masked token and the list line, never the name"
 fi
+# A token can hold two listed names. Reporting on one must not print the other.
+d="$TMP/two"; mkdir -p "$d"; echo "class ExampleGraphOtherStoreBridge: pass" > "$d/a.py"
+out="$(python3 "$GATE" --list "$LIST" --root "$d" --plain "$PLAIN" --explain a.py:1 2>&1)" || true
+if echo "$out" | grep -qi -E 'examplegraph|otherstore'; then
+  echo "FAIL: --explain printed one name while reporting the other, in a token holding two"; fails=1
+elif ! echo "$out" | grep -q -F '[blocked][blocked]bridge'; then
+  echo "FAIL: --explain did not show the token with both names masked"; echo "$out" | sed 's/^/    /'; fails=1
+else
+  echo "ok: --explain masks every listed name in a token holding two"
+fi
+
+# A name on the plain list that was never hashed is still a name: masked too.
+printf 'ExampleGraph\tsystem A\nOtherStore\tsystem B\nThirdThing\tsystem C\n' > "$TMP/plain3.txt"
+d="$TMP/unhashed"; mkdir -p "$d"; echo "class ExampleGraphThirdThingBridge: pass" > "$d/a.py"
+out="$(python3 "$GATE" --list "$LIST" --root "$d" --plain "$TMP/plain3.txt" --explain a.py:1 2>&1)" || true
+if echo "$out" | grep -qi -E 'examplegraph|thirdthing'; then
+  echo "FAIL: --explain printed a plain-list name that is not on the hashed list"; fails=1
+else
+  echo "ok: --explain masks a plain-list name even when it was never hashed"
+fi
+
+# The same in bare-path mode, with two name-bearing components.
+d="$TMP/twopath"; mkdir -p "$d/examplegraph-otherstore"; echo "pass" > "$d/examplegraph-otherstore/otherstoreexamplegraph.py"
+out="$(python3 "$GATE" --list "$LIST" --root "$d" --plain "$PLAIN" --explain examplegraph-otherstore/otherstoreexamplegraph.py 2>&1)" || true
+if echo "$out" | grep -qi -E 'examplegraph|otherstore'; then
+  echo "FAIL: --explain printed a name from a path with two name-bearing components"; fails=1
+elif ! echo "$out" | grep -q -F '[blocked][blocked]'; then
+  echo "FAIL: --explain did not report the path component holding two names"; echo "$out" | sed 's/^/    /'; fails=1
+else
+  echo "ok: --explain masks every listed name in a path with two name-bearing components"
+fi
+
+# With no digests, the main gate fails; so must --explain, rather than say "nothing found".
+: > "$TMP/empty.sha256"
+if python3 "$GATE" --list "$TMP/empty.sha256" --root "$TMP/middle" --plain "$PLAIN" --explain a.py:1 >/dev/null 2>&1; then
+  echo "FAIL: --explain passed with an empty hashed list"; fails=1
+else
+  echo "ok: --explain fails closed when the hashed list is empty"
+fi
+
 if python3 "$GATE" --list "$LIST" --root "$TMP/middle" --plain "$TMP/absent.txt" --explain a.py:1 >/dev/null 2>&1; then
   echo "FAIL: --explain ran without the plain list"; fails=1
 else

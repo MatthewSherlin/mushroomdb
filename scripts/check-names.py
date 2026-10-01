@@ -177,10 +177,14 @@ def explain(root: Path, plain_path: Path, blocked: set[str], target: str) -> int
             file=sys.stderr,
         )
         return 2
-    entries: list[tuple[int, str]] = []
+    entries: list[tuple[int, str]] = []  # the plain names the hashed list holds
+    spelled: set[str] = set()            # every plain name, hashed or not
     for lineno, raw in enumerate(plain_path.read_text(encoding="utf-8").splitlines(), 1):
         name = raw.split("\t", 1)[0].strip()
-        if name and not name.startswith("#") and digest(normal(name)) in blocked:
+        if not name or name.startswith("#") or not normal(name):
+            continue
+        spelled.add(normal(name))
+        if digest(normal(name)) in blocked:
             entries.append((lineno, normal(name)))
     rel, _, line_part = target.rpartition(":")
     if not rel or not line_part.isdigit():
@@ -195,11 +199,19 @@ def explain(root: Path, plain_path: Path, blocked: set[str], target: str) -> int
         where = f"line {line_part}"
     else:
         text, where = rel, "the path itself"
+    # Mask EVERY name on the plain list in a token before printing it, not only
+    # the one being reported: a token or a path component can hold two, and one
+    # of them may not be hashed yet. Longest first, so a name that contains
+    # another is masked whole.
+    every = re.compile("|".join(
+        re.escape(name) for name in sorted(spelled, key=len, reverse=True)
+    )) if spelled else None
     found = 0
     for word in sorted(set(WORD.findall(fold(text)))):
+        masked = every.sub("[blocked]", word) if every else word
         for lineno, name in entries:
             if name in word:
-                print(f"{where}: token `{word.replace(name, '[blocked]')}` holds the name "
+                print(f"{where}: token `{masked}` holds the name "
                       f"on line {lineno} of the plain list")
                 found += 1
     if not found:
@@ -220,11 +232,11 @@ def main() -> int:
         return add(a.list)
 
     blocked = load(a.list)
-    if a.explain:
-        return explain(a.root, a.plain, blocked, a.explain)
     if not blocked:
         print(f"check-names.py: no digests in {a.list}; nothing to check", file=sys.stderr)
         return 1
+    if a.explain:
+        return explain(a.root, a.plain, blocked, a.explain)
     matcher = Matcher(blocked)
     bad = 0
     for rel in tracked(a.root):
