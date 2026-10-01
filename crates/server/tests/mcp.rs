@@ -193,7 +193,7 @@ fn tools_list_returns_all_tools_with_schemas() {
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 22);
+    assert_eq!(tools.len(), 23);
 
     let by_name = |n: &str| {
         tools
@@ -1044,7 +1044,7 @@ fn hybrid_search_text_only_and_missing_field_errors() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The task tools, in the order `tools/list` must list them.
-const TASK_TOOLS: [&str; 8] = [
+const TASK_TOOLS: [&str; 9] = [
     "explain_association",
     "node_edges",
     "neighborhood",
@@ -1053,6 +1053,7 @@ const TASK_TOOLS: [&str; 8] = [
     "recall",
     "remember",
     "schema",
+    "forget",
 ];
 
 /// The fourteen graph tools, in their established order, after the task tools.
@@ -1446,7 +1447,7 @@ fn a_memory_store_lists_the_association_surface() {
         server::ASSOCIATION_TOOLS.to_vec(),
         "default tools/list on a memory store"
     );
-    assert_eq!(tools.len(), 20);
+    assert_eq!(tools.len(), 21);
     for hidden in [
         "explore", "map", "context", "impact", "owners", "why", "sync",
     ] {
@@ -3442,7 +3443,7 @@ fn what_if_with_an_edge_type_answers_in_partner_keys() {
 /// said what they *returned* rather than what they were *for*.
 #[test]
 fn every_association_tool_description_opens_with_its_question() {
-    const OPENERS: [(&str, &str); 20] = [
+    const OPENERS: [(&str, &str); 21] = [
         ("query", "Who may see this"),
         ("explain_association", "Why are A and B related"),
         ("neighborhood", "What is around K"),
@@ -3476,6 +3477,7 @@ fn every_association_tool_description_opens_with_its_question() {
         ),
         ("stats", "How big is this store"),
         ("schema", "What's in here"),
+        ("forget", "Forget that"),
     ];
 
     let (res, out) = exchange(open("descriptions"), &req(json!(1), "tools/list", None));
@@ -3741,7 +3743,7 @@ fn tools_list_has_every_tool_task_tools_first_and_advanced_prefix() {
         .copied()
         .collect();
     assert_eq!(names, expected, "tools/list order");
-    assert_eq!(tools.len(), 22);
+    assert_eq!(tools.len(), 23);
 
     for t in tools.iter().take(TASK_TOOLS.len()) {
         let d = t["description"].as_str().expect("description");
@@ -3960,6 +3962,9 @@ fn every_task_tool_frames_its_text_as_untrusted() {
         "node_edges" | "neighborhood" => json!({"key": "src/core.rs"}),
         "edges_at" => json!({"key": "src/core.rs", "at": 0}),
         "what_if" => json!({"key": "src/core.rs", "field": "lines", "value": 2}),
+        // Last in the sweep, and a property the node does not carry: it
+        // answers without removing anything a later tool would read.
+        "forget" => json!({"key": "src/core.rs", "prop": "no_such_prop"}),
         _ => json!({}),
     };
     for tool in TASK_TOOLS {
@@ -5227,4 +5232,149 @@ fn schema_on_an_empty_memory_store_lists_its_declarations() {
         !text.contains("provisional:"),
         "nothing provisional: {text}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// forget — "forget that"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Review focus: forgetting a key many notes were about deletes the node and
+/// names the notes — capped, counted — without touching their text.
+#[test]
+fn forgetting_a_key_many_notes_name_lists_them_and_keeps_them() {
+    let db = memory_store("forget-many");
+    for i in 0..25 {
+        one_task_call(
+            db.clone(),
+            "remember",
+            json!({"text": format!("Reid fact number {i}"), "about": ["reid"]}),
+        );
+    }
+    let text = task_reply(&one_task_call(db.clone(), "forget", json!({"key": "reid"})));
+    assert!(text.starts_with("forgot reid (Entity)"), "{text}");
+    assert!(text.contains("25 note(s) still say it"), "{text}");
+    assert!(
+        text.contains("(+15 more)"),
+        "ten named, fifteen counted: {text}"
+    );
+    assert!(text.contains("history still holds it"), "{text}");
+    assert!(text.contains("`mushroomdb migrate`"), "{text}");
+    let g = db.read();
+    assert!(!g.has_node("reid"), "the node is gone");
+    assert_eq!(
+        g.nodes_with_label("Note").len(),
+        25,
+        "every note is still there"
+    );
+}
+
+/// Binding: removing one property — the one deletion MCP had no path to,
+/// because Cypher here has no REMOVE.
+#[test]
+fn forgetting_a_property_removes_only_that_property() {
+    let db = memory_store("forget-prop");
+    one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew", "label": "Person",
+               "props": {"name": "Matthew", "email": "m@example.com"}}),
+    );
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "matthew", "prop": "email"}),
+    ));
+    assert!(text.starts_with("forgot matthew.email"), "{text}");
+    assert_eq!(db.read().get_prop("matthew", "email"), None);
+    assert_eq!(
+        db.read().get_prop("matthew", "name"),
+        Some(Value::Str("Matthew".into()))
+    );
+
+    let again = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "matthew", "prop": "email"}),
+    ));
+    assert!(again.contains("is not set; nothing to forget"), "{again}");
+    assert!(
+        !again.contains("history still holds it"),
+        "nothing was written, so there is nothing in history to warn about: {again}"
+    );
+}
+
+/// Binding: retracting a fact removes the edge and names the notes whose text
+/// still states it.
+#[test]
+fn forgetting_a_fact_retracts_the_edge_and_names_the_notes_behind_it() {
+    let db = memory_store("forget-fact");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({
+            "text": "Matthew wants 0.7 to focus on the write path",
+            "about": ["matthew", "v0.7"],
+            "entities": [{"key": "matthew", "label": "Person"},
+                         {"key": "v0.7", "label": "Release"}],
+            "facts": [{"subject": "matthew", "predicate": "WANTS", "object": "v0.7"}]
+        }),
+    );
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"fact": {"subject": "matthew", "predicate": "WANTS", "object": "v0.7"}}),
+    ));
+    assert!(text.starts_with("retracted WANTS matthew → v0.7"), "{text}");
+    assert!(text.contains("1 note(s) still say it"), "{text}");
+    assert!(
+        db.read()
+            .neighbors("matthew", "WANTS", core_api::Direction::Out)
+            .unwrap()
+            .is_empty(),
+        "the edge is gone"
+    );
+}
+
+/// Binding: an edge a rule derived cannot be retracted by hand; the refusal
+/// names the rule and the only two ways it can change.
+#[test]
+fn forgetting_a_rule_owned_fact_is_refused_with_the_rule_named() {
+    let db = memory_store("forget-owned");
+    db.write().create_rule(same_name_rule()).unwrap();
+    for key in ["a", "b"] {
+        db.write()
+            .insert_node("Person", key, vec![("name".into(), Value::Str("X".into()))])
+            .unwrap();
+    }
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"fact": {"subject": "a", "predicate": "SAME_NAME", "object": "b"}}),
+    ));
+    assert!(err.contains("derived by rule same_name"), "{err}");
+    assert!(err.contains("(name)"), "the field the rule reads: {err}");
+    assert!(err.contains("Nothing was written"), "{err}");
+    assert_eq!(
+        db.read()
+            .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+            .unwrap(),
+        vec!["b".to_string()]
+    );
+}
+
+/// Binding: exactly one of the three shapes, and an unknown key is named.
+#[test]
+fn forget_takes_exactly_one_shape_and_names_an_unknown_key() {
+    let db = memory_store("forget-shape");
+    seed_person(&db, "a");
+    for args in [
+        json!({}),
+        json!({"prop": "name"}),
+        json!({"key": "a", "fact": {"subject": "a", "predicate": "X", "object": "a"}}),
+    ] {
+        let err = error_text(&one_task_call(db.clone(), "forget", args.clone()));
+        assert!(err.contains("pass exactly one of"), "{args}: {err}");
+    }
+    let err = error_text(&one_task_call(db, "forget", json!({"key": "nobody"})));
+    assert!(err.contains("nobody"), "{err}");
 }

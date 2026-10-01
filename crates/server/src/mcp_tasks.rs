@@ -63,7 +63,7 @@ use std::path::Path;
 /// they are the same question widened: every relationship of one node rather
 /// than of one pair, that listing at a past commit, and that listing under a
 /// change that has not been made.
-pub(crate) const TASK_TOOLS: [&str; 8] = [
+pub(crate) const TASK_TOOLS: [&str; 9] = [
     "explain_association",
     "node_edges",
     "neighborhood",
@@ -72,6 +72,7 @@ pub(crate) const TASK_TOOLS: [&str; 8] = [
     "recall",
     "remember",
     "schema",
+    "forget",
 ];
 
 /// Route a task tool. `None` when `name` is not one of [`TASK_TOOLS`].
@@ -101,6 +102,7 @@ pub(crate) fn dispatch(
         "recall" => tool_recall(db, db_dir, args, json_out),
         "remember" => tool_remember(db, args, json_out),
         "schema" => tool_schema(db, json_out),
+        "forget" => tool_forget(db, args, json_out),
         _ => unreachable!("TASK_TOOLS and this match list the same names"),
     })
 }
@@ -1986,6 +1988,254 @@ fn tool_schema(db: &SharedDb, json_out: bool) -> CallOutcome {
     ok(json_out, &report, core_api::memory::schema::render_schema)
 }
 
+// ── forget ───────────────────────────────────────────────────────────────────
+
+/// Notes a `forget` reply names when what it forgot was written about; the
+/// rest are counted.
+const FORGET_NOTE_LIST: usize = 10;
+
+/// The refusal for a call that is not exactly one of the three shapes.
+const FORGET_SHAPE: &str = "pass exactly one of: key (forget a node), key and prop \
+     (forget one property), or fact {subject, predicate, object} (retract one edge)";
+
+/// What one `forget` call did.
+#[derive(serde::Serialize)]
+struct ForgetReport {
+    /// `node`, `prop` or `fact`.
+    mode: &'static str,
+    /// The node, property or edge named, as the caller named it.
+    target: String,
+    /// False when there was nothing to forget, and nothing was written.
+    changed: bool,
+    /// Edges removed with a node: written by hand, and derived by rules.
+    manual_edges: u64,
+    derived_edges: u64,
+    /// Notes with an `ABOUT` edge to the node, or to both ends of the fact.
+    /// Listed, never deleted: their text still says what was forgotten.
+    notes: Vec<String>,
+    notes_total: usize,
+    /// The first commit history still answers from.
+    history_floor: u64,
+}
+
+/// Every field a predicate reads, its parts' included, sorted and deduped.
+fn predicate_fields(p: &core_api::PredicateSummary) -> Vec<String> {
+    let mut out: BTreeSet<String> = p.fields.iter().cloned().collect();
+    for part in p.parts.iter().flatten() {
+        out.extend(predicate_fields(part));
+    }
+    out.into_iter().collect()
+}
+
+/// Notes with an `ABOUT` edge to every one of `keys`, sorted.
+fn notes_about(g: &core_api::GraphDb<core_api::RealFs>, keys: &[&str]) -> Vec<String> {
+    let mut common: Option<BTreeSet<String>> = None;
+    for key in keys {
+        let into: BTreeSet<String> = g
+            .neighbors(key, "ABOUT", core_api::Direction::In)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|k| g.node_ref(k).is_some_and(|n| n.label() == "Note"))
+            .collect();
+        common = Some(match common {
+            None => into,
+            Some(c) => c.intersection(&into).cloned().collect(),
+        });
+    }
+    common.unwrap_or_default().into_iter().collect()
+}
+
+/// The history sentence every successful `forget` ends with. A tombstone is
+/// not a redaction, and the caller is told so in the same reply.
+fn history_line(floor: u64) -> String {
+    format!(
+        "history still holds it: node_history, edge_history, edges_at and was_linked \
+         read it back from commit {floor} on, until `mushroomdb migrate`, \
+         `snapshot --truncate` or `--retention` prunes the log\n"
+    )
+}
+
+fn render_forget(r: &ForgetReport) -> String {
+    let target = digest::sanitize(&r.target);
+    let mut out = match (r.mode, r.changed) {
+        ("node", _) => format!(
+            "forgot {target} — {} edge(s) removed, {} derived edge(s) retracted\n",
+            r.manual_edges, r.derived_edges
+        ),
+        ("prop", true) => format!("forgot {target}\n"),
+        ("prop", false) => format!("{target} is not set; nothing to forget\n"),
+        (_, true) => format!("retracted {target}\n"),
+        (_, false) => format!("no edge {target}; nothing to retract\n"),
+    };
+    if r.notes_total > 0 {
+        let named: Vec<String> = r.notes.iter().map(|k| digest::sanitize(k)).collect();
+        let more = r.notes_total - named.len();
+        out.push_str(&format!(
+            "{} note(s) still say it — their text is unchanged and recall can return them; \
+             forget a note by its key: {}{}\n",
+            r.notes_total,
+            named.join(", "),
+            if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    if r.changed {
+        out.push_str(&history_line(r.history_floor));
+    }
+    out
+}
+
+/// A `fact` argument: three non-empty strings.
+fn fact_arg(v: &Js) -> Result<(String, String, String), String> {
+    let field = |name: &str| {
+        v.get(name)
+            .and_then(Js::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("fact.{name} must be a non-empty string"))
+    };
+    Ok((field("subject")?, field("predicate")?, field("object")?))
+}
+
+fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
+    let key = match opt_str_arg(args, "key") {
+        Ok(k) => k.map(str::to_string),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let prop = match opt_str_arg(args, "prop") {
+        Ok(p) => p.map(str::to_string),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let fact = match args.get("fact") {
+        None | Some(Js::Null) => None,
+        Some(v) if v.is_object() => match fact_arg(v) {
+            Ok(f) => Some(f),
+            Err(e) => return CallOutcome::ToolErr(e),
+        },
+        Some(_) => return CallOutcome::ToolErr("fact must be an object".into()),
+    };
+    // One write guard for the reads the reply needs and the write itself, so
+    // nothing can change between what the reply says and what was done.
+    let mut g = db.write();
+    let report = match (key, prop, fact) {
+        (Some(key), None, None) => {
+            if !g.has_node(&key) {
+                return CallOutcome::ToolErr(graph_err_msg(GraphError::KeyNotFound { key }));
+            }
+            let notes = notes_about(&g, &[key.as_str()]);
+            let label = g
+                .node_ref(&key)
+                .map(|n| n.label().to_string())
+                .unwrap_or_default();
+            let deleted = match g.delete_node(&key) {
+                Ok(r) => r,
+                Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+            };
+            ForgetReport {
+                mode: "node",
+                target: format!("{key} ({label})"),
+                changed: true,
+                manual_edges: deleted.manual_edges,
+                derived_edges: deleted.derived_edges,
+                notes_total: notes.len(),
+                notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
+                history_floor: g.stats().history_floor,
+            }
+        }
+        (Some(key), Some(prop), None) => {
+            let changed = match g.remove_prop(&key, &prop) {
+                Ok(c) => c,
+                Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+            };
+            ForgetReport {
+                mode: "prop",
+                target: format!("{key}.{prop}"),
+                changed,
+                manual_edges: 0,
+                derived_edges: 0,
+                notes: Vec::new(),
+                notes_total: 0,
+                history_floor: g.stats().history_floor,
+            }
+        }
+        (None, None, Some((subject, predicate, object))) => {
+            let target = format!("{predicate} {subject} → {object}");
+            let changed = match g.delete_edge(&predicate, &subject, &object) {
+                Ok(c) => c,
+                Err(GraphError::RuleOwned { detail }) => {
+                    return CallOutcome::ToolErr(rule_owned_refusal(
+                        &g, &predicate, &subject, &object, &detail,
+                    ))
+                }
+                Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+            };
+            let notes = if changed {
+                notes_about(&g, &[subject.as_str(), object.as_str()])
+            } else {
+                Vec::new()
+            };
+            ForgetReport {
+                mode: "fact",
+                target,
+                changed,
+                manual_edges: 0,
+                derived_edges: 0,
+                notes_total: notes.len(),
+                notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
+                history_floor: g.stats().history_floor,
+            }
+        }
+        _ => return CallOutcome::ToolErr(FORGET_SHAPE.into()),
+    };
+    drop(g);
+    ok(json_out, &report, render_forget)
+}
+
+/// Why a fact edge cannot be retracted: which rule owns it, and the only two
+/// ways it can change.
+fn rule_owned_refusal(
+    g: &core_api::GraphDb<core_api::RealFs>,
+    predicate: &str,
+    subject: &str,
+    object: &str,
+    detail: &str,
+) -> String {
+    let label = |k: &str| g.node_ref(k).map(|n| n.label().to_string());
+    let (src, dst) = (label(subject), label(object));
+    let owners: Vec<core_api::RuleDef> = g
+        .rules()
+        .into_iter()
+        .filter(|r| {
+            r.edge_type == predicate
+                && Some(&r.src_label) == src.as_ref()
+                && Some(&r.dst_label) == dst.as_ref()
+        })
+        .collect();
+    if owners.is_empty() {
+        return digest::sanitize(detail);
+    }
+    let names: Vec<String> = owners.iter().map(|r| digest::sanitize(&r.name)).collect();
+    let mut fields: BTreeSet<String> = BTreeSet::new();
+    for r in &owners {
+        fields.extend(predicate_fields(&core_api::PredicateSummary::from(
+            &r.predicate,
+        )));
+    }
+    let fields: Vec<String> = fields.iter().map(|f| digest::sanitize(f)).collect();
+    format!(
+        "refused: {} {} → {} is derived by rule {}. It changes only when the fields \
+         that rule reads change ({}), or when the rule is deleted. Nothing was written.",
+        digest::sanitize(predicate),
+        digest::sanitize(subject),
+        digest::sanitize(object),
+        names.join(", "),
+        fields.join(", ")
+    )
+}
+
 // ── tools/list ───────────────────────────────────────────────────────────────
 
 /// The `json` argument every task tool takes, added to every task tool's schema
@@ -2260,6 +2510,27 @@ fn task_tool_schemas() -> Vec<Js> {
             "name": "schema",
             "description": "What's in here — the store's labels with their property names, its edge types and what derives them, every rule with its predicate, the full-text fields recall searches, the equality indexes, and how many provisional nodes remember created. Call it before writing Cypher against a store you have not seen.",
             "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "forget",
+            "description": "Forget that — tombstone a node ('key'), remove one property ('key' and 'prop'), or retract one fact edge ('fact': subject, predicate, object). An edge a rule derived is refused with the rule that owns it. Notes that still state what was forgotten are listed, not deleted. History keeps it until the log is pruned, and the reply says so. There is no role check: this server has no auth.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "minLength": 1, "description": "The node to forget, or whose property to forget." },
+                    "prop": { "type": "string", "minLength": 1, "description": "With 'key': the one property to remove." },
+                    "fact": {
+                        "type": "object",
+                        "description": "The edge to retract, as remember's facts name it.",
+                        "properties": {
+                            "subject":   { "type": "string" },
+                            "predicate": { "type": "string" },
+                            "object":    { "type": "string" }
+                        },
+                        "required": ["subject", "predicate", "object"]
+                    }
+                }
+            }
         }),
     ]
 }

@@ -121,12 +121,12 @@ fn doctor_passes_on_fresh_project_install() {
 
     let handshake = find_check(&report.output, "handshake");
     assert!(handshake.starts_with("ok"), "handshake check: {handshake}");
-    // The twenty a default `mushroomdb mcp` advertises on a memory store —
+    // The twenty-one a default `mushroomdb mcp` advertises on a memory store —
     // which is what a fresh install points at: the association surface. The
-    // other two stay callable, and `--all-tools` lists all twenty-two.
+    // other two stay callable, and `--all-tools` lists all twenty-three.
     assert!(
-        handshake.contains("20 tools"),
-        "expected the handshake to report 20 tools: {handshake}"
+        handshake.contains("21 tools"),
+        "expected the handshake to report 21 tools: {handshake}"
     );
     assert!(
         handshake.contains("explain_association present"),
@@ -172,7 +172,7 @@ fn doctor_handshake_passes_on_a_code_graph_store() {
         "a code-graph store must pass the handshake: {handshake}"
     );
     assert!(
-        handshake.contains("20 tools") && handshake.contains("explain_association present"),
+        handshake.contains("21 tools") && handshake.contains("explain_association present"),
         "the handshake names the task tool it found: {handshake}"
     );
 }

@@ -370,7 +370,7 @@ jobs:
             --command ../../target/debug/mushroomdb \
             --db "$(mktemp -d)" \
             --expect-version "$(cargo pkgid -p mushroomdb-cli | sed 's/.*[#@]//')" \
-            --expect-tools query,explain_association,neighborhood,node_info,node_edges,was_linked,edges_at,what_if,node_history,edge_history,find_similar,pairwise_similar,hybrid_search,remember,recall,upsert_entity,ingest_json,create_rule,stats,schema
+            --expect-tools query,explain_association,neighborhood,node_info,node_edges,was_linked,edges_at,what_if,node_history,edge_history,find_similar,pairwise_similar,hybrid_search,remember,recall,upsert_entity,ingest_json,create_rule,stats,schema,forget
         working-directory: scripts/mcp-handshake
 
   plugin-validate:
