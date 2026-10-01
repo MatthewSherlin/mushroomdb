@@ -33,6 +33,10 @@ rkyv = "0.8"
 memmap2 = "0.9"
 # Default features only (std). Do not enable `threading` or `cgemm`.
 matrixmultiply = "0.3"
+# NFC for identity aliases (`core-api::memory::identity::canonical`), so a
+# name typed with combining marks matches its precomposed form. Approved by the
+# owner 2026-10-01.
+unicode-normalization = "0.1"
 # Bench-only. Consumed as a dev-dep by core-bench; do not take it as a
 # runtime dependency.
 criterion = "0.8"

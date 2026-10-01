@@ -1273,3 +1273,55 @@ fn a_claimed_stub_joins_a_larger_identity_only_when_every_member_claims_it() {
     assert_eq!(identity_clusters(&db, SAME_AS_FLOOR).claims, 3);
     assert_eq!(clusters_of(&db), vec![strings(&["c0", "c1", "t1"])]);
 }
+
+// ── NFC: a decomposed name is the same name ─────────────────────────────────
+
+/// `E` followed by U+0301 COMBINING ACUTE ACCENT is `É` typed another way —
+/// what macOS file names and some keyboards produce. Both spell one name.
+#[test]
+fn a_decomposed_name_yields_the_same_aliases_as_its_composed_form() {
+    let decomposed = "E\u{301}mile Zola";
+    let composed = "Émile Zola";
+    assert_ne!(decomposed, composed, "the fixture must differ in bytes");
+    assert_eq!(
+        core_api::memory::identity::canonical(decomposed),
+        "émile zola"
+    );
+    assert_eq!(
+        derive_aliases("zola", Some(decomposed), &strings(&[decomposed])),
+        derive_aliases("zola", Some(composed), &strings(&[composed])),
+    );
+    assert_eq!(
+        derive_aliases("zola", Some(decomposed), &[]),
+        strings(&["zola", "émile", "émile zola"])
+    );
+}
+
+/// End to end: two people whose names differ only in Unicode form link.
+#[test]
+fn a_decomposed_and_a_composed_name_link() {
+    let mut db = identity_store("nfc-link");
+    remember_people(
+        &mut db,
+        "composed",
+        vec![person("zola-1", "Émile Zola", &[])],
+    );
+    let report = remember_people(
+        &mut db,
+        "decomposed",
+        vec![person("zola-2", "E\u{301}mile Zola", &[])],
+    );
+    assert_eq!(
+        report.same_as,
+        vec![SameAsPair {
+            a: "zola-1".into(),
+            b: "zola-2".into(),
+            score: 0.6
+        }]
+    );
+    assert_eq!(
+        db.get_prop("zola-2", "name"),
+        Some(Value::Str("E\u{301}mile Zola".into())),
+        "the name itself is stored as written; only the aliases are normalised"
+    );
+}

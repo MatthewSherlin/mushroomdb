@@ -24,6 +24,7 @@ use crate::GraphDb;
 use core_storage::fs::Fs;
 use core_storage::{GraphError, Result, Value};
 use std::collections::BTreeSet;
+use unicode_normalization::UnicodeNormalization;
 
 /// The property every entity's alias list lives in.
 pub const ALIASES_FIELD: &str = "aliases";
@@ -101,24 +102,35 @@ pub fn same_as_pairs<F: Fs>(db: &GraphDb<F>, keys: &[String]) -> Vec<SameAsPair>
 /// for half the store on every write.
 pub const MAX_ALIASES: usize = 32;
 
-/// `s` lowercased, with every run of characters that are not letters or digits
-/// collapsed to one space and the ends trimmed.
+/// `s` in Unicode NFC, lowercased, with every run of characters that are not
+/// letters or digits collapsed to one space and the ends trimmed.
 ///
 /// `"Matthew  Sherlin"`, `"matthew_sherlin"` and `"MATTHEW-SHERLIN"` all
 /// become `"matthew sherlin"`. Letters are Unicode letters: `"José Ñúñez"`
 /// becomes `"josé ñúñez"`.
 ///
-/// Known limitation: input is not normalised to NFC, so a name pasted in
-/// decomposed (NFD) form — `e` followed by a combining accent — does not
-/// match its precomposed form, and splits at the combining mark.
+/// NFC comes first, so a name typed in decomposed form — `e` followed by
+/// U+0301, a combining accent — becomes the same `é` as its precomposed
+/// spelling instead of splitting at the mark. A combining mark with no
+/// precomposed form is still not a letter, and still separates words.
 #[must_use]
 pub fn canonical(s: &str) -> String {
     tokens(s).join(" ")
 }
 
-/// The words of `s`: maximal runs of letters and digits, lowercased.
+/// The words of `s`: maximal runs of letters and digits, in NFC, lowercased.
+///
+/// NFC is applied on both sides of the lowercasing. Before, so a decomposed
+/// letter is one letter when it is lowercased and split. After, because
+/// lowercasing can leave a sequence that composes further — `ᾼ` with an acute
+/// lowercases to `ᾳ` beside the accent, which is `ᾴ` — and without the second
+/// pass [`canonical`] would not be idempotent on it.
 fn tokens(s: &str) -> Vec<String> {
-    s.to_lowercase()
+    s.nfc()
+        .collect::<String>()
+        .to_lowercase()
+        .nfc()
+        .collect::<String>()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .map(str::to_string)
@@ -578,6 +590,13 @@ mod tests {
             "Matthew  Sherlin",
             "matthew_sherlin",
             "JOSÉ-Ñúñez",
+            "E\u{301}mile Zola",
+            "x\u{301}y",
+            "İstanbul",
+            "ǅemal",
+            // Lowercasing `ᾼ` leaves `ᾳ` beside the accent, which composes
+            // to `ᾴ` — only a second NFC pass makes this one stable.
+            "ᾼ\u{301}",
             "",
             "!!",
             "a1 B2",
