@@ -49,6 +49,9 @@
 use crate::mcp::{graph_err_msg, CallOutcome};
 use core_api::digest::{self, MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING};
 use core_api::explain_digest::{explain_with_evidence, predicate_summary, render_explain};
+use core_api::memory::forget::{
+    forget, predicate_fields, ForgetReport, ForgetTarget, FORGET_SHAPE,
+};
 use core_api::memory::remember::{remember, EntityIn, FactIn, RememberInput, NOTE_KINDS};
 use core_api::{json_to_value, Dir, Explanation, GraphError, SharedDb, Value};
 use serde_json::{json, Value as Js};
@@ -2095,87 +2098,6 @@ fn tool_schema(db: &SharedDb, json_out: bool) -> CallOutcome {
 
 // ── forget ───────────────────────────────────────────────────────────────────
 
-/// Notes a `forget` reply names when what it forgot was written about; the
-/// rest are counted.
-const FORGET_NOTE_LIST: usize = 10;
-
-/// The refusal for a call that is not exactly one of the three shapes.
-const FORGET_SHAPE: &str = "pass exactly one of: key (forget a node), key and prop \
-     (forget one property), or fact {subject, predicate, object} (retract one edge)";
-
-/// What one `forget` call did.
-#[derive(serde::Serialize)]
-struct ForgetReport {
-    /// `node`, `prop` or `fact`.
-    mode: &'static str,
-    /// The node, property or edge named, as the caller named it.
-    target: String,
-    /// False when there was nothing to forget, and nothing was written.
-    changed: bool,
-    /// Edges removed with a node: written by hand, and derived by rules. For a
-    /// property, `derived_edges` counts the rule-derived edges on the node that
-    /// the removal retracted, because a rule read that property.
-    manual_edges: u64,
-    derived_edges: u64,
-    /// The property removed, in `prop` mode.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prop: Option<String>,
-    /// Notes with an `ABOUT` edge to the node, or to both ends of the fact.
-    /// Listed, never deleted: their text still says what was forgotten.
-    notes: Vec<String>,
-    notes_total: usize,
-    /// The first commit history still answers from.
-    history_floor: u64,
-    /// `prop` mode removed `name` from a node that carries `aliases`, and
-    /// rewrote that list in the same write: the name's words left it.
-    aliases_rewritten: bool,
-    /// `prop` mode removed `aliases` from a node that still carries
-    /// `alias_keys`, the aliases it declared, which still link stubs.
-    alias_keys_remain: bool,
-}
-
-/// Every field a predicate reads, its parts' included, sorted and deduped.
-fn predicate_fields(p: &core_api::PredicateSummary) -> Vec<String> {
-    let mut out: BTreeSet<String> = p.fields.iter().cloned().collect();
-    for part in p.parts.iter().flatten() {
-        out.extend(predicate_fields(part));
-    }
-    out.into_iter().collect()
-}
-
-/// Notes with an `ABOUT` edge to every one of `keys`, sorted.
-fn notes_about(g: &core_api::GraphDb<core_api::RealFs>, keys: &[&str]) -> Vec<String> {
-    let mut common: Option<BTreeSet<String>> = None;
-    for key in keys {
-        let into: BTreeSet<String> = g
-            .neighbors(key, "ABOUT", core_api::Direction::In)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|k| g.node_ref(k).is_some_and(|n| n.label() == "Note"))
-            .collect();
-        common = Some(match common {
-            None => into,
-            Some(c) => c.intersection(&into).cloned().collect(),
-        });
-    }
-    common.unwrap_or_default().into_iter().collect()
-}
-
-/// An edge as `(edge_type, src_key, dst_key)`.
-type EdgeTriple = (String, String, String);
-
-/// The rule-derived edges incident on `key`, both directions, each once.
-fn derived_edges_on(
-    g: &core_api::GraphDb<core_api::RealFs>,
-    key: &str,
-) -> Result<BTreeSet<EdgeTriple>, GraphError> {
-    Ok(g.node_edges(key)?
-        .into_iter()
-        .filter(|e| e.derived)
-        .map(|e| (e.edge_type, e.src_key, e.dst_key))
-        .collect())
-}
-
 /// The history sentence every successful `forget` ends with. A tombstone is
 /// not a redaction, and the caller is told so in the same reply.
 fn history_line(floor: u64) -> String {
@@ -2288,172 +2210,25 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         },
         Some(_) => return CallOutcome::ToolErr("fact must be an object".into()),
     };
-    // One write guard for the reads the reply needs and the write itself, so
-    // nothing can change between what the reply says and what was done.
-    let mut g = db.write();
-    let report = match (key, prop, fact) {
-        (Some(key), None, None) => {
-            if !g.has_node(&key) {
-                return CallOutcome::ToolErr(graph_err_msg(GraphError::KeyNotFound { key }));
-            }
-            let notes = notes_about(&g, &[key.as_str()]);
-            let label = g
-                .node_ref(&key)
-                .map(|n| n.label().to_string())
-                .unwrap_or_default();
-            let deleted = match g.delete_node(&key) {
-                Ok(r) => r,
-                Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
-            };
-            ForgetReport {
-                mode: "node",
-                target: format!("{key} ({label})"),
-                changed: true,
-                manual_edges: deleted.manual_edges,
-                derived_edges: deleted.derived_edges,
-                prop: None,
-                notes_total: notes.len(),
-                notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
-                history_floor: g.stats().history_floor,
-                aliases_rewritten: false,
-                alias_keys_remain: false,
-            }
-        }
-        (Some(key), Some(prop), None) => {
-            // Removing a property re-runs rule retraction, so a rule that read
-            // it drops the edges it derived. Compare the node's derived edges
-            // either side of the write to say how many went.
-            let before = match derived_edges_on(&g, &key) {
-                Ok(e) => e,
-                Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
-            };
-            // A name's words live in `aliases`. When the name goes, the list is
-            // rewritten from the key alone in the same commit, so the words
-            // leave with it. A node with no `aliases` list, or one holding a
-            // value the store cannot read as a list, is left as it is.
-            let rewrite = if prop == core_api::memory_schema::NAME_FIELD
-                && g.get_prop(&key, &prop).is_some()
-            {
-                core_api::memory::identity::identity_props_after_forgetting_name(&g, &key)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let removed = if rewrite.is_empty() {
-                g.remove_prop(&key, &prop)
-            } else {
-                let mut batch = g.batch();
-                batch.remove_prop(&key, &prop);
-                for (field, value) in &rewrite {
-                    batch.set_prop(&key, field, value.clone());
-                }
-                batch.commit().map(|_| true)
-            };
-            let changed = match removed {
-                Ok(c) => c,
-                Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
-            };
-            let aliases_rewritten = changed && !rewrite.is_empty();
-            let alias_keys_remain = changed
-                && prop == core_api::memory::identity::ALIASES_FIELD
-                && g.get_prop(&key, core_api::memory::identity::ALIAS_KEYS_FIELD)
-                    .is_some();
-            let retracted = if changed {
-                let after = derived_edges_on(&g, &key).unwrap_or_default();
-                before.difference(&after).count() as u64
-            } else {
-                0
-            };
-            ForgetReport {
-                mode: "prop",
-                target: format!("{key}.{prop}"),
-                changed,
-                manual_edges: 0,
-                derived_edges: retracted,
-                prop: Some(prop),
-                notes: Vec::new(),
-                notes_total: 0,
-                history_floor: g.stats().history_floor,
-                aliases_rewritten,
-                alias_keys_remain,
-            }
-        }
-        (None, None, Some((subject, predicate, object))) => {
-            let target = format!("{predicate} {subject} → {object}");
-            let changed = match g.delete_edge(&predicate, &subject, &object) {
-                Ok(c) => c,
-                Err(GraphError::RuleOwned { detail }) => {
-                    return CallOutcome::ToolErr(rule_owned_refusal(
-                        &g, &predicate, &subject, &object, &detail,
-                    ))
-                }
-                Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
-            };
-            let notes = if changed {
-                notes_about(&g, &[subject.as_str(), object.as_str()])
-            } else {
-                Vec::new()
-            };
-            ForgetReport {
-                mode: "fact",
-                target,
-                changed,
-                manual_edges: 0,
-                derived_edges: 0,
-                prop: None,
-                notes_total: notes.len(),
-                notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
-                history_floor: g.stats().history_floor,
-                aliases_rewritten: false,
-                alias_keys_remain: false,
-            }
-        }
-        _ => return CallOutcome::ToolErr(FORGET_SHAPE.into()),
+    let Some(target) = ForgetTarget::from_parts(key, prop, fact) else {
+        return CallOutcome::ToolErr(FORGET_SHAPE.into());
     };
-    drop(g);
+    // Only a fact's refusal is the enriched sentence. Any other `RuleOwned`
+    // is rendered the way every engine error is.
+    let is_fact = matches!(target, ForgetTarget::Fact { .. });
+    // One write guard for the reads the report needs and the write itself, so
+    // nothing can change between what the reply says and what was done.
+    let report = {
+        let mut g = db.write();
+        match forget(&mut *g, &target) {
+            Ok(r) => r,
+            Err(GraphError::RuleOwned { detail }) if is_fact => {
+                return CallOutcome::ToolErr(detail)
+            }
+            Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
+        }
+    };
     ok(json_out, &report, render_forget)
-}
-
-/// Why a fact edge cannot be retracted: which rule owns it, and the only two
-/// ways it can change.
-fn rule_owned_refusal(
-    g: &core_api::GraphDb<core_api::RealFs>,
-    predicate: &str,
-    subject: &str,
-    object: &str,
-    detail: &str,
-) -> String {
-    let label = |k: &str| g.node_ref(k).map(|n| n.label().to_string());
-    let (src, dst) = (label(subject), label(object));
-    let owners: Vec<core_api::RuleDef> = g
-        .rules()
-        .into_iter()
-        .filter(|r| {
-            r.edge_type == predicate
-                && Some(&r.src_label) == src.as_ref()
-                && Some(&r.dst_label) == dst.as_ref()
-        })
-        .collect();
-    if owners.is_empty() {
-        return digest::sanitize(detail);
-    }
-    let names: Vec<String> = owners.iter().map(|r| digest::sanitize(&r.name)).collect();
-    let mut fields: BTreeSet<String> = BTreeSet::new();
-    for r in &owners {
-        fields.extend(predicate_fields(&core_api::PredicateSummary::from(
-            &r.predicate,
-        )));
-    }
-    let fields: Vec<String> = fields.iter().map(|f| digest::sanitize(f)).collect();
-    format!(
-        "refused: {} {} → {} is derived by rule {}. It changes only when the fields \
-         that rule reads change ({}), or when the rule is deleted. Nothing was written.",
-        digest::sanitize(predicate),
-        digest::sanitize(subject),
-        digest::sanitize(object),
-        names.join(", "),
-        fields.join(", ")
-    )
 }
 
 // ── suggest_rules ────────────────────────────────────────────────────────────

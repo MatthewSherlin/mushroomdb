@@ -4,6 +4,7 @@
 //! 0.7 deleted. They are the memory product's core, so they moved here before
 //! that module was removed.
 pub mod brief;
+pub mod forget;
 pub mod identity;
 pub mod recall;
 pub mod remember;
