@@ -543,6 +543,7 @@ _DOCUMENTED = [
     "schema_report",
     "forget",
     "identity_clusters",
+    "set_props_many",
 ]
 
 

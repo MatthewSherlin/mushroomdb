@@ -29,6 +29,18 @@ stored one. Fields you omit are left alone, and unchanged fields produce no WAL
 record, so rules do not re-fire needlessly. An existing key under a different
 label raises `ValueError` — relabelling is not an upsert.
 
+To change properties on many nodes, use one call rather than one per node:
+
+```python
+db.set_props_many([("alice", {"score": 3}), ("bob", {"score": 5, "stale": None})])
+# {"nodes": 2, "props_set": 2, "props_removed": 1}
+```
+
+It is one commit: unchanged values write nothing, an unknown key raises
+`KeyNotFound` and nothing is written, and rules fire on what changed inside
+that commit. `wal_total_commits()` moves by one frame, or by two when a rule
+derived or retracted an edge — never by the number of nodes.
+
 ## Querying
 
 `query` and `query_write` both accept parameters as a `dict`, as a list of
@@ -252,7 +264,7 @@ returns its report as a dict rather than a rendered digest.
 ```python
 r = db.remember(
     "Matthew is driving the 0.7 release",
-    about=["matthew"],                                   # unknown → a provisional stub
+    about=["matthew", "v0.7"],                           # matthew is unknown → a provisional stub
     entities=[{"key": "v0.7", "label": "Release", "props": {"name": "v0.7"}}],
     facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}],
 )
@@ -261,7 +273,7 @@ r["note"], r["provisional"]           # "note:…", ["matthew"]
 db.recall("who is driving the release")["hits"]          # ranked rows, not text
 db.upsert_entity("matthew", {"name": "Matthew Sherlin"}, label=None, aliases=["Matt"])
 db.schema_report()["provisional"]                        # 0 — it has been described
-db.forget(key="v0.7")["notes"]                           # the notes that still say it
+db.forget(key="v0.7")["notes"]                           # ["note:…"] — the note about it, still there
 db.identity_clusters()["clusters"]                       # which keys are one entity
 ```
 

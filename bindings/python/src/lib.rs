@@ -8,8 +8,8 @@ use core_api::restore::{restore_if_empty, RestoreOutcome};
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString};
-use std::collections::BTreeMap;
+use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySequence, PyString, PyTuple};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -296,6 +296,150 @@ impl GraphDb {
     #[pyo3(text_signature = "($self, key, field)")]
     fn remove_prop(&self, key: &str, field: &str) -> PyResult<bool> {
         self.with_mut(|db| db.remove_prop(key, field))
+    }
+
+    /// Set properties on many existing nodes in **one commit**.
+    ///
+    /// `rows` is a sequence of `(key, props)` tuples. Only values that differ
+    /// from what is stored are written; a `None` value removes the property.
+    /// Returns `{"nodes": n, "props_set": s, "props_removed": r}` — what was
+    /// written after the comparison, so a call that changed nothing returns
+    /// zeros and writes nothing at all.
+    ///
+    /// **Existing nodes only.** An unknown key raises `KeyNotFound` and
+    /// nothing is written, even when that key's row would have changed
+    /// nothing. Use `ingest_batch` to create nodes.
+    ///
+    /// **One commit, and rules fire in it.** Every change is one WAL frame.
+    /// Rules re-fire on each changed property inside that commit; when one
+    /// derives or retracts an edge the engine appends one more frame of
+    /// history markers, so `wal_total_commits()` moves by 1, or by 2 — never
+    /// by the number of nodes.
+    ///
+    /// The comparison and the write happen under one lock acquisition, so no
+    /// other writer can come between them.
+    ///
+    /// A key that appears twice is a `ValueError`: merge its dicts first.
+    /// `1` and `1.0` are different values. A view-owned property, or `ns` set
+    /// to a different namespace, refuses the whole call. Keep a call under
+    /// about 10,000 rows — it is one frame and one fsync.
+    ///
+    /// ```python
+    /// db.set_props_many([("alice", {"score": 3}), ("bob", {"score": 5, "old": None})])
+    /// # {"nodes": 2, "props_set": 2, "props_removed": 1}
+    /// ```
+    #[pyo3(text_signature = "($self, rows)")]
+    fn set_props_many(&self, py: Python<'_>, rows: Bound<'_, PyAny>) -> PyResult<Py<PyDict>> {
+        // First, so a scoped handle is refused before any argument is read
+        // and long before the store is.
+        self.refuse_if_scoped()?;
+
+        // Converted before the lock is taken: a conversion error needs the
+        // GIL, and nothing here depends on the store.
+        let rows = sequence_items(&rows, "set_props_many takes a list of (key, props) tuples")?;
+        // One row: a key, and each named property's new value — `None` to
+        // remove it.
+        type Row = (String, Vec<(String, Option<Value>)>);
+        let mut parsed: Vec<Row> = Vec::with_capacity(rows.len());
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for item in &rows {
+            let pair = item.downcast::<PyTuple>().map_err(|_| {
+                PyTypeError::new_err("set_props_many takes a list of (key, props) tuples")
+            })?;
+            if pair.len() != 2 {
+                return Err(PyTypeError::new_err(
+                    "each set_props_many row must be a (key, props) tuple",
+                ));
+            }
+            let key: String = pair
+                .get_item(0)?
+                .extract()
+                .map_err(|_| PyTypeError::new_err("a set_props_many row's key must be a str"))?;
+            let second = pair.get_item(1)?;
+            let props = second
+                .downcast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("a set_props_many row's props must be a dict"))?;
+            if !seen.insert(key.clone()) {
+                return Err(PyValueError::new_err(format!(
+                    "set_props_many: key {key:?} appears twice; merge its props into one row"
+                )));
+            }
+            let mut fields: Vec<(String, Option<Value>)> = Vec::with_capacity(props.len());
+            for (name, value) in props.iter() {
+                let name: String = name
+                    .extract()
+                    .map_err(|_| PyTypeError::new_err("property names must be str"))?;
+                let value = if value.is_none() {
+                    None
+                } else {
+                    Some(py_to_value(&value)?)
+                };
+                fields.push((name, value));
+            }
+            parsed.push((key, fields));
+        }
+
+        enum Op<'a> {
+            Set(&'a str, &'a str, &'a Value),
+            Remove(&'a str, &'a str),
+        }
+
+        // One closure, one lock acquisition: the reads that decide what
+        // changed and the write that applies it. `&mut Db` reborrows
+        // immutably for the reads.
+        let (nodes, set, removed) = self.with_mut(|db| {
+            let mut ops: Vec<Op<'_>> = Vec::new();
+            let mut nodes = 0usize;
+            for (key, fields) in &parsed {
+                // Checked here, for every row: the engine checks a key only
+                // when an operation names it, and a row that changes nothing
+                // queues none.
+                if !db.has_node(key) {
+                    return Err(GraphError::KeyNotFound { key: key.clone() });
+                }
+                let before = ops.len();
+                for (field, value) in fields {
+                    let stored = db.get_prop(key, field);
+                    match value {
+                        Some(v) if stored.as_ref() != Some(v) => {
+                            ops.push(Op::Set(key, field, v));
+                        }
+                        None if stored.is_some() => {
+                            ops.push(Op::Remove(key, field));
+                        }
+                        _ => {} // unchanged: no record, no rule re-fire
+                    }
+                }
+                if ops.len() > before {
+                    nodes += 1;
+                }
+            }
+            if ops.is_empty() {
+                return Ok((0usize, 0usize, 0usize));
+            }
+            let (mut set, mut removed) = (0usize, 0usize);
+            let mut batch = db.batch();
+            for op in ops {
+                match op {
+                    Op::Set(key, field, value) => {
+                        batch.set_prop(key, field, value.clone());
+                        set += 1;
+                    }
+                    Op::Remove(key, field) => {
+                        batch.remove_prop(key, field);
+                        removed += 1;
+                    }
+                }
+            }
+            batch.commit()?;
+            Ok((nodes, set, removed))
+        })?;
+
+        let d = PyDict::new(py);
+        d.set_item("nodes", nodes)?;
+        d.set_item("props_set", set)?;
+        d.set_item("props_removed", removed)?;
+        Ok(d.unbind())
     }
 
     /// Execute a read query, optionally with named parameters.
@@ -1884,7 +2028,8 @@ impl GraphDb {
     /// `entities` is a list of `{"key", "label", "props"?, "aliases"?}`
     /// dicts — entities you recognised in the text, created or updated in the
     /// same commit. `facts` is a list of `{"subject", "predicate", "object"}`
-    /// dicts — relationships among them, written as edges.
+    /// dicts — relationships among them, written as edges. Either may be a
+    /// tuple or any other sequence, as `about` may.
     ///
     /// `kind` is `"note"` (the default), `"decision"` or `"todo"`. `ts` is
     /// Unix seconds and defaults to now; it is part of the note's key, so the
@@ -1896,7 +2041,9 @@ impl GraphDb {
     /// `matched`, `derived`, `provisional`, `provisional_capped` (keys past
     /// the per-call cap of 20, **not** created), `fulltext_declared`,
     /// `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
-    /// the identity links this call made, and the ones it retracted).
+    /// the identity links this call made, and the ones it retracted). A
+    /// `score` is the raw float (`0.6666666666666666`); the MCP tool prints
+    /// the same score to two decimals.
     ///
     /// Raises `IngestError` when the text is empty or over 4,000 characters,
     /// the `kind` is unknown, or an entity's `props` carry `aliases` or
@@ -1927,8 +2074,8 @@ impl GraphDb {
         kind: Option<&str>,
         ts: Option<i64>,
         source: Option<&str>,
-        entities: Option<Bound<'_, PyList>>,
-        facts: Option<Bound<'_, PyList>>,
+        entities: Option<Bound<'_, PyAny>>,
+        facts: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         use core_api::memory::remember::{
             dedup_keep_order, remember, unix_now_secs, RememberInput, DEFAULT_NOTE_KIND,
@@ -2013,7 +2160,8 @@ impl GraphDb {
     /// Returns `{"key", "label", "created", "updated_fields",
     /// "same_as_lost"}`. `same_as_lost` lists the identity links this update
     /// retracted, as `{"a", "b", "score"}`: a changed `name` can take a
-    /// full-name link below the floor.
+    /// full-name link below the floor. A `score` is the raw float
+    /// (`0.6666666666666666`); the MCP tool prints it to two decimals.
     ///
     /// `aliases` or `alias_keys` inside `props` raise `IngestError`: the
     /// store maintains both. An `IngestError`'s `.detail` is the bare
@@ -2084,7 +2232,10 @@ impl GraphDb {
     /// nothing has described) and `provisional_sample` (the first ten keys).
     ///
     /// `budget_ms` bounds the counting; a spent budget sets
-    /// `brief["partial"]` and the counts are then lower bounds.
+    /// `brief["partial"]` and the counts are then lower bounds. **`0` is not
+    /// "no limit" here**, as it is for the graph algorithms: it is a budget
+    /// already spent, and returns a partial report. For an unhurried report
+    /// pass a large value, such as `60_000`.
     ///
     /// The MCP `schema` tool renders this same report. The names under
     /// `rules`, `fulltext`, `indexes` and `provisional_sample` are raw stored
@@ -2178,7 +2329,8 @@ impl GraphDb {
     /// pair of `members` is linked at `floor` or above, `canonical` is the
     /// oldest member and `members[0]`, and `weakest` is the lowest pairwise
     /// score inside it. `claims` counts unordered pairs — both directions of
-    /// a link are one claim.
+    /// a link are one claim. `weakest` is the raw float
+    /// (`0.6666666666666666`); the MCP tool prints it to two decimals.
     ///
     /// Empty on a store with no `SAME_AS` edges. The identity preset that
     /// derives them is applied with `mushroomdb schema apply <db>
@@ -2188,6 +2340,7 @@ impl GraphDb {
     /// Raises `ValueError` for a `floor` that is not a finite number.
     ///
     /// Refused on a `scoped()` handle with `ValueError`.
+    #[allow(deprecated)]
     #[pyo3(
         signature = (floor = core_api::memory::identity::SAME_AS_FLOOR),
         text_signature = "($self, floor=0.6)"
@@ -2199,8 +2352,9 @@ impl GraphDb {
                 "identity_clusters: floor must be a finite number, got {floor}"
             )));
         }
-        let report =
-            self.with_ref(|db| Ok(core_api::memory::identity::identity_clusters(db, floor)))?;
+        let report = py.allow_threads(|| {
+            self.with_ref(|db| Ok(core_api::memory::identity::identity_clusters(db, floor)))
+        })?;
         report_to_py(py, serde_json::to_value(&report))
     }
 
@@ -3073,6 +3227,19 @@ fn dict_to_props(props: &Bound<'_, PyDict>) -> PyResult<Vec<(String, Value)>> {
     Ok(out)
 }
 
+/// The items of a list-shaped argument: a `list`, a `tuple`, or any other
+/// `Sequence` — what the stub types these arguments as. A `str` is a
+/// sequence to Python and never what the caller meant, so it is refused with
+/// `message`, as a mapping or an iterator is.
+fn sequence_items<'py>(obj: &Bound<'py, PyAny>, message: &str) -> PyResult<Vec<Bound<'py, PyAny>>> {
+    let refused = || PyTypeError::new_err(message.to_string());
+    if obj.is_instance_of::<PyString>() {
+        return Err(refused());
+    }
+    let seq = obj.downcast::<PySequence>().map_err(|_| refused())?;
+    seq.try_iter()?.collect()
+}
+
 /// A required string entry of a dict argument. `what` names the argument in
 /// the message: `entities[]`, `facts[]`, `fact`.
 fn required_str(d: &Bound<'_, PyDict>, name: &str, what: &str) -> PyResult<String> {
@@ -3086,10 +3253,11 @@ fn required_str(d: &Bound<'_, PyDict>, name: &str, what: &str) -> PyResult<Strin
 
 /// `remember(entities=[{"key", "label", "props"?, "aliases"?}, …])`.
 fn entities_from_py(
-    list: &Bound<'_, PyList>,
+    list: &Bound<'_, PyAny>,
 ) -> PyResult<Vec<core_api::memory::remember::EntityIn>> {
-    let mut out = Vec::with_capacity(list.len());
-    for item in list.iter() {
+    let items = sequence_items(list, "entities must be a list of dicts")?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in &items {
         let d = item
             .downcast::<PyDict>()
             .map_err(|_| PyTypeError::new_err("entities must be a list of dicts"))?;
@@ -3119,9 +3287,10 @@ fn entities_from_py(
 }
 
 /// `remember(facts=[{"subject", "predicate", "object"}, …])`.
-fn facts_from_py(list: &Bound<'_, PyList>) -> PyResult<Vec<core_api::memory::remember::FactIn>> {
-    let mut out = Vec::with_capacity(list.len());
-    for item in list.iter() {
+fn facts_from_py(list: &Bound<'_, PyAny>) -> PyResult<Vec<core_api::memory::remember::FactIn>> {
+    let items = sequence_items(list, "facts must be a list of dicts")?;
+    let mut out = Vec::with_capacity(items.len());
+    for item in &items {
         let d = item
             .downcast::<PyDict>()
             .map_err(|_| PyTypeError::new_err("facts must be a list of dicts"))?;

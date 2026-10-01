@@ -63,6 +63,30 @@ def test_remember_writes_entities_and_facts_in_the_same_call(db):
     assert db.node_info(report["note"])["props"]["source"] == "session-1"
 
 
+def test_entities_and_facts_take_any_sequence_as_the_stub_says(db):
+    """The stub types both `Sequence`, as it does `about`; a tuple is one."""
+    report = db.remember(
+        "Matthew is driving the 0.7 release",
+        about=("matthew",),
+        ts=TS,
+        entities=({"key": "v0.7", "label": "Release", "aliases": ("zero-seven",)},),
+        facts=({"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"},),
+    )
+    assert db.node_info("v0.7")["label"] == "Release"
+    assert db.neighbors("matthew", "WORKS_ON", "out") == ["v0.7"]
+    assert report["provisional"] == ["matthew"]
+
+    # A str is a sequence of str to Python, and never a list of dicts here.
+    nodes = db.stats()["nodes_live"]
+    with pytest.raises(TypeError, match="entities"):
+        db.remember("x", ts=TS + 1, entities="v0.7")
+    with pytest.raises(TypeError, match="facts"):
+        db.remember("x", ts=TS + 1, facts="matthew")
+    with pytest.raises(TypeError, match="entities"):
+        db.remember("x", ts=TS + 1, entities={"key": "k", "label": "L"})
+    assert db.stats()["nodes_live"] == nodes
+
+
 def test_a_bad_kind_and_bad_shapes_are_refused_before_anything_is_written(db):
     with pytest.raises(IngestError) as err:
         db.remember("a rumour", kind="rumour")

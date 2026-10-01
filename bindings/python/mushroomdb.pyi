@@ -367,6 +367,41 @@ class GraphDb:
         Removing a field a rule watches retracts the edges that field derived.
         """
 
+    def set_props_many(
+        self, rows: Sequence[tuple[str, dict[str, Scalar | None]]]
+    ) -> dict[str, int]:
+        """Set properties on many existing nodes in one commit.
+
+        `rows` is a sequence of `(key, props)` tuples. Only values that differ
+        from what is stored are written; a `None` value removes the property.
+        Returns `{"nodes", "props_set", "props_removed"}` — what was written
+        after the comparison, so a call that changed nothing returns zeros and
+        writes nothing at all.
+
+        **Existing nodes only.** An unknown key raises `KeyNotFound` and
+        nothing is written, even when that key's row would have changed
+        nothing. Use `ingest_batch` to create nodes.
+
+        **One commit, and rules fire in it.** Every change is one WAL frame.
+        Rules re-fire on each changed property inside that commit; when one
+        derives or retracts an edge the engine appends one more frame of
+        history markers, so `wal_total_commits()` moves by 1, or by 2 — never
+        by the number of nodes.
+
+        The comparison and the write happen under one lock acquisition, so no
+        other writer can come between them.
+
+        A key that appears twice is a `ValueError`: merge its dicts first.
+        `1` and `1.0` are different values. A view-owned property, or `ns` set
+        to a different namespace, refuses the whole call. Keep a call under
+        about 10,000 rows — it is one frame and one fsync.
+
+        ```python
+        db.set_props_many([("alice", {"score": 3}), ("bob", {"score": 5, "old": None})])
+        # {"nodes": 2, "props_set": 2, "props_removed": 1}
+        ```
+        """
+
     def query(
         self,
         cypher: str,
@@ -1077,7 +1112,8 @@ class GraphDb:
         `entities` is a list of `{"key", "label", "props"?, "aliases"?}`
         dicts — entities you recognised in the text, created or updated in the
         same commit. `facts` is a list of `{"subject", "predicate", "object"}`
-        dicts — relationships among them, written as edges.
+        dicts — relationships among them, written as edges. Either may be a
+        tuple or any other sequence, as `about` may.
 
         `kind` is `"note"` (the default), `"decision"` or `"todo"`. `ts` is
         Unix seconds and defaults to now; it is part of the note's key, so the
@@ -1089,7 +1125,9 @@ class GraphDb:
         `matched`, `derived`, `provisional`, `provisional_capped` (keys past
         the per-call cap of 20, **not** created), `fulltext_declared`,
         `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
-        the identity links this call made, and the ones it retracted).
+        the identity links this call made, and the ones it retracted). A
+        `score` is the raw float (`0.6666666666666666`); the MCP tool prints
+        the same score to two decimals.
 
         Raises `IngestError` when the text is empty or over 4,000 characters,
         the `kind` is unknown, or an entity's `props` carry `aliases` or
@@ -1168,7 +1206,8 @@ class GraphDb:
         Returns `{"key", "label", "created", "updated_fields",
         "same_as_lost"}`. `same_as_lost` lists the identity links this update
         retracted, as `{"a", "b", "score"}`: a changed `name` can take a
-        full-name link below the floor.
+        full-name link below the floor. A `score` is the raw float
+        (`0.6666666666666666`); the MCP tool prints it to two decimals.
 
         `aliases` or `alias_keys` inside `props` raise `IngestError`: the
         store maintains both. An `IngestError`'s `.detail` is the bare
@@ -1190,7 +1229,10 @@ class GraphDb:
         nothing has described) and `provisional_sample` (the first ten keys).
 
         `budget_ms` bounds the counting; a spent budget sets
-        `brief["partial"]` and the counts are then lower bounds.
+        `brief["partial"]` and the counts are then lower bounds. **`0` is not
+        "no limit" here**, as it is for the graph algorithms: it is a budget
+        already spent, and returns a partial report. For an unhurried report
+        pass a large value, such as `60_000`.
 
         The MCP `schema` tool renders this same report. The names under
         `rules`, `fulltext`, `indexes` and `provisional_sample` are raw stored
@@ -1240,7 +1282,8 @@ class GraphDb:
         pair of `members` is linked at `floor` or above, `canonical` is the
         oldest member and `members[0]`, and `weakest` is the lowest pairwise
         score inside it. `claims` counts unordered pairs — both directions of
-        a link are one claim.
+        a link are one claim. `weakest` is the raw float
+        (`0.6666666666666666`); the MCP tool prints it to two decimals.
 
         Empty on a store with no `SAME_AS` edges. The identity preset that
         derives them is applied with `mushroomdb schema apply <db>

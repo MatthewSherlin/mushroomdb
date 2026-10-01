@@ -640,6 +640,7 @@ _WRITES_BY_KEY = {
     ("delete_node", "key"): lambda s, k: s.delete_node(k),
     ("set_prop", "key"): lambda s, k: s.set_prop(k, "t", 1),
     ("remove_prop", "key"): lambda s, k: s.remove_prop(k, "t"),
+    ("set_props_many", "key"): lambda s, k: s.set_props_many([(k, {"t": 1})]),
     ("rename_node", "old"): lambda s, k: s.rename_node(k, "__probe__"),
     ("rename_node", "new"): lambda s, k: s.rename_node("vis_a", k),
     ("query_write", "key"): lambda s, k: s.query_write(
@@ -807,6 +808,7 @@ COVERED = {
     "delete_node": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "set_prop": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "remove_prop": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
+    "set_props_many": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "rename_node": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "query_write": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",
     "ingest_batch": "test_a_keyed_write_refuses_identically_for_hidden_and_absent",

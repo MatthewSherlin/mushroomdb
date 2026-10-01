@@ -1545,7 +1545,9 @@ source until it is recreated.
 
 Matches when a named field on the source node exactly equals the same
 field on the destination node. Comparison is on any scalar `ValueKey`
-(string, int, float, bool), not strings only.
+(string, int, float, bool), not strings only. **An empty string is a value
+like any other: two nodes whose field is `""` match, at score 1.0.** Leave the
+field unset, or remove it, on a node that should not be linked.
 
 ```rust
 Predicate::FieldEqual { field: "industry".into() }
@@ -1572,8 +1574,10 @@ not the predicate.
 
 ### 3. Overlap
 
-Computes the Jaccard coefficient between two list-valued fields and writes
-an edge when the coefficient meets a minimum threshold.
+Computes the Jaccard coefficient between the **same list-valued field on both
+nodes** — `field` names one property, read on the source and on the
+destination — and writes an edge when the coefficient meets a minimum
+threshold.
 
 ```rust
 Predicate::Overlap { field: "skills".into(), min: 0.5 }
