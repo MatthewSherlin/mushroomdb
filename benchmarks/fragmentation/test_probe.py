@@ -47,6 +47,11 @@ def test_fragmenting_keeps_every_rule_value_somewhere():
             assert sum(field in p["props"] for p in parts) == 1, field
 
 
-def test_a_reader_on_the_canonical_alias_never_sees_more_than_one_following_same_as():
+def test_fragmenting_costs_the_canonical_alias_recall():
+    # A blind probe (canonical score == any-alias score) fails the strict
+    # inequality; at fraction 0.5, k = 3 a rule's field leaves ~0 about 2/3 of
+    # the time, so the canonical alias must lose edges the whole entity holds.
     c = probe.cell(NODES, RULES, TRUTH, 0.5, 3)
-    assert c["canonical/every"][0] <= c["any-alias/every"][0], c
+    assert c["canonical/leaf"][0] < 1.0, c
+    assert c["canonical/every"][0] < c["any-alias/every"][0], c
+    assert c["any-alias/every"][0] <= 1.0, c

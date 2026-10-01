@@ -3,6 +3,10 @@
 Written 2026-09-30 and committed before the first run. An amendment is dated,
 says why, and is made before a run — never after one.
 
+Corrected 2026-10-01, before any run: one unit test that could not fail was
+replaced by one that does (`test_probe.py`). No threshold, axis or procedure
+changed.
+
 ## The question
 
 How much rule accuracy is lost when one entity's properties are split across
