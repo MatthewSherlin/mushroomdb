@@ -210,10 +210,10 @@ pub struct RememberReport {
 ///
 /// Upsert semantics lived only in `tool_upsert_entity` before 0.7, so HTTP
 /// and Python had no upsert and could not clear a provisional mark. This is
-/// the one implementation **`tool_upsert_entity` (the MCP surface) calls** —
-/// HTTP and Python are untouched by this branch and still have no upsert of
-/// their own at all. Binding parity, so a later plan's HTTP/Python surface
-/// calls this same function instead of growing a third copy, is future work.
+/// the one implementation: [`upsert_entity`] adds the caller-facing policy on
+/// top of it, and both the MCP tool and the Python binding's `upsert_entity`
+/// call that. HTTP still has no entity upsert — `POST /nodes` is a raw node
+/// write that does not come through here.
 ///
 /// `label` is used only when `key` does not already exist — an update never
 /// changes a node's label. A subject stops being provisional the moment

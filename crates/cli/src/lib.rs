@@ -443,7 +443,7 @@ Usage:
   mushroomdb doctor [--project|--user] [--platform claude-code|cursor|codex|all]
                      verify an install: config entry, store, hooks, and a real stdio
                      handshake with the configured MCP command; exits 1 on any `fail`
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>]
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>]
                      --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
   mushroomdb mcp <db-dir>|--auto [--all-tools]
@@ -3691,6 +3691,7 @@ mod tests {
             "--no-ui",
             "--demo-if-empty",
             "--token",
+            "--role-token TOKEN:ROLE",
             "--snapshot-every",
         ] {
             assert!(

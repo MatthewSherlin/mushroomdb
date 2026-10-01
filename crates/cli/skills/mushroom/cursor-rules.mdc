@@ -21,7 +21,7 @@ One call per question, on the store's own keys:
 
 - **why are these two related** → `explain_association a b`, rule by rule with the predicate each matched, the score, and the values the two share.
 - **what is it related to** → `node_edges a`, grouped by edge type with the rule and score per edge; `all_of: [T, U]` returns the partners carrying *every* named type, and `label:` narrows them.
-- **what did it look like then** → `edges_at a <commit>`, every edge that existed at that commit.
+- **what did it look like then** → `edges_at a <date>`, every edge that existed then: an RFC 3339 date (`2026-06-19`), or a 0-based commit index.
 - **what would this change do** → `what_if a <field> <value>`, the derived edges a change would lose and gain, nothing written.
 - **who may see** → `query` with a `role` from the store's `roles.json`.
 - **how many** → a counting Cypher over the labels and edge types the brief named.
