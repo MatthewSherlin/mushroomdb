@@ -76,6 +76,10 @@ Earlier committed figures for the rows that moved:
 | cypher two-hop join | 421.0 µs, single pass | 261.6 µs, median of 10 after 3 warmups over 5,810,000 edges (2026-08-21); single passes 185.8 µs (2026-08-24), 206.7 µs and 325.6 µs (2026-08-21) | `head-to-head-10k-v2.md:343-352`; the two regression files |
 | rule_derive (total) | 8.781 s | 2.849 s, 2.929 s, 3.149 s, 3.493 s, 3.514 s (2026-08-21 and 2026-08-24) | `regression-v0.1-20260821.md:36` and its note; `regression-v0.1.1-20260824.md:38` |
 
-**rule_derive is under investigation as a possible regression.** The earlier runs of the same two
-rules took 2.85–3.51 s, and `regression-v0.1-20260821.md` calls that workload stable to 0.6% within
-a binary. This run took about two and a half times as long. No cause has been established.
+**Conclusion (added 2026-10-01, after an A/B against v0.6.12): no 0.7 regression.** See
+`mushroomdb-10k-0.7-ab.md`. The released v0.6.12 takes 8.611 s for the same backfill and derives the
+same 448,000 edges. The 2.85–3.51 s runs were a different workload: before v0.2.0 a rule without an
+explicit `max_edges` stopped at a 1,000,000-edge global cap per rule, and since v0.2.0 it keeps the
+top 32 per source, so the backfill evaluates every source. The two-hop figure above is a cold first
+execution; the warm median on this tree is 192.1 µs. An earlier annotation here, made before the
+A/B, said the backfill was under investigation as a possible regression; this replaces it.

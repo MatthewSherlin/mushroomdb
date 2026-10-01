@@ -139,11 +139,12 @@ def run_ours(nodes: list[dict], scale: int, seed: int) -> dict[str, Any]:
 
         # 5. Rule-derive (must come before cypher_two_hop)
         print("  [ours] rule_derive (INDUSTRY_ALIGNMENT) ...", flush=True)
-        # max_edges omitted → None → DEFAULT_MAX_EDGES=1_000_000 global budget.
-        # This matches v2 benchmark semantics (global cap, not per-source top-k).
-        # Passing max_edges=1_000_000 would mean per-source top-1M (uncapped at
-        # 10k scale) and create 2.8M INDUSTRY_ALIGNMENT + 5.2M SPECIALTY_MATCH
-        # edges instead of capping globally at 1M each.
+        # max_edges is omitted, and the Python binding fills an omitted max_edges
+        # with a per-source top-k of 32. So the backfill evaluates every source
+        # and keeps its best 32 targets: 224,000 edges per rule at 10k scale,
+        # 448,000 in all. Before v0.2.0 an omitted max_edges meant a global
+        # 1,000,000-edge budget per rule and an early exit; figures from then
+        # are a different workload. See results/mushroomdb-10k-0.7-ab.md.
         rules = [
             {
                 "name": "bench_industry_tc",
