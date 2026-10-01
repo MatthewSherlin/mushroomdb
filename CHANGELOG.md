@@ -141,11 +141,29 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   equal to a provisional stub's key links that stub, at 1.00:
   `remember {about: ["matt"]}` and an entity written with `aliases: ["matt"]`
   are linked, in either order. Jaccard could not do this — the stub holds one
-  alias against the entity's five. Three limits: the match is on the stub's
-  key exactly and keys are case-sensitive, so `aliases: ["Matt"]` does not
-  link a stub keyed `matt`; it links stubs (`Entity`) only, never two
-  described entities; and the claiming entity must be a `Person`, `Org`,
-  `Project`, `Concept` or `Event`.
+  alias against the entity's five. A declared alias equal to an unrelated
+  stub's key links them at 1.00 too: declaring it is the caller's explicit
+  claim. Three limits:
+  - The match is on the key exactly, and keys are case-sensitive:
+    `aliases: ["Matt"]` does not link a stub keyed `matt`.
+  - The target must carry label `Entity`, which a node created by `about`
+    keeps for life, even after it is described. Such a node can still be
+    claimed once described. Two nodes that both carry one of the five entity
+    labels are never linked by claim.
+  - The claiming node must be a `Person`, `Org`, `Project`, `Concept` or
+    `Event`. So a subject named by `about` before it was described cannot
+    itself claim: it is an `Entity`, the alias it declares is stored, and no
+    rule reads it.
+- **A write that retracts identity links says so.** `remember` prints one
+  `unlinked` line and returns `same_as_lost` and `same_as_lost_total`;
+  `upsert_entity` returns the same two fields, and a note, when an update
+  loses a link. Each pair is listed once with the score it had, ten at most,
+  the rest counted. This matters because every full-name link sits exactly on
+  the floor, 3/5: an alias declared on one node and not the other makes it
+  3/6, so declaring `matt` on one of two same-named entities unlinks them,
+  and unlinks a stub that spells the full name. The remedy is to declare the
+  same aliases on every entity that is the same thing, and to declare a
+  full-name stub's key too.
 - **`alias_keys` is a second store-maintained list**: the aliases a caller
   declared, trimmed and otherwise as written, which is what the claim rules
   read. Derived name words never go in — an entity merely named "Alex" does
@@ -199,7 +217,14 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   identity.
 - **A declared alias counts against `Overlap`.** It is one more entry in that
   entity's `aliases`, so declaring `matt` on one of two same-named entities
-  takes their score from 3/5 to 3/6, under the floor.
+  takes their score from 3/5 to 3/6, under the floor, and does the same to a
+  stub that spells the full name. The write's reply names the links it lost.
+  Declare the same aliases on every entity that is the same thing, and a
+  full-name stub's key too; a stub cannot declare anything itself.
+- **A subject named before it was described cannot claim a stub.** It is an
+  `Entity` for life, and the claim rules run from the five entity labels.
+  `upsert_entity` refuses to relabel it; `remember`'s `entities` describes it
+  without relabelling.
 - **Two strangers with one full name link.** `john-smith-nyc` and
   `john-smith-sf` score 3/5. The link is visible in `remember`'s reply and
   explainable with `explain_association`, but it is wrong — the gate's one
