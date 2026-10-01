@@ -41,7 +41,7 @@ fn run(args: &[&str], stdin: &str) -> std::process::Output {
 
 fn expected_stderr(sub: &str) -> String {
     format!(
-        "mushroomdb {sub}: retired in 0.7; run `mushroomdb install` (or `doctor`) to remove this hook\n"
+        "mushroomdb {sub}: retired in 0.7; run `mushroomdb install` to remove this hook (`mushroomdb doctor` lists any that remain)\n"
     )
 }
 

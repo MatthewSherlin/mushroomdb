@@ -38,7 +38,7 @@ nothing changes for anyone who does not deliberately upgrade.
   suite runs through them: `benchmarks/agent-tasks/run.py` now defaults to
   `--suite association` and refuses `--suite code`.
 
-After upgrading, run `mushroomdb install` (or `mushroomdb doctor`) once to remove the retired hooks.
+After upgrading, run `mushroomdb install` once to remove the retired hooks; `mushroomdb doctor` reports any that remain.
 
 To keep any of it: pin `mushroomdb@0.6.x`.
 

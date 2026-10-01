@@ -65,7 +65,7 @@ fn main() -> ExitCode {
             }
             let _ = writeln!(
                 io::stderr(),
-                "mushroomdb {sub}: retired in 0.7; run `mushroomdb install` (or `doctor`) to remove this hook"
+                "mushroomdb {sub}: retired in 0.7; run `mushroomdb install` to remove this hook (`mushroomdb doctor` lists any that remain)"
             );
             ExitCode::SUCCESS
         }
