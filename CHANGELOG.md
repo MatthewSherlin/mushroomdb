@@ -109,7 +109,9 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   derived and names the rule, reports the derived edges a property removal
   retracts because a rule read that property, lists the notes that still state
   what was forgotten, and says plainly that history keeps it until the log is
-  pruned. It is not redaction, and it has no role check.
+  pruned. Forgetting an entity's `name` rewrites its `aliases` in the same
+  write, so the name's words stop matching identity rules at once, and the
+  reply says so. It is not redaction, and it has no role check.
 - **`suggest_rules`** relays the store's own rule proposals with arguments
   `create_rule` accepts unchanged. It never proposes a field the store writes
   for itself, and it creates nothing.
@@ -117,15 +119,27 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   `clusters` and `identities`, over the whole store, at most 50 rows, the same
   answer every time.
 - **Every entity carries a normalised `aliases` list** — its key, its name in
-  lowercase with punctuation folded, that name's words, and any `aliases` the
-  caller passes to `remember`'s `entities` or to `upsert_entity`.
-- **`aliases` is now maintained by the store.** A caller supplies extra
-  aliases through the `aliases` argument; an `aliases` key inside `props` is
-  refused. A value an older store already holds is taken in on the next write
-  to that entity — a string as one alias, a list with each mixed-case or
-  padded item normalised; an item already lowercase is kept as is — and any
-  other type is refused with the node named, to clear with
+  lowercase with punctuation folded, and that name's words. Nothing else goes
+  in. It is recomputed from the key and the current name on each write that
+  describes the entity, not accumulated: a renamed entity stops matching its
+  old name, and a forgotten name leaves nothing behind.
+- **`aliases` is now maintained by the store.** An `aliases` key inside
+  `props` is refused. Other names a caller knows go through the `aliases`
+  argument of `remember`'s `entities` or of `upsert_entity`, and are kept in
+  `alias_keys` (below), not in `aliases`. A value an older store already holds
+  in `aliases` is its owner's data and is kept: on the next describing write
+  to that entity, or when the identity preset's backfill runs, every item the
+  key and the name do not imply moves to `alias_keys` as written — trimmed,
+  not normalised. Only a blank item is let go. Any value that is not a string
+  or a list of strings is refused with the node named, to clear with
   `forget {key, prop: "aliases"}`, rather than overwritten.
+- **A declared alias does not count toward `Overlap`** (owner decision,
+  2026-10-01). Every full-name link sits exactly on the floor, 3/5; when
+  declared aliases were entries in `aliases`, declaring `matt` on one of two
+  same-named entities made it 3/6 and silently unlinked them. Now it changes
+  nothing. The consequence: two entities that declare the same alias gain no
+  overlap from it. A declared alias links only through an explicit claim on a
+  stub's key.
 - **Aliases are normalised to Unicode NFC.** A name typed with combining
   marks — `E` followed by U+0301 — yields the same aliases as its precomposed
   form, `É`, so the two link. The stored `name` is left as written. This adds
@@ -141,7 +155,8 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   equal to a provisional stub's key links that stub, at 1.00:
   `remember {about: ["matt"]}` and an entity written with `aliases: ["matt"]`
   are linked, in either order. Jaccard could not do this — the stub holds one
-  alias against the entity's five. A declared alias equal to an unrelated
+  alias, `matt`, and the entity's four hold no `matt`: its key, its name and
+  the name's two words. A declared alias equal to an unrelated
   stub's key links them at 1.00 too: declaring it is the caller's explicit
   claim. Three limits:
   - The match is on the key exactly, and keys are case-sensitive:
@@ -158,23 +173,26 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   `unlinked` line and returns `same_as_lost` and `same_as_lost_total`;
   `upsert_entity` returns the same two fields, and a note, when an update
   loses a link. Each pair is listed once with the score it had, ten at most,
-  the rest counted. This matters because every full-name link sits exactly on
-  the floor, 3/5: an alias declared on one node and not the other makes it
-  3/6, so declaring `matt` on one of two same-named entities unlinks them,
-  and unlinks a stub that spells the full name. The remedy is to declare the
-  same aliases on every entity that is the same thing, and to declare a
-  full-name stub's key too.
+  the rest counted. This matters because `aliases` follows the name: renaming
+  one of two same-named entities takes their score under the floor and
+  unlinks them, and unlinks a stub that spelled the old name. Declaring an
+  alias never costs a link. The remedy is to give both the same name, or to
+  declare a provisional stub's key as an alias, which links it whatever the
+  names.
 - **`alias_keys` is a second store-maintained list**: the aliases a caller
   declared, trimmed and otherwise as written, which is what the claim rules
   read. Derived name words never go in — an entity merely named "Alex" does
-  not claim a stub keyed `alex`. It accumulates like `aliases`, holds at most
-  32, is refused as a key inside `props`, is never proposed by
-  `suggest_rules`, and is cleared by `forget {key, prop: "alias_keys"}`. A
-  store that already took the preset gains the five claim rules by running
-  `schema apply --memory-identity` again; there is no `alias_keys` backfill,
-  because an older store kept no record of which aliases were declared.
-- **The default tool listing is 23 tools and 27,174 bytes**, from 19 and
-  23,548 (`scripts/measure-tool-listing.py`; all 25 tools are 27,975 bytes).
+  not claim a stub keyed `alex`. It is the only place a declared alias is
+  kept. It accumulates, where `aliases` does not; holds at most 32; is refused
+  as a key inside `props`; is never proposed by `suggest_rules`; and is
+  cleared by `forget {key, prop: "alias_keys"}`. A store that already took the
+  preset gains the five claim rules by running
+  `schema apply --memory-identity` again. Its backfill writes each entity's
+  `aliases` from its key and name, moves into `alias_keys` whatever an older
+  node's `aliases` held beyond that, and says how many nodes that touched
+  before it writes.
+- **The default tool listing is 23 tools and 27,137 bytes**, from 19 and
+  23,548 (`scripts/measure-tool-listing.py`; all 25 tools are 27,938 bytes).
 - **The fragmentation probe (spec §8.2) says LARGE**: at the reference cell,
   25% of Talent split into 3 aliases, recall of the edges the canonical alias
   holds is 0.8324 over every rule, a loss of 0.1676 against the pre-registered
@@ -202,8 +220,8 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 ### Known limits
 
 - **A nickname stub links only when the alias is declared.** A bare `matt`
-  stub holds one alias and cannot reach Jaccard 0.6 against an entity holding
-  five. An entity that declares `aliases: ["matt"]` now links it by claim; one
+  stub holds one alias and cannot reach Jaccard 0.6 against an entity named
+  Matthew Sherlin, which holds four and none of them `matt`. An entity that declares `aliases: ["matt"]` now links it by claim; one
   that does not declare it still does not, and neither does a second entity
   with the same name that never made the claim. That is three of the gate's
   nine false negatives, whose labelled set declares no such alias. The other
@@ -215,12 +233,20 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   `analyze`'s identities are complete-linkage: a stub one of two linked
   entities claims is linked to that one and is not a member of the pair's
   identity.
-- **A declared alias counts against `Overlap`.** It is one more entry in that
-  entity's `aliases`, so declaring `matt` on one of two same-named entities
-  takes their score from 3/5 to 3/6, under the floor, and does the same to a
-  stub that spells the full name. The write's reply names the links it lost.
-  Declare the same aliases on every entity that is the same thing, and a
-  full-name stub's key too; a stub cannot declare anything itself.
+- **A name change can remove a link.** `aliases` is the key, the current name
+  and its words, so renaming an entity retracts every link its old name made.
+  The write's reply names the links it lost. Declaring an alias cannot do
+  this.
+- **A shared declared alias links nothing by itself.** Two entities that both
+  declare `the boss` gain no overlap from it; declared aliases act only as
+  claims on a provisional stub's key.
+- **The store tells a derived alias from a kept one by the name it finds.** A
+  name changed by a raw write — `query`, not `remember` or `upsert_entity` —
+  leaves its old words in `aliases`, and the next describing write keeps them
+  as declared aliases in `alias_keys`, where one equal to a stub's key links
+  that stub. So does a former key left by `rename_node`. Change a name
+  through `upsert_entity` or `remember`, or `forget` it, and nothing is left;
+  `forget {key, prop: "alias_keys"}` clears what was kept.
 - **A subject named before it was described cannot claim a stub.** It is an
   `Entity` for life, and the claim rules run from the five entity labels.
   `upsert_entity` refuses to relabel it; `remember`'s `entities` describes it
@@ -234,9 +260,6 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   line can name keys from other namespaces.
 - **`forget` has no role check.** Like every other MCP write tool, it is not
   an authorisation boundary.
-- **A forgotten `name` stays in `aliases`.** `forget {key, prop: "name"}` says
-  so: the name's words keep matching identity rules, and later writes keep
-  them, until `forget {key, prop: "aliases"}` clears the list.
 - **Forgotten `aliases` leave `alias_keys`.** The two lists are cleared
   separately. `forget {key, prop: "aliases"}` says so when declared aliases
   remain: they keep linking a stub keyed so until
