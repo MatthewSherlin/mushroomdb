@@ -10,7 +10,8 @@ Checked, in each tracked Markdown file under the paths in SOURCES:
     reachable from nowhere a reader starts.
 
 External URLs (http, https, mailto) are not fetched: a gate must not need a
-network. Links inside fenced code blocks are ignored.
+network. Links inside fenced code blocks (``` or ~~~) and inside inline code
+spans are ignored, and a heading inside a fence is not an anchor.
 
 Exits 1 printing `KIND  file:line: target` for every problem.
 """
@@ -50,6 +51,38 @@ LINK = re.compile(
 )
 
 
+FENCE = re.compile(r"^\s*(```|~~~)")
+# A code span may wrap onto the next line, but never across a blank one.
+CODE_SPAN = re.compile(r"(`+)(?!`)((?:(?!\n[ \t]*\n).)+?)(?<!`)\1(?!`)", re.DOTALL)
+
+
+def unfenced(path: Path) -> list[str]:
+    """The file's lines, with every line of a fenced block (``` or ~~~) blanked.
+
+    A fence closes only on the marker that opened it. Line numbers are kept.
+    """
+    out: list[str] = []
+    fence: str | None = None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        m = FENCE.match(line)
+        if fence is not None:
+            if m and m.group(1) == fence:
+                fence = None
+            out.append("")
+        elif m:
+            fence = m.group(1)
+            out.append("")
+        else:
+            out.append(line)
+    return out
+
+
+def without_code_spans(lines: list[str]) -> list[str]:
+    """`lines` with the inside of every inline code span blanked, line count kept."""
+    blank = lambda m: re.sub(r"[^\n]", " ", m.group(0))
+    return CODE_SPAN.sub(blank, "\n".join(lines)).split("\n")
+
+
 def git(*args: str) -> str:
     return subprocess.check_output(["git", "-C", str(ROOT), *args], text=True)
 
@@ -66,12 +99,7 @@ def slug(heading: str) -> str:
 def anchors(path: Path) -> set[str]:
     out: set[str] = set()
     seen: dict[str, int] = {}
-    fenced = False
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.lstrip().startswith("```"):
-            fenced = not fenced
-        if fenced:
-            continue
+    for line in unfenced(path):
         m = re.match(r"^(#{1,6})\s+(.*?)\s*#*\s*$", line)
         if m:
             s = slug(m.group(2))
@@ -90,12 +118,7 @@ def main() -> int:
 
     for rel in files:
         path = ROOT / rel
-        fenced = False
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if line.lstrip().startswith("```"):
-                fenced = not fenced
-            if fenced:
-                continue
+        for lineno, line in enumerate(without_code_spans(unfenced(path)), 1):
             for m in LINK.finditer(line):
                 target = next(g for g in m.groups() if g)
                 if re.match(r"^(https?:|mailto:)", target):
