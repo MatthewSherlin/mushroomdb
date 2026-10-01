@@ -25,7 +25,10 @@ nothing changes for anyone who does not deliberately upgrade.
   `post-checkout` and `post-merge` for this store, and `doctor` warns about one
   left behind. `install --no-git-hooks` is still accepted, as a no-op.
 - **Ten CLI subcommands**: `sync`, `touch`, `intercept`, `impact-hook`,
-  `enrich`, `map`, `explore`, `context`, `impact`, `owners`.
+  `enrich`, `map`, `explore`, `context`, `impact`, `owners`. The first five
+  were hook bodies, and a hook a 0.6 install wrote keeps calling them until
+  it is removed, so they are still accepted, unlisted: each does nothing,
+  exits 0 and prints one line on stderr saying how to remove the hook.
 - **The `UserPromptSubmit` hook's dirty-tree nudge** — what the changed files
   reach, who owns them, which learned concept just went stale. It read
   `CO_CHANGED`, `IMPORTS` and `DESCRIBED_IN` edges only `ingest-git` writes.
@@ -34,6 +37,8 @@ nothing changes for anyone who does not deliberately upgrade.
   deprecated the door. The harness files stay too, because the association
   suite runs through them: `benchmarks/agent-tasks/run.py` now defaults to
   `--suite association` and refuses `--suite code`.
+
+After upgrading, run `mushroomdb install` (or `mushroomdb doctor`) once to remove the retired hooks.
 
 To keep any of it: pin `mushroomdb@0.6.x`.
 

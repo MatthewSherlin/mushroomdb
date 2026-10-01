@@ -8,7 +8,7 @@ use cli::{
 };
 use core_api::{GraphError, SharedDb};
 use std::collections::HashMap;
-use std::io::{self, Read as _, Write};
+use std::io::{self, IsTerminal as _, Read as _, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -55,6 +55,18 @@ fn main() -> ExitCode {
     match parse_args(&raw) {
         Ok(Command::Help) => {
             print!("{}", usage());
+            ExitCode::SUCCESS
+        }
+        Ok(Command::RetiredHook { sub }) => {
+            // Drain a hook payload so the runner's write never meets a closed
+            // pipe. A terminal is not drained: nobody is going to type EOF.
+            if !io::stdin().is_terminal() {
+                let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+            }
+            let _ = writeln!(
+                io::stderr(),
+                "mushroomdb {sub}: retired in 0.7; run `mushroomdb install` (or `doctor`) to remove this hook"
+            );
             ExitCode::SUCCESS
         }
         Ok(Command::Recall { db_dir, auto }) => {
