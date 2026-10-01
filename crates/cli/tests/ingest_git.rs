@@ -1956,7 +1956,9 @@ fn the_reach_line_on_a_cli_delivery_install_names_only_the_binary() {
 fn an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool() {
     let root = tmp("brief-cli-empty");
     let home = tmp("brief-cli-empty-home");
-    let db_dir = root.join("mushroom-memory");
+    // A hostile store path: a space and a single quote, the two characters
+    // that break a shell argument quoted carelessly.
+    let db_dir = root.join("mushroom memory's");
     std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
 
     cli::install::run_install_with(
@@ -1994,42 +1996,57 @@ fn an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool() {
             "a cli install has no server to call {tool} on: {first}"
         );
     }
+    let quoted = db_dir.display().to_string().replace('\'', r"'\''");
     assert!(
-        first.contains(&format!(" query '{}' ", db_dir.display()))
-            && first.contains("CREATE (n:Note {id:"),
+        first.contains(&format!(" query '{quoted}' ")) && first.contains("CREATE (n:Note {id:"),
         "it offers the one write a shell has, with the `id:` a CREATE needs: {first}"
     );
-    // The offer has to run as printed. The engine's Cypher takes single-quoted
-    // strings only, so the statement is the line's one double-quoted shell
-    // argument; hand exactly that to `query` and read the note back.
-    let cypher = first
-        .split('"')
-        .nth(1)
+    // The id is a placeholder, as the skill's `note:…` is: a literal id would
+    // be the same key on every paste, and the second paste would not be a new
+    // note.
+    assert!(
+        first.contains("'note:<fresh-id>'") && first.contains("'<the fact>'"),
+        "the id and the text are for the session to fill in: {first}"
+    );
+    // The offer has to run as a shell would run it, hostile path included.
+    // The engine's Cypher takes single-quoted strings only, so the statement
+    // is the line's one double-quoted shell argument. Everything after
+    // ` query ` up to that argument's closing quote goes to `sh` with the two
+    // placeholders filled in — behind the binary this test built, never the
+    // launcher the line names, which may be one that fetches a package.
+    let args = first
+        .split_once(" query ")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.rfind('"').map(|end| &rest[..=end]))
         .unwrap_or_else(|| panic!("no double-quoted statement in: {first}"));
     assert!(
-        first.split('"').count() == 3 && !cypher.contains(['$', '`', '\\']),
+        args.split('"').count() == 3 && !args.contains(['$', '`']),
         "one double-quoted argument a shell passes through unchanged: {first}"
     );
-    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
-        .arg("query")
-        .arg(&db_dir)
-        .arg(cypher)
+    let concrete = args
+        .replace("<fresh-id>", "1")
+        .replace("<the fact>", "ada likes tea");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("\"$MUSHROOMDB_UNDER_TEST\" query {concrete}"))
+        .env("MUSHROOMDB_UNDER_TEST", env!("CARGO_BIN_EXE_mushroomdb"))
         .output()
         .unwrap();
     assert!(
         out.status.success(),
-        "the statement the brief offers does not run: {cypher}: {}",
+        "the command the brief offers does not run: {concrete}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
         .arg("query")
         .arg(&db_dir)
-        .arg("MATCH (n:Note) RETURN n.id AS id")
+        .arg("MATCH (n:Note) RETURN n.id AS id, n.text AS text")
         .output()
         .unwrap();
+    let rows = String::from_utf8_lossy(&out.stdout);
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("note:1"),
-        "{out:?}"
+        rows.contains("note:1") && rows.contains("ada likes tea"),
+        "the note landed in the store the line named: {out:?}"
     );
 
     // No install beside the store means both doors, and the line is the

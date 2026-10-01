@@ -153,3 +153,37 @@ fn the_rendered_schema_is_capped_in_bytes_and_says_so() {
     let text = render_schema(&schema_report(&small, &BriefOptions::default()));
     assert!(!text.contains("truncated"), "{text}");
 }
+
+/// The cut is at the first line that does not fit, and a section heading
+/// whose first entry was that line does not stay behind with nothing under it.
+#[test]
+fn a_schema_cut_leaves_no_heading_without_entries() {
+    use core_api::memory::brief::BriefOptions;
+    use core_api::memory::schema::{render_schema, schema_report, SCHEMA_MAX_BYTES};
+
+    let mut db = GraphDb::open(&tmp("schema-heading")).unwrap();
+    // Sixteen labels of 703 characters: about 11.4 KB of label lines, which
+    // leaves room for the `edge types:` heading and not for the one edge
+    // type's line, which names two of those labels.
+    let label = |i: usize| format!("L{i:02}{}", "x".repeat(700));
+    for i in 0..16 {
+        db.insert_node(&label(i), &format!("n{i}"), vec![]).unwrap();
+    }
+    db.insert_edge("KNOWS", "n0", "n1").unwrap();
+    let report = schema_report(&db, &BriefOptions::default());
+    assert_eq!(report.brief.edge_types.len(), 1, "fixture: one edge type");
+    let text = render_schema(&report);
+    assert!(text.len() <= SCHEMA_MAX_BYTES, "{} bytes", text.len());
+
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[lines.len() - 1].contains("truncated"), "{text}");
+    let last_kept = lines[lines.len() - 2];
+    assert!(
+        last_kept.starts_with("  L15"),
+        "fixture: every label fit, so the cut fell in the edge types: {last_kept}"
+    );
+    assert!(
+        !text.contains("edge types:"),
+        "a heading with nothing under it: {text}"
+    );
+}

@@ -2171,9 +2171,13 @@ fn reach_line(db_dir: &Path) -> String {
 /// skill's CLI table names, with the `id:` property a `CREATE` needs.
 ///
 /// The statement is in double quotes for the shell because the engine's
-/// Cypher takes single-quoted strings only: the line has to run as printed,
-/// and `an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool`
-/// runs it.
+/// Cypher takes single-quoted strings only: the line has to run as a shell
+/// would run it, and
+/// `an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool` runs
+/// it, on a store path with a space and a quote in it.
+///
+/// The id and the text are placeholders, as the skill's `note:…` is. A
+/// literal id would be the same key on every paste, and the key is the node.
 fn empty_brief_cli(db_dir: &Path) -> String {
     // Sanitized as the reach line is: `render` returned a constant for this
     // store, so nothing downstream sanitizes what is built here.
@@ -2181,7 +2185,8 @@ fn empty_brief_cli(db_dir: &Path) -> String {
     let db = core_api::digest::sanitize(&install::sh_quote(&db_dir.to_string_lossy()));
     format!(
         "mushroomdb brief — empty store; offer to fill it: {bin} query {db} \
-         \"CREATE (n:Note {{id: 'note:1', text: '…'}})\" writes a fact\n"
+         \"CREATE (n:Note {{id: 'note:<fresh-id>', text: '<the fact>'}})\" writes a fact; \
+         fill in both, with an id no note has yet\n"
     )
 }
 

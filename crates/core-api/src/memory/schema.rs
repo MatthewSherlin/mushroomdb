@@ -34,10 +34,19 @@ pub const PROVISIONAL_SAMPLE: usize = 10;
 /// labels, twenty edge types, the identity preset's rules — renders
 /// about half of it. The `json: true` report is not capped: a program that
 /// asked for the whole report gets it.
+///
+/// The cut is at the first line that does not fit: that line and everything
+/// after it are dropped, a shorter line further down included, so what is
+/// kept is a prefix of the report. A section heading left with no entry
+/// under it goes too.
 pub const SCHEMA_MAX_BYTES: usize = 12_000;
 
 /// Keep whole lines of `out` inside [`SCHEMA_MAX_BYTES`], and say so on a
 /// last line when any were dropped.
+///
+/// Entries are indented and a heading is not, so a kept text that ends on an
+/// unindented line closing with `:` ends on a heading whose first entry was
+/// the line that did not fit. That heading is dropped with it.
 fn cap_schema(out: String) -> String {
     if out.len() <= SCHEMA_MAX_BYTES {
         return out;
@@ -52,6 +61,11 @@ fn cap_schema(out: String) -> String {
         }
         kept.push_str(line);
         kept.push('\n');
+    }
+    let last_start = kept.trim_end_matches('\n').rfind('\n').map_or(0, |i| i + 1);
+    let last = kept[last_start..].trim_end_matches('\n');
+    if last.ends_with(':') && !last.starts_with(' ') {
+        kept.truncate(last_start);
     }
     kept.push_str(&note);
     kept

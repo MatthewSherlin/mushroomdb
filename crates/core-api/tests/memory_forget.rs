@@ -296,3 +296,68 @@ fn the_refusal_names_the_rule_that_derived_the_edge_not_every_look_alike() {
         other => panic!("expected a RuleOwned refusal, got {other:?}"),
     }
 }
+
+/// An edge written by hand that a live rule would derive is refused as well,
+/// and no rule derived it: it is in no provenance. The refusal says so, and
+/// names only the rule whose predicate holds for this pair — `same_city`
+/// has the same edge type and labels and does not match these two.
+///
+/// Like the test above, this never retracts (ledger row 37).
+#[test]
+fn a_hand_written_fact_a_rule_would_rederive_is_refused_without_a_false_owner() {
+    let mut db = store("hand-written");
+    for (key, city) in [("a", "Oslo"), ("b", "Lima")] {
+        db.insert_node(
+            "Person",
+            key,
+            vec![
+                ("team".into(), Value::Str("red".into())),
+                ("city".into(), Value::Str(city.into())),
+            ],
+        )
+        .unwrap();
+    }
+    // The edge first, by hand; the rules after it.
+    db.insert_edge("LINKED", "a", "b").unwrap();
+    let mut by_city = same_team_rule();
+    by_city.name = "same_city".into();
+    by_city.predicate = Predicate::FieldEqual {
+        field: "city".into(),
+    };
+    by_city.edge_type = "LINKED".into();
+    let mut by_team = same_team_rule();
+    by_team.edge_type = "LINKED".into();
+    db.create_rule(by_city).unwrap();
+    db.create_rule(by_team).unwrap();
+    assert!(
+        db.explain("a", "b")
+            .unwrap()
+            .iter()
+            .all(|e| !(e.edge_type == "LINKED" && e.src_key == "a" && e.dst_key == "b")),
+        "fixture: no rule derived a → b, so provenance has nothing to say"
+    );
+
+    let refused = forget(
+        &mut db,
+        &ForgetTarget::Fact {
+            subject: "a".into(),
+            predicate: "LINKED".into(),
+            object: "b".into(),
+        },
+    );
+    match refused {
+        Err(GraphError::RuleOwned { detail }) => assert_eq!(
+            detail,
+            "refused: LINKED a → b was written by hand and no rule derived it, but rule \
+             same_team would derive it again, so the delete is refused. It can be deleted \
+             once the fields that rule reads (team) no longer match, or once the rule is \
+             deleted. Nothing was written.",
+        ),
+        other => panic!("expected a RuleOwned refusal, got {other:?}"),
+    }
+    assert_eq!(
+        db.neighbors("a", "LINKED", Direction::Out).unwrap(),
+        vec!["b".to_string()],
+        "nothing was written"
+    );
+}

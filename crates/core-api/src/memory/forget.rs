@@ -16,6 +16,7 @@ use crate::memory::identity::{
 };
 use crate::memory_schema::NAME_FIELD;
 use crate::{GraphDb, PredicateSummary, RuleDef};
+use core_rules::{evaluate, NodeView};
 use core_storage::fs::Fs;
 use core_storage::{Direction, GraphError, Result};
 use std::collections::BTreeSet;
@@ -257,14 +258,21 @@ pub fn forget<F: Fs>(db: &mut GraphDb<F>, target: &ForgetTarget) -> Result<Forge
     }
 }
 
-/// Why a fact edge cannot be retracted: the rule that derived it — from the
-/// engine's own provenance — and the only two ways it can change.
+/// Why a fact edge cannot be retracted, in one of two true sentences.
 ///
-/// An edge a rule derived is in provenance, and the refusal names exactly the
-/// rules [`GraphDb::explain`] attributes it to. An edge written by hand that a
-/// live rule would re-derive is refused too and is in no provenance; for that
-/// one the refusal names every rule of the same edge type and endpoint labels.
-/// When neither finds a rule, the engine's own `detail` is returned, sanitized.
+/// The engine refuses the delete in two cases, and they are not the same
+/// fact:
+///
+/// - **A rule derived the edge.** It is in provenance, and the refusal names
+///   exactly the rules [`GraphDb::explain`] attributes it to.
+/// - **The edge was written by hand and a live rule would derive it again.**
+///   It is in no provenance, so no rule is said to have derived it. The
+///   refusal names the rules whose predicate holds for this pair now — the
+///   engine's own test, `would_derive` below — and not every rule that shares
+///   the edge type and the endpoint labels.
+///
+/// When neither names a rule, the engine's own `detail` is returned,
+/// sanitized.
 pub fn rule_owned_refusal<F: Fs>(
     db: &GraphDb<F>,
     predicate: &str,
@@ -272,13 +280,10 @@ pub fn rule_owned_refusal<F: Fs>(
     object: &str,
     detail: &str,
 ) -> String {
-    let label = |k: &str| db.node_ref(k).map(|n| n.label().to_string());
-    let (src, dst) = (label(subject), label(object));
     // Which rule derived this edge is something the engine knows: `explain`
     // answers from provenance, one entry per derived edge between the two
     // keys. Matching on edge type and labels alone names every look-alike —
-    // every rule of the identity preset derives `SAME_AS` — so that is
-    // only the fallback, for an edge `explain` has nothing to say about.
+    // every rule of the identity preset derives `SAME_AS`.
     let by_provenance: BTreeSet<String> = db
         .explain(subject, object)
         .unwrap_or_default()
@@ -286,35 +291,84 @@ pub fn rule_owned_refusal<F: Fs>(
         .filter(|e| e.edge_type == predicate && e.src_key == subject && e.dst_key == object)
         .map(|e| e.rule)
         .collect();
-    let owners: Vec<RuleDef> = db
-        .rules()
-        .into_iter()
-        .filter(|r| {
-            if by_provenance.is_empty() {
-                r.edge_type == predicate
-                    && Some(&r.src_label) == src.as_ref()
-                    && Some(&r.dst_label) == dst.as_ref()
-            } else {
-                by_provenance.contains(&r.name)
-            }
-        })
+    let rules = db.rules();
+    let derived_by: Vec<&RuleDef> = rules
+        .iter()
+        .filter(|r| by_provenance.contains(&r.name))
         .collect();
-    if owners.is_empty() {
+    if !derived_by.is_empty() {
+        let (names, fields) = names_and_fields(&derived_by);
+        return format!(
+            "refused: {} {} → {} is derived by rule {names}. It changes only when the fields \
+             that rule reads change ({fields}), or when the rule is deleted. Nothing was written.",
+            sanitize(predicate),
+            sanitize(subject),
+            sanitize(object),
+        );
+    }
+    let would: Vec<&RuleDef> = rules
+        .iter()
+        .filter(|r| would_derive(db, r, predicate, subject, object))
+        .collect();
+    if would.is_empty() {
         return sanitize(detail);
     }
-    let names: Vec<String> = owners.iter().map(|r| sanitize(&r.name)).collect();
-    let mut fields: BTreeSet<String> = BTreeSet::new();
-    for r in &owners {
-        fields.extend(predicate_fields(&PredicateSummary::from(&r.predicate)));
-    }
-    let fields: Vec<String> = fields.iter().map(|f| sanitize(f)).collect();
+    let (names, fields) = names_and_fields(&would);
     format!(
-        "refused: {} {} → {} is derived by rule {}. It changes only when the fields \
-         that rule reads change ({}), or when the rule is deleted. Nothing was written.",
+        "refused: {} {} → {} was written by hand and no rule derived it, but rule {names} \
+         would derive it again, so the delete is refused. It can be deleted once the fields \
+         that rule reads ({fields}) no longer match, or once the rule is deleted. Nothing was \
+         written.",
         sanitize(predicate),
         sanitize(subject),
         sanitize(object),
-        names.join(", "),
-        fields.join(", ")
     )
+}
+
+/// The rules' names, and every field their predicates read, each sanitized
+/// and comma-joined; the fields sorted and deduped.
+fn names_and_fields(rules: &[&RuleDef]) -> (String, String) {
+    let names: Vec<String> = rules.iter().map(|r| sanitize(&r.name)).collect();
+    let mut fields: BTreeSet<String> = BTreeSet::new();
+    for r in rules {
+        fields.extend(predicate_fields(&PredicateSummary::from(&r.predicate)));
+    }
+    let fields: Vec<String> = fields.iter().map(|f| sanitize(f)).collect();
+    (names.join(", "), fields.join(", "))
+}
+
+/// Whether `rule` would derive `(predicate, subject, object)` from what the
+/// two nodes hold now.
+///
+/// The same test the engine's delete guard makes before it refuses a
+/// hand-written edge (`would_derive` in `db.rs`): the rule's edge type and
+/// endpoint labels, then its predicate evaluated on the pair.
+fn would_derive<F: Fs>(
+    db: &GraphDb<F>,
+    rule: &RuleDef,
+    predicate: &str,
+    subject: &str,
+    object: &str,
+) -> bool {
+    if subject == object || rule.edge_type != predicate {
+        return false;
+    }
+    let label_is = |key: &str, label: &str| db.node_ref(key).is_some_and(|n| n.label() == label);
+    if !label_is(subject, &rule.src_label) || !label_is(object, &rule.dst_label) {
+        return false;
+    }
+    let src_props = |field: &str| db.get_prop(subject, field);
+    let dst_props = |field: &str| db.get_prop(object, field);
+    evaluate(
+        &rule.predicate,
+        &NodeView {
+            key: subject,
+            props: &src_props,
+        },
+        &NodeView {
+            key: object,
+            props: &dst_props,
+        },
+    )
+    .is_some()
 }
