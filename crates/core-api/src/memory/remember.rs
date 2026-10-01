@@ -87,10 +87,10 @@ pub struct EntityIn {
     pub key: String,
     pub label: String,
     pub props: BTreeMap<String, Value>,
-    /// Other names the caller knows this entity by. Normalised into the
-    /// node's `aliases` list alongside its key and name, and kept as declared
-    /// in its `alias_keys` list, which links a provisional stub keyed exactly
-    /// so; see [`crate::memory::identity`].
+    /// Other names the caller knows this entity by. Kept as declared in the
+    /// node's `alias_keys` list, which links a provisional stub keyed exactly
+    /// so. They do not enter `aliases`, which holds only what the key and the
+    /// name imply; see [`crate::memory::identity`].
     pub aliases: Vec<String>,
 }
 
@@ -179,10 +179,11 @@ pub struct RememberReport {
     pub same_as: Vec<SameAsPair>,
     /// `SAME_AS` claims this call retracted: pairs that linked an entity it
     /// wrote before the commit and do not after it, each with the score it
-    /// had. A full-name link sits exactly on the floor, 3/5, so one alias
-    /// declared on one side and not the other makes it 3/6 and the rule lets
-    /// go. Reported so a write that costs an identity says so, rather than
-    /// only naming what it gained.
+    /// had. `aliases` is recomputed from the key and the current name, so a
+    /// write that changes a name can take a full-name link below the floor,
+    /// and so can the first write to a node whose `aliases` held items its
+    /// key and name do not imply. Reported so a write that costs an identity
+    /// says so, rather than only naming what it gained.
     pub same_as_lost: Vec<SameAsPair>,
 }
 
@@ -219,11 +220,11 @@ pub fn describe_entity<F: Fs>(
 
 /// [`describe_entity`], with aliases the caller knows the entity by.
 ///
-/// Either way the node's `aliases` list is brought up to date from its key,
-/// its name and `aliases` ([`crate::memory::identity`]), and left untouched
-/// when it already says exactly that; `aliases` as declared are added to its
-/// `alias_keys` list. A `props` entry named `aliases` or `alias_keys` is
-/// refused before anything is written.
+/// Either way the node's `aliases` list is recomputed from its key and its
+/// name ([`crate::memory::identity`]), and left untouched when it already
+/// says exactly that; `aliases` as declared are added to its `alias_keys`
+/// list and to nothing else. A `props` entry named `aliases` or `alias_keys`
+/// is refused before anything is written.
 pub fn describe_entity_with_aliases<F: Fs>(
     db: &mut GraphDb<F>,
     key: &str,
@@ -284,9 +285,9 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
     }
 
     // Each entity's `aliases` and `alias_keys` after this call, as the
-    // properties to set: each list unites what the node already holds with
-    // what this call names, and is absent when the stored list is already
-    // exactly that. Computed before anything below declares full-text, so a
+    // properties to set: `aliases` recomputed from the key and the name,
+    // `alias_keys` what the node holds united with what this call declares,
+    // each absent when the stored list is already exactly that. Computed before anything below declares full-text, so a
     // call refused here (an `aliases` or `alias_keys` property, or more than
     // either cap) declares nothing new either; and before `db.batch()` takes
     // `db` mutably, because it reads the store.
@@ -594,7 +595,7 @@ fn stub_props(key: &str) -> Vec<(String, Value)> {
         (PROVISIONAL_PROP.to_string(), Value::Bool(true)),
         (
             ALIASES_FIELD.to_string(),
-            aliases_value(&derive_aliases(key, Some(key), &[])),
+            aliases_value(&derive_aliases(key, Some(key))),
         ),
     ]
 }

@@ -5,20 +5,24 @@
 //! folding, no tokenising — so `"Matt"` and `"matt"` never meet unless both
 //! sides were written the same way. This module is the one place that writes
 //! them the same way: every entity `remember` or `upsert_entity` touches gets an
-//! `aliases` list built here, from its key, its `name` and whatever aliases the
-//! caller supplied, normalised identically on every node.
+//! `aliases` list built here, from its key and its current `name` and nothing
+//! else, normalised identically on every node.
 //!
-//! Normalisation is idempotent and deterministic: the list is sorted and
-//! deduplicated, and normalising an already-normalised alias returns it
-//! unchanged, so a node rewritten with the same inputs is not rewritten at all.
+//! The list is recomputed on each describing write, not accumulated: it is a
+//! function of the key and the name as they stand, sorted and deduplicated, so
+//! a node rewritten with the same inputs is not rewritten at all, and a
+//! renamed node stops matching its old name.
 //!
-//! A second list, `alias_keys`, holds only what a caller declared, as declared.
-//! Jaccard punishes unequal sets: a stub keyed `matt` holds one alias and an
-//! entity that declares `matt` holds five, so `Overlap` scores 1/5 and never
-//! links them. The declared list is what a `KeyMatch` rule reads instead — an
-//! entity that names a stub's key links it exactly. It is a separate list
-//! because `aliases` also holds derived name words: an entity merely *named*
-//! "Alex" would otherwise claim every stub keyed `alex`.
+//! A second list, `alias_keys`, holds what a caller declared, as declared, and
+//! only there. Declared aliases are kept out of `aliases` for two reasons.
+//! Jaccard punishes unequal sets: every full-name link sits exactly on the
+//! floor, 3/5, and one alias declared on one side would make it 3/6 and
+//! retract it. And `aliases` holds derived name words, which must not act as
+//! claims: an entity merely *named* "Alex" would otherwise claim every stub
+//! keyed `alex`. The declared list is what a `KeyMatch` rule reads instead —
+//! an entity that names a stub's key links it exactly. So two entities that
+//! declare the same alias gain no overlap from it; a declared alias links
+//! only through a claim on a stub's key.
 
 use crate::GraphDb;
 use core_storage::fs::Fs;
@@ -110,10 +114,10 @@ pub fn same_as_lost(before: &[SameAsPair], after: &[SameAsPair]) -> Vec<SameAsPa
 
 /// Most aliases one node may carry.
 ///
-/// A real entity carries its key, its full name, that name's two to four
-/// words and a few nicknames — about ten. Thirty-two is three times that, and
-/// it keeps one node from becoming a bag of tokens that is a rule candidate
-/// for half the store on every write.
+/// A real entity carries its key, its full name and that name's two to four
+/// words — about six. Thirty-two is five times that, and it keeps one node
+/// from becoming a bag of tokens that is a rule candidate for half the store
+/// on every write. Only a name of more than thirty words can reach it.
 pub const MAX_ALIASES: usize = 32;
 
 /// `s` in Unicode NFC, lowercased, with every run of characters that are not
@@ -151,16 +155,16 @@ fn tokens(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// The aliases a node's own fields imply, plus the caller's.
+/// The aliases a node's own fields imply — the whole of its `aliases` list.
 ///
 /// - the key, lowercased — keys are identifiers, so they are not tokenised;
 /// - the name in [`canonical`] form, and each of its words when it has more
-///   than one;
-/// - each caller alias in [`canonical`] form.
+///   than one.
 ///
-/// Sorted and deduplicated. Empty strings never appear.
+/// Sorted and deduplicated. Empty strings never appear. An alias a caller
+/// declares is not here: it goes to `alias_keys` ([`declared_alias_keys`]).
 #[must_use]
-pub fn derive_aliases(key: &str, name: Option<&str>, caller: &[String]) -> Vec<String> {
+pub fn derive_aliases(key: &str, name: Option<&str>) -> Vec<String> {
     let mut out: BTreeSet<String> = BTreeSet::new();
     let key = key.to_lowercase();
     if !key.trim().is_empty() {
@@ -175,92 +179,7 @@ pub fn derive_aliases(key: &str, name: Option<&str>, caller: &[String]) -> Vec<S
             out.extend(words);
         }
     }
-    for alias in caller {
-        let c = canonical(alias);
-        if !c.is_empty() {
-            out.insert(c);
-        }
-    }
     out.into_iter().collect()
-}
-
-/// `existing` (what the node already holds) united with `derived`.
-///
-/// Aliases accumulate: a node renamed keeps its former name as an alias, which
-/// is what an identity rule should compare. `forget` with `prop: "aliases"`
-/// clears them. Refused, naming the node, when the union would exceed
-/// [`MAX_ALIASES`].
-///
-/// An `existing` value written before 0.7 is taken in, not overwritten: a
-/// string is one alias in [`canonical`] form, and each list item that is not
-/// already lowercase and trimmed is folded through it. A list the store wrote
-/// passes through byte-identical, with one exception: the alias of a key with
-/// leading or trailing whitespace is the key lowercased, untrimmed, so the
-/// next write folds it and adds its canonical form beside it — once.
-/// Any other value — a number, a map, a list holding one — is refused, naming
-/// the node, rather than silently replaced.
-pub fn merge_aliases(
-    key: &str,
-    existing: Option<&Value>,
-    derived: &[String],
-) -> Result<Vec<String>> {
-    let mut out: BTreeSet<String> = derived.iter().cloned().collect();
-    let foreign = || GraphError::IngestError {
-        detail: format!(
-            "'{key}' already carries an '{ALIASES_FIELD}' property that is not a string or \
-             a list of strings; clear it with forget {{key: \"{key}\", prop: \
-             \"{ALIASES_FIELD}\"}} first"
-        ),
-    };
-    match existing {
-        None => {}
-        // The store never writes a bare string, so it is a caller's: canonical.
-        Some(Value::Str(s)) => {
-            let c = canonical(s);
-            if !c.is_empty() {
-                out.insert(c);
-            }
-        }
-        Some(Value::List(items)) => {
-            for item in items {
-                match item {
-                    Value::Str(s) => insert_folded(&mut out, s),
-                    _ => return Err(foreign()),
-                }
-            }
-        }
-        Some(_) => return Err(foreign()),
-    }
-    if out.len() > MAX_ALIASES {
-        return Err(GraphError::IngestError {
-            detail: format!(
-                "'{key}' would carry {} aliases, more than {MAX_ALIASES}; forget its \
-                 'aliases' property first, or pass fewer",
-                out.len()
-            ),
-        });
-    }
-    Ok(out.into_iter().collect())
-}
-
-/// Add one existing alias to `out`, folded through [`canonical`].
-///
-/// An item already lowercase and trimmed is kept verbatim: that is the form of
-/// the items the store writes, including the lowercased key (current, or a
-/// former one a rename left behind), which is deliberately not tokenised. So a
-/// list the store wrote passes through byte-identical — unless a key carries
-/// leading or trailing whitespace. Such a key's alias is lowercased but not
-/// trimmed, so it is not "already trimmed" here: it is folded, and its
-/// canonical form joins the list beside the untrimmed one.
-fn insert_folded(out: &mut BTreeSet<String>, alias: &str) {
-    let folded = if alias == alias.to_lowercase() && alias == alias.trim() {
-        alias.to_string()
-    } else {
-        canonical(alias)
-    };
-    if !folded.is_empty() {
-        out.insert(folded);
-    }
 }
 
 /// The list as a stored value.
@@ -269,50 +188,12 @@ pub fn aliases_value(aliases: &[String]) -> Value {
     Value::List(aliases.iter().cloned().map(Value::Str).collect())
 }
 
-/// The alias list `key` should carry after a write that sets `props` on it,
-/// or `None` when that is exactly what it already carries.
-///
-/// The name is the one `props` sets, else the one the node already has. Reads
-/// the store, so call it before a batch takes `db` mutably.
-pub fn aliases_after_write<F: Fs>(
-    db: &GraphDb<F>,
-    key: &str,
-    props: &[(String, Value)],
-    caller: &[String],
-) -> Result<Option<Vec<String>>> {
-    if props.iter().any(|(f, _)| f == ALIASES_FIELD) {
-        return Err(GraphError::IngestError {
-            detail: format!(
-                "'{ALIASES_FIELD}' is maintained by the store; pass aliases as the \
-                 'aliases' argument instead of a property"
-            ),
-        });
-    }
-    let name = props
-        .iter()
-        .find(|(f, _)| f == crate::memory_schema::NAME_FIELD)
-        .map(|(_, v)| v.clone())
-        .or_else(|| db.get_prop(key, crate::memory_schema::NAME_FIELD));
-    let name = match &name {
-        Some(Value::Str(s)) => Some(s.as_str()),
-        _ => None,
-    };
-    let existing = db.get_prop(key, ALIASES_FIELD);
-    let merged = merge_aliases(key, existing.as_ref(), &derive_aliases(key, name, caller))?;
-    if existing.as_ref() == Some(&aliases_value(&merged)) {
-        return Ok(None);
-    }
-    Ok(Some(merged))
-}
-
 /// Most declared aliases one node may carry in `alias_keys`.
 ///
-/// The same bound as [`MAX_ALIASES`], for the same reason: every declared
-/// alias is also one entry of `aliases`, so a node cannot usefully declare
-/// more than it may carry. The two counts still differ — `Matt` and `matt` are
-/// two declared aliases and one normalised one — so this is checked on its
-/// own. It is far below the engine's `MAX_KEYMATCH_LIST`, so a `KeyMatch` rule
-/// always reads the whole list.
+/// The same bound as [`MAX_ALIASES`]: a real entity has a few nicknames, and
+/// thirty-two keeps one node from claiming half the store's stubs. It is far
+/// below the engine's `MAX_KEYMATCH_LIST`, so a `KeyMatch` rule always reads
+/// the whole list.
 pub const MAX_ALIAS_KEYS: usize = MAX_ALIASES;
 
 /// The aliases a caller declared, as keys a `KeyMatch` rule can compare:
@@ -331,55 +212,181 @@ pub fn declared_alias_keys(caller: &[String]) -> Vec<String> {
     out.into_iter().collect()
 }
 
-/// `existing` (what the node already holds in `alias_keys`) united with
-/// `declared`.
-///
-/// Declared aliases accumulate, as `aliases` do; `forget` with
-/// `prop: "alias_keys"` clears them. Refused, naming the node, when the union
-/// would exceed [`MAX_ALIAS_KEYS`].
-///
-/// The store only ever writes a sorted list of trimmed strings. A value a
-/// caller wrote raw is taken in rather than overwritten — a string as one
-/// declared alias, a list of strings item by item, each trimmed — and any
-/// other value is refused, naming the node.
-pub fn merge_alias_keys(
-    key: &str,
-    existing: Option<&Value>,
-    declared: &[String],
-) -> Result<Vec<String>> {
-    let foreign = || GraphError::IngestError {
-        detail: format!(
-            "'{key}' already carries an '{ALIAS_KEYS_FIELD}' property that is not a string \
-             or a list of strings; clear it with forget {{key: \"{key}\", prop: \
-             \"{ALIAS_KEYS_FIELD}\"}} first"
-        ),
-    };
-    let mut held: Vec<String> = Vec::new();
-    match existing {
-        None => {}
-        Some(Value::Str(s)) => held.push(s.clone()),
-        Some(Value::List(items)) => {
-            for item in items {
-                match item {
-                    Value::Str(s) => held.push(s.clone()),
-                    _ => return Err(foreign()),
-                }
-            }
-        }
-        Some(_) => return Err(foreign()),
+/// The strings a stored `aliases` or `alias_keys` value holds: a string is
+/// one, a list of strings is each. `None` for anything else — a number, a
+/// map, a list holding one — which the caller refuses rather than replaces.
+fn stored_strings(value: Option<&Value>) -> Option<Vec<String>> {
+    match value {
+        None => Some(Vec::new()),
+        Some(Value::Str(s)) => Some(vec![s.clone()]),
+        Some(Value::List(items)) => items
+            .iter()
+            .map(|item| match item {
+                Value::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        Some(_) => None,
     }
-    held.extend(declared.iter().cloned());
-    let out = declared_alias_keys(&held);
-    if out.len() > MAX_ALIAS_KEYS {
+}
+
+/// The refusal for a stored identity list that is not a string or a list of
+/// strings: naming the node, the property, and the way out.
+fn foreign_value(key: &str, field: &str) -> GraphError {
+    GraphError::IngestError {
+        detail: format!(
+            "'{key}' already carries an '{field}' property that is not a string or \
+             a list of strings; clear it with forget {{key: \"{key}\", prop: \
+             \"{field}\"}} first"
+        ),
+    }
+}
+
+/// The two identity lists a node should carry, each `None` when the stored
+/// value is already exactly that.
+struct IdentityLists {
+    aliases: Option<Vec<String>>,
+    alias_keys: Option<Vec<String>>,
+}
+
+/// What `key`'s identity lists become when its name goes from `old_name` to
+/// `new_name` and the caller declares `caller`.
+///
+/// `aliases` is recomputed, not accumulated: it is exactly
+/// [`derive_aliases`] of the key and `new_name`. A changed or removed name
+/// leaves nothing behind.
+///
+/// `alias_keys` accumulates: what it holds, what `caller` declares, and
+/// whatever the stored `aliases` holds that the store did not derive. That
+/// last part is how a user's own data survives. A node written before 0.7 may
+/// carry an `aliases` property of its owner's, and a list this store wrote
+/// before declared aliases left `aliases` holds them too. An item is the
+/// store's when the key with `old_name`, or with `new_name`, implies it byte
+/// for byte; every other item is moved to `alias_keys` as it stands — trimmed,
+/// never canonicalised — on the first describing write, after which `aliases`
+/// holds nothing to move. Only a blank item carries nothing and is let go.
+///
+/// The store can only compare against the name it finds. A name changed
+/// underneath it by a raw write leaves its old words in `aliases`, and they
+/// are then kept as declared; so is a former key `rename_node` left behind.
+///
+/// Refused, naming the node, when either stored value is not a string or a
+/// list of strings, or when either list would exceed its cap.
+fn identity_lists<F: Fs>(
+    db: &GraphDb<F>,
+    key: &str,
+    old_name: Option<&str>,
+    new_name: Option<&str>,
+    caller: &[String],
+) -> Result<IdentityLists> {
+    let stored_aliases = db.get_prop(key, ALIASES_FIELD);
+    let stored_keys = db.get_prop(key, ALIAS_KEYS_FIELD);
+    let held_aliases =
+        stored_strings(stored_aliases.as_ref()).ok_or_else(|| foreign_value(key, ALIASES_FIELD))?;
+    let mut declared =
+        stored_strings(stored_keys.as_ref()).ok_or_else(|| foreign_value(key, ALIAS_KEYS_FIELD))?;
+
+    let derived = derive_aliases(key, new_name);
+    if derived.len() > MAX_ALIASES {
         return Err(GraphError::IngestError {
             detail: format!(
-                "'{key}' would carry {} declared aliases, more than {MAX_ALIAS_KEYS}; forget \
-                 its '{ALIAS_KEYS_FIELD}' property first, or pass fewer",
-                out.len()
+                "'{key}' would carry {} aliases, more than {MAX_ALIASES}: its key, its name \
+                 and each word of that name; give it a shorter name",
+                derived.len()
             ),
         });
     }
-    Ok(out)
+
+    let was_derived = derive_aliases(key, old_name);
+    let moved: Vec<String> = held_aliases
+        .into_iter()
+        .filter(|a| !derived.contains(a) && !was_derived.contains(a))
+        .collect();
+    let moved_count = declared_alias_keys(&moved).len();
+    declared.extend(moved);
+    declared.extend(caller.iter().cloned());
+    let declared = declared_alias_keys(&declared);
+    if declared.len() > MAX_ALIAS_KEYS {
+        let carried = if moved_count > 0 {
+            format!(
+                " ({moved_count} of them carried over from its '{ALIASES_FIELD}' property; \
+                 forget that to drop them)"
+            )
+        } else {
+            String::new()
+        };
+        return Err(GraphError::IngestError {
+            detail: format!(
+                "'{key}' would carry {} declared aliases, more than {MAX_ALIAS_KEYS}{carried}; \
+                 forget its '{ALIAS_KEYS_FIELD}' property first, or pass fewer",
+                declared.len()
+            ),
+        });
+    }
+
+    let aliases = (stored_aliases.as_ref() != Some(&aliases_value(&derived))).then_some(derived);
+    // Never written empty: a node that holds none and declares none carries
+    // no `alias_keys` property at all.
+    let alias_keys = if declared.is_empty() && stored_keys.is_none() {
+        None
+    } else {
+        (stored_keys.as_ref() != Some(&aliases_value(&declared))).then_some(declared)
+    };
+    Ok(IdentityLists {
+        aliases,
+        alias_keys,
+    })
+}
+
+/// [`identity_lists`] for a write that sets `props` on `key`: the name is the
+/// one `props` sets, else the one the node already has. A `props` entry named
+/// `aliases` or `alias_keys` is refused first — both lists are the store's.
+fn identity_lists_after_write<F: Fs>(
+    db: &GraphDb<F>,
+    key: &str,
+    props: &[(String, Value)],
+    caller: &[String],
+) -> Result<IdentityLists> {
+    for field in [ALIASES_FIELD, ALIAS_KEYS_FIELD] {
+        if props.iter().any(|(f, _)| f == field) {
+            return Err(GraphError::IngestError {
+                detail: format!(
+                    "'{field}' is maintained by the store; pass aliases as the \
+                     'aliases' argument instead of a property"
+                ),
+            });
+        }
+    }
+    let old_name = db.get_prop(key, crate::memory_schema::NAME_FIELD);
+    let new_name = props
+        .iter()
+        .find(|(f, _)| f == crate::memory_schema::NAME_FIELD)
+        .map(|(_, v)| v.clone())
+        .or_else(|| old_name.clone());
+    let text = |v: &Option<Value>| match v {
+        Some(Value::Str(s)) => Some(s.clone()),
+        _ => None,
+    };
+    identity_lists(
+        db,
+        key,
+        text(&old_name).as_deref(),
+        text(&new_name).as_deref(),
+        caller,
+    )
+}
+
+/// The `aliases` list `key` should carry after a write that sets `props` on
+/// it, or `None` when that is exactly what it already carries.
+///
+/// Reads the store, so call it before a batch takes `db` mutably.
+pub fn aliases_after_write<F: Fs>(
+    db: &GraphDb<F>,
+    key: &str,
+    props: &[(String, Value)],
+    caller: &[String],
+) -> Result<Option<Vec<String>>> {
+    Ok(identity_lists_after_write(db, key, props, caller)?.aliases)
 }
 
 /// The `alias_keys` list `key` should carry after a write that declares
@@ -387,7 +394,6 @@ pub fn merge_alias_keys(
 /// includes a node that holds none and declares none: the property is never
 /// written empty.
 ///
-/// A `props` entry named `alias_keys` is refused: the list is the store's.
 /// Reads the store, so call it before a batch takes `db` mutably.
 pub fn alias_keys_after_write<F: Fs>(
     db: &GraphDb<F>,
@@ -395,46 +401,56 @@ pub fn alias_keys_after_write<F: Fs>(
     props: &[(String, Value)],
     caller: &[String],
 ) -> Result<Option<Vec<String>>> {
-    if props.iter().any(|(f, _)| f == ALIAS_KEYS_FIELD) {
-        return Err(GraphError::IngestError {
-            detail: format!(
-                "'{ALIAS_KEYS_FIELD}' is maintained by the store; pass aliases as the \
-                 'aliases' argument instead of a property"
-            ),
-        });
+    Ok(identity_lists_after_write(db, key, props, caller)?.alias_keys)
+}
+
+fn identity_props(lists: IdentityLists) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    if let Some(list) = lists.aliases {
+        out.push((ALIASES_FIELD.to_string(), aliases_value(&list)));
     }
-    let existing = db.get_prop(key, ALIAS_KEYS_FIELD);
-    let merged = merge_alias_keys(key, existing.as_ref(), caller)?;
-    if merged.is_empty() && existing.is_none() {
-        return Ok(None);
+    if let Some(list) = lists.alias_keys {
+        out.push((ALIAS_KEYS_FIELD.to_string(), aliases_value(&list)));
     }
-    if existing.as_ref() == Some(&aliases_value(&merged)) {
-        return Ok(None);
-    }
-    Ok(Some(merged))
+    out
 }
 
 /// The store-maintained identity properties a write to `key` must set:
 /// `aliases` and `alias_keys`, each only when it changes.
 ///
-/// One call so the two lists are always checked together, and so a refusal of
-/// either — a property of that name, a foreign value, a cap — happens before
-/// anything is written. Reads the store, so call it before a batch takes `db`
-/// mutably.
+/// One call so the two lists are always decided together — an item leaves
+/// `aliases` only by entering `alias_keys` in the same write — and so a
+/// refusal of either (a property of that name, a foreign value, a cap) happens
+/// before anything is written. Reads the store, so call it before a batch
+/// takes `db` mutably.
 pub fn identity_props_after_write<F: Fs>(
     db: &GraphDb<F>,
     key: &str,
     props: &[(String, Value)],
     caller: &[String],
 ) -> Result<Vec<(String, Value)>> {
-    let mut out = Vec::new();
-    if let Some(list) = aliases_after_write(db, key, props, caller)? {
-        out.push((ALIASES_FIELD.to_string(), aliases_value(&list)));
+    identity_lists_after_write(db, key, props, caller).map(identity_props)
+}
+
+/// The identity properties to set on `key` in the write that removes its
+/// `name`: `aliases` as the key alone implies it.
+///
+/// The name being removed is the old name here, so its words are recognised
+/// as derived and dropped rather than kept as declared. Empty for a node that
+/// carries no `aliases` list — one the memory tools never described is not
+/// given one by a `forget`.
+pub fn identity_props_after_forgetting_name<F: Fs>(
+    db: &GraphDb<F>,
+    key: &str,
+) -> Result<Vec<(String, Value)>> {
+    if db.get_prop(key, ALIASES_FIELD).is_none() {
+        return Ok(Vec::new());
     }
-    if let Some(list) = alias_keys_after_write(db, key, props, caller)? {
-        out.push((ALIAS_KEYS_FIELD.to_string(), aliases_value(&list)));
-    }
-    Ok(out)
+    let old_name = match db.get_prop(key, crate::memory_schema::NAME_FIELD) {
+        Some(Value::Str(s)) => Some(s),
+        _ => None,
+    };
+    identity_lists(db, key, old_name.as_deref(), None, &[]).map(identity_props)
 }
 
 /// Labels whose nodes carry an `aliases` list: the entity labels and the
@@ -455,10 +471,31 @@ pub fn entity_node_count<F: Fs>(db: &GraphDb<F>) -> usize {
         .sum()
 }
 
+/// One node the identity backfill writes to: its key, and the identity
+/// properties to set on it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdentityBackfill {
+    pub key: String,
+    pub props: Vec<(String, Value)>,
+}
+
+impl IdentityBackfill {
+    /// Whether this node's backfill sets `field`.
+    #[must_use]
+    pub fn sets(&self, field: &str) -> bool {
+        self.props.iter().any(|(f, _)| f == field)
+    }
+}
+
 /// Every node under an entity label or the provisional label whose stored
-/// `aliases` differs from what its key and name imply, with the list it should
-/// carry. Key order.
-pub fn aliases_to_backfill<F: Fs>(db: &GraphDb<F>) -> Result<Vec<(String, Vec<String>)>> {
+/// identity lists differ from what its key, its name and its own data imply,
+/// with the properties to set. Key order.
+///
+/// For most nodes that is one property: an `aliases` list where there was
+/// none. A node that carries items in `aliases` its key and name do not imply
+/// — a user's own, or aliases declared before they left that list — has them
+/// moved to `alias_keys` here too, so applying the preset drops nothing.
+pub fn aliases_to_backfill<F: Fs>(db: &GraphDb<F>) -> Result<Vec<IdentityBackfill>> {
     let mut keys: Vec<String> = identity_labels()
         .flat_map(|l| db.nodes_with_label(l))
         .map(|n| n.key().to_string())
@@ -466,21 +503,24 @@ pub fn aliases_to_backfill<F: Fs>(db: &GraphDb<F>) -> Result<Vec<(String, Vec<St
     keys.sort();
     let mut out = Vec::new();
     for key in keys {
-        if let Some(list) = aliases_after_write(db, &key, &[], &[])? {
-            out.push((key, list));
+        let props = identity_props_after_write(db, &key, &[], &[])?;
+        if !props.is_empty() {
+            out.push(IdentityBackfill { key, props });
         }
     }
     Ok(out)
 }
 
-/// Write the lists [`aliases_to_backfill`] found, in one commit.
-pub fn write_aliases<F: Fs>(db: &mut GraphDb<F>, lists: &[(String, Vec<String>)]) -> Result<()> {
+/// Write the properties [`aliases_to_backfill`] found, in one commit.
+pub fn write_aliases<F: Fs>(db: &mut GraphDb<F>, lists: &[IdentityBackfill]) -> Result<()> {
     if lists.is_empty() {
         return Ok(());
     }
     let mut batch = db.batch();
-    for (key, list) in lists {
-        batch.set_prop(key, ALIASES_FIELD, aliases_value(list));
+    for node in lists {
+        for (field, value) in &node.props {
+            batch.set_prop(&node.key, field, value.clone());
+        }
     }
     batch.commit().map(|_| ())
 }
@@ -625,9 +665,9 @@ mod tests {
     }
 
     #[test]
-    fn derive_is_idempotent_over_its_own_output() {
-        let once = derive_aliases("matthew-sherlin", Some("Matthew Sherlin"), &["Matt".into()]);
-        let twice = derive_aliases("matthew-sherlin", Some("Matthew Sherlin"), &once);
-        assert_eq!(once, twice);
+    fn derive_is_deterministic_sorted_and_deduplicated() {
+        let once = derive_aliases("Sherlin", Some("Matthew  SHERLIN"));
+        assert_eq!(once, ["matthew", "matthew sherlin", "sherlin"]);
+        assert_eq!(once, derive_aliases("Sherlin", Some("Matthew  SHERLIN")));
     }
 }

@@ -43,8 +43,8 @@ fn the_preset_states_its_backfill_first_then_links() {
         "the second says what it will backfill, measured before writing: {out}"
     );
     assert!(
-        lines[2].starts_with("alias_keys: nothing to backfill"),
-        "the third says the declared list has no backfill: {out}"
+        lines[2].starts_with("alias_keys: nothing to move"),
+        "the third says no node carried an alias of its owner's: {out}"
     );
     assert!(out.contains("16 created"), "{out}");
     assert!(out.contains("SAME_AS edges now: 2 (1 pair(s))"), "{out}");
@@ -56,6 +56,63 @@ fn the_preset_states_its_backfill_first_then_links() {
         "no declared list is invented"
     );
     assert!(db.get_prop("matthew-sherlin", "aliases").is_some());
+}
+
+/// A node written before 0.7 may carry its owner's own `aliases` property.
+/// The backfill says how many such nodes there are, before writing, and moves
+/// what the key and name do not imply to `alias_keys` as written: nothing is
+/// dropped, and a second apply finds nothing left to do.
+#[test]
+fn the_backfill_moves_a_users_own_aliases_to_alias_keys_and_says_so() {
+    let dir = pre_alias_store("moves");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.set_prop(
+            "msherlin",
+            "aliases",
+            Value::List(vec![
+                Value::Str("Matt".into()),
+                Value::Str("sherlin".into()),
+                Value::Str("The Boss".into()),
+            ]),
+        )
+        .unwrap();
+    }
+    let out = run_schema_apply_memory_identity(&dir).expect("apply");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines[1].starts_with("before applying: 2 entity node(s); 2 need an aliases list"),
+        "{out}"
+    );
+    assert!(
+        lines[2].starts_with(
+            "alias_keys: 1 node(s) carry aliases their key and name do not imply; those are \
+             kept, moved to alias_keys as declared aliases"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("SAME_AS edges now: 2 (1 pair(s))"), "{out}");
+    let strs = |xs: &[&str]| Value::List(xs.iter().map(|s| Value::Str((*s).into())).collect());
+    {
+        let db = GraphDb::open(&dir).unwrap();
+        assert_eq!(
+            db.get_prop("msherlin", "aliases"),
+            Some(strs(&["matthew", "matthew sherlin", "msherlin", "sherlin"]))
+        );
+        assert_eq!(
+            db.get_prop("msherlin", "alias_keys"),
+            Some(strs(&["Matt", "The Boss"])),
+            "verbatim; `sherlin` was derivable and is not moved"
+        );
+        assert_eq!(db.get_prop("matthew-sherlin", "alias_keys"), None);
+    }
+    let again = run_schema_apply_memory_identity(&dir).unwrap();
+    assert!(again.contains("0 need an aliases list"), "{again}");
+    assert!(again.contains("alias_keys: nothing to move"), "{again}");
+    assert!(
+        again.contains("0 created, 0 updated, 16 unchanged"),
+        "{again}"
+    );
 }
 
 #[test]

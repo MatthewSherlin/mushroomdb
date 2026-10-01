@@ -62,20 +62,22 @@ fn person(key: &str, name: &str, aliases: &[&str]) -> EntityIn {
     }
 }
 
+/// Owner decision, 2026-10-01: `aliases` is what the key and the name imply
+/// and nothing else. An alias the caller declares goes to `alias_keys`, as
+/// written, and never into the list `Overlap` compares.
 #[test]
-fn an_entity_carries_its_key_its_name_its_words_and_the_callers_aliases() {
+fn an_entity_carries_its_key_its_name_and_the_names_words_and_nothing_declared() {
     let mut db = store("entity");
     let entities = vec![person("matthew-sherlin", "Matthew Sherlin", &["Matt"])];
     remember(&mut db, &note("Matthew owns 0.7", &[], &entities)).unwrap();
     assert_eq!(
         aliases_of(&db, "matthew-sherlin"),
-        strings(&[
-            "matt",
-            "matthew",
-            "matthew sherlin",
-            "matthew-sherlin",
-            "sherlin"
-        ])
+        strings(&["matthew", "matthew sherlin", "matthew-sherlin", "sherlin"])
+    );
+    assert_eq!(
+        db.get_prop("matthew-sherlin", "alias_keys"),
+        Some(Value::List(vec![Value::Str("Matt".into())])),
+        "the declared alias is kept, as written, in its own list"
     );
 }
 
@@ -96,18 +98,18 @@ fn a_provisional_stub_carries_the_aliases_its_key_implies() {
 #[test]
 fn normalisation_folds_case_punctuation_and_unicode_letters() {
     assert_eq!(
-        derive_aliases("ÉMILE-Zola", Some("Émile  ZOLA"), &strings(&["É. Zola"])),
-        strings(&["zola", "é zola", "émile", "émile zola", "émile-zola"])
+        derive_aliases("ÉMILE-Zola", Some("Émile  ZOLA")),
+        strings(&["zola", "émile", "émile zola", "émile-zola"])
     );
     assert_eq!(
-        derive_aliases("McDonald", Some("McDONALD"), &[]),
+        derive_aliases("McDonald", Some("McDONALD")),
         strings(&["mcdonald"]),
         "a one-word name adds no separate words, and the key folds into it"
     );
     assert_eq!(
-        derive_aliases("x", Some("!!!"), &strings(&["", "  "])),
+        derive_aliases("x", Some("!!!")),
         strings(&["x"]),
-        "a name or alias with no letters contributes nothing"
+        "a name with no letters contributes nothing"
     );
 }
 
@@ -132,30 +134,39 @@ fn describing_with_the_same_inputs_leaves_the_list_alone() {
     );
 }
 
+/// The list is recomputed from the key and the current name on each
+/// describing write, not accumulated: a former name leaves nothing behind, in
+/// `aliases` or in `alias_keys`.
 #[test]
-fn a_former_name_stays_an_alias() {
+fn a_former_name_leaves_no_alias() {
     let mut db = store("rename");
     describe_entity(
         &mut db,
-        "matthew",
+        "ms",
         Some("Person"),
         &[("name".to_string(), Value::Str("Matthew Sherlin".into()))],
     )
     .unwrap();
+    assert_eq!(
+        aliases_of(&db, "ms"),
+        strings(&["matthew", "matthew sherlin", "ms", "sherlin"])
+    );
     describe_entity(
         &mut db,
-        "matthew",
+        "ms",
         None,
         &[("name".to_string(), Value::Str("Matt Sherlin".into()))],
     )
     .unwrap();
-    let aliases = aliases_of(&db, "matthew");
-    for want in ["matthew sherlin", "matt sherlin", "matt", "matthew"] {
-        assert!(
-            aliases.contains(&want.to_string()),
-            "{want} missing: {aliases:?}"
-        );
-    }
+    assert_eq!(
+        aliases_of(&db, "ms"),
+        strings(&["matt", "matt sherlin", "ms", "sherlin"])
+    );
+    assert_eq!(
+        db.get_prop("ms", "alias_keys"),
+        None,
+        "the old name's words were derived, not declared: they are not moved"
+    );
 }
 
 #[test]
@@ -203,41 +214,221 @@ fn set_role(db: &mut GraphDb<core_storage::fs::RealFs>, key: &str) -> core_api::
     .map(|_| ())
 }
 
+const DERIVED: [&str; 4] = ["matthew", "matthew sherlin", "matthew-sherlin", "sherlin"];
+
+fn declared_of(db: &GraphDb<core_storage::fs::RealFs>, key: &str) -> Option<Value> {
+    db.get_prop(key, "alias_keys")
+}
+
+fn str_list(xs: &[&str]) -> Value {
+    Value::List(xs.iter().map(|s| Value::Str((*s).into())).collect())
+}
+
+/// A user's own `aliases` string on a pre-0.7 node is their data. The first
+/// describing write moves it to `alias_keys` as written — not canonicalised —
+/// and `aliases` becomes the derived list.
 #[test]
-fn an_existing_string_alias_is_kept_in_canonical_form() {
+fn an_existing_string_alias_moves_to_alias_keys_as_written() {
     let mut db = upgraded_node("str-alias", "matthew-sherlin", Value::Str("Matt S".into()));
     set_role(&mut db, "matthew-sherlin").unwrap();
+    assert_eq!(aliases_of(&db, "matthew-sherlin"), strings(&DERIVED));
     assert_eq!(
-        aliases_of(&db, "matthew-sherlin"),
-        strings(&[
-            "matt s",
-            "matthew",
-            "matthew sherlin",
-            "matthew-sherlin",
-            "sherlin"
-        ]),
-        "the caller's string must survive as one alias"
+        declared_of(&db, "matthew-sherlin"),
+        Some(str_list(&["Matt S"])),
+        "the caller's string must survive, verbatim"
     );
 }
 
+/// The same for a list: every item the key and the name do not imply is moved,
+/// verbatim apart from surrounding whitespace; an item they do imply is the
+/// store's and stays derived. Nothing is dropped.
 #[test]
-fn an_existing_mixed_case_list_is_normalised() {
+fn an_existing_list_moves_what_the_key_and_name_do_not_imply() {
     let mut db = upgraded_node(
         "list-alias",
         "matthew-sherlin",
-        Value::List(vec![
-            Value::Str("Countess".into()),
-            Value::Str("Ada".into()),
-        ]),
+        str_list(&["Countess", " Ada ", "matthew", "Matthew Sherlin"]),
     );
     set_role(&mut db, "matthew-sherlin").unwrap();
-    let aliases = aliases_of(&db, "matthew-sherlin");
-    for want in ["countess", "ada"] {
-        assert!(aliases.contains(&want.to_string()), "{want}: {aliases:?}");
-    }
-    for gone in ["Countess", "Ada"] {
-        assert!(!aliases.contains(&gone.to_string()), "{gone}: {aliases:?}");
-    }
+    assert_eq!(aliases_of(&db, "matthew-sherlin"), strings(&DERIVED));
+    assert_eq!(
+        declared_of(&db, "matthew-sherlin"),
+        Some(str_list(&["Ada", "Countess", "Matthew Sherlin"])),
+        "`matthew` is derived and stays out; the mixed-case full name is not \
+         byte-equal to a derived alias, so it is kept as the user's"
+    );
+}
+
+/// The moved items join what `alias_keys` already holds and what this write
+/// declares, and the move happens once: the next write finds nothing to do.
+#[test]
+fn moved_items_join_the_declared_list_and_the_move_is_made_once() {
+    let mut db = store("move-once");
+    db.insert_node(
+        "Person",
+        "matthew-sherlin",
+        vec![
+            ("name".to_string(), Value::Str("Matthew Sherlin".into())),
+            // What the first amendment wrote for `aliases: ["Matt"]`.
+            (
+                ALIASES_FIELD.to_string(),
+                str_list(&[
+                    "matt",
+                    "matthew",
+                    "matthew sherlin",
+                    "matthew-sherlin",
+                    "sherlin",
+                ]),
+            ),
+            ("alias_keys".to_string(), str_list(&["Matt"])),
+        ],
+    )
+    .unwrap();
+    describe_entity_with_aliases(&mut db, "matthew-sherlin", None, &[], &strings(&["sherl"]))
+        .unwrap();
+    assert_eq!(aliases_of(&db, "matthew-sherlin"), strings(&DERIVED));
+    assert_eq!(
+        declared_of(&db, "matthew-sherlin"),
+        Some(str_list(&["Matt", "matt", "sherl"]))
+    );
+    assert_eq!(
+        core_api::memory::identity::identity_props_after_write(&db, "matthew-sherlin", &[], &[])
+            .unwrap(),
+        Vec::<(String, Value)>::new(),
+        "nothing left to move or rewrite"
+    );
+}
+
+/// A move that would take `alias_keys` past its cap is refused, naming the
+/// node and the property the items come from, and nothing is written.
+#[test]
+fn a_move_past_the_alias_keys_cap_is_refused_and_nothing_is_written() {
+    let many: Vec<String> = (0..=MAX_ALIASES).map(|i| format!("Alias {i}")).collect();
+    let mut db = upgraded_node(
+        "move-cap",
+        "matthew-sherlin",
+        Value::List(many.iter().cloned().map(Value::Str).collect()),
+    );
+    let err = set_role(&mut db, "matthew-sherlin")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("'matthew-sherlin' would carry 33 declared aliases")
+            && err.contains("33 of them carried over from its 'aliases' property"),
+        "{err}"
+    );
+    assert_eq!(db.get_prop("matthew-sherlin", "role"), None);
+    assert_eq!(declared_of(&db, "matthew-sherlin"), None);
+    assert_eq!(aliases_of(&db, "matthew-sherlin"), many);
+}
+
+/// `aliases` has its own cap, and only a name can reach it now: the key, the
+/// name and each of its words.
+#[test]
+fn a_name_of_more_words_than_the_cap_is_refused() {
+    let mut db = store("name-cap");
+    let name: Vec<String> = (0..MAX_ALIASES).map(|i| format!("w{i}")).collect();
+    let err = describe_entity(
+        &mut db,
+        "wordy",
+        Some("Person"),
+        &[("name".to_string(), Value::Str(name.join(" ")))],
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("'wordy' would carry 34 aliases, more than 32")
+            && err.contains("shorter name"),
+        "{err}"
+    );
+    assert!(!db.has_node("wordy"));
+}
+
+/// A key renamed with `rename_node` leaves its former, lowercased key in
+/// `aliases`. The key and name no longer imply it, so the next describing
+/// write keeps it the only way left: as a declared alias.
+#[test]
+fn a_former_key_is_kept_as_a_declared_alias() {
+    let mut db = store("rekey");
+    describe_entity(
+        &mut db,
+        "Zed",
+        Some("Person"),
+        &[("name".to_string(), Value::Str("Zed Shaw".into()))],
+    )
+    .unwrap();
+    db.rename_node("Zed", "zed-shaw").unwrap();
+    set_role(&mut db, "zed-shaw").unwrap();
+    assert_eq!(
+        aliases_of(&db, "zed-shaw"),
+        strings(&["shaw", "zed", "zed shaw", "zed-shaw"]),
+        "`zed` is a word of the name; the former key equalled it"
+    );
+    assert_eq!(declared_of(&db, "zed-shaw"), None);
+
+    describe_entity(&mut db, "Old_Key", Some("Person"), &[]).unwrap();
+    db.rename_node("Old_Key", "new-key").unwrap();
+    set_role(&mut db, "new-key").unwrap();
+    assert_eq!(aliases_of(&db, "new-key"), strings(&["new-key"]));
+    assert_eq!(declared_of(&db, "new-key"), Some(str_list(&["old_key"])));
+}
+
+/// The limit of telling derived from declared: the store compares against the
+/// name it finds. A name changed by a raw write — not `remember`, not
+/// `upsert_entity` — leaves `aliases` stale, and the next describing write
+/// cannot tell the old name's words from a user's own. It keeps them, as
+/// declared. Changing the name through a describing write leaves nothing.
+#[test]
+fn a_name_changed_by_a_raw_write_leaves_its_old_words_declared() {
+    let mut db = store("raw-rename");
+    describe_entity(
+        &mut db,
+        "ms",
+        Some("Person"),
+        &[("name".to_string(), Value::Str("Matthew Sherlin".into()))],
+    )
+    .unwrap();
+    db.set_prop("ms", "name", Value::Str("Matt".into()))
+        .unwrap();
+    set_role(&mut db, "ms").unwrap();
+    assert_eq!(aliases_of(&db, "ms"), strings(&["matt", "ms"]));
+    assert_eq!(
+        declared_of(&db, "ms"),
+        Some(str_list(&["matthew", "matthew sherlin", "sherlin"]))
+    );
+}
+
+/// `forget {key, prop: "name"}` asks for this: what the node's identity lists
+/// become when its name goes. The name's words leave `aliases` in that same
+/// write, and are not mistaken for declared aliases. A node that carries no
+/// `aliases` list is not given one.
+#[test]
+fn forgetting_the_name_rewrites_aliases_from_the_key_alone() {
+    use core_api::memory::identity::identity_props_after_forgetting_name;
+    let mut db = store("forget-name");
+    describe_entity_with_aliases(
+        &mut db,
+        "ms",
+        Some("Person"),
+        &[("name".to_string(), Value::Str("Matthew Sherlin".into()))],
+        &strings(&["Matt"]),
+    )
+    .unwrap();
+    assert_eq!(
+        identity_props_after_forgetting_name(&db, "ms").unwrap(),
+        vec![(ALIASES_FIELD.to_string(), str_list(&["ms"]))],
+        "only `aliases` changes; `alias_keys` keeps what was declared"
+    );
+    db.insert_node(
+        "Doc",
+        "readme",
+        vec![("name".to_string(), Value::Str("Read Me".into()))],
+    )
+    .unwrap();
+    assert_eq!(
+        identity_props_after_forgetting_name(&db, "readme").unwrap(),
+        Vec::<(String, Value)>::new()
+    );
 }
 
 #[test]
@@ -617,14 +808,11 @@ fn the_reader_survives_the_preset_on_an_empty_store() {
 
 use core_api::memory::identity::identity_clusters;
 
-/// A node with no name whose alias set is its key plus `words`.
+/// A node whose name is `words`, so its alias set is its key, that name and
+/// each word: twelve aliases for ten words.
 fn tagged(key: &str, words: std::ops::RangeInclusive<u32>) -> EntityIn {
-    EntityIn {
-        key: key.into(),
-        label: "Person".into(),
-        props: BTreeMap::new(),
-        aliases: words.map(|w| format!("t{w}")).collect(),
-    }
+    let name: Vec<String> = words.map(|w| format!("t{w}")).collect();
+    person(key, &name.join(" "), &[])
 }
 
 fn clusters_of(db: &GraphDb<core_storage::fs::RealFs>) -> Vec<Vec<String>> {
@@ -635,7 +823,7 @@ fn clusters_of(db: &GraphDb<core_storage::fs::RealFs>) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// c0~c1 at 9/13 and c1~c2 at 9/13, but c0~c2 at 8/14 is below the floor.
+/// c0~c1 at 9/15 and c1~c2 at 9/15, but c0~c2 at 8/16 is below the floor.
 /// Closure would make one person of three; complete linkage does not.
 #[test]
 fn a_chain_of_two_claims_is_not_one_identity() {
@@ -658,7 +846,7 @@ fn a_chain_of_two_claims_is_not_one_identity() {
 }
 
 /// The same chain with its middle node oldest: the seed c1 admits c0, then
-/// must refuse c2 because c0~c2 is 8/14. Admitting every neighbour of the
+/// must refuse c2 because c0~c2 is 8/16. Admitting every neighbour of the
 /// seed would answer all three.
 #[test]
 fn a_candidate_must_link_to_every_member_not_just_the_seed() {
@@ -804,8 +992,9 @@ fn the_claim() -> Vec<SameAsPair> {
     }]
 }
 
-/// Owner decision Q2. `matt` holds one alias and `matthew-sherlin` five, so
-/// `Overlap` scores 1/5 and never links them; the declared alias does, at 1.0.
+/// Owner decision Q2. `matt` holds one alias and `matthew-sherlin` four, none
+/// of them `matt`, so `Overlap` never links them; the declared alias does, at
+/// 1.0.
 #[test]
 fn a_declared_alias_links_the_stub_it_names_entity_first() {
     let mut db = identity_store("claim-entity-first");
@@ -1111,8 +1300,8 @@ fn an_alias_keys_property_is_refused_with_the_argument_named() {
     );
 }
 
-/// Thirty-three declared aliases that fold to one canonical alias: `aliases`
-/// stays far under its own cap, so it is the `alias_keys` cap that refuses.
+/// Thirty-three declared aliases. They never enter `aliases`, so it is the
+/// `alias_keys` cap that refuses.
 #[test]
 fn more_alias_keys_than_the_cap_is_refused_before_anything_is_written() {
     let mut db = store("alias-keys-cap");
@@ -1250,29 +1439,36 @@ fn a_claimed_stub_joins_the_identity_and_the_oldest_is_canonical() {
 /// Complete linkage still holds for a claim: a stub joins an identity of two
 /// only when both members claim it. One claim is one link, not a merge.
 ///
-/// c0 declares t1..t10 and c1 declares t2..t11, so they link at 9/13; only c0
-/// names the stub keyed `t1`.
+/// c0 and c1 share a full name, so they link at 3/5; only c0 declares the
+/// stub keyed `matt`. Declaring it costs c0 nothing against c1.
 #[test]
 fn a_claimed_stub_joins_a_larger_identity_only_when_every_member_claims_it() {
     let mut db = identity_store("claim-cluster-three");
     remember_people(
         &mut db,
         "two linked nodes",
-        vec![tagged("c0", 1..=10), tagged("c1", 2..=11)],
+        vec![
+            person("c0", "Matthew Sherlin", &["matt"]),
+            person("c1", "Matthew Sherlin", &[]),
+        ],
     );
-    let about = strings(&["t1"]);
+    let about = strings(&["matt"]);
     remember(&mut db, &note("named later", &about, &[])).unwrap();
     let report = identity_clusters(&db, SAME_AS_FLOOR);
-    assert_eq!(report.claims, 2, "c0~c1 and c0~t1: {report:?}");
+    assert_eq!(report.claims, 2, "c0~c1 and c0~matt: {report:?}");
     assert_eq!(
         clusters_of(&db),
         vec![strings(&["c0", "c1"])],
-        "c1 never claimed t1"
+        "c1 never claimed matt"
     );
 
-    remember_people(&mut db, "c1 claims it too", vec![tagged("c1", 1..=1)]);
+    remember_people(
+        &mut db,
+        "c1 claims it too",
+        vec![person("c1", "Matthew Sherlin", &["matt"])],
+    );
     assert_eq!(identity_clusters(&db, SAME_AS_FLOOR).claims, 3);
-    assert_eq!(clusters_of(&db), vec![strings(&["c0", "c1", "t1"])]);
+    assert_eq!(clusters_of(&db), vec![strings(&["c0", "c1", "matt"])]);
 }
 
 // ── NFC: a decomposed name is the same name ─────────────────────────────────
@@ -1289,11 +1485,11 @@ fn a_decomposed_name_yields_the_same_aliases_as_its_composed_form() {
         "émile zola"
     );
     assert_eq!(
-        derive_aliases("zola", Some(decomposed), &strings(&[decomposed])),
-        derive_aliases("zola", Some(composed), &strings(&[composed])),
+        derive_aliases("zola", Some(decomposed)),
+        derive_aliases("zola", Some(composed)),
     );
     assert_eq!(
-        derive_aliases("zola", Some(decomposed), &[]),
+        derive_aliases("zola", Some(decomposed)),
         strings(&["zola", "émile", "émile zola"])
     );
 }
@@ -1329,12 +1525,12 @@ fn a_decomposed_and_a_composed_name_link() {
 
 // ── limits the changelog states, pinned ─────────────────────────────────────
 
-/// A declared alias is one more entry in `aliases`, so it counts against
-/// `Overlap`: two same-named entities link at 3/5, and at 3/6 — under the
-/// floor — once one of them declares a nickname the other does not.
+/// Owner decision, 2026-10-01. A declared alias is not an entry in `aliases`,
+/// so it does not count against `Overlap`: two same-named entities link at
+/// 3/5 whether or not one of them declares a nickname the other lacks.
 #[test]
-fn a_declared_alias_counts_against_overlap() {
-    let mut db = identity_store("claim-dilutes");
+fn a_declared_alias_does_not_count_against_overlap() {
+    let mut db = identity_store("claim-does-not-dilute");
     let report = remember_people(
         &mut db,
         "one declares a nickname",
@@ -1343,7 +1539,34 @@ fn a_declared_alias_counts_against_overlap() {
             person("msherlin", "Matthew Sherlin", &[]),
         ],
     );
-    assert!(report.same_as.is_empty(), "3/6 = 0.5: {:?}", report.same_as);
+    assert_eq!(
+        report.same_as,
+        vec![SameAsPair {
+            a: "matthew-sherlin".into(),
+            b: "msherlin".into(),
+            score: 0.6
+        }]
+    );
+}
+
+/// The stated consequence: two entities that declare the same alias gain no
+/// overlap from it. Declared aliases link only through a claim on a stub key.
+#[test]
+fn a_shared_declared_alias_adds_no_overlap() {
+    let mut db = identity_store("shared-declared");
+    let report = remember_people(
+        &mut db,
+        "both declare the same six",
+        vec![
+            person("m1", "Matthew", &["a1", "a2", "a3", "a4", "a5", "a6"]),
+            person("m2", "Matt", &["a1", "a2", "a3", "a4", "a5", "a6"]),
+        ],
+    );
+    assert!(
+        report.same_as.is_empty(),
+        "six shared declared aliases would have been 6/10: {:?}",
+        report.same_as
+    );
 }
 
 /// The claim rules run from the five entity labels. An entity under any other
@@ -1363,20 +1586,21 @@ fn a_claim_from_a_label_outside_the_five_does_not_link() {
     assert!(report.same_as.is_empty(), "{:?}", report.same_as);
 }
 
-/// The byte-identity exception the doc comments state: a key with padding
-/// keeps its untrimmed lowercase alias, gains the canonical one on the next
-/// write, and is stable after that.
+/// A key with padding has its lowercased, untrimmed self as its alias — keys
+/// are identifiers and are not tokenised — and the list is stable from the
+/// first write: recomputing it gives the same bytes.
 #[test]
-fn a_padded_keys_alias_list_settles_after_one_more_write() {
+fn a_padded_keys_alias_is_its_lowercased_key_and_is_stable() {
     let mut db = store("padded-key");
     describe_entity(&mut db, " Matt ", Some("Person"), &[]).unwrap();
     assert_eq!(aliases_of(&db, " Matt "), strings(&[" matt "]));
     set_role(&mut db, " Matt ").unwrap();
-    assert_eq!(aliases_of(&db, " Matt "), strings(&[" matt ", "matt"]));
+    assert_eq!(aliases_of(&db, " Matt "), strings(&[" matt "]));
+    assert_eq!(db.get_prop(" Matt ", "alias_keys"), None);
     assert_eq!(
         core_api::memory::identity::aliases_after_write(&db, " Matt ", &[], &[]).unwrap(),
         None,
-        "stable from here"
+        "stable"
     );
 }
 
@@ -1454,11 +1678,10 @@ fn a_described_ex_stub_cannot_itself_claim() {
 
 // ── a write that retracts identity links says so ────────────────────────────
 
-/// Every full-name link sits exactly on the floor, 3/5. A declared alias the
-/// other node lacks makes it 3/6, and the link is retracted — the report
-/// names it, with the score it had.
+/// Every full-name link sits exactly on the floor, 3/5. Declaring an alias the
+/// other node lacks no longer moves it: the link stays and nothing is lost.
 #[test]
-fn declaring_an_alias_reports_the_link_it_costs() {
+fn declaring_an_alias_costs_no_link() {
     let mut db = identity_store("lost-pair");
     let report = remember_people(
         &mut db,
@@ -1477,6 +1700,30 @@ fn declaring_an_alias_reports_the_link_it_costs() {
         vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])],
     );
     assert!(report.same_as.is_empty(), "{:?}", report.same_as);
+    assert!(report.same_as_lost.is_empty(), "{:?}", report.same_as_lost);
+    assert_eq!(same_as_edges(&db).len(), 2, "both directions still stand");
+}
+
+/// What a describing write can still retract: a name change. The renamed
+/// entity stops matching its old name, and the report names the link, with
+/// the score it had.
+#[test]
+fn renaming_reports_the_link_it_costs() {
+    let mut db = identity_store("lost-rename");
+    remember_people(
+        &mut db,
+        "two keys, one name",
+        vec![
+            person("matthew-sherlin", "Matthew Sherlin", &[]),
+            person("msherlin", "Matthew Sherlin", &[]),
+        ],
+    );
+    let report = remember_people(
+        &mut db,
+        "one is renamed",
+        vec![person("msherlin", "Matt S", &[])],
+    );
+    assert!(report.same_as.is_empty(), "{:?}", report.same_as);
     assert_eq!(
         report.same_as_lost,
         vec![SameAsPair {
@@ -1488,10 +1735,10 @@ fn declaring_an_alias_reports_the_link_it_costs() {
     assert!(same_as_edges(&db).is_empty(), "and the edges are gone");
 }
 
-/// The same loss against a stub that spells the full name — four aliases
-/// against five becomes 3/6 — which a stub cannot declare its way out of.
+/// A stub that spells the full name stays linked when the entity declares a
+/// nickname, and the nickname's own stub is linked beside it.
 #[test]
-fn declaring_an_alias_reports_the_full_name_stub_it_unlinks() {
+fn declaring_a_nickname_keeps_the_full_name_stub_linked() {
     let mut db = identity_store("lost-stub");
     let about = strings(&["Matthew_Sherlin"]);
     remember(&mut db, &note("named first", &about, &[])).unwrap();
@@ -1504,19 +1751,20 @@ fn declaring_an_alias_reports_the_full_name_stub_it_unlinks() {
     let entities = vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])];
     let report = remember(&mut db, &note("a nickname", &about, &entities)).unwrap();
     assert_eq!(report.same_as, the_claim(), "one link gained");
+    assert!(
+        report.same_as_lost.is_empty(),
+        "and none lost: {:?}",
+        report.same_as_lost
+    );
     assert_eq!(
-        report.same_as_lost,
-        vec![SameAsPair {
-            a: "Matthew_Sherlin".into(),
-            b: "matthew-sherlin".into(),
-            score: 0.6
-        }],
-        "and one lost"
+        same_as_pairs(&db, &strings(&["matthew-sherlin"])).len(),
+        2,
+        "the full-name stub and the nickname stub"
     );
 }
 
-/// A write that keeps every link — the same aliases declared on both sides,
-/// 4/6 — reports nothing lost; nor does a repeat of it.
+/// A write that keeps every link reports nothing lost; nor does a repeat of
+/// it. Both sides declare an alias here, and the link stays at 3/5.
 #[test]
 fn a_write_that_retracts_nothing_reports_nothing_lost() {
     let mut db = identity_store("lost-nothing");

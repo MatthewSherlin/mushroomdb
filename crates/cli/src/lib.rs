@@ -1730,15 +1730,17 @@ pub fn run_schema_apply_memory_defaults(db_dir: &Path) -> Result<String, CliErro
 /// before they can. Then the lists are written in one commit and the rules
 /// created, each with its own backfill.
 ///
-/// `alias_keys`, the list the five claim rules read, has no backfill: it
-/// holds only what a caller declared through an `aliases` argument, and a
-/// store written before it existed kept no record of which aliases those
-/// were. The output says so. On a store that already carries the preset's
+/// `aliases` is what a node's key and name imply. A node that already carries
+/// items those do not imply — a user's own `aliases` property from before
+/// 0.7 — keeps them: the same commit moves them to `alias_keys`, the list the
+/// five claim rules read, and the output says how many nodes that touched.
+/// Nothing is dropped. On a store that already carries the preset's
 /// earlier eleven rules, this adds the five claim rules and leaves the rest
 /// unchanged.
 pub fn run_schema_apply_memory_identity(db_dir: &Path) -> Result<String, CliError> {
     use core_api::memory::identity::{
-        aliases_to_backfill, entity_node_count, write_aliases, SAME_AS_EDGE,
+        aliases_to_backfill, entity_node_count, write_aliases, ALIASES_FIELD, ALIAS_KEYS_FIELD,
+        SAME_AS_EDGE,
     };
     let mut db = GraphDb::open(db_dir)?;
     let preset = core_api::memory_schema::memory_identity();
@@ -1751,18 +1753,29 @@ pub fn run_schema_apply_memory_identity(db_dir: &Path) -> Result<String, CliErro
          across namespaces",
         preset.rules.len()
     );
+    let writes = |field: &str| backfill.iter().filter(|node| node.sets(field)).count();
     let _ = writeln!(
         out,
         "before applying: {entity_nodes} entity node(s); {} need an aliases list written \
-         first; each rule then compares aliases across its labels once, and every later \
-         write to an entity is re-checked",
-        backfill.len()
+         first, from the key and the name; each rule then compares aliases across its labels \
+         once, and every later write to an entity is re-checked",
+        writes(ALIASES_FIELD)
     );
-    let _ = writeln!(
-        out,
-        "alias_keys: nothing to backfill — it holds only aliases declared from here on; \
-         an entity that declares one equal to a provisional stub's key links that stub"
-    );
+    let moved = writes(ALIAS_KEYS_FIELD);
+    if moved == 0 {
+        let _ = writeln!(
+            out,
+            "alias_keys: nothing to move — it holds only declared aliases; an entity that \
+             declares one equal to a provisional stub's key links that stub"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "alias_keys: {moved} node(s) carry aliases their key and name do not imply; those \
+             are kept, moved to alias_keys as declared aliases — one equal to a provisional \
+             stub's key links that stub"
+        );
+    }
     // Two commits: the aliases, then the rules. A failure between them leaves
     // the lists written and no rule; a re-run recovers, since the backfill is
     // idempotent and finds nothing left to write.

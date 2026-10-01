@@ -2016,9 +2016,15 @@ pub(crate) const SAME_AS_LOST_LIST: usize = 10;
 
 /// Why a write retracts an identity link, and what restores it. One sentence,
 /// shared by `remember`'s text line and `upsert_entity`'s json reply.
+///
+/// `aliases` is the key, the name and the name's words, recomputed on each
+/// describing write, so a link is lost when a name changes — or, once, when a
+/// node's `aliases` held items those do not imply and they moved to
+/// `alias_keys`. A declared alias never costs one.
 pub(crate) const SAME_AS_LOST_REMEDY: &str =
-    "an alias only one side declares counts against their overlap; declare the same \
-     aliases on every entity that is the same thing, and a full-name stub's key too";
+    "a link holds while two nodes' keys, names and the names' words overlap at 0.6, and \
+     this write changed them; give both the same name, or declare a provisional stub's key \
+     as an alias to link it whatever the names";
 
 /// The `SAME_AS` links a write retracted, for a json reply: the first
 /// [`SAME_AS_LOST_LIST`], scores at the precision the text prints.
@@ -2120,9 +2126,9 @@ struct ForgetReport {
     notes_total: usize,
     /// The first commit history still answers from.
     history_floor: u64,
-    /// `prop` mode removed `name` from a node that still carries `aliases`,
-    /// which hold that name's words.
-    name_in_aliases: bool,
+    /// `prop` mode removed `name` from a node that carries `aliases`, and
+    /// rewrote that list in the same write: the name's words left it.
+    aliases_rewritten: bool,
     /// `prop` mode removed `aliases` from a node that still carries
     /// `alias_keys`, the aliases it declared, which still link stubs.
     alias_keys_remain: bool,
@@ -2180,17 +2186,13 @@ fn history_line(floor: u64) -> String {
     )
 }
 
-/// What a forgotten `name` leaves behind. The store keeps `aliases` by
-/// accumulation: a later write unites the old list with what the key and the
-/// current name imply, so the words stay until `aliases` itself is forgotten,
-/// after which the next write rebuilds it from the key and current name.
-fn name_in_aliases_line(target: &str) -> String {
-    let key = digest::sanitize(target.strip_suffix(".name").unwrap_or(target));
-    format!(
-        "its words remain in `aliases` and keep matching identity rules; later writes \
-         keep them — forget {{key: \"{key}\", prop: \"aliases\"}} clears them\n"
-    )
-}
+/// What a forgotten `name` takes with it. `aliases` is the key, the name and
+/// the name's words, so the forget rewrites it in the same write: the words
+/// leave at the forget, not at some later write, and identity rules stop
+/// matching them at once.
+const ALIASES_REWRITTEN_LINE: &str =
+    "its words left `aliases` in the same write; `aliases` now holds what the key alone \
+     implies\n";
 
 /// What a forgotten `aliases` leaves behind on a node that declared aliases.
 /// `alias_keys` is a separate list, read by the identity preset's `KeyMatch`
@@ -2214,13 +2216,18 @@ fn render_forget(r: &ForgetReport) -> String {
             let mut line = format!("forgot {target}\n");
             if r.derived_edges > 0 {
                 line.push_str(&format!(
-                    "{} derived edge(s) retracted because a rule read {}\n",
+                    "{} derived edge(s) retracted because a rule read {}{}\n",
                     r.derived_edges,
-                    digest::sanitize(r.prop.as_deref().unwrap_or_default())
+                    digest::sanitize(r.prop.as_deref().unwrap_or_default()),
+                    if r.aliases_rewritten {
+                        " or aliases"
+                    } else {
+                        ""
+                    }
                 ));
             }
-            if r.name_in_aliases {
-                line.push_str(&name_in_aliases_line(&r.target));
+            if r.aliases_rewritten {
+                line.push_str(ALIASES_REWRITTEN_LINE);
             }
             if r.alias_keys_remain {
                 line.push_str(&alias_keys_remain_line(&r.target));
@@ -2308,7 +2315,7 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 notes_total: notes.len(),
                 notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
                 history_floor: g.stats().history_floor,
-                name_in_aliases: false,
+                aliases_rewritten: false,
                 alias_keys_remain: false,
             }
         }
@@ -2320,14 +2327,33 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 Ok(e) => e,
                 Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
             };
-            let changed = match g.remove_prop(&key, &prop) {
+            // A name's words live in `aliases`. When the name goes, the list is
+            // rewritten from the key alone in the same commit, so the words
+            // leave with it. A node with no `aliases` list, or one holding a
+            // value the store cannot read as a list, is left as it is.
+            let rewrite = if prop == core_api::memory_schema::NAME_FIELD
+                && g.get_prop(&key, &prop).is_some()
+            {
+                core_api::memory::identity::identity_props_after_forgetting_name(&g, &key)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let removed = if rewrite.is_empty() {
+                g.remove_prop(&key, &prop)
+            } else {
+                let mut batch = g.batch();
+                batch.remove_prop(&key, &prop);
+                for (field, value) in &rewrite {
+                    batch.set_prop(&key, field, value.clone());
+                }
+                batch.commit().map(|_| true)
+            };
+            let changed = match removed {
                 Ok(c) => c,
                 Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
             };
-            let name_in_aliases = changed
-                && prop == core_api::memory_schema::NAME_FIELD
-                && g.get_prop(&key, core_api::memory::identity::ALIASES_FIELD)
-                    .is_some();
+            let aliases_rewritten = changed && !rewrite.is_empty();
             let alias_keys_remain = changed
                 && prop == core_api::memory::identity::ALIASES_FIELD
                 && g.get_prop(&key, core_api::memory::identity::ALIAS_KEYS_FIELD)
@@ -2348,7 +2374,7 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 notes: Vec::new(),
                 notes_total: 0,
                 history_floor: g.stats().history_floor,
-                name_in_aliases,
+                aliases_rewritten,
                 alias_keys_remain,
             }
         }
@@ -2378,7 +2404,7 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 notes_total: notes.len(),
                 notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
                 history_floor: g.stats().history_floor,
-                name_in_aliases: false,
+                aliases_rewritten: false,
                 alias_keys_remain: false,
             }
         }
@@ -3214,7 +3240,7 @@ fn task_tool_schemas() -> Vec<Js> {
                                 "aliases": {
                                     "type": "array",
                                     "items": { "type": "string" },
-                                    "description": "Other names this entity goes by; the store normalises them into its 'aliases' list. With the identity preset, one equal to a provisional stub's key (exact, case-sensitive) links that stub."
+                                    "description": "Other names this entity goes by, kept as written in its 'alias_keys' list. With the identity preset, one equal to a provisional stub's key (exact, case-sensitive) links that stub."
                                 }
                             },
                             "required": ["key", "label"]

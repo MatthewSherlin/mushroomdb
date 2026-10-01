@@ -78,8 +78,9 @@ pub fn memory_defaults() -> Schema {
 /// - one directed rule from each entity label to the provisional label —
 ///   `Person→Entity`, … — `KeyMatch` on `alias_keys`: an entity that declares
 ///   an alias equal to a stub's key links that stub, at 1.0. `Overlap` cannot:
-///   a stub keyed `matt` holds one alias against the entity's five. It reads
-///   `alias_keys`, not `aliases`, because `aliases` also holds derived name
+///   a stub keyed `matt` holds one alias, and a declared alias is not among
+///   the entity's own — those are its key, its name and the name's words. It
+///   reads `alias_keys`, not `aliases`, because `aliases` holds derived name
 ///   words, and an entity merely named "Alex" must not claim a stub keyed
 ///   `alex`. The rules key on labels, and a node `about` created keeps
 ///   `Entity` for life: a stub that was later described can still be claimed,

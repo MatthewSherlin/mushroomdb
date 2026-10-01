@@ -742,8 +742,7 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
         let count = to_set.len();
         // The node's `SAME_AS` claims either side of the write, under the one
         // write guard, so the reply can name the links this update retracted:
-        // a declared alias the other node lacks takes a full-name link below
-        // the floor.
+        // a changed name takes a full-name link below the floor.
         let keys = [key.to_string()];
         let same_as_before = memory::identity::same_as_pairs(&g, &keys);
         if let Err(e) =
@@ -1470,7 +1469,7 @@ fn graph_tools() -> Vec<Js> {
                         "aliases": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Other names this entity goes by. The store keeps a normalised 'aliases' list from these, the key and the name, and keeps them as written in 'alias_keys': with the identity preset, one equal to a provisional stub's key (exact, case-sensitive) links that stub. Do not set either in props."
+                            "description": "Other names this entity goes by, kept as written in 'alias_keys': with the identity preset, one equal to a provisional stub's key (exact, case-sensitive) links that stub. The store derives 'aliases' from the key and the name only. Do not set either in props."
                         }
                     },
                     "required": ["key", "props"]
