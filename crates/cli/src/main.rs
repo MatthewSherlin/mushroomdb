@@ -3,8 +3,9 @@
 use cli::{
     format_backup, format_demo, format_stats, format_suggest, install, maybe_run_demo_if_empty,
     parse_args, read_stats, run_algo, run_asof, run_backup, run_build_index, run_demo, run_export,
-    run_migrate, run_query, run_schema_apply, run_schema_apply_memory_defaults, run_snapshot,
-    run_suggest, run_verify, usage, Command, ServeUi,
+    run_migrate, run_query, run_schema_apply, run_schema_apply_memory_defaults,
+    run_schema_apply_memory_identity, run_snapshot, run_suggest, run_verify, usage, Command,
+    ServeUi,
 };
 use core_api::{GraphError, SharedDb};
 use std::collections::HashMap;
@@ -307,8 +308,11 @@ fn main() -> ExitCode {
             db_dir,
             schema_file,
             memory_defaults,
+            memory_identity,
         }) => {
-            let result = if memory_defaults {
+            let result = if memory_identity {
+                run_schema_apply_memory_identity(&db_dir)
+            } else if memory_defaults {
                 run_schema_apply_memory_defaults(&db_dir)
             } else {
                 match schema_file {

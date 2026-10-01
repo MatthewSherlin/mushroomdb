@@ -105,7 +105,7 @@ pub(crate) fn dispatch(
         "remember" => tool_remember(db, args, json_out),
         "schema" => tool_schema(db, json_out),
         "analyze" => tool_analyze(db, args, json_out),
-        "suggest_rules" => tool_suggest_rules(db, json_out),
+        "suggest_rules" => tool_suggest_rules(db, db_dir, json_out),
         "forget" => tool_forget(db, args, json_out),
         _ => unreachable!("TASK_TOOLS and this match list the same names"),
     })
@@ -1954,6 +1954,14 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                         .join(", ")
                 ));
             }
+            for pair in &report.same_as {
+                rendered.push_str(&format!(
+                    "same as  {} ~ {} ({:.2}) — explain_association shows why\n",
+                    digest::sanitize(&pair.a),
+                    digest::sanitize(&pair.b),
+                    pair.score
+                ));
+            }
             if !report.fulltext_declared.is_empty() {
                 rendered.push_str(&format!(
                     "indexed  {} — full-text search enabled for the first time\n",
@@ -1972,6 +1980,7 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                     "provisional": report.provisional,
                     "provisional_capped": report.provisional_capped,
                     "fulltext_declared": report.fulltext_declared,
+                    "same_as": report.same_as,
                 }),
                 |_| rendered,
             )
@@ -2345,6 +2354,43 @@ struct SuggestOut {
     bookkeeping_hidden: usize,
     /// The engine's time budget ran out; a second call may find more.
     truncated: bool,
+    /// Entity nodes on a store with no `SAME_AS` rule, and the command that
+    /// adds the identity preset. `None` when there are none, or the store
+    /// already derives `SAME_AS`.
+    identity_preset: Option<IdentityPresetOut>,
+}
+
+/// The one proposal that is not a single rule: the identity preset.
+#[derive(serde::Serialize)]
+struct IdentityPresetOut {
+    entity_nodes: usize,
+    command: String,
+}
+
+/// Whether to offer the identity preset, and with what command.
+///
+/// Offered when the store holds nodes under an entity label or the
+/// provisional label and no rule derives `SAME_AS`. It is eleven rules and an
+/// alias backfill, so it is a CLI step a person runs, not a `create_rule` an
+/// assistant relays. Names the real store path when the server knows it, as
+/// `recall`'s own `schema apply` hint does.
+fn identity_preset_offer(
+    g: &core_api::GraphDb<core_api::RealFs>,
+    db_dir: Option<&Path>,
+) -> Option<IdentityPresetOut> {
+    use core_api::memory::identity::{entity_node_count, SAME_AS_EDGE};
+    if g.rules().iter().any(|r| r.edge_type == SAME_AS_EDGE) {
+        return None;
+    }
+    let entity_nodes = entity_node_count(g);
+    if entity_nodes == 0 {
+        return None;
+    }
+    let path = db_dir.map_or_else(|| "<db>".to_string(), |d| d.display().to_string());
+    Some(IdentityPresetOut {
+        entity_nodes,
+        command: format!("mushroomdb schema apply {path} --memory-identity"),
+    })
 }
 
 /// `def` as `create_rule` arguments: no nulls, `approximate` only when set,
@@ -2363,7 +2409,14 @@ fn create_rule_args(def: &core_api::RuleDef) -> Js {
 }
 
 fn render_suggestions(r: &SuggestOut) -> String {
-    let mut out = if r.suggestions.is_empty() {
+    let mut out = if r.suggestions.is_empty() && r.truncated {
+        // Not "no pattern": the engine stopped before it could say so.
+        "mushroomdb suggest_rules — no rule proposal found before the time budget ran \
+         out\n"
+            .to_string()
+    } else if r.suggestions.is_empty() && r.identity_preset.is_some() {
+        "mushroomdb suggest_rules — no single-rule proposal; one preset to offer\n".to_string()
+    } else if r.suggestions.is_empty() {
         "mushroomdb suggest_rules — nothing to propose: no pattern a rule does not \
          already cover\n"
             .to_string()
@@ -2415,18 +2468,30 @@ fn render_suggestions(r: &SuggestOut) -> String {
             BOOKKEEPING_FIELDS.join(", ")
         ));
     }
+    if let Some(p) = &r.identity_preset {
+        out.push_str(&format!(
+            "identity: {} entity node(s) and no SAME_AS rule. `{}` adds the identity \
+             preset — eleven SAME_AS rules over each node's aliases — after saying what it \
+             will backfill. It is a command for a person to run, not a create_rule call.\n",
+            p.entity_nodes,
+            digest::sanitize(&p.command)
+        ));
+    }
     if r.truncated {
         out.push_str("(the time budget ran out; a second call may find more)\n");
     }
     out
 }
 
-fn tool_suggest_rules(db: &SharedDb, json_out: bool) -> CallOutcome {
-    let report = {
+fn tool_suggest_rules(db: &SharedDb, db_dir: Option<&Path>, json_out: bool) -> CallOutcome {
+    let (report, identity_preset) = {
         let g = db.read();
-        g.suggest_rules_with_config(
-            &core_api::SuggestConfig::default(),
-            core_api::SUGGEST_DEFAULT_SEED,
+        (
+            g.suggest_rules_with_config(
+                &core_api::SuggestConfig::default(),
+                core_api::SUGGEST_DEFAULT_SEED,
+            ),
+            identity_preset_offer(&g, db_dir),
         )
     };
     let mut kept: Vec<SuggestionOut> = Vec::new();
@@ -2448,7 +2513,13 @@ fn tool_suggest_rules(db: &SharedDb, json_out: bool) -> CallOutcome {
             dst_label: s.def.dst_label,
             edge_type: s.def.edge_type,
             est_edges: s.est_edges,
-            examples: s.examples,
+            // Fixed precision in the json report too, not only in the text:
+            // the text prints `{:.2}`, and a determinism claim covers both.
+            examples: s
+                .examples
+                .into_iter()
+                .map(|(a, b, score)| (a, b, (score * 100.0).round() / 100.0))
+                .collect(),
             rationale: s.rationale,
         });
     }
@@ -2459,6 +2530,7 @@ fn tool_suggest_rules(db: &SharedDb, json_out: bool) -> CallOutcome {
         total,
         bookkeeping_hidden: hidden,
         truncated: report.truncated,
+        identity_preset,
     };
     ok(json_out, &out, render_suggestions)
 }
@@ -3054,6 +3126,23 @@ fn task_tool_schemas() -> Vec<Js> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fold-in from the Task 6 review: an empty, truncated run did not find
+    /// "no pattern"; it ran out of time before finding one.
+    #[test]
+    fn an_empty_truncated_suggestion_run_does_not_claim_full_coverage() {
+        let out = SuggestOut {
+            suggestions: Vec::new(),
+            total: 0,
+            bookkeeping_hidden: 0,
+            truncated: true,
+            identity_preset: None,
+        };
+        let text = render_suggestions(&out);
+        let header = text.lines().next().unwrap_or_default();
+        assert!(!header.contains("already cover"), "{text}");
+        assert!(header.contains("time budget"), "{text}");
+    }
 
     fn edge_at(edge_type: &str, src: &str, dst: &str) -> core_api::EdgeAt {
         core_api::EdgeAt {

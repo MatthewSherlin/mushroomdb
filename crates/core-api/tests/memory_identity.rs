@@ -197,3 +197,237 @@ fn more_aliases_than_the_cap_is_refused_before_anything_is_written() {
         "neither the note nor the entity"
     );
 }
+
+/// A `remember` refused for its aliases declares nothing either: the alias
+/// check runs before the full-text self-declare for an unseen label.
+#[test]
+fn a_remember_refused_for_aliases_declares_no_fulltext() {
+    let mut db = store("refused-declares-nothing");
+    let before = db.fulltext_pairs();
+    let many: Vec<String> = (0..=MAX_ALIASES).map(|i| format!("alias {i}")).collect();
+    let entities = vec![EntityIn {
+        key: "v0.7".into(),
+        label: "Release".into(),
+        props: BTreeMap::new(),
+        aliases: many,
+    }];
+    let err = remember(&mut db, &note("too many names", &[], &entities))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("aliases"), "{err}");
+    assert_eq!(
+        db.fulltext_pairs(),
+        before,
+        "a refused call must not declare (Release, name)"
+    );
+}
+
+// ── the identity preset ─────────────────────────────────────────────────────
+
+use core_api::memory::identity::{SameAsPair, SAME_AS_EDGE, SAME_AS_FLOOR};
+use core_api::memory_schema::memory_identity;
+use core_api::Predicate;
+
+fn identity_store(name: &str) -> GraphDb<core_storage::fs::RealFs> {
+    let mut db = store(name);
+    db.apply_schema(&memory_identity()).unwrap();
+    db
+}
+
+fn remember_people(
+    db: &mut GraphDb<core_storage::fs::RealFs>,
+    text: &str,
+    people: Vec<EntityIn>,
+) -> core_api::memory::remember::RememberReport {
+    remember(db, &note(text, &[], &people)).unwrap()
+}
+
+#[test]
+fn the_preset_is_eleven_global_rules_over_aliases() {
+    let s = memory_identity();
+    assert_eq!(
+        s.rules.len(),
+        11,
+        "{:?}",
+        s.rules.iter().map(|r| &r.name).collect::<Vec<_>>()
+    );
+    for r in &s.rules {
+        assert_eq!(r.edge_type, SAME_AS_EDGE, "{}", r.name);
+        assert_eq!(r.namespace, None, "{} must be global", r.name);
+        assert_eq!(r.weight_prop.as_deref(), Some("weight"), "{}", r.name);
+        assert_eq!(r.max_edges, Some(32), "{}", r.name);
+        assert_eq!(
+            r.predicate,
+            Predicate::Overlap {
+                field: ALIASES_FIELD.into(),
+                min: SAME_AS_FLOOR
+            },
+            "{}",
+            r.name
+        );
+    }
+    let pairs: Vec<(&str, &str)> = s
+        .rules
+        .iter()
+        .map(|r| (r.src_label.as_str(), r.dst_label.as_str()))
+        .collect();
+    for label in ["Person", "Org", "Project", "Concept", "Event", "Entity"] {
+        assert!(
+            pairs.contains(&(label, label)),
+            "no same-label rule for {label}"
+        );
+    }
+    for label in ["Person", "Org", "Project", "Concept", "Event"] {
+        assert!(pairs.contains(&("Entity", label)), "no Entity→{label} rule");
+    }
+}
+
+/// OD-2: the defaults a new store is created with stay rule-free.
+#[test]
+fn the_memory_defaults_still_create_no_rule() {
+    assert!(memory_defaults().rules.is_empty());
+}
+
+#[test]
+fn two_nodes_with_the_same_full_name_link_and_the_report_says_so() {
+    let mut db = identity_store("fullname");
+    remember_people(
+        &mut db,
+        "first",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &[])],
+    );
+    let report = remember_people(
+        &mut db,
+        "second",
+        vec![person("msherlin", "Matthew Sherlin", &[])],
+    );
+    assert_eq!(
+        report.same_as,
+        vec![SameAsPair {
+            a: "matthew-sherlin".into(),
+            b: "msherlin".into(),
+            score: 0.6
+        }]
+    );
+}
+
+/// Review focus: a same-label rule writes a→b and b→a. That is one claim.
+#[test]
+fn both_directions_of_a_same_label_link_are_one_claim() {
+    let mut db = identity_store("directed");
+    let report = remember_people(
+        &mut db,
+        "both at once",
+        vec![
+            person("matthew-sherlin", "Matthew Sherlin", &[]),
+            person("msherlin", "Matthew Sherlin", &[]),
+        ],
+    );
+    assert_eq!(
+        db.weighted_edges(SAME_AS_EDGE, Some("weight")).len(),
+        2,
+        "the engine derives both directions"
+    );
+    assert_eq!(report.same_as.len(), 1, "{:?}", report.same_as);
+}
+
+#[test]
+fn a_stub_links_to_the_entity_whose_name_it_spells() {
+    let mut db = identity_store("stub-link");
+    let about = strings(&["Matthew_Sherlin"]);
+    remember(&mut db, &note("named first", &about, &[])).unwrap();
+    let report = remember_people(
+        &mut db,
+        "described later",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &[])],
+    );
+    assert_eq!(
+        report.same_as,
+        vec![SameAsPair {
+            a: "Matthew_Sherlin".into(),
+            b: "matthew-sherlin".into(),
+            score: 0.6
+        }]
+    );
+}
+
+/// Precision: one shared word is not an identity.
+#[test]
+fn people_who_share_a_first_name_do_not_link() {
+    let mut db = identity_store("alexes");
+    let report = remember_people(
+        &mut db,
+        "two alexes",
+        vec![
+            person("alex-chen", "Alex Chen", &[]),
+            person("alex-kim", "Alex Kim", &[]),
+            person("alex-1", "Alex", &[]),
+        ],
+    );
+    assert!(report.same_as.is_empty(), "{:?}", report.same_as);
+    let about = strings(&["alex"]);
+    let report = remember(&mut db, &note("which alex?", &about, &[])).unwrap();
+    assert!(
+        report.same_as.is_empty(),
+        "a bare first name scores 1/2 against alex-1 and must not link: {:?}",
+        report.same_as
+    );
+}
+
+#[test]
+fn remembering_the_same_people_again_reports_nothing_new() {
+    let mut db = identity_store("again");
+    let people = || {
+        vec![
+            person("matthew-sherlin", "Matthew Sherlin", &[]),
+            person("msherlin", "Matthew Sherlin", &[]),
+        ]
+    };
+    assert_eq!(remember_people(&mut db, "once", people()).same_as.len(), 1);
+    assert!(remember_people(&mut db, "twice", people())
+        .same_as
+        .is_empty());
+}
+
+/// Review focus: the preset's rules are global, so in a namespaced store a
+/// link crosses namespaces — and is reported, not hidden.
+#[test]
+fn a_global_identity_rule_links_across_namespaces_and_says_so() {
+    let mut db = identity_store("namespaces");
+    let in_ns = |key: &str, ns: &str| {
+        let mut e = person(key, "Matthew Sherlin", &[]);
+        e.props.insert("ns".into(), Value::Str(ns.into()));
+        e
+    };
+    let report = remember_people(
+        &mut db,
+        "two teams",
+        vec![in_ns("matthew-a", "team-a"), in_ns("matthew-b", "team-b")],
+    );
+    assert_eq!(db.namespace_of("matthew-a").as_deref(), Some("team-a"));
+    assert_eq!(db.namespace_of("matthew-b").as_deref(), Some("team-b"));
+    assert_eq!(
+        report.same_as.len(),
+        1,
+        "the global rule links across namespaces: {:?}",
+        report.same_as
+    );
+}
+
+/// The preset's real shape through the lock-free reader: eleven rules exist
+/// before any node carries `aliases`.
+#[test]
+fn the_reader_survives_the_preset_on_an_empty_store() {
+    let mut db = identity_store("reader");
+    remember_people(
+        &mut db,
+        "after the preset",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &[])],
+    );
+    let rows = db
+        .reader()
+        .query("MATCH (n:Person) RETURN n.id", &Default::default())
+        .map(|rs| rs.len())
+        .map_err(|e| e.to_string());
+    assert_eq!(rows, Ok(1));
+}

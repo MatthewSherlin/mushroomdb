@@ -5882,3 +5882,113 @@ fn remember_entities_and_stubs_carry_aliases() {
         "{err}"
     );
 }
+
+/// A memory store with the identity preset applied, as
+/// `schema apply --memory-identity` leaves one.
+fn identity_store(name: &str) -> SharedDb {
+    let db = memory_store(name);
+    db.write()
+        .apply_schema(&core_api::memory_schema::memory_identity())
+        .unwrap();
+    db
+}
+
+/// Binding (R2): with the preset on, `remember` says which identities its
+/// write agreed with — once per pair, though the rule derived both directions.
+#[test]
+fn remember_reports_the_same_as_claims_it_created() {
+    let db = identity_store("remember-same-as");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "first", "entities": [{"key": "matthew-sherlin", "label": "Person",
+                                              "props": {"name": "Matthew Sherlin"}}]}),
+    );
+    let args = json!({"text": "second", "entities": [{"key": "msherlin", "label": "Person",
+                                                    "props": {"name": "Matthew Sherlin"}}]});
+    let text = task_reply(&one_task_call(db.clone(), "remember", args));
+    assert_eq!(
+        text.matches("same as  matthew-sherlin ~ msherlin (0.60)")
+            .count(),
+        1,
+        "{text}"
+    );
+    let report = task_report(
+        db,
+        "remember",
+        json!({"text": "third", "entities": [{"key": "m-sherlin", "label": "Person",
+                                              "props": {"name": "Matthew Sherlin"}}]}),
+    );
+    assert_eq!(
+        report["same_as"].as_array().map(Vec::len),
+        Some(2),
+        "the third links to both earlier ones: {report}"
+    );
+}
+
+/// Binding (OD-2): `suggest_rules` offers the preset to a store with entities
+/// and no SAME_AS rule, as a command — and stops once the preset is on.
+#[test]
+fn suggest_rules_offers_the_identity_preset_until_it_is_applied() {
+    let db = memory_store("suggest-identity");
+    seed_person(&db, "matthew");
+    let (text, report) = task_both(db.clone(), "suggest_rules", json!({}));
+    assert!(text.contains("--memory-identity"), "{text}");
+    assert!(text.contains("not a create_rule call"), "{text}");
+    assert_eq!(
+        report["identity_preset"]["entity_nodes"],
+        json!(1),
+        "{report}"
+    );
+    db.write()
+        .apply_schema(&core_api::memory_schema::memory_identity())
+        .unwrap();
+    let report = task_report(db, "suggest_rules", json!({}));
+    assert!(report["identity_preset"].is_null(), "{report}");
+}
+
+/// Determinism: a proposal's example scores are at fixed precision in the
+/// json report too, not only in the rendered text — a Jaccard of 1/3 is
+/// `0.33`, never `0.3333333333333333`.
+#[test]
+fn suggest_rules_json_example_scores_are_two_decimal_places() {
+    let db = memory_store("suggest-precision");
+    {
+        let mut g = db.write();
+        for i in 0..6 {
+            for (label, own) in [("Red", "r"), ("Blue", "b")] {
+                g.insert_node(
+                    label,
+                    &format!("{own}{i}"),
+                    vec![(
+                        "tags".into(),
+                        Value::List(vec![
+                            Value::Str("shared".into()),
+                            Value::Str(format!("{own}{i}")),
+                        ]),
+                    )],
+                )
+                .unwrap();
+            }
+        }
+    }
+    let report = task_report(db, "suggest_rules", json!({}));
+    let scores: Vec<f64> = report["suggestions"]
+        .as_array()
+        .expect("suggestions")
+        .iter()
+        .flat_map(|s| s["examples"].as_array().cloned().unwrap_or_default())
+        .map(|e| e[2].as_f64().expect("score"))
+        .collect();
+    assert!(
+        !scores.is_empty(),
+        "the fixture must yield examples: {report}"
+    );
+    for score in scores {
+        assert_eq!(
+            score,
+            (score * 100.0).round() / 100.0,
+            "an example score past two decimal places: {report}"
+        );
+    }
+}

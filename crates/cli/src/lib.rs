@@ -314,12 +314,14 @@ pub enum Command {
         rule: Option<String>,
     },
     /// Apply a JSON schema file idempotently (`schema apply <db-dir> <schema.json>`),
-    /// or the built-in memory schema (`schema apply <db-dir> --memory-defaults`).
+    /// the built-in memory schema (`schema apply <db-dir> --memory-defaults`), or
+    /// the identity preset (`schema apply <db-dir> --memory-identity`).
     SchemaApply {
         db_dir: PathBuf,
-        /// `None` when `--memory-defaults` was given instead.
+        /// `None` when a built-in was named instead.
         schema_file: Option<PathBuf>,
         memory_defaults: bool,
+        memory_identity: bool,
     },
     /// Migrate an old-format snapshot to the current version and keep `.bak`.
     Migrate {
@@ -495,6 +497,9 @@ Usage:
   mushroomdb schema apply <db-dir> --memory-defaults
                                    applies the built-in memory schema to an existing store;
                                    full-text on a populated store rebuilds the index at every open from here on
+  mushroomdb schema apply <db-dir> --memory-identity
+                                   adds the identity preset: eleven SAME_AS rules over each entity's aliases;
+                                   says what it will backfill, then backfills
   mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
   mushroomdb algo wcc <db-dir> [--top N]
   mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
@@ -1601,9 +1606,12 @@ fn parse_schema_apply(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut schema_file = None;
     let mut memory_defaults = false;
+    let mut memory_identity = false;
     for a in args {
         if *a == "--memory-defaults" {
             memory_defaults = true;
+        } else if *a == "--memory-identity" {
+            memory_identity = true;
         } else if a.starts_with('-') {
             return Err(format!("unexpected flag: {a}"));
         } else if db_dir.is_none() {
@@ -1615,6 +1623,20 @@ fn parse_schema_apply(args: &[&str]) -> Result<Command, String> {
         }
     }
     let db_dir = db_dir.ok_or_else(|| "schema apply requires <db-dir>".to_string())?;
+    if memory_identity {
+        if memory_defaults || schema_file.is_some() {
+            return Err(
+                "schema apply --memory-identity takes no schema file and no other preset"
+                    .to_string(),
+            );
+        }
+        return Ok(Command::SchemaApply {
+            db_dir,
+            schema_file: None,
+            memory_defaults: false,
+            memory_identity: true,
+        });
+    }
     if memory_defaults {
         if schema_file.is_some() {
             return Err("schema apply --memory-defaults takes no schema file argument".to_string());
@@ -1623,6 +1645,7 @@ fn parse_schema_apply(args: &[&str]) -> Result<Command, String> {
             db_dir,
             schema_file: None,
             memory_defaults: true,
+            memory_identity: false,
         });
     }
     let schema_file =
@@ -1631,6 +1654,7 @@ fn parse_schema_apply(args: &[&str]) -> Result<Command, String> {
         db_dir,
         schema_file: Some(schema_file),
         memory_defaults: false,
+        memory_identity: false,
     })
 }
 
@@ -1693,6 +1717,53 @@ pub fn run_schema_apply_memory_defaults(db_dir: &Path) -> Result<String, CliErro
         "note: {} live nodes are now full-text indexed; the index rebuilds at \
          every open from here on.",
         before.nodes_live
+    );
+    Ok(out)
+}
+
+/// `mushroomdb schema apply <db> --memory-identity`
+///
+/// Applies `core_api::memory_schema::memory_identity()` — opt-in, because a
+/// store never gains a rule silently. What it will do is measured and stated
+/// first, in the same output, before anything is written: how many entity
+/// nodes the rules will compare, and how many need an `aliases` list written
+/// before they can. Then the lists are written in one commit and the rules
+/// created, each with its own backfill.
+pub fn run_schema_apply_memory_identity(db_dir: &Path) -> Result<String, CliError> {
+    use core_api::memory::identity::{
+        aliases_to_backfill, entity_node_count, write_aliases, SAME_AS_EDGE,
+    };
+    let mut db = GraphDb::open(db_dir)?;
+    let preset = core_api::memory_schema::memory_identity();
+    let entity_nodes = entity_node_count(&db);
+    let backfill = aliases_to_backfill(&db)?;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "identity preset: {} SAME_AS rules over each entity's aliases, global — they link \
+         across namespaces",
+        preset.rules.len()
+    );
+    let _ = writeln!(
+        out,
+        "before applying: {entity_nodes} entity node(s); {} need an aliases list written \
+         first; each rule then compares aliases across its labels once, and every later \
+         write to an entity is re-checked",
+        backfill.len()
+    );
+    write_aliases(&mut db, &backfill)?;
+    let diff = db.apply_schema(&preset)?;
+    let _ = writeln!(
+        out,
+        "schema apply: {} created, {} updated, {} unchanged",
+        diff.created.len(),
+        diff.updated.len(),
+        diff.unchanged.len()
+    );
+    let _ = writeln!(
+        out,
+        "SAME_AS edges now: {}",
+        db.weighted_edges(SAME_AS_EDGE, None).len()
     );
     Ok(out)
 }

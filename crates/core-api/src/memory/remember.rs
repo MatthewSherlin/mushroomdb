@@ -20,7 +20,9 @@
 //! their keys become visible to the batch's own validation) before the
 //! `about` keys and the facts' own endpoints are resolved.
 
-use crate::memory::identity::{aliases_after_write, aliases_value, derive_aliases, ALIASES_FIELD};
+use crate::memory::identity::{
+    aliases_after_write, aliases_value, derive_aliases, same_as_pairs, SameAsPair, ALIASES_FIELD,
+};
 use crate::memory_schema::{NAME_FIELD, PROVISIONAL_LABEL, PROVISIONAL_PROP};
 use crate::GraphDb;
 use core_storage::fs::Fs;
@@ -143,15 +145,14 @@ pub struct RememberReport {
     /// *note* — edges the engine's rule provenance attributes to a rule,
     /// never one this call inserted itself (`ABOUT`, a fact's own edge, or a
     /// provisional stub have no rule and never count here). `memory_defaults()`
-    /// ships with zero rules (`SAME_AS` arrives in a later plan), so this is
-    /// `0` against a plain memory store today — and it stays structurally `0`
-    /// for the foreseeable future even once `SAME_AS` exists: that rule is
-    /// Person→Person, never incident on a note, so nothing it derives is
-    /// counted here. This field only moves once a rule exists whose
-    /// predicate can match the note itself — such as an `about_<label>` rule
-    /// `ingest-git` declared before 0.7, which derives the note's `ABOUT`
-    /// edge (counted here, on the commit that derived it) in place of the
-    /// insert this call would otherwise make.
+    /// ships with zero rules, so this is `0` against a plain memory store — and
+    /// it stays `0` with the identity preset applied: its `SAME_AS` rules link
+    /// entity labels, never a note, and are reported in
+    /// [`same_as`](Self::same_as) instead. This field only moves once a rule
+    /// exists whose predicate can match the note itself — such as an
+    /// `about_<label>` rule `ingest-git` declared before 0.7, which derives the
+    /// note's `ABOUT` edge (counted here, on the commit that derived it) in
+    /// place of the insert this call would otherwise make.
     pub derived: usize,
     /// `about` keys and fact endpoints that had to be stubbed, in the order
     /// each was first seen (`about` before `facts`).
@@ -168,6 +169,12 @@ pub struct RememberReport {
     /// on every call that named no unseen label, or that found
     /// [`MAX_FULLTEXT_PAIRS`] already spent.
     pub fulltext_declared: Vec<String>,
+    /// `SAME_AS` claims this call created, between an entity or stub it
+    /// wrote and any other node — one entry per pair, whichever directions
+    /// the rules derived. Empty on a store without the identity preset
+    /// (`memory_schema::memory_identity`). This is what tells the caller its
+    /// extraction agreed with something the store already held.
+    pub same_as: Vec<SameAsPair>,
 }
 
 /// Create-or-update one entity, clearing any provisional mark.
@@ -267,6 +274,25 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         });
     }
 
+    // Each entity's `aliases` after this call: it unites what the node
+    // already holds with what this call names, and `None` means the stored
+    // list is already exactly that. Computed before anything below declares
+    // full-text, so a call refused here (an `aliases` property, or more than
+    // `MAX_ALIASES`) declares nothing new either; and before `db.batch()`
+    // takes `db` mutably, because it reads the store.
+    let entity_aliases: Vec<Option<Vec<String>>> = input
+        .entities
+        .iter()
+        .map(|e| {
+            let props: Vec<(String, Value)> = e
+                .props
+                .iter()
+                .map(|(f, v)| (f.clone(), v.clone()))
+                .collect();
+            aliases_after_write(db, &e.key, &props, &e.aliases)
+        })
+        .collect::<Result<_>>()?;
+
     let mut fulltext = db.fulltext_pairs();
     if !fulltext.contains(&("Note".to_string(), "text".to_string())) {
         db.enable_fulltext("Note", "text")?;
@@ -332,21 +358,6 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
     // frame, not the live store, so "does this already exist" has to be
     // asked of the store now.
     let entity_existed: Vec<bool> = input.entities.iter().map(|e| db.has_node(&e.key)).collect();
-    // Each entity's `aliases` after this call, computed now for the same
-    // reason: it unites what the node already holds with what this call
-    // names, and `None` means the stored list is already exactly that.
-    let entity_aliases: Vec<Option<Vec<String>>> = input
-        .entities
-        .iter()
-        .map(|e| {
-            let props: Vec<(String, Value)> = e
-                .props
-                .iter()
-                .map(|(f, v)| (f.clone(), v.clone()))
-                .collect();
-            aliases_after_write(db, &e.key, &props, &e.aliases)
-        })
-        .collect::<Result<_>>()?;
     let about_existed: Vec<Option<bool>> = about
         .iter()
         .map(|k| {
@@ -399,6 +410,12 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         }
     }
     let fact_endpoint_existed: Vec<bool> = fact_endpoints.iter().map(|k| db.has_node(k)).collect();
+
+    // `SAME_AS` claims already touching what this call writes, so the report
+    // names only the ones this commit made. Stubs are new by definition, so
+    // only the entities can have any yet.
+    let entity_key_list: Vec<String> = input.entities.iter().map(|e| e.key.clone()).collect();
+    let same_as_before = same_as_pairs(db, &entity_key_list);
 
     let mut report = RememberReport {
         note: key.clone(),
@@ -548,6 +565,13 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         .filter(|e| e.derived)
         .count();
     report.derived = derived_after.saturating_sub(derived_before);
+
+    let mut touched = entity_key_list;
+    touched.extend(report.provisional.iter().cloned());
+    report.same_as = same_as_pairs(db, &touched)
+        .into_iter()
+        .filter(|p| !same_as_before.iter().any(|b| b.a == p.a && b.b == p.b))
+        .collect();
 
     Ok(report)
 }
