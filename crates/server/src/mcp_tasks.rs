@@ -1980,7 +1980,17 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                     "provisional": report.provisional,
                     "provisional_capped": report.provisional_capped,
                     "fulltext_declared": report.fulltext_declared,
-                    "same_as": report.same_as,
+                    // Fixed precision, as the text's `{:.2}`; the report
+                    // itself keeps the raw score.
+                    "same_as": report
+                        .same_as
+                        .iter()
+                        .map(|p| json!({
+                            "a": p.a,
+                            "b": p.b,
+                            "score": (p.score * 100.0).round() / 100.0,
+                        }))
+                        .collect::<Vec<_>>(),
                 }),
                 |_| rendered,
             )

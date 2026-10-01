@@ -43,7 +43,7 @@ fn the_preset_states_its_backfill_first_then_links() {
         "the second says what it will backfill, measured before writing: {out}"
     );
     assert!(out.contains("11 created"), "{out}");
-    assert!(out.contains("SAME_AS edges now: 2"), "{out}");
+    assert!(out.contains("SAME_AS edges now: 2 (1 pair(s))"), "{out}");
 
     let db = GraphDb::open(&dir).unwrap();
     assert_eq!(db.rules().len(), 11);

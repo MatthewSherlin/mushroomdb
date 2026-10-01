@@ -5926,6 +5926,31 @@ fn remember_reports_the_same_as_claims_it_created() {
     );
 }
 
+/// Determinism: a `same_as` score in the json report is at fixed precision.
+/// Four shared aliases out of six is 2/3, which has no finite decimal form.
+#[test]
+fn remember_json_same_as_scores_are_two_decimal_places() {
+    let db = identity_store("remember-same-as-precision");
+    let aliases = json!(["p", "q", "r", "s"]);
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "first", "entities": [{"key": "ka", "label": "Person",
+                                              "aliases": aliases}]}),
+    );
+    let report = task_report(
+        db,
+        "remember",
+        json!({"text": "second", "entities": [{"key": "kb", "label": "Person",
+                                               "aliases": aliases}]}),
+    );
+    assert_eq!(
+        report["same_as"],
+        json!([{"a": "ka", "b": "kb", "score": 0.67}]),
+        "{report}"
+    );
+}
+
 /// Binding (OD-2): `suggest_rules` offers the preset to a store with entities
 /// and no SAME_AS rule, as a command — and stops once the preset is on.
 #[test]

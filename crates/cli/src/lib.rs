@@ -1751,6 +1751,9 @@ pub fn run_schema_apply_memory_identity(db_dir: &Path) -> Result<String, CliErro
          write to an entity is re-checked",
         backfill.len()
     );
+    // Two commits: the aliases, then the rules. A failure between them leaves
+    // the lists written and no rule; a re-run recovers, since the backfill is
+    // idempotent and finds nothing left to write.
     write_aliases(&mut db, &backfill)?;
     let diff = db.apply_schema(&preset)?;
     let _ = writeln!(
@@ -1760,10 +1763,24 @@ pub fn run_schema_apply_memory_identity(db_dir: &Path) -> Result<String, CliErro
         diff.updated.len(),
         diff.unchanged.len()
     );
+    // Edges are directed and a same-label rule derives both directions, so
+    // the pair count is the number of identities claimed.
+    let edges = db.weighted_edges(SAME_AS_EDGE, None);
+    let pairs: std::collections::BTreeSet<(&str, &str)> = edges
+        .iter()
+        .map(|(a, b, _)| {
+            if a <= b {
+                (a.as_str(), b.as_str())
+            } else {
+                (b.as_str(), a.as_str())
+            }
+        })
+        .collect();
     let _ = writeln!(
         out,
-        "SAME_AS edges now: {}",
-        db.weighted_edges(SAME_AS_EDGE, None).len()
+        "SAME_AS edges now: {} ({} pair(s))",
+        edges.len(),
+        pairs.len()
     );
     Ok(out)
 }
