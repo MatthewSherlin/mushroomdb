@@ -137,7 +137,7 @@ def run_ours(nodes: list[dict], scale: int, seed: int) -> dict[str, Any]:
         print("  [ours] cypher_scan_filter ...", flush=True)
         results["cypher_scan_filter"] = cypher_scan_filter(db)
 
-        # 5. Rule-derive (ours-only; must come before cypher_two_hop)
+        # 5. Rule-derive (must come before cypher_two_hop)
         print("  [ours] rule_derive (INDUSTRY_ALIGNMENT) ...", flush=True)
         # max_edges omitted → None → DEFAULT_MAX_EDGES=1_000_000 global budget.
         # This matches v2 benchmark semantics (global cap, not per-source top-k).
@@ -282,7 +282,7 @@ def write_markdown(
       f"rows={cth.get('row_count', 0)} wall={_fmt_s(cth.get('wall_s', float('nan')))}"
       + (f" — {cth['note']}" if cth.get("note") else ""))
     a("")
-    a("## mushroomdb — rule_derive (ours-only)")
+    a("## mushroomdb — rule_derive")
     a("")
     a("Edges are derived when a rule is declared and on every later write that changes")
     a("what it reads. This is the cost of declaring the rules over the loaded graph.")

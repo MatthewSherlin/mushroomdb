@@ -308,12 +308,12 @@ Upgrading from 0.6.10 therefore brings both releases at once.
 written. Run
 [`20260928T195302Z`](benchmarks/agent-tasks/results/20260928T195302Z/summary.md),
 same 2,000-entity world digest as the two before it: the graph arm scores
-**1.000 on all twenty tasks and all sixty cells** against the sqlite baseline's
+**1.000 on all twenty tasks and all sixty cells** against the relational baseline's
 0.990, at **$0.0614 against $0.1127** — cost **-45.6%** with its 95% interval
 `[-0.06875, -0.03147]`, tokens **-26.5%**, turns **-44.3%**, every interval
 excluding zero. 180 cells, 0 timeouts, 0 errors, 0 dropped.
 
-Correctness had been amended on 2026-09-11 to pass on a tie, because the sqlite
+Correctness had been amended on 2026-09-11 to pass on a tie, because the relational
 arm saturated at 1.00 and the original wording — exceed both baselines with the
 interval excluding zero — was judged unpassable by any arm. **This run passes
 the original wording**: +0.0101 against arm Q with `[0.0005, 0.0229]`, and above
@@ -501,7 +501,7 @@ wrong guess came back as a plausible wrong graph rather than an error.
 benchmark's four time-travel tasks were the release's target: in the committed
 run they took 6-10 MCP calls and 450,000-640,000 tokens each, carrying ~67% of
 the graph arm's cost and all of its variance. They now take **one call and about
-50,000 tokens**. Against the sqlite baseline, paired over 20 tasks with every
+50,000 tokens**. Against the relational baseline, paired over 20 tasks with every
 interval excluding zero: **cost -41.2%**, tokens **-26.8%**, turns **-25.6%**.
 The 95% cost interval — the leg the pre-registered gate calls the discriminator,
 and the leg that failed before — is now `[-0.0353, -0.0124]`, **entirely below
