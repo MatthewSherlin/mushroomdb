@@ -1218,7 +1218,7 @@ const ADVANCED_PREFIX: &str = "Advanced: ";
 /// They sit after the readers deliberately. Listing order is ranking and the
 /// questions remain the point; writing is what a session does once, at the
 /// start, before it has anything to ask.
-pub const ASSOCIATION_TOOLS: [&str; 22] = [
+pub const ASSOCIATION_TOOLS: [&str; 23] = [
     "query",
     "explain_association",
     "neighborhood",
@@ -1239,6 +1239,7 @@ pub const ASSOCIATION_TOOLS: [&str; 22] = [
     "create_rule",
     "stats",
     "schema",
+    "analyze",
     "suggest_rules",
     "forget",
 ];
@@ -1762,6 +1763,7 @@ mod tests {
             "recall",
             "remember",
             "schema",
+            "analyze",
             "suggest_rules",
             "forget",
             // The fourteen graph tools.
@@ -1784,12 +1786,12 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            24,
-            "expected exactly 24 tools, got {}",
+            25,
+            "expected exactly 25 tools, got {}",
             names.len()
         );
         assert_eq!(
-            &names[..10],
+            &names[..11],
             [
                 "explain_association",
                 "node_edges",
@@ -1799,12 +1801,13 @@ mod tests {
                 "recall",
                 "remember",
                 "schema",
+                "analyze",
                 "suggest_rules",
                 "forget",
             ],
             "the task tools come first, in order"
         );
-        assert_eq!(names[10], "query", "the graph tools follow them");
+        assert_eq!(names[11], "query", "the graph tools follow them");
     }
 
     /// Binding: the default listing is the association tools, in [`ASSOCIATION_TOOLS`]
@@ -1834,7 +1837,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
-        const EXPECTED: [&str; 22] = [
+        const EXPECTED: [&str; 23] = [
             "query",
             "explain_association",
             "neighborhood",
@@ -1855,6 +1858,7 @@ mod tests {
             "create_rule",
             "stats",
             "schema",
+            "analyze",
             "suggest_rules",
             "forget",
         ];

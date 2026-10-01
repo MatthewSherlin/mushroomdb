@@ -193,7 +193,7 @@ fn tools_list_returns_all_tools_with_schemas() {
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 24);
+    assert_eq!(tools.len(), 25);
 
     let by_name = |n: &str| {
         tools
@@ -1044,7 +1044,7 @@ fn hybrid_search_text_only_and_missing_field_errors() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// The task tools, in the order `tools/list` must list them.
-const TASK_TOOLS: [&str; 10] = [
+const TASK_TOOLS: [&str; 11] = [
     "explain_association",
     "node_edges",
     "neighborhood",
@@ -1053,6 +1053,7 @@ const TASK_TOOLS: [&str; 10] = [
     "recall",
     "remember",
     "schema",
+    "analyze",
     "suggest_rules",
     "forget",
 ];
@@ -1448,7 +1449,7 @@ fn a_memory_store_lists_the_association_surface() {
         server::ASSOCIATION_TOOLS.to_vec(),
         "default tools/list on a memory store"
     );
-    assert_eq!(tools.len(), 22);
+    assert_eq!(tools.len(), 23);
     for hidden in [
         "explore", "map", "context", "impact", "owners", "why", "sync",
     ] {
@@ -3444,7 +3445,7 @@ fn what_if_with_an_edge_type_answers_in_partner_keys() {
 /// said what they *returned* rather than what they were *for*.
 #[test]
 fn every_association_tool_description_opens_with_its_question() {
-    const OPENERS: [(&str, &str); 22] = [
+    const OPENERS: [(&str, &str); 23] = [
         ("query", "Who may see this"),
         ("explain_association", "Why are A and B related"),
         ("neighborhood", "What is around K"),
@@ -3478,6 +3479,7 @@ fn every_association_tool_description_opens_with_its_question() {
         ),
         ("stats", "How big is this store"),
         ("schema", "What's in here"),
+        ("analyze", "What matters here, and what clusters"),
         ("suggest_rules", "What relationships are in my data"),
         ("forget", "Forget that"),
     ];
@@ -3745,7 +3747,7 @@ fn tools_list_has_every_tool_task_tools_first_and_advanced_prefix() {
         .copied()
         .collect();
     assert_eq!(names, expected, "tools/list order");
-    assert_eq!(tools.len(), 24);
+    assert_eq!(tools.len(), 25);
 
     for t in tools.iter().take(TASK_TOOLS.len()) {
         let d = t["description"].as_str().expect("description");
@@ -3964,6 +3966,7 @@ fn every_task_tool_frames_its_text_as_untrusted() {
         "node_edges" | "neighborhood" => json!({"key": "src/core.rs"}),
         "edges_at" => json!({"key": "src/core.rs", "at": 0}),
         "what_if" => json!({"key": "src/core.rs", "field": "lines", "value": 2}),
+        "analyze" => json!({"kind": "central"}),
         // Last in the sweep, and a property the node does not carry: it
         // answers without removing anything a later tool would read.
         "forget" => json!({"key": "src/core.rs", "prop": "no_such_prop"}),
@@ -5623,4 +5626,180 @@ fn proposals_say_they_are_global_and_stop_at_five() {
         "{text}"
     );
     assert!(text.contains("… and "), "the rest are counted: {text}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// analyze — "what matters here, what clusters?"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Two linked groups — a star of five around `hub` and a pair — and four
+/// nodes linked to nothing.
+fn analyze_store(name: &str) -> SharedDb {
+    let db = memory_store(name);
+    {
+        let mut g = db.write();
+        for key in [
+            "hub", "s1", "s2", "s3", "s4", "p1", "p2", "lone1", "lone2", "lone3", "lone4",
+        ] {
+            g.insert_node("Person", key, vec![("name".into(), Value::Str(key.into()))])
+                .unwrap();
+        }
+        for s in ["s1", "s2", "s3", "s4"] {
+            g.insert_edge("KNOWS", s, "hub").unwrap();
+        }
+        g.insert_edge("KNOWS", "p1", "p2").unwrap();
+    }
+    db
+}
+
+#[test]
+fn analyze_central_ranks_the_hub_first_with_its_label() {
+    let (text, report) = task_both(
+        analyze_store("analyze-central"),
+        "analyze",
+        json!({"kind": "central", "top": 3}),
+    );
+    assert!(text.contains("  1. hub [Person]"), "{text}");
+    assert_eq!(report["listed"], json!(3), "{report}");
+    assert_eq!(report["nodes"], json!(11), "{report}");
+}
+
+/// Binding: components are grouped, with sizes, never listed node by node.
+#[test]
+fn analyze_components_reports_groups_and_counts_singletons() {
+    let (text, report) = task_both(
+        analyze_store("analyze-wcc"),
+        "analyze",
+        json!({"kind": "components"}),
+    );
+    assert!(
+        text.contains("6 component(s) over 11 node(s)")
+            && text.contains("largest 5; 4 singleton(s)"),
+        "{text}"
+    );
+    assert!(text.contains("  1. size 5 — hub, s1, s2, s3, s4"), "{text}");
+    assert!(text.contains("  2. size 2 — p1, p2"), "{text}");
+    assert_eq!(
+        report["listed"],
+        json!(2),
+        "singletons are counted, not listed"
+    );
+}
+
+/// Binding (R6): clusters drops singletons and says how many.
+#[test]
+fn analyze_clusters_drops_singletons_and_says_how_many() {
+    let (text, report) = task_both(
+        analyze_store("analyze-louvain"),
+        "analyze",
+        json!({"kind": "clusters"}),
+    );
+    assert!(text.contains("4 singleton(s) not listed"), "{text}");
+    assert_eq!(report["singletons"], json!(4), "{report}");
+    for row in report["rows"].as_array().unwrap() {
+        assert!(row["size"].as_u64().unwrap() > 1, "{row}");
+    }
+}
+
+/// Binding (R6): no wall-clock budget, so the same store gets the same answer.
+#[test]
+fn analyze_answers_the_same_store_the_same_way_every_time() {
+    let db = analyze_store("analyze-determinism");
+    for kind in ["central", "clusters", "components", "degree"] {
+        let first = task_reply(&one_task_call(db.clone(), "analyze", json!({"kind": kind})));
+        let second = task_reply(&one_task_call(db.clone(), "analyze", json!({"kind": kind})));
+        assert_eq!(first, second, "{kind}");
+    }
+}
+
+#[test]
+fn analyze_refuses_an_unknown_kind_and_names_real_edge_types() {
+    let db = analyze_store("analyze-args");
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "analyze",
+        json!({"kind": "vibes"}),
+    ));
+    assert!(
+        err.contains("central, clusters, components, degree"),
+        "{err}"
+    );
+    let err = error_text(&one_task_call(
+        db,
+        "analyze",
+        json!({"kind": "central", "edge_type": "NOPE"}),
+    ));
+    assert!(
+        err.contains("no edge type named NOPE") && err.contains("KNOWS"),
+        "{err}"
+    );
+}
+
+/// Binding (R6): `top` is capped, whatever the caller asks for.
+#[test]
+fn analyze_lists_at_most_fifty_rows() {
+    let db = memory_store("analyze-cap");
+    {
+        let mut g = db.write();
+        for i in 0..120 {
+            g.insert_node("Person", &format!("n{i:03}"), vec![])
+                .unwrap();
+        }
+    }
+    let report = task_report(db, "analyze", json!({"kind": "degree", "top": 500}));
+    assert_eq!(report["listed"], json!(50), "{report}");
+    assert_eq!(report["nodes"], json!(120), "{report}");
+}
+
+/// Review focus: on a 100,000-node store the four analyses and the rule
+/// proposals still answer inside the reply's bounds, and in time.
+///
+/// Ignored because building the store is the slow part, not the tools:
+/// `cargo test --release -p mushroomdb-server --test mcp -- --ignored
+/// analyze_and_suggest_stay_bounded_on_a_100k_node_store`.
+#[test]
+#[ignore = "builds a 100,000-node store; run in release with --ignored"]
+fn analyze_and_suggest_stay_bounded_on_a_100k_node_store() {
+    const NODES: usize = 100_000;
+    let db = open("scale-100k");
+    {
+        let mut g = db.write();
+        let mut b = g.batch();
+        for i in 0..NODES {
+            b.insert_node(
+                if i % 10 == 0 { "Person" } else { "Note" },
+                &format!("n{i}"),
+                vec![("team".into(), Value::Str(format!("t{}", i % 7)))],
+            );
+        }
+        for i in 1..NODES {
+            // A star: every node linked to one hub, the shape of a memory
+            // store where every note is about the same person.
+            b.insert_edge("ABOUT", &format!("n{i}"), "n0");
+        }
+        b.commit().unwrap();
+    }
+    for kind in ["central", "clusters", "components", "degree"] {
+        let started = std::time::Instant::now();
+        let text = task_reply(&one_task_call(
+            db.clone(),
+            "analyze",
+            json!({"kind": kind, "top": 50}),
+        ));
+        let took = started.elapsed();
+        assert!(
+            text.lines().count() <= 51,
+            "{kind}: {} lines",
+            text.lines().count()
+        );
+        assert!(text.len() <= 16_000, "{kind}: {} bytes", text.len());
+        assert!(took.as_secs() < 10, "{kind} took {took:?}");
+        eprintln!("{kind}: {took:?}, {} bytes", text.len());
+    }
+    let started = std::time::Instant::now();
+    let text = task_reply(&one_task_call(db.clone(), "suggest_rules", json!({})));
+    let took = started.elapsed();
+    assert!(text.len() <= 16_000, "suggest_rules: {} bytes", text.len());
+    assert!(took.as_secs() < 10, "suggest_rules took {took:?}");
+    eprintln!("suggest_rules: {took:?}, {} bytes", text.len());
 }

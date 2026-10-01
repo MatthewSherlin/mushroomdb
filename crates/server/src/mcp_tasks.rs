@@ -63,7 +63,7 @@ use std::path::Path;
 /// they are the same question widened: every relationship of one node rather
 /// than of one pair, that listing at a past commit, and that listing under a
 /// change that has not been made.
-pub(crate) const TASK_TOOLS: [&str; 10] = [
+pub(crate) const TASK_TOOLS: [&str; 11] = [
     "explain_association",
     "node_edges",
     "neighborhood",
@@ -72,6 +72,7 @@ pub(crate) const TASK_TOOLS: [&str; 10] = [
     "recall",
     "remember",
     "schema",
+    "analyze",
     "suggest_rules",
     "forget",
 ];
@@ -103,6 +104,7 @@ pub(crate) fn dispatch(
         "recall" => tool_recall(db, db_dir, args, json_out),
         "remember" => tool_remember(db, args, json_out),
         "schema" => tool_schema(db, json_out),
+        "analyze" => tool_analyze(db, args, json_out),
         "suggest_rules" => tool_suggest_rules(db, json_out),
         "forget" => tool_forget(db, args, json_out),
         _ => unreachable!("TASK_TOOLS and this match list the same names"),
@@ -2446,6 +2448,256 @@ fn tool_suggest_rules(db: &SharedDb, json_out: bool) -> CallOutcome {
     ok(json_out, &out, render_suggestions)
 }
 
+// ── analyze ──────────────────────────────────────────────────────────────────
+
+/// Rows `analyze` lists when the caller names no `top`, and the most it will.
+const ANALYZE_DEFAULT_TOP: usize = 10;
+const ANALYZE_MAX_TOP: usize = 50;
+
+/// Member keys shown per component or cluster; the rest are counted.
+const ANALYZE_SAMPLE_MEMBERS: usize = 5;
+
+/// Characters of one key `analyze` prints before cutting it with `…`.
+const ANALYZE_KEY_CHARS: usize = 80;
+
+/// The kinds `analyze` answers.
+const ANALYZE_KINDS: [&str; 4] = ["central", "clusters", "components", "degree"];
+
+fn top_arg(args: &Js) -> Result<usize, String> {
+    match args.get("top") {
+        None | Some(Js::Null) => Ok(ANALYZE_DEFAULT_TOP),
+        Some(v) => match v.as_u64() {
+            Some(0) | None => Err("top must be a positive integer".into()),
+            Some(n) => Ok(usize::try_from(n)
+                .unwrap_or(ANALYZE_MAX_TOP)
+                .min(ANALYZE_MAX_TOP)),
+        },
+    }
+}
+
+/// A key as `analyze` prints it: sanitized and cut at [`ANALYZE_KEY_CHARS`].
+fn shown_key(key: &str) -> String {
+    let s = digest::sanitize(key);
+    if s.chars().count() <= ANALYZE_KEY_CHARS {
+        return s;
+    }
+    let mut cut: String = s.chars().take(ANALYZE_KEY_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
+/// `members` as a sample line: the first few keys, and how many more.
+fn sample(members: &[String]) -> String {
+    let shown: Vec<String> = members
+        .iter()
+        .take(ANALYZE_SAMPLE_MEMBERS)
+        .map(|k| shown_key(k))
+        .collect();
+    let more = members.len().saturating_sub(shown.len());
+    if more > 0 {
+        format!("{} (+{more} more)", shown.join(", "))
+    } else {
+        shown.join(", ")
+    }
+}
+
+/// One ranked node line: rank, key, label, value, and its summary when it has one.
+fn node_row(
+    g: &core_api::GraphDb<core_api::RealFs>,
+    rank: usize,
+    key: &str,
+    value: &str,
+) -> (String, Js) {
+    let label = g
+        .node_ref(key)
+        .map(|n| n.label().to_string())
+        .unwrap_or_default();
+    let summary = g.node_summary_line(key);
+    let mut line = format!(
+        "{rank:>3}. {} [{}] {value}",
+        shown_key(key),
+        digest::sanitize(&label)
+    );
+    if let Some(s) = &summary {
+        line.push_str(&format!(" — {}", digest::sanitize(s)));
+    }
+    line.push('\n');
+    (
+        line,
+        json!({ "key": key, "label": label, "value": value, "summary": summary }),
+    )
+}
+
+fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
+    let kind = match str_arg(args, "kind") {
+        Ok(k) => k.to_string(),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    if !ANALYZE_KINDS.contains(&kind.as_str()) {
+        return CallOutcome::ToolErr(format!(
+            "kind must be one of {}, got {:?}",
+            ANALYZE_KINDS.join(", "),
+            kind
+        ));
+    }
+    let top = match top_arg(args) {
+        Ok(t) => t,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let edge_type = match opt_str_arg(args, "edge_type") {
+        Ok(t) => t.map(str::to_string),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    if let Some(t) = &edge_type {
+        if let Some(msg) = unknown_edge_type(db, std::slice::from_ref(t)) {
+            return CallOutcome::ToolErr(msg);
+        }
+    }
+    let over = edge_type.as_deref().map_or_else(
+        || "every edge type".to_string(),
+        |t| format!("{} edges", digest::sanitize(t)),
+    );
+    // `budget_ms: 0` everywhere: a wall-clock budget makes the answer depend on
+    // the machine's load, and the same question must get the same answer.
+    // Measured on a 100,000-node, 180,000-edge store in a release build, the
+    // slowest of the four ran in 88 ms unbudgeted.
+    let g = db.read();
+    let (text, doc) = match kind.as_str() {
+        "central" | "degree" => {
+            let (scores, header): (Vec<(String, String)>, String) = if kind == "central" {
+                let r = g.pagerank(&core_api::PageRankConfig {
+                    edge_type: edge_type.clone(),
+                    budget_ms: 0,
+                    ..Default::default()
+                });
+                let note = if r.converged {
+                    "converged"
+                } else {
+                    "stopped at 50 iterations"
+                };
+                (
+                    r.scores
+                        .iter()
+                        .map(|(k, s)| (k.clone(), format!("{s:.6}")))
+                        .collect(),
+                    format!("PageRank over {over}, {note}"),
+                )
+            } else {
+                let r = g.degree_centrality(&core_api::DegreeConfig {
+                    edge_type: edge_type.clone(),
+                    budget_ms: 0,
+                    ..Default::default()
+                });
+                (
+                    r.scores
+                        .iter()
+                        .map(|(k, d)| (k.clone(), format!("degree {d}")))
+                        .collect(),
+                    format!("degree over {over}, in and out"),
+                )
+            };
+            let mut text = format!(
+                "mushroomdb analyze {kind} — {header}; {} node(s), top {}\n",
+                scores.len(),
+                top.min(scores.len())
+            );
+            let mut rows = Vec::new();
+            for (i, (k, v)) in scores.iter().take(top).enumerate() {
+                let (line, row) = node_row(&g, i + 1, k, v);
+                text.push_str(&line);
+                rows.push(row);
+            }
+            (
+                text,
+                json!({ "kind": kind, "nodes": scores.len(), "listed": rows.len(), "rows": rows }),
+            )
+        }
+        "components" => {
+            let r = g.connected_components(&core_api::WccConfig {
+                edge_type: edge_type.clone(),
+                budget_ms: 0,
+                ..Default::default()
+            });
+            let mut groups: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+            for (key, comp) in &r.components {
+                groups.entry(comp.as_str()).or_default().push(key.clone());
+            }
+            let mut groups: Vec<Vec<String>> = groups.into_values().collect();
+            groups.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
+            let singletons = groups.iter().filter(|g| g.len() == 1).count();
+            let mut text = format!(
+                "mushroomdb analyze components — {} component(s) over {} node(s) by {over}; \
+                 largest {}; {singletons} singleton(s)\n",
+                groups.len(),
+                r.components.len(),
+                groups.first().map_or(0, Vec::len)
+            );
+            let mut rows = Vec::new();
+            for (i, members) in groups.iter().filter(|g| g.len() > 1).take(top).enumerate() {
+                text.push_str(&format!(
+                    "{:>3}. size {} — {}\n",
+                    i + 1,
+                    members.len(),
+                    sample(members)
+                ));
+                rows.push(json!({
+                    "size": members.len(),
+                    "members": members.iter().take(ANALYZE_SAMPLE_MEMBERS).collect::<Vec<_>>()
+                }));
+            }
+            (
+                text,
+                json!({
+                    "kind": kind, "nodes": r.components.len(), "components": groups.len(),
+                    "singletons": singletons, "listed": rows.len(), "rows": rows
+                }),
+            )
+        }
+        _ => {
+            let r = g.communities(&core_api::LouvainConfig {
+                edge_types: edge_type.clone().into_iter().collect(),
+                budget_ms: 0,
+                ..Default::default()
+            });
+            let nodes: usize = r.communities.iter().map(|c| c.members.len()).sum();
+            let (multi, single): (Vec<_>, Vec<_>) =
+                r.communities.iter().partition(|c| c.members.len() > 1);
+            let mut text = format!(
+                "mushroomdb analyze clusters — {} cluster(s) of two or more over {nodes} node(s) \
+                 by {over}, modularity {:.3}; {} singleton(s) not listed\n",
+                multi.len(),
+                r.modularity,
+                single.len()
+            );
+            let mut rows = Vec::new();
+            for (i, c) in multi.iter().take(top).enumerate() {
+                text.push_str(&format!(
+                    "{:>3}. size {}, cohesion {:.2} — {}\n",
+                    i + 1,
+                    c.members.len(),
+                    c.cohesion,
+                    sample(&c.members)
+                ));
+                rows.push(json!({
+                    "size": c.members.len(),
+                    "cohesion": c.cohesion,
+                    "members": c.members.iter().take(ANALYZE_SAMPLE_MEMBERS).collect::<Vec<_>>()
+                }));
+            }
+            (
+                text,
+                json!({
+                    "kind": kind, "nodes": nodes, "clusters": multi.len(),
+                    "singletons": single.len(), "modularity": r.modularity,
+                    "listed": rows.len(), "rows": rows
+                }),
+            )
+        }
+    };
+    drop(g);
+    ok(json_out, &doc, |_| text)
+}
+
 // ── tools/list ───────────────────────────────────────────────────────────────
 
 /// The `json` argument every task tool takes, added to every task tool's schema
@@ -2720,6 +2972,31 @@ fn task_tool_schemas() -> Vec<Js> {
             "name": "schema",
             "description": "What's in here — the store's labels with their property names, its edge types and what derives them, every rule with its predicate, the full-text fields recall searches, the equality indexes, and how many provisional nodes remember created. Call it before writing Cypher against a store you have not seen.",
             "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "analyze",
+            "description": "What matters here, and what clusters — over the whole store, with no role or mask applied. kind 'central' ranks nodes by PageRank, 'degree' by edge count, 'components' groups connected nodes with sizes, 'clusters' finds communities of two or more. 'top' (default 10, at most 50) bounds the rows; 'edge_type' restricts to one type. The same store always gets the same answer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["central", "clusters", "components", "degree"],
+                        "description": "Which question."
+                    },
+                    "top": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Rows to list (default 10)."
+                    },
+                    "edge_type": {
+                        "type": "string",
+                        "description": "Only edges of this type."
+                    }
+                },
+                "required": ["kind"]
+            }
         }),
         json!({
             "name": "suggest_rules",
