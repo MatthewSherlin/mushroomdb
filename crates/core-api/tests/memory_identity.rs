@@ -431,3 +431,121 @@ fn the_reader_survives_the_preset_on_an_empty_store() {
         .map_err(|e| e.to_string());
     assert_eq!(rows, Ok(1));
 }
+
+// ── resolution: complete linkage ────────────────────────────────────────────
+
+use core_api::memory::identity::identity_clusters;
+
+/// A node with no name whose alias set is its key plus `words`.
+fn tagged(key: &str, words: std::ops::RangeInclusive<u32>) -> EntityIn {
+    EntityIn {
+        key: key.into(),
+        label: "Person".into(),
+        props: BTreeMap::new(),
+        aliases: words.map(|w| format!("t{w}")).collect(),
+    }
+}
+
+fn clusters_of(db: &GraphDb<core_storage::fs::RealFs>) -> Vec<Vec<String>> {
+    identity_clusters(db, SAME_AS_FLOOR)
+        .clusters
+        .into_iter()
+        .map(|c| c.members)
+        .collect()
+}
+
+/// c0~c1 at 9/13 and c1~c2 at 9/13, but c0~c2 at 8/14 is below the floor.
+/// Closure would make one person of three; complete linkage does not.
+#[test]
+fn a_chain_of_two_claims_is_not_one_identity() {
+    let mut db = identity_store("chain");
+    remember_people(
+        &mut db,
+        "chain",
+        vec![
+            tagged("c0", 1..=10),
+            tagged("c1", 2..=11),
+            tagged("c2", 3..=12),
+        ],
+    );
+    assert_eq!(
+        identity_clusters(&db, SAME_AS_FLOOR).claims,
+        2,
+        "the fixture must hold exactly the two adjacent claims"
+    );
+    assert_eq!(clusters_of(&db), vec![strings(&["c0", "c1"])]);
+}
+
+/// Locality: a hundred unrelated linked pairs added after the fact do not move
+/// an existing identity. Modularity clustering fails exactly this.
+#[test]
+fn unrelated_identities_cannot_move_an_existing_one() {
+    let mut db = identity_store("local");
+    remember_people(
+        &mut db,
+        "chain",
+        vec![
+            tagged("c0", 1..=10),
+            tagged("c1", 2..=11),
+            tagged("c2", 3..=12),
+        ],
+    );
+    let before = clusters_of(&db);
+    for i in 0..100 {
+        let name = format!("Other Person{i}");
+        remember_people(
+            &mut db,
+            &format!("pair {i}"),
+            vec![
+                person(&format!("x{i}"), &name, &[]),
+                person(&format!("y{i}"), &name, &[]),
+            ],
+        );
+    }
+    let after = clusters_of(&db);
+    assert_eq!(after.len(), 101, "a hundred pairs plus the chain's one");
+    assert!(
+        after.contains(&before[0]),
+        "the chain's identity moved: {after:?}"
+    );
+}
+
+/// The canonical is the oldest live node, whatever its key sorts as, and it
+/// survives a rename — the id does.
+#[test]
+fn the_canonical_is_the_oldest_live_node() {
+    let mut db = identity_store("canonical");
+    remember_people(&mut db, "first", vec![person("zed", "Zed Shaw", &[])]);
+    remember_people(&mut db, "second", vec![person("abe", "Zed Shaw", &[])]);
+    let report = identity_clusters(&db, SAME_AS_FLOOR);
+    assert_eq!(
+        report.clusters[0].canonical, "zed",
+        "oldest, not first by key"
+    );
+    assert_eq!(report.clusters[0].members, strings(&["zed", "abe"]));
+    // {zed, zed shaw, shaw} against {abe, zed shaw, zed, shaw}: 3/4.
+    assert!((report.clusters[0].weakest - 0.75).abs() < 1e-12);
+
+    db.rename_node("zed", "zed-shaw").unwrap();
+    assert_eq!(
+        identity_clusters(&db, SAME_AS_FLOOR).clusters[0].canonical,
+        "zed-shaw"
+    );
+
+    remember_people(&mut db, "third", vec![person("zs", "Zed Shaw", &[])]);
+    db.delete_node("zed-shaw").unwrap();
+    let report = identity_clusters(&db, SAME_AS_FLOOR);
+    assert_eq!(
+        report.clusters[0].canonical, "abe",
+        "the next oldest live node"
+    );
+    assert_eq!(report.clusters[0].members, strings(&["abe", "zs"]));
+}
+
+#[test]
+fn a_store_without_claims_has_no_identities() {
+    let db = identity_store("none");
+    let report = identity_clusters(&db, SAME_AS_FLOOR);
+    assert!(report.clusters.is_empty());
+    assert_eq!((report.linked, report.claims), (0, 0));
+}

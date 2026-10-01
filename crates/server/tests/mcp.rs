@@ -5660,6 +5660,10 @@ fn analyze_central_ranks_the_hub_first_with_its_label() {
         json!({"kind": "central", "top": 3}),
     );
     assert!(text.contains("  1. hub [Person]"), "{text}");
+    assert!(
+        text.contains("PageRank over every edge type, following edge direction, converged"),
+        "{text}"
+    );
     assert_eq!(report["listed"], json!(3), "{report}");
     assert_eq!(report["nodes"], json!(11), "{report}");
 }
@@ -5721,7 +5725,7 @@ fn analyze_refuses_an_unknown_kind_and_names_real_edge_types() {
         json!({"kind": "vibes"}),
     ));
     assert!(
-        err.contains("central, clusters, components, degree"),
+        err.contains("central, clusters, components, degree, identities"),
         "{err}"
     );
     let err = error_text(&one_task_call(
@@ -6016,4 +6020,39 @@ fn suggest_rules_json_example_scores_are_two_decimal_places() {
             "an example score past two decimal places: {report}"
         );
     }
+}
+
+/// Binding (OD-3): `analyze` resolves SAME_AS into identities — every pair
+/// linked, the oldest node first — and takes no edge type for it.
+#[test]
+fn analyze_identities_lists_each_identity_under_its_oldest_node() {
+    let db = identity_store("analyze-identities");
+    for (i, key) in ["matthew-sherlin", "msherlin"].iter().enumerate() {
+        one_task_call(
+            db.clone(),
+            "remember",
+            json!({"text": format!("mention {i}"),
+                   "entities": [{"key": key, "label": "Person",
+                                 "props": {"name": "Matthew Sherlin"}}]}),
+        );
+    }
+    let (text, report) = task_both(db.clone(), "analyze", json!({"kind": "identities"}));
+    assert!(
+        text.contains("1 identit(ies) over 2 linked node(s), 1 SAME_AS claim(s) at ≥ 0.6"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  1. matthew-sherlin — matthew-sherlin, msherlin, weakest link 0.60"),
+        "{text}"
+    );
+    assert_eq!(report["rows"][0]["canonical"], json!("matthew-sherlin"));
+    let err = error_text(&one_task_call(
+        db,
+        "analyze",
+        json!({"kind": "identities", "edge_type": "SAME_AS"}),
+    ));
+    assert!(
+        err.contains("edge_type does not apply to identities"),
+        "{err}"
+    );
 }

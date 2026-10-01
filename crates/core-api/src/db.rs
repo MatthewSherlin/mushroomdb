@@ -7451,6 +7451,17 @@ impl<F: Fs> GraphDb<F> {
         self.prop_index.enabled_pairs().cloned().collect()
     }
 
+    /// The dense id of a live key, `None` for an unknown or deleted one.
+    ///
+    /// Ids are allocated in insertion order and never reused, so the lowest
+    /// live id among a set of keys is the oldest node — which is how identity
+    /// resolution picks a canonical node without a timestamp field
+    /// (`memory::identity`). Crate-private: an id is an engine detail, not
+    /// something a caller should hold.
+    pub(crate) fn dense_id(&self, key: &str) -> Option<u32> {
+        self.ids.get(key)
+    }
+
     /// Start recording insert-count multiplicity on this store (§5.13).
     ///
     /// Adjacency stays a set and nothing about an existing read changes: a

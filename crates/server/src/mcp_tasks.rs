@@ -2558,7 +2558,7 @@ const ANALYZE_SAMPLE_MEMBERS: usize = 5;
 const ANALYZE_KEY_CHARS: usize = 80;
 
 /// The kinds `analyze` answers.
-const ANALYZE_KINDS: [&str; 4] = ["central", "clusters", "components", "degree"];
+const ANALYZE_KINDS: [&str; 5] = ["central", "clusters", "components", "degree", "identities"];
 
 fn top_arg(args: &Js) -> Result<usize, String> {
     match args.get("top") {
@@ -2645,6 +2645,11 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Ok(t) => t.map(str::to_string),
         Err(e) => return CallOutcome::ToolErr(e),
     };
+    if kind == "identities" && edge_type.is_some() {
+        return CallOutcome::ToolErr(
+            "edge_type does not apply to identities: they are read from SAME_AS alone".into(),
+        );
+    }
     if let Some(t) = &edge_type {
         if let Some(msg) = unknown_edge_type(db, std::slice::from_ref(t)) {
             return CallOutcome::ToolErr(msg);
@@ -2662,22 +2667,23 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let (text, doc) = match kind.as_str() {
         "central" | "degree" => {
             let (scores, header): (Vec<(String, String)>, String) = if kind == "central" {
-                let r = g.pagerank(&core_api::PageRankConfig {
+                let config = core_api::PageRankConfig {
                     edge_type: edge_type.clone(),
                     budget_ms: 0,
                     ..Default::default()
-                });
+                };
+                let r = g.pagerank(&config);
                 let note = if r.converged {
-                    "converged"
+                    "converged".to_string()
                 } else {
-                    "stopped at 50 iterations"
+                    format!("stopped at {} iterations", config.max_iters)
                 };
                 (
                     r.scores
                         .iter()
                         .map(|(k, s)| (k.clone(), format!("{s:.6}")))
                         .collect(),
-                    format!("PageRank over {over}, {note}"),
+                    format!("PageRank over {over}, following edge direction, {note}"),
                 )
             } else {
                 let r = g.degree_centrality(&core_api::DegreeConfig {
@@ -2747,6 +2753,41 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 json!({
                     "kind": kind, "nodes": r.components.len(), "components": groups.len(),
                     "singletons": singletons, "listed": rows.len(), "rows": rows
+                }),
+            )
+        }
+        "identities" => {
+            use core_api::memory::identity::{identity_clusters, SAME_AS_FLOOR};
+            let r = identity_clusters(&g, SAME_AS_FLOOR);
+            let mut text = format!(
+                "mushroomdb analyze identities — {} identit(ies) over {} linked node(s), \
+                 {} SAME_AS claim(s) at ≥ {SAME_AS_FLOOR}; every pair in an identity is \
+                 linked, and the oldest node is canonical\n",
+                r.clusters.len(),
+                r.linked,
+                r.claims
+            );
+            let mut rows = Vec::new();
+            for (i, c) in r.clusters.iter().take(top).enumerate() {
+                text.push_str(&format!(
+                    "{:>3}. {} — {}, weakest link {:.2}\n",
+                    i + 1,
+                    shown_key(&c.canonical),
+                    sample(&c.members),
+                    c.weakest
+                ));
+                rows.push(json!({
+                    "canonical": c.canonical,
+                    "size": c.members.len(),
+                    "weakest": c.weakest,
+                    "members": c.members.iter().take(ANALYZE_SAMPLE_MEMBERS).collect::<Vec<_>>()
+                }));
+            }
+            (
+                text,
+                json!({
+                    "kind": kind, "identities": r.clusters.len(), "linked": r.linked,
+                    "claims": r.claims, "floor": r.floor, "listed": rows.len(), "rows": rows
                 }),
             )
         }
@@ -3077,13 +3118,13 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "analyze",
-            "description": "What matters here, and what clusters — over the whole store, with no role or mask applied. kind 'central' ranks nodes by PageRank, 'degree' by edge count, 'components' groups connected nodes with sizes, 'clusters' finds communities of two or more. 'top' (default 10, at most 50) bounds the rows; 'edge_type' restricts to one type. The same store always gets the same answer.",
+            "description": "What matters here, and what clusters — over the whole store, with no role or mask applied. kind 'central' ranks nodes by PageRank along edge direction, 'degree' by edge count, 'components' groups connected nodes with sizes, 'clusters' finds communities of two or more, 'identities' resolves SAME_AS links into sets every pair of which is linked, oldest node first. 'top' (default 10, at most 50) bounds the rows; 'edge_type' restricts to one type. The same store always gets the same answer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "kind": {
                         "type": "string",
-                        "enum": ["central", "clusters", "components", "degree"],
+                        "enum": ["central", "clusters", "components", "degree", "identities"],
                         "description": "Which question."
                     },
                     "top": {

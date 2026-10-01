@@ -267,6 +267,118 @@ pub fn write_aliases<F: Fs>(db: &mut GraphDb<F>, lists: &[(String, Vec<String>)]
     batch.commit().map(|_| ())
 }
 
+/// One resolved identity: nodes every pair of which is linked by `SAME_AS`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct IdentityCluster {
+    /// The oldest member — the lowest live dense id.
+    pub canonical: String,
+    /// Every member, oldest first; `members[0] == canonical`.
+    pub members: Vec<String>,
+    /// The lowest pairwise score inside the cluster.
+    pub weakest: f64,
+}
+
+/// [`identity_clusters`]' answer.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct IdentityReport {
+    /// Largest first, then oldest canonical first.
+    pub clusters: Vec<IdentityCluster>,
+    /// Nodes with at least one `SAME_AS` claim at or above the floor.
+    pub linked: usize,
+    /// Distinct unordered pairs at or above the floor.
+    pub claims: usize,
+    /// The floor the claims were read at.
+    pub floor: f64,
+}
+
+/// Resolve `SAME_AS` claims into identities, by complete linkage.
+///
+/// A cluster is a set in which **every** pair is linked at `floor` or above.
+/// Built greedily and deterministically: seeds in ascending dense id, and for
+/// each seed its neighbours in ascending dense id, each admitted only if it is
+/// linked to every member admitted so far. A node goes into the first cluster
+/// that admits it and no other.
+///
+/// Three properties follow, and each is the reason for the choice:
+///
+/// - **No daisy chain.** `a~b` and `b~c` without `a~c` is two claims, not one
+///   person, so `c` is not pulled in. Transitive closure would merge them;
+///   so does modularity clustering once the rest of the graph is large
+///   (`communities` put a six-node chain into one community beside 300
+///   unrelated pairs, and split it when alone).
+/// - **Locality.** A cluster depends only on the nodes linked to its members.
+///   Adding a node with no claim to them cannot move it.
+/// - **A stable canonical.** Ids are never reused and a new node always gets
+///   a higher one, so a later arrival can join a cluster but never displace
+///   its canonical — the oldest node, as settled in the spec's O-2.
+///
+/// A singleton is not a cluster and is not returned. Reads every `SAME_AS`
+/// edge once ([`GraphDb::weighted_edges`]); an edge with no score is a
+/// caller's own assertion and counts as 1.0.
+pub fn identity_clusters<F: Fs>(db: &GraphDb<F>, floor: f64) -> IdentityReport {
+    use std::collections::BTreeMap;
+    let mut key_of: BTreeMap<u32, String> = BTreeMap::new();
+    let mut adj: BTreeMap<u32, BTreeMap<u32, f64>> = BTreeMap::new();
+    for (src, dst, weight) in db.weighted_edges(SAME_AS_EDGE, Some(SAME_AS_WEIGHT)) {
+        let score = weight.unwrap_or(1.0);
+        if score < floor || src == dst {
+            continue;
+        }
+        let (Some(s), Some(d)) = (db.dense_id(&src), db.dense_id(&dst)) else {
+            continue;
+        };
+        key_of.insert(s, src);
+        key_of.insert(d, dst);
+        for (x, y) in [(s, d), (d, s)] {
+            let slot = adj.entry(x).or_default().entry(y).or_insert(score);
+            if score > *slot {
+                *slot = score;
+            }
+        }
+    }
+    let claims = adj.values().map(BTreeMap::len).sum::<usize>() / 2;
+    let mut assigned: BTreeSet<u32> = BTreeSet::new();
+    let mut clusters: Vec<(u32, Vec<u32>, f64)> = Vec::new();
+    for (&seed, neighbours) in &adj {
+        if !assigned.insert(seed) {
+            continue;
+        }
+        let mut members = vec![seed];
+        let mut weakest = f64::INFINITY;
+        for &cand in neighbours.keys() {
+            if assigned.contains(&cand) {
+                continue;
+            }
+            let scores: Option<Vec<f64>> = members
+                .iter()
+                .map(|m| adj.get(m).and_then(|n| n.get(&cand)).copied())
+                .collect();
+            if let Some(scores) = scores {
+                weakest = scores.into_iter().fold(weakest, f64::min);
+                members.push(cand);
+            }
+        }
+        if members.len() > 1 {
+            assigned.extend(members.iter().copied());
+            clusters.push((seed, members, weakest));
+        }
+    }
+    clusters.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+    IdentityReport {
+        clusters: clusters
+            .into_iter()
+            .map(|(seed, members, weakest)| IdentityCluster {
+                canonical: key_of[&seed].clone(),
+                members: members.iter().map(|m| key_of[m].clone()).collect(),
+                weakest,
+            })
+            .collect(),
+        linked: adj.len(),
+        claims,
+        floor,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
