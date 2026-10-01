@@ -2065,3 +2065,97 @@ fn an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool() {
         "{text}"
     );
 }
+
+/// Binding: the Cypher rows a `--delivery cli` skill teaches run as a shell
+/// would run them.
+///
+/// That skill's CLI table is the only place such a session learns to write a
+/// fact, and the engine's Cypher takes single-quoted strings only: an example
+/// with a double-quoted string is `illegal character '"'`, and a template
+/// that wraps the statement in single quotes ends at the first string
+/// literal. So the rows are run as printed — the row's command with the
+/// row's own example as its statement — behind the binary this test built,
+/// never a launcher that may fetch a package.
+#[test]
+fn the_cli_skills_cypher_rows_run_as_a_shell_runs_them() {
+    // A space in the store path: the row quotes it, and has to keep doing so.
+    let db_dir = tmp("skill-cli-rows").join("mushroom memory");
+    let template = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/mushroom/SKILL.md"),
+    )
+    .expect("skill template");
+    let skill = cli::install::render_template(
+        &template,
+        &db_dir.to_string_lossy(),
+        "\"$MUSHROOMDB_UNDER_TEST\"",
+        cli::install::Delivery::Cli,
+    )
+    .expect("the committed template's regions are well formed");
+
+    // The code spans of one table row, in order.
+    let row = |question: &str| -> Vec<String> {
+        let line = skill
+            .lines()
+            .find(|l| l.starts_with(&format!("| {question} |")))
+            .unwrap_or_else(|| panic!("no `{question}` row in the cli skill:\n{skill}"));
+        line.split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    };
+    let sh = |command: &str| {
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("MUSHROOMDB_UNDER_TEST", env!("CARGO_BIN_EXE_mushroomdb"))
+            .output()
+            .unwrap()
+    };
+
+    // The durable fact: the `query` form, with the example the row gives for
+    // it and the two placeholders filled in.
+    let fact = row("anything else, including a durable fact");
+    let command = &fact[0];
+    let example = fact
+        .iter()
+        .find(|span| span.starts_with("CREATE "))
+        .unwrap_or_else(|| panic!("the row gives no CREATE example: {fact:?}"));
+    assert!(command.contains("<cypher>"), "{command}");
+    let write = command.replace(
+        "<cypher>",
+        &example
+            .replace("<fresh-id>", "1")
+            .replace("<the fact>", "ada likes tea"),
+    );
+    let out = sh(&write);
+    assert!(
+        out.status.success(),
+        "the write the skill teaches does not run: {write}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&db_dir)
+        .arg("MATCH (n:Note) RETURN n.id AS id, n.text AS text")
+        .output()
+        .unwrap();
+    let rows = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        rows.contains("note:1") && rows.contains("ada likes tea"),
+        "the note landed in the store the row named: {out:?}"
+    );
+
+    // The dated read: the same trap, one row up. A string literal in the
+    // statement is what a careless template breaks on.
+    let then = row("what did it look like then");
+    let read = then[0].replace("<date>", "2100-01-01").replace(
+        "<cypher>",
+        "MATCH (n:Note) WHERE n.id = 'note:1' RETURN n.text AS text",
+    );
+    let out = sh(&read);
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ada likes tea"),
+        "the dated read the skill teaches does not run: {read}: {out:?}"
+    );
+}

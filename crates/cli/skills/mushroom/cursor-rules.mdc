@@ -25,7 +25,7 @@ One call per question, on the store's own keys:
 - **what would this change do** → `what_if a <field> <value>`, the derived edges a change would lose and gain, nothing written.
 - **who may see** → `query` with a `role` from the store's `roles.json`.
 - **how many** → a counting Cypher over the labels and edge types the brief named.
-- **a durable fact** → `remember` with `text` and the existing keys it is `about`; say the returned key (`note:` plus 16 hex) back. What was remembered → `recall`.
+- **a durable fact** → `remember` with `text` and the keys it is `about`; say the returned key (`note:` plus 16 hex) back. What was remembered → `recall`.
 
 Since when → `node_history`, `edge_history`, `was_linked`; around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`; what's in here → `schema`; what matters, what clusters, which keys are one entity → `analyze`; forget it → `forget`. All take `json: true`, the raw report instead of the digest. You want the digest.
 

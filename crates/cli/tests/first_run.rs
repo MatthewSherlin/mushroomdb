@@ -242,3 +242,87 @@ fn an_mcp_created_store_can_find_the_entity_it_was_told_about() {
         "recall for the entity's own name did not return the entity's key.\ngot: {recalled}"
     );
 }
+
+/// The README's quick start, run as printed: remember → recall →
+/// suggest_rules → (create_rule, on approval) → explain_association.
+///
+/// The README may only print a flow this test proves. A dozen people in two
+/// teams is the smallest store the flow is claimed for: `suggest_rules` needs
+/// enough nodes sharing a value to propose a rule over it.
+#[test]
+fn the_readme_quick_start_runs_as_printed() {
+    let dir = tmp("quickstart");
+
+    // remember ×12 — each a sentence and the entity it names, with a team.
+    let mut calls: Vec<Js> = (0..12u64)
+        .map(|i| {
+            let team = ["infra", "ui"][(i % 2) as usize];
+            serde_json::json!({"jsonrpc":"2.0","id":i + 1,"method":"tools/call","params":{
+                "name":"remember","arguments":{
+                    "text": format!("Person {i} joined the {team} team"),
+                    "ts": 1_759_000_000u64 + i,
+                    "entities":[{"key": format!("p{i}"), "label":"Person",
+                                 "props":{"name": format!("Person {i}"), "team": team}}]}}})
+        })
+        .collect();
+    // recall, in ordinary words.
+    calls.push(
+        serde_json::json!({"jsonrpc":"2.0","id":20,"method":"tools/call","params":{
+        "name":"recall","arguments":{"topic":"who joined the infra team"}}}),
+    );
+    // suggest_rules, as data, so the proposal's arguments can be passed on.
+    calls.push(
+        serde_json::json!({"jsonrpc":"2.0","id":21,"method":"tools/call","params":{
+        "name":"suggest_rules","arguments":{"json":true}}}),
+    );
+    let r = mcp(&dir, &calls);
+
+    for id in 1..=12u64 {
+        assert!(
+            !is_error(&r[&id]),
+            "remember {id} failed: {}",
+            text_of(&r[&id])
+        );
+    }
+    let recalled = text_of(&r[&20]);
+    assert!(
+        recalled.contains("note:") && recalled.contains("infra"),
+        "recall did not return a remembered fact: {recalled}"
+    );
+
+    let report: Js = serde_json::from_str(&text_of(&r[&21])).expect("suggest_rules json");
+    let over_team = report["suggestions"]
+        .as_array()
+        .expect("suggestions")
+        .iter()
+        .find(|s| {
+            s["create_rule_args"]
+                .to_string()
+                .contains("\"field\":\"team\"")
+        })
+        .unwrap_or_else(|| panic!("no proposal over `team` on a twelve-person store: {report}"));
+    let args = over_team["create_rule_args"].clone();
+    let rule_name = args["name"].as_str().expect("a rule name").to_string();
+
+    // create_rule with the proposal's arguments, unchanged; then the question
+    // the product exists for.
+    let r = mcp(
+        &dir,
+        &[
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"create_rule","arguments": args}}),
+            serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":"explain_association","arguments":{"a":"p0","b":"p2"}}}),
+        ],
+    );
+    assert!(
+        !is_error(&r[&1]),
+        "create_rule refused its own suggestion: {}",
+        text_of(&r[&1])
+    );
+    let why = text_of(&r[&2]);
+    assert!(
+        why.contains(&rule_name) && why.contains("team"),
+        "explain_association did not name the rule and the field: {why}"
+    );
+}

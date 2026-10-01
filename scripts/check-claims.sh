@@ -141,6 +141,20 @@ for f in "${CLAIM_FILES[@]}"; do
   done
 done
 
+# Commands the docs printed that do not exist. `claude marketplace add` was
+# the first install line in seven files; the subcommand lives under `plugin`.
+RETIRED_COMMANDS=('claude marketplace add')
+for f in "${CLAIM_FILES[@]}"; do
+  [[ -f "$f" ]] || continue
+  for pat in "${RETIRED_COMMANDS[@]}"; do
+    if hits="$(grep -n -F -- "$pat" "$f")"; then
+      echo "check-claims.sh: $f prints a command that does not exist — '$pat':" >&2
+      printf '%s\n' "$hits" | sed "s|^|  $f:|" >&2
+      fail=1
+    fi
+  done
+done
+
 # The stub-docstring drift check. Separate script, one gate: a caller reading a
 # thinner contract than the binding carries is the same class of defect as a
 # retired claim, and CI already runs this one script.

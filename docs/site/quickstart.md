@@ -250,7 +250,7 @@ cargo run -p mushroomdb-cli --bin mushroomdb -- serve ./demo-db
 The shortest path needs no local binary at all. Install the Claude Code plugin:
 
 ```text
-claude marketplace add MatthewSherlin/mushroomdb
+claude plugin marketplace add MatthewSherlin/mushroomdb
 claude plugin install mushroom@mushroomdb
 ```
 

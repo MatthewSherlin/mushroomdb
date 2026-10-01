@@ -119,7 +119,7 @@ existing `.mcp.json`. An install over a 0.6 one removes the hooks and git hook
 blocks 0.7 no longer ships.
 
 ```sh
-claude marketplace add MatthewSherlin/mushroomdb   # then: claude plugin install mushroom@mushroomdb
+claude plugin marketplace add MatthewSherlin/mushroomdb   # then: claude plugin install mushroom@mushroomdb
                                                   # skill is /mushroom:mushroom
 npx mushroomdb install                            # skill is /mushroom
 mushroomdb doctor                                 # verify: config, npx, store, lock, hooks, handshake

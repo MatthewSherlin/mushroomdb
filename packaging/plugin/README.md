@@ -5,7 +5,7 @@ Graph memory for agents, wired into Claude Code as an MCP server, a `/mushroom:m
 ## Install
 
 ```
-claude marketplace add MatthewSherlin/mushroomdb
+claude plugin marketplace add MatthewSherlin/mushroomdb
 claude plugin install mushroom@mushroomdb
 ```
 

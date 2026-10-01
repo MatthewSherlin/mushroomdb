@@ -11,7 +11,7 @@ project or your home directory, and can pin a store with `--db`.
 ## Route 1 — the Claude Code plugin
 
 ```
-claude marketplace add MatthewSherlin/mushroomdb
+claude plugin marketplace add MatthewSherlin/mushroomdb
 claude plugin install mushroom@mushroomdb
 ```
 

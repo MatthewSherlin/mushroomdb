@@ -11,7 +11,7 @@ and explain why two entities are linked.
 ## Getting the server registered
 
 For Claude Code and Cursor, do not write the config by hand. The plugin
-(`claude marketplace add MatthewSherlin/mushroomdb`, then `claude plugin install
+(`claude plugin marketplace add MatthewSherlin/mushroomdb`, then `claude plugin install
 mushroom@mushroomdb`) or `npx mushroomdb install` writes the entry, picks a
 `command` that will resolve from the assistant's process, and wires the hooks.
 `mushroomdb doctor` then verifies the result with a real stdio handshake. See

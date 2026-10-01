@@ -29,7 +29,7 @@ One call per question, on the store's own keys. The `SessionStart` brief printed
 | what would this change do | `what_if a <field> <value>` — lost and gained, nothing written |
 | who may see | `query` with a `role` from the store's `roles.json` |
 | how many | a counting Cypher over the labels the brief listed |
-| a durable fact | `remember` — the `text` and the existing keys it is `about`; say the `note:` key back |
+| a durable fact | `remember` — the `text` and the keys it is `about`; say the `note:` key back |
 
 Since when → `node_history`, `edge_history`, `was_linked` (its `at_commit` takes a date too); around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`; what's in here → `schema`; what matters, what clusters, which keys are one entity → `analyze`; forget it → `forget`.
 

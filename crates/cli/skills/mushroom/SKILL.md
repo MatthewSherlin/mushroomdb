@@ -33,7 +33,7 @@ One call per question, on the store's own keys. The `SessionStart` brief printed
 | what would this change do | `what_if a <field> <value>` — lost and gained, nothing written |
 | who may see | `query` with a `role` from the store's `roles.json` |
 | how many | a counting Cypher over the labels the brief listed |
-| a durable fact | `remember` — the `text` and the existing keys it is `about`; say the `note:` key back |
+| a durable fact | `remember` — the `text` and the keys it is `about`; say the `note:` key back |
 
 Since when → `node_history`, `edge_history`, `was_linked` (its `at_commit` takes a date too); around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`; what's in here → `schema`; what matters, what clusters, which keys are one entity → `analyze`; forget it → `forget`.
 <!-- /mcp -->
@@ -42,10 +42,10 @@ Since when → `node_history`, `edge_history`, `was_linked` (its `at_commit` tak
 | The question | The command |
 |---|---|
 | why are these two related | `{{BIN}} why '{{DB_PATH}}' <a> <b>` — what links two keys, with the evidence |
-| what did it look like then | `{{BIN}} asof '{{DB_PATH}}' --at <date> --query '<cypher>'` — a date, e.g. `2026-06-19`; `--commit N` still takes an index, and exactly one of the two |
-| anything else, including a durable fact | `{{BIN}} query '{{DB_PATH}}' '<cypher>'` — any Cypher, read or write; a fact is a `CREATE (n:Note {id: "note:…", text: "…"})`, and say the key back |
+| what did it look like then | `{{BIN}} asof '{{DB_PATH}}' --at <date> --query "<cypher>"` — a date, e.g. `2026-06-19`; `--commit N` still takes an index, and exactly one of the two |
+| anything else, including a durable fact | `{{BIN}} query '{{DB_PATH}}' "<cypher>"` — any Cypher, read or write, its strings in single quotes; a fact is a `CREATE (n:Note {id: 'note:<fresh-id>', text: '<the fact>'})`, and say the key back |
 
-`explain_association`, `node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked` and `neighborhood` have no subcommand here, `query` takes no `role`, and there is no `remember` subcommand. The rest need `--delivery mcp`.
+`explain_association`, `node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked` and `neighborhood` have no subcommand here, and there is no `remember` subcommand. The rest need `--delivery mcp`. Who may see → `query --role <name>`, a `role` from the store's `roles.json`.
 <!-- /cli -->
 
 A store built by `{{BIN}} ingest-git '{{DB_PATH}}' . --prs --ensure-gitignore` is a repository as entities — commits, pull requests, files, authors — and answers to the same calls as any other store. Use the repository as a data source; do not reach for it ahead of a search.

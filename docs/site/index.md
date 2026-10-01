@@ -55,7 +55,7 @@ Pre-1.0 alpha — APIs and formats may change between minor versions. Single
 writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
 
 v0.6.12 is the current release. The shortest way in is the Claude Code plugin —
-`claude marketplace add MatthewSherlin/mushroomdb` then `claude plugin install
+`claude plugin marketplace add MatthewSherlin/mushroomdb` then `claude plugin install
 mushroom@mushroomdb`, and type `/mushroom:mushroom` in a repository. Or run
 `npx mushroomdb install`, which writes the `/mushroom` skill, the MCP server
 entry, and the session-start and prompt hooks for Claude Code or Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`)

@@ -43,12 +43,19 @@ npx mushroomdb install --db ./memory
 ```
 
 One command writes the `/mushroom` skill, an MCP server listing the twenty-three-tool association
-surface, and the session hooks. Then a worked flow, four tool calls:
+surface, and the session hooks. Then the loop a session runs:
 
 ```text
-upsert_entity  →  create_rule  →  find_similar  →  explain_association
-  (store)           (link)           (recall)          (explain)
+remember  →  recall  →  suggest_rules  →  explain_association
+ (a fact)    (find it)   (the store        (why two things
+                          proposes a rule)   are related)
 ```
+
+`remember` takes a sentence and the entities it names; a subject it has never seen is stubbed
+rather than refused. `recall` answers a question in ordinary words. Once a dozen entities carry a
+field whose values repeat, `suggest_rules` proposes the rule that links them — nothing is created
+until you approve its `create_rule` — and from then on every write maintains those edges.
+`explain_association` says which rule linked two entities, and on what evidence.
 
 Full tool reference: [`docs/site/mcp.md`](docs/site/mcp.md).
 
@@ -66,6 +73,139 @@ Full tool reference: [`docs/site/mcp.md`](docs/site/mcp.md).
   `mushroomdb asof ./db --at 2026-06-19 --query "…"` replays the WAL to the last commit at or
   before it, derived edges included. A store that records no times says so by name rather than
   guessing a commit.
+
+---
+
+## Agent memory
+
+Graph structure captures the shape of real knowledge — entities, associations, similarity, and
+lineage — and rule-derived edges keep those associations fresh as new facts arrive.
+
+- Entities map to nodes (`Person`, `Document`, `Project`, `Concept`, …).
+- Associations are edges derived from data: cosine similarity on embeddings, shared field values,
+  FK relationships, geographic proximity. Declare a rule once; every write maintains the matching
+  edges without agent-side bookkeeping.
+- Recall has four modes: `recall` for a question in ordinary words, ranked over every indexed
+  text field; `find_similar` by query vector (HNSW when available, brute force otherwise);
+  `find_similar` by key (neighbors along a rule-derived edge type); and `query` for structured
+  Cypher. `hybrid_search` fuses fulltext and vector results via Reciprocal Rank Fusion, and
+  `pairwise_similar` answers "which of these are most like each other" over a caller's own key
+  set, exactly — it never uses HNSW. **`find_similar`'s `min` defaults to 0.8 on every surface.**
+- Explanations are built in: `explain_association` shows which rules and scores produced each
+  link, so an agent can cite evidence instead of asserting a conclusion.
+- Scoping is a property of the handle, not of each call: `db.scoped(role=…, namespace=…, keys=[…])`
+  returns a read-only child sharing the same store, and **every** read on it obeys one contract —
+  *hidden behaves exactly as absent*, so a key outside the scope is indistinguishable from a key
+  that does not exist. Legs intersect, so a scope narrows and never widens; every mutation raises
+  `ReadOnly`. Per-call `mask: [key1, key2, …]` on `query` still works and still rejects writes.
+  Both are cooperative in-process argument handling rather than an access boundary — real
+  enforcement is the HTTP server's role tokens. [`docs/site/masks.md`](docs/site/masks.md)
+- Bulk loading is one atomic frame: `ingest_batch(nodes, edges, on_conflict="error" | "skip" |
+  "replace")` lets a mirror rebuild onto a store that already has content without wiping the
+  directory, and reports `inserted`, `edges_inserted`, `skipped`, `replaced` and
+  `kept_view_owned`. `"error"` is the default and is the older behaviour exactly.
+- Schema-as-code: `mushroomdb schema apply <dir> <schema.json>` idempotently applies rules, views,
+  and fulltext indexes, printing a created/updated/unchanged diff. Two presets need no file:
+  `--memory-defaults` gives an existing store the text fields `recall` searches, and
+  `--memory-identity` adds the `SAME_AS` rules that link two keys for one entity, after saying
+  what it will backfill.
+
+**Eleven task tools** answer a question in prose in one call, on any store. They are what the
+skill reaches for, and what `tools/list` shows first:
+
+| Tool | Purpose |
+|---|---|
+| `explain_association` | Why two entities are associated: every rule-derived edge between them, with the rule, the score, the predicate it matched, and the values the two actually share |
+| `node_edges` | Every edge on one node, grouped by edge type, with the rule and score behind each. `all_of: [types]` answers with the partners linked by every one of them, as keys; `edge_type`, `label`, `direction` and `limit` narrow it further |
+| `neighborhood` | At depth 1 the same grouped listing; above 1 the breadth-first `(key, label, depth)` table |
+| `edges_at` | The edges a node had on a past date — or at a 0-based commit index — the graph as it was, not as it is — with the same `all_of` / `edge_type` / `label` / `direction` filters |
+| `what_if` | The derived edges a property change would lose and gain, computed without writing anything. `edge_type` prints both sides as partner keys |
+| `recall` | What the store already knows about a topic: ranked nodes matching free text across every indexed text field, one line each with how many of the topic's terms it matched |
+| `remember` | Write a note, and what it names: `about` keys (an unknown one is stubbed as a provisional entity, not refused), `entities` to create or describe, and `facts` among them — one commit. The reply says what it created, matched, stubbed and linked |
+| `schema` | The store's labels with their fields, its edge types and what derives them, every rule with its predicate, the full-text fields `recall` searches, the equality indexes, and how many provisional nodes `remember` created. |
+| `analyze` | `central` (PageRank), `degree`, `components` (connected groups with sizes), `clusters` (communities of two or more; singletons counted, not listed) or `identities` (`SAME_AS` links resolved by complete linkage, oldest node canonical). The whole store with no role or mask; at most 50 rows; the same store always gets the same answer. |
+| `suggest_rules` | Rules the store proposes from its own values, each with an estimate, examples and `create_rule_args` to pass to `create_rule` unchanged. Fields the store writes for itself — `ns`, `kind`, `ts`, `source`, `provisional`, `id`, `aliases`, `alias_keys` — are never proposed, and every proposal is global. It creates nothing. On a store with entities and no `SAME_AS` rule it names the `schema apply --memory-identity` command. |
+| `forget` | Tombstone a node, remove one property — the only property removal on MCP, since this Cypher has no `REMOVE` — or retract one fact edge. A rule-derived edge is refused with the rule named. Removing a property reports the derived edges a rule loses with it. The notes that still state what was forgotten are listed, not deleted. The reply says history keeps it until `mushroomdb migrate`, `snapshot --truncate` or `--retention` prunes the log. No role check. |
+
+Each of the eleven also takes `json: true`, which answers with the raw report instead of
+the rendered digest.
+
+**The fourteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
+in `tools/list`, so an assistant knows which surface is the front door. Every store lists the same
+twenty-three, a store built by `ingest-git` included — the association surface: `query` (with an optional `role`),
+`explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `edges_at`,
+`what_if`, `node_history`, `edge_history`, `find_similar`, `pairwise_similar`, `hybrid_search`,
+`remember`, `recall`, `upsert_entity`, `ingest_json`, `create_rule`, `stats`, `schema`, `analyze`, `suggest_rules` and `forget`. All 25 stay served either way — the listing decides what a
+session can call, not what the server answers — and `mushroomdb mcp <db> --all-tools` lists the
+whole set:
+
+| Tool | Purpose |
+|---|---|
+| `upsert_entity` | Insert or update a node by key (no existence check needed) |
+| `ingest_json` | Batch-ingest nodes of one label from a JSON array |
+| `create_rule` | Declare a derivation rule; backfills existing nodes in the same commit (a vector index over 2,048 vectors builds in slices, and the edges arrive in a later commit) |
+| `find_similar` | Find similar nodes by query vector (HNSW) or by derived edge traversal |
+| `pairwise_similar` | Exact cosine top-k among the `keys` you name, on one `field` — never HNSW. Self excluded; scores are cosine in `[-1, 1]`, and `distance = 1 - sim` is the caller's conversion |
+| `hybrid_search` | RRF over fulltext + vector results |
+| `explain` | The rules and scores that link two nodes, as JSON — `explain_association` above answers the same question in prose |
+| `query` | Cypher query (read or write); pass `mask` for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` |
+| `node_info` | Return a node's key, label, and properties |
+| `stats` | Live node, edge, and rule counts |
+| `node_history` | WAL change history for a node (archives included; a `snapshot --truncate` ends the reach) |
+| `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
+| `was_linked` | Point-in-time edge check: was an edge active at a given commit? |
+| `rename_node` | Rename a node's key; old_key, new_key |
+
+Full walkthrough, tool reference, and Claude Desktop setup: [`docs/site/mcp.md`](docs/site/mcp.md).
+Skill, plugin, and hook details: [`docs/site/skill.md`](docs/site/skill.md).
+
+---
+
+## Install
+
+Pick the row for what you want to do. The paths are not interchangeable: the last column is what
+each one leaves out.
+
+| You want to… | Run | You get | You do not get |
+|---|---|---|---|
+| Give Claude Code a memory | `claude plugin marketplace add MatthewSherlin/mushroomdb` then `claude plugin install mushroom@mushroomdb` | The `/mushroom:mushroom` skill, the MCP server and its 23 tools, the session and prompt hooks | A store path of your choosing: it uses `./mushroom-memory` |
+| The same in Cursor or Codex, or with a store you name | `npx mushroomdb install --db ./memory` | The `/mushroom` skill, the MCP entry, the hooks; `--platform claude-code\|cursor\|codex\|all` | Anything installed globally: the entry runs `npx` |
+| See the graph in a browser | `npx mushroomdb demo ./db && npx mushroomdb serve ./db`, or `docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=changeme ghcr.io/matthewsherlin/mushroomdb` | The explorer UI and the HTTP API at `:8080` | An assistant wired to it: that is one of the two rows above |
+| Use it from a shell only, with no MCP server | `npx mushroomdb install --delivery cli` | The skill, the hooks, and three commands: `why` (why two keys are related), `asof --at <date>` (a Cypher read at a past date), `query` (any Cypher; `--role <name>` answers as one role) | Three task tools as one call — no `edges_at`, `what_if` or `node_edges` — and no `remember`: a fact is a `CREATE` |
+| Embed it in a Rust program | `cargo add mushroomdb` | The engine as a library | The CLI, the MCP server, the UI |
+| Embed it in a Python program | `pip install mushroomdb` | The engine as a module: rules, Cypher, vectors, history, scoped handles, the graph algorithms, full-text, and the memory calls (`remember`, `recall`, `upsert_entity`, `forget`) as data | The MCP server and the UI: it is a library, not a tool surface |
+| Build the CLI from crates.io | `cargo install mushroomdb-cli` | The `mushroomdb` binary | **The explorer UI.** This build has none, and `serve` answers the API only without saying so. Use the `npx` or Docker row to see the graph |
+
+Docker details, `install.sh`, and building the binary with the UI embedded are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+`install` writes an MCP entry that runs `npx -y mushroomdb@<version>`, so the assistant needs
+nothing installed globally and nothing is copied into your home directory. Point it at a local
+build with `--command <path>`. `mushroomdb doctor` verifies the result end to end — config entry,
+store, lock, hooks, and a real stdio handshake with the configured command.
+
+To see the bundled explorer, write a demo graph and serve it:
+
+```sh
+mushroomdb demo ./db
+mushroomdb serve ./db
+```
+
+Open `http://127.0.0.1:8080/`. The demo graph has 10 Orgs, 20 Projects, 30 People, and 334
+edges — 304 of them derived by seven rule sets. When a token is configured, open
+`http://host:8080/?token=…`. Building the binary with the UI embedded, Docker, and the
+`install.sh` script are covered in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**Role-bound tokens** limit a caller to a named subset of nodes. Define roles in `schema.json`
+under the `roles` key (each role has a `label` selector list), then pass `--role-token TOKEN:ROLE`
+(repeatable) when starting the server, or set `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`.
+A role token receives only the nodes matching its label selectors — read endpoints return rows
+filtered to the visible set; write, subscription, and analytics endpoints return 403. Unknown token
+or role name: 401. The never-widen invariant is enforced in the server: a client-supplied mask is
+always intersected with the role mask. The MCP interface (`mushroomdb mcp`) is a stdio JSON-RPC
+server for local agent use and is not subject to bearer-token or role enforcement.
+
+---
 
 ## Where it fits
 
@@ -170,132 +310,6 @@ fixed-seed probe). Full reference: [`docs/site/rules.md`](docs/site/rules.md).
 
 ---
 
-## Agent memory
-
-Graph structure captures the shape of real knowledge — entities, associations, similarity, and
-lineage — and rule-derived edges keep those associations fresh as new facts arrive.
-
-- Entities map to nodes (`Person`, `Document`, `Project`, `Concept`, …).
-- Associations are edges derived from data: cosine similarity on embeddings, shared field values,
-  FK relationships, geographic proximity. Declare a rule once; every write maintains the matching
-  edges without agent-side bookkeeping.
-- Recall has three modes: `find_similar` by query vector (HNSW when available, brute force
-  otherwise); `find_similar` by key (neighbors along a rule-derived edge type); `query` for
-  structured Cypher recall. `hybrid_search` fuses fulltext and vector results via Reciprocal Rank
-  Fusion, and `pairwise_similar` answers "which of these are most like each other" over a caller's
-  own key set, exactly — it never uses HNSW.
-- Explanations are built in: `explain_association` shows which rules and scores produced each
-  link, so an agent can cite evidence instead of asserting a conclusion.
-- Scoping is a property of the handle, not of each call: `db.scoped(role=…, namespace=…, keys=[…])`
-  returns a read-only child sharing the same store, and **every** read on it obeys one contract —
-  *hidden behaves exactly as absent*, so a key outside the scope is indistinguishable from a key
-  that does not exist. Legs intersect, so a scope narrows and never widens; every mutation raises
-  `ReadOnly`. Per-call `mask: [key1, key2, …]` on `query` still works and still rejects writes.
-  Both are cooperative in-process argument handling rather than an access boundary — real
-  enforcement is the HTTP server's role tokens. [`docs/site/masks.md`](docs/site/masks.md)
-- Bulk loading is one atomic frame: `ingest_batch(nodes, edges, on_conflict="error" | "skip" |
-  "replace")` lets a mirror rebuild onto a store that already has content without wiping the
-  directory, and reports `inserted`, `edges_inserted`, `skipped`, `replaced` and
-  `kept_view_owned`. `"error"` is the default and is the older behaviour exactly.
-- Schema-as-code: `mushroomdb schema apply <dir> <schema.json>` idempotently applies rules, views,
-  and fulltext indexes, printing a created/updated/unchanged diff.
-
-**Minimal workflow** (four tool calls):
-
-```text
-upsert_entity  →  create_rule  →  find_similar  →  explain_association
-  (store)           (link)           (recall)          (explain)
-```
-
-**Eleven task tools** answer a question in prose in one call, on any store. They are what the
-skill reaches for, and what `tools/list` shows first:
-
-| Tool | Purpose |
-|---|---|
-| `explain_association` | Why two entities are associated: every rule-derived edge between them, with the rule, the score, the predicate it matched, and the values the two actually share |
-| `node_edges` | Every edge on one node, grouped by edge type, with the rule and score behind each. `all_of: [types]` answers with the partners linked by every one of them, as keys; `edge_type`, `label`, `direction` and `limit` narrow it further |
-| `neighborhood` | At depth 1 the same grouped listing; above 1 the breadth-first `(key, label, depth)` table |
-| `edges_at` | The edges a node had at one 0-based WAL commit — the graph as it was, not as it is — with the same `all_of` / `edge_type` / `label` / `direction` filters |
-| `what_if` | The derived edges a property change would lose and gain, computed without writing anything. `edge_type` prints both sides as partner keys |
-| `recall` | What the store already knows about a topic: ranked nodes matching free text across every indexed text field, one line each with how many of the topic's terms it matched |
-| `remember` | Write a note into the graph and return its key |
-| `schema` | The store's labels with their fields, its edge types and what derives them, every rule with its predicate, the full-text fields `recall` searches, the equality indexes, and how many provisional nodes `remember` created. |
-| `analyze` | `central` (PageRank), `degree`, `components` (connected groups with sizes), `clusters` (communities of two or more; singletons counted, not listed) or `identities` (`SAME_AS` links resolved by complete linkage, oldest node canonical). The whole store with no role or mask; at most 50 rows; the same store always gets the same answer. |
-| `suggest_rules` | Rules the store proposes from its own values, each with an estimate, examples and `create_rule_args` to pass to `create_rule` unchanged. Fields the store writes for itself — `ns`, `kind`, `ts`, `source`, `provisional`, `id`, `aliases`, `alias_keys` — are never proposed, and every proposal is global. It creates nothing. On a store with entities and no `SAME_AS` rule it names the `schema apply --memory-identity` command. |
-| `forget` | Tombstone a node, remove one property — the only property removal on MCP, since this Cypher has no `REMOVE` — or retract one fact edge. A rule-derived edge is refused with the rule named. Removing a property reports the derived edges a rule loses with it. The notes that still state what was forgotten are listed, not deleted. The reply says history keeps it until `mushroomdb migrate`, `snapshot --truncate` or `--retention` prunes the log. No role check. |
-
-Each of the eleven also takes `json: true`, which answers with the raw report instead of
-the rendered digest.
-
-**The fourteen graph tools** reach the store directly. Their descriptions are prefixed `Advanced:`
-in `tools/list`, so an assistant knows which surface is the front door. Every store lists the same
-twenty-three, a store built by `ingest-git` included — the association surface: `query` (with an optional `role`),
-`explain_association`, `neighborhood`, `node_info`, `node_edges`, `was_linked`, `edges_at`,
-`what_if`, `node_history`, `edge_history`, `find_similar`, `pairwise_similar`, `hybrid_search`,
-`remember`, `recall`, `upsert_entity`, `ingest_json`, `create_rule`, `stats`, `schema`, `analyze`, `suggest_rules` and `forget`. All 25 stay served either way — the listing decides what a
-session can call, not what the server answers — and `mushroomdb mcp <db> --all-tools` lists the
-whole set:
-
-| Tool | Purpose |
-|---|---|
-| `upsert_entity` | Insert or update a node by key (no existence check needed) |
-| `ingest_json` | Batch-ingest nodes of one label from a JSON array |
-| `create_rule` | Declare a derivation rule; backfills existing nodes in the same commit (a vector index over 2,048 vectors builds in slices, and the edges arrive in a later commit) |
-| `find_similar` | Find similar nodes by query vector (HNSW) or by derived edge traversal |
-| `pairwise_similar` | Exact cosine top-k among the `keys` you name, on one `field` — never HNSW. Self excluded; scores are cosine in `[-1, 1]`, and `distance = 1 - sim` is the caller's conversion |
-| `hybrid_search` | RRF over fulltext + vector results |
-| `explain` | The rules and scores that link two nodes, as JSON — `explain_association` above answers the same question in prose |
-| `query` | Cypher query (read or write); pass `mask` for an ACL-scoped read, or `role` to answer as one role from the store's `roles.json` |
-| `node_info` | Return a node's key, label, and properties |
-| `stats` | Live node, edge, and rule counts |
-| `node_history` | WAL change history for a node (archives included; a `snapshot --truncate` ends the reach) |
-| `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
-| `was_linked` | Point-in-time edge check: was an edge active at a given commit? |
-| `rename_node` | Rename a node's key; old_key, new_key |
-
-Full walkthrough, tool reference, and Claude Desktop setup: [`docs/site/mcp.md`](docs/site/mcp.md).
-Skill, plugin, and hook details: [`docs/site/skill.md`](docs/site/skill.md).
-
----
-
-## Install options
-
-```sh
-claude plugin install mushroom@mushroomdb   # after `claude marketplace add MatthewSherlin/mushroomdb`
-npx mushroomdb install            # skill + MCP server + hooks, no toolchain needed
-cargo install mushroomdb-cli      # `mushroomdb` binary from crates.io (no embedded UI)
-cargo add mushroomdb              # embedded Rust library
-pip install mushroomdb            # Python bindings
-```
-
-`install` writes an MCP entry that runs `npx -y mushroomdb@<version>`, so the assistant needs
-nothing installed globally and nothing is copied into your home directory. Point it at a local
-build with `--command <path>`. `mushroomdb doctor` verifies the result end to end — config entry,
-store, lock, hooks, and a real stdio handshake with the configured command.
-
-To see the bundled explorer, write a demo graph and serve it:
-
-```sh
-mushroomdb demo ./db
-mushroomdb serve ./db
-```
-
-Open `http://127.0.0.1:8080/`. The demo graph has 10 Orgs, 20 Projects, 30 People, and 334
-edges — 304 of them derived by seven rule sets. When a token is configured, open
-`http://host:8080/?token=…`. Building the binary with the UI embedded, Docker, and the
-`install.sh` script are covered in [CONTRIBUTING.md](CONTRIBUTING.md).
-
-**Role-bound tokens** limit a caller to a named subset of nodes. Define roles in `schema.json`
-under the `roles` key (each role has a `label` selector list), then pass `--role-token TOKEN:ROLE`
-(repeatable) when starting the server, or set `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`.
-A role token receives only the nodes matching its label selectors — read endpoints return rows
-filtered to the visible set; write, subscription, and analytics endpoints return 403. Unknown token
-or role name: 401. The never-widen invariant is enforced in the server: a client-supplied mask is
-always intersected with the role mask. The MCP interface (`mushroomdb mcp`) is a stdio JSON-RPC
-server for local agent use and is not subject to bearer-token or role enforcement.
-
----
-
 ## CLI reference
 
 | Command | What it does |
@@ -305,18 +319,18 @@ server for local agent use and is not subject to bearer-token or role enforcemen
 | `mushroomdb disable [--platform …] [--project\|--user]` | Turn an install off without removing it: strips the MCP entry, the hooks, and any git hook block a 0.6 install wrote. The skill, the store and `.gitignore` stay |
 | `mushroomdb enable [--platform …] [--project\|--user]` | Turn a disabled install back on, re-resolving the command instead of replaying what `disable` removed |
 | `mushroomdb doctor [--project\|--user] [--platform …]` | Verify an install: config entry, npx reachability, store, lock, hooks, a 0.6 git hook left behind, a real stdio handshake, and duplicate-scope servers. Exit 1 on any `fail` |
-| `mushroomdb ingest-git <dir> <repo> [--exclude <pattern>]... [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]` | Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHANGED`, `KNOWS`, `IMPORTS`, `CALLS` and `MENTIONS` rules. Re-run to sync. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
+| `mushroomdb ingest-git <dir> <repo> [--exclude <pattern>]... [--max-commits-per-file N] [--recurse-submodules] [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]` | Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHANGED`, `KNOWS`, `IMPORTS`, `CALLS` and `MENTIONS` rules. Re-run to sync. See [`docs/site/ingest-git.md`](docs/site/ingest-git.md) |
 | `mushroomdb brief <dir>\|--auto` | The store's schema in one block — labels, edge types, how deep its history runs, who may read it, and one worked call per question kind — capped at 4,000 bytes and byte-stable between runs. Hook body for `SessionStart` |
 | `mushroomdb why <dir> <a> <b>` | Every rule edge between two keys with the evidence that derived it, or a note that there is none — the shell form of `explain_association` |
 | `mushroomdb recall <dir>\|--auto` | Hook body for the `/mushroom` skill's `UserPromptSubmit` recall hook: reads a prompt payload on stdin and prints a `recall` digest for it — a question in ordinary words is enough — and nothing when the store has nothing to say. Wired automatically by `install` |
-| `mushroomdb mcp <dir>\|--auto` | Start a stdio MCP JSON-RPC server for agent tools |
+| `mushroomdb mcp <dir>\|--auto [--all-tools]` | Start a stdio MCP JSON-RPC server for agent tools. `--all-tools` lists all 25 served tools; the default lists 23 |
 | `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
-| `mushroomdb serve <dir>` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`) |
+| `mushroomdb serve <dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>]` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not |
 | `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted). `--role <name>` answers as one of the store's roles and `--namespace <ns>` from one namespace; together they intersect, so neither widens the other, and either makes the query a read |
-| `mushroomdb asof <dir> --commit N` | Read-only view at a WAL commit. `--namespace <ns>` reads one namespace as it was then |
+| `mushroomdb asof <dir> --commit N\|--at <date>` | Read-only view at a WAL commit or at a date (`2026-06-19`, or RFC 3339) — the last commit at or before it. Exactly one of the two. `--namespace <ns>` reads one namespace as it was then |
 | `mushroomdb stats <dir>` | Print node/edge/rule counts, plus a `namespaces:` line once a store has more than the implicit `default` one |
 | `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
-| `mushroomdb schema apply <dir> <schema.json>` | Idempotently apply a schema file (rules, views, fulltext indexes); prints a diff |
+| `mushroomdb schema apply <dir> <schema.json>\|--memory-defaults\|--memory-identity` | Idempotently apply a schema file (rules, views, fulltext indexes), the built-in memory schema, or the identity preset; prints a diff |
 | `mushroomdb build-index <dir> [--rule <name>]` | Drive a rule's vector index to completion a slice at a time, for an operator who wants the build finished before traffic arrives — a rule created over a large corpus derives no edges until its index is whole. After a restart, the first write or this command is what registers an unfinished build |
 | `mushroomdb snapshot <dir> [--keep-wal\|--truncate] [--retention N]` | Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads still reach it. `--truncate` discards it; `--keep-wal` leaves `wal.bin` whole |
 | `mushroomdb verify <dir>` | Audit snapshot integrity: CRC32 all 13 sections plus an rkyv structural pass over the mmap'd ones, exit 2 on any mismatch |
@@ -404,7 +418,7 @@ general. [`benchmarks/results/handrolled-vs-rules.md`](benchmarks/results/handro
 **Agent benchmarks** measure the entity engine directly. `benchmarks/agent-tasks/` runs real
 `claude -p` sessions against executable truth. The association suite (`--suite association`) asks
 twenty relationship questions of one generated world written three ways — as JSON files, as a
-single relational file, and as a mushroomdb store. **The pre-registered gate passes** as of
+single relational file, and as a mushroomdb store. **The pre-registered gate passed on 0.6.12**, in
 [`20260928T195302Z`](benchmarks/agent-tasks/results/20260928T195302Z/summary.md), on a
 2,000-entity world — the first run in which it has. The graph arm scored **1.000 on all twenty
 tasks and all sixty cells** against the relational baseline's 0.990, at **$0.0614 against
@@ -416,6 +430,9 @@ $0.1127**:
 | cost $ | **0.0614** | 0.1127 | -45.6% | `[-0.06875, -0.03147]` |
 | total tokens | **155,397** | 211,487 | -26.5% | `[-95482, -8268]` |
 | turns | **3.93** | 7.07 | -44.3% | `[-4.017, -2.133]` |
+
+That run was on 0.6.12, whose default listing was 19 tools; 0.7's is 23 and about 15% larger,
+so the cost row is not 0.7's. The suite has not been re-run on 0.7.
 
 180 cells, 0 timeouts, 0 errors, 0 dropped. Correctness had been amended on 2026-09-11 to pass on
 a tie, because the relational arm saturated at 1.00 and the original wording — exceed both baselines,
@@ -468,7 +485,7 @@ wrongly. Derived edges are not WAL-logged; they are restored directly from the m
 
 ## Roadmap
 
-Phases 1–4 and Plan 18 all landed. What remains:
+What is not built yet:
 
 | Priority | Item |
 |---|---|
@@ -482,12 +499,12 @@ Phases 1–4 and Plan 18 all landed. What remains:
 ## Docs
 
 - [Quickstart](docs/site/quickstart.md) · [Rules](docs/site/rules.md) · [Cypher reference](docs/site/query.md) · [HTTP + MCP API](docs/site/api.md)
-- [Concurrency](docs/site/concurrency.md) · [Codebase graph](docs/site/ingest-git.md)
+- [Concurrency](docs/site/concurrency.md) · [`ingest-git` as a data source](docs/site/ingest-git.md)
 - [Install, plugin and hooks](docs/site/skill.md) · [MCP tools](docs/site/mcp.md) · [Association benchmark](docs/site/association-bench.md)
 - [Time travel](docs/site/timetravel.md) · [Subscriptions](docs/site/subscriptions.md) · [Views](docs/site/views.md) · [Rule suggestions](docs/site/suggest.md)
 - [Masks and access control](docs/site/masks.md) · [Full-text search](docs/site/fulltext.md) · [Property indexes](docs/site/indexes.md) · [Graph algorithms](docs/site/algorithms.md)
 - [Durability and recovery](docs/site/durability.md) · [Running it as a service](docs/site/service.md) · [Panic policy](docs/site/panic-policy.md) · [Testing](docs/site/testing.md) · [Format stability](docs/format-stability.md)
-- [Design spec](docs/design.md) · [Moat roadmap](docs/site/roadmap-moat.md) · [Case study](docs/dogfood-report.md)
+- [Case study](docs/dogfood-report.md) · [The original design, 2026-08](docs/design.md)
 
 Building from source, Docker, packaging, and the test gates are in
 [CONTRIBUTING.md](CONTRIBUTING.md).
