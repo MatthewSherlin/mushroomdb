@@ -1,8 +1,19 @@
-# Graph-DB Design Spec (working title — name TBD)
+# The original design, August 2026 — a historical record
+
+> **This is the design the project started from. It is dated 2026-08-14, the day before the
+> first commit, and was last revised on 2026-08-26, during the first releases. It is kept as the
+> record of what was intended, and it is not a description of what exists now.** The storage
+> engine, the concurrency model and several decisions below changed after it was written: the
+> snapshot is memory-mapped, a plain read runs on an epoch snapshot instead of under the writer's
+> lock, and the license is dual MIT / Apache-2.0. Paths under `docs/superpowers/` point at
+> working notes that were taken out of the repository on 2026-08-28 and are not in it now. Other
+> systems are referred to as "a named system", or as "system A", "B" and "C".
+>
+> For what exists: the README's [Architecture](../README.md#architecture) section,
+> [`docs/format-stability.md`](format-stability.md), and the pages under [`docs/site/`](site/index.md).
 
 **Date:** 2026-08-14
-**Status:** Living design document
-**License:** Apache 2.0
+**Status:** Historical — superseded by the implementation
 **Language:** Rust (core), TypeScript (UI), Python/TS/Rust bindings at launch
 
 ---
@@ -232,7 +243,8 @@ Not v1: general editing/admin UI, dashboards, saved queries.
    `docs/superpowers/specs/2026-08-25-best-graph-db.md`. cargo-fuzz on parser and
    WAL/snapshot readers ships.
 5. **Cross-binding conformance:** one shared corpus (queries + expected Arrow
-   results) through Rust/Python/TS in the CI matrix.
+   results) through Rust/Python/TS in the CI matrix. *(Never built. The bindings are tested
+   separately; there is no shared corpus.)*
 6. **Performance:** criterion microbenchmarks with CI regression gates; public
    reproducible benchmark harness vs system A, system B 0.11.3, system C (LDBC-SNB-style
    interactive + typed-neighborhood workload); numbers, hardware, and rerun scripts
@@ -254,10 +266,10 @@ Not v1: general editing/admin UI, dashboards, saved queries.
 
 ## 11. Open Items
 
+*As they stood on 2026-08-14. The name, the repository and the snapshot format all exist now.*
+
 - **Name** — required before repo creation; "graph-db" is a placeholder.
 - Git repo not yet initialized (user performs/authorizes git actions explicitly).
 - UDF rule escape hatch design (fast-follow, not v1).
 - LLM-extraction plugin (post-v1, optional, opt-in cost model).
 - Snapshot format spec doc (write during implementation planning).
-
-## 12. Next Step

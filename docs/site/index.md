@@ -44,8 +44,8 @@ several processes can share one store — see [Concurrency](concurrency.md).
 entities with rule-derived relationships, which is what makes a ticket↔commit link a rule rather
 than a script.
 
-The roadmap and the benchmark numbers are in [README.md](../../README.md). The
-full design spec is at [docs/design.md](../design.md).
+The roadmap and the benchmark numbers are in [README.md](../../README.md), and the architecture
+as built is in its [Architecture](../../README.md#architecture) section.
 
 ---
 
@@ -54,14 +54,14 @@ full design spec is at [docs/design.md](../design.md).
 Pre-1.0 alpha — APIs and formats may change between minor versions. Single
 writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
 
-v0.6.12 is the current release. The shortest way in is the Claude Code plugin —
-`claude plugin marketplace add MatthewSherlin/mushroomdb` then `claude plugin install
-mushroom@mushroomdb`, and type `/mushroom:mushroom` in a repository. Or run
-`npx mushroomdb install`, which writes the `/mushroom` skill, the MCP server
-entry, and the session-start and prompt hooks for Claude Code or Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`)
-and PyPI (`pip install mushroomdb`) packages are live at the same version.
-Docker, `install.sh`, and the build-from-source path are in
-[CONTRIBUTING.md](../../CONTRIBUTING.md).
+The current release is on the [releases page](https://github.com/MatthewSherlin/mushroomdb/releases).
+The shortest way in is the Claude Code plugin — `claude plugin marketplace add
+MatthewSherlin/mushroomdb` then `claude plugin install mushroom@mushroomdb`, and type
+`/mushroom:mushroom` in a repository. Or run `npx mushroomdb install`, which writes the
+`/mushroom` skill, the MCP server entry, and the session-start and prompt hooks for Claude Code
+or Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`) and PyPI
+(`pip install mushroomdb`) packages are published at the same version; which path gives you what
+is in the README's [Install](../../README.md#install) table.
 
 ---
 
@@ -70,7 +70,7 @@ Docker, `install.sh`, and the build-from-source path are in
 - [Quickstart](quickstart.md) — a store, an assistant wired to it, and the four questions with one worked call each
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
-- [Codebase graph](ingest-git.md) — `ingest-git`, its rules, submodules, pull requests, incremental sync
+- [`ingest-git` as a data source](ingest-git.md) — what `ingest-git` writes, its rules, submodules, pull requests, incremental sync
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
 - [MCP tools](mcp.md) — the eleven task tools, the fourteen graph tools, and the twenty-three every store lists
 - [The association benchmark](association-bench.md) — one world in three forms, the twenty questions, and the gate
@@ -78,3 +78,18 @@ Docker, `install.sh`, and the build-from-source path are in
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
 - [Running it as a service](service.md) — the volume, the snapshot interval, backup, restore, and what a restart costs
 - [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error
+
+Reference:
+
+- [Cypher Query Reference](query.md)
+- [Temporal history: what was connected when, and why](timetravel.md)
+- [Full-Text Search](fulltext.md)
+- [Property (equality) indexes](indexes.md)
+- [Graph Algorithms](algorithms.md)
+- [Materialized Property Views](views.md)
+- [Live Subscriptions](subscriptions.md)
+- [Rule Suggestion](suggest.md)
+- [Durability and crash recovery](durability.md)
+- [Running several processes against one store](multiprocess.md)
+- [Deployment](deployment.md)
+- [Testing](testing.md)

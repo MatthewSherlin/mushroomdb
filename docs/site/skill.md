@@ -68,11 +68,11 @@ rather than probing Cypher for the schema:
 |---|---|
 | why are these two related | `explain_association a b` — the rule, the score and the values the two share |
 | what is it related to | `node_edges a` — grouped by type, rule and score; `all_of: [T, U]` for the partners carrying every named type; `label:` narrows them |
-| what did it look like then | `edges_at a <commit>` |
+| what did it look like then | `edges_at a <date>` — the date itself, `2026-06-19` or `2026-06-19T12:00:00Z`; a 0-based commit index also works |
 | what would this change do | `what_if a <field> <value>` — lost and gained, nothing written |
 | who may see | `query` with a `role` from the store's `roles.json` |
 | how many | a counting Cypher over the labels the brief listed |
-| a durable fact | `remember` — the `text` and the existing keys it is `about`; say the `note:` key back |
+| a durable fact | `remember` — the `text` and the keys it is `about`; say the `note:` key back |
 
 Since when is `node_history` / `edge_history` / `was_linked`; around it is
 `neighborhood` / `node_info`; like it is `find_similar` / `hybrid_search`.
@@ -83,12 +83,12 @@ The skill treats `ingest-git` as a data source, not as the tool to reach for
 ahead of a search.
 
 That table is the MCP variant's. The **`--delivery cli` variant carries its own
-table of shell forms** — `mushroomdb why <a> <b>`, `asof --commit N --query`,
+table of shell forms** — `mushroomdb why <a> <b>`, `asof --at <date> --query`,
 and `query` for any Cypher, read or write, a durable fact included — and says
 plainly which tools have no subcommand there: `explain_association`,
 `node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked` and
-`neighborhood`, with no `role` on `query` and no `remember`. Those need
-`--delivery mcp`.
+`neighborhood`, and that there is no `remember` subcommand. Those need
+`--delivery mcp`. Who may see is `query --role <name>` there.
 
 **The `learn` pass** turns prose — design docs, ADRs, READMEs — into `Concept`
 nodes carrying the source files and their hashes. When a source file's hash

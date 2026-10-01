@@ -930,7 +930,6 @@ per-source cardinality control.
   API (`node_edges` / `neighborhood`) for multi-hop lookups on large
   graphs. LIMIT pushdown is on the roadmap.
 - WAL-only cold-start re-fires all rules from node data. At 100k nodes (9 rules), re-open takes
-  ~8.16 min; ANN index (HNSW) re-fitting dominates. V5/V6 snapshots persist derived edges and IVF
-  centroids; V7 snapshots additionally persist HNSW blobs — `open_with` from a V6 snapshot takes
-  8.88 s at 100k (V6 snapshot write cost: 22.5 s; V7 numbers not yet separately published). Call
-  `snapshot()` before close to avoid re-derivation on next open.
+  ~8.16 min; ANN index (HNSW) re-fitting dominates. A snapshot persists the derived edges and the
+  ANN state, so opening from one takes 0.02 s at 100k (measured on V8). Call `snapshot()` before
+  close to avoid re-derivation on next open.

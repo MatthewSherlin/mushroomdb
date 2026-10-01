@@ -483,13 +483,14 @@ genesis chains → CommitOutOfRange for archive-resident commits (never wrong da
 - V5–V8 snapshots are migrated on open; V3/V4 are rejected
 - Single writer, many readers (RwLock-backed SharedDb)
 - RAM-bound. Measured to 100,000 nodes (~10M derived edges) on a 24 GiB machine: 4.72 GiB
-  peak while building (v0.1.1, 2026-08-24; not re-measured on the current build). Nothing larger has been run; ten million nodes was a design intent,
-  not a measurement
+  peak while building (v0.1.1, 2026-08-24; not re-measured on the current build). Nothing
+  larger has been run; ten million nodes was a design intent, not a measurement
 - 100k nodes (~10M derived edges), V8 snapshot open: **0.02 s, 31–41 MiB RSS**
   (warm file cache, cold process; measured 2026-08-28, Apple M4 Pro, release build)
 - 100k nodes, WAL-only open: ~8.16 min (HNSW re-fitting dominates; measured 2026-08-24)
 - V8 snapshot size: 1.8 GiB (same 100k dataset; 18% smaller than V5's 2.2 GiB)
-- mushroomdb verify <db-dir>: CRC32 audit of all 12 sections; 0.26 s on 1.8 GiB; exits 2 on mismatch
+- mushroomdb verify <db-dir>: CRC32 audit of all 13 sections; exits 2 on mismatch
+  (0.26 s measured on a 1.8 GiB V8 snapshot, which had 11 sections)
 
 ## GitHub
 
@@ -497,7 +498,7 @@ https://github.com/MatthewSherlin/mushroomdb
 
 ## Docs
 
-- Codebase graph (ingest-git reference): docs/site/ingest-git.md
+- ingest-git as a data source: docs/site/ingest-git.md
 - Concurrency across processes: docs/site/concurrency.md
 - Install, plugin, hooks and doctor: docs/site/skill.md
 - Rules: docs/site/rules.md

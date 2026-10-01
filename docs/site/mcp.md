@@ -330,7 +330,7 @@ date or a 0-based WAL commit index** — replayed from the WAL and its archives 
 one scan, each edge carrying the rule that had derived it.
 
 **Pass the date when the question names one.** `edges_at(key, "2026-06-19")`
-resolves to the last commit at or before midnight UTC on that day; a bare date, a
+resolves to the last commit at or before the end of that day, UTC; a bare date, a
 full instant (`2026-06-19T12:00:00Z`) and an offset (`+01:00`) all work. Before
 v0.6.11 there was no way to express a date, and an agent asked "what did this
 look like on the 19th" had to reconstruct a date→commit map by hand — a guess that
@@ -425,8 +425,8 @@ direction, and no task tool returns `structuredContent`.
 **JSON replies are unframed and control-char-sanitised.** They carry no
 untrusted-data framing line, because prefixing one would stop the payload
 parsing and a caller that asked for JSON asked for a document rather than
-prose. They are still graph content, so every string in them — paths, author
-names, commit subjects, note text, quoted source — has its control characters
+prose. They are still graph content, so every string in them — names, keys,
+note text, property values — has its control characters
 replaced with spaces before serialising, the same substitution the rendered
 digest makes. JSON escaping alone would keep a control character from breaking
 the document while leaving it intact for whatever reads the parsed value.
@@ -443,7 +443,7 @@ heading or a line break in an agent's context.
 | `explain_association` | `a`, `b` | Every rule-derived edge between two node keys, one line each: the edge type, the rule that wrote it, the score, the predicate it matched on, and the values the two actually share. Both keys must already exist. `json: true` returns the array of explanations, each with an `evidence` object. |
 | `node_edges` | `key`, `edge_type?`, `all_of?`, `label?`, `direction?`, `limit?` | Every edge incident on one node, grouped by edge type, with the rule, score and predicate behind each derived edge. `all_of` answers with the partners linked by every listed type, as keys; `edge_type` with one type's partner keys and the rule named once; `label` narrows partners and their counts. |
 | `neighborhood` | `key`, `depth?`, `edge_types?`, `direction?`, `limit?` | At `depth: 1`, the same grouped relationship listing `node_edges` gives; above 1, the breadth-first table of `(key, label, depth)`. |
-| `edges_at` | `key`, `at`, `edge_type?`, `all_of?`, `label?`, `direction?`, `limit?` | The edges the node had at one 0-based WAL commit — the graph as it was then, replayed from the WAL and its archives in one scan. Renames are followed, so a node's current key finds edges written under an earlier name. Takes `node_edges`' filters, so the intersection question is one call at a past commit too. |
+| `edges_at` | `key`, `at`, `edge_type?`, `all_of?`, `label?`, `direction?`, `limit?` | The edges the node had on a past date, or at a 0-based commit index — the graph as it was then, replayed from the WAL and its archives in one scan. Renames are followed, so a node's current key finds edges written under an earlier name. Takes `node_edges`' filters, so the intersection question is one call at a past commit too. |
 | `what_if` | `key`, `field`, `value`, `edge_type?`, `label?`, `limit?` | The derived edges a property change would retract and derive, computed without writing anything: the rule engine runs the same re-derivation a real `set_prop` would, against a clone. `edge_type` prints both sides as partner keys. |
 | `recall` | `topic` | What the store already knows about a topic: ranked nodes matching free text across every indexed text field, one line each. Every line says how many of the topic's terms it matched — `(2/3 terms)` — and hits rank by that first. A question in ordinary words is enough. |
 | `remember` | `text`, `about?`, `kind?`, `entities?`, `facts?` | Writes a note into the graph and returns its key. A key in `about` that does not exist yet is created as a provisional entity — label `Entity`, marked `provisional` — rather than refused; so is an unknown `facts` endpoint. At most 20 stubs per call; keys past that are reported as capped and not written, and the rest of the call still commits. The store keeps a normalised `aliases` list on every entity it writes — the key, the name and the name's words, recomputed on each write, so a renamed entity stops matching its old name. Each `entities[]` item takes `aliases`, other names it goes by; those are kept as written in `alias_keys` and nowhere else, so they do not count toward the overlap. With the identity preset applied (`mushroomdb schema apply <db> --memory-identity`, sixteen `SAME_AS` rules), the reply lists the `same as` links the write created. A declared alias equal to a provisional stub's key links that stub at 1.00 — `aliases: ["matt"]` links a stub keyed `matt`. The match is exact and case-sensitive (`Matt` does not). The target must carry label `Entity`, which a node created by `about` keeps for life: such a node can still be claimed after it is described, and cannot itself claim, since the claiming node must carry one of the five entity labels. A declared alias equal to an unrelated stub's key links them at 1.00 too, because declaring it is the caller's claim. A write that retracts `same as` links says so: one `unlinked` line, and `same_as_lost` with `same_as_lost_total` in the json, ten pairs at most. A link holds while two nodes' keys, names and the names' words overlap at 0.6, so a changed name is what retracts one; declaring an alias never does. Give both the same name, or declare a provisional stub's key as an alias to link it whatever the names. |

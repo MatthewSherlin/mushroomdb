@@ -168,7 +168,7 @@ each one leaves out.
 
 | You want to… | Run | You get | You do not get |
 |---|---|---|---|
-| Give Claude Code a memory | `claude plugin marketplace add MatthewSherlin/mushroomdb` then `claude plugin install mushroom@mushroomdb` | The `/mushroom:mushroom` skill, the MCP server and its 23 tools, the session and prompt hooks | A store path of your choosing: it uses `./mushroom-memory` |
+| Give Claude Code a memory | `claude plugin marketplace add MatthewSherlin/mushroomdb` then `claude plugin install mushroom@mushroomdb` | The `/mushroom:mushroom` skill, the MCP server and its 23 tools, the session and prompt hooks | A store path of your choosing: it uses `$CLAUDE_PROJECT_DIR/mushroom-memory`, the project Claude Code is open in |
 | The same in Cursor or Codex, or with a store you name | `npx mushroomdb install --db ./memory` | The `/mushroom` skill, the MCP entry, the hooks; `--platform claude-code\|cursor\|codex\|all` | Anything installed globally: the entry runs `npx` |
 | See the graph in a browser | `npx mushroomdb demo ./db && npx mushroomdb serve ./db`, or `docker run --rm -p 8080:8080 -e MUSHROOMDB_TOKEN=changeme ghcr.io/matthewsherlin/mushroomdb` | The explorer UI and the HTTP API at `:8080` | An assistant wired to it: that is one of the two rows above |
 | Use it from a shell only, with no MCP server | `npx mushroomdb install --delivery cli` | The skill, the hooks, and three commands: `why` (why two keys are related), `asof --at <date>` (a Cypher read at a past date), `query` (any Cypher; `--role <name>` answers as one role) | Three task tools as one call — no `edges_at`, `what_if` or `node_edges` — and no `remember`: a fact is a `CREATE` |

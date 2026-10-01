@@ -1,4 +1,4 @@
-# Codebase Graph (`ingest-git`)
+# `ingest-git`: a repository as entities
 
 `mushroomdb ingest-git <db-dir> <repo-dir>` turns a git repository into a graph
 of authors, commits, and files, reads the working tree for the symbols each file

@@ -59,7 +59,7 @@ claude plugin validate packaging/plugin --strict
 ```
 
 Nothing under `packaging/plugin/` or `.claude-plugin/marketplace.json` is
-hand-edited: every one is rendered by `scripts/render-plugin.sh` from the four
+hand-edited: every one is rendered by `scripts/render-plugin.sh` from the five
 templates in `scripts/plugin-templates/` and from the CLI's real
 `crates/cli/skills/mushroom/SKILL.md`, with `{{VERSION}}`, `{{BIN}}` and
 `{{DB_PATH}}` substituted, and the skill's `<!-- cli -->…<!-- /cli -->` blocks
