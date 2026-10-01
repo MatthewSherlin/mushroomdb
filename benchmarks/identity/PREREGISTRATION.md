@@ -150,3 +150,94 @@ below 0.90 on either prediction is FAILED.
         > benchmarks/identity/results/$TS/summary.md
 
 The first run's directory is left as it is.
+
+## Amendment, 2026-10-01 (second amendment) — after the second run, before the third
+
+Amended 2026-10-01 (second amendment), after the second run
+(`results/20261001T143503Z`) and before the third: owner decision — declared
+aliases no longer count toward `Overlap`. Floors and labelled set unchanged.
+
+The owner also decided, the same day, to add an `Entity→Entity` claim rule,
+which would make the preset seventeen rules. It was considered and is **held,
+not built**: the engine gives an edge one owner, so a `KeyMatch` rule beside
+the `Entity→Entity` `Overlap` rule on the same label pair and edge type loses
+a still-declared claim when the `Overlap` rule retracts (defect ledger row 37,
+`docs/roadmap/v0.6.10-defects.md`, deferred to 0.8). **The preset measured by
+the third run is unchanged at sixteen rules.**
+
+### What changed in what is measured
+
+- **The derivation of `aliases`.** It was the key, the name, the name's words
+  and every alias a caller declared, accumulated across writes. It is now
+  exactly what the node's current key and current name imply — the key
+  lowercased, the name in canonical form, and each word of a name of two or
+  more words — recomputed on each describing write. A declared alias is kept
+  only in `alias_keys`, where the five `KeyMatch` claim rules read it.
+- **The first two results were measured on the earlier derivation**
+  (`results/20261001T061131Z` and `results/20261001T143503Z`). They are left as
+  they are and are not comparable score for score with the third.
+- **Not changed:** `benchmarks/identity/labelled.json`, the three floors, the
+  two predictions, the sixteen rules, and the runner
+  (`crates/core-api/examples/identity_gate.rs`), including its summary header.
+- **The build profile.** `cargo run` without `--release`, as for the second
+  run. The runner is deterministic and the profile does not enter the score.
+
+### The expectation, stated before the run
+
+Computed by arithmetic from `labelled.json`: each node's `aliases` built from
+its key and name with declared aliases excluded, `Overlap` at ≥ 0.6 over the
+label pairs the sixteen rules cover, and a claim wherever a declared alias
+equals a stub's key.
+
+**9 true positives, 1 false positive, 9 false negatives on both predictions —
+precision 0.900, recall 0.500, PASSED at the precision floor with no margin.
+No pair changes side.**
+
+The set declares three aliases, on three nodes, so only pairs touching those
+nodes can move at all:
+
+- `jd` ~ `jane-doe`. Before: each held five aliases and they shared four —
+  `jane doe`, `jane`, `doe` and the declared `j doe` (`J. Doe` and `J Doe` fold
+  to the same form) — 4/6. Now: {jd, jane doe, jane, doe} against {jane-doe,
+  jane doe, jane, doe}, 3/5 = 0.6. Still linked, now exactly on the floor. A
+  true positive before and after.
+- `countess-lovelace` against `ada-lovelace` and against `Ada_Lovelace`.
+  Before: the declared `ada lovelace` and the word `ada` were shared, 2/8.
+  Now: {countess-lovelace, augusta ada king, augusta, ada, king} shares only
+  `ada` with either, 1/8. Not linked before or after. Two false negatives
+  before and after.
+- No declared alias equals a stub's key (`Ada Lovelace` is not
+  `Ada_Lovelace`), so no claim rule derives an edge, as in the second run.
+
+The other seven true positives and the one false positive link on a shared
+name and no declared alias: `matthew-sherlin`, `msherlin` and
+`Matthew_Sherlin` (three pairs, 3/5 each), `ada-lovelace` ~ `Ada_Lovelace`
+(3/5), `grace-hopper` ~ `ghopper` (3/5), `acme` ~ `acme-corp` (3/4),
+`mushroomdb` ~ `MushroomDB` (1/1), `launch-2026` ~ `launch2026` (3/5), and the
+false positive `john-smith-nyc` ~ `john-smith-sf` (3/5). The clusters equal
+the pairs: the only identity of three, the Matthew Sherlin nodes, is linked on
+every pair.
+
+**So this gate cannot show this decision's gain either.** What the decision
+buys is that declaring an alias on one side of a full-name link no longer
+retracts it, and no labelled pair is in that position: the one pair where both
+sides declare, `jd` and `jane-doe`, happened to declare aliases that fold to
+the same form. The gain is shown by tests in
+`crates/core-api/tests/memory_identity.rs`:
+`a_declared_alias_does_not_count_against_overlap`,
+`declaring_an_alias_costs_no_link` and
+`declaring_a_nickname_keeps_the_full_name_stub_linked`.
+
+If the result differs from the expectation above in either direction, it is
+committed as it came out and nothing is tuned; a precision below 0.90 or a
+recall below 0.40 on either prediction is FAILED.
+
+### Procedure for the third run
+
+    TS=$(date -u +%Y%m%dT%H%M%SZ)
+    mkdir -p benchmarks/identity/results/$TS
+    cargo run -p mushroomdb --example identity_gate -- \
+        benchmarks/identity/labelled.json \
+        > benchmarks/identity/results/$TS/summary.md
+
+The first two runs' directories are left as they are.
