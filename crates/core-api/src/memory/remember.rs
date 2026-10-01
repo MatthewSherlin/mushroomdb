@@ -25,7 +25,7 @@ use crate::memory::identity::{
     SameAsPair, ALIASES_FIELD,
 };
 use crate::memory_schema::{NAME_FIELD, PROVISIONAL_LABEL, PROVISIONAL_PROP};
-use crate::GraphDb;
+use crate::{GraphDb, NS_PROP};
 use core_storage::fs::Fs;
 use core_storage::{GraphError, Result, Value};
 use std::collections::BTreeMap;
@@ -37,6 +37,25 @@ const MAX_TEXT_CHARS: usize = 4000;
 
 /// The `kind` values a `Note` may carry.
 pub const NOTE_KINDS: [&str; 3] = ["note", "decision", "todo"];
+
+/// The `kind` a note gets when the caller names none.
+pub const DEFAULT_NOTE_KIND: &str = "note";
+
+/// Unix seconds now — the `ts` a note gets when the caller names none. `0`
+/// on a clock set before 1970 rather than a panic.
+#[must_use]
+pub fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Drop repeats from `keys`, keeping the first of each and the order — the
+/// order `remember` reports `provisional` keys in.
+pub fn dedup_keep_order(keys: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    keys.retain(|k| seen.insert(k.clone()));
+}
 
 /// The edge type linking a `Note` to what it is about.
 const ABOUT_EDGE: &str = "ABOUT";
@@ -245,6 +264,115 @@ pub fn describe_entity_with_aliases<F: Fs>(
         db.insert_node(label.unwrap_or(PROVISIONAL_LABEL), key, props)?;
         let _ = db.remove_prop(key, PROVISIONAL_PROP)?;
         Ok(true)
+    }
+}
+
+/// What one [`upsert_entity`] call did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpsertOutcome {
+    /// The label the node carries: the one given on a create, the stored one
+    /// on an update.
+    pub label: String,
+    /// True when the node did not exist before this call.
+    pub created: bool,
+    /// Properties this call set on an existing node. `0` on a create. The
+    /// namespace a node is already in is not counted: it writes no record.
+    pub updated_fields: usize,
+    /// `SAME_AS` claims the node held before an update and does not after it.
+    /// Empty on a create and on a store without the identity preset.
+    pub same_as_lost: Vec<SameAsPair>,
+}
+
+/// Create or update one entity by key, with the policy every surface shares.
+///
+/// - `id` is never taken from `row`: on a create it is set to `key`, and on
+///   an update it is left alone.
+/// - A create needs `label`. An update never changes one: a `label` that
+///   differs from the stored one is refused before anything is written, so
+///   nothing in `row` is applied either.
+/// - A `row` entry `ns` equal to the namespace the node is already in is the
+///   engine's no-op and is not counted as an update; a different one is the
+///   engine's `NamespaceImmutable` refusal.
+/// - Aliases are maintained and a provisional mark is cleared, as
+///   [`describe_entity_with_aliases`] does.
+///
+/// Reads and writes on the one `&mut` handle, so the existence check and the
+/// write cannot be separated by another writer.
+///
+/// # Errors
+/// [`GraphError::IngestError`] for the two policy refusals, with the whole
+/// sentence in `detail`; any engine refusal, as it came.
+pub fn upsert_entity<F: Fs>(
+    db: &mut GraphDb<F>,
+    key: &str,
+    label: Option<&str>,
+    mut row: BTreeMap<String, Value>,
+    aliases: &[String],
+) -> Result<UpsertOutcome> {
+    row.remove("id");
+    if db.has_node(key) {
+        // The label actually stored — an update never changes it. Checked,
+        // and refused, before anything else: a `label` that disagrees is not
+        // a request this call can honor at all, so it does not partially
+        // apply the rest of `row` either.
+        let stored_label = db
+            .node_ref(key)
+            .map(|n| n.label().to_string())
+            .unwrap_or_default();
+        if let Some(requested) = label {
+            if requested != stored_label {
+                return Err(GraphError::IngestError {
+                    detail: format!(
+                        "'{key}' exists as {stored_label:?}, not {requested:?}; this release \
+                         cannot relabel a node. Pass the label in remember's 'entities' when you \
+                         know it (at first mention, before it goes provisional), or use a \
+                         different key."
+                    ),
+                });
+            }
+        }
+        let mut to_set: Vec<(String, Value)> = Vec::new();
+        for (field, v) in row {
+            // The namespace a node is already in is the engine's no-op: it
+            // writes no record and takes no commit, so counting it as an
+            // updated field would report an update that did not happen.
+            // Asking first also keeps the refusal for a *different* namespace
+            // coming from the engine rather than from a second rule stated
+            // here.
+            if field == NS_PROP && Some(&v) == db.namespace_of(key).map(Value::Str).as_ref() {
+                continue;
+            }
+            to_set.push((field, v));
+        }
+        let updated_fields = to_set.len();
+        // The node's `SAME_AS` claims either side of the write, so the
+        // outcome can name the links this update retracted: a changed name
+        // takes a full-name link below the floor.
+        let keys = [key.to_string()];
+        let same_as_before = same_as_pairs(db, &keys);
+        describe_entity_with_aliases(db, key, None, &to_set, aliases)?;
+        let same_as_lost = same_as_lost(&same_as_before, &same_as_pairs(db, &keys));
+        Ok(UpsertOutcome {
+            label: stored_label,
+            created: false,
+            updated_fields,
+            same_as_lost,
+        })
+    } else {
+        let Some(label) = label else {
+            return Err(GraphError::IngestError {
+                detail: "label required when creating a new entity".into(),
+            });
+        };
+        row.insert("id".to_string(), Value::Str(key.to_string()));
+        let props: Vec<(String, Value)> = row.into_iter().collect();
+        describe_entity_with_aliases(db, key, Some(label), &props, aliases)?;
+        Ok(UpsertOutcome {
+            label: label.to_string(),
+            created: true,
+            updated_fields: 0,
+            same_as_lost: Vec::new(),
+        })
     }
 }
 

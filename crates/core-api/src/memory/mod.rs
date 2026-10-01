@@ -9,3 +9,4 @@ pub mod identity;
 pub mod recall;
 pub mod remember;
 pub mod schema;
+pub mod suggest;

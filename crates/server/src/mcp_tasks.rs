@@ -49,10 +49,12 @@
 use crate::mcp::{graph_err_msg, CallOutcome};
 use core_api::digest::{self, MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING};
 use core_api::explain_digest::{explain_with_evidence, predicate_summary, render_explain};
-use core_api::memory::forget::{
-    forget, predicate_fields, ForgetReport, ForgetTarget, FORGET_SHAPE,
+use core_api::memory::forget::{forget, ForgetReport, ForgetTarget, FORGET_SHAPE};
+use core_api::memory::remember::{
+    dedup_keep_order, remember, unix_now_secs, EntityIn, FactIn, RememberInput, DEFAULT_NOTE_KIND,
+    NOTE_KINDS,
 };
-use core_api::memory::remember::{remember, EntityIn, FactIn, RememberInput, NOTE_KINDS};
+use core_api::memory::suggest::{filtered_suggestions, round_to, Suggestion, BOOKKEEPING_FIELDS};
 use core_api::{json_to_value, Dir, Explanation, GraphError, SharedDb, Value};
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1872,12 +1874,9 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Err(e) => return CallOutcome::ToolErr(e),
     };
     // Deduped, order kept — the order `remember` reports `provisional` keys in.
-    {
-        let mut seen = BTreeSet::new();
-        about.retain(|k| seen.insert(k.clone()));
-    }
+    dedup_keep_order(&mut about);
     let kind = match args.get("kind") {
-        None | Some(Js::Null) => "note".to_string(),
+        None | Some(Js::Null) => DEFAULT_NOTE_KIND.to_string(),
         Some(Js::String(k)) => k.clone(),
         Some(_) => return CallOutcome::ToolErr("kind must be a string".into()),
     };
@@ -1892,9 +1891,7 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Err(e) => return CallOutcome::ToolErr(e),
     };
     let ts = match args.get("ts") {
-        None | Some(Js::Null) => std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64),
+        None | Some(Js::Null) => unix_now_secs(),
         Some(v) => match v.as_i64() {
             Some(n) => n,
             None => return CallOutcome::ToolErr("ts must be an integer".into()),
@@ -2240,44 +2237,9 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
 /// can carry with all of that, and the reply counts the rest.
 const MAX_SUGGESTIONS: usize = 5;
 
-/// Fields the store writes for its own bookkeeping, never proposed as a rule.
-///
-/// On a memory store these are the whole of what the engine would otherwise
-/// propose: measured on a 100,000-node store `remember` filled, every proposal
-/// was `kind`, `source` or `ts` — clique rules that link every note to 32
-/// others for sharing a default value. `ns` is the namespace every namespaced
-/// node carries, `id` repeats the key, `provisional` is `remember`'s stub mark,
-/// `aliases` is the list `remember` maintains for identity matching and
-/// `alias_keys` is the list of aliases a caller declared, kept as written.
-const BOOKKEEPING_FIELDS: [&str; 8] = [
-    "ns",
-    "kind",
-    "ts",
-    "source",
-    "provisional",
-    "id",
-    "aliases",
-    "alias_keys",
-];
-
-/// One proposal, with the arguments that create it.
-#[derive(serde::Serialize)]
-struct SuggestionOut {
-    name: String,
-    src_label: String,
-    dst_label: String,
-    edge_type: String,
-    predicate: String,
-    est_edges: u64,
-    examples: Vec<(String, String, f64)>,
-    rationale: String,
-    /// Pass this object to `create_rule` as its arguments, unchanged.
-    create_rule_args: Js,
-}
-
 #[derive(serde::Serialize)]
 struct SuggestOut {
-    suggestions: Vec<SuggestionOut>,
+    suggestions: Vec<Suggestion>,
     /// Proposals after the bookkeeping filter, before the cap.
     total: usize,
     /// Proposals dropped because they read a bookkeeping field.
@@ -2321,21 +2283,6 @@ fn identity_preset_offer(
         entity_nodes,
         command: format!("mushroomdb schema apply {path} --memory-identity"),
     })
-}
-
-/// `def` as `create_rule` arguments: no nulls, `approximate` only when set,
-/// and `weight_prop` explicit — `create_rule` would default a missing one to
-/// `"weight"`, so it is written out to make what is shown what is created.
-fn create_rule_args(def: &core_api::RuleDef) -> Js {
-    let mut v = serde_json::to_value(def).unwrap_or(Js::Null);
-    if let Some(obj) = v.as_object_mut() {
-        obj.retain(|_, x| !x.is_null());
-        if obj.get("approximate") == Some(&Js::Bool(false)) {
-            obj.remove("approximate");
-        }
-        obj.entry("weight_prop").or_insert_with(|| json!("weight"));
-    }
-    v
 }
 
 fn render_suggestions(r: &SuggestOut) -> String {
@@ -2414,52 +2361,17 @@ fn render_suggestions(r: &SuggestOut) -> String {
 }
 
 fn tool_suggest_rules(db: &SharedDb, db_dir: Option<&Path>, json_out: bool) -> CallOutcome {
-    let (report, identity_preset) = {
+    let (found, identity_preset) = {
         let g = db.read();
-        (
-            g.suggest_rules_with_config(
-                &core_api::SuggestConfig::default(),
-                core_api::SUGGEST_DEFAULT_SEED,
-            ),
-            identity_preset_offer(&g, db_dir),
-        )
+        (filtered_suggestions(&*g), identity_preset_offer(&g, db_dir))
     };
-    let mut kept: Vec<SuggestionOut> = Vec::new();
-    let mut hidden = 0usize;
-    for s in report.suggestions {
-        let summary = core_api::PredicateSummary::from(&s.def.predicate);
-        if predicate_fields(&summary)
-            .iter()
-            .any(|f| BOOKKEEPING_FIELDS.contains(&f.as_str()))
-        {
-            hidden += 1;
-            continue;
-        }
-        kept.push(SuggestionOut {
-            create_rule_args: create_rule_args(&s.def),
-            predicate: predicate_summary(&summary),
-            name: s.def.name,
-            src_label: s.def.src_label,
-            dst_label: s.def.dst_label,
-            edge_type: s.def.edge_type,
-            est_edges: s.est_edges,
-            // Fixed precision in the json report too, not only in the text:
-            // the text prints `{:.2}`, and a determinism claim covers both.
-            examples: s
-                .examples
-                .into_iter()
-                .map(|(a, b, score)| (a, b, round_to(score, 2)))
-                .collect(),
-            rationale: s.rationale,
-        });
-    }
-    let total = kept.len();
+    let mut kept = found.suggestions;
     kept.truncate(MAX_SUGGESTIONS);
     let out = SuggestOut {
         suggestions: kept,
-        total,
-        bookkeeping_hidden: hidden,
-        truncated: report.truncated,
+        total: found.total,
+        bookkeeping_hidden: found.bookkeeping_hidden,
+        truncated: found.truncated,
         identity_preset,
     };
     ok(json_out, &out, render_suggestions)
@@ -2490,13 +2402,6 @@ fn top_arg(args: &Js) -> Result<usize, String> {
                 .min(ANALYZE_MAX_TOP)),
         },
     }
-}
-
-/// `x` rounded to `places` decimals: a json reply's floats at the precision
-/// its text prints them, so the two agree and a re-run is byte-identical.
-pub(crate) fn round_to(x: f64, places: i32) -> f64 {
-    let scale = 10f64.powi(places);
-    (x * scale).round() / scale
 }
 
 /// A key as `analyze` prints it: sanitized and cut at [`ANALYZE_KEY_CHARS`].

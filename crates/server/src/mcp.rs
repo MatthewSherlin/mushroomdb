@@ -53,7 +53,7 @@ use crate::json::{
 };
 use core_api::{
     json_to_rows, json_to_value, memory, AsOfScope, AutoFk, GraphError, IngestOptions, MaskMode,
-    NodeMask, PropPredicate, SharedDb, Value, NS_PROP,
+    NodeMask, PropPredicate, SharedDb, Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -613,10 +613,11 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
 
 /// Insert a new node or update an existing node's properties, keyed by `key`.
 ///
-/// The write itself is [`memory::remember::describe_entity`] — the shared
-/// upsert implementation for the MCP surface (HTTP and Python have no
-/// upsert of their own yet), which also clears a provisional mark
-/// (`memory_schema::PROVISIONAL_PROP`) on `key` if it had one, whoever set it.
+/// The policy and the write are [`memory::remember::upsert_entity`] — the one
+/// implementation this tool and the Python binding share — which also clears
+/// a provisional mark (`memory_schema::PROVISIONAL_PROP`) on `key` if it had
+/// one, whoever set it. This function parses the arguments and shapes the
+/// reply.
 ///
 /// If the node exists: every supplied property is checked (reserved names, the
 /// `ns` rule, a view-owned field, type) and then all of them are written in one
@@ -702,100 +703,44 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
         }
     }
 
-    let exists = {
-        let g = db.read();
-        g.has_node(key)
-    };
-
-    if exists {
+    // One write guard for the existence check and the write: the policy —
+    // label on create, no relabel, the namespace no-op, `id` from the key —
+    // is `core-api`'s, shared with the Python binding.
+    let outcome = {
         let mut g = db.write();
-        // The label actually stored — an update never changes it. Checked,
-        // and refused, before anything else: a `label` that disagrees is not
-        // a request this call can honor at all, so it does not partially
-        // apply the rest of `props` either (see the doc comment above).
-        let stored_label = g
-            .node_ref(key)
-            .map(|n| n.label().to_string())
-            .unwrap_or_default();
-        if let Some(requested) = label_opt {
-            if requested != stored_label {
-                return CallOutcome::ToolErr(format!(
-                    "'{key}' exists as {stored_label:?}, not {requested:?}; this release \
-                     cannot relabel a node. Pass the label in remember's 'entities' when you \
-                     know it (at first mention, before it goes provisional), or use a \
-                     different key."
-                ));
-            }
+        match memory::remember::upsert_entity(&mut *g, key, label_opt, row, &aliases) {
+            Ok(o) => o,
+            Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
         }
-        let mut to_set: Vec<(String, Value)> = Vec::new();
-        for (field, v) in row {
-            // The namespace a node is already in is the engine's no-op: it
-            // writes no record and takes no commit, so counting it as an updated
-            // field would report an update that did not happen. Asking first
-            // also keeps the refusal for a *different* namespace coming from the
-            // engine rather than from a second rule stated here.
-            if field == NS_PROP && Some(&v) == g.namespace_of(key).map(Value::Str).as_ref() {
-                continue;
-            }
-            to_set.push((field, v));
-        }
-        let count = to_set.len();
-        // The node's `SAME_AS` claims either side of the write, under the one
-        // write guard, so the reply can name the links this update retracted:
-        // a changed name takes a full-name link below the floor.
-        let keys = [key.to_string()];
-        let same_as_before = memory::identity::same_as_pairs(&g, &keys);
-        if let Err(e) =
-            memory::remember::describe_entity_with_aliases(&mut g, key, None, &to_set, &aliases)
-        {
-            return CallOutcome::ToolErr(graph_err_msg(e));
-        }
-        let lost = memory::identity::same_as_lost(
-            &same_as_before,
-            &memory::identity::same_as_pairs(&g, &keys),
-        );
-        let mut reply = json!({
+    };
+    if outcome.created {
+        return CallOutcome::ToolOk(json!({
             "ok": true,
             "key": key,
-            "label": stored_label,
-            "created": false,
-            "updated_fields": count
-        });
-        // Absent when nothing was lost, so an ordinary update's reply is
-        // unchanged.
-        if !lost.is_empty() {
-            reply["same_as_lost"] = crate::mcp_tasks::same_as_lost_json(&lost);
-            reply["same_as_lost_total"] = json!(lost.len());
-            reply["same_as_lost_note"] = json!(format!(
-                "this write retracted {} SAME_AS link(s): {}",
-                lost.len(),
-                crate::mcp_tasks::SAME_AS_LOST_REMEDY
-            ));
-        }
-        CallOutcome::ToolOk(reply)
-    } else {
-        let Some(label) = label_opt else {
-            return CallOutcome::ToolErr("label required when creating a new entity".into());
-        };
-        row.insert("id".to_string(), Value::Str(key.to_string()));
-        let props: Vec<(String, Value)> = row.into_iter().collect();
-        let mut g = db.write();
-        match memory::remember::describe_entity_with_aliases(
-            &mut g,
-            key,
-            Some(label),
-            &props,
-            &aliases,
-        ) {
-            Ok(_) => CallOutcome::ToolOk(json!({
-                "ok": true,
-                "key": key,
-                "label": label,
-                "created": true
-            })),
-            Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
-        }
+            "label": outcome.label,
+            "created": true
+        }));
     }
+    let mut reply = json!({
+        "ok": true,
+        "key": key,
+        "label": outcome.label,
+        "created": false,
+        "updated_fields": outcome.updated_fields
+    });
+    // Absent when nothing was lost, so an ordinary update's reply is
+    // unchanged.
+    let lost = &outcome.same_as_lost;
+    if !lost.is_empty() {
+        reply["same_as_lost"] = crate::mcp_tasks::same_as_lost_json(lost);
+        reply["same_as_lost_total"] = json!(lost.len());
+        reply["same_as_lost_note"] = json!(format!(
+            "this write retracted {} SAME_AS link(s): {}",
+            lost.len(),
+            crate::mcp_tasks::SAME_AS_LOST_REMEDY
+        ));
+    }
+    CallOutcome::ToolOk(reply)
 }
 
 /// Return neighbors connected by a given edge type (default `"SIMILAR"`).
