@@ -2125,6 +2125,18 @@ pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
     Ok(text)
 }
 
+/// How a Cypher statement is typed at a shell, in the words every place that
+/// prints a shell `query` uses: this brief's reach line, the CLI-only
+/// empty-store line, and the skill's CLI table.
+///
+/// The statement is one double-quoted argument because the engine's Cypher
+/// takes single-quoted strings only. A shell expands `$` and a backtick inside
+/// double quotes, so a fact holding either would run a command on its way in;
+/// the rule is in words rather than the characters themselves so it reads the
+/// same in a Markdown table as in a plain line.
+const SHELL_QUOTING_RULE: &str = "single-quote Cypher strings; inside the double quotes \
+                                  backslash every dollar sign, double quote and backtick";
+
 /// The brief's last line: how to reach the graph from this session.
 ///
 /// Two doors, because a session may have either one open — the MCP tool, and
@@ -2155,7 +2167,7 @@ fn reach_line(db_dir: &Path) -> String {
          or namespace: <ns> to narrow what it sees){sep}or:",
         sep = core_api::digest::SEP
     );
-    let shell = format!("{bin} query {db} '<cypher>'");
+    let shell = format!("{bin} query {db} \"<cypher>\" ({SHELL_QUOTING_RULE})");
     match install::delivery_for_store(db_dir) {
         install::Delivery::Cli => shell,
         _ => format!("{tools} {shell}"),
@@ -2174,7 +2186,9 @@ fn reach_line(db_dir: &Path) -> String {
 /// Cypher takes single-quoted strings only: the line has to run as a shell
 /// would run it, and
 /// `an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool` runs
-/// it, on a store path with a space and a quote in it.
+/// it, on a store path with a space and a quote in it. The fact a session
+/// fills in is arbitrary text inside those double quotes, so the line ends
+/// with [`SHELL_QUOTING_RULE`].
 ///
 /// The id and the text are placeholders, as the skill's `note:…` is. A
 /// literal id would be the same key on every paste, and the key is the node.
@@ -2186,7 +2200,7 @@ fn empty_brief_cli(db_dir: &Path) -> String {
     format!(
         "mushroomdb brief — empty store; offer to fill it: {bin} query {db} \
          \"CREATE (n:Note {{id: 'note:<fresh-id>', text: '<the fact>'}})\" writes a fact; \
-         fill in both, with an id no note has yet\n"
+         fill in both, with an id no note has yet; {SHELL_QUOTING_RULE}\n"
     )
 }
 

@@ -184,7 +184,9 @@ nothing installed globally and nothing is copied into your home directory. Point
 build with `--command <path>`. `mushroomdb doctor` verifies the result end to end — config entry,
 store, lock, hooks, and a real stdio handshake with the configured command.
 
-To see the bundled explorer, write a demo graph and serve it:
+To see the bundled explorer, write a demo graph and serve it. These lines assume a `mushroomdb`
+binary on your `PATH` that embeds the UI — a release binary, or the one `install.sh` fetches. The
+plugin and `npx` rows put nothing on `PATH`: there, prefix each line with `npx`.
 
 ```sh
 mushroomdb demo ./db
@@ -193,8 +195,7 @@ mushroomdb serve ./db
 
 Open `http://127.0.0.1:8080/`. The demo graph has 10 Orgs, 20 Projects, 30 People, and 334
 edges — 304 of them derived by seven rule sets. When a token is configured, open
-`http://host:8080/?token=…`. Building the binary with the UI embedded, Docker, and the
-`install.sh` script are covered in [CONTRIBUTING.md](CONTRIBUTING.md).
+`http://host:8080/?token=…`.
 
 **Role-bound tokens** limit a caller to a named subset of nodes. Define roles in `schema.json`
 under the `roles` key (each role has a `label` selector list), then pass `--role-token TOKEN:ROLE`
@@ -327,7 +328,7 @@ fixed-seed probe). Full reference: [`docs/site/rules.md`](docs/site/rules.md).
 | `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
 | `mushroomdb serve <dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>]` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not |
 | `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted). `--role <name>` answers as one of the store's roles and `--namespace <ns>` from one namespace; together they intersect, so neither widens the other, and either makes the query a read |
-| `mushroomdb asof <dir> --commit N\|--at <date>` | Read-only view at a WAL commit or at a date (`2026-06-19`, or RFC 3339) — the last commit at or before it. Exactly one of the two. `--namespace <ns>` reads one namespace as it was then |
+| `mushroomdb asof <dir> --commit N\|--at <date> [--query "…"]` | Read-only view at a WAL commit or at a date (`2026-06-19`, or RFC 3339) — the last commit at or before it. Exactly one of the two. `--namespace <ns>` reads one namespace as it was then |
 | `mushroomdb stats <dir>` | Print node/edge/rule counts, plus a `namespaces:` line once a store has more than the implicit `default` one |
 | `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
 | `mushroomdb schema apply <dir> <schema.json>\|--memory-defaults\|--memory-identity` | Idempotently apply a schema file (rules, views, fulltext indexes), the built-in memory schema, or the identity preset; prints a diff |

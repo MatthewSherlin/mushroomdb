@@ -43,7 +43,7 @@ Since when → `node_history`, `edge_history`, `was_linked` (its `at_commit` tak
 |---|---|
 | why are these two related | `{{BIN}} why '{{DB_PATH}}' <a> <b>` — what links two keys, with the evidence |
 | what did it look like then | `{{BIN}} asof '{{DB_PATH}}' --at <date> --query "<cypher>"` — a date, e.g. `2026-06-19`; `--commit N` still takes an index, and exactly one of the two |
-| anything else, including a durable fact | `{{BIN}} query '{{DB_PATH}}' "<cypher>"` — any Cypher, read or write, its strings in single quotes; a fact is a `CREATE (n:Note {id: 'note:<fresh-id>', text: '<the fact>'})`, and say the key back |
+| anything else, including a durable fact | `{{BIN}} query '{{DB_PATH}}' "<cypher>"` — any Cypher, read or write, here and in `--query`: single-quote Cypher strings; inside the double quotes backslash every dollar sign, double quote and backtick; a fact is a `CREATE (n:Note {id: 'note:<fresh-id>', text: '<the fact>'})`, and say the key back |
 
 `explain_association`, `node_edges`, `edges_at`, `what_if`, `node_history`, `was_linked` and `neighborhood` have no subcommand here, and there is no `remember` subcommand. The rest need `--delivery mcp`. Who may see → `query --role <name>`, a `role` from the store's `roles.json`.
 <!-- /cli -->

@@ -9,6 +9,26 @@ use std::process::Command;
 /// nanosecond, which would otherwise hand both the same repo.
 static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The one rule for a Cypher statement typed at a shell, in the words the
+/// skill's CLI table, the reach line and the CLI-only empty-store brief all
+/// print. The statement is one double-quoted argument, because the engine's
+/// Cypher takes single-quoted strings only — and a shell expands `$` and a
+/// backtick inside double quotes, so a fact that holds one would run.
+const QUOTING_RULE: &str = "single-quote Cypher strings; inside the double quotes backslash \
+                            every dollar sign, double quote and backtick";
+
+/// `text` as [`QUOTING_RULE`] says to write it inside the double quotes.
+fn as_the_quoting_rule_says(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '$' | '"' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn tmp(name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1730,7 +1750,10 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
         "{reach}"
     );
     assert!(
-        reach.ends_with(&format!(" query '{}' '<cypher>'", db_dir.display())),
+        reach.ends_with(&format!(
+            " query '{}' \"<cypher>\" ({QUOTING_RULE})",
+            db_dir.display()
+        )),
         "{reach}"
     );
 
@@ -1822,7 +1845,7 @@ fn the_reach_line_names_the_association_door_on_a_store_with_no_git_sync_marker(
         reach,
         format!(
             "explain_association <a> <b> · query '<cypher>' (MCP tools; add role: <name> or \
-             namespace: <ns> to narrow what it sees) · or: {} query '{}' '<cypher>'",
+             namespace: <ns> to narrow what it sees) · or: {} query '{}' \"<cypher>\" ({QUOTING_RULE})",
             cli::install::detect_mcp_command(None).shell(),
             db_dir.display()
         ),
@@ -1942,7 +1965,10 @@ fn the_reach_line_on_a_cli_delivery_install_names_only_the_binary() {
         "a cli install has no server to name: {reach}"
     );
     assert!(
-        reach.ends_with(&format!(" query '{}' '<cypher>'", db_dir.display())),
+        reach.ends_with(&format!(
+            " query '{}' \"<cypher>\" ({QUOTING_RULE})",
+            db_dir.display()
+        )),
         "{reach}"
     );
 }
@@ -2007,6 +2033,10 @@ fn an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool() {
     assert!(
         first.contains("'note:<fresh-id>'") && first.contains("'<the fact>'"),
         "the id and the text are for the session to fill in: {first}"
+    );
+    assert!(
+        first.contains(QUOTING_RULE),
+        "the line says how to quote the fact it asks for: {first}"
     );
     // The offer has to run as a shell would run it, hostile path included.
     // The engine's Cypher takes single-quoted strings only, so the statement
@@ -2079,7 +2109,8 @@ fn an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool() {
 #[test]
 fn the_cli_skills_cypher_rows_run_as_a_shell_runs_them() {
     // A space in the store path: the row quotes it, and has to keep doing so.
-    let db_dir = tmp("skill-cli-rows").join("mushroom memory");
+    let root = tmp("skill-cli-rows");
+    let db_dir = root.join("mushroom memory");
     let template = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/mushroom/SKILL.md"),
     )
@@ -2093,12 +2124,15 @@ fn the_cli_skills_cypher_rows_run_as_a_shell_runs_them() {
     .expect("the committed template's regions are well formed");
 
     // The code spans of one table row, in order.
-    let row = |question: &str| -> Vec<String> {
-        let line = skill
+    let line = |question: &str| -> &str {
+        skill
             .lines()
             .find(|l| l.starts_with(&format!("| {question} |")))
-            .unwrap_or_else(|| panic!("no `{question}` row in the cli skill:\n{skill}"));
-        line.split('`')
+            .unwrap_or_else(|| panic!("no `{question}` row in the cli skill:\n{skill}"))
+    };
+    let row = |question: &str| -> Vec<String> {
+        line(question)
+            .split('`')
             .skip(1)
             .step_by(2)
             .map(str::to_string)
@@ -2114,7 +2148,18 @@ fn the_cli_skills_cypher_rows_run_as_a_shell_runs_them() {
     };
 
     // The durable fact: the `query` form, with the example the row gives for
-    // it and the two placeholders filled in.
+    // it and the two placeholders filled in. The fact is hostile to a shell —
+    // a dollar sign, a double quote, and a backticked command that would
+    // leave a file behind — and is written the way the row says to write it.
+    let executed = root.join("executed");
+    let hostile = format!(
+        "costs $5, said \"no\", run `touch {}` first",
+        executed.display()
+    );
+    assert!(
+        line("anything else, including a durable fact").contains(QUOTING_RULE),
+        "the row does not say how to quote a statement:\n{skill}"
+    );
     let fact = row("anything else, including a durable fact");
     let command = &fact[0];
     let example = fact
@@ -2126,7 +2171,7 @@ fn the_cli_skills_cypher_rows_run_as_a_shell_runs_them() {
         "<cypher>",
         &example
             .replace("<fresh-id>", "1")
-            .replace("<the fact>", "ada likes tea"),
+            .replace("<the fact>", &as_the_quoting_rule_says(&hostile)),
     );
     let out = sh(&write);
     assert!(
@@ -2142,8 +2187,12 @@ fn the_cli_skills_cypher_rows_run_as_a_shell_runs_them() {
         .unwrap();
     let rows = String::from_utf8_lossy(&out.stdout);
     assert!(
-        rows.contains("note:1") && rows.contains("ada likes tea"),
-        "the note landed in the store the row named: {out:?}"
+        rows.contains("note:1") && rows.contains(&hostile),
+        "the note landed in the store the row named, verbatim: {out:?}"
+    );
+    assert!(
+        !executed.exists(),
+        "the shell ran the command inside the fact: {write}"
     );
 
     // The dated read: the same trap, one row up. A string literal in the
@@ -2155,7 +2204,7 @@ fn the_cli_skills_cypher_rows_run_as_a_shell_runs_them() {
     );
     let out = sh(&read);
     assert!(
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ada likes tea"),
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&hostile),
         "the dated read the skill teaches does not run: {read}: {out:?}"
     );
 }
