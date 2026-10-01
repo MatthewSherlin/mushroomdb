@@ -6033,7 +6033,8 @@ fn analyze_identities_lists_each_identity_under_its_oldest_node() {
             "remember",
             json!({"text": format!("mention {i}"),
                    "entities": [{"key": key, "label": "Person",
-                                 "props": {"name": "Matthew Sherlin"}}]}),
+                                 "props": {"name": "Matthew Sherlin"},
+                                 "aliases": ["Matt"]}]}),
         );
     }
     let (text, report) = task_both(db.clone(), "analyze", json!({"kind": "identities"}));
@@ -6042,10 +6043,13 @@ fn analyze_identities_lists_each_identity_under_its_oldest_node() {
         "{text}"
     );
     assert!(
-        text.contains("  1. matthew-sherlin — matthew-sherlin, msherlin, weakest link 0.60"),
+        text.contains("  1. matthew-sherlin — matthew-sherlin, msherlin, weakest link 0.67"),
         "{text}"
     );
     assert_eq!(report["rows"][0]["canonical"], json!("matthew-sherlin"));
+    // A shared nickname makes the score 4/6: the reply carries it at two
+    // places, as `same_as` does, not as 0.6666666666666666.
+    assert_eq!(report["rows"][0]["weakest"], json!(0.67), "{report}");
     let err = error_text(&one_task_call(
         db,
         "analyze",

@@ -314,7 +314,9 @@ pub struct IdentityReport {
 ///
 /// A singleton is not a cluster and is not returned. Reads every `SAME_AS`
 /// edge once ([`GraphDb::weighted_edges`]); an edge with no score is a
-/// caller's own assertion and counts as 1.0.
+/// caller's own assertion and counts as 1.0, and so does one whose `weight`
+/// is not a number (`weighted_edges` reads only `Int` and `Float`) — the same
+/// rule [`same_as_pairs`] applies.
 pub fn identity_clusters<F: Fs>(db: &GraphDb<F>, floor: f64) -> IdentityReport {
     use std::collections::BTreeMap;
     let mut key_of: BTreeMap<u32, String> = BTreeMap::new();

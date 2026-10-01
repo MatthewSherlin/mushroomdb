@@ -476,6 +476,25 @@ fn a_chain_of_two_claims_is_not_one_identity() {
     assert_eq!(clusters_of(&db), vec![strings(&["c0", "c1"])]);
 }
 
+/// The same chain with its middle node oldest: the seed c1 admits c0, then
+/// must refuse c2 because c0~c2 is 8/14. Admitting every neighbour of the
+/// seed would answer all three.
+#[test]
+fn a_candidate_must_link_to_every_member_not_just_the_seed() {
+    let mut db = identity_store("hub-first");
+    remember_people(
+        &mut db,
+        "hub-first",
+        vec![
+            tagged("c1", 2..=11),
+            tagged("c0", 1..=10),
+            tagged("c2", 3..=12),
+        ],
+    );
+    assert_eq!(identity_clusters(&db, SAME_AS_FLOOR).claims, 2);
+    assert_eq!(clusters_of(&db), vec![strings(&["c1", "c0"])]);
+}
+
 /// Locality: a hundred unrelated linked pairs added after the fact do not move
 /// an existing identity. Modularity clustering fails exactly this.
 #[test]
@@ -540,6 +559,27 @@ fn the_canonical_is_the_oldest_live_node() {
         "the next oldest live node"
     );
     assert_eq!(report.clusters[0].members, strings(&["abe", "zs"]));
+}
+
+/// A provisional stub `remember` made for an `about` key is a node like any
+/// other: named first, it is the oldest, so it is the canonical.
+#[test]
+fn a_stub_named_first_is_the_canonical_of_its_identity() {
+    let mut db = identity_store("stub-canonical");
+    let about = strings(&["Matthew_Sherlin"]);
+    remember(&mut db, &note("named first", &about, &[])).unwrap();
+    remember_people(
+        &mut db,
+        "described later",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &[])],
+    );
+    let report = identity_clusters(&db, SAME_AS_FLOOR);
+    assert_eq!(report.clusters.len(), 1, "{report:?}");
+    assert_eq!(report.clusters[0].canonical, "Matthew_Sherlin");
+    assert_eq!(
+        report.clusters[0].members,
+        strings(&["Matthew_Sherlin", "matthew-sherlin"])
+    );
 }
 
 #[test]

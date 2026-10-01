@@ -2779,7 +2779,7 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 rows.push(json!({
                     "canonical": c.canonical,
                     "size": c.members.len(),
-                    "weakest": c.weakest,
+                    "weakest": (c.weakest * 100.0).round() / 100.0,
                     "members": c.members.iter().take(ANALYZE_SAMPLE_MEMBERS).collect::<Vec<_>>()
                 }));
             }
