@@ -331,7 +331,9 @@ fn a_remember_refused_for_aliases_declares_no_fulltext() {
 
 // ── the identity preset ─────────────────────────────────────────────────────
 
-use core_api::memory::identity::{SameAsPair, SAME_AS_EDGE, SAME_AS_FLOOR};
+use core_api::memory::identity::{
+    same_as_pairs, SameAsPair, ALIAS_KEYS_FIELD, MAX_ALIAS_KEYS, SAME_AS_EDGE, SAME_AS_FLOOR,
+};
 use core_api::memory_schema::memory_identity;
 use core_api::Predicate;
 
@@ -350,42 +352,114 @@ fn remember_people(
 }
 
 #[test]
-fn the_preset_is_eleven_global_rules_over_aliases() {
+fn the_preset_is_sixteen_global_rules_eleven_over_aliases_and_five_over_alias_keys() {
     let s = memory_identity();
+    let shape: Vec<(&str, &str, &str, &Predicate, Option<u64>)> = s
+        .rules
+        .iter()
+        .map(|r| {
+            (
+                r.name.as_str(),
+                r.src_label.as_str(),
+                r.dst_label.as_str(),
+                &r.predicate,
+                r.max_edges,
+            )
+        })
+        .collect();
+    let overlap = Predicate::Overlap {
+        field: ALIASES_FIELD.into(),
+        min: SAME_AS_FLOOR,
+    };
+    let claim = Predicate::KeyMatch {
+        field: ALIAS_KEYS_FIELD.into(),
+    };
     assert_eq!(
-        s.rules.len(),
-        11,
-        "{:?}",
-        s.rules.iter().map(|r| &r.name).collect::<Vec<_>>()
+        shape,
+        vec![
+            ("same_as_person", "Person", "Person", &overlap, Some(32)),
+            ("same_as_org", "Org", "Org", &overlap, Some(32)),
+            ("same_as_project", "Project", "Project", &overlap, Some(32)),
+            ("same_as_concept", "Concept", "Concept", &overlap, Some(32)),
+            ("same_as_event", "Event", "Event", &overlap, Some(32)),
+            ("same_as_entity", "Entity", "Entity", &overlap, Some(32)),
+            (
+                "same_as_entity_person",
+                "Entity",
+                "Person",
+                &overlap,
+                Some(32)
+            ),
+            ("same_as_entity_org", "Entity", "Org", &overlap, Some(32)),
+            (
+                "same_as_entity_project",
+                "Entity",
+                "Project",
+                &overlap,
+                Some(32)
+            ),
+            (
+                "same_as_entity_concept",
+                "Entity",
+                "Concept",
+                &overlap,
+                Some(32)
+            ),
+            (
+                "same_as_entity_event",
+                "Entity",
+                "Event",
+                &overlap,
+                Some(32)
+            ),
+            (
+                "same_as_claim_person",
+                "Person",
+                "Entity",
+                &claim,
+                Some(512)
+            ),
+            ("same_as_claim_org", "Org", "Entity", &claim, Some(512)),
+            (
+                "same_as_claim_project",
+                "Project",
+                "Entity",
+                &claim,
+                Some(512)
+            ),
+            (
+                "same_as_claim_concept",
+                "Concept",
+                "Entity",
+                &claim,
+                Some(512)
+            ),
+            ("same_as_claim_event", "Event", "Entity", &claim, Some(512)),
+        ]
     );
     for r in &s.rules {
         assert_eq!(r.edge_type, SAME_AS_EDGE, "{}", r.name);
         assert_eq!(r.namespace, None, "{} must be global", r.name);
         assert_eq!(r.weight_prop.as_deref(), Some("weight"), "{}", r.name);
-        assert_eq!(r.max_edges, Some(32), "{}", r.name);
+        assert!(!r.approximate, "{}", r.name);
         assert_eq!(
-            r.predicate,
-            Predicate::Overlap {
-                field: ALIASES_FIELD.into(),
-                min: SAME_AS_FLOOR
-            },
+            (&r.via_label, &r.via_edge, &r.via_dir),
+            (&None, &None, &None),
             "{}",
             r.name
         );
-    }
-    let pairs: Vec<(&str, &str)> = s
-        .rules
-        .iter()
-        .map(|r| (r.src_label.as_str(), r.dst_label.as_str()))
-        .collect();
-    for label in ["Person", "Org", "Project", "Concept", "Event", "Entity"] {
         assert!(
-            pairs.contains(&(label, label)),
-            "no same-label rule for {label}"
+            !matches!(r.predicate, Predicate::Any(_)),
+            "{}: a KeyMatch under Any loses the FK fast path",
+            r.name
         );
     }
-    for label in ["Person", "Org", "Project", "Concept", "Event"] {
-        assert!(pairs.contains(&("Entity", label)), "no Entity→{label} rule");
+    for r in s.rules.iter().filter(|r| r.name.contains("claim")) {
+        assert!(
+            core_api::is_keymatch_rooted(&r.predicate),
+            "{} must take the FK fast path",
+            r.name
+        );
     }
 }
 
@@ -521,7 +595,7 @@ fn a_global_identity_rule_links_across_namespaces_and_says_so() {
     );
 }
 
-/// The preset's real shape through the lock-free reader: eleven rules exist
+/// The preset's real shape through the lock-free reader: sixteen rules exist
 /// before any node carries `aliases`.
 #[test]
 fn the_reader_survives_the_preset_on_an_empty_store() {
@@ -695,4 +769,507 @@ fn a_store_without_claims_has_no_identities() {
     let report = identity_clusters(&db, SAME_AS_FLOOR);
     assert!(report.clusters.is_empty());
     assert_eq!((report.linked, report.claims), (0, 0));
+}
+
+// ── an explicit alias claim links a stub ────────────────────────────────────
+
+fn alias_keys_of(db: &GraphDb<core_storage::fs::RealFs>, key: &str) -> Option<Vec<String>> {
+    match db.get_prop(key, ALIAS_KEYS_FIELD) {
+        None => None,
+        Some(Value::List(items)) => Some(
+            items
+                .into_iter()
+                .map(|v| match v {
+                    Value::Str(s) => s,
+                    other => panic!("non-string alias key {other:?}"),
+                })
+                .collect(),
+        ),
+        other => panic!("{key} holds a foreign alias_keys: {other:?}"),
+    }
+}
+
+/// The `SAME_AS` edges as stored: `(src, dst, weight)`, sorted.
+fn same_as_edges(db: &GraphDb<core_storage::fs::RealFs>) -> Vec<(String, String, Option<f64>)> {
+    let mut edges = db.weighted_edges(SAME_AS_EDGE, Some("weight"));
+    edges.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    edges
+}
+
+fn the_claim() -> Vec<SameAsPair> {
+    vec![SameAsPair {
+        a: "matt".into(),
+        b: "matthew-sherlin".into(),
+        score: 1.0,
+    }]
+}
+
+/// Owner decision Q2. `matt` holds one alias and `matthew-sherlin` five, so
+/// `Overlap` scores 1/5 and never links them; the declared alias does, at 1.0.
+#[test]
+fn a_declared_alias_links_the_stub_it_names_entity_first() {
+    let mut db = identity_store("claim-entity-first");
+    let report = remember_people(
+        &mut db,
+        "described first",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])],
+    );
+    assert!(
+        report.same_as.is_empty(),
+        "no stub yet: {:?}",
+        report.same_as
+    );
+    assert_eq!(
+        alias_keys_of(&db, "matthew-sherlin"),
+        Some(strings(&["matt"]))
+    );
+    let about = strings(&["matt"]);
+    let report = remember(&mut db, &note("named later", &about, &[])).unwrap();
+    assert_eq!(report.same_as, the_claim());
+    assert_eq!(
+        same_as_edges(&db),
+        vec![("matthew-sherlin".into(), "matt".into(), Some(1.0))],
+        "one directed edge, entity to stub, at the exact claim's weight"
+    );
+    assert_eq!(
+        same_as_pairs(&db, &strings(&["matt", "matthew-sherlin"])),
+        the_claim(),
+        "asked from both ends, it is still one claim"
+    );
+    assert_eq!(alias_keys_of(&db, "matt"), None, "a stub declares nothing");
+}
+
+/// The reverse order: the stub exists, and the entity that declares it
+/// arrives afterwards.
+#[test]
+fn a_declared_alias_links_the_stub_it_names_stub_first() {
+    let mut db = identity_store("claim-stub-first");
+    let about = strings(&["matt"]);
+    let report = remember(&mut db, &note("named first", &about, &[])).unwrap();
+    assert!(report.same_as.is_empty(), "{:?}", report.same_as);
+    let report = remember_people(
+        &mut db,
+        "described later",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])],
+    );
+    assert_eq!(report.same_as, the_claim());
+    assert_eq!(
+        same_as_edges(&db),
+        vec![("matthew-sherlin".into(), "matt".into(), Some(1.0))]
+    );
+}
+
+/// The entity and the stub it names, written by one call.
+#[test]
+fn a_declared_alias_links_a_stub_made_by_the_same_call() {
+    let mut db = identity_store("claim-same-call");
+    let about = strings(&["matt"]);
+    let entities = vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])];
+    let report = remember(&mut db, &note("both at once", &about, &entities)).unwrap();
+    assert_eq!(report.same_as, the_claim());
+}
+
+/// `upsert_entity`'s path declares a claim the same way, on a create and on a
+/// later update of a node that declared nothing.
+#[test]
+fn describe_entity_declares_a_claim_on_create_and_on_update() {
+    let mut db = identity_store("claim-describe");
+    let about = strings(&["matt", "sherl"]);
+    remember(&mut db, &note("two stubs", &about, &[])).unwrap();
+    let name = vec![("name".to_string(), Value::Str("Matthew Sherlin".into()))];
+    describe_entity_with_aliases(
+        &mut db,
+        "matthew-sherlin",
+        Some("Person"),
+        &name,
+        &strings(&["matt"]),
+    )
+    .unwrap();
+    assert_eq!(
+        same_as_pairs(&db, &strings(&["matthew-sherlin"])),
+        the_claim()
+    );
+    describe_entity_with_aliases(&mut db, "matthew-sherlin", None, &[], &strings(&["sherl"]))
+        .unwrap();
+    assert_eq!(
+        alias_keys_of(&db, "matthew-sherlin"),
+        Some(strings(&["matt", "sherl"])),
+        "declared aliases accumulate"
+    );
+    assert_eq!(
+        same_as_pairs(&db, &strings(&["matthew-sherlin"])).len(),
+        2,
+        "the second claim links the second stub"
+    );
+}
+
+/// A claim that is also a full-name match is one claim, at the higher score:
+/// `Entity→Person` by `Overlap` at 0.6 and `Person→Entity` by `KeyMatch` at 1.0.
+#[test]
+fn a_claim_and_an_overlap_on_one_pair_are_one_claim_at_the_higher_score() {
+    let mut db = identity_store("claim-and-overlap");
+    let about = strings(&["Matthew_Sherlin"]);
+    remember(&mut db, &note("named first", &about, &[])).unwrap();
+    let report = remember_people(
+        &mut db,
+        "described later",
+        vec![person(
+            "matthew-sherlin",
+            "Matthew Sherlin",
+            &["Matthew_Sherlin"],
+        )],
+    );
+    assert_eq!(
+        same_as_edges(&db),
+        vec![
+            (
+                "Matthew_Sherlin".into(),
+                "matthew-sherlin".into(),
+                Some(0.6)
+            ),
+            (
+                "matthew-sherlin".into(),
+                "Matthew_Sherlin".into(),
+                Some(1.0)
+            ),
+        ],
+        "each direction is owned by its own rule"
+    );
+    assert_eq!(
+        report.same_as,
+        vec![SameAsPair {
+            a: "Matthew_Sherlin".into(),
+            b: "matthew-sherlin".into(),
+            score: 1.0
+        }]
+    );
+}
+
+/// The false positive the design avoids. `alex-1` is named "Alex", so its
+/// derived `aliases` hold `alex` — which is also a stub's key. A rule keyed on
+/// `aliases` would link them; `alias_keys` holds only what a caller declared,
+/// and nobody declared this.
+#[test]
+fn a_name_that_merely_spells_a_stubs_key_does_not_link_it() {
+    let mut db = identity_store("claim-alex");
+    remember_people(&mut db, "an alex", vec![person("alex-1", "Alex", &[])]);
+    assert!(aliases_of(&db, "alex-1").contains(&"alex".to_string()));
+    assert_eq!(alias_keys_of(&db, "alex-1"), None, "nothing was declared");
+    let about = strings(&["alex"]);
+    let report = remember(&mut db, &note("which alex?", &about, &[])).unwrap();
+    assert!(report.same_as.is_empty(), "{:?}", report.same_as);
+    assert!(same_as_edges(&db).is_empty());
+}
+
+/// The limitation, pinned: a claim matches the stub's key exactly, and keys
+/// are case-sensitive. `Matt` is stored as declared and does not name `matt`.
+#[test]
+fn a_claim_matches_the_stubs_key_exactly_so_case_differs_do_not_link() {
+    let mut db = identity_store("claim-case");
+    let about = strings(&["matt"]);
+    remember(&mut db, &note("named first", &about, &[])).unwrap();
+    let report = remember_people(
+        &mut db,
+        "described later",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &["Matt"])],
+    );
+    assert_eq!(
+        alias_keys_of(&db, "matthew-sherlin"),
+        Some(strings(&["Matt"])),
+        "stored verbatim"
+    );
+    assert!(report.same_as.is_empty(), "{:?}", report.same_as);
+    assert!(same_as_edges(&db).is_empty());
+}
+
+/// The limitation's other half: a claim links a stub (`Entity`), never two
+/// described entities, even when one declares the other's key.
+#[test]
+fn a_claim_does_not_link_two_described_entities() {
+    let mut db = identity_store("claim-described");
+    let report = remember_people(
+        &mut db,
+        "two people",
+        vec![
+            person("matt", "Matt", &[]),
+            person("matthew-sherlin", "Matthew Sherlin", &["matt"]),
+        ],
+    );
+    assert!(report.same_as.is_empty(), "{:?}", report.same_as);
+}
+
+#[test]
+fn alias_keys_are_trimmed_deduped_sorted_and_otherwise_verbatim() {
+    let mut db = store("alias-keys-shape");
+    let entities = vec![person(
+        "matthew-sherlin",
+        "Matthew Sherlin",
+        &["  matt ", "Matt", "matt", "M. Sherlin", "", "   "],
+    )];
+    remember(&mut db, &note("declared", &[], &entities)).unwrap();
+    assert_eq!(
+        alias_keys_of(&db, "matthew-sherlin"),
+        Some(strings(&["M. Sherlin", "Matt", "matt"])),
+        "byte order, case and punctuation kept, blanks dropped"
+    );
+    // The derived name and key tokens never go in.
+    for derived in ["matthew", "sherlin", "matthew sherlin", "matthew-sherlin"] {
+        assert!(
+            !alias_keys_of(&db, "matthew-sherlin")
+                .unwrap()
+                .contains(&derived.to_string()),
+            "{derived} is derived, not declared"
+        );
+    }
+}
+
+#[test]
+fn an_entity_that_declares_nothing_carries_no_alias_keys() {
+    let mut db = store("alias-keys-absent");
+    remember_people(
+        &mut db,
+        "plain",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &[])],
+    );
+    assert_eq!(alias_keys_of(&db, "matthew-sherlin"), None);
+}
+
+#[test]
+fn alias_keys_accumulate_across_writes_and_a_repeat_writes_nothing() {
+    let mut db = store("alias-keys-accumulate");
+    remember_people(
+        &mut db,
+        "first",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])],
+    );
+    remember_people(
+        &mut db,
+        "second",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &["sherl"])],
+    );
+    describe_entity_with_aliases(&mut db, "matthew-sherlin", None, &[], &strings(&["ms"])).unwrap();
+    assert_eq!(
+        alias_keys_of(&db, "matthew-sherlin"),
+        Some(strings(&["matt", "ms", "sherl"]))
+    );
+    // A write that declares nothing, or only what is already held, leaves it.
+    describe_entity(&mut db, "matthew-sherlin", None, &[]).unwrap();
+    assert_eq!(
+        core_api::memory::identity::alias_keys_after_write(
+            &db,
+            "matthew-sherlin",
+            &[],
+            &strings(&["matt", " ms "])
+        )
+        .unwrap(),
+        None,
+        "nothing to rewrite"
+    );
+    assert_eq!(
+        alias_keys_of(&db, "matthew-sherlin"),
+        Some(strings(&["matt", "ms", "sherl"]))
+    );
+}
+
+#[test]
+fn an_alias_keys_property_is_refused_with_the_argument_named() {
+    let mut db = store("alias-keys-prop");
+    let claim = (
+        ALIAS_KEYS_FIELD.to_string(),
+        Value::List(vec![Value::Str("matt".into())]),
+    );
+    let err = describe_entity(
+        &mut db,
+        "matthew",
+        Some("Person"),
+        std::slice::from_ref(&claim),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("'alias_keys' is maintained by the store")
+            && err.contains("'aliases' argument"),
+        "{err}"
+    );
+    assert!(!db.has_node("matthew"), "a refusal writes nothing");
+
+    let mut entity = person("matthew", "Matthew", &[]);
+    entity.props.insert(claim.0, claim.1);
+    let before = db.stats().nodes_live;
+    let err = remember(&mut db, &note("refused", &[], &[entity]))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("'alias_keys' is maintained by the store"),
+        "{err}"
+    );
+    assert_eq!(
+        db.stats().nodes_live,
+        before,
+        "neither the note nor the entity"
+    );
+}
+
+/// Thirty-three declared aliases that fold to one canonical alias: `aliases`
+/// stays far under its own cap, so it is the `alias_keys` cap that refuses.
+#[test]
+fn more_alias_keys_than_the_cap_is_refused_before_anything_is_written() {
+    let mut db = store("alias-keys-cap");
+    assert_eq!(MAX_ALIAS_KEYS, 32);
+    let spelled =
+        |n: usize| -> Vec<String> { (0..n).map(|i| format!("a{}", ".".repeat(i))).collect() };
+    let entity = |aliases: Vec<String>| EntityIn {
+        key: "hoarder".into(),
+        label: "Person".into(),
+        props: BTreeMap::new(),
+        aliases,
+    };
+    let before = db.stats().nodes_live;
+    let err = remember(
+        &mut db,
+        &note("too many", &[], &[entity(spelled(MAX_ALIAS_KEYS + 1))]),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("hoarder")
+            && err.contains("33 declared aliases")
+            && err.contains("alias_keys"),
+        "{err}"
+    );
+    assert_eq!(
+        db.stats().nodes_live,
+        before,
+        "neither the note nor the entity"
+    );
+
+    // Exactly the cap is accepted; one more on a later write is refused and
+    // leaves the stored list as it was.
+    remember(
+        &mut db,
+        &note("at the cap", &[], &[entity(spelled(MAX_ALIAS_KEYS))]),
+    )
+    .unwrap();
+    assert_eq!(alias_keys_of(&db, "hoarder").unwrap().len(), MAX_ALIAS_KEYS);
+    let err = describe_entity_with_aliases(&mut db, "hoarder", None, &[], &strings(&["one more"]))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("alias_keys"), "{err}");
+    assert_eq!(alias_keys_of(&db, "hoarder").unwrap().len(), MAX_ALIAS_KEYS);
+    assert!(!aliases_of(&db, "hoarder").contains(&"one more".to_string()));
+}
+
+/// An `alias_keys` value written raw before the store maintained it: a string
+/// or a list of strings is taken in, anything else refused with the node named.
+#[test]
+fn an_existing_alias_keys_value_is_taken_in_or_refused_never_overwritten() {
+    let mut db = store("alias-keys-foreign");
+    for (key, value) in [
+        ("as-string", Value::Str(" matt ".into())),
+        ("as-list", Value::List(vec![Value::Str("matt".into())])),
+        ("as-int", Value::Int(3)),
+    ] {
+        db.insert_node("Person", key, vec![(ALIAS_KEYS_FIELD.to_string(), value)])
+            .unwrap();
+    }
+    for key in ["as-string", "as-list"] {
+        describe_entity_with_aliases(&mut db, key, None, &[], &strings(&["sherl"])).unwrap();
+        assert_eq!(
+            alias_keys_of(&db, key),
+            Some(strings(&["matt", "sherl"])),
+            "{key}"
+        );
+    }
+    let err = set_role(&mut db, "as-int").unwrap_err().to_string();
+    assert!(
+        err.contains("as-int") && err.contains("forget") && err.contains("alias_keys"),
+        "{err}"
+    );
+    assert_eq!(db.get_prop("as-int", "role"), None, "nothing written");
+    assert_eq!(db.get_prop("as-int", ALIAS_KEYS_FIELD), Some(Value::Int(3)));
+}
+
+/// Removing the declared list retracts the claim; the engine re-evaluates the
+/// rule that read it.
+#[test]
+fn clearing_alias_keys_retracts_the_claim() {
+    let mut db = identity_store("claim-cleared");
+    let about = strings(&["matt"]);
+    let entities = vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])];
+    remember(&mut db, &note("both", &about, &entities)).unwrap();
+    assert_eq!(same_as_edges(&db).len(), 1);
+    assert!(db.remove_prop("matthew-sherlin", ALIAS_KEYS_FIELD).unwrap());
+    assert!(same_as_edges(&db).is_empty());
+    // A later write that declares nothing does not bring it back.
+    describe_entity(&mut db, "matthew-sherlin", None, &[]).unwrap();
+    assert_eq!(alias_keys_of(&db, "matthew-sherlin"), None);
+    assert!(same_as_edges(&db).is_empty());
+}
+
+// ── a claimed stub in identity resolution ───────────────────────────────────
+
+/// A stub linked by claim joins the entity's identity, and the canonical is
+/// the older of the two whichever one that is.
+#[test]
+fn a_claimed_stub_joins_the_identity_and_the_oldest_is_canonical() {
+    let mut db = identity_store("claim-cluster-stub-first");
+    let about = strings(&["matt"]);
+    remember(&mut db, &note("named first", &about, &[])).unwrap();
+    remember_people(
+        &mut db,
+        "described later",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])],
+    );
+    let report = identity_clusters(&db, SAME_AS_FLOOR);
+    assert_eq!((report.linked, report.claims), (2, 1), "{report:?}");
+    assert_eq!(report.clusters.len(), 1, "{report:?}");
+    assert_eq!(report.clusters[0].canonical, "matt");
+    assert_eq!(
+        report.clusters[0].members,
+        strings(&["matt", "matthew-sherlin"])
+    );
+    assert_eq!(report.clusters[0].weakest, 1.0);
+
+    let mut db = identity_store("claim-cluster-entity-first");
+    remember_people(
+        &mut db,
+        "described first",
+        vec![person("matthew-sherlin", "Matthew Sherlin", &["matt"])],
+    );
+    remember(&mut db, &note("named later", &about, &[])).unwrap();
+    let report = identity_clusters(&db, SAME_AS_FLOOR);
+    assert_eq!(report.clusters.len(), 1, "{report:?}");
+    assert_eq!(report.clusters[0].canonical, "matthew-sherlin");
+    assert_eq!(
+        report.clusters[0].members,
+        strings(&["matthew-sherlin", "matt"])
+    );
+}
+
+/// Complete linkage still holds for a claim: a stub joins an identity of two
+/// only when both members claim it. One claim is one link, not a merge.
+///
+/// c0 declares t1..t10 and c1 declares t2..t11, so they link at 9/13; only c0
+/// names the stub keyed `t1`.
+#[test]
+fn a_claimed_stub_joins_a_larger_identity_only_when_every_member_claims_it() {
+    let mut db = identity_store("claim-cluster-three");
+    remember_people(
+        &mut db,
+        "two linked nodes",
+        vec![tagged("c0", 1..=10), tagged("c1", 2..=11)],
+    );
+    let about = strings(&["t1"]);
+    remember(&mut db, &note("named later", &about, &[])).unwrap();
+    let report = identity_clusters(&db, SAME_AS_FLOOR);
+    assert_eq!(report.claims, 2, "c0~c1 and c0~t1: {report:?}");
+    assert_eq!(
+        clusters_of(&db),
+        vec![strings(&["c0", "c1"])],
+        "c1 never claimed t1"
+    );
+
+    remember_people(&mut db, "c1 claims it too", vec![tagged("c1", 1..=1)]);
+    assert_eq!(identity_clusters(&db, SAME_AS_FLOOR).claims, 3);
+    assert_eq!(clusters_of(&db), vec![strings(&["c0", "c1", "t1"])]);
 }

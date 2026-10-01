@@ -1448,7 +1448,7 @@ fn graph_tools() -> Vec<Js> {
                         "aliases": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Other names this entity goes by. The store keeps a normalised 'aliases' list from these, the key and the name; do not set 'aliases' in props."
+                            "description": "Other names this entity goes by. The store keeps a normalised 'aliases' list from these, the key and the name, and keeps them as written in 'alias_keys': with the identity preset, one equal to a provisional stub's key (exact, case-sensitive) links that stub. Do not set either in props."
                         }
                     },
                     "required": ["key", "props"]

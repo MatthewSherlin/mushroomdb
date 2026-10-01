@@ -2062,6 +2062,9 @@ struct ForgetReport {
     /// `prop` mode removed `name` from a node that still carries `aliases`,
     /// which hold that name's words.
     name_in_aliases: bool,
+    /// `prop` mode removed `aliases` from a node that still carries
+    /// `alias_keys`, the aliases it declared, which still link stubs.
+    alias_keys_remain: bool,
 }
 
 /// Every field a predicate reads, its parts' included, sorted and deduped.
@@ -2128,6 +2131,17 @@ fn name_in_aliases_line(target: &str) -> String {
     )
 }
 
+/// What a forgotten `aliases` leaves behind on a node that declared aliases.
+/// `alias_keys` is a separate list, read by the identity preset's `KeyMatch`
+/// rules, and no later write removes from it.
+fn alias_keys_remain_line(target: &str) -> String {
+    let key = digest::sanitize(target.strip_suffix(".aliases").unwrap_or(target));
+    format!(
+        "its declared aliases remain in `alias_keys` and keep linking a provisional stub \
+         keyed exactly so — forget {{key: \"{key}\", prop: \"alias_keys\"}} clears them\n"
+    )
+}
+
 fn render_forget(r: &ForgetReport) -> String {
     let target = digest::sanitize(&r.target);
     let mut out = match (r.mode, r.changed) {
@@ -2146,6 +2160,9 @@ fn render_forget(r: &ForgetReport) -> String {
             }
             if r.name_in_aliases {
                 line.push_str(&name_in_aliases_line(&r.target));
+            }
+            if r.alias_keys_remain {
+                line.push_str(&alias_keys_remain_line(&r.target));
             }
             line
         }
@@ -2231,6 +2248,7 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
                 history_floor: g.stats().history_floor,
                 name_in_aliases: false,
+                alias_keys_remain: false,
             }
         }
         (Some(key), Some(prop), None) => {
@@ -2249,6 +2267,10 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 && prop == core_api::memory_schema::NAME_FIELD
                 && g.get_prop(&key, core_api::memory::identity::ALIASES_FIELD)
                     .is_some();
+            let alias_keys_remain = changed
+                && prop == core_api::memory::identity::ALIASES_FIELD
+                && g.get_prop(&key, core_api::memory::identity::ALIAS_KEYS_FIELD)
+                    .is_some();
             let retracted = if changed {
                 let after = derived_edges_on(&g, &key).unwrap_or_default();
                 before.difference(&after).count() as u64
@@ -2266,6 +2288,7 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 notes_total: 0,
                 history_floor: g.stats().history_floor,
                 name_in_aliases,
+                alias_keys_remain,
             }
         }
         (None, None, Some((subject, predicate, object))) => {
@@ -2295,6 +2318,7 @@ fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                 notes: notes.into_iter().take(FORGET_NOTE_LIST).collect(),
                 history_floor: g.stats().history_floor,
                 name_in_aliases: false,
+                alias_keys_remain: false,
             }
         }
         _ => return CallOutcome::ToolErr(FORGET_SHAPE.into()),
@@ -2360,10 +2384,19 @@ const MAX_SUGGESTIONS: usize = 5;
 /// propose: measured on a 100,000-node store `remember` filled, every proposal
 /// was `kind`, `source` or `ts` — clique rules that link every note to 32
 /// others for sharing a default value. `ns` is the namespace every namespaced
-/// node carries, `id` repeats the key, `provisional` is `remember`'s stub mark
-/// and `aliases` is the list `remember` maintains for identity matching.
-const BOOKKEEPING_FIELDS: [&str; 7] =
-    ["ns", "kind", "ts", "source", "provisional", "id", "aliases"];
+/// node carries, `id` repeats the key, `provisional` is `remember`'s stub mark,
+/// `aliases` is the list `remember` maintains for identity matching and
+/// `alias_keys` is the list of aliases a caller declared, kept as written.
+const BOOKKEEPING_FIELDS: [&str; 8] = [
+    "ns",
+    "kind",
+    "ts",
+    "source",
+    "provisional",
+    "id",
+    "aliases",
+    "alias_keys",
+];
 
 /// One proposal, with the arguments that create it.
 #[derive(serde::Serialize)]
@@ -2405,7 +2438,7 @@ struct IdentityPresetOut {
 /// Whether to offer the identity preset, and with what command.
 ///
 /// Offered when the store holds nodes under an entity label or the
-/// provisional label and no rule derives `SAME_AS`. It is eleven rules and an
+/// provisional label and no rule derives `SAME_AS`. It is sixteen rules and an
 /// alias backfill, so it is a CLI step a person runs, not a `create_rule` an
 /// assistant relays. Names the real store path when the server knows it, as
 /// `recall`'s own `schema apply` hint does.
@@ -2506,7 +2539,7 @@ fn render_suggestions(r: &SuggestOut) -> String {
     if let Some(p) = &r.identity_preset {
         out.push_str(&format!(
             "identity: {} entity node(s) and no SAME_AS rule. `{}` adds the identity \
-             preset — eleven SAME_AS rules over each node's aliases — after saying what it \
+             preset — sixteen SAME_AS rules over each node's aliases — after saying what it \
              will backfill. It is a command for a person to run, not a create_rule call.\n",
             p.entity_nodes,
             digest::sanitize(&p.command)
@@ -3120,7 +3153,7 @@ fn task_tool_schemas() -> Vec<Js> {
                                 "aliases": {
                                     "type": "array",
                                     "items": { "type": "string" },
-                                    "description": "Other names this entity goes by; the store normalises them into its 'aliases' list."
+                                    "description": "Other names this entity goes by; the store normalises them into its 'aliases' list. With the identity preset, one equal to a provisional stub's key (exact, case-sensitive) links that stub."
                                 }
                             },
                             "required": ["key", "label"]

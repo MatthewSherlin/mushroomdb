@@ -5567,7 +5567,16 @@ fn suggest_store(name: &str) -> SharedDb {
 #[test]
 fn suggest_rules_never_proposes_a_bookkeeping_field() {
     let report = task_report(suggest_store("suggest-noise"), "suggest_rules", json!({}));
-    let bookkeeping = ["ns", "kind", "ts", "source", "provisional", "id", "aliases"];
+    let bookkeeping = [
+        "ns",
+        "kind",
+        "ts",
+        "source",
+        "provisional",
+        "id",
+        "aliases",
+        "alias_keys",
+    ];
     for s in report["suggestions"].as_array().expect("suggestions") {
         let args = s["create_rule_args"].to_string();
         for f in bookkeeping {
@@ -6015,6 +6024,247 @@ fn remember_json_same_as_scores_are_two_decimal_places() {
         report["same_as"],
         json!([{"a": "ka", "b": "kb", "score": 0.67}]),
         "{report}"
+    );
+}
+
+fn alias_keys_in(db: &SharedDb, key: &str) -> Option<Value> {
+    db.read().get_prop(key, "alias_keys")
+}
+
+fn str_list(items: &[&str]) -> Value {
+    Value::List(items.iter().map(|s| Value::Str((*s).into())).collect())
+}
+
+/// Owner decision Q2: an entity that declares an alias links the stub keyed
+/// exactly so, and `remember` reports the link — whichever was written first.
+#[test]
+fn remember_reports_a_stub_linked_by_a_declared_alias() {
+    let entity = json!({"key": "matthew-sherlin", "label": "Person",
+                        "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]});
+    let line = "same as  matt ~ matthew-sherlin (1.00) — explain_association shows why";
+
+    let db = identity_store("claim-stub-first");
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matt owns 0.7", "about": ["matt"]}),
+    ));
+    assert!(!text.contains("same as"), "nothing to link yet: {text}");
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matthew Sherlin is Matt", "entities": [entity.clone()]}),
+    ));
+    assert_eq!(text.matches(line).count(), 1, "{text}");
+    assert_eq!(
+        alias_keys_in(&db, "matthew-sherlin"),
+        Some(str_list(&["matt"]))
+    );
+    // The line's own promise: explain_association does show why.
+    let why = task_reply(&one_task_call(
+        db,
+        "explain_association",
+        json!({"a": "matthew-sherlin", "b": "matt"}),
+    ));
+    assert!(why.contains("same_as_claim_person"), "{why}");
+
+    let db = identity_store("claim-entity-first");
+    one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "label": "Person",
+               "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]}),
+    );
+    let report = task_report(
+        db,
+        "remember",
+        json!({"text": "Matt owns 0.7", "about": ["matt"]}),
+    );
+    assert_eq!(
+        report["same_as"],
+        json!([{"a": "matt", "b": "matthew-sherlin", "score": 1.0}]),
+        "{report}"
+    );
+}
+
+/// `alias_keys` is the store's, like `aliases`: refused as a property on both
+/// write tools, with the argument to use named.
+#[test]
+fn alias_keys_is_refused_as_a_property() {
+    let db = memory_store("alias-keys-prop");
+    for (tool, args) in [
+        (
+            "upsert_entity",
+            json!({"key": "m", "label": "Person", "props": {"alias_keys": ["matt"]}}),
+        ),
+        (
+            "remember",
+            json!({"text": "x", "entities": [{"key": "m", "label": "Person",
+                                             "props": {"alias_keys": ["matt"]}}]}),
+        ),
+    ] {
+        let err = error_text(&one_task_call(db.clone(), tool, args));
+        assert!(
+            err.contains("'alias_keys' is maintained by the store")
+                && err.contains("'aliases' argument"),
+            "{tool}: {err}"
+        );
+    }
+    assert!(!db.read().has_node("m"), "a refusal writes nothing");
+}
+
+/// `forget {key, prop: "alias_keys"}` clears the declared list, and with it
+/// the link the claim made; the reply counts the retraction.
+#[test]
+fn forgetting_alias_keys_clears_the_claim() {
+    let db = identity_store("forget-alias-keys");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matt", "about": ["matt"],
+               "entities": [{"key": "matthew-sherlin", "label": "Person",
+                             "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]}]}),
+    );
+    let same_as = |db: &SharedDb| db.read().weighted_edges("SAME_AS", None).len();
+    assert_eq!(same_as(&db), 1, "precondition: the claim linked them");
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "matthew-sherlin", "prop": "alias_keys"}),
+    ));
+    assert!(
+        text.starts_with("forgot matthew-sherlin.alias_keys"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 derived edge(s) retracted because a rule read alias_keys"),
+        "{text}"
+    );
+    assert_eq!(alias_keys_in(&db, "matthew-sherlin"), None);
+    assert_eq!(same_as(&db), 0);
+
+    // A later write that declares nothing does not bring the claim back.
+    one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "props": {"role": "owner"}}),
+    );
+    assert_eq!(alias_keys_in(&db, "matthew-sherlin"), None);
+    assert_eq!(same_as(&db), 0);
+}
+
+/// Forgetting `aliases` leaves the declared list, which still links a stub
+/// keyed so. The reply says that, and how to clear it — and says nothing of
+/// the kind for a node that declared no alias.
+#[test]
+fn forgetting_aliases_says_declared_aliases_remain_in_alias_keys() {
+    let db = identity_store("forget-aliases-keys-remain");
+    let person = |key: &str, name: &str, aliases: Js| json!({"key": key, "label": "Person", "props": {"name": name}, "aliases": aliases});
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matt, Grace and Reid", "about": ["matt"],
+               "entities": [person("matthew-sherlin", "Matthew Sherlin", json!(["matt"])),
+                            person("grace-hopper", "Grace Hopper", json!(["amazing grace"])),
+                            person("reid", "Reid Hoffman", json!([]))]}),
+    );
+    let forget_aliases = |key: &str| json!({"key": key, "prop": "aliases"});
+
+    let text = task_reply(&one_task_call(db.clone(), "forget", forget_aliases("reid")));
+    assert!(text.starts_with("forgot reid.aliases"), "{text}");
+    assert!(
+        !text.contains("alias_keys"),
+        "reid declared nothing: {text}"
+    );
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        forget_aliases("matthew-sherlin"),
+    ));
+    assert!(text.starts_with("forgot matthew-sherlin.aliases"), "{text}");
+    assert!(
+        text.contains("its declared aliases remain in `alias_keys`")
+            && text.contains("forget {key: \"matthew-sherlin\", prop: \"alias_keys\"}"),
+        "{text}"
+    );
+    assert_eq!(
+        alias_keys_in(&db, "matthew-sherlin"),
+        Some(str_list(&["matt"])),
+        "the reply is true: the list is still there"
+    );
+    assert_eq!(
+        db.read().weighted_edges("SAME_AS", None).len(),
+        1,
+        "and so is the link it makes"
+    );
+
+    let report = task_report(db.clone(), "forget", forget_aliases("grace-hopper"));
+    assert_eq!(report["changed"], json!(true), "{report}");
+    assert_eq!(report["alias_keys_remain"], json!(true), "{report}");
+    let report = task_report(db, "forget", forget_aliases("grace-hopper"));
+    assert_eq!(report["changed"], json!(false), "{report}");
+    assert_eq!(
+        report["alias_keys_remain"],
+        json!(false),
+        "nothing was forgotten, so nothing is said to remain: {report}"
+    );
+}
+
+/// The claim's edge is rule-owned like any other: retracting it by hand is
+/// refused, naming the rule that owns that direction and the field it reads.
+#[test]
+fn forgetting_a_claimed_same_as_fact_names_the_claim_rule() {
+    let db = identity_store("forget-claim-fact");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matt", "about": ["matt"],
+               "entities": [{"key": "matthew-sherlin", "label": "Person",
+                             "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]}]}),
+    );
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"fact": {"subject": "matthew-sherlin", "predicate": "SAME_AS", "object": "matt"}}),
+    ));
+    assert!(
+        err.contains("derived by rule same_as_claim_person") && err.contains("(alias_keys)"),
+        "{err}"
+    );
+    assert!(!err.contains("same_as_entity_person"), "{err}");
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 1);
+}
+
+/// `alias_keys` is bookkeeping. Twelve people who all declare one alias give
+/// the engine a list field with a sampled Jaccard of 1.0 — exactly what it
+/// proposes an `Overlap` rule over — and the reply must not relay it.
+#[test]
+fn suggest_rules_never_proposes_a_rule_on_alias_keys() {
+    let db = memory_store("suggest-alias-keys");
+    for i in 0..12 {
+        one_task_call(
+            db.clone(),
+            "upsert_entity",
+            json!({"key": format!("p{i}"), "label": "Person",
+                   "props": {"name": format!("Person {i}")},
+                   "aliases": ["crew"]}),
+        );
+    }
+    let (text, report) = task_both(db, "suggest_rules", json!({}));
+    for s in report["suggestions"].as_array().expect("suggestions") {
+        assert!(
+            !s["create_rule_args"]
+                .to_string()
+                .contains("\"field\":\"alias_keys\""),
+            "proposed a rule over alias_keys: {s}"
+        );
+    }
+    assert!(!text.contains("OVERLAPS_ALIAS_KEYS"), "{text}");
+    assert!(
+        text.contains("alias_keys — not shown"),
+        "the hidden fields are named: {text}"
     );
 }
 

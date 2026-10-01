@@ -498,7 +498,7 @@ Usage:
                                    applies the built-in memory schema to an existing store;
                                    full-text on a populated store rebuilds the index at every open from here on
   mushroomdb schema apply <db-dir> --memory-identity
-                                   adds the identity preset: eleven SAME_AS rules over each entity's aliases;
+                                   adds the identity preset: sixteen SAME_AS rules over each entity's aliases;
                                    says what it will backfill, then backfills
   mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
   mushroomdb algo wcc <db-dir> [--top N]
@@ -1729,6 +1729,13 @@ pub fn run_schema_apply_memory_defaults(db_dir: &Path) -> Result<String, CliErro
 /// nodes the rules will compare, and how many need an `aliases` list written
 /// before they can. Then the lists are written in one commit and the rules
 /// created, each with its own backfill.
+///
+/// `alias_keys`, the list the five claim rules read, has no backfill: it
+/// holds only what a caller declared through an `aliases` argument, and a
+/// store written before it existed kept no record of which aliases those
+/// were. The output says so. On a store that already carries the preset's
+/// earlier eleven rules, this adds the five claim rules and leaves the rest
+/// unchanged.
 pub fn run_schema_apply_memory_identity(db_dir: &Path) -> Result<String, CliError> {
     use core_api::memory::identity::{
         aliases_to_backfill, entity_node_count, write_aliases, SAME_AS_EDGE,
@@ -1750,6 +1757,11 @@ pub fn run_schema_apply_memory_identity(db_dir: &Path) -> Result<String, CliErro
          first; each rule then compares aliases across its labels once, and every later \
          write to an entity is re-checked",
         backfill.len()
+    );
+    let _ = writeln!(
+        out,
+        "alias_keys: nothing to backfill — it holds only aliases declared from here on; \
+         an entity that declares one equal to a provisional stub's key links that stub"
     );
     // Two commits: the aliases, then the rules. A failure between them leaves
     // the lists written and no rule; a re-run recovers, since the backfill is

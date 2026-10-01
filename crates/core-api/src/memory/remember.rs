@@ -21,7 +21,8 @@
 //! `about` keys and the facts' own endpoints are resolved.
 
 use crate::memory::identity::{
-    aliases_after_write, aliases_value, derive_aliases, same_as_pairs, SameAsPair, ALIASES_FIELD,
+    aliases_value, derive_aliases, identity_props_after_write, same_as_pairs, SameAsPair,
+    ALIASES_FIELD,
 };
 use crate::memory_schema::{NAME_FIELD, PROVISIONAL_LABEL, PROVISIONAL_PROP};
 use crate::GraphDb;
@@ -87,8 +88,9 @@ pub struct EntityIn {
     pub label: String,
     pub props: BTreeMap<String, Value>,
     /// Other names the caller knows this entity by. Normalised into the
-    /// node's `aliases` list alongside its key and name; see
-    /// [`crate::memory::identity`].
+    /// node's `aliases` list alongside its key and name, and kept as declared
+    /// in its `alias_keys` list, which links a provisional stub keyed exactly
+    /// so; see [`crate::memory::identity`].
     pub aliases: Vec<String>,
 }
 
@@ -212,7 +214,8 @@ pub fn describe_entity<F: Fs>(
 ///
 /// Either way the node's `aliases` list is brought up to date from its key,
 /// its name and `aliases` ([`crate::memory::identity`]), and left untouched
-/// when it already says exactly that. A `props` entry named `aliases` is
+/// when it already says exactly that; `aliases` as declared are added to its
+/// `alias_keys` list. A `props` entry named `aliases` or `alias_keys` is
 /// refused before anything is written.
 pub fn describe_entity_with_aliases<F: Fs>(
     db: &mut GraphDb<F>,
@@ -222,9 +225,8 @@ pub fn describe_entity_with_aliases<F: Fs>(
     aliases: &[String],
 ) -> Result<bool> {
     let mut props = props.to_vec();
-    if let Some(list) = aliases_after_write(db, key, &props, aliases)? {
-        props.push((ALIASES_FIELD.to_string(), aliases_value(&list)));
-    }
+    let identity = identity_props_after_write(db, key, &props, aliases)?;
+    props.extend(identity);
     if db.has_node(key) {
         if !props.is_empty() {
             db.set_props(key, props)?;
@@ -274,13 +276,14 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         });
     }
 
-    // Each entity's `aliases` after this call: it unites what the node
-    // already holds with what this call names, and `None` means the stored
-    // list is already exactly that. Computed before anything below declares
-    // full-text, so a call refused here (an `aliases` property, or more than
-    // `MAX_ALIASES`) declares nothing new either; and before `db.batch()`
-    // takes `db` mutably, because it reads the store.
-    let entity_aliases: Vec<Option<Vec<String>>> = input
+    // Each entity's `aliases` and `alias_keys` after this call, as the
+    // properties to set: each list unites what the node already holds with
+    // what this call names, and is absent when the stored list is already
+    // exactly that. Computed before anything below declares full-text, so a
+    // call refused here (an `aliases` or `alias_keys` property, or more than
+    // either cap) declares nothing new either; and before `db.batch()` takes
+    // `db` mutably, because it reads the store.
+    let entity_identity: Vec<Vec<(String, Value)>> = input
         .entities
         .iter()
         .map(|e| {
@@ -289,7 +292,7 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
                 .iter()
                 .map(|(f, v)| (f.clone(), v.clone()))
                 .collect();
-            aliases_after_write(db, &e.key, &props, &e.aliases)
+            identity_props_after_write(db, &e.key, &props, &e.aliases)
         })
         .collect::<Result<_>>()?;
 
@@ -434,18 +437,18 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
 
     // 1. Entities first, so an `about` key also named here lands as the real
     //    entity rather than a provisional stub.
-    for ((entity, existed), aliases) in input
+    for ((entity, existed), identity) in input
         .entities
         .iter()
         .zip(&entity_existed)
-        .zip(&entity_aliases)
+        .zip(&entity_identity)
     {
         if *existed {
             for (field, value) in &entity.props {
                 batch.set_prop(&entity.key, field, value.clone());
             }
-            if let Some(list) = aliases {
-                batch.set_prop(&entity.key, ALIASES_FIELD, aliases_value(list));
+            for (field, value) in identity {
+                batch.set_prop(&entity.key, field, value.clone());
             }
             report.matched += 1;
         } else {
@@ -458,9 +461,7 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
                 .iter()
                 .map(|(f, v)| (f.clone(), v.clone()))
                 .collect();
-            if let Some(list) = aliases {
-                props.push((ALIASES_FIELD.to_string(), aliases_value(list)));
-            }
+            props.extend(identity.iter().cloned());
             batch.insert_node(&entity.label, &entity.key, props);
             report.created += 1;
         }
