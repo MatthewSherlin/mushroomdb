@@ -83,3 +83,70 @@ link-first's whole argument for accepting it.
 
 The runner computes the verdict and exits 1 when a floor is missed. Its
 `summary.md` is committed as it came out, PASSED or FAILED.
+
+## Amendment, 2026-10-01 — after the first run, before the second
+
+Amended 2026-10-01, after the first run (`results/20261001T061131Z`) and
+before the second: owner decision Q2 added explicit alias claims
+(`alias_keys`, five `X→Entity` `KeyMatch` rules) and NFC normalisation; floors
+and labelled set unchanged.
+
+### What changed in what is measured
+
+- **The preset is sixteen rules, not eleven.** The eleven `Overlap` rules
+  above are unchanged. Five more, `Person→Entity`, `Org→Entity`,
+  `Project→Entity`, `Concept→Entity` and `Event→Entity`, are `KeyMatch` on
+  `alias_keys`: a list holding only the aliases a caller declared through an
+  `aliases` argument, kept as written. An entity that declares an alias
+  byte-equal to a provisional stub's key links that stub at 1.0.
+- **`canonical` applies Unicode NFC** around lowercasing, so a decomposed
+  accented name yields the same aliases as its composed form.
+- **Not changed:** `benchmarks/identity/labelled.json`, the three floors, the
+  two predictions, and the runner's loading and scoring. One sentence of the
+  runner's summary header changes, to say the preset now also holds the
+  `KeyMatch` rules; it is prose, not arithmetic.
+- **The build profile.** This run is `cargo run` without `--release`, for
+  disk space. The runner is deterministic and the profile does not enter the
+  score.
+
+### The expectation, stated before the run
+
+Unchanged from the first run: **9 true positives, 1 false positive, 9 false
+negatives on both predictions — precision 0.900, recall 0.500, PASSED at the
+precision floor with no margin.**
+
+Why nothing is expected to move:
+
+- A claim fires only when a declared alias equals a stub's key. The set
+  declares three aliases — `Ada Lovelace` (on `countess-lovelace`), `J. Doe`
+  (on `jd`) and `J Doe` (on `jane-doe`) — and holds five stubs, keyed
+  `Matthew_Sherlin`, `matt`, `Ada_Lovelace`, `MushroomDB` and `alex`. No
+  declared alias equals a stub's key: `Ada Lovelace` is not `Ada_Lovelace`,
+  and the match is exact. So no `KeyMatch` rule derives an edge.
+- Every key, name and alias in the set is ASCII, so NFC changes no alias.
+
+**So this gate cannot show Q2's gain.** The three false negatives on the
+`matt` stub stay, because no labelled node declares `matt`; the set was frozen
+before the question was answered and is not edited to flatter the answer. The
+gain is shown by tests instead: in `crates/core-api/tests/memory_identity.rs`,
+`a_declared_alias_links_the_stub_it_names_entity_first` and `_stub_first`
+(the link, at 1.0, in both orders),
+`a_name_that_merely_spells_a_stubs_key_does_not_link_it` (the false positive a
+`KeyMatch` on `aliases` would add: `alex-1`, named "Alex", against the `alex`
+stub — two of them in this set, which would put precision at 0.750) and
+`a_claim_matches_the_stubs_key_exactly_so_case_differs_do_not_link`.
+
+What the new rules could do to this gate is add a false positive, not remove a
+false negative. If the result differs from the expectation above in either
+direction, it is committed as it came out and nothing is tuned; a precision
+below 0.90 on either prediction is FAILED.
+
+### Procedure for the second run
+
+    TS=$(date -u +%Y%m%dT%H%M%SZ)
+    mkdir -p benchmarks/identity/results/$TS
+    cargo run -p mushroomdb --example identity_gate -- \
+        benchmarks/identity/labelled.json \
+        > benchmarks/identity/results/$TS/summary.md
+
+The first run's directory is left as it is.

@@ -164,7 +164,8 @@ fn main() {
     out.push_str("# SAME_AS quality gate\n\n");
     out.push_str(&format!(
         "Labelled set: `{path}` — {} nodes, {} labelled pairs, {} of them the same entity. \
-         Identity preset: `Overlap` on `aliases` at ≥ {SAME_AS_FLOOR}.\n\n",
+         Identity preset: `Overlap` on `aliases` at ≥ {SAME_AS_FLOOR}, and `KeyMatch` on \
+         `alias_keys` from each entity label to `Entity`.\n\n",
         nodes.len(),
         nodes.len() * (nodes.len() - 1) / 2,
         truth.len()
