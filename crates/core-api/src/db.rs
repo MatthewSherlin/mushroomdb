@@ -298,6 +298,30 @@ pub enum MutationEvent {
     },
 }
 
+/// Whether `rec` is the frame [`GraphDb::create_rule`] logs: a `CreateRule`,
+/// alone or behind the `Intern` record for its edge type.
+///
+/// `create_rule` goes through the dense rewrite like every other write, so its
+/// frame is `Batch([Intern { edge_type }, CreateRule])` rather than a bare
+/// `CreateRule`. Anything that asks "was this commit a rule creation" must
+/// accept both shapes, or it silently stops recognising the one the
+/// standalone call writes. A batch carrying anything else is a user batch and
+/// is not this frame.
+fn is_create_rule_frame(rec: &WalRecord) -> bool {
+    match rec {
+        WalRecord::CreateRule { .. } => true,
+        WalRecord::Batch(inner) => {
+            inner
+                .iter()
+                .any(|r| matches!(r, WalRecord::CreateRule { .. }))
+                && inner
+                    .iter()
+                    .all(|r| matches!(r, WalRecord::CreateRule { .. } | WalRecord::Intern { .. }))
+        }
+        _ => false,
+    }
+}
+
 fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<MutationEvent> {
     match rec {
         WalRecord::InsertNode { label, key, .. } => Some(MutationEvent::NodeInserted {
@@ -5492,9 +5516,7 @@ impl<F: Fs> GraphDb<F> {
             // a map lookup, not an engine swap: a store being written to has
             // long since populated its indexes, so the `pump_index_build`
             // entry point owns the not-yet-populated case on its own.
-            if !matches!(&rec, WalRecord::CreateRule { .. })
-                && !self.engine.builds_in_progress().is_empty()
-            {
+            if !is_create_rule_frame(&rec) && !self.engine.builds_in_progress().is_empty() {
                 rebuilds.extend(self.pump_one_slice().into_iter().map(|b| b.rule));
             }
             let mut failed = Vec::new();
@@ -6955,7 +6977,7 @@ impl<F: Fs> GraphDb<F> {
         let def_bytes = bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
             detail: format!("serialize rule: {e}"),
         })?;
-        self.log_then_apply(WalRecord::CreateRule { def_bytes })
+        self.log_dense(vec![WalRecord::CreateRule { def_bytes }])
     }
 
     /// Override this handle's HNSW build-slice size, or `None` to restore
