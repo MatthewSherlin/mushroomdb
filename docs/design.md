@@ -1,13 +1,14 @@
 # The original design, August 2026 — a historical record
 
-> **This is the design the project started from. It is dated 2026-08-14, the day before the
-> first commit, and was last revised on 2026-08-26, during the first releases. It is kept as the
-> record of what was intended, and it is not a description of what exists now.** The storage
-> engine, the concurrency model and several decisions below changed after it was written: the
-> snapshot is memory-mapped, a plain read runs on an epoch snapshot instead of under the writer's
-> lock, and the license is dual MIT / Apache-2.0. Paths under `docs/superpowers/` point at
-> working notes that were taken out of the repository on 2026-08-28 and are not in it now. Other
-> systems are referred to as "a named system", or as "system A", "B" and "C".
+> **This is the design the project started from. It is dated 2026-08-14, the day before the first
+> commit, and was last revised on 2026-08-26, during the first releases; the only edits since are
+> this note, the corrections marked inline and the replaced names, made on 2026-10-01. It is kept
+> as the record of what was intended, and it is not a description of what exists now.** The
+> storage engine, the concurrency model and several decisions below changed after it was written:
+> the snapshot is memory-mapped, several processes can share one store, and the license is dual
+> MIT / Apache-2.0. Paths under `docs/superpowers/` point at working notes that were taken out of
+> the repository on 2026-08-28 and are not in it now. Other systems are referred to as "a named
+> system", or as "system A", "B" and "C".
 >
 > For what exists: the README's [Architecture](../README.md#architecture) section,
 > [`docs/format-stability.md`](format-stability.md), and the pages under [`docs/site/`](site/index.md).
@@ -30,7 +31,7 @@ One-line positioning: *"The embedded graph database that builds itself."*
 
 ### Market rationale (validated 2026-08)
 
-- system B (the "a named system for graphs") was archived Oct 2025 after Apple acquired it;
+- system B is no longer maintained by its authors;
   community forks are thin. There is a live vacuum for a truly open-source embedded
   graph engine.
 - No shipping engine offers declarative, incrementally maintained linking rules as a

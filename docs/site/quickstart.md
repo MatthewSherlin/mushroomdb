@@ -70,7 +70,7 @@ fetch both property lists and diff them by hand.
 
 ```json
 // tool: edges_at
-{ "key": "person-01", "at": "2026-10-01", "label": "Project" }
+{ "key": "person-01", "at": "<today's date, UTC>", "label": "Project" }
 ```
 
 ```text
@@ -85,8 +85,9 @@ PROJECT (1)
 ```
 
 `at` is a date — `2026-10-01`, or a full RFC 3339 instant — and resolves to the last commit at
-or before it; a bare date covers that whole day, in UTC. The store above was built on
-2026-10-01: pass the day you ran `demo`, or any later one. A date before the store's first
+or before it; a bare date covers that whole day, in UTC. The reply above was captured on
+2026-10-01, the day that store was built, with `"at": "2026-10-01"`: pass the UTC date on which
+you ran `demo`, or any later one. A date before the store's first
 commit is refused — `no commit time is recorded that early; the oldest is commit 0 at … ms` —
 not answered with a guess. A 0-based commit index works too, but do not hunt for one: the date
 is the question. A store that records no commit times says so by name rather than guessing.

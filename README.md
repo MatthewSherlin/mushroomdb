@@ -111,7 +111,8 @@ lineage — and rule-derived edges keep those associations fresh as new facts ar
   what it will backfill.
 
 **Eleven task tools** answer a question in prose in one call, on any store. They are what the
-skill reaches for, and what `tools/list` shows first:
+skill reaches for. `mushroomdb mcp <db> --all-tools` lists these eleven first; the default listing
+mixes them with the graph tools and opens with `query` and `explain_association`:
 
 | Tool | Purpose |
 |---|---|
@@ -153,7 +154,7 @@ whole set:
 | `stats` | Live node, edge, and rule counts |
 | `node_history` | WAL change history for a node (archives included; a `snapshot --truncate` ends the reach) |
 | `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
-| `was_linked` | Point-in-time edge check: was an edge active at a given commit? |
+| `was_linked` | Point-in-time edge check: was an edge active at a given commit? `at_commit` also accepts a date, which its schema does not declare yet |
 | `rename_node` | Rename a node's key; old_key, new_key |
 
 Full walkthrough, tool reference, and Claude Desktop setup: [`docs/site/mcp.md`](docs/site/mcp.md).

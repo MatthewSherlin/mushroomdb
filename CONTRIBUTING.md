@@ -2,8 +2,10 @@
 
 ## Before you start
 
-Read `README.md` and the design spec at `docs/design.md` so you understand the
-architecture, the generality guarantee, and the wire discipline.
+Read `README.md` — its [Architecture](README.md#architecture) section is the
+architecture as built — and the wire discipline below. `docs/design.md` is the
+original design, kept as a historical record: it no longer describes the code,
+but its generality guarantee still applies to all of it.
 
 ---
 

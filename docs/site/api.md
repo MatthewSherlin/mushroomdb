@@ -1019,9 +1019,10 @@ Response:
 ### Tools
 
 The server serves twenty-five tools and lists twenty-three by default; `mushroomdb mcp <db>
---all-tools` lists all of them. The tools, their arguments and what each answers are in
-[Task tools](mcp.md#task-tools) and [Tool reference](mcp.md#tool-reference), the one list of
-them.
+--all-tools` lists all of them. What each one answers is in
+[Task tools](mcp.md#task-tools), which also gives each task tool's arguments, and in
+[Tool reference](mcp.md#tool-reference) — the one list of them. The arguments of the fourteen
+graph tools are in each tool's `inputSchema`, which `tools/list` returns.
 
 **`stub_hidden` on the `query` tool:** when `true` and a `mask` is supplied,
 hidden nodes in the mask appear as `{"key":"…","restricted":true}` in node-info and
