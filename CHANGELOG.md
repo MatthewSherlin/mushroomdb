@@ -193,8 +193,8 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   `aliases` from its key and name, moves into `alias_keys` whatever an older
   node's `aliases` held beyond that, and says how many nodes that touched
   before it writes.
-- **The default tool listing is 23 tools and 27,137 bytes**, from 19 and
-  23,548 (`scripts/measure-tool-listing.py`; all 25 tools are 27,938 bytes).
+- **The default tool listing is 23 tools and 27,067 bytes**, from 19 and
+  23,548 (`scripts/measure-tool-listing.py`; all 25 tools are 27,868 bytes).
 - **The fragmentation probe (spec §8.2) says LARGE**: at the reference cell,
   25% of Talent split into 3 aliases, recall of the edges the canonical alias
   holds is 0.8324 over every rule, a loss of 0.1676 against the pre-registered

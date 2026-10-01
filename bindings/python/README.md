@@ -118,10 +118,11 @@ When no approximate rule covers the field — check with
 `has_vector_rule("embedding")` — every call is already an exact brute-force
 scan.
 
-**`min` defaults to `0.0` here and to `0.8` in the MCP `find_similar` tool.**
-Same operation, same name, different results, and nothing raises. Pass `min`
-explicitly if a call moves between the two surfaces. HTTP `POST /find_similar`
-follows this binding and defaults to `0.0`.
+**`min` defaults to `0.8`** — here, in the MCP `find_similar` tool and on HTTP
+`POST /find_similar`. Through 0.6 this binding and HTTP defaulted to `0.0`: a
+call that never named `min` now drops every hit below `0.8`, and nothing
+raises. Pass `min=0.0` for the old behaviour. `pairwise_similar` still defaults
+to `0.0`.
 
 **`where=` uses the property index only when a `label` accompanies it.** The
 index is keyed on `(label, field)`, so both `label=` and a prior

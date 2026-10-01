@@ -2570,11 +2570,10 @@ direction and whether the edge is rule-derived.
 Scores are cosine similarity in `[-1, 1]`; `min` is inclusive (`score >= min`).
 A distance of `1 - sim` is the caller's conversion.
 
-**Vector-mode `min` defaults to `0.8` here and to `0.0` in the Python binding.**
-Same operation, same name, two different defaults, and nothing fails when you
-move between them — a call ported from Python to MCP without an explicit `min`
-quietly drops every hit below `0.8`. Pass `min` explicitly on both surfaces.
-HTTP `POST /find_similar` follows Python and defaults to `0.0`.
+**Vector-mode `min` defaults to `0.8`, here and on every other surface.** Through
+0.6 the Python binding and HTTP `POST /find_similar` defaulted to `0.0`, so a call
+ported between surfaces without an explicit `min` changed its results silently.
+Since 0.7 they agree. Pass `min` explicitly when you want hits below `0.8`.
 
 **A `mask` alone is the approximate path.** `where` is a property predicate
 (`{field, eq}` or `{field, in}`) and implies exact GEMM; `exact: true` skips
@@ -2875,8 +2874,8 @@ answers. A session can only call what its client was shown, though, so the two
 unlisted tools — `explain` and `rename_node` — are reached by starting the
 server with `mushroomdb mcp <db> --all-tools`, which lists the whole set with
 their schemas. The default listing a session pays for before its first turn —
-the `tools` array of the `tools/list` reply, as compact JSON — is 27,137 bytes;
-all 25 are 27,938. Before this release added `schema`, `analyze`,
+the `tools` array of the `tools/list` reply, as compact JSON — is 27,067 bytes;
+all 25 are 27,868. Before this release added `schema`, `analyze`,
 `suggest_rules` and `forget` it was 23,548 and 24,349;
 `scripts/measure-tool-listing.py` takes both.
 
@@ -2885,7 +2884,7 @@ all 25 are 27,938. Before this release added `schema`, `analyze`,
 | `upsert_entity` | Insert or update a node by key. Creates if absent, updates props if present. An update is atomic: every property is checked before any is written, so a refusal leaves the node unchanged. Pass `namespace` for the namespace a created node lands in; on a node that already exists, naming the namespace it is in is a no-op and naming another is refused — a namespace is set at insert and cannot be changed. Takes `aliases`, other names the entity goes by, kept as written in `alias_keys`; with the identity preset, one equal to a provisional stub's key (exact, case-sensitive) links that stub. The store's own `aliases` list is the key, the name and the name's words only, recomputed on each write. An update that retracts `SAME_AS` links returns them in `same_as_lost`, with `same_as_lost_total` and a note: a changed name is what retracts a link, and declaring an alias never does, so give both nodes the same name, or declare a provisional stub's key as an alias. `aliases` and `alias_keys` are refused as properties. |
 | `ingest_json` | Batch-ingest an array of nodes of the same label from JSON. Pass `namespace` to put every node the call creates in one namespace; a row carrying a different `ns` is refused before anything is written. A field whose values point at two labels is skipped with `ambiguous target labels`; declare one `create_rule` KeyMatch rule per target label instead. |
 | `create_rule` | Declare a derivation rule; backfills existing nodes in the same commit, unless it has a vector index over more than 2,048 vectors, in which case the build is sliced and the edges arrive in a later commit (`stats` reports the progress). Pass `namespace` to scope it to one namespace — source, via hop and destination — so every edge it derives stays inside; omitted is a global rule, the only kind that may cross a boundary. Propose it and wait for approval — it is a store-wide write. |
-| `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity in `[-1, 1]` (`score >= min`; a distance of `1 - sim` is the caller's conversion). Brute `find_similar` is exact GEMM; HNSW is still the approximate path; `exact: true` forces GEMM. Optional `where` (`{field, eq}` or `{field, in}`) implies exact, and uses the property index only when `label` accompanies it and `(label, where.field)` is index-enabled — without a label it is a correct-but-slower scan. Vector-mode `min` defaults to 0.8 here; **Python and HTTP default it to 0.0**, so a call ported between surfaces without an explicit `min` changes its results silently. (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). Edge-traversal mode ignores `where` and `exact`. **A `mask` alone is the approximate path**: vector search under `mask` widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist, and it is still not guaranteed to have found the true top `k` — pass `exact` or a `where` alongside the mask for an exhaustive answer over the same visible set. |
+| `find_similar` | Two modes: (1) vector search — provide `vector` to find similar nodes by cosine similarity in `[-1, 1]` (`score >= min`; a distance of `1 - sim` is the caller's conversion). Brute `find_similar` is exact GEMM; HNSW is still the approximate path; `exact: true` forces GEMM. Optional `where` (`{field, eq}` or `{field, in}`) implies exact, and uses the property index only when `label` accompanies it and `(label, where.field)` is index-enabled — without a label it is a correct-but-slower scan. Vector-mode `min` defaults to 0.8, as it does in Python and over HTTP since 0.7. (2) edge traversal — provide `key` to return neighbors connected by a derived rule edge (default edge type: `SIMILAR`). Edge-traversal mode ignores `where` and `exact`. **A `mask` alone is the approximate path**: vector search under `mask` widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist, and it is still not guaranteed to have found the true top `k` — pass `exact` or a `where` alongside the mask for an exhaustive answer over the same visible set. |
 | `pairwise_similar` | Exact cosine top-k among a caller `keys` set on `field`. Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. Self excluded. Never uses HNSW. `k` defaults to 10; `min` defaults to 0.0. Unknown keys, missing embeddings, zero-norm and wrong-dimension vectors are skipped. |
 | `hybrid_search` | RRF over fulltext + vector. Provide `query_text` + `text_field` for text-only ranking; add `vector` for combined ranking. `label` restricts vector search. |
 | `explain` | The rules and scores that produced the edges between two nodes, as JSON. `explain_association` above is the same question answered in prose. |
@@ -4646,8 +4645,10 @@ Request body:
 }
 ```
 
-`field` and `vector` are required. `k` defaults to 10. HTTP `min` defaults to **0.0**
-(the Python default). MCP vector-mode `find_similar` still defaults `min` to **0.8**.
+`field` and `vector` are required. `k` defaults to 10.
+`min` defaults to **0.8**, as it does over MCP and in the Python binding. It was **0.0** here
+through 0.6 — a request that names no `min` now drops every hit below 0.8. Pass `"min": 0.0`
+for the old behaviour.
 `where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; invalid
 `where` is 400. `exact: true` skips HNSW.
 
@@ -4992,7 +4993,7 @@ Seventeen tools:
 | `node_info` | Node info and props; params: `key` |
 | `node_edges` | Incident edges; params: `key` |
 | `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?`, `namespace?` (the namespace a created node lands in; on an existing node, the one it is already in is a no-op and another is refused). An update is atomic: every property is checked before any is written, so a refusal leaves the node unchanged. |
-| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?` (default **0.8**), `where?`, `exact?`; (2) edge traversal — `key`, `edge_type?`, `limit?`. Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. `where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; `exact` true skips HNSW. Edge-traversal mode ignores both. **A `mask` alone is the approximate path**: vector search under a mask (a role, or the MCP `mask` allow-list) widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist, and it is still not guaranteed to have found the true top `k` — for an exhaustive answer over the same visible set pass `exact` or a `where`. `where` uses the property index only when `label` accompanies it and `(label, where.field)` is index-enabled; without a label it is a correct-but-slower scan. HTTP `POST /find_similar` is vector-only and defaults `min` to **0.0**. |
+| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?` (default **0.8**), `where?`, `exact?`; (2) edge traversal — `key`, `edge_type?`, `limit?`. Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. `where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; `exact` true skips HNSW. Edge-traversal mode ignores both. **A `mask` alone is the approximate path**: vector search under a mask (a role, or the MCP `mask` allow-list) widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist, and it is still not guaranteed to have found the true top `k` — for an exhaustive answer over the same visible set pass `exact` or a `where`. `where` uses the property index only when `label` accompanies it and `(label, where.field)` is index-enabled; without a label it is a correct-but-slower scan. HTTP `POST /find_similar` is vector-only and defaults `min` to **0.8** too. |
 | `pairwise_similar` | Exact cosine top-k among `keys` on `field`; params: `keys`, `field`, `k?` (default 10), `min?` (default 0.0). Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. Self excluded. Never HNSW. |
 | `explain_association` | Alias of `explain`; params: `a`, `b` |
 | `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
@@ -5245,7 +5246,7 @@ neighbors = db.neighbors("alice", "KNOWS", "out")   # one hop, list of keys
 
 ### Vector search
 
-`find_similar(field, vector, label=None, k=10, min=0.0, mask=None, where=None, exact=False)`
+`find_similar(field, vector, label=None, k=10, min=0.8, mask=None, where=None, exact=False)`
 returns the `k` nearest nodes to `vector` by cosine similarity on `field`.
 
 Scores are cosine similarity in `[-1, 1]`. The engine keeps `score >= min`
@@ -5258,8 +5259,8 @@ hits = db.find_similar("embedding", query_vec, k=10, min=0.0)
 # [(key, similarity), ...]
 ```
 
-Python `min` defaults to `0.0`. MCP vector mode defaults `min` to `0.8`; that
-default is unchanged.
+`min` defaults to `0.8`, on every surface. Through 0.6 the Python default was `0.0`: pass
+`min=0.0` if a call relied on it.
 
 **Exact vs approximate.** When no approximate `VectorSimilar` rule covers
 `field`, brute `find_similar` is an exact GEMM. HNSW is still the approximate

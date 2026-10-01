@@ -1936,7 +1936,8 @@ async fn neighborhood(
 
 /// `POST /find_similar` — vector kNN. First-class read, not `/algo/*`, so a
 /// role token is allowed and a client `mask` intersects the role (never widens).
-/// Default `min` is **0.0** (Python), not MCP vector-mode 0.8.
+/// Default `min` is `core_api::FIND_SIMILAR_DEFAULT_MIN` (0.8), as on MCP and
+/// in the Python binding. It was 0.0 here through 0.6.
 async fn find_similar(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
@@ -1958,7 +1959,7 @@ async fn find_similar(
         },
     };
     let min = match body.get("min") {
-        None | Some(Js::Null) => 0.0,
+        None | Some(Js::Null) => core_api::FIND_SIMILAR_DEFAULT_MIN,
         Some(v) => match v.as_f64() {
             Some(n) => n,
             None => return err_response("min must be a number"),

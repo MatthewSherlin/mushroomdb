@@ -849,7 +849,10 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
             .and_then(Js::as_u64)
             .map(|n| n as usize)
             .unwrap_or(10);
-        let min = args.get("min").and_then(Js::as_f64).unwrap_or(0.8);
+        let min = args
+            .get("min")
+            .and_then(Js::as_f64)
+            .unwrap_or(core_api::FIND_SIMILAR_DEFAULT_MIN);
         let where_pred = match parse_where_arg(args) {
             Ok(p) => p,
             Err(e) => return CallOutcome::ToolErr(e),
@@ -1489,7 +1492,7 @@ fn graph_tools() -> Vec<Js> {
                         "field": { "type": "string", "description": "Property field holding the embedding vectors (default: embedding). Used in vector-search mode." },
                         "label": { "type": "string", "description": "Restrict search to nodes with this label. Empty string means all labels. Used in vector-search mode." },
                         "k": { "type": "integer", "description": "Maximum results to return in vector-search mode (default: 10)." },
-                        "min": { "type": "number", "description": "Minimum cosine similarity threshold in vector-search mode (default: 0.8). The Python binding's find_similar defaults this to 0.0 instead — same operation, same name, different default, so name it explicitly when a call has to agree across both surfaces." },
+                        "min": { "type": "number", "description": "Minimum cosine similarity threshold in vector-search mode (default: 0.8 on every surface; before 0.7 HTTP and the Python binding defaulted to 0.0). Pass 0.0 to keep low-similarity hits." },
                         "mask": {
                             "type": "array",
                             "items": { "type": "string" },
@@ -2431,6 +2434,17 @@ mod tests {
                 )],
             )
             .unwrap();
+            // mid: [0.6,0.8] → cosine 0.6 with query [1,0]: above the old HTTP
+            // and Python default (0.0), below this one (0.8).
+            g.insert_node(
+                "Item",
+                "mid",
+                vec![(
+                    "emb".into(),
+                    Value::List(vec![Value::Float(0.6), Value::Float(0.8)]),
+                )],
+            )
+            .unwrap();
         }
 
         // No `min` in the request — must default to 0.8.
@@ -2450,13 +2464,15 @@ mod tests {
         let results = result["results"].as_array().expect("results array");
 
         let keys: Vec<&str> = results.iter().filter_map(|r| r["key"].as_str()).collect();
-        assert!(
-            keys.contains(&"close"),
-            "close node (sim=1.0) must be included"
+        assert_eq!(
+            keys,
+            vec!["close"],
+            "only the hit at or above the default survives: mid (0.6) and far (0.0) do not"
         );
-        assert!(
-            !keys.contains(&"far"),
-            "far node (sim=0.0) must be excluded by default min=0.8"
+        assert_eq!(
+            result["min"],
+            json!(core_api::FIND_SIMILAR_DEFAULT_MIN),
+            "the reply echoes the floor it applied"
         );
     }
 

@@ -497,6 +497,11 @@ impl GraphDb {
     /// Returns a list of `(node_key, similarity_score)` tuples sorted by
     /// score descending, filtered to `score >= min`.
     ///
+    /// **`min` defaults to `0.8`**, the same floor the MCP `find_similar` tool
+    /// and HTTP `POST /find_similar` apply. It was `0.0` here through 0.6: a
+    /// call that never named `min` now drops every hit below `0.8`, and
+    /// nothing raises. Pass `min=0.0` for the old behaviour.
+    ///
     /// ```python
     /// hits = db.find_similar("embedding", query_vec, k=10, min=0.7)
     /// # restrict to a label:
@@ -508,8 +513,8 @@ impl GraphDb {
     #[allow(clippy::too_many_arguments)]
     #[allow(deprecated)]
     #[pyo3(
-        signature = (field, vector, label = None, k = 10, min = 0.0, mask = None, r#where = None, exact = false),
-        text_signature = "($self, field, vector, label=None, k=10, min=0.0, mask=None, where=None, exact=False)"
+        signature = (field, vector, label = None, k = 10, min = core_api::FIND_SIMILAR_DEFAULT_MIN, mask = None, r#where = None, exact = false),
+        text_signature = "($self, field, vector, label=None, k=10, min=0.8, mask=None, where=None, exact=False)"
     )]
     fn find_similar(
         &self,

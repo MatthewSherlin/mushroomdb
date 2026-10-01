@@ -631,7 +631,7 @@ class GraphDb:
         vector: Sequence[float],
         label: str | None = None,
         k: int = 10,
-        min: float = 0.0,
+        min: float = 0.8,
         mask: Sequence[str] | None = None,
         where: dict | None = None,
         exact: bool = False,
@@ -668,10 +668,10 @@ class GraphDb:
         different length than the query is skipped; a zero-norm query returns
         `[]`.
 
-        **`min` defaults to `0.0` here and to `0.8` in the MCP `find_similar`
-        tool.** The same operation under the same name returns different
-        results across the two surfaces and neither raises, so pass `min`
-        explicitly if the call is ported between them.
+        **`min` defaults to `0.8`**, the same floor the MCP `find_similar` tool
+        and HTTP `POST /find_similar` apply. It was `0.0` here through 0.6, so
+        a call that never named `min` now drops every hit below `0.8` and
+        nothing raises. Pass `min=0.0` for the old behaviour.
         """
 
     def pairwise_similar(

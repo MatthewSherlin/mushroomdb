@@ -42,6 +42,18 @@ pub use db::{
 };
 pub use exact_knn::{with_pairwise_caps, PAIRWISE_GRAM_MAX, PAIRWISE_MAX_N};
 
+/// The similarity floor `find_similar` applies when the caller names none.
+///
+/// One value, read by every surface that has a default — the MCP tool, HTTP
+/// `POST /find_similar` and the Python binding. Through 0.6 each hard-coded
+/// its own literal, and they disagreed: MCP 0.8, the other two 0.0, so a call
+/// ported between them changed its results with nothing raised. The engine
+/// itself has no default: `GraphDb::find_similar_vector_filtered` takes `min`
+/// as an argument.
+///
+/// `pairwise_similar` is a different operation and defaults to 0.0 everywhere.
+pub const FIND_SIMILAR_DEFAULT_MIN: f64 = 0.8;
+
 /// The on-disk snapshot version a store that has opted in to nothing writes —
 /// the **floor**, not the whole answer.
 ///
