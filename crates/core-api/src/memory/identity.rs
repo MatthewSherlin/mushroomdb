@@ -230,6 +230,27 @@ fn stored_strings(value: Option<&Value>) -> Option<Vec<String>> {
     }
 }
 
+/// Whether the stored `aliases` is a list this store derived for `key` from
+/// some name — the current one or an earlier one it can no longer read.
+///
+/// A list the store writes always holds its name in [`canonical`] form, and
+/// deriving from that form reproduces the list. So the stored value is the
+/// store's own exactly when it is byte-identical to [`derive_aliases`] of the
+/// key and one of its own items. Every item of such a list is a derived
+/// token, and none is a declaration.
+///
+/// The cost of telling by shape, accepted: a list a user wrote before 0.7
+/// that happens to be this node's lowercased key plus one name and that
+/// name's words, sorted — key `bob`, list `["bob", "bobby"]` — reads as the
+/// store's, and `bobby` is let go rather than kept in `alias_keys`. A list
+/// with anything more in it, such as one the store wrote while declared
+/// aliases still went into `aliases`, does not have the shape and is moved
+/// item by item.
+fn store_wrote(key: &str, stored: Option<&Value>, held: &[String]) -> bool {
+    held.iter()
+        .any(|name| stored == Some(&aliases_value(&derive_aliases(key, Some(name)))))
+}
+
 /// The refusal for a stored identity list that is not a string or a list of
 /// strings: naming the node, the property, and the way out.
 fn foreign_value(key: &str, field: &str) -> GraphError {
@@ -266,9 +287,14 @@ struct IdentityLists {
 /// never canonicalised — on the first describing write, after which `aliases`
 /// holds nothing to move. Only a blank item carries nothing and is let go.
 ///
-/// The store can only compare against the name it finds. A name changed
-/// underneath it by a raw write leaves its old words in `aliases`, and they
-/// are then kept as declared; so is a former key `rename_node` left behind.
+/// Derived name words must never become claims, and a name can change
+/// underneath the store: a raw write — `query`, `ingest_json`, HTTP — sets a
+/// new name and leaves `aliases` holding the old one's words, which neither
+/// name the store can now read implies. [`store_wrote`] recognises such a
+/// list by its shape, and nothing is moved from it.
+///
+/// A former key `rename_node` left behind is not recognised that way: the
+/// list was derived from another key. It is kept, as a declared alias.
 ///
 /// Refused, naming the node, when either stored value is not a string or a
 /// list of strings, or when either list would exceed its cap.
@@ -298,10 +324,14 @@ fn identity_lists<F: Fs>(
     }
 
     let was_derived = derive_aliases(key, old_name);
-    let moved: Vec<String> = held_aliases
-        .into_iter()
-        .filter(|a| !derived.contains(a) && !was_derived.contains(a))
-        .collect();
+    let moved: Vec<String> = if store_wrote(key, stored_aliases.as_ref(), &held_aliases) {
+        Vec::new()
+    } else {
+        held_aliases
+            .into_iter()
+            .filter(|a| !derived.contains(a) && !was_derived.contains(a))
+            .collect()
+    };
     let moved_count = declared_alias_keys(&moved).len();
     declared.extend(moved);
     declared.extend(caller.iter().cloned());

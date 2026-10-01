@@ -373,14 +373,43 @@ fn a_former_key_is_kept_as_a_declared_alias() {
     assert_eq!(declared_of(&db, "new-key"), Some(str_list(&["old_key"])));
 }
 
-/// The limit of telling derived from declared: the store compares against the
-/// name it finds. A name changed by a raw write — not `remember`, not
-/// `upsert_entity` — leaves `aliases` stale, and the next describing write
-/// cannot tell the old name's words from a user's own. It keeps them, as
-/// declared. Changing the name through a describing write leaves nothing.
+/// The stated limit of recognising the store's list by shape: after
+/// `rename_node` the list was derived from another key, so it is not
+/// recognised. If the name was also changed by a raw write in between, the
+/// next describing write keeps the former key and the old name's words as
+/// declared aliases.
 #[test]
-fn a_name_changed_by_a_raw_write_leaves_its_old_words_declared() {
-    let mut db = store("raw-rename");
+fn a_rekeyed_node_with_a_raw_name_change_keeps_its_stale_list_as_declared() {
+    let mut db = store("rekey-raw-rename");
+    describe_entity(
+        &mut db,
+        "old",
+        Some("Person"),
+        &[("name".to_string(), Value::Str("Matthew Sherlin".into()))],
+    )
+    .unwrap();
+    db.rename_node("old", "new").unwrap();
+    db.set_prop("new", "name", Value::Str("Matt".into()))
+        .unwrap();
+    set_role(&mut db, "new").unwrap();
+    assert_eq!(aliases_of(&db, "new"), strings(&["matt", "new"]));
+    assert_eq!(
+        declared_of(&db, "new"),
+        Some(str_list(&["matthew", "matthew sherlin", "old", "sherlin"]))
+    );
+}
+
+/// Derived name words must never become claims. A name changed by a raw
+/// write — not `remember`, not `upsert_entity` — leaves `aliases` stale: the
+/// stored name is already the new one, so the old name's words are no longer
+/// derivable from anything the store can read. They are still recognisably
+/// the store's: the list is exactly what the key and one of its own items,
+/// the old canonical name, derive. So the next describing write replaces the
+/// list and moves nothing, and a stub keyed with an old name word is not
+/// claimed.
+#[test]
+fn a_name_changed_by_a_raw_write_leaves_no_claim() {
+    let mut db = identity_store("raw-rename");
     describe_entity(
         &mut db,
         "ms",
@@ -394,8 +423,105 @@ fn a_name_changed_by_a_raw_write_leaves_its_old_words_declared() {
     assert_eq!(aliases_of(&db, "ms"), strings(&["matt", "ms"]));
     assert_eq!(
         declared_of(&db, "ms"),
-        Some(str_list(&["matthew", "matthew sherlin", "sherlin"]))
+        None,
+        "the old name's words were the store's, not the caller's"
     );
+    let about = strings(&["matthew", "sherlin"]);
+    let report = remember(&mut db, &note("first names", &about, &[])).unwrap();
+    assert!(report.same_as.is_empty(), "{:?}", report.same_as);
+    assert!(db.weighted_edges(SAME_AS_EDGE, None).is_empty());
+}
+
+/// The same through the preset's backfill, which is a describing write too.
+#[test]
+fn the_backfill_moves_nothing_from_a_list_a_stale_name_derived() {
+    let mut db = store("raw-rename-backfill");
+    describe_entity(
+        &mut db,
+        "ms",
+        Some("Person"),
+        &[("name".to_string(), Value::Str("Matthew Sherlin".into()))],
+    )
+    .unwrap();
+    db.set_prop("ms", "name", Value::Str("Matt".into()))
+        .unwrap();
+    let backfill = core_api::memory::identity::aliases_to_backfill(&db).unwrap();
+    assert_eq!(backfill.len(), 1);
+    assert_eq!(
+        backfill[0].props,
+        vec![(ALIASES_FIELD.to_string(), str_list(&["matt", "ms"]))]
+    );
+}
+
+/// What a caller really declared is untouched by a raw name change: it was
+/// never in `aliases`, and it stays in `alias_keys`, alone.
+#[test]
+fn a_declared_alias_survives_a_raw_name_change_and_nothing_joins_it() {
+    let mut db = store("raw-rename-declared");
+    describe_entity_with_aliases(
+        &mut db,
+        "ms",
+        Some("Person"),
+        &[("name".to_string(), Value::Str("Matthew Sherlin".into()))],
+        &strings(&["Matt"]),
+    )
+    .unwrap();
+    db.set_prop("ms", "name", Value::Str("M Sherlin".into()))
+        .unwrap();
+    set_role(&mut db, "ms").unwrap();
+    assert_eq!(
+        aliases_of(&db, "ms"),
+        strings(&["m", "m sherlin", "ms", "sherlin"])
+    );
+    assert_eq!(declared_of(&db, "ms"), Some(str_list(&["Matt"])));
+}
+
+/// A list that is one name's derivation *plus* something is not the store's
+/// own from a stale name: the extra item is a declaration — what the first
+/// amendment wrote for `aliases: ["the boss"]` — and it still moves.
+#[test]
+fn a_derived_list_with_a_declared_item_still_moves_that_item() {
+    let mut db = upgraded_node(
+        "derived-plus-declared",
+        "matthew-sherlin",
+        str_list(&[
+            "matthew",
+            "matthew sherlin",
+            "matthew-sherlin",
+            "sherlin",
+            "the boss",
+        ]),
+    );
+    set_role(&mut db, "matthew-sherlin").unwrap();
+    assert_eq!(aliases_of(&db, "matthew-sherlin"), strings(&DERIVED));
+    assert_eq!(
+        declared_of(&db, "matthew-sherlin"),
+        Some(str_list(&["the boss"]))
+    );
+}
+
+/// The accepted cost of recognising the store's own lists by shape. A pre-0.7
+/// user list that happens to be exactly this node's lowercased key plus one
+/// name and that name's words, sorted, reads as the store's, and the item is
+/// let go. Here the key is `bob` and the user's list is `["bob", "bobby"]`.
+#[test]
+fn a_user_list_shaped_like_the_stores_own_is_read_as_the_stores() {
+    let mut db = store("shape-residual");
+    db.insert_node(
+        "Person",
+        "bob",
+        vec![
+            ("name".to_string(), Value::Str("Robert Smith".into())),
+            (ALIASES_FIELD.to_string(), str_list(&["bob", "bobby"])),
+        ],
+    )
+    .unwrap();
+    set_role(&mut db, "bob").unwrap();
+    assert_eq!(
+        aliases_of(&db, "bob"),
+        strings(&["bob", "robert", "robert smith", "smith"])
+    );
+    assert_eq!(declared_of(&db, "bob"), None, "`bobby` is let go");
 }
 
 /// `forget {key, prop: "name"}` asks for this: what the node's identity lists
@@ -1649,8 +1775,8 @@ fn a_described_ex_stub_is_still_linked_by_a_declared_alias() {
 /// it is an `Entity`, and the claim rules run from the five entity labels
 /// only. The alias it declares is stored and no rule reads it.
 ///
-/// An `Entity→Entity` claim rule would close this. It is an owner decision
-/// (plan 3, "Owner decisions — answered 2026-10-01", Q2), not taken here.
+/// An `Entity→Entity` claim rule would close this. The owner decided to add
+/// one on 2026-10-01; it is held pending an engine fix (defect ledger row 37).
 #[test]
 fn a_described_ex_stub_cannot_itself_claim() {
     let mut db = identity_store("ex-stub-cannot-claim");
