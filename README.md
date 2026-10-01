@@ -365,16 +365,17 @@ its machine, date and command. Embedded: no figure includes a network round-trip
 
 | Workload | Result | Measured |
 |---|---|---|
-| Bulk ingest, 10,000 nodes | 784 ms | v0.1.1, 2026-08-24 |
-| Neighborhood depth-1 (p50 / p95) | 0.4 µs / 2.2 µs | v0.1.1, 2026-08-24 |
-| Neighborhood depth-2 (p50) | 0.2 µs | v0.1.1, 2026-08-24 |
-| Cypher scan-filter-project (1.4k rows) | 1.22 ms | v0.1.1, 2026-08-24 |
-| Cypher two-hop join (200 rows, 5.8M derived edges) | 261.6 µs | v0.1.1, 2026-08-24 |
+| Bulk ingest, 10,000 nodes | 1.076 s | 0.7 pre-release, 2026-10-01 |
+| Neighborhood depth-1 (p50 / p95) | 0.4 µs / 2.4 µs | 0.7 pre-release, 2026-10-01 |
+| Neighborhood depth-2 (p50) | 0.2 µs | 0.7 pre-release, 2026-10-01 |
+| Cypher scan-filter-project (1,400 rows) | 1.02 ms | 0.7 pre-release, 2026-10-01 |
+| Cypher two-hop join (200 rows) | 421.0 µs | 0.7 pre-release, 2026-10-01 |
+| Rule backfill, 2 rules | 8.781 s | 0.7 pre-release, 2026-10-01 |
 | Open from a snapshot, 100,000 nodes / ~10M derived edges | 0.02 s at 31–41 MiB RSS | v0.2, 2026-08-28 |
 | Open from the WAL alone, same store | 8.16 min | v0.1.1, 2026-08-24 |
 
-Rows 1–5: [`benchmarks/results/head-to-head-10k-v2.md`](benchmarks/results/head-to-head-10k-v2.md),
-Apple M4 Pro. Rows 6–7: [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md), warm
+Rows 1–6: [`benchmarks/results/mushroomdb-10k-0.7.md`](benchmarks/results/mushroomdb-10k-0.7.md),
+Apple M4 Pro, one run. Rows 7–8: [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md), warm
 file cache, cold process; cold-cache was not measured.
 
 Rule engine against hand-rolled maintenance (10,000 nodes, 1,000 specialty updates, drift 0 for
