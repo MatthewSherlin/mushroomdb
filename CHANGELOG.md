@@ -7,8 +7,13 @@ store. The memory write path is what it is for; the code-graph door is what it
 removes.
 
 **This is the first breaking release.** Under Cargo semver the minor slot is
-the breaking position for `0.x`, so `^0.6.x` does not match `0.7.0` and
-nothing changes for anyone who does not deliberately upgrade.
+the breaking position for `0.x`, so a Cargo dependency on `^0.6.x` does not
+match `0.7.0` and stays where it is. Nothing else is held back. An unpinned
+`pip install mushroomdb`, `npx mushroomdb`, `cargo install mushroomdb-cli`,
+the container image pulled without a tag and the Claude Code plugin each take
+0.7 the next time they resolve, with no deliberate upgrade. An MCP entry that
+`install` already wrote names its version, and stays on it until `install` is
+run again.
 
 > **If you call `find_similar` without `min`, your results change, and nothing
 > tells you.**
@@ -22,7 +27,8 @@ nothing changes for anyone who does not deliberately upgrade.
 > results.
 >
 > **To keep the old behaviour, name it: `min=0.0` in Python, `"min": 0.0` in
-> an HTTP body or an MCP call.**
+> an HTTP body.** Over MCP the default did not move; an explicit `min` is
+> honoured there as before.
 >
 > `pairwise_similar` is unchanged: its `min` still defaults to `0.0`, over MCP
 > and in Python. The 0.6.10 and 0.6.11 notes both proposed this change for 0.7
@@ -64,10 +70,16 @@ not look like a code identifier.
   `Event` and the provisional `Entity`. `remember` declares the `name` of a
   label it has not seen when `entities` names one, up to 32 text fields in
   all; past that the entity is still written and is not searchable.
-- **An existing store is never upgraded behind your back.** A full-text index
-  is rebuilt every time the store is opened, so a 0.6 store gains `recall`
-  when you ask: `mushroomdb schema apply <db> --memory-defaults`. Until then
-  `recall` and the session brief say exactly that.
+- **The memory schema is never applied to an existing store unasked.** A
+  full-text index is rebuilt every time the store is opened, so the defaults
+  go on when you ask: `mushroomdb schema apply <db> --memory-defaults`.
+  `remember` still declares what it writes, on any store: `Note.text`, and the
+  `name` of a label `entities` names. So `recall`'s "no text index" answer and
+  the session brief's line appear only while the store has no text field at
+  all. After the first `remember` — and on a 0.6 store that has already
+  remembered a note — `recall` answers from the fields the store has and says
+  nothing about the rest: an entity written before, or by another path, is
+  not found by its name until the defaults are applied (see the known limits).
 - **A topic is at most 24 search terms.** A pasted paragraph is cut to its
   first 24 content words: glue words and repeats are dropped first, and the
   rest are not searched.
@@ -256,7 +268,9 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   or a list of strings is refused with the node named, to clear with
   `forget {key, prop: "aliases"}`, rather than overwritten.
 - **A declared alias does not count toward `Overlap`** (owner decision,
-  2026-10-01). Every full-name link sits exactly on the floor, 3/5; when
+  2026-10-01). A link between two entities with the same two-word name sits
+  exactly on the floor, 3/5 (the same three-word name scores 4/6; the same
+  one-word name scores 1/3 and does not link); when
   declared aliases were entries in `aliases`, declaring `matt` on one of two
   same-named entities made it 3/6 and silently unlinked them. Now it changes
   nothing. The consequence: two entities that declare the same alias gain no
@@ -362,9 +376,10 @@ Twenty methods, each with a signature and a docstring in
 - **`set_props_many`** sets properties on many nodes in one commit. Existing
   nodes only: an unknown key is an error and nothing is written. A value equal
   to what is stored is not written, so an identical repeat writes nothing at
-  all. Rules fire inside the commit. `wal_total_commits()` moves by one frame,
-  or by two when a rule derived or retracted an edge — never by the number of
-  nodes. It is a raw property write, like `set_prop`: it accepts `name`,
+  all. Rules fire inside the commit. `wal_total_commits()` moves by no frame
+  when nothing changed, by one when something did, and by two when a rule
+  also derived or retracted an edge — never by the number of nodes. It is a
+  raw property write, like `set_prop`: it accepts `name`,
   `aliases` and `alias_keys` on an entity and does not maintain the alias
   lists (see the known limits).
 - **Whole-store reads are refused on a `scoped()` handle.** The four
@@ -448,13 +463,22 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   dropped rather than kept in `alias_keys`. And after `rename_node` the list
   was derived from another key, so it does not have the shape: the next
   describing write moves into `alias_keys` every item the new key and the
-  stored name do not imply. That is always the former key, lowercased, where
-  it links a provisional stub keyed exactly so. If the name was also changed
+  stored name do not imply. That is the former key, lowercased, unless the new
+  key or the name already implies it — `alex`, named Alex Stone and renamed to
+  `alex-stone`, leaves nothing — and once kept it links a provisional stub
+  keyed exactly so. If the name was also changed
   by a raw write at any point since the last describing write — before the
   rename or after it — it is the old name and each of its words as well, and
   each of those then claims a stub keyed so: the one case in which derived
   name words become declared aliases.
   `forget {key, prop: "alias_keys"}` clears what was kept.
+- **`rename_node` leaves a stored `id` property at the old key.**
+  `upsert_entity`'s create and a Cypher `CREATE {id: …}` store the key as an
+  `id` property as well, and a rename does not rewrite it. After
+  `rename_node q1 → q2`, `WHERE n.id = 'q2'` returns nothing,
+  `WHERE n.id = 'q1'` returns the renamed node, and `RETURN n.id` prints `q1`.
+  `key(n)` and the inline pattern `{id: 'q2'}` are right: use `key(n)` to read
+  or filter on a key. It predates 0.7 (row 72, deferred to 0.7.1).
 - **A subject named before it was described cannot claim a stub.** It is an
   `Entity` for life, and the claim rules run from the five entity labels.
   `upsert_entity` refuses to relabel it; `remember`'s `entities` describes it
@@ -467,7 +491,8 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   owner's predicate stops holding, the edge is removed although the other
   rule still wants it, until that rule is rebuilt or one of its own fields is
   written. No rule this release ships collides. Row 37, deferred to 0.8.
-- **Two strangers with one full name link.** `john-smith-nyc` and
+- **Two strangers with one full name of two or more words link.**
+  `john-smith-nyc` and
   `john-smith-sf` score 3/5. The link is visible in `remember`'s reply and
   explainable with `explain_association`, but it is wrong — the gate's one
   false positive, and why its precision has no margin.
@@ -506,10 +531,35 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   `~/.mushroomdb`, and the session brief looks for one only beside the store's
   parent directory, so with the store anywhere else the brief's last line
   names MCP tools in a session that has none (row 69, deferred to 0.8).
+- **After the first `remember` on a store without the memory defaults, nothing
+  says the defaults are missing.** The store then has one text field, so
+  `recall` and the brief stop saying "no text index", and an entity that was
+  already there is not found by its name. `mushroomdb schema apply <db>
+  --memory-defaults` indexes them; the `schema` tool lists the fields `recall`
+  searches (row 73, deferred to 0.7.1).
 - **A store the Python binding creates has no memory schema.** `remember`
   declares the text fields it needs as it goes. The identity preset is applied
   from the command line — `mushroomdb schema apply <db> --memory-identity` —
   with the Python handle closed (row 55, deferred to 0.8).
+- **A hand-written edge can be undeletable while a rule matches its
+  endpoints.** The engine refuses to delete an edge when a rule with the same
+  edge type and labels has a predicate the two nodes satisfy, without checking
+  that the rule's via hop, namespace or cap would let it derive that edge, and
+  it refuses the same way for an edge that does not exist. `forget` says which
+  case it is; the refusal stands until the rule or the properties change
+  (row 67, deferred to 0.8).
+- **`suggest_rules` can propose `approximate: true`.** `create_rule` accepts
+  it, and its advertised schema does not list it, so a client that validates
+  arguments against the schema refuses that proposal (row 52, deferred to
+  0.7.1).
+- **Two counts in replies run low.** `forget` of a node under-reports the
+  derived edges retracted when that node was the via node of a via-hop rule
+  (row 50), and `remember`'s `matched` does not count a fact endpoint that
+  already existed (row 48). Both deferred to 0.7.1.
+- **Cypher has no boolean literals.** `WHERE n.provisional = true` fails with
+  `unbound variable`; the `schema` tool lists the provisional nodes. And an
+  older skill at user scope can shadow the one `install` writes, with nothing
+  detecting it (row 63, deferred to 0.8).
 - **`set_props_many` holds the GIL for the whole call**, the fsync included,
   so other Python threads wait for it (row 65, deferred to 0.7.1).
 - **Scale is measured to 100,000 nodes, and no further.** The measurements
