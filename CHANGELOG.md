@@ -203,7 +203,10 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
   10,000 nodes, release builds, 20 runs a side on an Apple M4 Pro that was
   never fully quiet (the file records the load): rule backfill 8.584 s against
   8.611 s, ingest 0.998 s against 0.991 s, warm two-hop 192.1 µs against
-  195.3 µs. One exception, cause not established: the first, cold execution
+  195.3 µs. Those are the driver's pooled twenty runs; the README's table
+  gives the same tree's medians of three harness runs from the same file,
+  8.551 s for the backfill and 1.061 s for ingest. One exception, cause not
+  established: the first, cold execution
   of the two-hop query is about 0.15 ms slower on 0.7
   (`benchmarks/results/mushroomdb-10k-0.7-ab.md`, driver
   `benchmarks/ab_driver.py`). The backfill figure is not the workload behind
@@ -567,8 +570,24 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   `unbound variable`; the `schema` tool lists the provisional nodes. And an
   older skill at user scope can shadow the one `install` writes, with nothing
   detecting it (row 63, deferred to 0.8).
-- **`set_props_many` holds the GIL for the whole call**, the fsync included,
-  so other Python threads wait for it (row 65, deferred to 0.7.1).
+- **The Python binding's memory calls hold the GIL for the whole call.**
+  `set_props_many`, `remember`, `upsert_entity`, `forget`, `recall` and
+  `search` do, a write's fsync included, so other Python threads wait; the
+  algorithms, `suggest_rules`, `schema_report`, `identity_clusters` and the
+  similarity reads release it (row 65, deferred to 0.7.1).
+- **An empty string is accepted as a key by `remember`.** `""` in `about`, or
+  as a fact's `subject` or `object`, creates a provisional `Entity` whose key
+  is the empty string and links to it, over MCP and in Python alike.
+  `forget` with that key removes it (row 76, deferred to 0.7.1).
+- **Over MCP, a `min` that is not a number is ignored.** `find_similar` with
+  `"min": "0.5"` answers at the default 0.8 and echoes `min: 0.8`; HTTP
+  refuses the same body with `min must be a number` (row 74, deferred to
+  0.7.1).
+- **Two small identity gaps.** If reading a node's edges fails, the `same_as`
+  report leaves that node's links out rather than failing (row 51); and a
+  provisional stub's derived `aliases` are not held to the 32-alias cap an
+  entity's are, so a stub key of many words carries a long list (row 53).
+  Both deferred to 0.7.1.
 - **Scale is measured to 100,000 nodes, and no further.** The measurements
   are from v0.1.1 and v0.2; they were not repeated on 0.7, and nothing larger
   has been run.
