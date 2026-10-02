@@ -3,7 +3,7 @@
 ## Machine / date
 
 - **Date:** 2026-10-01T16:06:43
-- **Host:** Matthews-MBP.lan
+- **Host:** an Apple M4 Pro laptop (the hardware is in the next lines)
 - **OS:** macOS-15.7.3-arm64-arm-64bit
 - **CPU:** Apple M4 Pro (12 cores, arm64)
 - **RAM:** 24.00 GiB
@@ -57,7 +57,9 @@ what it reads. This is the cost of declaring the rules over the loaded graph.
 
 ## Annotations (added 2026-10-01, after the run)
 
-Nothing above this heading was changed; these lines record what the run did not.
+Nothing above this heading was changed, with one exception: the **Host** line gave the
+machine's network name and now describes the machine instead. These lines record what the run
+did not.
 
 - **Command:** `bindings/python/.venv/bin/python benchmarks/run.py --scale 10000 --out benchmarks/results/mushroomdb-10k-0.7.md`,
   from the repository root, straight after

@@ -328,7 +328,7 @@ fixed-seed probe). Full reference: [`docs/site/rules.md`](docs/site/rules.md).
 | `mushroomdb mcp <dir>\|--auto [--all-tools]` | Start a stdio MCP JSON-RPC server for agent tools. `--all-tools` lists all 25 served tools; the default lists 23 |
 | `mushroomdb demo <dir>` | Write a deterministic demo graph (10 Orgs, 20 Projects, 30 People) |
 | `mushroomdb serve <dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>]` | Start the HTTP server + optional UI (default `127.0.0.1:8080`; `--token` on non-loopback; `--role-token TOKEN:ROLE`). The UI is served only by a build that embeds it — `npx`, Docker and the release binaries do; `cargo install` does not |
-| `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted). `--role <name>` answers as one of the store's roles and `--namespace <ns>` from one namespace; together they intersect, so neither widens the other, and either makes the query a read |
+| `mushroomdb query <dir> <cypher>` | Run a Cypher read or write (`--query` also accepted). Pass the statement in shell double quotes: single-quote Cypher strings; inside the double quotes backslash every dollar sign, double quote and backtick. `--role <name>` answers as one of the store's roles and `--namespace <ns>` from one namespace; together they intersect, so neither widens the other, and either makes the query a read |
 | `mushroomdb asof <dir> --commit N\|--at <date> [--query "…"]` | Read-only view at a WAL commit or at a date (`2026-06-19`, or RFC 3339) — the last commit at or before it. Exactly one of the two. `--namespace <ns>` reads one namespace as it was then |
 | `mushroomdb stats <dir>` | Print node/edge/rule counts, plus a `namespaces:` line once a store has more than the implicit `default` one |
 | `mushroomdb suggest <dir>` | Rank candidate linking rules (scored top-k 32, KeyMatch 512) |
@@ -394,9 +394,11 @@ its machine, date and command. Embedded: no figure includes a network round-trip
 Rows 1–7: [`benchmarks/results/mushroomdb-10k-0.7-ab.md`](benchmarks/results/mushroomdb-10k-0.7-ab.md),
 Apple M4 Pro, 1-minute load 3.4–3.8 on 12 cores. Each is the median of three runs of the harness,
 except the warm two-hop, which is the median of twenty runs of `benchmarks/ab_driver.py`;
-`benchmarks/run.py` reports the single pass only. The released 0.6.12, measured
-alongside on the same day, is indistinguishable: backfill 8.611 s, ingest 0.991 s, warm two-hop
-195.3 µs. The first single run on this tree is
+`benchmarks/run.py` reports the single pass only. The released 0.6.12 was measured alongside on
+the same day and is indistinguishable. That comparison is the driver's twenty runs a side, not
+the medians of three above: backfill 8.611 s for 0.6.12 against 8.584 s for this tree, ingest
+0.991 s against 0.998 s, warm two-hop 195.3 µs against 192.1 µs. The first single run on this
+tree is
 [`mushroomdb-10k-0.7.md`](benchmarks/results/mushroomdb-10k-0.7.md). Rows 8–9:
 [`dogfood/results/scale-100k.md`](dogfood/results/scale-100k.md), warm file cache, cold process;
 cold-cache was not measured.
