@@ -398,7 +398,7 @@ jobs:
       # was regenerated only by a version bump, so it drifted between releases
       # with nothing to say so.
       - run: bash scripts/gen-llms-full.sh --check
-      # One version, twenty-four places. Catches the two shapes that have both
+      # One version, many places. Catches the two shapes that have both
       # already shipped: a package manifest left behind (0.6.9 told readers to
       # install 0.6.8; a v0.6.11 tag would have published a wheel labelled
       # 0.6.10), and an inter-crate pin left behind, which resolves under caret

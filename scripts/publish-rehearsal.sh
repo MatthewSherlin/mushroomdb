@@ -9,6 +9,9 @@
 #   publish-rehearsal.sh           crates (verified build), wheel, both npm packages
 #   publish-rehearsal.sh --quick   crates without the verify build (the wheel and npm steps still run)
 #
+# It packages the working tree (`--allow-dirty`): an untracked file inside a
+# crate directory is packaged here and would be absent from a clean checkout.
+#
 # Every command here is a dry run or writes only build output and a temp
 # directory. Nothing contacts a registry to upload. There is no flag that
 # makes this script publish; publishing is a tag, and a person pushes it.
@@ -27,6 +30,7 @@ WS="$(awk -F'"' '/^version = "/{print $2; exit}' Cargo.toml)"
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 fail=0
+skipped=""
 step() { printf '\n── %s ──\n' "$1"; }
 bad()  { echo "publish-rehearsal.sh: FAILED — $1" >&2; fail=1; }
 
@@ -75,6 +79,7 @@ if [[ -x bindings/python/.venv/bin/maturin ]]; then
   fi
 else
   echo "skipped: no bindings/python/.venv/bin/maturin"
+  skipped="${skipped:+$skipped, }wheel"
 fi
 
 step "npm: pack both packages without publishing"
@@ -91,11 +96,17 @@ if command -v npm >/dev/null 2>&1; then
   done
 else
   echo "skipped: npm is not installed"
+  skipped="${skipped:+$skipped, }npm"
 fi
 
 echo
 if [[ $fail -ne 0 ]]; then
   echo "publish-rehearsal.sh: FAILED — see above. Nothing was uploaded." >&2
   exit 1
+fi
+# A skipped step is not a packaged one, and the last line is the one quoted.
+if [[ -n "$skipped" ]]; then
+  echo "publish-rehearsal.sh: OK — $WS crates packaged; skipped: $skipped. Nothing was uploaded."
+  exit 0
 fi
 echo "publish-rehearsal.sh: OK — $WS packages cleanly. Nothing was uploaded."

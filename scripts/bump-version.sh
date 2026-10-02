@@ -7,7 +7,7 @@
 # its siblings, the package manifests outside Cargo carry it for npm, PyPI, the
 # MCP registry and the discovery card, and two lockfiles record it.
 #
-# Hand-editing twenty-four places is how 0.6.9 shipped telling readers to
+# Hand-editing them is how 0.6.9 shipped telling readers to
 # install 0.6.8, and how a v0.6.11 tag would have published a Python wheel
 # labelled 0.6.10 — `pyproject.toml` is the one npm and the TypeScript client
 # rewrite from the tag and maturin does not.
