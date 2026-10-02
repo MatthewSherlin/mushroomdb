@@ -70,9 +70,9 @@ not look like a code identifier.
   `mushroomdb query <db> "MATCH (n) WHERE key(n) = '' DETACH DELETE n"` or by
   `forget(key="")` in Python (the MCP `forget` refuses an empty key); a node
   under an empty label by `forget` with its key. An edge whose type is the
-  empty string is retracted by `forget(fact=…)` in Python; over MCP `forget`
-  refuses an empty predicate, so there it goes only with one of its endpoint
-  nodes.
+  empty string is retracted by `forget(fact=…)` in Python, or over HTTP by
+  `DELETE /edges//<src>/<dst>` on a served store; over MCP `forget` refuses an
+  empty predicate, so there it goes only with one of its endpoint nodes.
 - **A node's label is fixed.** `upsert_entity` with a `label` that differs
   from the stored one is refused, and writes nothing, where it used to be
   silently ignored. Name the label in `remember`'s `entities` at first
