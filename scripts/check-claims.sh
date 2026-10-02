@@ -196,11 +196,14 @@ if [[ -n "$WORKSPACE_VERSION" ]]; then
       \( -name target -o -name 'target-*' -o -name .venv -o -name node_modules \) -prune -o \
       \( -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.sh' \) -print0)
   fi
+  # `scripts/` is exempt here for the reason it is exempt below, and because
+  # the bump no longer rewrites it: a script's comment that quotes an old pin is
+  # telling history, and a gate the bump cannot satisfy fails every release.
   stale=""
   if [[ ${#_scan[@]} -gt 0 ]]; then
     stale="$( (cd "$ROOT" && grep -nE "mushroomdb@[0-9]+\.[0-9]+\.[0-9]+" "${_scan[@]}" 2>/dev/null) \
              | grep -v "mushroomdb@${WORKSPACE_VERSION}" \
-             | grep -vE "(^|/)CHANGELOG\.md:|(^|/)docs/roadmap/" || true)"
+             | grep -vE "(^|/)CHANGELOG\.md:|(^|/)docs/roadmap/|(^|/)scripts/" || true)"
   fi
   # A pin the rewriter mangled: `mushroomdb` immediately followed by a version
   # with no `@`. This exists because the bump script once produced exactly that
