@@ -163,7 +163,7 @@ whole set:
 | `stats` | Live node, edge, and rule counts |
 | `node_history` | WAL change history for a node (archives included; a `snapshot --truncate` ends the reach) |
 | `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
-| `was_linked` | Point-in-time edge check: was an edge active at a given commit? `at_commit` also accepts a date, which its schema does not declare yet |
+| `was_linked` | Point-in-time edge check: was an edge active on a given date, or at a given commit? |
 | `rename_node` | Rename a node's key; old_key, new_key |
 
 Full walkthrough, tool reference, and Claude Desktop setup: [`docs/site/mcp.md`](docs/site/mcp.md).
@@ -3441,9 +3441,10 @@ answers. A session can only call what its client was shown, though, so the two
 unlisted tools — `explain` and `rename_node` — are reached by starting the
 server with `mushroomdb mcp <db> --all-tools`, which lists the whole set with
 their schemas. The default listing a session pays for before its first turn —
-the `tools` array of the `tools/list` reply, as compact JSON — is 27,067 bytes;
-all 25 are 27,868. Before this release added `schema`, `analyze`,
-`suggest_rules` and `forget` it was 23,548 and 24,349;
+the `tools` array of the `tools/list` reply, as compact JSON — is 27,371 bytes;
+all 25 are 28,172. In 0.7.0 it was 27,067 and 27,868: the difference is
+`was_linked`'s schema declaring the date it takes. Before 0.7 added `schema`,
+`analyze`, `suggest_rules` and `forget` it was 23,548 and 24,349;
 `scripts/measure-tool-listing.py` takes both.
 
 | Tool | Purpose |
@@ -3460,7 +3461,7 @@ all 25 are 27,868. Before this release added `schema`, `analyze`,
 | `stats` | Return live node, edge, and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned). Pass `role` or `namespace` to also receive `namespaces` — the namespaces that argument may see, each with a live-node count. A call that passes neither **omits the roster entirely** (not an empty array), so a store with one namespace and a store with ten answer identically; the store-wide counts beside it are unchanged either way. |
 | `node_history` | Every recorded change to one node, newest last, plus `total_commits` (the horizon upper bound) and `horizon`, the oldest commit still retained. |
 | `edge_history` | Add/retract lifecycle for all edges between two nodes, with the rule behind each event. |
-| `was_linked` | Point-in-time check: was an edge of this type active at this commit? `at_commit` is a 0-based commit index. The server also accepts an RFC 3339 date there, as `edges_at` does, but the tool's schema declares only the integer, so a client that validates arguments against the schema will refuse the date. |
+| `was_linked` | Point-in-time check: was an edge of this type active on this date, or at this commit? `at_commit` takes an RFC 3339 date, which resolves to the last commit at or before it, or a 0-based commit index — typed in the tool's schema exactly as `edges_at`'s `at` is. |
 | `rename_node` | Rename a node's key, preserving all its edges. A stored `id` property that equals the old key moves with it, in the same commit. |
 
 ---

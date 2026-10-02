@@ -3451,7 +3451,12 @@ fn every_association_tool_description_opens_with_its_question() {
         ("neighborhood", "What is around K"),
         ("node_info", "What is K —"),
         ("node_edges", "What is K related to"),
-        ("was_linked", "Were A and B linked at commit C"),
+        (
+            // Leads with the date, as `edges_at` below does and for its
+            // reason: `at_commit` takes one, and its schema now says so.
+            "was_linked",
+            "Were A and B linked on DATE (or at commit C)",
+        ),
         (
             // Broadened in v0.6.11: `at` takes a date as well as a commit
             // index, and the description must lead with the date. Opening with
@@ -6903,5 +6908,83 @@ fn rename_node_moves_the_id_upsert_entity_stored() {
         content_json(&replies[4])["rows"],
         json!([]),
         "nothing answers to the old key"
+    );
+}
+
+/// Binding: `was_linked` declares the date its handler takes (ledger row 71).
+///
+/// The handler has resolved an RFC 3339 string since `edges_at` did, and the
+/// skill teaches that form. While the schema said `integer`, a host that
+/// checks arguments against `inputSchema` refused the call the skill teaches.
+/// The two time-travel tools type their instant the same way, so the schema
+/// is compared to `edges_at`'s rather than restated.
+#[test]
+fn was_linked_declares_the_date_it_accepts() {
+    let db = open("was-linked-date");
+    seed_person(&db, "alice");
+    seed_person(&db, "bob");
+    db.write().insert_edge("LINK", "alice", "bob").unwrap();
+    let last = db.read().wal_total_commits().unwrap() - 1;
+
+    let link = |at: Js| json!({"a": "alice", "b": "bob", "edge_type": "LINK", "at_commit": at});
+    let stdin = format!(
+        "{}{}{}{}{}",
+        req(json!(1), "tools/list", None),
+        call(2, "was_linked", link(json!("2099-01-01T00:00:00Z"))),
+        call(3, "was_linked", link(json!(last))),
+        call(4, "was_linked", link(json!("not a date"))),
+        call(5, "was_linked", link(json!(1.5))),
+    );
+    let (res, out) = exchange(db, &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+
+    let tools = replies[0]["result"]["tools"].as_array().expect("tools");
+    let arg = |tool: &str, name: &str| -> Js {
+        tools
+            .iter()
+            .find(|t| t["name"] == tool)
+            .unwrap_or_else(|| panic!("{tool} is not listed"))["inputSchema"]["properties"][name]
+            .clone()
+    };
+    let at_commit = arg("was_linked", "at_commit");
+    assert_eq!(
+        at_commit["anyOf"],
+        json!([
+            { "type": "string", "minLength": 1 },
+            { "type": "integer", "minimum": 0 }
+        ]),
+        "a date string or a commit index: {at_commit}"
+    );
+    assert_eq!(
+        at_commit["anyOf"],
+        arg("edges_at", "at")["anyOf"],
+        "`was_linked` and `edges_at` type their instant alike"
+    );
+    assert!(
+        at_commit.get("type").is_none(),
+        "a bare `type` beside `anyOf` would still refuse the string: {at_commit}"
+    );
+    assert!(
+        at_commit["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("RFC 3339")),
+        "{at_commit}"
+    );
+
+    // What the schema now says is what the handler does.
+    let by_date = content_json(&replies[1]);
+    assert_eq!(by_date["linked"], json!(true), "{by_date}");
+    assert_eq!(by_date["at_commit"], json!(last), "{by_date}");
+    assert_eq!(content_json(&replies[2])["linked"], json!(true));
+    assert!(
+        replies[3]["result"]["isError"].as_bool().unwrap_or(false),
+        "a string that is no date is a tool error, never a guessed commit: {}",
+        replies[3]
+    );
+    assert!(
+        error_text(&replies[4]).contains("non-negative commit index or an RFC 3339 date"),
+        "{}",
+        replies[4]
     );
 }

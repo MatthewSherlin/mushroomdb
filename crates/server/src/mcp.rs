@@ -1520,14 +1520,20 @@ fn graph_tools() -> Vec<Js> {
             },
             {
                 "name": "was_linked",
-                "description": "Were A and B linked at commit C — whether an edge of `edge_type` existed between the two keys (either direction) at that WAL commit. Returns an error when `at_commit` is outside the retained horizon (`horizon..total_commits`).",
+                "description": "Were A and B linked on DATE (or at commit C) — whether an edge of `edge_type` existed between the two keys (either direction) at that point in the store's history. Pass the date directly; do not guess a commit index for it. Returns an error when the commit is outside the retained horizon (`horizon..total_commits`).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "a": { "type": "string", "minLength": 1, "description": "First node key." },
                         "b": { "type": "string", "minLength": 1, "description": "Second node key." },
                         "edge_type": { "type": "string", "minLength": 1, "description": "Edge type to check." },
-                        "at_commit": { "type": "integer", "minimum": 0, "description": "0-based WAL commit index to query." }
+                        "at_commit": {
+                            "description": "When to check. Either an RFC 3339 date string — \"2026-06-19\", \"2026-06-19T12:00:00Z\", offsets accepted — which resolves to the last commit at or before that instant, or a 0-based WAL commit index.",
+                            "anyOf": [
+                                { "type": "string", "minLength": 1 },
+                                { "type": "integer", "minimum": 0 }
+                            ]
+                        }
                     },
                     "required": ["a", "b", "edge_type", "at_commit"]
                 }

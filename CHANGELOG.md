@@ -25,8 +25,21 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
   That also lists a node whose `id` was written as something else on purpose,
   so repair by key, one node at a time:
   `mushroomdb query <db> "MATCH (n) WHERE key(n) = 'q2' SET n.id = 'q2'"`.
+- **`was_linked`'s schema declares the date it accepts.** The handler has
+  taken an RFC 3339 date for `at_commit` since `edges_at` took one, and the
+  skill teaches that form, but the tool's `inputSchema` said `integer`: a
+  client that checks arguments against the schema refused the taught call,
+  and one that does not accepted it. `at_commit` is now typed as `edges_at`'s
+  `at` is — a string or a non-negative integer — and the description leads
+  with the date. Nothing about the handler changed (row 71).
 
 ### Changed
+
+- **The default tool listing is 27,371 bytes, from 27,067; all 25 tools are
+  28,172, from 27,868** (`scripts/measure-tool-listing.py`). The 304 bytes
+  are `was_linked`'s schema and description. Still 23 tools by default; the
+  script puts the default listing at about 6,842 tokens a session, at its
+  estimate of 4 bytes per token.
 
 ## v0.7.0 — memory that fills itself
 
@@ -562,10 +575,11 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   keeps its stored label, and the label that was not used gets a full-text
   declaration if it had none. `upsert_entity` refuses the same disagreement.
   Over MCP and in Python alike (row 64, deferred to 0.7.1).
-- **`was_linked`'s schema types `at_commit` as an integer, and the tool takes
-  a date too.** The handler accepts an RFC 3339 date and the skill teaches
-  that form, so a client that validates arguments against the advertised
-  schema refuses a call the skill teaches (row 71, deferred to 0.7.1).
+- **In 0.7.0, `was_linked`'s schema types `at_commit` as an integer, and the
+  tool takes a date too.** Fixed in 0.7.1 (row 71). The handler accepts an
+  RFC 3339 date and the skill teaches that form, so on 0.7.0 a client that
+  validates arguments against the advertised schema refuses a call the skill
+  teaches.
 - **`query` reads its statement only as a shell argument.** There is no stdin
   and no file form, so a fact written from a shell depends on the quoting rule
   above; an apostrophe inside a Cypher string is written `\'`, and a literal
