@@ -553,3 +553,188 @@ fn node_history_alias_multi_hop_reuse() {
         "node_history('c') must not see the first identity's phase=1 event"
     );
 }
+
+// ── rename_node: a stored `id` follows the key (ledger row 72) ───────────────
+
+/// A `Person` whose key is also stored as its `id` property — what
+/// `upsert_entity`'s create path and a Cypher `CREATE {id: …}` write.
+fn person_with_id(db: &mut GraphDb<core_api::RealFs>, key: &str) {
+    db.insert_node("Person", key, vec![("id".into(), Value::Str(key.into()))])
+        .unwrap();
+}
+
+/// `(key(n), n.id)` for every `Person` matching `where_clause`.
+fn key_and_id(db: &GraphDb<core_api::RealFs>, where_clause: &str) -> Vec<(String, String)> {
+    let cypher = format!("MATCH (n:Person) WHERE {where_clause} RETURN key(n), n.id");
+    let rs = db.query(&cypher, &BTreeMap::new()).unwrap();
+    (0..rs.len())
+        .map(|i| {
+            let cell = |c: usize| match rs.row(i)[c].as_ref() {
+                Some(Value::Str(s)) => s.clone(),
+                other => panic!("expected a string in column {c}, got {other:?}"),
+            };
+            (cell(0), cell(1))
+        })
+        .collect()
+}
+
+#[test]
+fn rename_moves_a_stored_id_that_equals_the_key() {
+    let dir = tmp("id-follows");
+    let mut db = GraphDb::open(&dir).unwrap();
+    person_with_id(&mut db, "q1");
+    db.rename_node("q1", "q2").unwrap();
+
+    assert_eq!(db.get_prop("q2", "id"), Some(Value::Str("q2".into())));
+    let renamed = vec![("q2".to_string(), "q2".to_string())];
+    assert_eq!(key_and_id(&db, "n.id = 'q2'"), renamed);
+    assert_eq!(key_and_id(&db, "key(n) = 'q2'"), renamed);
+    assert_eq!(
+        key_and_id(&db, "n.id = 'q1'"),
+        vec![],
+        "nothing answers to the old key"
+    );
+}
+
+#[test]
+fn rename_leaves_an_id_that_was_not_the_key() {
+    let dir = tmp("id-foreign");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node(
+        "Person",
+        "q1",
+        vec![("id".into(), Value::Str("badge-7".into()))],
+    )
+    .unwrap();
+    db.insert_node("Person", "n1", vec![("id".into(), Value::Int(7))])
+        .unwrap();
+    db.rename_node("q1", "q2").unwrap();
+    db.rename_node("n1", "n2").unwrap();
+
+    assert_eq!(
+        db.get_prop("q2", "id"),
+        Some(Value::Str("badge-7".into())),
+        "an id a caller wrote as something else is the caller's"
+    );
+    assert_eq!(db.get_prop("n2", "id"), Some(Value::Int(7)));
+}
+
+#[test]
+fn rename_writes_no_id_on_a_node_that_stored_none() {
+    let dir = tmp("id-absent");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("Person", "q1", vec![]).unwrap();
+    let before = db.wal_total_commits().unwrap();
+    db.rename_node("q1", "q2").unwrap();
+
+    assert_eq!(db.get_prop("q2", "id"), None);
+    assert_eq!(db.wal_total_commits().unwrap(), before + 1);
+    // `n.id` falls back to the key when nothing is stored.
+    assert_eq!(
+        key_and_id(&db, "n.id = 'q2'"),
+        vec![("q2".to_string(), "q2".to_string())]
+    );
+}
+
+#[test]
+fn rename_with_its_id_is_one_commit_and_survives_reopen() {
+    let dir = tmp("id-one-commit");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        person_with_id(&mut db, "q1");
+        let before = db.wal_total_commits().unwrap();
+        db.rename_node("q1", "q2").unwrap();
+        assert_eq!(
+            db.wal_total_commits().unwrap(),
+            before + 1,
+            "the key and its id move in one frame"
+        );
+    }
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(db.has_node("q2") && !db.has_node("q1"));
+    assert_eq!(db.get_prop("q2", "id"), Some(Value::Str("q2".into())));
+}
+
+#[test]
+fn rename_through_a_batch_moves_the_id_too() {
+    let dir = tmp("id-batch");
+    let mut db = GraphDb::open(&dir).unwrap();
+    person_with_id(&mut db, "q1");
+    person_with_id(&mut db, "r1");
+    // One rename, and a chain of two inside a single batch.
+    db.batch()
+        .rename_node("q1", "q2")
+        .rename_node("r1", "r2")
+        .rename_node("r2", "r3")
+        .commit()
+        .unwrap();
+
+    assert_eq!(db.get_prop("q2", "id"), Some(Value::Str("q2".into())));
+    assert_eq!(db.get_prop("r3", "id"), Some(Value::Str("r3".into())));
+    assert!(!db.has_node("r2"));
+}
+
+#[test]
+fn rename_through_the_group_commit_queue_moves_the_id_too() {
+    let dir = tmp("id-submit");
+    let db = SharedDb::open(&dir).unwrap();
+    db.write()
+        .insert_node("Person", "q1", vec![("id".into(), Value::Str("q1".into()))])
+        .unwrap();
+    db.submit_batch(vec![core_api::BatchOp::RenameNode {
+        old_key: "q1".into(),
+        new_key: "q2".into(),
+    }])
+    .unwrap();
+
+    assert_eq!(
+        db.read().get_prop("q2", "id"),
+        Some(Value::Str("q2".into()))
+    );
+    // A lock-free reader replays the same frame.
+    let rs = db
+        .reader()
+        .query(
+            "MATCH (n:Person) WHERE n.id = 'q2' RETURN key(n)",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 1);
+}
+
+#[test]
+fn the_past_keeps_the_old_key_and_the_old_id() {
+    let dir = tmp("id-asof");
+    let mut db = GraphDb::open(&dir).unwrap();
+    person_with_id(&mut db, "q1");
+    let before = db.wal_total_commits().unwrap() - 1;
+    db.rename_node("q1", "q2").unwrap();
+    let after = db.wal_total_commits().unwrap() - 1;
+
+    let at = |commit: u64| -> Vec<(String, String)> {
+        let rs = db
+            .query_at(
+                commit,
+                "MATCH (n:Person) RETURN key(n), n.id",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        (0..rs.len())
+            .map(|i| match (rs.row(i)[0].as_ref(), rs.row(i)[1].as_ref()) {
+                (Some(Value::Str(k)), Some(Value::Str(id))) => (k.clone(), id.clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(at(before), vec![("q1".to_string(), "q1".to_string())]);
+    assert_eq!(at(after), vec![("q2".to_string(), "q2".to_string())]);
+
+    // The rewrite is a recorded change to the node, at the rename's commit.
+    let hist = db.node_history("q2").unwrap().items;
+    assert!(
+        hist.iter().any(|e| e.commit == after
+            && matches!(&e.change, HistoryChange::PropSet { field, value }
+                if field == "id" && *value == Value::Str("q2".into()))),
+        "{hist:?}"
+    );
+}

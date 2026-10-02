@@ -6858,3 +6858,50 @@ fn analyze_identities_lists_each_identity_under_its_oldest_node() {
         "{err}"
     );
 }
+
+/// Binding: `rename_node` moves the `id` that `upsert_entity` stored, so the
+/// two ways of naming a node in Cypher keep agreeing (ledger row 72).
+///
+/// `upsert_entity`'s create path stores the key as an `id` property. Until
+/// 0.7.1 a rename left it at the old key: `WHERE n.id = '<new key>'` found
+/// nothing, and `RETURN n.id` printed a key the node no longer had.
+#[test]
+fn rename_node_moves_the_id_upsert_entity_stored() {
+    let stdin = format!(
+        "{}{}{}{}{}",
+        call(
+            1,
+            "upsert_entity",
+            json!({"key": "q1", "label": "Person", "props": {"name": "Quinn"}})
+        ),
+        call(2, "rename_node", json!({"old_key": "q1", "new_key": "q2"})),
+        call(3, "node_info", json!({"key": "q2"})),
+        call(
+            4,
+            "query",
+            json!({"cypher": "MATCH (n:Person) WHERE n.id = 'q2' RETURN key(n), n.id"})
+        ),
+        call(
+            5,
+            "query",
+            json!({"cypher": "MATCH (n:Person) WHERE n.id = 'q1' RETURN key(n), n.id"})
+        ),
+    );
+    let (res, out) = exchange(open("rename-id"), &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+
+    assert_eq!(content_json(&replies[1])["ok"], json!(true));
+    let node = content_json(&replies[2]);
+    assert_eq!(node["props"]["id"], json!("q2"), "{node}");
+    assert_eq!(
+        content_json(&replies[3])["rows"],
+        json!([["q2", "q2"]]),
+        "the new key finds the node, and `n.id` prints it"
+    );
+    assert_eq!(
+        content_json(&replies[4])["rows"],
+        json!([]),
+        "nothing answers to the old key"
+    );
+}

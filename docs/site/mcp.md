@@ -498,7 +498,7 @@ all 25 are 27,868. Before this release added `schema`, `analyze`,
 | `node_history` | Every recorded change to one node, newest last, plus `total_commits` (the horizon upper bound) and `horizon`, the oldest commit still retained. |
 | `edge_history` | Add/retract lifecycle for all edges between two nodes, with the rule behind each event. |
 | `was_linked` | Point-in-time check: was an edge of this type active at this commit? `at_commit` is a 0-based commit index. The server also accepts an RFC 3339 date there, as `edges_at` does, but the tool's schema declares only the integer, so a client that validates arguments against the schema will refuse the date. |
-| `rename_node` | Rename a node's key, preserving all its edges. |
+| `rename_node` | Rename a node's key, preserving all its edges. A stored `id` property that equals the old key moves with it, in the same commit. |
 
 ---
 

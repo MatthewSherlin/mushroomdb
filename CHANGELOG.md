@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.7.1 (unreleased) — four corrections
+
+No new feature and nothing removed. A 0.7.0 store opens unchanged.
+
+### Fixed
+
+- **`rename_node` moves a stored `id` with the key.** `upsert_entity`'s
+  create and a Cypher `CREATE {id: …}` store the key as an `id` property, and
+  a rename left it at the old key: `WHERE n.id = '<new key>'` found nothing
+  and `RETURN n.id` printed the old key, with no error. The rename now
+  rewrites an `id` that equals the old key, in the same commit, on every
+  surface — the MCP tool, Python's `rename_node`, HTTP
+  `POST /nodes/{key}/rename` and a batch. An `id` holding anything else is
+  the caller's and is left alone; a node that stores none gains none. The
+  rename is still one WAL frame, and a read as of a commit before it still
+  answers with the old key and the old `id`. `node_history` shows the
+  rewrite as a property change at the rename's commit. It predates 0.7
+  (row 72).
+
+  **A node renamed by 0.7.0 or earlier is not repaired on open.** To list
+  every node whose stored `id` is not its key:
+  `mushroomdb query <db> "MATCH (n) WHERE n.id <> key(n) RETURN key(n), n.id"`.
+  That also lists a node whose `id` was written as something else on purpose,
+  so repair by key, one node at a time:
+  `mushroomdb query <db> "MATCH (n) WHERE key(n) = 'q2' SET n.id = 'q2'"`.
+
+### Changed
+
 ## v0.7.0 — memory that fills itself
 
 0.7 is the release in which `remember` followed by `recall` works on a new
@@ -494,13 +522,12 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   each of those then claims a stub keyed so: the one case in which derived
   name words become declared aliases.
   `forget {key, prop: "alias_keys"}` clears what was kept.
-- **`rename_node` leaves a stored `id` property at the old key.**
-  `upsert_entity`'s create and a Cypher `CREATE {id: …}` store the key as an
-  `id` property as well, and a rename does not rewrite it. After
-  `rename_node q1 → q2`, `WHERE n.id = 'q2'` returns nothing,
-  `WHERE n.id = 'q1'` returns the renamed node, and `RETURN n.id` prints `q1`.
-  `key(n)` and the inline pattern `{id: 'q2'}` are right: use `key(n)` to read
-  or filter on a key. It predates 0.7 (row 72, deferred to 0.7.1).
+- **In 0.7.0, `rename_node` leaves a stored `id` property at the old key.**
+  Fixed in 0.7.1 (row 72): the rename rewrites it. On 0.7.0 and earlier,
+  after `rename_node q1 → q2`, `WHERE n.id = 'q2'` returns nothing,
+  `WHERE n.id = 'q1'` returns the renamed node, and `RETURN n.id` prints `q1`;
+  `key(n)` and the inline pattern `{id: 'q2'}` are right. 0.7.1's notes say
+  how to find and repair a node an earlier version renamed.
 - **A subject named before it was described cannot claim a stub.** It is an
   `Entity` for life, and the claim rules run from the five entity labels.
   `upsert_entity` refuses to relabel it; `remember`'s `entities` describes it
