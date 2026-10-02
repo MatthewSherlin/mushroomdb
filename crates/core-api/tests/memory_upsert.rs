@@ -279,3 +279,40 @@ fn declared_aliases_pass_through_to_alias_keys_and_stay_out_of_aliases() {
     upsert_entity(&mut db, "bob", Some("Person"), row(&[("name", "Bob")]), &[]).unwrap();
     assert_eq!(string_list(&db, "bob", ALIAS_KEYS_FIELD), None);
 }
+
+/// Defect 76: a key with nothing in it names no entity. Refused on the create
+/// path and on the update path alike, before anything is read or written, so
+/// a store that already holds an empty-key node is not updated through here
+/// either.
+#[test]
+fn an_empty_or_whitespace_only_key_is_refused() {
+    let mut db = store("empty-key");
+    for key in ["", "   ", "\t\n"] {
+        let before = (db.stats().nodes_live, db.commit_seq());
+        let refused = upsert_entity(&mut db, key, Some("Person"), row(&[("name", "Ada")]), &[]);
+        match refused {
+            Err(GraphError::IngestError { detail }) => assert_eq!(
+                detail,
+                format!("key must not be empty or only whitespace, got {key:?}")
+            ),
+            other => panic!("expected the empty-key refusal, got {other:?}"),
+        }
+        assert!(!db.has_node(key), "refused before anything was written");
+        assert_eq!((db.stats().nodes_live, db.commit_seq()), before);
+    }
+
+    // One already in the store, written by a path that does not refuse it.
+    db.insert_node("Entity", "", vec![]).unwrap();
+    let before = db.commit_seq();
+    let refused = upsert_entity(&mut db, "", None, row(&[("name", "Nobody")]), &[]);
+    assert!(
+        matches!(refused, Err(GraphError::IngestError { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(
+        db.get_prop("", "name"),
+        None,
+        "nothing in the row was applied"
+    );
+    assert_eq!(db.commit_seq(), before);
+}

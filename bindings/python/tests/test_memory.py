@@ -4,6 +4,8 @@ gets as dicts — from the same `core-api` functions.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from mushroomdb import GraphDb, IngestError, KeyNotFound, RuleOwned
@@ -98,6 +100,69 @@ def test_a_bad_kind_and_bad_shapes_are_refused_before_anything_is_written(db):
     with pytest.raises(ValueError, match="object"):
         db.remember("x", facts=[{"subject": "a", "predicate": "P"}])
     assert db.stats()["nodes_live"] == 0
+
+
+@pytest.mark.parametrize("key", ["", "   ", "\t\n"])
+def test_an_empty_key_is_refused_and_nothing_is_written(db, key):
+    """Defect 76: a key with nothing in it used to be stubbed like any other
+    unknown key, leaving an `Entity` keyed by the empty string."""
+    db.remember("Ada wrote the first one", about=["ada"], ts=TS)
+    before = (db.stats(), db.wal_total_commits())
+    calls = {
+        "remember: about[1]": dict(about=["ada", key]),
+        "remember: facts[0].subject": dict(
+            facts=[{"subject": key, "predicate": "KNOWS", "object": "ada"}]
+        ),
+        "remember: facts[0].object": dict(
+            facts=[{"subject": "ada", "predicate": "KNOWS", "object": key}]
+        ),
+        "remember: entities[1].key": dict(
+            entities=[{"key": "v0.7", "label": "Release"}, {"key": key, "label": "Person"}]
+        ),
+    }
+    for argument, kwargs in calls.items():
+        with pytest.raises(IngestError) as err:
+            db.remember("a note that must not land", ts=TS + 1, **kwargs)
+        assert err.value.detail == (
+            f"{argument} must not be empty or only whitespace, got {json.dumps(key)}"
+        )
+    with pytest.raises(IngestError) as err:
+        db.upsert_entity(key, {"name": "Nobody"}, label="Person")
+    assert err.value.detail == (
+        f"key must not be empty or only whitespace, got {json.dumps(key)}"
+    )
+
+    assert (db.stats(), db.wal_total_commits()) == before, "a refusal writes nothing"
+    assert db.node_info(key) is None
+    assert db.node_info("v0.7") is None, "all-or-nothing"
+
+
+def test_a_store_that_already_holds_an_empty_key_node_still_answers(tmp_path):
+    """Nothing migrates a node keyed by the empty string that an earlier
+    release let `remember` create. The store reopens and answers with it
+    there, and `forget` removes it."""
+    path = str(tmp_path / "db")
+    db = GraphDb.open(path)
+    db.remember("Ada wrote the first one", about=["ada"], ts=TS)
+    db.upsert_node("Entity", "", {"name": "", "provisional": True})
+    db.insert_edge("ABOUT", db.recall("Ada")["hits"][0]["key"], "")
+    db.close()
+
+    db = GraphDb.open(path)
+    try:
+        assert db.node_info("")["label"] == "Entity"
+        assert db.stats()["nodes_live"] == 3
+        assert db.recall("Ada")["hits"][0]["label"] == "Note"
+        assert db.schema_report()["provisional"] >= 1
+        with pytest.raises(IngestError):
+            db.remember("more of the same", about=[""], ts=TS + 1)
+
+        gone = db.forget(key="")
+        assert gone["mode"] == "node" and gone["changed"] is True
+        assert db.node_info("") is None
+        assert db.stats()["nodes_live"] == 2
+    finally:
+        db.close()
 
 
 def test_upsert_entity_maintains_aliases_and_clears_a_provisional_mark(db):

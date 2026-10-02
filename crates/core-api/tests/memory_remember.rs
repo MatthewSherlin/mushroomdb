@@ -417,3 +417,204 @@ fn remembering_the_same_note_twice_about_a_rule_linked_node_succeeds() {
     // first call's rule derived the edge, the second derived nothing.
     assert_eq!((first.derived, second.derived), (1, 0));
 }
+
+// ── an empty key (defect 76) ─────────────────────────────────────────────────
+
+/// Everything a refused `remember` could have moved.
+#[derive(Debug, PartialEq)]
+struct Written {
+    nodes_live: usize,
+    edges: u64,
+    commit_seq: u64,
+    fulltext: Vec<(String, String)>,
+    notes: usize,
+}
+
+fn written(db: &GraphDb<core_storage::fs::RealFs>) -> Written {
+    let stats = db.stats();
+    Written {
+        nodes_live: stats.nodes_live,
+        edges: stats.edges,
+        commit_seq: db.commit_seq(),
+        fulltext: db.fulltext_pairs(),
+        notes: db.nodes_with_label("Note").len(),
+    }
+}
+
+/// A `remember` naming `key` in `about`, as a fact's subject, as a fact's
+/// object and as an entity's key — one call each, every one of them refused
+/// with a message naming the argument and the position, and nothing written:
+/// not the note, not the entity under an unseen label beside the bad key, not
+/// that label's full-text pair.
+fn assert_every_argument_refuses(name: &str, key: &str) {
+    let mut db = store(name);
+    remember(&mut db, &input("Ada wrote the first one", &["ada".into()])).unwrap();
+    let before = written(&db);
+
+    let good = EntityIn {
+        key: "v0.7".into(),
+        label: "Release".into(),
+        props: BTreeMap::new(),
+        aliases: vec![],
+    };
+    let bad_entity = EntityIn {
+        key: key.into(),
+        label: "Person".into(),
+        props: BTreeMap::new(),
+        aliases: vec![],
+    };
+    let fact = |subject: &str, object: &str| FactIn {
+        subject: subject.into(),
+        predicate: "KNOWS".into(),
+        object: object.into(),
+    };
+
+    let about = vec!["ada".to_string(), key.to_string()];
+    let cases = vec![
+        ("about[1]", about, vec![good.clone()], vec![]),
+        (
+            "facts[1].subject",
+            vec![],
+            vec![good.clone()],
+            vec![fact("ada", "v0.7"), fact(key, "ada")],
+        ),
+        (
+            "facts[0].object",
+            vec![],
+            vec![good.clone()],
+            vec![fact("ada", key)],
+        ),
+        ("entities[1].key", vec![], vec![good, bad_entity], vec![]),
+    ];
+    for (argument, about, entities, facts) in cases {
+        let refused = remember(
+            &mut db,
+            &RememberInput {
+                entities: &entities,
+                facts: &facts,
+                ..input("a note that must not land", &about)
+            },
+        );
+        match refused {
+            Err(core_api::GraphError::IngestError { detail }) => assert_eq!(
+                detail,
+                format!("remember: {argument} must not be empty or only whitespace, got {key:?}")
+            ),
+            other => panic!("{argument}: expected the empty-key refusal, got {other:?}"),
+        }
+        assert_eq!(written(&db), before, "{argument}: a refusal writes nothing");
+        assert!(!db.has_node(key), "{argument}: no node keyed {key:?}");
+        assert!(!db.has_node("v0.7"), "{argument}: all-or-nothing");
+    }
+}
+
+#[test]
+fn an_empty_key_is_refused_wherever_remember_takes_one() {
+    assert_every_argument_refuses("empty-key", "");
+}
+
+#[test]
+fn a_whitespace_only_key_is_refused_the_same_way() {
+    assert_every_argument_refuses("blank-key", " \t\n");
+}
+
+/// The refusal is for a key with nothing in it. A padded key is a different,
+/// recorded behaviour and is stored as given.
+#[test]
+fn a_padded_key_is_still_taken_as_given() {
+    let mut db = store("padded-key");
+    let about = vec![" reid ".to_string()];
+    let report = remember(&mut db, &input("Reid reviewed the copy", &about)).expect("remember");
+    assert_eq!(report.provisional, about);
+    assert!(db.has_node(" reid "));
+}
+
+/// `describe_entity` is the other door into the memory write path: it creates
+/// a node under whatever key it is handed.
+#[test]
+fn describing_an_empty_key_is_refused() {
+    let mut db = store("describe-empty");
+    let before = written(&db);
+    for key in ["", "  "] {
+        match describe_entity(&mut db, key, Some("Person"), &[]) {
+            Err(core_api::GraphError::IngestError { detail }) => {
+                assert_eq!(
+                    detail,
+                    format!("key must not be empty or only whitespace, got {key:?}")
+                )
+            }
+            other => panic!("expected the empty-key refusal, got {other:?}"),
+        }
+        assert!(!db.has_node(key));
+    }
+    assert_eq!(written(&db), before);
+}
+
+/// A store written before the refusal existed can hold a node keyed by the
+/// empty string, with notes linked to it. Nothing migrates it: the store
+/// reopens, and `recall`, `schema` and `stats` answer with it present.
+#[test]
+fn a_store_that_already_holds_an_empty_key_node_still_opens_and_answers() {
+    use core_api::memory::brief::BriefOptions;
+    use core_api::memory::recall::recall_rows;
+    use core_api::memory::schema::{provisional_keys, render_schema, schema_report};
+
+    let path = tmp("legacy-empty-key");
+    {
+        let mut db = GraphDb::open(&path).unwrap();
+        db.apply_schema(&memory_defaults()).unwrap();
+        // What 0.7.0's `remember` wrote for `about: [""]`, through the raw
+        // write path this fix does not close.
+        db.insert_node(
+            "Entity",
+            "",
+            vec![
+                (NAME_FIELD.to_string(), Value::Str(String::new())),
+                (PROVISIONAL_PROP.to_string(), Value::Bool(true)),
+            ],
+        )
+        .unwrap();
+        db.insert_node(
+            "Note",
+            "note:legacy",
+            vec![
+                (
+                    "text".to_string(),
+                    Value::Str("zanzibar is the router".into()),
+                ),
+                ("kind".to_string(), Value::Str("note".into())),
+                ("ts".to_string(), Value::Int(1_759_000_000)),
+                (
+                    "about".to_string(),
+                    Value::List(vec![Value::Str(String::new())]),
+                ),
+            ],
+        )
+        .unwrap();
+        db.insert_edge("ABOUT", "note:legacy", "").unwrap();
+    }
+
+    let mut db = GraphDb::open(&path).expect("the store reopens");
+    assert!(db.has_node(""));
+    let stats = db.stats();
+    assert_eq!((stats.nodes_live, stats.edges), (2, 1));
+
+    let rows = recall_rows(&db, "zanzibar");
+    assert!(rows.indexed);
+    assert_eq!(
+        rows.hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+        ["note:legacy"]
+    );
+    match recall_digest(&db, "zanzibar", "test", 4_000) {
+        RecallOutcome::Hits(digest) => assert!(digest.contains("zanzibar"), "{digest}"),
+        other => panic!("expected a hit, got {other:?}"),
+    }
+
+    assert_eq!(provisional_keys(&db), vec![String::new()]);
+    let rendered = render_schema(&schema_report(&db, &BriefOptions::default()));
+    assert!(rendered.contains("Entity"), "{rendered}");
+
+    // A new note about a real key lands beside it; naming it again does not.
+    remember(&mut db, &input("Reid reviewed the copy", &["reid".into()])).expect("remember");
+    assert!(remember(&mut db, &input("more of the same", &[String::new()])).is_err());
+}

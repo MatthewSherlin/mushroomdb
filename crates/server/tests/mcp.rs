@@ -6219,6 +6219,67 @@ fn alias_keys_is_refused_as_a_property() {
     assert!(!db.read().has_node("m"), "a refusal writes nothing");
 }
 
+/// Defect 76: a key with nothing in it is refused by both write tools, as a
+/// tool error naming the argument, and `stats` reads the same before and
+/// after. The check is `core-api`'s; this pins that the tools surface it.
+#[test]
+fn an_empty_key_is_a_tool_error_and_writes_nothing() {
+    let db = memory_store("empty-key");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Ada wrote the first one", "about": ["ada"]}),
+    );
+    let before = content_json(&one_task_call(db.clone(), "stats", json!({})));
+    for (tool, args, argument) in [
+        (
+            "remember",
+            json!({"text": "about nothing", "about": ["ada", ""]}),
+            "remember: about[1]",
+        ),
+        (
+            "remember",
+            json!({"text": "about a blank", "about": ["   "]}),
+            "remember: about[0]",
+        ),
+        (
+            "remember",
+            json!({"text": "a fact from nothing",
+                   "facts": [{"subject": "", "predicate": "KNOWS", "object": "ada"}]}),
+            "remember: facts[0].subject",
+        ),
+        (
+            "remember",
+            json!({"text": "a fact to nothing",
+                   "facts": [{"subject": "ada", "predicate": "KNOWS", "object": ""}]}),
+            "remember: facts[0].object",
+        ),
+        (
+            "remember",
+            json!({"text": "an entity with no key",
+                   "entities": [{"key": "", "label": "Person"}]}),
+            "remember: entities[0].key",
+        ),
+        (
+            "upsert_entity",
+            json!({"key": "", "label": "Person", "props": {"name": "Nobody"}}),
+            "key",
+        ),
+    ] {
+        let err = error_text(&one_task_call(db.clone(), tool, args));
+        assert!(
+            err.contains(&format!("{argument} must not be empty or only whitespace")),
+            "{tool} {argument}: {err}"
+        );
+    }
+    assert_eq!(
+        content_json(&one_task_call(db.clone(), "stats", json!({}))),
+        before,
+        "a refusal writes nothing"
+    );
+    assert!(!db.read().has_node(""), "no node keyed by the empty string");
+}
+
 /// `forget {key, prop: "alias_keys"}` clears the declared list, and with it
 /// the link the claim made; the reply counts the retraction.
 #[test]
