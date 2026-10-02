@@ -390,13 +390,13 @@ its machine, date and command. Embedded: no figure includes a network round-trip
 
 | Workload | Result | Measured |
 |---|---|---|
-| Bulk ingest, 10,000 nodes | 1.061 s | 0.7 pre-release, 2026-10-01 |
-| Neighborhood depth-1 (p50 / p95) | 0.4 µs / 3.2 µs | 0.7 pre-release, 2026-10-01 |
-| Neighborhood depth-2 (p50) | 0.2 µs | 0.7 pre-release, 2026-10-01 |
-| Cypher scan-filter-project (1,400 rows) | 1.41 ms | 0.7 pre-release, 2026-10-01 |
-| Cypher two-hop join (200 rows), median of 10 after 3 warmups, over 448,000 derived edges | 192.1 µs | 0.7 pre-release, 2026-10-01 |
-| Cypher two-hop join (200 rows), single cold pass | 1.00 ms | 0.7 pre-release, 2026-10-01 |
-| Rule backfill, 2 rules, 448,000 derived edges | 8.551 s | 0.7 pre-release, 2026-10-01 |
+| Bulk ingest, 10,000 nodes | 1.061 s | 0.7 branch at `4d68e9a`, 2026-10-01 |
+| Neighborhood depth-1 (p50 / p95) | 0.4 µs / 3.2 µs | 0.7 branch at `4d68e9a`, 2026-10-01 |
+| Neighborhood depth-2 (p50) | 0.2 µs | 0.7 branch at `4d68e9a`, 2026-10-01 |
+| Cypher scan-filter-project (1,400 rows) | 1.41 ms | 0.7 branch at `4d68e9a`, 2026-10-01 |
+| Cypher two-hop join (200 rows), median of 10 after 3 warmups, over 448,000 derived edges | 192.1 µs | 0.7 branch at `4d68e9a`, 2026-10-01 |
+| Cypher two-hop join (200 rows), single cold pass | 1.00 ms | 0.7 branch at `4d68e9a`, 2026-10-01 |
+| Rule backfill, 2 rules, 448,000 derived edges | 8.551 s | 0.7 branch at `4d68e9a`, 2026-10-01 |
 | Open from a snapshot, 100,000 nodes / ~10M derived edges | 0.02 s at 31–41 MiB RSS | v0.2, 2026-08-28 |
 | Open from the WAL alone, same store | 8.16 min | v0.1.1, 2026-08-24 |
 
