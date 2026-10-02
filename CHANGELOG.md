@@ -58,6 +58,13 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
   are `was_linked`'s schema and description. Still 23 tools by default; the
   script puts the default listing at about 6,842 tokens a session, at its
   estimate of 4 bytes per token.
+- **The container image waits for the release.** `release.yml`'s `docker`
+  job needed no other job, so a `v*` tag pushed the moving `latest` image
+  while the binaries were still building, and pushed it even when they
+  failed. It now needs `github-release`, which needs all three binaries: the
+  image is pushed only after the release is published. A tag publishes
+  exactly what it did. The workflow still runs no test, so a tag still goes
+  only on a commit whose CI is green (row 61).
 
 ## v0.7.0 — memory that fills itself
 
