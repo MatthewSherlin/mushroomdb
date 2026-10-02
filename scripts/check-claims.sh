@@ -61,6 +61,9 @@ CLAIM_PATTERNS=(
   # A scale that was never run. 100,000 nodes is the largest store measured;
   # "10M nodes" was a design intent stated as a target (spec section 6.4).
   '(^|[^0-9A-Za-z,])(10[[:space:]]?M\+?|10,000,000|10[[:space:]]million)[[:space:]-]+nodes?'
+  # A release named in prose. No scan can keep "vX.Y.Z is the current release"
+  # current, and it went stale twice; name the releases page instead.
+  'v?[0-9]+\.[0-9]+\.[0-9]+[[:space:]]+is[[:space:]]+the[[:space:]]+current[[:space:]]+release'
 )
 
 GREP_PATTERNS=(

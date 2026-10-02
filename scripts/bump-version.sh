@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# One version, twenty-four places.
+# One version, many places.
 #
 # The workspace version lives in `Cargo.toml`, and nothing else inherits it:
-# four crates carry a literal because `cargo package` needs one, fourteen
-# inter-crate dependency pins carry it again so a published crate can resolve
-# its siblings, and five package manifests outside Cargo carry it for npm, PyPI,
-# the MCP registry and the discovery card.
+# several crates carry a literal because `cargo package` needs one, every
+# inter-crate dependency pin carries it again so a published crate can resolve
+# its siblings, the package manifests outside Cargo carry it for npm, PyPI, the
+# MCP registry and the discovery card, and two lockfiles record it.
 #
 # Hand-editing twenty-four places is how 0.6.9 shipped telling readers to
 # install 0.6.8, and how a v0.6.11 tag would have published a Python wheel
@@ -109,6 +109,23 @@ if [[ "$cur" != "$NEW" ]]; then
   fi
 fi
 
+# 5. Lockfiles. `--check` read neither until 0.7, and the binding's refresh
+#    below swallowed its own failure, so a lockfile naming the previous version
+#    for this workspace's own packages passed. Checked, never edited: a bump
+#    regenerates them with `cargo metadata`.
+if [[ $CHECK -eq 1 ]]; then
+  for lock in Cargo.lock bindings/python/Cargo.lock; do
+    while IFS= read -r cur; do
+      [[ "$cur" == "$NEW" ]] && continue
+      report "$lock" "a workspace package entry" "$cur"
+    done < <(awk '
+      /^name = "(mushroomdb|mushroomdb-[a-z]+|core-bench|sim-harness)"$/ { want = 1; next }
+      want && /^version = "/ { gsub(/^version = "|"$/, ""); print; want = 0; next }
+      { want = 0 }
+    ' "$lock")
+  done
+fi
+
 if [[ $CHECK -eq 1 ]]; then
   if [[ $fail -ne 0 ]]; then
     echo "bump-version.sh: FAILED — run 'bash scripts/bump-version.sh $WS' to set every site" >&2
@@ -118,7 +135,7 @@ if [[ $CHECK -eq 1 ]]; then
   exit 0
 fi
 
-# 5. Install pins a reader copy-pastes: `npx -y mushroomdb@X.Y.Z …` in the
+# 6. Install pins a reader copy-pastes: `npx -y mushroomdb@X.Y.Z …` in the
 #    hand-maintained docs. `check-claims.sh` already fails the build when one
 #    of these lags — it was added because 0.6.9 shipped telling readers to
 #    install 0.6.8 — so the bump has to move them or every release trips its
@@ -127,7 +144,7 @@ fi
 if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   while IFS= read -r -d '' f; do
     case "$f" in
-      CHANGELOG.md|docs/roadmap/*) continue ;;
+      CHANGELOG.md|docs/roadmap/*|scripts/*) continue ;;
     esac
     if grep -qE "mushroomdb@[0-9]+\.[0-9]+\.[0-9]+" "$ROOT/$f" 2>/dev/null; then
       # The `@` must be escaped on BOTH sides: unescaped in the replacement,
@@ -142,7 +159,11 @@ fi
 
 # Regenerate what is derived from the version rather than editing it.
 cargo metadata --format-version 1 --offline >/dev/null 2>&1 || cargo metadata --format-version 1 >/dev/null
-(cd bindings/python && cargo metadata --format-version 1 >/dev/null 2>&1 || true)
+# Not `|| true`: a binding lockfile left at the old version is a wheel build
+# that resolves the wrong crates, and nothing else would say so.
+(cd bindings/python && { cargo metadata --format-version 1 --offline >/dev/null 2>&1 \
+  || cargo metadata --format-version 1 >/dev/null; }) \
+  || { echo "bump-version.sh: could not refresh bindings/python/Cargo.lock" >&2; exit 1; }
 bash scripts/render-plugin.sh >/dev/null
 bash scripts/gen-llms-full.sh >/dev/null
 
