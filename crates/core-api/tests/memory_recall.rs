@@ -600,3 +600,57 @@ fn a_store_with_its_own_schema_and_no_memory_labels_is_not_told_to_apply_the_def
     let empty = GraphDb::open(&tmp("empty")).unwrap();
     assert_eq!(unindexed_memory_fields(&empty), vec![]);
 }
+
+// ── the bound on that check: the first 1,000 nodes of a label (row 73) ──
+
+/// `count` `Person` nodes with no `name`, in one commit, keyed `<prefix>-<i>`.
+fn unnamed_people(db: &mut GraphDb<core_storage::fs::RealFs>, prefix: &str, count: usize) {
+    let mut batch = db.batch();
+    for i in 0..count {
+        batch.insert_node("Person", &format!("{prefix}-{i}"), vec![]);
+    }
+    batch.commit().unwrap();
+}
+
+fn named_person(db: &mut GraphDb<core_storage::fs::RealFs>, key: &str) {
+    db.insert_node(
+        "Person",
+        key,
+        vec![("name".into(), Value::Str("Pat Doe".into()))],
+    )
+    .unwrap();
+}
+
+/// The check runs on every `recall` call and every brief, so it reads a
+/// bounded number of nodes per label. A field carried only past that bound is
+/// not named: the notice is advice, and silence is the cheaper mistake.
+#[test]
+fn a_field_carried_only_beyond_the_scan_bound_is_not_named() {
+    use core_api::memory::recall::{unindexed_memory_fields, UNINDEXED_SCAN_LIMIT};
+    let mut db = GraphDb::open(&tmp("beyond-bound")).unwrap();
+    db.enable_fulltext("Note", "text").unwrap();
+    unnamed_people(&mut db, "early", UNINDEXED_SCAN_LIMIT);
+    named_person(&mut db, "late");
+    assert_eq!(unindexed_memory_fields(&db), vec![]);
+}
+
+/// Inside the bound the carrier is found wherever it sits: first, with any
+/// number of nodes after it, or last of the nodes the check reads.
+#[test]
+fn a_field_carried_inside_the_scan_bound_is_named_however_many_nodes_lack_it() {
+    use core_api::memory::recall::{unindexed_memory_fields, UNINDEXED_SCAN_LIMIT};
+    let mut first = GraphDb::open(&tmp("bound-first")).unwrap();
+    first.enable_fulltext("Note", "text").unwrap();
+    named_person(&mut first, "p1");
+    unnamed_people(&mut first, "later", UNINDEXED_SCAN_LIMIT);
+    assert_eq!(
+        unindexed_memory_fields(&first),
+        vec![pair("Person", "name")]
+    );
+
+    let mut last = GraphDb::open(&tmp("bound-last")).unwrap();
+    last.enable_fulltext("Note", "text").unwrap();
+    unnamed_people(&mut last, "early", UNINDEXED_SCAN_LIMIT - 1);
+    named_person(&mut last, "p1");
+    assert_eq!(unindexed_memory_fields(&last), vec![pair("Person", "name")]);
+}

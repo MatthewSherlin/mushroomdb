@@ -36,16 +36,20 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
   `remember`.** `remember` declares `Note.text` as it writes, so "this store
   has no text index" stopped at the first note, and nothing replaced it: on a
   0.6 store, or one a `query` created, `recall` then returned the note and
-  not the person it was about. The `recall` tool's reply and the session
-  brief now end with `text index incomplete: recall does not search
-  Person.name`, naming each memory-default field the store has not declared
-  and holds a value for, with the `mushroomdb schema apply <db>
-  --memory-defaults` command that indexes them. Nothing is declared for you:
-  an existing store is still upgraded only by that command. A store with no
-  node under a memory label — one with its own schema — is told nothing, and
-  so is the prompt hook's digest, which fires every turn. Python's `recall`
-  rows are unchanged; `fulltext_pairs()` is how a Python caller sees what is
-  declared (row 73).
+  not the person it was about. The `recall` tool's reply now ends with
+  `text index incomplete: recall does not search Person.name`, and the
+  session brief carries the same line just above its reach line, naming each
+  memory-default field the store has not declared and holds a value for,
+  with the `mushroomdb schema apply <db> --memory-defaults` command that
+  indexes them. The check is bounded: it looks at the first 1,000 nodes of
+  each memory label, so a field only a later node carries is not named.
+  Nothing is declared for you: an existing store is still upgraded only by
+  that command. A store with no node under a memory label — one with its own
+  schema — is told nothing, and so is the prompt hook's digest, which fires
+  every turn. Python's `recall` rows are unchanged; `fulltext_pairs()` is how
+  a Python caller sees what is declared. The tool's older "no text index"
+  answer now strips control characters from the store path it prints, as the
+  new line does (row 73).
 
 ### Changed
 

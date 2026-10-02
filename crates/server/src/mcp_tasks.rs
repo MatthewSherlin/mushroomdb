@@ -1780,12 +1780,14 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
         // placeholder the caller has to translate themselves; `label` falls
         // back to the word "store" on the one path with no directory to
         // name (the in-process `SharedDb` case, `db_dir: None`), where that
-        // really is the best available answer.
+        // really is the best available answer. Sanitized as the line above
+        // and the digest's header are: the path is the caller's.
         core_api::memory::recall::RecallOutcome::NoIndex => (
             String::new(),
             format!(
                 "mushroomdb recall — this store has no text index, so no topic can \
-                 match. Run `mushroomdb schema apply {label} --memory-defaults`.\n"
+                 match. Run `mushroomdb schema apply {} --memory-defaults`.\n",
+                digest::sanitize(&label)
             ),
         ),
     };

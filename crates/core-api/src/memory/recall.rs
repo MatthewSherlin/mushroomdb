@@ -467,6 +467,12 @@ pub fn recall_rows<F: Fs>(db: &GraphDb<F>, topic: &str) -> RecallRows {
     }
 }
 
+/// How many live nodes under one label [`unindexed_memory_fields`] reads, at
+/// most, looking for one that carries a field. The check runs on every
+/// `recall` tool call and every session brief, so it is bounded whatever the
+/// store holds: eight default pairs, this many property reads each.
+pub const UNINDEXED_SCAN_LIMIT: usize = 1_000;
+
 /// The memory defaults' full-text fields this store has not declared and has
 /// something to find in: each `(label, field)` of
 /// [`memory_defaults`](crate::memory_schema::memory_defaults) that
@@ -484,19 +490,19 @@ pub fn recall_rows<F: Fs>(db: &GraphDb<F>, topic: &str) -> RecallRows {
 /// index nothing there, so it is never told to apply them. A field no node
 /// carries is not reported, whatever the label holds.
 ///
-/// Reads nodes only under a label whose default is undeclared, and stops at
-/// the first that carries the field.
+/// Bounded, because it runs on every `recall` tool call and every session
+/// brief: for a pair whose default is undeclared it reads the first
+/// [`UNINDEXED_SCAN_LIMIT`] live nodes under the label, in id order, and stops
+/// at the first that carries the field. A field carried only by a node past
+/// that bound is not reported — the notice is advice, and it stays silent
+/// rather than read the whole label to give it.
 pub fn unindexed_memory_fields<F: Fs>(db: &GraphDb<F>) -> Vec<(String, String)> {
     let declared = db.fulltext_pairs();
     crate::memory_schema::memory_defaults()
         .fulltext
         .into_iter()
         .filter(|pair| !declared.contains(pair))
-        .filter(|(label, field)| {
-            db.nodes_with_label(label)
-                .iter()
-                .any(|n| n.prop(field).is_some())
-        })
+        .filter(|(label, field)| db.first_nodes_carry_prop(label, field, UNINDEXED_SCAN_LIMIT))
         .collect()
 }
 

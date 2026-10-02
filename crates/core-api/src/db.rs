@@ -10014,6 +10014,27 @@ impl<F: Fs> GraphDb<F> {
             .collect()
     }
 
+    /// Whether any of the first `limit` live nodes under `label`, in id
+    /// order, carries `field`.
+    ///
+    /// Bounded for a caller that asks on every request: one props view, at
+    /// most `limit` property reads, no value cloned and no `NodeRef` built,
+    /// and it stops at the first carrier. The label column itself has no
+    /// per-label index, so on a label with fewer than `limit` nodes the walk
+    /// of that column runs to its end — integer compares, no property read.
+    pub fn first_nodes_carry_prop(&self, label: &str, field: &str, limit: usize) -> bool {
+        let Some(sym) = self.syms.get(label) else {
+            return false;
+        };
+        let props = self.props_view();
+        self.labels
+            .iter()
+            .enumerate()
+            .filter(|&(_, &s)| s == sym)
+            .take(limit)
+            .any(|(id, _)| props.get(id as u32, field).is_some())
+    }
+
     pub fn find_nodes(&self, label: &str, filter: &Filter) -> Vec<NodeRef<'_, F>> {
         let view = self.view();
         view.nodes_with_label(label)
