@@ -61,6 +61,13 @@ not look like a code identifier.
   mark, and `forget` removes it. A fact's subject and object get the same
   treatment. At most 20 are stubbed per call; any past that are named in the
   reply as **not** created, and the rest of the call still commits.
+- **A key that is empty or only whitespace is refused.** In `remember`'s
+  `about`, as an `entities` key or as a fact's `subject` or `object`, and as
+  `upsert_entity`'s `key`, over MCP and in Python alike: the error names the
+  argument and its position, and the call writes nothing. A raw write can
+  still store a node under the empty key; `mushroomdb query <db> "MATCH (n)
+  WHERE key(n) = '' DETACH DELETE n"` removes one, as does `forget(key="")` in
+  Python (the MCP `forget` refuses an empty key).
 - **A node's label is fixed.** `upsert_entity` with a `label` that differs
   from the stored one is refused, and writes nothing, where it used to be
   silently ignored. Name the label in `remember`'s `entities` at first
@@ -575,10 +582,6 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   `search` do, a write's fsync included, so other Python threads wait; the
   algorithms, `suggest_rules`, `schema_report`, `identity_clusters` and the
   similarity reads release it (row 65, deferred to 0.7.1).
-- **An empty string is accepted as a key by `remember`.** `""` in `about`, or
-  as a fact's `subject` or `object`, creates a provisional `Entity` whose key
-  is the empty string and links to it, over MCP and in Python alike.
-  `forget` with that key removes it (row 76, deferred to 0.7.1).
 - **Over MCP, a `min` that is not a number is ignored.** `find_similar` with
   `"min": "0.5"` answers at the default 0.8 and echoes `min: 0.8`; HTTP
   refuses the same body with `min must be a number` (row 74, deferred to
