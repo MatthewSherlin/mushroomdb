@@ -16,6 +16,10 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --workspace --examples
       - run: cargo test --workspace
+      # Informational, never a failure: prints how many #[ignore]d tests exist
+      # against how many any workflow actually names. Added because 20 of 28
+      # ran nowhere, including every memory-ceiling and scale-growth assertion.
+      - run: bash scripts/ignored-test-census.sh
       # Multi-process suite: spawns the `mp_worker` helper binary, which only
       # exists behind the `mp-test` feature (so a plain workspace test run never
       # builds it). Cross-process locking has no other coverage.
@@ -23,6 +27,11 @@ jobs:
       - run: cargo clippy -p mushroomdb --all-targets --features mp-test -- -D warnings
       # Compile-only: CI runners are too noisy for timing gates.
       - run: cargo bench --no-run
+      # The first minute on a new store, against the built binary. Every
+      # assertion in it failed on v0.6.12; none may fail again silently. Kept
+      # last in this job on purpose: a failure here must not strand the
+      # multiprocess suite above, which has no other coverage.
+      - run: cargo test -p mushroomdb-cli --test first_run
       # TODO: add a Miri job for crates/core-storage (MappedBase::topology/columns/
       # edge_props_section access_unchecked seams). These seams have no proptest
       # hostile-bytes coverage; Miri is the appropriate defence against corrupt
@@ -75,13 +84,17 @@ jobs:
       # edges at all and scores 0.0000, which is how it sat dark through 0.6.6's Task 2.
       # At prune=own this gate fails at 0.8581; see docs/site/rules.md.
       - run: cargo test --release -p sim-harness -- approximate_recall_5k_timing --ignored --nocapture
-      # dist_evals_per_insert_is_bounded: counts distance evaluations per insert at
-      # 1k and 5k (dimension 32 — the count is a property of the graph, not of the
-      # dimension). A count, not a wall clock, so it holds on any machine: this is
-      # the gate that notices the insert path doing more work per vector as the
-      # index grows, which no timing-free test did before. Measured 12,739.5 at 1k
-      # and 23,901.7 at 5k, ratio 1.876, against ceilings of 36,000 and 2.8x. ~2 s.
-      - run: cargo test --release -p mushroomdb-rules --features test-hooks -- dist_evals_per_insert_is_bounded --ignored --nocapture
+      # dist_evals_5k_is_under_36000 / dist_evals_ratio_1k_to_5k_is_under_2_8x: counts
+      # distance evaluations per insert at 1k and 5k (dimension 32 — the count is a
+      # property of the graph, not of the dimension). A count, not a wall clock, so
+      # it holds on any machine: this is the gate that notices the insert path doing
+      # more work per vector as the index grows, which no timing-free test did
+      # before. Split from one test (dist_evals_per_insert_is_bounded) into two so
+      # a red absolute-ceiling assertion cannot hide the ratio assertion behind it —
+      # named separately here so `cargo test`'s substring filter still runs both.
+      # Measured 12,739.5 at 1k and 23,901.7 at 5k, ratio 1.876, against ceilings of
+      # 36,000 and 2.8x. ~2 s.
+      - run: cargo test --release -p mushroomdb-rules --features test-hooks -- dist_evals_5k_is_under_36000 dist_evals_ratio_1k_to_5k_is_under_2_8x --ignored --nocapture
       # exact_vector_rule_recall_5k: an exact VectorSimilar rule over the same
       # 5k × 1536-D corpus; asserts recall >= 0.98 against the same O(n^2)
       # ground truth the approximate gate uses. From 0.6.6 an exact rule finds its
@@ -334,7 +347,7 @@ jobs:
             --threshold 0.15
 
   # SDK-level MCP handshake: speaks to a real `mushroomdb mcp <db>` process
-  # on an empty store — a memory store, so the nineteen association tools —
+  # on an empty store — a memory store, so the association tools —
   # over stdio using the official @modelcontextprotocol/sdk client, not a
   # hand-rolled JSON-RPC probe, so a break in the wire protocol or the tool
   # list fails the same way it would for a real assistant host.
@@ -357,66 +370,8 @@ jobs:
             --command ../../target/debug/mushroomdb \
             --db "$(mktemp -d)" \
             --expect-version "$(cargo pkgid -p mushroomdb-cli | sed 's/.*[#@]//')" \
-            --expect-tools query,explain_association,neighborhood,node_info,node_edges,was_linked,edges_at,what_if,node_history,edge_history,find_similar,pairwise_similar,hybrid_search,remember,recall,upsert_entity,ingest_json,create_rule,stats
+            --expect-tools query,explain_association,neighborhood,node_info,node_edges,was_linked,edges_at,what_if,node_history,edge_history,find_similar,pairwise_similar,hybrid_search,remember,recall,upsert_entity,ingest_json,create_rule,stats,schema,analyze,suggest_rules,forget
         working-directory: scripts/mcp-handshake
-
-  # DEPRECATED DOOR, STILL GATED. The code graph is deprecated in 0.6.4 and removed in 0.7;
-  # this job keeps running until then, because a deprecated feature that still ships is a
-  # feature that still has to work.
-  # The v0.6 code-graph acceptance run: ingest, map, determinism, freshness,
-  # the recall nudge, a 20-writer concurrency stress against a live MCP server,
-  # and timings — all driven through the shipped binary on a real checkout
-  # rather than through unit tests. See scripts/acceptance-0.6.sh.
-  code-graph:
-    needs: [test]
-    runs-on: ubuntu-latest
-    steps:
-      # fetch-depth: 0 — the graph is built from history. A shallow checkout
-      # has almost none, so the co-change edges the nudge step asserts on
-      # would never form.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
-        with: { toolchain: "1.92.0" }
-      # Release, because the script only asserts its timing budgets against a
-      # release build — a debug binary is ~6x slower and would measure rustc.
-      - run: cargo build --release -p mushroomdb-cli
-      # `gh` is installed on the runner but is not authenticated, so the script
-      # drops `--prs` by itself and says so in its output.
-      #
-      # What these four numbers actually measure, measured rather than assumed:
-      # each is a whole process, and on a ~520-file graph `--version` takes 3 ms
-      # while `stats` — which opens the store and does almost nothing else —
-      # takes 371 ms. `map` is 376 and `brief` 401. So ~95% of every reading
-      # here is store open, the per-command work is 0-30 ms on top, and the four
-      # budgets are four thresholds on one shared quantity, not on the commands
-      # they name.
-      #
-      # That quantity tracks runner speed, not this repository. Across
-      # 2026-09-11..09-21 the touch median on green runs read 359, 360, 487,
-      # 557, 588, 398 ms — a ~1.8x spread with the code unchanged underneath it,
-      # and 588 already sat at 98% of the 600 ms the old budget allowed. The
-      # previous comment here justified these as "3x the local budgets", which
-      # the runner has since outgrown: it now lands at 600-650 ms routinely, so
-      # the gate had begun failing on runner load. 0.6.10 is what happened to be
-      # in flight when it finally crossed; it is not what moved the number.
-      #
-      # 1400 ms is ~2x the worst reading observed on unchanged code, which keeps
-      # a gross regression — a doubling of store-open cost — inside the gate
-      # while leaving the noise outside it. `map` keeps its larger budget
-      # because it is the one leg that also grows with graph size. A gate that
-      # could see a 200 ms regression is not reachable on a hosted runner; the
-      # product's real numbers are what scripts/bench-code-graph.sh measures,
-      # and this repository already keeps its throughput and p95 gates out of CI
-      # for the same reason.
-      - name: acceptance-0.6
-        run: MUSHROOMDB=target/release/mushroomdb bash scripts/acceptance-0.6.sh
-        env:
-          TOUCH_BUDGET_MS: "1400"
-          MAP_BUDGET_MS: "3000"
-          BRIEF_BUDGET_MS: "1400"
-          EXPLORE_BUDGET_MS: "1400"
 
   plugin-validate:
     runs-on: ubuntu-latest
@@ -434,9 +389,26 @@ jobs:
       # product-facing file, and no skill telling an agent to call the graph
       # ahead of a search. See scripts/check-claims.sh for why.
       - run: bash scripts/check-claims.sh
-      # One version, twenty-four places. Catches the two shapes that have both
+      # The names gate, shown failing on what it guards and never printing it.
+      - run: bash scripts/tests/test-check-names.sh
+      # Every relative link and anchor in the hand-written docs resolves, and
+      # every page under docs/site is reachable from its index.
+      - run: python3 scripts/check-links.py
+      # llms-full.txt is generated from the README and docs/site. Until 0.7 it
+      # was regenerated only by a version bump, so it drifted between releases
+      # with nothing to say so.
+      - run: bash scripts/gen-llms-full.sh --check
+      # One version, many places. Catches the two shapes that have both
       # already shipped: a package manifest left behind (0.6.9 told readers to
       # install 0.6.8; a v0.6.11 tag would have published a wheel labelled
       # 0.6.10), and an inter-crate pin left behind, which resolves under caret
       # until the minor bumps and then fails every publish in the sequence.
       - run: bash scripts/bump-version.sh --check
+      # The gate's own blind spot: until 0.7 it enumerated crates/*/Cargo.toml
+      # only, so the 0.6.10 pins in bindings/python were invisible and --check
+      # reported OK on a tree that could not publish 0.7.0.
+      - run: bash scripts/tests/test-bump-version-scope.sh
+      # Ran in no workflow until 0.7 — invoked by hand as "Task 12" of a
+      # release plan. It also now refuses a DEFERRED row whose target release
+      # has already shipped, which row 36 had done for two tags.
+      - run: bash scripts/check-defect-ledger.sh

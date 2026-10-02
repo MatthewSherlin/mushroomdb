@@ -55,7 +55,6 @@ use code_extract::{
     call_lookup_names, extract, indexed_under, resolve_call, resolve_import, resolve_mention,
     CallScope, FileFacts, SymbolIndex, MAX_FILE_BYTES,
 };
-use core_api::repograph::rules::{about_rule, concept_sources_rule, ABOUT_LABELS};
 use core_api::{default_max_edges, BatchOp, Predicate, RuleDef, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -79,12 +78,12 @@ const BATCH_FILES: usize = 500;
 /// `FILE` that inference would derive from the field name.
 pub const DEFINES_RULE: &str = "auto_fk_symbol_file_id";
 
-/// `(label, field)` pairs this module indexes for full-text search.
+/// `(label, field)` pairs this module indexes for full-text search, declared
+/// through [`ingest_git_schema`] on the store `ingest-git` creates.
 ///
-/// `Note` and `Concept` are indexed here rather than where they are written
-/// (`remember` and the semantic-pass `ingest_json`) because a store synced
-/// after either wrote is still expected to gain the index — `remember` also
-/// ensures its own `Note.text` pair, in case it is the very first write.
+/// `Note` and `Concept` appear here as well as in the memory defaults; the
+/// schema deduplicates them — `remember` also ensures its own `Note.text`
+/// pair, in case it is the very first write.
 pub const FULLTEXT: [(&str, &str); 8] = [
     ("Concept", "name"),
     ("Concept", "summary"),
@@ -120,26 +119,42 @@ pub struct StructureReport {
 /// Every rule this module declares, in creation order.
 ///
 /// Exported so a test — or a store built some other way — can recreate exactly
-/// the rule set these props expect. [`ensure_rules_and_fulltext`] creates an
-/// `about_<label>` rule only when its destination label is present in the
-/// graph; every other rule here is unconditional. The `about_<label>` and
-/// `concept_sources` definitions themselves come from
-/// [`core_api::repograph::rules`], which `remember` also builds them from —
-/// one definition, so a note written by `remember` and one backfilled by a
-/// sync agree on exactly the same rule.
+/// the rule set these props expect; [`ingest_git_schema`] declares all of them
+/// on the store `ingest-git` creates. `ingest-git` itself writes no `Concept`:
+/// the skill's `learn` pass writes `Concept.source_files` through
+/// `ingest_json`, and [`concept_sources_rule`] links each concept to those
+/// files with `DESCRIBED_IN`, which is how the skill tells a stale concept.
+///
+/// No `about_<label>` rule. `remember` writes `Note.about` *and* inserts the
+/// `ABOUT` edges itself; a rule deriving the same edges would own them, and the
+/// next `remember` of the same note would be refused as writing a rule-owned
+/// edge.
 #[must_use]
 pub fn rules() -> Vec<RuleDef> {
-    let mut out = vec![
+    vec![
         key_rule(DEFINES_RULE, "Symbol", "File", "file_id", "DEFINES"),
         key_rule("imports", "File", "File", "imports", "IMPORTS"),
         key_rule("calls", "Symbol", "Symbol", "calls_to", "CALLS"),
         key_rule("mentions", "File", "File", "mentions", "MENTIONS"),
         concept_sources_rule(),
-    ];
-    for label in ABOUT_LABELS {
-        out.push(about_rule(label));
-    }
-    out
+    ]
+}
+
+// The `concept_sources` rule definition, moved here in 0.7 when `repograph`
+// was deleted. It was shared because `repograph::remember` declared the rules
+// it sat beside; that no longer exists, and `ingest-git` is the only writer
+// left, so it lives next to it.
+
+/// `Concept.source_files` → `DESCRIBED_IN` edges to `File`.
+#[must_use]
+pub fn concept_sources_rule() -> RuleDef {
+    key_rule(
+        "concept_sources",
+        "Concept",
+        "File",
+        "source_files",
+        "DESCRIBED_IN",
+    )
 }
 
 /// A `KeyMatch` rule with the engine's default fan-out for the predicate,
@@ -165,48 +180,55 @@ fn key_rule(name: &str, src: &str, dst: &str, field: &str, edge: &str) -> RuleDe
     }
 }
 
-/// Declare the structure rules and full-text fields that are missing, and
-/// return the names of the rules created.
+/// The schema a store `ingest-git` creates is declared with: the structure
+/// and `concept_sources` rules, the text fields the repository graph
+/// carries, and the memory defaults on top — a repository-as-entities store is
+/// an ordinary memory store in 0.7 and `recall` has to work on it.
 ///
-/// Idempotent: existence is checked against `rules()` and `fulltext_pairs()`,
-/// so a second call writes nothing. Call it *after* the props are written — a
-/// rule backfills once, on creation, and by then both the `Symbol` label and
-/// the lists it matches on exist.
-pub fn ensure_rules_and_fulltext(w: &mut Db) -> Result<Vec<String>, CliError> {
-    let existing: BTreeSet<String> = w.rules().into_iter().map(|r| r.name).collect();
-    let mut created = Vec::new();
-    for def in rules() {
-        if existing.contains(&def.name) {
-            continue;
-        }
-        // An `about_<label>` rule is only worth declaring once something can
-        // be on the receiving end of it.
-        if def.src_label == "Note" && !label_present(w, &def.dst_label)? {
-            continue;
-        }
-        let name = def.name.clone();
-        w.create_rule(def)?;
-        created.push(name);
-    }
+/// A `Schema` rather than a sequence of `enable_fulltext` calls because
+/// `enable_fulltext` is not idempotent — `Err(RuleInvalid)` on a pair already
+/// declared — while `apply_schema` applies full-text idempotently. It is
+/// applied once, to a store `ingest-git` is creating; an existing store is
+/// never re-declared on.
+#[must_use]
+pub fn ingest_git_schema() -> core_api::schema::Schema {
+    let mut schema = core_api::memory_schema::memory_defaults();
+    schema.rules.extend(rules());
     for (label, field) in FULLTEXT {
-        if !w
-            .fulltext_pairs()
-            .contains(&(label.to_string(), field.to_string()))
-        {
-            w.enable_fulltext(label, field)?;
-        }
+        schema
+            .fulltext
+            .push(((*label).to_string(), (*field).to_string()));
     }
-    Ok(created)
+    schema.fulltext.sort();
+    schema.fulltext.dedup();
+    schema
 }
 
-/// Whether the graph holds at least one node of `label`. `label` is always one
-/// of [`ABOUT_LABELS`], so it is never user input.
-fn label_present(w: &Db, label: &str) -> Result<bool, CliError> {
-    let rs = w.query(
-        &format!("MATCH (n:{label}) RETURN n.id AS id LIMIT 1"),
-        &BTreeMap::new(),
-    )?;
-    Ok(!rs.is_empty())
+/// What a store `ingest-git` did *not* create still lacks of ingest-git's own
+/// declarations: the [`rules`] whose names it does not hold and the
+/// [`FULLTEXT`] pairs it does not declare. Never the memory defaults.
+///
+/// Writing a repository into a store is an explicit act, and the structure
+/// props it writes derive no edge without these rules — the ordinary order is
+/// `mcp` creating the store first, then `ingest-git`. Filtered by absent name
+/// rather than handed whole to `apply_schema`, which deletes and recreates a
+/// live rule whose definition differs.
+#[must_use]
+pub fn missing_structure_schema(w: &Db) -> core_api::schema::Schema {
+    let live: BTreeSet<String> = w.rules().into_iter().map(|r| r.name).collect();
+    let declared = w.fulltext_pairs();
+    core_api::schema::Schema {
+        rules: rules()
+            .into_iter()
+            .filter(|r| !live.contains(&r.name))
+            .collect(),
+        fulltext: FULLTEXT
+            .iter()
+            .map(|(l, f)| ((*l).to_string(), (*f).to_string()))
+            .filter(|pair| !declared.contains(pair))
+            .collect(),
+        ..Default::default()
+    }
 }
 
 /// The `File` keys under a key prefix. `""` is the whole graph, `"vendor/lib/"`
@@ -816,14 +838,15 @@ mod tests {
             "calls",
             "mentions",
             "concept_sources",
-            "about_author",
-            "about_concept",
-            "about_file",
-            "about_note",
-            "about_symbol",
         ] {
             assert!(names.contains(&want.to_string()), "missing rule {want}");
         }
+        // `remember` inserts its own ABOUT edges; a rule owning them would
+        // refuse the next `remember` of the same note.
+        assert!(
+            !names.iter().any(|n| n.starts_with("about_")),
+            "ingest-git must declare no about_* rule: {names:?}"
+        );
         for def in rules() {
             assert_eq!(
                 def.max_edges,
@@ -832,6 +855,15 @@ mod tests {
                 def.name
             );
         }
+    }
+
+    #[test]
+    fn concept_sources_rule_is_concept_to_file() {
+        let r = concept_sources_rule();
+        assert_eq!(r.name, "concept_sources");
+        assert_eq!(r.src_label, "Concept");
+        assert_eq!(r.dst_label, "File");
+        assert_eq!(r.edge_type, "DESCRIBED_IN");
     }
 
     #[test]

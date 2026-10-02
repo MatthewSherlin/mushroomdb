@@ -280,3 +280,27 @@ def test_degrees_where_invalid_raises_valueerror(tmp_path):
     else:
         raise AssertionError("expected ValueError for both eq and in")
     db.close()
+
+
+def test_find_similar_default_min_is_0_8(tmp_path):
+    """Since 0.7 `min` defaults to 0.8 here, as it does over MCP and HTTP.
+
+    `mid` scores 0.6 against the query — between the old default (0.0) and
+    the new one — so it is the hit that tells the two apart. Before 0.7 the
+    first call returned all three.
+    """
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Item", "close", {"emb": [1.0, 0.0]})
+    db.insert_node("Item", "mid", {"emb": [0.6, 0.8]})
+    db.insert_node("Item", "far", {"emb": [0.0, 1.0]})
+
+    default = db.find_similar("emb", [1.0, 0.0], label="Item", k=10, exact=True)
+    assert [k for k, _ in default] == ["close"]
+
+    named = db.find_similar("emb", [1.0, 0.0], label="Item", k=10, min=0.0, exact=True)
+    assert [k for k, _ in named] == ["close", "mid", "far"]
+
+    assert "min=0.8" in GraphDb.find_similar.__text_signature__
+    # pairwise_similar is a different operation and keeps its own default.
+    assert "min=0.0" in GraphDb.pairwise_similar.__text_signature__
+    db.close()

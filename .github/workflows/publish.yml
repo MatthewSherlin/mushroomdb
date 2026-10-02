@@ -329,7 +329,7 @@ jobs:
           git -c user.name=smoke -c user.email=smoke@example.test \
             commit -q --allow-empty -m "smoke test project"
 
-          npx -y "mushroomdb@$VER" install --project --platform claude-code --no-git-hooks
+          npx -y "mushroomdb@$VER" install --project --platform claude-code
 
           test -f .mcp.json
           command=$(jq -r '.mcpServers.mushroomdb.command' .mcp.json)
@@ -349,9 +349,9 @@ jobs:
               ;;
           esac
 
-          # A fresh `--db`-less install resolves to an empty entity store at
-          # `--auto` (the memory surface, 16 tools), not a code graph — so the
-          # handshake below expects that surface, not the code-door tools.
+          # A fresh `--db`-less install resolves to an empty store at `--auto`,
+          # which lists the association surface every store
+          # lists — so the handshake below expects those tools.
           OUT=$(node "$GITHUB_WORKSPACE/scripts/mcp-handshake/handshake.mjs" \
             --config .mcp.json --server mushroomdb \
             --expect-version "$VER" \

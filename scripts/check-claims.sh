@@ -11,6 +11,8 @@
 #   2. No skill or rules file tells an agent to reach for the graph before or
 #      instead of a search. That instruction is what the benchmark measured and
 #      it is not worth what it cost.
+#   3. The code-graph door removed in 0.7 is not referenced again from source,
+#      and no product-facing file names one of its three retired install flags.
 #
 # The claim scan covers every product-facing surface: the README, the llms
 # files, the plugin manifests and their templates, every page under docs/site
@@ -56,6 +58,12 @@ CLAIM_PATTERNS=(
   'token[[:space:]]+savings'
   'cheaper[[:space:]]+(sessions?|turns?|coding|agents?)'
   '(beats|outperforms)[[:space:]]+(a[[:space:]]+)?stock'
+  # A scale that was never run. 100,000 nodes is the largest store measured;
+  # "10M nodes" was a design intent stated as a target (spec section 6.4).
+  '(^|[^0-9A-Za-z,])(10[[:space:]]?M\+?|10,000,000|10[[:space:]]million)[[:space:]-]+nodes?'
+  # A release named in prose. No scan can keep "vX.Y.Z is the current release"
+  # current, and it went stale twice; name the releases page instead.
+  'v?[0-9]+\.[0-9]+\.[0-9]+[[:space:]]+is[[:space:]]+the[[:space:]]+current[[:space:]]+release'
 )
 
 GREP_PATTERNS=(
@@ -94,10 +102,72 @@ scan_grep_files() {
 scan_claim_files
 scan_grep_files
 
+# Rule 3: the code-graph door was removed in 0.7 and does not come back by
+# accident. A deprecated feature that still ships is a feature that still has
+# to work, which is why this runs instead of a comment asking people to
+# remember.
+#
+# Comment lines are skipped: surviving doc comments say what moved out of
+# `repograph` in 0.7, and a gate that fires on history is a gate someone
+# disables. A declaration (`pub mod repograph;`) or a path (`repograph::`) in
+# code is not a comment and is caught. `crates/code-extract/tests/` is skipped
+# because its fixtures hold `repograph::render::sanitize` as a parser input,
+# not a reference to anything.
+#
+# The seven tool names are not scanned for: `map`, `why`, `context`, `owners`,
+# `explore` and `sync` are ordinary words and `why` is a live CLI subcommand.
+# The MCP handshake test pins the tool listing instead.
+RETIRED_SOURCE=(repograph)
+for pat in "${RETIRED_SOURCE[@]}"; do
+  hits="$(git grep -n -- "$pat" -- 'crates/*' ':!crates/code-extract/tests/*' 2>/dev/null \
+          | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)"
+  if [[ -n "$hits" ]]; then
+    echo "check-claims.sh: '$pat' was removed in 0.7 and is referenced again:" >&2
+    printf '%s\n' "$hits" >&2
+    fail=1
+  fi
+done
+
+# Rule 3, the flag half: the three opt-in hooks `install` wrote in 0.6 are
+# rejected in 0.7, so no product-facing file may tell a reader to pass one.
+# CHANGELOG.md is not a claim file and is not scanned: its v0.7.0 section
+# names the flags on purpose, as the record of what was removed.
+RETIRED_FLAGS=(--intercept-grep --impact-before-edit --enrich-grep)
+for f in "${CLAIM_FILES[@]}"; do
+  [[ -f "$f" ]] || continue
+  for pat in "${RETIRED_FLAGS[@]}"; do
+    if hits="$(grep -n -- "$pat" "$f")"; then
+      echo "check-claims.sh: $f names the retired flag $pat:" >&2
+      printf '%s\n' "$hits" | sed "s|^|  $f:|" >&2
+      fail=1
+    fi
+  done
+done
+
+# Commands the docs printed that do not exist. `claude marketplace add` was
+# the first install line in seven files; the subcommand lives under `plugin`.
+RETIRED_COMMANDS=('claude marketplace add')
+for f in "${CLAIM_FILES[@]}"; do
+  [[ -f "$f" ]] || continue
+  for pat in "${RETIRED_COMMANDS[@]}"; do
+    if hits="$(grep -n -F -- "$pat" "$f")"; then
+      echo "check-claims.sh: $f prints a command that does not exist — '$pat':" >&2
+      printf '%s\n' "$hits" | sed "s|^|  $f:|" >&2
+      fail=1
+    fi
+  done
+done
+
 # The stub-docstring drift check. Separate script, one gate: a caller reading a
 # thinner contract than the binding carries is the same class of defect as a
 # retired claim, and CI already runs this one script.
 if ! bash "$ROOT/scripts/check-pyi.sh"; then
+  fail=1
+fi
+
+# The names gate: nothing tracked names another system. Separate script, one
+# gate, for the reason check-pyi.sh is: CI already runs this one.
+if ! python3 "$ROOT/scripts/check-names.py"; then
   fail=1
 fi
 
@@ -126,11 +196,14 @@ if [[ -n "$WORKSPACE_VERSION" ]]; then
       \( -name target -o -name 'target-*' -o -name .venv -o -name node_modules \) -prune -o \
       \( -name '*.md' -o -name '*.txt' -o -name '*.json' -o -name '*.sh' \) -print0)
   fi
+  # `scripts/` is exempt here for the reason it is exempt below, and because
+  # the bump no longer rewrites it: a script's comment that quotes an old pin is
+  # telling history, and a gate the bump cannot satisfy fails every release.
   stale=""
   if [[ ${#_scan[@]} -gt 0 ]]; then
     stale="$( (cd "$ROOT" && grep -nE "mushroomdb@[0-9]+\.[0-9]+\.[0-9]+" "${_scan[@]}" 2>/dev/null) \
              | grep -v "mushroomdb@${WORKSPACE_VERSION}" \
-             | grep -vE "(^|/)CHANGELOG\.md:|(^|/)docs/roadmap/" || true)"
+             | grep -vE "(^|/)CHANGELOG\.md:|(^|/)docs/roadmap/|(^|/)scripts/" || true)"
   fi
   # A pin the rewriter mangled: `mushroomdb` immediately followed by a version
   # with no `@`. This exists because the bump script once produced exactly that

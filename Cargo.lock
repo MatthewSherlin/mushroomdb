@@ -499,7 +499,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "core-bench"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "criterion",
  "mushroomdb",
@@ -1297,7 +1297,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "bincode",
  "matrixmultiply",
@@ -1307,11 +1307,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sim-harness",
+ "unicode-normalization",
 ]
 
 [[package]]
 name = "mushroomdb-arrow"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -1321,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-cli"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -1338,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-extract"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "blake3",
  "tree-sitter",
@@ -1351,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-query"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "mushroomdb-storage",
  "proptest",
@@ -1359,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-rules"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "bincode",
  "mushroomdb-storage",
@@ -1370,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-server"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -1397,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-storage"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -2179,7 +2180,7 @@ dependencies = [
 
 [[package]]
 name = "sim-harness"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "mushroomdb",
  "mushroomdb-rules",
@@ -2655,6 +2656,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "untrusted"

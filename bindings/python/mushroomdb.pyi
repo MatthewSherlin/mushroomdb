@@ -282,6 +282,13 @@ class GraphDb:
         stale. `refresh()` is permitted. `has_vector_rule` and
         `is_index_enabled` answer unscoped: they are schema, not node data.
 
+        A read that answers about the whole store takes no mask, so it is
+        **refused** on a scoped handle with `ValueError` rather than narrowed:
+        `pagerank`, `connected_components`, `degree_centrality`, `communities`,
+        `search`, `fulltext_pairs`, `rules`, `suggest_rules`, `recall`,
+        `schema_report`, `identity_clusters` and `roles`. `is_fulltext_enabled`
+        answers: it is a schema fact about a pair you named.
+
         ```python
         s = db.scoped(role="reader-a")
         t = db.scoped(namespace="tenant-a", keys=visible_ids)
@@ -358,6 +365,46 @@ class GraphDb:
         absent. Raises `KeyNotFound` for an unknown or deleted key.
 
         Removing a field a rule watches retracts the edges that field derived.
+        """
+
+    def set_props_many(
+        self, rows: Sequence[tuple[str, dict[str, Scalar | None]]]
+    ) -> dict[str, int]:
+        """Set properties on many existing nodes in one commit.
+
+        `rows` is a sequence of `(key, props)` tuples. Only values that differ
+        from what is stored are written; a `None` value removes the property.
+        Returns `{"nodes", "props_set", "props_removed"}` — what was written
+        after the comparison, so a call that changed nothing returns zeros and
+        writes nothing at all.
+
+        **Existing nodes only.** An unknown key raises `KeyNotFound` and
+        nothing is written, even when that key's row would have changed
+        nothing. Use `ingest_batch` to create nodes.
+
+        **One commit, and rules fire in it.** Every change is one WAL frame.
+        Rules re-fire on each changed property inside that commit; when one
+        derives or retracts an edge the engine appends one more frame of
+        history markers, so `wal_total_commits()` moves by 1, or by 2 — never
+        by the number of nodes.
+
+        The comparison and the write happen under one lock acquisition, so no
+        other writer can come between them.
+
+        A key that appears twice is a `ValueError`: merge its dicts first.
+        `1` and `1.0` are different values. A view-owned property, or `ns` set
+        to a different namespace, refuses the whole call. Keep a call under
+        about 10,000 rows — it is one frame and one fsync.
+
+        **This is a raw property write, like `set_prop`.** On an entity node,
+        `name` and the two alias lists are maintained by `upsert_entity` and
+        `remember`: a `name` written here is not reflected in `aliases` until
+        the next describing write.
+
+        ```python
+        db.set_props_many([("alice", {"score": 3}), ("bob", {"score": 5, "old": None})])
+        # {"nodes": 2, "props_set": 2, "props_removed": 1}
+        ```
         """
 
     def query(
@@ -631,7 +678,7 @@ class GraphDb:
         vector: Sequence[float],
         label: str | None = None,
         k: int = 10,
-        min: float = 0.0,
+        min: float = 0.8,
         mask: Sequence[str] | None = None,
         where: dict | None = None,
         exact: bool = False,
@@ -668,10 +715,10 @@ class GraphDb:
         different length than the query is skipped; a zero-norm query returns
         `[]`.
 
-        **`min` defaults to `0.0` here and to `0.8` in the MCP `find_similar`
-        tool.** The same operation under the same name returns different
-        results across the two surfaces and neither raises, so pass `min`
-        explicitly if the call is ported between them.
+        **`min` defaults to `0.8`**, the same floor the MCP `find_similar` tool
+        and HTTP `POST /find_similar` apply. It was `0.0` here through 0.6, so
+        a call that never named `min` now drops every hit below `0.8` and
+        nothing raises. Pass `min=0.0` for the old behaviour.
         """
 
     def pairwise_similar(
@@ -845,6 +892,419 @@ class GraphDb:
         Returns `{"edges_inserted": N, "edges_deleted": M}`.
         """
 
+    def pagerank(
+        self,
+        damping: float = 0.85,
+        max_iters: int = 50,
+        tol: float = 1e-06,
+        edge_type: str | None = None,
+        direction: Literal["out", "in", "both"] = "out",
+        budget_ms: int = 0,
+        weight_prop: str | None = None,
+        min_weight: float | None = None,
+    ) -> dict[str, Any]:
+        """PageRank over the whole store.
+
+        Returns `{"scores": [(key, score), …], "converged": bool}`, one row
+        per live node, highest first, ties by key.
+
+        `direction` is `"out"` (rank flows along each edge, the default),
+        `"in"` or `"both"`. `edge_type=None` follows every edge type.
+        `weight_prop` names an edge property to weight by, and `min_weight`
+        drops edges below it.
+
+        **`budget_ms` defaults to `0` — no time limit.** The engine's own
+        default is a 5-second wall-clock budget, under which a loaded machine
+        returns a different answer for the same store; `0` means the same
+        store always gives the same scores. Pass a budget to bound the call,
+        and read `converged`.
+
+        Refused on a `scoped()` handle with `ValueError`: no algorithm takes a
+        mask, and a visible node's score would be computed over hidden edges.
+
+            top = db.pagerank(edge_type="CITES")["scores"][:10]
+        """
+
+    def connected_components(
+        self,
+        edge_type: str | None = None,
+        budget_ms: int = 0,
+        weight_prop: str | None = None,
+        min_weight: float | None = None,
+    ) -> dict[str, Any]:
+        """Weakly connected components.
+
+        Returns `{"components": [(key, component), …], "truncated": bool}`,
+        one row per live node. `component` is an identifier shared by every
+        node in the same component; compare them, do not parse them.
+
+        `edge_type=None` follows every edge type; direction is ignored.
+        `budget_ms` defaults to `0` (no limit) — see `pagerank`.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def degree_centrality(
+        self,
+        edge_type: str | None = None,
+        direction: Literal["out", "in", "both"] = "both",
+        budget_ms: int = 0,
+        weight_prop: str | None = None,
+        min_weight: float | None = None,
+    ) -> dict[str, Any]:
+        """Degree centrality: every node's degree, highest first.
+
+        Returns `{"scores": [(key, degree), …], "truncated": bool}`.
+
+        **Not `degree()` or `degrees()`.** Those answer for the keys you name
+        and can be scoped, masked and filtered; this ranks the whole store.
+        `direction` is `"both"` (the default), `"out"` or `"in"`.
+        `budget_ms` defaults to `0` (no limit) — see `pagerank`.
+
+        Refused on a `scoped()` handle with `ValueError`; `degrees()` is the
+        scoped way to ask.
+        """
+
+    def communities(
+        self,
+        edge_types: Sequence[str] | None = None,
+        weight_prop: str | None = None,
+        min_weight: float | None = None,
+        resolution: float = 1.0,
+        max_passes: int = 10,
+        max_sweeps: int = 20,
+        budget_ms: int = 0,
+        node_label: str | None = None,
+    ) -> dict[str, Any]:
+        """Communities by modularity (Louvain).
+
+        Returns `{"communities": [{"id", "members", "internal_weight",
+        "cohesion"}, …], "modularity": float, "truncated": bool}`.
+
+        `edge_types` is a **list** — unlike the other three algorithms, which
+        take one `edge_type` — and `None` or `[]` follows every edge type.
+        `node_label` restricts the pass to one label. `resolution` above 1.0
+        favours smaller communities. `budget_ms` defaults to `0` (no limit) —
+        see `pagerank`.
+
+        Modularity is global: adding unrelated nodes can move an existing
+        community. For "which keys are one entity", use `identity_clusters`.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def enable_fulltext(self, label: str, field: str, if_not_exists: bool = False) -> bool:
+        """Declare a full-text index on `(label, field)`. Returns `True` when it
+        was newly enabled.
+
+        The engine's call is not idempotent: enabling a pair that is already
+        enabled raises `RuleInvalid`. With `if_not_exists=True` it returns
+        `False` instead, so a caller that declares its schema at boot can call
+        this every time.
+
+        The declaration is logged; the index itself is rebuilt on every open,
+        so each declared pair adds to how long the store takes to open.
+
+            db.enable_fulltext("Doc", "body", if_not_exists=True)
+        """
+
+    def disable_fulltext(self, label: str, field: str) -> None:
+        """Drop the full-text index on `(label, field)` and its postings.
+
+        Raises `RuleNotFound` when the pair is not enabled; its `.name` is
+        `"fulltext(label,field)"`.
+        """
+
+    def is_fulltext_enabled(self, label: str, field: str) -> bool:
+        """Whether `(label, field)` has a full-text index.
+
+        A schema fact about a pair you named, so it answers on a `scoped()`
+        handle too, as `is_index_enabled` does.
+        """
+
+    def fulltext_pairs(self) -> list[tuple[str, str]]:
+        """Every `(label, field)` pair with a full-text index, sorted.
+
+        Refused on a `scoped()` handle with `ValueError`: it enumerates labels
+        the scope may hide. `is_fulltext_enabled` answers about one pair.
+        """
+
+    def search(self, field: str, query: str, k: int = 0) -> list[tuple[str, float]]:
+        """Full-text search on `field`. Returns `[(key, score), …]`, BM25,
+        highest first, ties by key.
+
+        The query grammar: space-separated terms are ANDed; `OR` between
+        terms; `"a phrase"`; `-term` excludes; `prefix*` matches a prefix.
+
+        **Keyed by field alone.** If two labels are indexed on the same field
+        name, both are searched; filter the keys yourself.
+
+        `k=0` (the default) returns every hit; a positive `k` stops at the
+        best `k`.
+
+        Refused on a `scoped()` handle with `ValueError`: the index takes no
+        mask. `search_hybrid` is the scoped way to search text.
+        """
+
+    def rules(self) -> list[dict[str, Any]]:
+        """Every rule the store holds, as a list of dicts sorted by name.
+
+        Each dict is a rule definition in the shape `create_rule` accepts —
+        `name`, `src_label`, `dst_label`, `predicate` (the externally-tagged
+        form, `{"FieldEqual": {"field": "team"}}`), `edge_type`,
+        `weight_prop`, `max_edges`, `approximate`, `via_label`, `via_edge`,
+        `via_dir`, `namespace` — so a listed rule can be deleted and
+        recreated from its own listing. Unset fields are `None`.
+
+        Refused on a `scoped()` handle with `ValueError`: a rule names labels,
+        fields and a namespace the scope may hide. `has_vector_rule` answers
+        about one field.
+        """
+
+    def delete_rule(self, name: str) -> None:
+        """Delete a rule and retract every edge it derived.
+
+        Raises `RuleNotFound` (with `.name`) when no rule has that name.
+        """
+
+    def rebuild_rule(self, name: str) -> None:
+        """Re-derive every edge of one rule from the store as it is now.
+
+        The only way out of a tripped rule: `stats()` reports `tripped` when a
+        rule hit its `max_edges` cap and stopped deriving.
+
+        Raises `RuleNotFound` (with `.name`) when no rule has that name.
+        """
+
+    def suggest_rules(self) -> dict[str, Any]:
+        """What rules the store's own data suggests. Creates nothing.
+
+        Returns `{"suggestions": [...], "total": int, "bookkeeping_hidden":
+        int, "truncated": bool}`. Each suggestion has `name`, `src_label`,
+        `dst_label`, `edge_type`, `predicate` (one clause of text),
+        `est_edges`, `examples` (`[src, dst, score]` lists), `rationale`, and
+        **`create_rule_args`: pass that dict to `create_rule` unchanged.** It
+        carries an explicit `weight_prop`, so the rule it creates here is the
+        rule the MCP `create_rule` tool creates from the same suggestion.
+
+        Proposals over fields the store writes for itself — `ns`, `kind`,
+        `ts`, `source`, `provisional`, `id`, `aliases`, `alias_keys` — are
+        dropped and counted in `bookkeeping_hidden`. The list is not capped
+        (the MCP tool shows five); `truncated` means the engine's 5-second
+        budget ran out and a second call may find more.
+
+        Every proposal is a global rule: it links across namespaces.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def remember(
+        self,
+        text: str,
+        about: Sequence[str] | None = None,
+        kind: Literal["note", "decision", "todo"] | None = None,
+        ts: int | None = None,
+        source: str | None = None,
+        entities: Sequence[dict[str, Any]] | None = None,
+        facts: Sequence[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Write a note the store can later `recall`, and whatever it names.
+
+        `about` is the keys the note is about. A key that does not exist is
+        created as a provisional `Entity` rather than refusing the call, and
+        listed under `provisional` in the report.
+
+        `entities` is a list of `{"key", "label", "props"?, "aliases"?}`
+        dicts — entities you recognised in the text, created or updated in the
+        same commit. `facts` is a list of `{"subject", "predicate", "object"}`
+        dicts — relationships among them, written as edges. Either may be a
+        tuple or any other sequence, as `about` may.
+
+        `kind` is `"note"` (the default), `"decision"` or `"todo"`. `ts` is
+        Unix seconds and defaults to now; it is part of the note's key, so the
+        same text at the same `ts` is the same note. `source` defaults to
+        `"agent"`.
+
+        Returns the report as a dict: `note` (the note's key — **not** `key`,
+        which is what the MCP tool's JSON reply calls it), `created`,
+        `matched`, `derived`, `provisional`, `provisional_capped` (keys past
+        the per-call cap of 20, **not** created), `fulltext_declared`,
+        `same_as` and `same_as_lost` (each a list of `{"a", "b", "score"}`:
+        the identity links this call made, and the ones it retracted). A
+        `score` is the raw float (`0.6666666666666666`); the MCP tool prints
+        the same score to two decimals.
+
+        Raises `IngestError` when the text is empty or over 4,000 characters,
+        the `kind` is unknown, an entity's `props` carry `aliases` or
+        `alias_keys`, or a name is empty or only whitespace — a key in
+        `about`, an entity's `key` or `label`, or a fact's `subject`,
+        `predicate` or `object`; nothing is written. Its `.detail` is the
+        bare sentence; the message carries an `ingest error: ` prefix in
+        front of it.
+
+        A store this binding creates has no memory schema. `remember`
+        declares full-text on `Note.text` and on each new entity label's
+        `name` itself, so `recall` works after the first call.
+
+        ```python
+        r = db.remember("Matthew is driving 0.7", about=["matthew"],
+                        entities=[{"key": "v0.7", "label": "Release"}],
+                        facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}])
+        r["note"]         # "note:…"
+        r["provisional"]  # ["matthew"]
+        ```
+        """
+
+    def recall(self, topic: str) -> dict[str, Any]:
+        """What the store holds about a topic, as rows.
+
+        Returns `{"indexed": bool, "terms": int, "hits": [...]}`. Each hit is
+        `{"key", "label", "summary", "covered", "score"}`, best first:
+        `covered` is how many of the topic's `terms` the node's own text
+        holds, and it leads the ranking — the fused `score` is nearly flat.
+        A hit covers at least half the terms. At most six hits. `terms == 0`
+        with hits present means the topic was all stopwords: its words were
+        searched together and every hit's `covered` is `0`. `summary` is
+        the first 120 characters of the node's `text`, `summary` or `name`,
+        or `None` when it has none of them.
+
+        `indexed` is `False` when the store declares no full-text index at
+        all, so no topic can match — a different answer from an empty `hits`.
+        `remember` declares `Note.text` on its first call.
+
+        This is the MCP `recall` tool's ranking, as data; the tool renders the
+        same rows as a digest, and this method does not offer the digest.
+
+        **The rows are raw stored content.** `key`, `label` and `summary` are
+        unsanitized: only the digest renderer replaces control characters,
+        line separators and bidi or zero-width characters with spaces. If you
+        render a row into an assistant's context, that sanitisation is yours
+        to do — a stored line break can otherwise forge a line of your
+        prompt. This binding exposes no helper for it.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def upsert_entity(
+        self,
+        key: str,
+        props: dict[str, Scalar],
+        label: str | None = None,
+        aliases: Sequence[str] | None = None,
+        namespace: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or update one entity by key, the way the memory tools do.
+
+        Unlike `upsert_node`, this maintains the entity's two identity lists:
+        `aliases`, which the store derives from the current key and `name` and
+        recomputes on every call — never accumulated, never yours to set — and
+        `alias_keys`, the `aliases` you pass, kept as written and accumulating.
+        It also sets `id` to the key and clears a `provisional` mark
+        `remember` left.
+
+        `label` is required to create and optional to update. **An update
+        never changes a label**: one that differs from the stored label
+        raises `IngestError` and nothing in `props` is written.
+
+        `namespace` is the namespace a created node lands in. On an existing
+        node its own namespace is a no-op and another raises
+        `NamespaceImmutable`. A `props["ns"]` that disagrees with `namespace`
+        is a `ValueError`.
+
+        Returns `{"key", "label", "created", "updated_fields",
+        "same_as_lost"}`. `same_as_lost` lists the identity links this update
+        retracted, as `{"a", "b", "score"}`: a changed `name` can take a
+        full-name link below the floor. A `score` is the raw float
+        (`0.6666666666666666`); the MCP tool prints it to two decimals.
+
+        `aliases` or `alias_keys` inside `props` raise `IngestError`: the
+        store maintains both. So does a `key` that is empty or only
+        whitespace, and a create under such a `label`. An `IngestError`'s
+        `.detail` is the bare sentence; its message carries an
+        `ingest error: ` prefix.
+
+        ```python
+        db.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])
+        ```
+        """
+
+    def schema_report(self, budget_ms: int = 1000) -> dict[str, Any]:
+        """What the store holds and how it is wired.
+
+        Returns a dict: `brief` (`nodes` and `edges` counts, `labels` each
+        with its fields, `edge_types` each with its endpoints, `commits`,
+        `roles`, `recipes`, `partial`), `rules` (each with its predicate in
+        one clause and its namespace), `fulltext` and `indexes` (`[label,
+        field]` lists), `provisional` (how many nodes `remember` named and
+        nothing has described) and `provisional_sample` (the first ten keys).
+
+        `budget_ms` bounds the counting; a spent budget sets
+        `brief["partial"]` and the counts are then lower bounds. **`0` is not
+        "no limit" here**, as it is for the graph algorithms: it is a budget
+        already spent, and returns a partial report. For an unhurried report
+        pass a large value, such as `60_000`.
+
+        The MCP `schema` tool renders this same report. The names under
+        `rules`, `fulltext`, `indexes` and `provisional_sample` are raw stored
+        content, unsanitized, as `recall`'s rows are.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
+    def forget(
+        self,
+        key: str | None = None,
+        prop: str | None = None,
+        fact: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Forget a node, one property, or one fact — exactly one of the three.
+
+        - `forget(key=k)` tombstones the node and every edge on it.
+        - `forget(key=k, prop=p)` removes one property.
+        - `forget(fact={"subject", "predicate", "object"})` retracts one
+          hand-written edge.
+
+        Returns the report as a dict: `mode` (`"node"`, `"prop"` or
+        `"fact"`), `target`, `changed` (`False` when there was nothing to
+        forget), `manual_edges`, `derived_edges`, `notes` and `notes_total`
+        (notes that still say it — **listed, never deleted**), `history_floor`,
+        `prop` in prop mode, `aliases_rewritten` (a forgotten `name` took its
+        words out of `aliases` in the same commit) and `alias_keys_remain`
+        (forgotten `aliases` left declared aliases behind in `alias_keys`).
+
+        **This is a tombstone, not a redaction.** `node_history`,
+        `edge_history`, `edges_at` and `was_linked` still read what was
+        forgotten, from `history_floor` on, until the log is pruned.
+
+        Raises `ValueError` for any other combination of arguments,
+        `KeyNotFound` for an unknown key or fact endpoint, and `RuleOwned` for
+        a fact a rule derived. That refusal's message and its `.detail` are
+        the same whole sentence — which rule owns the edge and the fields it
+        reads — with no `edge is rule-owned: ` prefix in front of it. Nothing
+        is written in any of the three.
+        """
+
+    def identity_clusters(self, floor: float = 0.6) -> dict[str, Any]:
+        """Which keys are one entity: `SAME_AS` links resolved into identities.
+
+        Returns `{"clusters": [...], "linked": int, "claims": int, "floor":
+        float}`. Each cluster is `{"canonical", "members", "weakest"}`: every
+        pair of `members` is linked at `floor` or above, `canonical` is the
+        oldest member and `members[0]`, and `weakest` is the lowest pairwise
+        score inside it. `claims` counts unordered pairs — both directions of
+        a link are one claim. `weakest` is the raw float
+        (`0.6666666666666666`); the MCP tool prints it to two decimals.
+
+        Empty on a store with no `SAME_AS` edges. The identity preset that
+        derives them is applied with `mushroomdb schema apply <db>
+        --memory-identity`, on the command line, with this handle closed; a
+        `SAME_AS` rule made with `create_rule` is the other way.
+
+        Raises `ValueError` for a `floor` that is not a finite number.
+
+        Refused on a `scoped()` handle with `ValueError`.
+        """
+
     def stats(self) -> dict[str, Any]:
         """Node and edge counts, `history_floor`, `namespaces`, and per-rule figures.
 
@@ -868,8 +1328,10 @@ class GraphDb:
         on a `scoped()` handle: a role definition names node keys, namespaces
         and the other roles in the store.
 
-        That refusal is a plain **`ValueError`**, not a `MushroomError` — the
-        one refusal here that is not a typed engine error. `ReadOnly` means *a
+        That refusal is a plain **`ValueError`**, not a `MushroomError` — a
+        refused read is the one kind of refusal here that is not a typed engine
+        error, and the whole-store reads (`pagerank`, `search`, `rules` and the
+        others that say so) raise the same. `ReadOnly` means *a
         scoped handle never writes*, and `roles()` is a read; calling it on a
         scoped handle is caller misuse, the same kind of thing as `scoped()`'s
         empty-scope `ValueError`. So a sidecar wrapping its boot-time role

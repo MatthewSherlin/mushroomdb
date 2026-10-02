@@ -1,5 +1,620 @@
 # Changelog
 
+## v0.7.0 — memory that fills itself
+
+0.7 is the release in which `remember` followed by `recall` works on a new
+store. The memory write path is what it is for; the code-graph door is what it
+removes.
+
+**This is the first breaking release.** Under Cargo semver the minor slot is
+the breaking position for `0.x`, so a Cargo dependency on `^0.6.x` does not
+match `0.7.0` and stays where it is. Nothing else unpinned is held back. An
+unpinned `pip install mushroomdb`, `npx mushroomdb`, `cargo install
+mushroomdb-cli` and the container image pulled without a tag each take 0.7 the
+next time they resolve, with no deliberate upgrade. Two things name their
+version and stay on it: an MCP entry that `install` already wrote, until
+`install` is run again, and the Claude Code plugin, whose `.mcp.json` and hook
+script pin the launcher and move only when the plugin or its marketplace is
+updated.
+
+> **If you call `find_similar` without `min`, your results change, and nothing
+> tells you.**
+>
+> `min` now defaults to **0.8 on every surface that has a default**, through
+> one constant, `core_api::FIND_SIMILAR_DEFAULT_MIN`. The MCP tool's vector
+> mode already used 0.8. In the **Python binding** and on **HTTP
+> `POST /find_similar`** it was `0.0`: a call that never named `min` returned
+> every hit scoring 0.0 or above, up to `k`, and now returns only those
+> scoring 0.8 or above — which can be none. No error, no warning, fewer
+> results.
+>
+> **To keep the old behaviour, name it: `min=0.0` in Python, `"min": 0.0` in
+> an HTTP body.** Over MCP the default did not move; an explicit `min` is
+> honoured there as before.
+>
+> `pairwise_similar` is unchanged: its `min` still defaults to `0.0`, over MCP
+> and in Python. The 0.6.10 and 0.6.11 notes both proposed this change for 0.7
+> and told callers to pass `min` explicitly; this is that release.
+
+### The memory write path
+
+On 0.6.12, `remember` followed by `recall` returned nothing. The store held
+the note and the index held its words; `recall` discarded every topic that did
+not look like a code identifier.
+
+- **`recall` answers ordinary language.** "who is Matthew Sherlin?" finds the
+  entity and the notes that name it. The gate that required a path, a
+  `mod::name`, a snake_case word or backticks is deleted; an identifier still
+  works.
+- **`recall` tells "no text index" from "no match".** A store that cannot
+  search says so, with the command that fixes it, instead of answering as if
+  the topic were unknown.
+- **`remember` takes what a sentence names.** Beside `text` and `about` it
+  accepts `entities` — each a key, a label, properties and aliases, created or
+  described in the same commit — and `facts`, relationships among them. The
+  reply says what it created, what it matched, and what it could only stub.
+- **An unknown subject is stubbed, not refused.** `remember {about:
+  ["matthew"]}` on a store that has never heard of `matthew` used to fail. It
+  now creates a provisional `Entity`, marked as one, that the `schema` tool
+  counts and lists the first ten of. A provisional node never expires;
+  describing it — `upsert_entity`, or `remember`'s `entities` — clears the
+  mark, and `forget` removes it. A fact's subject and object get the same
+  treatment. At most 20 are stubbed per call; any past that are named in the
+  reply as **not** created, and the rest of the call still commits.
+- **A key, a label or a predicate that is empty or only whitespace is
+  refused.** In `remember`: a key in `about`, an `entities` key or label, and
+  a fact's `subject`, `predicate` or `object`. In `upsert_entity`: the `key`,
+  and the `label` of a create. Over MCP and in Python alike, the error names
+  the argument and its position, and the call writes nothing. A raw write can
+  still store any of them. A node under the empty key is removed by
+  `mushroomdb query <db> "MATCH (n) WHERE key(n) = '' DETACH DELETE n"` or by
+  `forget(key="")` in Python (the MCP `forget` refuses an empty key); a node
+  under an empty label by `forget` with its key. An edge whose type is the
+  empty string is retracted by `forget(fact=…)` in Python, or over HTTP by
+  `DELETE /edges//<src>/<dst>` on a served store; over MCP `forget` refuses an
+  empty predicate, so there it goes only with one of its endpoint nodes.
+- **A node's label is fixed.** `upsert_entity` with a `label` that differs
+  from the stored one is refused, and writes nothing, where it used to be
+  silently ignored. Name the label in `remember`'s `entities` at first
+  mention. `remember` itself does not refuse a disagreeing label yet (see the
+  known limits).
+- **A store that `mcp`, `serve` or `demo` creates can be recalled from.** Each
+  creates it with the memory schema: full-text on `Note.text`,
+  `Concept.summary` and the `name` of `Person`, `Org`, `Project`, `Concept`,
+  `Event` and the provisional `Entity`. `remember` declares the `name` of a
+  label it has not seen when `entities` names one, up to 32 text fields in
+  all; past that the entity is still written and is not searchable.
+- **The memory schema is never applied to an existing store unasked.** A
+  full-text index is rebuilt every time the store is opened, so the defaults
+  go on when you ask: `mushroomdb schema apply <db> --memory-defaults`.
+  `remember` still declares what it writes, on any store: `Note.text`, and the
+  `name` of a label `entities` names. So `recall`'s "no text index" answer and
+  the session brief's line appear only while the store has no text field at
+  all. After the first `remember` — and on a 0.6 store that has already
+  remembered a note — `recall` answers from the fields the store has and says
+  nothing about the rest: an entity written before, or by another path, is
+  not found by its name until the defaults are applied (see the known limits).
+- **A topic is at most 24 search terms.** A pasted paragraph is cut to its
+  first 24 content words: glue words and repeats are dropped first, and the
+  rest are not searched.
+- **The first minute is a test.** `crates/cli/tests/first_run.rs` drives the
+  real binary over stdio through the flows that failed on 0.6.12, and through
+  the loop the README's quick start prints: `remember`, `recall`,
+  `suggest_rules`, `create_rule` with the proposal's own arguments, then
+  `explain_association`.
+
+### Removed — the code-graph door
+
+- **Seven MCP tools**: `explore`, `map`, `context`, `impact`, `owners`, `why`,
+  `sync`. There is now one tool surface: every store advertises the same
+  twenty-three, a store built by `ingest-git` included. `--all-tools` lists all
+  twenty-five.
+- **Four install hooks**: the three opt-in ones (`--intercept-grep`,
+  `--impact-before-edit`, `--enrich-grep`, now rejected with a message) and
+  the `PostToolUse` `touch` hook, which was written on every install and
+  re-extracted edited files into the code graph. **An install, uninstall or
+  enable on 0.7 removes all four from a settings file that still has them**,
+  so an upgraded machine is not left invoking a subcommand that no longer
+  exists.
+  The Claude Code plugin's own `PostToolUse` `touch` hook is gone too.
+- **The `sync` git hooks.** 0.7 writes no git hooks. `install`, `uninstall`
+  and `enable` remove the `sync` block a 0.6 install put in `post-commit`,
+  `post-checkout` and `post-merge` for this store, and `doctor` warns about one
+  left behind. `install --no-git-hooks` is still accepted, as a no-op.
+- **Ten CLI subcommands**: `sync`, `touch`, `intercept`, `impact-hook`,
+  `enrich`, `map`, `explore`, `context`, `impact`, `owners`. The first five
+  were hook bodies, and a hook a 0.6 install wrote keeps calling them until
+  it is removed, so they are still accepted, unlisted: each does nothing,
+  exits 0 and prints one line on stderr saying how to remove the hook.
+- **The `UserPromptSubmit` hook's dirty-tree nudge** — what the changed files
+  reach, who owns them, which learned concept just went stale. It read
+  `CO_CHANGED`, `IMPORTS` and `DESCRIBED_IN` edges only `ingest-git` writes.
+- **The code-graph benchmark suite.** It measured the door this release
+  removes. Its committed results stay as the record of the measurement that
+  deprecated the door. The harness files stay too, because the association
+  suite runs through them: `benchmarks/agent-tasks/run.py` now defaults to
+  `--suite association` and refuses `--suite code`.
+
+After upgrading, run `mushroomdb install` once to remove the retired hooks; `mushroomdb doctor` reports any that remain.
+
+To keep any of it: pin `mushroomdb@0.6.x`.
+
+Every retired hook, in a settings file or a git hook, is recognised as ours
+only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
+`/mushroomdb`, or `node …/mushroomdb.js`. A hook of your own is never touched.
+
+### Kept, and changed
+
+- **`ingest-git` stays**, positioned as a data source. Its store is now an
+  ordinary memory store — the same twenty-three tools, the same brief — and it
+  declares its schema through `apply_schema`, so re-ingesting is idempotent.
+  Into an existing store it declares its own missing rules and full-text pairs,
+  as 0.6 did, and never the memory defaults.
+- **`ingest-git` no longer declares the `about_*` rules.** `remember` writes a
+  note's `ABOUT` edges itself, and those rules took ownership of the edges,
+  which made re-remembering a note fail. A store that already carries them
+  from 0.6 keeps them, and `remember` works alongside them.
+- **`mushroomdb why <db> <a> <b>` stays and answers a different question**:
+  every rule edge between two keys with the evidence that derived it, from the
+  association engine. It is the shell form of `explain_association`, which had
+  no CLI door before. The code-graph `why` answered from `CALLS`, `IMPORTS`
+  and co-change. It prints each edge once per direction, so a symmetric rule
+  shows two lines for one pair: that is the engine's existing behaviour, now
+  visible in the CLI.
+- **The prompt hook answers ordinary language.** It used to say nothing unless
+  the prompt named a path, a `mod::name`, a snake_case word or something in
+  backticks — so on a memory store it was silent on every prompt. The MCP
+  `recall` tool's fix is the first section above; this is the automatic
+  path. It prepends the untrusted-content framing line to what it prints.
+- **On a store built by `ingest-git`, the prompt hook now answers every
+  prompt**, matching commits, files and symbols too, and opens the store on
+  every turn. In 0.6 a prompt naming no identifier returned before opening it.
+- **The prompt hook is silent on a store with no text index.** `mushroomdb
+  brief` says so instead, once per session, with the
+  `schema apply … --memory-defaults` command that fixes it.
+- **`recall` says how much of the topic each hit matched** — `(2/3 terms)` —
+  and ranks by it, and no longer drops a hit for covering exactly half. The
+  entity a two-word question is about holds one of the two words, which is all
+  an entity node ever holds, and it was being dropped from the answer to it.
+  The header counts the lines actually printed, and a `…` line marks a cut
+  when the byte budget drops hits.
+- **`recall` sanitizes what it prints.** Keys, summaries and the store label
+  now have their control characters stripped. Before this the MCP `recall`
+  tool printed stored text raw, control characters included.
+- **Each command that sets a store up declares a schema on it.** Four do —
+  `mcp`, `serve`, `demo` and `ingest-git` — and `ingest-git` was the one
+  without a schema. `install` creates no store; it now prints a line when its
+  target store does not exist yet, naming the commands that will create it
+  with the memory schema. A general-purpose command such as `query` still
+  creates a bare store on a fresh path, and so does the Python binding's
+  `GraphDb.open`; the schema there is opt-in, via `schema apply`.
+- **The concurrency check is a Rust test.** The step of
+  `scripts/acceptance-0.6.sh` that ran twenty concurrent writers against a
+  live server is now `crates/cli/tests/mcp_concurrency.rs`: 20 HTTP writers
+  against one `serve`, plus 20 separate `mcp` processes writing while `serve`
+  holds the store. It runs in `cargo test --workspace`.
+- **A Cypher statement written from a shell has one quoting rule.** The
+  skill's shell row, the session brief's last line and the empty-store brief
+  of a CLI-only install print the same form: shell double quotes around the
+  statement, Cypher strings in single quotes, and a backslash before every
+  dollar sign, double quote and backtick inside the double quotes. The skill's
+  example before this was a `CREATE` with double-quoted Cypher strings, which
+  the lexer refuses: it reads single-quoted strings only. `query` takes its
+  statement only as an argument: there is no stdin or file form (see the known
+  limits).
+- **The README opens on the write path.** Its quick start is the `remember`,
+  `recall`, `suggest_rules`, `explain_association` loop, `Agent memory` is the
+  second section, and the install section is a table of what each path gives
+  and what it leaves out.
+- **The README's benchmark table shows mushroomdb's own numbers**, each row
+  naming the committed file it comes from. The benchmark harness measures one
+  engine. A names gate (`scripts/check-names.py`, run by
+  `scripts/check-claims.sh`) fails the build when a tracked file contains one
+  of a listed set of other projects' names.
+- **0.7 against 0.6.12, same harness, same day: no regression found.** At
+  10,000 nodes, release builds, 20 runs a side on an Apple M4 Pro that was
+  never fully quiet (the file records the load): rule backfill 8.584 s against
+  8.611 s, ingest 0.998 s against 0.991 s, warm two-hop 192.1 µs against
+  195.3 µs. Those are the driver's pooled twenty runs; the README's table
+  gives the same tree's medians of three harness runs from the same file,
+  8.551 s for the backfill and 1.061 s for ingest. One exception, cause not
+  established: the first, cold execution
+  of the two-hop query is about 0.15 ms slower on 0.7
+  (`benchmarks/results/mushroomdb-10k-0.7-ab.md`, driver
+  `benchmarks/ab_driver.py`). The backfill figure is not the workload behind
+  the 2.85–3.51 s runs of 2026-08-21 and 2026-08-24: those stopped at a global
+  edge cap after 2,000,000 edges, and since v0.2.0 the same rules derive the
+  top 32 per source for every source, 448,000 edges.
+- **The scale statement is what was measured**: 100,000 nodes and about 10
+  million derived edges. "10M nodes" was a design intent, never a measurement,
+  and is no longer stated as a target: the README, `llms.txt` and
+  `docs/concurrency-decision.md` give the measured figure, and `docs/design.md`
+  keeps its original sentence with a dated correction beside it. A claims rule
+  fails the build if the target comes back in a product-facing file.
+- **The plugin install command in the docs was wrong.** It is `claude plugin
+  marketplace add MatthewSherlin/mushroomdb`, then `claude plugin install
+  mushroom@mushroomdb`; seven files printed the first without the word
+  `plugin`, and a claims rule now refuses that form.
+- **`docs/site` no longer publishes two internal notes** — they moved to
+  `docs/roadmap/` — and `docs/design.md` is headed as the historical record it
+  is: the design the project started from, not a description of what exists.
+- **Six gates the release process did not have.** The version check sees the
+  Python binding's manifest, its pins and both lockfiles, and a bump whose
+  lockfile refresh fails now fails; the defect ledger runs in CI and refuses a
+  deferral to a release that has shipped; and four are new — the names gate, a
+  link-and-anchor gate over the hand-written docs (`scripts/check-links.py`),
+  a check that `llms-full.txt` is what its generator writes and that the
+  generator accounts for every page under `docs/site`
+  (`scripts/gen-llms-full.sh --check`), and a publish rehearsal
+  (`scripts/publish-rehearsal.sh`) that packages the eight crates, the wheel
+  and both npm packages in dry runs and uploads nothing. The first five run in
+  CI; the rehearsal is run by hand before a tag. A claims rule also refuses a
+  sentence that names a release as the current one.
+
+### Added — identity, and four tools for the store as a whole
+
+- **`schema`** answers "what's in here": labels with their fields, edge types
+  and what derives them, every rule with its predicate, the full-text fields
+  `recall` searches, the equality indexes, and the provisional nodes
+  `remember` created. A host with no session hook had no way to learn a
+  store's shape but guessing Cypher.
+- **`forget`** tombstones a node, removes one property — the first way to
+  remove a property over MCP — or retracts one fact. It refuses an edge a rule
+  derived and names the rule, reports the derived edges a property removal
+  retracts because a rule read that property, lists the notes that still state
+  what was forgotten, and says plainly that history keeps it until the log is
+  pruned. Forgetting an entity's `name` rewrites its `aliases` in the same
+  write, so the name's words stop matching identity rules at once, and the
+  reply says so. It is not redaction, and it has no role check.
+- **`suggest_rules`** relays the store's own rule proposals with arguments
+  `create_rule` accepts unchanged. It never proposes a field the store writes
+  for itself, and it creates nothing.
+- **`analyze`** ranks and groups: `central`, `degree`, `components`,
+  `clusters` and `identities`, over the whole store, at most 50 rows, the same
+  answer every time.
+- **Every entity carries a normalised `aliases` list** — its key, its name in
+  lowercase with punctuation folded, and that name's words. Nothing else goes
+  in. It is recomputed from the key and the current name on each write that
+  describes the entity, not accumulated: a renamed entity stops matching its
+  old name, and a forgotten name leaves nothing behind.
+- **`aliases` is now maintained by the store.** An `aliases` key inside
+  `props` is refused. Other names a caller knows go through the `aliases`
+  argument of `remember`'s `entities` or of `upsert_entity`, and are kept in
+  `alias_keys` (below), not in `aliases`. A value an older store already holds
+  in `aliases` is its owner's data and is kept: on the next describing write
+  to that entity, or when the identity preset's backfill runs, every item the
+  key and the name do not imply moves to `alias_keys` as written — trimmed,
+  not normalised. Only a blank item is let go. A list the store itself
+  derived from an earlier name is not such a value: it is replaced, and
+  nothing moves (see the known limits). Any value that is not a string
+  or a list of strings is refused with the node named, to clear with
+  `forget {key, prop: "aliases"}`, rather than overwritten.
+- **A declared alias does not count toward `Overlap`** (owner decision,
+  2026-10-01). A link between two entities with the same two-word name sits
+  exactly on the floor, 3/5 (the same three-word name scores 4/6; the same
+  one-word name scores 1/3 and does not link); when
+  declared aliases were entries in `aliases`, declaring `matt` on one of two
+  same-named entities made it 3/6 and silently unlinked them. Now it changes
+  nothing. The consequence: two entities that declare the same alias gain no
+  overlap from it. A declared alias links only through an explicit claim on a
+  stub's key.
+- **Aliases are normalised to Unicode NFC.** A name typed with combining
+  marks — `E` followed by U+0301 — yields the same aliases as its precomposed
+  form, `É`, so the two link. The stored `name` is left as written. This adds
+  one dependency to the core crate, `unicode-normalization` 0.1.
+- **`mushroomdb schema apply <db> --memory-identity`** adds the identity
+  preset: sixteen global `SAME_AS` rules. Eleven compare `aliases` at Jaccard
+  ≥ 0.6, covering provisional stubs; five link a stub an entity explicitly
+  claims (below). It says what it will backfill before it writes. New stores
+  do not get it; rules are never created silently. With it on, `remember`
+  reports the `same as` links each write created, and `analyze` resolves them
+  into identities in which every pair is linked, oldest node first.
+- **An explicit alias claim links a stub.** An entity that declares an alias
+  equal to a provisional stub's key links that stub, at 1.00:
+  `remember {about: ["matt"]}` and an entity written with `aliases: ["matt"]`
+  are linked, in either order. Jaccard could not do this — the stub holds one
+  alias, `matt`, and the entity's four hold no `matt`: its key, its name and
+  the name's two words. A declared alias equal to an unrelated
+  stub's key links them at 1.00 too: declaring it is the caller's explicit
+  claim. Three limits:
+  - The match is on the key exactly, and keys are case-sensitive:
+    `aliases: ["Matt"]` does not link a stub keyed `matt`.
+  - The target must carry label `Entity`, which a node created by `about`
+    keeps for life, even after it is described. Such a node can still be
+    claimed once described. Two nodes that both carry one of the five entity
+    labels are never linked by claim.
+  - The claiming node must be a `Person`, `Org`, `Project`, `Concept` or
+    `Event`. So a subject named by `about` before it was described cannot
+    itself claim: it is an `Entity`, the alias it declares is stored, and no
+    rule reads it.
+- **A write that retracts identity links says so.** `remember` prints one
+  `unlinked` line and returns `same_as_lost` and `same_as_lost_total`;
+  `upsert_entity` returns the same two fields, and a note, when an update
+  loses a link. Each pair is listed once with the score it had, ten at most,
+  the rest counted. This matters because `aliases` follows the name: renaming
+  one of two same-named entities takes their score under the floor and
+  unlinks them, and unlinks a stub that spelled the old name. Declaring an
+  alias never costs a link. The remedy is to give both the same name, or to
+  declare a provisional stub's key as an alias, which links it whatever the
+  names.
+- **`alias_keys` is a second store-maintained list**: the aliases a caller
+  declared, trimmed and otherwise as written, which is what the claim rules
+  read. Derived name words do not go in — an entity merely named "Alex" does
+  not claim a stub keyed `alex` — with one exception, after `rename_node`,
+  described in the known limits. It is the only place a declared alias is
+  kept. It accumulates, where `aliases` does not; holds at most 32; is refused
+  as a key inside `props`; is never proposed by `suggest_rules`; and is
+  cleared by `forget {key, prop: "alias_keys"}`. A store that already took the
+  preset gains the five claim rules by running
+  `schema apply --memory-identity` again. Its backfill writes each entity's
+  `aliases` from its key and name, moves into `alias_keys` whatever an older
+  node's `aliases` held beyond that, and says how many nodes that touched
+  before it writes.
+- **The default tool listing is 23 tools and 27,067 bytes**, from 19 and
+  23,548 (`scripts/measure-tool-listing.py`; all 25 tools are 27,868 bytes).
+  The script puts the default listing at about 6,766 tokens a session, at its
+  estimate of 4 bytes per token.
+- **The fragmentation probe (spec §8.2) says LARGE**: at the reference cell,
+  25% of Talent split into 3 aliases, recall of the edges the canonical alias
+  holds is 0.8324 over every rule, a loss of 0.1676 against the pre-registered
+  0.05 — so, as pre-registered, the canonical node is 0.8's headline
+  (`benchmarks/fragmentation/results/20261001T060009Z/summary.md`).
+- **The `SAME_AS` quality gate (spec §8.3) PASSED**: 9 true positives, 1 false
+  positive, 9 false negatives — precision 0.900, exactly the floor, and recall
+  0.500 — for both the pairwise links and the resolved identities
+  (`benchmarks/identity/results/20261001T061131Z/summary.md`). A second run
+  after the claim rules and NFC were added, pre-registered as expecting no
+  change, gave the same numbers
+  (`benchmarks/identity/results/20261001T143503Z/summary.md`): the frozen set
+  declares no alias equal to a stub's key, so the gate cannot show the claim
+  rules' gain, and tests do. Those two runs were measured while declared
+  aliases still counted toward `Overlap`. A third run after they stopped,
+  pre-registered as expecting no pair to change side, gave the same numbers
+  again (`benchmarks/identity/results/20261001T161603Z/summary.md`).
+
+### Added — the Python binding reaches the memory surface
+
+Twenty methods, each with a signature and a docstring in
+`bindings/python/mushroomdb.pyi`.
+
+- **Graph algorithms**: `pagerank`, `connected_components`,
+  `degree_centrality` and `communities`. `degree()` and `degrees()` are
+  unchanged and are a different thing — the degree of the keys you name.
+  `budget_ms` defaults to `0`, no time limit, so the same store gives the same
+  answer.
+- **Full-text**: `enable_fulltext` (with `if_not_exists=`),
+  `disable_fulltext`, `is_fulltext_enabled`, `fulltext_pairs` and `search`.
+- **The rule lifecycle**: `rules`, `delete_rule`, `rebuild_rule` and
+  `suggest_rules`, whose `create_rule_args` create the same rule here as they
+  do over MCP.
+- **The memory calls, as data**: `remember`, `recall`, `upsert_entity`
+  (aliases maintained, a provisional mark cleared, no relabel),
+  `schema_report`, `forget` and `identity_clusters`. Each calls the function
+  the MCP tool calls: `forget`, the suggestion filter and the entity upsert
+  moved from the MCP server into the core crate for it, with the MCP replies
+  unchanged. `recall` returns ranked rows, not the digest, and **the rows are
+  raw stored content**: only the digest strips control characters, so a caller
+  that renders a row into an assistant's context has that to do.
+- **`set_props_many`** sets properties on many nodes in one commit. Existing
+  nodes only: an unknown key is an error and nothing is written. A value equal
+  to what is stored is not written, so an identical repeat writes nothing at
+  all. Rules fire inside the commit. `wal_total_commits()` moves by no frame
+  when nothing changed, by one when something did, and by two when a rule
+  also derived or retracted an edge — never by the number of nodes. It is a
+  raw property write, like `set_prop`: it accepts `name`,
+  `aliases` and `alias_keys` on an entity and does not maintain the alias
+  lists (see the known limits).
+- **Whole-store reads are refused on a `scoped()` handle.** The four
+  algorithms, `search`, `fulltext_pairs`, `rules`, `suggest_rules`, `recall`,
+  `schema_report` and `identity_clusters` take no mask, so each raises
+  `ValueError` there rather than answer over nodes the scope hides. The new
+  writes raise `ReadOnly` there, as every write on a scoped handle does.
+  `is_fulltext_enabled` answers: it is a schema fact about a pair the caller
+  named.
+
+### Fixed
+
+- **A rule created on its own no longer breaks lock-free readers.** Creating
+  a rule whose edge type the store had not seen left every reader snapshot one
+  symbol behind the writer until the next fold, up to 63 commits: the next new
+  field or label made every read fail with "mvcc delta intern mismatch", and
+  before that a read of the new rule's edges silently returned none. HTTP
+  reads go through these readers. Batched rule creation was never affected.
+- **`upsert_entity` over MCP checks and writes under one write guard.** The
+  existence check ran under a read guard and the write under a second one, so
+  another writer could come between them. The cost is in how it waits: a call
+  with well-formed arguments now takes the store's cross-process write lock
+  before it answers, for up to 2 seconds while another process holds it, a
+  refusal that writes nothing included. If the wait runs out the call is
+  answered from this process's last view of the store, so one that names no
+  `label`, for a key the other process has just created, is refused with
+  `label required when creating a new entity` where it used to report the
+  store busy. Nothing is written either way.
+- **A long evidence list no longer floods a reply.** `explain_association`
+  and the `why` command cut the bracketed evidence at 240 characters;
+  `explain_association` with `json: true` still returns every value.
+- **`schema`'s text is capped at 12,000 bytes** and says when it was cut.
+  `json: true` returns the whole report.
+- **`forget` names the rule that derived the edge**, from the engine's
+  provenance, rather than every rule with the same edge type and labels.
+- **A CLI-only install's empty-store brief offers the shell**, not three MCP
+  tools that install has no server for.
+
+### Known limits
+
+Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
+
+- **A nickname stub links only when the alias is declared.** A bare `matt`
+  stub holds one alias and cannot reach Jaccard 0.6 against an entity named
+  Matthew Sherlin, which holds four and none of them `matt`. An entity that
+  declares `aliases: ["matt"]` now links it by claim; one
+  that does not declare it still does not, and neither does a second entity
+  with the same name that never made the claim. That is three of the gate's
+  nine false negatives, whose labelled set declares no such alias. The other
+  six miss on unequal alias sets: a formal name with a declared alias
+  (`countess-lovelace`, twice), a longer full name (`amazing-grace`, twice), a
+  nickname pair with no stub (`chris-lee` and `christopher-lee`), and a legal
+  suffix (`anthropic` and `anthropic-pbc`).
+- **A claimed stub joins an identity only when every member claims it.**
+  `analyze`'s identities are complete-linkage: a stub one of two linked
+  entities claims is linked to that one and is not a member of the pair's
+  identity.
+- **A name change can remove a link.** `aliases` is the key, the current name
+  and its words, so renaming an entity retracts every link its old name made.
+  The write's reply names the links it lost. Declaring an alias cannot do
+  this.
+- **A shared declared alias links nothing by itself.** Two entities that both
+  declare `the boss` gain no overlap from it; declared aliases act only as
+  claims on a provisional stub's key.
+- **A name changed by a raw write leaves `aliases` stale until the next
+  describing write.** `query`, `ingest_json`, HTTP and the Python binding's
+  property writes (`set_prop`, `upsert_node`, `set_props_many`) do not
+  maintain the list; `remember` and `upsert_entity`, over MCP or in Python,
+  and `schema apply --memory-identity` do. Until one of those runs, the old
+  name's words keep matching identity rules. When it runs, the list is
+  replaced and the old words are dropped: they do not become declared
+  aliases, unless the node was also renamed with `rename_node` since its last
+  describing write (the next limit). The same raw paths can write `aliases`
+  and `alias_keys` themselves, which the describing writes refuse, and a
+  hand-written list can make an identity link. Whether raw writes should
+  refuse the store's own fields is not decided (row 66, deferred to 0.8).
+- **The store recognises its own `aliases` list by its shape**: the node's
+  lowercased key, one name and that name's words, sorted. Two things follow.
+  A list an owner wrote before 0.7 that has exactly that shape — key `bob`,
+  `aliases: ["bob", "bobby"]` — is read as the store's, and `bobby` is
+  dropped rather than kept in `alias_keys`. And after `rename_node` the list
+  was derived from another key, so it does not have the shape: the next
+  describing write moves into `alias_keys` every item the new key and the
+  stored name do not imply. That is the former key, lowercased, unless the new
+  key or the name already implies it — `alex`, named Alex Stone and renamed to
+  `alex-stone`, leaves nothing — and once kept it links a provisional stub
+  keyed exactly so. If the name was also changed
+  by a raw write at any point since the last describing write — before the
+  rename or after it — it is the old name and each of its words as well, and
+  each of those then claims a stub keyed so: the one case in which derived
+  name words become declared aliases.
+  `forget {key, prop: "alias_keys"}` clears what was kept.
+- **`rename_node` leaves a stored `id` property at the old key.**
+  `upsert_entity`'s create and a Cypher `CREATE {id: …}` store the key as an
+  `id` property as well, and a rename does not rewrite it. After
+  `rename_node q1 → q2`, `WHERE n.id = 'q2'` returns nothing,
+  `WHERE n.id = 'q1'` returns the renamed node, and `RETURN n.id` prints `q1`.
+  `key(n)` and the inline pattern `{id: 'q2'}` are right: use `key(n)` to read
+  or filter on a key. It predates 0.7 (row 72, deferred to 0.7.1).
+- **A subject named before it was described cannot claim a stub.** It is an
+  `Entity` for life, and the claim rules run from the five entity labels.
+  `upsert_entity` refuses to relabel it; `remember`'s `entities` describes it
+  without relabelling. An `Entity`-to-`Entity` claim rule that would close
+  this is held pending an engine fix: the engine gives a derived edge one
+  owner, so that rule and the existing `Entity` overlap rule would lose each
+  other's links on retraction (row 37, deferred to 0.8).
+- **Two rules that share a label pair and an edge type can lose each other's
+  edges.** When both derive the same directed edge, one owns it; when the
+  owner's predicate stops holding, the edge is removed although the other
+  rule still wants it, until that rule is rebuilt or one of its own fields is
+  written. No rule this release ships collides. Row 37, deferred to 0.8.
+- **Two strangers with one full name of two or more words link.**
+  `john-smith-nyc` and
+  `john-smith-sf` score 3/5. The link is visible in `remember`'s reply and
+  explainable with `explain_association`, but it is wrong — the gate's one
+  false positive, and why its precision has no margin.
+- **Identity is global.** The preset's rules carry no namespace, so
+  same-named entities in different namespaces link, and `remember`'s `same as`
+  line can name keys from other namespaces.
+- **`forget` has no role check.** Like every other MCP write tool, it is not
+  an authorisation boundary.
+- **Forgotten `aliases` leave `alias_keys`.** The two lists are cleared
+  separately. `forget {key, prop: "aliases"}` says so when declared aliases
+  remain: they keep linking a stub keyed so until
+  `forget {key, prop: "alias_keys"}` clears them.
+- **`analyze` and `suggest_rules` read the whole store, with no role or
+  mask.** Filtering their rows would be unsound, because a visible node's score
+  is computed over hidden topology.
+- **`remember` does not refuse a label that disagrees.** An `entities` entry
+  naming an existing key under another label is counted as matched, the node
+  keeps its stored label, and the label that was not used gets a full-text
+  declaration if it had none. `upsert_entity` refuses the same disagreement.
+  Over MCP and in Python alike (row 64, deferred to 0.7.1).
+- **`was_linked`'s schema types `at_commit` as an integer, and the tool takes
+  a date too.** The handler accepts an RFC 3339 date and the skill teaches
+  that form, so a client that validates arguments against the advertised
+  schema refuses a call the skill teaches (row 71, deferred to 0.7.1).
+- **`query` reads its statement only as a shell argument.** There is no stdin
+  and no file form, so a fact written from a shell depends on the quoting rule
+  above; an apostrophe inside a Cypher string is written `\'`, and a literal
+  backslash cannot be written at all — the lexer refuses it with `invalid
+  escape` rather than store something else (row 70, deferred to 0.8).
+- **The installed skill can exceed its 6,000-byte budget.** The budget is
+  tested on a render with a 17-byte store path and `install` writes the
+  store's absolute path, six times: the `both` delivery is over at a path of
+  24 bytes or more (row 68, deferred to 0.8).
+- **A user-scope CLI-only install can be briefed as if it had a server.**
+  `install --user --delivery cli --db <path>` keeps its manifest under
+  `~/.mushroomdb`, and the session brief looks for one only beside the store's
+  parent directory, so with the store anywhere else the brief's last line
+  names MCP tools in a session that has none (row 69, deferred to 0.8).
+- **After the first `remember` on a store without the memory defaults, nothing
+  says the defaults are missing.** The store then has one text field, so
+  `recall` and the brief stop saying "no text index", and an entity that was
+  already there is not found by its name. `mushroomdb schema apply <db>
+  --memory-defaults` indexes them; the `schema` tool lists the fields `recall`
+  searches (row 73, deferred to 0.7.1).
+- **A store the Python binding creates has no memory schema.** `remember`
+  declares the text fields it needs as it goes. The identity preset is applied
+  from the command line — `mushroomdb schema apply <db> --memory-identity` —
+  with the Python handle closed (row 55, deferred to 0.8).
+- **A hand-written edge can be undeletable while a rule matches its
+  endpoints.** The engine refuses to delete an edge when a rule with the same
+  edge type and labels has a predicate the two nodes satisfy, without checking
+  that the rule's via hop, namespace or cap would let it derive that edge, and
+  it refuses the same way for an edge that does not exist. `forget` says which
+  case it is; the refusal stands until the rule or the properties change
+  (row 67, deferred to 0.8).
+- **`suggest_rules` can propose `approximate: true`.** `create_rule` accepts
+  it, and its advertised schema does not list it, so a client that validates
+  arguments against the schema refuses that proposal (row 52, deferred to
+  0.7.1).
+- **Two counts in replies run low.** `forget` of a node under-reports the
+  derived edges retracted when that node was the via node of a via-hop rule
+  (row 50), and `remember`'s `matched` does not count a fact endpoint that
+  already existed (row 48). Both deferred to 0.7.1.
+- **Cypher has no boolean literals.** `WHERE n.provisional = true` fails with
+  `unbound variable`; the `schema` tool lists the provisional nodes. And an
+  older skill at user scope can shadow the one `install` writes, with nothing
+  detecting it (row 63, deferred to 0.8).
+- **The Python binding's memory calls hold the GIL for the whole call.**
+  `set_props_many`, `remember`, `upsert_entity`, `forget`, `recall` and
+  `search` do, a write's fsync included, so other Python threads wait; the
+  algorithms, `suggest_rules`, `schema_report`, `identity_clusters` and the
+  similarity reads release it (row 65, deferred to 0.7.1).
+- **Over MCP, a `min` that is not a number is ignored.** `find_similar` with
+  `"min": "0.5"` answers at the default 0.8 and echoes `min: 0.8`; HTTP
+  refuses the same body with `min must be a number` (row 74, deferred to
+  0.7.1).
+- **Two small identity gaps.** If reading a node's edges fails, the `same_as`
+  report leaves that node's links out rather than failing (row 51); and a
+  provisional stub's derived `aliases` are not held to the 32-alias cap an
+  entity's are, so a stub key of many words carries a long list (row 53).
+  Both deferred to 0.7.1.
+- **Scale is measured to 100,000 nodes, and no further.** The measurements
+  are from v0.1.1 and v0.2; they were not repeated on 0.7, and nothing larger
+  has been run.
+- **The prompt hook pays a store open on every prompt, and that grows with
+  the store.** On a 100,000-note store, 19.2 MiB on disk, it took 585–592 ms
+  at the median and 640 ms at worst, against the hook's 5,000 ms timeout
+  (`benchmarks/hook-latency/results/20261001T192739Z.md`). The conditions: a
+  release build, a warm file cache, 20 runs per prompt, and a machine that was
+  not quiet — its 1-minute load average read 18.94 — so these are not
+  quiet-machine timings. What was timed is `mushroomdb recall <db>`, not the
+  plugin's `run.sh recall --auto` wrapper. `stats`, which opens the store and
+  does almost nothing else, took the same 585 ms: the cost is the full-text
+  index, rebuilt on every open (row 36, deferred to 0.8).
+- **The docs site still serves raw Markdown.** A rendered site did not ship in
+  this release.
+- **The association benchmark has not been re-run on 0.7.** Its published
+  numbers were measured on 0.6.12 and earlier, against a default listing of
+  19 tools; 0.7 lists 23.
+
 ## v0.6.12 — a date that lands where it says, and a server you can run
 
 **v0.6.11 was never published.** It was merged, and the release was stopped when
@@ -17,12 +632,12 @@ Upgrading from 0.6.10 therefore brings both releases at once.
 written. Run
 [`20260928T195302Z`](benchmarks/agent-tasks/results/20260928T195302Z/summary.md),
 same 2,000-entity world digest as the two before it: the graph arm scores
-**1.000 on all twenty tasks and all sixty cells** against the sqlite baseline's
+**1.000 on all twenty tasks and all sixty cells** against the relational baseline's
 0.990, at **$0.0614 against $0.1127** — cost **-45.6%** with its 95% interval
 `[-0.06875, -0.03147]`, tokens **-26.5%**, turns **-44.3%**, every interval
 excluding zero. 180 cells, 0 timeouts, 0 errors, 0 dropped.
 
-Correctness had been amended on 2026-09-11 to pass on a tie, because the sqlite
+Correctness had been amended on 2026-09-11 to pass on a tie, because the relational
 arm saturated at 1.00 and the original wording — exceed both baselines with the
 interval excluding zero — was judged unpassable by any arm. **This run passes
 the original wording**: +0.0101 against arm Q with `[0.0005, 0.0229]`, and above
@@ -210,7 +825,7 @@ wrong guess came back as a plausible wrong graph rather than an error.
 benchmark's four time-travel tasks were the release's target: in the committed
 run they took 6-10 MCP calls and 450,000-640,000 tokens each, carrying ~67% of
 the graph arm's cost and all of its variance. They now take **one call and about
-50,000 tokens**. Against the sqlite baseline, paired over 20 tasks with every
+50,000 tokens**. Against the relational baseline, paired over 20 tasks with every
 interval excluding zero: **cost -41.2%**, tokens **-26.8%**, turns **-25.6%**.
 The 95% cost interval — the leg the pre-registered gate calls the discriminator,
 and the leg that failed before — is now `[-0.0353, -0.0124]`, **entirely below

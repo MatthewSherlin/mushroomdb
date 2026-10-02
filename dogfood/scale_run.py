@@ -1184,7 +1184,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         big3_note += " — intersection empty (matcher rules not live at this scale)"
     a(f"| Talent→Company matcher (Big-3) | 5+ second queries | {big3_note} |")
     a(
-        "| Search fan-out | 14 sharded Meilisearch indices + in-memory merge | "
+        "| Search fan-out | 14 sharded search indices + in-memory merge | "
         "derived-edge `neighbors` on declared rules |"
     )
     sem_note = (
@@ -1194,7 +1194,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         if approx
         else f"exact: {sem.get('status', 'n/a')} (full={sem.get('attempted_full')})"
     )
-    a(f"| Semantic / vector | Meili `_vectors` 1536-dim | {sem_note} |")
+    a(f"| Semantic / vector | search-service `_vectors` 1536-dim | {sem_note} |")
     a(
         f"| Ingest 100k | (not published) | "
         f"{_fmt_s(phases['ingest']['wall_s'])} "

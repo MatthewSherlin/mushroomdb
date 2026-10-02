@@ -1,4 +1,4 @@
-//! The harness behind the `sanitize` ordering in `repograph::render`.
+//! The harness behind the `sanitize` ordering in `digest`.
 //!
 //! 0.6.9 widened `sanitize` from a bare `is_ascii_control()` to the full
 //! bidi/zero-width class, and every character of every digest string began
@@ -16,10 +16,12 @@
 //! ```
 //!
 //! Figures quoted in the 0.6.10 changelog came from this harness on an Apple
-//! Silicon laptop. They are a ratio between three predicates measured in one
-//! process, not a portable number: re-run it rather than trusting the absolute
-//! microseconds, and expect the *ordering* to hold while the magnitudes move.
+//! Silicon laptop. They are a ratio between three predicates and the shipped
+//! function, measured in one process, not a portable number: re-run it rather
+//! than trusting the absolute microseconds, and expect the *ordering* to hold
+//! while the magnitudes move.
 
+use core_api::digest::sanitize;
 use std::time::Instant;
 
 /// 0.6.8: ASCII controls only.
@@ -85,6 +87,14 @@ fn main() {
     println!("0.6.9 vs 0.6.10 over every code point: {disagreements} disagreements\n");
     assert_eq!(disagreements, 0, "the reorder must be behaviour-preserving");
 
+    // The shipped function must produce exactly what the 0.6.10 predicate does,
+    // or the timings below are of a copy that is not what runs in production.
+    assert_eq!(
+        sanitize(&corpus),
+        sanitize_with(is_forging_0_6_10, &corpus),
+        "digest::sanitize must match the 0.6.10 predicate"
+    );
+
     for (name, f) in [
         (
             "0.6.8  ascii-control only ",
@@ -103,4 +113,14 @@ fn main() {
         let per = t.elapsed() / reps;
         println!("{name} {per:>10.2?}   (checksum {sink})");
     }
+
+    // The shipped function itself, not a re-implementation of it.
+    let _ = sanitize(&corpus);
+    let t = Instant::now();
+    let mut sink = 0usize;
+    for _ in 0..reps {
+        sink += sanitize(&corpus).len();
+    }
+    let per = t.elapsed() / reps;
+    println!("digest::sanitize (shipped) {per:>10.2?}   (checksum {sink})");
 }

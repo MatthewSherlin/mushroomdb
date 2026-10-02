@@ -184,6 +184,32 @@ def test_code_suite_default_arms_unchanged():
     assert SUITES["code"]["arms"] == ["A", "B", "C", "D"]
 
 
+def test_code_suite_is_refused_naming_0_7(monkeypatch, capsys):
+    import run
+    # Refused before any setup: nothing is provisioned or spawned.
+    monkeypatch.setattr(run, "setup", lambda **_: (_ for _ in ()).throw(
+        AssertionError("setup ran for a retired suite")))
+    assert run.main(["--suite", "code", "--setup-only"]) == 2
+    err = capsys.readouterr().err
+    assert "retired in 0.7" in err
+    assert "README.md" in err
+
+
+def test_the_default_suite_is_association():
+    import run
+    captured = {}
+
+    def fake_setup(**kw):
+        captured.update(kw)
+        return set()
+
+    import pytest
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(run, "setup", fake_setup)
+        assert run.main(["--setup-only"]) == 0
+    assert captured["suite"] == "association"
+
+
 # --- grading -------------------------------------------------------------
 
 
@@ -1494,7 +1520,8 @@ def test_the_graph_subject_holds_the_store_the_install_and_nothing_else(tmp_path
     mcp = json.loads((cell / ".mcp.json").read_text())
     assert mcp["mcpServers"]["mushroomdb"]["args"][-1] == cell_store
     hooks = json.loads((cell / ".claude" / "settings.json").read_text())["hooks"]
-    assert set(hooks) == {"UserPromptSubmit", "PostToolUse", "SessionStart"}
+    # 0.7 removed the `PostToolUse` hook (`touch`) with the code-graph door.
+    assert set(hooks) == {"UserPromptSubmit", "SessionStart"}
     for entries in hooks.values():
         for entry in entries:
             for hook in entry["hooks"]:

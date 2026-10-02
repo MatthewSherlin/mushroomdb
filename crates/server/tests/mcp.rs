@@ -19,7 +19,7 @@
 //! `arguments`, and every `GraphError` from core-api (bad Cypher, ingest
 //! shape, unknown key, …).
 
-use core_api::repograph::UNTRUSTED_FRAMING;
+use core_api::digest::UNTRUSTED_FRAMING;
 use core_api::{Direction, SharedDb, Value, ViewDef, ViewSource};
 use serde_json::{json, Value as Js};
 use server::run_mcp_stdio;
@@ -42,7 +42,7 @@ fn exchange(db: SharedDb, stdin: &str) -> (std::io::Result<()>, Vec<u8>) {
 }
 
 /// Like [`exchange`], but tells the loop where the store is on disk — what
-/// `mushroomdb mcp <db>` passes and what the `sync` tool needs.
+/// `mushroomdb mcp <db>` passes.
 fn exchange_at(
     db: SharedDb,
     db_dir: Option<PathBuf>,
@@ -193,7 +193,7 @@ fn tools_list_returns_all_tools_with_schemas() {
     ] {
         assert!(names.contains(*expected), "missing tool: {expected}");
     }
-    assert_eq!(tools.len(), 28);
+    assert_eq!(tools.len(), 25);
 
     let by_name = |n: &str| {
         tools
@@ -1034,24 +1034,17 @@ fn hybrid_search_text_only_and_missing_field_errors() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Task tools: explore, map, context, impact, owners, why, recall, remember,
-// sync
+// Task tools — the names in `TASK_TOOLS` below.
 //
-// These nine answer a question about a graphed repository rather than about
-// the graph API, so they come first in `tools/list` and the graph tools listed
-// beside them are prefixed `Advanced:`. Each returns the rendered digest as
-// its text content and nothing else; a caller that wants the report passes
-// `json: true` and gets it *as* the text.
+// These answer a question in prose rather than in JSON, so they come
+// first in `--all-tools` and the graph tools listed beside them are prefixed
+// `Advanced:`. Each returns the rendered digest as its text content and
+// nothing else; a caller that wants the report passes `json: true` and gets
+// it *as* the text.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The ten task tools, in the order `tools/list` must list them.
-const TASK_TOOLS: [&str; 14] = [
-    "explore",
-    "map",
-    "context",
-    "impact",
-    "owners",
-    "why",
+/// The task tools, in the order `tools/list` must list them.
+const TASK_TOOLS: [&str; 11] = [
     "explain_association",
     "node_edges",
     "neighborhood",
@@ -1059,7 +1052,10 @@ const TASK_TOOLS: [&str; 14] = [
     "what_if",
     "recall",
     "remember",
-    "sync",
+    "schema",
+    "analyze",
+    "suggest_rules",
+    "forget",
 ];
 
 /// The fourteen graph tools, in their established order, after the task tools.
@@ -1164,9 +1160,8 @@ fn code_rules() -> Vec<core_api::RuleDef> {
             "TOP_AUTHOR",
         ),
     ];
-    for label in core_api::repograph::rules::ABOUT_LABELS {
-        out.push(core_api::repograph::rules::about_rule(label));
-    }
+    // No `about_*` rules: ingest-git stopped declaring them in 0.7, because
+    // `remember` inserts its own ABOUT edges and a rule would own them.
     let co = core_api::Predicate::Overlap {
         field: "commits".into(),
         min: 0.25,
@@ -1323,8 +1318,8 @@ fn seed_code_graph(db: &SharedDb) {
             ("id".into(), s("__mushroomdb_git_sync__")),
             ("sha".into(), s(&code_sha(CODE_COMMITS - 1))),
             ("synced_at".into(), Value::Int(CODE_T0 + 4 * 86_400)),
-            // Deliberately not a real path: `context` must still answer from
-            // the graph when the working tree it names is not there.
+            // Deliberately not a real path: nothing here reads the working
+            // tree, so every tool must answer from the graph alone.
             ("repo".into(), s("/nonexistent/mushroomdb-test-repo")),
             ("recurse".into(), Value::Bool(false)),
             ("prs".into(), Value::Bool(false)),
@@ -1436,33 +1431,9 @@ fn one_task_call(db: SharedDb, name: &str, args: Js) -> Js {
     parse_lines(&out).remove(0)
 }
 
-/// The nineteen a memory store lists, in the order it lists them: the entity
-/// questions first, then the three that fill a store, then its own counts.
-const ASSOCIATION_TOOLS: [&str; 19] = [
-    "query",
-    "explain_association",
-    "neighborhood",
-    "node_info",
-    "node_edges",
-    "was_linked",
-    "edges_at",
-    "what_if",
-    "node_history",
-    "edge_history",
-    "find_similar",
-    "pairwise_similar",
-    "hybrid_search",
-    "remember",
-    "recall",
-    "upsert_entity",
-    "ingest_json",
-    "create_rule",
-    "stats",
-];
-
-/// Binding: a store no repository was ingested into lists the association
-/// surface — the nineteen tools that answer a question about an entity graph
-/// or fill one, in that order — and none of the code-door task tools.
+/// Binding: a memory store lists the association surface — the tools
+/// that answer a question about an entity graph or fill one, in that order —
+/// and none of the removed code-graph tools.
 #[test]
 fn a_memory_store_lists_the_association_surface() {
     let (res, out) = exchange(open("list-default"), &req(json!(1), "tools/list", None));
@@ -1475,18 +1446,113 @@ fn a_memory_store_lists_the_association_surface() {
         .collect();
     assert_eq!(
         names,
-        ASSOCIATION_TOOLS.to_vec(),
+        server::ASSOCIATION_TOOLS.to_vec(),
         "default tools/list on a memory store"
     );
-    assert_eq!(tools.len(), 19);
+    assert_eq!(tools.len(), 23);
     for hidden in [
         "explore", "map", "context", "impact", "owners", "why", "sync",
     ] {
         assert!(
             !names.contains(&hidden),
-            "{hidden} answers from a code graph there is none of, so it must not be listed"
+            "{hidden} was removed in 0.7 and must not be listed"
         );
     }
+}
+
+/// A store of one of the two shapes a server can be started on: `"memory"`,
+/// empty, or `"ingested"`, carrying the `GitSync` marker `ingest-git` writes.
+/// The marker is all that ever told the two apart, so it is all this needs.
+fn store_of_shape(shape: &str, name: &str) -> SharedDb {
+    let db = open(&format!("{name}-{shape}"));
+    match shape {
+        "memory" => {}
+        "ingested" => {
+            db.write()
+                .insert_node(
+                    "GitSync",
+                    "__mushroomdb_git_sync__",
+                    vec![("id".into(), s("__mushroomdb_git_sync__"))],
+                )
+                .expect("marker");
+        }
+        other => panic!("no store shape {other}"),
+    }
+    db
+}
+
+/// The names a real `tools/list` advertises, default or `--all-tools`.
+fn list_tool_names(db: &SharedDb, all_tools: bool) -> Vec<String> {
+    let stdin = req(json!(1), "tools/list", None);
+    let (res, out) = if all_tools {
+        exchange_all_tools(db.clone(), &stdin)
+    } else {
+        exchange(db.clone(), &stdin)
+    };
+    assert!(res.is_ok(), "{res:?}");
+    parse_lines(&out)[0]["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .map(|t| t["name"].as_str().expect("name").to_string())
+        .collect()
+}
+
+/// One `tools/call` against a server started with or without `--all-tools`.
+fn call_tool(db: &SharedDb, all_tools: bool, name: &str, arguments: &Js) -> Js {
+    let stdin = call(1, name, arguments.clone());
+    let (res, out) = if all_tools {
+        exchange_all_tools(db.clone(), &stdin)
+    } else {
+        exchange(db.clone(), &stdin)
+    };
+    assert!(res.is_ok(), "{res:?}");
+    parse_lines(&out).remove(0)
+}
+
+/// The seven code-graph tools are gone from both listings and from the served
+/// set, on both shapes of store.
+///
+/// Asserted against a real `tools/list` rather than against a constant this
+/// file declares. The 0.6.12 version of exactly this test compared against
+/// its own copy of the tool list and passed with the bug reintroduced
+/// (`docs/roadmap/road-to-0.7-plan.md:186-193`).
+#[test]
+fn the_code_graph_tools_are_absent_from_every_listing() {
+    const GONE: [&str; 7] = [
+        "explore", "map", "context", "impact", "owners", "why", "sync",
+    ];
+
+    for all_tools in [false, true] {
+        for store_shape in ["memory", "ingested"] {
+            let db = store_of_shape(store_shape, &format!("gone-{all_tools}"));
+            let listed = list_tool_names(&db, all_tools);
+            for name in GONE {
+                assert!(
+                    !listed.contains(&name.to_string()),
+                    "{name} still listed (all_tools={all_tools}, store={store_shape}): {listed:?}"
+                );
+            }
+            // And a call must be refused, not merely unlisted: "served but
+            // hidden" is what these were before.
+            let reply = call_tool(&db, all_tools, "explore", &json!({"target": "x"}));
+            assert!(
+                reply.get("error").is_some() || reply["result"]["isError"].as_bool() == Some(true),
+                "explore is still answering (all_tools={all_tools}, store={store_shape}): {reply}"
+            );
+        }
+    }
+}
+
+/// An `ingest-git` store now gets the same listing as any other. There is one
+/// surface in 0.7.
+#[test]
+fn an_ingested_store_is_served_the_association_listing() {
+    let db = store_of_shape("ingested", "one-surface");
+    assert_eq!(
+        list_tool_names(&db, false),
+        server::ASSOCIATION_TOOLS.to_vec()
+    );
 }
 
 /// A memory store holding one `Person`, one `Org`, and the `works_at` rule
@@ -3094,7 +3160,7 @@ fn what_if_refuses_an_unknown_key_and_an_unsupported_value() {
     assert!(error_text(&reply).contains("missing value"), "{reply}");
 
     // There is no store to copy any more, so no store path is required: the
-    // same call succeeds without one, unlike `sync`.
+    // same call succeeds without one.
     let reply = one_task_call(
         db.clone(),
         "what_if",
@@ -3379,7 +3445,7 @@ fn what_if_with_an_edge_type_answers_in_partner_keys() {
 /// said what they *returned* rather than what they were *for*.
 #[test]
 fn every_association_tool_description_opens_with_its_question() {
-    const OPENERS: [(&str, &str); 19] = [
+    const OPENERS: [(&str, &str); 23] = [
         ("query", "Who may see this"),
         ("explain_association", "Why are A and B related"),
         ("neighborhood", "What is around K"),
@@ -3412,6 +3478,10 @@ fn every_association_tool_description_opens_with_its_question() {
             "How should this kind of relationship be derived from now on",
         ),
         ("stats", "How big is this store"),
+        ("schema", "What's in here"),
+        ("analyze", "What matters here, and what clusters"),
+        ("suggest_rules", "What relationships are in my data"),
+        ("forget", "Forget that"),
     ];
 
     let (res, out) = exchange(open("descriptions"), &req(json!(1), "tools/list", None));
@@ -3440,7 +3510,7 @@ fn every_association_tool_description_opens_with_its_question() {
     }
     assert_eq!(
         OPENERS.map(|(n, _)| n).to_vec(),
-        ASSOCIATION_TOOLS.to_vec(),
+        server::ASSOCIATION_TOOLS.to_vec(),
         "the openers cover the whole surface, in its order"
     );
 
@@ -3641,71 +3711,27 @@ fn query_as_of_composes_with_a_role_and_a_mask() {
     assert!(far.contains("out of range"), "{far}");
 }
 
-/// Binding: a store carrying the `GitSync` marker — a repository was ingested
-/// into it — lists three tools and nothing else. A host defers MCP schemas and
-/// makes the model search for them, so what is listed is what gets found.
-#[test]
-fn a_code_graph_store_lists_three_tools_by_default() {
-    let (res, out) = exchange(
-        code_store("surface-code"),
-        &req(json!(1), "tools/list", None),
-    );
-    assert!(res.is_ok(), "{res:?}");
-    let replies = parse_lines(&out);
-    let names: Vec<&str> = replies[0]["result"]["tools"]
-        .as_array()
-        .expect("tools")
-        .iter()
-        .map(|t| t["name"].as_str().expect("name"))
-        .collect();
-    assert_eq!(names, vec!["explore", "query", "stats"]);
-}
-
-/// Binding: the surface decides what is *listed*, never what is served. Every
-/// tool the memory surface advertises is still callable on a code-graph store,
-/// and `explore` is still callable on a memory store.
-#[test]
-fn a_hidden_tool_is_still_callable_on_either_surface() {
-    let map = task_reply(&one_task_call(
-        code_store("surface-hidden"),
-        "map",
-        json!({}),
-    ));
-    assert!(
-        map.starts_with("mushroomdb map —"),
-        "map is unlisted on a code graph but must still answer: {map}"
-    );
-    let explore = task_reply(&one_task_call(
-        open("surface-memory-explore"),
-        "explore",
-        json!({"target": "x"}),
-    ));
-    assert!(
-        explore.contains("unknown: x"),
-        "explore is unlisted on a memory store but must still answer: {explore}"
-    );
-}
-
 /// Binding: an unlisted tool is still served. The flag decides what is
-/// advertised, not what a caller that knows the name can reach.
+/// advertised, not what a caller that knows the name can reach. `explain` is
+/// one of the two served tools the default listing leaves out.
 #[test]
 fn an_unlisted_graph_tool_is_still_callable() {
     let (res, out) = exchange(
-        code_store("list-unlisted"),
-        &call(1, "node_info", json!({"key": "src/core.rs"})),
+        association_store("list-unlisted"),
+        &call(1, "explain", json!({"a": "p1", "b": "acme"})),
     );
     assert!(res.is_ok(), "{res:?}");
     let reply = parse_lines(&out).remove(0);
     assert!(
         !reply["result"]["isError"].as_bool().unwrap_or(false),
-        "node_info is unlisted by default but must still answer: {reply}"
+        "explain is unlisted by default but must still answer: {reply}"
     );
 }
 
-/// Binding: `--all-tools` lists 28, task tools first in their fixed order, and
+/// Binding: `--all-tools` lists every served tool, task tools first in their fixed order, and
 /// every one of the fourteen graph tools carries the `Advanced:` prefix.
 #[test]
-fn tools_list_has_28_tools_task_tools_first_and_advanced_prefix() {
+fn tools_list_has_every_tool_task_tools_first_and_advanced_prefix() {
     let (res, out) = exchange_all_tools(open("list-order"), &req(json!(1), "tools/list", None));
     assert!(res.is_ok(), "{res:?}");
     let replies = parse_lines(&out);
@@ -3721,7 +3747,7 @@ fn tools_list_has_28_tools_task_tools_first_and_advanced_prefix() {
         .copied()
         .collect();
     assert_eq!(names, expected, "tools/list order");
-    assert_eq!(tools.len(), 28);
+    assert_eq!(tools.len(), 25);
 
     for t in tools.iter().take(TASK_TOOLS.len()) {
         let d = t["description"].as_str().expect("description");
@@ -3761,37 +3787,6 @@ fn tools_list_has_28_tools_task_tools_first_and_advanced_prefix() {
         );
     }
     assert_eq!(
-        by_name("map")["inputSchema"]["properties"]
-            .as_object()
-            .map(serde_json::Map::len),
-        Some(1),
-        "map takes nothing but json"
-    );
-    assert_eq!(
-        by_name("sync")["inputSchema"]["properties"]
-            .as_object()
-            .map(serde_json::Map::len),
-        Some(1),
-        "sync takes nothing but json"
-    );
-    assert_eq!(
-        by_name("context")["inputSchema"]["required"],
-        json!(["target"])
-    );
-    assert_eq!(
-        by_name("explore")["inputSchema"]["required"],
-        json!(["target"])
-    );
-    assert_eq!(
-        by_name("explore")["inputSchema"]["properties"]["depth"]["enum"],
-        json!(["context", "impact", "history", "all"])
-    );
-    assert_eq!(
-        by_name("owners")["inputSchema"]["required"],
-        json!(["path"])
-    );
-    assert_eq!(by_name("why")["inputSchema"]["required"], json!(["a", "b"]));
-    assert_eq!(
         by_name("recall")["inputSchema"]["required"],
         json!(["topic"])
     );
@@ -3799,7 +3794,6 @@ fn tools_list_has_28_tools_task_tools_first_and_advanced_prefix() {
         by_name("remember")["inputSchema"]["required"],
         json!(["text"])
     );
-    assert!(by_name("impact")["inputSchema"].get("required").is_none());
     assert_eq!(
         by_name("remember")["inputSchema"]["properties"]["kind"]["enum"],
         json!(["note", "decision", "todo"])
@@ -3811,8 +3805,8 @@ fn tools_list_has_28_tools_task_tools_first_and_advanced_prefix() {
 ///
 /// The card is the whole surface, not the default listing: it says what
 /// `mushroomdb mcp --all-tools` advertises and what every name in it can be
-/// called as, so it is compared against that list rather than the thirteen a
-/// default session sees.
+/// called as, so it is compared against that list rather than the association
+/// listing a default session sees.
 #[test]
 fn server_card_lists_the_same_tools_in_the_same_order() {
     let card_path =
@@ -3856,375 +3850,6 @@ fn server_card_version_matches_crate_version() {
     );
 }
 
-/// Binding: `map` on a store with nothing in it names the command that fills it.
-#[test]
-fn map_on_empty_store_is_helpful() {
-    let (text, structured) = task_both(open("map-empty"), "map", json!({}));
-    assert!(
-        text.contains("empty store") && text.contains("ingest-git"),
-        "empty map must say what to run: {text}"
-    );
-    assert_eq!(structured["files"], json!(0));
-    assert_eq!(structured["symbols"], json!(0));
-}
-
-/// Binding: `map` counts what the graph holds and renders the same numbers.
-#[test]
-fn map_reports_the_graphed_repository() {
-    let (text, structured) = task_both(code_store("map-full"), "map", json!({}));
-    assert_eq!(structured["files"], json!(3));
-    assert_eq!(structured["symbols"], json!(2));
-    assert_eq!(structured["commits"], json!(4));
-    assert_eq!(structured["authors"], json!(2));
-    assert!(text.starts_with("mushroomdb map — 3 files"), "{text}");
-    assert!(
-        text.lines().count() <= 40,
-        "map must stay within its line budget: {text}"
-    );
-}
-
-/// Binding: a `map` served from a handle another handle wrote through is
-/// current without the server being restarted.
-#[test]
-fn map_reflects_writes_made_by_another_handle() {
-    let dir = tmp("map-follows");
-    let db = SharedDb::open(&dir).expect("open");
-    seed_code_graph(&db);
-
-    let before = task_report(db.clone(), "map", json!({}));
-    assert_eq!(before["files"], json!(3));
-
-    // A second handle on the same directory — what a git hook is — inserts a
-    // fourth file and exits, releasing the store's write lock.
-    {
-        let mut other = core_api::GraphDb::open(&dir).expect("second handle");
-        other
-            .insert_node(
-                "File",
-                "src/extra.rs",
-                vec![
-                    ("id".into(), s("src/extra.rs")),
-                    ("path".into(), s("src/extra.rs")),
-                    ("dir".into(), s("src")),
-                    ("lang".into(), s("rust")),
-                    ("lines".into(), Value::Int(9)),
-                ],
-            )
-            .expect("insert through second handle");
-    }
-    // No wait: the read path checks the store on every read, so the very next
-    // call sees the other handle's commit.
-    let (text, after) = task_both(db.clone(), "map", json!({}));
-    assert_eq!(
-        after["files"],
-        json!(4),
-        "the server must follow the other handle's write: {text}"
-    );
-    drop(db);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Binding: `context` on a bare symbol name resolves it and reports its file,
-/// its signature and what calls it.
-#[test]
-fn context_on_symbol() {
-    let (text, structured) = task_both(
-        code_store("context-symbol"),
-        "context",
-        json!({"target": "core::init"}),
-    );
-    assert_eq!(
-        structured["target"]["symbol"]["key"],
-        json!("src/core.rs#core::init")
-    );
-    assert_eq!(structured["file"], json!("src/core.rs"));
-    assert_eq!(structured["signature"], json!("fn core::init()"));
-    // Callers come back as call sites grouped by the file they sit in.
-    let callers: Vec<(&str, Vec<&str>)> = structured["callers"]
-        .as_array()
-        .expect("callers")
-        .iter()
-        .map(|c| {
-            (
-                c["file"].as_str().expect("caller file"),
-                c["symbols"]
-                    .as_array()
-                    .expect("caller symbols")
-                    .iter()
-                    .map(|s| s.as_str().expect("caller key"))
-                    .collect(),
-            )
-        })
-        .collect();
-    assert_eq!(callers, vec![("src/web.rs", vec!["src/web.rs#web::serve"])]);
-    assert!(text.contains("core::init"), "{text}");
-    assert!(
-        text.lines().count() <= 60,
-        "context must stay within its line budget: {text}"
-    );
-}
-
-/// Binding: a default `context` answers with a pointer and the graph's facts,
-/// inside the reply budget; `full: true` quotes the body from the working tree.
-#[test]
-fn context_answers_with_pointers_by_default_and_bodies_on_full() {
-    let db = code_store("context-pointers");
-    // The seed's marker names a working tree that is not there, so `full`
-    // would have nothing to quote. Point it at a real one.
-    let repo = tmp("context-pointers-tree");
-    std::fs::create_dir_all(repo.join("src")).expect("mkdir");
-    let body: String = (1..=30).map(|n| format!("// line {n}\n")).collect();
-    std::fs::write(repo.join("src/core.rs"), body).expect("write source");
-    db.write()
-        .set_prop(
-            "__mushroomdb_git_sync__",
-            "repo",
-            s(&repo.to_string_lossy()),
-        )
-        .expect("repo");
-
-    let (text, structured) = task_both(db.clone(), "context", json!({"target": "core::init"}));
-    assert!(
-        structured["source"].is_null(),
-        "no body by default: {structured}"
-    );
-    assert!(
-        text.contains("src/core.rs:10-20"),
-        "pointer line present: {text}"
-    );
-    assert!(!text.contains("// line 10"), "no body by default: {text}");
-    assert!(
-        text.len() <= 4_800,
-        "default context reply within budget: {}",
-        text.len()
-    );
-
-    let (full, structured_full) =
-        task_both(db, "context", json!({"target": "core::init", "full": true}));
-    assert!(
-        structured_full["source"].is_string(),
-        "full quotes the working tree: {structured_full}"
-    );
-    assert!(full.contains("// line 10"), "the body is quoted: {full}");
-    assert!(
-        full.len() > text.len(),
-        "the default is the shorter answer: {} vs {}",
-        text.len(),
-        full.len()
-    );
-}
-
-/// Binding: `context` on a target the graph does not know says so rather than
-/// failing.
-#[test]
-fn context_on_unknown_target_is_not_an_error() {
-    let (text, structured) = task_both(
-        code_store("context-unknown"),
-        "context",
-        json!({"target": "nope"}),
-    );
-    assert_eq!(structured["target"]["unknown"]["target"], json!("nope"));
-    assert!(!text.is_empty());
-}
-
-/// Binding: `context` without a target is a tool error.
-#[test]
-fn context_without_target_is_a_tool_error() {
-    let reply = one_task_call(code_store("context-no-target"), "context", json!({}));
-    assert!(error_text(&reply).contains("target"));
-}
-
-/// Binding: `explore` at `all` is one call for the three answers — the
-/// context, the blast radius, and who owns it — inside the default budget.
-#[test]
-fn explore_all_composes_context_impact_and_history_within_budget() {
-    let (text, structured) = task_both(
-        code_store("explore-all"),
-        "explore",
-        json!({"target": "core::init", "depth": "all"}),
-    );
-    assert_eq!(
-        structured["context"]["target"]["symbol"]["key"],
-        json!("src/core.rs#core::init")
-    );
-    assert_eq!(structured["depth"], json!("all"));
-    assert!(
-        structured["impact"].is_object() && structured["owners"].is_object(),
-        "all carries the blast radius and the ownership: {structured}"
-    );
-    assert!(text.len() <= 4_800, "{} bytes:\n{text}", text.len());
-    for want in ["callers", "impact:", "owner:"] {
-        assert!(text.contains(want), "the digest is missing {want}:\n{text}");
-    }
-    // The partners reach a caller through the report; the digest names them
-    // once, on the context section's own `co-change` line.
-    assert!(
-        structured["partners"].is_array(),
-        "the report carries the co-change partners: {structured}"
-    );
-    assert!(
-        !text.contains("changes with"),
-        "and the digest does not repeat them:\n{text}"
-    );
-}
-
-/// Binding: the default depth is `context`, and it costs neither the blast
-/// radius nor the history.
-#[test]
-fn explore_defaults_to_context_depth() {
-    let (text, structured) = task_both(
-        code_store("explore-default"),
-        "explore",
-        json!({"target": "core::init"}),
-    );
-    assert_eq!(structured["depth"], json!("context"));
-    assert!(structured["impact"].is_null() && structured["owners"].is_null());
-    assert!(!text.contains("impact:"), "{text}");
-}
-
-/// Binding: `budget` is in tokens and caps the whole reply, framing included.
-#[test]
-fn explore_budget_caps_the_reply() {
-    let reply = one_task_call(
-        code_store("explore-budget"),
-        "explore",
-        json!({"target": "core::init", "depth": "all", "budget": 200}),
-    );
-    let text = task_reply(&reply);
-    assert!(
-        text.len() <= 200 * 4,
-        "a 200-token budget is 800 bytes, got {}:\n{text}",
-        text.len()
-    );
-    assert!(!text.is_empty(), "the header survives any budget");
-}
-
-/// Binding: a depth that is not one of the four is a tool error naming them.
-#[test]
-fn explore_with_an_unknown_depth_is_a_tool_error() {
-    let reply = one_task_call(
-        code_store("explore-depth"),
-        "explore",
-        json!({"target": "core::init", "depth": "everything"}),
-    );
-    let msg = error_text(&reply);
-    assert!(msg.contains("depth") && msg.contains("history"), "{msg}");
-}
-
-/// Binding: `impact` on an explicit file list marks the partners that are
-/// themselves in that list.
-#[test]
-fn impact_explicit_files_marks_modified() {
-    let (text, structured) = task_both(
-        code_store("impact-explicit"),
-        "impact",
-        json!({"files": ["src/core.rs", "src/web.rs"]}),
-    );
-    let files = structured["files"].as_array().expect("files");
-    assert_eq!(files.len(), 2);
-    assert_eq!(files[0]["path"], json!("src/core.rs"));
-
-    let partners = files[0]["partners"].as_array().expect("partners");
-    let web = partners
-        .iter()
-        .find(|p| p["path"] == "src/web.rs")
-        .expect("src/web.rs is a co-change partner of src/core.rs");
-    assert_eq!(web["modified"], json!(true), "it is in the changed set");
-    let util = partners.iter().find(|p| p["path"] == "src/util.rs");
-    if let Some(util) = util {
-        assert_eq!(
-            util["modified"],
-            json!(false),
-            "it is not in the changed set"
-        );
-    }
-    assert!(text.contains("src/web.rs 1.00 modified"), "{text}");
-    assert!(
-        text.lines().count() <= 25,
-        "impact must stay within its line budget: {text}"
-    );
-}
-
-/// Binding: `impact` reports a path the graph has never seen as unknown.
-#[test]
-fn impact_reports_unknown_paths() {
-    let (text, structured) = task_both(
-        code_store("impact-unknown"),
-        "impact",
-        json!({"files": ["src/core.rs", "no/such.rs"]}),
-    );
-    assert_eq!(structured["unknown"], json!(["no/such.rs"]));
-    assert!(text.contains("unknown: no/such.rs"), "{text}");
-}
-
-// The default `impact` file list — where the diff comes from, how it is
-// filtered, and what happens with no checkout — is decided before the graph is
-// touched, and is covered by the unit tests in `crates/server/src/mcp_tasks.rs`.
-// They take `$CLAUDE_PROJECT_DIR` as an argument; asserting it here would mean
-// setting a process-global variable in a binary whose other tests read the
-// environment concurrently.
-
-/// Binding: `owners` names the top author once, with the key in parentheses.
-#[test]
-fn owners_reports_the_top_author() {
-    let (text, structured) = task_both(
-        code_store("owners-ok"),
-        "owners",
-        json!({"path": "src/core.rs"}),
-    );
-    assert_eq!(structured["path"], json!("src/core.rs"));
-    assert!(text.contains("Ada Example (a@example.test)"), "{text}");
-    assert!(
-        text.lines().count() <= 25,
-        "owners must stay within its line budget: {text}"
-    );
-}
-
-/// Binding: `owners` on a path the store holds no file for is a tool error.
-#[test]
-fn owners_unknown_path_error() {
-    let reply = one_task_call(
-        code_store("owners-unknown"),
-        "owners",
-        json!({"path": "no/such.rs"}),
-    );
-    let msg = error_text(&reply);
-    assert!(msg.contains("no/such.rs"), "{msg}");
-}
-
-/// Binding: `why` names both unknown keys rather than only the first.
-#[test]
-fn why_unknown_keys_say_unknown() {
-    let (text, structured) = task_both(
-        code_store("why-unknown"),
-        "why",
-        json!({"a": "nope", "b": "zzz"}),
-    );
-    assert!(text.contains("unknown:"), "{text}");
-    assert_eq!(structured["unknown"], json!(["nope", "zzz"]));
-}
-
-/// Binding: `why` between two co-changed files reports the link and its
-/// evidence.
-#[test]
-fn why_reports_the_link_between_two_files() {
-    let (text, structured) = task_both(
-        code_store("why-link"),
-        "why",
-        json!({"a": "src/core.rs", "b": "src/web.rs"}),
-    );
-    let links = structured["links"].as_array().expect("links");
-    assert!(
-        links.iter().any(|l| l["edge_type"] == "CO_CHANGED"),
-        "expected a CO_CHANGED link: {structured}"
-    );
-    assert!(text.contains("CO_CHANGED"), "{text}");
-    assert!(
-        text.lines().count() <= 25,
-        "why must stay within its line budget: {text}"
-    );
-}
-
 /// Binding: `recall` turns a topic that names something into a digest of
 /// pointers to the nodes nearest it.
 #[test]
@@ -4239,12 +3864,14 @@ fn recall_returns_digest() {
         text.contains("src/core.rs"),
         "the digest must name the matching node: {text}"
     );
-    // `text` here is the digest with its framing line stripped by `task_reply`,
-    // so putting it back must give exactly what core-api produced.
+    // `text` here is the digest with its framing line stripped by `task_reply`.
+    // `recall_digest` itself never carries that line — the framing is stamped
+    // by the text wrapper, not by core-api's digest — so the json reply's own
+    // `digest` field is the same body, unframed either way.
     assert_eq!(
         structured["digest"],
-        json!(format!("{UNTRUSTED_FRAMING}{text}")),
-        "the reply shows the digest unaltered"
+        json!(text),
+        "the json reply's digest is the same body the framed text carries"
     );
 }
 
@@ -4260,9 +3887,9 @@ fn recall_on_an_unsearchable_topic_says_nothing_matched() {
 }
 
 /// Binding: `remember` writes a note and returns its key; unknown `about`
-/// keys are all named, and nothing is written.
+/// keys are created as provisional entities rather than refusing the call.
 #[test]
-fn remember_writes_note_and_rejects_unknown_about() {
+fn remember_writes_note_and_stubs_unknown_about() {
     let db = code_store("remember");
 
     let reply = one_task_call(
@@ -4281,19 +3908,28 @@ fn remember_writes_note_and_rejects_unknown_about() {
     assert_eq!(key.len(), "note:".len() + 16, "{key}");
     assert!(db.read().has_node(&key), "the note must be in the store");
 
-    // Two unknown keys: both are named, sorted, and nothing is written.
-    let before = db.read().node_count();
+    // Two unknown keys: both are named as provisional and written, not refused.
     let reply = one_task_call(
         db.clone(),
         "remember",
-        json!({"text": "about nothing that exists", "about": ["zzz.rs", "no/such.rs"]}),
+        json!({"text": "about nothing that exists yet", "about": ["zzz.rs", "no/such.rs"]}),
     );
-    let msg = error_text(&reply);
+    let text = task_reply(&reply);
     assert!(
-        msg.contains("no/such.rs") && msg.contains("zzz.rs"),
-        "{msg}"
+        text.contains("zzz.rs") && text.contains("no/such.rs") && text.contains("provisional"),
+        "{text}"
     );
-    assert_eq!(db.read().node_count(), before, "nothing may be written");
+    let g = db.read();
+    assert_eq!(
+        g.get_prop("zzz.rs", core_api::memory_schema::PROVISIONAL_PROP),
+        Some(Value::Bool(true)),
+        "an unknown about key must land as a provisional entity"
+    );
+    assert_eq!(
+        g.get_prop("no/such.rs", core_api::memory_schema::PROVISIONAL_PROP),
+        Some(Value::Bool(true)),
+        "an unknown about key must land as a provisional entity"
+    );
 }
 
 /// Binding: `remember` needs text.
@@ -4314,32 +3950,6 @@ fn remember_rejects_an_unknown_kind() {
     assert!(error_text(&reply).contains("kind"));
 }
 
-/// Binding: `sync` cannot run without knowing where the store is, and says so.
-#[test]
-fn sync_without_db_dir_is_a_tool_error() {
-    let reply = one_task_call(code_store("sync-no-dir"), "sync", json!({}));
-    let msg = error_text(&reply);
-    assert!(msg.contains("store path unknown"), "{msg}");
-}
-
-/// Binding: with a store path, `sync` runs this binary and reports what it
-/// could not do rather than panicking.
-#[test]
-fn sync_with_db_dir_reports_the_child_failure() {
-    let dir = tmp("sync-with-dir");
-    let db = SharedDb::open(&dir).expect("open");
-    let (res, out) = exchange_at(db.clone(), Some(dir.clone()), &call(1, "sync", json!({})));
-    assert!(res.is_ok(), "{res:?}");
-    let reply = parse_lines(&out).remove(0);
-    // `current_exe()` under `cargo test` is this test binary, not the CLI, so
-    // the run cannot produce a sync report. What matters is that the tool
-    // reports that as an error instead of hanging or panicking.
-    let msg = error_text(&reply);
-    assert!(msg.contains("sync"), "{msg}");
-    drop(db);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// Binding: every task tool stamps its text with the untrusted-data framing
 /// line, exactly once, before any repository content.
 ///
@@ -4350,30 +3960,19 @@ fn sync_with_db_dir_reports_the_child_failure() {
 fn every_task_tool_frames_its_text_as_untrusted() {
     let db = code_store("framing");
     let args = |tool: &str| match tool {
-        "explore" | "context" => json!({"target": "core::init"}),
-        "impact" => json!({"files": ["src/core.rs"]}),
-        "owners" => json!({"path": "src/core.rs"}),
-        "why" | "explain_association" => json!({"a": "src/core.rs", "b": "src/web.rs"}),
+        "explain_association" => json!({"a": "src/core.rs", "b": "src/web.rs"}),
         "recall" => json!({"topic": "src/core.rs"}),
         "remember" => json!({"text": "framing check", "about": ["src/core.rs"]}),
         "node_edges" | "neighborhood" => json!({"key": "src/core.rs"}),
         "edges_at" => json!({"key": "src/core.rs", "at": 0}),
         "what_if" => json!({"key": "src/core.rs", "field": "lines", "value": 2}),
+        "analyze" => json!({"kind": "central"}),
+        // Last in the sweep, and a property the node does not carry: it
+        // answers without removing anything a later tool would read.
+        "forget" => json!({"key": "src/core.rs", "prop": "no_such_prop"}),
         _ => json!({}),
     };
     for tool in TASK_TOOLS {
-        // `sync` is the one tool left that answers with an error here: it
-        // needs the store path this transcript does not pass. A tool error is
-        // a message to the caller, not graph content, and carries no framing
-        // by design.
-        if tool == "sync" {
-            let reply = one_task_call(db.clone(), tool, args(tool));
-            assert!(
-                !error_text(&reply).starts_with(UNTRUSTED_FRAMING),
-                "a tool error is not graph content"
-            );
-            continue;
-        }
         let reply = one_task_call(db.clone(), tool, args(tool));
         let full = reply["result"]["content"][0]["text"]
             .as_str()
@@ -4401,9 +4000,9 @@ fn every_task_tool_frames_its_text_as_untrusted() {
 #[test]
 fn json_true_answers_with_the_report_as_the_text() {
     let db = code_store("json-arg");
-    let (digest, report) = task_both(db, "impact", json!({"files": ["src/core.rs"]}));
-    assert!(digest.starts_with("mushroomdb impact"), "{digest}");
-    assert_eq!(report["files"][0]["path"], json!("src/core.rs"));
+    let (digest, report) = task_both(db, "node_edges", json!({"key": "src/core.rs"}));
+    assert!(digest.contains("src/core.rs"), "{digest}");
+    assert_eq!(report["key"], json!("src/core.rs"));
     assert!(
         report.get("text").is_none(),
         "the report must not carry a copy of the digest: {report}"
@@ -4463,21 +4062,29 @@ fn a_json_reply_is_unframed_and_sanitized() {
 /// Binding: the one control character a JSON value keeps is the newline, and
 /// keeping it is what makes the report faithful.
 ///
-/// `recall`'s report carries the whole rendered digest under `digest`, and
-/// `context` carries quoted source. Those newlines are the document's own
-/// structure, not something a contributor injected — a JSON value is delimited
-/// by the grammar, so nothing inside one can forge a line the way it could in
-/// a line-structured digest.
+/// `recall`'s report carries the whole rendered digest under `digest`. Those
+/// newlines are the document's own structure, not something a contributor
+/// injected — a JSON value is delimited by the grammar, so nothing inside one
+/// can forge a line the way it could in a line-structured digest.
 #[test]
 fn a_json_reply_keeps_the_newlines_of_a_multi_line_value() {
     let db = code_store("json-multiline");
-    let report = task_report(db, "recall", json!({"topic": "src/core.rs"}));
+    let report = task_report(db.clone(), "recall", json!({"topic": "src/core.rs"}));
     let digest = report["digest"].as_str().expect("digest");
     assert!(
         digest.lines().count() > 2,
         "the rendered digest must survive as a document, not one flat line: {digest:?}"
     );
-    assert!(digest.starts_with(UNTRUSTED_FRAMING), "{digest:?}");
+    // The framing line is a transport concern the text wrapper owns now, not
+    // core-api's digest — a json reply never carries it (see
+    // `a_json_reply_is_unframed_and_sanitized`), so it is the plain-text reply
+    // of the same call that must open with it.
+    let text = task_text(&one_task_call(
+        db,
+        "recall",
+        json!({"topic": "src/core.rs"}),
+    ));
+    assert!(text.starts_with(UNTRUSTED_FRAMING), "{text:?}");
 }
 
 /// Every string value in a JSON reply, at any depth.
@@ -4494,23 +4101,40 @@ fn collect_strings(value: &Js, out: &mut Vec<String>) {
 /// so rather than served a digest it did not ask for.
 #[test]
 fn a_wrong_typed_json_argument_is_a_tool_error() {
-    let reply = one_task_call(code_store("json-bad"), "map", json!({"json": "yes"}));
+    let reply = one_task_call(
+        code_store("json-bad"),
+        "recall",
+        json!({"topic": "src/core.rs", "json": "yes"}),
+    );
     assert!(error_text(&reply).contains("json must be a boolean"));
 }
 
-/// Binding: `recall` carries the framing line its own digest already emits, and
-/// does not gain a second one.
+/// Binding: `recall`'s reply carries the framing line exactly once, first,
+/// whether the topic matched or not. The digest itself never carries it — only
+/// the text wrapper stamps it, and the wrapper no longer checks for a copy
+/// already there — so this test is what keeps a second stamp from appearing.
 #[test]
 fn recall_is_framed_once_not_twice() {
     let db = code_store("recall-framing");
+    let no_match = task_text(&one_task_call(
+        db.clone(),
+        "recall",
+        json!({"topic": "zzqx-nothing-matches-this"}),
+    ));
+    assert!(no_match.starts_with(UNTRUSTED_FRAMING), "{no_match}");
+    assert_eq!(no_match.matches(UNTRUSTED_FRAMING).count(), 1, "{no_match}");
+
     let reply = one_task_call(db.clone(), "recall", json!({"topic": "src/core.rs"}));
     let full = task_text(&reply);
+    assert!(full.starts_with(UNTRUSTED_FRAMING), "{full}");
     assert_eq!(full.matches(UNTRUSTED_FRAMING).count(), 1, "{full}");
-    // The digest core-api produced is what was shown, unaltered.
+    // What is left after stripping the one framing line is exactly the json
+    // reply's own digest — the same body, whichever way it was asked for.
+    let body = task_reply(&reply);
     assert_eq!(
         task_report(db, "recall", json!({"topic": "src/core.rs"}))["digest"],
-        json!(full),
-        "recall's own digest already opens with the framing line"
+        json!(body),
+        "the framed text and the json digest carry the same body"
     );
 }
 
@@ -5288,6 +4912,128 @@ fn upsert_entity_does_not_count_a_no_op_namespace() {
     assert_eq!(db.read().namespace_of("a1").as_deref(), Some("tenant-a"));
 }
 
+/// Binding: a provisional entity `remember` creates is stuck at its
+/// creation-time label forever — the engine has no label-mutation path at
+/// all — so `upsert_entity` naming a different label on an existing key is a
+/// refusal, not a silent accept-and-drop. Fix round 3, 0.7 (corrected from
+/// fix round 2's weaker "disclose it" call): a supplied `label` was
+/// previously ignored on *every* update, not only a provisional stub's, and
+/// `{"ok":true,"created":false}` beside a dropped field is not a signal an
+/// agent acts on for a mistake this permanent. On a clean binary,
+/// `remember{about:["matthew"]}` then
+/// `upsert_entity{key:"matthew", label:"Person", ...}` used to report
+/// `{"ok":true,"created":false}` and leave the node permanently `Entity`,
+/// invisible to `MATCH (n:Person)`.
+#[test]
+fn upsert_entity_on_an_existing_key_with_a_different_label_is_refused() {
+    let db = open("upsert-label-mismatch");
+
+    // An unknown `about` key is created provisional, label `Entity`.
+    let remembered = one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matthew reviewed it", "about": ["matthew"]}),
+    );
+    task_reply(&remembered); // panics if `remember` errored
+    assert_eq!(
+        db.read().node_info("matthew").map(|n| n.label),
+        Some("Entity".to_string())
+    );
+
+    let refused = one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew", "label": "Person", "props": {"name": "Matthew Sherlin"}}),
+    );
+    let msg = error_text(&refused);
+    assert!(
+        msg.contains("Person") && msg.contains("Entity"),
+        "the refusal must name both the requested and the stored label: {msg}"
+    );
+
+    // All-or-nothing, like every other pre-write refusal this tool makes: the
+    // label could not be honoured, so none of `props` was written either.
+    let g = db.read();
+    assert_eq!(
+        g.node_info("matthew").map(|n| n.label),
+        Some("Entity".to_string())
+    );
+    assert_eq!(
+        g.get_prop("matthew", "name"),
+        Some(Value::Str("matthew".into())),
+        "a refused label change must not leave props partially written — \
+         `name` must still be the provisional stub's own key, not \"Matthew Sherlin\""
+    );
+    drop(g);
+    let count = content_json(&one_task_call(
+        db.clone(),
+        "query",
+        json!({"cypher": "MATCH (n:Entity) RETURN count(n) AS c"}),
+    ));
+    assert_eq!(
+        count["rows"],
+        json!([[1]]),
+        "the node must still be reachable by its real label: {count}"
+    );
+
+    // Naming the label the node already has still works — only a *different*
+    // label is refused.
+    let same = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew", "label": "Entity", "props": {"name": "Matthew Sherlin"}}),
+    ));
+    assert_eq!(same["ok"], json!(true), "{same}");
+    assert_eq!(same["label"], json!("Entity"), "{same}");
+}
+
+/// Binding: the correct path — naming the label in `remember`'s `entities` at
+/// first mention — produces a correctly labelled, non-provisional node with
+/// its `ABOUT` edge intact, and `recall` finds it. This is the escape the
+/// refusal above points callers to.
+#[test]
+fn remember_entities_names_the_label_correctly_the_first_time() {
+    let db = open("remember-entities-label");
+    let remembered = one_task_call(
+        db.clone(),
+        "remember",
+        json!({
+            "text": "Matthew reviewed the launch copy",
+            "about": ["matthew"],
+            "entities": [{"key": "matthew", "label": "Person", "props": {"name": "Matthew Sherlin"}}]
+        }),
+    );
+    task_reply(&remembered);
+
+    let g = db.read();
+    assert_eq!(
+        g.node_info("matthew").map(|n| n.label),
+        Some("Person".to_string()),
+        "an entity named at first mention must be created under the label given, not `Entity`"
+    );
+    assert_eq!(
+        g.get_prop("matthew", core_api::memory_schema::PROVISIONAL_PROP),
+        None,
+        "a described entity must never be marked provisional"
+    );
+    let edges = g.node_edges("matthew").expect("node_edges");
+    assert!(
+        edges.iter().any(|e| e.edge_type == "ABOUT"),
+        "the ABOUT edge must still land: {edges:?}"
+    );
+    drop(g);
+
+    let recalled = task_reply(&one_task_call(
+        db,
+        "recall",
+        json!({"topic": "Matthew Sherlin"}),
+    ));
+    assert!(
+        recalled.contains("matthew"),
+        "recall must find the correctly-labelled entity: {recalled}"
+    );
+}
+
 /// Binding: `stats` with a `role` on a store whose `roles.json` was corrupt at
 /// open says what `query` with a `role` says — the cause, not "unknown role".
 #[test]
@@ -5361,19 +5107,10 @@ fn every_tool_the_skill_names_is_advertised() {
     assert!(res.is_ok(), "{res:?}");
     let advertised = names_from(&out);
 
-    // The code-door tools are deprecated and deliberately unlisted on a memory
-    // store; the skill names them in the paragraph that says so.
-    const DEPRECATED: [&str; 7] = [
-        "explore", "map", "context", "impact", "owners", "why", "sync",
-    ];
-
     let mut named: Vec<String> = Vec::new();
     for chunk in skill.split('`').skip(1).step_by(2) {
         let name = chunk.trim();
-        if served.iter().any(|s| s == name)
-            && !DEPRECATED.contains(&name)
-            && !named.iter().any(|n| n == name)
-        {
+        if served.iter().any(|s| s == name) && !named.iter().any(|n| n == name) {
             named.push(name.to_string());
         }
     }
@@ -5389,5 +5126,1735 @@ fn every_tool_the_skill_names_is_advertised() {
          tools/list does not advertise. A host builds its tool set from that \
          listing, so the model cannot reach them however well the server \
          serves them. Either advertise them or stop naming them."
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// schema — "what's in here?"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A store created the way `mushroomdb mcp` creates one: the memory schema
+/// applied, nothing written.
+fn memory_store(name: &str) -> SharedDb {
+    let db = open(name);
+    db.write()
+        .apply_schema(&core_api::memory_schema::memory_defaults())
+        .unwrap();
+    db
+}
+
+/// A rule over `name`, written straight to the store as a test fixture.
+fn same_name_rule() -> core_api::RuleDef {
+    core_api::RuleDef {
+        name: "same_name".into(),
+        src_label: "Person".into(),
+        dst_label: "Person".into(),
+        predicate: core_api::Predicate::FieldEqual {
+            field: "name".into(),
+        },
+        edge_type: "SAME_NAME".into(),
+        weight_prop: Some("weight".into()),
+        max_edges: Some(32),
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    }
+}
+
+/// Binding: `schema` answers with what `stats` never carried — labels with
+/// their fields, edge types, every rule with its predicate, the full-text and
+/// equality declarations, and the provisional nodes `remember` stubbed.
+#[test]
+fn schema_names_labels_rules_indexes_and_provisional_nodes() {
+    let db = memory_store("schema-full");
+    db.write().create_rule(same_name_rule()).unwrap();
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Reid reviewed the copy", "about": ["reid"]}),
+    );
+    seed_person(&db, "matthew");
+
+    let text = task_reply(&one_task_call(db.clone(), "schema", json!({})));
+    for want in [
+        "labels:",
+        "Person (1)",
+        "Entity (1)",
+        "rules:",
+        "same_name: Person → Person derives SAME_NAME — field_equal on name (global)",
+        "full-text (recall searches these):",
+        "Note.text",
+        "equality indexes:",
+        "Person.name",
+        "provisional: 1 — named but not yet described: reid",
+    ] {
+        assert!(text.contains(want), "schema missing {want:?}:\n{text}");
+    }
+}
+
+/// Binding: the report behind it, for a program — counts, not prose.
+#[test]
+fn schema_json_carries_every_declaration() {
+    let db = memory_store("schema-json");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "two unknowns", "about": ["reid", "ada"]}),
+    );
+    let report = task_report(db, "schema", json!({}));
+    assert_eq!(report["provisional"], json!(2));
+    assert_eq!(report["provisional_sample"], json!(["ada", "reid"]));
+    assert!(
+        report["indexes"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(["Person", "name"])),
+        "{report}"
+    );
+    assert!(
+        report["fulltext"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(["Note", "text"])),
+        "{report}"
+    );
+}
+
+/// Binding: a store with nothing in it still answers, and says what it has
+/// declared — a memory store is created with its indexes before any node.
+#[test]
+fn schema_on_an_empty_memory_store_lists_its_declarations() {
+    let text = task_reply(&one_task_call(
+        memory_store("schema-empty"),
+        "schema",
+        json!({}),
+    ));
+    assert!(text.contains("0 node(s)"), "{text}");
+    assert!(text.contains("Person.name"), "{text}");
+    assert!(
+        !text.contains("provisional:"),
+        "nothing provisional: {text}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// forget — "forget that"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Review focus: forgetting a key many notes were about deletes the node and
+/// names the notes — capped, counted — without touching their text.
+#[test]
+fn forgetting_a_key_many_notes_name_lists_them_and_keeps_them() {
+    let db = memory_store("forget-many");
+    for i in 0..25 {
+        one_task_call(
+            db.clone(),
+            "remember",
+            json!({"text": format!("Reid fact number {i}"), "about": ["reid"]}),
+        );
+    }
+    let text = task_reply(&one_task_call(db.clone(), "forget", json!({"key": "reid"})));
+    assert!(text.starts_with("forgot reid (Entity)"), "{text}");
+    assert!(text.contains("25 note(s) still say it"), "{text}");
+    assert!(
+        text.contains("(+15 more)"),
+        "ten named, fifteen counted: {text}"
+    );
+    assert!(text.contains("history still holds it"), "{text}");
+    assert!(text.contains("`mushroomdb migrate`"), "{text}");
+    let g = db.read();
+    assert!(!g.has_node("reid"), "the node is gone");
+    assert_eq!(
+        g.nodes_with_label("Note").len(),
+        25,
+        "every note is still there"
+    );
+}
+
+/// Binding: removing one property — the one deletion MCP had no path to,
+/// because Cypher here has no REMOVE.
+#[test]
+fn forgetting_a_property_removes_only_that_property() {
+    let db = memory_store("forget-prop");
+    one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew", "label": "Person",
+               "props": {"name": "Matthew", "email": "m@example.com"}}),
+    );
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "matthew", "prop": "email"}),
+    ));
+    assert!(text.starts_with("forgot matthew.email"), "{text}");
+    assert_eq!(db.read().get_prop("matthew", "email"), None);
+    assert_eq!(
+        db.read().get_prop("matthew", "name"),
+        Some(Value::Str("Matthew".into()))
+    );
+
+    let again = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "matthew", "prop": "email"}),
+    ));
+    assert!(again.contains("is not set; nothing to forget"), "{again}");
+    assert!(
+        !again.contains("history still holds it"),
+        "nothing was written, so there is nothing in history to warn about: {again}"
+    );
+}
+
+/// A forgotten name takes its words out of the store-maintained `aliases` in
+/// the same write, and the reply says so. Forgetting any other property says
+/// nothing about aliases, and a declared alias is not touched.
+#[test]
+fn forgetting_a_name_takes_its_words_out_of_aliases_and_says_so() {
+    let db = memory_store("forget-name");
+    one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "jane", "label": "Person",
+               "props": {"name": "Jane Q Public", "email": "j@example.com"},
+               "aliases": ["JQP"]}),
+    );
+    assert_eq!(
+        aliases_in(&db, "jane"),
+        vec!["jane", "jane q public", "public", "q"]
+    );
+    let email = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "jane", "prop": "email"}),
+    ));
+    assert!(!email.contains("aliases"), "{email}");
+
+    let name = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "jane", "prop": "name"}),
+    ));
+    assert!(name.starts_with("forgot jane.name"), "{name}");
+    assert!(
+        name.contains(
+            "its words left `aliases` in the same write; `aliases` now holds what the key \
+             alone implies\n"
+        ),
+        "{name}"
+    );
+    assert!(!name.contains("remain"), "{name}");
+    assert_eq!(aliases_in(&db, "jane"), vec!["jane"], "the reply is true");
+    assert_eq!(
+        db.read().get_prop("jane", "alias_keys"),
+        Some(Value::List(vec![Value::Str("JQP".into())])),
+        "what was declared stays, and nothing of the name was added to it"
+    );
+    assert_eq!(db.read().get_prop("jane", "name"), None);
+
+    // The json says the same, and a second forget has nothing to rewrite.
+    one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "jane", "props": {"name": "Jane Q Public"}}),
+    );
+    let forget_name = json!({"key": "jane", "prop": "name"});
+    let report = task_report(db.clone(), "forget", forget_name.clone());
+    assert_eq!(report["aliases_rewritten"], json!(true), "{report}");
+    let report = task_report(db.clone(), "forget", forget_name);
+    assert_eq!(report["changed"], json!(false), "{report}");
+    assert_eq!(report["aliases_rewritten"], json!(false), "{report}");
+
+    // A node the memory tools never described has no `aliases`, and a forget
+    // does not give it one.
+    db.write()
+        .insert_node(
+            "Doc",
+            "readme",
+            vec![("name".into(), Value::Str("Read Me".into()))],
+        )
+        .unwrap();
+    let doc = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "readme", "prop": "name"}),
+    ));
+    assert!(doc.starts_with("forgot readme.name"), "{doc}");
+    assert!(!doc.contains("aliases"), "{doc}");
+    assert_eq!(db.read().get_prop("readme", "aliases"), None);
+}
+
+/// With the identity preset, forgetting a name retracts the link the name
+/// made, in that same write, and the reply counts it.
+#[test]
+fn forgetting_a_name_retracts_the_link_it_made() {
+    let db = linked_pair_store("forget-name-link");
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "msherlin", "prop": "name"}),
+    ));
+    assert!(
+        text.contains("2 derived edge(s) retracted because a rule read name or aliases"),
+        "{text}"
+    );
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 0);
+}
+
+/// Binding: retracting a fact removes the edge and names the notes whose text
+/// still states it.
+#[test]
+fn forgetting_a_fact_retracts_the_edge_and_names_the_notes_behind_it() {
+    let db = memory_store("forget-fact");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({
+            "text": "Matthew wants 0.7 to focus on the write path",
+            "about": ["matthew", "v0.7"],
+            "entities": [{"key": "matthew", "label": "Person"},
+                         {"key": "v0.7", "label": "Release"}],
+            "facts": [{"subject": "matthew", "predicate": "WANTS", "object": "v0.7"}]
+        }),
+    );
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"fact": {"subject": "matthew", "predicate": "WANTS", "object": "v0.7"}}),
+    ));
+    assert!(text.starts_with("retracted WANTS matthew → v0.7"), "{text}");
+    assert!(text.contains("1 note(s) still say it"), "{text}");
+    assert!(
+        db.read()
+            .neighbors("matthew", "WANTS", core_api::Direction::Out)
+            .unwrap()
+            .is_empty(),
+        "the edge is gone"
+    );
+}
+
+/// Binding: an edge a rule derived cannot be retracted by hand; the refusal
+/// names the rule and the only two ways it can change.
+#[test]
+fn forgetting_a_rule_owned_fact_is_refused_with_the_rule_named() {
+    let db = memory_store("forget-owned");
+    db.write().create_rule(same_name_rule()).unwrap();
+    for key in ["a", "b"] {
+        db.write()
+            .insert_node("Person", key, vec![("name".into(), Value::Str("X".into()))])
+            .unwrap();
+    }
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"fact": {"subject": "a", "predicate": "SAME_NAME", "object": "b"}}),
+    ));
+    assert!(err.contains("derived by rule same_name"), "{err}");
+    assert!(err.contains("(name)"), "the field the rule reads: {err}");
+    assert!(err.contains("Nothing was written"), "{err}");
+    assert_eq!(
+        db.read()
+            .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+            .unwrap(),
+        vec!["b".to_string()]
+    );
+}
+
+/// Binding: exactly one of the three shapes, and an unknown key is named.
+#[test]
+fn forget_takes_exactly_one_shape_and_names_an_unknown_key() {
+    let db = memory_store("forget-shape");
+    seed_person(&db, "a");
+    for args in [
+        json!({}),
+        json!({"prop": "name"}),
+        json!({"key": "a", "fact": {"subject": "a", "predicate": "X", "object": "a"}}),
+    ] {
+        let err = error_text(&one_task_call(db.clone(), "forget", args.clone()));
+        assert!(err.contains("pass exactly one of"), "{args}: {err}");
+    }
+    let err = error_text(&one_task_call(db, "forget", json!({"key": "nobody"})));
+    assert!(err.contains("nobody"), "{err}");
+}
+
+/// Binding: removing a property a rule reads retracts the edges that rule
+/// derived from it, and the reply says so rather than only "forgot k.name".
+#[test]
+fn forgetting_a_property_a_rule_reads_reports_the_derived_edges_it_retracts() {
+    let db = memory_store("forget-prop-derived");
+    db.write().create_rule(same_name_rule()).unwrap();
+    for key in ["a", "b"] {
+        db.write()
+            .insert_node("Person", key, vec![("name".into(), Value::Str("X".into()))])
+            .unwrap();
+    }
+    assert_eq!(
+        db.read()
+            .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+            .unwrap(),
+        vec!["b".to_string()],
+        "precondition: the rule linked them"
+    );
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "a", "prop": "name"}),
+    ));
+    assert!(text.starts_with("forgot a.name"), "{text}");
+    assert!(
+        text.contains("derived edge(s) retracted because a rule read name"),
+        "{text}"
+    );
+    assert!(!text.contains("0 derived edge(s) retracted"), "{text}");
+    let g = db.read();
+    assert!(g
+        .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+        .unwrap()
+        .is_empty());
+    assert!(g
+        .neighbors("b", "SAME_NAME", core_api::Direction::Out)
+        .unwrap()
+        .is_empty());
+}
+
+/// Binding: a property no rule reads retracts nothing, and the reply does not
+/// claim it did.
+#[test]
+fn forgetting_a_property_no_rule_reads_reports_no_derived_edges() {
+    let db = memory_store("forget-prop-plain");
+    db.write().create_rule(same_name_rule()).unwrap();
+    for key in ["a", "b"] {
+        db.write()
+            .insert_node(
+                "Person",
+                key,
+                vec![
+                    ("name".into(), Value::Str("X".into())),
+                    ("email".into(), Value::Str(format!("{key}@example.com"))),
+                ],
+            )
+            .unwrap();
+    }
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "a", "prop": "email"}),
+    ));
+    assert!(!text.contains("derived edge(s) retracted"), "{text}");
+    assert_eq!(
+        db.read()
+            .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+            .unwrap(),
+        vec!["b".to_string()]
+    );
+}
+
+/// Binding: a fact naming a key the store does not have is refused with the
+/// key named, and nothing is written.
+#[test]
+fn forgetting_a_fact_with_an_unknown_subject_names_it_and_writes_nothing() {
+    let db = memory_store("forget-fact-unknown");
+    seed_person(&db, "a");
+    let (nodes, edges, seq) = {
+        let g = db.read();
+        (g.stats().nodes_live, g.stats().edges, g.commit_seq())
+    };
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"fact": {"subject": "ghost", "predicate": "KNOWS", "object": "a"}}),
+    ));
+    assert!(err.contains("ghost"), "{err}");
+    let g = db.read();
+    assert_eq!(g.stats().nodes_live, nodes);
+    assert_eq!(g.stats().edges, edges);
+    assert_eq!(g.commit_seq(), seq, "nothing was committed");
+}
+
+/// Binding: a fact whose ends exist but are not linked retracts nothing, says
+/// so, and does not warn about history it did not write.
+#[test]
+fn forgetting_an_absent_fact_says_nothing_to_retract() {
+    let db = memory_store("forget-fact-absent");
+    seed_person(&db, "a");
+    seed_person(&db, "b");
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"fact": {"subject": "a", "predicate": "KNOWS", "object": "b"}}),
+    ));
+    assert!(
+        text.contains("no edge KNOWS a → b; nothing to retract"),
+        "{text}"
+    );
+    assert!(!text.contains("history still holds it"), "{text}");
+}
+
+/// Binding: an absent fact is nothing to retract even when a rule's predicate
+/// matches the pair. The engine's delete guard refuses before it looks for
+/// the edge (ledger row 67); the reply is the absent-fact reply, byte for
+/// byte, not a refusal about an edge "written by hand".
+#[test]
+fn forgetting_an_absent_fact_a_rule_matches_says_nothing_to_retract() {
+    let reply = |name: &str, with_rule: bool| {
+        let db = memory_store(name);
+        for key in ["a", "b"] {
+            db.write()
+                .insert_node("Person", key, vec![("name".into(), Value::Str("X".into()))])
+                .unwrap();
+        }
+        if with_rule {
+            // A via-hop rule with no via node: it derives nothing.
+            let mut rule = same_name_rule();
+            rule.via_label = Some("Team".into());
+            rule.via_edge = Some("MEMBER_OF".into());
+            db.write().create_rule(rule).unwrap();
+        }
+        let seq = db.read().commit_seq();
+        let text = task_reply(&one_task_call(
+            db.clone(),
+            "forget",
+            json!({"fact": {"subject": "a", "predicate": "SAME_NAME", "object": "b"}}),
+        ));
+        assert_eq!(db.read().commit_seq(), seq, "nothing was committed");
+        text
+    };
+    let text = reply("forget-absent-rule", true);
+    assert!(
+        text.contains("no edge SAME_NAME a → b; nothing to retract"),
+        "{text}"
+    );
+    assert_eq!(text, reply("forget-absent-no-rule", false));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// suggest_rules — "what relationships are in my data?"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A memory store the way `remember` fills one — notes with kinds, sources
+/// and timestamps — plus people with a field worth a rule.
+fn suggest_store(name: &str) -> SharedDb {
+    let db = memory_store(name);
+    for i in 0..30 {
+        let kind = ["note", "decision", "todo"][i % 3];
+        let source = ["session-a", "session-b"][i % 2];
+        one_task_call(
+            db.clone(),
+            "remember",
+            json!({
+                "text": format!("note {i} about the release"),
+                "kind": kind,
+                "source": source,
+                "ts": 1_759_000_000 + i as i64,
+            }),
+        );
+    }
+    for i in 0..12 {
+        let team = ["infra", "ui"][i % 2];
+        one_task_call(
+            db.clone(),
+            "upsert_entity",
+            json!({"key": format!("p{i}"), "label": "Person",
+                   "props": {"name": format!("Person {i}"), "team": team}}),
+        );
+    }
+    db
+}
+
+/// Binding (R5): on a store `remember` filled, nothing is proposed over a
+/// field the store writes for itself — and the filter is shown to have fired.
+#[test]
+fn suggest_rules_never_proposes_a_bookkeeping_field() {
+    let report = task_report(suggest_store("suggest-noise"), "suggest_rules", json!({}));
+    let bookkeeping = [
+        "ns",
+        "kind",
+        "ts",
+        "source",
+        "provisional",
+        "id",
+        "aliases",
+        "alias_keys",
+    ];
+    for s in report["suggestions"].as_array().expect("suggestions") {
+        let args = s["create_rule_args"].to_string();
+        for f in bookkeeping {
+            assert!(
+                !args.contains(&format!("\"field\":\"{f}\"")),
+                "proposed a rule over bookkeeping field {f}: {s}"
+            );
+        }
+    }
+    assert!(
+        report["bookkeeping_hidden"].as_u64().unwrap() > 0,
+        "this store's notes share kind, source and ts; the filter must have dropped those: {report}"
+    );
+    assert!(
+        report["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["edge_type"] == "SAME_TEAM"),
+        "the one real pattern survives: {report}"
+    );
+}
+
+/// Binding (R5): a proposal's arguments are what `create_rule` takes — no
+/// nulls, `weight_prop` written out — and passing them unchanged creates
+/// exactly the rule proposed. The tool itself creates nothing.
+#[test]
+fn a_proposal_is_accepted_by_create_rule_unchanged() {
+    let db = suggest_store("suggest-roundtrip");
+    let rules_before = db.read().rules().len();
+    let report = task_report(db.clone(), "suggest_rules", json!({}));
+    assert_eq!(
+        db.read().rules().len(),
+        rules_before,
+        "suggest_rules created a rule"
+    );
+
+    let s = report["suggestions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["edge_type"] == "SAME_TEAM")
+        .expect("SAME_TEAM proposed")
+        .clone();
+    let args = s["create_rule_args"].clone();
+    let obj = args.as_object().unwrap();
+    assert!(obj.values().all(|v| !v.is_null()), "a null in {args}");
+    assert!(obj.contains_key("weight_prop"), "{args}");
+    assert!(!obj.contains_key("namespace"), "{args}");
+
+    let (res, out) = exchange(db.clone(), &call(1, "create_rule", args.clone()));
+    assert!(res.is_ok(), "{res:?}");
+    let reply = parse_lines(&out).remove(0);
+    assert_eq!(content_json(&reply)["ok"], json!(true), "{reply}");
+    let created = db
+        .read()
+        .rules()
+        .into_iter()
+        .find(|r| r.name == s["name"].as_str().unwrap())
+        .expect("the proposed rule now exists");
+    assert_eq!(
+        serde_json::to_value(&created.predicate).unwrap(),
+        args["predicate"]
+    );
+}
+
+/// Binding: every proposal says it is global, and the listing is bounded.
+#[test]
+fn proposals_say_they_are_global_and_stop_at_five() {
+    let db = memory_store("suggest-many");
+    for (i, label) in ["Red", "Green", "Blue"].iter().cycle().take(18).enumerate() {
+        db.write()
+            .insert_node(
+                label,
+                &format!("n{i}"),
+                vec![("colour".into(), Value::Str(["warm", "cool"][i % 2].into()))],
+            )
+            .unwrap();
+    }
+    let (text, report) = task_both(db, "suggest_rules", json!({}));
+    let listed = report["suggestions"].as_array().unwrap().len();
+    assert_eq!(listed, 5, "{report}");
+    assert!(report["total"].as_u64().unwrap() > 5, "{report}");
+    assert_eq!(
+        text.matches("global: links across namespaces").count(),
+        5,
+        "{text}"
+    );
+    assert!(text.contains("… and "), "the rest are counted: {text}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// analyze — "what matters here, what clusters?"
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Two linked groups — a star of five around `hub` and a pair — and four
+/// nodes linked to nothing.
+fn analyze_store(name: &str) -> SharedDb {
+    let db = memory_store(name);
+    {
+        let mut g = db.write();
+        for key in [
+            "hub", "s1", "s2", "s3", "s4", "p1", "p2", "lone1", "lone2", "lone3", "lone4",
+        ] {
+            g.insert_node("Person", key, vec![("name".into(), Value::Str(key.into()))])
+                .unwrap();
+        }
+        for s in ["s1", "s2", "s3", "s4"] {
+            g.insert_edge("KNOWS", s, "hub").unwrap();
+        }
+        g.insert_edge("KNOWS", "p1", "p2").unwrap();
+    }
+    db
+}
+
+#[test]
+fn analyze_central_ranks_the_hub_first_with_its_label() {
+    let (text, report) = task_both(
+        analyze_store("analyze-central"),
+        "analyze",
+        json!({"kind": "central", "top": 3}),
+    );
+    assert!(text.contains("  1. hub [Person]"), "{text}");
+    assert!(
+        text.contains("PageRank over every edge type, following edge direction, converged"),
+        "{text}"
+    );
+    assert_eq!(report["listed"], json!(3), "{report}");
+    assert_eq!(report["nodes"], json!(11), "{report}");
+}
+
+/// Binding: components are grouped, with sizes, never listed node by node.
+#[test]
+fn analyze_components_reports_groups_and_counts_singletons() {
+    let (text, report) = task_both(
+        analyze_store("analyze-wcc"),
+        "analyze",
+        json!({"kind": "components"}),
+    );
+    assert!(
+        text.contains("6 component(s) over 11 node(s)")
+            && text.contains("largest 5; 4 singleton(s)"),
+        "{text}"
+    );
+    assert!(text.contains("  1. size 5 — hub, s1, s2, s3, s4"), "{text}");
+    assert!(text.contains("  2. size 2 — p1, p2"), "{text}");
+    assert_eq!(
+        report["listed"],
+        json!(2),
+        "singletons are counted, not listed"
+    );
+}
+
+/// Binding (R6): clusters drops singletons and says how many.
+#[test]
+fn analyze_clusters_drops_singletons_and_says_how_many() {
+    let (text, report) = task_both(
+        analyze_store("analyze-louvain"),
+        "analyze",
+        json!({"kind": "clusters"}),
+    );
+    assert!(text.contains("4 singleton(s) not listed"), "{text}");
+    assert_eq!(report["singletons"], json!(4), "{report}");
+    for row in report["rows"].as_array().unwrap() {
+        assert!(row["size"].as_u64().unwrap() > 1, "{row}");
+    }
+}
+
+/// Floats at fixed precision: the json reply rounds as the text does — 3
+/// places for modularity, 2 for cohesion. Two triangles joined by one edge
+/// score modularity 6/7 - 1/2 = 0.357142…, which has no exact decimal form.
+#[test]
+fn analyze_clusters_json_rounds_its_floats_as_the_text_does() {
+    let db = memory_store("analyze-rounding");
+    {
+        let mut g = db.write();
+        for key in ["a", "b", "c", "d", "e", "f"] {
+            g.insert_node("Person", key, vec![("name".into(), Value::Str(key.into()))])
+                .unwrap();
+        }
+        for (s, d) in [
+            ("a", "b"),
+            ("b", "c"),
+            ("a", "c"),
+            ("d", "e"),
+            ("e", "f"),
+            ("d", "f"),
+            ("c", "d"),
+        ] {
+            g.insert_edge("KNOWS", s, d).unwrap();
+        }
+    }
+    let report = task_report(db, "analyze", json!({"kind": "clusters"}));
+    assert_eq!(report["modularity"], json!(0.357), "{report}");
+    for row in report["rows"].as_array().unwrap() {
+        let c = row["cohesion"].as_f64().unwrap();
+        assert_eq!(c, (c * 100.0).round() / 100.0, "{row}");
+    }
+}
+
+/// Binding (R6): no wall-clock budget, so the same store gets the same answer.
+#[test]
+fn analyze_answers_the_same_store_the_same_way_every_time() {
+    let db = analyze_store("analyze-determinism");
+    for kind in ["central", "clusters", "components", "degree"] {
+        let first = task_reply(&one_task_call(db.clone(), "analyze", json!({"kind": kind})));
+        let second = task_reply(&one_task_call(db.clone(), "analyze", json!({"kind": kind})));
+        assert_eq!(first, second, "{kind}");
+    }
+}
+
+#[test]
+fn analyze_refuses_an_unknown_kind_and_names_real_edge_types() {
+    let db = analyze_store("analyze-args");
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "analyze",
+        json!({"kind": "vibes"}),
+    ));
+    assert!(
+        err.contains("central, clusters, components, degree, identities"),
+        "{err}"
+    );
+    let err = error_text(&one_task_call(
+        db,
+        "analyze",
+        json!({"kind": "central", "edge_type": "NOPE"}),
+    ));
+    assert!(
+        err.contains("no edge type named NOPE") && err.contains("KNOWS"),
+        "{err}"
+    );
+}
+
+/// Binding (R6): `top` is capped, whatever the caller asks for.
+#[test]
+fn analyze_lists_at_most_fifty_rows() {
+    let db = memory_store("analyze-cap");
+    {
+        let mut g = db.write();
+        for i in 0..120 {
+            g.insert_node("Person", &format!("n{i:03}"), vec![])
+                .unwrap();
+        }
+    }
+    let report = task_report(db, "analyze", json!({"kind": "degree", "top": 500}));
+    assert_eq!(report["listed"], json!(50), "{report}");
+    assert_eq!(report["nodes"], json!(120), "{report}");
+}
+
+/// Review focus: on a 100,000-node store the four analyses and the rule
+/// proposals still answer inside the reply's bounds, and in time.
+///
+/// Ignored because building the store is the slow part, not the tools:
+/// `cargo test --release -p mushroomdb-server --test mcp -- --ignored
+/// analyze_and_suggest_stay_bounded_on_a_100k_node_store`.
+#[test]
+#[ignore = "builds a 100,000-node store; run in release with --ignored"]
+fn analyze_and_suggest_stay_bounded_on_a_100k_node_store() {
+    const NODES: usize = 100_000;
+    let db = open("scale-100k");
+    {
+        let mut g = db.write();
+        let mut b = g.batch();
+        for i in 0..NODES {
+            b.insert_node(
+                if i % 10 == 0 { "Person" } else { "Note" },
+                &format!("n{i}"),
+                vec![("team".into(), Value::Str(format!("t{}", i % 7)))],
+            );
+        }
+        for i in 1..NODES {
+            // A star: every node linked to one hub, the shape of a memory
+            // store where every note is about the same person.
+            b.insert_edge("ABOUT", &format!("n{i}"), "n0");
+        }
+        b.commit().unwrap();
+    }
+    for kind in ["central", "clusters", "components", "degree"] {
+        let started = std::time::Instant::now();
+        let text = task_reply(&one_task_call(
+            db.clone(),
+            "analyze",
+            json!({"kind": kind, "top": 50}),
+        ));
+        let took = started.elapsed();
+        assert!(
+            text.lines().count() <= 51,
+            "{kind}: {} lines",
+            text.lines().count()
+        );
+        assert!(text.len() <= 16_000, "{kind}: {} bytes", text.len());
+        assert!(took.as_secs() < 10, "{kind} took {took:?}");
+        eprintln!("{kind}: {took:?}, {} bytes", text.len());
+    }
+    let started = std::time::Instant::now();
+    let text = task_reply(&one_task_call(db.clone(), "suggest_rules", json!({})));
+    let took = started.elapsed();
+    assert!(text.len() <= 16_000, "suggest_rules: {} bytes", text.len());
+    assert!(took.as_secs() < 10, "suggest_rules took {took:?}");
+    eprintln!("suggest_rules: {took:?}, {} bytes", text.len());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// identity — aliases, the preset's report, and resolution
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn aliases_in(db: &SharedDb, key: &str) -> Vec<String> {
+    match db.read().get_prop(key, "aliases") {
+        Some(Value::List(items)) => items
+            .into_iter()
+            .filter_map(|v| match v {
+                Value::Str(s) => Some(s),
+                _ => None,
+            })
+            .collect(),
+        other => panic!("{key} has no aliases list: {other:?}"),
+    }
+}
+
+/// Binding (OD-1, as amended 2026-10-01): `upsert_entity` keeps the
+/// normalised list from the key and the name, takes caller aliases as an
+/// argument — kept in `alias_keys`, as written — and refuses them as a
+/// property.
+#[test]
+fn upsert_entity_keeps_a_normalised_alias_list() {
+    let db = memory_store("upsert-aliases");
+    one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "label": "Person",
+               "props": {"name": "Matthew Sherlin"}, "aliases": ["Matt"]}),
+    );
+    assert_eq!(
+        aliases_in(&db, "matthew-sherlin"),
+        vec!["matthew", "matthew sherlin", "matthew-sherlin", "sherlin"]
+    );
+    assert_eq!(
+        db.read().get_prop("matthew-sherlin", "alias_keys"),
+        Some(Value::List(vec![Value::Str("Matt".into())]))
+    );
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "props": {"aliases": ["m"]}}),
+    ));
+    assert!(err.contains("maintained by the store"), "{err}");
+    let err = error_text(&one_task_call(
+        db,
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "props": {}, "aliases": "Matt"}),
+    ));
+    assert!(err.contains("aliases must be an array of strings"), "{err}");
+}
+
+/// Binding (OD-1): `remember`'s entities take aliases too, and stubs get the
+/// list their key implies.
+#[test]
+fn remember_entities_and_stubs_carry_aliases() {
+    let db = memory_store("remember-aliases");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({
+            "text": "Matt and Reid met",
+            "about": ["reid"],
+            "entities": [{"key": "matthew", "label": "Person", "aliases": ["Matt"]}]
+        }),
+    );
+    assert_eq!(aliases_in(&db, "matthew"), vec!["matthew"]);
+    assert_eq!(
+        db.read().get_prop("matthew", "alias_keys"),
+        Some(Value::List(vec![Value::Str("Matt".into())]))
+    );
+    assert_eq!(aliases_in(&db, "reid"), vec!["reid"]);
+    let err = error_text(&one_task_call(
+        db,
+        "remember",
+        json!({"text": "x", "entities": [{"key": "k", "label": "Person", "aliases": 3}]}),
+    ));
+    assert!(
+        err.contains("entities[].aliases must be an array of strings"),
+        "{err}"
+    );
+}
+
+/// A memory store with the identity preset applied, as
+/// `schema apply --memory-identity` leaves one.
+fn identity_store(name: &str) -> SharedDb {
+    let db = memory_store(name);
+    db.write()
+        .apply_schema(&core_api::memory_schema::memory_identity())
+        .unwrap();
+    db
+}
+
+/// Binding (R2): with the preset on, `remember` says which identities its
+/// write agreed with — once per pair, though the rule derived both directions.
+#[test]
+fn remember_reports_the_same_as_claims_it_created() {
+    let db = identity_store("remember-same-as");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "first", "entities": [{"key": "matthew-sherlin", "label": "Person",
+                                              "props": {"name": "Matthew Sherlin"}}]}),
+    );
+    let args = json!({"text": "second", "entities": [{"key": "msherlin", "label": "Person",
+                                                    "props": {"name": "Matthew Sherlin"}}]});
+    let text = task_reply(&one_task_call(db.clone(), "remember", args));
+    assert_eq!(
+        text.matches("same as  matthew-sherlin ~ msherlin (0.60)")
+            .count(),
+        1,
+        "{text}"
+    );
+    let report = task_report(
+        db,
+        "remember",
+        json!({"text": "third", "entities": [{"key": "m-sherlin", "label": "Person",
+                                              "props": {"name": "Matthew Sherlin"}}]}),
+    );
+    assert_eq!(
+        report["same_as"].as_array().map(Vec::len),
+        Some(2),
+        "the third links to both earlier ones: {report}"
+    );
+}
+
+/// Determinism: a `same_as` score in the json report is at fixed precision.
+/// A three-word name shared under two keys is four aliases out of six, 2/3,
+/// which has no finite decimal form.
+#[test]
+fn remember_json_same_as_scores_are_two_decimal_places() {
+    let db = identity_store("remember-same-as-precision");
+    let props = json!({"name": "P Q R"});
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "first", "entities": [{"key": "ka", "label": "Person",
+                                              "props": props}]}),
+    );
+    let report = task_report(
+        db,
+        "remember",
+        json!({"text": "second", "entities": [{"key": "kb", "label": "Person",
+                                               "props": props}]}),
+    );
+    assert_eq!(
+        report["same_as"],
+        json!([{"a": "ka", "b": "kb", "score": 0.67}]),
+        "{report}"
+    );
+}
+
+fn alias_keys_in(db: &SharedDb, key: &str) -> Option<Value> {
+    db.read().get_prop(key, "alias_keys")
+}
+
+fn str_list(items: &[&str]) -> Value {
+    Value::List(items.iter().map(|s| Value::Str((*s).into())).collect())
+}
+
+/// Owner decision Q2: an entity that declares an alias links the stub keyed
+/// exactly so, and `remember` reports the link — whichever was written first.
+#[test]
+fn remember_reports_a_stub_linked_by_a_declared_alias() {
+    let entity = json!({"key": "matthew-sherlin", "label": "Person",
+                        "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]});
+    let line = "same as  matt ~ matthew-sherlin (1.00) — explain_association shows why";
+
+    let db = identity_store("claim-stub-first");
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matt owns 0.7", "about": ["matt"]}),
+    ));
+    assert!(!text.contains("same as"), "nothing to link yet: {text}");
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matthew Sherlin is Matt", "entities": [entity.clone()]}),
+    ));
+    assert_eq!(text.matches(line).count(), 1, "{text}");
+    assert_eq!(
+        alias_keys_in(&db, "matthew-sherlin"),
+        Some(str_list(&["matt"]))
+    );
+    // The line's own promise: explain_association does show why.
+    let why = task_reply(&one_task_call(
+        db,
+        "explain_association",
+        json!({"a": "matthew-sherlin", "b": "matt"}),
+    ));
+    assert!(why.contains("same_as_claim_person"), "{why}");
+
+    let db = identity_store("claim-entity-first");
+    one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "label": "Person",
+               "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]}),
+    );
+    let report = task_report(
+        db,
+        "remember",
+        json!({"text": "Matt owns 0.7", "about": ["matt"]}),
+    );
+    assert_eq!(
+        report["same_as"],
+        json!([{"a": "matt", "b": "matthew-sherlin", "score": 1.0}]),
+        "{report}"
+    );
+}
+
+/// `alias_keys` is the store's, like `aliases`: refused as a property on both
+/// write tools, with the argument to use named.
+#[test]
+fn alias_keys_is_refused_as_a_property() {
+    let db = memory_store("alias-keys-prop");
+    for (tool, args) in [
+        (
+            "upsert_entity",
+            json!({"key": "m", "label": "Person", "props": {"alias_keys": ["matt"]}}),
+        ),
+        (
+            "remember",
+            json!({"text": "x", "entities": [{"key": "m", "label": "Person",
+                                             "props": {"alias_keys": ["matt"]}}]}),
+        ),
+    ] {
+        let err = error_text(&one_task_call(db.clone(), tool, args));
+        assert!(
+            err.contains("'alias_keys' is maintained by the store")
+                && err.contains("'aliases' argument"),
+            "{tool}: {err}"
+        );
+    }
+    assert!(!db.read().has_node("m"), "a refusal writes nothing");
+}
+
+/// Defect 76: a key with nothing in it is refused by both write tools, as a
+/// tool error naming the argument, and `stats` reads the same before and
+/// after. The check is `core-api`'s; this pins that the tools surface it.
+#[test]
+fn an_empty_key_is_a_tool_error_and_writes_nothing() {
+    let db = memory_store("empty-key");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Ada wrote the first one", "about": ["ada"]}),
+    );
+    let before = content_json(&one_task_call(db.clone(), "stats", json!({})));
+    for (tool, args, argument) in [
+        (
+            "remember",
+            json!({"text": "about nothing", "about": ["ada", ""]}),
+            "remember: about[1]",
+        ),
+        (
+            "remember",
+            json!({"text": "about a blank", "about": ["   "]}),
+            "remember: about[0]",
+        ),
+        (
+            "remember",
+            json!({"text": "a fact from nothing",
+                   "facts": [{"subject": "", "predicate": "KNOWS", "object": "ada"}]}),
+            "remember: facts[0].subject",
+        ),
+        (
+            "remember",
+            json!({"text": "a fact to nothing",
+                   "facts": [{"subject": "ada", "predicate": "KNOWS", "object": ""}]}),
+            "remember: facts[0].object",
+        ),
+        (
+            "remember",
+            json!({"text": "an entity with no key",
+                   "entities": [{"key": "", "label": "Person"}]}),
+            "remember: entities[0].key",
+        ),
+        (
+            "upsert_entity",
+            json!({"key": "", "label": "Person", "props": {"name": "Nobody"}}),
+            "key",
+        ),
+    ] {
+        let err = error_text(&one_task_call(db.clone(), tool, args));
+        assert!(
+            err.contains(&format!("{argument} must not be empty or only whitespace")),
+            "{tool} {argument}: {err}"
+        );
+    }
+    assert_eq!(
+        content_json(&one_task_call(db.clone(), "stats", json!({}))),
+        before,
+        "a refusal writes nothing"
+    );
+    assert!(!db.read().has_node(""), "no node keyed by the empty string");
+}
+
+/// Defect 77: a fact's `predicate` and an entity's `label` with nothing in
+/// them are tool errors naming the argument, and `stats` and `schema` read the
+/// same before and after — no unnamed edge type, no unnamed label, no
+/// full-text pair declared for one.
+#[test]
+fn an_empty_predicate_or_label_is_a_tool_error_and_writes_nothing() {
+    let db = memory_store("empty-type");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Ada wrote the first one", "about": ["ada"]}),
+    );
+    let snapshot = |db: &SharedDb| {
+        (
+            content_json(&one_task_call(db.clone(), "stats", json!({}))),
+            task_reply(&one_task_call(db.clone(), "schema", json!({}))),
+        )
+    };
+    let before = snapshot(&db);
+    for (tool, args, argument) in [
+        (
+            "remember",
+            json!({"text": "a fact with no predicate",
+                   "entities": [{"key": "v0.7", "label": "Release"}],
+                   "facts": [{"subject": "ada", "predicate": "", "object": "v0.7"}]}),
+            "remember: facts[0].predicate",
+        ),
+        (
+            "remember",
+            json!({"text": "an entity with no label",
+                   "entities": [{"key": "v0.7", "label": "Release"},
+                                {"key": "widget", "label": "  "}]}),
+            "remember: entities[1].label",
+        ),
+        (
+            "upsert_entity",
+            json!({"key": "gizmo", "label": "", "props": {"name": "Gizmo"}}),
+            "label",
+        ),
+    ] {
+        let err = error_text(&one_task_call(db.clone(), tool, args));
+        assert!(
+            err.contains(&format!("{argument} must not be empty or only whitespace")),
+            "{tool} {argument}: {err}"
+        );
+    }
+    assert_eq!(snapshot(&db), before, "a refusal writes nothing");
+    let g = db.read();
+    for key in ["v0.7", "widget", "gizmo"] {
+        assert!(!g.has_node(key), "{key} must not have been written");
+    }
+}
+
+/// `forget {key, prop: "alias_keys"}` clears the declared list, and with it
+/// the link the claim made; the reply counts the retraction.
+#[test]
+fn forgetting_alias_keys_clears_the_claim() {
+    let db = identity_store("forget-alias-keys");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matt", "about": ["matt"],
+               "entities": [{"key": "matthew-sherlin", "label": "Person",
+                             "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]}]}),
+    );
+    let same_as = |db: &SharedDb| db.read().weighted_edges("SAME_AS", None).len();
+    assert_eq!(same_as(&db), 1, "precondition: the claim linked them");
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"key": "matthew-sherlin", "prop": "alias_keys"}),
+    ));
+    assert!(
+        text.starts_with("forgot matthew-sherlin.alias_keys"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 derived edge(s) retracted because a rule read alias_keys"),
+        "{text}"
+    );
+    assert_eq!(alias_keys_in(&db, "matthew-sherlin"), None);
+    assert_eq!(same_as(&db), 0);
+
+    // A later write that declares nothing does not bring the claim back.
+    one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "props": {"role": "owner"}}),
+    );
+    assert_eq!(alias_keys_in(&db, "matthew-sherlin"), None);
+    assert_eq!(same_as(&db), 0);
+}
+
+/// Forgetting `aliases` leaves the declared list, which still links a stub
+/// keyed so. The reply says that, and how to clear it — and says nothing of
+/// the kind for a node that declared no alias.
+#[test]
+fn forgetting_aliases_says_declared_aliases_remain_in_alias_keys() {
+    let db = identity_store("forget-aliases-keys-remain");
+    let person = |key: &str, name: &str, aliases: Js| json!({"key": key, "label": "Person", "props": {"name": name}, "aliases": aliases});
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matt, Grace and Reid", "about": ["matt"],
+               "entities": [person("matthew-sherlin", "Matthew Sherlin", json!(["matt"])),
+                            person("grace-hopper", "Grace Hopper", json!(["amazing grace"])),
+                            person("reid", "Reid Hoffman", json!([]))]}),
+    );
+    let forget_aliases = |key: &str| json!({"key": key, "prop": "aliases"});
+
+    let text = task_reply(&one_task_call(db.clone(), "forget", forget_aliases("reid")));
+    assert!(text.starts_with("forgot reid.aliases"), "{text}");
+    assert!(
+        !text.contains("alias_keys"),
+        "reid declared nothing: {text}"
+    );
+
+    let text = task_reply(&one_task_call(
+        db.clone(),
+        "forget",
+        forget_aliases("matthew-sherlin"),
+    ));
+    assert!(text.starts_with("forgot matthew-sherlin.aliases"), "{text}");
+    assert!(
+        text.contains("its declared aliases remain in `alias_keys`")
+            && text.contains("forget {key: \"matthew-sherlin\", prop: \"alias_keys\"}"),
+        "{text}"
+    );
+    assert_eq!(
+        alias_keys_in(&db, "matthew-sherlin"),
+        Some(str_list(&["matt"])),
+        "the reply is true: the list is still there"
+    );
+    assert_eq!(
+        db.read().weighted_edges("SAME_AS", None).len(),
+        1,
+        "and so is the link it makes"
+    );
+
+    let report = task_report(db.clone(), "forget", forget_aliases("grace-hopper"));
+    assert_eq!(report["changed"], json!(true), "{report}");
+    assert_eq!(report["alias_keys_remain"], json!(true), "{report}");
+    let report = task_report(db, "forget", forget_aliases("grace-hopper"));
+    assert_eq!(report["changed"], json!(false), "{report}");
+    assert_eq!(
+        report["alias_keys_remain"],
+        json!(false),
+        "nothing was forgotten, so nothing is said to remain: {report}"
+    );
+}
+
+/// The claim's edge is rule-owned like any other: retracting it by hand is
+/// refused, naming the rule that owns that direction and the field it reads.
+#[test]
+fn forgetting_a_claimed_same_as_fact_names_the_claim_rule() {
+    let db = identity_store("forget-claim-fact");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Matt", "about": ["matt"],
+               "entities": [{"key": "matthew-sherlin", "label": "Person",
+                             "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]}]}),
+    );
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "forget",
+        json!({"fact": {"subject": "matthew-sherlin", "predicate": "SAME_AS", "object": "matt"}}),
+    ));
+    assert!(
+        err.contains("derived by rule same_as_claim_person") && err.contains("(alias_keys)"),
+        "{err}"
+    );
+    assert!(!err.contains("same_as_entity_person"), "{err}");
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 1);
+}
+
+/// Two same-named people, linked at 3/5 — exactly the floor.
+fn linked_pair_store(name: &str) -> SharedDb {
+    let db = identity_store(name);
+    for key in ["matthew-sherlin", "msherlin"] {
+        one_task_call(
+            db.clone(),
+            "upsert_entity",
+            json!({"key": key, "label": "Person", "props": {"name": "Matthew Sherlin"}}),
+        );
+    }
+    assert_eq!(
+        db.read().weighted_edges("SAME_AS", None).len(),
+        2,
+        "precondition: linked, both directions"
+    );
+    db
+}
+
+/// Owner decision, 2026-10-01: declaring an alias on one of two linked
+/// entities costs nothing. The link stays, and neither tool reports a loss.
+#[test]
+fn declaring_an_alias_on_one_of_two_linked_entities_keeps_the_link() {
+    let db = linked_pair_store("declared-keeps");
+    let (text, report) = task_both(
+        db.clone(),
+        "remember",
+        json!({"text": "Matthew goes by Matt",
+               "entities": [{"key": "matthew-sherlin", "label": "Person",
+                             "aliases": ["matt"]}]}),
+    );
+    assert!(!text.contains("unlinked"), "{text}");
+    assert_eq!(report["same_as_lost_total"], json!(0), "{report}");
+    let reply = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "msherlin", "props": {}, "aliases": ["sherl"]}),
+    ));
+    assert!(reply.get("same_as_lost").is_none(), "{reply}");
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 2);
+}
+
+/// Controller ruling: the reply is the contract. What a describing write can
+/// still retract is a link a name made: renaming one of two linked entities
+/// takes their overlap below the floor; `remember` says so, in the text and
+/// in the json.
+#[test]
+fn remember_reports_the_same_as_link_a_rename_costs() {
+    let args = json!({"text": "Matthew is Matt S now",
+                      "entities": [{"key": "matthew-sherlin", "label": "Person",
+                                    "props": {"name": "Matt S"}}]});
+    let text = task_reply(&one_task_call(
+        linked_pair_store("lost-text"),
+        "remember",
+        args.clone(),
+    ));
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("unlinked"))
+        .unwrap_or_else(|| panic!("no unlinked line: {text}"));
+    assert!(
+        line.starts_with(
+            "unlinked  1 same-as link(s) this write retracted: matthew-sherlin ~ msherlin (was 0.60) — "
+        ),
+        "{line}"
+    );
+    assert!(
+        line.ends_with(
+            " — a link holds while two nodes' keys, names and the names' words overlap at \
+             0.6, and this write changed them; give both the same name, or declare a \
+             provisional stub's key as an alias to link it whatever the names"
+        ),
+        "the cause and the remedy: {line}"
+    );
+    assert_eq!(text.matches("unlinked").count(), 1, "one line: {text}");
+
+    let db = linked_pair_store("lost-json");
+    let report = task_report(db.clone(), "remember", args);
+    assert_eq!(
+        report["same_as_lost"],
+        json!([{"a": "matthew-sherlin", "b": "msherlin", "score": 0.6}]),
+        "{report}"
+    );
+    assert_eq!(report["same_as_lost_total"], json!(1), "{report}");
+    assert_eq!(
+        db.read().weighted_edges("SAME_AS", None).len(),
+        0,
+        "the reply is true"
+    );
+}
+
+/// `upsert_entity` retracts the same way and says so the same way: a stub
+/// spelling the full name keeps its link when the entity declares a nickname,
+/// and loses it when the entity is renamed.
+#[test]
+fn upsert_entity_reports_the_full_name_stub_a_rename_unlinks() {
+    let db = identity_store("lost-upsert-stub");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "named first", "about": ["Matthew_Sherlin"]}),
+    );
+    let reply = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "label": "Person",
+               "props": {"name": "Matthew Sherlin"}}),
+    ));
+    assert!(
+        reply.get("same_as_lost").is_none(),
+        "a create loses nothing: {reply}"
+    );
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 1);
+
+    let reply = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "props": {}, "aliases": ["matt"]}),
+    ));
+    assert!(
+        reply.get("same_as_lost").is_none(),
+        "a declared alias loses nothing: {reply}"
+    );
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 1);
+
+    let reply = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "props": {"name": "Matt S"}}),
+    ));
+    assert_eq!(
+        reply["same_as_lost"],
+        json!([{"a": "Matthew_Sherlin", "b": "matthew-sherlin", "score": 0.6}]),
+        "{reply}"
+    );
+    assert_eq!(reply["same_as_lost_total"], json!(1), "{reply}");
+    assert!(
+        reply["same_as_lost_note"].as_str().is_some_and(|n| n
+            .starts_with("this write retracted 1 SAME_AS link(s): a link holds while")
+            && n.contains("give both the same name")
+            && n.contains("declare a provisional stub's key as an alias")),
+        "{reply}"
+    );
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 0);
+}
+
+/// A write that retracts nothing says nothing about it: no text line, an
+/// empty list from `remember`, and no field at all from `upsert_entity`.
+#[test]
+fn a_write_that_loses_no_link_reports_none() {
+    let db = linked_pair_store("lost-none");
+    let (text, report) = task_both(
+        db.clone(),
+        "remember",
+        json!({"text": "both go by Matt",
+               "entities": [{"key": "matthew-sherlin", "label": "Person", "aliases": ["matt"]},
+                            {"key": "msherlin", "label": "Person", "aliases": ["matt"]}]}),
+    );
+    assert!(!text.contains("unlinked"), "{text}");
+    assert_eq!(report["same_as_lost"], json!([]), "{report}");
+    assert_eq!(report["same_as_lost_total"], json!(0), "{report}");
+    let reply = content_json(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "msherlin", "props": {"role": "owner"}}),
+    ));
+    assert_eq!(
+        reply,
+        json!({"ok": true, "key": "msherlin", "label": "Person",
+               "created": false, "updated_fields": 1}),
+        "unchanged when nothing is lost"
+    );
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 2);
+}
+
+/// The lost list is bounded: ten pairs, and a count of the rest.
+#[test]
+fn the_lost_links_are_listed_up_to_ten_and_counted() {
+    let store = |name: &str| {
+        let db = identity_store(name);
+        for i in 0..12 {
+            one_task_call(
+                db.clone(),
+                "upsert_entity",
+                json!({"key": format!("k{i:02}"), "label": "Person",
+                       "props": {"name": "Matthew Sherlin"}}),
+            );
+        }
+        db
+    };
+    let args = json!({"text": "k00 is Matt S now",
+                      "entities": [{"key": "k00", "label": "Person",
+                                    "props": {"name": "Matt S"}}]});
+    let report = task_report(store("lost-cap-json"), "remember", args.clone());
+    assert_eq!(report["same_as_lost_total"], json!(11), "{report}");
+    assert_eq!(report["same_as_lost"].as_array().map(Vec::len), Some(10));
+    let text = task_reply(&one_task_call(store("lost-cap-text"), "remember", args));
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("unlinked"))
+        .expect("line");
+    assert!(
+        line.starts_with(
+            "unlinked  11 same-as link(s) this write retracted: k00 ~ k01 (was 0.60), "
+        ),
+        "{line}"
+    );
+    assert_eq!(line.matches(" ~ ").count(), 10, "{line}");
+    assert!(line.contains("k00 ~ k10 (was 0.60) (+1 more) — "), "{line}");
+
+    let reply = content_json(&one_task_call(
+        store("lost-cap-upsert"),
+        "upsert_entity",
+        json!({"key": "k00", "props": {"name": "Matt S"}}),
+    ));
+    assert_eq!(reply["same_as_lost_total"], json!(11), "{reply}");
+    assert_eq!(reply["same_as_lost"].as_array().map(Vec::len), Some(10));
+}
+
+/// Important 1, at the tool surface. A subject named by `about` before it was
+/// described is an `Entity` for life: `upsert_entity` refuses to relabel it,
+/// `remember`'s `entities` describes it without relabelling, and either way
+/// the alias it declares is stored and links nothing — the claim rules run
+/// from the five entity labels. An `Entity→Entity` rule is the owner's call.
+#[test]
+fn a_subject_named_before_it_was_described_cannot_claim_a_stub() {
+    let db = identity_store("ex-stub-cannot-claim");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "named first", "about": ["matthew-sherlin"]}),
+    );
+    let err = error_text(&one_task_call(
+        db.clone(),
+        "upsert_entity",
+        json!({"key": "matthew-sherlin", "label": "Person",
+               "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]}),
+    ));
+    assert!(
+        err.contains("exists as \"Entity\", not \"Person\""),
+        "{err}"
+    );
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "described", "entities": [{"key": "matthew-sherlin", "label": "Person",
+               "props": {"name": "Matthew Sherlin"}, "aliases": ["matt"]}]}),
+    );
+    assert_eq!(
+        db.read()
+            .node_ref("matthew-sherlin")
+            .map(|n| n.label().to_string()),
+        Some("Entity".to_string())
+    );
+    assert_eq!(
+        alias_keys_in(&db, "matthew-sherlin"),
+        Some(str_list(&["matt"]))
+    );
+    let report = task_report(
+        db.clone(),
+        "remember",
+        json!({"text": "the nickname", "about": ["matt"]}),
+    );
+    assert_eq!(report["same_as"], json!([]), "{report}");
+    assert_eq!(db.read().weighted_edges("SAME_AS", None).len(), 0);
+}
+
+/// `alias_keys` is bookkeeping. Twelve people who all declare one alias give
+/// the engine a list field with a sampled Jaccard of 1.0 — exactly what it
+/// proposes an `Overlap` rule over — and the reply must not relay it.
+#[test]
+fn suggest_rules_never_proposes_a_rule_on_alias_keys() {
+    let db = memory_store("suggest-alias-keys");
+    for i in 0..12 {
+        one_task_call(
+            db.clone(),
+            "upsert_entity",
+            json!({"key": format!("p{i}"), "label": "Person",
+                   "props": {"name": format!("Person {i}")},
+                   "aliases": ["crew"]}),
+        );
+    }
+    let (text, report) = task_both(db, "suggest_rules", json!({}));
+    for s in report["suggestions"].as_array().expect("suggestions") {
+        assert!(
+            !s["create_rule_args"]
+                .to_string()
+                .contains("\"field\":\"alias_keys\""),
+            "proposed a rule over alias_keys: {s}"
+        );
+    }
+    assert!(!text.contains("OVERLAPS_ALIAS_KEYS"), "{text}");
+    assert!(
+        text.contains("alias_keys — not shown"),
+        "the hidden fields are named: {text}"
+    );
+}
+
+/// Binding (OD-2): `suggest_rules` offers the preset to a store with entities
+/// and no SAME_AS rule, as a command — and stops once the preset is on.
+#[test]
+fn suggest_rules_offers_the_identity_preset_until_it_is_applied() {
+    let db = memory_store("suggest-identity");
+    seed_person(&db, "matthew");
+    let (text, report) = task_both(db.clone(), "suggest_rules", json!({}));
+    assert!(text.contains("--memory-identity"), "{text}");
+    assert!(text.contains("not a create_rule call"), "{text}");
+    assert_eq!(
+        report["identity_preset"]["entity_nodes"],
+        json!(1),
+        "{report}"
+    );
+    db.write()
+        .apply_schema(&core_api::memory_schema::memory_identity())
+        .unwrap();
+    let report = task_report(db, "suggest_rules", json!({}));
+    assert!(report["identity_preset"].is_null(), "{report}");
+}
+
+/// Determinism: a proposal's example scores are at fixed precision in the
+/// json report too, not only in the rendered text — a Jaccard of 1/3 is
+/// `0.33`, never `0.3333333333333333`.
+#[test]
+fn suggest_rules_json_example_scores_are_two_decimal_places() {
+    let db = memory_store("suggest-precision");
+    {
+        let mut g = db.write();
+        for i in 0..6 {
+            for (label, own) in [("Red", "r"), ("Blue", "b")] {
+                g.insert_node(
+                    label,
+                    &format!("{own}{i}"),
+                    vec![(
+                        "tags".into(),
+                        Value::List(vec![
+                            Value::Str("shared".into()),
+                            Value::Str(format!("{own}{i}")),
+                        ]),
+                    )],
+                )
+                .unwrap();
+            }
+        }
+    }
+    let report = task_report(db, "suggest_rules", json!({}));
+    let scores: Vec<f64> = report["suggestions"]
+        .as_array()
+        .expect("suggestions")
+        .iter()
+        .flat_map(|s| s["examples"].as_array().cloned().unwrap_or_default())
+        .map(|e| e[2].as_f64().expect("score"))
+        .collect();
+    assert!(
+        !scores.is_empty(),
+        "the fixture must yield examples: {report}"
+    );
+    for score in scores {
+        assert_eq!(
+            score,
+            (score * 100.0).round() / 100.0,
+            "an example score past two decimal places: {report}"
+        );
+    }
+}
+
+/// Binding (OD-3): `analyze` resolves SAME_AS into identities — every pair
+/// linked, the oldest node first — and takes no edge type for it.
+#[test]
+fn analyze_identities_lists_each_identity_under_its_oldest_node() {
+    let db = identity_store("analyze-identities");
+    for (i, key) in ["matthew-sherlin", "msherlin"].iter().enumerate() {
+        one_task_call(
+            db.clone(),
+            "remember",
+            json!({"text": format!("mention {i}"),
+                   "entities": [{"key": key, "label": "Person",
+                                 "props": {"name": "Matthew James Sherlin"}}]}),
+        );
+    }
+    let (text, report) = task_both(db.clone(), "analyze", json!({"kind": "identities"}));
+    assert!(
+        text.contains("1 identit(ies) over 2 linked node(s), 1 SAME_AS claim(s) at ≥ 0.6"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  1. matthew-sherlin — matthew-sherlin, msherlin, weakest link 0.67"),
+        "{text}"
+    );
+    assert_eq!(report["rows"][0]["canonical"], json!("matthew-sherlin"));
+    // A three-word name makes the score 4/6: the reply carries it at two
+    // places, as `same_as` does, not as 0.6666666666666666.
+    assert_eq!(report["rows"][0]["weakest"], json!(0.67), "{report}");
+    let err = error_text(&one_task_call(
+        db,
+        "analyze",
+        json!({"kind": "identities", "edge_type": "SAME_AS"}),
+    ));
+    assert!(
+        err.contains("edge_type does not apply to identities"),
+        "{err}"
     );
 }

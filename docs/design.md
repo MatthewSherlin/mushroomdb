@@ -1,8 +1,20 @@
-# Graph-DB Design Spec (working title — name TBD)
+# The original design, August 2026 — a historical record
+
+> **This is the design the project started from. It is dated 2026-08-14, the day before the first
+> commit, and was last revised on 2026-08-26, during the first releases; the only edits since are
+> this note, the corrections marked inline and the replaced names, made on 2026-10-01. It is kept
+> as the record of what was intended, and it is not a description of what exists now.** The
+> storage engine, the concurrency model and several decisions below changed after it was written:
+> the snapshot is memory-mapped, several processes can share one store, and the license is dual
+> MIT / Apache-2.0. Paths under `docs/superpowers/` point at working notes that were taken out of
+> the repository on 2026-08-28 and are not in it now. Other systems are referred to as "a named
+> system", or as "system A", "B" and "C".
+>
+> For what exists: the README's [Architecture](../README.md#architecture) section,
+> [`docs/format-stability.md`](format-stability.md), and the pages under [`docs/site/`](site/index.md).
 
 **Date:** 2026-08-14
-**Status:** Living design document
-**License:** Apache 2.0
+**Status:** Historical — superseded by the implementation
 **Language:** Rust (core), TypeScript (UI), Python/TS/Rust bindings at launch
 
 ---
@@ -19,13 +31,13 @@ One-line positioning: *"The embedded graph database that builds itself."*
 
 ### Market rationale (validated 2026-08)
 
-- Kuzu (the "SQLite for graphs") was archived Oct 2025 after Apple acquired it;
+- system B is no longer maintained by its authors;
   community forks are thin. There is a live vacuum for a truly open-source embedded
   graph engine.
 - No shipping engine offers declarative, incrementally maintained linking rules as a
-  native primitive. Closest prior art: TigerGraph ER solution patterns (build-it-
-  yourself, enterprise), Neo4j GDS similarity (batch, not incremental), RDF reasoners
-  (SPARQL land), Materialize/differential dataflow (not a graph DB). The underlying
+  native primitive. Closest prior art: a named system ER solution patterns (build-it-
+  yourself, enterprise), system A GDS similarity (batch, not incremental), RDF reasoners
+  (SPARQL land), a named system/differential dataflow (not a graph DB). The underlying
   CS is de-risked; the product does not exist.
 - GQL became an ISO standard (April 2024); openCypher compatibility inherits the
   ecosystem. A custom query language is explicitly rejected.
@@ -50,7 +62,7 @@ ingestion posture.
 
 | Decision | Choice |
 |---|---|
-| Deployment shape | Embedded Rust core + optional thin server + bundled UI (DuckDB playbook); `mushroomdb serve <db-dir>` serves the UI locally |
+| Deployment shape | Embedded Rust core + optional thin server + bundled UI (a named system playbook); `mushroomdb serve <db-dir>` serves the UI locally |
 | Query surface | Programmatic traversal API (primary) + openCypher subset (compat). No custom language, ever |
 | Auto-linking | Layered: zero-config key/FK inference by default + declared incremental rules. LLM extraction is a possible later optional plugin, never core |
 | Storage model | Memory-first HashMap topology + HashMap columns; CRC WAL + zstd-compressed bincode snapshots (V6). Sortledton adjacency and mmap'd snapshots deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
@@ -59,8 +71,8 @@ ingestion posture.
 | Results format | Apache Arrow for query results (IPC over HTTP; pandas/polars in Python). JSON is used for `?format=json`, `/watch`, `/subscribe`, and MCP |
 | UI rendering | cosmos.gl (GPU force layout + rendering; OpenJS Foundation) |
 | Bindings | Python (PyO3) and Rust at launch; TypeScript via HTTP `mushroomdb-client`. napi-rs deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
-| Testing | Deterministic simulation testing (FoundationDB-style) from day one + model-based oracle testing + rule-equivalence invariant. Differential Cypher testing vs Neo4j deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
-| Scale target | Design for 10M nodes in RAM (~5–15 GB with properties); document the RAM ceiling honestly. Real initial workloads are ~10k nodes |
+| Testing | Deterministic simulation testing (a named system-style) from day one + model-based oracle testing + rule-equivalence invariant. Differential Cypher testing vs system A deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
+| Scale target | Design for 10M nodes in RAM (~5–15 GB with properties); document the RAM ceiling honestly. Real initial workloads are ~10k nodes *(Correction, 2026-10: never measured above 100,000 nodes — 4.72 GiB peak while building. See README, Known limitations.)* |
 
 ### Explicit non-goals (v1)
 
@@ -228,13 +240,14 @@ Not v1: general editing/admin UI, dashboards, saved queries.
    a deliberately naive in-memory oracle; exact-match required.
 3. **Rule-equivalence invariant:** after any op sequence, incremental edges ==
    from-scratch `rebuild`. Shrunken repro on failure.
-4. **Differential Cypher testing vs Neo4j** is deferred; see
+4. **Differential Cypher testing vs system A** is deferred; see
    `docs/superpowers/specs/2026-08-25-best-graph-db.md`. cargo-fuzz on parser and
    WAL/snapshot readers ships.
 5. **Cross-binding conformance:** one shared corpus (queries + expected Arrow
-   results) through Rust/Python/TS in the CI matrix.
+   results) through Rust/Python/TS in the CI matrix. *(Never built. The bindings are tested
+   separately; there is no shared corpus.)*
 6. **Performance:** criterion microbenchmarks with CI regression gates; public
-   reproducible benchmark harness vs Neo4j, Kuzu 0.11.3, Memgraph (LDBC-SNB-style
+   reproducible benchmark harness vs system A, system B 0.11.3, system C (LDBC-SNB-style
    interactive + typed-neighborhood workload); numbers, hardware, and rerun scripts
    in-repo.
 7. **UI:** automated Playwright frame-rate tests (500 / 5k / 50k nodes) asserting
@@ -245,19 +258,19 @@ Not v1: general editing/admin UI, dashboards, saved queries.
 | Metric | Target |
 |---|---|
 | Point lookup + depth-2 typed neighborhood, 10k-node graph | < 100 µs engine-side |
-| Same, 10M-node graph | < 10 ms |
+| Same, 10M-node graph | < 10 ms *(Correction, 2026-10: never measured; the largest store run is 100,000 nodes)* |
 | Insert with 5 active rules, 100k-node graph | < 1 ms |
 | DB open (5 GB snapshot) | Target < 100 ms (mmap/rkyv; deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md`). Current V6 zstd-bincode open is ~8.88 s at 100k nodes |
 | UI: click-to-rendered neighborhood (500 nodes, end-to-end) | < 100 ms |
 | UI: smooth interaction | 50k+ nodes without frame collapse |
-| Replaces talent-backend Neo4j usage | current 5+ s queries < 50 ms end-to-end |
+| Replaces talent-backend system A usage | current 5+ s queries < 50 ms end-to-end |
 
 ## 11. Open Items
+
+*As they stood on 2026-08-14. The name, the repository and the snapshot format all exist now.*
 
 - **Name** — required before repo creation; "graph-db" is a placeholder.
 - Git repo not yet initialized (user performs/authorizes git actions explicitly).
 - UDF rule escape hatch design (fast-follow, not v1).
 - LLM-extraction plugin (post-v1, optional, opt-in cost model).
 - Snapshot format spec doc (write during implementation planning).
-
-## 12. Next Step

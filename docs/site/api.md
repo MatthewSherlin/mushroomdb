@@ -683,8 +683,10 @@ Request body:
 }
 ```
 
-`field` and `vector` are required. `k` defaults to 10. HTTP `min` defaults to **0.0**
-(the Python default). MCP vector-mode `find_similar` still defaults `min` to **0.8**.
+`field` and `vector` are required. `k` defaults to 10.
+`min` defaults to **0.8**, as it does over MCP and in the Python binding. It was **0.0** here
+through 0.6 — a request that names no `min` now drops every hit below 0.8. Pass `"min": 0.0`
+for the old behaviour.
 `where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; invalid
 `where` is 400. `exact: true` skips HNSW.
 
@@ -1009,34 +1011,18 @@ Response:
   "result": {
     "capabilities": {"tools": {}},
     "protocolVersion": "2024-11-05",
-    "serverInfo": {"name": "mushroomdb", "version": "0.6.10"}
+    "serverInfo": {"name": "mushroomdb", "version": "<the server's version>"}
   }
 }
 ```
 
 ### Tools
 
-Seventeen tools:
-
-| Tool | Description |
-|---|---|
-| `query` | Run a Cypher query (read or write); params: `cypher`, `params?`, `mask?` (node key allow-list; read-only when set), `role?` (answer as one of the store's roles), `namespace?` (answer from one namespace — intersects `role` and `mask`, never widens them; a role bound to namespaces honours them with no argument), `as_of?` (0-based commit index — answer from the graph as it was then; composes with `role` or with `mask`, not both, since the tool refuses `role` + `mask` together, and with `namespace`; writes and `stub_hidden` refused), `stub_hidden?` (bool; see below) |
-| `ingest_json` | Ingest nodes; params: `label`, `rows_json`, `edges?`, `namespace?` (the namespace every node it creates lands in; a row naming a different `ns` is refused) |
-| `create_rule` | Declare a linking rule; params: `RuleDef` fields, including `namespace?` (scope the rule to one namespace; omitted is global). Over ~2,048 vectors the reply carries `building: {indexed, total}` and a note: the rule is installed but derives no edges until its vector index is built (see [POST /rules](#post-rules)) |
-| `explain` | Explain edges; params: `a`, `b` |
-| `stats` | Database statistics, including `namespaces`; params: `role?` and `namespace?`, which narrow the `namespaces` roster (the store-wide counts are unchanged) |
-| `neighborhood` | Typed neighborhood; params: `key`, `depth?`, `dir?` |
-| `node_info` | Node info and props; params: `key` |
-| `node_edges` | Incident edges; params: `key` |
-| `upsert_entity` | Insert or update a node by key; params: `key`, `props`, `label?`, `namespace?` (the namespace a created node lands in; on an existing node, the one it is already in is a no-op and another is refused). An update is atomic: every property is checked before any is written, so a refusal leaves the node unchanged. |
-| `find_similar` | Two modes: (1) vector search — `vector`, `field?`, `label?`, `k?`, `min?` (default **0.8**), `where?`, `exact?`; (2) edge traversal — `key`, `edge_type?`, `limit?`. Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. `where` is a `{field, eq}` / `{field, in}` predicate and implies exact GEMM; `exact` true skips HNSW. Edge-traversal mode ignores both. **A `mask` alone is the approximate path**: vector search under a mask (a role, or the MCP `mask` allow-list) widens its HNSW beam until it has `k` visible hits; if the beam reaches the same cap an exact `VectorSimilar` rule uses (`EF_MAX` = 4,096) it falls back to an exhaustive masked scan. It does not return fewer than `k` while more visible hits exist, and it is still not guaranteed to have found the true top `k` — for an exhaustive answer over the same visible set pass `exact` or a `where`. `where` uses the property index only when `label` accompanies it and `(label, where.field)` is index-enabled; without a label it is a correct-but-slower scan. HTTP `POST /find_similar` is vector-only and defaults `min` to **0.0**. |
-| `pairwise_similar` | Exact cosine top-k among `keys` on `field`; params: `keys`, `field`, `k?` (default 10), `min?` (default 0.0). Scores are cosine similarity in `[-1, 1]`; a distance of `1 - sim` is the caller's conversion. Self excluded. Never HNSW. |
-| `explain_association` | Alias of `explain`; params: `a`, `b` |
-| `hybrid_search` | RRF over fulltext + vector; params: `query_text`, `text_field`, `vector?`, `vector_field?`, `label?`, `k?` |
-| `node_history` | WAL change history for a node; params: `key`. Returns `{key, history, total_commits, horizon}` |
-| `edge_history` | Add/retract lifecycle for edges between two nodes; params: `a`, `b`. Returns `{a, b, events, total_commits, horizon}` |
-| `was_linked` | Point-in-time edge check; params: `a`, `b`, `edge_type`, `at_commit`. Returns `{linked}` or error when outside horizon |
-| `rename_node` | Rename a node's key; params: `old_key`, `new_key`. Errors if old key absent or new key already exists. |
+The server serves twenty-five tools and lists twenty-three by default; `mushroomdb mcp <db>
+--all-tools` lists all of them. What each one answers is in
+[Task tools](mcp.md#task-tools), which also gives each task tool's arguments, and in
+[Tool reference](mcp.md#tool-reference) — the one list of them. The arguments of the fourteen
+graph tools are in each tool's `inputSchema`, which `tools/list` returns.
 
 **`stub_hidden` on the `query` tool:** when `true` and a `mask` is supplied,
 hidden nodes in the mask appear as `{"key":"…","restricted":true}` in node-info and
@@ -1054,8 +1040,7 @@ why `stats` answers with the whole namespace roster unless one of them is passed
 
 ## Python bindings
 
-Install (after the first `v*` tag: `pip install mushroomdb`; before that,
-build from source):
+Install with `pip install mushroomdb`, or build from source:
 
 ```text
 cd bindings/python
@@ -1078,7 +1063,7 @@ manual `mkdir` is required.
 
 A read-write handle takes the store's cross-process write lock and raises
 `MushroomBusy` if another one already holds it; `read_only=True` never takes the
-lock. See [Concurrency](#concurrency-1) below.
+lock. See [Concurrency](#concurrency) below.
 
 ### Insert nodes
 
@@ -1282,7 +1267,7 @@ neighbors = db.neighbors("alice", "KNOWS", "out")   # one hop, list of keys
 
 ### Vector search
 
-`find_similar(field, vector, label=None, k=10, min=0.0, mask=None, where=None, exact=False)`
+`find_similar(field, vector, label=None, k=10, min=0.8, mask=None, where=None, exact=False)`
 returns the `k` nearest nodes to `vector` by cosine similarity on `field`.
 
 Scores are cosine similarity in `[-1, 1]`. The engine keeps `score >= min`
@@ -1295,8 +1280,8 @@ hits = db.find_similar("embedding", query_vec, k=10, min=0.0)
 # [(key, similarity), ...]
 ```
 
-Python `min` defaults to `0.0`. MCP vector mode defaults `min` to `0.8`; that
-default is unchanged.
+`min` defaults to `0.8`, on every surface. Through 0.6 the Python default was `0.0`: pass
+`min=0.0` if a call relied on it.
 
 **Exact vs approximate.** When no approximate `VectorSimilar` rule covers
 `field`, brute `find_similar` is an exact GEMM. HNSW is still the approximate

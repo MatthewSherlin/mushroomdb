@@ -9,6 +9,26 @@ use std::process::Command;
 /// nanosecond, which would otherwise hand both the same repo.
 static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The one rule for a Cypher statement typed at a shell, in the words the
+/// skill's CLI table, the reach line and the CLI-only empty-store brief all
+/// print. The statement is one double-quoted argument, because the engine's
+/// Cypher takes single-quoted strings only — and a shell expands `$` and a
+/// backtick inside double quotes, so a fact that holds one would run.
+const QUOTING_RULE: &str = "single-quote Cypher strings; inside the double quotes backslash \
+                            every dollar sign, double quote and backtick";
+
+/// `text` as [`QUOTING_RULE`] says to write it inside the double quotes.
+fn as_the_quoting_rule_says(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '$' | '"' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn tmp(name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1022,10 +1042,9 @@ fn legacy_store_recovers_the_majority_name_on_first_sync() {
 
 /// The `co_changed` rule scores on jaccard similarity, which is a ratio, so a
 /// file that changes with this one often and *also* changes a lot on its own
-/// falls under the floor and gets no edge. `impact` must still name it, by how
-/// many commits the two share, and label it as a count rather than a score.
+/// falls under the floor and gets no edge.
 #[test]
-fn impact_includes_partners_by_shared_commit_count() {
+fn co_changed_writes_no_edge_for_a_partner_under_the_similarity_floor() {
     let repo = tmp("repo");
     git(&repo, &["init", "-q", "-b", "main"]);
 
@@ -1076,41 +1095,12 @@ fn impact_includes_partners_by_shared_commit_count() {
             .unwrap(),
     );
     assert!(
+        edges.contains(&"src/pair.rs".to_string()),
+        "the partner that rarely changes apart scores over the floor: {edges:?}"
+    );
+    assert!(
         !edges.contains(&"src/busy.rs".to_string()),
         "the rule writes no edge for the busy file: {edges:?}"
-    );
-
-    let r = core_api::repograph::impact(
-        &db,
-        &["src/api.rs".to_string()],
-        &std::collections::BTreeSet::new(),
-        &core_api::repograph::ImpactOptions::default(),
-    );
-    let named: Vec<(&str, Option<usize>)> = r.files[0]
-        .partners
-        .iter()
-        .map(|p| (p.path.as_str(), p.shared_commits))
-        .collect();
-    assert_eq!(
-        named,
-        vec![("src/pair.rs", None), ("src/busy.rs", Some(4))],
-        "the scored partner first, then the one only the commit counts see"
-    );
-
-    let text = core_api::repograph::render_impact(&r);
-    assert!(
-        text.contains("src/busy.rs (4 shared commits)"),
-        "the digest labels it a count, not a score:\n{text}"
-    );
-
-    // `why` says the same thing when asked about the pair the rule skipped.
-    let w = core_api::repograph::why(&db, "src/api.rs", "src/busy.rs");
-    assert!(w.links.is_empty(), "no rule edge to report");
-    assert_eq!(w.shared.as_ref().map(|s| s.count), Some(4));
-    assert!(
-        core_api::repograph::render_why(&w).contains("4 shared commits"),
-        "{}",
-        core_api::repograph::render_why(&w)
     );
 }
 
@@ -1729,7 +1719,7 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
     let text = cli::run_brief(&db_dir).expect("brief");
     assert_eq!(text, cli::run_brief(&db_dir).expect("brief"));
     assert!(
-        text.len() <= core_api::repograph::MAX_BRIEF_BYTES,
+        text.len() <= core_api::memory::brief::MAX_BRIEF_BYTES,
         "{} bytes",
         text.len()
     );
@@ -1737,36 +1727,33 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
     // with the marker every digest rendered out of a store opens with — inside
     // the budget asserted above, not on top of it.
     assert!(
-        text.starts_with(core_api::repograph::UNTRUSTED_FRAMING),
+        text.starts_with(core_api::digest::UNTRUSTED_FRAMING),
         "{text}"
     );
-    // The header names the repository, its size and the sha it is at — and no
-    // age, which is what would move between two prompts of one session.
+    // Since 0.7 an ingested store gets the same brief as any memory store: a
+    // header counting what is there, then the schema. No age, which is what
+    // would move between two prompts of one session.
     let header = text.lines().nth(1).unwrap();
-    let name = repo.file_name().unwrap().to_str().unwrap();
-    let sha = marker(&db_dir, "__mushroomdb_git_sync__").expect("a sync marker");
+    assert_eq!(header, "mushroomdb brief — 9 nodes · 21 edges · 5 labels");
+    assert!(!text.contains("ago"), "{text}");
     assert!(
-        header.starts_with(&format!(
-            "mushroomdb brief — {name} · 3 files · 3 symbols · "
-        )),
-        "{header}"
+        text.contains("\nlabels:\n  File (3) — "),
+        "the schema, led by the label with the most nodes: {text}"
     );
-    assert!(
-        header.ends_with(&format!("· synced {}", &sha[..7])),
-        "{header}"
-    );
-    assert!(!header.contains("ago"), "{header}");
-    assert!(text.contains("src/core.rs"), "{text}");
-    // The last line names both doors, and the CLI one is runnable: `explore`
+    // The last line names both doors, and the CLI one is runnable: `query`
     // takes a store, so the line has to carry one. This store was built by
-    // `ingest-git`, so the door it names is the code graph's one tool.
+    // `ingest-git`, and it is served the same listing as any other store, so
+    // the door it names is the association one.
     let reach = text.lines().next_back().unwrap();
     assert!(
-        reach.starts_with("reach the graph: explore <target> (MCP tool)"),
+        reach.starts_with("reach the graph: explain_association <a> <b>"),
         "{reach}"
     );
     assert!(
-        reach.ends_with(&format!(" explore '{}' <target>", db_dir.display())),
+        reach.ends_with(&format!(
+            " query '{}' \"<cypher>\" ({QUOTING_RULE})",
+            db_dir.display()
+        )),
         "{reach}"
     );
 
@@ -1812,6 +1799,25 @@ fn memory_store(name: &str) -> PathBuf {
     db_dir
 }
 
+/// Binding: `run_brief` briefs a store with no `GitSync` marker with its
+/// schema, not the code graph's two rankings.
+///
+/// The reach-line tests below cannot pin this: the reach line is the same
+/// whichever renderer produced the text above it.
+#[test]
+fn the_brief_of_a_store_with_no_git_sync_marker_is_the_schema() {
+    let db_dir = memory_store("brief-memory-dispatch");
+    let text = cli::run_brief(&db_dir).expect("brief");
+    assert!(
+        text.contains("labels:\n"),
+        "a memory store gets its schema: {text}"
+    );
+    assert!(
+        !text.contains("key files"),
+        "and not the code graph's rankings: {text}"
+    );
+}
+
 /// The brief's last line, without its `reach the graph: ` label.
 fn reach_line_of(db_dir: &Path) -> String {
     let text = cli::run_brief(db_dir).expect("brief");
@@ -1827,11 +1833,9 @@ fn reach_line_of(db_dir: &Path) -> String {
 /// names the association door — `explain_association` and `query`, with the
 /// `role` and `namespace` arguments — and not one code-graph tool.
 ///
-/// The two lines track the two MCP surfaces. A store with no `GitSync` marker
-/// lists neither `explore` nor `context`, so naming either would send a
-/// session at a tool it cannot see. The shell half names `query`, the one of
-/// the two that has a CLI subcommand, and it is introduced with the same
-/// `SEP`-then-`or:` the code-graph line uses.
+/// No server serves `explore` or `context` any more, so naming either would
+/// send a session at a tool it cannot call. The shell half names `query`, the
+/// one of the two that has a CLI subcommand, introduced with `SEP`-then-`or:`.
 #[test]
 fn the_reach_line_names_the_association_door_on_a_store_with_no_git_sync_marker() {
     let db_dir = memory_store("brief-memory-db");
@@ -1841,7 +1845,7 @@ fn the_reach_line_names_the_association_door_on_a_store_with_no_git_sync_marker(
         reach,
         format!(
             "explain_association <a> <b> · query '<cypher>' (MCP tools; add role: <name> or \
-             namespace: <ns> to narrow what it sees) · or: {} query '{}' '<cypher>'",
+             namespace: <ns> to narrow what it sees) · or: {} query '{}' \"<cypher>\" ({QUOTING_RULE})",
             cli::install::detect_mcp_command(None).shell(),
             db_dir.display()
         ),
@@ -1855,14 +1859,15 @@ fn the_reach_line_names_the_association_door_on_a_store_with_no_git_sync_marker(
     }
 }
 
-/// Binding: every MCP tool the reach line names is one the store's own
-/// `tools/list` advertises — on both surfaces.
+/// Binding: every MCP tool the reach line names is one `tools/list`
+/// advertises — on a store `ingest-git` built and on a memory store alike.
 ///
 /// This is the guard on the class of break the thirteen-tool listing caused:
 /// the line named `context`, which stayed *served* on a memory store but
-/// stopped being *listed*, and nothing failed. The lists come from the server
-/// crate itself ([`server::ASSOCIATION_TOOLS`], [`server::CODE_GRAPH_TOOLS`]),
-/// so a surface that drops a tool this line names cannot pass silently again.
+/// stopped being *listed*, and nothing failed. The list comes from the server
+/// crate itself ([`server::ASSOCIATION_TOOLS`]), so a listing that drops a
+/// tool this line names cannot pass silently again. Both store shapes are
+/// kept so an ingested store is shown to get the same line as a memory one.
 #[test]
 fn the_reach_line_names_only_tools_its_surface_lists() {
     // The first word of each ` · `-separated clause of the MCP half — the half
@@ -1871,7 +1876,7 @@ fn the_reach_line_names_only_tools_its_surface_lists() {
     fn tools_named_in(reach: &str) -> Vec<String> {
         let mcp_half = reach.split(" or: ").next().expect("split yields one part");
         mcp_half
-            .split(core_api::repograph::render::SEP)
+            .split(core_api::digest::SEP)
             .filter_map(|clause| clause.split_whitespace().next())
             .filter(|word| {
                 !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase() || c == '_')
@@ -1892,10 +1897,8 @@ fn the_reach_line_names_only_tools_its_surface_lists() {
     run_ingest_git(&code_db, &opts(&repo)).unwrap();
     let memory_db = memory_store("reach-surface-memory");
 
-    for (label, db_dir, listed) in [
-        ("code graph", code_db, server::CODE_GRAPH_TOOLS.to_vec()),
-        ("memory", memory_db, server::ASSOCIATION_TOOLS.to_vec()),
-    ] {
+    let listed = server::ASSOCIATION_TOOLS.to_vec();
+    for (label, db_dir) in [("ingested", code_db), ("memory", memory_db)] {
         let reach = reach_line_of(&db_dir);
         assert!(
             reach.contains("(MCP tool"),
@@ -1938,12 +1941,8 @@ fn the_reach_line_on_a_cli_delivery_install_names_only_the_binary() {
             scope: Some(cli::install::Scope::Project),
             db: Some(db_dir.clone()),
             command: None,
-            git_hooks: true,
             prewarm: false,
             delivery: cli::install::Delivery::Cli,
-            intercept_grep: false,
-            impact_before_edit: false,
-            enrich_grep: false,
             always_load: false,
         },
         &cli::install::McpCommand::OnPath,
@@ -1966,7 +1965,246 @@ fn the_reach_line_on_a_cli_delivery_install_names_only_the_binary() {
         "a cli install has no server to name: {reach}"
     );
     assert!(
-        reach.ends_with(&format!(" query '{}' '<cypher>'", db_dir.display())),
+        reach.ends_with(&format!(
+            " query '{}' \"<cypher>\" ({QUOTING_RULE})",
+            db_dir.display()
+        )),
         "{reach}"
+    );
+}
+
+/// Binding: an empty store's brief on a `--delivery cli` install offers the
+/// shell, not three MCP tools the session has no server to call.
+///
+/// `EMPTY_BRIEF` names `remember`, `upsert_entity` and `ingest_json`. The
+/// reach line already branches on delivery; the empty line did not.
+#[test]
+fn an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool() {
+    let root = tmp("brief-cli-empty");
+    let home = tmp("brief-cli-empty-home");
+    // A hostile store path: a space and a single quote, the two characters
+    // that break a shell argument quoted carelessly.
+    let db_dir = root.join("mushroom memory's");
+    std::fs::create_dir_all(root.join(".git").join("hooks")).unwrap();
+
+    cli::install::run_install_with(
+        &root,
+        &home,
+        &cli::install::InstallOpts {
+            platform: Some(cli::install::Platform::ClaudeCode),
+            scope: Some(cli::install::Scope::Project),
+            db: Some(db_dir.clone()),
+            command: None,
+            prewarm: false,
+            delivery: cli::install::Delivery::Cli,
+            always_load: false,
+        },
+        &cli::install::McpCommand::OnPath,
+        &cli::install::Externals::with_path(None),
+    )
+    .expect("install");
+
+    // A read that creates the store and puts nothing in it.
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&db_dir)
+        .arg("MATCH (n) RETURN count(n) AS c")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    let text = cli::run_brief(&db_dir).expect("brief");
+    let first = text.lines().next().unwrap();
+    assert!(first.contains("empty store"), "{first}");
+    for tool in ["`remember`", "`upsert_entity`", "`ingest_json`"] {
+        assert!(
+            !first.contains(tool),
+            "a cli install has no server to call {tool} on: {first}"
+        );
+    }
+    let quoted = db_dir.display().to_string().replace('\'', r"'\''");
+    assert!(
+        first.contains(&format!(" query '{quoted}' ")) && first.contains("CREATE (n:Note {id:"),
+        "it offers the one write a shell has, with the `id:` a CREATE needs: {first}"
+    );
+    // The id is a placeholder, as the skill's `note:…` is: a literal id would
+    // be the same key on every paste, and the second paste would not be a new
+    // note.
+    assert!(
+        first.contains("'note:<fresh-id>'") && first.contains("'<the fact>'"),
+        "the id and the text are for the session to fill in: {first}"
+    );
+    assert!(
+        first.contains(QUOTING_RULE),
+        "the line says how to quote the fact it asks for: {first}"
+    );
+    // The offer has to run as a shell would run it, hostile path included.
+    // The engine's Cypher takes single-quoted strings only, so the statement
+    // is the line's one double-quoted shell argument. Everything after
+    // ` query ` up to that argument's closing quote goes to `sh` with the two
+    // placeholders filled in — behind the binary this test built, never the
+    // launcher the line names, which may be one that fetches a package.
+    let args = first
+        .split_once(" query ")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.rfind('"').map(|end| &rest[..=end]))
+        .unwrap_or_else(|| panic!("no double-quoted statement in: {first}"));
+    assert!(
+        args.split('"').count() == 3 && !args.contains(['$', '`']),
+        "one double-quoted argument a shell passes through unchanged: {first}"
+    );
+    let concrete = args
+        .replace("<fresh-id>", "1")
+        .replace("<the fact>", "ada likes tea");
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("\"$MUSHROOMDB_UNDER_TEST\" query {concrete}"))
+        .env("MUSHROOMDB_UNDER_TEST", env!("CARGO_BIN_EXE_mushroomdb"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the command the brief offers does not run: {concrete}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&db_dir)
+        .arg("MATCH (n:Note) RETURN n.id AS id, n.text AS text")
+        .output()
+        .unwrap();
+    let rows = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        rows.contains("note:1") && rows.contains("ada likes tea"),
+        "the note landed in the store the line named: {out:?}"
+    );
+
+    // No install beside the store means both doors, and the line is the
+    // MCP one, unchanged.
+    let bare = tmp("brief-no-install").join("db");
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&bare)
+        .arg("MATCH (n) RETURN count(n) AS c")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let text = cli::run_brief(&bare).expect("brief");
+    assert!(
+        text.starts_with(core_api::memory::brief::EMPTY_BRIEF),
+        "{text}"
+    );
+}
+
+/// Binding: the Cypher rows a `--delivery cli` skill teaches run as a shell
+/// would run them.
+///
+/// That skill's CLI table is the only place such a session learns to write a
+/// fact, and the engine's Cypher takes single-quoted strings only: an example
+/// with a double-quoted string is `illegal character '"'`, and a template
+/// that wraps the statement in single quotes ends at the first string
+/// literal. So the rows are run as printed — the row's command with the
+/// row's own example as its statement — behind the binary this test built,
+/// never a launcher that may fetch a package.
+#[test]
+fn the_cli_skills_cypher_rows_run_as_a_shell_runs_them() {
+    // A space in the store path: the row quotes it, and has to keep doing so.
+    let root = tmp("skill-cli-rows");
+    let db_dir = root.join("mushroom memory");
+    let template = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("skills/mushroom/SKILL.md"),
+    )
+    .expect("skill template");
+    let skill = cli::install::render_template(
+        &template,
+        &db_dir.to_string_lossy(),
+        "\"$MUSHROOMDB_UNDER_TEST\"",
+        cli::install::Delivery::Cli,
+    )
+    .expect("the committed template's regions are well formed");
+
+    // The code spans of one table row, in order.
+    let line = |question: &str| -> &str {
+        skill
+            .lines()
+            .find(|l| l.starts_with(&format!("| {question} |")))
+            .unwrap_or_else(|| panic!("no `{question}` row in the cli skill:\n{skill}"))
+    };
+    let row = |question: &str| -> Vec<String> {
+        line(question)
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    };
+    let sh = |command: &str| {
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("MUSHROOMDB_UNDER_TEST", env!("CARGO_BIN_EXE_mushroomdb"))
+            .output()
+            .unwrap()
+    };
+
+    // The durable fact: the `query` form, with the example the row gives for
+    // it and the two placeholders filled in. The fact is hostile to a shell —
+    // a dollar sign, a double quote, and a backticked command that would
+    // leave a file behind — and is written the way the row says to write it.
+    let executed = root.join("executed");
+    let hostile = format!(
+        "costs $5, said \"no\", run `touch {}` first",
+        executed.display()
+    );
+    assert!(
+        line("anything else, including a durable fact").contains(QUOTING_RULE),
+        "the row does not say how to quote a statement:\n{skill}"
+    );
+    let fact = row("anything else, including a durable fact");
+    let command = &fact[0];
+    let example = fact
+        .iter()
+        .find(|span| span.starts_with("CREATE "))
+        .unwrap_or_else(|| panic!("the row gives no CREATE example: {fact:?}"));
+    assert!(command.contains("<cypher>"), "{command}");
+    let write = command.replace(
+        "<cypher>",
+        &example
+            .replace("<fresh-id>", "1")
+            .replace("<the fact>", &as_the_quoting_rule_says(&hostile)),
+    );
+    let out = sh(&write);
+    assert!(
+        out.status.success(),
+        "the write the skill teaches does not run: {write}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("query")
+        .arg(&db_dir)
+        .arg("MATCH (n:Note) RETURN n.id AS id, n.text AS text")
+        .output()
+        .unwrap();
+    let rows = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        rows.contains("note:1") && rows.contains(&hostile),
+        "the note landed in the store the row named, verbatim: {out:?}"
+    );
+    assert!(
+        !executed.exists(),
+        "the shell ran the command inside the fact: {write}"
+    );
+
+    // The dated read: the same trap, one row up. A string literal in the
+    // statement is what a careless template breaks on.
+    let then = row("what did it look like then");
+    let read = then[0].replace("<date>", "2100-01-01").replace(
+        "<cypher>",
+        "MATCH (n:Note) WHERE n.id = 'note:1' RETURN n.text AS text",
+    );
+    let out = sh(&read);
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains(&hostile),
+        "the dated read the skill teaches does not run: {read}: {out:?}"
     );
 }

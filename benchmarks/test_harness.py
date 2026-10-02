@@ -1,12 +1,8 @@
-"""Comparative benchmark harness — pytest suite.
+"""Benchmark harness — pytest suite.
 
 What this covers:
 - datasets.py: deterministic generation and JSONL round-trip.
 - ours adapter: full end-to-end at 2k scale (all workloads including rule_derive).
-- competitor adapters (neo4j, kuzu, memgraph): import + skip-path verification.
-  When a competitor is installed and its server is running the test executes;
-  otherwise it emits a clear skip message.  CI is expected to run with NO
-  competitors installed, so all competitor tests are expected-skip in CI.
 
 Run (from repo root, using the bindings venv)::
 
@@ -280,83 +276,3 @@ class TestOursAdapter:
         s = db2.stats()
         assert s["nodes_live"] == BENCH_SCALE
         db2.close()
-
-
-# ===========================================================================
-# Competitor adapters — skip-path verification
-# ===========================================================================
-
-class TestNeo4jSkipPath:
-    """Verify neo4j adapter emits a clean skip (or runs) based on availability."""
-
-    def test_bulk_ingest_skip_or_run(self, tmp_path):
-        """The adapter either runs fully or skips with a clear message."""
-        # We import and call; if the driver/server is absent pytest.skip fires.
-        try:
-            from adapters import neo4j as neo4j_adapter
-        except Exception as e:
-            pytest.skip(f"neo4j adapter import error: {e}")
-        # If we reach here the import succeeded; bulk_ingest will skip internally
-        # if the server is down.
-        nodes = [{"key": f"n{i}", "label": "Talent", "props": {"industry": "a", "size_bucket": 1}} for i in range(5)]
-        try:
-            result = neo4j_adapter.bulk_ingest(nodes)
-            assert result["engine"] == "neo4j"
-        except Exception as e:
-            if "not installed" in str(e).lower() or "could not connect" in str(e).lower():
-                pytest.skip(str(e))
-            raise
-
-    def test_skip_message_is_informative(self):
-        """neo4j skip messages contain installation/startup guidance."""
-        from adapters.neo4j import _SKIP_MSG_NO_DRIVER, _SKIP_MSG_NO_SERVER
-        assert "neo4j" in _SKIP_MSG_NO_DRIVER.lower()
-        assert "pip install" in _SKIP_MSG_NO_DRIVER
-        assert "docker" in _SKIP_MSG_NO_SERVER.lower() or "start" in _SKIP_MSG_NO_SERVER.lower()
-
-
-class TestKuzuSkipPath:
-    """Verify kuzu adapter emits a clean skip (or runs) based on availability."""
-
-    def test_bulk_ingest_skip_or_run(self, tmp_path):
-        try:
-            from adapters import kuzu as kuzu_adapter
-        except Exception as e:
-            pytest.skip(f"kuzu adapter import error: {e}")
-        nodes = [{"key": f"n{i}", "label": "Talent", "props": {}} for i in range(5)]
-        try:
-            result = kuzu_adapter.bulk_ingest(nodes, tmp_path / "kuzu_db")
-            assert result["engine"] == "kuzu"
-        except Exception as e:
-            if "not installed" in str(e).lower():
-                pytest.skip(str(e))
-            raise
-
-    def test_skip_message_is_informative(self):
-        from adapters.kuzu import _SKIP_MSG
-        assert "kuzu" in _SKIP_MSG.lower()
-        assert "pip install" in _SKIP_MSG
-
-
-class TestMemgraphSkipPath:
-    """Verify memgraph adapter emits a clean skip (or runs) based on availability."""
-
-    def test_bulk_ingest_skip_or_run(self):
-        try:
-            from adapters import memgraph as memgraph_adapter
-        except Exception as e:
-            pytest.skip(f"memgraph adapter import error: {e}")
-        nodes = [{"key": f"n{i}", "label": "Talent", "props": {}} for i in range(5)]
-        try:
-            result = memgraph_adapter.bulk_ingest(nodes)
-            assert result["engine"] == "memgraph"
-        except Exception as e:
-            if "not installed" in str(e).lower() or "could not connect" in str(e).lower():
-                pytest.skip(str(e))
-            raise
-
-    def test_skip_message_is_informative(self):
-        from adapters.memgraph import _SKIP_MSG_NO_DRIVER, _SKIP_MSG_NO_SERVER
-        assert "memgraph" in _SKIP_MSG_NO_DRIVER.lower()
-        assert "pip install" in _SKIP_MSG_NO_DRIVER
-        assert "docker" in _SKIP_MSG_NO_SERVER.lower() or "start" in _SKIP_MSG_NO_SERVER.lower()

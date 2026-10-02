@@ -15,7 +15,9 @@
 # actionable, or removed from the table while its section lingers.
 set -euo pipefail
 
-LEDGER="${1:-docs/roadmap/v0.6.10-defects.md}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+LEDGER="${1:-$ROOT/docs/roadmap/v0.6.10-defects.md}"
 [ -f "$LEDGER" ] || { echo "check-defect-ledger.sh: no ledger at $LEDGER" >&2; exit 1; }
 
 grep -q 'DEFECT-INDEX:BEGIN' "$LEDGER" && grep -q 'DEFECT-INDEX:END' "$LEDGER" || {
@@ -58,4 +60,51 @@ if [ -n "$open_rows" ]; then
   printf 'check-defect-ledger.sh: FAILED — these are still open:\n%s' "$open_rows" >&2
   exit 1
 fi
+
+# Emits `<row number>|<version>` for each DEFERRED row that names a target.
+#
+# Written in perl, not awk: the natural expression uses 3-argument
+# `match($0, /re/, m)`, a gawk extension. BSD awk (what darwin ships) fails
+# at parse time on it. Reuses the bounded DEFECT-INDEX:BEGIN/END window and,
+# for the row number, the same "split on |, take field 2" the main parse
+# above uses — never a fixed field index for the *status*, because the Where
+# column carries literal `|` (Rust patterns, alternations).
+deferred_rows_with_targets() {
+  perl -ne '
+    BEGIN { $inside = 0 }
+    if (/DEFECT-INDEX:BEGIN/) { $inside = 1; next }
+    if (/DEFECT-INDEX:END/)   { $inside = 0; next }
+    next unless $inside;
+    next unless /DEFERRED/;
+    my @f = split /\|/, $_, -1;
+    my $row = defined $f[1] ? $f[1] : "";
+    $row =~ s/\D//g;
+    next if $row eq "";
+    if (/DEFERRED[^0-9]*to[^0-9]*v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)/) {
+      print "$row|$1\n";
+    }
+  ' "$LEDGER"
+}
+
+# A deferral to a version that has already shipped is an open defect wearing a
+# stale label. Row 36 deferred to 0.6.11; 0.6.11 and 0.6.12 both shipped and
+# this gate stayed green, because `DEFERRED*` matched and nothing read the
+# target. Compare the named target against the workspace version.
+ws="$(awk -F'"' '/^version = "/{print $2; exit}' "$ROOT/Cargo.toml")"
+stale=0
+while IFS='|' read -r row target; do
+  [[ -z "${target// }" ]] && continue
+  # Sorts as versions: if the target is <= the shipped workspace version it
+  # cannot still be in the future.
+  newest="$(printf '%s\n%s\n' "$ws" "$target" | sort -V | tail -1)"
+  if [[ "$newest" == "$ws" ]]; then
+    echo "check-defect-ledger.sh: row $row defers to $target, which is not after $ws" >&2
+    stale=1
+  fi
+done < <(deferred_rows_with_targets)
+if [[ $stale -ne 0 ]]; then
+  echo "check-defect-ledger.sh: FAILED — a deferral target has already shipped" >&2
+  exit 1
+fi
+
 echo "check-defect-ledger.sh: OK — the release gate is satisfied"

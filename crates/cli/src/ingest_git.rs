@@ -36,13 +36,19 @@ use std::process::Command;
 /// cost of the jaccard overlap the `co_changed` rule runs over that list.
 pub const DEFAULT_MAX_COMMITS_PER_FILE: usize = 200;
 
-/// Applied when the user names no `--exclude` pattern of their own.
+/// The paths a repository carries that are not its source: build output,
+/// vendored dependencies, generated bundles, and lockfiles nobody reads.
 ///
-/// Defined in core-api because the `impact` MCP tool builds its default file
-/// list straight off a working tree and has to leave out exactly what this
-/// ingest leaves out; two lists would let the tool ask about files no store was
-/// ever going to hold.
-pub use core_api::repograph::DEFAULT_EXCLUDES;
+/// Applied when the user names no `--exclude` pattern of their own, which keeps
+/// them out of the history graph *and* out of the working-tree pass.
+pub const DEFAULT_EXCLUDES: [&str; 6] = [
+    "target/",
+    "node_modules/",
+    "dist/",
+    ".git/",
+    "*.lock",
+    "*.min.js",
+];
 
 /// Minimum jaccard overlap of two files' `commits` lists for `CO_CHANGED`.
 const CO_CHANGE_MIN: f64 = 0.25;
@@ -168,13 +174,26 @@ struct GitCommit {
     changes: Vec<Change>,
 }
 
-/// Simple, dependency-free path matcher. Documented in `docs/site/ingest-git.md`.
+/// Whether `path` matches any of `patterns`. Documented in `docs/site/ingest-git.md`.
 ///
-/// The matcher itself is `core_api::repograph::path_excluded`, next to
-/// [`DEFAULT_EXCLUDES`], because the `impact` MCP tool filters a working tree
-/// with the same patterns and must read them the same way.
-fn excluded(path: &str, patterns: &[String]) -> bool {
-    core_api::repograph::path_excluded(path, patterns)
+/// A `foo/` pattern is a *directory prefix*. A `*.` pattern is a **file-name
+/// suffix**, not a single extension: `*.min.js` matches `ui/bundle.min.js` the
+/// same way `*.lock` matches `Cargo.lock`. Matching only the last dot segment
+/// would leave every compound suffix inert, and a compound suffix is exactly
+/// how generated files announce themselves. Anything else is a substring.
+#[must_use]
+pub fn path_excluded(path: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|p| {
+        if let Some(prefix) = p.strip_suffix('/') {
+            path.starts_with(&format!("{prefix}/"))
+        } else if let Some(suffix) = p.strip_prefix('*').filter(|s| s.starts_with('.')) {
+            // The suffix must follow something, so `*.lock` does not claim a
+            // path that is nothing but the suffix itself.
+            path.len() > suffix.len() && path.ends_with(suffix)
+        } else {
+            path.contains(p.as_str())
+        }
+    })
 }
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, CliError> {
@@ -1139,6 +1158,11 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
         .filter(|p| !p.is_empty())
         .collect();
 
+    // The same gate `serve` and `mcp` use, read before `open` creates the
+    // directory's files: after the open it would always answer "existing".
+    // A run that finds nothing to write leaves the WAL empty, which this
+    // still reads as new, so the schema lands with the first run that writes.
+    let is_new_store = !core_api::restore::holds_a_store(db_dir);
     let db = SharedDb::open(db_dir)?;
     let mut report = IngestGitReport {
         submodules: units.len() - 1,
@@ -1214,6 +1238,20 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     })?;
     let ingest = IngestOptions::default(); // key `id`, auto-FK suffix `_id`
 
+    // A store this run is creating is declared on before its first write, so a
+    // failure part-way through still leaves it searchable. An existing store
+    // is never re-declared on: declaring full-text rebuilds its index at every
+    // later open (ledger row 36), and only `schema apply` may ask for that.
+    if is_new_store {
+        let diff = w.apply_schema(&structure::ingest_git_schema())?;
+        report.rules_created.extend(
+            diff.created
+                .iter()
+                .filter_map(|entry| entry.strip_prefix("rule:"))
+                .map(str::to_string),
+        );
+    }
+
     // Pull requests first: their nodes are what `Commit.pr_id` resolves to.
     if !prs.is_empty() {
         ingest_prs(&mut w, &prs, &ingest, &mut report)?;
@@ -1286,8 +1324,8 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     }
 
     // The working tree, on top of the history. It runs after the commit walk
-    // so every `File` node it reads exists, and its rules are declared after
-    // its props so each one backfills exactly once.
+    // so every `File` node it reads exists. On a store this run created, its
+    // rules came with the schema declared before the first write.
     if opts.structure {
         // A first run has nothing to be incremental against, and a run whose
         // flags changed (structure or docs just turned on) has to revisit
@@ -1306,9 +1344,21 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
             let paths: Vec<String> = paths.into_iter().collect();
             structure::refresh_files(&mut w, &repo, "", &paths, opts.docs)?
         };
-        report
-            .rules_created
-            .extend(structure::ensure_rules_and_fulltext(&mut w)?);
+        // A store this run did not create — `mcp` made it, or an older run
+        // with `--no-structure` did — gets ingest-git's own rules and text
+        // fields, declared after the props so each rule backfills once. Only
+        // what is absent, so a re-run declares nothing; never the memory
+        // defaults, which reach an existing store only through `schema apply`.
+        if !is_new_store {
+            let missing = structure::missing_structure_schema(&w);
+            let diff = w.apply_schema(&missing)?;
+            report.rules_created.extend(
+                diff.created
+                    .iter()
+                    .filter_map(|entry| entry.strip_prefix("rule:"))
+                    .map(str::to_string),
+            );
+        }
     }
 
     // Every commit this run could link is in the graph by now.
@@ -1441,7 +1491,7 @@ fn ingest_unit(
         for ch in &c.changes {
             match ch {
                 Change::Added(p) | Change::Modified(p) => {
-                    if excluded(p, &opts.exclude) {
+                    if path_excluded(p, &opts.exclude) {
                         continue;
                     }
                     walk.deleted.remove(p);
@@ -1455,7 +1505,7 @@ fn ingest_unit(
                         .push(("TOUCHED".into(), c.sha.clone(), p.clone()));
                 }
                 Change::Deleted(p) => {
-                    if excluded(p, &opts.exclude) {
+                    if path_excluded(p, &opts.exclude) {
                         continue;
                     }
                     walk.files.remove(p);
@@ -1463,7 +1513,7 @@ fn ingest_unit(
                     walk.deleted.insert(p.clone());
                 }
                 Change::Renamed { from, to } => {
-                    if excluded(to, &opts.exclude) {
+                    if path_excluded(to, &opts.exclude) {
                         // Moved out of scope: drop the old node, keep no alias
                         // so its TOUCHED edges are filtered out below.
                         walk.files.remove(from);
@@ -1661,362 +1711,6 @@ fn ingest_unit(
     Ok(())
 }
 
-// ── sync and touch ──────────────────────────────────────────────────────────
-//
-// `ingest-git` is the command a person runs. These two are what a *hook* runs:
-// `sync` after a commit lands, `touch` after a single file is edited. Both read
-// the repository out of the `GitSync` marker rather than taking it as an
-// argument, so a hook line carries only the database path and keeps working
-// when the checkout moves.
-
-/// What a store with no `GitSync` node is told. Naming the fix matters: this is
-/// the error a hook installed against the wrong database prints.
-const NO_MARKER: &str = "store has no git sync marker; run ingest-git first";
-
-/// The `GitSync` props that say how this store was built, read back so a later
-/// `sync` repeats the same run without being told any of it again.
-///
-/// `exclude` and `max_commits_per_file` are not on the marker, so a `sync`
-/// applies [`DEFAULT_EXCLUDES`] and [`DEFAULT_MAX_COMMITS_PER_FILE`]. A store
-/// first built with custom `--exclude` patterns should keep being maintained
-/// with `ingest-git`, which takes them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SyncMarker {
-    repo: PathBuf,
-    recurse: bool,
-    prs: bool,
-    structure: bool,
-    docs: bool,
-}
-
-impl SyncMarker {
-    fn opts(&self) -> IngestGitOpts {
-        IngestGitOpts {
-            repo: self.repo.clone(),
-            exclude: DEFAULT_EXCLUDES.iter().map(|p| (*p).to_string()).collect(),
-            max_commits_per_file: DEFAULT_MAX_COMMITS_PER_FILE,
-            recurse_submodules: self.recurse,
-            prs: self.prs,
-            structure: self.structure,
-            docs: self.docs,
-            ensure_gitignore: false,
-        }
-    }
-}
-
-/// Read the marker off an already-open handle.
-///
-/// Deliberately not "open the store and read the marker": opening this store is
-/// by far the most expensive thing either command does — it replays the whole
-/// WAL — so both of them open once and read the marker through that same
-/// handle. A separate read-only open just to learn the repository path would
-/// double the cost of every hook invocation.
-fn marker_of(r: &structure::Db) -> Result<SyncMarker, CliError> {
-    let node = r
-        .node_ref(SYNC_KEY)
-        .ok_or_else(|| CliError(NO_MARKER.into()))?;
-    let flag = |name: &str| matches!(node.prop(name), Some(Value::Bool(true)));
-    match node.prop("repo") {
-        Some(Value::Str(repo)) if !repo.is_empty() => Ok(SyncMarker {
-            repo: PathBuf::from(repo),
-            recurse: flag("recurse"),
-            prs: flag("prs"),
-            // A marker written before these two flags existed carries neither,
-            // and a working-tree pass is what such a run did.
-            structure: node.prop("structure") != Some(Value::Bool(false)),
-            docs: node.prop("docs") != Some(Value::Bool(false)),
-        }),
-        _ => Err(CliError(NO_MARKER.into())),
-    }
-}
-
-/// Open a store that must already exist.
-///
-/// `SharedDb::open` runs `create_dir_all`, so without this guard a hook line
-/// carrying a typo'd path would keep creating empty databases and reporting
-/// that they hold no marker — the same trap [`run_recall`] guards against.
-///
-/// [`run_recall`]: crate::recall::run_recall
-fn open_existing(db_dir: &Path) -> Result<SharedDb, CliError> {
-    if !db_dir.exists() {
-        return Err(CliError(format!(
-            "no database directory at {}",
-            db_dir.display()
-        )));
-    }
-    Ok(SharedDb::open(db_dir)?)
-}
-
-/// What one [`run_sync`] did.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct SyncReport {
-    /// The incremental history walk.
-    pub git: IngestGitReport,
-    /// The working-tree pass over the dirty paths, which the history walk does
-    /// not see: an edit that has not been committed is in no commit.
-    pub structure: crate::structure::StructureReport,
-    /// Dirty paths handed to that pass. Higher than `structure.files_scanned`
-    /// when some of them are new to the graph, or no longer on disk.
-    pub dirty_refreshed: usize,
-}
-
-/// Paths that differ from `HEAD` or are not tracked at all, repository-relative
-/// and sorted.
-///
-/// `-z` rather than the default listing: git escapes and quotes a path holding
-/// a tab, a newline or a non-ASCII byte, and a quoted path matches no key.
-fn dirty_paths(repo: &Path, exclude: &[String]) -> Result<Vec<String>, CliError> {
-    const LISTS: [&[&str]; 2] = [
-        &["diff", "--name-only", "-z", "HEAD"],
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    ];
-    let mut out = BTreeSet::new();
-    for args in LISTS {
-        let o = git_output(repo, args)?;
-        if !o.status.success() {
-            // `diff HEAD` fails in a repository with no commits yet. Nothing is
-            // dirty relative to a head that does not exist.
-            continue;
-        }
-        for path in String::from_utf8_lossy(&o.stdout).split('\0') {
-            if path.is_empty() || excluded(path, exclude) {
-                continue;
-            }
-            out.insert(path.to_string());
-        }
-    }
-    Ok(out.into_iter().collect())
-}
-
-/// Bring the store up to date with the repository it was built from: the
-/// commits since the marker, then the working tree where it differs from
-/// `HEAD`.
-///
-/// The second half is what a plain `ingest-git` cannot do. Its working-tree
-/// pass only visits the paths the *commits* touched, so a file edited and not
-/// yet committed keeps whatever the graph last recorded about it. A hook that
-/// runs on every commit wants the uncommitted remainder refreshed too.
-pub fn run_sync(db_dir: &Path) -> Result<SyncReport, CliError> {
-    // One handle for the whole run. It is opened before `run_ingest_git`, which
-    // opens its own and commits through it, but a `SharedDb` refreshes off the
-    // WAL when a write scope is entered — so the dirty pass below sees every
-    // commit the ingest just made without this handle being reopened.
-    let db = open_existing(db_dir)?;
-    let marker = marker_of(&db.read())?;
-    let opts = marker.opts();
-    let mut report = SyncReport {
-        git: run_ingest_git(db_dir, &opts)?,
-        ..Default::default()
-    };
-    if !opts.structure {
-        return Ok(report);
-    }
-
-    // Only the root repository's working tree. A submodule's dirty files are
-    // its own checkout's business, and `--recurse-submodules` resumes each unit
-    // from its own marker on the next commit there.
-    let repo = canonical(&marker.repo);
-    let paths = dirty_paths(&repo, &opts.exclude)?;
-    report.dirty_refreshed = paths.len();
-    if paths.is_empty() {
-        // Nothing to refresh: never enter a write scope, so the run takes no
-        // lock and `commit_seq` cannot move.
-        return Ok(report);
-    }
-
-    let mut w = db.write_with_wait(WRITE_LOCK_WAIT).map_err(|e| match e {
-        GraphError::Busy { .. } => CliError(BUSY_MESSAGE.to_string()),
-        other => CliError(other.to_string()),
-    })?;
-    report.structure = structure::refresh_files(&mut w, &repo, "", &paths, opts.docs)?;
-
-    // The history half already snapshotted if this was a first ingest; this
-    // covers the tail the dirty pass just appended. `full` is false because a
-    // sync is by definition a run against a store that already exists.
-    drop(w);
-    snapshot_if_due(&db, db_dir, false);
-    Ok(report)
-}
-
-pub fn format_touch(r: &structure::StructureReport) -> String {
-    format!(
-        "touch: {} file(s), {} symbol(s), {} import(s), {} call(s), {} mention(s)\n",
-        r.files_scanned, r.symbols, r.imports, r.calls, r.mentions
-    )
-}
-
-/// One [`SyncReport`] as a single JSON object, for `sync --json`.
-///
-/// `text` is exactly what [`format_sync`] prints, so a caller that has the
-/// object never has to render the digest a second way and never has to parse
-/// the counts back out of the prose. The MCP `sync` tool is that caller: it
-/// runs this binary and hands both halves straight to the assistant.
-#[must_use]
-pub fn format_sync_json(r: &SyncReport) -> String {
-    let g = &r.git;
-    let s = &r.structure;
-    let gs = &g.structure;
-    let value = serde_json::json!({
-        "text": format_sync(r),
-        "commits": g.commits,
-        "files": g.files,
-        "authors": g.authors,
-        "renamed": g.renamed,
-        "deleted": g.deleted,
-        "evicted": g.evicted,
-        "incremental": g.incremental,
-        "submodules": g.submodules,
-        "prs": g.prs,
-        "rules_created": g.rules_created,
-        "scanned": {
-            "files": gs.files_scanned,
-            "symbols": gs.symbols,
-            "imports": gs.imports,
-            "calls": gs.calls,
-            "mentions": gs.mentions,
-        },
-        "dirty_refreshed": r.dirty_refreshed,
-        "dirty": {
-            "files": s.files_scanned,
-            "symbols": s.symbols,
-            "imports": s.imports,
-            "calls": s.calls,
-            "mentions": s.mentions,
-        },
-    });
-    format!("{value}\n")
-}
-
-pub fn format_sync(r: &SyncReport) -> String {
-    let mut out = format_ingest_git(&r.git);
-    let s = &r.structure;
-    out.push_str(&format!(
-        "  dirty {} path(s): scanned {}, {} symbol(s), {} import(s), {} call(s)\n",
-        r.dirty_refreshed, s.files_scanned, s.symbols, s.imports, s.calls
-    ));
-    out
-}
-
-/// Re-extract exactly the files named, and nothing else.
-///
-/// `files` comes from argv when a caller has the paths; otherwise they are read
-/// out of a `PostToolUse` hook payload on stdin, the same way [`run_recall`]
-/// reads a prompt. Anything that is not a working-tree file this store already
-/// knows — a path outside the repository, an excluded one, one the graph has
-/// never seen — is dropped without comment, because a hook fires on every edit
-/// the assistant makes and most of them are none of this store's business.
-///
-/// [`run_recall`]: crate::recall::run_recall
-pub fn run_touch(
-    db_dir: &Path,
-    files: &[PathBuf],
-    hook_stdin: Option<&str>,
-) -> Result<structure::StructureReport, CliError> {
-    let named: Vec<PathBuf> = if files.is_empty() {
-        hook_stdin.map(paths_from_payload).unwrap_or_default()
-    } else {
-        files.to_vec()
-    };
-    if named.is_empty() {
-        return Ok(structure::StructureReport::default());
-    }
-
-    let db = open_existing(db_dir)?;
-    let marker = marker_of(&db.read())?;
-    if !marker.structure {
-        // The store was built with `--no-structure`, so it holds no working-tree
-        // props at all and re-extracting one file would be the only exception.
-        return Ok(structure::StructureReport::default());
-    }
-    let repo = canonical(&marker.repo);
-    let exclude: Vec<String> = DEFAULT_EXCLUDES.iter().map(|p| (*p).to_string()).collect();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut paths: BTreeSet<String> = BTreeSet::new();
-    for path in &named {
-        let Some(rel) = repo_relative(&repo, &cwd, path) else {
-            continue;
-        };
-        if !excluded(&rel, &exclude) {
-            paths.insert(rel);
-        }
-    }
-    if paths.is_empty() {
-        // Nothing of ours changed: never enter a write scope, so no lock is
-        // taken and a running writer is never made to wait.
-        return Ok(structure::StructureReport::default());
-    }
-
-    let paths: Vec<String> = paths.into_iter().collect();
-    let mut w = db.write_with_wait(WRITE_LOCK_WAIT).map_err(|e| match e {
-        GraphError::Busy { .. } => CliError(BUSY_MESSAGE.to_string()),
-        other => CliError(other.to_string()),
-    })?;
-    structure::refresh_files(&mut w, &repo, "", &paths, marker.docs)
-}
-
-/// The file paths in a `PostToolUse` payload.
-///
-/// `tool_input.file_path` covers Edit and Write; `tool_input.edits[].file_path`
-/// covers the multi-edit shape. Both are read, so a payload carrying either (or
-/// both) is handled without knowing which tool produced it. A payload that is
-/// not JSON, or that names no file, yields nothing — never an error.
-fn paths_from_payload(raw: &str) -> Vec<PathBuf> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return Vec::new();
-    };
-    let input = &v["tool_input"];
-    let mut out = Vec::new();
-    let mut push = |value: &serde_json::Value| {
-        if let Some(s) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
-            out.push(PathBuf::from(s));
-        }
-    };
-    push(&input["file_path"]);
-    if let Some(edits) = input["edits"].as_array() {
-        for e in edits {
-            push(&e["file_path"]);
-        }
-    }
-    out
-}
-
-/// `path` as a key under `repo`, or `None` when it is not inside it.
-///
-/// A hook payload carries absolute paths and a person typing the command uses
-/// relative ones, so a relative path is taken against `cwd`. Both sides are
-/// then resolved through symlinks before comparing: the marker records the
-/// canonical repository path, and on macOS a checkout under `/tmp` is reached
-/// through a symlink that never compares equal as written.
-fn repo_relative(repo: &Path, cwd: &Path, path: &Path) -> Option<String> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    };
-    let resolved = resolve_symlinks(&absolute);
-    let rel = resolved.strip_prefix(repo).ok()?;
-    let key: Vec<String> = rel
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect();
-    let key = key.join("/");
-    (!key.is_empty()).then_some(key)
-}
-
-/// [`canonical`] that still works for a path that no longer exists: a file
-/// deleted between the edit and the hook resolves through its parent directory.
-fn resolve_symlinks(p: &Path) -> PathBuf {
-    if let Ok(resolved) = std::fs::canonicalize(p) {
-        return resolved;
-    }
-    match (p.parent(), p.file_name()) {
-        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
-            .map(|d| d.join(name))
-            .unwrap_or_else(|_| p.to_path_buf()),
-        _ => p.to_path_buf(),
-    }
-}
-
 pub fn format_ingest_git(r: &IngestGitReport) -> String {
     let mut out = format!(
         "ingest-git: {} commit(s), {} file(s), {} author(s){}\n",
@@ -2070,16 +1764,16 @@ mod tests {
             "*.lock".into(),
             "node_modules".into(),
         ];
-        assert!(excluded("target/debug/foo.rs", &pats));
+        assert!(path_excluded("target/debug/foo.rs", &pats));
         assert!(
-            !excluded("targeted/foo.rs", &pats),
+            !path_excluded("targeted/foo.rs", &pats),
             "prefix needs the slash"
         );
-        assert!(excluded("Cargo.lock", &pats));
-        assert!(!excluded("Cargo.toml", &pats));
-        assert!(excluded("ui/node_modules/x/y.js", &pats));
-        assert!(!excluded("src/lib.rs", &pats));
-        assert!(!excluded("anything", &[]));
+        assert!(path_excluded("Cargo.lock", &pats));
+        assert!(!path_excluded("Cargo.toml", &pats));
+        assert!(path_excluded("ui/node_modules/x/y.js", &pats));
+        assert!(!path_excluded("src/lib.rs", &pats));
+        assert!(!path_excluded("anything", &[]));
     }
 
     /// A `*.` pattern is a file-name suffix, so a compound one works. Reading
@@ -2090,18 +1784,18 @@ mod tests {
     fn a_compound_suffix_pattern_matches() {
         let defaults: Vec<String> = DEFAULT_EXCLUDES.iter().map(|p| (*p).to_string()).collect();
         // Not under `dist/`, so only the suffix rule can match it.
-        assert!(excluded("ui/build/bundle.min.js", &defaults));
-        assert!(excluded("bundle.min.js", &defaults));
+        assert!(path_excluded("ui/build/bundle.min.js", &defaults));
+        assert!(path_excluded("bundle.min.js", &defaults));
         assert!(
-            !excluded("ui/src/app.js", &defaults),
+            !path_excluded("ui/src/app.js", &defaults),
             "an ordinary source file is not a bundle"
         );
-        assert!(!excluded("ui/src/minify.js", &defaults));
+        assert!(!path_excluded("ui/src/minify.js", &defaults));
         // The single-extension form is unchanged, and a bare suffix is not a
         // match: `*.lock` means something *dot* lock.
-        assert!(excluded("Cargo.lock", &defaults));
-        assert!(!excluded(".lock", &defaults));
-        assert!(!excluded("src/lib.rs", &defaults));
+        assert!(path_excluded("Cargo.lock", &defaults));
+        assert!(!path_excluded(".lock", &defaults));
+        assert!(!path_excluded("src/lib.rs", &defaults));
     }
 
     #[test]

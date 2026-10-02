@@ -1,12 +1,8 @@
-//! `sync` and `touch`: keeping a codebase graph current between full ingests.
-//!
-//! `sync` is what a git hook runs after a commit — an incremental `ingest-git`
-//! plus a working-tree pass over whatever is still dirty. `touch` is what an
-//! editor hook runs after one file changes, and re-extracts only that file.
-//!
-//! Also covers the two small resolvers the same surface needs: `--auto`
-//! database discovery and the version string.
-use cli::ingest_git::{run_ingest_git, run_sync, run_touch, IngestGitOpts};
+//! What is left of the hook surface once `sync` and `touch` went in 0.7: the
+//! snapshot a full `ingest-git` takes, the `recall` hook body's silence at the
+//! process boundary, `--auto` database discovery, where the cleanup of a 0.6
+//! install's git hooks looks for them, and the version string.
+use cli::ingest_git::{run_ingest_git, IngestGitOpts};
 use cli::{resolve_auto_db, version_string};
 use core_api::{Direction, GraphDb};
 use std::path::{Path, PathBuf};
@@ -97,15 +93,6 @@ pub fn connect(port: u32) -> u32 {
 }
 ";
 
-/// `use crate::util::helper;` removed, so the `IMPORTS` edge must retract.
-const NET_RS_NO_IMPORT: &str = "//! Networking.
-
-/// Open a connection.
-pub fn connect(port: u32) -> u32 {
-    2
-}
-";
-
 /// A three-module Rust crate, committed once.
 fn seed_repo() -> PathBuf {
     let repo = tmp("repo");
@@ -145,168 +132,10 @@ fn out(db: &cli::structure::Db, key: &str, edge: &str) -> Vec<String> {
     v
 }
 
-// ── sync ────────────────────────────────────────────────────────────────────
-
-/// `sync` re-stamps the marker when it takes new commits, so `map` can say how
-/// stale the graph is rather than how old its newest commit is.
-#[test]
-fn sync_restamps_the_marker_when_it_takes_new_commits() {
-    let repo = seed_repo();
-    let db_dir = tmp("db");
-    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-
-    let stamp = |dir: &Path| match GraphDb::open(dir)
-        .unwrap()
-        .node_ref("__mushroomdb_git_sync__")
-        .unwrap()
-        .prop("synced_at")
-    {
-        Some(core_api::Value::Int(at)) => at,
-        other => panic!("synced_at must be an integer, got {other:?}"),
-    };
-    let first = stamp(&db_dir);
-
-    // Nothing new: the whole run writes nothing, the stamp included.
-    let seq = GraphDb::open(&db_dir).unwrap().commit_seq();
-    run_sync(&db_dir).unwrap();
-    assert_eq!(GraphDb::open(&db_dir).unwrap().commit_seq(), seq);
-    assert_eq!(stamp(&db_dir), first);
-
-    // One new commit, and the sync dates itself.
-    std::thread::sleep(std::time::Duration::from_millis(1_100));
-    commit(&repo, "add extra", &[("src/extra.rs", "//! Extra.\n")]);
-    let r = run_sync(&db_dir).unwrap();
-    assert_eq!(r.git.commits, 1, "{r:?}");
-    assert!(stamp(&db_dir) > first, "the sync re-stamped the marker");
-}
-
-/// A hook-driven `sync` has to do both halves of the job: walk the commits
-/// that landed since the marker, and re-extract the files the working tree has
-/// changed but not committed. Neither half alone keeps the graph honest.
-#[test]
-fn sync_after_new_commit_is_incremental_and_refreshes_dirty_working_tree() {
-    let repo = seed_repo();
-    let db_dir = tmp("db");
-    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-    {
-        let db = GraphDb::open(&db_dir).unwrap();
-        assert_eq!(
-            out(&db, "src/net.rs", "IMPORTS"),
-            vec!["src/util.rs".to_string()]
-        );
-    }
-
-    // One new commit, plus one file dirtied in the working tree afterwards.
-    commit(
-        &repo,
-        "add extra",
-        &[(
-            "src/extra.rs",
-            "//! Extra.\n\npub fn extra() -> u32 {\n    1\n}\n",
-        )],
-    );
-    write_files(&repo, &[("src/net.rs", NET_RS_NO_IMPORT)]);
-
-    let r = run_sync(&db_dir).unwrap();
-    assert!(r.git.incremental, "the marker was already there: {r:?}");
-    assert_eq!(r.git.commits, 1, "exactly the one new commit: {r:?}");
-    assert_eq!(
-        r.dirty_refreshed, 1,
-        "src/net.rs is the only dirty path: {r:?}"
-    );
-    assert_eq!(r.structure.files_scanned, 1, "{r:?}");
-
-    let db = GraphDb::open(&db_dir).unwrap();
-    assert!(db.has_node("src/extra.rs"), "the new commit was walked");
-    assert!(
-        out(&db, "src/net.rs", "IMPORTS").is_empty(),
-        "the uncommitted edit must retract the import edge"
-    );
-    drop(db);
-
-    // Nothing new to do: no commits, and the working tree is no longer dirty
-    // relative to the last refresh — but net.rs is still uncommitted, so it is
-    // scanned again and found unchanged, which writes nothing.
-    let again = run_sync(&db_dir).unwrap();
-    assert_eq!(again.git.commits, 0, "no new commits: {again:?}");
-    assert_eq!(again.git.files, 0, "{again:?}");
-}
-
-/// A database that was never pointed at a repository cannot guess one.
-#[test]
-fn sync_without_repo_prop_errors_clearly() {
-    let db_dir = tmp("db");
-    // A real store, just one that has never seen `ingest-git`.
-    drop(GraphDb::open(&db_dir).unwrap());
-
-    let err = run_sync(&db_dir).expect_err("no marker, so no repository");
-    assert!(
-        err.0.contains("no git sync marker") && err.0.contains("ingest-git"),
-        "the message must name the fix: {}",
-        err.0
-    );
-}
-
-/// `sync` writes, so it serialises on the store's cross-process lock like every
-/// other writer: exit 3 and a retry message, with nothing written.
-#[test]
-fn sync_reports_busy_when_lock_held() {
-    let repo = seed_repo();
-    let db_dir = tmp("db");
-    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-    commit(
-        &repo,
-        "another",
-        &[("src/util.rs", "//! Shared helpers v2.\n")],
-    );
-
-    // A plain read-write handle holds the lock for as long as it lives, so the
-    // child process cannot get it.
-    let holder = GraphDb::open(&db_dir).unwrap();
-    let seq_before = holder.commit_seq();
-
-    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
-        .arg("sync")
-        .arg(&db_dir)
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(3), "Busy is exit code 3");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("another mushroomdb process is writing; retry"),
-        "got: {stderr}"
-    );
-    assert_eq!(
-        holder.commit_seq(),
-        seq_before,
-        "the busy run wrote nothing"
-    );
-    drop(holder);
-
-    // Once the lock is free the same sync succeeds.
-    let r = run_sync(&db_dir).unwrap();
-    assert_eq!(r.git.commits, 1);
-}
-
 // ── snapshots ───────────────────────────────────────────────────────────────
 
 fn wal_len(db_dir: &Path) -> u64 {
     std::fs::metadata(db_dir.join("wal.bin")).map_or(0, |m| m.len())
-}
-
-/// Enough Markdown to push one incremental run's WAL tail past
-/// [`cli::ingest_git::SNAPSHOT_WAL_BYTES`]. Each file stores a body prop, so
-/// the WAL grows roughly with the bytes committed.
-fn bulky_docs() -> Vec<(String, String)> {
-    let para = "Nodes and edges and rules and files and symbols and commits. ".repeat(1_000);
-    (0..96)
-        .map(|n| {
-            (
-                format!("docs/page{n}.md"),
-                format!("# Page {n}\n\n{para}\n"),
-            )
-        })
-        .collect()
 }
 
 /// A first ingest is the run that writes the whole history into an empty WAL.
@@ -349,96 +178,7 @@ fn full_ingest_writes_a_snapshot() {
     );
 }
 
-/// An incremental run snapshots only when the tail it appended is long enough
-/// to be worth the write. A small sync leaves the snapshot alone; a large one
-/// folds itself in.
-#[test]
-fn incremental_sync_snapshots_past_the_threshold() {
-    let repo = seed_repo();
-    let db_dir = tmp("db");
-    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-    let first = std::fs::read(db_dir.join("snapshot.bin")).unwrap();
-
-    // A small commit: under the threshold, so the snapshot is not rewritten.
-    commit(&repo, "one more", &[("src/extra.rs", "//! Extra.\n")]);
-    run_sync(&db_dir).unwrap();
-    assert_eq!(
-        std::fs::read(db_dir.join("snapshot.bin")).unwrap(),
-        first,
-        "a small incremental run is not worth a snapshot"
-    );
-    let small_tail = wal_len(&db_dir);
-    assert!(small_tail > 0, "the increment is in the WAL");
-
-    // A bulky one: the tail clears the threshold and is folded in.
-    let docs = bulky_docs();
-    let files: Vec<(&str, &str)> = docs.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
-    commit(&repo, "a pile of docs", &files);
-    run_sync(&db_dir).unwrap();
-
-    let after = wal_len(&db_dir);
-    assert!(
-        after < small_tail.max(cli::ingest_git::SNAPSHOT_WAL_BYTES),
-        "the long tail was folded into the snapshot, leaving {after} bytes"
-    );
-    assert!(
-        std::fs::metadata(db_dir.join("snapshot.bin"))
-            .unwrap()
-            .len()
-            > first.len() as u64,
-        "the snapshot grew to hold what the WAL no longer carries"
-    );
-    let db = GraphDb::open(&db_dir).unwrap();
-    assert!(db.has_node("docs/page0.md"), "nothing was lost");
-}
-
-/// `touch` runs on every edit the assistant makes, inside the hook's budget.
-/// A snapshot costs hundreds of milliseconds, so it never takes one — even
-/// when the store has none at all and one would otherwise be due.
-#[test]
-fn touch_never_snapshots() {
-    let repo = seed_repo();
-    let db_dir = tmp("db");
-    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-
-    // Get the files into the graph, then rewrite every one of them through
-    // `touch` alone. That pushes the WAL tail past the threshold, so a
-    // snapshot is unambiguously due by the time the last edit lands — and only
-    // the rule that `touch` never takes one can keep it away.
-    let docs = bulky_docs();
-    let files: Vec<(&str, &str)> = docs.iter().map(|(p, b)| (p.as_str(), b.as_str())).collect();
-    commit(&repo, "a pile of docs", &files);
-    run_sync(&db_dir).unwrap();
-    let before = std::fs::read(db_dir.join("snapshot.bin")).unwrap();
-
-    let edited: Vec<(String, String)> = docs
-        .iter()
-        .map(|(p, b)| (p.clone(), format!("{b}\nEdited by the assistant.\n")))
-        .collect();
-    write_files(
-        &repo,
-        &edited
-            .iter()
-            .map(|(p, b)| (p.as_str(), b.as_str()))
-            .collect::<Vec<_>>(),
-    );
-    let named: Vec<PathBuf> = edited.iter().map(|(p, _)| repo.join(p)).collect();
-    let r = run_touch(&db_dir, &named, None).unwrap();
-    assert_eq!(r.files_scanned, docs.len(), "every edit was taken: {r:?}");
-
-    assert!(
-        wal_len(&db_dir) > cli::ingest_git::SNAPSHOT_WAL_BYTES,
-        "a snapshot is genuinely due: {} bytes of tail",
-        wal_len(&db_dir)
-    );
-    assert_eq!(
-        std::fs::read(db_dir.join("snapshot.bin")).unwrap(),
-        before,
-        "touch stays inside the hook budget and writes no snapshot"
-    );
-}
-
-// ── touch ───────────────────────────────────────────────────────────────────
+// ── the recall hook at the process boundary ─────────────────────────────────
 
 /// Run the real binary with `stdin` piped in, and return
 /// `(exit code, stdout, stderr)`.
@@ -465,96 +205,7 @@ fn run_bin(args: &[&str], stdin: &str) -> (Option<i32>, String, String) {
     )
 }
 
-/// A `PostToolUse` hook fires on every edit the assistant makes, and whatever
-/// it writes lands in the user's session. Pointed at a database that was never
-/// built from a repository — the common case for a hook installed globally —
-/// it must say nothing at all and exit 0.
-#[test]
-fn touch_hook_mode_is_silent_on_missing_marker() {
-    let db_dir = tmp("db");
-    drop(GraphDb::open(&db_dir).unwrap()); // a real store, but no ingest-git
-    let payload = format!(
-        r#"{{"tool_name":"Edit","tool_input":{{"file_path":{}}}}}"#,
-        serde_json::to_string(&db_dir.join("x.rs").to_string_lossy().into_owned()).unwrap()
-    );
-
-    // Hook mode is "no files on the command line", with or without --auto.
-    let (code, stdout, stderr) = run_bin(&["touch", &db_dir.to_string_lossy()], &payload);
-    assert_eq!(code, Some(0), "a hook must never fail the tool call");
-    assert_eq!(stdout, "", "hook mode prints nothing on stdout");
-    assert_eq!(stderr, "", "hook mode prints nothing on stderr");
-
-    // A database directory that does not exist at all is just as silent, and
-    // must not be created on the way past.
-    let missing = db_dir.join("nope").join("deeper");
-    let (code, stdout, stderr) = run_bin(&["touch", &missing.to_string_lossy()], &payload);
-    assert_eq!(code, Some(0));
-    assert_eq!(stdout, "");
-    assert_eq!(stderr, "");
-    assert!(!missing.exists(), "a hook must not seed a database");
-
-    // A person naming files on the command line still gets the error, because
-    // they are owed an answer and nothing is reading their stdout.
-    let (code, _stdout, stderr) = run_bin(
-        &[
-            "touch",
-            &db_dir.to_string_lossy(),
-            &db_dir.join("x.rs").to_string_lossy(),
-        ],
-        "",
-    );
-    assert_eq!(code, Some(1), "explicit files: a real exit code");
-    assert!(
-        stderr.contains("no git sync marker"),
-        "explicit files: a real message, got {stderr:?}"
-    );
-}
-
-/// Anything at all can arrive on a hook's stdin, including nothing. None of it
-/// is worth a word of output.
-#[test]
-fn touch_hook_mode_is_silent_on_garbage_payload() {
-    let repo = seed_repo();
-    let db_dir = tmp("db");
-    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-    let db = db_dir.to_string_lossy().into_owned();
-
-    for payload in [
-        "",
-        "not json at all",
-        "{",
-        r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#,
-        r#"{"tool_input":{"file_path":""}}"#,
-        r#"{"tool_input":{"file_path":"/etc/hosts"}}"#,
-        r#"{"tool_input":{"file_path":12345}}"#,
-        r#"{"tool_input":{"edits":"not an array"}}"#,
-        r#"[1,2,3]"#,
-    ] {
-        let (code, stdout, stderr) = run_bin(&["touch", &db], payload);
-        assert_eq!(code, Some(0), "payload {payload:?}");
-        assert_eq!(stdout, "", "payload {payload:?}");
-        assert_eq!(stderr, "", "payload {payload:?}");
-    }
-
-    // A payload that *does* name a known file is equally silent, and still did
-    // the work: the import it dropped is gone from the graph.
-    write_files(&repo, &[("src/net.rs", NET_RS_NO_IMPORT)]);
-    let payload = format!(
-        r#"{{"tool_input":{{"file_path":{}}}}}"#,
-        serde_json::to_string(&repo.join("src/net.rs").to_string_lossy().into_owned()).unwrap()
-    );
-    let (code, stdout, stderr) = run_bin(&["touch", &db], &payload);
-    assert_eq!(code, Some(0));
-    assert_eq!(stdout, "", "a successful hook fire is noise too");
-    assert_eq!(stderr, "");
-    let graph = GraphDb::open(&db_dir).unwrap();
-    assert!(
-        out(&graph, "src/net.rs", "IMPORTS").is_empty(),
-        "silent does not mean idle"
-    );
-}
-
-/// The other hook body, held to the same standard at the process boundary.
+/// The prompt hook's body, held to its contract at the process boundary.
 /// `run_recall` is silent on every error by contract, but nothing checked that
 /// the binary around it is.
 #[test]
@@ -573,116 +224,6 @@ fn recall_hook_is_silent_and_exits_zero() {
         assert_eq!(stderr, "", "payload {payload:?}");
     }
     assert!(!missing.exists(), "recall must not seed a database");
-}
-
-/// The single-file path: one edit, one re-extraction, and the edges the old
-/// content derived are gone.
-#[test]
-fn touch_reextracts_one_file_and_retracts_removed_import() {
-    let repo = seed_repo();
-    let db_dir = tmp("db");
-    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-
-    write_files(&repo, &[("src/net.rs", NET_RS_NO_IMPORT)]);
-    let report = run_touch(&db_dir, &[repo.join("src/net.rs")], None).unwrap();
-    assert_eq!(
-        report.files_scanned, 1,
-        "exactly the touched file: {report:?}"
-    );
-
-    let db = GraphDb::open(&db_dir).unwrap();
-    assert!(
-        out(&db, "src/net.rs", "IMPORTS").is_empty(),
-        "the removed `use` must retract the edge"
-    );
-    // Nothing else was re-extracted: lib.rs still imports both modules.
-    assert_eq!(
-        out(&db, "src/lib.rs", "IMPORTS"),
-        vec!["src/net.rs".to_string(), "src/util.rs".to_string()]
-    );
-}
-
-/// Driven from a `PostToolUse` payload the same way `recall` is driven from a
-/// `UserPromptSubmit` one: the path comes off stdin, not argv.
-#[test]
-fn touch_reads_file_path_from_hook_payload() {
-    let repo = seed_repo();
-    let db_dir = tmp("db");
-    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-    write_files(&repo, &[("src/net.rs", NET_RS_NO_IMPORT)]);
-
-    let path = repo.join("src/net.rs");
-    let payload = format!(
-        r#"{{"tool_name":"Edit","tool_input":{{"file_path":{}}}}}"#,
-        serde_json::to_string(&path.to_string_lossy().into_owned()).unwrap()
-    );
-    let report = run_touch(&db_dir, &[], Some(&payload)).unwrap();
-    assert_eq!(report.files_scanned, 1, "{report:?}");
-
-    {
-        let db = GraphDb::open(&db_dir).unwrap();
-        assert!(out(&db, "src/net.rs", "IMPORTS").is_empty());
-    }
-
-    // The MultiEdit shape carries the paths one level deeper.
-    write_files(&repo, &[("src/util.rs", "//! Shared helpers.\n")]);
-    let payload = format!(
-        r#"{{"tool_name":"MultiEdit","tool_input":{{"edits":[{{"file_path":{}}}]}}}}"#,
-        serde_json::to_string(&repo.join("src/util.rs").to_string_lossy().into_owned()).unwrap()
-    );
-    let report = run_touch(&db_dir, &[], Some(&payload)).unwrap();
-    assert_eq!(report.files_scanned, 1, "{report:?}");
-    let db = GraphDb::open(&db_dir).unwrap();
-    assert!(
-        !db.has_node("src/util.rs#helper"),
-        "the deleted function's symbol must be swept"
-    );
-
-    // Payloads with nothing usable in them are a silent no-op, never an error.
-    assert_eq!(
-        run_touch(&db_dir, &[], Some("not json"))
-            .unwrap()
-            .files_scanned,
-        0
-    );
-    assert_eq!(
-        run_touch(&db_dir, &[], Some(r#"{"tool_name":"Bash"}"#))
-            .unwrap()
-            .files_scanned,
-        0
-    );
-}
-
-/// A hook fires on every edit the assistant makes, most of which are nowhere
-/// near this repository. Those must cost nothing and write nothing.
-#[test]
-fn touch_ignores_paths_outside_repo() {
-    let repo = seed_repo();
-    let db_dir = tmp("db");
-    run_ingest_git(&db_dir, &opts(&repo)).unwrap();
-    let seq_before = GraphDb::open(&db_dir).unwrap().commit_seq();
-
-    let elsewhere = tmp("elsewhere");
-    std::fs::write(elsewhere.join("stray.rs"), "pub fn stray() {}\n").unwrap();
-    let report = run_touch(
-        &db_dir,
-        &[
-            elsewhere.join("stray.rs"),
-            PathBuf::from("/etc/hosts"),
-            // Inside the repo but excluded by the default patterns.
-            repo.join("target/debug/build.rs"),
-            // Inside the repo but not a file the graph knows.
-            repo.join("src/never-existed.rs"),
-        ],
-        None,
-    )
-    .unwrap();
-    assert_eq!(report.files_scanned, 0, "{report:?}");
-    assert_eq!(
-        GraphDb::open(&db_dir).unwrap().commit_seq(),
-        seq_before,
-        "an out-of-repo touch must not write"
-    );
 }
 
 // ── --auto and --version ────────────────────────────────────────────────────
@@ -723,7 +264,7 @@ fn auto_db_prefers_project_dir_then_git_cwd_then_home() {
 /// subdirectory of a checkout resolves to that checkout's.
 ///
 /// This is what makes committed config safe. `install --project` writes
-/// `--auto` into `.mcp.json`, the settings hooks and the git hooks; those
+/// `--auto` into `.mcp.json` and the settings hooks; those
 /// files travel to a `git worktree`, and a store path baked into them would
 /// point every hook in the new worktree at the old checkout's graph.
 #[test]
@@ -776,90 +317,28 @@ fn auto_db_resolves_to_the_worktree_root() {
     );
 }
 
-/// The `post-commit` block `install` writes, run for real from inside a
-/// linked worktree, updates that worktree's store and leaves the main
-/// checkout's alone.
-///
-/// Worktrees share one hooks directory, so this is literally the same file
-/// running in both places — the only thing that can tell them apart is that
-/// `sync --auto` resolves the store when it runs.
-#[test]
-fn git_hook_sync_auto_uses_the_worktree_store() {
-    use cli::install::{merge_git_hook, StoreRef};
-
-    let repo = tmp("hook-main");
-    git(&repo, &["init", "-q", "-b", "main"]);
-    commit(&repo, "first", &[("src/lib.rs", LIB_RS)]);
-
-    let wt = tmp("hook-wt").join("feature");
-    git(
-        &repo,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "feature",
-            wt.to_str().unwrap(),
-        ],
-    );
-
-    // Each checkout starts with its own store, built from its own files.
-    let main_db = repo.join("mushroom-memory");
-    let wt_db = wt.join("mushroom-memory");
-    run_ingest_git(&main_db, &opts(&repo)).unwrap();
-    run_ingest_git(&wt_db, &opts(&wt)).unwrap();
-    let main_seq_before = GraphDb::open(&main_db).unwrap().commit_seq();
-    let wt_seq_before = GraphDb::open(&wt_db).unwrap().commit_seq();
-
-    // Exactly the block install writes, with the test binary as the command.
-    let bin = env!("CARGO_BIN_EXE_mushroomdb");
-    let hook = repo.join(".git").join("hooks").join("post-commit");
-    let block_written =
-        merge_git_hook(&hook, &format!("'{bin}'"), &StoreRef::auto(main_db.clone())).unwrap();
-    assert!(block_written);
-    assert!(
-        std::fs::read_to_string(&hook)
-            .unwrap()
-            .contains("sync --auto"),
-        "the block resolves the store at run time"
-    );
-
-    // Commit in the worktree. The hook is backgrounded, so wait for it.
-    commit(&wt, "only in the worktree", &[("src/feature.rs", NET_RS)]);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
-        if GraphDb::open(&wt_db).unwrap().commit_seq() > wt_seq_before {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the post-commit sync never reached {}",
-            wt_db.display()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-
-    assert_eq!(
-        GraphDb::open(&main_db).unwrap().commit_seq(),
-        main_seq_before,
-        "the other checkout's store must not be touched"
-    );
+/// The `post-commit` block a 0.6 install wrote from a linked worktree, as
+/// 0.6.12 wrote it with an explicit `--command` and `--auto`.
+fn block_0_6(bin: &str) -> String {
+    format!(
+        "#!/bin/sh\n\n# >>> mushroomdb >>>\n( '{bin}' sync --auto >/dev/null 2>&1 & )\n# <<< mushroomdb <<<\n"
+    )
 }
 
-/// `install` run from inside a linked worktree puts its git hooks where git
-/// will actually run them: the repository's **common** hooks directory.
+/// `install` run from inside a linked worktree takes a 0.6 `sync` block out
+/// of where git actually ran it: the repository's **common** hooks directory.
 ///
 /// A linked worktree's gitdir is `<main>/.git/worktrees/<name>`, and that is
 /// what the `gitdir:` link in its `.git` file points at — but git resolves
-/// hooks through the common dir, so a hook written into the worktree's own
-/// gitdir is a file nothing ever executes. This installs from the worktree,
-/// makes a real commit there, and requires the hook to have fired.
+/// hooks through the common dir, so a cleanup that looked in the worktree's
+/// own gitdir would find nothing and leave the block running on every commit.
+/// `doctor` has to read the same directory, or it could not report the block
+/// the cleanup is for.
 #[test]
-fn install_from_a_worktree_writes_hooks_to_the_common_dir() {
+fn install_from_a_worktree_cleans_the_common_dir_hooks() {
     use cli::doctor::{run_doctor_with, DoctorOpts};
     use cli::install::{
-        run_install_with, Delivery, Externals, InstallOpts, McpCommand, Platform, Scope, HOOK_BEGIN,
+        run_install_with, Delivery, Externals, InstallOpts, McpCommand, Platform, Scope,
     };
 
     let repo = tmp("wt-hooks-main");
@@ -883,31 +362,38 @@ fn install_from_a_worktree_writes_hooks_to_the_common_dir() {
         "a linked worktree marks its root with a .git file, not a directory"
     );
 
-    // Each checkout has its own store, so a hook that fires is visible as a
-    // commit on that checkout's graph and nowhere else.
-    let main_db = repo.join("mushroom-memory");
-    let wt_db = wt.join("mushroom-memory");
-    run_ingest_git(&main_db, &opts(&repo)).unwrap();
-    run_ingest_git(&wt_db, &opts(&wt)).unwrap();
-    let main_seq_before = GraphDb::open(&main_db).unwrap().commit_seq();
-    let wt_seq_before = GraphDb::open(&wt_db).unwrap().commit_seq();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+    let common_hook = repo.join(".git").join("hooks").join("post-commit");
+    std::fs::write(&common_hook, block_0_6(&bin.to_string_lossy())).unwrap();
 
     let home = tmp("wt-hooks-home");
-    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
     let install_opts = InstallOpts {
         platform: Some(Platform::ClaudeCode),
         scope: Some(Scope::Project),
         db: None, // `--auto`: each checkout resolves its own store
         command: Some(bin.clone()),
-        git_hooks: true,
         prewarm: false,
         delivery: Delivery::Both,
-        intercept_grep: false,
-        impact_before_edit: false,
-        enrich_grep: false,
         always_load: false,
     };
-    let summary = run_install_with(
+    let doctor = |dir: &Path| {
+        run_doctor_with(
+            dir,
+            &home,
+            &DoctorOpts {
+                platform: Some(Platform::ClaudeCode),
+                scope: Some(Scope::Project),
+            },
+            &Externals::with_path(None),
+        )
+        .expect("doctor")
+        .output
+    };
+
+    // Install once so doctor has a config to read, then put the 0.6 block
+    // back as if the install had been 0.6's: doctor must find it where git
+    // runs it.
+    run_install_with(
         &wt,
         &home,
         &install_opts,
@@ -915,109 +401,59 @@ fn install_from_a_worktree_writes_hooks_to_the_common_dir() {
         &Externals::with_path(None),
     )
     .expect("install from the worktree");
-
-    // The block is in the common dir, and the worktree's own gitdir holds no
-    // hooks at all — writing one there is the whole bug.
-    let common_hook = repo.join(".git").join("hooks").join("post-commit");
-    let block = std::fs::read_to_string(&common_hook).expect("post-commit in the common hooks dir");
     assert!(
-        block.contains(HOOK_BEGIN),
-        "the block is in {common_hook:?}"
+        !common_hook.exists(),
+        "the first install already cleaned it"
     );
-    assert!(
-        block.contains("sync --auto"),
-        "the store resolves at run time, per checkout"
-    );
-    let wt_gitdir = repo.join(".git").join("worktrees").join("feature");
-    assert!(wt_gitdir.is_dir(), "the worktree's gitdir exists");
-    assert!(
-        !wt_gitdir.join("hooks").exists(),
-        "nothing may be written to the worktree's own gitdir: git never reads it"
-    );
-    assert!(
-        summary.contains(&common_hook.display().to_string()),
-        "the summary names the file git will run:\n{summary}"
-    );
-
-    // `doctor` must read the same directory, or the failure this fixes stays
-    // invisible from the tool that exists to catch it.
-    let report = run_doctor_with(
-        &wt,
-        &home,
-        &DoctorOpts {
-            platform: Some(Platform::ClaudeCode),
-            scope: Some(Scope::Project),
-        },
-        &Externals::with_path(None),
-    )
-    .expect("doctor");
+    std::fs::write(&common_hook, block_0_6(&bin.to_string_lossy())).unwrap();
+    let report = doctor(&wt);
     let git_line = report
-        .output
         .lines()
         .find(|l| l.contains("git-hooks"))
-        .unwrap_or_else(|| panic!("no git-hooks line in:\n{}", report.output));
+        .unwrap_or_else(|| panic!("no git-hooks line in:\n{report}"));
+    assert!(git_line.starts_with("warn"), "{git_line}");
     assert!(
-        git_line.starts_with("ok"),
-        "git-hooks should be ok: {git_line}"
-    );
-    assert!(
-        git_line.contains(&repo.join(".git").join("hooks").display().to_string()),
-        "doctor reports the common hooks dir: {git_line}"
+        git_line.contains(&common_hook.display().to_string()),
+        "doctor reports the file in the common hooks dir: {git_line}"
     );
 
-    // The real thing: commit in the worktree and require the hook to run.
-    commit(&wt, "only in the worktree", &[("src/feature.rs", NET_RS)]);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    loop {
-        if GraphDb::open(&wt_db).unwrap().commit_seq() > wt_seq_before {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the post-commit hook never reached {}",
-            wt_db.display()
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert_eq!(
-        GraphDb::open(&main_db).unwrap().commit_seq(),
-        main_seq_before,
-        "the other checkout's store must not be touched"
-    );
-
-    // Installing again from the main checkout targets the same file, so the
-    // block must be merged in place rather than appended a second time.
-    let main_opts = InstallOpts {
-        db: None,
-        ..install_opts
-    };
-    run_install_with(
-        &repo,
+    let summary = run_install_with(
+        &wt,
         &home,
-        &main_opts,
+        &install_opts,
         &McpCommand::Explicit(bin),
         &Externals::with_path(None),
     )
-    .expect("install from the main checkout");
-    let after = std::fs::read_to_string(&common_hook).unwrap();
-    assert_eq!(
-        after.matches(HOOK_BEGIN).count(),
-        1,
-        "one block per hook, however many checkouts installed:\n{after}"
+    .expect("install from the worktree");
+    assert!(
+        !common_hook.exists(),
+        "the block was the whole file, so the file goes:\n{summary}"
     );
+    assert!(
+        summary.contains(&common_hook.display().to_string()),
+        "the summary names the file it cleaned:\n{summary}"
+    );
+    let wt_gitdir = repo.join(".git").join("worktrees").join("feature");
+    assert!(
+        !wt_gitdir.join("hooks").exists(),
+        "nothing may be written to the worktree's own gitdir"
+    );
+    assert!(!doctor(&wt).contains("git-hooks"), "nothing left to report");
 }
 
 /// A submodule keeps its own hooks: its gitdir has no `commondir`, and git
-/// runs `.git/modules/<path>/hooks` for it.
+/// runs `.git/modules/<path>/hooks` for it — so that is where a 0.6 install
+/// in a submodule put its block, and where the cleanup has to look. The
+/// superproject's hooks are not the submodule's to touch.
 ///
 /// The two shapes are told apart by that one file, so this is the other half
-/// of [`install_from_a_worktree_writes_hooks_to_the_common_dir`]. The gitdir
+/// of [`install_from_a_worktree_cleans_the_common_dir_hooks`]. The gitdir
 /// link is written by hand rather than by `git submodule add`, which needs a
 /// clonable origin and is blocked over local paths by default on current git.
 #[test]
-fn install_in_a_submodule_keeps_the_submodule_hooks() {
+fn install_in_a_submodule_cleans_the_submodule_hooks() {
     use cli::install::{
-        run_install_with, Delivery, Externals, InstallOpts, McpCommand, Platform, Scope, HOOK_BEGIN,
+        run_install_with, Delivery, Externals, InstallOpts, McpCommand, Platform, Scope,
     };
 
     let repo = tmp("sub-hooks-main");
@@ -1027,7 +463,7 @@ fn install_in_a_submodule_keeps_the_submodule_hooks() {
     // Exactly the shape git leaves for a submodule: a gitdir link with no
     // `commondir` beside it.
     let module = repo.join(".git").join("modules").join("vendor").join("sub");
-    std::fs::create_dir_all(&module).unwrap();
+    std::fs::create_dir_all(module.join("hooks")).unwrap();
     let sub = repo.join("vendor").join("sub");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(sub.join(".git"), format!("gitdir: {}\n", module.display())).unwrap();
@@ -1036,8 +472,14 @@ fn install_in_a_submodule_keeps_the_submodule_hooks() {
         "a submodule's gitdir has no commondir — that is the discriminator"
     );
 
-    let home = tmp("sub-hooks-home");
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+    let block = block_0_6(&bin.to_string_lossy());
+    let sub_hook = module.join("hooks").join("post-commit");
+    let super_hook = repo.join(".git").join("hooks").join("post-commit");
+    std::fs::write(&sub_hook, &block).unwrap();
+    std::fs::write(&super_hook, &block).unwrap();
+
+    let home = tmp("sub-hooks-home");
     run_install_with(
         &sub,
         &home,
@@ -1046,12 +488,8 @@ fn install_in_a_submodule_keeps_the_submodule_hooks() {
             scope: Some(Scope::Project),
             db: None,
             command: Some(bin.clone()),
-            git_hooks: true,
             prewarm: false,
             delivery: Delivery::Both,
-            intercept_grep: false,
-            impact_before_edit: false,
-            enrich_grep: false,
             always_load: false,
         },
         &McpCommand::Explicit(bin),
@@ -1059,16 +497,11 @@ fn install_in_a_submodule_keeps_the_submodule_hooks() {
     )
     .expect("install in the submodule");
 
-    let hook = module.join("hooks").join("post-commit");
-    assert!(
-        std::fs::read_to_string(&hook)
-            .unwrap_or_default()
-            .contains(HOOK_BEGIN),
-        "the submodule's own hooks dir holds the block: {hook:?}"
-    );
-    assert!(
-        !repo.join(".git").join("hooks").join("post-commit").exists(),
-        "a submodule must not write into the superproject's hooks"
+    assert!(!sub_hook.exists(), "the submodule's own block is cleaned");
+    assert_eq!(
+        std::fs::read_to_string(&super_hook).unwrap(),
+        block,
+        "a submodule must not edit the superproject's hooks"
     );
 }
 

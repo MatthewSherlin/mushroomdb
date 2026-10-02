@@ -72,12 +72,8 @@ fn base_opts() -> InstallOpts {
         scope: None,
         db: None,
         command: None,
-        git_hooks: true,
         prewarm: false,
         delivery: Delivery::Both,
-        intercept_grep: false,
-        impact_before_edit: false,
-        enrich_grep: false,
         always_load: false,
     }
 }
@@ -135,16 +131,7 @@ fn disable_removes_hooks_and_mcp_entry_and_keeps_skill_store_gitignore() {
     assert!(root.join(".mcp.json").exists());
     let settings_before: serde_json::Value = read_json(&root, ".claude/settings.json");
     assert!(settings_before["hooks"]["UserPromptSubmit"].is_array());
-    assert!(settings_before["hooks"]["PostToolUse"].is_array());
     assert!(settings_before["hooks"]["SessionStart"].is_array());
-    for name in ["post-commit", "post-checkout", "post-merge"] {
-        assert!(
-            fs::read_to_string(hooks_dir.join(name))
-                .unwrap()
-                .contains("mushroomdb sync"),
-            "{name} missing the sync block before disable"
-        );
-    }
 
     let out = run_disable_with(
         &root,
@@ -176,13 +163,6 @@ fn disable_removes_hooks_and_mcp_entry_and_keeps_skill_store_gitignore() {
         "{settings}"
     );
     assert!(
-        settings["hooks"]["PostToolUse"]
-            .as_array()
-            .map(|a| a.is_empty())
-            .unwrap_or(true),
-        "{settings}"
-    );
-    assert!(
         settings["hooks"]["SessionStart"]
             .as_array()
             .map(|a| a.is_empty())
@@ -190,13 +170,9 @@ fn disable_removes_hooks_and_mcp_entry_and_keeps_skill_store_gitignore() {
         "{settings}"
     );
 
-    // Git hook blocks gone (files were created by install, so they are
-    // removed entirely — same rule `uninstall` follows).
+    // No git hook was written, and disable writes none either.
     for name in ["post-commit", "post-checkout", "post-merge"] {
-        assert!(
-            !hooks_dir.join(name).exists(),
-            "{name} still has our block after disable"
-        );
+        assert!(!hooks_dir.join(name).exists(), "{name} exists");
     }
 
     // The skill file, the .gitignore line, and the manifest itself all stay.
@@ -206,11 +182,11 @@ fn disable_removes_hooks_and_mcp_entry_and_keeps_skill_store_gitignore() {
     assert!(gitignore.contains("mushroom-memory"));
     let manifest: serde_json::Value = read_json(&root, MANIFEST_REL);
     assert_eq!(manifest["disabled"], true, "{manifest}");
-    // The mcp_keys/hooks/git_hooks lists still describe what the install
-    // owns — disable does not clear them, only takes the config off disk.
+    // The mcp_keys/hooks lists still describe what the install owns —
+    // disable does not clear them, only takes the config off disk.
     assert!(!manifest["mcp_keys"].as_array().unwrap().is_empty());
     assert!(!manifest["hooks"].as_array().unwrap().is_empty());
-    assert_eq!(manifest["git_hooks"].as_array().unwrap().len(), 3);
+    assert!(manifest["git_hooks"].as_array().unwrap().is_empty());
     // The stashed entry is what enable will read the store back out of.
     assert!(!manifest["stashed_mcp"].as_array().unwrap().is_empty());
 }
@@ -295,10 +271,18 @@ fn enable_reresolves_an_npx_command_to_its_current_shape() {
         "{mcp}"
     );
 
-    for name in ["post-commit", "post-checkout", "post-merge"] {
-        let text = fs::read_to_string(hooks_dir.join(name)).unwrap();
-        assert!(text.contains(resolved.to_str().unwrap()), "{name}: {text}");
+    // The hooks run the same resolved file, and no git hook is written.
+    let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
+    for event in ["UserPromptSubmit", "SessionStart"] {
+        let command = settings["hooks"][event][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            command.contains(resolved.to_str().unwrap()),
+            "{event}: {settings}"
+        );
     }
+    assert!(!hooks_dir.join("post-commit").exists());
 }
 
 /// I1: `enable` restores an explicit `--command` pin verbatim rather than
@@ -807,68 +791,84 @@ fn enable_restores_a_cli_delivery_install_without_a_server() {
         brief.ends_with(&format!("brief '{}'", db.display())),
         "the hook must name the store it was installed with: {brief}"
     );
-    let post_commit = fs::read_to_string(hooks_dir.join("post-commit")).unwrap();
     assert!(
-        post_commit.contains(&db.display().to_string()),
-        "{post_commit}"
+        !hooks_dir.join("post-commit").exists(),
+        "no git hook is written"
     );
 }
 
-/// The fourth hook is the manifest's to remember: `disable` takes it off disk
-/// like the other three, and `enable` puts back exactly the install that was
-/// disabled — with the redirect if it had one, without if it did not.
+/// Enabling an install a 0.6 build disabled puts back the two live hooks and
+/// none of the retired ones, whatever the manifest says it had — and the
+/// manifest stops owning them, and the git hooks, from then on.
 #[test]
-fn enable_restores_the_grep_redirect_only_when_the_install_had_one() {
-    for intercept_grep in [true, false] {
-        let label = if intercept_grep { "on" } else { "off" };
-        let root = temp_dir(&format!("intercept-{label}"));
-        let home = temp_dir(&format!("intercept-{label}-home"));
-        let db = root.join("mushroom-memory");
-        git_repo(&root);
-        let opts = InstallOpts {
-            intercept_grep,
-            ..claude_project_opts(&db)
-        };
-        install_on_path(&root, &home, &opts).expect("install");
+fn enable_over_a_0_6_disabled_install_restores_no_retired_hook() {
+    let root = temp_dir("enable-0-6");
+    let home = temp_dir("enable-0-6-home");
+    let db = root.join("mushroom-memory");
+    let hooks_dir = git_repo(&root);
+    install_on_path(&root, &home, &claude_project_opts(&db)).expect("install");
+    run_disable_with(
+        &root,
+        &home,
+        &toggle(Platform::ClaudeCode, Scope::Project),
+        &no_externals(),
+    )
+    .expect("disable");
 
-        run_disable_with(
-            &root,
-            &home,
-            &toggle(Platform::ClaudeCode, Scope::Project),
-            &no_externals(),
-        )
-        .expect("disable");
-        let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
-        assert!(
-            settings["hooks"]["PreToolUse"]
-                .as_array()
-                .map(|a| a.is_empty())
-                .unwrap_or(true),
-            "the redirect survived disable: {settings}"
-        );
-
-        run_enable_with(
-            &root,
-            &home,
-            &toggle(Platform::ClaudeCode, Scope::Project),
-            &McpCommand::OnPath,
-            &no_externals(),
-        )
-        .expect("enable");
-
-        let settings: serde_json::Value = read_json(&root, ".claude/settings.json");
-        let restored = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
-            .map(str::to_string);
-        if intercept_grep {
-            assert_eq!(
-                restored.as_deref(),
-                Some(format!("mushroomdb intercept '{}'", db.display()).as_str()),
-                "{settings}"
-            );
-            assert_eq!(settings["hooks"]["PreToolUse"][0]["matcher"], "Grep");
-        } else {
-            assert_eq!(restored, None, "enable invented a redirect: {settings}");
-        }
+    // What a 0.6.12 install with `--intercept-grep` left in its manifest once
+    // disabled: the four retired hooks and three git hooks still owned.
+    let settings = root.join(".claude/settings.json");
+    let mut manifest: serde_json::Value = read_json(&root, MANIFEST_REL);
+    let hooks = manifest["hooks"].as_array_mut().unwrap();
+    for (event, sub) in [("PostToolUse", "touch"), ("PreToolUse", "intercept")] {
+        hooks.push(serde_json::json!({
+            "file": settings,
+            "event": event,
+            "command": format!("npx -y mushroomdb@0.6.12 {sub} '{}'", db.display()),
+        }));
     }
+    manifest["git_hooks"] = serde_json::json!([
+        hooks_dir.join("post-commit"),
+        hooks_dir.join("post-checkout"),
+        hooks_dir.join("post-merge"),
+    ]);
+    manifest["intercept_grep"] = serde_json::json!(true);
+    fs::write(
+        root.join(MANIFEST_REL),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+
+    run_enable_with(
+        &root,
+        &home,
+        &toggle(Platform::ClaudeCode, Scope::Project),
+        &McpCommand::OnPath,
+        &no_externals(),
+    )
+    .expect("enable");
+
+    let s: serde_json::Value = read_json(&root, ".claude/settings.json");
+    assert!(s["hooks"]["UserPromptSubmit"].is_array(), "{s}");
+    assert!(s["hooks"]["SessionStart"].is_array(), "{s}");
+    assert!(s["hooks"].get("PreToolUse").is_none(), "{s}");
+    assert!(s["hooks"].get("PostToolUse").is_none(), "{s}");
+    let manifest: serde_json::Value = read_json(&root, MANIFEST_REL);
+    let commands: Vec<&str> = manifest["hooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["command"].as_str().unwrap())
+        .collect();
+    assert!(
+        !commands
+            .iter()
+            .any(|c| c.contains(" touch ") || c.contains(" intercept ")),
+        "{manifest}"
+    );
+    assert!(
+        manifest["git_hooks"].as_array().unwrap().is_empty(),
+        "{manifest}"
+    );
+    assert!(manifest.get("intercept_grep").is_none(), "{manifest}");
 }

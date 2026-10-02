@@ -9,7 +9,7 @@
 
 use cli::install::{
     classify_mcp_command, run_install_with, run_uninstall, run_uninstall_with, Delivery, Externals,
-    InstallOpts, McpCommand, Platform, Scope, StoreRef,
+    InstallOpts, McpCommand, Platform, Scope,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -83,20 +83,16 @@ fn fake_program(dir: &Path, name: &str, body: &str) -> PathBuf {
     p
 }
 
-/// Base options: no platform, no scope, no db, no command, hooks on, pre-warm
-/// off. Tests never pre-warm — that would run `npx` against the network.
+/// Base options: no platform, no scope, no db, no command, pre-warm off.
+/// Tests never pre-warm — that would run `npx` against the network.
 fn base_opts() -> InstallOpts {
     InstallOpts {
         platform: None,
         scope: None,
         db: None,
         command: None,
-        git_hooks: true,
         prewarm: false,
         delivery: Delivery::Both,
-        intercept_grep: false,
-        impact_before_edit: false,
-        enrich_grep: false,
         always_load: false,
     }
 }
@@ -188,18 +184,9 @@ fn project_install_writes_npx_entry_and_hooks() {
         format!("npx -y mushroomdb@{VERSION} recall '{}'", db.display())
     );
     assert_eq!(prompt["timeout"], 5);
-    let post = &s["hooks"]["PostToolUse"][0]["hooks"][0];
-    assert_eq!(
-        post["command"],
-        format!("npx -y mushroomdb@{VERSION} touch '{}'", db.display())
-    );
-    assert_eq!(post["timeout"], 30);
-    assert_eq!(post["async"], true);
-    assert_eq!(
-        s["hooks"]["PostToolUse"][0]["matcher"],
-        "Edit|Write|MultiEdit"
-    );
-    // The third: one brief per session, on no matcher — a session start is not
+    // No tool-call hook: the `touch` re-extraction left with the code graph.
+    assert!(s["hooks"].get("PostToolUse").is_none(), "{s}");
+    // The second: one brief per session, on no matcher — a session start is not
     // a tool call — and on the prompt hook's short timeout.
     let brief = &s["hooks"]["SessionStart"][0]["hooks"][0];
     assert_eq!(
@@ -264,27 +251,14 @@ fn project_install_writes_auto_entries() {
         format!("npx -y mushroomdb@{VERSION} recall --auto")
     );
     assert_eq!(
-        s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-        format!("npx -y mushroomdb@{VERSION} touch --auto")
-    );
-    assert_eq!(
         s["hooks"]["SessionStart"][0]["hooks"][0]["command"],
         format!("npx -y mushroomdb@{VERSION} brief --auto")
     );
+    assert!(s["hooks"].get("PostToolUse").is_none(), "{s}");
 
-    // All three git hook blocks.
+    // No git hook blocks: the `sync` they ran left with the code graph.
     for name in ["post-commit", "post-checkout", "post-merge"] {
-        let body = fs::read_to_string(hooks.join(name)).unwrap();
-        assert!(
-            body.contains(&format!(
-                "( npx -y mushroomdb@{VERSION} sync --auto >/dev/null 2>&1 & )"
-            )),
-            "{name}: {body}"
-        );
-        assert!(
-            !body.contains(&root.display().to_string()),
-            "{name} must not bake in this checkout's path: {body}"
-        );
+        assert!(!hooks.join(name).exists(), "{name} was written");
     }
 
     // The ignore line is still the real directory — a repository ignores a
@@ -341,16 +315,8 @@ fn cursor_install_pins_the_store_path() {
         "{out}"
     );
 
-    // The git hooks are git's, not Cursor's: git runs a hook with the working
-    // tree it acted on as the working directory, so `--auto` resolves there
-    // with no assistant involved. A Cursor-only install still pins them, so
-    // the whole install spells one store one way.
-    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
-    assert!(
-        body.contains(&format!(" sync '{}' ", db.display())),
-        "{body}"
-    );
-    assert!(!body.contains("--auto"), "{body}");
+    // No git hooks, and the store is still ignored.
+    assert!(!hooks.join("post-commit").exists());
     assert_eq!(read(&root, ".gitignore"), "mushroom-memory/\n");
 }
 
@@ -426,9 +392,10 @@ fn platform_all_gives_each_host_the_form_it_can_resolve() {
         "{out}"
     );
 
-    // Claude Code is in the install, so the git hooks match its spelling.
-    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
-    assert!(body.contains("sync --auto"), "{body}");
+    assert!(
+        !hooks.join("post-commit").exists(),
+        "no git hooks are written"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -461,12 +428,10 @@ fn explicit_db_pins_the_store() {
         s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
         format!("npx -y mushroomdb@{VERSION} recall '{}'", db.display())
     );
-    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
     assert!(
-        body.contains(&format!(" sync '{}' ", db.display())),
-        "{body}"
+        !hooks.join("post-commit").exists(),
+        "no git hooks are written"
     );
-    assert!(!body.contains("--auto"), "{body}");
     assert!(
         out.contains(&format!("store  {} (pinned)", db.display())),
         "{out}"
@@ -474,6 +439,64 @@ fn explicit_db_pins_the_store() {
 
     // The store is outside the repository, so there is nothing to ignore.
     assert_absent(&root, ".gitignore");
+}
+
+// ---------------------------------------------------------------------------
+// Test: install creates no store, and says who does when there is none yet
+// ---------------------------------------------------------------------------
+
+/// The notice `install` prints for a store that does not exist yet.
+fn no_store_notice(db: &Path) -> String {
+    format!(
+        "note   no store at {} yet — the first `mushroomdb mcp`, `serve` or `ingest-git` run \
+         that writes to it creates it with the memory schema; to create it now: \
+         mushroomdb schema apply '{}' --memory-defaults",
+        db.display(),
+        db.display()
+    )
+}
+
+#[test]
+fn install_names_who_creates_a_store_that_does_not_exist_yet() {
+    // Every delivery, because the sentence must be true in each: a `cli`
+    // install registers no `mcp` server, so the notice names the commands
+    // that create a store with a schema rather than promising one will run.
+    for delivery in [Delivery::Cli, Delivery::Mcp, Delivery::Both] {
+        let root = temp_dir("notice");
+        let home = temp_dir("notice-home");
+        let db = root.join("not-yet").join("memory");
+        let opts = InstallOpts {
+            delivery,
+            ..claude_project_opts(&db)
+        };
+        let out = install_on_path(&root, &home, &opts).expect("install failed");
+        let notice = no_store_notice(&db);
+        assert_eq!(out.matches(&notice).count(), 1, "{delivery:?}: {out}");
+        assert!(
+            !db.exists(),
+            "{delivery:?}: install must not create the store"
+        );
+        assert!(
+            out.trim_end().ends_with(&format!(
+                "next: restart Claude Code in {}, then type /mushroom",
+                root.display()
+            )),
+            "{out}"
+        );
+    }
+}
+
+#[test]
+fn install_says_nothing_about_a_store_that_exists() {
+    let root = temp_dir("notice-exists");
+    let home = temp_dir("notice-exists-home");
+    let db = root.join("memory");
+    {
+        let mut store = core_api::GraphDb::open(&db).expect("create store");
+        store.insert_node("Person", "p1", vec![]).expect("write");
+    }
+    let out = install_on_path(&root, &home, &claude_project_opts(&db)).expect("install failed");
+    assert!(!out.contains("no store at"), "{out}");
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +544,16 @@ fn upgrade_rewrites_absolute_entries_to_auto() {
         .unwrap(),
     )
     .unwrap();
+    // And the git hook block 0.6.0 wrote: `git_hook_block` at v0.6.0 quoted
+    // the path the same way, after the `#!/bin/sh` line of a file it created.
+    fs::write(
+        hooks.join("post-commit"),
+        format!(
+            "#!/bin/sh\n\n# >>> mushroomdb >>>\n( {old} sync '{}' >/dev/null 2>&1 & )\n# <<< mushroomdb <<<\n",
+            db.display()
+        ),
+    )
+    .unwrap();
 
     let opts = InstallOpts {
         platform: Some(Platform::ClaudeCode),
@@ -539,11 +572,7 @@ fn upgrade_rewrites_absolute_entries_to_auto() {
     // Exactly one hook per event: the old absolute-path spelling of the same
     // store is ours, and running both would inject two digests every prompt.
     let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    for (event, sub) in [
-        ("UserPromptSubmit", "recall"),
-        ("PostToolUse", "touch"),
-        ("SessionStart", "brief"),
-    ] {
+    for (event, sub) in [("UserPromptSubmit", "recall"), ("SessionStart", "brief")] {
         let groups = s["hooks"][event].as_array().unwrap();
         let commands: Vec<&str> = groups
             .iter()
@@ -560,12 +589,14 @@ fn upgrade_rewrites_absolute_entries_to_auto() {
         out.contains("replaced stale UserPromptSubmit hook"),
         "{out}"
     );
-    assert!(out.contains("replaced stale PostToolUse hook"), "{out}");
+    // The retired `touch` hook, in its absolute-path spelling, is taken out
+    // rather than rewritten: the store it names is the one `--auto` means.
+    assert!(s["hooks"].get("PostToolUse").is_none(), "{s}");
+    assert!(out.contains("removed retired code-graph hooks"), "{out}");
 
-    // The git hooks are rewritten in place, not stacked.
-    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
-    assert_eq!(body.matches("mushroomdb >>>").count(), 1, "{body}");
-    assert!(body.contains("sync --auto"), "{body}");
+    // So is the git hook block, and the file with it: it held nothing else.
+    assert!(!hooks.join("post-commit").exists(), "{out}");
+    assert!(out.contains("removed retired git hook block"), "{out}");
 }
 
 // ---------------------------------------------------------------------------
@@ -850,67 +881,39 @@ fn gitignore_untouched_when_the_store_is_outside_the_project() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn git_hooks_installed_and_removed() {
+fn install_writes_no_git_hooks_and_leaves_the_users_own() {
     let root = temp_dir("git-hooks");
     let home = temp_dir("git-hooks-home");
     let db = root.join("mushroom-memory");
     let hooks = git_repo(&root);
     let opts = claude_project_opts(&db);
 
-    // A pre-existing post-commit hook of the user's must survive both ways.
+    // A post-commit hook of the user's must survive both ways, untouched.
     let user_text = "#!/bin/sh\nmake lint\n";
     fs::write(hooks.join("post-commit"), user_text).unwrap();
 
-    install_on_path(&root, &home, &opts).expect("install");
+    let out = install_on_path(&root, &home, &opts).expect("install");
+    assert!(!out.contains("git hook"), "{out}");
 
-    for name in ["post-commit", "post-checkout", "post-merge"] {
-        let text = fs::read_to_string(hooks.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert!(text.contains("# >>> mushroomdb >>>"), "{name}: {text}");
-        assert!(
-            text.contains(&format!("mushroomdb sync '{}'", db.display())),
-            "{name}: {text}"
-        );
+    assert_eq!(
+        fs::read_to_string(hooks.join("post-commit")).unwrap(),
+        user_text
+    );
+    for name in ["post-checkout", "post-merge"] {
+        assert!(!hooks.join(name).exists(), "{name} was written");
     }
-    assert!(fs::read_to_string(hooks.join("post-commit"))
-        .unwrap()
-        .starts_with(user_text));
-
-    // The manifest lists them so uninstall knows which files to open.
     let m: serde_json::Value = serde_json::from_str(&read(
         &root,
         ".claude/skills/mushroom/.install-manifest.json",
     ))
     .unwrap();
-    assert_eq!(m["git_hooks"].as_array().unwrap().len(), 3, "{m}");
+    assert!(m["git_hooks"].as_array().unwrap().is_empty(), "{m}");
 
     run_uninstall(&root, &home, &opts).expect("uninstall");
     assert_eq!(
         fs::read_to_string(hooks.join("post-commit")).unwrap(),
         user_text
     );
-    assert!(
-        !hooks.join("post-checkout").exists(),
-        "ours was the whole file"
-    );
-    assert!(!hooks.join("post-merge").exists());
-}
-
-#[test]
-fn no_git_hooks_flag_writes_none() {
-    let root = temp_dir("no-git-hooks");
-    let home = temp_dir("no-git-hooks-home");
-    let db = root.join("mushroom-memory");
-    let hooks = git_repo(&root);
-    let opts = InstallOpts {
-        git_hooks: false,
-        ..claude_project_opts(&db)
-    };
-
-    install_on_path(&root, &home, &opts).expect("install");
-
-    for name in ["post-commit", "post-checkout", "post-merge"] {
-        assert!(!hooks.join(name).exists(), "{name} was written anyway");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,15 +1164,13 @@ fn hooks_use_the_native_binary_when_resolvable() {
         format!("{quoted} recall --auto")
     );
     assert_eq!(
-        s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-        format!("{quoted} touch --auto")
+        s["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        format!("{quoted} brief --auto")
     );
-    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
-    assert!(body.contains(&format!("( {quoted} sync --auto ")), "{body}");
-    for f in ["post-checkout", "post-merge"] {
-        let b = fs::read_to_string(hooks.join(f)).unwrap();
-        assert!(!b.contains("npx") && !b.contains("node "), "{f}: {b}");
-    }
+    assert!(
+        !hooks.join("post-commit").exists(),
+        "no git hooks are written"
+    );
 
     // The MCP entry too, unquoted: a host spawns an argv, where quotes would
     // become part of the filename.
@@ -1252,11 +1253,13 @@ fn launcher_is_resolved_once_and_every_hook_calls_node() {
         format!("{node} recall --auto")
     );
     assert_eq!(
-        s["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-        format!("{node} touch --auto")
+        s["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+        format!("{node} brief --auto")
     );
-    let body = fs::read_to_string(hooks.join("post-commit")).unwrap();
-    assert!(body.contains(&format!("( {node} sync --auto ")), "{body}");
+    assert!(
+        !hooks.join("post-commit").exists(),
+        "no git hooks are written"
+    );
 
     // The MCP entry uses the resolved path too: one spawn per session, but a
     // session that starts 400 ms sooner is still worth having.
@@ -1548,13 +1551,9 @@ fn upgrade_replaces_stale_hooks_from_a_0_5_install() {
         ups[0]["hooks"][0]["command"],
         format!("npx -y mushroomdb@{VERSION} recall '{}'", db.display())
     );
-    let ptu = s["hooks"]["PostToolUse"].as_array().unwrap();
-    assert_eq!(ptu.len(), 1, "exactly one touch hook must remain: {s}");
-    assert_eq!(
-        ptu[0]["hooks"][0]["command"],
-        format!("npx -y mushroomdb@{VERSION} touch '{}'", db.display())
-    );
-    // The user's own hook under our third event is not ours to replace: the
+    // The 0.5 `touch` hook is retired, not replaced.
+    assert!(s["hooks"].get("PostToolUse").is_none(), "{s}");
+    // The user's own hook under our second event is not ours to replace: the
     // brief joins it, in a group of its own.
     let ss = s["hooks"]["SessionStart"].as_array().unwrap();
     assert_eq!(ss.len(), 2, "the user's hook must survive beside ours: {s}");
@@ -2169,17 +2168,17 @@ fn parse_install_new_flags() {
             assert_eq!(opts.scope, Some(Scope::User));
             assert_eq!(opts.platform, Some(Platform::Codex));
             assert_eq!(opts.command, Some(PathBuf::from("/opt/mushroomdb")));
-            assert!(!opts.git_hooks);
+            // `--no-git-hooks` still parses: 0.7 writes none, so it asks for
+            // what every install gets.
             assert!(!opts.prewarm);
         }
         other => panic!("expected Install, got {other:?}"),
     }
 
-    // Defaults: git hooks on, pre-warm on, scope and platform auto.
+    // Defaults: pre-warm on, scope and platform auto.
     let cmd = parse_args(&["install"]).unwrap();
     match cmd {
         Command::Install(opts) => {
-            assert!(opts.git_hooks);
             assert!(opts.prewarm);
             assert_eq!(opts.scope, None);
             assert_eq!(opts.command, None);
@@ -2452,81 +2451,6 @@ fn install_refuses_when_settings_root_is_not_an_object() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Claude Code install also wires the PostToolUse refresh hook — matched
-//       to the file-editing tools, async, on its own longer budget — and
-//       uninstall takes it back out
-// ---------------------------------------------------------------------------
-
-#[test]
-fn install_writes_post_tool_use_async_hook_and_uninstall_removes_it() {
-    let root = temp_dir("post-tool-use");
-    let home = temp_dir("post-tool-use-home");
-    let db = root.join("mushroom-memory");
-    let opts = claude_project_opts(&db);
-
-    install_on_path(&root, &home, &opts).expect("install");
-
-    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    let groups = s["hooks"]["PostToolUse"]
-        .as_array()
-        .expect("PostToolUse array");
-    assert_eq!(groups.len(), 1, "{groups:?}");
-    assert_eq!(groups[0]["matcher"], "Edit|Write|MultiEdit");
-    let hook = &groups[0]["hooks"][0];
-    assert_eq!(hook["type"], "command");
-    assert_eq!(
-        hook["command"],
-        format!("mushroomdb touch '{}'", db.display())
-    );
-    // A re-extraction is not on the prompt's critical path: its own budget,
-    // and it must not hold the tool call open.
-    assert_eq!(hook["timeout"], 30);
-    assert_eq!(hook["async"], true);
-
-    // The prompt hook is still there, and is still the 5 s synchronous one.
-    assert_eq!(s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"], 5);
-
-    // Idempotent: a second install adds no second group.
-    install_on_path(&root, &home, &opts).expect("second install");
-    let s2: serde_json::Value =
-        serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    assert_eq!(s2["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
-
-    // The manifest tracks it under its own event, so uninstall knows where to
-    // look for it.
-    let m: serde_json::Value = serde_json::from_str(&read(
-        &root,
-        ".claude/skills/mushroom/.install-manifest.json",
-    ))
-    .unwrap();
-    let events: Vec<&str> = m["hooks"]
-        .as_array()
-        .expect("hooks array")
-        .iter()
-        .map(|h| h["event"].as_str().expect("event"))
-        .collect();
-    assert_eq!(
-        events,
-        vec!["UserPromptSubmit", "PostToolUse", "SessionStart"],
-        "{m}"
-    );
-
-    run_uninstall(&root, &home, &opts).expect("uninstall");
-    let s3: serde_json::Value =
-        serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    assert!(
-        s3["hooks"]["PostToolUse"].is_null()
-            || s3["hooks"]["PostToolUse"].as_array().unwrap().is_empty(),
-        "PostToolUse must be gone: {s3}"
-    );
-    assert!(
-        s3["hooks"]["SessionStart"].is_null()
-            || s3["hooks"]["SessionStart"].as_array().unwrap().is_empty(),
-        "SessionStart must be gone: {s3}"
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Test: uninstall on a group that mixes a user hook with ours removes only
 //       ours and leaves the user's hook in place
 // ---------------------------------------------------------------------------
@@ -2577,41 +2501,10 @@ fn uninstall_leaves_mixed_hook_group_with_user_hook_intact() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: turning on one of the experimental code-graph hooks says, in the
-//       summary the user is already reading, that the hook is on its way out.
+// Test: an install says nothing about deprecation
 // ---------------------------------------------------------------------------
 
-/// Each of the three experimental hooks is deprecated in 0.6.4 and removed in
-/// 0.7. A user who turns one on has to be told by the thing they ran, not only
-/// by a docs page they may never open.
-#[test]
-fn each_deprecated_hook_flag_prints_a_deprecation_line() {
-    for (flag, set) in [
-        ("--intercept-grep", 0usize),
-        ("--impact-before-edit", 1),
-        ("--enrich-grep", 2),
-    ] {
-        let root = temp_dir(&format!("deprecated{set}"));
-        let home = temp_dir(&format!("deprecated{set}-home"));
-        git_repo(&root);
-        let opts = InstallOpts {
-            platform: Some(Platform::ClaudeCode),
-            scope: Some(Scope::Project),
-            intercept_grep: set == 0,
-            impact_before_edit: set == 1,
-            enrich_grep: set == 2,
-            ..base_opts()
-        };
-        let out = install_on_path(&root, &home, &opts).expect("install failed");
-        let want = format!(
-            "deprecated  {flag} — the code-graph hooks are deprecated and are removed in 0.7"
-        );
-        assert!(out.contains(&want), "{flag}: expected {want:?} in:\n{out}");
-    }
-}
-
-/// …and a default install says nothing about deprecation: the line is a
-/// consequence of asking for the hook, not noise every install pays for.
+/// A default install says nothing about deprecation: nothing it writes is.
 #[test]
 fn a_default_install_prints_no_deprecation_line() {
     let root = temp_dir("no-deprecation");
@@ -2635,10 +2528,11 @@ fn a_default_install_prints_no_deprecation_line() {
 // ---------------------------------------------------------------------------
 
 /// The code door's task tools, written the way the text writes them so a bare
-/// word inside another word cannot pass. They are deprecated in 0.6.4 and
-/// removed in 0.7, and the skill still has to name them — an assistant on a
-/// code-graph store needs to know what it is looking at.
-const DEPRECATED_TOOL_MENTIONS: &[&str] = &[
+/// word inside another word cannot match. They were removed in 0.7, and a
+/// skill that still names one sends an assistant after a tool no server
+/// serves. The CLI `why` subcommand lives on, but the skill writes it as a
+/// shell form, never as the backticked tool name.
+const REMOVED_TOOL_MENTIONS: &[&str] = &[
     "`explore`",
     "`map`",
     "`context`",
@@ -2722,19 +2616,18 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
             text.contains("ingest-git"),
             "{name}: ingest-git bootstrap undocumented"
         );
-        for tool in DEPRECATED_TOOL_MENTIONS
-            .iter()
-            .chain(ASSOCIATION_TOOL_MENTIONS)
-        {
+        for tool in ASSOCIATION_TOOL_MENTIONS {
             assert!(
                 text.contains(tool),
                 "{name}: {tool} is never named — the assistant has no cue to call it"
             );
         }
-        assert!(
-            text.contains("removed in 0.7"),
-            "{name}: the deprecated code tools must be named as deprecated, not as the first thing to call"
-        );
+        for tool in REMOVED_TOOL_MENTIONS {
+            assert!(
+                !text.contains(tool),
+                "{name}: names {tool}, a tool 0.7 no longer serves"
+            );
+        }
         for banned in ["before `Grep`", "before any `Grep`", "instead of `Grep`"] {
             assert!(
                 !text.contains(banned),
@@ -2744,8 +2637,8 @@ fn skill_text_is_truthful_about_masks_and_tool_args() {
     }
     // The skill is re-read every turn, so its size is a per-turn cost. It was
     // 17,148 bytes, 62% of that worked examples and a table restating what
-    // `tools/list` already carries; the examples now live in
-    // docs/site/code-graph.md. The budget is on the *template*, since the
+    // `tools/list` already carries; the examples were dropped rather than
+    // re-read every turn. The budget is on the *template*, since the
     // rendered copy also carries whatever `{{BIN}}` expanded to.
     let template = std::fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("skills/mushroom/SKILL.md"),
@@ -2800,13 +2693,16 @@ fn every_delivery_variant_names_every_tool_and_fits_the_budget() {
             delivery,
         )
         .expect("the committed template's regions are well formed");
-        for tool in DEPRECATED_TOOL_MENTIONS
-            .iter()
-            .chain(ASSOCIATION_TOOL_MENTIONS)
-        {
+        for tool in ASSOCIATION_TOOL_MENTIONS {
             assert!(
                 skill.contains(tool),
                 "{label}: {tool} is never named — the assistant has no cue to call it"
+            );
+        }
+        for tool in REMOVED_TOOL_MENTIONS {
+            assert!(
+                !skill.contains(tool),
+                "{label}: names {tool}, a tool 0.7 no longer serves"
             );
         }
         // A `--delivery cli` install registers no server, so an MCP-only call
@@ -2934,8 +2830,8 @@ fn delivery_cli_writes_skill_and_hooks_but_no_mcp_entry() {
 
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
     assert!(
-        skill.contains("explore '") && skill.contains("--depth context|impact|history|all"),
-        "the cli skill must teach the shell form:\n{skill}"
+        skill.contains(" why '") && skill.contains(" asof '") && skill.contains(" query '"),
+        "the cli skill must teach the shell forms:\n{skill}"
     );
     assert!(
         !skill.contains("MCP tool") && !skill.contains("tools/list"),
@@ -2943,15 +2839,15 @@ fn delivery_cli_writes_skill_and_hooks_but_no_mcp_entry() {
     );
 
     let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    for event in ["SessionStart", "UserPromptSubmit", "PostToolUse"] {
+    for event in ["SessionStart", "UserPromptSubmit"] {
         assert!(
             s["hooks"][event].is_array(),
             "the {event} hook is missing: {s}"
         );
     }
     assert!(
-        root.join(".git/hooks/post-commit").is_file(),
-        "the git hooks are still written under cli delivery"
+        !root.join(".git/hooks/post-commit").exists(),
+        "no git hooks are written under any delivery"
     );
 }
 
@@ -2979,7 +2875,7 @@ fn delivery_mcp_writes_the_entry_and_the_tool_skill() {
         "the mcp skill must still teach the served surface:\n{skill}"
     );
     assert!(
-        !skill.contains("--depth context|impact|history|all"),
+        !skill.contains(" why '"),
         "the mcp skill must not carry the cli invocation:\n{skill}"
     );
 }
@@ -3116,72 +3012,39 @@ fn a_different_native_binary_first_on_path_shadows_us_so_we_pin_npx() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: the git post-commit hook block — writing it twice must be a no-op, and
-//       removing it must leave a user's own hook lines exactly as they were.
+// Test: the git hook block a 0.6 install wrote — removing it must leave a
+//       user's own hook lines exactly as they were.
 // ---------------------------------------------------------------------------
 
+/// The block 0.6 wrote for a store at `db`: one backgrounded, silenced `sync`.
+fn block_0_6(db: &Path) -> String {
+    format!(
+        "# >>> mushroomdb >>>\n( mushroomdb sync '{}' >/dev/null 2>&1 & )\n# <<< mushroomdb <<<\n",
+        db.display()
+    )
+}
+
 #[test]
-fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
-    use cli::install::{git_hook_block, merge_git_hook, remove_git_hook};
+fn a_0_6_git_hook_block_is_removable_leaving_user_lines() {
+    use cli::install::remove_git_hook;
 
     let dir = temp_dir("git-hook");
-    let db = dir.join("mushroom memory"); // a space, so quoting has to work
+    let db = dir.join("mushroom memory"); // a space, as 0.6 quoted it
+    fs::create_dir_all(dir.join("hooks")).unwrap();
 
-    // The block is a marked, self-contained fragment that backgrounds a sync.
-    let block = git_hook_block("mushroomdb", &StoreRef::pinned(&db));
-    assert!(block.starts_with("# >>> mushroomdb >>>\n"), "{block}");
-    assert!(block.ends_with("# <<< mushroomdb <<<\n"), "{block}");
-    assert!(block.contains(" sync "), "{block}");
-    assert!(
-        block.contains(&format!("'{}'", db.display())),
-        "the db path must be shell-quoted: {block}"
-    );
-    assert!(block.contains(">/dev/null 2>&1 &"), "{block}");
-
-    // 1. No hook file yet: one is created, with a shebang, and executable.
+    // 1. A hook file 0.6 created: a shebang, a blank line, the block. Removal
+    //    deletes it, since nothing of the user's is left in it.
     let hook = dir.join("hooks").join("post-commit");
-    assert!(merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
-    let created = fs::read_to_string(&hook).unwrap();
-    assert!(created.starts_with("#!/bin/sh\n"), "{created}");
-    assert!(created.contains(&block), "{created}");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_eq!(
-            fs::metadata(&hook).unwrap().permissions().mode() & 0o777,
-            0o755,
-            "a git hook has to be executable"
-        );
-    }
-
-    // 2. Idempotent: a second merge changes nothing at all.
-    assert!(
-        !merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap(),
-        "the block is already there"
-    );
-    assert_eq!(fs::read_to_string(&hook).unwrap(), created);
-
-    // 3. Removal deletes the file we created, since nothing of the user's is
-    //    left in it.
+    fs::write(&hook, format!("#!/bin/sh\n\n{}", block_0_6(&db))).unwrap();
     assert!(remove_git_hook(&hook).unwrap());
     assert!(!hook.exists(), "an empty hook of ours is removed entirely");
     assert!(!remove_git_hook(&hook).unwrap(), "already gone");
 
-    // 4. A hook the user wrote: our block is appended, then removed, and their
-    //    file comes back byte-for-byte.
+    // 2. A hook the user wrote, with 0.6's block appended after a blank line:
+    //    their file comes back byte-for-byte.
     let user_hook = dir.join("hooks").join("pre-commit");
     let user_text = "#!/usr/bin/env bash\nset -eu\nmake lint\n";
-    fs::write(&user_hook, user_text).unwrap();
-
-    assert!(merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
-    let merged = fs::read_to_string(&user_hook).unwrap();
-    assert!(merged.starts_with(user_text), "user lines lead: {merged}");
-    assert!(merged.contains(&block), "{merged}");
-
-    // Idempotent over a user file too.
-    assert!(!merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
-    assert_eq!(fs::read_to_string(&user_hook).unwrap(), merged);
-
+    fs::write(&user_hook, format!("{user_text}\n{}", block_0_6(&db))).unwrap();
     assert!(remove_git_hook(&user_hook).unwrap());
     assert_eq!(
         fs::read_to_string(&user_hook).unwrap(),
@@ -3192,37 +3055,19 @@ fn git_hook_block_is_idempotent_and_removable_leaving_user_lines() {
         !remove_git_hook(&user_hook).unwrap(),
         "nothing of ours is left to remove"
     );
-
-    // 5. Changing the database path rewrites the block in place rather than
-    //    stacking a second one.
-    let other = dir.join("other-memory");
-    assert!(merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
-    assert!(merge_git_hook(&user_hook, "mushroomdb", &StoreRef::pinned(&other)).unwrap());
-    let rewritten = fs::read_to_string(&user_hook).unwrap();
-    assert_eq!(
-        rewritten.matches("# >>> mushroomdb >>>").count(),
-        1,
-        "exactly one block: {rewritten}"
-    );
-    assert!(
-        rewritten.contains(&format!("'{}'", other.display())),
-        "{rewritten}"
-    );
-    assert!(rewritten.starts_with(user_text), "{rewritten}");
 }
 
 // ---------------------------------------------------------------------------
 // Test: a hook file whose mushroomdb block was hand-edited so its closing
 //       marker is gone. Everything after the opening marker could be the
-//       user's own work, so neither merge nor remove may guess.
+//       user's own work, so removal may not guess.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn unterminated_hook_block_is_refused_rather_than_swallowed() {
-    use cli::install::{merge_git_hook, remove_git_hook};
+    use cli::install::remove_git_hook;
 
     let dir = temp_dir("git-hook-unterminated");
-    let db = dir.join("mushroom-memory");
     let hook = dir.join("post-commit");
 
     // The closing marker is missing: the user deleted it, or an editor mangled
@@ -3231,8 +3076,7 @@ fn unterminated_hook_block_is_refused_rather_than_swallowed() {
         "#!/bin/sh\nmake lint\n# >>> mushroomdb >>>\n( mushroomdb sync '/old' & )\necho done\n";
     fs::write(&hook, corrupt).unwrap();
 
-    let err = merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db))
-        .expect_err("an unterminated block must not be rewritten");
+    let err = remove_git_hook(&hook).expect_err("an unterminated block must not be edited");
     assert!(
         err.0.contains("never closes"),
         "the message must say what is wrong: {}",
@@ -3246,31 +3090,13 @@ fn unterminated_hook_block_is_refused_rather_than_swallowed() {
     assert_eq!(
         fs::read_to_string(&hook).unwrap(),
         corrupt,
-        "refusing means writing nothing at all"
-    );
-
-    let err = remove_git_hook(&hook).expect_err("removal must refuse too");
-    assert!(err.0.contains("never closes"), "{}", err.0);
-    assert_eq!(
-        fs::read_to_string(&hook).unwrap(),
-        corrupt,
         "the user's `echo done` must survive"
     );
 
-    // Repaired by hand, both work again.
+    // Repaired by hand, removal works again.
     fs::write(&hook, format!("{corrupt}# <<< mushroomdb <<<\n")).unwrap();
-    assert!(merge_git_hook(&hook, "mushroomdb", &StoreRef::pinned(&db)).unwrap());
-    let merged = fs::read_to_string(&hook).unwrap();
-    assert_eq!(
-        merged.matches("# >>> mushroomdb >>>").count(),
-        1,
-        "{merged}"
-    );
-    assert!(merged.contains("make lint"), "{merged}");
-    assert!(
-        !merged.contains("echo done"),
-        "that line was inside our region once the block closed: {merged}"
-    );
+    assert!(remove_git_hook(&hook).unwrap());
+    assert_eq!(fs::read_to_string(&hook).unwrap(), "#!/bin/sh\nmake lint\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -3317,13 +3143,13 @@ fn reinstalling_as_cli_removes_the_server_the_earlier_install_registered() {
     );
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
     assert!(
-        skill.contains("--depth context|impact|history|all"),
+        skill.contains(" why '"),
         "the skill must have been rewritten for the new door:\n{skill}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Test: --intercept-grep adds a fourth hook, and nothing else does
+// Test: a default install writes no tool-call hook at all, and --always-load
 // ---------------------------------------------------------------------------
 
 /// Every hook group under `event` whose `matcher` is exactly `matcher`.
@@ -3338,14 +3164,13 @@ fn groups_matching<'a>(
         .unwrap_or_default()
 }
 
-/// All three experiments are opt-in, so the default install must leave
-/// `PreToolUse` entirely absent — not present and empty, which would still be
-/// a hook array the user did not ask for — and must add no `Grep`-matched
-/// `PostToolUse` group beside the `touch` one it always writes.
+/// Neither tool-call event is written — not present and empty, which would
+/// still be a hook array the user did not ask for — and the manifest carries
+/// none of the retired experiments' keys.
 #[test]
-fn default_install_writes_no_pretooluse_hook() {
-    let root = temp_dir("no-intercept");
-    let home = temp_dir("no-intercept-home");
+fn default_install_writes_no_tool_call_hook() {
+    let root = temp_dir("no-tool-hooks");
+    let home = temp_dir("no-tool-hooks-home");
     git_repo(&root);
 
     install_on_path(
@@ -3360,29 +3185,16 @@ fn default_install_writes_no_pretooluse_hook() {
     .expect("install failed");
 
     let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    assert!(
-        s["hooks"].get("PreToolUse").is_none(),
-        "an install nobody asked for the redirect or the impact hook wrote one: {s}"
-    );
-    // `touch` is a PostToolUse hook on the editing tools and must survive; the
-    // grep enrichment would be a second group, matched to `Grep`.
-    assert_eq!(
-        groups_matching(&s, "PostToolUse", "Edit|Write|MultiEdit").len(),
-        1,
-        "the touch hook is not the only editing-tool PostToolUse group: {s}"
-    );
-    assert!(
-        groups_matching(&s, "PostToolUse", "Grep").is_empty(),
-        "an install nobody asked for the enrichment wrote one: {s}"
-    );
+    assert!(s["hooks"].get("PreToolUse").is_none(), "{s}");
+    assert!(s["hooks"].get("PostToolUse").is_none(), "{s}");
     let manifest: serde_json::Value = serde_json::from_str(&read(
         &root,
         ".claude/skills/mushroom/.install-manifest.json",
     ))
     .unwrap();
-    assert_eq!(manifest["intercept_grep"], false, "{manifest}");
-    assert_eq!(manifest["impact_before_edit"], false, "{manifest}");
-    assert_eq!(manifest["enrich_grep"], false, "{manifest}");
+    for retired in ["intercept_grep", "impact_before_edit", "enrich_grep"] {
+        assert!(manifest.get(retired).is_none(), "{retired}: {manifest}");
+    }
     assert_eq!(manifest["always_load"], false, "{manifest}");
     // And nothing marks the server entry as always loaded.
     let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
@@ -3392,264 +3204,13 @@ fn default_install_writes_no_pretooluse_hook() {
     );
 }
 
-#[test]
-fn intercept_grep_writes_a_grep_matched_pretooluse_hook() {
-    let root = temp_dir("intercept");
-    let home = temp_dir("intercept-home");
-    git_repo(&root);
-    let opts = InstallOpts {
-        platform: Some(Platform::ClaudeCode),
-        scope: Some(Scope::Project),
-        intercept_grep: true,
-        ..base_opts()
-    };
-
-    let out = install_on_path(&root, &home, &opts).expect("install failed");
-    assert!(out.contains("added  PreToolUse hook"), "{out}");
-
-    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    let group = &s["hooks"]["PreToolUse"][0];
-    assert_eq!(group["matcher"], "Grep");
-    let hook = &group["hooks"][0];
-    assert_eq!(hook["command"], "mushroomdb intercept --auto");
-    assert_eq!(hook["timeout"], 5);
-    assert!(
-        hook.get("async").is_none(),
-        "the decision is awaited — an async hook cannot block a tool call: {hook}"
-    );
-    // The three standing hooks are untouched by the fourth.
-    assert!(s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-        .as_str()
-        .is_some_and(|c| c.ends_with("recall --auto")));
-
-    let manifest: serde_json::Value = serde_json::from_str(&read(
-        &root,
-        ".claude/skills/mushroom/.install-manifest.json",
-    ))
-    .unwrap();
-    assert_eq!(manifest["intercept_grep"], true, "{manifest}");
-
-    // Manifest-driven, like every other hook: uninstall takes it back out.
-    run_uninstall(&root, &home, &opts).expect("uninstall failed");
-    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    assert!(
-        s["hooks"].get("PreToolUse").is_none(),
-        "the redirect survived uninstall: {s}"
-    );
-}
-
-/// Re-installing without the flag turns the experiment off: the hook goes, and
-/// the manifest stops claiming it — otherwise `doctor` would keep reporting a
-/// redirect that is no longer wired.
-#[test]
-fn reinstalling_without_the_flag_removes_the_redirect() {
-    let root = temp_dir("intercept-off");
-    let home = temp_dir("intercept-off-home");
-    git_repo(&root);
-    let on = InstallOpts {
-        platform: Some(Platform::ClaudeCode),
-        scope: Some(Scope::Project),
-        intercept_grep: true,
-        ..base_opts()
-    };
-    install_on_path(&root, &home, &on).expect("install with the redirect");
-
-    install_on_path(
-        &root,
-        &home,
-        &InstallOpts {
-            intercept_grep: false,
-            ..on
-        },
-    )
-    .expect("install without it");
-
-    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    assert!(
-        s["hooks"].get("PreToolUse").is_none(),
-        "the redirect survived an install that did not ask for it: {s}"
-    );
-    let manifest: serde_json::Value = serde_json::from_str(&read(
-        &root,
-        ".claude/skills/mushroom/.install-manifest.json",
-    ))
-    .unwrap();
-    assert_eq!(manifest["intercept_grep"], false, "{manifest}");
-    assert!(
-        !manifest["hooks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|h| h["event"] == "PreToolUse"),
-        "the manifest still owns a hook that is gone: {manifest}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Test: the three code-door flags — --impact-before-edit, --enrich-grep,
-//       --always-load
-// ---------------------------------------------------------------------------
-
-/// Opts for a Claude Code project install with every code-door flag off.
+/// Opts for a Claude Code project install with `--always-load` off.
 fn door_opts() -> InstallOpts {
     InstallOpts {
         platform: Some(Platform::ClaudeCode),
         scope: Some(Scope::Project),
         ..base_opts()
     }
-}
-
-#[test]
-fn impact_before_edit_writes_an_edit_matched_pretooluse_hook() {
-    let root = temp_dir("impact-hook");
-    let home = temp_dir("impact-hook-home");
-    git_repo(&root);
-    let opts = InstallOpts {
-        impact_before_edit: true,
-        ..door_opts()
-    };
-
-    let out = install_on_path(&root, &home, &opts).expect("install failed");
-    assert!(out.contains("added  PreToolUse hook"), "{out}");
-
-    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    let groups = groups_matching(&s, "PreToolUse", "Edit|Write|MultiEdit");
-    assert_eq!(groups.len(), 1, "{s}");
-    let hook = &groups[0]["hooks"][0];
-    assert_eq!(hook["command"], "mushroomdb impact-hook --auto");
-    assert_eq!(hook["timeout"], 5);
-    assert!(
-        hook.get("async").is_none(),
-        "the context has to be there before the edit: {hook}"
-    );
-    // The redirect was not asked for, so `Grep` gets no PreToolUse group.
-    assert!(groups_matching(&s, "PreToolUse", "Grep").is_empty(), "{s}");
-
-    let manifest: serde_json::Value = serde_json::from_str(&read(
-        &root,
-        ".claude/skills/mushroom/.install-manifest.json",
-    ))
-    .unwrap();
-    assert_eq!(manifest["impact_before_edit"], true, "{manifest}");
-
-    run_uninstall(&root, &home, &opts).expect("uninstall failed");
-    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    assert!(
-        s["hooks"].get("PreToolUse").is_none(),
-        "the impact hook survived uninstall: {s}"
-    );
-}
-
-#[test]
-fn enrich_grep_writes_a_grep_matched_posttooluse_hook() {
-    let root = temp_dir("enrich");
-    let home = temp_dir("enrich-home");
-    git_repo(&root);
-    let opts = InstallOpts {
-        enrich_grep: true,
-        ..door_opts()
-    };
-
-    install_on_path(&root, &home, &opts).expect("install failed");
-
-    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    let groups = groups_matching(&s, "PostToolUse", "Grep");
-    assert_eq!(groups.len(), 1, "{s}");
-    let hook = &groups[0]["hooks"][0];
-    assert_eq!(hook["command"], "mushroomdb enrich --auto");
-    assert_eq!(hook["timeout"], 5);
-    assert!(
-        hook.get("async").is_none(),
-        "the facts have to reach the transcript with the result: {hook}"
-    );
-    // The `touch` hook is the other PostToolUse group and is untouched.
-    let touch = groups_matching(&s, "PostToolUse", "Edit|Write|MultiEdit");
-    assert_eq!(touch.len(), 1, "{s}");
-    assert_eq!(touch[0]["hooks"][0]["command"], "mushroomdb touch --auto");
-    assert_eq!(touch[0]["hooks"][0]["async"], true, "{s}");
-
-    let manifest: serde_json::Value = serde_json::from_str(&read(
-        &root,
-        ".claude/skills/mushroom/.install-manifest.json",
-    ))
-    .unwrap();
-    assert_eq!(manifest["enrich_grep"], true, "{manifest}");
-
-    run_uninstall(&root, &home, &opts).expect("uninstall failed");
-    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    assert!(
-        groups_matching(&s, "PostToolUse", "Grep").is_empty(),
-        "the enrichment survived uninstall: {s}"
-    );
-}
-
-/// Re-installing without a flag turns that experiment off — the hook goes and
-/// the manifest stops claiming it — and turning one off must not disturb
-/// another that shares its event.
-#[test]
-fn reinstalling_without_a_door_flag_removes_only_that_hook() {
-    let root = temp_dir("door-off");
-    let home = temp_dir("door-off-home");
-    git_repo(&root);
-    let both = InstallOpts {
-        intercept_grep: true,
-        impact_before_edit: true,
-        enrich_grep: true,
-        ..door_opts()
-    };
-    install_on_path(&root, &home, &both).expect("install with every door");
-
-    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2, "{s}");
-
-    install_on_path(
-        &root,
-        &home,
-        &InstallOpts {
-            impact_before_edit: false,
-            ..both
-        },
-    )
-    .expect("install without the impact hook");
-
-    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    assert!(
-        groups_matching(&s, "PreToolUse", "Edit|Write|MultiEdit").is_empty(),
-        "the impact hook survived an install that did not ask for it: {s}"
-    );
-    assert_eq!(
-        groups_matching(&s, "PreToolUse", "Grep").len(),
-        1,
-        "turning the impact hook off took the redirect with it: {s}"
-    );
-    assert_eq!(
-        groups_matching(&s, "PostToolUse", "Grep").len(),
-        1,
-        "turning the impact hook off took the enrichment with it: {s}"
-    );
-
-    let manifest: serde_json::Value = serde_json::from_str(&read(
-        &root,
-        ".claude/skills/mushroom/.install-manifest.json",
-    ))
-    .unwrap();
-    assert_eq!(manifest["impact_before_edit"], false, "{manifest}");
-    assert_eq!(manifest["intercept_grep"], true, "{manifest}");
-    assert_eq!(manifest["enrich_grep"], true, "{manifest}");
-    let events: Vec<&str> = manifest["hooks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|h| h["command"].as_str().unwrap())
-        .collect();
-    assert!(
-        !events.iter().any(|c| c.contains("impact-hook")),
-        "the manifest still owns a hook that is gone: {manifest}"
-    );
-    assert!(
-        events.iter().any(|c| c.contains(" intercept ")),
-        "the manifest dropped the redirect it still owns: {manifest}"
-    );
 }
 
 /// Binding: the command line an entity-store install is typed as — a `--db`
@@ -3780,15 +3341,14 @@ fn always_load_marks_the_server_entry_and_re_install_clears_it() {
 }
 
 /// `disable` then `enable` rebuilds the install that was turned off, not a
-/// different one: the three flags survive the round trip.
+/// different one: `alwaysLoad` survives the round trip, and nothing retired
+/// comes back with it.
 #[test]
-fn disable_then_enable_preserves_the_door_flags() {
+fn disable_then_enable_preserves_always_load() {
     let root = temp_dir("door-toggle");
     let home = temp_dir("door-toggle-home");
     git_repo(&root);
     let opts = InstallOpts {
-        impact_before_edit: true,
-        enrich_grep: true,
         always_load: true,
         ..door_opts()
     };
@@ -3803,16 +3363,8 @@ fn disable_then_enable_preserves_the_door_flags() {
         .expect("enable failed");
 
     let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
-    assert_eq!(
-        groups_matching(&s, "PreToolUse", "Edit|Write|MultiEdit").len(),
-        1,
-        "enable dropped the impact hook: {s}"
-    );
-    assert_eq!(
-        groups_matching(&s, "PostToolUse", "Grep").len(),
-        1,
-        "enable dropped the enrichment: {s}"
-    );
+    assert!(s["hooks"].get("PreToolUse").is_none(), "{s}");
+    assert!(s["hooks"].get("PostToolUse").is_none(), "{s}");
     let mcp: serde_json::Value = serde_json::from_str(&read(&root, ".mcp.json")).unwrap();
     assert_eq!(
         mcp["mcpServers"]["mushroomdb"]["alwaysLoad"], true,
@@ -3820,70 +3372,597 @@ fn disable_then_enable_preserves_the_door_flags() {
     );
 }
 
-/// The manifest prune matches the whole ` <sub> <store>` tail, not the bare
-/// subcommand word, so a store path that happens to read ` enrich ` cannot
-/// make turning the enrichment off take every other hook with it.
+/// The retired-hook prune matches the whole ` <sub> <store>` tail, not the
+/// bare subcommand word, so a store path that happens to read ` enrich ` or
+/// ` touch ` cannot make the cleanup take the live hooks with it.
 #[test]
 fn a_store_path_naming_a_subcommand_does_not_confuse_the_prune() {
     let root = temp_dir("prune-path");
     let home = temp_dir("prune-path-home");
     git_repo(&root);
     // The store lives outside the project, so `--auto` is not written and the
-    // hook commands carry this path verbatim.
-    let db = temp_dir("my enrich impact-hook intercept tools").join("memory");
-    let on = InstallOpts {
-        db: Some(db.clone()),
-        intercept_grep: true,
-        impact_before_edit: true,
-        enrich_grep: true,
-        ..door_opts()
+    // hook commands carry this path verbatim, quoted as 0.6 quoted it.
+    let db = temp_dir("my enrich impact-hook intercept touch tools").join("memory");
+    let quoted = format!("'{}'", db.display());
+    let hook = |matcher: Option<&str>, sub: &str| {
+        let mut g = serde_json::json!({
+            "hooks": [{"type": "command", "command": format!("npx -y mushroomdb@0.6.12 {sub} {quoted}"), "timeout": 5}]
+        });
+        if let Some(m) = matcher {
+            g["matcher"] = serde_json::json!(m);
+        }
+        g
     };
-    install_on_path(&root, &home, &on).expect("install with every door");
+    let settings = serde_json::json!({
+        "hooks": {
+            "UserPromptSubmit": [hook(None, "recall")],
+            "SessionStart": [hook(None, "brief")],
+            "PostToolUse": [hook(Some("Edit|Write|MultiEdit"), "touch"), hook(Some("Grep"), "enrich")],
+            "PreToolUse": [hook(Some("Grep"), "intercept"), hook(Some("Edit|Write|MultiEdit"), "impact-hook")],
+        }
+    });
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    fs::write(
+        root.join(".claude/settings.json"),
+        serde_json::to_string_pretty(&settings).unwrap(),
+    )
+    .unwrap();
 
     install_on_path(
         &root,
         &home,
         &InstallOpts {
-            enrich_grep: false,
-            ..on
+            db: Some(db.clone()),
+            ..door_opts()
         },
     )
-    .expect("install without the enrichment");
+    .expect("install");
+
+    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+    let hooks: Vec<&str> = ["UserPromptSubmit", "SessionStart"]
+        .iter()
+        .map(|e| s["hooks"][e][0]["hooks"][0]["command"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        hooks,
+        vec![
+            format!("mushroomdb recall {quoted}"),
+            format!("mushroomdb brief {quoted}")
+        ],
+        "{s}"
+    );
+    assert!(s["hooks"].get("PreToolUse").is_none(), "{s}");
+    assert!(s["hooks"].get("PostToolUse").is_none(), "{s}");
+    assert!(groups_matching(&s, "PostToolUse", "Grep").is_empty(), "{s}");
 
     let manifest: serde_json::Value = serde_json::from_str(&read(
         &root,
         ".claude/skills/mushroom/.install-manifest.json",
     ))
     .unwrap();
-    let commands: Vec<&str> = manifest["hooks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|h| h["command"].as_str().unwrap())
-        .collect();
-    let runs = |sub: &str| {
-        commands
-            .iter()
-            .any(|c| c.ends_with(&format!(" {sub} '{}'", db.display())))
-    };
-    assert!(runs("recall"), "{commands:?}");
-    assert!(runs("touch"), "{commands:?}");
-    assert!(runs("brief"), "{commands:?}");
-    assert!(runs("intercept"), "{commands:?}");
-    assert!(runs("impact-hook"), "{commands:?}");
-    assert!(
-        !runs("enrich"),
-        "the pruned hook is still owned: {commands:?}"
-    );
-    assert_eq!(commands.len(), 5, "{commands:?}");
+    assert_eq!(manifest["hooks"].as_array().unwrap().len(), 2, "{manifest}");
+}
 
-    // And on disk: the `touch` hook still stands beside the removed one.
-    let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
+// ---------------------------------------------------------------------------
+// 0.7: the four code-graph hooks and the three git sync hooks are retired, and
+//      an install or uninstall over a 0.6 install takes them back out
+// ---------------------------------------------------------------------------
+
+/// A project checkout and a home directory, both temporary.
+struct FakeHome {
+    root: PathBuf,
+    home: PathBuf,
+}
+
+fn fake_home(label: &str) -> FakeHome {
+    let root = temp_dir(label);
+    let home = temp_dir(&format!("{label}-home"));
+    git_repo(&root);
+    FakeHome { root, home }
+}
+
+/// `mushroomdb install --platform claude-code --project --no-prewarm <args>`,
+/// parsed by the real argument parser and run offline. A parse error is
+/// reported the same way as an install error: `(false, message)`.
+fn install_raw(env: &FakeHome, args: &[&str]) -> (bool, String) {
+    let mut argv = vec![
+        "install",
+        "--platform",
+        "claude-code",
+        "--project",
+        "--no-prewarm",
+    ];
+    argv.extend_from_slice(args);
+    let opts = match cli::parse_args(&argv) {
+        Ok(cli::Command::Install(opts)) => opts,
+        Ok(other) => panic!("{argv:?} did not parse as an install: {other:?}"),
+        Err(e) => return (false, e),
+    };
+    match install_on_path(&env.root, &env.home, &opts) {
+        Ok(out) => (true, out),
+        Err(e) => (false, e.to_string()),
+    }
+}
+
+fn install_ok(env: &FakeHome, args: &[&str]) -> String {
+    let (ok, out) = install_raw(env, args);
+    assert!(ok, "install {args:?} failed: {out}");
+    out
+}
+
+fn settings_json(env: &FakeHome) -> serde_json::Value {
+    serde_json::from_str(&read(&env.root, ".claude/settings.json")).unwrap()
+}
+
+/// The hook events present in the project's settings file, in key order.
+fn hook_events_written(env: &FakeHome) -> Vec<String> {
+    settings_json(env)["hooks"]
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Every hook command in the project's settings file, whatever its event.
+fn hook_commands_written(env: &FakeHome) -> Vec<String> {
+    let s = settings_json(env);
+    let mut out = Vec::new();
+    for groups in s["hooks"].as_object().into_iter().flat_map(|o| o.values()) {
+        for g in groups.as_array().into_iter().flatten() {
+            for h in g["hooks"].as_array().into_iter().flatten() {
+                if let Some(c) = h["command"].as_str() {
+                    out.push(c.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `settings.json` a 0.6.12 install wrote with all three experiments on,
+/// byte for byte as `npx -y mushroomdb@0.6.12 install --platform claude-code
+/// --project --intercept-grep --impact-before-edit --enrich-grep --no-prewarm`
+/// left it in a git checkout. The four retired commands are the real shape:
+/// the `npx` prefix, the subcommand, and `--auto` — nothing after the store.
+const SETTINGS_0_6_12: &str = r#"{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "npx -y mushroomdb@0.6.12 touch --auto",
+            "timeout": 30,
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit|Write|MultiEdit"
+      },
+      {
+        "hooks": [
+          {
+            "command": "npx -y mushroomdb@0.6.12 enrich --auto",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "Grep"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "npx -y mushroomdb@0.6.12 intercept --auto",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "Grep"
+      },
+      {
+        "hooks": [
+          {
+            "command": "npx -y mushroomdb@0.6.12 impact-hook --auto",
+            "timeout": 5,
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit|Write|MultiEdit"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "npx -y mushroomdb@0.6.12 brief --auto",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "npx -y mushroomdb@0.6.12 recall --auto",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}"#;
+
+/// The block the same 0.6.12 install wrote into each of `post-commit`,
+/// `post-checkout` and `post-merge`, after whatever the file already held.
+const GIT_HOOK_BLOCK_0_6_12: &str =
+    "# >>> mushroomdb >>>\n( npx -y mushroomdb@0.6.12 sync --auto >/dev/null 2>&1 & )\n# <<< mushroomdb <<<\n";
+
+fn seed_settings_0_6_12(env: &FakeHome) {
+    fs::create_dir_all(env.root.join(".claude")).unwrap();
+    fs::write(env.root.join(".claude/settings.json"), SETTINGS_0_6_12).unwrap();
+}
+
+/// Seed the three git hooks as 0.6.12 left them: a file it created holds the
+/// shebang and the block; `post-commit` also carries a line of the user's.
+fn seed_git_hooks_0_6_12(env: &FakeHome) -> PathBuf {
+    let hooks = env.root.join(".git/hooks");
+    fs::write(
+        hooks.join("post-commit"),
+        format!("#!/bin/sh\nmake lint\n\n{GIT_HOOK_BLOCK_0_6_12}"),
+    )
+    .unwrap();
+    for name in ["post-checkout", "post-merge"] {
+        fs::write(
+            hooks.join(name),
+            format!("#!/bin/sh\n\n{GIT_HOOK_BLOCK_0_6_12}"),
+        )
+        .unwrap();
+    }
+    hooks
+}
+
+/// Merge `fields` into the install manifest already on disk, the way a 0.6.x
+/// manifest carries keys this version no longer writes.
+fn seed_manifest_json(env: &FakeHome, fields: &str) {
+    let path = env
+        .root
+        .join(".claude/skills/mushroom/.install-manifest.json");
+    let mut m: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path).unwrap())
+        .expect("the install wrote a manifest");
+    let extra: serde_json::Value = serde_json::from_str(fields).unwrap();
+    for (k, v) in extra.as_object().unwrap() {
+        m[k] = v.clone();
+    }
+    fs::write(&path, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+}
+
+fn run_doctor(env: &FakeHome) -> (bool, String) {
+    let report = cli::doctor::run_doctor_with(
+        &env.root,
+        &env.home,
+        &cli::doctor::DoctorOpts {
+            platform: Some(Platform::ClaudeCode),
+            scope: Some(Scope::Project),
+        },
+        &no_externals(),
+    )
+    .expect("doctor errored");
+    (!report.had_fail, report.output)
+}
+
+/// A fresh install writes two hooks: the session brief and the prompt recall.
+/// `touch` re-extracted an edited file into a code graph and left with it.
+#[test]
+fn a_fresh_install_writes_exactly_two_hooks() {
+    let env = fake_home("two-hooks");
+    install_ok(&env, &["--delivery", "mcp"]);
+    let events = hook_events_written(&env);
     assert_eq!(
-        groups_matching(&s, "PostToolUse", "Edit|Write|MultiEdit").len(),
-        1,
-        "{s}"
+        events,
+        vec!["SessionStart".to_string(), "UserPromptSubmit".to_string()],
+        "expected exactly the brief and the recall hook, got {events:?}"
     );
-    assert!(groups_matching(&s, "PostToolUse", "Grep").is_empty(), "{s}");
-    assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 2, "{s}");
+}
+
+/// Installing over a settings file that still carries the retired hooks takes
+/// them out. Without this every upgraded user keeps a PostToolUse hook calling
+/// `mushroomdb touch`, a subcommand 0.7 does not have, on every edit.
+#[test]
+fn installing_over_a_0_6_settings_file_prunes_the_retired_hooks() {
+    let env = fake_home("prune");
+    seed_settings_0_6_12(&env);
+    install_ok(&env, &["--delivery", "mcp"]);
+    let commands = hook_commands_written(&env);
+    for retired in ["touch", "intercept", "impact-hook", "enrich"] {
+        assert!(
+            !commands.iter().any(|c| c.contains(retired)),
+            "{retired} survived the install: {commands:?}"
+        );
+    }
+    // What stays is the two live hooks, each once, rewritten to this install.
+    assert_eq!(
+        commands,
+        vec![
+            "mushroomdb brief --auto".to_string(),
+            "mushroomdb recall --auto".to_string()
+        ],
+        "{commands:?}"
+    );
+    assert_eq!(
+        hook_events_written(&env),
+        ["SessionStart", "UserPromptSubmit"]
+    );
+}
+
+/// The three flags are rejected, loudly, naming the pin that still has them.
+#[test]
+fn the_three_retired_flags_are_refused_with_a_route_to_0_6() {
+    let env = fake_home("flags");
+    for flag in ["--intercept-grep", "--impact-before-edit", "--enrich-grep"] {
+        let (ok, out) = install_raw(&env, &[flag]);
+        assert!(!ok, "{flag} was accepted: {out}");
+        assert!(out.contains(flag), "the message must name the flag: {out}");
+        assert!(out.contains("0.6"), "and the pin that still has it: {out}");
+    }
+}
+
+/// A 0.6.x manifest still deserializes, because the cleanup above needs to
+/// read it.
+///
+/// A `cli` install is the one shape whose doctor run depends on the manifest
+/// reading: it has no MCP entry, so the store comes from the manifest's hooks,
+/// and an unreadable manifest falls back to a default that expects a server
+/// entry and fails `config`.
+#[test]
+fn a_0_6_manifest_with_the_retired_fields_still_reads() {
+    let env = fake_home("manifest");
+    install_ok(&env, &["--delivery", "cli"]);
+    seed_manifest_json(
+        &env,
+        r#"{"intercept_grep":true,"impact_before_edit":true,"enrich_grep":false}"#,
+    );
+    let (ok, out) = run_doctor(&env);
+    assert!(ok, "doctor could not read a 0.6 manifest: {out}");
+}
+
+/// The git hooks a 0.6 install wrote background `mushroomdb sync`, which 0.7
+/// does not have. An install over that checkout takes the block out of all
+/// three and leaves the user's own lines exactly as they were.
+#[test]
+fn installing_over_a_0_6_checkout_takes_the_sync_block_out_of_its_git_hooks() {
+    let env = fake_home("git-prune");
+    let hooks = seed_git_hooks_0_6_12(&env);
+    let out = install_ok(&env, &["--delivery", "mcp"]);
+
+    assert_eq!(
+        fs::read_to_string(hooks.join("post-commit")).unwrap(),
+        "#!/bin/sh\nmake lint\n",
+        "the user's line must survive, and nothing of ours"
+    );
+    for name in ["post-checkout", "post-merge"] {
+        assert!(
+            !hooks.join(name).exists(),
+            "{name}: ours was the whole file, so the file goes"
+        );
+    }
+    assert!(out.contains("removed retired git hook"), "{out}");
+    // And nothing new is written in their place.
+    let m: serde_json::Value = serde_json::from_str(&read(
+        &env.root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert!(
+        m["git_hooks"].as_array().is_none_or(|a| a.is_empty()),
+        "{m}"
+    );
+    assert!(m.get("intercept_grep").is_none(), "{m}");
+}
+
+/// Uninstall over a 0.6 install — the settings, the git hooks and the manifest
+/// exactly as 0.6.12 wrote them — leaves none of the retired hooks behind.
+#[test]
+fn uninstalling_a_0_6_install_leaves_no_retired_hook_behind() {
+    let env = fake_home("uninstall-0-6");
+    seed_settings_0_6_12(&env);
+    let hooks = seed_git_hooks_0_6_12(&env);
+    let settings = env.root.join(".claude/settings.json");
+    let manifest_path = env
+        .root
+        .join(".claude/skills/mushroom/.install-manifest.json");
+    fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+    // The manifest 0.6.12 wrote, trimmed to the parts uninstall acts on.
+    let hook = |event: &str, sub: &str| {
+        serde_json::json!({
+            "file": settings,
+            "event": event,
+            "command": format!("npx -y mushroomdb@0.6.12 {sub} --auto"),
+        })
+    };
+    let manifest = serde_json::json!({
+        "files": [],
+        "mcp_keys": [],
+        "hooks": [
+            hook("UserPromptSubmit", "recall"),
+            hook("PostToolUse", "touch"),
+            hook("SessionStart", "brief"),
+            hook("PreToolUse", "intercept"),
+            hook("PreToolUse", "impact-hook"),
+            hook("PostToolUse", "enrich"),
+        ],
+        "git_hooks": [
+            hooks.join("post-commit"),
+            hooks.join("post-checkout"),
+            hooks.join("post-merge"),
+        ],
+        "gitignore": [],
+        "codex": false,
+        "disabled": false,
+        "stashed_mcp": [],
+        "requested_cmd": {"Npx": {"version": "0.6.12"}},
+        "delivery": "both",
+        "intercept_grep": true,
+        "impact_before_edit": true,
+        "enrich_grep": true,
+        "always_load": false
+    });
+    fs::write(&manifest_path, manifest.to_string()).unwrap();
+
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+    run_uninstall_with(&env.root, &env.home, &opts, &no_externals()).expect("uninstall");
+
+    let commands = hook_commands_written(&env);
+    assert!(commands.is_empty(), "{commands:?}");
+    assert_eq!(
+        fs::read_to_string(hooks.join("post-commit")).unwrap(),
+        "#!/bin/sh\nmake lint\n"
+    );
+    assert!(!hooks.join("post-checkout").exists());
+    assert!(!hooks.join("post-merge").exists());
+}
+
+/// The retired prune takes out ours and nothing else. A user's own tool-call
+/// hooks sit beside the 0.6.12 ones under the same events: one whose command
+/// merely *mentions* a retired word, and one that ends in exactly the tail a
+/// retired hook of ours ends in but runs a different program. Both survive
+/// the install and the uninstall.
+#[test]
+fn a_users_own_hooks_survive_the_retired_prune() {
+    let env = fake_home("foreign-hooks");
+    seed_settings_0_6_12(&env);
+    let prettier = r#"prettier --write "$FILE" && echo touch"#;
+    let othertool = "othertool enrich --auto";
+    let mentions = "echo mushroomdb && othertool touch --auto";
+    let path = env.root.join(".claude/settings.json");
+    let mut s: serde_json::Value = serde_json::from_str(SETTINGS_0_6_12).unwrap();
+    s["hooks"]["PostToolUse"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            serde_json::json!({"matcher": "Edit", "hooks": [{"type": "command", "command": prettier}]}),
+            serde_json::json!({"matcher": "Grep", "hooks": [{"type": "command", "command": othertool}]}),
+            serde_json::json!({"matcher": "Write", "hooks": [{"type": "command", "command": mentions}]}),
+        ]);
+    fs::write(&path, serde_json::to_string_pretty(&s).unwrap()).unwrap();
+
+    install_ok(&env, &["--delivery", "mcp"]);
+    let commands = hook_commands_written(&env);
+    for foreign in [prettier, othertool, mentions] {
+        assert!(
+            commands.iter().any(|c| c == foreign),
+            "install took the user's {foreign:?}: {commands:?}"
+        );
+    }
+    for retired in [" touch --auto", " intercept --auto", " impact-hook --auto"] {
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.ends_with(retired) && c.starts_with("npx -y mushroomdb@")),
+            "{retired} survived: {commands:?}"
+        );
+    }
+    assert!(
+        !commands
+            .iter()
+            .any(|c| c.contains("mushroomdb@0.6.12 enrich")),
+        "{commands:?}"
+    );
+
+    let opts = InstallOpts {
+        platform: Some(Platform::ClaudeCode),
+        scope: Some(Scope::Project),
+        ..base_opts()
+    };
+    run_uninstall_with(&env.root, &env.home, &opts, &no_externals()).expect("uninstall");
+    let commands = hook_commands_written(&env);
+    assert_eq!(
+        commands,
+        vec![
+            prettier.to_string(),
+            othertool.to_string(),
+            mentions.to_string()
+        ],
+        "uninstall leaves exactly the user's three hooks"
+    );
+}
+
+/// A 0.6 `sync` block naming a *different* store is not this install's to
+/// take out, so the cleanup leaves it — and the manifest keeps owning it, or
+/// `uninstall` could never find it again.
+#[test]
+fn a_git_hook_block_for_another_store_survives_and_stays_owned() {
+    let env = fake_home("foreign-block");
+    install_ok(&env, &["--delivery", "mcp"]);
+    let hook = env.root.join(".git/hooks/post-commit");
+    let other = temp_dir("elsewhere").join("memory");
+    let text = format!(
+        "#!/bin/sh\n\n# >>> mushroomdb >>>\n( npx -y mushroomdb@0.6.12 sync '{}' >/dev/null 2>&1 & )\n# <<< mushroomdb <<<\n",
+        other.display()
+    );
+    fs::write(&hook, &text).unwrap();
+    seed_manifest_json(
+        &env,
+        &serde_json::json!({ "git_hooks": [hook] }).to_string(),
+    );
+
+    let out = install_ok(&env, &["--delivery", "mcp"]);
+    assert_eq!(fs::read_to_string(&hook).unwrap(), text, "{out}");
+    let m: serde_json::Value = serde_json::from_str(&read(
+        &env.root,
+        ".claude/skills/mushroom/.install-manifest.json",
+    ))
+    .unwrap();
+    assert_eq!(
+        m["git_hooks"],
+        serde_json::json!([hook]),
+        "the block is still on disk, so the manifest still owns it"
+    );
+}
+
+/// Every program spelling a 0.5/0.6 install wrote in front of a retired
+/// subcommand is recognised as ours, and taken out: bare, `npx` with and
+/// without `-y`, a quoted absolute path (spaces included), and the resolved
+/// npm launcher run by `node`. The launcher's file is the package's `bin`
+/// script, `bin/mushroomdb.js` (`packaging/npm/package.json`).
+#[test]
+fn every_0_6_program_spelling_of_a_retired_hook_is_pruned() {
+    let env = fake_home("spellings");
+    let spellings = [
+        "mushroomdb touch --auto".to_string(),
+        "npx -y mushroomdb@0.6.12 intercept --auto".to_string(),
+        "npx mushroomdb@0.6.3 enrich --auto".to_string(),
+        "'/opt/my tools/node_modules/mushroomdb/vendor/mushroomdb' impact-hook --auto".to_string(),
+        "node '/opt/my tools/node_modules/mushroomdb/bin/mushroomdb.js' touch --auto".to_string(),
+    ];
+    let group = |c: &str| serde_json::json!({"hooks": [{"type": "command", "command": c}]});
+    let settings = serde_json::json!({"hooks": {
+        "PostToolUse": [group(&spellings[0]), group(&spellings[2]), group(&spellings[4])],
+        "PreToolUse": [group(&spellings[1]), group(&spellings[3])],
+    }});
+    fs::create_dir_all(env.root.join(".claude")).unwrap();
+    fs::write(
+        env.root.join(".claude/settings.json"),
+        serde_json::to_string_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+
+    install_ok(&env, &["--delivery", "mcp"]);
+    let commands = hook_commands_written(&env);
+    for spelling in &spellings {
+        assert!(
+            !commands.contains(spelling),
+            "{spelling} survived: {commands:?}"
+        );
+    }
+    assert_eq!(
+        hook_events_written(&env),
+        ["SessionStart", "UserPromptSubmit"]
+    );
 }

@@ -109,12 +109,13 @@ applies the mutation to the inactive side, then flips an `AtomicPtr` /
 | Storage | Current mutable `GraphDb` is enough — no immutability rewrite. |
 | Consistency | A `read()` guard pins one replica for its lifetime, same as today. |
 
-Cost is honest: 2× RAM on a design that already targets ~5–15 GB at 10M
-nodes, and 2× CPU on every write. Two write strategies, both unfinished:
+Cost is honest: 2× RAM on a design that already holds the working graph
+in memory (4.72 GiB peak at the 100,000 nodes measured), and 2× CPU on
+every write. Two write strategies, both unfinished:
 
 - **Snapshot-copy** (apply once, clone onto the inactive side) is a full
-  in-memory graph clone — multi-GB at the 10M-node target, paid on every
-  publish.
+  in-memory graph clone — multi-GB already at the 100,000 nodes
+  measured, paid on every publish.
 - **Apply-twice** (replay the mutation on each replica) can diverge unless
   every write is applied deterministically and in the same order on both
   sides. A missed fire, a non-deterministic rule walk, or a one-sided

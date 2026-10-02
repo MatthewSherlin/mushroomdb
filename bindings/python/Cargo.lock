@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "bincode",
  "matrixmultiply",
@@ -255,11 +255,12 @@ dependencies = [
  "mushroomdb-storage",
  "serde",
  "serde_json",
+ "unicode-normalization",
 ]
 
 [[package]]
 name = "mushroomdb-python"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "mushroomdb",
  "mushroomdb-storage",
@@ -269,14 +270,14 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-query"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "mushroomdb-storage",
 ]
 
 [[package]]
 name = "mushroomdb-rules"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "bincode",
  "mushroomdb-storage",
@@ -285,7 +286,7 @@ dependencies = [
 
 [[package]]
 name = "mushroomdb-storage"
-version = "0.6.12"
+version = "0.7.0"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -605,6 +606,15 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unindent"

@@ -17,7 +17,7 @@
 |---|---|
 | `cargo test --workspace` | **721 passed / 0 failed / 4 ignored** |
 | `cargo clippy --all-targets -- -D warnings` | **clean** |
-| `benchmarks/test_harness.py` | **20 passed / 2 skipped** (neo4j + memgraph not running; expected) |
+| `benchmarks/test_harness.py` | **20 passed / 2 skipped** (system A + system C not running; expected) |
 | Bug found and fixed | `engine_matches_oracle` proptest found fulltext `disable_fulltext` bug: when label A disabled but label B still indexes same field, stale postings from A remained. Fixed in `crates/core-storage/src/fulltext.rs` (new `field_indexed_by_other` method) + `crates/core-api/src/db.rs` (DisableFulltext apply). |
 
 ## 10k suite — mushroomdb (v0.1.0)
@@ -66,11 +66,11 @@ From `benchmarks/results/four-way-twohop-20260821-044100.md` and `twohop-isolate
 | Engine | Median | Dataset | Warmup policy |
 |---|---|---|---|
 | mushroomdb | **261.6 µs** | 5,810,000 INDUSTRY_ALIGNMENT edges | 3 warmup + 10 measured |
-| KùzuDB | 1.59 ms | same | 3 warmup + 10 measured |
-| Memgraph | 1.96 ms | same | 3 warmup + 10 measured |
-| Neo4j | 3.99 ms | same | 3 warmup + 10 measured |
+| system B | 1.59 ms | same | 3 warmup + 10 measured |
+| system C | 1.96 ms | same | 3 warmup + 10 measured |
+| system A | 3.99 ms | same | 3 warmup + 10 measured |
 
-Contamination guard: dai-neo4j stopped before bench-neo4j; port :7687 exclusivity asserted; dai-neo4j
+Contamination guard: dai-system A stopped before bench-system A; port :7687 exclusivity asserted; dai-system A
 restored after. No cross-engine postings. Full log in result files.
 
 ## Rule maintenance three-way

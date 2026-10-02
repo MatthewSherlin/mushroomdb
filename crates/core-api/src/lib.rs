@@ -1,11 +1,14 @@
 pub mod algo;
 mod db;
+pub mod digest;
 mod exact_knn;
+pub mod explain_digest;
 pub mod history;
 mod ingest;
 pub mod mask;
+pub mod memory;
+pub mod memory_schema;
 pub mod reader;
-pub mod repograph;
 pub mod restore;
 pub mod roles;
 pub mod schema;
@@ -38,6 +41,18 @@ pub use db::{
     MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT, NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
 };
 pub use exact_knn::{with_pairwise_caps, PAIRWISE_GRAM_MAX, PAIRWISE_MAX_N};
+
+/// The similarity floor `find_similar` applies when the caller names none.
+///
+/// One value, read by every surface that has a default — the MCP tool, HTTP
+/// `POST /find_similar` and the Python binding. Through 0.6 each hard-coded
+/// its own literal, and they disagreed: MCP 0.8, the other two 0.0, so a call
+/// ported between them changed its results with nothing raised. The engine
+/// itself has no default: `GraphDb::find_similar_vector_filtered` takes `min`
+/// as an argument.
+///
+/// `pairwise_similar` is a different operation and defaults to 0.0 everywhere.
+pub const FIND_SIMILAR_DEFAULT_MIN: f64 = 0.8;
 
 /// The on-disk snapshot version a store that has opted in to nothing writes —
 /// the **floor**, not the whole answer.

@@ -1,7 +1,6 @@
 //! Rules every hook body in this binary obeys, in one place.
 //!
-//! `recall`, `brief`, `touch`, `intercept`, `impact-hook` and `enrich` all run
-//! as a host's hook: inside a short timeout, in front of or beside a tool call
+//! `recall` and `brief` both run as a host's hook: inside a short timeout, in front of or beside a tool call
 //! the user is waiting on, with a store that may be missing, busy, or older
 //! than this binary. Two of those rules are worth stating once rather than
 //! restating in each module — how such a body opens a store

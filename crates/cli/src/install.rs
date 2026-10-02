@@ -1,5 +1,5 @@
 //! `mushroomdb install` / `uninstall` — wire the /mushroom skill, the MCP
-//! server, the prompt hooks and the git hooks into an assistant.
+//! server and the session hooks into an assistant.
 //!
 //! # Design notes
 //!
@@ -262,9 +262,8 @@ pub const AUTO_ARG: &str = "--auto";
 
 /// How the config an install writes names the store.
 ///
-/// A project install writes `--auto`, not a path. The MCP entry, the three
-/// settings hooks and the three git hook blocks then resolve the store when
-/// they run — `$CLAUDE_PROJECT_DIR/mushroom-memory`, else `mushroom-memory` at
+/// A project install writes `--auto`, not a path. The MCP entry and the two
+/// settings hooks then resolve the store when they run — `$CLAUDE_PROJECT_DIR/mushroom-memory`, else `mushroom-memory` at
 /// the root of the working tree they were run in.
 ///
 /// The reason is `git worktree`. Those config files live in the repository and
@@ -508,24 +507,11 @@ pub struct InstallOpts {
     pub db: Option<PathBuf>,
     /// `--command <path>`: invoke this binary instead of `npx`/the bare name.
     pub command: Option<PathBuf>,
-    /// Write the `post-commit` / `post-checkout` / `post-merge` sync hooks.
-    pub git_hooks: bool,
     /// Run `npx -y mushroomdb@<v> --version` once so the first real spawn is
     /// not a cold download.
     pub prewarm: bool,
     /// `--delivery cli|mcp|both`: which door the Claude Code install opens.
     pub delivery: Delivery,
-    /// `--intercept-grep`: also write the experimental `PreToolUse` hook that
-    /// redirects a `Grep` for a known symbol name to `explore`. Off by
-    /// default — it is the one hook of ours that can block a tool call.
-    pub intercept_grep: bool,
-    /// `--impact-before-edit`: also write the experimental `PreToolUse` hook
-    /// that puts a file's blast radius in front of an edit. Off by default.
-    pub impact_before_edit: bool,
-    /// `--enrich-grep`: also write the experimental `PostToolUse` hook that
-    /// appends what the graph knows about the symbols a `Grep` matched. Off by
-    /// default.
-    pub enrich_grep: bool,
     /// `--always-load`: mark the registered server `alwaysLoad` so the host
     /// keeps its tools in context rather than deferring them. Off by default,
     /// and meaningless on a `--delivery cli` install, which registers none.
@@ -568,7 +554,7 @@ pub fn default_db(scope: Scope, project_root: &Path, home: &Path) -> PathBuf {
 /// simply see a graph with nothing in it. So those two get the path.
 ///
 /// The worktree argument is weaker for them in any case. `.mcp.json` and the
-/// three settings hooks are Claude Code's, and they are what a `git worktree`
+/// two settings hooks are Claude Code's, and they are what a `git worktree`
 /// carries across; a Cursor install's committed artifact is one rules file
 /// that names the store in prose.
 fn resolves_at_runtime(platform: &Platform) -> bool {
@@ -618,8 +604,35 @@ fn describe_stores(stores: &[(Platform, StoreRef)]) -> String {
     }
 }
 
-/// The store the *repository* wiring names: the `.gitignore` line and the
-/// three git hook blocks.
+/// One line per named store that does not exist yet, saying what creates it.
+///
+/// Install creates no store; the commands that do declare the memory schema
+/// when they create one. Without this line a user meets that gap as a brief
+/// saying "no text index" — most likely under `--delivery cli`, whose first
+/// write can come from a `query` that declares nothing. Worded to be true in
+/// every delivery: it names the commands, not a server this install may not
+/// have registered.
+fn describe_missing_stores(stores: &[(Platform, StoreRef)]) -> String {
+    let mut paths: Vec<&Path> = stores.iter().map(|(_, s)| s.path()).collect();
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter(|p| !core_api::restore::holds_a_store(p))
+        .map(|p| {
+            format!(
+                "  note   no store at {} yet — the first `mushroomdb mcp`, `serve` or \
+                 `ingest-git` run that writes to it creates it with the memory schema; to \
+                 create it now: mushroomdb schema apply {} --memory-defaults\n",
+                p.display(),
+                sh_quote(&p.to_string_lossy())
+            )
+        })
+        .collect()
+}
+
+/// The store the *repository* wiring names: the `.gitignore` line, and the
+/// store whose retired git hook blocks install takes back out.
 ///
 /// `--auto` is safe here on its own terms, whatever platform asked for the
 /// install: git runs a hook with the working tree it acted on as the working
@@ -997,20 +1010,17 @@ struct Manifest {
     /// is what every manifest written before this field existed described.
     #[serde(default)]
     delivery: Delivery,
-    /// Whether this install asked for the experimental grep redirect. The
-    /// hook itself is listed in `hooks` like any other, so `uninstall` and
-    /// `disable` need nothing from this field; `enable` reads it to rebuild
-    /// the same install that was disabled, and `doctor` to know whether a
-    /// missing `PreToolUse` hook is a fault or the default. Defaults to
-    /// false, which is what every manifest written before it existed means.
-    #[serde(default)]
+    /// Retired in 0.7 with the code graph. Read so a 0.6.x manifest still
+    /// deserializes — the retired-hook cleanup needs to be able to open one —
+    /// and never written again. Nothing reads them once they are in.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     intercept_grep: bool,
-    /// Whether this install asked for the pre-edit impact hook. Read for the
-    /// same three reasons as `intercept_grep`, and defaulted the same way.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     impact_before_edit: bool,
-    /// Whether this install asked for the grep enrichment hook.
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     enrich_grep: bool,
     /// Whether the registered server entry carries `alwaysLoad`. The key lives
     /// in the MCP JSON, which `uninstall` removes whole, so nothing needs this
@@ -1125,19 +1135,8 @@ pub(crate) const HOOK_EVENT: &str = "UserPromptSubmit";
 /// Kept short: the hook must never noticeably slow a prompt.
 const HOOK_TIMEOUT_SECS: u64 = 5;
 
-/// The second hook event: fires after a tool call, so an edit reaches the
-/// graph while the assistant is still working rather than at the next commit.
-pub(crate) const TOUCH_EVENT: &str = "PostToolUse";
-/// The tools that change a file on disk. Anything else — a read, a search, a
-/// shell command — leaves the working tree as the graph already has it.
-const TOUCH_MATCHER: &str = "Edit|Write|MultiEdit";
-/// Longer than the prompt hook's: re-extracting a file costs more than reading
-/// a digest, and nothing is waiting on the answer. The run is `async`, so this
-/// bounds a background process rather than the assistant's turn.
-const TOUCH_TIMEOUT_SECS: u64 = 30;
-
-/// The third hook event: fires once as a session opens, so the assistant knows
-/// what the repository is before it is asked anything.
+/// The second hook event: fires once as a session opens, so the assistant knows
+/// what the store holds before it is asked anything.
 ///
 /// No matcher — a session start is not a tool call — and not `async`: the
 /// point of the brief is to be there for the first turn, and the host caches
@@ -1145,50 +1144,28 @@ const TOUCH_TIMEOUT_SECS: u64 = 30;
 /// once. It shares the prompt hook's [`HOOK_TIMEOUT_SECS`] budget.
 pub(crate) const BRIEF_EVENT: &str = "SessionStart";
 
-/// The optional fourth hook event: fires *before* a tool call, so a search the
-/// graph answers exactly can be turned into an `explore` before it runs.
+/// Subcommands this install used to write hooks for and no longer does.
 ///
-/// Written only for `install --intercept-grep` (see
-/// [`InstallOpts::intercept_grep`]). It is the one hook of ours that can block
-/// a tool call — Claude Code reads exit 2 as "refuse this call, and give the
-/// model what stderr said" — so it is opt-in, awaited rather than `async`
-/// (nothing else could block the call), and on the prompt hook's short
-/// [`HOOK_TIMEOUT_SECS`] budget.
-pub(crate) const INTERCEPT_EVENT: &str = "PreToolUse";
-
-/// The one tool it fires for. A `Read`, an `Edit` or a `Bash` is never
-/// redirected: the graph has no better answer to those.
-const INTERCEPT_MATCHER: &str = "Grep";
-
-/// The optional fifth hook: the blast radius of a file, in front of the edit
-/// that is about to change it.
+/// `remove_stale_hooks` only prunes hooks for an event and subcommand we are
+/// still writing, so a retired hook is invisible to it: stop writing `touch`
+/// and every existing install keeps a `PostToolUse` hook calling a
+/// subcommand 0.7 does not have, on every edit, forever. Named by
+/// subcommand because that is how `is_our_hook_command` recognises ours.
 ///
-/// Written only for `install --impact-before-edit`. It shares `PreToolUse`
-/// with the redirect but is a different group, matched to the editing tools
-/// rather than to `Grep`, so the two are independent: each is recognised by
-/// its own subcommand word (see [`is_our_hook_command`]) and turning one off
-/// leaves the other alone. It never blocks — it prints one
-/// `hookSpecificOutput` object with `additionalContext` and exits 0 — but it
-/// is awaited, because context that arrives after the edit is context nobody
-/// read.
-pub(crate) const IMPACT_EVENT: &str = "PreToolUse";
+/// Literals, not anything derived from the CLI's command table: these
+/// subcommands no longer exist there, and recognising what a 0.6 install
+/// wrote is the whole job.
+pub(crate) const RETIRED_HOOK_SUBCOMMANDS: [(&str, &str); 4] = [
+    ("PostToolUse", "touch"),
+    ("PreToolUse", "intercept"),
+    ("PreToolUse", "impact-hook"),
+    ("PostToolUse", "enrich"),
+];
 
-/// The tools it fires for: the ones that change a file, the same set
-/// [`TOUCH_MATCHER`] names.
-const IMPACT_MATCHER: &str = TOUCH_MATCHER;
-
-/// The optional sixth hook: what the graph knows about the symbols a `Grep`
-/// just matched, appended to the result.
-///
-/// Written only for `install --enrich-grep`. It shares `PostToolUse` with the
-/// `touch` re-extraction and, like the impact hook, is a separate group with
-/// its own matcher and its own subcommand word. Awaited on the short budget:
-/// the facts have to reach the transcript with the tool result, and an `async`
-/// hook's output arrives too late to be part of it.
-pub(crate) const ENRICH_EVENT: &str = "PostToolUse";
-
-/// The one tool it fires for.
-const ENRICH_MATCHER: &str = "Grep";
+/// The subcommand the 0.6 git hook block backgrounded after every commit,
+/// checkout and merge — the line-based equivalent of
+/// [`RETIRED_HOOK_SUBCOMMANDS`].
+pub(crate) const RETIRED_GIT_HOOK_SUBCOMMAND: &str = "sync";
 
 /// Single-quote `s` for embedding in a POSIX shell command line, escaping
 /// embedded single quotes as `'\''`. Claude Code runs a `type: "command"`
@@ -1203,7 +1180,7 @@ pub(crate) fn sh_quote(s: &str) -> String {
 /// the subcommand that is that hook's body, and the store. Both outer halves
 /// arrive already quoted where quoting is needed.
 ///
-/// One function for all six hooks, because the shape is the thing every other
+/// One function for every hook, because the shape is the thing every other
 /// part of the installer depends on: [`is_our_hook_command`] recognises a hook
 /// of ours by exactly this tail, and a second spelling of the same line would
 /// be a hook nothing could later find to replace or remove.
@@ -1219,37 +1196,6 @@ fn hook_command(shell: &str, sub: &str, store: &StoreRef) -> String {
 /// is not the same as no matcher.
 fn hook_entry(command: &str) -> serde_json::Value {
     serde_json::json!({ "hooks": [ { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS } ] })
-}
-
-/// One `hooks.<event>` array entry matched to a set of tools.
-///
-/// Four of our hooks are this shape and differ only in three values, so they
-/// share one builder: two events hold two hooks of ours each (`PreToolUse` has
-/// the redirect and the impact hook, `PostToolUse` has `touch` and the grep
-/// enrichment), and what keeps each pair apart on disk is the matcher plus the
-/// subcommand inside `command`.
-///
-/// `async` is written only when asked for, because the key's *absence* is what
-/// makes a hook awaited, and every hook here but `touch` has to be: a hook
-/// that decides after the tool call has gone through has decided nothing, and
-/// context that arrives after the edit is context nobody read. `touch` is the
-/// exception — nothing waits on a re-extraction — and pays for it with the
-/// longer [`TOUCH_TIMEOUT_SECS`] budget.
-fn matched_hook_entry(
-    matcher: &str,
-    command: &str,
-    timeout: u64,
-    run_async: bool,
-) -> serde_json::Value {
-    let mut hook = serde_json::json!({
-        "type": "command",
-        "command": command,
-        "timeout": timeout,
-    });
-    if run_async {
-        hook["async"] = serde_json::Value::Bool(true);
-    }
-    serde_json::json!({ "matcher": matcher, "hooks": [hook] })
 }
 
 /// True if any hook group under `event` contains a command hook equal to `command`.
@@ -1396,6 +1342,129 @@ fn remove_stale_hooks(
     })
 }
 
+/// Take every retired hook of ours out of `settings_file`. Returns whether
+/// the file was rewritten.
+fn remove_retired_hooks(settings_file: &Path, store: &StoreRef) -> Result<bool, CliError> {
+    let mut changed = false;
+    for (event, sub) in RETIRED_HOOK_SUBCOMMANDS {
+        changed |= drop_hooks(settings_file, event, |c| {
+            is_retired_hook_of_ours(c, sub, store)
+        })?;
+    }
+    Ok(changed)
+}
+
+/// Whether `command` is the retired hook `sub` of ours for `store`.
+///
+/// Stricter than [`is_our_hook_command`]: the tail alone would claim any
+/// command ending in ` enrich --auto`, whatever program it runs, and this
+/// test decides what gets *deleted* from a file the user owns. So the
+/// command's program must also be mushroomdb — see [`runs_mushroomdb`].
+/// `othertool enrich --auto` and `echo mushroomdb && othertool touch --auto`
+/// both survive.
+pub(crate) fn is_retired_hook_of_ours(command: &str, sub: &str, store: &StoreRef) -> bool {
+    store.hook_tails(sub).iter().any(|tail| {
+        command
+            .strip_suffix(tail.as_str())
+            .is_some_and(runs_mushroomdb)
+    })
+}
+
+/// Whether the program a hook command line starts with is mushroomdb, in
+/// one of the spellings [`McpCommand::shell`] has written since 0.5:
+///
+/// - bare `mushroomdb` (on PATH, and a `--command mushroomdb`);
+/// - `npx -y mushroomdb@x.y.z` (and `npx mushroomdb@…` without the `-y`);
+/// - a path ending in `/mushroomdb`, single-quoted or not — the resolved
+///   native binary (`…/vendor/mushroomdb`), a 0.5.x copy
+///   (`~/.mushroomdb/bin/mushroomdb`), a `--command` build path;
+/// - `node '<…>/mushroomdb.js'` — the resolved npm launcher, the package's
+///   `bin` script.
+///
+/// Only the leading program token counts: a later word that merely reads
+/// `mushroomdb`, as in `echo mushroomdb && …`, does not make a command ours.
+fn runs_mushroomdb(prefix: &str) -> bool {
+    let words = shell_words(prefix);
+    let mut words = words.iter().map(String::as_str);
+    let is_bin = |w: &str| w == BIN_NAME || w.ends_with(&format!("/{BIN_NAME}"));
+    match words.next() {
+        Some("npx") => {
+            let next = match words.next() {
+                Some("-y") => words.next(),
+                other => other,
+            };
+            next.is_some_and(|w| w.starts_with(&format!("{NPM_PACKAGE}@")))
+        }
+        Some(NODE_BIN) => words
+            .next()
+            .is_some_and(|w| w.ends_with(&format!("/{BIN_NAME}.js"))),
+        Some(first) => is_bin(first) || first.starts_with(&format!("{NPM_PACKAGE}@")),
+        None => false,
+    }
+}
+
+/// Split a POSIX command line into words, the way [`sh_quote`]'s output
+/// reads back: single quotes are literal, a backslash outside them escapes
+/// the next character, whitespace outside them separates. Enough for the
+/// command prefixes this installer writes; not a general shell parser.
+fn shell_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quoted = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                quoted = !quoted;
+                in_word = true;
+            }
+            '\\' if !quoted => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+                in_word = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            c => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+}
+
+/// Whether `command` is a retired hook of ours for any of `stores`.
+fn is_retired_hook_command<'a>(
+    command: &str,
+    mut stores: impl Iterator<Item = &'a StoreRef>,
+) -> bool {
+    stores.any(|store| {
+        RETIRED_HOOK_SUBCOMMANDS
+            .iter()
+            .any(|(_, sub)| is_retired_hook_of_ours(command, sub, store))
+    })
+}
+
+/// Whether the git hook at `path` still holds a mushroomdb marked block.
+///
+/// What decides whether a manifest keeps a 0.6 `git_hooks` entry: the
+/// cleanup takes out only the blocks that run `sync` for this install's
+/// store, so a block naming a different store stays on disk — and stays in
+/// the manifest, or `uninstall` could never find it again.
+fn still_holds_hook_block(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| text.lines().any(|l| l.trim_end() == HOOK_BEGIN))
+}
+
 /// Drop every hook under `event` whose command satisfies `drop_it`, pruning
 /// groups that end up empty. Returns whether the file was rewritten.
 ///
@@ -1477,26 +1546,16 @@ struct Ctx<'a> {
     home: &'a Path,
     scope: Scope,
     /// The store the repository wiring names — the `.gitignore` line and the
-    /// git hook blocks. Each platform's own config gets its own [`StoreRef`],
+    /// retired git hook blocks. Each platform's own config gets its own [`StoreRef`],
     /// passed to the per-platform writers, because only Claude Code can
     /// resolve `--auto`; see [`repo_store_ref`] and [`resolves_at_runtime`].
     repo_store: &'a StoreRef,
     cmd: &'a McpCommand,
     ext: &'a Externals,
-    git_hooks: bool,
     prewarm: bool,
     /// Which door to open — see [`Delivery`]. Read by [`install_claude_code`],
     /// which is the only writer it changes.
     delivery: Delivery,
-    /// Whether to write the experimental grep redirect. Claude Code only —
-    /// it is a Claude Code hook.
-    intercept_grep: bool,
-    /// Whether to write the experimental pre-edit impact hook. Claude Code
-    /// only, for the same reason.
-    impact_before_edit: bool,
-    /// Whether to write the experimental grep enrichment hook. Claude Code
-    /// only, for the same reason.
-    enrich_grep: bool,
     /// Whether the server entry this install writes carries `alwaysLoad`.
     /// Claude Code's `.mcp.json` only: it is a Claude Code key, and a Cursor
     /// or Codex registration has no equivalent to set.
@@ -1628,12 +1687,8 @@ pub fn run_install_with(
         repo_store: &repo_store,
         cmd,
         ext,
-        git_hooks: opts.git_hooks,
         prewarm: opts.prewarm && !package_fetched,
         delivery: opts.delivery,
-        intercept_grep: opts.intercept_grep,
-        impact_before_edit: opts.impact_before_edit,
-        enrich_grep: opts.enrich_grep,
         always_load: opts.always_load,
     };
 
@@ -1649,20 +1704,20 @@ pub fn run_install_with(
     // other drift, so the only extra step is clearing the flag once that
     // write lands, and saying so in the summary.
     let was_disabled = existing.disabled;
-    // Turning an experiment off writes nothing new, so the manifest would
-    // otherwise go on claiming a hook — or an `alwaysLoad` key — this run just
-    // removed.
-    let doors_changed = existing.intercept_grep != opts.intercept_grep
-        || existing.impact_before_edit != opts.impact_before_edit
-        || existing.enrich_grep != opts.enrich_grep
-        || existing.always_load != opts.always_load;
+    // Turning `alwaysLoad` off writes nothing new, so the manifest would
+    // otherwise go on claiming a key this run just removed. A 0.6 manifest
+    // that still owns a retired hook, or any git hook, is in the same place:
+    // the cleanup below takes them off disk and writes nothing in their stead.
+    let always_load_changed = existing.always_load != opts.always_load;
+    let owns_retired = !existing.git_hooks.is_empty()
+        || existing
+            .hooks
+            .iter()
+            .any(|h| is_retired_hook_command(&h.command, stores.iter().map(|(_, s)| s)));
 
     let mut manifest = Manifest {
         requested_cmd,
         delivery: opts.delivery,
-        intercept_grep: opts.intercept_grep,
-        impact_before_edit: opts.impact_before_edit,
-        enrich_grep: opts.enrich_grep,
         always_load: opts.always_load,
         ..Manifest::default()
     };
@@ -1670,19 +1725,6 @@ pub fn run_install_with(
     notes.extend(launcher_note);
     if was_disabled {
         notes.push("this install was disabled — install re-enabled it".to_string());
-    }
-    // Deprecated in 0.6.4, removed in 0.7. The hook still installs and still
-    // works; the person who asked for it is told once, by the command they ran.
-    for (on, flag) in [
-        (opts.intercept_grep, "--intercept-grep"),
-        (opts.impact_before_edit, "--impact-before-edit"),
-        (opts.enrich_grep, "--enrich-grep"),
-    ] {
-        if on {
-            notes.push(format!(
-                "deprecated  {flag} — the code-graph hooks are deprecated and are removed in 0.7"
-            ));
-        }
     }
 
     let outcome = write_everything(&ctx, &stores, &mut manifest, &mut notes);
@@ -1698,7 +1740,7 @@ pub fn run_install_with(
     }
 
     let anything_written = !manifest.is_empty();
-    if anything_written || was_disabled || doors_changed {
+    if anything_written || was_disabled || always_load_changed || owns_retired {
         // Union this-run entries with the existing manifest (dedup by path/key).
         let mut merged = if anything_written {
             union_manifests(existing, &manifest)
@@ -1715,33 +1757,23 @@ pub fn run_install_with(
         if !opts.delivery.wires_mcp() {
             merged.mcp_keys.retain(|k| has_our_server(&k.file));
         }
-        // Same for each experiment: an install without the flag has just taken
-        // that hook off disk, so the manifest must stop owning it.
+        merged.always_load = opts.always_load;
+        // Same for the retired hooks: this run has just taken every one of
+        // ours off disk, so the manifest must stop owning them.
         //
         // Matched with [`is_our_hook_command`], the same predicate the removal
-        // itself used — not on the event, because the three opt-in hooks share
-        // two events between them and with `touch`, and not on the subcommand
-        // word alone, because a `--db` or `--command` path may contain it (a
-        // store at `~/my enrich tools/memory` would otherwise make the prune
-        // drop every hook it owns). Matching the whole ` <sub> <store>` tail
-        // can only ever be true of the hook that is actually going away.
-        merged.intercept_grep = opts.intercept_grep;
-        merged.impact_before_edit = opts.impact_before_edit;
-        merged.enrich_grep = opts.enrich_grep;
-        merged.always_load = opts.always_load;
-        for (on, sub) in [
-            (opts.intercept_grep, "intercept"),
-            (opts.impact_before_edit, "impact-hook"),
-            (opts.enrich_grep, "enrich"),
-        ] {
-            if !on {
-                merged.hooks.retain(|h| {
-                    !stores
-                        .iter()
-                        .any(|(_, store)| is_our_hook_command(&h.command, sub, store))
-                });
-            }
-        }
+        // itself used — not on the event, which the retired hooks share, and
+        // not on the subcommand word alone, because a `--db` or `--command`
+        // path may contain it (a store at `~/my enrich tools/memory` would
+        // otherwise make the prune drop every hook it owns). Matching the
+        // whole ` <sub> <store>` tail can only ever be true of a retired hook.
+        merged
+            .hooks
+            .retain(|h| !is_retired_hook_command(&h.command, stores.iter().map(|(_, s)| s)));
+        // No version from 0.7 on writes a git hook; any the manifest lists
+        // were 0.6 `sync` blocks. The ones the cleanup took out go; one it
+        // left, because it names another store, stays owned.
+        merged.git_hooks.retain(|f| still_holds_hook_block(f));
         write_manifest(&manifest_path, &merged)?;
     }
 
@@ -1772,9 +1804,6 @@ pub fn run_install_with(
     for g in &manifest.gitignore {
         out.push_str(&format!("  added  {} to {}\n", g.line, g.file.display()));
     }
-    for h in &manifest.git_hooks {
-        out.push_str(&format!("  added  git hook {}\n", h.display()));
-    }
     if manifest.codex {
         out.push_str(&format!("  added  codex mcp server {SERVER_NAME}\n"));
     }
@@ -1792,6 +1821,7 @@ pub fn run_install_with(
     } else {
         out.push_str("  (already installed — no changes)\n");
     }
+    out.push_str(&describe_missing_stores(&stores));
     for n in &notes {
         out.push_str(&format!("  {n}\n"));
     }
@@ -1820,21 +1850,25 @@ fn write_everything(
     }
 
     // The repository-level wiring is shared by the platforms whose config
-    // lives in the repository: the store is ignored by git and the graph is
-    // re-synced after commits whichever of them reads it.
+    // lives in the repository: the store is ignored by git whichever of them
+    // reads it, and the `sync` block a 0.6 install put in the git hooks is
+    // taken back out.
     //
     // A Codex-only install is excluded. It writes nothing else project-local
     // (Codex keeps its own config, and the manifest for it lives under the
-    // home directory), so an ignore line and three git hooks recorded there
-    // would be removed by a `uninstall --platform codex` out from under a
-    // Claude Code install that shares the repository and never recorded them.
+    // home directory), so an ignore line recorded there would be removed by a
+    // `uninstall --platform codex` out from under a Claude Code install that
+    // shares the repository and never recorded it.
     let repo_wiring = platforms
         .iter()
         .any(|p| matches!(p, Platform::ClaudeCode | Platform::Cursor));
     if ctx.scope == Scope::Project && repo_wiring {
         ensure_gitignore_line(ctx, manifest)?;
-        if ctx.git_hooks {
-            install_git_hooks(ctx, manifest)?;
+        for file in remove_retired_git_hooks(ctx.project_root, ctx.repo_store)? {
+            notes.push(format!(
+                "removed retired git hook block ({RETIRED_GIT_HOOK_SUBCOMMAND}) from {}",
+                file.display()
+            ));
         }
     }
 
@@ -1949,6 +1983,35 @@ pub fn run_uninstall_with(
         }
     }
 
+    // What a 0.6 install wrote and this version no longer does. A 0.6
+    // manifest lists those hooks and the loops above have already taken them
+    // out; this pass recognises them by subcommand and store instead, so one
+    // the manifest does not name exactly still goes.
+    let stores = recorded_hook_stores(&manifest, project_root, home);
+    let mut settings_files: Vec<&PathBuf> = Vec::new();
+    for h in &manifest.hooks {
+        if !settings_files.contains(&&h.file) {
+            settings_files.push(&h.file);
+        }
+    }
+    for file in settings_files {
+        for store in &stores {
+            if remove_retired_hooks(file, store)? {
+                removed.push(format!("removed  retired hooks from {}", file.display()));
+            }
+        }
+    }
+    if scope == Scope::Project {
+        for store in &stores {
+            for file in remove_retired_git_hooks(project_root, store)? {
+                removed.push(format!(
+                    "removed  retired git hook block from {}",
+                    file.display()
+                ));
+            }
+        }
+    }
+
     // The ignore line, exactly as it was written. A file that exists only
     // because install created it goes too — but only when our line was all it
     // ever held; anything the user added to it since is theirs to keep.
@@ -2002,7 +2065,7 @@ pub fn run_uninstall_with(
 // ---------------------------------------------------------------------------
 //
 // `disable` takes the dynamic, per-assistant config off disk — the MCP entry,
-// the three Claude Code hooks, the three git hook blocks, the Codex
+// the Claude Code hooks, a 0.6 install's git hook blocks, the Codex
 // registration — and leaves everything a person might have customised or that
 // the store depends on: the skill/rules file, the store itself, the
 // `.gitignore` line. `enable` puts the config back, re-derived from whatever
@@ -2089,6 +2152,29 @@ fn store_from_hooks(manifest: &Manifest, project_root: &Path, home: &Path) -> Op
         .map(|arg| store_from_arg(&arg, project_root, home))
 }
 
+/// Every store a hook in `manifest` names, live or retired, in the order the
+/// hooks are listed. What `uninstall` matches retired hooks against: it has no
+/// store of its own to compute, only what the install it is undoing wrote.
+fn recorded_hook_stores(manifest: &Manifest, project_root: &Path, home: &Path) -> Vec<StoreRef> {
+    let subs: Vec<&str> = ["recall", "brief"]
+        .into_iter()
+        .chain(RETIRED_HOOK_SUBCOMMANDS.iter().map(|(_, sub)| *sub))
+        .collect();
+    let mut out: Vec<StoreRef> = Vec::new();
+    for h in &manifest.hooks {
+        for sub in &subs {
+            let Some(arg) = hook_command_store_arg(&h.command, sub) else {
+                continue;
+            };
+            let store = store_from_arg(&arg, project_root, home);
+            if !out.contains(&store) {
+                out.push(store);
+            }
+        }
+    }
+    out
+}
+
 /// What an install at this scope recorded: the door it opened, and the store
 /// its hooks name. Both are `None`/`Both` when there is no manifest at all.
 pub(crate) fn installed_shape(
@@ -2171,8 +2257,8 @@ fn repo_store_for_enable(stores: &[(Platform, StoreRef)]) -> StoreRef {
         .expect("enable always resolves at least one platform")
 }
 
-/// Turn an install off: remove the MCP entry, the three Claude Code hooks, the
-/// git hook blocks and the Codex registration; leave the skill/rules file, the
+/// Turn an install off: remove the MCP entry, the Claude Code hooks, a 0.6
+/// install's git hook blocks and the Codex registration; leave the skill/rules file, the
 /// store, and the `.gitignore` line untouched. Idempotent.
 pub fn run_disable(
     project_root: &Path,
@@ -2261,8 +2347,8 @@ pub fn run_disable_with(
     Ok(out)
 }
 
-/// Turn a disabled install back on. Re-adds the MCP entry, the three Claude Code
-/// hooks and the git hook blocks using the store a stashed entry named and the
+/// Turn a disabled install back on. Re-adds the MCP entry and the two Claude
+/// Code hooks using the store a stashed entry named and the
 /// command `install` would resolve right now — not a replay of what
 /// `disable` took out, which may no longer be the fastest path to the
 /// published package. Idempotent, and a no-op (not an error) when the install
@@ -2346,7 +2432,6 @@ pub fn run_enable_with(
         })
         .collect();
     let repo_store = repo_store_for_enable(&stores);
-    let had_git_hooks = !manifest.git_hooks.is_empty();
 
     let ctx = Ctx {
         project_root,
@@ -2355,17 +2440,13 @@ pub fn run_enable_with(
         repo_store: &repo_store,
         cmd,
         ext,
-        git_hooks: true,
         prewarm: false,
         // Re-enable the install that was disabled, not a different one: a
         // `cli` install has no server to put back, and its skill is the one
         // that teaches the binary.
         delivery: manifest.delivery,
-        // Likewise the experiments: `enable` never adds one the install it is
-        // restoring never had, and never drops one it did.
-        intercept_grep: manifest.intercept_grep,
-        impact_before_edit: manifest.impact_before_edit,
-        enrich_grep: manifest.enrich_grep,
+        // Likewise `alwaysLoad`: `enable` never adds it to an install that
+        // never had it, and never drops it from one that did.
         always_load: manifest.always_load,
     };
 
@@ -2379,11 +2460,18 @@ pub fn run_enable_with(
         }
     }
 
+    // `disable` took a 0.6 install's git hook blocks off disk already; this
+    // catches any it did not own, the same pass `install` makes.
     let repo_wiring = platforms
         .iter()
         .any(|p| matches!(p, Platform::ClaudeCode | Platform::Cursor));
-    if had_git_hooks && scope == Scope::Project && repo_wiring {
-        install_git_hooks(&ctx, &mut fresh)?;
+    if scope == Scope::Project && repo_wiring {
+        for file in remove_retired_git_hooks(project_root, &repo_store)? {
+            notes.push(format!(
+                "removed retired git hook block ({RETIRED_GIT_HOOK_SUBCOMMAND}) from {}",
+                file.display()
+            ));
+        }
     }
 
     // Fold this run's writes into the manifest: entries for files this run
@@ -2405,10 +2493,12 @@ pub fn run_enable_with(
         .hooks
         .retain(|h| !touched_hooks.contains(&(&h.file, h.event.as_str())));
     manifest.hooks.extend(fresh.hooks.iter().cloned());
-
-    if !fresh.git_hooks.is_empty() {
-        manifest.git_hooks = fresh.git_hooks.clone();
-    }
+    // A 0.6 manifest still owns the hooks this version retired; the writers
+    // above have just taken them off disk, so it stops owning them here.
+    manifest
+        .hooks
+        .retain(|h| !is_retired_hook_command(&h.command, stores.iter().map(|(_, s)| s)));
+    manifest.git_hooks.retain(|f| still_holds_hook_block(f));
     manifest.codex |= fresh.codex;
     for f in &fresh.files {
         if !manifest.files.contains(f) {
@@ -2440,9 +2530,6 @@ pub fn run_enable_with(
             h.event,
             h.file.display()
         ));
-    }
-    for g in &fresh.git_hooks {
-        out.push_str(&format!("enabled  git hook {}\n", g.display()));
     }
     if fresh.codex {
         out.push_str(&format!("enabled  codex mcp server {SERVER_NAME}\n"));
@@ -2797,7 +2884,7 @@ fn install_claude_code(
         ));
     }
 
-    // All three hooks: settings.json in the same scope as the skill. The
+    // Both hooks: settings.json in the same scope as the skill. The
     // prompt hook first, so a manifest lists them in the order they were
     // written.
     let settings_file = match ctx.scope {
@@ -2818,17 +2905,6 @@ fn install_claude_code(
         hook_entry(&recall),
         manifest,
     )?;
-    let touch = hook_command(&shell, "touch", store);
-    if remove_stale_hooks(&settings_file, TOUCH_EVENT, "touch", store, &touch)? {
-        notes.push(format!("replaced stale {TOUCH_EVENT} hook"));
-    }
-    merge_hook_entry(
-        &settings_file,
-        TOUCH_EVENT,
-        &touch,
-        matched_hook_entry(TOUCH_MATCHER, &touch, TOUCH_TIMEOUT_SECS, true),
-        manifest,
-    )?;
     let brief = hook_command(&shell, "brief", store);
     if remove_stale_hooks(&settings_file, BRIEF_EVENT, "brief", store, &brief)? {
         notes.push(format!("replaced stale {BRIEF_EVENT} hook"));
@@ -2840,78 +2916,12 @@ fn install_claude_code(
         hook_entry(&brief),
         manifest,
     )?;
-
-    // The fourth hook is opt-in, and an install that does not ask for it takes
-    // back any earlier one of ours for this store — otherwise the experiment
-    // could only ever be turned on.
-    let intercept = hook_command(&shell, "intercept", store);
-    if ctx.intercept_grep {
-        if remove_stale_hooks(
-            &settings_file,
-            INTERCEPT_EVENT,
-            "intercept",
-            store,
-            &intercept,
-        )? {
-            notes.push(format!("replaced stale {INTERCEPT_EVENT} hook"));
-        }
-        merge_hook_entry(
-            &settings_file,
-            INTERCEPT_EVENT,
-            &intercept,
-            matched_hook_entry(INTERCEPT_MATCHER, &intercept, HOOK_TIMEOUT_SECS, false),
-            manifest,
-        )?;
-    } else if drop_hooks(&settings_file, INTERCEPT_EVENT, |c| {
-        is_our_hook_command(c, "intercept", store)
-    })? {
+    // The hooks a 0.6 install wrote beside these two, and this version does
+    // not: taken out rather than left calling subcommands that are gone.
+    if remove_retired_hooks(&settings_file, store)? {
         notes.push(format!(
-            "removed {INTERCEPT_EVENT} hook — no --intercept-grep"
-        ));
-    }
-
-    // The fifth and sixth are opt-in the same way, and each shares its event
-    // with a hook that is not it: the impact hook sits beside the redirect
-    // under `PreToolUse`, the enrichment beside `touch` under `PostToolUse`.
-    // The subcommand word keeps them apart, so turning one off leaves its
-    // neighbour exactly where it was.
-    let impact = hook_command(&shell, "impact-hook", store);
-    if ctx.impact_before_edit {
-        if remove_stale_hooks(&settings_file, IMPACT_EVENT, "impact-hook", store, &impact)? {
-            notes.push(format!("replaced stale {IMPACT_EVENT} impact hook"));
-        }
-        merge_hook_entry(
-            &settings_file,
-            IMPACT_EVENT,
-            &impact,
-            matched_hook_entry(IMPACT_MATCHER, &impact, HOOK_TIMEOUT_SECS, false),
-            manifest,
-        )?;
-    } else if drop_hooks(&settings_file, IMPACT_EVENT, |c| {
-        is_our_hook_command(c, "impact-hook", store)
-    })? {
-        notes.push(format!(
-            "removed {IMPACT_EVENT} impact hook — no --impact-before-edit"
-        ));
-    }
-
-    let enrich = hook_command(&shell, "enrich", store);
-    if ctx.enrich_grep {
-        if remove_stale_hooks(&settings_file, ENRICH_EVENT, "enrich", store, &enrich)? {
-            notes.push(format!("replaced stale {ENRICH_EVENT} enrichment hook"));
-        }
-        merge_hook_entry(
-            &settings_file,
-            ENRICH_EVENT,
-            &enrich,
-            matched_hook_entry(ENRICH_MATCHER, &enrich, HOOK_TIMEOUT_SECS, false),
-            manifest,
-        )?;
-    } else if drop_hooks(&settings_file, ENRICH_EVENT, |c| {
-        is_our_hook_command(c, "enrich", store)
-    })? {
-        notes.push(format!(
-            "removed {ENRICH_EVENT} enrichment hook — no --enrich-grep"
+            "removed retired code-graph hooks from {}",
+            settings_file.display()
         ));
     }
 
@@ -3007,12 +3017,12 @@ fn install_codex(ctx: &Ctx<'_>, store: &StoreRef, manifest: &mut Manifest) -> Re
 }
 
 // ---------------------------------------------------------------------------
-// Repository wiring: the ignore line and the sync hooks
+// Repository wiring: the ignore line, and the retired sync hooks' cleanup
 // ---------------------------------------------------------------------------
 
-/// The git hooks a sync belongs in: after a commit lands, after a branch
-/// changes the working tree, and after a merge brings other people's commits
-/// in. All three leave the graph a commit behind if they are skipped.
+/// The git hooks a 0.6 install put its `sync` block in: after a commit, a
+/// checkout and a merge. 0.7 writes none of them and only ever reads these to
+/// take that block back out.
 pub(crate) const GIT_HOOKS: &[&str] = &["post-commit", "post-checkout", "post-merge"];
 
 /// The `.gitignore` line for a store kept inside the repository, or `None`
@@ -3165,19 +3175,42 @@ fn lexically_normalize(path: &Path) -> PathBuf {
     out
 }
 
-fn install_git_hooks(ctx: &Ctx<'_>, manifest: &mut Manifest) -> Result<(), CliError> {
-    // Not a checkout: there is nothing to hook into, and that is not an error.
-    let Some(dir) = git_hooks_dir(ctx.project_root) else {
-        return Ok(());
+/// Take the retired `sync` block of ours out of this checkout's git hooks.
+/// Returns the files that changed.
+///
+/// A block is ours when a line inside its markers runs `sync` for `store` —
+/// the same tail test [`line_runs_for_store`] makes, so a block another
+/// install wrote for a different store is left alone. Only the marked region
+/// goes; see [`remove_git_hook`] for what happens to the rest of the file.
+fn remove_retired_git_hooks(
+    project_root: &Path,
+    store: &StoreRef,
+) -> Result<Vec<PathBuf>, CliError> {
+    // Not a checkout: there is nothing to clean, and that is not an error.
+    let Some(dir) = git_hooks_dir(project_root) else {
+        return Ok(Vec::new());
     };
-    let shell = ctx.cmd.shell();
+    let mut changed = Vec::new();
     for name in GIT_HOOKS {
         let file = dir.join(name);
-        if merge_git_hook(&file, &shell, ctx.repo_store)? {
-            manifest.git_hooks.push(file);
+        let Ok(text) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let ours = hook_block_lines(&text)
+            .any(|l| line_runs_for_store(l, RETIRED_GIT_HOOK_SUBCOMMAND, store));
+        if ours && remove_git_hook(&file)? {
+            changed.push(file);
         }
     }
-    Ok(())
+    Ok(changed)
+}
+
+/// The lines between our markers in a git hook file, markers excluded.
+pub(crate) fn hook_block_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .skip_while(|l| l.trim_end() != HOOK_BEGIN)
+        .skip(1)
+        .take_while(|l| l.trim_end() != HOOK_END)
 }
 
 // ---------------------------------------------------------------------------
@@ -3424,12 +3457,9 @@ pub(crate) fn is_disabled(
     load_manifest(&manifest_path(project_root, home, scope, platforms)).disabled
 }
 
-/// Which of the four opt-in experiments an install asked for.
+/// Which opt-in experiments an install asked for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct OptIns {
-    pub(crate) intercept_grep: bool,
-    pub(crate) impact_before_edit: bool,
-    pub(crate) enrich_grep: bool,
     pub(crate) always_load: bool,
 }
 
@@ -3446,9 +3476,6 @@ pub(crate) fn opt_ins(
 ) -> OptIns {
     let m = load_manifest(&manifest_path(project_root, home, scope, platforms));
     OptIns {
-        intercept_grep: m.intercept_grep,
-        impact_before_edit: m.impact_before_edit,
-        enrich_grep: m.enrich_grep,
         always_load: m.always_load,
     }
 }
@@ -3495,11 +3522,7 @@ fn union_manifests(mut existing: Manifest, this_run: &Manifest) -> Manifest {
     // is how a user changes it, and the manifest has to describe what is on
     // disk now, not what an earlier run put there.
     existing.delivery = this_run.delivery;
-    // Same rule for the three experiments (and `run_install_with` prunes the
-    // hook entries when the latest run turned one off).
-    existing.intercept_grep = this_run.intercept_grep;
-    existing.impact_before_edit = this_run.impact_before_edit;
-    existing.enrich_grep = this_run.enrich_grep;
+    // Same rule for `alwaysLoad`.
     existing.always_load = this_run.always_load;
     existing
 }
@@ -3520,46 +3543,20 @@ fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), CliError> {
 }
 
 // ---------------------------------------------------------------------------
-// Git hook block — `mushroomdb sync` after every commit
+// Git hook block — the `mushroomdb sync` a 0.6 install ran after every commit
 // ---------------------------------------------------------------------------
 //
-// A git hook file belongs to the repository owner, not to us. Everything below
-// therefore edits one marked region and nothing else: the region is rewritten
-// in place when it changes, and removing it restores the user's lines exactly.
-// The pure text transforms are split out from the filesystem wrappers so the
-// merge and removal rules can be reasoned about — and tested — without a disk.
+// A git hook file belongs to the repository owner, not to us. 0.6 wrote one
+// marked region into it, holding one backgrounded `<bin> sync <store>`; 0.7
+// writes nothing there and only takes that region back out, restoring the
+// user's lines exactly. The pure text transform is split out from the
+// filesystem wrapper so the removal rule can be reasoned about — and tested —
+// without a disk.
 
 /// Opening marker of the region this module owns inside a git hook.
 pub const HOOK_BEGIN: &str = "# >>> mushroomdb >>>";
 /// Closing marker of that region.
 pub const HOOK_END: &str = "# <<< mushroomdb <<<";
-/// Written as the first line when we create a hook file ourselves.
-const HOOK_SHEBANG: &str = "#!/bin/sh";
-
-/// The block a git hook runs: one backgrounded, silenced `sync`.
-///
-/// Backgrounded (`( … & )` in a subshell, so no job-control notice reaches the
-/// terminal) because a hook must not make `git commit` wait on a graph
-/// refresh, and silenced because a hook that prints — or fails — on a store
-/// that is momentarily busy would be noise on every commit. `sync` exits 3 when
-/// another process holds the write lock, and the next commit picks the work up.
-///
-/// `shell` is the already-quoted command prefix from [`McpCommand::shell`];
-/// the store contributes either `--auto` or its own quoted path, since a path
-/// with a space in it would otherwise be word-split into two arguments.
-///
-/// `--auto` is what makes the block correct in a `git worktree`. Git runs a
-/// hook with the working tree it acted on as the working directory, so `sync`
-/// walks up from there to that tree's own root and updates that tree's own
-/// store — the same block, committed once, doing the right thing in every
-/// checkout of the repository.
-#[must_use]
-pub fn git_hook_block(shell: &str, store: &StoreRef) -> String {
-    format!(
-        "{HOOK_BEGIN}\n( {shell} sync {} >/dev/null 2>&1 & )\n{HOOK_END}\n",
-        store.shell_arg()
-    )
-}
 
 /// What [`strip_hook_block`] found in a hook file.
 enum Stripped {
@@ -3574,17 +3571,17 @@ enum Stripped {
 
 /// `text` with our marked region removed.
 ///
-/// Blank lines left dangling at the end are dropped, so a merge followed by a
-/// removal returns the original bytes rather than the original plus the blank
+/// Blank lines left dangling at the end are dropped, so removing a block 0.6
+/// merged returns the original bytes rather than the original plus the blank
 /// separator the merge inserted.
 ///
 /// An opening marker with no closing marker is [`Stripped::Unterminated`]
 /// rather than "ours to the end of the file". Someone hand-edited the region,
 /// and the lines below the opening marker are now as likely to be theirs as
 /// ours — a `make lint` they added under it would be deleted by the guess.
-/// Both public helpers turn this into an error and write nothing, which is the
-/// same rule the rest of this module follows for a config file whose shape it
-/// does not recognise.
+/// [`remove_git_hook`] turns this into an error and writes nothing, which is
+/// the same rule the rest of this module follows for a config file whose
+/// shape it does not recognise.
 fn strip_hook_block(text: &str) -> Stripped {
     let mut kept: Vec<&str> = Vec::new();
     let mut inside = false;
@@ -3619,7 +3616,7 @@ fn strip_hook_block(text: &str) -> Stripped {
     Stripped::Removed(out)
 }
 
-/// The error both helpers return for [`Stripped::Unterminated`].
+/// The error [`remove_git_hook`] returns for [`Stripped::Unterminated`].
 fn unterminated(hook_file: &Path) -> CliError {
     CliError(format!(
         "{}: a mushroomdb block opens with `{HOOK_BEGIN}` but never closes \
@@ -3628,82 +3625,12 @@ fn unterminated(hook_file: &Path) -> CliError {
     ))
 }
 
-/// What the hook file should contain once `block` is in it.
-///
-/// Idempotent by construction: any existing region is stripped first and the
-/// fresh one appended, so a re-merge of the same block reproduces the same
-/// bytes and a merge of a *different* block rewrites in place instead of
-/// stacking a second region.
-fn merged_hook_text(existing: Option<&str>, block: &str) -> Result<String, ()> {
-    let base = match existing {
-        None => String::new(),
-        Some(text) => match strip_hook_block(text) {
-            Stripped::Absent => text.to_string(),
-            Stripped::Removed(rest) => rest,
-            Stripped::Unterminated => return Err(()),
-        },
-    };
-    let mut lines: Vec<&str> = base.lines().collect();
-    while lines.last().is_some_and(|l| l.trim().is_empty()) {
-        lines.pop();
-    }
-    // A file we are creating needs an interpreter line; one the user wrote
-    // already has whichever they chose, and we must not add a second.
-    if lines.is_empty() {
-        lines.push(HOOK_SHEBANG);
-    }
-    let mut out = lines.join("\n");
-    out.push_str("\n\n");
-    out.push_str(block);
-    Ok(out)
-}
-
 /// Whether `text` is nothing but an interpreter line — the shape a hook file we
 /// created is left in once our region is stripped out of it.
 fn only_a_shebang(text: &str) -> bool {
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .all(|l| l.starts_with("#!"))
-}
-
-/// Put the sync block in `hook_file`, creating the file (mode 755, with a
-/// `#!/bin/sh` line) if it is not there. Returns whether anything changed.
-///
-/// Every line the user has in the file is preserved, and running this twice
-/// with the same arguments writes nothing the second time. A file whose
-/// mushroomdb block was hand-edited so its closing marker is gone is an error
-/// and is left byte-for-byte alone; see [`strip_hook_block`].
-pub fn merge_git_hook(hook_file: &Path, shell: &str, store: &StoreRef) -> Result<bool, CliError> {
-    let existing = if hook_file.exists() {
-        Some(
-            fs::read_to_string(hook_file)
-                .map_err(|e| CliError(format!("cannot read {}: {e}", hook_file.display())))?,
-        )
-    } else {
-        None
-    };
-    let next = merged_hook_text(existing.as_deref(), &git_hook_block(shell, store))
-        .map_err(|()| unterminated(hook_file))?;
-    if existing.as_deref() == Some(next.as_str()) {
-        return Ok(false);
-    }
-    let parent = hook_file.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)
-        .map_err(|e| CliError(format!("cannot create {}: {e}", parent.display())))?;
-    fs::write(hook_file, &next)
-        .map_err(|e| CliError(format!("cannot write {}: {e}", hook_file.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // git ignores a hook that is not executable, so this is not cosmetic.
-        fs::set_permissions(hook_file, fs::Permissions::from_mode(0o755)).map_err(|e| {
-            CliError(format!(
-                "cannot make {} executable: {e}",
-                hook_file.display()
-            ))
-        })?;
-    }
-    Ok(true)
 }
 
 /// Take the sync block back out of `hook_file`. Returns whether anything

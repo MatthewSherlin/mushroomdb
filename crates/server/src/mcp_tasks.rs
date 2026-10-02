@@ -1,14 +1,9 @@
-//! The fourteen MCP tools that answer a question in prose rather than in JSON.
+//! The MCP tools that answer a question in prose rather than in JSON.
 //!
-//! `explore`, `map`, `context`, `impact`, `owners`, `why`, `recall`,
-//! `remember` and `sync` sit in front of the fourteen graph tools in
-//! `mcp::tools_list`, because they are what an assistant working in a checkout
-//! actually reaches for: find me this thing, what is this repository, what is
-//! this symbol, what does my diff touch, who wrote this, why are these two
-//! linked, what do I already know, remember this, and bring the store up to
-//! date. `explain_association` answers on a store with no repository in it:
-//! why these two entities are associated, with the rule that derived each
-//! edge.
+//! They sit in front of the fourteen graph tools in `mcp::tools_list`.
+//! `explain_association` answers why two entities are associated, with the
+//! rule that derived each edge; `recall` answers what is already known about
+//! a topic, and `remember` writes a note for next time.
 //!
 //! Four more answer the rest of the entity graph's questions, and they are the
 //! ones the first association benchmark run showed an assistant failing to
@@ -20,11 +15,6 @@
 //! rule that derived it, its score, and the predicate it matched on.
 //! `edges_at` answers the same question at a past commit, and `what_if`
 //! answers it about a change that has not been made.
-//!
-//! `explore` is the composition of `context`, `impact` and `owners` behind one
-//! name, and on a store a repository was ingested into it is the *only* task
-//! tool `tools/list` advertises — see `mcp::Surface`. The rest stay callable
-//! and are one `--all-tools` away.
 //!
 //! # Shape of a reply
 //!
@@ -43,74 +33,42 @@
 //!
 //! # What each one reads and writes
 //!
-//! All but two are pure reads of the graph. `remember` writes one `Note`, and
-//! `sync` writes nothing itself: it runs this binary again as
-//! `<exe> sync <db> --json` and hands back what that reports. The server crate
-//! cannot depend on the CLI crate that owns the incremental ingest, and
-//! re-implementing it here would give two answers to one question.
-//!
-//! # Reading the working tree
-//!
-//! Two tools look outside the graph. `context` quotes source from the
-//! repository the `GitSync` marker names, which core-api does for us. `impact`
-//! defaults its file list to the current diff, taken from `$CLAUDE_PROJECT_DIR`
-//! when the host sets it to a checkout and from that same marker otherwise;
-//! with neither, it says to pass files explicitly rather than guessing.
+//! All but one are pure reads of the graph. `remember` writes one `Note`.
 //!
 //! # Untrusted content
 //!
-//! Everything these tools render came out of the graph, and a graph built by
-//! `ingest-git` holds whatever contributors wrote: author names, paths, commit
-//! subjects, doc comments, and — through `context` — lines of the working tree.
+//! Everything these tools render came out of the graph, and a graph holds
+//! whatever its writers put there: an `ingest-git` store carries author names,
+//! paths, commit subjects and doc comments, and a memory store carries notes.
 //! [`ok`] therefore stamps every reply with
-//! [`repograph::UNTRUSTED_FRAMING`], the same marker
-//! `recall_digest` puts on its own digest, so an assistant is told to read the
+//! [`core_api::digest::UNTRUSTED_FRAMING`], the same marker the prompt hook
+//! and the session brief put on theirs, so an assistant is told to read the
 //! lines under it as data before it reads any of them. The renderers already
 //! sanitize each line; the framing is what says whose words they are.
 
 use crate::mcp::{graph_err_msg, CallOutcome};
-use core_api::repograph::{
-    self, ContextOptions, ImpactOptions, MapOptions, RememberInput, DEFAULT_EXCLUDES,
-    MAX_OUTPUT_BYTES, NOTE_KINDS, UNTRUSTED_FRAMING,
+use core_api::digest::{self, MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING};
+use core_api::explain_digest::{explain_with_evidence, predicate_summary, render_explain};
+use core_api::memory::forget::{forget, ForgetReport, ForgetTarget, FORGET_SHAPE};
+use core_api::memory::remember::{
+    dedup_keep_order, remember, unix_now_secs, EntityIn, FactIn, RememberInput, DEFAULT_NOTE_KIND,
+    NOTE_KINDS,
 };
-use core_api::{
-    json_to_value, Dir, Explanation, GraphError, NodeInfo, PredicateSummary, SharedDb, Value,
-};
+use core_api::memory::suggest::{filtered_suggestions, round_to, Suggestion, BOOKKEEPING_FIELDS};
+use core_api::{json_to_value, Dir, Explanation, GraphError, SharedDb, Value};
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
-/// The `GitSync` marker `ingest-git` writes, and the prop naming the checkout.
-///
-/// Its presence is also what tells a code-graph store from a memory one, which
-/// is how [`mcp::Surface`](crate::mcp) picks the tools to advertise.
-pub(crate) const SYNC_KEY: &str = "__mushroomdb_git_sync__";
-const SYNC_REPO_PROP: &str = "repo";
-
-/// The host's project directory: the checkout an assistant is working in.
-const PROJECT_DIR_VAR: &str = "CLAUDE_PROJECT_DIR";
-
-/// The fourteen names this module answers to. Listed once, so the `json`
+/// The names this module answers to. Listed once, so the `json`
 /// argument below is read for exactly the tools that declare it.
 ///
-/// `explore` comes first because it is the whole default surface of a
-/// code-graph store: the one tool a session finds, composed from the three
-/// beneath it. `explain_association` sits beside `why` because they are the
-/// same question asked of the two doors: what links these two, with the
-/// evidence — `why` from a code graph, `explain_association` from the rules
-/// that derived the edge. The four entity tools follow it, because they are
-/// the same question widened: every relationship of one node rather than of
-/// one pair, that listing at a past commit, and that listing under a change
-/// that has not been made.
-pub(crate) const TASK_TOOLS: [&str; 14] = [
-    "explore",
-    "map",
-    "context",
-    "impact",
-    "owners",
-    "why",
+/// `explain_association` comes first: what links these two, with the evidence
+/// — the rules that derived the edge. The four entity tools follow it, because
+/// they are the same question widened: every relationship of one node rather
+/// than of one pair, that listing at a past commit, and that listing under a
+/// change that has not been made.
+pub(crate) const TASK_TOOLS: [&str; 11] = [
     "explain_association",
     "node_edges",
     "neighborhood",
@@ -118,10 +76,13 @@ pub(crate) const TASK_TOOLS: [&str; 14] = [
     "what_if",
     "recall",
     "remember",
-    "sync",
+    "schema",
+    "analyze",
+    "suggest_rules",
+    "forget",
 ];
 
-/// Route a task tool. `None` when `name` is not one of the fourteen.
+/// Route a task tool. `None` when `name` is not one of [`TASK_TOOLS`].
 pub(crate) fn dispatch(
     db: &SharedDb,
     db_dir: Option<&Path>,
@@ -132,7 +93,7 @@ pub(crate) fn dispatch(
         return None;
     }
     // Every task tool takes the same optional `json`, so it is read and
-    // type-checked once here rather than ten times — and before any work, so
+    // type-checked once here rather than once per tool — and before any work, so
     // a caller that mistyped it is told so rather than served a digest it did
     // not ask for.
     let json_out = match bool_arg(args, "json") {
@@ -140,20 +101,6 @@ pub(crate) fn dispatch(
         Err(e) => return Some(CallOutcome::ToolErr(e)),
     };
     Some(match name {
-        "explore" => tool_explore(db, args, json_out),
-        "map" => tool_map(db, json_out),
-        "context" => tool_context(db, args, json_out),
-        // The one environment read on this path, done here so every function
-        // below takes the value and can be tested without touching the
-        // process environment.
-        "impact" => tool_impact(
-            db,
-            args,
-            std::env::var_os(PROJECT_DIR_VAR).as_deref(),
-            json_out,
-        ),
-        "owners" => tool_owners(db, args, json_out),
-        "why" => tool_why(db, args, json_out),
         "explain_association" => tool_explain_association(db, args, json_out),
         "node_edges" => tool_node_edges(db, args, json_out),
         "neighborhood" => tool_neighborhood(db, args, json_out),
@@ -161,8 +108,11 @@ pub(crate) fn dispatch(
         "what_if" => tool_what_if(db, args, json_out),
         "recall" => tool_recall(db, db_dir, args, json_out),
         "remember" => tool_remember(db, args, json_out),
-        "sync" => tool_sync(db_dir, json_out),
-        _ => unreachable!("TASK_TOOLS and this match list the same fourteen names"),
+        "schema" => tool_schema(db, json_out),
+        "analyze" => tool_analyze(db, args, json_out),
+        "suggest_rules" => tool_suggest_rules(db, db_dir, json_out),
+        "forget" => tool_forget(db, args, json_out),
+        _ => unreachable!("TASK_TOOLS and this match list the same names"),
     })
 }
 
@@ -170,8 +120,8 @@ pub(crate) fn dispatch(
 ///
 /// With `json_out` clear — the default — it is the rendered digest under the
 /// untrusted-data framing line, and nothing else: no `structuredContent`, no
-/// second copy of the same text. `recall_digest` emits the framing itself, so
-/// a digest that already carries it is left alone rather than marked twice.
+/// second copy of the same text. No renderer here frames its own output —
+/// `recall_digest` included — so this is the one place the line is stamped.
 ///
 /// With `json_out` set it is the serialised report as the text content, for a
 /// program that wants the numbers. The report is never rendered in that case,
@@ -199,33 +149,29 @@ fn ok<T: serde::Serialize>(
             Err(e) => CallOutcome::ToolErr(format!("serialise report: {e}")),
         };
     }
-    let text = render(report);
-    let text = if text.starts_with(UNTRUSTED_FRAMING) {
-        text
-    } else {
-        format!("{UNTRUSTED_FRAMING}{text}")
-    };
-    CallOutcome::TaskOk { text }
+    CallOutcome::TaskOk {
+        text: format!("{UNTRUSTED_FRAMING}{}", render(report)),
+    }
 }
 
 /// Replace the control characters in every string of `value` with spaces.
 ///
 /// Graph content reaches a JSON reply in the **values**: paths, author names,
-/// commit subjects, note text, quoted source lines. The keys are the report's
-/// own field names, fixed in the Rust types the reports serialise from and in
-/// the `sync` child's `--json` output, so they carry nothing an outsider wrote
-/// and are left alone — rewriting a key could silently merge two of them.
+/// commit subjects, note text. The keys are the report's own field names,
+/// fixed in the Rust types the reports serialise from, so they carry nothing
+/// an outsider wrote and are left alone — rewriting a key could silently merge
+/// two of them.
 ///
 /// Newline and tab survive; every other control character does not. That is
-/// the one place this differs from [`repograph::sanitize`], and the reason is
+/// the one place this differs from [`digest::sanitize`], and the reason is
 /// what the two channels are. A digest is line-structured, so a newline inside
 /// a value could forge a heading or an extra hit and has to go. A JSON value is
 /// delimited by the grammar, so a newline inside one cannot escape it — and
 /// some of these values *are* multi-line documents: `recall`'s report carries
-/// the whole rendered digest, and `context` carries quoted source. Flattening
-/// those would corrupt the report to defend against nothing. What is still
-/// removed is everything that acts on a reader whatever contains it: escape
-/// sequences, carriage returns that overwrite a line, backspace, `DEL`.
+/// the whole rendered digest. Flattening that would corrupt the report to
+/// defend against nothing. What is still removed is everything that acts on a
+/// reader whatever contains it: escape sequences, carriage returns that
+/// overwrite a line, backspace, `DEL`.
 fn sanitize_json(value: &mut Js) {
     match value {
         Js::String(s) => {
@@ -298,272 +244,6 @@ fn str_list_arg(args: &Js, name: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
-// ── explore ──────────────────────────────────────────────────────────────────
-
-/// Bytes an assistant's token is taken to be, for turning a `budget` in tokens
-/// into one in bytes. Four is the usual English-and-code average, and the
-/// budget is a ceiling rather than a measurement, so erring low would only
-/// spend less than the caller allowed.
-const BYTES_PER_TOKEN: usize = 4;
-/// The default `budget`, in tokens: `DEFAULT_EXPLORE_BYTES` back in the unit a
-/// caller thinks in, so the two cannot drift.
-const DEFAULT_EXPLORE_TOKENS: u64 = (repograph::DEFAULT_EXPLORE_BYTES / BYTES_PER_TOKEN) as u64;
-/// The smallest `budget` worth serving, matching the schema's `minimum`. Below
-/// this a reply is a header and nothing else, so a smaller number is taken as
-/// this one rather than as a request for silence.
-const MIN_EXPLORE_TOKENS: u64 = 200;
-
-fn tool_explore(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
-    let target = match str_arg(args, "target") {
-        Ok(t) => t,
-        Err(e) => return CallOutcome::ToolErr(e),
-    };
-    let depth = match args.get("depth") {
-        None | Some(Js::Null) => repograph::Depth::Context,
-        Some(Js::String(s)) => match repograph::Depth::parse(s) {
-            Some(d) => d,
-            None => {
-                return CallOutcome::ToolErr(format!(
-                    "depth must be one of {}, got {s:?}",
-                    repograph::Depth::NAMES.join(", ")
-                ))
-            }
-        },
-        Some(_) => return CallOutcome::ToolErr("depth must be a string".into()),
-    };
-    let tokens = match args.get("budget") {
-        None | Some(Js::Null) => DEFAULT_EXPLORE_TOKENS,
-        Some(v) => match v.as_u64() {
-            Some(n) => n.max(MIN_EXPLORE_TOKENS),
-            None => return CallOutcome::ToolErr("budget must be a positive integer".into()),
-        },
-    };
-    let full = match bool_arg(args, "full") {
-        Ok(b) => b,
-        Err(e) => return CallOutcome::ToolErr(e),
-    };
-    let budget_bytes = usize::try_from(tokens)
-        .unwrap_or(usize::MAX)
-        .saturating_mul(BYTES_PER_TOKEN);
-    // `None` for the repository, as `context` does: core-api falls back to the
-    // `GitSync` marker, which is the checkout the store was built from.
-    let report = {
-        let g = db.read();
-        repograph::explore(&*g, None, target, depth, full)
-    };
-    ok(json_out, &report, |r| {
-        repograph::render_explore(r, budget_bytes)
-    })
-}
-
-// ── map ──────────────────────────────────────────────────────────────────────
-
-fn tool_map(db: &SharedDb, json_out: bool) -> CallOutcome {
-    let map = {
-        let g = db.read();
-        repograph::repo_map(&*g, &MapOptions::default())
-    };
-    ok(json_out, &map, repograph::render_map)
-}
-
-// ── context ──────────────────────────────────────────────────────────────────
-
-fn tool_context(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
-    let target = match str_arg(args, "target") {
-        Ok(t) => t,
-        Err(e) => return CallOutcome::ToolErr(e),
-    };
-    let full = match bool_arg(args, "full") {
-        Ok(b) => b,
-        Err(e) => return CallOutcome::ToolErr(e),
-    };
-    // `None` for the repository: core-api falls back to the `GitSync` marker,
-    // which is the checkout the store was built from.
-    let report = {
-        let g = db.read();
-        repograph::context_with(&*g, None, target, &ContextOptions { source: full })
-    };
-    ok(json_out, &report, repograph::render_context)
-}
-
-// ── impact ───────────────────────────────────────────────────────────────────
-
-/// `project_dir` is the value of `$CLAUDE_PROJECT_DIR`, passed in rather than
-/// read here so a test can exercise both branches of [`project_repo`] without
-/// mutating the process environment.
-fn tool_impact(
-    db: &SharedDb,
-    args: &Js,
-    project_dir: Option<&OsStr>,
-    json_out: bool,
-) -> CallOutcome {
-    let mut files = match str_list_arg(args, "files") {
-        Ok(f) => f,
-        Err(e) => return CallOutcome::ToolErr(e),
-    };
-    if files.is_empty() {
-        let repo = match project_repo(db, project_dir) {
-            Some(r) => r,
-            None => {
-                return CallOutcome::ToolErr(
-                    "no repository to read a diff from: pass files explicitly".into(),
-                )
-            }
-        };
-        match changed_paths(&repo) {
-            Ok(paths) => files = paths,
-            Err(e) => {
-                return CallOutcome::ToolErr(format!(
-                    "could not read the diff in {}: {e}; pass files explicitly",
-                    repo.display()
-                ))
-            }
-        }
-    }
-    // The caller's whole change is also what decides the `modified` flag: a
-    // partner that is itself being edited is a different fact from one that is
-    // not, and only this set can tell them apart.
-    let modified: BTreeSet<String> = files.iter().cloned().collect();
-    let report = {
-        let g = db.read();
-        repograph::impact(&*g, &files, &modified, &ImpactOptions::default())
-    };
-    ok(json_out, &report, repograph::render_impact)
-}
-
-/// The checkout root a default `impact` reads its diff from: the host's
-/// project directory when it named one inside a repository, else the
-/// repository the store was built from.
-///
-/// `$CLAUDE_PROJECT_DIR` wins because an assistant asking "what does my change
-/// touch" means the tree it is editing, which is where the host put it. It has
-/// to be inside a checkout to win, though: a host that points it at a plain
-/// directory has said nothing about the repository the store knows, so the
-/// marker still answers rather than the call failing.
-///
-/// Both branches resolve to the repository **root**, not to the directory that
-/// named it, so the two listings in [`changed_paths`] agree about what their
-/// paths are relative to — and so those paths match `File` keys, which are
-/// root-relative.
-fn project_repo(db: &SharedDb, project_dir: Option<&OsStr>) -> Option<PathBuf> {
-    if let Some(root) = project_dir.map(Path::new).and_then(repo_root) {
-        return Some(root);
-    }
-    let repo = {
-        let g = db.read();
-        g.node_ref(SYNC_KEY)
-            .and_then(|n| n.prop(SYNC_REPO_PROP))
-            .and_then(|v| match v {
-                core_api::Value::Str(s) => Some(s),
-                _ => None,
-            })
-    }?;
-    repo_root(Path::new(&repo))
-}
-
-/// The root of the checkout `dir` is in, or `None` when it is not in one.
-fn repo_root(dir: &Path) -> Option<PathBuf> {
-    if !dir.is_dir() {
-        return None;
-    }
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!root.is_empty()).then(|| PathBuf::from(root))
-}
-
-/// Paths under the checkout rooted at `root` that differ from `HEAD` or are not
-/// tracked at all: root-relative, sorted, deduplicated, and filtered by the
-/// same [`DEFAULT_EXCLUDES`] the ingest applied.
-///
-/// The exclusion matters because a path the ingest skipped is a path no `File`
-/// node exists for, and reporting it back as `unknown:` reads like a hole in
-/// the graph rather than a build artefact the store never wanted.
-///
-/// `-z` rather than the default listing: git escapes and quotes a path holding
-/// a tab, a newline or a non-ASCII byte, and a quoted path matches no key.
-/// `root` rather than the directory the caller named: `ls-files` lists relative
-/// to the working directory while `diff` lists relative to the root, so running
-/// both anywhere but the root would mix two conventions in one list.
-fn changed_paths(root: &Path) -> Result<Vec<String>, String> {
-    const LISTS: [&[&str]; 2] = [
-        &["diff", "--name-only", "-z", "HEAD"],
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    ];
-    let excludes: Vec<String> = DEFAULT_EXCLUDES.iter().map(|p| (*p).to_string()).collect();
-    let mut out: BTreeSet<String> = BTreeSet::new();
-    let mut ran = false;
-    for args in LISTS {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .map_err(|e| e.to_string())?;
-        // `diff HEAD` fails in a repository with no commits yet. Nothing is
-        // dirty relative to a head that does not exist, so that is not an error
-        // — but if *neither* listing runs, this is not a repository at all.
-        if !output.status.success() {
-            continue;
-        }
-        ran = true;
-        for path in String::from_utf8_lossy(&output.stdout).split('\0') {
-            if !path.is_empty() && !repograph::path_excluded(path, &excludes) {
-                out.insert(path.to_string());
-            }
-        }
-    }
-    if !ran {
-        return Err("git listed nothing there".into());
-    }
-    Ok(out.into_iter().collect())
-}
-
-// ── owners ───────────────────────────────────────────────────────────────────
-
-fn tool_owners(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
-    let path = match str_arg(args, "path") {
-        Ok(p) => p,
-        Err(e) => return CallOutcome::ToolErr(e),
-    };
-    let report = {
-        let g = db.read();
-        repograph::owners(&*g, path, None)
-    };
-    let Some(report) = report else {
-        return CallOutcome::ToolErr(format!("no file in the store at {path}"));
-    };
-    ok(json_out, &report, repograph::render_owners)
-}
-
-// ── why ──────────────────────────────────────────────────────────────────────
-
-fn tool_why(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
-    let a = match str_arg(args, "a") {
-        Ok(v) => v.to_string(),
-        Err(e) => return CallOutcome::ToolErr(e),
-    };
-    let b = match str_arg(args, "b") {
-        Ok(v) => v.to_string(),
-        Err(e) => return CallOutcome::ToolErr(e),
-    };
-    // Keys the graph does not hold are an answer, not a failure: the report
-    // names them and the digest says `unknown:`, which tells the caller which
-    // of the two to fix.
-    let report = {
-        let g = db.read();
-        repograph::why(&*g, &a, &b)
-    };
-    ok(json_out, &report, repograph::render_why)
-}
-
 // ── explain_association ──────────────────────────────────────────────────────
 
 /// Why two entities are associated: every rule-derived edge between them, with
@@ -584,403 +264,17 @@ fn tool_explain_association(db: &SharedDb, args: &Js, json_out: bool) -> CallOut
         Ok(v) => v.to_string(),
         Err(e) => return CallOutcome::ToolErr(e),
     };
-    // Unlike `why`, a key the graph does not hold is an error here rather than
-    // an `unknown:` line: `explain` resolves both keys to dense ids before it
+    // A key the graph does not hold is an error here, not an empty answer:
+    // `explain` resolves both keys to dense ids before it
     // looks at a single edge, and that is the engine's answer to give.
     let report = {
         let g = db.read();
-        let found = match g.explain(&a, &b) {
+        match explain_with_evidence(&g, &a, &b) {
             Ok(v) => v,
             Err(e) => return CallOutcome::ToolErr(crate::mcp::graph_err_msg(e)),
-        };
-        // The matched values are read here, under the same read guard the
-        // edges came from, so the evidence cannot describe a graph that has
-        // since moved.
-        found
-            .into_iter()
-            .map(|e| {
-                // A via-hop rule evaluates its predicate between the *via*
-                // node and the destination, not between the two keys the
-                // caller asked about, so there is no pair of nodes here whose
-                // values would be the evidence — the line still names the hop.
-                let evidence = if e.via_edge.is_some() {
-                    None
-                } else {
-                    match (g.node_info(&e.src_key), g.node_info(&e.dst_key)) {
-                        (Some(src), Some(dst)) => {
-                            predicate_evidence(&e.predicate, &src, &dst, e.weight)
-                        }
-                        _ => None,
-                    }
-                };
-                ExplainedEdge { edge: e, evidence }
-            })
-            .collect::<Vec<_>>()
+        }
     };
-    ok(json_out, &report, |found| {
-        render_explanations(&a, &b, found)
-    })
-}
-
-/// One explained edge, with the values that made the predicate true.
-///
-/// The `Explanation` fields are flattened, so `json: true` hands back the
-/// array it always did with one `evidence` object added per relationship.
-#[derive(serde::Serialize)]
-struct ExplainedEdge {
-    #[serde(flatten)]
-    edge: Explanation,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    evidence: Option<Evidence>,
-}
-
-/// What the two nodes actually had in common, per predicate kind.
-///
-/// Naming the rule and the threshold was never the answer to "why are these
-/// two related" — the shared values are. Without them an assistant fetches
-/// both nodes' raw property lists and reads them out, which names every
-/// value either node holds rather than the ones they share.
-#[derive(serde::Serialize)]
-#[serde(untagged)]
-enum Evidence {
-    /// `overlap` — the intersection of the two lists, sorted.
-    Shared { field: String, shared: Vec<Js> },
-    /// `field_equal` / `key_match` — the one value both carry.
-    Value { field: String, value: Js },
-    /// `geo_radius` — both points and the distance between them.
-    Geo {
-        field: String,
-        a: Js,
-        b: Js,
-        km: f64,
-    },
-    /// `numeric_within` / `vector_similar` — the two sides. For
-    /// `vector_similar` the vectors themselves are useless to read, so `a`
-    /// and `b` are omitted and only the score stands.
-    Pair {
-        field: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        a: Option<Js>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        b: Option<Js>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        similarity: Option<f64>,
-    },
-    /// `all` / `any` — one entry per branch that contributed.
-    Parts { parts: Vec<Evidence> },
-}
-
-/// Mean Earth radius, as the rules engine uses for `geo_radius`.
-const EARTH_RADIUS_KM: f64 = 6371.0088;
-
-/// Evidence for one predicate, recursing through `all` / `any`.
-///
-/// `score` is the edge's weight and is passed only at the top level: `all`
-/// takes the minimum of its branches and `any` the maximum, so a branch's own
-/// score is not recoverable from the edge and a nested `vector_similar` has
-/// no similarity to report.
-///
-/// # Only what matched
-///
-/// A branch reports evidence **only when that branch is itself satisfied**,
-/// thresholds applied: an `overlap` under its `min`, a `numeric_within` past
-/// its `tolerance`, a `geo_radius` past its `km`, a `key_match` whose field
-/// does not name the other node. Under `any` that is the whole point — one
-/// branch carries the edge and the others did not — and printing an unmatched
-/// branch stated a reason the engine had rejected (`size_bucket: 1 vs 9` on a
-/// `±2` tolerance). Under `all` every branch matched by construction, so the
-/// checks change nothing there.
-fn predicate_evidence(
-    p: &PredicateSummary,
-    src: &NodeInfo,
-    dst: &NodeInfo,
-    score: Option<f64>,
-) -> Option<Evidence> {
-    if let Some(parts) = &p.parts {
-        let parts: Vec<Evidence> = parts
-            .iter()
-            .filter_map(|q| predicate_evidence(q, src, dst, None))
-            .collect();
-        return (!parts.is_empty()).then_some(Evidence::Parts { parts });
-    }
-    let field = p.fields.first()?.clone();
-    match p.kind.as_str() {
-        "overlap" => {
-            let (Some(Value::List(a)), Some(Value::List(b))) =
-                (src.props.get(&field), dst.props.get(&field))
-            else {
-                return None;
-            };
-            // Compared as the rules engine compares them: only a scalar
-            // element is a token, and its type is part of its identity, so a
-            // `1` and a `1.0` in two lists are not an overlap.
-            let left: BTreeSet<(u8, String)> = a.iter().filter_map(scalar_token).collect();
-            let right: BTreeSet<(u8, String)> = b.iter().filter_map(scalar_token).collect();
-            let union = left.union(&right).count();
-            let mut shared: Vec<String> = left
-                .intersection(&right)
-                .map(|(_, text)| text.clone())
-                .collect();
-            shared.sort();
-            shared.dedup();
-            if shared.is_empty() || union == 0 {
-                return None;
-            }
-            // The rule's own test: the Jaccard ratio, against the `min` the
-            // predicate declares. Inside an `any`, a list that overlaps but
-            // not enough is a branch the engine rejected.
-            let jaccard = shared.len() as f64 / union as f64;
-            if p.min.is_some_and(|min| jaccard < min) {
-                return None;
-            }
-            Some(Evidence::Shared {
-                field,
-                shared: shared.into_iter().map(Js::String).collect(),
-            })
-        }
-        "field_equal" => {
-            let v = src.props.get(&field)?;
-            (dst.props.get(&field) == Some(v)).then(|| Evidence::Value {
-                field,
-                value: crate::json::value_to_json(v),
-            })
-        }
-        // A key-match rule reads a foreign key off the source; the value they
-        // share is the destination's own key — when the field really does name
-        // it, directly or as one element of a list of foreign keys.
-        "key_match" => {
-            let names_dst = match src.props.get(&field)? {
-                Value::Str(s) => s == &dst.key,
-                Value::List(items) => items
-                    .iter()
-                    .any(|v| matches!(v, Value::Str(s) if s == &dst.key)),
-                _ => false,
-            };
-            names_dst.then(|| Evidence::Value {
-                field,
-                value: Js::String(dst.key.clone()),
-            })
-        }
-        "numeric_within" => {
-            let (a, b) = (src.props.get(&field)?, dst.props.get(&field)?);
-            let (x, y) = (numeric(a)?, numeric(b)?);
-            let delta = (x - y).abs();
-            // The rule's own test. A zero tolerance asks for equality.
-            let within = match p.tolerance {
-                Some(0.0) => delta == 0.0,
-                Some(t) => delta <= t,
-                None => true,
-            };
-            within.then(|| Evidence::Pair {
-                field,
-                a: Some(crate::json::value_to_json(a)),
-                b: Some(crate::json::value_to_json(b)),
-                similarity: None,
-            })
-        }
-        "geo_radius" => {
-            let (alat, alon) = lat_lon(src.props.get(&field)?)?;
-            let (blat, blon) = lat_lon(dst.props.get(&field)?)?;
-            let km = haversine_km(alat, alon, blat, blon);
-            if p.km.is_some_and(|radius| km > radius) {
-                return None;
-            }
-            Some(Evidence::Geo {
-                field,
-                a: Js::String(format_lat_lon(alat, alon)),
-                b: Js::String(format_lat_lon(blat, blon)),
-                km: round2(km),
-            })
-        }
-        // The two vectors say nothing a reader can use; the cosine the rule
-        // scored does, and that is the edge's weight.
-        "vector_similar" => score.map(|sim| Evidence::Pair {
-            field,
-            a: None,
-            b: None,
-            similarity: Some(sim),
-        }),
-        _ => None,
-    }
-}
-
-/// The comparable token of one list element, as `(type tag, text)`.
-///
-/// Mirrors `ValueKey::from_value`: a nested list or map is not a token and
-/// cannot overlap, and two tokens of different types never match however
-/// alike they read.
-fn scalar_token(v: &Value) -> Option<(u8, String)> {
-    match v {
-        Value::Str(s) => Some((0, s.clone())),
-        Value::Int(i) => Some((1, i.to_string())),
-        Value::Float(f) => Some((2, format!("{f}"))),
-        Value::Bool(b) => Some((3, b.to_string())),
-        Value::List(_) | Value::Map(_) => None,
-    }
-}
-
-/// A `[lat, lon]` pair, as `geo_radius` reads it.
-fn lat_lon(v: &Value) -> Option<(f64, f64)> {
-    let Value::List(items) = v else {
-        return None;
-    };
-    if items.len() != 2 {
-        return None;
-    }
-    Some((numeric(&items[0])?, numeric(&items[1])?))
-}
-
-/// A finite number, as the rules engine reads one: an integer or a finite
-/// float, and nothing else.
-fn numeric(v: &Value) -> Option<f64> {
-    match v {
-        #[allow(clippy::cast_precision_loss)]
-        Value::Int(i) => Some(*i as f64),
-        Value::Float(f) if f.is_finite() => Some(*f),
-        _ => None,
-    }
-}
-
-fn format_lat_lon(lat: f64, lon: f64) -> String {
-    format!("{:.4},{:.4}", lat, lon)
-}
-
-fn round2(km: f64) -> f64 {
-    (km * 100.0).round() / 100.0
-}
-
-/// Great-circle distance in km — the same formula `geo_radius` scores with,
-/// so the printed distance and the edge's score agree.
-fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let phi1 = lat1.to_radians();
-    let phi2 = lat2.to_radians();
-    let dphi = (lat2 - lat1).to_radians();
-    let dlam = (lon2 - lon1).to_radians();
-    let a = ((dphi / 2.0).sin().powi(2) + phi1.cos() * phi2.cos() * (dlam / 2.0).sin().powi(2))
-        .clamp(0.0, 1.0);
-    EARTH_RADIUS_KM * 2.0 * a.sqrt().atan2((1.0 - a).sqrt())
-}
-
-/// One evidence clause, rendered for the digest line.
-fn evidence_summary(e: &Evidence) -> String {
-    match e {
-        Evidence::Shared { field, shared } => {
-            let vals: Vec<String> = shared.iter().map(json_scalar_text).collect();
-            format!("{}: {}", repograph::sanitize(field), vals.join(", "))
-        }
-        Evidence::Value { field, value } => format!(
-            "{}: {}",
-            repograph::sanitize(field),
-            json_scalar_text(value)
-        ),
-        Evidence::Geo { field, a, b, km } => format!(
-            "{}: {} vs {}, {km} km apart",
-            repograph::sanitize(field),
-            json_scalar_text(a),
-            json_scalar_text(b)
-        ),
-        Evidence::Pair {
-            field,
-            a: Some(a),
-            b: Some(b),
-            ..
-        } => format!(
-            "{}: {} vs {}",
-            repograph::sanitize(field),
-            json_scalar_text(a),
-            json_scalar_text(b)
-        ),
-        Evidence::Pair {
-            field,
-            similarity: Some(sim),
-            ..
-        } => format!("{}: similarity {sim:.2}", repograph::sanitize(field)),
-        Evidence::Pair { field, .. } => repograph::sanitize(field),
-        Evidence::Parts { parts } => parts
-            .iter()
-            .map(evidence_summary)
-            .collect::<Vec<_>>()
-            .join("; "),
-    }
-}
-
-/// A JSON scalar as the digest prints it: a string without its quotes,
-/// anything else as-is. Property values are graph content, so every string
-/// goes through [`repograph::sanitize`].
-fn json_scalar_text(v: &Js) -> String {
-    match v {
-        Js::String(s) => repograph::sanitize(s),
-        other => other.to_string(),
-    }
-}
-
-/// One header, then one line per rule-derived edge, capped like every other
-/// task digest.
-///
-/// Rule names, edge types and predicate fields are all graph content — a rule
-/// is named by whoever created it — so each goes through
-/// [`repograph::sanitize`] before it reaches a line-structured digest.
-fn render_explanations(a: &str, b: &str, found: &[ExplainedEdge]) -> String {
-    let mut out = format!(
-        "mushroomdb explain — {} ↔ {}: {} relationship(s)\n",
-        repograph::sanitize(a),
-        repograph::sanitize(b),
-        found.len()
-    );
-    if found.is_empty() {
-        out.push_str("  none\n");
-        return out;
-    }
-    for ExplainedEdge { edge: e, evidence } in found {
-        out.push_str(&format!(
-            "  {} via rule {}",
-            repograph::sanitize(&e.edge_type),
-            repograph::sanitize(&e.rule)
-        ));
-        if let Some(weight) = e.weight {
-            out.push_str(&format!(" (score {weight:.2})"));
-        }
-        if let Some(via) = &e.via_edge {
-            out.push_str(&format!(" via {}", repograph::sanitize(via)));
-        }
-        out.push_str(&format!(" — {}", predicate_summary(&e.predicate)));
-        // The matched values, in brackets, after the threshold that admitted
-        // them: "overlap on specialties >= 0.2 [specialties: hospitality,
-        // residential]". This is the line that stops an assistant fetching
-        // both nodes' raw lists and reading out everything either one holds.
-        if let Some(ev) = evidence {
-            out.push_str(&format!(" [{}]", evidence_summary(ev)));
-        }
-        out.push('\n');
-    }
-    repograph::cap_lines(&out, repograph::MAX_TOOL_LINES)
-}
-
-/// A predicate in one clause: what it compares, on which fields, and the
-/// threshold it had to clear.
-fn predicate_summary(p: &PredicateSummary) -> String {
-    let mut out = repograph::sanitize(&p.kind);
-    if !p.fields.is_empty() {
-        let fields: Vec<String> = p.fields.iter().map(|f| repograph::sanitize(f)).collect();
-        out.push_str(&format!(" on {}", fields.join(", ")));
-    }
-    if let Some(min) = p.min {
-        out.push_str(&format!(" >= {min}"));
-    }
-    if let Some(tolerance) = p.tolerance {
-        out.push_str(&format!(" +/- {tolerance}"));
-    }
-    if let Some(km) = p.km {
-        out.push_str(&format!(" within {km} km"));
-    }
-    if let Some(parts) = &p.parts {
-        let inner: Vec<String> = parts.iter().map(predicate_summary).collect();
-        out.push_str(&format!(" ({})", inner.join("; ")));
-    }
-    if p.approximate {
-        out.push_str(" (approximate)");
-    }
-    out
+    ok(json_out, &report, |found| render_explain(&a, &b, found))
 }
 
 // ── node_edges / neighborhood ────────────────────────────────────────────────
@@ -997,12 +291,12 @@ const DEFAULT_EDGE_LIMIT: usize = 10;
 /// partners; a reply is a screen, not a dump.
 const MAX_EDGE_LIMIT: usize = 100;
 
-/// Longest edge digest, in lines. Wider than [`repograph::MAX_TOOL_LINES`]
+/// Longest edge digest, in lines. Wider than [`digest::MAX_TOOL_LINES`]
 /// because this listing is the reply an assistant reads instead of calling
 /// `query` twenty times, and a default `limit` over four edge types already
 /// runs past twenty-five lines. The header counts every edge whatever is
 /// printed, so a capped digest still says how much it is not showing.
-const MAX_EDGE_LINES: usize = repograph::MAX_MAP_LINES;
+const MAX_EDGE_LINES: usize = digest::MAX_MAP_LINES;
 
 /// Cap a grouped digest at [`MAX_EDGE_LINES`], saying so when it cuts.
 ///
@@ -1014,7 +308,7 @@ fn cap_grouped(out: &str) -> String {
     if out.lines().count() <= MAX_EDGE_LINES {
         return out.to_string();
     }
-    let mut capped = repograph::cap_lines(out, MAX_EDGE_LINES);
+    let mut capped = digest::cap_lines(out, MAX_EDGE_LINES);
     capped.push_str(&format!(
         "… listing capped at {MAX_EDGE_LINES} lines; pass edge_type or all_of for the whole set\n"
     ));
@@ -1173,12 +467,12 @@ fn node_edge_groups(
 /// predicate.
 ///
 /// Edge types, partner keys, rule names and predicate fields are all graph
-/// content, so every one of them goes through [`repograph::sanitize`] before
+/// content, so every one of them goes through [`digest::sanitize`] before
 /// it reaches a line-structured digest.
 fn render_edge_groups(key: &str, total: usize, groups: &[EdgeGroup]) -> String {
     let mut out = format!(
         "mushroomdb edges — {}: {total} edge(s) over {} type(s)\n",
-        repograph::sanitize(key),
+        digest::sanitize(key),
         groups.len()
     );
     if groups.is_empty() {
@@ -1188,14 +482,14 @@ fn render_edge_groups(key: &str, total: usize, groups: &[EdgeGroup]) -> String {
     for g in groups {
         out.push_str(&format!(
             "{} ({})\n",
-            repograph::sanitize(&g.edge_type),
+            digest::sanitize(&g.edge_type),
             g.count
         ));
         for e in &g.listed {
             let arrow = if e.outgoing { "→" } else { "←" };
-            out.push_str(&format!("  {arrow} {}", repograph::sanitize(&e.other)));
+            out.push_str(&format!("  {arrow} {}", digest::sanitize(&e.other)));
             if let Some(rule) = &e.rule {
-                out.push_str(&format!("  rule {}", repograph::sanitize(rule)));
+                out.push_str(&format!("  rule {}", digest::sanitize(rule)));
             }
             if let Some(score) = e.score {
                 out.push_str(&format!("  score {score:.2}"));
@@ -1325,7 +619,7 @@ fn unknown_edge_type(db: &SharedDb, named: &[String]) -> Option<String> {
     let listed: Vec<String> = known
         .iter()
         .take(MAX_KNOWN_EDGE_TYPES)
-        .map(|t| repograph::sanitize(t))
+        .map(|t| digest::sanitize(t))
         .collect();
     let rest = known.len().saturating_sub(listed.len());
     let more = if rest > 0 {
@@ -1335,7 +629,7 @@ fn unknown_edge_type(db: &SharedDb, named: &[String]) -> Option<String> {
     };
     let names = missing
         .iter()
-        .map(|t| repograph::sanitize(t))
+        .map(|t| digest::sanitize(t))
         .collect::<Vec<_>>()
         .join(", ");
     Some(if known.is_empty() {
@@ -1438,7 +732,7 @@ fn partner_dir_arg(args: &Js) -> Result<Dir, String> {
             Some(s) if s.eq_ignore_ascii_case("any") || s.eq_ignore_ascii_case("both") => {
                 Ok(Dir::Both)
             }
-            Some(other) => Err(format!("unknown direction: {}", repograph::sanitize(other))),
+            Some(other) => Err(format!("unknown direction: {}", digest::sanitize(other))),
             None => Err("direction must be a string".into()),
         },
     }
@@ -1498,13 +792,13 @@ fn partners_of_type(rows: &[PartnerEdge], edge_type: &str, dir: Dir) -> (usize, 
 /// Append `keys` as `a, b, c`, continuing `lead` and wrapping at
 /// [`KEY_WRAP_COLUMNS`].
 ///
-/// Every key goes through [`repograph::sanitize`] — a key is graph content,
+/// Every key goes through [`digest::sanitize`] — a key is graph content,
 /// and these lines are line-structured digests like any other.
 fn push_key_list(out: &mut String, lead: &str, keys: &[String]) {
     let mut line = lead.to_string();
     let mut empty = line.is_empty();
     for (i, k) in keys.iter().enumerate() {
-        let k = repograph::sanitize(k);
+        let k = digest::sanitize(k);
         let comma = usize::from(i + 1 < keys.len());
         if !empty && line.len() + 1 + k.len() + comma > KEY_WRAP_COLUMNS {
             out.push_str(&line);
@@ -1551,13 +845,13 @@ fn render_all_of(
 ) -> String {
     let types = all_of
         .iter()
-        .map(|t| repograph::sanitize(t))
+        .map(|t| digest::sanitize(t))
         .collect::<Vec<_>>()
         .join(", ");
     let when = at.map_or_else(String::new, |a| format!(" as of commit {a}"));
     let mut out = format!(
         "mushroomdb {tool} — {}{when} — partners linked by all of {types}: {}\n",
-        repograph::sanitize(key),
+        digest::sanitize(key),
         partners.len()
     );
     if partners.is_empty() {
@@ -1611,10 +905,8 @@ fn render_type_partners(
         out.push_str("  none\n");
         return out;
     }
-    let rule = rule.map_or_else(String::new, |r| {
-        format!(", rule {}", repograph::sanitize(r))
-    });
-    let lead = format!("{} ({edges}{rule}):", repograph::sanitize(edge_type));
+    let rule = rule.map_or_else(String::new, |r| format!(", rule {}", digest::sanitize(r)));
+    let lead = format!("{} ({edges}{rule}):", digest::sanitize(edge_type));
     push_partner_block(&mut out, &lead, partners, limit);
     out
 }
@@ -1732,7 +1024,7 @@ fn tool_node_edges(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         return ok(json_out, &report, |_| {
             let header = format!(
                 "mushroomdb edges — {}: {count} edge(s) over {} type(s)\n",
-                repograph::sanitize(key),
+                digest::sanitize(key),
                 usize::from(count > 0)
             );
             render_type_partners(header, edge_type, count, rule.as_deref(), &partners, limit)
@@ -1943,7 +1235,7 @@ fn edges_at_groups(
 fn render_edges_at(key: &str, at: u64, total: usize, groups: &[EdgeAtGroup]) -> String {
     let mut out = format!(
         "mushroomdb edges_at — {} as of commit {at}: {total} edge(s)\n",
-        repograph::sanitize(key)
+        digest::sanitize(key)
     );
     if groups.is_empty() {
         out.push_str("  none\n");
@@ -1952,14 +1244,14 @@ fn render_edges_at(key: &str, at: u64, total: usize, groups: &[EdgeAtGroup]) -> 
     for g in groups {
         out.push_str(&format!(
             "{} ({})\n",
-            repograph::sanitize(&g.edge_type),
+            digest::sanitize(&g.edge_type),
             g.count
         ));
         for e in &g.listed {
             let arrow = if e.outgoing { "→" } else { "←" };
-            out.push_str(&format!("  {arrow} {}", repograph::sanitize(&e.other)));
+            out.push_str(&format!("  {arrow} {}", digest::sanitize(&e.other)));
             if let Some(rule) = &e.rule {
-                out.push_str(&format!("  rule {}", repograph::sanitize(rule)));
+                out.push_str(&format!("  rule {}", digest::sanitize(rule)));
             }
             out.push('\n');
         }
@@ -2111,7 +1403,7 @@ fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         return ok(json_out, &report, |_| {
             let header = format!(
                 "mushroomdb edges_at — {} as of commit {at}: {count} edge(s)\n",
-                repograph::sanitize(&self_key)
+                digest::sanitize(&self_key)
             );
             render_type_partners(header, edge_type, count, rule.as_deref(), &partners, limit)
         });
@@ -2227,23 +1519,23 @@ fn render_what_if_groups(out: &mut String, groups: &[WhatIfGroup], limit: usize)
     for g in groups {
         out.push_str(&format!(
             "  {} ({})\n",
-            repograph::sanitize(&g.edge_type),
+            digest::sanitize(&g.edge_type),
             g.count
         ));
         for l in g.lines.iter().take(limit) {
             if l.incident {
                 let arrow = if l.outgoing { "→" } else { "←" };
                 let other = if l.outgoing { &l.dst } else { &l.src };
-                out.push_str(&format!("    {arrow} {}", repograph::sanitize(other)));
+                out.push_str(&format!("    {arrow} {}", digest::sanitize(other)));
             } else {
                 out.push_str(&format!(
                     "    {} → {}",
-                    repograph::sanitize(&l.src),
-                    repograph::sanitize(&l.dst)
+                    digest::sanitize(&l.src),
+                    digest::sanitize(&l.dst)
                 ));
             }
             if let Some(rule) = &l.rule {
-                out.push_str(&format!("  rule {}", repograph::sanitize(rule)));
+                out.push_str(&format!("  rule {}", digest::sanitize(rule)));
             }
             out.push('\n');
         }
@@ -2285,9 +1577,9 @@ fn what_if_header(
 ) -> String {
     format!(
         "mushroomdb what_if — {}.{} = {}: would lose {lost_total}, would gain {gained_total}\n",
-        repograph::sanitize(key),
-        repograph::sanitize(field),
-        repograph::sanitize(&value.to_string()),
+        digest::sanitize(key),
+        digest::sanitize(field),
+        digest::sanitize(&value.to_string()),
     )
 }
 
@@ -2333,10 +1625,8 @@ fn render_what_if_keys_only(
         let rule = side
             .iter()
             .find_map(|e| e.rule.as_deref())
-            .map_or_else(String::new, |r| {
-                format!(", rule {}", repograph::sanitize(r))
-            });
-        let lead = format!("{} ({}{rule}):", repograph::sanitize(edge_type), side.len());
+            .map_or_else(String::new, |r| format!(", rule {}", digest::sanitize(r)));
+        let lead = format!("{} ({}{rule}):", digest::sanitize(edge_type), side.len());
         push_partner_block(&mut out, &lead, &partners, limit);
     }
     out
@@ -2361,7 +1651,7 @@ fn tool_what_if(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let Some(value) = json_to_value(raw.clone()) else {
         return CallOutcome::ToolErr(format!(
             "value is not a supported value type: {}",
-            repograph::sanitize(&raw.to_string())
+            digest::sanitize(&raw.to_string())
         ));
     };
 
@@ -2450,20 +1740,33 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
         Err(e) => return CallOutcome::ToolErr(e),
     };
     let label = db_dir.map_or_else(|| "store".to_string(), |d| d.display().to_string());
-    // The topic goes in as the caller wrote it: `recall_digest` searches the
-    // identifiers in it, and it is the same call the `recall` hook makes, so
-    // the two cannot disagree about what a topic means.
-    let digest = {
+    let outcome = {
         let g = db.read();
-        repograph::recall_digest(&*g, &topic, &label, MAX_OUTPUT_BYTES)
+        core_api::memory::recall::recall_digest(&*g, &topic, &label, MAX_OUTPUT_BYTES)
     };
-    let text = if digest.is_empty() {
-        format!(
-            "mushroomdb recall — nothing indexed matches {}\n",
-            repograph::sanitize(&topic)
-        )
-    } else {
-        digest.clone()
+    let (digest, text) = match outcome {
+        core_api::memory::recall::RecallOutcome::Hits(d) => (d.clone(), d),
+        core_api::memory::recall::RecallOutcome::NoMatch => (
+            String::new(),
+            format!(
+                "mushroomdb recall — nothing matches {}\n",
+                digest::sanitize(&topic)
+            ),
+        ),
+        // Not the same answer as "no match": nothing here can ever match, and
+        // the caller can fix that. Names the real store path — `db_dir` is
+        // already in hand as `label` above — rather than a literal `<db>`
+        // placeholder the caller has to translate themselves; `label` falls
+        // back to the word "store" on the one path with no directory to
+        // name (the in-process `SharedDb` case, `db_dir: None`), where that
+        // really is the best available answer.
+        core_api::memory::recall::RecallOutcome::NoIndex => (
+            String::new(),
+            format!(
+                "mushroomdb recall — this store has no text index, so no topic can \
+                 match. Run `mushroomdb schema apply {label} --memory-defaults`.\n"
+            ),
+        ),
     };
     ok(
         json_out,
@@ -2474,6 +1777,93 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
 
 // ── remember ─────────────────────────────────────────────────────────────────
 
+/// Parse `args.entities` into [`EntityIn`]s. Absent/null is an empty list;
+/// anything else must be an array of `{key, label, props?}` objects.
+fn entities_arg(args: &Js) -> Result<Vec<EntityIn>, String> {
+    let items = match args.get("entities") {
+        None | Some(Js::Null) => return Ok(Vec::new()),
+        Some(Js::Array(items)) => items,
+        Some(_) => return Err("entities must be an array".into()),
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            return Err("entities[] must be objects".into());
+        };
+        let Some(key) = obj.get("key").and_then(Js::as_str) else {
+            return Err("entities[].key is required".into());
+        };
+        let Some(label) = obj.get("label").and_then(Js::as_str) else {
+            return Err("entities[].label is required".into());
+        };
+        let mut props = BTreeMap::new();
+        if let Some(props_obj) = obj.get("props").and_then(Js::as_object) {
+            for (field, json_val) in props_obj {
+                match json_to_value(json_val.clone()) {
+                    Some(v) => {
+                        props.insert(field.clone(), v);
+                    }
+                    None => {
+                        return Err(format!(
+                            "entities[].props.{field} is not a supported value type"
+                        ))
+                    }
+                }
+            }
+        }
+        let aliases = match obj.get("aliases") {
+            None | Some(Js::Null) => Vec::new(),
+            Some(Js::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item.as_str() {
+                        Some(a) => out.push(a.to_string()),
+                        None => return Err("entities[].aliases must be an array of strings".into()),
+                    }
+                }
+                out
+            }
+            Some(_) => return Err("entities[].aliases must be an array of strings".into()),
+        };
+        out.push(EntityIn {
+            key: key.to_string(),
+            label: label.to_string(),
+            props,
+            aliases,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse `args.facts` into [`FactIn`]s. Absent/null is an empty list; anything
+/// else must be an array of `{subject, predicate, object}` objects.
+fn facts_arg(args: &Js) -> Result<Vec<FactIn>, String> {
+    let items = match args.get("facts") {
+        None | Some(Js::Null) => return Ok(Vec::new()),
+        Some(Js::Array(items)) => items,
+        Some(_) => return Err("facts must be an array".into()),
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            return Err("facts[] must be objects".into());
+        };
+        let (Some(subject), Some(predicate), Some(object)) = (
+            obj.get("subject").and_then(Js::as_str),
+            obj.get("predicate").and_then(Js::as_str),
+            obj.get("object").and_then(Js::as_str),
+        ) else {
+            return Err("facts[] requires subject, predicate, and object".into());
+        };
+        out.push(FactIn {
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
+            object: object.to_string(),
+        });
+    }
+    Ok(out)
+}
+
 fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let text = match str_arg(args, "text") {
         Ok(t) => t.to_string(),
@@ -2483,10 +1873,10 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
         Ok(a) => a,
         Err(e) => return CallOutcome::ToolErr(e),
     };
-    about.sort();
-    about.dedup();
+    // Deduped, order kept — the order `remember` reports `provisional` keys in.
+    dedup_keep_order(&mut about);
     let kind = match args.get("kind") {
-        None | Some(Js::Null) => "note".to_string(),
+        None | Some(Js::Null) => DEFAULT_NOTE_KIND.to_string(),
         Some(Js::String(k)) => k.clone(),
         Some(_) => return CallOutcome::ToolErr("kind must be a string".into()),
     };
@@ -2496,55 +1886,117 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             NOTE_KINDS.join(", ")
         ));
     }
-
-    // The engine names the first missing key, which makes a caller with three
-    // bad ones retry three times. Check them all here and name them all at
-    // once, before anything is written.
-    let missing: Vec<String> = {
-        let g = db.read();
-        about
-            .iter()
-            .filter(|k| !g.has_node(k))
-            .map(|k| repograph::sanitize(k))
-            .collect()
+    let source = match opt_str_arg(args, "source") {
+        Ok(s) => s,
+        Err(e) => return CallOutcome::ToolErr(e),
     };
-    if !missing.is_empty() {
-        return CallOutcome::ToolErr(format!(
-            "unknown about {}: {}",
-            if missing.len() == 1 { "key" } else { "keys" },
-            missing.join(", ")
-        ));
-    }
+    let ts = match args.get("ts") {
+        None | Some(Js::Null) => unix_now_secs(),
+        Some(v) => match v.as_i64() {
+            Some(n) => n,
+            None => return CallOutcome::ToolErr("ts must be an integer".into()),
+        },
+    };
+    let entities = match entities_arg(args) {
+        Ok(e) => e,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let facts = match facts_arg(args) {
+        Ok(f) => f,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
     let input = RememberInput {
         text: &text,
         about: &about,
         kind: &kind,
         ts,
+        source,
+        entities: &entities,
+        facts: &facts,
     };
-    let key = {
+    let result = {
         let mut g = db.write();
-        repograph::remember(&mut *g, &input)
+        remember(&mut *g, &input)
     };
-    match key {
-        Ok(key) => {
-            let mut rendered = format!("remembered {}\n", repograph::sanitize(&key));
-            if !about.is_empty() {
+    match result {
+        Ok(report) => {
+            let mut rendered = format!("remembered {}\n", digest::sanitize(&report.note));
+            if report.created > 0 || report.matched > 0 {
                 rendered.push_str(&format!(
-                    "about  {}\n",
-                    about
+                    "entities  {} created, {} matched\n",
+                    report.created, report.matched
+                ));
+            }
+            if report.derived > 0 {
+                rendered.push_str(&format!("derived   {} edge(s)\n", report.derived));
+            }
+            if !report.provisional.is_empty() {
+                rendered.push_str(&format!(
+                    "provisional  {} — named but not yet described\n",
+                    report
+                        .provisional
                         .iter()
-                        .map(|k| repograph::sanitize(k))
+                        .map(|k| digest::sanitize(k))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
             }
+            if !report.provisional_capped.is_empty() {
+                rendered.push_str(&format!(
+                    "REFUSED  {} — the per-commit provisional cap was already spent; \
+                     these were NOT created and have no edge in this note\n",
+                    report
+                        .provisional_capped
+                        .iter()
+                        .map(|k| digest::sanitize(k))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            for pair in &report.same_as {
+                rendered.push_str(&format!(
+                    "same as  {} ~ {} ({:.2}) — explain_association shows why\n",
+                    digest::sanitize(&pair.a),
+                    digest::sanitize(&pair.b),
+                    pair.score
+                ));
+            }
+            if let Some(line) = same_as_lost_line(&report.same_as_lost) {
+                rendered.push_str(&line);
+            }
+            if !report.fulltext_declared.is_empty() {
+                rendered.push_str(&format!(
+                    "indexed  {} — full-text search enabled for the first time\n",
+                    report.fulltext_declared.join(", ")
+                ));
+            }
             ok(
                 json_out,
-                &json!({ "key": key, "kind": kind, "about": about }),
+                &json!({
+                    "key": report.note,
+                    "kind": kind,
+                    "about": about,
+                    "created": report.created,
+                    "matched": report.matched,
+                    "derived": report.derived,
+                    "provisional": report.provisional,
+                    "provisional_capped": report.provisional_capped,
+                    "fulltext_declared": report.fulltext_declared,
+                    // Fixed precision, as the text's `{:.2}`; the report
+                    // itself keeps the raw score.
+                    "same_as": report
+                        .same_as
+                        .iter()
+                        .map(|p| json!({
+                            "a": p.a,
+                            "b": p.b,
+                            "score": round_to(p.score, 2),
+                        }))
+                        .collect::<Vec<_>>(),
+                    "same_as_lost": same_as_lost_json(&report.same_as_lost),
+                    "same_as_lost_total": report.same_as_lost.len(),
+                }),
                 |_| rendered,
             )
         }
@@ -2555,71 +2007,671 @@ fn tool_remember(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     }
 }
 
-// ── sync ─────────────────────────────────────────────────────────────────────
-
-/// Run the incremental ingest and report what it did.
+/// Retracted `SAME_AS` links one reply lists; the rest are counted.
 ///
-/// The child is waited on to completion. A full sync of a large repository is
-/// real work, and an assistant that asked for one is waiting on the answer;
-/// cutting it off part-way would leave the store half-updated with nothing said
-/// about it. The MCP loop is single-threaded, so nothing else is served while
-/// it runs — which is correct, since every other tool would be answering from
-/// the store the child is rewriting.
-fn tool_sync(db_dir: Option<&Path>, json_out: bool) -> CallOutcome {
-    let Some(db_dir) = db_dir else {
-        return CallOutcome::ToolErr(
-            "store path unknown: sync needs the directory this server was started on".into(),
-        );
+/// A write retracts at most the links its entities held, and a rule keeps at
+/// most 32 per node, so the list is small in practice. Ten keeps a reply that
+/// has gone wrong on one line an assistant can still read.
+pub(crate) const SAME_AS_LOST_LIST: usize = 10;
+
+/// Why a write retracts an identity link, and what restores it. One sentence,
+/// shared by `remember`'s text line and `upsert_entity`'s json reply.
+///
+/// `aliases` is the key, the name and the name's words, recomputed on each
+/// describing write, so a link is lost when a name changes — or, once, when a
+/// node's `aliases` held items those do not imply and they moved to
+/// `alias_keys`. A declared alias never costs one.
+pub(crate) const SAME_AS_LOST_REMEDY: &str =
+    "a link holds while two nodes' keys, names and the names' words overlap at 0.6, and \
+     this write changed them; give both the same name, or declare a provisional stub's key \
+     as an alias to link it whatever the names";
+
+/// The `SAME_AS` links a write retracted, for a json reply: the first
+/// [`SAME_AS_LOST_LIST`], scores at the precision the text prints.
+pub(crate) fn same_as_lost_json(lost: &[core_api::memory::identity::SameAsPair]) -> Js {
+    Js::Array(
+        lost.iter()
+            .take(SAME_AS_LOST_LIST)
+            .map(|p| json!({"a": p.a, "b": p.b, "score": round_to(p.score, 2)}))
+            .collect(),
+    )
+}
+
+/// The one line `remember` prints when its write retracted `SAME_AS` links:
+/// how many, the first [`SAME_AS_LOST_LIST`] with the score each had, and the
+/// remedy. `None` when nothing was lost.
+fn same_as_lost_line(lost: &[core_api::memory::identity::SameAsPair]) -> Option<String> {
+    if lost.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = lost
+        .iter()
+        .take(SAME_AS_LOST_LIST)
+        .map(|p| {
+            format!(
+                "{} ~ {} (was {:.2})",
+                digest::sanitize(&p.a),
+                digest::sanitize(&p.b),
+                p.score
+            )
+        })
+        .collect();
+    let more = lost.len() - listed.len();
+    Some(format!(
+        "unlinked  {} same-as link(s) this write retracted: {}{} — {SAME_AS_LOST_REMEDY}\n",
+        lost.len(),
+        listed.join(", "),
+        if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        }
+    ))
+}
+
+// ── schema ───────────────────────────────────────────────────────────────────
+
+/// How long `schema` may spend counting.
+///
+/// The brief's own default is three seconds because it re-reads the WAL, and
+/// this call holds a read guard for that long, so a writer in the same process
+/// waits behind it. One second is a third of that and, measured on a
+/// 100,000-node store in a release build, five times what the whole report
+/// takes (188 ms). A spent budget is reported, never silent.
+const SCHEMA_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn tool_schema(db: &SharedDb, json_out: bool) -> CallOutcome {
+    let report = {
+        let g = db.read();
+        core_api::memory::schema::schema_report(
+            &g,
+            &core_api::memory::brief::BriefOptions {
+                budget: SCHEMA_BUDGET,
+            },
+        )
     };
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => return CallOutcome::ToolErr(format!("sync cannot find this binary: {e}")),
+    ok(json_out, &report, core_api::memory::schema::render_schema)
+}
+
+// ── forget ───────────────────────────────────────────────────────────────────
+
+/// The history sentence every successful `forget` ends with. A tombstone is
+/// not a redaction, and the caller is told so in the same reply.
+fn history_line(floor: u64) -> String {
+    format!(
+        "history still holds it: node_history, edge_history, edges_at and was_linked \
+         read it back from commit {floor} on, until `mushroomdb migrate`, \
+         `snapshot --truncate` or `--retention` prunes the log\n"
+    )
+}
+
+/// What a forgotten `name` takes with it. `aliases` is the key, the name and
+/// the name's words, so the forget rewrites it in the same write: the words
+/// leave at the forget, not at some later write, and identity rules stop
+/// matching them at once.
+const ALIASES_REWRITTEN_LINE: &str =
+    "its words left `aliases` in the same write; `aliases` now holds what the key alone \
+     implies\n";
+
+/// What a forgotten `aliases` leaves behind on a node that declared aliases.
+/// `alias_keys` is a separate list, read by the identity preset's `KeyMatch`
+/// rules, and no later write removes from it.
+fn alias_keys_remain_line(target: &str) -> String {
+    let key = digest::sanitize(target.strip_suffix(".aliases").unwrap_or(target));
+    format!(
+        "its declared aliases remain in `alias_keys` and keep linking a provisional stub \
+         keyed exactly so — forget {{key: \"{key}\", prop: \"alias_keys\"}} clears them\n"
+    )
+}
+
+fn render_forget(r: &ForgetReport) -> String {
+    let target = digest::sanitize(&r.target);
+    let mut out = match (r.mode, r.changed) {
+        ("node", _) => format!(
+            "forgot {target} — {} edge(s) removed, {} derived edge(s) retracted\n",
+            r.manual_edges, r.derived_edges
+        ),
+        ("prop", true) => {
+            let mut line = format!("forgot {target}\n");
+            if r.derived_edges > 0 {
+                line.push_str(&format!(
+                    "{} derived edge(s) retracted because a rule read {}{}\n",
+                    r.derived_edges,
+                    digest::sanitize(r.prop.as_deref().unwrap_or_default()),
+                    if r.aliases_rewritten {
+                        " or aliases"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if r.aliases_rewritten {
+                line.push_str(ALIASES_REWRITTEN_LINE);
+            }
+            if r.alias_keys_remain {
+                line.push_str(&alias_keys_remain_line(&r.target));
+            }
+            line
+        }
+        ("prop", false) => format!("{target} is not set; nothing to forget\n"),
+        (_, true) => format!("retracted {target}\n"),
+        (_, false) => format!("no edge {target}; nothing to retract\n"),
     };
-    // The incremental ingest lives in the CLI crate, which the server cannot
-    // depend on, so `sync` re-runs this same binary. Under the npx launcher
-    // `current_exe()` is already the native binary rather than the shim.
-    let output = match Command::new(&exe)
-        .arg("sync")
-        .arg(db_dir)
-        .arg("--json")
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            return CallOutcome::ToolErr(format!("sync could not run {}: {e}", exe.display()))
+    if r.notes_total > 0 {
+        let named: Vec<String> = r.notes.iter().map(|k| digest::sanitize(k)).collect();
+        let more = r.notes_total - named.len();
+        out.push_str(&format!(
+            "{} note(s) still say it — their text is unchanged and recall can return them; \
+             forget a note by its key: {}{}\n",
+            r.notes_total,
+            named.join(", "),
+            if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    if r.changed {
+        out.push_str(&history_line(r.history_floor));
+    }
+    out
+}
+
+/// A `fact` argument: three non-empty strings.
+fn fact_arg(v: &Js) -> Result<(String, String, String), String> {
+    let field = |name: &str| {
+        v.get(name)
+            .and_then(Js::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("fact.{name} must be a non-empty string"))
+    };
+    Ok((field("subject")?, field("predicate")?, field("object")?))
+}
+
+fn tool_forget(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
+    let key = match opt_str_arg(args, "key") {
+        Ok(k) => k.map(str::to_string),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let prop = match opt_str_arg(args, "prop") {
+        Ok(p) => p.map(str::to_string),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let fact = match args.get("fact") {
+        None | Some(Js::Null) => None,
+        Some(v) if v.is_object() => match fact_arg(v) {
+            Ok(f) => Some(f),
+            Err(e) => return CallOutcome::ToolErr(e),
+        },
+        Some(_) => return CallOutcome::ToolErr("fact must be an object".into()),
+    };
+    let Some(target) = ForgetTarget::from_parts(key, prop, fact) else {
+        return CallOutcome::ToolErr(FORGET_SHAPE.into());
+    };
+    // Only a fact's refusal is the enriched sentence. Any other `RuleOwned`
+    // is rendered the way every engine error is.
+    let is_fact = matches!(target, ForgetTarget::Fact { .. });
+    // One write guard for the reads the report needs and the write itself, so
+    // nothing can change between what the reply says and what was done.
+    let report = {
+        let mut g = db.write();
+        match forget(&mut *g, &target) {
+            Ok(r) => r,
+            Err(GraphError::RuleOwned { detail }) if is_fact => {
+                return CallOutcome::ToolErr(detail)
+            }
+            Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
         }
     };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        let detail = if detail.is_empty() {
-            format!("exit {}", output.status)
-        } else {
-            repograph::sanitize(detail)
-        };
-        return CallOutcome::ToolErr(format!("sync failed: {detail}"));
+    ok(json_out, &report, render_forget)
+}
+
+// ── suggest_rules ────────────────────────────────────────────────────────────
+
+/// Proposals one reply lists.
+///
+/// Every one is relayed to a person for approval with its estimate, its
+/// examples and the exact `create_rule` arguments; five is what one message
+/// can carry with all of that, and the reply counts the rest.
+const MAX_SUGGESTIONS: usize = 5;
+
+#[derive(serde::Serialize)]
+struct SuggestOut {
+    suggestions: Vec<Suggestion>,
+    /// Proposals after the bookkeeping filter, before the cap.
+    total: usize,
+    /// Proposals dropped because they read a bookkeeping field.
+    bookkeeping_hidden: usize,
+    /// The engine's time budget ran out; a second call may find more.
+    truncated: bool,
+    /// Entity nodes on a store with no `SAME_AS` rule, and the command that
+    /// adds the identity preset. `None` when there are none, or the store
+    /// already derives `SAME_AS`.
+    identity_preset: Option<IdentityPresetOut>,
+}
+
+/// The one proposal that is not a single rule: the identity preset.
+#[derive(serde::Serialize)]
+struct IdentityPresetOut {
+    entity_nodes: usize,
+    command: String,
+}
+
+/// Whether to offer the identity preset, and with what command.
+///
+/// Offered when the store holds nodes under an entity label or the
+/// provisional label and no rule derives `SAME_AS`. It is sixteen rules and an
+/// alias backfill, so it is a CLI step a person runs, not a `create_rule` an
+/// assistant relays. Names the real store path when the server knows it, as
+/// `recall`'s own `schema apply` hint does.
+fn identity_preset_offer(
+    g: &core_api::GraphDb<core_api::RealFs>,
+    db_dir: Option<&Path>,
+) -> Option<IdentityPresetOut> {
+    use core_api::memory::identity::{entity_node_count, SAME_AS_EDGE};
+    if g.rules().iter().any(|r| r.edge_type == SAME_AS_EDGE) {
+        return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let Ok(Js::Object(report)) = serde_json::from_str::<Js>(stdout.trim()) else {
-        return CallOutcome::ToolErr(format!(
-            "sync produced no report: {}",
-            repograph::sanitize(stdout.trim())
-        ));
+    let entity_nodes = entity_node_count(g);
+    if entity_nodes == 0 {
+        return None;
+    }
+    let path = db_dir.map_or_else(|| "<db>".to_string(), |d| d.display().to_string());
+    Some(IdentityPresetOut {
+        entity_nodes,
+        command: format!("mushroomdb schema apply {path} --memory-identity"),
+    })
+}
+
+fn render_suggestions(r: &SuggestOut) -> String {
+    let mut out = if r.suggestions.is_empty() && r.truncated {
+        // Not "no pattern": the engine stopped before it could say so.
+        "mushroomdb suggest_rules — no rule proposal found before the time budget ran \
+         out\n"
+            .to_string()
+    } else if r.suggestions.is_empty() && r.identity_preset.is_some() {
+        "mushroomdb suggest_rules — no single-rule proposal; one preset to offer\n".to_string()
+    } else if r.suggestions.is_empty() {
+        "mushroomdb suggest_rules — nothing to propose: no pattern a rule does not \
+         already cover\n"
+            .to_string()
+    } else {
+        format!(
+            "mushroomdb suggest_rules — {} proposal(s); nothing is created until \
+             create_rule is called with the arguments shown\n",
+            r.total
+        )
     };
-    // The CLI already rendered the digest into the object, so the digest and
-    // the numbers come from the one run whichever the caller asked for.
-    let text = report
-        .get("text")
-        .and_then(Js::as_str)
-        .unwrap_or_default()
-        .to_string();
-    ok(json_out, &Js::Object(report), |_| text)
+    for (i, s) in r.suggestions.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {}: {} → {} derives {} — {} · ~{} edge(s) · global: links across namespaces\n",
+            i + 1,
+            digest::sanitize(&s.name),
+            digest::sanitize(&s.src_label),
+            digest::sanitize(&s.dst_label),
+            digest::sanitize(&s.edge_type),
+            s.predicate,
+            s.est_edges
+        ));
+        out.push_str(&format!("   why: {}\n", digest::sanitize(&s.rationale)));
+        if !s.examples.is_empty() {
+            let eg: Vec<String> = s
+                .examples
+                .iter()
+                .map(|(a, b, score)| {
+                    format!(
+                        "{} → {} {score:.2}",
+                        digest::sanitize(a),
+                        digest::sanitize(b)
+                    )
+                })
+                .collect();
+            out.push_str(&format!("   e.g. {}\n", eg.join("; ")));
+        }
+        out.push_str(&format!(
+            "   create_rule {}\n",
+            digest::sanitize(&s.create_rule_args.to_string())
+        ));
+    }
+    if r.total > r.suggestions.len() {
+        out.push_str(&format!("… and {} more\n", r.total - r.suggestions.len()));
+    }
+    if r.bookkeeping_hidden > 0 {
+        out.push_str(&format!(
+            "({} proposal(s) on bookkeeping fields — {} — not shown)\n",
+            r.bookkeeping_hidden,
+            BOOKKEEPING_FIELDS.join(", ")
+        ));
+    }
+    if let Some(p) = &r.identity_preset {
+        out.push_str(&format!(
+            "identity: {} entity node(s) and no SAME_AS rule. `{}` adds the identity \
+             preset — sixteen SAME_AS rules over each node's aliases — after saying what it \
+             will backfill. It is a command for a person to run, not a create_rule call.\n",
+            p.entity_nodes,
+            digest::sanitize(&p.command)
+        ));
+    }
+    if r.truncated {
+        out.push_str("(the time budget ran out; a second call may find more)\n");
+    }
+    out
+}
+
+fn tool_suggest_rules(db: &SharedDb, db_dir: Option<&Path>, json_out: bool) -> CallOutcome {
+    let (found, identity_preset) = {
+        let g = db.read();
+        (filtered_suggestions(&*g), identity_preset_offer(&g, db_dir))
+    };
+    let mut kept = found.suggestions;
+    kept.truncate(MAX_SUGGESTIONS);
+    let out = SuggestOut {
+        suggestions: kept,
+        total: found.total,
+        bookkeeping_hidden: found.bookkeeping_hidden,
+        truncated: found.truncated,
+        identity_preset,
+    };
+    ok(json_out, &out, render_suggestions)
+}
+
+// ── analyze ──────────────────────────────────────────────────────────────────
+
+/// Rows `analyze` lists when the caller names no `top`, and the most it will.
+const ANALYZE_DEFAULT_TOP: usize = 10;
+const ANALYZE_MAX_TOP: usize = 50;
+
+/// Member keys shown per component or cluster; the rest are counted.
+const ANALYZE_SAMPLE_MEMBERS: usize = 5;
+
+/// Characters of one key `analyze` prints before cutting it with `…`.
+const ANALYZE_KEY_CHARS: usize = 80;
+
+/// The kinds `analyze` answers.
+const ANALYZE_KINDS: [&str; 5] = ["central", "clusters", "components", "degree", "identities"];
+
+fn top_arg(args: &Js) -> Result<usize, String> {
+    match args.get("top") {
+        None | Some(Js::Null) => Ok(ANALYZE_DEFAULT_TOP),
+        Some(v) => match v.as_u64() {
+            Some(0) | None => Err("top must be a positive integer".into()),
+            Some(n) => Ok(usize::try_from(n)
+                .unwrap_or(ANALYZE_MAX_TOP)
+                .min(ANALYZE_MAX_TOP)),
+        },
+    }
+}
+
+/// A key as `analyze` prints it: sanitized and cut at [`ANALYZE_KEY_CHARS`].
+fn shown_key(key: &str) -> String {
+    let s = digest::sanitize(key);
+    if s.chars().count() <= ANALYZE_KEY_CHARS {
+        return s;
+    }
+    let mut cut: String = s.chars().take(ANALYZE_KEY_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
+/// `members` as a sample line: the first few keys, and how many more.
+fn sample(members: &[String]) -> String {
+    let shown: Vec<String> = members
+        .iter()
+        .take(ANALYZE_SAMPLE_MEMBERS)
+        .map(|k| shown_key(k))
+        .collect();
+    let more = members.len().saturating_sub(shown.len());
+    if more > 0 {
+        format!("{} (+{more} more)", shown.join(", "))
+    } else {
+        shown.join(", ")
+    }
+}
+
+/// One ranked node line: rank, key, label, value, and its summary when it has one.
+fn node_row(
+    g: &core_api::GraphDb<core_api::RealFs>,
+    rank: usize,
+    key: &str,
+    value: &str,
+) -> (String, Js) {
+    let label = g
+        .node_ref(key)
+        .map(|n| n.label().to_string())
+        .unwrap_or_default();
+    let summary = g.node_summary_line(key);
+    let mut line = format!(
+        "{rank:>3}. {} [{}] {value}",
+        shown_key(key),
+        digest::sanitize(&label)
+    );
+    if let Some(s) = &summary {
+        line.push_str(&format!(" — {}", digest::sanitize(s)));
+    }
+    line.push('\n');
+    (
+        line,
+        json!({ "key": key, "label": label, "value": value, "summary": summary }),
+    )
+}
+
+fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
+    let kind = match str_arg(args, "kind") {
+        Ok(k) => k.to_string(),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    if !ANALYZE_KINDS.contains(&kind.as_str()) {
+        return CallOutcome::ToolErr(format!(
+            "kind must be one of {}, got {:?}",
+            ANALYZE_KINDS.join(", "),
+            kind
+        ));
+    }
+    let top = match top_arg(args) {
+        Ok(t) => t,
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let edge_type = match opt_str_arg(args, "edge_type") {
+        Ok(t) => t.map(str::to_string),
+        Err(e) => return CallOutcome::ToolErr(e),
+    };
+    if kind == "identities" && edge_type.is_some() {
+        return CallOutcome::ToolErr(
+            "edge_type does not apply to identities: they are read from SAME_AS alone".into(),
+        );
+    }
+    if let Some(t) = &edge_type {
+        if let Some(msg) = unknown_edge_type(db, std::slice::from_ref(t)) {
+            return CallOutcome::ToolErr(msg);
+        }
+    }
+    let over = edge_type.as_deref().map_or_else(
+        || "every edge type".to_string(),
+        |t| format!("{} edges", digest::sanitize(t)),
+    );
+    // `budget_ms: 0` everywhere: a wall-clock budget makes the answer depend on
+    // the machine's load, and the same question must get the same answer.
+    // Measured on a 100,000-node, 180,000-edge store in a release build, the
+    // slowest of the four ran in 88 ms unbudgeted.
+    let g = db.read();
+    let (text, doc) = match kind.as_str() {
+        "central" | "degree" => {
+            let (scores, header): (Vec<(String, String)>, String) = if kind == "central" {
+                let config = core_api::PageRankConfig {
+                    edge_type: edge_type.clone(),
+                    budget_ms: 0,
+                    ..Default::default()
+                };
+                let r = g.pagerank(&config);
+                let note = if r.converged {
+                    "converged".to_string()
+                } else {
+                    format!("stopped at {} iterations", config.max_iters)
+                };
+                (
+                    r.scores
+                        .iter()
+                        .map(|(k, s)| (k.clone(), format!("{s:.6}")))
+                        .collect(),
+                    format!("PageRank over {over}, following edge direction, {note}"),
+                )
+            } else {
+                let r = g.degree_centrality(&core_api::DegreeConfig {
+                    edge_type: edge_type.clone(),
+                    budget_ms: 0,
+                    ..Default::default()
+                });
+                (
+                    r.scores
+                        .iter()
+                        .map(|(k, d)| (k.clone(), format!("degree {d}")))
+                        .collect(),
+                    format!("degree over {over}, in and out"),
+                )
+            };
+            let mut text = format!(
+                "mushroomdb analyze {kind} — {header}; {} node(s), top {}\n",
+                scores.len(),
+                top.min(scores.len())
+            );
+            let mut rows = Vec::new();
+            for (i, (k, v)) in scores.iter().take(top).enumerate() {
+                let (line, row) = node_row(&g, i + 1, k, v);
+                text.push_str(&line);
+                rows.push(row);
+            }
+            (
+                text,
+                json!({ "kind": kind, "nodes": scores.len(), "listed": rows.len(), "rows": rows }),
+            )
+        }
+        "components" => {
+            let r = g.connected_components(&core_api::WccConfig {
+                edge_type: edge_type.clone(),
+                budget_ms: 0,
+                ..Default::default()
+            });
+            let mut groups: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+            for (key, comp) in &r.components {
+                groups.entry(comp.as_str()).or_default().push(key.clone());
+            }
+            let mut groups: Vec<Vec<String>> = groups.into_values().collect();
+            groups.sort_by(|a, b| b.len().cmp(&a.len()).then(a[0].cmp(&b[0])));
+            let singletons = groups.iter().filter(|g| g.len() == 1).count();
+            let mut text = format!(
+                "mushroomdb analyze components — {} component(s) over {} node(s) by {over}; \
+                 largest {}; {singletons} singleton(s)\n",
+                groups.len(),
+                r.components.len(),
+                groups.first().map_or(0, Vec::len)
+            );
+            let mut rows = Vec::new();
+            for (i, members) in groups.iter().filter(|g| g.len() > 1).take(top).enumerate() {
+                text.push_str(&format!(
+                    "{:>3}. size {} — {}\n",
+                    i + 1,
+                    members.len(),
+                    sample(members)
+                ));
+                rows.push(json!({
+                    "size": members.len(),
+                    "members": members.iter().take(ANALYZE_SAMPLE_MEMBERS).collect::<Vec<_>>()
+                }));
+            }
+            (
+                text,
+                json!({
+                    "kind": kind, "nodes": r.components.len(), "components": groups.len(),
+                    "singletons": singletons, "listed": rows.len(), "rows": rows
+                }),
+            )
+        }
+        "identities" => {
+            use core_api::memory::identity::{identity_clusters, SAME_AS_FLOOR};
+            let r = identity_clusters(&g, SAME_AS_FLOOR);
+            let mut text = format!(
+                "mushroomdb analyze identities — {} identit(ies) over {} linked node(s), \
+                 {} SAME_AS claim(s) at ≥ {SAME_AS_FLOOR}; every pair in an identity is \
+                 linked, and the oldest node is canonical\n",
+                r.clusters.len(),
+                r.linked,
+                r.claims
+            );
+            let mut rows = Vec::new();
+            for (i, c) in r.clusters.iter().take(top).enumerate() {
+                text.push_str(&format!(
+                    "{:>3}. {} — {}, weakest link {:.2}\n",
+                    i + 1,
+                    shown_key(&c.canonical),
+                    sample(&c.members),
+                    c.weakest
+                ));
+                rows.push(json!({
+                    "canonical": c.canonical,
+                    "size": c.members.len(),
+                    "weakest": round_to(c.weakest, 2),
+                    "members": c.members.iter().take(ANALYZE_SAMPLE_MEMBERS).collect::<Vec<_>>()
+                }));
+            }
+            (
+                text,
+                json!({
+                    "kind": kind, "identities": r.clusters.len(), "linked": r.linked,
+                    "claims": r.claims, "floor": r.floor, "listed": rows.len(), "rows": rows
+                }),
+            )
+        }
+        _ => {
+            let r = g.communities(&core_api::LouvainConfig {
+                edge_types: edge_type.clone().into_iter().collect(),
+                budget_ms: 0,
+                ..Default::default()
+            });
+            let nodes: usize = r.communities.iter().map(|c| c.members.len()).sum();
+            let (multi, single): (Vec<_>, Vec<_>) =
+                r.communities.iter().partition(|c| c.members.len() > 1);
+            let mut text = format!(
+                "mushroomdb analyze clusters — {} cluster(s) of two or more over {nodes} node(s) \
+                 by {over}, modularity {:.3}; {} singleton(s) not listed\n",
+                multi.len(),
+                r.modularity,
+                single.len()
+            );
+            let mut rows = Vec::new();
+            for (i, c) in multi.iter().take(top).enumerate() {
+                text.push_str(&format!(
+                    "{:>3}. size {}, cohesion {:.2} — {}\n",
+                    i + 1,
+                    c.members.len(),
+                    c.cohesion,
+                    sample(&c.members)
+                ));
+                rows.push(json!({
+                    "size": c.members.len(),
+                    "cohesion": round_to(c.cohesion, 2),
+                    "members": c.members.iter().take(ANALYZE_SAMPLE_MEMBERS).collect::<Vec<_>>()
+                }));
+            }
+            (
+                text,
+                json!({
+                    "kind": kind, "nodes": nodes, "clusters": multi.len(),
+                    "singletons": single.len(), "modularity": round_to(r.modularity, 3),
+                    "listed": rows.len(), "rows": rows
+                }),
+            )
+        }
+    };
+    drop(g);
+    ok(json_out, &doc, |_| text)
 }
 
 // ── tools/list ───────────────────────────────────────────────────────────────
 
-/// The `json` argument every task tool takes, added to all ten schemas by
-/// [`task_tools`] rather than written out ten times.
+/// The `json` argument every task tool takes, added to every task tool's schema
+/// by [`task_tools`] rather than written out in each.
 fn json_arg() -> Js {
     json!({
         "type": "boolean",
@@ -2627,7 +2679,7 @@ fn json_arg() -> Js {
     })
 }
 
-/// The ten task tools, in the order `tools/list` puts them: the question an
+/// The task tools, in the order `tools/list` puts them: the question an
 /// assistant asks first comes first.
 pub(crate) fn task_tools() -> Vec<Js> {
     let mut tools = task_tool_schemas();
@@ -2641,99 +2693,6 @@ pub(crate) fn task_tools() -> Vec<Js> {
 
 fn task_tool_schemas() -> Vec<Js> {
     vec![
-        json!({
-            "name": "explore",
-            "description": "Find your way around this repository from its code graph: a symbol's definition, callers and callees; the blast radius (files that import it or change with it) if it changes; who owns it and why files are related. Cheaper than grep for anything cross-file. depth=context (default) | impact | history | all.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "A file path, a symbol key (path#name), or a bare symbol name."
-                    },
-                    "depth": {
-                        "type": "string",
-                        "enum": ["context", "impact", "history", "all"]
-                    },
-                    "budget": {
-                        "type": "integer",
-                        "minimum": 200,
-                        "description": "Max reply tokens (default 1200)."
-                    },
-                    "full": {
-                        "type": "boolean",
-                        "description": "Include the source body."
-                    }
-                },
-                "required": ["target"]
-            }
-        }),
-        json!({
-            "name": "map",
-            "description": "Summarise the graphed repository in one screen: size, last sync, clusters, key files, owners, hot files, stale concepts, and questions worth asking next. Start here when you do not know the codebase.",
-            "inputSchema": { "type": "object", "properties": {} }
-        }),
-        json!({
-            "name": "context",
-            "description": "Everything known about one file or symbol: where it is as path:start-end, its signature and doc, owner, every call site into it grouped by calling file, its callees, importers and imports, co-change partners, recent commits, and any notes or concepts about it. The body is not quoted unless you ask for it with 'full'.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "A file path, a symbol key (path#name), or a bare symbol name. An ambiguous bare name returns the candidates instead."
-                    },
-                    "full": {
-                        "type": "boolean",
-                        "description": "Include the source body (default: pointers and signature only)."
-                    }
-                },
-                "required": ["target"]
-            }
-        }),
-        json!({
-            "name": "impact",
-            "description": "What else the files in a change reach: co-change partners, by similarity score or by how many commits the two share, plus importers, symbols used elsewhere, and each file's owner. Defaults to the current git diff plus untracked files when no list is given.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "files": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Repository-relative paths. Omit to use the working tree's diff against HEAD plus its untracked files."
-                    }
-                }
-            }
-        }),
-        json!({
-            "name": "owners",
-            "description": "Who has written a file: top author and share, authors who know it, the last commit to touch it, and the split by quarter.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "Repository-relative file path."
-                    }
-                },
-                "required": ["path"]
-            }
-        }),
-        json!({
-            "name": "why",
-            "description": "What links two files, symbols, or people, with the evidence for each link: shared commits, the importing line, every calling line, the file two authors both know. With no rule edge it reports the commits the two share, and failing that the shortest path between them.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "a": { "type": "string", "minLength": 1, "description": "First node key." },
-                    "b": { "type": "string", "minLength": 1, "description": "Second node key." }
-                },
-                "required": ["a", "b"]
-            }
-        }),
         json!({
             "name": "explain_association",
             "description": "Why are A and B related — every relationship between the two keys and its evidence: the rule that derived it, its edge type, the match score, the predicate it matched on, and the values the two actually share (which specialties overlapped, which field was equal, how far apart they are). Answer from those shared values; the nodes' full property lists name everything either one holds, not what they have in common. Both keys must already exist.",
@@ -2899,14 +2858,14 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "recall",
-            "description": "What do I already know about this — where the graph says a topic lives: one pointer per hit, path:line, the symbol, and the first line of its doc, across notes, concepts, files, symbols and people.",
+            "description": "What do I already know about this — ranked nodes matching a free-text topic across every indexed text field, with one line each.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "topic": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "Free-form text. The identifiers in it — a path, a `mod::name`, a snake_case word, or any word in backticks — are searched as phrases; a topic naming none of those matches nothing."
+                        "description": "Free-form text. A question, a name, or a phrase."
                     }
                 },
                 "required": ["topic"]
@@ -2914,7 +2873,15 @@ fn task_tool_schemas() -> Vec<Js> {
         }),
         json!({
             "name": "remember",
-            "description": "Remember this for next time — write a note into the graph and return its key. Keys listed in 'about' are linked to the note, and every one of them must already exist.",
+            "description": "Remember this for next time — write a note into the graph and return what it \
+        did. Use 'about' for a subject whose type you don't know yet — an unknown key there is \
+        created as a provisional entity (label 'Entity'), not refused, and stays that label \
+        permanently until it is named through 'entities' instead. Use 'entities' for a subject \
+        whose type you DO know: it is created (or described, if it already exists) under the \
+        label you give it, correctly labelled the first time — the label can never be changed \
+        afterward, not even by upsert_entity, so name it here when you can rather than leaving it \
+        for 'about' to guess at. Pass 'facts' for the relationships you recognised, between keys \
+        named in 'entities' or 'about', in the same commit.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2926,308 +2893,138 @@ fn task_tool_schemas() -> Vec<Js> {
                     "about": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Existing node keys the note is about: files, symbols, authors, concepts, other notes."
+                        "description": "Node keys the note is about, when you don't know their type. A key that does not exist yet is created as a provisional entity (label 'Entity') — permanently: prefer 'entities' when you know the label, since a provisional node's label can never change later."
                     },
                     "kind": {
                         "type": "string",
                         "enum": ["note", "decision", "todo"],
                         "description": "What kind of note this is (default: note)."
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Where this came from — a session id, a file, a person. Defaults to \"agent\"."
+                    },
+                    "ts": {
+                        "type": "integer",
+                        "description": "Unix seconds the fact dates from. Defaults to now. Pass it when importing."
+                    },
+                    "entities": {
+                        "type": "array",
+                        "description": "Entities you recognised in the text.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key":   { "type": "string" },
+                                "label": { "type": "string" },
+                                "props": { "type": "object" },
+                                "aliases": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Other names this entity goes by, kept as written in its 'alias_keys' list. With the identity preset, one equal to a provisional stub's key (exact, case-sensitive) links that stub."
+                                }
+                            },
+                            "required": ["key", "label"]
+                        }
+                    },
+                    "facts": {
+                        "type": "array",
+                        "description": "Relationships you recognised, between keys named above.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "subject":   { "type": "string" },
+                                "predicate": { "type": "string" },
+                                "object":    { "type": "string" }
+                            },
+                            "required": ["subject", "predicate", "object"]
+                        }
                     }
                 },
                 "required": ["text"]
             }
         }),
         json!({
-            "name": "sync",
-            "description": "Bring the store up to date with the repository it was built from: the commits since the last sync, then the files that differ from HEAD. Returns what changed.",
+            "name": "schema",
+            "description": "What's in here — the store's labels with their property names, its edge types and what derives them, every rule with its predicate, the full-text fields recall searches, the equality indexes, and how many provisional nodes remember created. Call it before writing Cypher against a store you have not seen.",
             "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "analyze",
+            "description": "What matters here, and what clusters — over the whole store, with no role or mask applied. kind 'central' ranks nodes by PageRank along edge direction, 'degree' by edge count, 'components' groups connected nodes with sizes, 'clusters' finds communities of two or more, 'identities' resolves SAME_AS links into sets every pair of which is linked, oldest node first. 'top' (default 10, at most 50) bounds the rows; 'edge_type' restricts to one type. The same store always gets the same answer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["central", "clusters", "components", "degree", "identities"],
+                        "description": "Which question."
+                    },
+                    "top": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Rows to list (default 10)."
+                    },
+                    "edge_type": {
+                        "type": "string",
+                        "description": "Only edges of this type."
+                    }
+                },
+                "required": ["kind"]
+            }
+        }),
+        json!({
+            "name": "suggest_rules",
+            "description": "What relationships are in my data — rules the store proposes from its own values, each with an estimate, examples and the exact create_rule arguments. Nothing is created: show the proposal and wait for approval before calling create_rule. Fields the store writes for bookkeeping are never proposed. Every proposal is global and links across namespaces.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "forget",
+            "description": "Forget that — tombstone a node ('key'), remove one property ('key' and 'prop'), or retract one fact edge ('fact': subject, predicate, object). An edge a rule derived is refused with the rule that owns it. Notes that still state what was forgotten are listed, not deleted. History keeps it until the log is pruned, and the reply says so. There is no role check: this server has no auth.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "minLength": 1, "description": "The node to forget, or whose property to forget." },
+                    "prop": { "type": "string", "minLength": 1, "description": "With 'key': the one property to remove." },
+                    "fact": {
+                        "type": "object",
+                        "description": "The edge to retract, as remember's facts name it.",
+                        "properties": {
+                            "subject":   { "type": "string" },
+                            "predicate": { "type": "string" },
+                            "object":    { "type": "string" }
+                        },
+                        "required": ["subject", "predicate", "object"]
+                    }
+                }
+            }
         }),
     ]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tests: the two things these tools decide before they touch the graph — where
-// a default `impact` reads its diff from, and how that diff is filtered.
-//
-// They live here rather than in `tests/mcp.rs` because `$CLAUDE_PROJECT_DIR`
-// reaches `tool_impact` as an argument, not as a process-global read: setting
-// it for real would race every other test in the binary that calls
-// `std::env::temp_dir()`.
+// Tests: helpers these tools share that a `tools/call` transcript cannot reach.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_api::Value;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn tmp(name: &str) -> PathBuf {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let d = std::env::temp_dir().join(format!("mcp-tasks-{name}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        d
-    }
-
-    fn git(repo: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(args)
-            .output()
-            .expect("git");
-        assert!(out.status.success(), "git {args:?}: {out:?}");
-    }
-
-    /// A checkout holding one committed file, since edited, plus one untracked
-    /// file under an excluded directory.
-    fn dirty_repo(name: &str) -> PathBuf {
-        let repo = tmp(name);
-        std::fs::create_dir_all(repo.join("src")).expect("src");
-        std::fs::create_dir_all(repo.join("target")).expect("target");
-        git(&repo, &["init", "-q"]);
-        git(&repo, &["config", "user.email", "t@example.test"]);
-        git(&repo, &["config", "user.name", "Test"]);
-        std::fs::write(repo.join("src/core.rs"), "fn init() {}\n").expect("write");
-        git(&repo, &["add", "src/core.rs"]);
-        git(&repo, &["commit", "-qm", "first"]);
-        std::fs::write(repo.join("src/core.rs"), "fn init() { /* edited */ }\n").expect("edit");
-        // Untracked and excluded at ingest time, so it must not reach the list.
-        std::fs::write(repo.join("target/debug.log"), "noise\n").expect("artefact");
-        repo
-    }
-
-    /// A store holding one `File` node and a `GitSync` marker pointing at `repo`.
-    fn store_for(name: &str, repo: Option<&Path>) -> (SharedDb, PathBuf) {
-        let dir = tmp(name);
-        let db = SharedDb::open(&dir).expect("open");
-        {
-            let mut w = db.write();
-            w.insert_node(
-                "File",
-                "src/core.rs",
-                vec![
-                    ("id".into(), Value::Str("src/core.rs".into())),
-                    ("path".into(), Value::Str("src/core.rs".into())),
-                    ("lines".into(), Value::Int(1)),
-                ],
-            )
-            .expect("file");
-            let marker = repo.map_or_else(
-                || "/nonexistent/mushroomdb-test-repo".to_string(),
-                |r| r.display().to_string(),
-            );
-            w.insert_node(
-                "GitSync",
-                SYNC_KEY,
-                vec![
-                    ("id".into(), Value::Str(SYNC_KEY.into())),
-                    (SYNC_REPO_PROP.into(), Value::Str(marker)),
-                ],
-            )
-            .expect("marker");
-        }
-        (db, dir)
-    }
-
-    /// The report behind a `json: true` reply, which is now the only place a
-    /// caller reads the numbers from: the text content *is* the JSON.
-    fn report(outcome: &CallOutcome) -> Js {
-        match outcome {
-            CallOutcome::TaskOk { text } => {
-                serde_json::from_str(text).expect("a json reply is the serialised report")
-            }
-            other => panic!("expected a task result, got {}", describe(other)),
-        }
-    }
-
-    fn impact_files(outcome: &CallOutcome) -> Vec<String> {
-        report(outcome)["files"]
-            .as_array()
-            .expect("files")
-            .iter()
-            .map(|f| f["path"].as_str().expect("path").to_string())
-            .collect()
-    }
-
-    /// `impact` with no `files`, asking for the report rather than the digest.
-    fn impact_report(db: &SharedDb, project_dir: Option<&OsStr>) -> CallOutcome {
-        tool_impact(db, &json!({"json": true}), project_dir, true)
-    }
-
-    fn describe(outcome: &CallOutcome) -> String {
-        match outcome {
-            CallOutcome::ToolErr(m) => format!("tool error: {m}"),
-            CallOutcome::TaskOk { text } => format!("ok: {text}"),
-            CallOutcome::ToolOk(v) => format!("json: {v}"),
-            CallOutcome::Protocol { message, .. } => format!("protocol: {message}"),
-        }
-    }
-
-    /// Binding: with no `files`, the diff comes from the checkout the marker
-    /// names, and excluded artefacts are left out of it.
+    /// Fold-in from the Task 6 review: an empty, truncated run did not find
+    /// "no pattern"; it ran out of time before finding one.
     #[test]
-    fn default_files_come_from_the_marker_repo_and_skip_excluded_paths() {
-        let repo = dirty_repo("marker-repo");
-        let (db, dir) = store_for("marker-store", Some(&repo));
-
-        let outcome = impact_report(&db, None);
-        assert_eq!(
-            impact_files(&outcome),
-            vec!["src/core.rs".to_string()],
-            "the uncommitted edit, and not the build artefact"
-        );
-        assert_eq!(
-            report(&outcome)["unknown"],
-            json!([]),
-            "an excluded path must not come back as unknown"
-        );
-
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&repo);
-    }
-
-    /// Binding: `$CLAUDE_PROJECT_DIR` wins over the marker when it names a
-    /// checkout.
-    #[test]
-    fn the_project_directory_wins_over_the_marker() {
-        let project = dirty_repo("project-repo");
-        // The marker points somewhere that does not exist, so a result at all
-        // proves the project directory was the one read.
-        let (db, dir) = store_for("project-store", None);
-
-        let outcome = impact_report(&db, Some(project.as_os_str()));
-        assert_eq!(impact_files(&outcome), vec!["src/core.rs".to_string()]);
-
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&project);
-    }
-
-    /// Binding: a subdirectory of a checkout resolves to the checkout root, so
-    /// both git listings agree about what their paths are relative to.
-    #[test]
-    fn a_project_subdirectory_resolves_to_the_repository_root() {
-        let repo = dirty_repo("subdir-repo");
-        let (db, dir) = store_for("subdir-store", None);
-
-        let outcome = impact_report(&db, Some(repo.join("src").as_os_str()));
-        assert_eq!(
-            impact_files(&outcome),
-            vec!["src/core.rs".to_string()],
-            "paths stay root-relative, matching File keys"
-        );
-
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&repo);
-    }
-
-    /// Binding: a project directory that is not inside a checkout says nothing
-    /// about the store's repository, so the marker still answers.
-    #[test]
-    fn a_project_directory_outside_a_checkout_falls_back_to_the_marker() {
-        let repo = dirty_repo("fallback-repo");
-        let plain = tmp("fallback-plain");
-        std::fs::create_dir_all(&plain).expect("plain dir");
-        let (db, dir) = store_for("fallback-store", Some(&repo));
-
-        let outcome = impact_report(&db, Some(plain.as_os_str()));
-        assert_eq!(impact_files(&outcome), vec!["src/core.rs".to_string()]);
-
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&plain);
-        let _ = std::fs::remove_dir_all(&repo);
-    }
-
-    /// Binding: with neither a project checkout nor a marker checkout, the tool
-    /// says what the caller must do instead.
-    #[test]
-    fn no_checkout_anywhere_says_pass_files_explicitly() {
-        let (db, dir) = store_for("no-repo-store", None);
-
-        let outcome = impact_report(
-            &db,
-            Some(OsStr::new("/nonexistent/mushroomdb-test-project")),
-        );
-        match &outcome {
-            CallOutcome::ToolErr(m) => assert!(m.contains("pass files explicitly"), "{m}"),
-            other => panic!("{}", describe(other)),
-        }
-
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Binding: an explanation's line carries the score and the hop a via-rule
-    /// went over, and the digest never runs past the line budget.
-    ///
-    /// `tests/mcp.rs` covers the plain rule and the empty case end to end; what
-    /// is only reachable from here is a via-hop rule and a report longer than
-    /// [`repograph::MAX_TOOL_LINES`], neither of which a two-node fixture
-    /// produces.
-    #[test]
-    fn an_explanation_line_names_the_score_the_hop_and_the_predicate() {
-        let one = |rule: &str, via: Option<&str>| ExplainedEdge {
-            edge: Explanation {
-                rule: rule.to_string(),
-                edge_type: "SIMILAR".to_string(),
-                src_key: "a".to_string(),
-                dst_key: "b".to_string(),
-                weight: Some(0.9625),
-                predicate: PredicateSummary {
-                    kind: "vector_similar".to_string(),
-                    fields: vec!["emb".to_string()],
-                    min: Some(0.85),
-                    tolerance: None,
-                    km: None,
-                    parts: None,
-                    approximate: false,
-                },
-                via_edge: via.map(str::to_string),
-            },
-            // A via-hop rule matched between the via node and the
-            // destination, so there is no pair here to show evidence from.
-            evidence: None,
+    fn an_empty_truncated_suggestion_run_does_not_claim_full_coverage() {
+        let out = SuggestOut {
+            suggestions: Vec::new(),
+            total: 0,
+            bookkeeping_hidden: 0,
+            truncated: true,
+            identity_preset: None,
         };
-
-        let text = render_explanations("a", "b", &[one("close", Some("WORKS_AT"))]);
-        assert_eq!(
-            text,
-            "mushroomdb explain — a ↔ b: 1 relationship(s)\n  SIMILAR via rule close (score 0.96) \
-             via WORKS_AT — vector_similar on emb >= 0.85\n"
-        );
-
-        let many: Vec<ExplainedEdge> = (0..40).map(|i| one(&format!("r{i}"), None)).collect();
-        let capped = render_explanations("a", "b", &many);
-        assert_eq!(
-            capped.lines().count(),
-            repograph::MAX_TOOL_LINES,
-            "the digest is capped like every other one"
-        );
-        assert!(
-            capped.starts_with("mushroomdb explain — a ↔ b: 40 relationship(s)"),
-            "and the header still says how many there were: {capped}"
-        );
-    }
-
-    /// Binding: an explicit `files` list never looks at a repository at all.
-    #[test]
-    fn explicit_files_ignore_the_project_directory() {
-        let (db, dir) = store_for("explicit-store", None);
-
-        let outcome = tool_impact(
-            &db,
-            &json!({"files": ["src/core.rs"], "json": true}),
-            Some(OsStr::new("/nonexistent/mushroomdb-test-project")),
-            true,
-        );
-        assert_eq!(impact_files(&outcome), vec!["src/core.rs".to_string()]);
-
-        drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
+        let text = render_suggestions(&out);
+        let header = text.lines().next().unwrap_or_default();
+        assert!(!header.contains("already cover"), "{text}");
+        assert!(header.contains("time budget"), "{text}");
     }
 
     fn edge_at(edge_type: &str, src: &str, dst: &str) -> core_api::EdgeAt {

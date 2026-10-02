@@ -298,6 +298,30 @@ pub enum MutationEvent {
     },
 }
 
+/// Whether `rec` is the frame [`GraphDb::create_rule`] logs: a `CreateRule`,
+/// alone or behind the `Intern` record for its edge type.
+///
+/// `create_rule` goes through the dense rewrite like every other write, so its
+/// frame is `Batch([Intern { edge_type }, CreateRule])` rather than a bare
+/// `CreateRule`. Anything that asks "was this commit a rule creation" must
+/// accept both shapes, or it silently stops recognising the one the
+/// standalone call writes. A batch carrying anything else is a user batch and
+/// is not this frame.
+fn is_create_rule_frame(rec: &WalRecord) -> bool {
+    match rec {
+        WalRecord::CreateRule { .. } => true,
+        WalRecord::Batch(inner) => {
+            inner
+                .iter()
+                .any(|r| matches!(r, WalRecord::CreateRule { .. }))
+                && inner
+                    .iter()
+                    .all(|r| matches!(r, WalRecord::CreateRule { .. } | WalRecord::Intern { .. }))
+        }
+        _ => false,
+    }
+}
+
 fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<MutationEvent> {
     match rec {
         WalRecord::InsertNode { label, key, .. } => Some(MutationEvent::NodeInserted {
@@ -5492,9 +5516,7 @@ impl<F: Fs> GraphDb<F> {
             // a map lookup, not an engine swap: a store being written to has
             // long since populated its indexes, so the `pump_index_build`
             // entry point owns the not-yet-populated case on its own.
-            if !matches!(&rec, WalRecord::CreateRule { .. })
-                && !self.engine.builds_in_progress().is_empty()
-            {
+            if !is_create_rule_frame(&rec) && !self.engine.builds_in_progress().is_empty() {
                 rebuilds.extend(self.pump_one_slice().into_iter().map(|b| b.rule));
             }
             let mut failed = Vec::new();
@@ -6955,7 +6977,7 @@ impl<F: Fs> GraphDb<F> {
         let def_bytes = bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
             detail: format!("serialize rule: {e}"),
         })?;
-        self.log_then_apply(WalRecord::CreateRule { def_bytes })
+        self.log_dense(vec![WalRecord::CreateRule { def_bytes }])
     }
 
     /// Override this handle's HNSW build-slice size, or `None` to restore
@@ -7418,6 +7440,26 @@ impl<F: Fs> GraphDb<F> {
     /// Whether `(label, field)` currently has an equality index.
     pub fn is_index_enabled(&self, label: &str, field: &str) -> bool {
         self.prop_index.is_enabled(label, field)
+    }
+
+    /// Every `(label, field)` pair with a live equality index, sorted.
+    ///
+    /// The enumerator [`is_index_enabled`](Self::is_index_enabled) never had:
+    /// the MCP `schema` tool lists a store's indexes rather than probing them
+    /// one guess at a time.
+    pub fn index_pairs(&self) -> Vec<(String, String)> {
+        self.prop_index.enabled_pairs().cloned().collect()
+    }
+
+    /// The dense id of a live key, `None` for an unknown or deleted one.
+    ///
+    /// Ids are allocated in insertion order and never reused, so the lowest
+    /// live id among a set of keys is the oldest node — which is how identity
+    /// resolution picks a canonical node without a timestamp field
+    /// (`memory::identity`). Crate-private: an id is an engine detail, not
+    /// something a caller should hold.
+    pub(crate) fn dense_id(&self, key: &str) -> Option<u32> {
+        self.ids.get(key)
     }
 
     /// Start recording insert-count multiplicity on this store (§5.13).
@@ -8156,6 +8198,20 @@ impl<F: Fs> GraphDb<F> {
 
     pub fn has_node(&self, key: &str) -> bool {
         self.ids.get(key).is_some()
+    }
+
+    /// One human line for a node: the first of `text`, `summary` or `name` it
+    /// carries, truncated. Used by the recall digest.
+    pub fn node_summary_line(&self, key: &str) -> Option<String> {
+        for field in ["text", "summary", "name"] {
+            if let Some(Value::Str(s)) = self.get_prop(key, field) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return Some(s.chars().take(120).collect());
+                }
+            }
+        }
+        None
     }
 
     /// Borrow the raw id map. Used by `NodeMask::from_keys` to resolve keys.
@@ -14534,6 +14590,9 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     /// `(edge_type, src, dst)` from current overlay-visible props/labels.
     /// CreateRule names in `extra_rules` are ignored — same documented
     /// same-batch rule-window as [`Self::is_rule_owned`].
+    ///
+    /// Mirrored by `guard_matches` in `memory/forget.rs`, which names the
+    /// rules this refused for: change the two together (ledger row 67).
     fn would_derive(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
         if src_key == dst_key {
             return false;

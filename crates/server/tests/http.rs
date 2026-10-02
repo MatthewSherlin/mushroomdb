@@ -1008,7 +1008,8 @@ fn seed_emb(db: &SharedDb, label: &str, key: &str, x: f64, y: f64) {
 }
 
 /// Binding: POST /find_similar exact hits equal GraphDb::find_similar_vector_filtered
-/// on the same store (Python tuple shape: [[key, score], ...]). HTTP min defaults to 0.0.
+/// on the same store (Python tuple shape: [[key, score], ...]). `min` is named,
+/// because the default no longer keeps the orthogonal hit.
 #[tokio::test]
 async fn http_find_similar_exact_agrees_with_python_shape() {
     let (app, db) = open("http-find-similar-exact");
@@ -1022,7 +1023,7 @@ async fn http_find_similar_exact_agrees_with_python_shape() {
     };
     assert!(
         expected.iter().any(|(k, _)| k == "far"),
-        "engine min=0.0 must keep the orthogonal hit so HTTP default min is pinned: {expected:?}"
+        "engine min=0.0 must keep the orthogonal hit: {expected:?}"
     );
 
     let (status, body, _) = send(
@@ -1034,6 +1035,7 @@ async fn http_find_similar_exact_agrees_with_python_shape() {
                 "field": "emb",
                 "vector": [1.0, 0.0],
                 "k": 10,
+                "min": 0.0,
                 "label": "Item",
                 "exact": true
             }),
@@ -1043,6 +1045,59 @@ async fn http_find_similar_exact_agrees_with_python_shape() {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let v = parse_json(&body);
     assert_eq!(v["hits"], serde_json::to_value(&expected).unwrap());
+}
+
+/// Binding (plan 4, PD-1): a `POST /find_similar` that names no `min` applies
+/// `core_api::FIND_SIMILAR_DEFAULT_MIN`, the same floor MCP and the Python
+/// binding apply. `mid` scores 0.6 — between the old HTTP default (0.0) and
+/// the unified one (0.8) — so it is the hit that tells them apart.
+#[tokio::test]
+async fn http_find_similar_defaults_min_to_the_shared_constant() {
+    let (app, db) = open("http-find-similar-default-min");
+    seed_emb(&db, "Item", "close", 1.0, 0.0);
+    seed_emb(&db, "Item", "mid", 0.6, 0.8);
+    seed_emb(&db, "Item", "far", 0.0, 1.0);
+
+    let keys_for = |v: &Json| -> Vec<String> {
+        v["hits"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .map(|h| h[0].as_str().expect("key").to_string())
+            .collect()
+    };
+    let body_without_min = json!({
+        "field": "emb", "vector": [1.0, 0.0], "k": 10, "label": "Item", "exact": true
+    });
+
+    let (status, body, _) = send(
+        app.clone(),
+        json_req("POST", "/find_similar", body_without_min),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        keys_for(&parse_json(&body)),
+        vec!["close"],
+        "no min named: only the hit at or above {} survives",
+        core_api::FIND_SIMILAR_DEFAULT_MIN
+    );
+
+    // Naming it still reaches everything, in score order.
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/find_similar",
+            json!({
+                "field": "emb", "vector": [1.0, 0.0], "k": 10, "min": 0.0,
+                "label": "Item", "exact": true
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(keys_for(&parse_json(&body)), vec!["close", "mid", "far"]);
 }
 
 /// Binding: a role token on POST /find_similar intersects a client mask

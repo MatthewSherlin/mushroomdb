@@ -30,8 +30,8 @@ cypher_two_hop(db)
 
 rule_derive(db, rules)
     Declare each rule dict via db.create_rule() and time the backfill.
-    Returns per-rule wall_s and total.
-    OURS-ONLY — no competitor equivalent; see README for why.
+    Returns per-rule wall_s and total.  A one-time cost, paid when a rule is
+    declared; see benchmarks/README.md.
 """
 
 from __future__ import annotations
@@ -239,9 +239,9 @@ def cold_start_to_first_query(db_dir: str | Path, snapshot: bool = False) -> dic
 def rule_derive(db: Any, rules: list[dict]) -> dict[str, Any]:
     """Declare *rules* via db.create_rule() and time the backfill.
 
-    OURS-ONLY workload — auto-derivation has no competitor equivalent.
-    See benchmarks/README.md for a detailed explanation of why this
-    workload is excluded from the cross-engine comparison table.
+    This is the cost of declaring the rules over the loaded graph: a one-time
+    backfill.  Afterwards each write re-derives only what it changed.  See
+    benchmarks/README.md.
     """
     per_rule: list[dict[str, Any]] = []
     t_total_0 = time.perf_counter()
@@ -260,9 +260,9 @@ def rule_derive(db: Any, rules: list[dict]) -> dict[str, Any]:
         "engine": "mushroomdb",
         "ours_only": True,
         "note": (
-            "Auto-derivation: rules fire automatically on ingest/update with "
-            "no competitor equivalent. Not included in cross-engine table. "
-            "See README.md honesty section."
+            "Rule backfill: the one-time cost of declaring the rules over the "
+            "loaded graph. Afterwards each write re-derives only what it changed. "
+            "See benchmarks/README.md."
         ),
         "n_rules": len(rules),
         "per_rule": per_rule,

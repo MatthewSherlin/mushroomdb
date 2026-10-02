@@ -3,8 +3,8 @@
 A mushroomdb store is **many readers, one writer**. Any number of processes may
 read it at the same time, and every one of them sees every commit; exactly one
 may be writing at any moment. This is what makes it safe to run a server on a
-store while an editor hook, a git hook, and a `mushroomdb` command all touch the
-same directory.
+store while the session hooks, an `ingest-git` run and other `mushroomdb`
+commands all touch the same directory.
 
 Two mechanisms carry the whole model:
 
@@ -120,32 +120,27 @@ every prompt under a short timeout, opens this way for exactly these reasons: it
 cannot delay a writer, cannot fail because one is running, and cannot discard a
 frame a writer believes durable.
 
-## What the hooks rely on
+## What other writers rely on
 
-An editor hook, a git hook, and a `sync` command all write to a store the server
-holds open. Three properties make that safe:
+A second `mcp` process, an `ingest-git` run and a CLI write all write to a store
+the server holds open. Three properties make that safe:
 
-1. The server's handle does not hold the lock between writes, so a hook can get
-   it.
-2. A hook's write is serialised against the server's by the lock, so the WAL
-   never interleaves two processes' frames.
-3. The server's handle picks the hook's commits up on its next read, without
-   restarting and without the hook telling it anything.
+1. The server's handle does not hold the lock between writes, so another
+   process can get it.
+2. That process's write is serialised against the server's by the lock, so the
+   WAL never interleaves two processes' frames.
+3. The server's handle picks the other process's commits up on its next read,
+   without restarting and without being told anything.
 
-A hook that finds the store busy exits without writing and tries again on the
-next event. That is the intended behaviour, not a failure: the work it was going
-to do is derived from state that is still there.
+A long `ingest-git` is the case where a writer waits for more than an instant:
+it holds the lock for its whole run, so another writer that arrives during it
+waits the two-second `WRITE_LOCK_WAIT`, gets `Busy`, and a CLI command exits 3
+with `another mushroomdb process is writing; retry`. Retrying is always safe.
 
-A long `sync` is the case where that happens for more than an instant: it holds
-the lock for its whole run, so an editor `touch` fired during it waits the
-two-second `WRITE_LOCK_WAIT`, gets `Busy`, and gives up silently with exit 0.
-That edit is not lost — it is re-extracted by the next `touch` on the same file
-or by the next `sync`, which re-reads everything the working tree has changed.
-
-`scripts/acceptance-0.6.sh` exercises this on every release: 20 `touch`
-processes run in parallel against a store a live `mushroomdb mcp` server holds
-open, all 20 must exit 0, the server's `map` must still count every ingested
-file afterwards, and `mushroomdb verify` must pass on the result.
+`crates/cli/tests/mcp_concurrency.rs` exercises this in every test run, against
+a live `mushroomdb serve`: 20 HTTP writers released at once, and 20 separate
+`mushroomdb mcp` processes each writing while the server holds the store. Every
+write must land, and `mushroomdb verify` must pass on the result.
 
 `mushroomdb doctor` reports the lock's current state as one of its checks —
 `free`, or a `warn` naming the fact that another process is writing right now.

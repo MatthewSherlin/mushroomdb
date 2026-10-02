@@ -26,23 +26,23 @@ v0.4.0 is live on crates.io, npm, PyPI, and ghcr.io. It was an additive, backwar
 
 ## 2. Strategic thesis (read this before arguing about features)
 
-**Win a category; do not chase Neo4j.** You will not become "the best graph DB" by out-scaling Neo4j on general workloads. You become GOAT by being the **uncontested default for agent memory + self-maintaining app relationships** — the way SQLite owns *local relational* without beating Postgres. Depth in the wedge beats breadth everywhere.
+**Win a category; do not chase system A.** You will not become "the best graph DB" by out-scaling system A on general workloads. You become GOAT by being the **uncontested default for agent memory + self-maintaining app relationships** — the way a named system owns *local relational* without beating a named system. Depth in the wedge beats breadth everywhere.
 
 **mushroomdb's differentiated position (verified against the 2026 competitive landscape):**
 
-The agent-memory category (Zep/Graphiti, Mem0, Letta, Cognee, LangMem) is *entirely* built on **LLM extraction** — a model extracts entities/facts from text into a store. mushroomdb is a structurally different **third camp**: **declarative + deterministic + explainable + embedded + access-controlled.** It already owns primitives the leaders charge for:
+The agent-memory category (a named system/a named system, a named system, a named system, a named system, a named system) is *entirely* built on **LLM extraction** — a model extracts entities/facts from text into a store. mushroomdb is a structurally different **third camp**: **declarative + deterministic + explainable + embedded + access-controlled.** It already owns primitives the leaders charge for:
 
 | Category feature | Their approach | mushroomdb already has |
 |---|---|---|
-| Fact invalidation | Zep temporal edge invalidation | **Rule auto-retraction** (edges retract when props diverge; recorded in `edge_history`) |
-| Provenance | Zep "episode-level provenance" | **`explain()`** — why any edge exists, with the arithmetic |
-| "Millions of small cold graphs" runtime | Zep's tuned service | **V8 mmap** — 0.02s cold open, 31 MiB RSS |
+| Fact invalidation | a named system temporal edge invalidation | **Rule auto-retraction** (edges retract when props diverge; recorded in `edge_history`) |
+| Provenance | a named system "episode-level provenance" | **`explain()`** — why any edge exists, with the arithmetic |
+| "Millions of small cold graphs" runtime | a named system's tuned service | **V8 mmap** — 0.02s cold open, 31 MiB RSS |
 | Hybrid retrieval | vector+graph+text | **`hybrid_search`** (RRF) |
 | **Who is allowed to see it (ACL)** | **nobody in the category** | **RBAC masks + write-scopes** |
 
-**The 2026 SOTA question list** (from Mem0's own state-of-memory report): *"what should the agent know now, where did it come from, is it still true, **who is allowed to see it**, and how is it assembled into context."* That ACL question is on everyone's list and **only mushroomdb answers it.** That is the wedge-within-the-wedge: **the agent-memory engine with real access control.**
+**The 2026 SOTA question list** (from a named system's own state-of-memory report): *"what should the agent know now, where did it come from, is it still true, **who is allowed to see it**, and how is it assembled into context."* That ACL question is on everyone's list and **only mushroomdb answers it.** That is the wedge-within-the-wedge: **the agent-memory engine with real access control.**
 
-**Benchmark reality (be honest):** Zep/Graphiti scores **63.8%** on LongMemEval (the category's standard test) with GPT-4o; Mem0 **49.0%**. mushroomdb has **no published number yet.** Zep is backed by Neo4j, funded, has production users. **We are a credible, differentiated, early-stage challenger — not the leader.** Publishing an honest LongMemEval number (even if not #1) is the price of admission to the conversation and is itself the differentiator (nobody else publishes deterministic + ACL'd memory numbers).
+**Benchmark reality (be honest):** a named system/a named system scores **63.8%** on LongMemEval (the category's standard test) with GPT-4o; a named system **49.0%**. mushroomdb has **no published number yet.** a named system is backed by system A, funded, has production users. **We are a credible, differentiated, early-stage challenger — not the leader.** Publishing an honest LongMemEval number (even if not #1) is the price of admission to the conversation and is itself the differentiator (nobody else publishes deterministic + ACL'd memory numbers).
 
 ---
 
@@ -85,7 +85,7 @@ The release that makes mushroomdb undeniably #1 at the thing it is uniquely buil
 
 > **Format warning:** namespaces and bi-temporal change the on-disk data model. They are minor-version features and **must be built with the maintainer reviewing** — not unattended. Auto-migration from any 0.4.x store is required, with a changelog note.
 
-### Tier 1 — the wedge (the reasons to choose mushroomdb over Zep/Mem0)
+### Tier 1 — the wedge (the reasons to choose mushroomdb over a named system/a named system)
 
 **1. Namespaces (the #1 feature — validated by both the KB agent and the market).**
 Per-agent / per-user / per-project partitioning, composed with the existing RBAC mask **at the same enforcement choke point** so the security proofs carry over. This collapses "compute an allow-list per request" into "declare the isolation once." Two shapes to support (the 2026 production pattern is *both*):
@@ -96,11 +96,11 @@ Per-agent / per-user / per-project partitioning, composed with the existing RBAC
 **2. Temporal + RBAC composition (promote from "follow-on" to headline).**
 Today `query_at` is rejected with role tokens/masks (no ACL'd time travel). The KB agent flagged this as a hard limiter; the competitive analysis shows *why it's a moat*: **temporal memory + per-caller ACL is a combination literally no competitor has.** Make `query_at` mask-aware (open the temporal instance, apply the role's mask to the temporal read). This unblocks exposing time-travel beyond admin-only.
 
-**3. Bi-temporal edges (valid-time) — match Zep's defining feature.**
-`query_at` gives *system/ingestion*-time travel. You are missing *valid time* — "who worked at Acme in 2021?" when the fact was recorded in 2026. Zep tracks four timestamps (t_valid, t_invalid, t_created, t_expired). The **pragmatic version is cheap**: edges already carry properties, so support `valid_from`/`valid_to` edge intervals + query predicates over them (and optionally an `AS OF VALID TIME t` sugar). This gives Zep-class temporal reasoning **without their LLM-extraction machinery** — and combined with rule auto-retraction (your existing "fact invalidation"), it's a complete temporal model.
+**3. Bi-temporal edges (valid-time) — match a named system's defining feature.**
+`query_at` gives *system/ingestion*-time travel. You are missing *valid time* — "who worked at Acme in 2021?" when the fact was recorded in 2026. a named system tracks four timestamps (t_valid, t_invalid, t_created, t_expired). The **pragmatic version is cheap**: edges already carry properties, so support `valid_from`/`valid_to` edge intervals + query predicates over them (and optionally an `AS OF VALID TIME t` sugar). This gives a named system-class temporal reasoning **without their LLM-extraction machinery** — and combined with rule auto-retraction (your existing "fact invalidation"), it's a complete temporal model.
 
 **4. Published LongMemEval number (task #7, still pending — now a competitive necessity, not just honesty infra).**
-It's *the* number buyers compare (Zep 63.8%, Mem0 49%). Build the harness, run it, publish the number **with methodology and known limitations** — even if not #1. If the declarative + RBAC approach scores well, that's the differentiation made concrete. The repo already operates this way (measured gates, published misses); this extends it.
+It's *the* number buyers compare (a named system 63.8%, a named system 49%). Build the harness, run it, publish the number **with methodology and known limitations** — even if not #1. If the declarative + RBAC approach scores well, that's the differentiation made concrete. The repo already operates this way (measured gates, published misses); this extends it.
 
 ### Tier 2 — depth (the moat matured)
 

@@ -129,8 +129,8 @@ process on the machine above, synthetic hash-chain embeddings.
 | Path | Reported (production) | mushroomdb this run |
 |---|---|---|
 | Talent→Company matcher (Big-3) | 5+ second queries | p50=7.1 µs p95=15.5 µs mean_matches=0.0 — intersection empty (matcher rules not live at this scale) |
-| Search fan-out | 14 sharded Meilisearch indices + in-memory merge | derived-edge `neighbors` on declared rules |
-| Semantic / vector | Meili `_vectors` 1536-dim | exact: extrapolated (full=False); approx: 7.81 min recall=0.080 |
+| Search fan-out | 14 sharded a named system indices + in-memory merge | derived-edge `neighbors` on declared rules |
+| Semantic / vector | a named system `_vectors` 1536-dim | exact: extrapolated (full=False); approx: 7.81 min recall=0.080 |
 | Ingest 100k | (not published) | 1.37 min peak 4.12 GiB (ingest_batch 10k chunks) |
 
 ## Findings

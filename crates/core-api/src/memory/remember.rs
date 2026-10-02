@@ -1,0 +1,814 @@
+//! `remember` — write a `Note` the graph can later `recall`.
+//!
+//! Unlike the code-graph `remember` this module superseded, deleted in 0.7 with
+//! the rest of that module, an `about` key here is not required to already
+//! exist: a fact may name its subject before anything has described that
+//! subject. A missing key is stubbed as a provisional entity
+//! (`memory_schema::PROVISIONAL_LABEL`, `memory_schema::PROVISIONAL_PROP`)
+//! rather than refusing the whole call — the store learns the shape of what it
+//! does not yet know. `facts[]` endpoints get the identical stub, not a bare
+//! `insert_edge_upsert` auto-create: an unnamed, unmarked node from a typo'd
+//! `object` would be unfindable by the same `provisional` query that surfaces
+//! every other guess this module makes (fix round 1, 0.7).
+//!
+//! Everything one call writes — the entities the caller recognised, the note,
+//! the `ABOUT` edges linking the note to `about`, and the facts among those
+//! entities — goes through one [`GraphDb::batch`] commit, in that order: an
+//! `about` key or a fact endpoint that is also named in `entities` (or, for a
+//! fact endpoint, also in `about`) is created as the real entity the caller
+//! described, not a provisional stub, because the entity ops are queued (and
+//! their keys become visible to the batch's own validation) before the
+//! `about` keys and the facts' own endpoints are resolved.
+
+use crate::memory::identity::{
+    aliases_value, derive_aliases, identity_props_after_write, same_as_lost, same_as_pairs,
+    SameAsPair, ALIASES_FIELD,
+};
+use crate::memory_schema::{NAME_FIELD, PROVISIONAL_LABEL, PROVISIONAL_PROP};
+use crate::{GraphDb, NS_PROP};
+use core_storage::fs::Fs;
+use core_storage::{GraphError, Result, Value};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+
+/// Text length bounds, in characters, after trimming.
+const MIN_TEXT_CHARS: usize = 1;
+const MAX_TEXT_CHARS: usize = 4000;
+
+/// The `kind` values a `Note` may carry.
+pub const NOTE_KINDS: [&str; 3] = ["note", "decision", "todo"];
+
+/// The `kind` a note gets when the caller names none.
+pub const DEFAULT_NOTE_KIND: &str = "note";
+
+/// Unix seconds now — the `ts` a note gets when the caller names none. `0`
+/// on a clock set before 1970 rather than a panic.
+#[must_use]
+pub fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Drop repeats from `keys`, keeping the first of each and the order — the
+/// order `remember` reports `provisional` keys in.
+pub fn dedup_keep_order(keys: &mut Vec<String>) {
+    let mut seen = BTreeSet::new();
+    keys.retain(|k| seen.insert(k.clone()));
+}
+
+/// The edge type linking a `Note` to what it is about.
+const ABOUT_EDGE: &str = "ABOUT";
+
+/// The `source` a note is stamped with when the caller supplies none.
+const DEFAULT_SOURCE: &str = "agent";
+
+/// Ceiling on the store's total declared full-text surface — the defaults
+/// `memory_defaults()` ships (8: the five entity labels, `Note.text`,
+/// `Concept.summary`, `Entity.name`) plus whatever `remember` self-declares
+/// for an `entities[].label` outside those. See the self-declare comment in
+/// [`remember`] for why this is bounded rather than unlimited.
+const MAX_FULLTEXT_PAIRS: usize = 32;
+
+/// Ceiling on provisional stubs one `remember` call may create — `about`
+/// keys and `facts[]` endpoints combined, counted in resolution order
+/// (`about` before `facts`). Spec §3.2's own guard: "a cap per commit, so a
+/// malformed batch cannot flood the graph."
+///
+/// A real extraction from one conversation turn names at most a handful of
+/// unknown subjects — `about` typically carries one to a few keys, and
+/// `facts[]` rarely introduces more than a couple more that `entities`
+/// didn't already cover — so this is generous against that shape and tight
+/// against the shape of a bug: a loop that built `facts` from a cross
+/// product, or a caller that fed a whole document's worth of names into
+/// `about` at once. 20 is comfortably above any single legitimate call and
+/// well short of "the graph is now full of typos."
+///
+/// Past the cap, the note and everything else valid in the call still
+/// commits — a caller's one bad key should not cost the whole write, the
+/// same reasoning that makes an unknown key provisional instead of a refusal
+/// in the first place — but a key that would have been stubbed is not: no
+/// node is created for it, and no edge (`ABOUT` or a fact's own) names it
+/// either, since that edge's endpoint would not exist. It is listed in
+/// [`RememberReport::provisional_capped`], so the caller is told plainly
+/// rather than discovering a silently short digest later — the same
+/// "unmistakable, not a quiet field" standard the label-mismatch fix in
+/// `upsert_entity` was held to.
+const MAX_PROVISIONAL_PER_COMMIT: usize = 20;
+
+/// One entity the caller recognised in the text.
+///
+/// Create-or-update, same as [`describe_entity`]: a `key` already in the
+/// store is described (its `props` set, its provisional mark cleared if it
+/// had one) rather than re-created.
+#[derive(Debug, Clone)]
+pub struct EntityIn {
+    pub key: String,
+    pub label: String,
+    pub props: BTreeMap<String, Value>,
+    /// Other names the caller knows this entity by. Kept as declared in the
+    /// node's `alias_keys` list, which links a provisional stub keyed exactly
+    /// so. They do not enter `aliases`, which holds only what the key and the
+    /// name imply; see [`crate::memory::identity`].
+    pub aliases: Vec<String>,
+}
+
+/// One relationship the caller recognised, between keys named in `entities`
+/// or `about`.
+///
+/// `subject`/`object` need not already exist — same provisional treatment as
+/// an unknown `about` key — so a fact can arrive before either endpoint has
+/// been described.
+#[derive(Debug, Clone)]
+pub struct FactIn {
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+}
+
+/// What to remember.
+pub struct RememberInput<'a> {
+    /// The note's text, trimmed to [`MIN_TEXT_CHARS`]..=[`MAX_TEXT_CHARS`]
+    /// characters.
+    pub text: &'a str,
+    /// Keys the note is about. A key that does not exist yet is created as a
+    /// provisional entity rather than refusing the call.
+    pub about: &'a [String],
+    /// One of [`NOTE_KINDS`].
+    pub kind: &'a str,
+    /// Unix seconds the note was written at. Part of the note's key, so
+    /// remembering the same text again at the same `ts` is a no-op rather
+    /// than a duplicate. Caller-supplied so a fact imported from a
+    /// transcript is stamped with when it was said, not when it was
+    /// imported.
+    pub ts: i64,
+    /// Where this came from — a session id, a file, a person. `None`
+    /// defaults to `"agent"`, the only value this ever stored before 0.7.
+    pub source: Option<&'a str>,
+    /// Entities the caller recognised in the text, written in the same
+    /// commit as the note.
+    pub entities: &'a [EntityIn],
+    /// Relationships the caller recognised, written in the same commit as
+    /// the note.
+    pub facts: &'a [FactIn],
+}
+
+/// Everything one `remember` call writes.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RememberReport {
+    /// The note's key.
+    pub note: String,
+    /// Entities this call brought into existence.
+    pub created: usize,
+    /// `about` keys and entities that already existed.
+    pub matched: usize,
+    /// Derived edges the rules produced for this commit, incident on the
+    /// *note* — edges the engine's rule provenance attributes to a rule,
+    /// never one this call inserted itself (`ABOUT`, a fact's own edge, or a
+    /// provisional stub have no rule and never count here). `memory_defaults()`
+    /// ships with zero rules, so this is `0` against a plain memory store — and
+    /// it stays `0` with the identity preset applied: its `SAME_AS` rules link
+    /// entity labels, never a note, and are reported in
+    /// [`same_as`](Self::same_as) instead. This field only moves once a rule
+    /// exists whose predicate can match the note itself — such as an
+    /// `about_<label>` rule `ingest-git` declared before 0.7, which derives the
+    /// note's `ABOUT` edge (counted here, on the commit that derived it) in
+    /// place of the insert this call would otherwise make.
+    pub derived: usize,
+    /// `about` keys and fact endpoints that had to be stubbed, in the order
+    /// each was first seen (`about` before `facts`).
+    pub provisional: Vec<String>,
+    /// `about` keys and fact endpoints that would have been stubbed but were
+    /// refused instead — [`MAX_PROVISIONAL_PER_COMMIT`] was already spent by
+    /// the time this call reached them. Neither the node nor any edge naming
+    /// it exists; everything else in the call still committed. Empty on
+    /// every call this cap does not bind.
+    pub provisional_capped: Vec<String>,
+    /// Entity labels full-text search had never seen before this call, now
+    /// declared on `(label, "name")` so `recall` can reach them — the same
+    /// self-declare `Note.text` gets, extended to `entities[].label`. Empty
+    /// on every call that named no unseen label, or that found
+    /// [`MAX_FULLTEXT_PAIRS`] already spent.
+    pub fulltext_declared: Vec<String>,
+    /// `SAME_AS` claims this call created, between an entity or stub it
+    /// wrote and any other node — one entry per pair, whichever directions
+    /// the rules derived. Empty on a store without the identity preset
+    /// (`memory_schema::memory_identity`). This is what tells the caller its
+    /// extraction agreed with something the store already held.
+    pub same_as: Vec<SameAsPair>,
+    /// `SAME_AS` claims this call retracted: pairs that linked an entity it
+    /// wrote before the commit and do not after it, each with the score it
+    /// had. `aliases` is recomputed from the key and the current name, so a
+    /// write that changes a name can take a full-name link below the floor,
+    /// and so can the first write to a node whose `aliases` held items its
+    /// key and name do not imply. Reported so a write that costs an identity
+    /// says so, rather than only naming what it gained.
+    pub same_as_lost: Vec<SameAsPair>,
+}
+
+/// Refuse a key that is empty, or only whitespace: it names nothing, and a
+/// node created under it is one no caller meant (defect 76). The same goes
+/// for a fact's predicate and an entity's label, which become an edge type
+/// and a node label (defect 77). `argument` says which argument held it and
+/// is only built for the refusal.
+///
+/// A value with text between its padding is not this function's business: it
+/// is stored as given.
+fn refuse_blank(value: &str, argument: impl FnOnce() -> String) -> Result<()> {
+    if value.trim().is_empty() {
+        return Err(GraphError::IngestError {
+            detail: format!(
+                "{} must not be empty or only whitespace, got {value:?}",
+                argument()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Create-or-update one entity, clearing any provisional mark.
+///
+/// Upsert semantics lived only in `tool_upsert_entity` before 0.7, so HTTP
+/// and Python had no upsert and could not clear a provisional mark. This is
+/// the one implementation: [`upsert_entity`] adds the caller-facing policy on
+/// top of it, and both the MCP tool and the Python binding's `upsert_entity`
+/// call that. HTTP still has no entity upsert — `POST /nodes` is a raw node
+/// write that does not come through here.
+///
+/// `label` is used only when `key` does not already exist — an update never
+/// changes a node's label. A subject stops being provisional the moment
+/// anything describes it, whoever does the describing, so the clearing lives
+/// here rather than in any one caller: `remove_prop` is `Ok(false)` and logs
+/// nothing when the field is already absent, so this is unconditional and
+/// free on a node that was never provisional.
+///
+/// A create passes `props` straight to [`GraphDb::insert_node`] rather than
+/// inserting bare and following up with [`GraphDb::set_props`]: a namespace
+/// is set at insert and immutable after, so a caller-supplied `ns` reaching
+/// `set_props` on a node that already exists (even one this same call just
+/// created) is the engine's `NamespaceImmutable` refusal rather than the
+/// no-op it should be.
+pub fn describe_entity<F: Fs>(
+    db: &mut GraphDb<F>,
+    key: &str,
+    label: Option<&str>,
+    props: &[(String, Value)],
+) -> Result<bool> {
+    describe_entity_with_aliases(db, key, label, props, &[])
+}
+
+/// [`describe_entity`], with aliases the caller knows the entity by.
+///
+/// Either way the node's `aliases` list is recomputed from its key and its
+/// name ([`crate::memory::identity`]), and left untouched when it already
+/// says exactly that; `aliases` as declared are added to its `alias_keys`
+/// list and to nothing else. A `props` entry named `aliases` or `alias_keys`
+/// is refused before anything is written, and so is a `key` or a `label`
+/// that is empty or only whitespace.
+pub fn describe_entity_with_aliases<F: Fs>(
+    db: &mut GraphDb<F>,
+    key: &str,
+    label: Option<&str>,
+    props: &[(String, Value)],
+    aliases: &[String],
+) -> Result<bool> {
+    refuse_blank(key, || "key".to_string())?;
+    if let Some(label) = label {
+        refuse_blank(label, || "label".to_string())?;
+    }
+    let mut props = props.to_vec();
+    let identity = identity_props_after_write(db, key, &props, aliases)?;
+    props.extend(identity);
+    if db.has_node(key) {
+        if !props.is_empty() {
+            db.set_props(key, props)?;
+        }
+        let _ = db.remove_prop(key, PROVISIONAL_PROP)?;
+        Ok(false)
+    } else {
+        db.insert_node(label.unwrap_or(PROVISIONAL_LABEL), key, props)?;
+        let _ = db.remove_prop(key, PROVISIONAL_PROP)?;
+        Ok(true)
+    }
+}
+
+/// What one [`upsert_entity`] call did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpsertOutcome {
+    /// The label the node carries: the one given on a create, the stored one
+    /// on an update.
+    pub label: String,
+    /// True when the node did not exist before this call.
+    pub created: bool,
+    /// Properties this call set on an existing node. `0` on a create. The
+    /// namespace a node is already in is not counted: it writes no record.
+    pub updated_fields: usize,
+    /// `SAME_AS` claims the node held before an update and does not after it.
+    /// Empty on a create and on a store without the identity preset.
+    pub same_as_lost: Vec<SameAsPair>,
+}
+
+/// Create or update one entity by key, with the policy every surface shares.
+///
+/// - `id` is never taken from `row`: on a create it is set to `key`, and on
+///   an update it is left alone.
+/// - A create needs `label`. An update never changes one: a `label` that
+///   differs from the stored one is refused before anything is written, so
+///   nothing in `row` is applied either.
+/// - A `row` entry `ns` equal to the namespace the node is already in is the
+///   engine's no-op and is not counted as an update; a different one is the
+///   engine's `NamespaceImmutable` refusal.
+/// - Aliases are maintained and a provisional mark is cleared, as
+///   [`describe_entity_with_aliases`] does.
+/// - A `key` that is empty or only whitespace is refused before anything is
+///   read or written, whether or not a node is stored under it.
+/// - A create under a `label` that is empty or only whitespace is refused
+///   before anything is written, by [`describe_entity_with_aliases`]. On an
+///   update such a label is the relabel refusal above, like any other label
+///   the node does not carry.
+///
+/// Reads and writes on the one `&mut` handle, so the existence check and the
+/// write cannot be separated by another writer.
+///
+/// # Errors
+/// [`GraphError::IngestError`] for the four policy refusals, with the whole
+/// sentence in `detail`; any engine refusal, as it came.
+pub fn upsert_entity<F: Fs>(
+    db: &mut GraphDb<F>,
+    key: &str,
+    label: Option<&str>,
+    mut row: BTreeMap<String, Value>,
+    aliases: &[String],
+) -> Result<UpsertOutcome> {
+    refuse_blank(key, || "key".to_string())?;
+    row.remove("id");
+    if db.has_node(key) {
+        // The label actually stored — an update never changes it. Checked,
+        // and refused, before anything else: a `label` that disagrees is not
+        // a request this call can honor at all, so it does not partially
+        // apply the rest of `row` either.
+        let stored_label = db
+            .node_ref(key)
+            .map(|n| n.label().to_string())
+            .unwrap_or_default();
+        if let Some(requested) = label {
+            if requested != stored_label {
+                return Err(GraphError::IngestError {
+                    detail: format!(
+                        "'{key}' exists as {stored_label:?}, not {requested:?}; this release \
+                         cannot relabel a node. Pass the label in remember's 'entities' when you \
+                         know it (at first mention, before it goes provisional), or use a \
+                         different key."
+                    ),
+                });
+            }
+        }
+        let mut to_set: Vec<(String, Value)> = Vec::new();
+        for (field, v) in row {
+            // The namespace a node is already in is the engine's no-op: it
+            // writes no record and takes no commit, so counting it as an
+            // updated field would report an update that did not happen.
+            // Asking first also keeps the refusal for a *different* namespace
+            // coming from the engine rather than from a second rule stated
+            // here.
+            if field == NS_PROP && Some(&v) == db.namespace_of(key).map(Value::Str).as_ref() {
+                continue;
+            }
+            to_set.push((field, v));
+        }
+        let updated_fields = to_set.len();
+        // The node's `SAME_AS` claims either side of the write, so the
+        // outcome can name the links this update retracted: a changed name
+        // takes a full-name link below the floor.
+        let keys = [key.to_string()];
+        let same_as_before = same_as_pairs(db, &keys);
+        describe_entity_with_aliases(db, key, None, &to_set, aliases)?;
+        let same_as_lost = same_as_lost(&same_as_before, &same_as_pairs(db, &keys));
+        Ok(UpsertOutcome {
+            label: stored_label,
+            created: false,
+            updated_fields,
+            same_as_lost,
+        })
+    } else {
+        let Some(label) = label else {
+            return Err(GraphError::IngestError {
+                detail: "label required when creating a new entity".into(),
+            });
+        };
+        row.insert("id".to_string(), Value::Str(key.to_string()));
+        let props: Vec<(String, Value)> = row.into_iter().collect();
+        describe_entity_with_aliases(db, key, Some(label), &props, aliases)?;
+        Ok(UpsertOutcome {
+            label: label.to_string(),
+            created: true,
+            updated_fields: 0,
+            same_as_lost: Vec::new(),
+        })
+    }
+}
+
+/// Write `input` as a `Note`, describing whatever it names along the way.
+///
+/// Validated before anything is written: `text` must be
+/// [`MIN_TEXT_CHARS`]..=[`MAX_TEXT_CHARS`] characters after trimming, and
+/// `kind` must be one of [`NOTE_KINDS`]. Unlike the code-graph `remember`
+/// 0.7 deleted, an unknown `about` key is never an error — see the module
+/// docs. A key that is empty or only whitespace is one: in `about`, as an
+/// `entities[].key` or as a fact's `subject` or `object` it refuses the
+/// whole call, naming the argument and its position, and nothing is written.
+/// So is an `entities[].label` or a fact's `predicate` with nothing in it.
+///
+/// The note's key is `"note:"` followed by 16 hex characters of a stable
+/// 64-bit hash of `ts` and `text` (see [`note_key`]), so remembering the
+/// same text at the same `ts` again returns the same key without writing a
+/// second node.
+///
+/// Also ensures full-text search is enabled on `Note.text`, so a store whose
+/// very first write is a `remember` call can still be recalled from.
+pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result<RememberReport> {
+    let text = input.text.trim();
+    let len = text.chars().count();
+    if !(MIN_TEXT_CHARS..=MAX_TEXT_CHARS).contains(&len) {
+        return Err(GraphError::IngestError {
+            detail: format!(
+                "remember: text must be {MIN_TEXT_CHARS}..={MAX_TEXT_CHARS} characters \
+                 after trimming, got {len}"
+            ),
+        });
+    }
+    if !NOTE_KINDS.contains(&input.kind) {
+        return Err(GraphError::IngestError {
+            detail: format!(
+                "remember: kind must be one of {}, got {:?}",
+                NOTE_KINDS.join(", "),
+                input.kind
+            ),
+        });
+    }
+    // Every key this call could create a node under or link a note to, and
+    // every label and predicate it could create a node or an edge under,
+    // before anything below reads the store or declares full-text: one with
+    // nothing in it would otherwise be written like any other.
+    for (i, k) in input.about.iter().enumerate() {
+        refuse_blank(k, || format!("remember: about[{i}]"))?;
+    }
+    for (i, entity) in input.entities.iter().enumerate() {
+        refuse_blank(&entity.key, || format!("remember: entities[{i}].key"))?;
+        refuse_blank(&entity.label, || format!("remember: entities[{i}].label"))?;
+    }
+    for (i, fact) in input.facts.iter().enumerate() {
+        refuse_blank(&fact.subject, || format!("remember: facts[{i}].subject"))?;
+        refuse_blank(&fact.predicate, || {
+            format!("remember: facts[{i}].predicate")
+        })?;
+        refuse_blank(&fact.object, || format!("remember: facts[{i}].object"))?;
+    }
+
+    // Each entity's `aliases` and `alias_keys` after this call, as the
+    // properties to set: `aliases` recomputed from the key and the name,
+    // `alias_keys` what the node holds united with what this call declares,
+    // each absent when the stored list is already exactly that. Computed before anything below declares full-text, so a
+    // call refused here (an `aliases` or `alias_keys` property, or more than
+    // either cap) declares nothing new either; and before `db.batch()` takes
+    // `db` mutably, because it reads the store.
+    let entity_identity: Vec<Vec<(String, Value)>> = input
+        .entities
+        .iter()
+        .map(|e| {
+            let props: Vec<(String, Value)> = e
+                .props
+                .iter()
+                .map(|(f, v)| (f.clone(), v.clone()))
+                .collect();
+            identity_props_after_write(db, &e.key, &props, &e.aliases)
+        })
+        .collect::<Result<_>>()?;
+
+    let mut fulltext = db.fulltext_pairs();
+    if !fulltext.contains(&("Note".to_string(), "text".to_string())) {
+        db.enable_fulltext("Note", "text")?;
+        fulltext.push(("Note".to_string(), "text".to_string()));
+    }
+
+    // Self-declare full-text for an `entities[].label` full-text has never
+    // seen — the same fix `Note.text` gets above, extended to entities.
+    // `memory_defaults()` declares `(label, "name")` for exactly the five
+    // built-in labels (`Person`, `Org`, `Project`, `Concept`, `Event`) plus
+    // the provisional label; `entities[].label` is free-form (the spec's own
+    // worked example, `{key:"v0.7", label:"Release"}`, uses a sixth), so an
+    // entity under any other label landed with a `name` no `recall` could
+    // ever reach — spec §1.1(b)'s defect, reproduced through this release's
+    // own new feature (fix round 2, 0.7).
+    //
+    // Bounded by `MAX_FULLTEXT_PAIRS`: `enable_fulltext`'s declaration is
+    // rebuilt from scratch on every re-open (227 ms measured against 3.8 ms
+    // with none, at a small declared surface — `memory_schema`'s module
+    // doc), and `entities[].label` is a caller-supplied string with no
+    // schema behind it — a well-behaved caller uses a handful of distinct
+    // labels, but nothing stops a run of calls from feeding a fresh one each
+    // time and growing the declared surface, and every future open's cost,
+    // without bound. Past the cap a new label's entity is still written and
+    // reported exactly as any other — only made not full-text-searchable
+    // yet, a bounded-cost degradation rather than a refusal.
+    let mut fulltext_declared: Vec<String> = Vec::new();
+    {
+        let mut declared_this_call: BTreeSet<&str> = BTreeSet::new();
+        for entity in input.entities {
+            let label = entity.label.as_str();
+            if !declared_this_call.insert(label) {
+                continue;
+            }
+            let pair = (label.to_string(), NAME_FIELD.to_string());
+            if fulltext.contains(&pair) || fulltext.len() >= MAX_FULLTEXT_PAIRS {
+                continue;
+            }
+            db.enable_fulltext(label, NAME_FIELD)?;
+            fulltext.push(pair);
+            fulltext_declared.push(label.to_string());
+        }
+    }
+
+    let source = input.source.unwrap_or(DEFAULT_SOURCE).to_string();
+    let key = note_key(input.ts, text);
+
+    // Deduped, first-occurrence order kept: that is the order
+    // `RememberReport::provisional` promises the caller.
+    let mut about: Vec<String> = Vec::with_capacity(input.about.len());
+    {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for k in input.about {
+            if seen.insert(k.as_str()) {
+                about.push(k.clone());
+            }
+        }
+    }
+    let entity_keys: BTreeSet<&str> = input.entities.iter().map(|e| e.key.as_str()).collect();
+
+    // Every existence check happens before `db.batch()` takes `db` mutably
+    // below — batch validation sees only ops queued earlier in the same
+    // frame, not the live store, so "does this already exist" has to be
+    // asked of the store now.
+    let entity_existed: Vec<bool> = input.entities.iter().map(|e| db.has_node(&e.key)).collect();
+    let about_existed: Vec<Option<bool>> = about
+        .iter()
+        .map(|k| {
+            if entity_keys.contains(k.as_str()) {
+                // Resolved by the `entities` loop below instead.
+                None
+            } else {
+                Some(db.has_node(k))
+            }
+        })
+        .collect();
+    let note_existed = db.has_node(&key);
+    // The note's edges as they stand, for two answers below: which `about`
+    // links already exist (step 4), and how many derived edges were there
+    // before this commit (so `derived` counts only what it produced).
+    let (already_about, derived_before): (BTreeSet<String>, usize) = if note_existed {
+        let edges = db.node_edges(&key)?;
+        (
+            edges
+                .iter()
+                .filter(|e| e.edge_type == ABOUT_EDGE && e.src_key == key)
+                .map(|e| e.dst_key.clone())
+                .collect(),
+            edges.iter().filter(|e| e.derived).count(),
+        )
+    } else {
+        (BTreeSet::new(), 0)
+    };
+
+    // Facts' endpoints not already named in `entities` or `about`: existence
+    // is checked now, before the batch, same as above. One not seen anywhere
+    // gets exactly the `about` path's provisional treatment — a stub with a
+    // `name` and `provisional: true`, reported in `provisional` — rather than
+    // the bare, unmarked node `insert_edge_upsert`'s own auto-create would
+    // otherwise leave behind with no signal anywhere that it was guessed.
+    let known: BTreeSet<&str> = entity_keys
+        .iter()
+        .copied()
+        .chain(about.iter().map(String::as_str))
+        .collect();
+    let mut fact_endpoints: Vec<&str> = Vec::new();
+    {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for fact in input.facts {
+            for k in [fact.subject.as_str(), fact.object.as_str()] {
+                if !known.contains(k) && seen.insert(k) {
+                    fact_endpoints.push(k);
+                }
+            }
+        }
+    }
+    let fact_endpoint_existed: Vec<bool> = fact_endpoints.iter().map(|k| db.has_node(k)).collect();
+
+    // `SAME_AS` claims already touching what this call writes, so the report
+    // names only the ones this commit made — and the ones it retracted. Stubs
+    // are new by definition, so only the entities can have any yet.
+    let entity_key_list: Vec<String> = input.entities.iter().map(|e| e.key.clone()).collect();
+    let same_as_before = same_as_pairs(db, &entity_key_list);
+
+    let mut report = RememberReport {
+        note: key.clone(),
+        fulltext_declared,
+        ..Default::default()
+    };
+
+    let mut batch = db.batch();
+
+    // Shared across steps 2 and 5: one `MAX_PROVISIONAL_PER_COMMIT` budget
+    // for `about` and `facts[]` combined, `about` spent first. `capped`
+    // collects a key the budget ran out on so steps 4 and 6 can skip the
+    // edge that would otherwise name a node this call never created.
+    let mut provisional_count = 0usize;
+    let mut capped: BTreeSet<String> = BTreeSet::new();
+
+    // 1. Entities first, so an `about` key also named here lands as the real
+    //    entity rather than a provisional stub.
+    for ((entity, existed), identity) in input
+        .entities
+        .iter()
+        .zip(&entity_existed)
+        .zip(&entity_identity)
+    {
+        if *existed {
+            for (field, value) in &entity.props {
+                batch.set_prop(&entity.key, field, value.clone());
+            }
+            for (field, value) in identity {
+                batch.set_prop(&entity.key, field, value.clone());
+            }
+            report.matched += 1;
+        } else {
+            // Straight to `insert_node`, not an empty insert followed by
+            // `set_props` — see `describe_entity`'s doc comment for why an
+            // insert-time-only field (a namespace) would otherwise be
+            // refused rather than accepted.
+            let mut props: Vec<(String, Value)> = entity
+                .props
+                .iter()
+                .map(|(f, v)| (f.clone(), v.clone()))
+                .collect();
+            props.extend(identity.iter().cloned());
+            batch.insert_node(&entity.label, &entity.key, props);
+            report.created += 1;
+        }
+        batch.remove_prop(&entity.key, PROVISIONAL_PROP);
+    }
+
+    // 2. Provisional stubs for `about` keys `entities` did not already cover
+    //    — bounded by `MAX_PROVISIONAL_PER_COMMIT` (see its doc comment).
+    for (k, status) in about.iter().zip(&about_existed) {
+        match status {
+            None => {}
+            Some(true) => report.matched += 1,
+            Some(false) => {
+                if provisional_count < MAX_PROVISIONAL_PER_COMMIT {
+                    batch.insert_node(PROVISIONAL_LABEL, k, stub_props(k));
+                    report.provisional.push(k.clone());
+                    provisional_count += 1;
+                } else {
+                    report.provisional_capped.push(k.clone());
+                    capped.insert(k.clone());
+                }
+            }
+        }
+    }
+
+    // 3. The note. `about` here is the caller's full, literal claim — a key
+    //    the cap refused stays listed, even though its edge (step 4) is not
+    //    written: the note is a record of what it was told, not only of what
+    //    could be linked, matching this store's audit-trail default (spec
+    //    §3.2, O-4). `report.provisional_capped` is the place that tells the
+    //    caller which of these has no edge.
+    if !note_existed {
+        let mut props: Vec<(String, Value)> = vec![
+            ("id".into(), Value::Str(key.clone())),
+            ("text".into(), Value::Str(text.to_string())),
+            ("kind".into(), Value::Str(input.kind.to_string())),
+            ("ts".into(), Value::Int(input.ts)),
+            ("source".into(), Value::Str(source)),
+        ];
+        if !about.is_empty() {
+            props.push((
+                "about".into(),
+                Value::List(about.iter().cloned().map(Value::Str).collect()),
+            ));
+        }
+        batch.insert_node("Note", &key, props);
+    }
+
+    // 4. ABOUT edges, note -> each about key that actually exists. A key the
+    //    cap refused (step 2) is skipped — its node was never created, so
+    //    the edge can't be either — and a link that already exists is left
+    //    alone. That covers the duplicate (the note already existed and
+    //    named the same `about` before) and, on a store carrying a 0.6
+    //    `about_*` rule, an edge that rule derived and owns: inserting it
+    //    again would be refused as a write to a rule-owned edge.
+    for k in &about {
+        if capped.contains(k) || already_about.contains(k) {
+            continue;
+        }
+        batch.insert_edge(ABOUT_EDGE, &key, k);
+    }
+
+    // 5. Provisional stubs for fact endpoints `entities`/`about` did not
+    //    already cover — same shape as step 2, same shared
+    //    `MAX_PROVISIONAL_PER_COMMIT` budget (`about` already spent its
+    //    share above), so a typo'd `facts[].object` is as visible and as
+    //    findable as an unknown `about` key, not a nameless, unmarked node
+    //    with no report entry anywhere — up to the same per-commit cap.
+    for (k, existed) in fact_endpoints.iter().zip(&fact_endpoint_existed) {
+        if *existed {
+            continue;
+        }
+        if provisional_count < MAX_PROVISIONAL_PER_COMMIT {
+            batch.insert_node(PROVISIONAL_LABEL, k, stub_props(k));
+            report.provisional.push((*k).to_string());
+            provisional_count += 1;
+        } else {
+            report.provisional_capped.push((*k).to_string());
+            capped.insert((*k).to_string());
+        }
+    }
+
+    // 6. Facts whose endpoints all exist — described above, already in the
+    //    store, or just stubbed. A fact naming an endpoint the cap refused
+    //    (step 5) is skipped whole: that endpoint does not exist, so the
+    //    edge can't either.
+    for fact in input.facts {
+        if capped.contains(&fact.subject) || capped.contains(&fact.object) {
+            continue;
+        }
+        batch.insert_edge(&fact.predicate, &fact.subject, &fact.object);
+    }
+
+    batch.commit()?;
+
+    // `commit()`'s own (nodes, edges) counts are the ops this call queued,
+    // not what any live rule derived from them — read the note's edges back
+    // and ask the engine which ones it owns.
+    let derived_after = db
+        .node_edges(&key)?
+        .into_iter()
+        .filter(|e| e.derived)
+        .count();
+    report.derived = derived_after.saturating_sub(derived_before);
+
+    let mut touched = entity_key_list;
+    touched.extend(report.provisional.iter().cloned());
+    let same_as_after = same_as_pairs(db, &touched);
+    report.same_as_lost = same_as_lost(&same_as_before, &same_as_after);
+    report.same_as = same_as_after
+        .into_iter()
+        .filter(|p| !same_as_before.iter().any(|b| b.a == p.a && b.b == p.b))
+        .collect();
+
+    Ok(report)
+}
+
+/// A provisional stub's properties: its key as its `name`, the
+/// `provisional` mark, and the aliases that name implies.
+fn stub_props(key: &str) -> Vec<(String, Value)> {
+    vec![
+        (NAME_FIELD.to_string(), Value::Str(key.to_string())),
+        (PROVISIONAL_PROP.to_string(), Value::Bool(true)),
+        (
+            ALIASES_FIELD.to_string(),
+            aliases_value(&derive_aliases(key, Some(key))),
+        ),
+    ]
+}
+
+/// The key one `remember` call writes to: `"note:"` followed by 16 hex
+/// characters of a 64-bit FNV-1a hash of `ts` and `text`.
+///
+/// Same construction as the code-graph `note_key` 0.7 deleted, so a note
+/// written by 0.6 and the same `ts` and `text` remembered by 0.7 share one
+/// key. FNV-1a rather than `blake3` for the
+/// same dependency reason: `blake3` is confined to `crates/code-extract`,
+/// which `core-api` cannot depend on.
+fn note_key(ts: i64, text: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    for b in ts.to_string().bytes().chain(text.bytes()) {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    format!("note:{h:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_key_is_a_function_of_ts_and_text_alone() {
+        assert_eq!(note_key(1, "a"), note_key(1, "a"));
+        assert_ne!(note_key(1, "a"), note_key(2, "a"));
+        assert_ne!(note_key(1, "a"), note_key(1, "b"));
+        assert!(note_key(1, "a").strip_prefix("note:").unwrap().len() == 16);
+    }
+}

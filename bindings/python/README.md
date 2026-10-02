@@ -29,6 +29,22 @@ stored one. Fields you omit are left alone, and unchanged fields produce no WAL
 record, so rules do not re-fire needlessly. An existing key under a different
 label raises `ValueError` — relabelling is not an upsert.
 
+To change properties on many nodes, use one call rather than one per node:
+
+```python
+db.set_props_many([("alice", {"score": 3}), ("bob", {"score": 5, "stale": None})])
+# {"nodes": 2, "props_set": 2, "props_removed": 1}
+```
+
+It is one commit: unchanged values write nothing, an unknown key raises
+`KeyNotFound` and nothing is written, and rules fire on what changed inside
+that commit. `wal_total_commits()` moves by one frame, or by two when a rule
+derived or retracted an edge — never by the number of nodes.
+
+It is a raw property write, like `set_prop`. On an entity node, `name` and the
+two alias lists are maintained by `upsert_entity` and `remember`: a `name`
+written here is not reflected in `aliases` until the next describing write.
+
 ## Querying
 
 `query` and `query_write` both accept parameters as a `dict`, as a list of
@@ -63,6 +79,13 @@ It shares the parent's store and mutex — not a second open, no second lock —
 and refuses every write. Legs intersect, so `scoped()` on a scoped handle
 narrows further and can never widen; an unknown `role` raises at `scoped()`,
 not on the first read. `refresh()` is allowed: it writes nothing.
+
+A read that answers about the whole store takes no mask, so a scoped handle
+**refuses** it with `ValueError` rather than narrow it: `pagerank`,
+`connected_components`, `degree_centrality`, `communities`, `search`,
+`fulltext_pairs`, `rules`, `suggest_rules`, `recall`, `schema_report`,
+`identity_clusters` and `roles`. `is_fulltext_enabled` answers: it is a schema
+fact about a pair you named.
 
 Every read obeys one contract: **the subject is checked first, so a key outside
 the scope is indistinguishable from a key that does not exist.** `node_info`
@@ -118,10 +141,11 @@ When no approximate rule covers the field — check with
 `has_vector_rule("embedding")` — every call is already an exact brute-force
 scan.
 
-**`min` defaults to `0.0` here and to `0.8` in the MCP `find_similar` tool.**
-Same operation, same name, different results, and nothing raises. Pass `min`
-explicitly if a call moves between the two surfaces. HTTP `POST /find_similar`
-follows this binding and defaults to `0.0`.
+**`min` defaults to `0.8`** — here, in the MCP `find_similar` tool and on HTTP
+`POST /find_similar`. Through 0.6 this binding and HTTP defaulted to `0.0`: a
+call that never named `min` now drops every hit below `0.8`, and nothing
+raises. Pass `min=0.0` for the old behaviour. `pairwise_similar` still defaults
+to `0.0`.
 
 **`where=` uses the property index only when a `label` accompanies it.** The
 index is keyed on `(label, field)`, so both `label=` and a prior
@@ -188,6 +212,98 @@ The Rust-native externally-tagged form is still accepted:
 `create_rule` returns `True` when it created the rule. Pass
 `if_not_exists=True` to get `False` instead of an exception when a rule of that
 name is already registered.
+
+### Listing, deleting, rebuilding, proposing
+
+```python
+db.rules()                    # every rule, as dicts create_rule accepts
+db.delete_rule("same_team")   # and every edge it derived
+db.rebuild_rule("same_team")  # the way out of a tripped rule
+for s in db.suggest_rules()["suggestions"]:
+    print(s["name"], s["est_edges"], s["rationale"])
+    # db.create_rule(s["create_rule_args"])  — nothing is created until you do
+```
+
+`suggest_rules()` never proposes a rule over a field the store writes for
+itself, and each proposal's `create_rule_args` creates the same rule here as
+it does through the MCP `create_rule` tool.
+
+## Full-text search
+
+```python
+db.enable_fulltext("Doc", "body", if_not_exists=True)
+db.search("body", 'graph OR "property index"', k=10)   # [(key, score), ...]
+db.fulltext_pairs()                                    # [("Doc", "body")]
+db.is_fulltext_enabled("Doc", "body")                  # True
+db.disable_fulltext("Doc", "body")                     # the index and its postings
+```
+
+`search` is keyed by field alone: two labels indexed on the same field name
+are searched together. Every declared pair is rebuilt when the store opens.
+
+## Graph algorithms
+
+```python
+db.pagerank(edge_type="CITES")["scores"][:10]
+db.connected_components()["components"]         # [(key, component), ...]
+db.degree_centrality(direction="in")["scores"]  # not degree() / degrees()
+db.communities(edge_types=["CITES"])["communities"]
+```
+
+`budget_ms` defaults to `0` — no time limit — so the same store gives the
+same answer; pass one to bound a call and read `converged` / `truncated`.
+`degree()` and `degrees()` are a different thing: the degree of the keys you
+name, which can be scoped and filtered.
+
+**None of these runs on a `scoped()` handle.** The algorithms, `search`,
+`fulltext_pairs`, `rules` and `suggest_rules` answer about the whole store and
+take no mask, so each raises `ValueError` there rather than return an answer
+computed over nodes the scope hides.
+
+## Memory
+
+The MCP memory tools, as data. Each calls the function the tool calls and
+returns its report as a dict rather than a rendered digest.
+
+```python
+r = db.remember(
+    "Matthew is driving the 0.7 release",
+    about=["matthew", "v0.7"],                           # matthew is unknown → a provisional stub
+    entities=[{"key": "v0.7", "label": "Release", "props": {"name": "v0.7"}}],
+    facts=[{"subject": "matthew", "predicate": "WORKS_ON", "object": "v0.7"}],
+)
+r["note"], r["provisional"]           # "note:…", ["matthew"]
+
+db.recall("who is driving the release")["hits"]          # ranked rows, not text
+db.upsert_entity("matthew", {"name": "Matthew Sherlin"}, label=None, aliases=["Matt"])
+db.schema_report()["provisional"]                        # 0 — it has been described
+db.forget(key="v0.7")["notes"]                           # ["note:…"] — the note about it, still there
+db.identity_clusters()["clusters"]                       # which keys are one entity
+```
+
+- `upsert_entity` is not `upsert_node`: it keeps `aliases` (derived from the
+  current key and name, recomputed each time) and `alias_keys` (the aliases
+  you declare, as written, accumulating), sets `id`, clears a `provisional`
+  mark, and refuses to change a label. Its `same_as_lost` names an identity
+  link the update retracted.
+- The memory module's refusals raise `IngestError`; `.detail` is the sentence,
+  and the message carries an `ingest error: ` prefix in front of it.
+- `remember`'s report names the note under `note`, not `key`.
+- **`recall` returns raw stored content.** `key`, `label` and `summary` are
+  unsanitized; only the MCP tool's rendered digest replaces control
+  characters, line separators and bidi or zero-width characters. Rendering a
+  row into an assistant's context makes that sanitisation yours to do, and
+  this binding exposes no helper for it. `recall` does not offer the digest.
+- `forget` is a tombstone, not a redaction: history still reads it. A fact a
+  rule derived raises `RuleOwned`, whose message is the whole refusal — which
+  rule owns the edge and the fields it reads.
+- A store this binding creates has no memory schema. `remember` declares the
+  text fields it needs as it goes; the identity preset is applied from the
+  command line — `mushroomdb schema apply <db> --memory-identity` — with the
+  handle closed.
+- `recall`, `schema_report` and `identity_clusters` raise `ValueError` on a
+  `scoped()` handle; `remember`, `upsert_entity` and `forget` are writes and
+  raise `ReadOnly` there.
 
 ## Concurrency
 

@@ -63,12 +63,8 @@ fn install_opts(scope: Scope, db: &Path, command: &Path) -> InstallOpts {
         scope: Some(scope),
         db: Some(db.to_path_buf()),
         command: Some(command.to_path_buf()),
-        git_hooks: true,
         prewarm: false,
         delivery: Delivery::Both,
-        intercept_grep: false,
-        impact_before_edit: false,
-        enrich_grep: false,
         always_load: false,
     }
 }
@@ -125,12 +121,12 @@ fn doctor_passes_on_fresh_project_install() {
 
     let handshake = find_check(&report.output, "handshake");
     assert!(handshake.starts_with("ok"), "handshake check: {handshake}");
-    // The nineteen a default `mushroomdb mcp` advertises on a memory store —
+    // The twenty-three a default `mushroomdb mcp` advertises on a memory store —
     // which is what a fresh install points at: the association surface. The
-    // other nine stay callable, and `--all-tools` lists all twenty-eight.
+    // other two stay callable, and `--all-tools` lists all twenty-five.
     assert!(
-        handshake.contains("19 tools"),
-        "expected the handshake to report 19 tools: {handshake}"
+        handshake.contains("23 tools"),
+        "expected the handshake to report 23 tools: {handshake}"
     );
     assert!(
         handshake.contains("explain_association present"),
@@ -138,13 +134,9 @@ fn doctor_passes_on_fresh_project_install() {
     );
 }
 
-/// Binding: the handshake passes on a store `ingest-git` built, whose default
-/// listing is three tools and does *not* include `map`.
-///
-/// The check proves the repository task path is served, not that one
-/// particular name is listed; a code-graph store serves it through `explore`.
-/// Requiring `map` would fail `doctor` on exactly the stores this surface
-/// exists for.
+/// Binding: the handshake passes on a store `ingest-git` built, which is served
+/// the same tools as any other store and proves the task path through
+/// `explain_association`.
 #[test]
 fn doctor_handshake_passes_on_a_code_graph_store() {
     let root = temp_dir("code-graph-handshake");
@@ -163,7 +155,7 @@ fn doctor_handshake_passes_on_a_code_graph_store() {
     )
     .expect("install failed");
 
-    // The marker `ingest-git` writes is what makes this a code graph.
+    // The marker `ingest-git` writes, which no longer changes the listing.
     let out = std::process::Command::new(&bin)
         .arg("query")
         .arg(&db)
@@ -180,14 +172,14 @@ fn doctor_handshake_passes_on_a_code_graph_store() {
         "a code-graph store must pass the handshake: {handshake}"
     );
     assert!(
-        handshake.contains("3 tools") && handshake.contains("explore present"),
+        handshake.contains("23 tools") && handshake.contains("explain_association present"),
         "the handshake names the task tool it found: {handshake}"
     );
 }
 
 /// A project install now names the store `--auto`, and doctor has to read
 /// that: resolve it the way a hook would, check the store it lands on, and
-/// recognise the hooks and git hook blocks that name it the same way.
+/// recognise the hooks that name it the same way.
 #[test]
 fn doctor_understands_auto_entries() {
     let root = temp_dir("auto-entry");
@@ -201,12 +193,8 @@ fn doctor_understands_auto_entries() {
         scope: Some(Scope::Project),
         db: None,
         command: Some(bin.clone()),
-        git_hooks: true,
         prewarm: false,
         delivery: Delivery::Both,
-        intercept_grep: false,
-        impact_before_edit: false,
-        enrich_grep: false,
         always_load: false,
     };
     run_install_with(
@@ -237,13 +225,15 @@ fn doctor_understands_auto_entries() {
     assert!(store.contains(&db.display().to_string()), "{store}");
     // And it says how far back the history behind those counts reaches.
     assert!(store.contains("history from commit 0 of "), "{store}");
-    // All three hook events, named: a missing one is a warning, not silence.
+    // Both hook events, named: a missing one is a warning, not silence.
     let hooks = find_check(&report.output, "hooks");
     assert!(hooks.starts_with("ok"), "{hooks}");
-    for event in ["UserPromptSubmit", "PostToolUse", "SessionStart"] {
+    for event in ["UserPromptSubmit", "SessionStart"] {
         assert!(hooks.contains(event), "{hooks}");
     }
-    assert!(find_check(&report.output, "git-hooks").starts_with("ok"));
+    assert!(!hooks.contains("PostToolUse"), "{hooks}");
+    // 0.7 writes no git hooks, so a clean checkout has nothing to report.
+    assert!(!report.output.contains("git-hooks"), "{}", report.output);
 }
 
 #[test]
@@ -432,46 +422,101 @@ fn doctor_on_cli_delivery_skips_handshake_and_passes() {
     }
 }
 
-/// The redirect is opt-in, so `doctor` reports it only when the manifest says
-/// this install asked for it. A report line for a hook nobody wired would say
-/// nothing true about the install in front of it.
+/// A hook a 0.6 install wrote and 0.7 retired is reported, one line per hook
+/// found, naming it — and nothing is said about a hook that is not there.
+/// The same goes for the `sync` block in a git hook.
+///
+/// The seeded strings are the exact shape a 0.6.12 install wrote with an
+/// explicit `--command` and a pinned store: `<bin> <sub> '<store>'`, and
+/// `( <bin> sync '<store>' >/dev/null 2>&1 & )` inside the marked block.
 #[test]
-fn doctor_reports_the_grep_redirect_only_when_it_is_installed() {
-    for intercept_grep in [true, false] {
-        let label = if intercept_grep { "on" } else { "off" };
-        let root = temp_dir(&format!("intercept-{label}"));
-        let home = temp_dir(&format!("intercept-{label}-home"));
-        git_repo(&root);
-        let db = root.join("mushroom-memory");
-        let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+fn doctor_reports_each_retired_hook_still_on_disk() {
+    let root = temp_dir("old-hooks");
+    let home = temp_dir("old-hooks-home");
+    let git_hooks = git_repo(&root);
+    let db = root.join("mushroom-memory");
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_mushroomdb"));
+    run_install_with(
+        &root,
+        &home,
+        &install_opts(Scope::Project, &db, &bin),
+        &McpCommand::Explicit(bin.clone()),
+        &no_externals(),
+    )
+    .expect("install failed");
 
-        let opts = InstallOpts {
-            intercept_grep,
-            ..install_opts(Scope::Project, &db, &bin)
-        };
-        run_install_with(
-            &root,
-            &home,
-            &opts,
-            &McpCommand::Explicit(bin),
-            &no_externals(),
-        )
-        .expect("install failed");
+    // Put back two of the four settings hooks and one git hook block.
+    let prefix = format!("'{}'", bin.display());
+    let quoted = format!("'{}'", db.display());
+    let settings_path = root.join(".claude/settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    settings["hooks"]["PostToolUse"] = serde_json::json!([{
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [{"type": "command", "command": format!("{prefix} touch {quoted}"), "timeout": 30, "async": true}]
+    }]);
+    settings["hooks"]["PreToolUse"] = serde_json::json!([{
+        "matcher": "Grep",
+        "hooks": [{"type": "command", "command": format!("{prefix} intercept {quoted}"), "timeout": 5}]
+    }]);
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        git_hooks.join("post-merge"),
+        format!("#!/bin/sh\n\n# >>> mushroomdb >>>\n( {prefix} sync {quoted} >/dev/null 2>&1 & )\n# <<< mushroomdb <<<\n"),
+    )
+    .unwrap();
 
-        let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
-            .expect("doctor errored");
-        let line = report
-            .output
-            .lines()
-            .find(|l| l.split_whitespace().nth(1) == Some("intercept"));
-        if intercept_grep {
-            let line = line.unwrap_or_else(|| panic!("no intercept check:\n{}", report.output));
-            assert!(line.starts_with("ok"), "{line}");
-            assert!(line.contains("PreToolUse"), "{line}");
-        } else {
-            assert_eq!(line, None, "unasked-for line:\n{}", report.output);
-        }
+    let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+        .expect("doctor errored");
+    assert!(
+        !report.had_fail,
+        "a retired hook is a warning:\n{}",
+        report.output
+    );
+    for sub in ["touch", "intercept"] {
+        let line = find_check(&report.output, sub);
+        assert!(line.starts_with("warn"), "{line}");
+        assert!(line.contains("retired"), "{line}");
+        assert!(
+            line.contains("fix: mushroomdb install --project"),
+            "the fix names this install's scope: {line}"
+        );
     }
+    for absent in ["impact-hook", "enrich"] {
+        assert!(
+            !report
+                .output
+                .lines()
+                .any(|l| l.split_whitespace().nth(1) == Some(absent)),
+            "{absent} is not on disk and must not be reported:\n{}",
+            report.output
+        );
+    }
+    let git_lines: Vec<&str> = report
+        .output
+        .lines()
+        .filter(|l| l.split_whitespace().nth(1) == Some("git-hooks"))
+        .collect();
+    assert_eq!(git_lines.len(), 1, "{}", report.output);
+    assert!(git_lines[0].starts_with("warn"), "{}", git_lines[0]);
+    assert!(git_lines[0].contains("post-merge"), "{}", git_lines[0]);
+
+    // Re-running install is the fix, and after it doctor has nothing to say.
+    run_install_with(
+        &root,
+        &home,
+        &install_opts(Scope::Project, &db, &bin),
+        &McpCommand::Explicit(bin),
+        &no_externals(),
+    )
+    .expect("reinstall failed");
+    let report = run_doctor_with(&root, &home, &doctor_project_opts(), &no_externals())
+        .expect("doctor errored");
+    assert!(!report.output.contains("retired "), "{}", report.output);
 }
 
 // ---------------------------------------------------------------------------

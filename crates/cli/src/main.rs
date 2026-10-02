@@ -3,12 +3,13 @@
 use cli::{
     format_backup, format_demo, format_stats, format_suggest, install, maybe_run_demo_if_empty,
     parse_args, read_stats, run_algo, run_asof, run_backup, run_build_index, run_demo, run_export,
-    run_migrate, run_query, run_schema_apply, run_snapshot, run_suggest, run_verify, usage,
-    Command, ServeUi,
+    run_migrate, run_query, run_schema_apply, run_schema_apply_memory_defaults,
+    run_schema_apply_memory_identity, run_snapshot, run_suggest, run_verify, usage, Command,
+    ServeUi,
 };
 use core_api::{GraphError, SharedDb};
 use std::collections::HashMap;
-use std::io::{self, Read as _, Write};
+use std::io::{self, IsTerminal as _, Read as _, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -57,6 +58,18 @@ fn main() -> ExitCode {
             print!("{}", usage());
             ExitCode::SUCCESS
         }
+        Ok(Command::RetiredHook { sub }) => {
+            // Drain a hook payload so the runner's write never meets a closed
+            // pipe. A terminal is not drained: nobody is going to type EOF.
+            if !io::stdin().is_terminal() {
+                let _ = io::copy(&mut io::stdin().lock(), &mut io::sink());
+            }
+            let _ = writeln!(
+                io::stderr(),
+                "mushroomdb {sub}: retired in 0.7; run `mushroomdb install` to remove this hook (`mushroomdb doctor` lists any that remain)"
+            );
+            ExitCode::SUCCESS
+        }
         Ok(Command::Recall { db_dir, auto }) => {
             let mut raw = String::new();
             let _ = io::stdin().read_to_string(&mut raw);
@@ -88,107 +101,7 @@ fn main() -> ExitCode {
             let _ = stdout.flush();
             ExitCode::SUCCESS
         }
-        Ok(Command::Intercept { db_dir, auto }) => {
-            // Claude Code reads exit 2 as "block this tool call, and give the
-            // model what stderr said"; every other outcome — no opinion, a
-            // store that will not open, a payload that will not parse, a panic
-            // — is exit 0 and not one byte written, so a hook of ours can
-            // never be why a search did not run.
-            let mut raw = String::new();
-            let _ = io::stdin().read_to_string(&mut raw);
-            match silently(|| cli::intercept::run_intercept(&resolve_db(db_dir, auto), &raw))
-                .flatten()
-            {
-                Some(message) => {
-                    let mut stderr = io::stderr();
-                    let _ = writeln!(stderr, "{message}");
-                    let _ = stderr.flush();
-                    ExitCode::from(2)
-                }
-                None => ExitCode::SUCCESS,
-            }
-        }
-        Ok(Command::ImpactHook { db_dir, auto }) => {
-            // Claude Code reads one `hookSpecificOutput` object on stdout as
-            // context to add to the turn; exit 0 lets the edit proceed either
-            // way. Nothing to say is nothing written, like every other hook
-            // this binary provides.
-            let mut raw = String::new();
-            let _ = io::stdin().read_to_string(&mut raw);
-            let text =
-                silently(|| cli::impact_hook::run(&resolve_db(db_dir, auto), &raw)).flatten();
-            print_hook_context("PreToolUse", text.as_deref());
-            ExitCode::SUCCESS
-        }
-        Ok(Command::Enrich { db_dir, auto }) => {
-            let mut raw = String::new();
-            let _ = io::stdin().read_to_string(&mut raw);
-            let text = silently(|| cli::enrich::run(&resolve_db(db_dir, auto), &raw)).flatten();
-            print_hook_context("PostToolUse", text.as_deref());
-            ExitCode::SUCCESS
-        }
-        Ok(Command::Map { db_dir, json }) => match cli::run_map(&db_dir, json) {
-            Ok(out) => {
-                print!("{out}");
-                ExitCode::SUCCESS
-            }
-            Err(e) => fail(&e.to_string()),
-        },
-        Ok(Command::Explore {
-            db_dir,
-            target,
-            depth,
-            full,
-        }) => print_or_fail(cli::run_explore(&db_dir, &target, depth, full)),
-        Ok(Command::Context {
-            db_dir,
-            target,
-            full,
-        }) => print_or_fail(cli::run_context(&db_dir, &target, full)),
-        Ok(Command::Impact { db_dir, files }) => print_or_fail(cli::run_impact(&db_dir, &files)),
-        Ok(Command::Owners { db_dir, path }) => print_or_fail(cli::run_owners(&db_dir, &path)),
         Ok(Command::Why { db_dir, a, b }) => print_or_fail(cli::run_why(&db_dir, &a, &b)),
-        Ok(Command::Sync { db_dir, auto, json }) => {
-            match cli::ingest_git::run_sync(&resolve_db(db_dir, auto)) {
-                Ok(report) => {
-                    if json {
-                        print!("{}", cli::ingest_git::format_sync_json(&report));
-                    } else {
-                        print!("{}", cli::ingest_git::format_sync(&report));
-                    }
-                    ExitCode::SUCCESS
-                }
-                Err(e) => busy_aware(&e),
-            }
-        }
-        Ok(Command::Touch {
-            db_dir,
-            auto,
-            files,
-        }) => {
-            // Only read stdin when there is nothing on the command line: a hook
-            // pipes a payload, a person does not, and blocking a person's
-            // terminal on a read that will never end is the worse failure.
-            let payload = if files.is_empty() {
-                let mut raw = String::new();
-                let _ = io::stdin().read_to_string(&mut raw);
-                Some(raw)
-            } else {
-                None
-            };
-            if files.is_empty() || auto {
-                silent_touch(db_dir, auto, &files, payload.as_deref());
-                return ExitCode::SUCCESS;
-            }
-            match cli::ingest_git::run_touch(&resolve_db(db_dir, auto), &files, payload.as_deref())
-            {
-                Ok(report) => {
-                    print!("{}", cli::ingest_git::format_touch(&report));
-                    ExitCode::SUCCESS
-                }
-                Err(e) => busy_aware(&e),
-            }
-        }
         Ok(Command::Version) => {
             println!("{}", cli::version_string());
             ExitCode::SUCCESS
@@ -394,13 +307,29 @@ fn main() -> ExitCode {
         Ok(Command::SchemaApply {
             db_dir,
             schema_file,
-        }) => match run_schema_apply(&db_dir, &schema_file) {
-            Ok(out) => {
-                print!("{out}");
-                ExitCode::SUCCESS
+            memory_defaults,
+            memory_identity,
+        }) => {
+            let result = if memory_identity {
+                run_schema_apply_memory_identity(&db_dir)
+            } else if memory_defaults {
+                run_schema_apply_memory_defaults(&db_dir)
+            } else {
+                match schema_file {
+                    Some(f) => run_schema_apply(&db_dir, &f),
+                    None => Err(cli::CliError(
+                        "schema apply requires <schema.json> or --memory-defaults".to_string(),
+                    )),
+                }
+            };
+            match result {
+                Ok(out) => {
+                    print!("{out}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e.to_string()),
             }
-            Err(e) => fail(&e.to_string()),
-        },
+        }
         Ok(Command::Migrate { db_dir }) => match run_migrate(&db_dir) {
             Ok(out) => {
                 print!("{out}");
@@ -548,58 +477,13 @@ fn busy_aware(e: &cli::CliError) -> ExitCode {
 /// The panic hook is replaced for the duration: an unwind would otherwise print
 /// a message and a backtrace to stderr and exit 101, which for a hook body is
 /// the noisiest possible outcome and the one a user can do least about. Both
-/// hook bodies (`recall`, and `touch` in hook mode) go through this.
+/// hook bodies (`recall` and `brief`) go through this.
 fn silently<T>(f: impl FnOnce() -> T) -> Option<T> {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     std::panic::set_hook(previous);
     outcome.ok()
-}
-
-/// Run `touch` as a hook body: say nothing, whatever happens, and let the
-/// caller exit 0.
-///
-/// A `PostToolUse` hook fires on every edit the assistant makes, and everything
-/// it writes to either stream lands in the user's session. Almost everything
-/// this command can fail on is *routine* there rather than exceptional — a
-/// payload for a file in some other project, a database that was never built
-/// from a repository, a peer process holding the write lock — and none of it is
-/// the user's problem to read about on every keystroke. So the outcome is
-/// discarded, including the successful report: a line per edit is the loudest
-/// noise of the lot.
-///
-/// Naming files on the command line opts out of all of it: see the `Touch` arm.
-fn silent_touch(db_dir: Option<PathBuf>, auto: bool, files: &[PathBuf], payload: Option<&str>) {
-    let _ = silently(|| {
-        let db = resolve_db(db_dir, auto);
-        cli::ingest_git::run_touch(&db, files, payload)
-    });
-}
-
-/// Print one hook result object on stdout, or nothing at all for `None`.
-///
-/// The shape is Claude Code's documented `hookSpecificOutput`: an object
-/// carrying the event's own name and `additionalContext`, the field both
-/// `PreToolUse` and `PostToolUse` read as "add this to the turn". Nothing else
-/// goes in it — no `permissionDecision`, no `decision` — because neither of
-/// these hooks has an opinion about whether the tool call should happen.
-///
-/// Not `print!`: that panics on EPIPE (exit 101) if the hook runner closes the
-/// pipe, and a hook body must never be why anything fails.
-fn print_hook_context(event: &str, text: Option<&str>) {
-    let Some(text) = text.filter(|t| !t.is_empty()) else {
-        return;
-    };
-    let out = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": event,
-            "additionalContext": text,
-        }
-    });
-    let mut stdout = io::stdout();
-    let _ = stdout.write_all(out.to_string().as_bytes());
-    let _ = stdout.flush();
 }
 
 /// The database a `<db-dir>`-or-`--auto` command should use.
@@ -630,7 +514,23 @@ fn run_serve(
 ) -> Result<(), String> {
     let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     rt.block_on(async {
+        // Same guard as `run_mcp`: checked before `open` creates the
+        // directory's files, so it tells a brand-new store from one this
+        // invocation is merely reopening (or one `--demo-if-empty` /
+        // `--restore-from` already populated above, in which case this is
+        // already `true` and nothing here re-declares anything). Declaring
+        // full-text on a populated store rebuilds the index at open (227 ms
+        // vs. 3.8 ms with none, ledger row 36), so an existing store is never
+        // touched here.
+        let is_new_store = !core_api::restore::holds_a_store(&db_dir);
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
+        if is_new_store {
+            // The first store most HTTP callers open. Declare the memory
+            // schema before the first write so `recall` can answer on it.
+            db.write()
+                .apply_schema(&core_api::memory_schema::memory_defaults())
+                .map_err(|e| e.to_string())?;
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Some(period) = snapshot_every {
             let db_snap = db.clone();
@@ -873,11 +773,26 @@ async fn shutdown_signal() {
 }
 
 fn run_mcp(db_dir: PathBuf, all_tools: bool) -> Result<(), String> {
+    // `holds_a_store` (the same predicate `restore_if_empty` gates on) must be
+    // checked before `open` creates the directory's files — it is what tells
+    // a brand-new store from one this invocation is merely reopening. Declaring
+    // full-text on a populated store rebuilds the index at open (227 ms vs.
+    // 3.8 ms with none, ledger row 36), so an existing store is never touched
+    // here; only a store this call is creating gets the memory schema.
+    let is_new_store = !core_api::restore::holds_a_store(&db_dir);
     let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
+    if is_new_store {
+        // The first store most MCP hosts open. Declare the memory schema
+        // before the first write so `recall` can answer on it from the start.
+        db.write()
+            .apply_schema(&core_api::memory_schema::memory_defaults())
+            .map_err(|e| e.to_string())?;
+    }
     let stdin = io::stdin();
     let stdout = io::stdout();
-    // The store's path, not just a handle: the `sync` tool re-runs this binary
-    // against the directory, and cannot infer it from an open database.
+    // The store's path, not just a handle: the `recall` tool names the store
+    // by that path when it tells the caller how to fix an unindexed one, and
+    // an open database cannot say where it lives.
     server::run_mcp_stdio_with(db, Some(db_dir), all_tools, stdin.lock(), stdout.lock())
         .map_err(|e| e.to_string())
 }

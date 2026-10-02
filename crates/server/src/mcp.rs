@@ -9,14 +9,13 @@
 //! - `initialize` — `protocolVersion` `"2024-11-05"`, `capabilities.tools`,
 //!   `serverInfo.name` `"mushroomdb"`, `serverInfo.version` (crate version)
 //! - `notifications/initialized` — ignored
-//! - `tools/list` — the default listing follows the store the server opened
-//!   (see [`Surface`]): a store a repository was ingested into lists three —
-//!   `explore`, `query`, `stats` — and any other store lists the nineteen of
+//! - `tools/list` — the default listing is
 //!   [`ASSOCIATION_TOOLS`], the tools that answer a question about an entity
-//!   graph, in that order. Graph-tool descriptions carry the
-//!   prefix `Advanced: ` so a host ranking tools by description puts the task
-//!   tools in front. `mushroomdb mcp --all-tools` lists all twenty-eight; the
-//!   rest are callable either way, just not advertised
+//!   graph, in that order, whatever store the server opened. Graph-tool
+//!   descriptions carry the prefix `Advanced: ` so a host ranking tools by
+//!   description puts the task tools in front. `mushroomdb mcp --all-tools`
+//!   lists every served tool; the rest are callable either way, just not
+//!   advertised
 //! - `tools/call` — dispatch; success for a graph tool is
 //!   `{content:[{type:"text", text:<json string>}]}`, and for a task tool one
 //!   text block holding the rendered digest — or, with `json: true`, the
@@ -53,8 +52,8 @@ use crate::json::{
     parse_ingest_edges, result_set_json, rule_def_from_json, stamp_namespace, stamp_namespace_row,
 };
 use core_api::{
-    json_to_rows, json_to_value, AsOfScope, AutoFk, GraphError, IngestOptions, MaskMode, NodeMask,
-    PropPredicate, SharedDb, Value, NS_PROP,
+    json_to_rows, json_to_value, memory, AsOfScope, AutoFk, GraphError, IngestOptions, MaskMode,
+    NodeMask, PropPredicate, SharedDb, Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -64,9 +63,10 @@ use std::path::{Path, PathBuf};
 /// Run the MCP loop until `reader` hits EOF.
 ///
 /// `db_dir` is where the store lives on disk. `mushroomdb mcp <db>` passes it;
-/// a caller that has only a handle passes `None`, and the one tool that needs a
-/// path — `sync`, which re-runs this binary against the store — reports that it
-/// cannot run rather than guessing one.
+/// a caller that has only a handle passes `None`. Its one consumer is
+/// `recall`, which names the store by this path in its digest header and in
+/// the `schema apply` command it suggests when there is no text index; with
+/// `None` it says "store" instead.
 pub fn run_mcp_stdio(
     db: SharedDb,
     db_dir: Option<PathBuf>,
@@ -78,15 +78,9 @@ pub fn run_mcp_stdio(
 
 /// [`run_mcp_stdio`], with the tool list chosen by the caller.
 ///
-/// `all_tools` false lists what the store's [`Surface`] names — three on a
-/// code graph, nineteen on a memory store; true lists all twenty-eight. Either
-/// way every tool remains callable — the flag decides what is advertised, not
-/// what is served.
-///
-/// The surface is read once, here, rather than per `tools/list`: a store does
-/// not become a code graph half way through a session, and a listing that
-/// changed under a host that caches it would be worse than one that is merely
-/// stale.
+/// `all_tools` false lists [`ASSOCIATION_TOOLS`]; true lists every served
+/// tool. Either way every tool remains callable — the flag decides
+/// what is advertised, not what is served.
 pub fn run_mcp_stdio_with(
     db: SharedDb,
     db_dir: Option<PathBuf>,
@@ -94,7 +88,6 @@ pub fn run_mcp_stdio_with(
     mut reader: impl BufRead,
     mut writer: impl Write,
 ) -> io::Result<()> {
-    let surface = surface_of(&db);
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -104,14 +97,7 @@ pub fn run_mcp_stdio_with(
         }
         match std::str::from_utf8(&buf) {
             Ok(s) if s.trim().is_empty() => continue,
-            Ok(s) => handle_line(
-                &db,
-                db_dir.as_deref(),
-                all_tools,
-                surface,
-                s.trim(),
-                &mut writer,
-            )?,
+            Ok(s) => handle_line(&db, db_dir.as_deref(), all_tools, s.trim(), &mut writer)?,
             Err(_) => write_error(&mut writer, None, -32700, "Parse error")?,
         }
     }
@@ -121,7 +107,6 @@ fn handle_line(
     db: &SharedDb,
     db_dir: Option<&Path>,
     all_tools: bool,
-    surface: Surface,
     line: &str,
     writer: &mut impl Write,
 ) -> io::Result<()> {
@@ -156,7 +141,7 @@ fn handle_line(
         }
         "tools/list" => {
             if is_request {
-                write_result(writer, id, tools_list(all_tools, surface))?;
+                write_result(writer, id, tools_list(all_tools))?;
             }
         }
         "tools/call" => {
@@ -214,7 +199,7 @@ fn dispatch_call(db: &SharedDb, db_dir: Option<&Path>, params: Option<&Js>) -> C
         Some(a) if a.is_object() => a,
         Some(_) => return protocol_invalid(),
     };
-    // The repository task tools first, in the order `tools/list` advertises.
+    // The task tools first, in the order `tools/list` advertises.
     if let Some(outcome) = crate::mcp_tasks::dispatch(db, db_dir, name, args) {
         return outcome;
     }
@@ -628,11 +613,17 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
 
 /// Insert a new node or update an existing node's properties, keyed by `key`.
 ///
+/// The policy and the write are [`memory::remember::upsert_entity`] — the one
+/// implementation this tool and the Python binding share — which also clears
+/// a provisional mark (`memory_schema::PROVISIONAL_PROP`) on `key` if it had
+/// one, whoever set it. This function parses the arguments and shapes the
+/// reply.
+///
 /// If the node exists: every supplied property is checked (reserved names, the
 /// `ns` rule, a view-owned field, type) and then all of them are written in one
 /// engine commit — a refusal leaves the node unchanged. If the node does not
-/// exist: `label` is required; the node is ingested with `key_field = "id"` and
-/// the supplied props.
+/// exist: `label` is required; the node is created and then given the
+/// supplied props, `id` among them.
 ///
 /// `namespace` is the namespace a node this call **creates** is created in. On a
 /// node that already exists it is written like any other property, which is what
@@ -642,14 +633,28 @@ fn tool_node_info(db: &SharedDb, args: &Js) -> CallOutcome {
 /// `updated_fields`, because nothing was updated.
 ///
 /// `id` in `props` is **dropped on both paths**: it is the node's key. The create
-/// path stores `id` from `key` (it ingests with `key_field: "id"`), and
-/// `rename_node` is the only way to change it. One row builder now serves the
-/// create and the update path, so the rule is the same on both — before v0.6.6 the
-/// update path wrote `props.id` straight through `set_prop`, which could leave a
-/// stored `id` disagreeing with the key the node is reached by, while the create
-/// path had always ignored it.
+/// path stores `id` from `key`, and `rename_node` is the only way to change it.
+/// One row builder now serves the create and the update path, so the rule is the
+/// same on both — before v0.6.6 the update path wrote `props.id` straight through
+/// `set_prop`, which could leave a stored `id` disagreeing with the key the node
+/// is reached by, while the create path had always ignored it.
 ///
-/// Returns `{ok, key, created, updated_fields?}`.
+/// A node's **label never changes on an update** — the engine has no
+/// label-mutation path at all, and `describe_entity` uses `label` only on
+/// create. A `label` that names something else on an existing `key` is a
+/// refusal, checked before anything is written: nothing in `props` is
+/// touched either, matching every other pre-write check this tool makes (a
+/// namespace mismatch, a view-owned field). Before fix round 2 this was
+/// silently accepted and dropped — every update, not only a provisional
+/// stub's — which is worse than it sounds for the one case the feature
+/// exists for: a provisional entity `remember` created is *always* `Entity`,
+/// permanently, and `{"created":false,"ok":true}` beside a quietly-ignored
+/// `label` is not a signal an agent acts on. There is a working path instead
+/// — `remember`'s `entities`, at first mention, produces a correctly
+/// labelled, non-provisional node with its `ABOUT` edge intact — so refusing
+/// costs nothing a caller could not already avoid.
+///
+/// Returns `{ok, key, label, created, updated_fields?}`.
 fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
     let Some(key) = args.get("key").and_then(Js::as_str) else {
         return CallOutcome::ToolErr("missing key".into());
@@ -661,6 +666,18 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
     let namespace = match namespace_arg(args.get("namespace")) {
         Ok(n) => n,
         Err(e) => return CallOutcome::ToolErr(e),
+    };
+    let aliases: Vec<String> = match args.get("aliases") {
+        None | Some(Js::Null) => Vec::new(),
+        Some(Js::Array(items)) => match items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(a) => a,
+            None => return CallOutcome::ToolErr("aliases must be an array of strings".into()),
+        },
+        Some(_) => return CallOutcome::ToolErr("aliases must be an array of strings".into()),
     };
 
     // One row, stamped with the namespace, whichever path takes it: the
@@ -686,50 +703,44 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
         }
     }
 
-    let exists = {
-        let g = db.read();
-        g.has_node(key)
-    };
-
-    if exists {
+    // One write guard for the existence check and the write: the policy —
+    // label on create, no relabel, the namespace no-op, `id` from the key —
+    // is `core-api`'s, shared with the Python binding.
+    let outcome = {
         let mut g = db.write();
-        let mut to_set: Vec<(String, Value)> = Vec::new();
-        for (field, v) in row {
-            // The namespace a node is already in is the engine's no-op: it
-            // writes no record and takes no commit, so counting it as an updated
-            // field would report an update that did not happen. Asking first
-            // also keeps the refusal for a *different* namespace coming from the
-            // engine rather than from a second rule stated here.
-            if field == NS_PROP && Some(&v) == g.namespace_of(key).map(Value::Str).as_ref() {
-                continue;
-            }
-            to_set.push((field, v));
+        match memory::remember::upsert_entity(&mut *g, key, label_opt, row, &aliases) {
+            Ok(o) => o,
+            Err(e) => return CallOutcome::ToolErr(graph_err_msg(e)),
         }
-        let count = to_set.len();
-        if let Err(e) = g.set_props(key, to_set) {
-            return CallOutcome::ToolErr(graph_err_msg(e));
-        }
-        CallOutcome::ToolOk(json!({
+    };
+    if outcome.created {
+        return CallOutcome::ToolOk(json!({
             "ok": true,
             "key": key,
-            "created": false,
-            "updated_fields": count
-        }))
-    } else {
-        let Some(label) = label_opt else {
-            return CallOutcome::ToolErr("label required when creating a new entity".into());
-        };
-        row.insert("id".to_string(), Value::Str(key.to_string()));
-        let opts = IngestOptions {
-            key_field: "id".to_string(),
-            auto_fk: AutoFk::Off,
-        };
-        let mut g = db.write();
-        match g.ingest(label, vec![row], &opts) {
-            Ok(_) => CallOutcome::ToolOk(json!({ "ok": true, "key": key, "created": true })),
-            Err(e) => CallOutcome::ToolErr(graph_err_msg(e)),
-        }
+            "label": outcome.label,
+            "created": true
+        }));
     }
+    let mut reply = json!({
+        "ok": true,
+        "key": key,
+        "label": outcome.label,
+        "created": false,
+        "updated_fields": outcome.updated_fields
+    });
+    // Absent when nothing was lost, so an ordinary update's reply is
+    // unchanged.
+    let lost = &outcome.same_as_lost;
+    if !lost.is_empty() {
+        reply["same_as_lost"] = crate::mcp_tasks::same_as_lost_json(lost);
+        reply["same_as_lost_total"] = json!(lost.len());
+        reply["same_as_lost_note"] = json!(format!(
+            "this write retracted {} SAME_AS link(s): {}",
+            lost.len(),
+            crate::mcp_tasks::SAME_AS_LOST_REMEDY
+        ));
+    }
+    CallOutcome::ToolOk(reply)
 }
 
 /// Return neighbors connected by a given edge type (default `"SIMILAR"`).
@@ -783,7 +794,10 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
             .and_then(Js::as_u64)
             .map(|n| n as usize)
             .unwrap_or(10);
-        let min = args.get("min").and_then(Js::as_f64).unwrap_or(0.8);
+        let min = args
+            .get("min")
+            .and_then(Js::as_f64)
+            .unwrap_or(core_api::FIND_SIMILAR_DEFAULT_MIN);
         let where_pred = match parse_where_arg(args) {
             Ok(p) => p,
             Err(e) => return CallOutcome::ToolErr(e),
@@ -1154,26 +1168,16 @@ fn initialize_result() -> Js {
 /// The prefix every graph tool's description carries.
 ///
 /// A host that ranks tools by their description now has one signal that the
-/// repository task tools are the ones to reach for first, and that everything
+/// task tools are the ones to reach for first, and that everything
 /// under this prefix is the lower-level surface beneath them.
 const ADVANCED_PREFIX: &str = "Advanced: ";
 
-/// The three a code-graph store advertises: one tool to find, one to ask an
-/// arbitrary question, one to size the store.
-///
-/// `ingest_json` is not among them. A store built by `ingest-git` is written by
-/// `sync` and `touch`, not by an assistant bulk-loading rows into it, and the
-/// tool that is never the right one on this surface is the one worth not
-/// listing.
-pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
-
-/// The nineteen a memory store advertises, in the order it lists them.
+/// The tools every store advertises, in the order it lists them.
 ///
 /// A store with no repository in it used to be handed the code door's own task
-/// tools — `map`, `context`, `impact`, `owners`, `why`, `sync` — which answer
-/// from a code graph there is none of, plus `ingest_json`. Six of the eleven
-/// names an assistant found answered from a repository the store did not
-/// hold. These are
+/// tools, which answered from a code graph there was none of. Those tools are
+/// gone, and a store `ingest-git` built is an entity store like any other, so
+/// it is served this same listing. These are
 /// the questions an entity graph *can* answer: what is there (`query` — now
 /// with a `role`), why two things are associated, what is around a node, what
 /// it is and what it is joined to, whether a link held at a commit and when it
@@ -1188,9 +1192,8 @@ pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 /// it, and had no way at all to ask what a change would do. They sit after
 /// `was_linked`, which is the narrowest form of the same time question.
 ///
-/// The code task tools stay served on a memory store, as these stay served on
-/// a code-graph one — [`tools_list`] decides what is *advertised*, never what
-/// is answered.
+/// [`tools_list`] decides what is *advertised*, never what is answered: the
+/// two served tools this leaves out, `explain` and `rename_node`, stay callable.
 ///
 /// `upsert_entity`, `ingest_json` and `create_rule` were added in 0.6.12, and
 /// the reason is the shape of a first session. A new install opens on an empty
@@ -1204,7 +1207,7 @@ pub const CODE_GRAPH_TOOLS: [&str; 3] = ["explore", "query", "stats"];
 /// They sit after the readers deliberately. Listing order is ranking and the
 /// questions remain the point; writing is what a session does once, at the
 /// start, before it has anything to ask.
-pub const ASSOCIATION_TOOLS: [&str; 19] = [
+pub const ASSOCIATION_TOOLS: [&str; 23] = [
     "query",
     "explain_association",
     "neighborhood",
@@ -1224,66 +1227,26 @@ pub const ASSOCIATION_TOOLS: [&str; 19] = [
     "ingest_json",
     "create_rule",
     "stats",
+    "schema",
+    "analyze",
+    "suggest_rules",
+    "forget",
 ];
 
-/// Which door a store is: which default tool list it gets.
-///
-/// Decided from the store the server opened, once, at startup — not from an
-/// install flag — so one `.mcp.json` serves both and neither has to be
-/// configured for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Surface {
-    /// A repository was ingested into this store: the `GitSync` marker is
-    /// there, and `explore` has a code graph to explore.
-    CodeGraph,
-    /// Any other store, including an empty one: the nineteen-tool association
-    /// surface, where `explore` would have nothing to answer from.
-    Memory,
-}
-
-impl Surface {
-    /// The tools a default `tools/list` on this surface advertises, in the
-    /// order it advertises them.
-    fn listing(self) -> &'static [&'static str] {
-        match self {
-            Surface::CodeGraph => &CODE_GRAPH_TOOLS,
-            Surface::Memory => &ASSOCIATION_TOOLS,
-        }
-    }
-}
-
-/// The surface the store `db` holds: [`Surface::CodeGraph`] when it carries the
-/// `GitSync` marker `ingest-git` writes, [`Surface::Memory`] otherwise.
-fn surface_of(db: &SharedDb) -> Surface {
-    let ingested = {
-        let g = db.read();
-        g.has_node(crate::mcp_tasks::SYNC_KEY)
-    };
-    if ingested {
-        Surface::CodeGraph
-    } else {
-        Surface::Memory
-    }
-}
-
-/// The tools `tools/list` advertises: the fourteen task tools, then the
+/// The tools `tools/list` advertises: the task tools, then the
 /// graph tools with their descriptions prefixed.
 ///
-/// `all` false — the default — lists what `surface` names, **in the order that
-/// surface names it**: three on a code graph, nineteen on a memory store. The
-/// order is the point. A host that defers tool schemas makes a model search
-/// for them, and the list it searches is read top-down, so each surface ranks
-/// its own tools rather than inheriting the task-tools-then-graph-tools order
-/// that only the code door has a reason for.
+/// `all` false — the default — lists [`ASSOCIATION_TOOLS`], **in the order it
+/// names them**. The order is the point. A host that defers tool schemas makes
+/// a model search for them, and the list it searches is read top-down.
 ///
-/// `all` true lists all twenty-eight in that established order whichever store
-/// this is, which is what `mushroomdb mcp --all-tools` runs and what the
-/// published server card documents: a caller that asked for everything asked
-/// for the whole surface, not for one door's ranking of it.
+/// `all` true lists every served tool, task tools first and graph tools after,
+/// which is what `mushroomdb mcp --all-tools` runs and what the published
+/// server card documents.
 ///
-/// Either way every tool stays callable: the flag and the surface decide what
-/// is advertised, not what is served.
-fn tools_list(all: bool, surface: Surface) -> Js {
+/// Either way every tool stays callable: the flag decides what is advertised,
+/// not what is served.
+fn tools_list(all: bool) -> Js {
     let mut served: Vec<Js> = crate::mcp_tasks::task_tools();
     for mut tool in graph_tools() {
         if let Some(d) = tool.get("description").and_then(Js::as_str) {
@@ -1295,14 +1258,13 @@ fn tools_list(all: bool, surface: Surface) -> Js {
     if all {
         return json!({ "tools": served });
     }
-    let listing = surface.listing();
-    let mut tools: Vec<Js> = Vec::with_capacity(listing.len());
-    for name in listing {
+    let mut tools: Vec<Js> = Vec::with_capacity(ASSOCIATION_TOOLS.len());
+    for name in ASSOCIATION_TOOLS {
         let Some(tool) = served
             .iter()
-            .find(|t| t.get("name").and_then(Js::as_str) == Some(*name))
+            .find(|t| t.get("name").and_then(Js::as_str) == Some(name))
         else {
-            debug_assert!(false, "{surface:?} lists {name}, which is not served");
+            debug_assert!(false, "ASSOCIATION_TOOLS lists {name}, which is not served");
             continue;
         };
         tools.push(tool.clone());
@@ -1451,6 +1413,11 @@ fn graph_tools() -> Vec<Js> {
                         "namespace": {
                             "type": "string",
                             "description": "Namespace for a node this call creates. Omitted means the 'default' namespace. On a node that already exists, naming the namespace it is in is a no-op and naming another one is refused — a namespace is set at insert and cannot be changed."
+                        },
+                        "aliases": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Other names this entity goes by, kept as written in 'alias_keys': with the identity preset, one equal to a provisional stub's key (exact, case-sensitive) links that stub. The store derives 'aliases' from the key and the name only. Do not set either in props."
                         }
                     },
                     "required": ["key", "props"]
@@ -1470,7 +1437,7 @@ fn graph_tools() -> Vec<Js> {
                         "field": { "type": "string", "description": "Property field holding the embedding vectors (default: embedding). Used in vector-search mode." },
                         "label": { "type": "string", "description": "Restrict search to nodes with this label. Empty string means all labels. Used in vector-search mode." },
                         "k": { "type": "integer", "description": "Maximum results to return in vector-search mode (default: 10)." },
-                        "min": { "type": "number", "description": "Minimum cosine similarity threshold in vector-search mode (default: 0.8). The Python binding's find_similar defaults this to 0.0 instead — same operation, same name, different default, so name it explicitly when a call has to agree across both surfaces." },
+                        "min": { "type": "number", "description": "Minimum cosine similarity threshold in vector-search mode (default: 0.8 on every surface; before 0.7 HTTP and the Python binding defaulted to 0.0). Pass 0.0 to keep low-similarity hits." },
                         "mask": {
                             "type": "array",
                             "items": { "type": "string" },
@@ -1781,13 +1748,7 @@ mod tests {
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
         for expected in &[
-            // The fourteen task tools, first and in order.
-            "explore",
-            "map",
-            "context",
-            "impact",
-            "owners",
-            "why",
+            // The task tools, first and in order.
             "explain_association",
             "node_edges",
             "neighborhood",
@@ -1795,7 +1756,10 @@ mod tests {
             "what_if",
             "recall",
             "remember",
-            "sync",
+            "schema",
+            "analyze",
+            "suggest_rules",
+            "forget",
             // The fourteen graph tools.
             "query",
             "ingest_json",
@@ -1816,19 +1780,13 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            28,
-            "expected exactly 28 tools, got {}",
+            25,
+            "expected exactly 25 tools, got {}",
             names.len()
         );
         assert_eq!(
-            &names[..14],
+            &names[..11],
             [
-                "explore",
-                "map",
-                "context",
-                "impact",
-                "owners",
-                "why",
                 "explain_association",
                 "node_edges",
                 "neighborhood",
@@ -1836,18 +1794,20 @@ mod tests {
                 "what_if",
                 "recall",
                 "remember",
-                "sync"
+                "schema",
+                "analyze",
+                "suggest_rules",
+                "forget",
             ],
             "the task tools come first, in order"
         );
-        assert_eq!(names[14], "query", "the graph tools follow them");
+        assert_eq!(names[11], "query", "the graph tools follow them");
     }
 
-    /// Binding: on a store no repository was ingested into, the default
-    /// listing is the nineteen association tools, in [`ASSOCIATION_TOOLS`]
+    /// Binding: the default listing is the association tools, in [`ASSOCIATION_TOOLS`]
     /// order, and nothing else.
     #[test]
-    fn tools_list_defaults_to_nineteen_on_a_memory_store() {
+    fn tools_list_defaults_to_the_association_tools_on_a_memory_store() {
         let db = demo_db();
         let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let names: Vec<&str> = resp["result"]["tools"]
@@ -1860,7 +1820,7 @@ mod tests {
     }
 
     /// Binding: `pairwise_similar` is advertised on the memory surface
-    /// immediately after `find_similar`. Listing length is 19.
+    /// immediately after `find_similar`, and the listing is exactly `EXPECTED`.
     #[test]
     fn association_listing_includes_pairwise_similar_after_find_similar() {
         let db = demo_db();
@@ -1871,7 +1831,7 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
-        const EXPECTED: [&str; 19] = [
+        const EXPECTED: [&str; 23] = [
             "query",
             "explain_association",
             "neighborhood",
@@ -1891,6 +1851,10 @@ mod tests {
             "ingest_json",
             "create_rule",
             "stats",
+            "schema",
+            "analyze",
+            "suggest_rules",
+            "forget",
         ];
         assert_eq!(names, EXPECTED.to_vec());
         assert_eq!(ASSOCIATION_TOOLS.as_slice(), EXPECTED.as_slice());
@@ -1901,26 +1865,15 @@ mod tests {
         assert_eq!(names[find + 1], "pairwise_similar");
     }
 
-    /// Binding: [`ASSOCIATION_TOOLS`] is a surface of its own, not the code
-    /// door's list with a name changed.
-    ///
-    /// It keeps the two task tools an entity store can answer with — the notes
-    /// it wrote and the notes it kept — and none of the seven that read a code
-    /// graph there is none of. Every name in it is served.
+    /// Binding: [`ASSOCIATION_TOOLS`] keeps the task tools an entity store can
+    /// answer with — the notes it wrote and the notes it kept — and every name
+    /// in it is served.
     #[test]
     fn the_association_surface_is_entity_tools_only() {
         for kept in ["remember", "recall", "explain_association"] {
             assert!(
                 ASSOCIATION_TOOLS.contains(&kept),
                 "{kept} answers on an entity graph and must be listed"
-            );
-        }
-        for code_only in [
-            "explore", "map", "context", "impact", "owners", "why", "sync",
-        ] {
-            assert!(
-                !ASSOCIATION_TOOLS.contains(&code_only),
-                "{code_only} reads a code graph and must not be listed on a memory store"
             );
         }
         let served: Vec<String> = crate::mcp_tasks::task_tools()
@@ -1935,32 +1888,6 @@ mod tests {
                 "{name} is listed but not served"
             );
         }
-        assert!(
-            CODE_GRAPH_TOOLS.contains(&"explore"),
-            "and `explore` is the task tool the other surface lists"
-        );
-    }
-
-    /// Binding: the same server on a store carrying the `GitSync` marker lists
-    /// three. One tool to find, one to query, one to size the store.
-    #[test]
-    fn tools_list_is_three_tools_on_a_code_graph_store() {
-        let db = demo_db();
-        db.write()
-            .insert_node(
-                "GitSync",
-                crate::mcp_tasks::SYNC_KEY,
-                vec![("id".into(), Value::Str(crate::mcp_tasks::SYNC_KEY.into()))],
-            )
-            .expect("marker");
-        let resp = roundtrip(&db, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
-        let names: Vec<&str> = resp["result"]["tools"]
-            .as_array()
-            .expect("tools array")
-            .iter()
-            .map(|t| t["name"].as_str().expect("name"))
-            .collect();
-        assert_eq!(names, ["explore", "query", "stats"]);
     }
 
     #[test]
@@ -2452,6 +2379,17 @@ mod tests {
                 )],
             )
             .unwrap();
+            // mid: [0.6,0.8] → cosine 0.6 with query [1,0]: above the old HTTP
+            // and Python default (0.0), below this one (0.8).
+            g.insert_node(
+                "Item",
+                "mid",
+                vec![(
+                    "emb".into(),
+                    Value::List(vec![Value::Float(0.6), Value::Float(0.8)]),
+                )],
+            )
+            .unwrap();
         }
 
         // No `min` in the request — must default to 0.8.
@@ -2471,13 +2409,44 @@ mod tests {
         let results = result["results"].as_array().expect("results array");
 
         let keys: Vec<&str> = results.iter().filter_map(|r| r["key"].as_str()).collect();
-        assert!(
-            keys.contains(&"close"),
-            "close node (sim=1.0) must be included"
+        assert_eq!(
+            keys,
+            vec!["close"],
+            "only the hit at or above the default survives: mid (0.6) and far (0.0) do not"
         );
-        assert!(
-            !keys.contains(&"far"),
-            "far node (sim=0.0) must be excluded by default min=0.8"
+        assert_eq!(
+            result["min"],
+            json!(core_api::FIND_SIMILAR_DEFAULT_MIN),
+            "the reply echoes the floor it applied"
+        );
+
+        // Naming it still reaches everything, in score order: the argument is
+        // read, not replaced by the default.
+        let resp = tool_call(
+            &db,
+            2,
+            "find_similar",
+            json!({
+                "vector": [1.0, 0.0],
+                "field": "emb",
+                "label": "Item",
+                "k": 10,
+                "min": 0.0
+            }),
+        );
+        assert!(!is_error(&resp), "vector search must not error");
+        let result = tool_text(&resp);
+        let results = result["results"].as_array().expect("results array");
+        let keys: Vec<&str> = results.iter().filter_map(|r| r["key"].as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["close", "mid", "far"],
+            "an explicit min of 0.0 keeps the hits the default drops"
+        );
+        assert_eq!(
+            result["min"],
+            json!(0.0),
+            "the reply echoes the named floor"
         );
     }
 

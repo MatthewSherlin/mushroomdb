@@ -9,7 +9,7 @@ mod ws;
 
 use core_api::{MutationEvent, SharedDb};
 
-pub use mcp::{run_mcp_stdio, run_mcp_stdio_with, ASSOCIATION_TOOLS, CODE_GRAPH_TOOLS};
+pub use mcp::{run_mcp_stdio, run_mcp_stdio_with, ASSOCIATION_TOOLS};
 
 /// The root this crate's `tracing` events are filtered by.
 ///
