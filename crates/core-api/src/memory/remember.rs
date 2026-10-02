@@ -207,16 +207,18 @@ pub struct RememberReport {
 }
 
 /// Refuse a key that is empty, or only whitespace: it names nothing, and a
-/// node created under it is one no caller meant (defect 76). `argument` says
-/// which argument held it and is only built for the refusal.
+/// node created under it is one no caller meant (defect 76). The same goes
+/// for a fact's predicate and an entity's label, which become an edge type
+/// and a node label (defect 77). `argument` says which argument held it and
+/// is only built for the refusal.
 ///
-/// A key with text between its padding is not this function's business: it
+/// A value with text between its padding is not this function's business: it
 /// is stored as given.
-fn refuse_empty_key(key: &str, argument: impl FnOnce() -> String) -> Result<()> {
-    if key.trim().is_empty() {
+fn refuse_blank(value: &str, argument: impl FnOnce() -> String) -> Result<()> {
+    if value.trim().is_empty() {
         return Err(GraphError::IngestError {
             detail: format!(
-                "{} must not be empty or only whitespace, got {key:?}",
+                "{} must not be empty or only whitespace, got {value:?}",
                 argument()
             ),
         });
@@ -261,8 +263,8 @@ pub fn describe_entity<F: Fs>(
 /// name ([`crate::memory::identity`]), and left untouched when it already
 /// says exactly that; `aliases` as declared are added to its `alias_keys`
 /// list and to nothing else. A `props` entry named `aliases` or `alias_keys`
-/// is refused before anything is written, and so is a `key` that is empty or
-/// only whitespace.
+/// is refused before anything is written, and so is a `key` or a `label`
+/// that is empty or only whitespace.
 pub fn describe_entity_with_aliases<F: Fs>(
     db: &mut GraphDb<F>,
     key: &str,
@@ -270,7 +272,10 @@ pub fn describe_entity_with_aliases<F: Fs>(
     props: &[(String, Value)],
     aliases: &[String],
 ) -> Result<bool> {
-    refuse_empty_key(key, || "key".to_string())?;
+    refuse_blank(key, || "key".to_string())?;
+    if let Some(label) = label {
+        refuse_blank(label, || "label".to_string())?;
+    }
     let mut props = props.to_vec();
     let identity = identity_props_after_write(db, key, &props, aliases)?;
     props.extend(identity);
@@ -317,12 +322,16 @@ pub struct UpsertOutcome {
 ///   [`describe_entity_with_aliases`] does.
 /// - A `key` that is empty or only whitespace is refused before anything is
 ///   read or written, whether or not a node is stored under it.
+/// - A create under a `label` that is empty or only whitespace is refused
+///   before anything is written, by [`describe_entity_with_aliases`]. On an
+///   update such a label is the relabel refusal above, like any other label
+///   the node does not carry.
 ///
 /// Reads and writes on the one `&mut` handle, so the existence check and the
 /// write cannot be separated by another writer.
 ///
 /// # Errors
-/// [`GraphError::IngestError`] for the three policy refusals, with the whole
+/// [`GraphError::IngestError`] for the four policy refusals, with the whole
 /// sentence in `detail`; any engine refusal, as it came.
 pub fn upsert_entity<F: Fs>(
     db: &mut GraphDb<F>,
@@ -331,7 +340,7 @@ pub fn upsert_entity<F: Fs>(
     mut row: BTreeMap<String, Value>,
     aliases: &[String],
 ) -> Result<UpsertOutcome> {
-    refuse_empty_key(key, || "key".to_string())?;
+    refuse_blank(key, || "key".to_string())?;
     row.remove("id");
     if db.has_node(key) {
         // The label actually stored — an update never changes it. Checked,
@@ -408,6 +417,7 @@ pub fn upsert_entity<F: Fs>(
 /// docs. A key that is empty or only whitespace is one: in `about`, as an
 /// `entities[].key` or as a fact's `subject` or `object` it refuses the
 /// whole call, naming the argument and its position, and nothing is written.
+/// So is an `entities[].label` or a fact's `predicate` with nothing in it.
 ///
 /// The note's key is `"note:"` followed by 16 hex characters of a stable
 /// 64-bit hash of `ts` and `text` (see [`note_key`]), so remembering the
@@ -436,18 +446,23 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
             ),
         });
     }
-    // Every key this call could create a node under or link a note to, before
-    // anything below reads the store or declares full-text: one with nothing
-    // in it would otherwise be stubbed like any other unknown key.
+    // Every key this call could create a node under or link a note to, and
+    // every label and predicate it could create a node or an edge under,
+    // before anything below reads the store or declares full-text: one with
+    // nothing in it would otherwise be written like any other.
     for (i, k) in input.about.iter().enumerate() {
-        refuse_empty_key(k, || format!("remember: about[{i}]"))?;
+        refuse_blank(k, || format!("remember: about[{i}]"))?;
     }
     for (i, entity) in input.entities.iter().enumerate() {
-        refuse_empty_key(&entity.key, || format!("remember: entities[{i}].key"))?;
+        refuse_blank(&entity.key, || format!("remember: entities[{i}].key"))?;
+        refuse_blank(&entity.label, || format!("remember: entities[{i}].label"))?;
     }
     for (i, fact) in input.facts.iter().enumerate() {
-        refuse_empty_key(&fact.subject, || format!("remember: facts[{i}].subject"))?;
-        refuse_empty_key(&fact.object, || format!("remember: facts[{i}].object"))?;
+        refuse_blank(&fact.subject, || format!("remember: facts[{i}].subject"))?;
+        refuse_blank(&fact.predicate, || {
+            format!("remember: facts[{i}].predicate")
+        })?;
+        refuse_blank(&fact.object, || format!("remember: facts[{i}].object"))?;
     }
 
     // Each entity's `aliases` and `alias_keys` after this call, as the

@@ -1136,10 +1136,11 @@ class GraphDb:
 
         Raises `IngestError` when the text is empty or over 4,000 characters,
         the `kind` is unknown, an entity's `props` carry `aliases` or
-        `alias_keys`, or a key is empty or only whitespace — in `about`, as
-        an entity's `key`, or as a fact's `subject` or `object`; nothing is
-        written. Its `.detail` is the bare sentence; the message carries an
-        `ingest error: ` prefix in front of it.
+        `alias_keys`, or a name is empty or only whitespace — a key in
+        `about`, an entity's `key` or `label`, or a fact's `subject`,
+        `predicate` or `object`; nothing is written. Its `.detail` is the
+        bare sentence; the message carries an `ingest error: ` prefix in
+        front of it.
 
         A store this binding creates has no memory schema. `remember`
         declares full-text on `Note.text` and on each new entity label's
@@ -1218,8 +1219,9 @@ class GraphDb:
 
         `aliases` or `alias_keys` inside `props` raise `IngestError`: the
         store maintains both. So does a `key` that is empty or only
-        whitespace. An `IngestError`'s `.detail` is the bare sentence; its
-        message carries an `ingest error: ` prefix.
+        whitespace, and a create under such a `label`. An `IngestError`'s
+        `.detail` is the bare sentence; its message carries an
+        `ingest error: ` prefix.
 
         ```python
         db.upsert_entity("ada", {"name": "Ada Lovelace"}, label="Person", aliases=["Countess"])

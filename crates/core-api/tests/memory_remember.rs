@@ -618,3 +618,180 @@ fn a_store_that_already_holds_an_empty_key_node_still_opens_and_answers() {
     remember(&mut db, &input("Reid reviewed the copy", &["reid".into()])).expect("remember");
     assert!(remember(&mut db, &input("more of the same", &[String::new()])).is_err());
 }
+
+// ── an empty predicate or label (defect 77) ──────────────────────────────────
+
+/// A fact's `predicate` becomes an edge type and an entity's `label` a node
+/// label and a full-text declaration. One with nothing in it refuses the whole
+/// call — the valid entity, the valid fact and the unseen label's full-text
+/// pair beside it included.
+fn assert_a_blank_predicate_or_label_refuses(name: &str, blank: &str) {
+    let mut db = store(name);
+    remember(&mut db, &input("Ada wrote the first one", &["ada".into()])).unwrap();
+    let before = written(&db);
+
+    let good = EntityIn {
+        key: "v0.7".into(),
+        label: "Release".into(),
+        props: BTreeMap::new(),
+        aliases: vec![],
+    };
+    let unlabelled = EntityIn {
+        key: "widget".into(),
+        label: blank.into(),
+        props: BTreeMap::new(),
+        aliases: vec![],
+    };
+    let fact = |predicate: &str| FactIn {
+        subject: "ada".into(),
+        predicate: predicate.into(),
+        object: "v0.7".into(),
+    };
+
+    let cases = vec![
+        (
+            "facts[1].predicate",
+            vec![good.clone()],
+            vec![fact("WORKS_ON"), fact(blank)],
+        ),
+        (
+            "entities[1].label",
+            vec![good, unlabelled],
+            vec![fact("WORKS_ON")],
+        ),
+    ];
+    for (argument, entities, facts) in cases {
+        let refused = remember(
+            &mut db,
+            &RememberInput {
+                entities: &entities,
+                facts: &facts,
+                ..input("a note that must not land", &["ada".into()])
+            },
+        );
+        match refused {
+            Err(core_api::GraphError::IngestError { detail }) => assert_eq!(
+                detail,
+                format!("remember: {argument} must not be empty or only whitespace, got {blank:?}")
+            ),
+            other => panic!("{argument}: expected the refusal, got {other:?}"),
+        }
+        assert_eq!(written(&db), before, "{argument}: a refusal writes nothing");
+        assert!(!db.has_node("v0.7"), "{argument}: all-or-nothing");
+        assert!(!db.has_node("widget"), "{argument}: all-or-nothing");
+    }
+}
+
+#[test]
+fn an_empty_predicate_or_label_is_refused_and_nothing_is_written() {
+    assert_a_blank_predicate_or_label_refuses("empty-type", "");
+}
+
+#[test]
+fn a_whitespace_only_predicate_or_label_is_refused_the_same_way() {
+    assert_a_blank_predicate_or_label_refuses("blank-type", " \t\n");
+}
+
+/// `describe_entity` uses its label only to create, and refuses one with
+/// nothing in it either way.
+#[test]
+fn describing_under_an_empty_label_is_refused() {
+    let mut db = store("describe-empty-label");
+    let before = written(&db);
+    for label in ["", "  "] {
+        match describe_entity(&mut db, "widget", Some(label), &[]) {
+            Err(core_api::GraphError::IngestError { detail }) => assert_eq!(
+                detail,
+                format!("label must not be empty or only whitespace, got {label:?}")
+            ),
+            other => panic!("expected the empty-label refusal, got {other:?}"),
+        }
+    }
+    assert!(!db.has_node("widget"));
+    assert_eq!(written(&db), before);
+}
+
+/// A store written before the refusal existed can hold an edge whose type is
+/// the empty string, a node under the empty label and the full-text pair
+/// `remember` declared for that label. Nothing migrates them: the store
+/// reopens and `recall`, `schema` and `stats` answer with them present.
+#[test]
+fn a_store_that_already_holds_an_empty_type_edge_and_label_still_opens_and_answers() {
+    use core_api::memory::brief::BriefOptions;
+    use core_api::memory::forget::{forget, ForgetTarget};
+    use core_api::memory::recall::recall_rows;
+    use core_api::memory::schema::{render_schema, schema_report};
+
+    let path = tmp("legacy-empty-type");
+    {
+        let mut db = GraphDb::open(&path).unwrap();
+        db.apply_schema(&memory_defaults()).unwrap();
+        remember(&mut db, &input("zanzibar is the router", &["ada".into()])).unwrap();
+        // What 0.7.0's `remember` wrote for `predicate: ""` and `label: ""`,
+        // through the raw write path this fix does not close.
+        db.insert_node("Entity", "bob", vec![]).unwrap();
+        db.insert_edge("", "ada", "bob").unwrap();
+        db.enable_fulltext("", NAME_FIELD).unwrap();
+        db.insert_node(
+            "",
+            "widget",
+            vec![(NAME_FIELD.to_string(), Value::Str("Widget".into()))],
+        )
+        .unwrap();
+    }
+
+    let mut db = GraphDb::open(&path).expect("the store reopens");
+    let stats = db.stats();
+    assert_eq!((stats.nodes_live, stats.edges), (4, 2));
+    assert!(db
+        .fulltext_pairs()
+        .contains(&(String::new(), NAME_FIELD.to_string())));
+
+    let rows = recall_rows(&db, "zanzibar");
+    assert!(rows.indexed);
+    assert_eq!(rows.hits.len(), 1);
+    assert_eq!(
+        recall_rows(&db, "widget")
+            .hits
+            .iter()
+            .map(|h| (h.key.as_str(), h.label.as_str()))
+            .collect::<Vec<_>>(),
+        [("widget", "")]
+    );
+    let rendered = render_schema(&schema_report(&db, &BriefOptions::default()));
+    assert!(rendered.contains("Entity"), "{rendered}");
+
+    // Naming either again is refused; `forget` removes both.
+    let again = FactIn {
+        subject: "ada".into(),
+        predicate: String::new(),
+        object: "bob".into(),
+    };
+    assert!(remember(
+        &mut db,
+        &RememberInput {
+            facts: &[again],
+            ..input("more of the same", &[])
+        }
+    )
+    .is_err());
+    let gone = forget(
+        &mut db,
+        &ForgetTarget::Fact {
+            subject: "ada".into(),
+            predicate: String::new(),
+            object: "bob".into(),
+        },
+    )
+    .expect("forget retracts the empty-type edge");
+    assert!(gone.changed);
+    forget(
+        &mut db,
+        &ForgetTarget::Node {
+            key: "widget".into(),
+        },
+    )
+    .expect("forget removes the empty-label node");
+    let stats = db.stats();
+    assert_eq!((stats.nodes_live, stats.edges), (3, 1));
+}

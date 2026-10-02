@@ -137,6 +137,68 @@ def test_an_empty_key_is_refused_and_nothing_is_written(db, key):
     assert db.node_info("v0.7") is None, "all-or-nothing"
 
 
+@pytest.mark.parametrize("blank", ["", "  "])
+def test_an_empty_predicate_or_label_is_refused_and_nothing_is_written(db, blank):
+    """Defect 77: a fact's predicate became an edge type and an entity's label
+    a node label and a full-text declaration, whatever was in them."""
+    db.remember("Ada wrote the first one", about=["ada"], ts=TS)
+    before = (db.stats(), db.wal_total_commits(), db.fulltext_pairs())
+    good = {"key": "v0.7", "label": "Release"}
+
+    with pytest.raises(IngestError) as err:
+        db.remember(
+            "a fact with no predicate",
+            ts=TS + 1,
+            entities=[good],
+            facts=[{"subject": "ada", "predicate": blank, "object": "v0.7"}],
+        )
+    assert err.value.detail == (
+        f"remember: facts[0].predicate must not be empty or only whitespace, got {json.dumps(blank)}"
+    )
+    with pytest.raises(IngestError) as err:
+        db.remember(
+            "an entity with no label", ts=TS + 1, entities=[good, {"key": "widget", "label": blank}]
+        )
+    assert err.value.detail == (
+        f"remember: entities[1].label must not be empty or only whitespace, got {json.dumps(blank)}"
+    )
+    with pytest.raises(IngestError) as err:
+        db.upsert_entity("gizmo", {"name": "Gizmo"}, label=blank)
+    assert err.value.detail == (
+        f"label must not be empty or only whitespace, got {json.dumps(blank)}"
+    )
+
+    assert (db.stats(), db.wal_total_commits(), db.fulltext_pairs()) == before
+    for key in ("v0.7", "widget", "gizmo"):
+        assert db.node_info(key) is None, "all-or-nothing"
+
+
+def test_a_store_that_already_holds_an_empty_type_edge_and_label_still_answers(tmp_path):
+    """Nothing migrates an edge whose type is the empty string or a node under
+    the empty label that an earlier release let `remember` write. The store
+    reopens and answers with them there, and `forget` removes both."""
+    path = str(tmp_path / "db")
+    db = GraphDb.open(path)
+    db.remember("Ada wrote the first one", about=["ada", "bob"], ts=TS)
+    db.insert_edge("", "ada", "bob")
+    db.insert_node("", "widget", {"name": "Widget"})
+    db.close()
+
+    db = GraphDb.open(path)
+    try:
+        assert db.node_info("widget")["label"] == ""
+        assert db.stats()["nodes_live"] == 4 and db.stats()["edges"] == 3
+        assert db.recall("Ada")["hits"][0]["label"] == "Note"
+        assert db.schema_report()["brief"]["nodes"] == 4
+
+        gone = db.forget(fact={"subject": "ada", "predicate": "", "object": "bob"})
+        assert gone["mode"] == "fact" and gone["changed"] is True
+        assert db.forget(key="widget")["changed"] is True
+        assert db.stats()["nodes_live"] == 3 and db.stats()["edges"] == 2
+    finally:
+        db.close()
+
+
 def test_a_store_that_already_holds_an_empty_key_node_still_answers(tmp_path):
     """Nothing migrates a node keyed by the empty string that an earlier
     release let `remember` create. The store reopens and answers with it

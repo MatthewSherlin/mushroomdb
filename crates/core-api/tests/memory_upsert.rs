@@ -316,3 +316,45 @@ fn an_empty_or_whitespace_only_key_is_refused() {
     );
     assert_eq!(db.commit_seq(), before);
 }
+
+/// Defect 77: a label with nothing in it is not a label. A create under one
+/// is refused before anything is written; an update naming one is the relabel
+/// refusal it always was.
+#[test]
+fn an_empty_or_whitespace_only_label_is_refused() {
+    let mut db = store("empty-label");
+    for label in ["", "   ", "\t\n"] {
+        let before = (db.stats().nodes_live, db.commit_seq(), db.fulltext_pairs());
+        let refused = upsert_entity(
+            &mut db,
+            "gizmo",
+            Some(label),
+            row(&[("name", "Gizmo")]),
+            &[],
+        );
+        match refused {
+            Err(GraphError::IngestError { detail }) => assert_eq!(
+                detail,
+                format!("label must not be empty or only whitespace, got {label:?}")
+            ),
+            other => panic!("expected the empty-label refusal, got {other:?}"),
+        }
+        assert!(!db.has_node("gizmo"), "refused before anything was written");
+        assert_eq!(
+            (db.stats().nodes_live, db.commit_seq(), db.fulltext_pairs()),
+            before
+        );
+    }
+
+    upsert_entity(&mut db, "ada", Some("Person"), row(&[("name", "Ada")]), &[]).unwrap();
+    let before = db.commit_seq();
+    let refused = upsert_entity(&mut db, "ada", Some(""), row(&[("role", "x")]), &[]);
+    match refused {
+        Err(GraphError::IngestError { detail }) => {
+            assert!(detail.contains("cannot relabel"), "{detail}")
+        }
+        other => panic!("expected the relabel refusal, got {other:?}"),
+    }
+    assert_eq!(db.get_prop("ada", "role"), None);
+    assert_eq!(db.commit_seq(), before);
+}

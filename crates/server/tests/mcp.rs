@@ -6280,6 +6280,59 @@ fn an_empty_key_is_a_tool_error_and_writes_nothing() {
     assert!(!db.read().has_node(""), "no node keyed by the empty string");
 }
 
+/// Defect 77: a fact's `predicate` and an entity's `label` with nothing in
+/// them are tool errors naming the argument, and `stats` and `schema` read the
+/// same before and after — no unnamed edge type, no unnamed label, no
+/// full-text pair declared for one.
+#[test]
+fn an_empty_predicate_or_label_is_a_tool_error_and_writes_nothing() {
+    let db = memory_store("empty-type");
+    one_task_call(
+        db.clone(),
+        "remember",
+        json!({"text": "Ada wrote the first one", "about": ["ada"]}),
+    );
+    let snapshot = |db: &SharedDb| {
+        (
+            content_json(&one_task_call(db.clone(), "stats", json!({}))),
+            task_reply(&one_task_call(db.clone(), "schema", json!({}))),
+        )
+    };
+    let before = snapshot(&db);
+    for (tool, args, argument) in [
+        (
+            "remember",
+            json!({"text": "a fact with no predicate",
+                   "entities": [{"key": "v0.7", "label": "Release"}],
+                   "facts": [{"subject": "ada", "predicate": "", "object": "v0.7"}]}),
+            "remember: facts[0].predicate",
+        ),
+        (
+            "remember",
+            json!({"text": "an entity with no label",
+                   "entities": [{"key": "v0.7", "label": "Release"},
+                                {"key": "widget", "label": "  "}]}),
+            "remember: entities[1].label",
+        ),
+        (
+            "upsert_entity",
+            json!({"key": "gizmo", "label": "", "props": {"name": "Gizmo"}}),
+            "label",
+        ),
+    ] {
+        let err = error_text(&one_task_call(db.clone(), tool, args));
+        assert!(
+            err.contains(&format!("{argument} must not be empty or only whitespace")),
+            "{tool} {argument}: {err}"
+        );
+    }
+    assert_eq!(snapshot(&db), before, "a refusal writes nothing");
+    let g = db.read();
+    for key in ["v0.7", "widget", "gizmo"] {
+        assert!(!g.has_node(key), "{key} must not have been written");
+    }
+}
+
 /// `forget {key, prop: "alias_keys"}` clears the declared list, and with it
 /// the link the claim made; the reply counts the retraction.
 #[test]
