@@ -6988,3 +6988,71 @@ fn was_linked_declares_the_date_it_accepts() {
         replies[4]
     );
 }
+
+/// Binding: after the first `remember` on a store that never took the memory
+/// defaults, `recall` says which entity fields it does not search, and names
+/// the command that indexes them (ledger row 73).
+///
+/// `remember` declares `Note.text` itself, so the "no text index" answer stops
+/// at the first note. Until this, nothing took its place: `recall` returned
+/// the note, not the person it was about, and said nothing was missing.
+#[test]
+fn recall_names_the_entity_fields_a_store_without_the_defaults_does_not_search() {
+    let dir = tmp("recall-incomplete");
+    let db = SharedDb::open(&dir).unwrap();
+    db.write()
+        .insert_node(
+            "Person",
+            "p1",
+            vec![("name".into(), Value::Str("Pat Doe".into()))],
+        )
+        .unwrap();
+    let recall = |id: i64, topic: &str| call(id, "recall", json!({"topic": topic}));
+    let stdin = format!(
+        "{}{}{}{}",
+        recall(1, "pat doe"),
+        call(
+            2,
+            "remember",
+            json!({"text": "Pat Doe likes tea", "about": ["p1"]})
+        ),
+        recall(3, "pat doe"),
+        recall(4, "zebra"),
+    );
+    let (res, out) = exchange_at(db.clone(), Some(dir.clone()), &stdin);
+    assert!(res.is_ok(), "{res:?}");
+    let replies = parse_lines(&out);
+    let notice = format!(
+        "text index incomplete: recall does not search Person.name. \
+         Run `mushroomdb schema apply {} --memory-defaults`.\n",
+        dir.display()
+    );
+
+    // Before any note: the answer 0.7.0 already gave, and only that one.
+    let none = task_reply(&replies[0]);
+    assert!(none.contains("this store has no text index"), "{none}");
+    assert!(!none.contains("text index incomplete"), "{none}");
+
+    // After it: the note is found, the person is not, and the reply says why.
+    let hits = task_reply(&replies[2]);
+    assert!(hits.contains("Pat Doe likes tea"), "{hits}");
+    assert!(!hits.contains("  p1 — "), "{hits}");
+    assert!(hits.ends_with(&notice), "{hits}");
+    assert_eq!(hits.matches("text index incomplete").count(), 1, "{hits}");
+
+    // A topic nothing matches gets it too: an unindexed field is one reason.
+    assert_eq!(
+        task_reply(&replies[3]),
+        format!("mushroomdb recall — nothing matches zebra\n{notice}")
+    );
+
+    // The command it names ends it, and the person is found.
+    db.write()
+        .apply_schema(&core_api::memory_schema::memory_defaults())
+        .unwrap();
+    let (res, out) = exchange_at(db, Some(dir), &recall(5, "pat doe"));
+    assert!(res.is_ok(), "{res:?}");
+    let whole = task_reply(&parse_lines(&out)[0]);
+    assert!(whole.contains("  p1 — "), "{whole}");
+    assert!(!whole.contains("text index"), "{whole}");
+}

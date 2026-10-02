@@ -252,6 +252,11 @@ reach line always surviving the cap. It reads no clock, so two sessions started
 an hour apart get byte-identical output and a host that caches it is never
 wrong. A store with no text index says so here, once per session, with the
 `mushroomdb schema apply <db> --memory-defaults` command that gives it one.
+A store that has a text field and lacks one of the memory defaults for a
+label it holds — the shape a store that never took them has after its first
+`remember` — says `text index incomplete`, names the fields `recall` does
+not search, and gives the same command. Either line is added after the cap
+is applied, so it is never the thing that gets cut.
 
 The prompt hook runs `<bin> recall <db>`, which opens the store without
 migration or WAL repair (`auto_migrate: false`, `repair_wal: false`) — it fires
@@ -260,6 +265,8 @@ the prompt — a question in ordinary words is enough — with one line per hit,
 each saying how many of the prompt's terms it matched. It prints nothing at all
 when nothing clears the relevance floor, when the store has no text index, or
 when the store will not open: a prompt hook never blocks or slows a prompt.
+It never carries the `text index incomplete` line either; the brief says that
+once, and the `recall` tool says it when asked.
 
 A digest opens with a line marking the content as untrusted graph data, and
 control characters are stripped from every rendered value: node keys and

@@ -509,3 +509,94 @@ fn recall_rows_from_the_all_stopword_fallback_carry_no_term_counts() {
         .collect();
     assert_eq!(got, vec![("note-1", 0)], "{rows:?}");
 }
+
+// ── the memory defaults a store lacks and has something to find in (row 73) ──
+
+fn pair(label: &str, field: &str) -> (String, String) {
+    (label.to_string(), field.to_string())
+}
+
+/// A store that never took the memory defaults and has remembered once: the
+/// shape `remember` leaves, with `Note.text` declared and nothing else.
+fn store_with_only_note_text(name: &str) -> GraphDb<core_storage::fs::RealFs> {
+    let mut db = GraphDb::open(&tmp(name)).unwrap();
+    db.insert_node(
+        "Person",
+        "p1",
+        vec![("name".into(), Value::Str("Pat Doe".into()))],
+    )
+    .unwrap();
+    db.enable_fulltext("Note", "text").unwrap();
+    db.insert_node(
+        "Note",
+        "note-1",
+        vec![("text".into(), Value::Str("Pat Doe likes tea".into()))],
+    )
+    .unwrap();
+    db
+}
+
+#[test]
+fn a_store_past_its_first_note_names_the_entity_fields_recall_cannot_search() {
+    use core_api::memory::recall::unindexed_memory_fields;
+    let mut db = store_with_only_note_text("unindexed");
+    assert_eq!(unindexed_memory_fields(&db), vec![pair("Person", "name")]);
+
+    // The defect itself: the person is in the store and recall cannot find it.
+    let rows = recall_rows(&db, "pat doe");
+    assert!(rows.indexed);
+    assert_eq!(
+        rows.hits.iter().map(|h| h.key.as_str()).collect::<Vec<_>>(),
+        vec!["note-1"]
+    );
+
+    // In the defaults' order, and only for a field some live node carries.
+    db.insert_node(
+        "Entity",
+        "stub",
+        vec![("name".into(), Value::Str("stub".into()))],
+    )
+    .unwrap();
+    db.insert_node("Org", "nameless", vec![]).unwrap();
+    db.insert_node(
+        "Concept",
+        "c1",
+        vec![("summary".into(), Value::Str("a summary".into()))],
+    )
+    .unwrap();
+    assert_eq!(
+        unindexed_memory_fields(&db),
+        vec![
+            pair("Person", "name"),
+            pair("Concept", "summary"),
+            pair("Entity", "name")
+        ]
+    );
+
+    // The one command the notice names ends it.
+    db.apply_schema(&memory_defaults()).unwrap();
+    assert_eq!(unindexed_memory_fields(&db), vec![]);
+}
+
+#[test]
+fn a_store_with_its_own_schema_and_no_memory_labels_is_not_told_to_apply_the_defaults() {
+    use core_api::memory::recall::unindexed_memory_fields;
+    let mut db = GraphDb::open(&tmp("own-schema")).unwrap();
+    db.enable_fulltext("Doc", "body").unwrap();
+    db.insert_node(
+        "Doc",
+        "d1",
+        vec![
+            ("body".into(), Value::Str("the quarterly report".into())),
+            ("name".into(), Value::Str("Q3".into())),
+        ],
+    )
+    .unwrap();
+    assert_eq!(unindexed_memory_fields(&db), vec![]);
+
+    // A store with the defaults is not told either, whatever it holds.
+    assert_eq!(unindexed_memory_fields(&store("defaults")), vec![]);
+    // Nor an empty one.
+    let empty = GraphDb::open(&tmp("empty")).unwrap();
+    assert_eq!(unindexed_memory_fields(&empty), vec![]);
+}

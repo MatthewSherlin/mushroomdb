@@ -1740,16 +1740,37 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
         Err(e) => return CallOutcome::ToolErr(e),
     };
     let label = db_dir.map_or_else(|| "store".to_string(), |d| d.display().to_string());
-    let outcome = {
+    // A store that never took the memory defaults has a text index from its
+    // first `remember` on — `Note.text`, self-declared — and entities it
+    // cannot find by name. The line says which fields and what indexes them.
+    // It follows the digest rather than spending the digest's budget: a hit
+    // is never dropped to make room for it.
+    let (outcome, incomplete) = {
         let g = db.read();
-        core_api::memory::recall::recall_digest(&*g, &topic, &label, MAX_OUTPUT_BYTES)
+        let unindexed = core_api::memory::recall::unindexed_memory_fields(&*g);
+        let incomplete = if unindexed.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "text index incomplete: recall does not search {}. \
+                 Run `mushroomdb schema apply {} --memory-defaults`.\n",
+                core_api::memory::recall::unindexed_fields_list(&unindexed),
+                digest::sanitize(&label)
+            )
+        };
+        let outcome =
+            core_api::memory::recall::recall_digest(&*g, &topic, &label, MAX_OUTPUT_BYTES);
+        (outcome, incomplete)
     };
     let (digest, text) = match outcome {
-        core_api::memory::recall::RecallOutcome::Hits(d) => (d.clone(), d),
+        core_api::memory::recall::RecallOutcome::Hits(d) => {
+            let d = d + &incomplete;
+            (d.clone(), d)
+        }
         core_api::memory::recall::RecallOutcome::NoMatch => (
             String::new(),
             format!(
-                "mushroomdb recall — nothing matches {}\n",
+                "mushroomdb recall — nothing matches {}\n{incomplete}",
                 digest::sanitize(&topic)
             ),
         ),

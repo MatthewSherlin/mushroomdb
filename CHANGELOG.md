@@ -32,6 +32,20 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
   and one that does not accepted it. `at_commit` is now typed as `edges_at`'s
   `at` is — a string or a non-negative integer — and the description leads
   with the date. Nothing about the handler changed (row 71).
+- **A store without the memory defaults keeps saying so after its first
+  `remember`.** `remember` declares `Note.text` as it writes, so "this store
+  has no text index" stopped at the first note, and nothing replaced it: on a
+  0.6 store, or one a `query` created, `recall` then returned the note and
+  not the person it was about. The `recall` tool's reply and the session
+  brief now end with `text index incomplete: recall does not search
+  Person.name`, naming each memory-default field the store has not declared
+  and holds a value for, with the `mushroomdb schema apply <db>
+  --memory-defaults` command that indexes them. Nothing is declared for you:
+  an existing store is still upgraded only by that command. A store with no
+  node under a memory label — one with its own schema — is told nothing, and
+  so is the prompt hook's digest, which fires every turn. Python's `recall`
+  rows are unchanged; `fulltext_pairs()` is how a Python caller sees what is
+  declared (row 73).
 
 ### Changed
 
@@ -594,12 +608,12 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   `~/.mushroomdb`, and the session brief looks for one only beside the store's
   parent directory, so with the store anywhere else the brief's last line
   names MCP tools in a session that has none (row 69, deferred to 0.8).
-- **After the first `remember` on a store without the memory defaults, nothing
-  says the defaults are missing.** The store then has one text field, so
-  `recall` and the brief stop saying "no text index", and an entity that was
-  already there is not found by its name. `mushroomdb schema apply <db>
-  --memory-defaults` indexes them; the `schema` tool lists the fields `recall`
-  searches (row 73, deferred to 0.7.1).
+- **In 0.7.0, after the first `remember` on a store without the memory
+  defaults, nothing says the defaults are missing.** Fixed in 0.7.1 (row 73).
+  The store then has one text field, so on 0.7.0 `recall` and the brief stop
+  saying "no text index", and an entity that was already there is not found
+  by its name. `mushroomdb schema apply <db> --memory-defaults` indexes them;
+  the `schema` tool lists the fields `recall` searches.
 - **A store the Python binding creates has no memory schema.** `remember`
   declares the text fields it needs as it goes. The identity preset is applied
   from the command line — `mushroomdb schema apply <db> --memory-identity` —
