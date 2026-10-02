@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.7.0 (unreleased) — memory that fills itself
+## v0.7.0 — memory that fills itself
 
 0.7 is the release in which `remember` followed by `recall` works on a new
 store. The memory write path is what it is for; the code-graph door is what it
@@ -8,12 +8,14 @@ removes.
 
 **This is the first breaking release.** Under Cargo semver the minor slot is
 the breaking position for `0.x`, so a Cargo dependency on `^0.6.x` does not
-match `0.7.0` and stays where it is. Nothing else is held back. An unpinned
-`pip install mushroomdb`, `npx mushroomdb`, `cargo install mushroomdb-cli`,
-the container image pulled without a tag and the Claude Code plugin each take
-0.7 the next time they resolve, with no deliberate upgrade. An MCP entry that
-`install` already wrote names its version, and stays on it until `install` is
-run again.
+match `0.7.0` and stays where it is. Nothing else unpinned is held back. An
+unpinned `pip install mushroomdb`, `npx mushroomdb`, `cargo install
+mushroomdb-cli` and the container image pulled without a tag each take 0.7 the
+next time they resolve, with no deliberate upgrade. Two things name their
+version and stay on it: an MCP entry that `install` already wrote, until
+`install` is run again, and the Claude Code plugin, whose `.mcp.json` and hook
+script pin the launcher and move only when the plugin or its marketplace is
+updated.
 
 > **If you call `find_similar` without `min`, your results change, and nothing
 > tells you.**
@@ -221,13 +223,18 @@ only when its program is mushroomdb — `npx … mushroomdb@…`, a path ending
 - **`docs/site` no longer publishes two internal notes** — they moved to
   `docs/roadmap/` — and `docs/design.md` is headed as the historical record it
   is: the design the project started from, not a description of what exists.
-- **Five gates the release process did not have.** The version check sees the
-  Python binding's manifest and its pins; the defect ledger runs in CI and
-  refuses a deferral to a release that has shipped; and three are new — the
-  names gate, a link-and-anchor gate over the hand-written docs
-  (`scripts/check-links.py`), and a check that `llms-full.txt` is what its
-  generator writes and that the generator accounts for every page under
-  `docs/site` (`scripts/gen-llms-full.sh --check`).
+- **Six gates the release process did not have.** The version check sees the
+  Python binding's manifest, its pins and both lockfiles, and a bump whose
+  lockfile refresh fails now fails; the defect ledger runs in CI and refuses a
+  deferral to a release that has shipped; and four are new — the names gate, a
+  link-and-anchor gate over the hand-written docs (`scripts/check-links.py`),
+  a check that `llms-full.txt` is what its generator writes and that the
+  generator accounts for every page under `docs/site`
+  (`scripts/gen-llms-full.sh --check`), and a publish rehearsal
+  (`scripts/publish-rehearsal.sh`) that packages the eight crates, the wheel
+  and both npm packages in dry runs and uploads nothing. The first five run in
+  CI; the rehearsal is run by hand before a tag. A claims rule also refuses a
+  sentence that names a release as the current one.
 
 ### Added — identity, and four tools for the store as a whole
 
