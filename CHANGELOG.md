@@ -61,13 +61,18 @@ not look like a code identifier.
   mark, and `forget` removes it. A fact's subject and object get the same
   treatment. At most 20 are stubbed per call; any past that are named in the
   reply as **not** created, and the rest of the call still commits.
-- **A key that is empty or only whitespace is refused.** In `remember`'s
-  `about`, as an `entities` key or as a fact's `subject` or `object`, and as
-  `upsert_entity`'s `key`, over MCP and in Python alike: the error names the
-  argument and its position, and the call writes nothing. A raw write can
-  still store a node under the empty key; `mushroomdb query <db> "MATCH (n)
-  WHERE key(n) = '' DETACH DELETE n"` removes one, as does `forget(key="")` in
-  Python (the MCP `forget` refuses an empty key).
+- **A key, a label or a predicate that is empty or only whitespace is
+  refused.** In `remember`: a key in `about`, an `entities` key or label, and
+  a fact's `subject`, `predicate` or `object`. In `upsert_entity`: the `key`,
+  and the `label` of a create. Over MCP and in Python alike, the error names
+  the argument and its position, and the call writes nothing. A raw write can
+  still store any of them. A node under the empty key is removed by
+  `mushroomdb query <db> "MATCH (n) WHERE key(n) = '' DETACH DELETE n"` or by
+  `forget(key="")` in Python (the MCP `forget` refuses an empty key); a node
+  under an empty label by `forget` with its key. An edge whose type is the
+  empty string is retracted by `forget(fact=…)` in Python; over MCP `forget`
+  refuses an empty predicate, so there it goes only with one of its endpoint
+  nodes.
 - **A node's label is fixed.** `upsert_entity` with a `label` that differs
   from the stored one is refused, and writes nothing, where it used to be
   silently ignored. Name the label in `remember`'s `entities` at first
