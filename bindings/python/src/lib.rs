@@ -1,10 +1,10 @@
+use core_api::restore::{restore_if_empty, RestoreOutcome};
 use core_api::{
     default_max_edges, valid_namespace, AlgoDir, AsOfScope, Direction, EdgeAt, Explanation,
     GraphDb as CoreDb, GraphError, HistoryChange, HistoryEntry, MaskedNodeResult, NamespaceStats,
     NodeInfo, NodeMask, OnConflict, PredicateSummary, PropPredicate, ResultSet, RuleDef, Scope,
     Value, NS_MAX_LEN, NS_PROP,
 };
-use core_api::restore::{restore_if_empty, RestoreOutcome};
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
