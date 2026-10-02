@@ -10022,7 +10022,7 @@ impl<F: Fs> GraphDb<F> {
     /// and it stops at the first carrier. The label column itself has no
     /// per-label index, so on a label with fewer than `limit` nodes the walk
     /// of that column runs to its end — integer compares, no property read.
-    pub fn first_nodes_carry_prop(&self, label: &str, field: &str, limit: usize) -> bool {
+    pub(crate) fn first_nodes_carry_prop(&self, label: &str, field: &str, limit: usize) -> bool {
         let Some(sym) = self.syms.get(label) else {
             return false;
         };

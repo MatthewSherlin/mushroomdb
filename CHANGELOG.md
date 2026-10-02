@@ -48,8 +48,8 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
   schema — is told nothing, and so is the prompt hook's digest, which fires
   every turn. Python's `recall` rows are unchanged; `fulltext_pairs()` is how
   a Python caller sees what is declared. The tool's older "no text index"
-  answer now strips control characters from the store path it prints, as the
-  new line does (row 73).
+  answer now replaces each control character in the store path it prints
+  with a space, as the new line does (row 73).
 
 ### Changed
 

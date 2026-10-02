@@ -255,8 +255,10 @@ wrong. A store with no text index says so here, once per session, with the
 A store that has a text field and lacks one of the memory defaults for a
 label it holds — the shape a store that never took them has after its first
 `remember` — says `text index incomplete`, names the fields `recall` does
-not search, and gives the same command. Either line is added after the cap
-is applied, so it is never the thing that gets cut.
+not search, and gives the same command. The check looks at the first 1,000
+live nodes of each memory label, so a store whose named entities come later
+is not told; the `schema` tool shows what is declared. Either line is added
+after the cap is applied, so it is never the thing that gets cut.
 
 The prompt hook runs `<bin> recall <db>`, which opens the store without
 migration or WAL repair (`auto_migrate: false`, `repair_wal: false`) — it fires
