@@ -196,3 +196,114 @@ fn the_brief_of_a_searchable_store_says_nothing_about_an_index() {
         "a store that can be searched needs no notice: {out:?}"
     );
 }
+
+/// One `remember` through `mushroomdb mcp <db>`, the way a session writes one.
+fn remember_over_mcp(db: &std::path::Path, text: &str, about: &str) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("mcp")
+        .arg(db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mcp");
+    let requests = format!(
+        concat!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"prompt-hook-test","version":"0"}}}}}}"#,
+            "\n",
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#,
+            "\n",
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"remember","arguments":{{"text":"{text}","about":["{about}"]}}}}}}"#,
+            "\n",
+        ),
+        text = text,
+        about = about,
+    );
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(requests.as_bytes())
+        .expect("write requests");
+    let out = child.wait_with_output().expect("wait");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("remembered note:"),
+        "remember failed: {out:?}"
+    );
+}
+
+/// A store that never took the memory defaults, holding one named `Person`,
+/// after its first `remember`: `Note.text` is declared and nothing else is.
+/// A 0.6.x store that has remembered anything has this shape.
+fn store_past_its_first_note(name: &str) -> std::path::PathBuf {
+    let db = tmp(name);
+    let out = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .args([
+            "query",
+            &db.to_string_lossy(),
+            "CREATE (n:Person {id:'p1', name:'Pat Doe'})",
+        ])
+        .output()
+        .expect("seed");
+    assert!(out.status.success(), "{out:?}");
+    remember_over_mcp(&db, "Pat Doe likes tea", "p1");
+    db
+}
+
+/// Binding: the brief keeps naming the fix after the first `remember` gave the
+/// store one text field (ledger row 73). `remember` declares `Note.text`
+/// itself, so "no text index" stops being true at the first note, while the
+/// person already in the store is still not found by name.
+#[test]
+fn the_brief_of_a_store_past_its_first_note_names_the_fields_recall_cannot_search() {
+    let db = store_past_its_first_note("brief-incomplete");
+    let out = brief(&db);
+    let expected = format!(
+        "text index incomplete: recall does not search Person.name. \
+         Run: mushroomdb schema apply '{}' --memory-defaults",
+        db.display()
+    );
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(
+        lines.len().checked_sub(2).map(|i| lines[i]),
+        Some(expected.as_str()),
+        "the notice sits just above the reach line: {out:?}"
+    );
+    assert!(!out.contains("no text index"), "{out:?}");
+    assert!(
+        out.len() <= core_api::memory::brief::MAX_BRIEF_BYTES,
+        "an ordinary store's brief holds the notice inside the cap: {} bytes",
+        out.len()
+    );
+
+    // The command it names ends it.
+    let applied = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .args([
+            "schema",
+            "apply",
+            &db.to_string_lossy(),
+            "--memory-defaults",
+        ])
+        .output()
+        .expect("schema apply");
+    assert!(applied.status.success(), "{applied:?}");
+    let after = brief(&db);
+    assert!(
+        !after.contains("schema apply") && !after.contains("text index"),
+        "{after:?}"
+    );
+}
+
+/// The prompt hook fires every turn, so it carries no notice — only the
+/// digest. The brief says it once.
+#[test]
+fn the_prompt_hook_says_nothing_about_an_incomplete_index() {
+    let db = store_past_its_first_note("hook-incomplete");
+    let out = hook(&db, r#"{"prompt":"pat doe"}"#);
+    assert!(out.contains("Pat Doe likes tea"), "{out:?}");
+    assert!(
+        !out.contains("text index") && !out.contains("schema apply"),
+        "{out:?}"
+    );
+}

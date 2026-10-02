@@ -273,7 +273,7 @@ Claude Desktop config (Claude Code and Cursor should use the plugin or
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.7.0", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.7.1", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -449,7 +449,8 @@ Three history APIs expose the WAL timeline with rule attribution:
 - `node_history(key)` — every change for a node since the last truncating snapshot
 - `edge_history(a, b)` — add/retract lifecycle for all edges between two nodes;
   `rule` field names the rule for derived edges, null for manual edges
-- `was_linked(a, b, edge_type, at_commit)` — point-in-time edge existence check
+- `was_linked(a, b, edge_type, at_commit)` — point-in-time edge existence check;
+  over MCP and HTTP `at_commit` takes a commit index or an RFC 3339 date
 
 Available over: Rust API, MCP tools (`node_history`, `edge_history`, `was_linked`),
 and HTTP (`GET /node/{key}/history`, `GET /history/edge`, `GET /history/was_linked`).

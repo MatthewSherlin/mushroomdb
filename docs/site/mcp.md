@@ -27,7 +27,7 @@ Claude Desktop has no installer path, so add mushroomdb by hand in
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.7.0", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.7.1", "mcp", "/path/to/your/db"]
     }
   }
 }
@@ -447,7 +447,7 @@ heading or a line break in an agent's context.
 | `neighborhood` | `key`, `depth?`, `edge_types?`, `direction?`, `limit?` | At `depth: 1`, the same grouped relationship listing `node_edges` gives; above 1, the breadth-first table of `(key, label, depth)`. |
 | `edges_at` | `key`, `at`, `edge_type?`, `all_of?`, `label?`, `direction?`, `limit?` | The edges the node had on a past date, or at a 0-based commit index — the graph as it was then, replayed from the WAL and its archives in one scan. Renames are followed, so a node's current key finds edges written under an earlier name. Takes `node_edges`' filters, so the intersection question is one call at a past commit too. |
 | `what_if` | `key`, `field`, `value`, `edge_type?`, `label?`, `limit?` | The derived edges a property change would retract and derive, computed without writing anything: the rule engine runs the same re-derivation a real `set_prop` would, against a clone. `edge_type` prints both sides as partner keys. |
-| `recall` | `topic` | What the store already knows about a topic: ranked nodes matching free text across every indexed text field, one line each. Every line says how many of the topic's terms it matched — `(2/3 terms)` — and hits rank by that first. A question in ordinary words is enough. |
+| `recall` | `topic` | What the store already knows about a topic: ranked nodes matching free text across every indexed text field, one line each. Every line says how many of the topic's terms it matched — `(2/3 terms)` — and hits rank by that first. A question in ordinary words is enough. On a store that never took the memory defaults and holds named entities the reply ends with a `text index incomplete` line naming the entity fields it does not search — `Person.name`, say — and the `mushroomdb schema apply <db> --memory-defaults` command that indexes them. |
 | `remember` | `text`, `about?`, `kind?`, `entities?`, `facts?` | Writes a note into the graph and returns its key. A key in `about` that does not exist yet is created as a provisional entity — label `Entity`, marked `provisional` — rather than refused; so is an unknown `facts` endpoint. A key that is empty or only whitespace — in `about`, as an `entities[]` key or as a fact's `subject` or `object` — is refused, and so is such an `entities[]` label or fact `predicate`; the call writes nothing. At most 20 stubs per call; keys past that are reported as capped and not written, and the rest of the call still commits. The store keeps a normalised `aliases` list on every entity it writes — the key, the name and the name's words, recomputed on each write, so a renamed entity stops matching its old name. Each `entities[]` item takes `aliases`, other names it goes by; those are kept as written in `alias_keys` and nowhere else, so they do not count toward the overlap. With the identity preset applied (`mushroomdb schema apply <db> --memory-identity`, sixteen `SAME_AS` rules), the reply lists the `same as` links the write created. A declared alias equal to a provisional stub's key links that stub at 1.00 — `aliases: ["matt"]` links a stub keyed `matt`. The match is exact and case-sensitive (`Matt` does not). The target must carry label `Entity`, which a node created by `about` keeps for life: such a node can still be claimed after it is described, and cannot itself claim, since the claiming node must carry one of the five entity labels. A declared alias equal to an unrelated stub's key links them at 1.00 too, because declaring it is the caller's claim. A write that retracts `same as` links says so: one `unlinked` line, and `same_as_lost` with `same_as_lost_total` in the json, ten pairs at most. A link holds while two nodes' keys, names and the names' words overlap at 0.6, so a changed name is what retracts one; declaring an alias never does. Give both the same name, or declare a provisional stub's key as an alias to link it whatever the names. |
 | `schema` | — | The store's labels with their fields, its edge types and what derives them, every rule with its predicate, the full-text fields `recall` searches, the equality indexes, and how many provisional nodes `remember` created. |
 | `analyze` | `kind`, `top?`, `edge_type?` | `central` (PageRank), `degree`, `components` (connected groups with sizes), `clusters` (communities of two or more; singletons counted, not listed) or `identities` (`SAME_AS` links resolved by complete linkage, oldest node canonical). The whole store with no role or mask; at most 50 rows; the same store always gets the same answer. |
@@ -478,9 +478,10 @@ answers. A session can only call what its client was shown, though, so the two
 unlisted tools — `explain` and `rename_node` — are reached by starting the
 server with `mushroomdb mcp <db> --all-tools`, which lists the whole set with
 their schemas. The default listing a session pays for before its first turn —
-the `tools` array of the `tools/list` reply, as compact JSON — is 27,067 bytes;
-all 25 are 27,868. Before this release added `schema`, `analyze`,
-`suggest_rules` and `forget` it was 23,548 and 24,349;
+the `tools` array of the `tools/list` reply, as compact JSON — is 27,371 bytes;
+all 25 are 28,172. In 0.7.0 it was 27,067 and 27,868: the difference is
+`was_linked`'s schema declaring the date it takes. Before 0.7 added `schema`,
+`analyze`, `suggest_rules` and `forget` it was 23,548 and 24,349;
 `scripts/measure-tool-listing.py` takes both.
 
 | Tool | Purpose |
@@ -497,8 +498,8 @@ all 25 are 27,868. Before this release added `schema`, `analyze`,
 | `stats` | Return live node, edge, and rule counts, plus `history_floor`, the oldest commit history still reaches (0 when nothing has been pruned). Pass `role` or `namespace` to also receive `namespaces` — the namespaces that argument may see, each with a live-node count. A call that passes neither **omits the roster entirely** (not an empty array), so a store with one namespace and a store with ten answer identically; the store-wide counts beside it are unchanged either way. |
 | `node_history` | Every recorded change to one node, newest last, plus `total_commits` (the horizon upper bound) and `horizon`, the oldest commit still retained. |
 | `edge_history` | Add/retract lifecycle for all edges between two nodes, with the rule behind each event. |
-| `was_linked` | Point-in-time check: was an edge of this type active at this commit? `at_commit` is a 0-based commit index. The server also accepts an RFC 3339 date there, as `edges_at` does, but the tool's schema declares only the integer, so a client that validates arguments against the schema will refuse the date. |
-| `rename_node` | Rename a node's key, preserving all its edges. |
+| `was_linked` | Point-in-time check: was an edge of this type active on this date, or at this commit? `at_commit` takes an RFC 3339 date, which resolves to the last commit at or before it, or a 0-based commit index — typed in the tool's schema exactly as `edges_at`'s `at` is. |
+| `rename_node` | Rename a node's key, preserving all its edges. A stored `id` property that equals the old key moves with it, in the same commit. |
 
 ---
 

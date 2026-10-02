@@ -455,6 +455,21 @@ def test_rename_node_python(tmp_path):
     db.close()
 
 
+def test_rename_node_moves_a_stored_id(tmp_path):
+    """rename_node rewrites a stored `id` that equals the old key, and no other."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("Person", "q1", {"id": "q1", "name": "Quinn"})
+    db.insert_node("Person", "b1", {"id": "badge-7"})
+    db.insert_node("Person", "n1", {"name": "No Id"})
+    db.rename_node("q1", "q2")
+    db.rename_node("b1", "b2")
+    db.rename_node("n1", "n2")
+    assert db.node_info("q2")["props"]["id"] == "q2"
+    assert db.node_info("b2")["props"]["id"] == "badge-7"
+    assert "id" not in db.node_info("n2")["props"]
+    db.close()
+
+
 # ── Task 2: insert_edge_upsert (Python) ───────────────────────────────────────
 
 def test_insert_edge_upsert_python(tmp_path):

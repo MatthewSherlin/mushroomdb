@@ -6567,8 +6567,29 @@ impl<F: Fs> GraphDb<F> {
                     }
                     BatchOp::RenameNode { old_key, new_key } => {
                         preview.check_rename_node(&old_key, &new_key)?;
+                        // A stored `id` that equals the key is the key, written
+                        // as a property by `upsert_entity`'s create path and by
+                        // Cypher `CREATE {id: …}`. It moves with the key, in
+                        // this frame; left behind, `WHERE n.id = '<new key>'`
+                        // finds nothing (ledger row 72). An `id` holding
+                        // anything else is the caller's and stays.
+                        let id_follows = preview.prop_value(&old_key, "id")
+                            == Some(Value::Str(old_key.clone()))
+                            && preview.db.view_store.view_for_prop("id").is_none();
                         preview.note_rename_node(&old_key, &new_key);
-                        recs.push(WalRecord::RenameNode { old_key, new_key });
+                        recs.push(WalRecord::RenameNode {
+                            old_key,
+                            new_key: new_key.clone(),
+                        });
+                        if id_follows {
+                            let value = Value::Str(new_key.clone());
+                            preview.note_set_prop(&new_key, "id", &value);
+                            recs.push(WalRecord::SetProp {
+                                key: new_key,
+                                field: "id".into(),
+                                value,
+                            });
+                        }
                     }
                     BatchOp::InsertEdgeUpsert {
                         edge_type,
@@ -6939,11 +6960,25 @@ impl<F: Fs> GraphDb<F> {
     /// Rename a live node's key.  The dense id (and therefore all edges,
     /// props, history, and last-change tracking) is unaffected.
     ///
+    /// A stored `id` property that equals `old` is rewritten to `new` in the
+    /// same commit, so `n.id` and `key(n)` keep agreeing; an `id` holding any
+    /// other value, and a node that stores none, are left as they are.
+    ///
     /// Returns `Err(KeyNotFound)` if `old` is not a live key.
     /// Returns `Err(DuplicateKey)` if `new` is already live.
     pub fn rename_node(&mut self, old: &str, new: &str) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
+        }
+        // The `id` rewrite lives in the batch arm, which HTTP reaches without
+        // this function. A node with no such `id` keeps the bare frame.
+        if self.get_prop(old, "id") == Some(Value::Str(old.to_string())) {
+            return self
+                .commit_batch(vec![BatchOp::RenameNode {
+                    old_key: old.into(),
+                    new_key: new.into(),
+                }])
+                .map(|_| ());
         }
         MutPreview::new(self).check_rename_node(old, new)?;
         self.log_then_apply(WalRecord::RenameNode {
@@ -9977,6 +10012,27 @@ impl<F: Fs> GraphDb<F> {
             .into_iter()
             .map(|id| NodeRef { db: self, id })
             .collect()
+    }
+
+    /// Whether any of the first `limit` live nodes under `label`, in id
+    /// order, carries `field`.
+    ///
+    /// Bounded for a caller that asks on every request: one props view, at
+    /// most `limit` property reads, no value cloned and no `NodeRef` built,
+    /// and it stops at the first carrier. The label column itself has no
+    /// per-label index, so on a label with fewer than `limit` nodes the walk
+    /// of that column runs to its end — integer compares, no property read.
+    pub(crate) fn first_nodes_carry_prop(&self, label: &str, field: &str, limit: usize) -> bool {
+        let Some(sym) = self.syms.get(label) else {
+            return false;
+        };
+        let props = self.props_view();
+        self.labels
+            .iter()
+            .enumerate()
+            .filter(|&(_, &s)| s == sym)
+            .take(limit)
+            .any(|(id, _)| props.get(id as u32, field).is_some())
     }
 
     pub fn find_nodes(&self, label: &str, filter: &Filter) -> Vec<NodeRef<'_, F>> {

@@ -712,7 +712,10 @@ Responses:
 - `404 Not Found` — old key does not exist.
 - `409 Conflict` — new key already exists.
 
-The rename is WAL-logged as a single `RenameNode` record. All edges referencing the
+The rename is one WAL frame. A node that stores its key as an `id` property — one
+created by `upsert_entity` or by a Cypher `CREATE {id: …}` — has that `id` rewritten to
+the new key in the same frame, so `n.id` and `key(n)` keep agreeing; an `id` holding any
+other value is left alone. All edges referencing the
 node continue to work under the new key. Node history and time-travel (`open_at`)
 correctly scope events to the identity that held the key at each commit — recycling
 a key for a different node does not contaminate the previous identity's history.

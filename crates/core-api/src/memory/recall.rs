@@ -467,6 +467,55 @@ pub fn recall_rows<F: Fs>(db: &GraphDb<F>, topic: &str) -> RecallRows {
     }
 }
 
+/// How many live nodes under one label [`unindexed_memory_fields`] reads, at
+/// most, looking for one that carries a field. The check runs on every
+/// `recall` tool call and every session brief, so it is bounded whatever the
+/// store holds: eight default pairs, this many property reads each.
+pub const UNINDEXED_SCAN_LIMIT: usize = 1_000;
+
+/// The memory defaults' full-text fields this store has not declared and has
+/// something to find in: each `(label, field)` of
+/// [`memory_defaults`](crate::memory_schema::memory_defaults) that
+/// `fulltext_pairs()` lacks while a live node under the label carries the
+/// field. In the defaults' order.
+///
+/// `remember` declares `Note.text`, and the name of each `entities[].label`,
+/// as it writes. So a store that never took the defaults stops being
+/// "a store with no text index" at its first note, while the entities already
+/// in it stay unsearchable by name. This is what `recall` and the session
+/// brief name from then on, with the one command that indexes them.
+///
+/// Empty on a store that took the defaults. Empty too on a store whose schema
+/// is its owner's and holds no node under a memory label: the defaults would
+/// index nothing there, so it is never told to apply them. A field no node
+/// carries is not reported, whatever the label holds.
+///
+/// Bounded, because it runs on every `recall` tool call and every session
+/// brief: for a pair whose default is undeclared it reads the first
+/// [`UNINDEXED_SCAN_LIMIT`] live nodes under the label, in id order, and stops
+/// at the first that carries the field. A field carried only by a node past
+/// that bound is not reported — the notice is advice, and it stays silent
+/// rather than read the whole label to give it.
+pub fn unindexed_memory_fields<F: Fs>(db: &GraphDb<F>) -> Vec<(String, String)> {
+    let declared = db.fulltext_pairs();
+    crate::memory_schema::memory_defaults()
+        .fulltext
+        .into_iter()
+        .filter(|pair| !declared.contains(pair))
+        .filter(|(label, field)| db.first_nodes_carry_prop(label, field, UNINDEXED_SCAN_LIMIT))
+        .collect()
+}
+
+/// `Person.name, Entity.name` — [`unindexed_memory_fields`] as a notice
+/// prints them.
+pub fn unindexed_fields_list(fields: &[(String, String)]) -> String {
+    fields
+        .iter()
+        .map(|(label, field)| format!("{label}.{field}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// [`recall_rows`], rendered as the digest an assistant reads: one header,
 /// one line per hit, inside `max_bytes`.
 pub fn recall_digest<F: Fs>(
