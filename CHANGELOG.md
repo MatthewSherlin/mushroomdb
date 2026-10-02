@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.7.1 (unreleased) — four corrections
+## v0.7.1 — four corrections
 
 No new feature and nothing removed. A 0.7.0 store opens unchanged.
 
@@ -16,8 +16,11 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
   the caller's and is left alone; a node that stores none gains none. The
   rename is still one WAL frame, and a read as of a commit before it still
   answers with the old key and the old `id`. `node_history` shows the
-  rewrite as a property change at the rename's commit. It predates 0.7
-  (row 72).
+  rewrite as a property change at the rename's commit. On `/watch`, a
+  rename that moves an `id` emits `prop_set` and `batch_applied` with
+  `ops: 2`, where a rename with no such `id` emits nothing, as before; and
+  under the `Batched` fsync policy its frame is fsynced, where a bare rename's
+  is not. It predates 0.7 (row 72).
 
   **A node renamed by 0.7.0 or earlier is not repaired on open.** To list
   every node whose stored `id` is not its key:
@@ -65,6 +68,27 @@ No new feature and nothing removed. A 0.7.0 store opens unchanged.
   image is pushed only after the release is published. A tag publishes
   exactly what it did. The workflow still runs no test, so a tag still goes
   only on a commit whose CI is green (row 61).
+
+### Known limits
+
+- **A batch that renames a node cannot see that node's stored properties in
+  the ops after the rename.** Only a batch built in Rust can put a rename
+  beside another op — `BatchBuilder` or `SharedDb::submit_batch`; MCP, HTTP,
+  Python and the CLI each send a rename alone. In such a batch, an
+  `insert_edge` from the renamed node is checked as if the node were in the
+  default namespace, so an edge across namespaces that a plain `insert_edge`
+  refuses is committed; a `remove_prop` on the renamed node returns Ok and
+  removes nothing; and a second rename of the same node does not move an `id`
+  equal to the key in between. It predates this release (row 79, deferred to
+  0.7.2).
+
+### Not in this release
+
+At 0.7.0 the defect ledger deferred fifteen rows to 0.7.1. This release
+closes three of them — 71, 72 and 73 — and row 61, which was deferred to 0.8.
+The other twelve move to 0.7.2 unchanged: rows 47, 48, 50, 51, 52, 53, 57,
+64, 65, 74, 75 and 78. The known limits under 0.7.0 below say so where they
+name one. Row 79 is new, and is the known limit above.
 
 ## v0.7.0 — memory that fills itself
 
@@ -599,7 +623,7 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   naming an existing key under another label is counted as matched, the node
   keeps its stored label, and the label that was not used gets a full-text
   declaration if it had none. `upsert_entity` refuses the same disagreement.
-  Over MCP and in Python alike (row 64, deferred to 0.7.1).
+  Over MCP and in Python alike (row 64, deferred to 0.7.2).
 - **In 0.7.0, `was_linked`'s schema types `at_commit` as an integer, and the
   tool takes a date too.** Fixed in 0.7.1 (row 71). The handler accepts an
   RFC 3339 date and the skill teaches that form, so on 0.7.0 a client that
@@ -639,11 +663,11 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
 - **`suggest_rules` can propose `approximate: true`.** `create_rule` accepts
   it, and its advertised schema does not list it, so a client that validates
   arguments against the schema refuses that proposal (row 52, deferred to
-  0.7.1).
+  0.7.2).
 - **Two counts in replies run low.** `forget` of a node under-reports the
   derived edges retracted when that node was the via node of a via-hop rule
   (row 50), and `remember`'s `matched` does not count a fact endpoint that
-  already existed (row 48). Both deferred to 0.7.1.
+  already existed (row 48). Both deferred to 0.7.2.
 - **Cypher has no boolean literals.** `WHERE n.provisional = true` fails with
   `unbound variable`; the `schema` tool lists the provisional nodes. And an
   older skill at user scope can shadow the one `install` writes, with nothing
@@ -652,16 +676,16 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   `set_props_many`, `remember`, `upsert_entity`, `forget`, `recall` and
   `search` do, a write's fsync included, so other Python threads wait; the
   algorithms, `suggest_rules`, `schema_report`, `identity_clusters` and the
-  similarity reads release it (row 65, deferred to 0.7.1).
+  similarity reads release it (row 65, deferred to 0.7.2).
 - **Over MCP, a `min` that is not a number is ignored.** `find_similar` with
   `"min": "0.5"` answers at the default 0.8 and echoes `min: 0.8`; HTTP
   refuses the same body with `min must be a number` (row 74, deferred to
-  0.7.1).
+  0.7.2).
 - **Two small identity gaps.** If reading a node's edges fails, the `same_as`
   report leaves that node's links out rather than failing (row 51); and a
   provisional stub's derived `aliases` are not held to the 32-alias cap an
   entity's are, so a stub key of many words carries a long list (row 53).
-  Both deferred to 0.7.1.
+  Both deferred to 0.7.2.
 - **Scale is measured to 100,000 nodes, and no further.** The measurements
   are from v0.1.1 and v0.2; they were not repeated on 0.7, and nothing larger
   has been run.

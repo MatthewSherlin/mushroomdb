@@ -27,7 +27,7 @@ Claude Desktop has no installer path, so add mushroomdb by hand in
   "mcpServers": {
     "mushroomdb": {
       "command": "npx",
-      "args": ["-y", "mushroomdb@0.7.0", "mcp", "/path/to/your/db"]
+      "args": ["-y", "mushroomdb@0.7.1", "mcp", "/path/to/your/db"]
     }
   }
 }

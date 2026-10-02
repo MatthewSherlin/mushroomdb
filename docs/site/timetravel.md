@@ -112,7 +112,7 @@ specific WAL commit.
 > commit index keeps addressing exactly what it did.
 
 **MCP:** `was_linked(a, b, edge_type, at_commit)` → `{linked}` or error when
-outside horizon
+outside horizon; `at_commit` takes a commit index or an RFC 3339 date
 
 **HTTP:** `GET /history/was_linked?a=&b=&edge_type=&at_commit=`
 
