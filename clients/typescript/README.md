@@ -3,24 +3,23 @@
 TypeScript client for the [mushroomdb](https://github.com/MatthewSherlin/mushroomdb) graph database.
 Wraps the HTTP and WebSocket API exposed by `mushroomdb serve`.
 
+The methods at a glance, and the routes the client leaves to `fetch`, are on the
+[documentation site](https://matthewsherlin.github.io/mushroomdb/docs/typescript.html).
+
 > Published to npm as [`mushroomdb-client`](https://www.npmjs.com/package/mushroomdb-client) on every release. Installing from the repo path (see below) is for working against an unreleased server.
 
 ---
 
-## Installation (from repo)
+## Installation
+
+```sh
+npm install mushroomdb-client
+```
+
+To use a checkout instead, while working on the client itself:
 
 ```sh
 npm install /path/to/graph-db/clients/typescript
-```
-
-Or add to `package.json`:
-
-```json
-{
-  "dependencies": {
-    "mushroomdb-client": "file:../path/to/graph-db/clients/typescript"
-  }
-}
 ```
 
 Node 18+ required. Fetch is built-in. For WebSocket in Node < 21, install `ws`:
@@ -167,6 +166,16 @@ Wires `GET /explain?a=&b=`. Returns rule-derived edges between two node keys.
 
 Wires `POST /rules` with a `RuleDef` JSON body.
 
+### `client.renameNode(oldKey, newKey) → Promise<void>`
+
+Wires `POST /nodes/{key}/rename`. Changes a node's key. Throws when the old key does not exist
+(the server answers 404) or the new one is taken (409).
+
+### `client.upsertEdge(edgeType, src, dst, placeholderLabel) → Promise<{ nodes_created, edge_inserted }>`
+
+Wires `POST /edges/upsert`. Creates the edge, and creates whichever endpoint is missing as a node
+of `placeholderLabel`.
+
 ### `client.node(key) → Promise<NodeInfo | null>`
 
 Wires `GET /node/{key}`. Returns `null` for an unknown key (HTTP 404).
@@ -254,7 +263,7 @@ await client.query("CREATE (n:Widget {id: 'w1', name: 'Sprocket'})");
 
 | Feature | Browser | Node 18+ |
 |---------|---------|----------|
-| `query`, `ingest`, `stats`, `suggest`, `algo`, `explain`, `createRule`, `node`, `neighborhood` | Yes (uses `fetch`) | Yes |
+| `query`, `ingest`, `stats`, `suggest`, `algo`, `explain`, `createRule`, `renameNode`, `upsertEdge`, `node`, `neighborhood` | Yes (uses `fetch`) | Yes |
 | `subscribe` | Yes (uses global `WebSocket`) | Requires `wsConstructor` option + `ws` package |
 
 ---

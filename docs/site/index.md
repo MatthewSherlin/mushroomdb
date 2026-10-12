@@ -92,6 +92,7 @@ Reference:
 - [MCP tools](mcp-tools.md) — every tool with its arguments, generated from the server's own listing
 - [Python API](python-api.md) — every method of `GraphDb`, generated from the type stub
 - [Rust](rust.md) — embedding the engine: the types you touch, with examples that are compiled
+- [TypeScript client](typescript.md) — the HTTP client: its methods, and the routes it leaves to `fetch`
 - [Cypher Query Reference](query.md)
 - [Temporal history: what was connected when, and why](timetravel.md)
 - [Full-Text Search](fulltext.md)

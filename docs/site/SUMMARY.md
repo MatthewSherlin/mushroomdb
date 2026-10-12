@@ -34,6 +34,7 @@
 - [HTTP API](http.md)
 - [Python API](python-api.md)
 - [Rust](rust.md)
+- [TypeScript client](typescript.md)
 
 # Operate
 

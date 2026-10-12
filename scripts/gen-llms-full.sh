@@ -45,6 +45,7 @@ SITE_DOCS=(
     cli.md
     python-api.md
     rust.md
+    typescript.md
     subscriptions.md
     timetravel.md
     durability.md
