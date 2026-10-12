@@ -513,15 +513,34 @@ all 25 are 28,172. In 0.7.0 it was 27,067 and 27,868: the difference is
 
 Graph databases are a natural fit for long-term agent memory:
 
-- **Entities** map to nodes (`Person`, `Document`, `Project`, `Concept`).
-- **Associations** are edges derived from data similarity, shared fields, or
-  FK relationships — declared once, maintained automatically.
-- **Recall** is graph traversal: "what is similar to X?", "what is near Y?",
-  "who shares Z's role?".
-- **Explainability** is built in: `explain_association` always shows the rule
-  and score, not just the edge.
-- **Incremental updates** are O(changed node × candidates), not full
-  recomputation — memory stays fresh as the agent writes new facts.
+- Entities map to nodes (`Person`, `Document`, `Project`, `Concept`, …).
+- Associations are edges derived from data: cosine similarity on embeddings, shared field values,
+  FK relationships, geographic proximity. Declare a rule once; every write maintains the matching
+  edges without agent-side bookkeeping.
+- Recall has four modes: `recall` for a question in ordinary words, ranked over every indexed
+  text field; `find_similar` by query vector (HNSW when available, brute force otherwise);
+  `find_similar` by key (neighbors along a rule-derived edge type); and `query` for structured
+  Cypher. `hybrid_search` fuses fulltext and vector results via Reciprocal Rank Fusion, and
+  `pairwise_similar` answers "which of these are most like each other" over a caller's own key
+  set, exactly — it never uses HNSW. **`find_similar`'s `min` defaults to 0.8 on every surface.**
+- Explanations are built in: `explain_association` shows which rules and scores produced each
+  link, so an agent can cite evidence instead of asserting a conclusion.
+- Scoping is a property of the handle, not of each call: `db.scoped(role=…, namespace=…, keys=[…])`
+  returns a read-only child sharing the same store, and **every** read on it obeys one contract —
+  *hidden behaves exactly as absent*, so a key outside the scope is indistinguishable from a key
+  that does not exist. Legs intersect, so a scope narrows and never widens; every mutation raises
+  `ReadOnly`. Per-call `mask: [key1, key2, …]` on `query` still works and still rejects writes.
+  Both are cooperative in-process argument handling rather than an access boundary — real
+  enforcement is the HTTP server's role tokens. [`docs/site/masks.md`](masks.md)
+- Bulk loading is one atomic frame: `ingest_batch(nodes, edges, on_conflict="error" | "skip" |
+  "replace")` lets a mirror rebuild onto a store that already has content without wiping the
+  directory, and reports `inserted`, `edges_inserted`, `skipped`, `replaced` and
+  `kept_view_owned`. `"error"` is the default and is the older behaviour exactly.
+- Schema-as-code: `mushroomdb schema apply <dir> <schema.json>` idempotently applies rules, views,
+  and fulltext indexes, printing a created/updated/unchanged diff. Two presets need no file:
+  `--memory-defaults` gives an existing store the text fields `recall` searches, and
+  `--memory-identity` adds the `SAME_AS` rules that link two keys for one entity, after saying
+  what it will backfill.
 
 See [`docs/site/rules.md`](rules.md) for the full predicate reference and
 [`docs/site/query.md`](query.md) for the Cypher subset.

@@ -10,7 +10,7 @@
 > the repository on 2026-08-28 and are not in it now. Other systems are referred to as "a named
 > system", or as "system A", "B" and "C".
 >
-> For what exists: the README's [Architecture](../README.md#architecture) section,
+> For what exists: the [Architecture](site/architecture.md) page,
 > [`docs/format-stability.md`](format-stability.md), and the pages under [`docs/site/`](site/index.md).
 
 **Date:** 2026-08-14
@@ -72,7 +72,7 @@ ingestion posture.
 | UI rendering | cosmos.gl (GPU force layout + rendering; OpenJS Foundation) |
 | Bindings | Python (PyO3) and Rust at launch; TypeScript via HTTP `mushroomdb-client`. napi-rs deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
 | Testing | Deterministic simulation testing (a named system-style) from day one + model-based oracle testing + rule-equivalence invariant. Differential Cypher testing vs system A deferred, see `docs/superpowers/specs/2026-08-25-best-graph-db.md` |
-| Scale target | Design for 10M nodes in RAM (~5–15 GB with properties); document the RAM ceiling honestly. Real initial workloads are ~10k nodes *(Correction, 2026-10: never measured above 100,000 nodes — 4.72 GiB peak while building. See README, Known limitations.)* |
+| Scale target | Design for 10M nodes in RAM (~5–15 GB with properties); document the RAM ceiling honestly. Real initial workloads are ~10k nodes *(Correction, 2026-10: never measured above 100,000 nodes — 4.72 GiB peak while building. See docs/site/limits.md.)* |
 
 ### Explicit non-goals (v1)
 

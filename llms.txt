@@ -27,13 +27,11 @@ cargo add mushroomdb            # embedded GraphDb API
 # Rust CLI + server (crates.io)
 cargo install mushroomdb-cli    # `mushroomdb` binary: serve/query/demo/schema
 
-# Python (from source until the PyPI wheel ships with the next release tag)
-cd bindings/python
-python -m venv .venv && .venv/bin/pip install -U pip maturin
-.venv/bin/maturin develop
+# Python (PyPI)
+pip install mushroomdb
 
-# TypeScript client (from repo until the npm publish lands)
-npm install /path/to/graph-db/clients/typescript
+# TypeScript client (npm)
+npm install mushroomdb-client
 ```
 
 Docker (local build):

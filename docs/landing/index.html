@@ -15,6 +15,18 @@
 <meta property="og:url" content="https://matthewsherlin.github.io/mushroomdb/" />
 <meta property="og:image" content="https://matthewsherlin.github.io/mushroomdb/assets/social-preview.png" />
 <meta name="twitter:card" content="summary_large_image" />
+<script>
+  // The choice is shared with the docs: mdBook keeps its theme under this key,
+  // as "light" or "navy", and removes it when the visitor picks Auto there.
+  (function () {
+    try {
+      var stored = localStorage.getItem("mdbook-theme");
+      if (stored === "light" || stored === "navy") {
+        document.documentElement.dataset.theme = stored === "navy" ? "dark" : "light";
+      }
+    } catch (e) {}
+  })();
+</script>
 <style>
   /* The palette is the mark's: its ink and its cap amber, on a pale spore
      green, with moss for links. docs/theme/mushroom.css carries the same
@@ -31,8 +43,10 @@
     --display: "Pixelify Sans", ui-monospace, Menlo, monospace;
     --body: "Nunito", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
+  /* Dark follows the system unless the visitor has chosen; the choice is the
+     data-theme attribute, set before first paint by the script in <head>. */
   @media (prefers-color-scheme: dark) {
-    :root {
+    :root:not([data-theme="light"]) {
       --bg: #0b0e14;
       --panel: #131824;
       --ink: #e8e6e1;
@@ -42,6 +56,16 @@
       --amber: #e8a33d;
       --code-bg: #161b27;
     }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b0e14;
+    --panel: #131824;
+    --ink: #e8e6e1;
+    --muted: #9aa39a;
+    --line: #262d3a;
+    --accent: #9fce8a;
+    --amber: #e8a33d;
+    --code-bg: #161b27;
   }
   * { box-sizing: border-box; }
   body {
@@ -64,6 +88,11 @@
   }
   .topbar .brand img { width: 28px; image-rendering: pixelated; }
   .topbar a { text-decoration: none; }
+  .topbar .theme {
+    font: 600 14px var(--body); color: var(--ink); background: transparent;
+    border: 2px solid var(--ink); padding: 2px 10px; cursor: pointer;
+  }
+  .topbar .theme:hover { background: var(--amber); color: #0b0e14; }
   .topbar a:hover { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 4px; }
 
   header { padding: 44px 0 48px; }
@@ -144,7 +173,9 @@
     .fits { grid-template-columns: 1fr; }
     .tagline { font-size: 21px; }
     .topbar { column-gap: 18px; }
-    .topbar .brand { flex-basis: 100%; }
+    .topbar .brand { flex-basis: calc(100% - 110px); }
+    .topbar .theme { order: 1; margin-left: auto; }
+    .topbar a:not(.brand) { order: 2; }
     .copy { display: none; }
   }
 
@@ -162,6 +193,7 @@
     <a href="docs/quickstart.html">Quickstart</a>
     <a href="docs/api.html">Reference</a>
     <a href="https://github.com/MatthewSherlin/mushroomdb">GitHub</a>
+    <button class="theme" type="button" hidden></button>
   </nav>
 
   <header>
@@ -269,6 +301,29 @@
 </div>
 
 <script>
+  // Light or dark. The button names the mode it switches to, and is hidden
+  // until this runs, so with JavaScript off the page just follows the system.
+  (function () {
+    var button = document.querySelector("button.theme");
+    var root = document.documentElement;
+    function current() {
+      return root.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    }
+    function label() {
+      var next = current() === "dark" ? "Light" : "Dark";
+      button.textContent = next;
+      button.setAttribute("aria-label", "Switch to " + next.toLowerCase() + " mode");
+    }
+    button.addEventListener("click", function () {
+      var next = current() === "dark" ? "light" : "dark";
+      root.dataset.theme = next;
+      try { localStorage.setItem("mdbook-theme", next === "dark" ? "navy" : "light"); } catch (e) {}
+      label();
+    });
+    label();
+    button.hidden = false;
+  })();
+
   // Copy the install command. No clipboard permission, no button: the text is still selectable.
   document.querySelectorAll("button.copy").forEach((button) => {
     if (!navigator.clipboard) { button.remove(); return; }

@@ -5,7 +5,8 @@
 # Start
 
 - [Quickstart](quickstart.md)
-- [Install, plugin and hooks](skill.md)
+- [Install](install.md)
+- [Plugin, skill and hooks](skill.md)
 
 # Guides
 
@@ -24,7 +25,8 @@
 
 # Reference
 
-- [API reference](api.md)
+- [CLI](cli.md)
+- [HTTP and Python API](api.md)
 
 # Operate
 
@@ -33,9 +35,12 @@
 - [Durability](durability.md)
 - [Concurrency](concurrency.md)
 - [Several processes, one store](multiprocess.md)
+- [Known limits](limits.md)
+- [Benchmarks](benchmarks.md)
 - [The association benchmark](association-bench.md)
 
 # Project
 
+- [Architecture and roadmap](architecture.md)
 - [Testing](testing.md)
 - [Panic policy](panic-policy.md)

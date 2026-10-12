@@ -359,6 +359,18 @@ Within one process the handle is guarded by a mutex, so calls from multiple
 threads are serialized and safe. They are not isolated transactions: readers
 can observe intermediate states while a batch is being applied.
 
+## Errors
+
+There is an exception class for each engine error. `MushroomError(RuntimeError)` is the base and
+eighteen subclasses hang off it — `KeyNotFound`, `ReadOnly`, `Corrupt`, `CasConflict`,
+`RoleWriteDenied` and the rest — each carrying `.code`, a stable snake_case string, and the
+variant's own fields as attributes. **`.code` is the compatibility surface**: classes may be
+added, a code is never respelled. Because the base subclasses `RuntimeError`, every
+`except RuntimeError` written against an earlier release keeps catching what it caught. A test
+asserts every Rust `GraphError` variant maps to a distinct class, so adding one without a class
+fails the build. `db.roles()` reads back what `roles.json` defines, so a sidecar can validate a
+role name at boot rather than on the first request.
+
 ## Type stubs
 
 The wheel ships `__init__.pyi` and a `py.typed` marker, so mypy and Pyright
