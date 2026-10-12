@@ -33,7 +33,7 @@ One call per question, on the store's own keys. The `SessionStart` brief printed
 
 Since when → `node_history`, `edge_history`, `was_linked` (its `at_commit` takes a date too); around it → `neighborhood`, `node_info`; like it → `find_similar`, `pairwise_similar`, `hybrid_search`; what's in here → `schema`; what matters, what clusters, which keys are one entity → `analyze`; forget it → `forget`.
 
-A store built by `npx -y mushroomdb@0.7.0 ingest-git './mushroom-memory' . --prs --ensure-gitignore` is a repository as entities — commits, pull requests, files, authors — and answers to the same calls as any other store. Use the repository as a data source; do not reach for it ahead of a search.
+A store built by `npx -y mushroomdb@0.7.1 ingest-git './mushroom-memory' . --prs --ensure-gitignore` is a repository as entities — commits, pull requests, files, authors — and answers to the same calls as any other store. Use the repository as a data source; do not reach for it ahead of a search.
 
 ### What runs without you
 
@@ -47,8 +47,8 @@ The `concept_sources` rule links each concept to its sources with `DESCRIBED_IN`
 
 ## Advanced
 
-`tools/list` shows the twenty-three above on every store, one built by `ingest-git` included; `query` is Cypher, read or write. `npx -y mushroomdb@0.7.0 mcp <db> --all-tools` lists the other two with schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive — `suggest_rules` drafts one — and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
+`tools/list` shows the twenty-three above on every store, one built by `ingest-git` included; `query` is Cypher, read or write. `npx -y mushroomdb@0.7.1 mcp <db> --all-tools` lists the other two with schemas. **Never create a rule silently:** *propose* `create_rule` with its predicate and the edges it would derive — `suggest_rules` drafts one — and wait for approval. When `ingest_json` skips a field with `ambiguous target labels`, declare one KeyMatch rule per target label instead. `mask` on `query` (and `find_similar`) is an **allow-list**, as `role` is: only those keys are visible, and writes are rejected while either is set. This server has **no auth** and both are cooperative — never a security boundary; real access control is `serve --role-token`.
 
-Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`npx -y mushroomdb@0.7.0 serve './mushroom-memory'`), and `doctor` checks the install.
+Never invent graph contents: if a call returns empty say so; if one fails show the error verbatim. `serve` browses the same store (`npx -y mushroomdb@0.7.1 serve './mushroom-memory'`), and `doctor` checks the install.
 
 More: [docs](https://github.com/MatthewSherlin/mushroomdb/tree/main/docs/site)

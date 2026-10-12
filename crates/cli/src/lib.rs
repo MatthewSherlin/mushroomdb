@@ -2112,12 +2112,30 @@ pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
     // The path is quoted and sanitized as the reach line's is: quoted so a
     // space or a quote in it stays one argument, sanitized because this line
     // is inserted after `render` sanitized everything else.
-    if db.fulltext_pairs().is_empty() {
-        let notice = format!(
+    //
+    // A store with one text field can still be missing the memory defaults:
+    // `remember` declares `Note.text` as it writes, so a store that never took
+    // them stops having "no text index" at its first note, while the entities
+    // already in it stay unsearchable by name. That store gets the second
+    // notice, naming the fields. A store with no node under a memory label
+    // gets neither: the defaults would index nothing there.
+    let store = core_api::digest::sanitize(&install::sh_quote(&db_dir.to_string_lossy()));
+    let notice = if db.fulltext_pairs().is_empty() {
+        Some(format!(
             "no text index: recall cannot match anything here. \
-             Run: mushroomdb schema apply {} --memory-defaults\n",
-            core_api::digest::sanitize(&install::sh_quote(&db_dir.to_string_lossy()))
-        );
+             Run: mushroomdb schema apply {store} --memory-defaults\n"
+        ))
+    } else {
+        let unindexed = core_api::memory::recall::unindexed_memory_fields(&db);
+        (!unindexed.is_empty()).then(|| {
+            format!(
+                "text index incomplete: recall does not search {}. \
+                 Run: mushroomdb schema apply {store} --memory-defaults\n",
+                core_api::memory::recall::unindexed_fields_list(&unindexed)
+            )
+        })
+    };
+    if let Some(notice) = notice {
         let at = text
             .rfind("\nreach the graph: ")
             .map_or(text.len(), |i| i + 1);

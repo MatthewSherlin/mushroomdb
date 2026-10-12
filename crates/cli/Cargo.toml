@@ -1,6 +1,6 @@
 [package]
 name = "mushroomdb-cli"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -33,9 +33,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "env-filter",
     "ansi",
 ] }
-core-api = { package = "mushroomdb", path = "../core-api", version = "0.7.0" }
-code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.7.0" }
-server = { package = "mushroomdb-server", path = "../server", version = "0.7.0" }
+core-api = { package = "mushroomdb", path = "../core-api", version = "0.7.1" }
+code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.7.1" }
+server = { package = "mushroomdb-server", path = "../server", version = "0.7.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }

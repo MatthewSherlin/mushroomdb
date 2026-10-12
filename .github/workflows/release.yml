@@ -146,7 +146,11 @@ jobs:
           gh release edit "$TAG" --draft=false
           echo "published $TAG with ${#ASSETS[@]} assets"
 
+  # Waits for the release. Until 0.7.1 this job needed nothing, so a tag whose
+  # binaries failed to build still moved `:latest`. It now runs only after
+  # `github-release` — which needs all three binaries — has published.
   docker:
+    needs: [github-release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

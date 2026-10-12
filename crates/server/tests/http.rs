@@ -6450,3 +6450,23 @@ async fn the_namespace_write_refusals_reach_the_surface() {
     );
     assert!(!db.read().has_node("ghost-1"));
 }
+
+/// Binding: a rename over HTTP moves a stored `id` with the key (ledger row
+/// 72). This route reaches the engine through `BatchOp::RenameNode` on the
+/// group-commit queue, not through `GraphDb::rename_node`, so it is pinned
+/// here as well as in `core-api`.
+#[tokio::test]
+async fn http_rename_node_moves_a_stored_id() {
+    let (app, db) = open("http-rename-id");
+    // `seed_person` stores the key as the `id` property.
+    seed_person(&db, "alice");
+
+    let req = json_req("POST", "/nodes/alice/rename", json!({"new_key": "alice2"}));
+    let (status, body, _) = send(app.clone(), req).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let (status, body, _) = send(app, get("/node/alice2")).await;
+    assert_eq!(status, StatusCode::OK);
+    let node = parse_json(&body);
+    assert_eq!(node["props"]["id"], json!("alice2"), "{node}");
+}

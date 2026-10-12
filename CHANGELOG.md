@@ -1,5 +1,95 @@
 # Changelog
 
+## v0.7.1 — four corrections
+
+No new feature and nothing removed. A 0.7.0 store opens unchanged.
+
+### Fixed
+
+- **`rename_node` moves a stored `id` with the key.** `upsert_entity`'s
+  create and a Cypher `CREATE {id: …}` store the key as an `id` property, and
+  a rename left it at the old key: `WHERE n.id = '<new key>'` found nothing
+  and `RETURN n.id` printed the old key, with no error. The rename now
+  rewrites an `id` that equals the old key, in the same commit, on every
+  surface — the MCP tool, Python's `rename_node`, HTTP
+  `POST /nodes/{key}/rename` and a batch. An `id` holding anything else is
+  the caller's and is left alone; a node that stores none gains none. The
+  rename is still one WAL frame, and a read as of a commit before it still
+  answers with the old key and the old `id`. `node_history` shows the
+  rewrite as a property change at the rename's commit. On `/watch`, a
+  rename that moves an `id` emits `prop_set` and `batch_applied` with
+  `ops: 2`, where a rename with no such `id` emits nothing, as before; and
+  under the `Batched` fsync policy its frame is fsynced, where a bare rename's
+  is not. It predates 0.7 (row 72).
+
+  **A node renamed by 0.7.0 or earlier is not repaired on open.** To list
+  every node whose stored `id` is not its key:
+  `mushroomdb query <db> "MATCH (n) WHERE n.id <> key(n) RETURN key(n), n.id"`.
+  That also lists a node whose `id` was written as something else on purpose,
+  so repair by key, one node at a time:
+  `mushroomdb query <db> "MATCH (n) WHERE key(n) = 'q2' SET n.id = 'q2'"`.
+- **`was_linked`'s schema declares the date it accepts.** The handler has
+  taken an RFC 3339 date for `at_commit` since `edges_at` took one, and the
+  skill teaches that form, but the tool's `inputSchema` said `integer`: a
+  client that checks arguments against the schema refused the taught call,
+  and one that does not accepted it. `at_commit` is now typed as `edges_at`'s
+  `at` is — a string or a non-negative integer — and the description leads
+  with the date. Nothing about the handler changed (row 71).
+- **A store without the memory defaults keeps saying so after its first
+  `remember`.** `remember` declares `Note.text` as it writes, so "this store
+  has no text index" stopped at the first note, and nothing replaced it: on a
+  0.6 store, or one a `query` created, `recall` then returned the note and
+  not the person it was about. The `recall` tool's reply now ends with
+  `text index incomplete: recall does not search Person.name`, and the
+  session brief carries the same line just above its reach line, naming each
+  memory-default field the store has not declared and holds a value for,
+  with the `mushroomdb schema apply <db> --memory-defaults` command that
+  indexes them. The check is bounded: it looks at the first 1,000 nodes of
+  each memory label, so a field only a later node carries is not named.
+  Nothing is declared for you: an existing store is still upgraded only by
+  that command. A store with no node under a memory label — one with its own
+  schema — is told nothing, and so is the prompt hook's digest, which fires
+  every turn. Python's `recall` rows are unchanged; `fulltext_pairs()` is how
+  a Python caller sees what is declared. The tool's older "no text index"
+  answer now replaces each control character in the store path it prints
+  with a space, as the new line does (row 73).
+
+### Changed
+
+- **The default tool listing is 27,371 bytes, from 27,067; all 25 tools are
+  28,172, from 27,868** (`scripts/measure-tool-listing.py`). The 304 bytes
+  are `was_linked`'s schema and description. Still 23 tools by default; the
+  script puts the default listing at about 6,842 tokens a session, at its
+  estimate of 4 bytes per token.
+- **The container image waits for the release.** `release.yml`'s `docker`
+  job needed no other job, so a `v*` tag pushed the moving `latest` image
+  while the binaries were still building, and pushed it even when they
+  failed. It now needs `github-release`, which needs all three binaries: the
+  image is pushed only after the release is published. A tag publishes
+  exactly what it did. The workflow still runs no test, so a tag still goes
+  only on a commit whose CI is green (row 61).
+
+### Known limits
+
+- **A batch that renames a node cannot see that node's stored properties in
+  the ops after the rename.** Only a batch built in Rust can put a rename
+  beside another op — `BatchBuilder` or `SharedDb::submit_batch`; MCP, HTTP,
+  Python and the CLI each send a rename alone. In such a batch, an
+  `insert_edge` from the renamed node is checked as if the node were in the
+  default namespace, so an edge across namespaces that a plain `insert_edge`
+  refuses is committed; a `remove_prop` on the renamed node returns Ok and
+  removes nothing; and a second rename of the same node does not move an `id`
+  equal to the key in between. It predates this release (row 79, deferred to
+  0.7.2).
+
+### Not in this release
+
+At 0.7.0 the defect ledger deferred fifteen rows to 0.7.1. This release
+closes three of them — 71, 72 and 73 — and row 61, which was deferred to 0.8.
+The other twelve move to 0.7.2 unchanged: rows 47, 48, 50, 51, 52, 53, 57,
+64, 65, 74, 75 and 78. The known limits under 0.7.0 below say so where they
+name one. Row 79 is new, and is the known limit above.
+
 ## v0.7.0 — memory that fills itself
 
 0.7 is the release in which `remember` followed by `recall` works on a new
@@ -494,13 +584,12 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   each of those then claims a stub keyed so: the one case in which derived
   name words become declared aliases.
   `forget {key, prop: "alias_keys"}` clears what was kept.
-- **`rename_node` leaves a stored `id` property at the old key.**
-  `upsert_entity`'s create and a Cypher `CREATE {id: …}` store the key as an
-  `id` property as well, and a rename does not rewrite it. After
-  `rename_node q1 → q2`, `WHERE n.id = 'q2'` returns nothing,
-  `WHERE n.id = 'q1'` returns the renamed node, and `RETURN n.id` prints `q1`.
-  `key(n)` and the inline pattern `{id: 'q2'}` are right: use `key(n)` to read
-  or filter on a key. It predates 0.7 (row 72, deferred to 0.7.1).
+- **In 0.7.0, `rename_node` leaves a stored `id` property at the old key.**
+  Fixed in 0.7.1 (row 72): the rename rewrites it. On 0.7.0 and earlier,
+  after `rename_node q1 → q2`, `WHERE n.id = 'q2'` returns nothing,
+  `WHERE n.id = 'q1'` returns the renamed node, and `RETURN n.id` prints `q1`;
+  `key(n)` and the inline pattern `{id: 'q2'}` are right. 0.7.1's notes say
+  how to find and repair a node an earlier version renamed.
 - **A subject named before it was described cannot claim a stub.** It is an
   `Entity` for life, and the claim rules run from the five entity labels.
   `upsert_entity` refuses to relabel it; `remember`'s `entities` describes it
@@ -534,11 +623,12 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   naming an existing key under another label is counted as matched, the node
   keeps its stored label, and the label that was not used gets a full-text
   declaration if it had none. `upsert_entity` refuses the same disagreement.
-  Over MCP and in Python alike (row 64, deferred to 0.7.1).
-- **`was_linked`'s schema types `at_commit` as an integer, and the tool takes
-  a date too.** The handler accepts an RFC 3339 date and the skill teaches
-  that form, so a client that validates arguments against the advertised
-  schema refuses a call the skill teaches (row 71, deferred to 0.7.1).
+  Over MCP and in Python alike (row 64, deferred to 0.7.2).
+- **In 0.7.0, `was_linked`'s schema types `at_commit` as an integer, and the
+  tool takes a date too.** Fixed in 0.7.1 (row 71). The handler accepts an
+  RFC 3339 date and the skill teaches that form, so on 0.7.0 a client that
+  validates arguments against the advertised schema refuses a call the skill
+  teaches.
 - **`query` reads its statement only as a shell argument.** There is no stdin
   and no file form, so a fact written from a shell depends on the quoting rule
   above; an apostrophe inside a Cypher string is written `\'`, and a literal
@@ -553,12 +643,12 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   `~/.mushroomdb`, and the session brief looks for one only beside the store's
   parent directory, so with the store anywhere else the brief's last line
   names MCP tools in a session that has none (row 69, deferred to 0.8).
-- **After the first `remember` on a store without the memory defaults, nothing
-  says the defaults are missing.** The store then has one text field, so
-  `recall` and the brief stop saying "no text index", and an entity that was
-  already there is not found by its name. `mushroomdb schema apply <db>
-  --memory-defaults` indexes them; the `schema` tool lists the fields `recall`
-  searches (row 73, deferred to 0.7.1).
+- **In 0.7.0, after the first `remember` on a store without the memory
+  defaults, nothing says the defaults are missing.** Fixed in 0.7.1 (row 73).
+  The store then has one text field, so on 0.7.0 `recall` and the brief stop
+  saying "no text index", and an entity that was already there is not found
+  by its name. `mushroomdb schema apply <db> --memory-defaults` indexes them;
+  the `schema` tool lists the fields `recall` searches.
 - **A store the Python binding creates has no memory schema.** `remember`
   declares the text fields it needs as it goes. The identity preset is applied
   from the command line — `mushroomdb schema apply <db> --memory-identity` —
@@ -573,11 +663,11 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
 - **`suggest_rules` can propose `approximate: true`.** `create_rule` accepts
   it, and its advertised schema does not list it, so a client that validates
   arguments against the schema refuses that proposal (row 52, deferred to
-  0.7.1).
+  0.7.2).
 - **Two counts in replies run low.** `forget` of a node under-reports the
   derived edges retracted when that node was the via node of a via-hop rule
   (row 50), and `remember`'s `matched` does not count a fact endpoint that
-  already existed (row 48). Both deferred to 0.7.1.
+  already existed (row 48). Both deferred to 0.7.2.
 - **Cypher has no boolean literals.** `WHERE n.provisional = true` fails with
   `unbound variable`; the `schema` tool lists the provisional nodes. And an
   older skill at user scope can shadow the one `install` writes, with nothing
@@ -586,16 +676,16 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   `set_props_many`, `remember`, `upsert_entity`, `forget`, `recall` and
   `search` do, a write's fsync included, so other Python threads wait; the
   algorithms, `suggest_rules`, `schema_report`, `identity_clusters` and the
-  similarity reads release it (row 65, deferred to 0.7.1).
+  similarity reads release it (row 65, deferred to 0.7.2).
 - **Over MCP, a `min` that is not a number is ignored.** `find_similar` with
   `"min": "0.5"` answers at the default 0.8 and echoes `min: 0.8`; HTTP
   refuses the same body with `min must be a number` (row 74, deferred to
-  0.7.1).
+  0.7.2).
 - **Two small identity gaps.** If reading a node's edges fails, the `same_as`
   report leaves that node's links out rather than failing (row 51); and a
   provisional stub's derived `aliases` are not held to the 32-alias cap an
   entity's are, so a stub key of many words carries a long list (row 53).
-  Both deferred to 0.7.1.
+  Both deferred to 0.7.2.
 - **Scale is measured to 100,000 nodes, and no further.** The measurements
   are from v0.1.1 and v0.2; they were not repeated on 0.7, and nothing larger
   has been run.

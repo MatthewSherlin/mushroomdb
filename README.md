@@ -154,7 +154,7 @@ whole set:
 | `stats` | Live node, edge, and rule counts |
 | `node_history` | WAL change history for a node (archives included; a `snapshot --truncate` ends the reach) |
 | `edge_history` | Add/retract lifecycle for edges between two nodes, with rule attribution |
-| `was_linked` | Point-in-time edge check: was an edge active at a given commit? `at_commit` also accepts a date, which its schema does not declare yet |
+| `was_linked` | Point-in-time edge check: was an edge active on a given date, or at a given commit? |
 | `rename_node` | Rename a node's key; old_key, new_key |
 
 Full walkthrough, tool reference, and Claude Desktop setup: [`docs/site/mcp.md`](docs/site/mcp.md).

@@ -91,13 +91,15 @@ fn open_read_only(db: &Path) -> cli::structure::Db {
 ///
 /// Two halves, because either alone can pass on a store with no schema. The
 /// hook is silent on a store with no text index, so "the hook did not
-/// complain" proves nothing; the brief is where the no-index notice lives. And
-/// a brief without the notice proves only that *some* pair is declared, so the
-/// hook must also actually find the thing the store holds.
+/// complain" proves nothing; the brief is where the index notices live — "no
+/// text index", and "text index incomplete" for a store that has one field
+/// and lacks a memory default it holds nodes for. And a brief without either
+/// proves only what is declared, so the hook must also actually find the
+/// thing the store holds.
 fn can_recall(db: &Path, term: &str) -> Result<(), String> {
     let brief = ok(mushroomdb(&["brief", &db.to_string_lossy()]));
-    if brief.contains("no text index") {
-        return Err(format!("brief reports no text index:\n{brief}"));
+    if brief.contains("text index") {
+        return Err(format!("brief reports a missing text index:\n{brief}"));
     }
     let digest = hook_digest(db, term);
     if digest.trim().is_empty() {
@@ -264,6 +266,13 @@ fn ingest_git_never_applies_the_memory_defaults_to_a_store_it_did_not_create() {
         hook_digest(&db, "Quillfeather").trim(),
         "",
         "Person.name became searchable on a store ingest-git did not create"
+    );
+    // The store has text fields now — ingest-git's own — and a person recall
+    // cannot find. The brief says which field, and what indexes it.
+    let brief = ok(mushroomdb(&["brief", &db.to_string_lossy()]));
+    assert!(
+        brief.contains("text index incomplete: recall does not search Person.name. Run: "),
+        "{brief}"
     );
 }
 

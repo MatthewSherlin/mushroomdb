@@ -472,6 +472,9 @@ class GraphDb:
         The dense id — edges, history, last-change — is unchanged, so nothing
         the old key was party to is lost.
 
+        A stored `id` property that equals `old` is rewritten to `new` in the
+        same commit; an `id` holding anything else is left alone.
+
         Raises `KeyNotFound` if `old` is unknown, or `DuplicateKey` if `new` is
         already live.
         """

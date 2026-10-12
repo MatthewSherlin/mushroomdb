@@ -561,6 +561,9 @@ impl GraphDb {
     /// Rename a node's key.  The dense id (edges, history, last-change) is
     /// unchanged.
     ///
+    /// A stored `id` property that equals `old` is rewritten to `new` in the
+    /// same commit; an `id` holding anything else is left alone.
+    ///
     /// Raises `RuntimeError` with `KeyNotFound` if `old` is unknown, or
     /// `DuplicateKey` if `new` is already live.
     #[pyo3(text_signature = "($self, old, new)")]
