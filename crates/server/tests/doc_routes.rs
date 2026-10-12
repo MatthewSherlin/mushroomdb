@@ -30,10 +30,27 @@ fn router_source() -> &'static str {
 }
 
 /// `(METHOD, path)` for every `.route("path", method(handler))` in `src`.
+///
+/// It reads source, so it refuses what it cannot read rather than guess: a
+/// route answering two methods, a method other than the four below, and a
+/// router built with `.nest` or `.route_service`. A line that is a `//`
+/// comment is not source.
 fn routes_in(src: &str) -> BTreeSet<(String, String)> {
-    const METHODS: [&str; 4] = ["get(", "post(", "put(", "delete("];
+    const KNOWN: [&str; 4] = ["get", "post", "put", "delete"];
+    const OTHER: [&str; 5] = ["patch", "head", "options", "trace", "any"];
+    let code: String = src
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for unreadable in [".nest(", ".route_service(", ".nest_service("] {
+        assert!(
+            !code.contains(unreadable),
+            "the router registers routes in a way this test cannot read: `{unreadable}`"
+        );
+    }
     let mut routes = BTreeSet::new();
-    let mut rest = src;
+    let mut rest = code.as_str();
     while let Some(at) = rest.find(".route(") {
         rest = &rest[at + ".route(".len()..];
         let open = rest.find('"').expect("a .route( with no path string");
@@ -42,15 +59,42 @@ fn routes_in(src: &str) -> BTreeSet<(String, String)> {
             .expect("an unterminated path string");
         let path = &rest[open + 1..open + 1 + len];
         let after = &rest[open + 1 + len..];
-        let method = METHODS
-            .iter()
-            .filter_map(|m| after.find(m).map(|i| (i, *m)))
-            .min()
-            .map(|(_, m)| m.trim_end_matches('(').to_uppercase())
+        // This route's own call: up to the next `.route(`, or the end.
+        let call = &after[..after.find(".route(").unwrap_or(after.len())];
+        let methods = methods_called(call, &KNOWN);
+        assert!(
+            methods_called(call, &OTHER).is_empty(),
+            "the route {path:?} uses a method this test does not know: {call:?}"
+        );
+        assert!(
+            methods.len() <= 1,
+            "the route {path:?} answers more than one method ({methods:?}); give each its own `.route(`"
+        );
+        let method = methods
+            .first()
             .unwrap_or_else(|| panic!("no routing method after the path {path:?}"));
-        routes.insert((method, path.to_string()));
+        routes.insert((method.to_uppercase(), path.to_string()));
     }
     routes
+}
+
+/// Each of `names` that `call` invokes as a function: `get(`, `routing::delete(`
+/// — not `budget(`, and not a handler merely named `delete_node`.
+fn methods_called<'a>(call: &str, names: &[&'a str]) -> Vec<&'a str> {
+    let mut found = Vec::new();
+    for name in names {
+        let needle = format!("{name}(");
+        let mut from = 0;
+        while let Some(at) = call[from..].find(&needle) {
+            let at = from + at;
+            let before = call[..at].chars().next_back();
+            if !before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                found.push(*name);
+            }
+            from = at + needle.len();
+        }
+    }
+    found
 }
 
 /// `(METHOD, path)` for every `### METHOD /path` heading in `page`.
@@ -103,6 +147,39 @@ fn the_reader_finds_a_route_split_across_lines() {
 }
 
 #[test]
+fn a_route_in_a_comment_is_not_a_route() {
+    let src = r#"
+        .route("/health", get(health))
+        // .route("/legacy", get(legacy))
+    "#;
+    let found: Vec<_> = routes_in(src).into_iter().collect();
+    assert_eq!(found, vec![("GET".to_string(), "/health".to_string())]);
+}
+
+#[test]
+#[should_panic(expected = "answers more than one method")]
+fn a_route_answering_two_methods_is_refused() {
+    routes_in(r#".route("/thing", get(read_thing).post(write_thing))"#);
+}
+
+#[test]
+#[should_panic(expected = "a method this test does not know")]
+fn a_method_the_reader_does_not_know_is_refused() {
+    routes_in(
+        r#"
+        .route("/thing", patch(patch_thing))
+        .route("/other", post(other))
+    "#,
+    );
+}
+
+#[test]
+#[should_panic(expected = "registers routes in a way this test cannot read")]
+fn a_nested_router_is_refused() {
+    routes_in(r#".route("/health", get(health)).nest("/v2", v2_router())"#);
+}
+
+#[test]
 fn a_heading_is_a_route_only_when_it_is_a_method_and_a_path() {
     let page =
         "### GET /health\n### Authentication\n#### GET /deeper\n### POST /nodes/{key}/rename\n";
@@ -125,11 +202,6 @@ fn a_route_heading_with_a_query_string_after_it_is_refused() {
 #[test]
 fn the_http_page_and_the_router_name_the_same_routes() {
     let routed = routes_in(router_source());
-    assert!(
-        routed.len() >= 29,
-        "the reader found {} routes in http.rs; it found 29 when this test was written",
-        routed.len()
-    );
     let documented = routes_documented(&http_page());
     let show = |set: &BTreeSet<(String, String)>, other: &BTreeSet<(String, String)>| {
         set.difference(other)
@@ -142,5 +214,13 @@ fn the_http_page_and_the_router_name_the_same_routes() {
     assert!(
         missing.is_empty() && stale.is_empty(),
         "docs/site/http.md and the router disagree.\n  routes with no `### METHOD /path` section: [{missing}]\n  sections for routes the server does not have: [{stale}]"
+    );
+    // Last, so that a route removed from the router is named above rather
+    // than counted here. This only guards the reader going blind: both sets
+    // empty would otherwise be equal.
+    assert!(
+        routed.len() >= 29,
+        "the reader found {} routes in http.rs; it found 29 when this test was written",
+        routed.len()
     );
 }

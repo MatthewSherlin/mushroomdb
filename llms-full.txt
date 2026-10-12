@@ -5145,12 +5145,14 @@ listener is accepting. Non-loopback `--addr` requires `--token` or
 For TLS configuration options, see [deployment.md](deployment.md).
 
 **Full-access token** (`--token` / `MUSHROOMDB_TOKEN`): sent as an `Authorization: Bearer`
-header, as a `?token=` query parameter, or in the `mushroomdb_token` cookie, which the server
-sets when a browser opens the explorer with `?token=`. The header is read first, then the
+header, as a `?token=` query parameter, or in the `mushroomdb_token` cookie. The server sets
+that cookie itself when it answers an explorer page to a request that carried the full-access
+token, so a browser opened with `?token=` stays signed in. The header is read first, then the
 query, then the cookie. Grants access to all endpoints.
 
 **Role-bound tokens** (`--role-token TOKEN:ROLE` / `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`):
-sent the same three ways. A role token receives a node-visibility mask derived from the
+read the same three ways, though the server never sets the cookie for one. A role token
+receives a node-visibility mask derived from the
 named role's label selectors (defined in `schema.json` or `roles.json`), and
 optionally narrowed by one property test on those labels. The mask is resolved
 live at request time against the same DB snapshot used for the query — one
@@ -5186,7 +5188,7 @@ Role-token behavior per endpoint:
 | `DELETE /node/{key}` | 200 if node visible and `label` in `delete_labels`; 403 otherwise |
 | `POST /edges` | 200 if type in `create_edge_types` and both endpoints visible; 403 otherwise |
 | `DELETE /edges/{t}/{s}/{d}` | 200 if type in `delete_edge_types` and both endpoints visible; 403 otherwise |
-| `POST /edges/upsert` | 200 if type in `create_edge_types` and both endpoints visible; 403 otherwise |
+| `POST /edges/upsert` | 200 if type in `create_edge_types`, every existing endpoint visible, and — for an endpoint it has to create — `placeholder_label` in `create_labels`; 403 otherwise |
 | `PUT /node/{key}/prop/{f}` | 200 if node visible and `label` in `update_labels`; 403 otherwise |
 | `DELETE /node/{key}/prop/{f}` | 200 if node visible and `label` in `update_labels`; 403 otherwise |
 | `POST /ingest` | 200 if `label` in `create_labels`; 403 otherwise (all-or-nothing) |
@@ -5346,24 +5348,30 @@ authentication and is not subject to role enforcement.
 - **Request id.** Every response carries `x-request-id`. Send your own, up to 128 ASCII
   characters, and it is echoed; otherwise the server makes one.
 
-An error is one JSON object, `{"error": "<what went wrong>"}`, whatever the status:
+An error the server's own handlers raise is one JSON object, `{"error": "<what went wrong>"}`:
 
 | Status | When |
 |---|---|
-| 400 | The request is malformed, or the engine refused it: an unknown key, a duplicate key, a rule-owned edge, a query that does not parse |
+| 400 | A field is missing or wrong, or the engine refused the request: an unknown key on a write, a duplicate key, a rule-owned edge, a query that does not parse |
 | 401 | A token is configured and the request carries none, or one the server does not know. Body: `{"error":"unauthorized"}` |
 | 403 | A role-bound token asked for something outside its role. The message says what |
-| 404 | `POST /nodes/{key}/rename` on a key that does not exist; a node read by a role that may not see it; a path that is not a route, on a server with no explorer to fall back to |
+| 404 | A key that does not exist on a read route — `GET /node/{key}` and its `/edges`, `/neighborhood` and `/history` — or one the caller's role may not see; `POST /nodes/{key}/rename` on a key that does not exist |
 | 409 | `POST /nodes/{key}/rename` onto a key that is taken |
+| 413 | A request body over 64 MiB |
 | 415 | A route that takes a JSON body was sent without `Content-Type: application/json` |
 | 500 | The store is corrupt, or `roles.json` is misconfigured |
 | 503 | Another process holds the write lock (`Retry-After: 1`), or the server is at its concurrency limit |
 
-Two things are not that object: the 415 and 408 bodies, which are plain text from the HTTP
-layer, and a failed `POST /backup`, which answers 500 with its report.
+What is refused before a handler runs is not that object. A body that is not valid JSON is
+400 with a plain-text message (`Failed to parse the request body as JSON: …`), and 408, 413
+and 415 are plain text too. A path that is not a route is 404 with an empty body, unless the
+server is serving the explorer, which answers instead; a route asked with the wrong method is
+405 with an empty body. A failed `POST /backup` answers 500 with its report.
 
-Most writes to a missing key are 400, not 404: `DELETE /node/{key}`, the property routes and
-`POST /edges` all answer `400 {"error":"node key not found: <key>"}`. Only rename maps it to 404.
+A write to a key that does not exist is 400, not 404: `DELETE /node/{key}`, the property routes
+and `POST /edges` all answer `400 {"error":"node key not found: <key>"}`, and only rename maps
+it to 404. For a role-bound token the same write is 403, `target node not visible`: a key it
+may not see and a key that does not exist are told apart for no one.
 
 ## Routes
 
@@ -5808,7 +5816,11 @@ create it. The same store always gets the same answer.
         "edge_type": "SAME_ORG_ID",
         "max_edges": 32,
         "weight_prop": null,
-        "approximate": false
+        "approximate": false,
+        "namespace": null,
+        "via_edge": null,
+        "via_label": null,
+        "via_dir": null
       },
       "est_edges": 60,
       "examples": [["person-04", "person-14", 1.0]],
@@ -5935,6 +5947,8 @@ The `edge_type` and `derived` fields are always present in the edge object. With
 
 ### GET /node/{key}/neighborhood
 
+`depth` and `dir` are query parameters: `GET /node/alice/neighborhood?depth=2&dir=out`.
+
 `depth` defaults to 1. `dir` is `out`, `in`, or `both` (default `both`).
 
 Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
@@ -5977,7 +5991,8 @@ is identical to querying an absent key (404) — no existence oracle.
 
 ### GET /history/edge
 
-Return the full add/retract lifecycle for edges between two nodes.
+Return the full add/retract lifecycle for edges between two nodes. `a` and `b` are query
+parameters, both required: `GET /history/edge?a=alice&b=bob`.
 
 Response:
 ```json
@@ -6006,7 +6021,8 @@ the response is 404 for that key (no existence oracle).
 Point-in-time check: was an edge of `edge_type` between `a` and `b` active at `at_commit`?
 `at_commit` is a 0-based WAL commit index, or an RFC 3339 date — `2026-06-19`, or
 `2026-06-19T12:00:00Z` — which resolves to the last commit at or before it. All four
-parameters are required. The `at_commit` in the response is the commit index it resolved to.
+parameters are required: `GET /history/was_linked?a=alice&b=bob&edge_type=KNOWS&at_commit=2026-06-19`.
+The `at_commit` in the response is the commit index it resolved to.
 
 Response:
 ```json
@@ -6045,17 +6061,18 @@ snapshots, or `archive_wal: true` to keep it in archives.
 Create one node.
 
 ```json
-{"label": "Person", "key": "ada", "props": {"name": "Ada", "skills": ["rust"]}, "namespace": "team-a"}
+{"label": "Person", "key": "ada", "props": {"name": "Ada", "skills": ["rust"]}}
 ```
 
 `label` and `key` are required. `props` is an object; a `null` value in it is dropped.
-`namespace` is optional and is the node's namespace for life.
+`namespace`, a string, is optional: it puts the node in that namespace, for life.
 
 ```json
 {"ok": true, "nodes": 1, "edges": 0}
 ```
 
-`nodes` and `edges` count what the write created, rule-derived edges included.
+`nodes` and `edges` count what the request itself wrote. The edges that rules derive from the
+new node are not in the count; `GET /node/{key}/edges` lists them.
 
 It is an insert, not an upsert: a key that exists is `400 {"error":"duplicate node key: ada"}`.
 A missing field is `400 {"error":"missing label"}` or `"missing key"`. A role-bound token may
@@ -6068,8 +6085,9 @@ Delete a node and the edges on it. `200 {"ok": true}`.
 A key that does not exist is `400 {"error":"node key not found: <key>"}`. A role-bound token
 may delete a node it can see whose label is in its `delete_labels`; otherwise 403.
 
-History keeps the node: `GET /node/{key}/history` still answers for it until the log is
-pruned. See [Time travel](timetravel.md).
+Afterwards the key answers 404 on every read route, `/history` included. What the node was
+is still in the log until it is pruned: a `POST /query` with `as_of` reads the graph as it stood
+before the delete. See [Time travel](timetravel.md).
 
 ### PUT /node/{key}/prop/{field}
 
@@ -6130,7 +6148,8 @@ Create one edge between two nodes that exist.
 
 All three are required. `200 {"ok": true}` — also when the edge is already there.
 
-A missing endpoint is `400 {"error":"node key not found: grace"}`; to have it created, use
+400 when a rule already owns that edge, or when the two nodes are in different namespaces. A
+missing endpoint is `400 {"error":"node key not found: grace"}`; to have it created, use
 `POST /edges/upsert`, whose body names the same three things differently (`edge_type`,
 `src_key`, `dst_key`). A role-bound token may create an edge whose type is in its
 `create_edge_types` between two nodes it can see; otherwise 403.
@@ -6138,7 +6157,9 @@ A missing endpoint is `400 {"error":"node key not found: grace"}`; to have it cr
 ### POST /edges/upsert
 
 Insert an edge, auto-creating any missing endpoint nodes. A role-bound token may do so when
-the edge type is in its `create_edge_types` and it can see both endpoints; otherwise 403.
+the edge type is in its `create_edge_types` and it can see each endpoint that exists. An
+endpoint that does not exist is created for it only when `placeholder_label` is in its
+`create_labels`. Otherwise 403.
 
 Request body:
 
@@ -6183,13 +6204,14 @@ type is in its `delete_edge_types` between two nodes it can see; otherwise 403.
 ### POST /algo/pagerank
 
 PageRank over hand-written and derived edges together. The body is a JSON object and may be
-`{}`: every field has a default.
+`{}`: every field has a default. It may not be empty, and a field the config does not have is
+ignored without a word, so `max_iter` for `max_iters` runs with the default.
 
 | Field | Default | What it is |
 |---|---|---|
 | `damping` | 0.85 | The damping factor |
 | `max_iters` | 50 | Iterations before giving up |
-| `tol` | 1e-6 | Stop when no score moves by more |
+| `tol` | 1e-6 | Stop when the scores' total change in one iteration falls below it |
 | `direction` | `"out"` | `"out"`, `"in"` or `"both"` |
 | `edge_type` | all | Count only edges of this type |
 | `weight_prop` | none | Weight each edge by this property |
@@ -6213,8 +6235,9 @@ More in [Algorithms](algorithms.md).
 
 ### POST /algo/wcc
 
-Weakly connected components. Fields: `edge_type`, `weight_prop`, `min_weight` and `budget_ms`,
-as for PageRank; `{}` is valid.
+Weakly connected components. Fields: `edge_type`, `weight_prop`, `min_weight` and `budget_ms`;
+`{}` is valid. Here `weight_prop` weights nothing: with `min_weight` it only leaves out the
+edges below that weight.
 
 ```json
 {"components": [["org-01", "org-01"], ["org-02", "org-01"]], "truncated": false}
@@ -6226,7 +6249,8 @@ when the budget ran out.
 ### POST /algo/degree
 
 Degree centrality. Fields: `direction` (default `"both"`), `edge_type`, `weight_prop`,
-`min_weight` and `budget_ms`; `{}` is valid.
+`min_weight` and `budget_ms`; `{}` is valid. As for components, `weight_prop` and `min_weight`
+only leave edges out; the score is a count.
 
 ```json
 {"scores": [["org-04", 11], ["org-05", 11]], "truncated": false}
@@ -6266,12 +6290,13 @@ After the upgrade, send one text frame saying what you want:
 {"rules": ["skill_fit"], "writes": true, "cypher": "MATCH (p:Person) RETURN p.name LIMIT 50"}
 ```
 
-Every field is optional. `rules` names the rules whose edges to follow, `writes` adds node,
-edge and property events, and `cypher` follows the rows of one query, re-run on each commit —
-give it a `LIMIT`. The server answers `{"subscribed": true}`, or `{"error": "…"}` and closes
-when a rule is unknown or the query does not parse.
+Ask for at least one of the three. `rules` names the rules whose edges to follow, `writes` adds
+node, edge and property events, and `cypher` follows the rows of one query, re-run on each
+commit — give it a `LIMIT`. The server answers `{"subscribed": true}`. A frame that asks for
+nothing gets that answer and is then closed, having nothing to send. A frame that is not JSON,
+a rule that does not exist or a query that does not parse gets `{"error": "…"}` and is closed.
 
-Then one frame an event, each with a `type` and the `commit_seq` it happened at:
+Then one frame an event, each with a `type`:
 
 | `type` | Fields |
 |---|---|
@@ -6282,6 +6307,12 @@ Then one frame an event, each with a `type` and the `commit_seq` it happened at:
 | `edge_inserted`, `edge_deleted` | `edge_type`, `src`, `dst` |
 | `prop_set`, `prop_removed` | `key`, `field` |
 | `query_row_added`, `query_row_removed` | `columns`, `row` |
+
+Every event but the two query-row ones also carries `commit_seq`, the commit it happened at.
+`weight` is there only when the rule scores its edges; a key-match rule's `edge_fired` has
+none. The values in `row` are in the store's tagged form — `[{"Str": "Ada"}]`, not `["Ada"]`.
+Frames of different kinds are not ordered against each other: a write event may arrive after
+a rule event from a later commit, so order by `commit_seq`.
 
 A consumer that falls behind is not disconnected. It gets `{"type": "lagged", "missed": 12}`
 for the events it did not see, and the stream goes on.
