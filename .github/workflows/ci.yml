@@ -409,6 +409,9 @@ jobs:
       # binary, and are checked in mcp-handshake, which builds it.
       - run: python3 -m unittest scripts/tests/test_gen_reference.py
       - run: python3 scripts/gen-reference.py --check python-api
+      # The check that runs the commands a docs page shows. Its own tests run
+      # here; the run against a real binary is in mcp-handshake.
+      - run: python3 -m unittest scripts/tests/test_check_doc_examples.py
       # One version, many places. Catches the two shapes that have both
       # already shipped: a package manifest left behind (0.6.9 told readers to
       # install 0.6.8; a v0.6.11 tag would have published a wheel labelled
