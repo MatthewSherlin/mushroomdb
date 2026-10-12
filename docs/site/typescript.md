@@ -7,8 +7,8 @@ It talks to a running `mushroomdb serve`; it does not embed the engine.
 npm install mushroomdb-client
 ```
 
-It needs Node 18 or later, and runs in a browser. In Node before 21, install `ws` as well if you
-use subscriptions.
+It needs Node 18 or later, and runs in a browser. In a Node without a global `WebSocket`,
+install `ws` as well if you use subscriptions.
 
 ## Quick start
 
@@ -34,8 +34,8 @@ const one = await client.query(
 const why = await client.explain('person-01', 'proj-01');
 ```
 
-The token is sent as an `Authorization: Bearer` header. Leave the second argument out for a
-server started without one.
+The token is sent as an `Authorization: Bearer` header, and on the WebSocket URL as `?token=`
+for subscriptions. Leave the second argument out for a server started without one.
 
 ## Methods
 
@@ -74,7 +74,8 @@ a Cypher `CREATE`, `SET` or `DELETE`.
 ## Errors
 
 A response that is not a success throws `MushroomError`. Its `detail`, which is also its
-`message`, is what the server said went wrong.
+`message`, is what the server said went wrong. The few failures the server answers without a
+JSON body — a path that is not a route, say — surface as the JSON parse error instead.
 
 ```ts
 import { MushroomError } from 'mushroomdb-client';
@@ -113,7 +114,8 @@ await handle.close();
 - It does not reconnect. When the connection drops, no more events arrive; subscribe again.
 - A `lagged` event means the server's queue for this subscriber overflowed and some events were
   not sent. The stream goes on.
-- In Node before 21, pass the `ws` constructor as `wsConstructor` in the first argument.
+- In a Node without a global `WebSocket`, pass the `ws` constructor as `wsConstructor` in the
+  first argument.
 
 Every option of every method is in the package's own
 [README](https://github.com/MatthewSherlin/mushroomdb/blob/main/clients/typescript/README.md).

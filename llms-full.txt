@@ -790,8 +790,8 @@ write when the predicate holds. There are six predicates:
 `All` and `Any` combine them. A rule can store the **score** of each match on its edge, and can
 keep only the best few matches for each source node.
 
-The demo's `skill_fit` rule links a person to every project that shares at least half of their
-skills:
+The demo's `skill_fit` rule links a person to every project whose skills overlap theirs by at
+least half: the skills the two have in common, as a share of all the skills either has.
 
 ```sh
 mushroomdb query ./db "MATCH (p:Person {id: 'person-01'})-[r:FIT]->(x:Project) RETURN x, r.score AS score ORDER BY score DESC, x"
@@ -864,8 +864,10 @@ x=proj-02  score=0.5
 x=proj-20  score=0.5
 ```
 
-History can be pruned, and a store says so when it has been. The oldest commit it still holds
-is its **floor**; a read from before the floor is refused by name, never answered with a guess.
+History can be pruned. A store pruned to a retention limit says so: the oldest commit it still
+holds is its **floor**, and a read from before the floor is refused by name, never answered
+with a guess. Discarding the log outright, with `snapshot --truncate`, is different: commit
+numbers start again from the snapshot, so a number from before it no longer means what it did.
 [Time travel](timetravel.md) has the other ways to ask: what edges a node had on a date,
 whether two nodes were linked then, and every change to one node.
 
@@ -896,8 +898,8 @@ On top of the graph is a small surface for an assistant's memory, and it is how 
 meet mushroomdb.
 
 - **`remember`** writes a note, the entities it names, and facts among them, in one commit.
-  An entity it has never heard of is created as a **provisional** one, marked as such, rather
-  than refused; it stops being provisional when something describes it.
+  An entity it has never heard of is created as a **provisional** one — label `Entity`, marked
+  as provisional — rather than refused. The mark is cleared when something describes it.
 - **`recall`** takes a question in ordinary words and returns what the store holds about it.
 - **`forget`** removes a node, a property or a hand-written fact from the graph. It does not
   erase history: that takes pruning.
@@ -937,7 +939,7 @@ Three ways to find a node without knowing its key.
 | provisional | Of an entity: created because something mentioned it, before anything described it |
 | tombstone | A deleted node: out of the graph, still in the history |
 | never-widen | A mask, a role and a scope combine by intersection: adding one can only hide more |
-| approximate | Of a vector rule: finds candidates through an index instead of comparing every pair |
+| approximate | Of a vector rule: allowed to miss some neighbours for speed. A search uses an index only on a field such a rule covers |
 
 ---
 
@@ -8998,7 +9000,7 @@ db.insert_node(
     vec![("skills".into(), skills(&["graph", "rust"]))],
 )?;
 
-// Link every Person to every Org sharing at least half of their skills.
+// Link every Person to every Org whose skills overlap theirs by at least half.
 db.create_rule(RuleDef {
     name: "skill_fit".into(),
     src_label: "Person".into(),
@@ -9037,7 +9039,8 @@ assert!(db.explain("ada", "acme")?.is_empty());
   for as long as the handle lives.
 - Properties are a `Vec<(String, Value)>`. A `Value` is `Int`, `Float`, `Str`, `Bool`, `List`
   or `Map`.
-- `RuleDef` has no default: every field is written out, as above.
+- `RuleDef` has no default: every field is written out, as above. `max_edges: None` means no
+  limit on the edges from one source node.
 - `query` takes the statement and its parameters, and returns a `ResultSet`, read with `len()`,
   `columns()` and `get(row, column)`.
 
@@ -9130,7 +9133,7 @@ convenience wrapper that auto-commits.
 
 | Precondition | Fails when |
 |---|---|
-| `NodeUnchangedSince { key, expected }` | Node does not exist, or `last_changed(key) != expected` |
+| `NodeUnchangedSince { key, expected }` | `last_changed(key)` is not `expected`. A node that does not exist counts as 0 |
 | `NodeAbsent { key }` | Node exists (for insert-only semantics) |
 
 **Touch definition:** `last_changed` is updated on `InsertNode`, `SetProp`,
@@ -9175,8 +9178,9 @@ assert_eq!(rows.len(), 4);
 - `SharedDb` is `Clone`, `Send` and `Sync`. It takes the cross-process lock for each write, not
   for its lifetime, so other processes can write between yours.
 - `read()` returns a guard. Do not hold one while calling the same handle again.
-- `write()` waits up to two seconds for the lock. `submit_batch` returns when the group it was
-  written with has been fsynced.
+- `write()` waits up to two seconds for the lock. If it does not get it, it still returns a
+  guard, and every write through that guard fails with `Busy`. `submit_batch` returns when the
+  group it was written with has been fsynced.
 - `reader()` returns a `ReaderSnapshot`: a view that does not move while you hold it.
 
 [Concurrency](concurrency.md) has the model across processes.
@@ -9191,7 +9195,8 @@ log. [Durability](durability.md) has what a crash can and cannot lose.
 
 ## Errors
 
-Every call returns `core_api::Result<T>`. The variants of `GraphError` worth matching on:
+A call that can fail returns `core_api::Result<T>`. The variants of `GraphError` worth matching
+on:
 
 | Variant | Means |
 |---|---|
@@ -9227,8 +9232,8 @@ It talks to a running `mushroomdb serve`; it does not embed the engine.
 npm install mushroomdb-client
 ```
 
-It needs Node 18 or later, and runs in a browser. In Node before 21, install `ws` as well if you
-use subscriptions.
+It needs Node 18 or later, and runs in a browser. In a Node without a global `WebSocket`,
+install `ws` as well if you use subscriptions.
 
 ## Quick start
 
@@ -9254,8 +9259,8 @@ const one = await client.query(
 const why = await client.explain('person-01', 'proj-01');
 ```
 
-The token is sent as an `Authorization: Bearer` header. Leave the second argument out for a
-server started without one.
+The token is sent as an `Authorization: Bearer` header, and on the WebSocket URL as `?token=`
+for subscriptions. Leave the second argument out for a server started without one.
 
 ## Methods
 
@@ -9294,7 +9299,8 @@ a Cypher `CREATE`, `SET` or `DELETE`.
 ## Errors
 
 A response that is not a success throws `MushroomError`. Its `detail`, which is also its
-`message`, is what the server said went wrong.
+`message`, is what the server said went wrong. The few failures the server answers without a
+JSON body — a path that is not a route, say — surface as the JSON parse error instead.
 
 ```ts
 import { MushroomError } from 'mushroomdb-client';
@@ -9333,7 +9339,8 @@ await handle.close();
 - It does not reconnect. When the connection drops, no more events arrive; subscribe again.
 - A `lagged` event means the server's queue for this subscriber overflowed and some events were
   not sent. The stream goes on.
-- In Node before 21, pass the `ws` constructor as `wsConstructor` in the first argument.
+- In a Node without a global `WebSocket`, pass the `ws` constructor as `wsConstructor` in the
+  first argument.
 
 Every option of every method is in the package's own
 [README](https://github.com/MatthewSherlin/mushroomdb/blob/main/clients/typescript/README.md).
@@ -10646,12 +10653,14 @@ What the rule does:
 - Similarity is cosine. It is the only metric.
 - `min` is the threshold, above 0 and at most 1. The similarity is stored on the edge under the
   rule's `weight_prop`.
-- With no `max_edges`, the rule keeps the 32 best matches for each source node. Set `max_edges`
-  to keep more or fewer.
+- Declared from Python, over HTTP or over MCP with no `max_edges`, the rule keeps the 32 best
+  matches for each source node. Set `max_edges` to keep more or fewer. In Rust, `max_edges: None`
+  means no limit for a source node.
 - A rule between a label and itself links in both directions: `a` to `b`, and `b` to `a`.
 - Two vectors of different lengths, a list with something in it that is not a number, and a
-  vector of all zeros produce no edge. They produce no error either, so a field that was
-  written with the wrong dimension is silent: check a node you expect to be linked.
+  vector of all zeros produce no edge. They produce no error either — at most one line on
+  standard error the first time — so a field written with the wrong dimension is easy to miss:
+  check a node you expect to be linked.
 
 ## Searching
 
@@ -10672,9 +10681,9 @@ db.find_similar("embedding", [1.0, 0.0], label="Item", k=3, min=-1.0)
 ```
 
 - `k` defaults to 10.
-- **`min` defaults to 0.8, on every surface.** A search that names no `min` returns only close
-  matches, and can return none. Pass a lower `min` to see everything ranked, as the second call
-  does.
+- **For `find_similar`, `min` defaults to 0.8, on every surface.** A search that names no `min`
+  returns only close matches, and can return none. Pass a lower `min` to see everything ranked,
+  as the second call does. `pairwise_similar` defaults to 0.0.
 - A score is a cosine similarity, from -1 to 1. If you need a distance, it is `1 - score`.
 - `pairwise_similar` compares only the keys you give it, exactly, and writes nothing.
 - Over MCP, `find_similar` has a second form: give it a `key` and an `edge_type` and it reads
@@ -10683,7 +10692,7 @@ db.find_similar("embedding", [1.0, 0.0], label="Item", k=3, min=-1.0)
 Every argument is in the [Python API](python-api.md), [MCP tools](mcp-tools.md) and
 [HTTP API](http.md#post-find_similar) references.
 
-## Exact and approximate
+## Exact and approximate searches
 
 By default a search compares the query with every vector it may return. That is exact, and it
 takes time in proportion to the number of nodes.
@@ -10707,6 +10716,12 @@ are the nearest. Use `exact=True` where a missed neighbour would matter.
 
 The index is an HNSW graph, built in the engine with no outside dependency.
 
+Every vector rule has one, approximate or not: it is how a rule finds candidates without
+comparing every pair of nodes. A rule that is not approximate searches its index more widely,
+and falls back to comparing every pair when that is not enough. So what follows — the
+parameters, the build, the memory — applies to any store with a vector rule. What
+`approximate: true` adds is a rule that may miss neighbours, and searches that may use its index.
+
 | Parameter | Default |
 |---|---|
 | `m` | 16 |
@@ -10714,13 +10729,16 @@ The index is an HNSW graph, built in the engine with no outside dependency.
 | `ef_construction` | 200 |
 | `ef_search` | 400 |
 
-They apply to the whole store and are set only through an environment variable, read once when
-the process starts: `MUSHROOMDB_HNSW_PARAMS=m,m0,ef_construction,ef_search`. There is no setting
-for one rule.
+They apply to the whole store and are set only through an environment variable, read once:
+`MUSHROOMDB_HNSW_PARAMS=m,m0,ef_construction,ef_search`, with an optional fifth field, `own` or
+`both`, for how neighbour lists are pruned. A value that does not parse is ignored, with one
+line on standard error. There is no setting for one rule.
 
 A rule created over more than 2,048 vectors builds its index in slices. `create_rule` returns
-before the edges exist, and they arrive in later commits. To have the build finished before
-traffic arrives:
+before the edges exist. They arrive when the build finishes, and the build advances only when
+something drives it: a later write, a running `serve`, or the command below. A program that
+creates the rule and then only reads will wait for edges that do not come. To finish the build
+at once:
 
 ```sh no-run
 mushroomdb build-index ./db

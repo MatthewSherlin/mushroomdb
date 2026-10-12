@@ -15,17 +15,28 @@ fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The lines between `// docs:start` and `// docs:end`, with the indent of
-/// the first one removed from all of them.
+/// The lines between the `// docs:start` line and the `// docs:end` line,
+/// with the smallest indent among them removed from all of them. Exactly one
+/// of each marker, or the example is refused.
 fn quoted_region(source: &str, name: &str) -> String {
-    let start = source
-        .find("// docs:start")
-        .unwrap_or_else(|| panic!("examples/{name}.rs has no `// docs:start` line"));
-    let end = source
-        .find("// docs:end")
-        .unwrap_or_else(|| panic!("examples/{name}.rs has no `// docs:end` line"));
-    let body: Vec<&str> = source[start..end].lines().skip(1).collect();
-    let body = &body[..body.len().saturating_sub(1)];
+    let lines: Vec<&str> = source.lines().collect();
+    let marked = |marker: &str| -> usize {
+        let at: Vec<usize> = (0..lines.len())
+            .filter(|&i| lines[i].trim() == marker)
+            .collect();
+        assert!(
+            at.len() == 1,
+            "examples/{name}.rs must have exactly one `{marker}` line; it has {}",
+            at.len()
+        );
+        at[0]
+    };
+    let (start, end) = (marked("// docs:start"), marked("// docs:end"));
+    assert!(
+        start < end,
+        "examples/{name}.rs ends its region before it starts"
+    );
+    let body = &lines[start + 1..end];
     let indent = body
         .iter()
         .filter(|l| !l.trim().is_empty())
@@ -42,6 +53,21 @@ fn quoted_region(source: &str, name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn a_region_ends_at_its_marker_wherever_the_marker_is_indented() {
+    let source = "fn main() {\n    // docs:start\n    let a = 1;\n    let b = 2;\n// docs:end\n}\n";
+    assert_eq!(quoted_region(source, "x"), "let a = 1;\nlet b = 2;");
+}
+
+#[test]
+#[should_panic(expected = "exactly one `// docs:start` line")]
+fn an_example_with_two_regions_is_refused() {
+    quoted_region(
+        "// docs:start\na\n// docs:end\n// docs:start\nb\n// docs:end\n",
+        "x",
+    );
 }
 
 #[test]

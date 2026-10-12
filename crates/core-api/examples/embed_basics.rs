@@ -26,7 +26,7 @@ fn main() -> core_api::Result<()> {
         vec![("skills".into(), skills(&["graph", "rust"]))],
     )?;
 
-    // Link every Person to every Org sharing at least half of their skills.
+    // Link every Person to every Org whose skills overlap theirs by at least half.
     db.create_rule(RuleDef {
         name: "skill_fit".into(),
         src_label: "Person".into(),

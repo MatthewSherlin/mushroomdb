@@ -67,8 +67,8 @@ write when the predicate holds. There are six predicates:
 `All` and `Any` combine them. A rule can store the **score** of each match on its edge, and can
 keep only the best few matches for each source node.
 
-The demo's `skill_fit` rule links a person to every project that shares at least half of their
-skills:
+The demo's `skill_fit` rule links a person to every project whose skills overlap theirs by at
+least half: the skills the two have in common, as a share of all the skills either has.
 
 ```sh
 mushroomdb query ./db "MATCH (p:Person {id: 'person-01'})-[r:FIT]->(x:Project) RETURN x, r.score AS score ORDER BY score DESC, x"
@@ -141,8 +141,10 @@ x=proj-02  score=0.5
 x=proj-20  score=0.5
 ```
 
-History can be pruned, and a store says so when it has been. The oldest commit it still holds
-is its **floor**; a read from before the floor is refused by name, never answered with a guess.
+History can be pruned. A store pruned to a retention limit says so: the oldest commit it still
+holds is its **floor**, and a read from before the floor is refused by name, never answered
+with a guess. Discarding the log outright, with `snapshot --truncate`, is different: commit
+numbers start again from the snapshot, so a number from before it no longer means what it did.
 [Time travel](timetravel.md) has the other ways to ask: what edges a node had on a date,
 whether two nodes were linked then, and every change to one node.
 
@@ -173,8 +175,8 @@ On top of the graph is a small surface for an assistant's memory, and it is how 
 meet mushroomdb.
 
 - **`remember`** writes a note, the entities it names, and facts among them, in one commit.
-  An entity it has never heard of is created as a **provisional** one, marked as such, rather
-  than refused; it stops being provisional when something describes it.
+  An entity it has never heard of is created as a **provisional** one — label `Entity`, marked
+  as provisional — rather than refused. The mark is cleared when something describes it.
 - **`recall`** takes a question in ordinary words and returns what the store holds about it.
 - **`forget`** removes a node, a property or a hand-written fact from the graph. It does not
   erase history: that takes pruning.
@@ -214,4 +216,4 @@ Three ways to find a node without knowing its key.
 | provisional | Of an entity: created because something mentioned it, before anything described it |
 | tombstone | A deleted node: out of the graph, still in the history |
 | never-widen | A mask, a role and a scope combine by intersection: adding one can only hide more |
-| approximate | Of a vector rule: finds candidates through an index instead of comparing every pair |
+| approximate | Of a vector rule: allowed to miss some neighbours for speed. A search uses an index only on a field such a rule covers |

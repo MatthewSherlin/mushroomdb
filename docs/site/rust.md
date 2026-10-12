@@ -34,7 +34,7 @@ db.insert_node(
     vec![("skills".into(), skills(&["graph", "rust"]))],
 )?;
 
-// Link every Person to every Org sharing at least half of their skills.
+// Link every Person to every Org whose skills overlap theirs by at least half.
 db.create_rule(RuleDef {
     name: "skill_fit".into(),
     src_label: "Person".into(),
@@ -73,7 +73,8 @@ assert!(db.explain("ada", "acme")?.is_empty());
   for as long as the handle lives.
 - Properties are a `Vec<(String, Value)>`. A `Value` is `Int`, `Float`, `Str`, `Bool`, `List`
   or `Map`.
-- `RuleDef` has no default: every field is written out, as above.
+- `RuleDef` has no default: every field is written out, as above. `max_edges: None` means no
+  limit on the edges from one source node.
 - `query` takes the statement and its parameters, and returns a `ResultSet`, read with `len()`,
   `columns()` and `get(row, column)`.
 
@@ -166,7 +167,7 @@ convenience wrapper that auto-commits.
 
 | Precondition | Fails when |
 |---|---|
-| `NodeUnchangedSince { key, expected }` | Node does not exist, or `last_changed(key) != expected` |
+| `NodeUnchangedSince { key, expected }` | `last_changed(key)` is not `expected`. A node that does not exist counts as 0 |
 | `NodeAbsent { key }` | Node exists (for insert-only semantics) |
 
 **Touch definition:** `last_changed` is updated on `InsertNode`, `SetProp`,
@@ -211,8 +212,9 @@ assert_eq!(rows.len(), 4);
 - `SharedDb` is `Clone`, `Send` and `Sync`. It takes the cross-process lock for each write, not
   for its lifetime, so other processes can write between yours.
 - `read()` returns a guard. Do not hold one while calling the same handle again.
-- `write()` waits up to two seconds for the lock. `submit_batch` returns when the group it was
-  written with has been fsynced.
+- `write()` waits up to two seconds for the lock. If it does not get it, it still returns a
+  guard, and every write through that guard fails with `Busy`. `submit_batch` returns when the
+  group it was written with has been fsynced.
 - `reader()` returns a `ReaderSnapshot`: a view that does not move while you hold it.
 
 [Concurrency](concurrency.md) has the model across processes.
@@ -227,7 +229,8 @@ log. [Durability](durability.md) has what a crash can and cannot lose.
 
 ## Errors
 
-Every call returns `core_api::Result<T>`. The variants of `GraphError` worth matching on:
+A call that can fail returns `core_api::Result<T>`. The variants of `GraphError` worth matching
+on:
 
 | Variant | Means |
 |---|---|
