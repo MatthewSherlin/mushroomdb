@@ -510,96 +510,6 @@ full section table and migration notes. 100k nodes (v0.2, ~10M derived edges):
 V8 snapshot open 0.02 s / 31–41 MiB RSS (warm file cache, cold process,
 2026-08-28, Apple M4 Pro).
 
-## Atomic write batches (Rust API)
-
-`write_batch` is the closure-style entry point for atomic multi-op commits.
-All ops queued inside the closure are validated in order and committed as a
-single `WalRecord::Batch` frame (one fsync). Rules fire per op, in order.
-
-```rust
-let (nodes, edges) = db.write_batch(|b| {
-    b.insert_node("Person", "alice", vec![("age".into(), Value::Int(30))]);
-    b.insert_node("Person", "bob", vec![]);
-    b.insert_edge("KNOWS", "alice", "bob");
-    b.set_prop("alice", "role", Value::Str("admin".into()));
-    b.delete_node("old_key");
-})?;
-// nodes == 2, edges == 1; one fsync, crash-atomic
-```
-
-**Error semantics — validate-then-apply:** the closure queues ops without
-touching the database. `commit` validates every op before writing anything.
-If op N fails validation (duplicate key, unknown key, rule-owned edge) the
-entire batch is rejected: no WAL bytes written, no in-memory state changes.
-
-**Crash atomicity, not isolation:** on WAL replay after a crash, a torn
-`Batch` frame applies none of its ops. However, while applying a committed
-batch in memory, concurrent readers may observe intermediate states. There is
-no interactive transaction isolation in v1.
-
-The following ops are supported inside `write_batch`:
-
-| Method | Description |
-|---|---|
-| `b.insert_node(label, key, props)` | Insert a new node |
-| `b.insert_edge(edge_type, src, dst)` | Insert a user-owned edge |
-| `b.set_prop(key, field, value)` | Set or overwrite a property |
-| `b.remove_prop(key, field)` | Remove a property (no-op if absent) |
-| `b.delete_edge(edge_type, src, dst)` | Delete a user-owned edge |
-| `b.delete_node(key)` | Delete a node and all its incident edges |
-| `b.create_rule(def)` | Register a linking rule |
-| `b.delete_rule(name)` | Remove a linking rule |
-
-The method-chaining `db.batch()` builder is equivalent; `write_batch` is a
-convenience wrapper that auto-commits.
-
-## Compare-and-set write batches (Rust API)
-
-`write_batch_cas` is the optimistic-concurrency entry point. All preconditions
-are checked atomically under the write lock before any operation is applied; if
-any precondition fails, the entire batch is rejected with `GraphError::CasConflict`
-and no WAL frame is written.
-
-```rust
-use core_api::{Precondition, GraphError};
-
-// Read the current last-changed commit for a node.
-let seq = db.last_changed("alice")?; // Some(commit_seq) or None if absent/deleted
-
-let result = db.write_batch_cas(
-    vec![Precondition::NodeUnchangedSince {
-        key: "alice".into(),
-        expected: seq.unwrap_or(0),
-    }],
-    |b| {
-        b.set_prop("alice", "role", Value::Str("admin".into()));
-    },
-);
-match result {
-    Ok(_) => { /* applied */ }
-    Err(GraphError::CasConflict { key, expected, actual }) => {
-        // alice was modified between last_changed() and write_batch_cas().
-    }
-    Err(e) => { /* other error */ }
-}
-```
-
-**Precondition types:**
-
-| Precondition | Fails when |
-|---|---|
-| `NodeUnchangedSince { key, expected }` | Node does not exist, or `last_changed(key) != expected` |
-| `NodeAbsent { key }` | Node exists (for insert-only semantics) |
-
-**Touch definition:** `last_changed` is updated on `InsertNode`, `SetProp`,
-`RemoveProp`, `InsertEdge` (both endpoints), `DeleteEdge` (both endpoints),
-`DeleteNode` (entry removed; `last_changed` returns `None` thereafter). History
-markers and rule-management records do not update `last_changed`. Values are
-persisted in V8 snapshot section 11 (LAST_CHANGE) and survive restarts.
-
-`SharedDb::submit_batch_cas` provides the same guarantee over the shared-writer
-async interface. See [timetravel.md](timetravel.md) for the full semantics.
-
 ## Exposed surface
 
 Every method the binding exposes, with its signature and docstring, is in the
@@ -610,6 +520,9 @@ closures capturing `&mut BatchBuilder` do not map naturally to the Python
 object model. Use `ingest_batch` (node + edge inserts in one frame) or
 `batch_edges` (mixed insert/delete edges in one frame) for atomic Python
 writes. Both use the same `WalRecord::Batch` frame and one-fsync guarantee.
+
+The Rust forms — `write_batch`, and the compare-and-set `write_batch_cas` — are on the
+[Rust](rust.md#several-writes-as-one) page.
 
 Not yet exposed: `ingest_json` (use `ingest_batch`), auto-FK inference
 (declare `KeyMatch` rules explicitly), `rebuild`.
