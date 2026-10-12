@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>mushroomdb — the graph that stays true</title>
+<meta name="description" content="The data layer for agents that reason over entities: an embedded Rust graph database in which a relationship is a schema declaration — write a rule once, and every write derives, maintains and retracts the matching edges." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,400;0,600;0,700;1,400&family=Pixelify+Sans:wght@500;700&display=swap" />
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="mushroomdb — the graph that stays true" />
+<meta property="og:description" content="An embedded Rust graph database in which a relationship is a schema declaration: write a rule once, and every write derives, maintains and retracts the matching edges." />
+<meta property="og:url" content="https://matthewsherlin.github.io/mushroomdb/" />
+<meta property="og:image" content="https://matthewsherlin.github.io/mushroomdb/assets/social-preview.png" />
+<meta name="twitter:card" content="summary_large_image" />
+<style>
+  /* The palette is the mark's: its ink and its cap amber, on a pale spore
+     green, with moss for links. docs/theme/mushroom.css carries the same
+     values for the book; change them in both places. */
+  :root {
+    --bg: #f3f6ec;
+    --panel: #ffffff;
+    --ink: #0b0e14;
+    --muted: #55604f;
+    --line: #cdd6bf;
+    --accent: #2c6a3b;
+    --amber: #e8a33d;
+    --code-bg: #e7ecdc;
+    --display: "Pixelify Sans", ui-monospace, Menlo, monospace;
+    --body: "Nunito", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0b0e14;
+      --panel: #131824;
+      --ink: #e8e6e1;
+      --muted: #9aa39a;
+      --line: #262d3a;
+      --accent: #9fce8a;
+      --amber: #e8a33d;
+      --code-bg: #161b27;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font: 17px/1.6 var(--body);
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 20px; }
+  a { color: var(--accent); }
+  a:focus-visible, button:focus-visible { outline: 3px solid var(--amber); outline-offset: 3px; }
+  img { max-width: 100%; height: auto; display: block; }
+
+  .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 24px; padding: 20px 0; font-weight: 600; }
+  .topbar .brand {
+    display: flex; align-items: center; gap: 6px; margin-right: auto;
+    font-family: var(--display); font-size: 20px; font-weight: 700;
+    color: var(--ink); text-decoration: none;
+  }
+  .topbar .brand img { width: 28px; image-rendering: pixelated; }
+  .topbar a { text-decoration: none; }
+  .topbar a:hover { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 4px; }
+
+  header { padding: 44px 0 48px; }
+  h1 {
+    font-family: var(--display); font-weight: 700;
+    font-size: clamp(52px, 11vw, 96px); line-height: 0.95; letter-spacing: -0.01em;
+    margin: 0 0 18px;
+  }
+  .tagline { font-size: 25px; line-height: 1.3; margin: 0 0 14px; max-width: 26ch; font-weight: 700; }
+  .lede { color: var(--muted); margin: 0 0 14px; max-width: 62ch; }
+  .lede strong { color: var(--ink); }
+  .alpha { color: var(--muted); font-size: 15px; margin: 0 0 26px; }
+
+  pre, code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+  pre {
+    background: var(--panel); border: 2px solid var(--ink);
+    padding: 14px 16px; overflow-x: auto; font-size: 15px; margin: 0;
+  }
+  code { font-size: 0.9em; }
+  .install { position: relative; max-width: 520px; margin: 0 0 10px; }
+  .install-note { color: var(--muted); font-size: 15px; margin: 0 0 24px; max-width: 62ch; }
+  .copy {
+    position: absolute; top: 9px; right: 9px; font: 600 13px var(--body);
+    color: var(--ink); background: var(--code-bg); border: 2px solid var(--ink);
+    padding: 2px 9px; cursor: pointer;
+  }
+  .copy:hover { background: var(--amber); color: #0b0e14; }
+
+  /* The one hard edge on the page: a pixel button, with the cap's amber
+     for its shadow. Pressing it moves it into the shadow. */
+  .cta { display: flex; flex-wrap: wrap; gap: 16px; margin: 0 0 40px; }
+  .cta a {
+    padding: 10px 20px; border: 2px solid var(--ink); color: var(--ink);
+    font-weight: 700; text-decoration: none;
+  }
+  .cta a.primary { background: var(--ink); color: var(--bg); box-shadow: 5px 5px 0 var(--amber); }
+  .cta a:hover { background: var(--amber); color: #0b0e14; }
+  .cta a.primary:hover { background: var(--ink); color: var(--bg); transform: translate(3px, 3px); box-shadow: 2px 2px 0 var(--amber); }
+
+  /* Mushrooms above the ground line, the threads that join them below it.
+     The threads grow in turn on load; then one more grows and one retracts,
+     which is what a rule does when a property changes. */
+  .mycelium { display: block; width: 100%; height: auto; margin: 0 0 30px; }
+  .mycelium image { image-rendering: pixelated; }
+  .mycelium .ground { stroke: var(--line); stroke-width: 3; stroke-dasharray: 6 6; }
+  .mycelium .hypha {
+    fill: none; stroke: var(--accent); stroke-width: 3; shape-rendering: crispEdges;
+    stroke-dasharray: 1; stroke-dashoffset: 1;
+    animation: grow 0.5s steps(12) var(--at) forwards;
+  }
+  .mycelium .hypha.late { stroke: var(--amber); }
+  .mycelium .hypha.retracts {
+    animation: grow 0.5s steps(12) var(--at) forwards, retract 0.5s steps(12) 3.5s forwards;
+  }
+  @keyframes grow { to { stroke-dashoffset: 0; } }
+  @keyframes retract { from { stroke-dashoffset: 0; } to { stroke-dashoffset: 1; } }
+  @media (prefers-reduced-motion: reduce) {
+    .mycelium .hypha { animation: none; stroke-dashoffset: 0; }
+    .mycelium .hypha.retracts { visibility: hidden; }
+    .cta a.primary:hover { transform: none; }
+  }
+
+  figure { margin: 0; }
+  figure img { border: 2px solid var(--ink); box-shadow: 6px 6px 0 var(--line); }
+
+  section { padding: 40px 0; border-top: 3px dashed var(--line); }
+  section h2 { font-family: var(--display); font-weight: 500; font-size: 28px; line-height: 1.2; margin: 0 0 10px; }
+  section p { margin: 0 0 20px; color: var(--muted); max-width: 66ch; }
+  section p strong { color: var(--ink); font-weight: 700; }
+
+  .fits { display: grid; grid-template-columns: 1fr 1fr; gap: 36px; }
+  .card h3 { margin: 0 0 10px; font-family: var(--display); font-weight: 500; font-size: 20px; }
+  .card ul { margin: 0; padding-left: 20px; list-style: square; }
+  .card li { margin-bottom: 10px; }
+  .card li::marker { color: var(--amber); }
+  .card li:last-child { margin-bottom: 0; }
+  @media (max-width: 640px) {
+    .fits { grid-template-columns: 1fr; }
+    .tagline { font-size: 21px; }
+    .topbar { column-gap: 18px; }
+    .topbar .brand { flex-basis: 100%; }
+    .copy { display: none; }
+  }
+
+  footer { padding: 30px 0 60px; border-top: 3px dashed var(--line); color: var(--muted); font-size: 15px; }
+  footer nav a { margin-right: 18px; white-space: nowrap; font-weight: 600; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <nav class="topbar">
+    <a class="brand" href="./"><img src="assets/mark-small.svg" alt="" />mushroomdb</a>
+    <a href="docs/">Docs</a>
+    <a href="docs/quickstart.html">Quickstart</a>
+    <a href="docs/api.html">Reference</a>
+    <a href="https://github.com/MatthewSherlin/mushroomdb">GitHub</a>
+  </nav>
+
+  <header>
+    <h1>mushroomdb</h1>
+    <p class="tagline">The graph that stays true — and knows who's allowed to see it.</p>
+    <p class="lede">
+      mushroomdb is the data layer for agents that reason over entities. It is an embedded Rust
+      graph database in which a relationship is a schema declaration: write a rule once, and every
+      write derives, maintains and <strong>retracts</strong> the matching edges, each one carrying
+      the rule, the score and the values that produced it.
+    </p>
+    <p class="alpha">Pre-1.0 alpha — APIs and formats may change between minor versions.</p>
+    <div class="install"><pre><code id="install-cmd">npx mushroomdb install --db ./memory</code></pre><button class="copy" type="button" data-copy="install-cmd">Copy</button></div>
+    <p class="install-note">Writes the <code>/mushroom</code> skill, an MCP server listing the twenty-three-tool association surface, and the session hooks, for Claude Code or Cursor.</p>
+    <p class="cta"><a class="primary" href="docs/quickstart.html">Quickstart</a><a href="docs/">Read the docs</a></p>
+    <svg class="mycelium" viewBox="0 0 860 176" aria-hidden="true" focusable="false">
+      <line class="ground" x1="0" y1="100" x2="860" y2="100" />
+      <path class="hypha" style="--at: 0.4s" pathLength="1" d="M70 100 V132 H250 V100" />
+      <path class="hypha retracts" style="--at: 0.9s" pathLength="1" d="M250 100 V152 H430 V100" />
+      <path class="hypha" style="--at: 1.4s" pathLength="1" d="M430 100 V126 H620 V100" />
+      <path class="hypha" style="--at: 1.9s" pathLength="1" d="M620 100 V148 H790 V100" />
+      <path class="hypha late" style="--at: 2.8s" pathLength="1" d="M70 100 V168 H430 V100" />
+      <image href="assets/mark.svg" x="34" y="35.2" width="72" height="72" />
+      <image href="assets/mark.svg" x="226" y="56.8" width="48" height="48" />
+      <image href="assets/mark.svg" x="382" y="13.6" width="96" height="96" />
+      <image href="assets/mark.svg" x="593" y="51.4" width="54" height="54" />
+      <image href="assets/mark.svg" x="757" y="40.6" width="66" height="66" />
+    </svg>
+    <figure>
+      <img src="assets/ingest-git-cascade.gif" alt="A single SET changes one property; the rule fires, new scored edges are derived and the stale ones retracted, inside the same write" />
+    </figure>
+  </header>
+
+  <section>
+    <h2>Declare the rule. The edges maintain themselves.</h2>
+    <p>
+      A rule is a schema object, not a script you re-run: <strong>connect every Person to every Org
+      whose skills overlap theirs by at least 50%</strong>, written once. Every insert and every
+      property change evaluates it incrementally, stores the score on the edge, and retracts the
+      edge when the properties stop matching.
+    </p>
+    <figure>
+      <img src="assets/rule-fire-explain.gif" alt="FIT edges before and after a SET that retracts one and fires another, then explain called on the edge that survives" />
+    </figure>
+  </section>
+
+  <section>
+    <h2>Every derived edge shows its arithmetic.</h2>
+    <p>
+      <strong>explain</strong> names the rule, the field values that matched, and the computed score
+      behind any link. An assistant answering "why are these two related?" can quote the derivation
+      instead of guessing, and the same why panel is built into the bundled graph explorer.
+    </p>
+    <figure>
+      <img src="assets/rules-why.gif" alt="The Rules panel and Why slide-over showing the overlap arithmetic behind a derived edge" />
+    </figure>
+  </section>
+
+  <section>
+    <h2>One property changes. The graph catches up in the same write.</h2>
+    <p>
+      A Cypher <strong>SET</strong> in the built-in console changes a single property, the
+      <code>founded_within</code> rule fires, and the new scored edges appear on the canvas.
+      There is no re-index step and no batch job to schedule — the derivation happens inside the
+      write that changed the property.
+    </p>
+    <figure>
+      <img src="assets/demo-set-derives.gif" alt="A Cypher SET changing one property, the founded_within rule firing, and new scored edges appearing in the explorer" />
+    </figure>
+  </section>
+
+  <section>
+    <h2>Where it fits</h2>
+    <div class="fits">
+      <div class="card">
+        <h3>What it is</h3>
+        <ul>
+          <li>An embedded, single-binary graph database with a rule engine that maintains edges for you.</li>
+          <li>A 25-tool MCP server — twenty-three listed on every store, a store built by <code>ingest-git</code> included — plus a <code>/mushroom</code> skill for Claude Code and Cursor.</li>
+          <li>Local-first: your data stays on disk, no cloud service, no model call in the write path unless you enable embeddings.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>What it isn't</h3>
+        <ul>
+          <li>Not a hosted memory service — no account, no endpoint, nothing to sign up for.</li>
+          <li>Not a vector database. Vector predicates and HNSW are built in; bring your own embeddings.</li>
+          <li>Not a transactional relational database. Single writer, no interactive transactions, memory-first storage.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <nav>
+      <a href="docs/">Docs</a>
+      <a href="docs/quickstart.html">Quickstart</a>
+      <a href="https://github.com/MatthewSherlin/mushroomdb/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://github.com/MatthewSherlin/mushroomdb">GitHub</a>
+      <a href="https://github.com/MatthewSherlin/mushroomdb/issues">Issues</a>
+    </nav>
+    <p>Copyright 2026 Matthew Sherlin. Dual-licensed under MIT or Apache-2.0, at your option.</p>
+  </footer>
+
+</div>
+
+<script>
+  // Copy the install command. No clipboard permission, no button: the text is still selectable.
+  document.querySelectorAll("button.copy").forEach((button) => {
+    if (!navigator.clipboard) { button.remove(); return; }
+    button.addEventListener("click", async () => {
+      const source = document.getElementById(button.dataset.copy);
+      await navigator.clipboard.writeText(source.textContent);
+      button.textContent = "Copied";
+      setTimeout(() => { button.textContent = "Copy"; }, 1500);
+    });
+  });
+</script>
+
+</body>
+</html>

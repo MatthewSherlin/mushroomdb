@@ -7,7 +7,17 @@ Checked, in each tracked Markdown file under the paths in SOURCES:
   - a `#fragment` on a link to a Markdown file matches a heading in that file,
     by the slug GitHub gives it;
   - every page in docs/site/ is linked from docs/site/index.md, so no page is
-    reachable from nowhere a reader starts.
+    reachable from nowhere a reader starts;
+  - every page in docs/site/ is listed in docs/site/SUMMARY.md, the sidebar of
+    the rendered site: a page it does not list is not rendered at all;
+  - a relative link from a page in docs/site/ lands inside docs/site/ or
+    docs/assets/, the only two trees the published site has, and not on the
+    sidebar file, which is never published;
+  - docs/site/ is one flat directory: a page in a subdirectory is seen by
+    neither list above.
+
+A link is `[text](target)`, an image, an `<img src>`, an `<a href>`, or a
+reference definition (`[label]: target`).
 
 External URLs (http, https, mailto) are not fetched: a gate must not need a
 network. Links inside fenced code blocks (``` or ~~~) and inside inline code
@@ -42,12 +52,22 @@ SOURCES = [
 ]
 
 # Pages in docs/site that are deliberately not in the index.
-UNINDEXED = {"index.md"}
+UNINDEXED = {"index.md", "SUMMARY.md"}
+
+# The sidebar of the rendered site.
+SUMMARY = "docs/site/SUMMARY.md"
+
+# Where a relative link from a site page may land. The published site is the
+# book and the assets staged beside it; a link anywhere else resolves on
+# GitHub and is a 404 once deployed.
+SITE_LINK_ROOTS = ("docs/site/", "docs/assets/")
 
 LINK = re.compile(
     r'(?<!\!)\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)'  # [text](target "title")
     r'|\!\[[^\]]*\]\(([^)\s]+)\)'                     # ![alt](target)
     r'|<img[^>]+src="([^"]+)"'                        # <img src="target">
+    r'|<a\s[^>]*?href="([^"]+)"'                      # <a href="target">
+    r'|^ {0,3}\[(?!\^)[^\]]+\]:\s+<?([^\s>]+)>?'      # [label]: target (not a footnote)
 )
 
 
@@ -115,6 +135,7 @@ def main() -> int:
     files = [f for f in git("ls-files", "--", *SOURCES).splitlines() if f]
     problems: list[str] = []
     index_targets: set[str] = set()
+    summary_targets: set[str] = set()
 
     for rel in files:
         path = ROOT / rel
@@ -130,6 +151,10 @@ def main() -> int:
                 except ValueError:
                     problems.append(f"OUTSIDE   {rel}:{lineno}: {target}")
                     continue
+                off_site = not dest_rel.startswith(SITE_LINK_ROOTS) or (dest_rel == SUMMARY and rel != SUMMARY)
+                if rel.startswith("docs/site/") and file_part and off_site:
+                    problems.append(f"OFFSITE   {rel}:{lineno}: {target}")
+                    continue
                 if not dest.exists():
                     problems.append(f"MISSING   {rel}:{lineno}: {target}")
                     continue
@@ -139,9 +164,17 @@ def main() -> int:
                     problems.append(f"ANCHOR    {rel}:{lineno}: {target}")
                 if rel == "docs/site/index.md":
                     index_targets.add(dest_rel)
+                if rel == SUMMARY:
+                    summary_targets.add(dest_rel)
+
+    for nested in sorted(f for f in tracked if re.fullmatch(r"docs/site/.+/.+", f)):
+        problems.append(f"NESTED    {nested}: docs/site is one flat directory")
 
     for page in sorted(f for f in tracked if re.fullmatch(r"docs/site/[^/]+\.md", f)):
-        if Path(page).name in UNINDEXED:
+        name = Path(page).name
+        if page != SUMMARY and page not in summary_targets:
+            problems.append(f"UNLISTED  {page}: not in {SUMMARY}")
+        if name in UNINDEXED:
             continue
         if page not in index_targets:
             problems.append(f"UNINDEXED {page}: not linked from docs/site/index.md")

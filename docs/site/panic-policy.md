@@ -105,4 +105,4 @@ KB-hardening audit.
 
 ---
 
-See also: [format-stability](../format-stability.md)
+See also: [format-stability](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md)

@@ -136,7 +136,7 @@ dedicated search engine via the subscription API and query both in parallel.
 
 ## Memory model
 
-The index stores per-token position lists (Vec<u32> per posting). Memory scales with
+The index stores per-token position lists (`Vec<u32>` per posting). Memory scales with
 total token occurrences and token repetition within documents. For a typical corpus
 of 10k documents averaging 100 tokens each, the v2 index uses roughly 1.25–3× more
 memory than a v1 (position-free) index, depending on token repetition. There is no

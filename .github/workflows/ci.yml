@@ -394,6 +394,9 @@ jobs:
       # Every relative link and anchor in the hand-written docs resolves, and
       # every page under docs/site is reachable from its index.
       - run: python3 scripts/check-links.py
+      # The link gate, shown failing on what it guards: a page the sidebar
+      # omits, and a site page linking a file the published site does not have.
+      - run: bash scripts/tests/test-check-links.sh
       # llms-full.txt is generated from the README and docs/site. Until 0.7 it
       # was regenerated only by a version bump, so it drifted between releases
       # with nothing to say so.
@@ -412,3 +415,24 @@ jobs:
       # release plan. It also now refuses a DEFERRED row whose target release
       # has already shipped, which row 36 had done for two tags.
       - run: bash scripts/check-defect-ledger.sh
+
+  # The published site, built exactly as pages.yml builds it. Without this a
+  # page that does not render, or a landing-page link to nothing, is found by
+  # the deploy on main and not by the pull request that caused it.
+  site:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mdBook
+        run: |
+          v="$(bash scripts/build-site.sh --mdbook-version)"
+          f="mdbook-v${v}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSfL -o "$f" "https://github.com/rust-lang/mdBook/releases/download/v${v}/${f}"
+          echo "$(bash scripts/build-site.sh --mdbook-sha256)  $f" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$f" -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: bash scripts/build-site.sh
+      # The build, shown failing on what it guards: a page the sidebar omits,
+      # a stray file over a page, a dead landing link, a directory not its own.
+      - run: bash scripts/tests/test-build-site.sh

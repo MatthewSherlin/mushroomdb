@@ -364,7 +364,7 @@ npx mushroomdb --help
 curl -fsSL https://raw.githubusercontent.com/MatthewSherlin/mushroomdb/main/packaging/install.sh | sh
 ```
 
-Which path gives you what is in the README's [Install](../../README.md#install) table.
+Which path gives you what is in the README's [Install](https://github.com/MatthewSherlin/mushroomdb/blob/main/README.md#install) table.
 
 ---
 

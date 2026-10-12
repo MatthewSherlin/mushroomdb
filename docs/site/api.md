@@ -3,7 +3,7 @@
 mushroomdb exposes the same graph operations through four surfaces:
 HTTP (served by `mushroomdb serve`), MCP JSON-RPC (served by `mushroomdb mcp`),
 Python bindings (via PyO3 / maturin), and the
-**[TypeScript client](../../clients/typescript/README.md)** (`mushroomdb-client` package).
+**[TypeScript client](https://github.com/MatthewSherlin/mushroomdb/blob/main/clients/typescript/README.md)** (`mushroomdb-client` package).
 
 ---
 
@@ -794,7 +794,7 @@ Responses:
 against a directory that a `serve` process is writing to is unsafe — the CLI copies
 are not atomic across processes. Use `POST /backup` when the server is running.
 
-See [format-stability.md](../format-stability.md) for the PITR (point-in-time
+See [format-stability.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md) for the PITR (point-in-time
 recovery) workflow using backup together with WAL archives.
 
 ---
@@ -1548,7 +1548,7 @@ idempotent — no manual recovery is needed. The WAL grows until an explicit
 **V9 snapshot format:** mmap-able rkyv sections (13 total); zero-copy open via
 mmap; no heap allocation for section data. V5–V8 stores are auto-migrated to
 V9 on open; a V9 snapshot cannot be opened by a pre-0.6.5 binary, which refuses
-it with `snapshot: unsupported version 9`. See [`docs/format-stability.md`](../format-stability.md) for the
+it with `snapshot: unsupported version 9`. See [`docs/format-stability.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md) for the
 full section table and migration notes. 100k nodes (v0.2, ~10M derived edges):
 V8 snapshot open 0.02 s / 31–41 MiB RSS (warm file cache, cold process,
 2026-08-28, Apple M4 Pro).

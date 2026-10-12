@@ -65,6 +65,7 @@ done
 # and under --check, so a new page cannot be missing from the output unseen.
 EXCLUDED_DOCS=(
     panic-policy.md   # an internal policy for contributors, not product reference
+    SUMMARY.md        # the rendered site's sidebar: a list of links, not a page
 )
 
 unlisted=0

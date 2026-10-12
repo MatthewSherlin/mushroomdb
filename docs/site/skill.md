@@ -31,7 +31,7 @@ once and caches the answer, so no session start or prompt pays for an `npx`
 spawn.
 
 Details, the cache location and local-development commands:
-[`packaging/plugin/README.md`](../../packaging/plugin/README.md).
+[`packaging/plugin/README.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/packaging/plugin/README.md).
 
 ## Route 2 — `mushroomdb install`
 
