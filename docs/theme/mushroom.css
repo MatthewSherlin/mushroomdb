@@ -1,79 +1,92 @@
-/* mushroomdb docs — the landing page's palette on mdBook's layout.
-   The values are docs/landing/index.html's; change them in both places. */
+/* mushroomdb docs — the landing page's palette and type on mdBook's layout.
+   The palette is the mark's: its ink and its cap amber, on a pale spore
+   green, with moss for links. The values are docs/landing/index.html's;
+   change them in both places. */
+@import url("https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,400;0,600;0,700;1,400&family=Pixelify+Sans:wght@500;700&display=swap");
 
 :root {
   --content-max-width: 780px;
   --mono-font: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --display-font: "Pixelify Sans", ui-monospace, Menlo, monospace;
 }
 
-html, body, .sidebar, .menu-title {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+html, body, .sidebar {
+  font-family: "Nunito", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
+
+/* The pixel face is for names and page titles. Running headings stay in the
+   body face: a reference page has dozens, and they have to be scanned. */
+.menu-title, .content main > h1 {
+  font-family: var(--display-font);
+  font-weight: 700;
+}
+.content main > h1 { font-size: 2.6em; line-height: 1.05; margin-block-end: 0.5em; }
+.sidebar .part-title { font-family: var(--display-font); font-weight: 500; font-size: 1.1em; }
 
 .light, html:not(.js) {
-  --bg: #fbfaf8;
-  --fg: #1b1a18;
-  --code-bg: #f3f1ec;
-  --sidebar-bg: #f3f1ec;
-  --sidebar-fg: #1b1a18;
-  --sidebar-non-existant: #a49d92;
-  --sidebar-active: #8a3324;
-  --sidebar-spacer: #e4e0d8;
-  --sidebar-header-border-color: #8a3324;
-  --scrollbar: #a49d92;
-  --icons: #625d55;
-  --icons-hover: #1b1a18;
-  --links: #8a3324;
-  --inline-code-color: #1b1a18;
+  --bg: #f3f6ec;
+  --fg: #0b0e14;
+  --code-bg: #e7ecdc;
+  --sidebar-bg: #e7ecdc;
+  --sidebar-fg: #0b0e14;
+  --sidebar-non-existant: #9aa39a;
+  --sidebar-active: #2c6a3b;
+  --sidebar-spacer: #cdd6bf;
+  --sidebar-header-border-color: #e8a33d;
+  --scrollbar: #9aa39a;
+  --icons: #55604f;
+  --icons-hover: #0b0e14;
+  --links: #2c6a3b;
+  --inline-code-color: #0b0e14;
   --theme-popup-bg: #ffffff;
-  --theme-popup-border: #e4e0d8;
-  --theme-hover: #f3f1ec;
-  --quote-bg: #f3f1ec;
-  --quote-border: #e4e0d8;
-  --table-border-color: #e4e0d8;
-  --table-header-bg: #f3f1ec;
-  --table-alternate-bg: #f7f5f1;
-  --searchbar-border-color: #e4e0d8;
+  --theme-popup-border: #cdd6bf;
+  --theme-hover: #e7ecdc;
+  --quote-bg: #e7ecdc;
+  --quote-border: #cdd6bf;
+  --table-border-color: #cdd6bf;
+  --table-header-bg: #e7ecdc;
+  --table-alternate-bg: #edf1e4;
+  --searchbar-border-color: #cdd6bf;
   --searchbar-bg: #ffffff;
-  --searchbar-fg: #1b1a18;
-  --searchbar-shadow-color: #e4e0d8;
-  --searchresults-header-fg: #625d55;
-  --searchresults-border-color: #e4e0d8;
-  --searchresults-li-bg: #f3f1ec;
-  --search-mark-bg: #f1d3c9;
+  --searchbar-fg: #0b0e14;
+  --searchbar-shadow-color: #cdd6bf;
+  --searchresults-header-fg: #55604f;
+  --searchresults-border-color: #cdd6bf;
+  --searchresults-li-bg: #e7ecdc;
+  --search-mark-bg: #f4c069;
 }
 
 .navy {
-  --bg: #14130f;
-  --fg: #ece8e0;
-  --code-bg: #23211c;
-  --sidebar-bg: #1c1b17;
-  --sidebar-fg: #ece8e0;
-  --sidebar-non-existant: #625d55;
-  --sidebar-active: #e58a6d;
-  --sidebar-spacer: #302e28;
-  --sidebar-header-border-color: #e58a6d;
-  --scrollbar: #625d55;
-  --icons: #a49d92;
-  --icons-hover: #ece8e0;
-  --links: #e58a6d;
-  --inline-code-color: #ece8e0;
-  --theme-popup-bg: #1c1b17;
-  --theme-popup-border: #302e28;
-  --theme-hover: #23211c;
-  --quote-bg: #1c1b17;
-  --quote-border: #302e28;
-  --table-border-color: #302e28;
-  --table-header-bg: #23211c;
-  --table-alternate-bg: #1a1915;
-  --searchbar-border-color: #302e28;
-  --searchbar-bg: #1c1b17;
-  --searchbar-fg: #ece8e0;
-  --searchbar-shadow-color: #302e28;
-  --searchresults-header-fg: #a49d92;
-  --searchresults-border-color: #302e28;
-  --searchresults-li-bg: #23211c;
-  --search-mark-bg: #5c3327;
+  --bg: #0b0e14;
+  --fg: #e8e6e1;
+  --code-bg: #161b27;
+  --sidebar-bg: #131824;
+  --sidebar-fg: #e8e6e1;
+  --sidebar-non-existant: #55604f;
+  --sidebar-active: #e8a33d;
+  --sidebar-spacer: #262d3a;
+  --sidebar-header-border-color: #e8a33d;
+  --scrollbar: #55604f;
+  --icons: #9aa39a;
+  --icons-hover: #e8e6e1;
+  --links: #9fce8a;
+  --inline-code-color: #e8e6e1;
+  --theme-popup-bg: #131824;
+  --theme-popup-border: #262d3a;
+  --theme-hover: #161b27;
+  --quote-bg: #131824;
+  --quote-border: #262d3a;
+  --table-border-color: #262d3a;
+  --table-header-bg: #161b27;
+  --table-alternate-bg: #10141d;
+  --searchbar-border-color: #262d3a;
+  --searchbar-bg: #131824;
+  --searchbar-fg: #e8e6e1;
+  --searchbar-shadow-color: #262d3a;
+  --searchresults-header-fg: #9aa39a;
+  --searchresults-border-color: #262d3a;
+  --searchresults-li-bg: #161b27;
+  --search-mark-bg: #8a6a25;
 }
 
 /* Two themes, the two the palette defines. */
@@ -88,8 +101,8 @@ html :not(pre) > code {
   background: var(--code-bg);
 }
 html pre > code.hljs {
-  border: 1px solid var(--table-border-color);
-  border-radius: 8px;
+  border: 2px solid var(--table-border-color);
+  border-radius: 0;
   padding: 14px 16px;
 }
 html :not(pre) > code {
@@ -106,6 +119,6 @@ html :not(pre) > code {
 }
 
 .content img {
-  border: 1px solid var(--table-border-color);
-  border-radius: 10px;
+  border: 2px solid var(--fg);
+  box-shadow: 6px 6px 0 var(--table-border-color);
 }

@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>mushroomdb — the graph that stays true</title>
 <meta name="description" content="The data layer for agents that reason over entities: an embedded Rust graph database in which a relationship is a schema declaration — write a rule once, and every write derives, maintains and retracts the matching edges." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,400;0,600;0,700;1,400&family=Pixelify+Sans:wght@500;700&display=swap" />
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
 <meta property="og:type" content="website" />
 <meta property="og:title" content="mushroomdb — the graph that stays true" />
@@ -13,24 +16,31 @@
 <meta property="og:image" content="https://matthewsherlin.github.io/mushroomdb/assets/social-preview.png" />
 <meta name="twitter:card" content="summary_large_image" />
 <style>
+  /* The palette is the mark's: its ink and its cap amber, on a pale spore
+     green, with moss for links. docs/theme/mushroom.css carries the same
+     values for the book; change them in both places. */
   :root {
-    --bg: #fbfaf8;
+    --bg: #f3f6ec;
     --panel: #ffffff;
-    --ink: #1b1a18;
-    --muted: #625d55;
-    --line: #e4e0d8;
-    --accent: #8a3324;
-    --code-bg: #f3f1ec;
+    --ink: #0b0e14;
+    --muted: #55604f;
+    --line: #cdd6bf;
+    --accent: #2c6a3b;
+    --amber: #e8a33d;
+    --code-bg: #e7ecdc;
+    --display: "Pixelify Sans", ui-monospace, Menlo, monospace;
+    --body: "Nunito", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #14130f;
-      --panel: #1c1b17;
-      --ink: #ece8e0;
-      --muted: #a49d92;
-      --line: #302e28;
-      --accent: #e58a6d;
-      --code-bg: #23211c;
+      --bg: #0b0e14;
+      --panel: #131824;
+      --ink: #e8e6e1;
+      --muted: #9aa39a;
+      --line: #262d3a;
+      --accent: #9fce8a;
+      --amber: #e8a33d;
+      --code-bg: #161b27;
     }
   }
   * { box-sizing: border-box; }
@@ -38,79 +48,108 @@
     margin: 0;
     background: var(--bg);
     color: var(--ink);
-    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font: 17px/1.6 var(--body);
     -webkit-font-smoothing: antialiased;
   }
   .wrap { max-width: 860px; margin: 0 auto; padding: 0 20px; }
   a { color: var(--accent); }
+  a:focus-visible, button:focus-visible { outline: 3px solid var(--amber); outline-offset: 3px; }
   img { max-width: 100%; height: auto; display: block; }
 
-  .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 22px; padding: 18px 0; font-size: 15px; }
-  .topbar .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--ink); text-decoration: none; margin-right: auto; }
-  .topbar .brand img { width: 22px; }
+  .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 24px; padding: 20px 0; font-weight: 600; }
+  .topbar .brand {
+    display: flex; align-items: center; gap: 6px; margin-right: auto;
+    font-family: var(--display); font-size: 20px; font-weight: 700;
+    color: var(--ink); text-decoration: none;
+  }
+  .topbar .brand img { width: 28px; image-rendering: pixelated; }
   .topbar a { text-decoration: none; }
-  .topbar a:hover { text-decoration: underline; }
-  .cta { display: flex; justify-content: center; gap: 12px; margin: 0 0 30px; }
-  .cta a { padding: 9px 18px; border-radius: 8px; border: 1px solid var(--accent); text-decoration: none; font-weight: 600; }
-  .cta a.primary { background: var(--accent); color: var(--bg); }
-  .install { position: relative; }
-  .copy {
-    position: absolute; top: 8px; right: 8px; font: inherit; font-size: 13px;
-    color: var(--muted); background: var(--panel); border: 1px solid var(--line);
-    border-radius: 6px; padding: 3px 9px; cursor: pointer;
-  }
-  .copy:hover { color: var(--ink); }
-  header { padding: 30px 0 8px; text-align: center; }
-  header .mark { width: 96px; margin: 0 auto 18px; }
+  .topbar a:hover { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 4px; }
+
+  header { padding: 44px 0 48px; }
   h1 {
-    font-size: 40px; line-height: 1.1; margin: 0 0 14px;
-    letter-spacing: -0.02em; font-weight: 700;
+    font-family: var(--display); font-weight: 700;
+    font-size: clamp(52px, 11vw, 96px); line-height: 0.95; letter-spacing: -0.01em;
+    margin: 0 0 18px;
   }
-  .tagline { font-size: 21px; line-height: 1.35; margin: 0 auto 14px; max-width: 34ch; font-weight: 600; }
-  .lede { color: var(--muted); margin: 0 auto 18px; max-width: 60ch; }
-  .alpha { color: var(--muted); font-size: 14px; font-style: italic; margin: 0 0 18px; }
-  .notice {
-    color: var(--muted); font-size: 14px; text-align: left;
-    max-width: 60ch; margin: 0 auto 26px;
-    background: var(--panel); border: 1px solid var(--line);
-    border-left: 3px solid var(--accent); border-radius: 8px; padding: 12px 14px;
-  }
-  .notice strong { color: var(--ink); }
-  .notice code { font-size: 13px; }
+  .tagline { font-size: 25px; line-height: 1.3; margin: 0 0 14px; max-width: 26ch; font-weight: 700; }
+  .lede { color: var(--muted); margin: 0 0 14px; max-width: 62ch; }
+  .lede strong { color: var(--ink); }
+  .alpha { color: var(--muted); font-size: 15px; margin: 0 0 26px; }
 
   pre, code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
   pre {
-    background: var(--code-bg); border: 1px solid var(--line); border-radius: 8px;
-    padding: 14px 16px; overflow-x: auto; font-size: 14.5px; margin: 0 0 10px; text-align: left;
+    background: var(--panel); border: 2px solid var(--ink);
+    padding: 14px 16px; overflow-x: auto; font-size: 15px; margin: 0;
   }
-  .install { max-width: 520px; margin: 0 auto 8px; }
-  .install-note { color: var(--muted); font-size: 14px; margin: 0 0 34px; }
+  code { font-size: 0.9em; }
+  .install { position: relative; max-width: 520px; margin: 0 0 10px; }
+  .install-note { color: var(--muted); font-size: 15px; margin: 0 0 24px; max-width: 62ch; }
+  .copy {
+    position: absolute; top: 9px; right: 9px; font: 600 13px var(--body);
+    color: var(--ink); background: var(--code-bg); border: 2px solid var(--ink);
+    padding: 2px 9px; cursor: pointer;
+  }
+  .copy:hover { background: var(--amber); color: #0b0e14; }
+
+  /* The one hard edge on the page: a pixel button, with the cap's amber
+     for its shadow. Pressing it moves it into the shadow. */
+  .cta { display: flex; flex-wrap: wrap; gap: 16px; margin: 0 0 40px; }
+  .cta a {
+    padding: 10px 20px; border: 2px solid var(--ink); color: var(--ink);
+    font-weight: 700; text-decoration: none;
+  }
+  .cta a.primary { background: var(--ink); color: var(--bg); box-shadow: 5px 5px 0 var(--amber); }
+  .cta a:hover { background: var(--amber); color: #0b0e14; }
+  .cta a.primary:hover { background: var(--ink); color: var(--bg); transform: translate(3px, 3px); box-shadow: 2px 2px 0 var(--amber); }
+
+  /* Mushrooms above the ground line, the threads that join them below it.
+     The threads grow in turn on load; then one more grows and one retracts,
+     which is what a rule does when a property changes. */
+  .mycelium { display: block; width: 100%; height: auto; margin: 0 0 30px; }
+  .mycelium image { image-rendering: pixelated; }
+  .mycelium .ground { stroke: var(--line); stroke-width: 3; stroke-dasharray: 6 6; }
+  .mycelium .hypha {
+    fill: none; stroke: var(--accent); stroke-width: 3; shape-rendering: crispEdges;
+    stroke-dasharray: 1; stroke-dashoffset: 1;
+    animation: grow 0.5s steps(12) var(--at) forwards;
+  }
+  .mycelium .hypha.late { stroke: var(--amber); }
+  .mycelium .hypha.retracts {
+    animation: grow 0.5s steps(12) var(--at) forwards, retract 0.5s steps(12) 3.5s forwards;
+  }
+  @keyframes grow { to { stroke-dashoffset: 0; } }
+  @keyframes retract { from { stroke-dashoffset: 0; } to { stroke-dashoffset: 1; } }
+  @media (prefers-reduced-motion: reduce) {
+    .mycelium .hypha { animation: none; stroke-dashoffset: 0; }
+    .mycelium .hypha.retracts { visibility: hidden; }
+    .cta a.primary:hover { transform: none; }
+  }
 
   figure { margin: 0; }
-  figure img { border: 1px solid var(--line); border-radius: 10px; }
+  figure img { border: 2px solid var(--ink); box-shadow: 6px 6px 0 var(--line); }
 
-  section { padding: 34px 0; border-top: 1px solid var(--line); }
-  section h2 { font-size: 23px; margin: 0 0 10px; letter-spacing: -0.01em; }
-  section p { margin: 0 0 18px; color: var(--muted); max-width: 66ch; }
-  section p strong { color: var(--ink); font-weight: 600; }
+  section { padding: 40px 0; border-top: 3px dashed var(--line); }
+  section h2 { font-family: var(--display); font-weight: 500; font-size: 28px; line-height: 1.2; margin: 0 0 10px; }
+  section p { margin: 0 0 20px; color: var(--muted); max-width: 66ch; }
+  section p strong { color: var(--ink); font-weight: 700; }
 
-  .fits { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
-  .card h3 { margin: 0 0 10px; font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
-  .card ul { margin: 0; padding-left: 18px; }
-  .card li { margin-bottom: 8px; }
+  .fits { display: grid; grid-template-columns: 1fr 1fr; gap: 36px; }
+  .card h3 { margin: 0 0 10px; font-family: var(--display); font-weight: 500; font-size: 20px; }
+  .card ul { margin: 0; padding-left: 20px; list-style: square; }
+  .card li { margin-bottom: 10px; }
+  .card li::marker { color: var(--amber); }
   .card li:last-child { margin-bottom: 0; }
   @media (max-width: 640px) {
     .fits { grid-template-columns: 1fr; }
+    .tagline { font-size: 21px; }
     .topbar { column-gap: 18px; }
     .topbar .brand { flex-basis: 100%; }
     .copy { display: none; }
-    h1 { font-size: 32px; }
-    .tagline { font-size: 19px; }
   }
 
-  footer { padding: 30px 0 60px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
-  footer nav a { margin-right: 18px; white-space: nowrap; }
+  footer { padding: 30px 0 60px; border-top: 3px dashed var(--line); color: var(--muted); font-size: 15px; }
+  footer nav a { margin-right: 18px; white-space: nowrap; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -126,7 +165,6 @@
   </nav>
 
   <header>
-    <img class="mark" src="assets/mark-animated.svg" alt="" />
     <h1>mushroomdb</h1>
     <p class="tagline">The graph that stays true — and knows who's allowed to see it.</p>
     <p class="lede">
@@ -139,6 +177,19 @@
     <div class="install"><pre><code id="install-cmd">npx mushroomdb install --db ./memory</code></pre><button class="copy" type="button" data-copy="install-cmd">Copy</button></div>
     <p class="install-note">Writes the <code>/mushroom</code> skill, an MCP server listing the twenty-three-tool association surface, and the session hooks, for Claude Code or Cursor.</p>
     <p class="cta"><a class="primary" href="docs/quickstart.html">Quickstart</a><a href="docs/">Read the docs</a></p>
+    <svg class="mycelium" viewBox="0 0 860 176" aria-hidden="true" focusable="false">
+      <line class="ground" x1="0" y1="100" x2="860" y2="100" />
+      <path class="hypha" style="--at: 0.4s" pathLength="1" d="M70 100 V132 H250 V100" />
+      <path class="hypha retracts" style="--at: 0.9s" pathLength="1" d="M250 100 V152 H430 V100" />
+      <path class="hypha" style="--at: 1.4s" pathLength="1" d="M430 100 V126 H620 V100" />
+      <path class="hypha" style="--at: 1.9s" pathLength="1" d="M620 100 V148 H790 V100" />
+      <path class="hypha late" style="--at: 2.8s" pathLength="1" d="M70 100 V168 H430 V100" />
+      <image href="assets/mark.svg" x="34" y="35.2" width="72" height="72" />
+      <image href="assets/mark.svg" x="226" y="56.8" width="48" height="48" />
+      <image href="assets/mark.svg" x="382" y="13.6" width="96" height="96" />
+      <image href="assets/mark.svg" x="593" y="51.4" width="54" height="54" />
+      <image href="assets/mark.svg" x="757" y="40.6" width="66" height="66" />
+    </svg>
     <figure>
       <img src="assets/ingest-git-cascade.gif" alt="A single SET changes one property; the rule fires, new scored edges are derived and the stale ones retracted, inside the same write" />
     </figure>

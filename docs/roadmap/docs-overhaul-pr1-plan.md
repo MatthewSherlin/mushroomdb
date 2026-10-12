@@ -16,7 +16,7 @@
 - `docs/site/*.md` stays the source, flat, one directory. No page is renamed or moved.
 - The raw `.md` files stay published at their current URLs (`…/mushroomdb/<page>.md`).
 - The book is published under `/docs/`; the landing page stays at the site root.
-- Palette: light `#fbfaf8` background, `#1b1a18` text, `#8a3324` accent; dark `#14130f`, `#ece8e0`, `#e58a6d`. System sans-serif. These are the landing page's values.
+- Palette and type: as the spec's "Visual direction" gives them. (This plan was written for the landing page's earlier off-white and rust; the owner asked for the design pass after Task 3, and the stylesheet blocks in Task 2 show the earlier values.)
 - mdBook is pinned to `0.5.4` in exactly one place, `scripts/build-site.sh`.
 - Nothing committed names another product or project as a comparison (`scripts/check-names.py` enforces a hashed list).
 - Every existing gate stays green: `check-links.py`, `check-claims.sh`, `gen-llms-full.sh --check`, `test-check-names.sh`, `bump-version.sh --check`.

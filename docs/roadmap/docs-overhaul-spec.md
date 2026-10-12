@@ -34,9 +34,9 @@ The project reads as a finished one to someone who arrives cold:
 | Order | site, README, reference, tone — four pull requests | owner, 2026-10-12 |
 | Source of truth | `docs/site/*.md` stays the source, flat, one directory | this spec |
 | Old URLs | the raw `.md` files stay published at their current paths | this spec |
-| Visual direction | the landing page's existing palette, applied to the docs | this spec |
+| Visual direction | the mark's own palette and a pixel display face, on the landing page and the docs | owner, 2026-10-12 |
 
-The last three are this spec's, and are open to change at review.
+The two marked "this spec" are open to change at review.
 
 **Flat source.** `gen-llms-full.sh`, `check-links.py`, `check-claims.sh` and
 `crates/server/tests/doc_strings.rs` all read `docs/site/*.md` by a flat glob. Grouping is done
@@ -46,9 +46,14 @@ in the sidebar, not in directories, so those gates keep working with list edits 
 the raw files beside the rendered ones costs one `cp` and keeps every such link alive; an agent
 fetching a page still gets Markdown.
 
-**Visual direction.** Warm off-white `#fbfaf8`, rust accent `#8a3324`, system sans-serif,
-automatic dark mode — what `index.html` has now. The social card uses a different palette (dark
-navy, amber, teal, monospace); it is redrawn to match in the fourth pull request.
+**Visual direction.** The owner asked for a design pass after the first build. The palette is
+the pixel mushroom mark's: its ink `#0b0e14` and cap amber `#e8a33d`, on a pale spore green
+`#f3f6ec`, with moss `#2c6a3b` for links; the dark scheme sits on the mark's ink. Pixelify Sans
+sets the wordmark and page titles, Nunito the text, both loaded from Google Fonts. Corners are
+square and shadows hard, as pixel art is. The landing page opens with a row of mushrooms whose
+threads grow between them below a ground line, and one retracts. This replaces the warm
+off-white and rust the page had. The social card still uses its older navy, amber and teal; it
+is redrawn to match in the fourth pull request.
 
 ## Out of scope
 
