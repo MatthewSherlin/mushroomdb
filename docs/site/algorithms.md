@@ -112,7 +112,7 @@ A **Degree materialized view** is maintained incrementally — every `insert_edg
 
 `degree_centrality` is a one-shot compute: it scans the whole graph on demand and is **not** persisted unless you call `write_scores`. Use it for batch ranking, one-time exports, or feeding `write_scores`.
 
-Python `degree` / `degrees` are the read-only subset API (unique-neighbour count for one key or a caller-supplied set; adjacency is a set), distinct from `degree_centrality` and from Degree views. See [api.md](api.md#degree).
+Python `degree` / `degrees` are the read-only subset API (unique-neighbour count for one key or a caller-supplied set; adjacency is a set), distinct from `degree_centrality` and from Degree views. See [Python guide](python.md#degree).
 
 ## Write-back
 

@@ -11,6 +11,7 @@
 # Guides
 
 - [Agent memory](mcp.md)
+- [Python guide](python.md)
 - [Rules](rules.md)
 - [Query](query.md)
 - [Time travel](timetravel.md)
@@ -27,7 +28,8 @@
 
 - [CLI](cli.md)
 - [MCP tools](mcp-tools.md)
-- [HTTP and Python API](api.md)
+- [Overview](api.md)
+- [HTTP API](http.md)
 - [Python API](python-api.md)
 
 # Operate
