@@ -19,8 +19,8 @@
 # served as text and the landing page linked to none of them. So the build
 # does not stop at "mdBook exited 0". It fails if docs/site holds anything but
 # top-level Markdown pages, if a page was not rendered, if mdBook warned, if
-# the landing page links something the site lacks, or if the book's front
-# page is not the book's.
+# a heading lost its {braces}, if the landing page links something the site
+# lacks, or if the book's front page is not the book's.
 set -euo pipefail
 
 MDBOOK_VERSION="0.5.4"
@@ -96,6 +96,17 @@ for path in "$ROOT"/docs/site/*.md; do
     || bad "docs/site/$page.md was not rendered — is it in docs/site/SUMMARY.md?"
   [[ -f "$OUT/$page.md" ]] \
     || bad "docs/site/$page.md was not published as Markdown"
+done
+
+# mdBook reads `{…}` at the end of a heading as attributes for it, so
+# `### GET /node/{key}` is rendered as "GET /node/" with a stray `key=""`,
+# and every link to its anchor dangles. A heading that needs braces carries
+# them in a code span. Any heading attribute but id and class is that mistake.
+for page in "$OUT"/docs/*.html; do
+  [[ "$(basename "$page")" == "print.html" ]] && continue
+  cut_off="$(grep -o -E '<h[1-6][^>]*>' "$page" | grep -v -E '^<h[1-6]( (id|class)="[^"]*")*>$' || true)"
+  [[ -z "$cut_off" ]] \
+    || bad "docs/$(basename "$page") has a heading mdBook cut off at its {braces} — put the heading's text in a code span: $(echo "$cut_off" | tr '\n' ' ')"
 done
 
 # A stray index.html in docs/site is copied over the rendered introduction.
