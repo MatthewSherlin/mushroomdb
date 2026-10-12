@@ -80,6 +80,9 @@ def fill(template: str, values: dict[str, str]) -> str:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 USAGE_ENTRY = re.compile(r"^  mushroomdb (\S+)")
+#: A line that names a subcommand, at any indent. Inside an entry it is a
+#: subcommand indented wrongly; under the usage it is one cut off by a blank line.
+USAGE_STRAY = re.compile(r"^\s*mushroomdb \S")
 USAGE_MARKER = re.compile(r"(?m)^\{\{usage (\S+)\}\}$")
 
 
@@ -105,9 +108,20 @@ def parse_usage(help_text: str) -> tuple[dict[str, list[str]], str]:
             blocks.setdefault(match.group(1), []).append(current)
         elif current is None:
             raise Problem(f"a usage line comes before any subcommand: {lines[i]!r}")
+        elif USAGE_STRAY.match(lines[i]):
+            raise Problem(
+                "a subcommand in the help is not indented by two spaces, so it would be read as part of "
+                f"the one above it: {lines[i].strip()!r}"
+            )
         else:
             current.append(lines[i][2:])
         i += 1
+    for line in lines[i:]:
+        if USAGE_STRAY.match(line):
+            raise Problem(
+                "there is a blank line inside the help's usage block; everything after it would be read "
+                f"as notes, starting with: {line.strip()!r}"
+            )
     notes = "\n".join(lines[i:]).strip("\n")
     return {name: ["\n".join(block) for block in forms] for name, forms in blocks.items()}, notes
 
@@ -153,6 +167,20 @@ def schema_type(prop: dict) -> str:
     return kind or "any"
 
 
+def argument_rows(properties: dict, required: set[str], prefix: str) -> list[str]:
+    """One table row an argument, and under an object — or an array of them —
+    a row for each of its fields: `entities[].key`, `fact.subject`."""
+    rows = []
+    for name, prop in properties.items():
+        needed = "yes" if name in required else "no"
+        about = cell(escape_html(prop.get("description", "")))
+        rows.append(f"| `{prefix}{name}` | {cell(schema_type(prop))} | {needed} | {about} |")
+        inner, mark = (prop.get("items", {}), "[].") if prop.get("type") == "array" else (prop, ".")
+        if isinstance(inner, dict) and inner.get("properties"):
+            rows += argument_rows(inner["properties"], set(inner.get("required", [])), f"{prefix}{name}{mark}")
+    return rows
+
+
 def render_tool(tool: dict, listed: bool) -> str:
     lines = [f"### `{tool['name']}`", "", escape_html(tool["description"].removeprefix(ADVANCED).strip()), ""]
     if not listed:
@@ -164,10 +192,7 @@ def render_tool(tool: dict, listed: bool) -> str:
         lines += ["Takes no arguments.", ""]
     else:
         lines += ["| Argument | Type | Required | What it is |", "|---|---|---|---|"]
-        for name, prop in properties.items():
-            needed = "yes" if name in required else "no"
-            about = cell(escape_html(prop.get("description", "")))
-            lines.append(f"| `{name}` | {cell(schema_type(prop))} | {needed} | {about} |")
+        lines += argument_rows(properties, required, "")
         lines.append("")
     return "\n".join(lines)
 
@@ -230,12 +255,22 @@ def parse_stub(source: str) -> dict:
     errors:  (name, base, docstring, [(field, annotation)]) — `code` left out,
              every class has it
     methods: (name, signature, docstring) — `__dunder__` methods left out
+
+    Anything else the stub holds is refused by name. A page that quietly left
+    out a module-level function, an `async def` or the second of two
+    overloads, or listed a `TypedDict` among the errors, would be a reference
+    that is wrong without being stale.
     """
     tree = ast.parse(source)
     lines = source.splitlines()
     segment = lambda node: ast.get_source_segment(source, node) or ""
     aliases, errors, methods = [], [], []
+    error_names = {"MushroomError"}
     for i, node in enumerate(tree.body):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            continue  # the module docstring, or the docstring under an alias
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             after = tree.body[i + 1] if i + 1 < len(tree.body) else None
             doc = ""
@@ -244,20 +279,36 @@ def parse_stub(source: str) -> dict:
             aliases.append((node.targets[0].id, segment(node.value), doc))
         elif isinstance(node, ast.ClassDef) and node.name == "GraphDb":
             for fn in node.body:
+                if isinstance(fn, ast.AsyncFunctionDef):
+                    raise Problem(f"the stub declares `async def {fn.name}`, which the Python page has no form for")
                 if not isinstance(fn, ast.FunctionDef) or fn.name.startswith("__"):
                     continue
+                if any(fn.name == seen for seen, _, _ in methods):
+                    raise Problem(f"the stub declares `{fn.name}` more than once, and the Python page has one entry a name")
                 first = min([fn.lineno] + [d.lineno for d in fn.decorator_list])
-                text = "\n".join(lines[first - 1 : fn.body[0].lineno - 1])
+                body = fn.body[0]
+                # Up to where the body starts: the line above it, or — for
+                # `def f(self) -> None: ...` — the column it starts at.
+                text = "\n".join(lines[first - 1 : body.lineno - 1] + [lines[body.lineno - 1][: body.col_offset]])
                 signature = re.sub(r"(?m)^    ", "", text).rstrip().removesuffix(":")
                 methods.append((fn.name, signature, ast.get_docstring(fn) or ""))
         elif isinstance(node, ast.ClassDef):
+            base = segment(node.bases[0]) if node.bases else ""
+            if node.name not in error_names and base not in error_names:
+                raise Problem(
+                    f"the stub declares the class `{node.name}`, which is neither `GraphDb` nor an error "
+                    "under `MushroomError`; the Python page has no section for it"
+                )
+            error_names.add(node.name)
             fields = [
                 (f.target.id, segment(f.annotation))
                 for f in node.body
                 if isinstance(f, ast.AnnAssign) and isinstance(f.target, ast.Name) and f.target.id != "code"
             ]
-            base = segment(node.bases[0]) if node.bases else ""
             errors.append((node.name, base, ast.get_docstring(node) or "", fields))
+        else:
+            name = getattr(node, "name", None) or type(node).__name__
+            raise Problem(f"the stub has a top-level `{name}` the Python page has no section for (line {node.lineno})")
     return {"aliases": aliases, "errors": errors, "methods": methods}
 
 
@@ -337,6 +388,10 @@ def main(argv: list[str]) -> int:
                 print(f"gen-reference.py: OK — docs/site/{page}.md is current")
     except Problem as problem:
         print(f"gen-reference.py: {problem}", file=sys.stderr)
+        return 1
+    except (OSError, subprocess.SubprocessError) as error:
+        # A binary that is not there or exits non-zero, a template that is missing.
+        print(f"gen-reference.py: {error}", file=sys.stderr)
         return 1
     return 1 if stale else 0
 

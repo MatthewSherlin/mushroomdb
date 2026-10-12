@@ -104,7 +104,14 @@ Remember this for next time — write a note into the graph and return what it d
 |---|---|---|---|
 | `about` | array of string | no | Node keys the note is about, when you don't know their type. A key that does not exist yet is created as a provisional entity (label 'Entity') — permanently: prefer 'entities' when you know the label, since a provisional node's label can never change later. |
 | `entities` | array of object | no | Entities you recognised in the text. |
+| `entities[].aliases` | array of string | no | Other names this entity goes by, kept as written in its 'alias_keys' list. With the identity preset, one equal to a provisional stub's key (exact, case-sensitive) links that stub. |
+| `entities[].key` | string | yes |  |
+| `entities[].label` | string | yes |  |
+| `entities[].props` | object | no |  |
 | `facts` | array of object | no | Relationships you recognised, between keys named above. |
+| `facts[].object` | string | yes |  |
+| `facts[].predicate` | string | yes |  |
+| `facts[].subject` | string | yes |  |
 | `json` | boolean | no | Answer with the report as JSON, not the rendered digest. |
 | `kind` | one of `"note"`, `"decision"`, `"todo"` | no | What kind of note this is (default: note). |
 | `source` | string | no | Where this came from — a session id, a file, a person. Defaults to "agent". |
@@ -145,6 +152,9 @@ Forget that — tombstone a node ('key'), remove one property ('key' and 'prop')
 | Argument | Type | Required | What it is |
 |---|---|---|---|
 | `fact` | object | no | The edge to retract, as remember's facts name it. |
+| `fact.object` | string | yes |  |
+| `fact.predicate` | string | yes |  |
+| `fact.subject` | string | yes |  |
 | `json` | boolean | no | Answer with the report as JSON, not the rendered digest. |
 | `key` | string | no | The node to forget, or whose property to forget. |
 | `prop` | string | no | With 'key': the one property to remove. |

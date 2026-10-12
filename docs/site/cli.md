@@ -311,7 +311,7 @@ root of the working tree the current directory is in, else ~/.mushroomdb/memory.
 
 ## Running several at once
 
-every CLI write command, the hooks, and a running `mushroomdb serve` coordinate
+Every CLI write command, the hooks, and a running `mushroomdb serve` coordinate
 through one advisory `LOCK` file in the store directory, so they are safe to run against the same
 store at the same time. A writer that cannot get the lock within two seconds exits 3 with
 `another mushroomdb process is writing; retry`, having written nothing. Readers never take the

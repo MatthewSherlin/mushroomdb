@@ -249,6 +249,80 @@ class Mcp(unittest.TestCase):
         self.assertIn("### `stats`", graph)
 
 
+class ReviewFindings(unittest.TestCase):
+    def test_a_method_written_on_one_line_keeps_its_signature(self):
+        stub = gen.parse_stub("class GraphDb:\n    def close(self) -> None: ...\n")
+        self.assertEqual(stub["methods"], [("close", "def close(self) -> None", "")])
+
+    def test_an_async_method_fails_by_name(self):
+        with self.assertRaises(gen.Problem) as raised:
+            gen.parse_stub('class GraphDb:\n    async def later(self) -> None:\n        """Doc."""\n')
+        self.assertIn("later", str(raised.exception))
+
+    def test_a_method_declared_twice_fails_by_name(self):
+        source = 'class GraphDb:\n    def get(self, a: int) -> int:\n        """One."""\n\n    def get(self, a: str) -> str:\n        """Two."""\n'
+        with self.assertRaises(gen.Problem) as raised:
+            gen.parse_stub(source)
+        self.assertIn("get", str(raised.exception))
+
+    def test_a_module_level_function_fails_by_name(self):
+        with self.assertRaises(gen.Problem) as raised:
+            gen.parse_stub('def connect(path: str) -> None:\n    """Doc."""\n')
+        self.assertIn("connect", str(raised.exception))
+
+    def test_a_class_that_is_not_an_error_is_not_listed_as_one(self):
+        source = 'class MushroomError(RuntimeError):\n    """Base."""\n\nclass Report(TypedDict):\n    """A shape."""\n\n    rows: int\n'
+        with self.assertRaises(gen.Problem) as raised:
+            gen.parse_stub(source)
+        self.assertIn("Report", str(raised.exception))
+
+    def test_an_error_two_levels_down_is_still_an_error(self):
+        source = 'class MushroomError(RuntimeError):\n    """Base."""\n\nclass Busy(MushroomError):\n    """Busy."""\n\nclass VeryBusy(Busy):\n    """Very."""\n'
+        self.assertEqual([e[0] for e in gen.parse_stub(source)["errors"]], ["MushroomError", "Busy", "VeryBusy"])
+
+    def test_a_subcommand_indented_as_a_continuation_fails_by_name(self):
+        text = HELP.replace("  mushroomdb --version", "    mushroomdb frobnicate <db-dir>\n  mushroomdb --version")
+        with self.assertRaises(gen.Problem) as raised:
+            gen.parse_usage(text)
+        self.assertIn("frobnicate", str(raised.exception))
+
+    def test_a_blank_line_inside_the_usage_fails_and_says_so(self):
+        text = HELP.replace("  mushroomdb --version", "\n  mushroomdb --version")
+        with self.assertRaises(gen.Problem) as raised:
+            gen.parse_usage(text)
+        self.assertIn("blank line", str(raised.exception))
+
+    def test_a_binary_that_is_not_there_is_one_line_and_not_a_traceback(self):
+        self.assertEqual(gen.main(["--check", "--binary", "/nonexistent/mushroomdb", "cli"]), 1)
+
+    def test_the_fields_of_a_nested_argument_are_listed_under_it(self):
+        tool = {
+            "name": "remember",
+            "description": "Write a note.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entities": {
+                        "type": "array",
+                        "description": "What it names.",
+                        "items": {
+                            "type": "object",
+                            "properties": {"key": {"type": "string", "description": "Its key."}, "aliases": {"type": "array", "items": {"type": "string"}}},
+                            "required": ["key"],
+                        },
+                    },
+                    "fact": {"type": "object", "properties": {"subject": {"type": "string"}}, "required": ["subject"]},
+                },
+                "required": [],
+            },
+        }
+        text = gen.render_tool(tool, listed=True)
+        self.assertIn("| `entities` | array of object | no | What it names. |", text)
+        self.assertIn("| `entities[].key` | string | yes | Its key. |", text)
+        self.assertIn("| `entities[].aliases` | array of string | no |  |", text)
+        self.assertIn("| `fact.subject` | string | yes |  |", text)
+
+
 class RealTree(unittest.TestCase):
     def test_every_method_in_the_real_stub_has_a_group(self):
         stub = gen.parse_stub((ROOT / "bindings" / "python" / "mushroomdb.pyi").read_text(encoding="utf-8"))
