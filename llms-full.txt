@@ -111,7 +111,7 @@ HTTP ([API reference](https://matthewsherlin.github.io/mushroomdb/docs/api.html)
 
 ## Documentation
 
-- **Start:** [Quickstart](https://matthewsherlin.github.io/mushroomdb/docs/quickstart.html) · [Install](https://matthewsherlin.github.io/mushroomdb/docs/install.html)
+- **Start:** [Quickstart](https://matthewsherlin.github.io/mushroomdb/docs/quickstart.html) · [Install](https://matthewsherlin.github.io/mushroomdb/docs/install.html) · [Concepts](https://matthewsherlin.github.io/mushroomdb/docs/concepts.html)
 - **Guides:** [Agent memory](https://matthewsherlin.github.io/mushroomdb/docs/mcp.html) · [Python](https://matthewsherlin.github.io/mushroomdb/docs/python.html) · [Rules](https://matthewsherlin.github.io/mushroomdb/docs/rules.html) · [Query](https://matthewsherlin.github.io/mushroomdb/docs/query.html) · [Time travel](https://matthewsherlin.github.io/mushroomdb/docs/timetravel.html) · [Access control](https://matthewsherlin.github.io/mushroomdb/docs/masks.html)
 - **Reference:** [CLI](https://matthewsherlin.github.io/mushroomdb/docs/cli.html) · [MCP tools](https://matthewsherlin.github.io/mushroomdb/docs/mcp-tools.html) · [Python API](https://matthewsherlin.github.io/mushroomdb/docs/python-api.html) · [HTTP API](https://matthewsherlin.github.io/mushroomdb/docs/http.html) · [TypeScript client](clients/typescript/README.md)
 - **Operate:** [Running as a service](https://matthewsherlin.github.io/mushroomdb/docs/service.html) · [Durability](https://matthewsherlin.github.io/mushroomdb/docs/durability.html) · [Concurrency](https://matthewsherlin.github.io/mushroomdb/docs/concurrency.html) · [Benchmarks](https://matthewsherlin.github.io/mushroomdb/docs/benchmarks.html)
@@ -197,6 +197,7 @@ is in the [Install](install.md) table.
 ## Pages in this section
 
 - [Quickstart](quickstart.md) — a store, an assistant wired to it, and the four questions with one worked call each
+- [Concepts](concepts.md) — how it works: stores, nodes, rules, explain, time, access, memory
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — which page covers which surface
 - [HTTP API](http.md) — every route `mushroomdb serve` answers
@@ -222,6 +223,7 @@ Reference:
 - [Cypher Query Reference](query.md)
 - [Temporal history: what was connected when, and why](timetravel.md)
 - [Full-Text Search](fulltext.md)
+- [Vector search](vector.md) — similarity rules, `find_similar`, exact and approximate, the index
 - [Property (equality) indexes](indexes.md)
 - [Graph Algorithms](algorithms.md)
 - [Materialized Property Views](views.md)
@@ -712,6 +714,228 @@ mushroomdb serve ./db
 Open `http://127.0.0.1:8080/`. The demo graph has 10 Orgs, 20 Projects, 30 People, and 334
 edges — 304 of them derived by seven rule sets. When a token is configured, open
 `http://host:8080/?token=…`.
+
+---
+
+## docs/site/concepts.md
+
+# Concepts
+
+How mushroomdb works, in the order you meet it. Every command on this page runs against the
+small graph `mushroomdb demo` writes, and the output shown is what it prints.
+
+## A store is a directory
+
+There is no server to start and nothing to connect to. A store is a directory, and a program
+opens it.
+
+```sh
+mushroomdb demo ./db
+mushroomdb stats ./db
+```
+
+```text
+nodes: 60 live, 0 tombstoned
+edges: 334
+history: complete (nothing pruned)
+rules: 7
+```
+
+`demo` wrote ten organisations, twenty projects, thirty people, and seven rules. It wrote none
+of the 334 edges: the rules did.
+
+Inside the directory, `wal.bin` is the log of every write. `snapshot.bin`, once you take a
+snapshot, is the whole store as one file that opens without being read through. `LOCK` is how
+processes take turns: one writer at a time, any number of readers, and that holds across
+processes as well as inside one.
+
+## Nodes
+
+A node has a **key**, a **label** and **properties**. The key is unique across the whole store,
+not per label. A node has exactly one label, fixed when it is created. A property is an integer,
+a float, a string, a boolean, a list or a map.
+
+In a query, a node's key is written as its `id` property: `CREATE (n:Person {id: 'ada'})`
+makes the node whose key is `ada`, and `MATCH (p:Person {id: 'person-01'})` finds one by key.
+`key(n)` returns it.
+
+Deleting a node **tombstones** it: it leaves the graph, and stays in the history.
+
+## Edges
+
+An edge has a **type**, a node it leaves and a node it reaches. It is directed, and there is at
+most one of a type between the same two nodes in the same direction.
+
+An edge gets there in one of two ways. You write it: a **hand-written** edge. Or a rule derives
+it: a **derived** edge, which the rule owns. You cannot delete a derived edge yourself; the
+store refuses. You change the data, or the rule, and the edge follows.
+
+## Rules
+
+A rule says which nodes should be linked. It names a source label, a destination label, a
+**predicate** that compares a node of one with a node of the other, and the type of edge to
+write when the predicate holds. There are six predicates:
+
+| Predicate | Links two nodes when |
+|---|---|
+| `KeyMatch` | a field of one holds the other's key |
+| `FieldEqual` | both hold the same value in a field |
+| `Overlap` | their lists share enough items |
+| `NumericWithin` | two numbers are within a tolerance |
+| `GeoRadius` | two points are within a distance |
+| `VectorSimilar` | two vectors are similar enough |
+
+`All` and `Any` combine them. A rule can store the **score** of each match on its edge, and can
+keep only the best few matches for each source node.
+
+The demo's `skill_fit` rule links a person to every project that shares at least half of their
+skills:
+
+```sh
+mushroomdb query ./db "MATCH (p:Person {id: 'person-01'})-[r:FIT]->(x:Project) RETURN x, r.score AS score ORDER BY score DESC, x"
+```
+
+```text
+columns: x, score
+x=proj-01  score=1.0
+x=proj-02  score=0.5
+x=proj-20  score=0.5
+```
+
+A rule is evaluated when it is created, against everything already in the store — the
+**backfill** — and then on every insert and every property change, inside the write that made
+the change. When a match stops holding, the rule **retracts** its edge in that same write.
+Nothing is re-indexed afterwards and no job runs later. [Rules](rules.md) has each predicate
+in full.
+
+## Why two things are related
+
+Every derived edge can say where it came from.
+
+```sh
+mushroomdb why ./db person-01 proj-01
+```
+
+```text
+mushroomdb explain — person-01 ↔ proj-01: 2 relationship(s)
+PROJECT via rule auto_fk_person_project_id (score 1.00) — key_match on project_id [project_id: proj-01]
+FIT via rule skill_fit (score 1.00) — overlap on skills >= 0.5 [skills: s01, s02, s03]
+```
+
+Each line is one edge: its type, the rule that derived it, the score, the predicate, and in
+brackets the **evidence** — the values the two nodes actually share. An assistant asked "why
+are these two related?" can quote that instead of guessing.
+
+Now change the person's skills, and ask again:
+
+```sh
+mushroomdb query ./db "MATCH (p:Person {id: 'person-01'}) SET p.skills = ['s20', 's21', 's22']"
+mushroomdb why ./db person-01 proj-01
+```
+
+```text
+mushroomdb explain — person-01 ↔ proj-01: 1 relationship(s)
+PROJECT via rule auto_fk_person_project_id (score 1.00) — key_match on project_id [project_id: proj-01]
+```
+
+The `FIT` edge is gone. Nobody deleted it. The one `SET` made it untrue, and the rule retracted
+it before the write returned.
+
+## Time
+
+A write does not replace what was there. It is appended to the log as a **commit**, and commits
+are numbered from 0. So the store can be read as it was at any commit it still has — or on a
+date, which resolves to the last commit at or before it.
+
+The demo was 26 commits, 0 to 25. The `SET` above came after them, as two: the write itself,
+and a record of what the rules did because of it. Read the graph as of commit 25, and the edge
+is there:
+
+```sh
+mushroomdb asof ./db --commit 25 --query "MATCH (p:Person {id: 'person-01'})-[r:FIT]->(x:Project) RETURN x, r.score AS score ORDER BY score DESC, x"
+```
+
+```text
+as-of commit 25 of 28
+x=proj-01  score=1.0
+x=proj-02  score=0.5
+x=proj-20  score=0.5
+```
+
+History can be pruned, and a store says so when it has been. The oldest commit it still holds
+is its **floor**; a read from before the floor is refused by name, never answered with a guess.
+[Time travel](timetravel.md) has the other ways to ask: what edges a node had on a date,
+whether two nodes were linked then, and every change to one node.
+
+One thing that looks like time travel and is not: **what-if** computes the edges a property
+change would gain and lose, and writes nothing.
+
+## Who can see what
+
+One store can answer different callers differently.
+
+- A **namespace** is a tenancy boundary. A node is put in one when it is created and stays
+  there; a node in none is in `default`. A hand-written edge cannot cross from one namespace to
+  another.
+- A **role** names what a caller may see — by label, by key, by a property test — and
+  optionally what it may write. Roles are part of the store.
+- A **mask** is a list of keys, for one call: only these.
+- A **scope** binds a role, a namespace or a list of keys to a handle, so that every read
+  through it obeys them. What a scope hides behaves exactly as if it did not exist.
+
+Where this is enforced matters. Over HTTP, a role-bound token is held to its role by the
+server. Over MCP and inside your own process, a role or a mask is a way of asking to be
+answered as someone, and nothing stops a caller asking for more.
+[Access control](masks.md) has the whole model.
+
+## Memory
+
+On top of the graph is a small surface for an assistant's memory, and it is how most people
+meet mushroomdb.
+
+- **`remember`** writes a note, the entities it names, and facts among them, in one commit.
+  An entity it has never heard of is created as a **provisional** one, marked as such, rather
+  than refused; it stops being provisional when something describes it.
+- **`recall`** takes a question in ordinary words and returns what the store holds about it.
+- **`forget`** removes a node, a property or a hand-written fact from the graph. It does not
+  erase history: that takes pruning.
+
+Entities are ordinary nodes — `Person`, `Org`, `Project`, `Concept`, `Event` — and notes are
+`Note` nodes linked to what they are about. So rules apply to memory as they do to anything
+else: when enough entities share a field, the store can propose a rule that links them, and
+once you accept it every later `remember` maintains those links. [Agent memory](mcp.md) walks through a session.
+
+## Search
+
+Three ways to find a node without knowing its key.
+
+- **Full-text.** You declare which fields are searchable, by label and field. `recall` and
+  `search` rank matches in them.
+- **Vector.** `find_similar` returns the nodes whose vector is nearest a query vector. You
+  supply the vectors; the store does not compute them. [Vector search](vector.md)
+- **Hybrid.** Both at once, fused into one ranking.
+
+## Words the other pages use
+
+| Word | Meaning |
+|---|---|
+| WAL | The write-ahead log, `wal.bin`: every commit since the last snapshot |
+| commit | One write, as appended to the log; numbered from 0 |
+| snapshot | The whole store written as one file, so that opening it does not replay the log |
+| archive | A stretch of the log set aside by a snapshot, so that history still reaches it |
+| floor, horizon | The oldest commit a store still holds; 0 when nothing has been pruned |
+| backfill | A new rule's first evaluation, against what is already in the store |
+| fires, retracts | A rule derives an edge; a rule removes one that stopped being true |
+| tripped | Of a rule: it reached its ceiling on derived edges and stopped adding more |
+| auto-FK | A `KeyMatch` rule made for you at ingest, when a field ending in `_id` holds another label's keys |
+| top-k, `max_edges` | Keep only the k best-scoring edges for each source node |
+| task tools, graph tools | Over MCP: the eleven tools that answer a question in prose, and the fourteen that reach the store directly |
+| the brief | The store's schema in one block, given to an assistant when a session starts |
+| the digest | The short text a task tool answers with |
+| provisional | Of an entity: created because something mentioned it, before anything described it |
+| tombstone | A deleted node: out of the graph, still in the history |
+| never-widen | A mask, a role and a scope combine by intersection: adding one can only hide more |
+| approximate | Of a vector rule: finds candidates through an index instead of comparing every pair |
 
 ---
 
@@ -10058,6 +10282,190 @@ The index is maintained incrementally on every mutation:
 
 On open, `rebuild_all()` corrects any drift accumulated during incremental WAL
 replay. This ensures crash safety at every WAL offset.
+
+---
+
+## docs/site/vector.md
+
+# Vector search
+
+A vector is an ordinary property: a list of numbers on a node. The store compares vectors; it
+never computes them. You bring the embeddings, from whatever model you use, and write them as
+you would any other property.
+
+## Two things you can do with a vector
+
+- **Declare a rule.** A `VectorSimilar` rule links every pair of nodes whose vectors are similar
+  enough, with a derived edge that is kept current on every write.
+- **Search.** `find_similar` returns the nodes whose vector is nearest a query vector.
+
+They are independent. A search needs no rule, and a rule needs no search.
+
+## A rule that links similar nodes
+
+The demo store has one: `similar_interests` links people whose `embedding` vectors have a cosine
+similarity of at least 0.8.
+
+```sh
+mushroomdb demo ./db
+mushroomdb query ./db "MATCH (p:Person {id: 'person-01'})-[r:SIMILAR]->(q:Person) RETURN q, r.score AS score ORDER BY score DESC, q LIMIT 3"
+```
+
+```text
+columns: q, score
+q=person-11  score=1.0
+q=person-21  score=1.0
+q=person-09  score=0.8
+```
+
+Nobody wrote those edges. Change a person's `embedding` and theirs are re-derived in the same
+write: new ones added, the ones that fell under 0.8 retracted.
+
+Declaring one, in Python:
+
+```python
+from mushroomdb import GraphDb
+
+db = GraphDb.open("./vecdb")
+db.insert_node("Item", "a", {"embedding": [1.0, 0.0]})
+db.insert_node("Item", "b", {"embedding": [0.9, 0.1]})
+db.insert_node("Item", "c", {"embedding": [-1.0, 0.0]})
+
+db.create_rule({
+    "name": "similar_items",
+    "src_label": "Item",
+    "dst_label": "Item",
+    "predicate": {"VectorSimilar": {"field": "embedding", "min": 0.8}},
+    "edge_type": "SIMILAR",
+    "weight_prop": "score",
+})
+
+print(db.neighbors("a", "SIMILAR", "out"))   # ['b']
+```
+
+The same rule over HTTP is the same object, sent to [`POST /rules`](http.md#post-rules).
+
+What the rule does:
+
+- Similarity is cosine. It is the only metric.
+- `min` is the threshold, above 0 and at most 1. The similarity is stored on the edge under the
+  rule's `weight_prop`.
+- With no `max_edges`, the rule keeps the 32 best matches for each source node. Set `max_edges`
+  to keep more or fewer.
+- A rule between a label and itself links in both directions: `a` to `b`, and `b` to `a`.
+- Two vectors of different lengths, a list with something in it that is not a number, and a
+  vector of all zeros produce no edge. They produce no error either, so a field that was
+  written with the wrong dimension is silent: check a node you expect to be linked.
+
+## Searching
+
+| | What it does | Python | MCP | HTTP |
+|---|---|---|---|---|
+| Find similar | The `k` nodes nearest a query vector | `find_similar` | `find_similar` | `POST /find_similar` |
+| Pairwise similar | Among keys you name, which are most alike | `pairwise_similar` | `pairwise_similar` | |
+| Hybrid | Full-text and vector results in one ranking | `search_hybrid` | `hybrid_search` | |
+
+Continuing the example above:
+
+```python
+db.find_similar("embedding", [1.0, 0.0], label="Item", k=3)
+# [('a', 1.0), ('b', 0.9938837346736189)]
+
+db.find_similar("embedding", [1.0, 0.0], label="Item", k=3, min=-1.0)
+# [('a', 1.0), ('b', 0.9938837346736189), ('c', -1.0)]
+```
+
+- `k` defaults to 10.
+- **`min` defaults to 0.8, on every surface.** A search that names no `min` returns only close
+  matches, and can return none. Pass a lower `min` to see everything ranked, as the second call
+  does.
+- A score is a cosine similarity, from -1 to 1. If you need a distance, it is `1 - score`.
+- `pairwise_similar` compares only the keys you give it, exactly, and writes nothing.
+- Over MCP, `find_similar` has a second form: give it a `key` and an `edge_type` and it reads
+  that node's derived edges instead of searching.
+
+Every argument is in the [Python API](python-api.md), [MCP tools](mcp-tools.md) and
+[HTTP API](http.md#post-find_similar) references.
+
+## Exact and approximate
+
+By default a search compares the query with every vector it may return. That is exact, and it
+takes time in proportion to the number of nodes.
+
+A search uses an index only when a rule over that field was declared with `approximate: true`.
+`has_vector_rule(field)` says whether one was. The demo's rule is not approximate, and neither
+is the one in the example above, so searches on both are exact scans.
+
+When there is an index:
+
+- `exact=True` sets it aside and scans.
+- A `where` filter sets it aside too: a filtered search is always exact.
+- A mask, or a scoped handle, does **not**. The search stays approximate. It widens until it has
+  `k` hits the caller may see, and falls back to an exact scan of the visible nodes when
+  widening is not enough.
+
+Approximate means what it says. The index finds near neighbours quickly; it does not prove they
+are the nearest. Use `exact=True` where a missed neighbour would matter.
+
+## The index
+
+The index is an HNSW graph, built in the engine with no outside dependency.
+
+| Parameter | Default |
+|---|---|
+| `m` | 16 |
+| `m0` | 64 |
+| `ef_construction` | 200 |
+| `ef_search` | 400 |
+
+They apply to the whole store and are set only through an environment variable, read once when
+the process starts: `MUSHROOMDB_HNSW_PARAMS=m,m0,ef_construction,ef_search`. There is no setting
+for one rule.
+
+A rule created over more than 2,048 vectors builds its index in slices. `create_rule` returns
+before the edges exist, and they arrive in later commits. To have the build finished before
+traffic arrives:
+
+```sh no-run
+mushroomdb build-index ./db
+```
+
+The index is saved in the snapshot, so a store opened from a snapshot does not build it again.
+
+## What has been measured
+
+Every pull request is held to a recall floor. On 5,000 vectors of dimension 1536, the ten
+nearest neighbours the index returns must include at least 0.90 of the true ten for every query
+and 0.95 on average. It measures 1.00 and 1.00.
+
+That is the easy case: vectors drawn at random, on a fixed seed. On clustered vectors, with
+clusters wider than the index's neighbour lists, the floor is 0.70 for the worst query and 0.95
+on average, and it measures 0.80 and 0.995.
+
+The index keeps its own 32-bit copy of each vector, about 6.7 kB a node at dimension 1536,
+beside the 64-bit values the node stores as a property. The largest index built so far is
+50,000 vectors. [Benchmarks](benchmarks.md) and [Known limits](limits.md) have the rest.
+
+## Hybrid search
+
+Hybrid search runs a full-text search and a vector search and fuses the two rankings. It takes
+the top `4 × k` from each side and scores a node by the sum of `1 / (60 + rank)` over the sides
+it appears in.
+
+- The text field has to be declared full-text, with `enable_fulltext(label, field)` or in a
+  schema. If it is not, the text side returns nothing.
+- An empty vector makes it a text-only search.
+- It takes no `exact` argument and no filter.
+
+[Full-text search](fulltext.md) covers the text side.
+
+## What it does not do
+
+- One metric, cosine.
+- No embedding model: vectors come from you.
+- No quantisation: the index holds 32-bit floats.
+- A filter on a search is one equality or membership test on one field, and makes it exact.
+- Index parameters belong to the store, not to a rule.
 
 ---
 

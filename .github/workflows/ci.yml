@@ -365,6 +365,8 @@ jobs:
       # The CLI and MCP reference pages are generated from this binary. A
       # subcommand or a tool the pages do not have fails here, by name.
       - run: python3 scripts/gen-reference.py --check --binary target/debug/mushroomdb cli mcp-tools
+      # The commands the docs show, run against this binary on a demo store.
+      - run: python3 scripts/check-doc-examples.py --binary target/debug/mushroomdb docs/site/concepts.md docs/site/vector.md
       - run: npm ci
         working-directory: scripts/mcp-handshake
       - run: |

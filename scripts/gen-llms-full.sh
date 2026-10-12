@@ -29,6 +29,7 @@ SITE_DOCS=(
     index.md
     quickstart.md
     install.md
+    concepts.md
     skill.md
     concurrency.md
     multiprocess.md
@@ -48,6 +49,7 @@ SITE_DOCS=(
     durability.md
     views.md
     fulltext.md
+    vector.md
     indexes.md
     algorithms.md
     masks.md
