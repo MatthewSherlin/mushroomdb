@@ -6,6 +6,7 @@
 
 - [Quickstart](quickstart.md)
 - [Install](install.md)
+- [Concepts](concepts.md)
 - [Plugin, skill and hooks](skill.md)
 
 # Guides
@@ -17,6 +18,7 @@
 - [Time travel](timetravel.md)
 - [Access control](masks.md)
 - [Full-text search](fulltext.md)
+- [Vector search](vector.md)
 - [Indexes](indexes.md)
 - [Views](views.md)
 - [Subscriptions](subscriptions.md)
@@ -31,6 +33,8 @@
 - [Overview](api.md)
 - [HTTP API](http.md)
 - [Python API](python-api.md)
+- [Rust](rust.md)
+- [TypeScript client](typescript.md)
 
 # Operate
 

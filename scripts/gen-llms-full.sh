@@ -29,6 +29,7 @@ SITE_DOCS=(
     index.md
     quickstart.md
     install.md
+    concepts.md
     skill.md
     concurrency.md
     multiprocess.md
@@ -43,11 +44,14 @@ SITE_DOCS=(
     python.md
     cli.md
     python-api.md
+    rust.md
+    typescript.md
     subscriptions.md
     timetravel.md
     durability.md
     views.md
     fulltext.md
+    vector.md
     indexes.md
     algorithms.md
     masks.md

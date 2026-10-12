@@ -16,6 +16,12 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --workspace --examples
       - run: cargo test --workspace
+      # The examples docs/site/rust.md quotes. `cargo build --workspace
+      # --examples` above built them; running the binaries checks each one's
+      # assertions without building anything again.
+      - run: target/debug/examples/embed_basics
+      - run: target/debug/examples/embed_batch
+      - run: target/debug/examples/embed_shared
       # Informational, never a failure: prints how many #[ignore]d tests exist
       # against how many any workflow actually names. Added because 20 of 28
       # ran nowhere, including every memory-ceiling and scale-growth assertion.
@@ -365,6 +371,8 @@ jobs:
       # The CLI and MCP reference pages are generated from this binary. A
       # subcommand or a tool the pages do not have fails here, by name.
       - run: python3 scripts/gen-reference.py --check --binary target/debug/mushroomdb cli mcp-tools
+      # The commands the docs show, run against this binary on a demo store.
+      - run: python3 scripts/check-doc-examples.py --binary target/debug/mushroomdb docs/site/concepts.md docs/site/vector.md
       - run: npm ci
         working-directory: scripts/mcp-handshake
       - run: |
@@ -409,6 +417,9 @@ jobs:
       # binary, and are checked in mcp-handshake, which builds it.
       - run: python3 -m unittest scripts/tests/test_gen_reference.py
       - run: python3 scripts/gen-reference.py --check python-api
+      # The check that runs the commands a docs page shows. Its own tests run
+      # here; the run against a real binary is in mcp-handshake.
+      - run: python3 -m unittest scripts/tests/test_check_doc_examples.py
       # One version, many places. Catches the two shapes that have both
       # already shipped: a package manifest left behind (0.6.9 told readers to
       # install 0.6.8; a v0.6.11 tag would have published a wheel labelled

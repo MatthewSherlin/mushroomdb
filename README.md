@@ -102,9 +102,9 @@ HTTP ([API reference](https://matthewsherlin.github.io/mushroomdb/docs/api.html)
 
 ## Documentation
 
-- **Start:** [Quickstart](https://matthewsherlin.github.io/mushroomdb/docs/quickstart.html) · [Install](https://matthewsherlin.github.io/mushroomdb/docs/install.html)
+- **Start:** [Quickstart](https://matthewsherlin.github.io/mushroomdb/docs/quickstart.html) · [Install](https://matthewsherlin.github.io/mushroomdb/docs/install.html) · [Concepts](https://matthewsherlin.github.io/mushroomdb/docs/concepts.html)
 - **Guides:** [Agent memory](https://matthewsherlin.github.io/mushroomdb/docs/mcp.html) · [Python](https://matthewsherlin.github.io/mushroomdb/docs/python.html) · [Rules](https://matthewsherlin.github.io/mushroomdb/docs/rules.html) · [Query](https://matthewsherlin.github.io/mushroomdb/docs/query.html) · [Time travel](https://matthewsherlin.github.io/mushroomdb/docs/timetravel.html) · [Access control](https://matthewsherlin.github.io/mushroomdb/docs/masks.html)
-- **Reference:** [CLI](https://matthewsherlin.github.io/mushroomdb/docs/cli.html) · [MCP tools](https://matthewsherlin.github.io/mushroomdb/docs/mcp-tools.html) · [Python API](https://matthewsherlin.github.io/mushroomdb/docs/python-api.html) · [HTTP API](https://matthewsherlin.github.io/mushroomdb/docs/http.html) · [TypeScript client](clients/typescript/README.md)
+- **Reference:** [CLI](https://matthewsherlin.github.io/mushroomdb/docs/cli.html) · [MCP tools](https://matthewsherlin.github.io/mushroomdb/docs/mcp-tools.html) · [Python API](https://matthewsherlin.github.io/mushroomdb/docs/python-api.html) · [HTTP API](https://matthewsherlin.github.io/mushroomdb/docs/http.html) · [Rust](https://matthewsherlin.github.io/mushroomdb/docs/rust.html) · [TypeScript client](https://matthewsherlin.github.io/mushroomdb/docs/typescript.html)
 - **Operate:** [Running as a service](https://matthewsherlin.github.io/mushroomdb/docs/service.html) · [Durability](https://matthewsherlin.github.io/mushroomdb/docs/durability.html) · [Concurrency](https://matthewsherlin.github.io/mushroomdb/docs/concurrency.html) · [Benchmarks](https://matthewsherlin.github.io/mushroomdb/docs/benchmarks.html)
 - **Project:** [Architecture and roadmap](https://matthewsherlin.github.io/mushroomdb/docs/architecture.html) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 

@@ -68,6 +68,7 @@ is in the [Install](install.md) table.
 ## Pages in this section
 
 - [Quickstart](quickstart.md) — a store, an assistant wired to it, and the four questions with one worked call each
+- [Concepts](concepts.md) — how it works: stores, nodes, rules, explain, time, access, memory
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — which page covers which surface
 - [HTTP API](http.md) — every route `mushroomdb serve` answers
@@ -90,9 +91,12 @@ Reference:
 - [CLI reference](cli.md)
 - [MCP tools](mcp-tools.md) — every tool with its arguments, generated from the server's own listing
 - [Python API](python-api.md) — every method of `GraphDb`, generated from the type stub
+- [Rust](rust.md) — embedding the engine: the types you touch, with examples that are compiled
+- [TypeScript client](typescript.md) — the HTTP client: its methods, and the routes it leaves to `fetch`
 - [Cypher Query Reference](query.md)
 - [Temporal history: what was connected when, and why](timetravel.md)
 - [Full-Text Search](fulltext.md)
+- [Vector search](vector.md) — similarity rules, `find_similar`, exact and approximate, the index
 - [Property (equality) indexes](indexes.md)
 - [Graph Algorithms](algorithms.md)
 - [Materialized Property Views](views.md)
