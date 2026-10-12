@@ -362,6 +362,9 @@ jobs:
         with:
           node-version: "22"
       - run: cargo build -p mushroomdb-cli --bin mushroomdb
+      # The CLI and MCP reference pages are generated from this binary. A
+      # subcommand or a tool the pages do not have fails here, by name.
+      - run: python3 scripts/gen-reference.py --check --binary target/debug/mushroomdb cli mcp-tools
       - run: npm ci
         working-directory: scripts/mcp-handshake
       - run: |
@@ -401,6 +404,11 @@ jobs:
       # was regenerated only by a version bump, so it drifted between releases
       # with nothing to say so.
       - run: bash scripts/gen-llms-full.sh --check
+      # The reference pages that are generated: the generator's own tests, and
+      # the Python page against the stub. The CLI and MCP pages need the
+      # binary, and are checked in mcp-handshake, which builds it.
+      - run: python3 -m unittest scripts/tests/test_gen_reference.py
+      - run: python3 scripts/gen-reference.py --check python-api
       # One version, many places. Catches the two shapes that have both
       # already shipped: a package manifest left behind (0.6.9 told readers to
       # install 0.6.8; a v0.6.11 tag would have published a wheel labelled

@@ -34,11 +34,13 @@ SITE_DOCS=(
     multiprocess.md
     rules.md
     mcp.md
+    mcp-tools.md
     association-bench.md
     ingest-git.md
     query.md
     api.md
     cli.md
+    python-api.md
     subscriptions.md
     timetravel.md
     durability.md
