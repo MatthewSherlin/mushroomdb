@@ -75,5 +75,26 @@ d="$(fixture fenced)"
 printf '# A\n\n```\n[readme](../../README.md)\n```\n' > "$d/docs/site/a.md"
 expect "a link inside a fenced block is not a link" 0 "$d"
 
+d="$(fixture reference)"
+printf '# A\n\nSee the [readme][r].\n\n[r]: ../../README.md\n' > "$d/docs/site/a.md"
+expect "a reference-style link out of the book fails" 1 "$d" "OFFSITE   docs/site/a.md:5: ../../README.md"
+
+d="$(fixture anchor-tag)"
+printf '# A\n\nSee the <a href="../../README.md">readme</a>.\n' > "$d/docs/site/a.md"
+expect "an <a href> out of the book fails" 1 "$d" "OFFSITE   docs/site/a.md:3: ../../README.md"
+
+d="$(fixture footnote)"
+printf '# A\n\nA claim.[^1]\n\n[^1]: Where it came from.\n' > "$d/docs/site/a.md"
+expect "a footnote definition is not a link" 0 "$d"
+
+d="$(fixture to-sidebar)"
+printf '# A\n\nSee the [contents](SUMMARY.md).\n' > "$d/docs/site/a.md"
+expect "a link to the sidebar file, which is never published, fails" 1 "$d" "OFFSITE   docs/site/a.md:3: SUMMARY.md"
+
+d="$(fixture nested)"
+mkdir -p "$d/docs/site/sub"
+printf '# Deep\n' > "$d/docs/site/sub/deep.md"
+expect "a page in a subdirectory, which neither list can see, fails" 1 "$d" "NESTED    docs/site/sub/deep.md"
+
 [[ $fails -eq 0 ]] || exit 1
 echo "test-check-links.sh: OK"

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # build-site.sh — the published site, built and checked.
 #
-# Usage: build-site.sh [out-dir]        build into out-dir (default: _site)
+# Usage: build-site.sh [out-dir]        build into out-dir (default: _site);
+#                                       out-dir is deleted first, so it must be
+#                                       empty, absent, or an earlier build
 #        build-site.sh --mdbook-version print the mdBook version this needs
 #        build-site.sh --mdbook-sha256  print the SHA-256 of that version's
 #                                       x86_64-unknown-linux-gnu tarball
@@ -15,9 +17,10 @@
 #
 # Before this script the workflow copied docs/site as it was: the pages were
 # served as text and the landing page linked to none of them. So the build
-# does not stop at "mdBook exited 0". It fails if a page was not rendered, if
-# mdBook warned, if the landing page links something the site lacks, or if
-# the book's front page is not the book's.
+# does not stop at "mdBook exited 0". It fails if docs/site holds anything but
+# top-level Markdown pages, if a page was not rendered, if mdBook warned, if
+# the landing page links something the site lacks, or if the book's front
+# page is not the book's.
 set -euo pipefail
 
 MDBOOK_VERSION="0.5.4"
@@ -26,6 +29,7 @@ MDBOOK_SHA256_LINUX_X86_64="3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430
 case "${1:-}" in
   --mdbook-version) echo "$MDBOOK_VERSION"; exit 0 ;;
   --mdbook-sha256)  echo "$MDBOOK_SHA256_LINUX_X86_64"; exit 0 ;;
+  -*) echo "usage: build-site.sh [out-dir] | --mdbook-version | --mdbook-sha256" >&2; exit 2 ;;
 esac
 
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
@@ -41,8 +45,25 @@ have="$("$MDBOOK" --version | awk '{print $2}' | sed 's/^v//')"
 [[ "$have" == "$MDBOOK_VERSION" ]] \
   || die "mdbook is v$have, and this build needs v$MDBOOK_VERSION"
 
+# mdBook renders only what SUMMARY.md lists and copies every other file
+# across, over a rendered page of the same name. So the source is top-level
+# Markdown and nothing else: no subdirectory, no stray file.
+strays="$(cd "$ROOT" && find docs/site -mindepth 1 \( -type d -o ! -name '*.md' \) ! -name '.DS_Store' | sort)"
+[[ -z "$strays" ]] \
+  || die "docs/site holds something that is not a top-level Markdown page:"$'\n'"$strays"
+
+# The output directory is deleted before the build. The marker is how a
+# later run knows the directory is its own.
+MARKER=".built-by-build-site"
+if [[ -e "$OUT" ]]; then
+  [[ -d "$OUT" ]] || die "$OUT exists and is not a directory"
+  if [[ -n "$(ls -A "$OUT")" && ! -f "$OUT/$MARKER" ]]; then
+    die "$OUT is not empty and was not built by this script — refusing to replace it"
+  fi
+fi
 rm -rf "$OUT"
 mkdir -p "$OUT"
+: > "$OUT/$MARKER"
 
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT

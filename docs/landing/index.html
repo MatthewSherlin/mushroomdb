@@ -45,7 +45,7 @@
   a { color: var(--accent); }
   img { max-width: 100%; height: auto; display: block; }
 
-  .topbar { display: flex; align-items: center; gap: 22px; padding: 18px 0; font-size: 15px; }
+  .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 22px; padding: 18px 0; font-size: 15px; }
   .topbar .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--ink); text-decoration: none; margin-right: auto; }
   .topbar .brand img { width: 22px; }
   .topbar a { text-decoration: none; }
@@ -102,6 +102,9 @@
   .card li:last-child { margin-bottom: 0; }
   @media (max-width: 640px) {
     .fits { grid-template-columns: 1fr; }
+    .topbar { column-gap: 18px; }
+    .topbar .brand { flex-basis: 100%; }
+    .copy { display: none; }
     h1 { font-size: 32px; }
     .tagline { font-size: 19px; }
   }

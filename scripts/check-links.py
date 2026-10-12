@@ -11,7 +11,13 @@ Checked, in each tracked Markdown file under the paths in SOURCES:
   - every page in docs/site/ is listed in docs/site/SUMMARY.md, the sidebar of
     the rendered site: a page it does not list is not rendered at all;
   - a relative link from a page in docs/site/ lands inside docs/site/ or
-    docs/assets/, the only two trees the published site has.
+    docs/assets/, the only two trees the published site has, and not on the
+    sidebar file, which is never published;
+  - docs/site/ is one flat directory: a page in a subdirectory is seen by
+    neither list above.
+
+A link is `[text](target)`, an image, an `<img src>`, an `<a href>`, or a
+reference definition (`[label]: target`).
 
 External URLs (http, https, mailto) are not fetched: a gate must not need a
 network. Links inside fenced code blocks (``` or ~~~) and inside inline code
@@ -60,6 +66,8 @@ LINK = re.compile(
     r'(?<!\!)\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)'  # [text](target "title")
     r'|\!\[[^\]]*\]\(([^)\s]+)\)'                     # ![alt](target)
     r'|<img[^>]+src="([^"]+)"'                        # <img src="target">
+    r'|<a\s[^>]*?href="([^"]+)"'                      # <a href="target">
+    r'|^ {0,3}\[(?!\^)[^\]]+\]:\s+<?([^\s>]+)>?'      # [label]: target (not a footnote)
 )
 
 
@@ -143,7 +151,8 @@ def main() -> int:
                 except ValueError:
                     problems.append(f"OUTSIDE   {rel}:{lineno}: {target}")
                     continue
-                if rel.startswith("docs/site/") and file_part and not dest_rel.startswith(SITE_LINK_ROOTS):
+                off_site = not dest_rel.startswith(SITE_LINK_ROOTS) or (dest_rel == SUMMARY and rel != SUMMARY)
+                if rel.startswith("docs/site/") and file_part and off_site:
                     problems.append(f"OFFSITE   {rel}:{lineno}: {target}")
                     continue
                 if not dest.exists():
@@ -157,6 +166,9 @@ def main() -> int:
                     index_targets.add(dest_rel)
                 if rel == SUMMARY:
                     summary_targets.add(dest_rel)
+
+    for nested in sorted(f for f in tracked if re.fullmatch(r"docs/site/.+/.+", f)):
+        problems.append(f"NESTED    {nested}: docs/site is one flat directory")
 
     for page in sorted(f for f in tracked if re.fullmatch(r"docs/site/[^/]+\.md", f)):
         name = Path(page).name

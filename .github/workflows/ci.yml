@@ -433,3 +433,6 @@ jobs:
           tar -xzf "$f" -C "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: bash scripts/build-site.sh
+      # The build, shown failing on what it guards: a page the sidebar omits,
+      # a stray file over a page, a dead landing link, a directory not its own.
+      - run: bash scripts/tests/test-build-site.sh
