@@ -1645,12 +1645,8 @@ async interface. See [timetravel.md](timetravel.md) for the full semantics.
 
 ### Exposed surface
 
-The bindings expose: `insert_node`, `ingest_batch`, `batch_edges`,
-`create_rule`, `set_prop`, `query` (with `params`), `query_with_params` (alias),
-`explain`, `neighbors`, `node_edges`, `node_info`, `find_similar`,
-`pairwise_similar`, `degree`, `degrees`, `stats`, `snapshot`,
-`refresh`, `rename_node`, `insert_edge_upsert`, plus the `MushroomBusy`
-exception.
+Every method the binding exposes, with its signature and docstring, is in the
+[Python API](python-api.md) reference, which is generated from the type stub.
 
 `write_batch` is not directly exposed in the Python bindings because Rust
 closures capturing `&mut BatchBuilder` do not map naturally to the Python

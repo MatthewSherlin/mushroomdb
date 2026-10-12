@@ -27,6 +27,7 @@
 
 - [CLI](cli.md)
 - [HTTP and Python API](api.md)
+- [Python API](python-api.md)
 
 # Operate
 

@@ -39,6 +39,7 @@ SITE_DOCS=(
     query.md
     api.md
     cli.md
+    python-api.md
     subscriptions.md
     timetravel.md
     durability.md
