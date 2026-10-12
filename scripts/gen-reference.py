@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
+import json
 import re
 import subprocess
 import sys
@@ -127,6 +129,65 @@ def render_cli(template: str, help_text: str) -> str:
         )
     page = USAGE_MARKER.sub(lambda m: fence("\n".join(entries[m.group(1)])), template)
     return fill(page, {"notes": fence(notes)})
+
+
+# ── MCP tools ─────────────────────────────────────────────────────────────────
+
+#: A graph tool's description opens with this, so an assistant knows the task
+#: tools are the front door. On a page that has a heading for each surface it
+#: is noise.
+ADVANCED = "Advanced: "
+
+
+def schema_type(prop: dict) -> str:
+    """What a JSON Schema property accepts, in words."""
+    if "enum" in prop:
+        return "one of " + ", ".join(f"`{json.dumps(value)}`" for value in prop["enum"])
+    if "anyOf" in prop:
+        return " or ".join(schema_type(option) for option in prop["anyOf"])
+    kind = prop.get("type")
+    if kind == "array":
+        return "array of " + schema_type(prop.get("items", {}))
+    if isinstance(kind, list):
+        return " or ".join(kind)
+    return kind or "any"
+
+
+def render_tool(tool: dict, listed: bool) -> str:
+    lines = [f"### `{tool['name']}`", "", escape_html(tool["description"].removeprefix(ADVANCED).strip()), ""]
+    if not listed:
+        lines += ["Listed only with `--all-tools`; the server answers it either way.", ""]
+    schema = tool.get("inputSchema", {})
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    if not properties:
+        lines += ["Takes no arguments.", ""]
+    else:
+        lines += ["| Argument | Type | Required | What it is |", "|---|---|---|---|"]
+        for name, prop in properties.items():
+            needed = "yes" if name in required else "no"
+            about = cell(escape_html(prop.get("description", "")))
+            lines.append(f"| `{name}` | {cell(schema_type(prop))} | {needed} | {about} |")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def render_mcp(template: str, default_tools: list[dict], all_tools: list[dict]) -> str:
+    listed = {tool["name"] for tool in default_tools}
+    render = lambda tools: "\n".join(render_tool(tool, tool["name"] in listed) for tool in tools).rstrip()
+    task = [tool for tool in all_tools if not tool["description"].startswith(ADVANCED)]
+    graph = [tool for tool in all_tools if tool["description"].startswith(ADVANCED)]
+    counts = f"The server answers {len(all_tools)} tools and lists {len(listed)} of them by default."
+    return fill(template, {"counts": counts, "task_tools": render(task), "graph_tools": render(graph)})
+
+
+def load_tools(binary: str, all_tools: bool) -> list[dict]:
+    """The `tools` array of a real `mushroomdb mcp` on an empty store."""
+    path = ROOT / "scripts" / "measure-tool-listing.py"
+    spec = importlib.util.spec_from_file_location("measure_tool_listing", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.tools_list(binary, all_tools)
 
 
 # ── Python API ────────────────────────────────────────────────────────────────
@@ -242,6 +303,8 @@ def generate(page: str, binary: str | None) -> str:
     if page == "cli":
         done = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=60, check=True)
         return render_cli(template, done.stdout)
+    if page == "mcp-tools":
+        return render_mcp(template, load_tools(binary, False), load_tools(binary, True))
     raise Problem(f"no generator for the page {page!r}")
 
 

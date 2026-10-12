@@ -184,6 +184,71 @@ class Cli(unittest.TestCase):
         self.assertEqual(gen.main(["--check", "cli"]), 1)
 
 
+RECALL = {
+    "name": "recall",
+    "description": "What do I already know about this — ranked nodes.\nSecond line.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "topic": {"type": "string", "description": "Free text | any words."},
+            "json": {"type": "boolean"},
+        },
+        "required": ["topic"],
+    },
+}
+WAS_LINKED = {
+    "name": "was_linked",
+    "description": "Advanced: Were A and B linked on DATE.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "at_commit": {"anyOf": [{"type": "string"}, {"type": "integer"}], "description": "When."},
+            "dir": {"enum": ["out", "in"]},
+            "keys": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["at_commit"],
+    },
+}
+STATS = {"name": "stats", "description": "Advanced: Live counts.", "inputSchema": {"type": "object", "properties": {}}}
+MCP_TEMPLATE = "# Tools\n\n{{counts}}\n\n## Task\n\n{{task_tools}}\n\n## Graph\n\n{{graph_tools}}\n"
+
+
+class Mcp(unittest.TestCase):
+    def test_a_type_is_what_the_schema_accepts(self):
+        self.assertEqual(gen.schema_type({"type": "string"}), "string")
+        self.assertEqual(gen.schema_type({"anyOf": [{"type": "string"}, {"type": "integer"}]}), "string or integer")
+        self.assertEqual(gen.schema_type({"enum": ["out", "in"]}), 'one of `"out"`, `"in"`')
+        self.assertEqual(gen.schema_type({"type": "array", "items": {"type": "string"}}), "array of string")
+        self.assertEqual(gen.schema_type({}), "any")
+
+    def test_a_tool_has_its_arguments_in_a_table(self):
+        text = gen.render_tool(RECALL, listed=True)
+        self.assertIn("### `recall`", text)
+        self.assertIn("| `topic` | string | yes | Free text \\| any words. |", text)
+        self.assertIn("| `json` | boolean | no |  |", text)
+        self.assertNotIn("--all-tools", text)
+
+    def test_the_advanced_prefix_is_not_printed(self):
+        text = gen.render_tool(WAS_LINKED, listed=True)
+        self.assertIn("\nWere A and B linked on DATE.\n", text)
+        self.assertIn("| `at_commit` | string or integer | yes | When. |", text)
+
+    def test_an_unlisted_tool_says_how_to_list_it(self):
+        self.assertIn("`--all-tools`", gen.render_tool(STATS, listed=False))
+
+    def test_a_tool_with_no_arguments_says_so(self):
+        self.assertIn("Takes no arguments.", gen.render_tool(STATS, listed=True))
+
+    def test_the_page_sorts_tools_by_the_surface_they_belong_to(self):
+        page = gen.render_mcp(MCP_TEMPLATE, [RECALL, WAS_LINKED], [RECALL, WAS_LINKED, STATS])
+        self.assertIn("The server answers 3 tools and lists 2 of them by default.", page)
+        task, graph = page.split("## Graph")
+        self.assertIn("### `recall`", task)
+        self.assertNotIn("### `was_linked`", task)
+        self.assertIn("### `was_linked`", graph)
+        self.assertIn("### `stats`", graph)
+
+
 class RealTree(unittest.TestCase):
     def test_every_method_in_the_real_stub_has_a_group(self):
         stub = gen.parse_stub((ROOT / "bindings" / "python" / "mushroomdb.pyi").read_text(encoding="utf-8"))

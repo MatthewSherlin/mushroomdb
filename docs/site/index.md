@@ -86,6 +86,7 @@ is in the [Install](install.md) table.
 Reference:
 
 - [CLI reference](cli.md)
+- [MCP tools](mcp-tools.md) — every tool with its arguments, generated from the server's own listing
 - [Python API](python-api.md) — every method of `GraphDb`, generated from the type stub
 - [Cypher Query Reference](query.md)
 - [Temporal history: what was connected when, and why](timetravel.md)

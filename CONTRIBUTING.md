@@ -71,6 +71,19 @@ the same source (`install --delivery` picks the variant at install time; see
 version bump is a re-render. The `plugin-validate` CI job runs both the strict
 validate and the drift check.
 
+Three reference pages are generated — `docs/site/cli.md`, `mcp-tools.md` and `python-api.md` —
+and CI fails when one is stale. After changing the CLI's usage, an MCP tool's description or
+schema, or the Python stub, regenerate and commit:
+
+```bash
+cargo build -p mushroomdb-cli --bin mushroomdb
+python3 scripts/gen-reference.py --binary target/debug/mushroomdb
+bash scripts/gen-llms-full.sh
+```
+
+Their words live in `scripts/reference/*.md.tmpl`. A new subcommand needs a `{{usage NAME}}`
+line there; a new stub method needs a section in `GROUPS` in `scripts/gen-reference.py`.
+
 ### Node gate (commits touching `ui/`)
 
 ```text

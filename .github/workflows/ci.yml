@@ -362,6 +362,9 @@ jobs:
         with:
           node-version: "22"
       - run: cargo build -p mushroomdb-cli --bin mushroomdb
+      # The CLI and MCP reference pages are generated from this binary. A
+      # subcommand or a tool the pages do not have fails here, by name.
+      - run: python3 scripts/gen-reference.py --check --binary target/debug/mushroomdb cli mcp-tools
       - run: npm ci
         working-directory: scripts/mcp-handshake
       - run: |
