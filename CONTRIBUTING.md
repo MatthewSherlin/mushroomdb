@@ -2,7 +2,7 @@
 
 ## Before you start
 
-Read `README.md` — its [Architecture](README.md#architecture) section is the
+Read `README.md` — the [Architecture](docs/site/architecture.md) page is the
 architecture as built — and the wire discipline below. `docs/design.md` is the
 original design, kept as a historical record: it no longer describes the code,
 but its generality guarantee still applies to all of it.
@@ -257,7 +257,7 @@ addition must extend the oracle path first.
 
 A new query feature adds a case to `crates/core-api/tests/query.rs` and a row to the coverage
 table in `docs/site/query.md`. Known gaps (no LIMIT pushdown in join materialization) are
-documented in `README.md` and may not be silently introduced — surface new limitations
+documented in `docs/site/limits.md` and may not be silently introduced — surface new limitations
 explicitly.
 
 ---

@@ -28,6 +28,7 @@ README="$REPO_ROOT/README.md"
 SITE_DOCS=(
     index.md
     quickstart.md
+    install.md
     skill.md
     concurrency.md
     multiprocess.md
@@ -37,6 +38,7 @@ SITE_DOCS=(
     ingest-git.md
     query.md
     api.md
+    cli.md
     subscriptions.md
     timetravel.md
     durability.md
@@ -48,6 +50,9 @@ SITE_DOCS=(
     service.md
     deployment.md
     suggest.md
+    limits.md
+    benchmarks.md
+    architecture.md
     testing.md
 )
 

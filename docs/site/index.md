@@ -44,8 +44,8 @@ several processes can share one store — see [Concurrency](concurrency.md).
 entities with rule-derived relationships, which is what makes a ticket↔commit link a rule rather
 than a script.
 
-The roadmap and the benchmark numbers are in [README.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/README.md), and the architecture
-as built is in its [Architecture](https://github.com/MatthewSherlin/mushroomdb/blob/main/README.md#architecture) section.
+The benchmark numbers are in [Benchmarks](benchmarks.md), and the architecture as built, with the
+roadmap, is in [Architecture](architecture.md).
 
 ---
 
@@ -61,7 +61,7 @@ MatthewSherlin/mushroomdb` then `claude plugin install mushroom@mushroomdb`, and
 `/mushroom` skill, the MCP server entry, and the session-start and prompt hooks for Claude Code
 or Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`) and PyPI
 (`pip install mushroomdb`) packages are published at the same version; which path gives you what
-is in the README's [Install](https://github.com/MatthewSherlin/mushroomdb/blob/main/README.md#install) table.
+is in the [Install](install.md) table.
 
 ---
 
@@ -71,6 +71,7 @@ is in the README's [Install](https://github.com/MatthewSherlin/mushroomdb/blob/m
 - [Rules](rules.md) — all six predicate kinds with examples
 - [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
 - [`ingest-git` as a data source](ingest-git.md) — what `ingest-git` writes, its rules, submodules, pull requests, incremental sync
+- [Install](install.md) — one row per way in, and what each leaves out
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
 - [MCP tools](mcp.md) — the eleven task tools, the fourteen graph tools, and the twenty-three every store lists
 - [The association benchmark](association-bench.md) — one world in three forms, the twenty questions, and the gate
@@ -78,9 +79,13 @@ is in the README's [Install](https://github.com/MatthewSherlin/mushroomdb/blob/m
 - [Node masks and access control](masks.md) — role tokens, client masks, restricted-stub mode
 - [Running it as a service](service.md) — the volume, the snapshot interval, backup, restore, and what a restart costs
 - [Panic policy](panic-policy.md) — which conditions panic vs. return a typed error
+- [Known limits](limits.md) — what it does not do, and what was measured
+- [Benchmarks](benchmarks.md) — its own numbers, each with the file it comes from
+- [Architecture](architecture.md) — the crates, the storage format, and the roadmap
 
 Reference:
 
+- [CLI reference](cli.md)
 - [Cypher Query Reference](query.md)
 - [Temporal history: what was connected when, and why](timetravel.md)
 - [Full-Text Search](fulltext.md)
