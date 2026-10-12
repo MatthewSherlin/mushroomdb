@@ -132,20 +132,20 @@ and is excluded from those means rather than counted as zero. Every section of a
 summary states how many cells it dropped.
 
 The first run of this suite is committed at
-[`benchmarks/agent-tasks/results/20260911T005749Z/summary.md`](../../benchmarks/agent-tasks/results/20260911T005749Z/summary.md),
+[`benchmarks/agent-tasks/results/20260911T005749Z/summary.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/agent-tasks/results/20260911T005749Z/summary.md),
 and it **failed**: the graph arm scored 0.795 against arm Q's 0.987 and cost
 $0.5089 against $0.1257. The v0.6.3 CHANGELOG entry reports it in full, and the
 association tools in [`mcp.md`](mcp.md) are what that run's failures turned into.
 
 The run after those fixes is committed at
-[`benchmarks/agent-tasks/results/20260911T065400Z/summary.md`](../../benchmarks/agent-tasks/results/20260911T065400Z/summary.md).
+[`benchmarks/agent-tasks/results/20260911T065400Z/summary.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/agent-tasks/results/20260911T065400Z/summary.md).
 It still **failed**, on two of the five legs: correctness −0.007 vs arm Q, and the cost
 interval [−0.0581, +0.0115] not entirely below zero. The graph arm moved from 0.795 to 0.967
 on correctness and from $0.5089 to $0.0923 on cost — a tie with the relational baseline on
 correctness and cheaper in mean cost, turns and wall time, but not the gate.
 
 The next run is committed at
-[`benchmarks/agent-tasks/results/20260925T200950Z/summary.md`](../../benchmarks/agent-tasks/results/20260925T200950Z/summary.md).
+[`benchmarks/agent-tasks/results/20260925T200950Z/summary.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/agent-tasks/results/20260925T200950Z/summary.md).
 It still **failed**, now on correctness only:
 
 | | |
@@ -185,7 +185,7 @@ The run above was produced by a binary carrying that defect.
 ## The run on the fix — 20260928T195302Z — PASSED
 
 Committed at
-[`benchmarks/agent-tasks/results/20260928T195302Z/summary.md`](../../benchmarks/agent-tasks/results/20260928T195302Z/summary.md),
+[`benchmarks/agent-tasks/results/20260928T195302Z/summary.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/agent-tasks/results/20260928T195302Z/summary.md),
 same world digest `f2b689ba52c80241`, same model and settings, so it is directly comparable.
 
 | | |
@@ -222,7 +222,7 @@ Two things are worth stating precisely, because they are easy to overclaim:
 Six cells scored below 1.0 and **all six belong to a baseline** — five arm Q, one arm P. Every key
 they missed was named correctly by arm R in the same rep, so none is a grader fault, and arm R lost
 no cell to classify. Per-cell evidence:
-[`classification.md`](../../benchmarks/agent-tasks/results/20260928T195302Z/classification.md).
+[`classification.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/agent-tasks/results/20260928T195302Z/classification.md).
 
 ---
 

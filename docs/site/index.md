@@ -44,8 +44,8 @@ several processes can share one store — see [Concurrency](concurrency.md).
 entities with rule-derived relationships, which is what makes a ticket↔commit link a rule rather
 than a script.
 
-The roadmap and the benchmark numbers are in [README.md](../../README.md), and the architecture
-as built is in its [Architecture](../../README.md#architecture) section.
+The roadmap and the benchmark numbers are in [README.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/README.md), and the architecture
+as built is in its [Architecture](https://github.com/MatthewSherlin/mushroomdb/blob/main/README.md#architecture) section.
 
 ---
 
@@ -61,7 +61,7 @@ MatthewSherlin/mushroomdb` then `claude plugin install mushroom@mushroomdb`, and
 `/mushroom` skill, the MCP server entry, and the session-start and prompt hooks for Claude Code
 or Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`) and PyPI
 (`pip install mushroomdb`) packages are published at the same version; which path gives you what
-is in the README's [Install](../../README.md#install) table.
+is in the README's [Install](https://github.com/MatthewSherlin/mushroomdb/blob/main/README.md#install) table.
 
 ---
 

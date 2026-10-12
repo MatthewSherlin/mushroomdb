@@ -105,5 +105,5 @@ or terminate TLS at a reverse proxy (see docs/site/deployment.md)
 mushroomdb defaults to `127.0.0.1:8080` and refuses to bind a non-loopback
 address without a token. This is intentional: the DB has no network stack of
 its own and should be shielded by the OS network boundary whenever possible.
-See [SECURITY.md](../../SECURITY.md) for the full threat model and
+See [SECURITY.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/SECURITY.md) for the full threat model and
 vulnerability reporting process.

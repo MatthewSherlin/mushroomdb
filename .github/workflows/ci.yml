@@ -394,6 +394,9 @@ jobs:
       # Every relative link and anchor in the hand-written docs resolves, and
       # every page under docs/site is reachable from its index.
       - run: python3 scripts/check-links.py
+      # The link gate, shown failing on what it guards: a page the sidebar
+      # omits, and a site page linking a file the published site does not have.
+      - run: bash scripts/tests/test-check-links.sh
       # llms-full.txt is generated from the README and docs/site. Until 0.7 it
       # was regenerated only by a version bump, so it drifted between releases
       # with nothing to say so.
