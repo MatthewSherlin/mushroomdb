@@ -1,6 +1,7 @@
 //! The HTTP page and the router name the same routes.
 //!
-//! `docs/site/http.md` has one `### METHOD /path` section a route. Before this
+//! `docs/site/http.md` has one `### METHOD /path` section a route, the
+//! heading written as a code span. Before this
 //! test its endpoint table listed 15 routes of 29, and nothing said so. A route
 //! added to the router with no section fails here by name; so does a section
 //! left behind for a route that is gone.
@@ -104,6 +105,10 @@ fn routes_documented(page: &str) -> BTreeSet<(String, String)> {
         let Some(heading) = line.strip_prefix("### ") else {
             continue;
         };
+        let heading = heading
+            .strip_prefix('`')
+            .and_then(|h| h.strip_suffix('`'))
+            .unwrap_or(heading);
         let mut words = heading.split_whitespace();
         let (Some(method), Some(path)) = (words.next(), words.next()) else {
             continue;
@@ -189,6 +194,24 @@ fn a_heading_is_a_route_only_when_it_is_a_method_and_a_path() {
         vec![
             ("GET".to_string(), "/health".to_string()),
             ("POST".to_string(), "/nodes/{key}/rename".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn a_route_heading_may_be_a_code_span() {
+    // mdBook reads `{key}` at the end of a heading as attributes and cuts the
+    // heading off there, so the page writes its route headings as code spans.
+    let page = "### `GET /node/{key}`\n### `DELETE /edges/{etype}/{src}/{dst}`\n";
+    let found: Vec<_> = routes_documented(page).into_iter().collect();
+    assert_eq!(
+        found,
+        vec![
+            (
+                "DELETE".to_string(),
+                "/edges/{etype}/{src}/{dst}".to_string()
+            ),
+            ("GET".to_string(), "/node/{key}".to_string()),
         ]
     );
 }

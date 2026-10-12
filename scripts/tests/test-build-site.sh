@@ -10,6 +10,8 @@
 #   - a stray file in docs/site is copied over the page of the same name;
 #   - a page in a subdirectory is seen by none of the checks;
 #   - the landing page links a page that does not exist;
+#   - a heading that ends in `{braces}` loses them, and its anchor, to mdBook's
+#     heading-attribute syntax;
 #   - and the output directory is deleted before the build, so the script
 #     must not accept a directory it did not build.
 #
@@ -75,6 +77,16 @@ expect "a subdirectory of pages fails" 1 "$d" "docs/site/sub"
 d="$(fixture dead-link)"
 sed -i.bak 's#docs/a.html#docs/nope.html#' "$d/docs/landing/index.html" && rm "$d/docs/landing/index.html.bak"
 expect "a landing-page link to nothing fails" 1 "$d" "the landing page links docs/nope.html"
+
+d="$(fixture braces)"
+printf '# A\n\nThe tool is rename_node.\n\n### GET /node/{key}\n\nReads a node.\n' > "$d/docs/site/a.md"
+expect "a heading ending in {braces}, which mdBook takes for attributes and cuts off, fails" 1 "$d" "a.html"
+
+d="$(fixture braces-in-code)"
+printf '# A\n\nThe tool is rename_node.\n\n### `GET /node/{key}`\n\nReads a node.\n' > "$d/docs/site/a.md"
+expect "the same heading in a code span is rendered whole" 0 "$d" "build-site.sh: OK"
+grep -q 'GET /node/{key}' "$d/_site/docs/a.html" \
+  || { echo "FAIL: the heading in a code span lost its braces"; fails=1; }
 
 d="$(fixture unknown-flag)"
 expect "an unknown flag is refused" 2 "$d" "usage:" "--help"
