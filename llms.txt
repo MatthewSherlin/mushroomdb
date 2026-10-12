@@ -260,7 +260,7 @@ Endpoints that remain 403 for all role tokens regardless of write scope:
 `POST /rules`, `GET /stats`, `GET /explain`, `GET /suggest`, `GET /algo/*`,
 `GET /subscribe`, `GET /watch`, `POST /nodes/{key}/rename`, `POST /backup`.
 
-Error bodies for write denials follow §4.3 — see `docs/site/api.md` for the
+Error bodies for write denials follow §4.3 — see `docs/site/http.md` for the
 full list. Hidden nodes are indistinguishable from absent nodes in all write
 responses.
 
@@ -504,7 +504,7 @@ https://github.com/MatthewSherlin/mushroomdb
 - Cypher reference: docs/site/query.md
 - MCP / agent memory: docs/site/mcp.md
 - Association benchmark (one world in three forms, the gate): docs/site/association-bench.md
-- HTTP API: docs/site/api.md
+- HTTP API: docs/site/http.md
 - Subscriptions: docs/site/subscriptions.md
 - Time travel: docs/site/timetravel.md
 - Materialized views: docs/site/views.md

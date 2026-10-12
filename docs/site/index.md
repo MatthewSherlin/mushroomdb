@@ -69,7 +69,9 @@ is in the [Install](install.md) table.
 
 - [Quickstart](quickstart.md) — a store, an assistant wired to it, and the four questions with one worked call each
 - [Rules](rules.md) — all six predicate kinds with examples
-- [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
+- [API reference](api.md) — which page covers which surface
+- [HTTP API](http.md) — every route `mushroomdb serve` answers
+- [Python guide](python.md) — the binding, with worked examples
 - [`ingest-git` as a data source](ingest-git.md) — what `ingest-git` writes, its rules, submodules, pull requests, incremental sync
 - [Install](install.md) — one row per way in, and what each leaves out
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`

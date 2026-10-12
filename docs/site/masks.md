@@ -87,7 +87,7 @@ explicit about:
 They do compose. A scoped handle plus a `where=` argument intersects: the scope
 decides what is visible, the predicate filters within it. On `find_similar`,
 `where=` also changes the kernel — it implies an exact search, which `mask=`
-alone does not. See [api.md](api.md#vector-search).
+alone does not. See the [Python guide](python.md#vector-search).
 
 ---
 
@@ -102,7 +102,7 @@ intersects it with any client mask — it can never widen the intersection.
 - Cypher rows referencing hidden nodes are filtered out entirely.
 - Roles without a declared write scope get 403 on all write and analytics endpoints.
 - Roles with a write scope may write within their declared scope — but only to nodes
-  currently in their read mask. See [api.md](api.md#write-scopes-for-role-bound-tokens)
+  currently in their read mask. See [HTTP API](http.md#write-scopes-for-role-bound-tokens)
   for the full write-scope surface, error body shapes, and the threat model.
 - An unknown token or a role name not present in `roles.json` returns 401.
 

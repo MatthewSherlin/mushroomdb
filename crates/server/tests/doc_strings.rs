@@ -1,6 +1,6 @@
 //! Documented refusal strings are pinned to the source that emits them.
 //!
-//! Each row is a backticked or fenced refusal from `docs/site/{api,masks,rules,mcp}.md`
+//! Each row is a backticked or fenced refusal from `docs/site/{http,python,masks,rules,mcp}.md`
 //! and the `.rs` file that produces that text. Interpolated examples pin the
 //! constant parts that appear in both. A missing pair names the doc, the
 //! string, and the source file.
@@ -12,60 +12,60 @@ use std::path::PathBuf;
 ///
 /// `doc` is a basename under `docs/site/`. `source` is relative to `crates/`.
 const PAIRS: &[(&str, &str, &str)] = &[
-    // docs/site/api.md
+    // docs/site/http.md and docs/site/python.md
     (
-        "api.md",
+        "http.md",
         "role-bound token: MERGE create requires the role to name one namespace",
         "core-api/src/db.rs",
     ),
     (
-        "api.md",
+        "http.md",
         "role-bound token: edge endpoint not visible",
         "core-api/src/db.rs",
     ),
     (
-        "api.md",
+        "http.md",
         "as_of (time-travel) does not compose with stub_hidden",
         "server/src/http.rs",
     ),
     (
-        "api.md",
+        "http.md",
         "role-bound token: target node not visible",
         "core-api/src/db.rs",
     ),
     (
-        "api.md",
+        "http.md",
         "role-bound token: this endpoint is not permitted",
         "core-api/src/db.rs",
     ),
     (
-        "api.md",
+        "http.md",
         "not in write scope (create_labels)",
         "core-api/src/db.rs",
     ),
     (
-        "api.md",
+        "http.md",
         "not in write scope (create_edge_types)",
         "core-api/src/db.rs",
     ),
     (
-        "api.md",
+        "http.md",
         "role-bound token: namespace '",
         "core-api/src/db.rs",
     ),
-    ("api.md", "node key not found", "core-storage/src/types.rs"),
+    ("http.md", "node key not found", "core-storage/src/types.rs"),
     (
-        "api.md",
+        "http.md",
         "is out of range; valid range is ",
         "core-storage/src/types.rs",
     ),
     (
-        "api.md",
+        "http.md",
         "events before commit ",
         "core-storage/src/types.rs",
     ),
     (
-        "api.md",
+        "python.md",
         "snapshot: unsupported version ",
         "core-storage/src/snapshot.rs",
     ),

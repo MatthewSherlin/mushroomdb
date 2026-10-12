@@ -506,6 +506,42 @@ all 25 are 28,172. In 0.7.0 it was 27,067 and 27,868: the difference is
 
 ---
 
+## Transport and handshake
+
+```text
+mushroomdb mcp <db-dir>
+```
+
+Runs a newline-delimited JSON-RPC 2.0 loop on stdio. No `Content-Length`
+framing.
+
+Handshake:
+
+```text
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+```
+
+Response:
+
+```json
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "capabilities": {"tools": {}},
+    "protocolVersion": "2024-11-05",
+    "serverInfo": {"name": "mushroomdb", "version": "<the server's version>"}
+  }
+}
+```
+
+**`stub_hidden` on the `query` tool:** when `true` and a `mask` is supplied,
+hidden nodes in the mask appear as `{"key":"…","restricted":true}` in node-info and
+neighborhood results. Cypher result rows are always omit-only — `stub_hidden` does not
+change which Cypher rows are returned.
+
+---
+
 ## Trust model
 
 `mushroomdb mcp` is a local stdio process with no auth. Masks passed via `mask` are cooperative — the caller supplies them, and nothing on the MCP path enforces them, and the same is true of `role` and `namespace`: they are a caller asking to *be answered as* a tenant, not a boundary it is held to. `stats` therefore omits the namespace roster unless the call narrows it with `role` or `namespace` — naming the tenants to a caller who asked about none of them is a disclosure the cooperative path has no reason to make. Real access control is the HTTP server's role tokens (`mushroomdb serve --role-token`), where the binding is enforced and `GET /stats` is refused outright; never present an MCP mask or namespace as a security boundary.

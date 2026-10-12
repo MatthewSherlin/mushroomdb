@@ -112,8 +112,8 @@ HTTP ([API reference](https://matthewsherlin.github.io/mushroomdb/docs/api.html)
 ## Documentation
 
 - **Start:** [Quickstart](https://matthewsherlin.github.io/mushroomdb/docs/quickstart.html) · [Install](https://matthewsherlin.github.io/mushroomdb/docs/install.html)
-- **Guides:** [Agent memory](https://matthewsherlin.github.io/mushroomdb/docs/mcp.html) · [Rules](https://matthewsherlin.github.io/mushroomdb/docs/rules.html) · [Query](https://matthewsherlin.github.io/mushroomdb/docs/query.html) · [Time travel](https://matthewsherlin.github.io/mushroomdb/docs/timetravel.html) · [Access control](https://matthewsherlin.github.io/mushroomdb/docs/masks.html)
-- **Reference:** [CLI](https://matthewsherlin.github.io/mushroomdb/docs/cli.html) · [MCP tools](https://matthewsherlin.github.io/mushroomdb/docs/mcp-tools.html) · [Python API](https://matthewsherlin.github.io/mushroomdb/docs/python-api.html) · [HTTP and Python guide](https://matthewsherlin.github.io/mushroomdb/docs/api.html) · [TypeScript client](clients/typescript/README.md)
+- **Guides:** [Agent memory](https://matthewsherlin.github.io/mushroomdb/docs/mcp.html) · [Python](https://matthewsherlin.github.io/mushroomdb/docs/python.html) · [Rules](https://matthewsherlin.github.io/mushroomdb/docs/rules.html) · [Query](https://matthewsherlin.github.io/mushroomdb/docs/query.html) · [Time travel](https://matthewsherlin.github.io/mushroomdb/docs/timetravel.html) · [Access control](https://matthewsherlin.github.io/mushroomdb/docs/masks.html)
+- **Reference:** [CLI](https://matthewsherlin.github.io/mushroomdb/docs/cli.html) · [MCP tools](https://matthewsherlin.github.io/mushroomdb/docs/mcp-tools.html) · [Python API](https://matthewsherlin.github.io/mushroomdb/docs/python-api.html) · [HTTP API](https://matthewsherlin.github.io/mushroomdb/docs/http.html) · [TypeScript client](clients/typescript/README.md)
 - **Operate:** [Running as a service](https://matthewsherlin.github.io/mushroomdb/docs/service.html) · [Durability](https://matthewsherlin.github.io/mushroomdb/docs/durability.html) · [Concurrency](https://matthewsherlin.github.io/mushroomdb/docs/concurrency.html) · [Benchmarks](https://matthewsherlin.github.io/mushroomdb/docs/benchmarks.html)
 - **Project:** [Architecture and roadmap](https://matthewsherlin.github.io/mushroomdb/docs/architecture.html) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
@@ -198,7 +198,9 @@ is in the [Install](install.md) table.
 
 - [Quickstart](quickstart.md) — a store, an assistant wired to it, and the four questions with one worked call each
 - [Rules](rules.md) — all six predicate kinds with examples
-- [API reference](api.md) — HTTP endpoints, MCP tools, Python bindings
+- [API reference](api.md) — which page covers which surface
+- [HTTP API](http.md) — every route `mushroomdb serve` answers
+- [Python guide](python.md) — the binding, with worked examples
 - [`ingest-git` as a data source](ingest-git.md) — what `ingest-git` writes, its rules, submodules, pull requests, incremental sync
 - [Install](install.md) — one row per way in, and what each leaves out
 - [Install, plugin and hooks](skill.md) — the two install routes, what each writes, and `doctor`
@@ -3118,6 +3120,42 @@ all 25 are 28,172. In 0.7.0 it was 27,067 and 27,868: the difference is
 
 ---
 
+## Transport and handshake
+
+```text
+mushroomdb mcp <db-dir>
+```
+
+Runs a newline-delimited JSON-RPC 2.0 loop on stdio. No `Content-Length`
+framing.
+
+Handshake:
+
+```text
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+```
+
+Response:
+
+```json
+{
+  "id": 1,
+  "jsonrpc": "2.0",
+  "result": {
+    "capabilities": {"tools": {}},
+    "protocolVersion": "2024-11-05",
+    "serverInfo": {"name": "mushroomdb", "version": "<the server's version>"}
+  }
+}
+```
+
+**`stub_hidden` on the `query` tool:** when `true` and a `mask` is supplied,
+hidden nodes in the mask appear as `{"key":"…","restricted":true}` in node-info and
+neighborhood results. Cypher result rows are always omit-only — `stub_hidden` does not
+change which Cypher rows are returned.
+
+---
+
 ## Trust model
 
 `mushroomdb mcp` is a local stdio process with no auth. Masks passed via `mask` are cooperative — the caller supplies them, and nothing on the MCP path enforces them, and the same is true of `role` and `namespace`: they are a caller asking to *be answered as* a tenant, not a boundary it is held to. `stats` therefore omits the namespace roster unless the call narrows it with `role` or `namespace` — naming the tenants to a caller who asked about none of them is a disclosure the cooperative path has no reason to make. Real access control is the HTTP server's role tokens (`mushroomdb serve --role-token`), where the binding is enforced and `GET /stats` is refused outright; never present an MCP mask or namespace as a security boundary.
@@ -5066,14 +5104,30 @@ unexpected-token parse error or other unspecified result.
 
 # API reference
 
-mushroomdb exposes the same graph operations through four surfaces:
-HTTP (served by `mushroomdb serve`), MCP JSON-RPC (served by `mushroomdb mcp`),
-Python bindings (via PyO3 / maturin), and the
-**[TypeScript client](https://github.com/MatthewSherlin/mushroomdb/blob/main/clients/typescript/README.md)** (`mushroomdb-client` package).
+mushroomdb is one engine behind several surfaces. Each has its own page.
+
+| Surface | Reference | Guide |
+|---|---|---|
+| HTTP, served by `mushroomdb serve` | [HTTP API](http.md) — every route | [Running as a service](service.md) |
+| MCP, served by `mushroomdb mcp` | [MCP tools](mcp-tools.md) — every tool and argument | [Agent memory](mcp.md) |
+| Python, `pip install mushroomdb` | [Python API](python-api.md) — every method | [Python guide](python.md) |
+| The `mushroomdb` binary | [CLI](cli.md) — every subcommand | [Quickstart](quickstart.md) |
+| TypeScript, `npm install mushroomdb-client` | [the client's README](https://github.com/MatthewSherlin/mushroomdb/blob/main/clients/typescript/README.md) | |
+
+This page used to hold the HTTP and Python references together. Its sections are now in
+[HTTP API](http.md), [Python guide](python.md) and, for backup and export from Rust and the
+CLI, [Durability](durability.md#backup-and-export-from-rust-and-the-cli).
 
 ---
 
-## HTTP API
+## docs/site/http.md
+
+# HTTP API
+
+Every route `mushroomdb serve` answers. Requests and responses are JSON unless a section says
+otherwise; `POST /query` answers Arrow by default.
+
+## Starting the server
 
 Start the server:
 
@@ -5086,15 +5140,19 @@ Default bind is `127.0.0.1:8080`. The bound address is printed after the
 listener is accepting. Non-loopback `--addr` requires `--token` or
 `MUSHROOMDB_TOKEN` (see `SECURITY.md`).
 
-### Authentication
+## Authentication
 
 For TLS configuration options, see [deployment.md](deployment.md).
 
-**Full-access token** (`--token` / `MUSHROOMDB_TOKEN`): bearer or `?token=`
-query param. Grants access to all endpoints.
+**Full-access token** (`--token` / `MUSHROOMDB_TOKEN`): sent as an `Authorization: Bearer`
+header, as a `?token=` query parameter, or in the `mushroomdb_token` cookie. The server sets
+that cookie itself when it answers an explorer page to a request that carried the full-access
+token, so a browser opened with `?token=` stays signed in. The header is read first, then the
+query, then the cookie. Grants access to all endpoints.
 
 **Role-bound tokens** (`--role-token TOKEN:ROLE` / `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`):
-bearer-only. A role token receives a node-visibility mask derived from the
+read the same three ways, though the server never sets the cookie for one. A role token
+receives a node-visibility mask derived from the
 named role's label selectors (defined in `schema.json` or `roles.json`), and
 optionally narrowed by one property test on those labels. The mask is resolved
 live at request time against the same DB snapshot used for the query — one
@@ -5130,7 +5188,7 @@ Role-token behavior per endpoint:
 | `DELETE /node/{key}` | 200 if node visible and `label` in `delete_labels`; 403 otherwise |
 | `POST /edges` | 200 if type in `create_edge_types` and both endpoints visible; 403 otherwise |
 | `DELETE /edges/{t}/{s}/{d}` | 200 if type in `delete_edge_types` and both endpoints visible; 403 otherwise |
-| `POST /edges/upsert` | 200 if type in `create_edge_types` and both endpoints visible; 403 otherwise |
+| `POST /edges/upsert` | 200 if type in `create_edge_types`, every existing endpoint visible, and — for an endpoint it has to create — `placeholder_label` in `create_labels`; 403 otherwise |
 | `PUT /node/{key}/prop/{f}` | 200 if node visible and `label` in `update_labels`; 403 otherwise |
 | `DELETE /node/{key}/prop/{f}` | 200 if node visible and `label` in `update_labels`; 403 otherwise |
 | `POST /ingest` | 200 if `label` in `create_labels`; 403 otherwise (all-or-nothing) |
@@ -5159,9 +5217,7 @@ any role carries a write scope, v3 when any role carries a `visible_where`
 predicate). A version this binary does not recognise poisons the roles state
 rather than loading it — denying beats over-granting.
 
----
-
-### Write scopes for role-bound tokens
+## Write scopes for role-bound tokens
 
 v0.3 lifts the write ban for roles that explicitly declare write scopes in
 `schema.json`. Roles without a write scope remain read-only.
@@ -5281,27 +5337,229 @@ drive this oracle.
 JSON-RPC server intended for local agent use; it operates without bearer-token
 authentication and is not subject to role enforcement.
 
-### Endpoints
+## Limits, errors and request ids
 
-| Method | Path | Description |
+- **Body size.** A request body may be at most 64 MiB.
+- **Deadline.** A request that has not finished in 120 seconds is answered `408 Request Timeout`
+  and dropped. The two WebSocket routes are exempt: a subscription is meant to outlive any
+  request.
+- **Concurrency.** At most 256 requests are in flight at once. The next one is answered
+  `503 Service Unavailable` straight away; nothing queues. The WebSocket routes do not count.
+- **Request id.** Every response carries `x-request-id`. Send your own, up to 128 ASCII
+  characters, and it is echoed; otherwise the server makes one.
+
+An error the server's own handlers raise is one JSON object, `{"error": "<what went wrong>"}`:
+
+| Status | When |
+|---|---|
+| 400 | A field is missing or wrong, or the engine refused the request: an unknown key on a write, a duplicate key, a rule-owned edge, a query that does not parse |
+| 401 | A token is configured and the request carries none, or one the server does not know. Body: `{"error":"unauthorized"}` |
+| 403 | A role-bound token asked for something outside its role. The message says what |
+| 404 | A key that does not exist on a read route — `GET /node/{key}` and its `/edges`, `/neighborhood` and `/history` — or one the caller's role may not see; `POST /nodes/{key}/rename` on a key that does not exist |
+| 409 | `POST /nodes/{key}/rename` onto a key that is taken |
+| 413 | A request body over 64 MiB |
+| 415 | A route that takes a JSON body was sent without `Content-Type: application/json` |
+| 500 | The store is corrupt, or `roles.json` is misconfigured |
+| 503 | Another process holds the write lock (`Retry-After: 1`), or the server is at its concurrency limit |
+
+What is refused before a handler runs is not that object. A body that is not valid JSON is
+400 with a plain-text message (`Failed to parse the request body as JSON: …`), and 408, 413
+and 415 are plain text too. A path that is not a route is 404 with an empty body, unless the
+server is serving the explorer, which answers instead; a route asked with the wrong method is
+405 with an empty body. A failed `POST /backup` answers 500 with its report.
+
+A write to a key that does not exist is 400, not 404: `DELETE /node/{key}`, the property routes
+and `POST /edges` all answer `400 {"error":"node key not found: <key>"}`, and only rename maps
+it to 404. For a role-bound token the same write is 403, `target node not visible`: a key it
+may not see and a key that does not exist are told apart for no one.
+
+## Routes
+
+| Method | Path | What it does |
 |---|---|---|
-| `GET` | `/health` | Liveness, no auth needed: `{"ok":true}`. With the full-access token — or on a server with no auth configured — it also carries `nodes`, `edges` and `addr`. A role-bound token gets liveness only, matching `/stats` and `/metrics`, which refuse it counters because they leak graph size |
-| `POST` | `/query` | Run a Cypher query |
-| `GET` | `/stats` | Database statistics |
-| `POST` | `/ingest` | Ingest nodes and/or edges |
-| `POST` | `/rules` | Declare a linking rule |
-| `GET` | `/explain` | Explain edges between two nodes |
-| `GET` | `/node/{key}` | Node info and properties |
-| `GET` | `/node/{key}/edges` | Incident edges (typed, with derived flag) |
-| `GET` | `/node/{key}/neighborhood` | Typed neighborhood expansion |
-| `POST` | `/find_similar` | Vector similarity search (role tokens allowed; not `/algo/*`) |
-| `POST` | `/nodes/{key}/rename` | Rename a node's key (full-token only) |
-| `POST` | `/edges/upsert` | Insert an edge, auto-creating missing endpoints (full-token only) |
-| `POST` | `/backup` | Consistent backup of the database to an admin-supplied path (full-token only) |
-| `GET` | `/watch` | WebSocket — live mutation events |
-| `GET` | `/subscribe` | WebSocket — rule and write events |
+| `GET` | [`/health`](#get-health) | Liveness; with the full-access token, node and edge counts |
+| `GET` | [`/stats`](#get-stats) | Node, edge and rule counts |
+| `GET` | [`/metrics`](#get-metrics) | Process and store metrics, as JSON |
+| `POST` | [`/backup`](#post-backup) | A verified copy of the store, taken while it serves |
+| `POST` | [`/query`](#post-query) | Run a Cypher read or write |
+| `POST` | [`/ingest`](#post-ingest) | Insert many nodes of one label |
+| `POST` | [`/rules`](#post-rules) | Declare a rule |
+| `GET` | [`/suggest`](#get-suggest) | Rules the store proposes from its own values |
+| `GET` | [`/explain`](#get-explain) | Why two nodes are linked: the rules, scores and values |
+| `POST` | [`/find_similar`](#post-find_similar) | Nearest nodes to a vector |
+| `GET` | [`/node/{key}`](#get-nodekey) | A node's label and properties |
+| `GET` | [`/node/{key}/edges`](#get-nodekeyedges) | The edges on a node, with the rule behind each |
+| `GET` | [`/node/{key}/neighborhood`](#get-nodekeyneighborhood) | What is within a few hops |
+| `GET` | [`/node/{key}/history`](#get-nodekeyhistory) | Every change to a node |
+| `GET` | [`/history/edge`](#get-historyedge) | When edges between two nodes came and went |
+| `GET` | [`/history/was_linked`](#get-historywas_linked) | Whether two nodes were linked on a date or at a commit |
+| `POST` | [`/nodes`](#post-nodes) | Create a node |
+| `DELETE` | [`/node/{key}`](#delete-nodekey) | Delete a node |
+| `PUT` | [`/node/{key}/prop/{field}`](#put-nodekeypropfield) | Set a property |
+| `DELETE` | [`/node/{key}/prop/{field}`](#delete-nodekeypropfield) | Remove a property |
+| `POST` | [`/nodes/{key}/rename`](#post-nodeskeyrename) | Change a node's key |
+| `POST` | [`/edges`](#post-edges) | Create an edge between two nodes that exist |
+| `POST` | [`/edges/upsert`](#post-edgesupsert) | Create an edge, and its endpoints if they are missing |
+| `DELETE` | [`/edges/{etype}/{src}/{dst}`](#delete-edgesetypesrcdst) | Delete a hand-written edge |
+| `POST` | [`/algo/pagerank`](#post-algopagerank) | PageRank |
+| `POST` | [`/algo/wcc`](#post-algowcc) | Weakly connected components |
+| `POST` | [`/algo/degree`](#post-algodegree) | Degree centrality |
+| `GET` | [`/watch`](#get-watch) | WebSocket: every committed mutation |
+| `GET` | [`/subscribe`](#get-subscribe) | WebSocket: rule firings, and optionally writes and a query's rows |
 
----
+## Service
+
+### GET /health
+
+Liveness. It needs no token and never answers 401, so a load balancer can call it.
+
+```json
+{"ok": true}
+```
+
+With the full-access token — or on a server started with no token at all — it also says what
+it is serving:
+
+```json
+{"ok": true, "nodes": 60, "edges": 334, "addr": "127.0.0.1:8080"}
+```
+
+A role-bound token, a wrong token and no token all get `{"ok": true}` and nothing more: the
+counts say how big the graph is, and `/stats` refuses a role the same counts.
+
+### GET /stats
+
+```json
+{
+  "nodes_live": 60,
+  "nodes_tombstoned": 0,
+  "edges": 334,
+  "history_floor": 0,
+  "chain_truncations": 0,
+  "namespaces": [
+    {"name": "default", "nodes_live": 58},
+    {"name": "tenant-a", "nodes_live": 2}
+  ],
+  "rules": [
+    {"name": "skill_fit", "edges": 90, "tripped": false, "fires": 90, "approximate": false},
+    ...
+  ]
+}
+```
+
+`namespaces` (v0.6.6) lists every namespace with at least one live node, in name
+order, always including `default` — so a store that has never named a namespace
+reports exactly one entry. The route requires a full-access token, as it always did,
+which is also what keeps the roster from being a cross-tenant disclosure: a role token
+gets 403 here. MCP `stats` takes `role` / `namespace` to narrow the roster instead.
+
+A rule whose vector index is still being built carries an extra `building`
+object and derives no edges until it disappears:
+
+```json
+{"name": "sim", "edges": 0, "tripped": false, "fires": 0, "approximate": true,
+ "building": {"rule": "sim", "indexed": 2048, "total": 120000}}
+```
+
+The field is absent for every rule that is not building. See
+[POST /rules](#post-rules) for what starts a build and
+`mushroomdb build-index` for finishing one on a quiet store.
+
+### GET /metrics
+
+Returns runtime counters and the slow-query log. Requires a full-access token
+(role-bound tokens receive 403, same as `/stats`).
+
+```json
+{
+  "nodes_live": 60,
+  "nodes_tombstoned": 0,
+  "edges": 334,
+  "commit_seq": 42,
+  "wal_size_bytes": 8192,
+  "rss_bytes": 20971520,
+  "uptime_s": 3600,
+  "slow_queries": {
+    "threshold_ms": 100,
+    "count": 3,
+    "last": [
+      {"ms": 142, "query": "MATCH (n:Person) RETURN n", "at_commit": 40}
+    ]
+  }
+}
+```
+
+**Fields:**
+
+| Field | Type | Notes |
+|---|---|---|
+| `nodes_live` | integer | Live (non-tombstoned) node count |
+| `nodes_tombstoned` | integer | Soft-deleted node count |
+| `edges` | integer | Total edge count |
+| `commit_seq` | integer | WAL commit sequence number (monotonically increasing) |
+| `wal_size_bytes` | integer | On-disk WAL file size in bytes |
+| `rss_bytes` | integer or null | Resident set size of the server process; null on unsupported platforms |
+| `uptime_s` | integer | Seconds since the HTTP server started |
+| `slow_queries.threshold_ms` | integer | Current slow-query threshold (0 = disabled) |
+| `slow_queries.count` | integer | Lifetime count of slow queries recorded |
+| `slow_queries.last` | array | Up to 16 most recent slow-query entries, oldest first |
+
+**Slow-query threshold:** set via the `MUSHROOMDB_SLOW_QUERY_MS` environment
+variable at server start (default 100 ms; 0 disables the log). Any read query
+whose execution time meets or exceeds the threshold is logged to `stderr` and
+appended to the in-memory ring buffer (capped at 16 entries).
+
+**RSS caveats:** `rss_bytes` is read from `mach_task_basic_info` on macOS and
+`/proc/self/statm` on Linux. On other platforms it is always `null`. The value
+includes shared library mappings and may not match tools like `top` exactly. It
+never causes a panic or blocking I/O.
+
+### POST /backup
+
+Take a consistent backup of the database. Full-token only; role tokens return 403.
+
+Request body:
+
+```json
+{"dest": "/absolute/path/to/backup-dir"}
+```
+
+`dest` must fall inside the backup root: `MUSHROOMDB_BACKUP_DIR` if it is set, otherwise the
+directory the server was started in. A relative `dest` is resolved under the root; an absolute
+one must already be inside it; a `..` segment is refused. Anything else is 400, and the
+message names the root. The server must be able to write there.
+
+The server holds the read lock for the **full duration** of the operation: file copies
+plus post-copy CRC verification. Writers are blocked for that entire window. For
+stores with large snapshots this may be tens of seconds.
+
+The server copies: `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
+`wal.floor`, `wal.genesis`, and `roles.json`. After the copies complete it opens the
+backup read-only and runs the CRC verifier.
+
+Responses:
+
+- `200 OK` — backup completed and verified. Body:
+
+  ```json
+  {
+    "files": ["snapshot.bin", "wal.bin", "wal.genesis"],
+    "bytes": 1887436800,
+    "verified": true
+  }
+  ```
+
+- `500 Internal Server Error` — backup succeeded but verification failed
+  (`verified: false` in body). Treat as a failure; do not use the backup.
+
+**This is the correct path for live-served stores.** Running `mushroomdb backup` CLI
+against a directory that a `serve` process is writing to is unsafe — the CLI copies
+are not atomic across processes. Use `POST /backup` when the server is running.
+
+See [format-stability.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md) for the PITR (point-in-time
+recovery) workflow using backup together with WAL archives.
+
+## Query, ingest and rules
 
 ### POST /query
 
@@ -5434,98 +5692,6 @@ edgeless-anchor rows produce `COUNT = 0` rather than being dropped.
 runs with O(LIMIT) memory via the pull-based executor. Dense patterns
 without `LIMIT` still error at 1,000,000 intermediate rows.
 
----
-
-### GET /stats
-
-```json
-{
-  "nodes_live": 60,
-  "nodes_tombstoned": 0,
-  "edges": 334,
-  "history_floor": 0,
-  "namespaces": [
-    {"name": "default", "nodes_live": 58},
-    {"name": "tenant-a", "nodes_live": 2}
-  ],
-  "rules": [
-    {"name": "skill_fit", "edges": 90, "tripped": false, "fires": 90, "approximate": false},
-    ...
-  ]
-}
-```
-
-`namespaces` (v0.6.6) lists every namespace with at least one live node, in name
-order, always including `default` — so a store that has never named a namespace
-reports exactly one entry. The route requires a full-access token, as it always did,
-which is also what keeps the roster from being a cross-tenant disclosure: a role token
-gets 403 here. MCP `stats` takes `role` / `namespace` to narrow the roster instead.
-
-A rule whose vector index is still being built carries an extra `building`
-object and derives no edges until it disappears:
-
-```json
-{"name": "sim", "edges": 0, "tripped": false, "fires": 0, "approximate": true,
- "building": {"rule": "sim", "indexed": 2048, "total": 120000}}
-```
-
-The field is absent for every rule that is not building. See
-[POST /rules](#post-rules) for what starts a build and
-`mushroomdb build-index` for finishing one on a quiet store.
-
----
-
-### GET /metrics
-
-Returns runtime counters and the slow-query log. Requires a full-access token
-(role-bound tokens receive 403, same as `/stats`).
-
-```json
-{
-  "nodes_live": 60,
-  "nodes_tombstoned": 0,
-  "edges": 334,
-  "commit_seq": 42,
-  "wal_size_bytes": 8192,
-  "rss_bytes": 20971520,
-  "uptime_s": 3600,
-  "slow_queries": {
-    "threshold_ms": 100,
-    "count": 3,
-    "last": [
-      {"ms": 142, "query": "MATCH (n:Person) RETURN n", "at_commit": 40}
-    ]
-  }
-}
-```
-
-**Fields:**
-
-| Field | Type | Notes |
-|---|---|---|
-| `nodes_live` | integer | Live (non-tombstoned) node count |
-| `nodes_tombstoned` | integer | Soft-deleted node count |
-| `edges` | integer | Total edge count |
-| `commit_seq` | integer | WAL commit sequence number (monotonically increasing) |
-| `wal_size_bytes` | integer | On-disk WAL file size in bytes |
-| `rss_bytes` | integer or null | Resident set size of the server process; null on unsupported platforms |
-| `uptime_s` | integer | Seconds since the HTTP server started |
-| `slow_queries.threshold_ms` | integer | Current slow-query threshold (0 = disabled) |
-| `slow_queries.count` | integer | Lifetime count of slow queries recorded |
-| `slow_queries.last` | array | Up to 16 most recent slow-query entries, oldest first |
-
-**Slow-query threshold:** set via the `MUSHROOMDB_SLOW_QUERY_MS` environment
-variable at server start (default 100 ms; 0 disables the log). Any read query
-whose execution time meets or exceeds the threshold is logged to `stderr` and
-appended to the in-memory ring buffer (capped at 16 entries).
-
-**RSS caveats:** `rss_bytes` is read from `mach_task_basic_info` on macOS and
-`/proc/self/statm` on Linux. On other platforms it is always `null`. The value
-includes shared library mappings and may not match tools like `top` exactly. It
-never causes a panic or blocking I/O.
-
----
-
 ### POST /ingest
 
 ```json
@@ -5563,8 +5729,6 @@ namespace is set at insert and cannot be changed afterwards — `PUT` or `DELETE
 Auto-FK inference: fields ending in `_id` whose values match existing node
 keys automatically create `KeyMatch` rules on the first ingest call that
 sees them.
-
----
 
 ### POST /rules
 
@@ -5634,9 +5798,44 @@ Predicate JSON shapes:
 {"All": [{"FieldEqual": {"field": "region"}}, {"Overlap": {"field": "tags", "min": 0.3}}]}
 ```
 
----
+### GET /suggest
 
-### GET /explain?a=&b=
+Rules the store proposes from its own values. It takes no parameters, reads the whole graph
+under a five-second budget, and creates nothing: pass a suggestion's `def` to `POST /rules` to
+create it. The same store always gets the same answer.
+
+```json
+{
+  "suggestions": [
+    {
+      "def": {
+        "name": "suggest_fe_person_person_org_id",
+        "src_label": "Person",
+        "dst_label": "Person",
+        "predicate": {"FieldEqual": {"field": "org_id"}},
+        "edge_type": "SAME_ORG_ID",
+        "max_edges": 32,
+        "weight_prop": null,
+        "approximate": false,
+        "namespace": null,
+        "via_edge": null,
+        "via_label": null,
+        "via_dir": null
+      },
+      "est_edges": 60,
+      "examples": [["person-04", "person-14", 1.0]],
+      "rationale": "…"
+    }
+  ],
+  "truncated": false
+}
+```
+
+`truncated` is true when the budget ran out before every candidate was scored. A role-bound
+token gets 403: the scan would reveal nodes outside its role. More in
+[Rule suggestion](suggest.md).
+
+### GET /explain
 
 ```text
 GET /explain?a=person-01&b=proj-01
@@ -5647,87 +5846,29 @@ Response: array of explanation objects:
 ```json
 [
   {
-    "rule": "auto_fk_person_project_id",
-    "edge_type": "PROJECT",
-    "src": "person-01",
-    "dst": "proj-01",
-    "weight": 1.0,
-    "approximate": false
-  },
-  {
     "rule": "skill_fit",
     "edge_type": "FIT",
-    "src": "person-01",
-    "dst": "proj-01",
+    "src_key": "person-01",
+    "dst_key": "proj-01",
     "weight": 1.0,
-    "approximate": false
+    "via_edge": null,
+    "predicate": {
+      "kind": "overlap",
+      "fields": ["skills"],
+      "min": 0.5,
+      "tolerance": null,
+      "km": null,
+      "parts": null,
+      "approximate": false
+    }
   }
 ]
 ```
 
----
-
-### GET /node/{key}
-
-Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
-
-```json
-{
-  "key": "person-01",
-  "label": "Person",
-  "props": {
-    "skills": ["graph", "rust", "search"],
-    "embedding": [0.1, 0.2, ...]
-  }
-}
-```
-
-Returns 404 with `{"error": "node key not found: person-01"}` for unknown keys.
-
-With `stub_hidden=true` and a client mask, a key that exists but is outside the mask
-returns `{"key": "person-01", "restricted": true}` rather than 404. A key that does
-not exist at all still returns 404. Role tokens: `stub_hidden` is ignored; hidden keys
-return 404 as if absent.
-
----
-
-### GET /node/{key}/edges
-
-Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
-
-```json
-{
-  "edges": [
-    {"edge_type": "FIT", "src_key": "person-01", "dst_key": "proj-01", "derived": true},
-    {"edge_type": "KNOWS", "src_key": "person-01", "dst_key": "person-02", "derived": false}
-  ]
-}
-```
-
-Sorted by `(edge_type, src_key, dst_key)`. `derived: true` means the edge was created
-by a rule; `derived: false` means it was written directly.
-
-With `stub_hidden=true` and a client mask, edges to restricted endpoints are included
-in the list; the restricted endpoint is rendered as `{"key": "…", "restricted": true}`.
-The `edge_type` and `derived` fields are always present in the edge object. Without
-`stub_hidden`, edges to hidden endpoints are omitted entirely.
-
----
-
-### GET /node/{key}/neighborhood?depth=&dir=
-
-`depth` defaults to 1. `dir` is `out`, `in`, or `both` (default `both`).
-
-Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
-
-With `stub_hidden=true` and a client mask, hidden **direct** neighbors of visited nodes
-appear as stub rows (`label: null`). The BFS frontier is not expanded through hidden
-nodes — stub rows are terminal.
-
-Returns 404 with `{"error": "node key not found: …"}` for unknown keys, including under
-a client mask — the same body as `GET /node/{key}`.
-
----
+One object for each rule-derived edge between the two keys. `predicate.kind` is `key_match`,
+`field_equal`, `overlap`, `numeric_within`, `geo_radius`, `vector_similar`, `all` or `any`; the
+fields that do not apply to a kind are `null`. Both keys are required, and a key that does not
+exist is `400 {"error":"node key not found: <key>"}`.
 
 ### POST /find_similar
 
@@ -5759,191 +5900,65 @@ for the old behaviour.
 Response: `{"hits": [[key, score], …]}` — the same `(key, similarity)` pairs Python
 `find_similar` returns. Scores are cosine similarity in `[-1, 1]`; `score >= min`.
 
----
+## Reading a node
 
-### POST /nodes/{key}/rename
+### GET /node/{key}
 
-Rename a node's key. `{key}` is the current (old) key. Full-token only; role tokens
-return 403.
-
-Request body:
-
-```json
-{"new_key": "alice2"}
-```
-
-Responses:
-
-- `200 OK` — `{"ok": true}` — rename succeeded.
-- `404 Not Found` — old key does not exist.
-- `409 Conflict` — new key already exists.
-
-The rename is one WAL frame. A node that stores its key as an `id` property — one
-created by `upsert_entity` or by a Cypher `CREATE {id: …}` — has that `id` rewritten to
-the new key in the same frame, so `n.id` and `key(n)` keep agreeing; an `id` holding any
-other value is left alone. All edges referencing the
-node continue to work under the new key. Node history and time-travel (`open_at`)
-correctly scope events to the identity that held the key at each commit — recycling
-a key for a different node does not contaminate the previous identity's history.
-
----
-
-### POST /edges/upsert
-
-Insert an edge, auto-creating any missing endpoint nodes. Full-token only; role tokens
-return 403.
-
-Request body:
+Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
 
 ```json
 {
-  "edge_type": "KNOWS",
-  "src_key": "alice",
-  "dst_key": "bob",
-  "placeholder_label": "Person"
+  "key": "person-01",
+  "label": "Person",
+  "props": {
+    "skills": ["graph", "rust", "search"],
+    "embedding": [0.1, 0.2, ...]
+  }
 }
 ```
 
-`placeholder_label` is the label used when a missing endpoint node is created. If both
-endpoints already exist the body still requires this field.
+Returns 404 with `{"error": "node key not found: person-01"}` for unknown keys.
 
-Response:
+With `stub_hidden=true` and a client mask, a key that exists but is outside the mask
+returns `{"key": "person-01", "restricted": true}` rather than 404. A key that does
+not exist at all still returns 404. Role tokens: `stub_hidden` is ignored; hidden keys
+return 404 as if absent.
 
-```json
-{"nodes_created": 1, "edge_inserted": true}
-```
+### GET /node/{key}/edges
 
-`nodes_created` is 0, 1, or 2. `edge_inserted` is `false` when the edge already
-existed (idempotent on re-submission). Linking rules fire on any newly created
-placeholder nodes within the same batch frame.
-
----
-
-### POST /backup
-
-Take a consistent backup of the database. Full-token only; role tokens return 403.
-
-Request body:
+Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
 
 ```json
-{"dest": "/absolute/path/to/backup-dir"}
+{
+  "edges": [
+    {"edge_type": "FIT", "src_key": "person-01", "dst_key": "proj-01", "derived": true},
+    {"edge_type": "KNOWS", "src_key": "person-01", "dst_key": "person-02", "derived": false}
+  ]
+}
 ```
 
-`dest` is an arbitrary admin-supplied path; the server must have write permission to
-it. The endpoint accepts any absolute path without validation — restrict access to
-this endpoint accordingly.
+Sorted by `(edge_type, src_key, dst_key)`. `derived: true` means the edge was created
+by a rule; `derived: false` means it was written directly.
 
-The server holds the read lock for the **full duration** of the operation: file copies
-plus post-copy CRC verification. Writers are blocked for that entire window. For
-stores with large snapshots this may be tens of seconds.
+With `stub_hidden=true` and a client mask, edges to restricted endpoints are included
+in the list; the restricted endpoint is rendered as `{"key": "…", "restricted": true}`.
+The `edge_type` and `derived` fields are always present in the edge object. Without
+`stub_hidden`, edges to hidden endpoints are omitted entirely.
 
-The server copies: `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
-`wal.floor`, `wal.genesis`, and `roles.json`. After the copies complete it opens the
-backup read-only and runs the CRC verifier.
+### GET /node/{key}/neighborhood
 
-Responses:
+`depth` and `dir` are query parameters: `GET /node/alice/neighborhood?depth=2&dir=out`.
 
-- `200 OK` — backup completed and verified. Body:
+`depth` defaults to 1. `dir` is `out`, `in`, or `both` (default `both`).
 
-  ```json
-  {
-    "files": ["snapshot.bin", "wal.bin", "wal.genesis"],
-    "bytes": 1887436800,
-    "verified": true
-  }
-  ```
+Query params: `mask=key1,key2,…` (optional), `stub_hidden=true` (optional).
 
-- `500 Internal Server Error` — backup succeeded but verification failed
-  (`verified: false` in body). Treat as a failure; do not use the backup.
+With `stub_hidden=true` and a client mask, hidden **direct** neighbors of visited nodes
+appear as stub rows (`label: null`). The BFS frontier is not expanded through hidden
+nodes — stub rows are terminal.
 
-**This is the correct path for live-served stores.** Running `mushroomdb backup` CLI
-against a directory that a `serve` process is writing to is unsafe — the CLI copies
-are not atomic across processes. Use `POST /backup` when the server is running.
-
-See [format-stability.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md) for the PITR (point-in-time
-recovery) workflow using backup together with WAL archives.
-
----
-
-## Backup and export (Rust API and CLI)
-
-### Backup (Rust API)
-
-```rust
-let report = db.backup_to(Path::new("/backup/dir"))?;
-// report.files: Vec<String>  — files copied, sorted
-// report.bytes: u64          — total bytes copied
-// report.verified: bool      — true when post-copy CRC check passed
-```
-
-`backup_to` copies the store files and verifies the copy by opening it read-only.
-The `&self` borrow excludes concurrent writers within the same process, but it
-provides **no cross-process guarantee**. Do not call `backup_to` via the Rust API
-against a directory that a separate `mushroomdb serve` process is writing to. Use
-`POST /backup` instead.
-
-### Backup (CLI)
-
-```sh
-mushroomdb backup <db-dir> <backup-dir>
-```
-
-WARNING: unsafe against a concurrently running `mushroomdb serve` process. For
-live-served stores use `POST /backup`.
-
-### Export (Rust API)
-
-```rust
-let nodes: Vec<NodeInfo>     = db.all_nodes_for_export();
-let edges: Vec<ExportEdge>   = db.all_edges_for_export();
-// ExportEdge { edge_type, src, dst, derived: bool, rule: Option<String>, weight: Option<f64> }
-```
-
-Nodes are sorted by key. Edges are sorted by `(edge_type, src, dst)`. Derived
-edges include the rule name in `rule`; manually-written edges have `rule: None`.
-
-### Export (CLI)
-
-```sh
-mushroomdb export <db-dir> <dest> [--format jsonl|parquet|graphml]
-```
-
-Default format: `jsonl`.
-
-**JSONL format** (default): writes `nodes.jsonl`, `edges.jsonl`, and `rules.jsonl`
-to `<dest>` (a directory). Each line is a JSON object. JSONL output is stable,
-deterministic, and byte-identical between two runs on the same store.
-
-**Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
-and `rules.parquet` to `<dest>` (a directory) with Snappy compression (parquet-rs
-default). Parquet output is **not** byte-identical between parquet-rs library
-versions — use JSONL if you need a stable byte checksum.
-
-**GraphML format** (`--format graphml`): writes a single GraphML file — nodes
-and edges only, since rules have no GraphML analogue — for import into generic
-graph viewers and analysis tools. If `<dest>` is an existing directory, the file
-is `<dest>/graph.graphml`; otherwise `<dest>` is the file path itself. Node
-elements carry a `label` attribute plus every property (lists and maps are
-JSON-encoded as `string`-typed attributes); edge elements carry `type` and
-`derived`, plus `rule` and `weight` when present. `weight` is the creating
-rule's declared `weight_prop`, read off the edge. GraphML output is
-byte-identical between two runs on the same store.
-
-**GraphML attribute types:** `int` properties (mushroomdb's `Value::Int` is a
-64-bit `i64`) declare `attr.type="long"`, not `"int"` — GraphML's informal
-convention treats `"int"` as 32-bit, so `"long"` is the interoperable choice
-for the full range. If nodes disagree on a property's type (one has an int
-under `score`, another a string), the key declares `attr.type="string"` for
-every node rather than risk a value that doesn't fit a narrower type.
-
-**Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as
-JSON `null` (JSONL/Parquet) or an empty `<data>` element (GraphML). Normal
-finite floats round-trip correctly.
-
-**Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is
-the rule name (present for derived edges, null/omitted for manual edges).
-
----
+Returns 404 with `{"error": "node key not found: …"}` for unknown keys, including under
+a client mask — the same body as `GET /node/{key}`.
 
 ### GET /node/{key}/history
 
@@ -5972,11 +5987,12 @@ visible. See [Horizon contract](#horizon-contract) below.
 Role tokens: if the requested key is outside the role's visibility mask, the response
 is identical to querying an absent key (404) — no existence oracle.
 
----
+## History between two nodes
 
-### GET /history/edge?a=&b=
+### GET /history/edge
 
-Return the full add/retract lifecycle for edges between two nodes.
+Return the full add/retract lifecycle for edges between two nodes. `a` and `b` are query
+parameters, both required: `GET /history/edge?a=alice&b=bob`.
 
 Response:
 ```json
@@ -6000,12 +6016,13 @@ in `events`.
 Role tokens: BOTH `a` AND `b` must be visible in the role mask. If either is hidden,
 the response is 404 for that key (no existence oracle).
 
----
+### GET /history/was_linked
 
-### GET /history/was_linked?a=&b=&edge_type=&at_commit=
-
-Point-in-time check: was an edge of `edge_type` between `a` and `b` active at WAL
-commit `at_commit` (0-based)?
+Point-in-time check: was an edge of `edge_type` between `a` and `b` active at `at_commit`?
+`at_commit` is a 0-based WAL commit index, or an RFC 3339 date — `2026-06-19`, or
+`2026-06-19T12:00:00Z` — which resolves to the last commit at or before it. All four
+parameters are required: `GET /history/was_linked?a=alice&b=bob&edge_type=KNOWS&at_commit=2026-06-19`.
+The `at_commit` in the response is the commit index it resolved to.
 
 Response:
 ```json
@@ -6037,9 +6054,213 @@ first WAL frame after the snapshot. Use
 `snapshot_with(SnapshotOptions { keep_wal: true })` to preserve deep history across
 snapshots, or `archive_wal: true` to keep it in archives.
 
----
+## Writing nodes and edges
 
-### GET /watch (WebSocket)
+### POST /nodes
+
+Create one node.
+
+```json
+{"label": "Person", "key": "ada", "props": {"name": "Ada", "skills": ["rust"]}}
+```
+
+`label` and `key` are required. `props` is an object; a `null` value in it is dropped.
+`namespace`, a string, is optional: it puts the node in that namespace, for life.
+
+```json
+{"ok": true, "nodes": 1, "edges": 0}
+```
+
+`nodes` and `edges` count what the request itself wrote. The edges that rules derive from the
+new node are not in the count; `GET /node/{key}/edges` lists them.
+
+It is an insert, not an upsert: a key that exists is `400 {"error":"duplicate node key: ada"}`.
+A missing field is `400 {"error":"missing label"}` or `"missing key"`. A role-bound token may
+create a node whose label is in its `create_labels`; otherwise 403 with the reason.
+
+### DELETE /node/{key}
+
+Delete a node and the edges on it. `200 {"ok": true}`.
+
+A key that does not exist is `400 {"error":"node key not found: <key>"}`. A role-bound token
+may delete a node it can see whose label is in its `delete_labels`; otherwise 403.
+
+Afterwards the key answers 404 on every read route, `/history` included. What the node was
+is still in the log until it is pruned: a `POST /query` with `as_of` reads the graph as it stood
+before the delete. See [Time travel](timetravel.md).
+
+### PUT /node/{key}/prop/{field}
+
+Set one property. Every rule that reads the field is re-evaluated in the same write.
+
+```json
+{"value": ["rust", "graphs"]}
+```
+
+`value` is required and may be any JSON value but `null`; to remove a property, use `DELETE`.
+`200 {"ok": true}`.
+
+400 when the key does not exist, when `value` is missing or `null`, or when the field is one a
+materialized view owns. A role-bound token may set a property on a node it can see whose label
+is in its `update_labels`; otherwise 403.
+
+### DELETE /node/{key}/prop/{field}
+
+Remove one property. It takes no body. `200 {"ok": true}` — also when the node has no such
+field, which is not an error.
+
+400 when the key does not exist or a materialized view owns the field. A rule that read the
+field retracts the edges it no longer supports, in the same write. Role-bound tokens: as for
+`PUT`.
+
+### POST /nodes/{key}/rename
+
+Rename a node's key. `{key}` is the current (old) key. Full-token only; role tokens
+return 403.
+
+Request body:
+
+```json
+{"new_key": "alice2"}
+```
+
+Responses:
+
+- `200 OK` — `{"ok": true}` — rename succeeded.
+- `404 Not Found` — old key does not exist.
+- `409 Conflict` — new key already exists.
+
+The rename is one WAL frame. A node that stores its key as an `id` property — one
+created by `upsert_entity` or by a Cypher `CREATE {id: …}` — has that `id` rewritten to
+the new key in the same frame, so `n.id` and `key(n)` keep agreeing; an `id` holding any
+other value is left alone. All edges referencing the
+node continue to work under the new key. Node history and time-travel (`open_at`)
+correctly scope events to the identity that held the key at each commit — recycling
+a key for a different node does not contaminate the previous identity's history.
+
+### POST /edges
+
+Create one edge between two nodes that exist.
+
+```json
+{"type": "KNOWS", "src": "ada", "dst": "grace"}
+```
+
+All three are required. `200 {"ok": true}` — also when the edge is already there.
+
+400 when a rule already owns that edge, or when the two nodes are in different namespaces. A
+missing endpoint is `400 {"error":"node key not found: grace"}`; to have it created, use
+`POST /edges/upsert`, whose body names the same three things differently (`edge_type`,
+`src_key`, `dst_key`). A role-bound token may create an edge whose type is in its
+`create_edge_types` between two nodes it can see; otherwise 403.
+
+### POST /edges/upsert
+
+Insert an edge, auto-creating any missing endpoint nodes. A role-bound token may do so when
+the edge type is in its `create_edge_types` and it can see each endpoint that exists. An
+endpoint that does not exist is created for it only when `placeholder_label` is in its
+`create_labels`. Otherwise 403.
+
+Request body:
+
+```json
+{
+  "edge_type": "KNOWS",
+  "src_key": "alice",
+  "dst_key": "bob",
+  "placeholder_label": "Person"
+}
+```
+
+`placeholder_label` is the label used when a missing endpoint node is created. If both
+endpoints already exist the body still requires this field.
+
+Response:
+
+```json
+{"nodes_created": 1, "edge_inserted": true}
+```
+
+`nodes_created` is 0, 1, or 2. `edge_inserted` is `false` when the edge already
+existed (idempotent on re-submission). Linking rules fire on any newly created
+placeholder nodes within the same batch frame.
+
+### DELETE /edges/{etype}/{src}/{dst}
+
+Delete one edge that was written by hand. `200 {"ok": true}` — also when there is no such edge
+between the two nodes.
+
+An edge a rule derived cannot be deleted this way:
+
+```json
+{"error": "edge is rule-owned: edge FIT person-01→proj-01 is rule-owned; delete or change the owning rule"}
+```
+
+That is 400, as is an endpoint that does not exist. A role-bound token may delete an edge whose
+type is in its `delete_edge_types` between two nodes it can see; otherwise 403.
+
+## Graph algorithms
+
+### POST /algo/pagerank
+
+PageRank over hand-written and derived edges together. The body is a JSON object and may be
+`{}`: every field has a default. It may not be empty, and a field the config does not have is
+ignored without a word, so `max_iter` for `max_iters` runs with the default.
+
+| Field | Default | What it is |
+|---|---|---|
+| `damping` | 0.85 | The damping factor |
+| `max_iters` | 50 | Iterations before giving up |
+| `tol` | 1e-6 | Stop when the scores' total change in one iteration falls below it |
+| `direction` | `"out"` | `"out"`, `"in"` or `"both"` |
+| `edge_type` | all | Count only edges of this type |
+| `weight_prop` | none | Weight each edge by this property |
+| `min_weight` | none | Ignore edges whose weight is below it |
+| `budget_ms` | 5000 | Stop after this long; 0 for no limit |
+
+```json
+{"scores": [["org-07", 0.1029], ["org-03", 0.0882]], "converged": true}
+```
+
+Scores are highest first. `converged` is false when the iterations or the budget ran out first.
+
+A value the config does not accept is 400, and the message names what it would have taken:
+
+```json
+{"error": "invalid pagerank config: unknown variant `sideways`, expected one of `out`, `in`, `both`"}
+```
+
+A role-bound token gets 403 on every `/algo` route, because the scan covers the whole graph.
+More in [Algorithms](algorithms.md).
+
+### POST /algo/wcc
+
+Weakly connected components. Fields: `edge_type`, `weight_prop`, `min_weight` and `budget_ms`;
+`{}` is valid. Here `weight_prop` weights nothing: with `min_weight` it only leaves out the
+edges below that weight.
+
+```json
+{"components": [["org-01", "org-01"], ["org-02", "org-01"]], "truncated": false}
+```
+
+Each pair is a node and its component, named by the smallest key in it. `truncated` is true
+when the budget ran out.
+
+### POST /algo/degree
+
+Degree centrality. Fields: `direction` (default `"both"`), `edge_type`, `weight_prop`,
+`min_weight` and `budget_ms`; `{}` is valid. As for components, `weight_prop` and `min_weight`
+only leave edges out; the score is a count.
+
+```json
+{"scores": [["org-04", 11], ["org-05", 11]], "truncated": false}
+```
+
+Highest first.
+
+## Live streams
+
+### GET /watch
 
 Connect with any WebSocket client. After upgrade the first text frame is
 `{"subscribed":true}`. Subsequent frames are `MutationEvent` JSON,
@@ -6052,62 +6273,59 @@ lag notice):
 {"lagged":3}
 ```
 
-When the server is started with a token, pass `?token=` on the WebSocket URL.
+The other frames are `prop_removed`, `edge_inserted` and `edge_deleted` (`edge_type`, `src`,
+`dst`), `node_deleted` (`key`), `rule_created`, `rule_deleted` and `rule_rebuilt` (`name`),
+`batch_applied` (`ops`) and `ingested` (`label`, `inserted`). The lag notice here is
+`{"lagged": n}`; on `/subscribe` it is `{"type": "lagged", "missed": n}`.
 
----
+When the server is started with a token, send it as a header or a cookie, or as `?token=` on
+the WebSocket URL when the client cannot set headers. A role-bound token gets 403.
 
-## MCP (Model Context Protocol)
+### GET /subscribe
 
-```text
-mushroomdb mcp <db-dir>
-```
-
-Runs a newline-delimited JSON-RPC 2.0 loop on stdio. No `Content-Length`
-framing.
-
-Handshake:
-
-```text
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
-```
-
-Response:
+A WebSocket that streams what rules do, and optionally every write and the rows of one query.
+After the upgrade, send one text frame saying what you want:
 
 ```json
-{
-  "id": 1,
-  "jsonrpc": "2.0",
-  "result": {
-    "capabilities": {"tools": {}},
-    "protocolVersion": "2024-11-05",
-    "serverInfo": {"name": "mushroomdb", "version": "<the server's version>"}
-  }
-}
+{"rules": ["skill_fit"], "writes": true, "cypher": "MATCH (p:Person) RETURN p.name LIMIT 50"}
 ```
 
-### Tools
+Ask for at least one of the three. `rules` names the rules whose edges to follow, `writes` adds
+node, edge and property events, and `cypher` follows the rows of one query, re-run on each
+commit — give it a `LIMIT`. The server answers `{"subscribed": true}`. A frame that asks for
+nothing gets that answer and is then closed, having nothing to send. A frame that is not JSON,
+a rule that does not exist or a query that does not parse gets `{"error": "…"}` and is closed.
 
-The server serves twenty-five tools and lists twenty-three by default; `mushroomdb mcp <db>
---all-tools` lists all of them. What each one answers is in
-[Task tools](mcp.md#task-tools), which also gives each task tool's arguments, and in
-[Tool reference](mcp.md#tool-reference) — the one list of them. The arguments of the fourteen
-graph tools are in each tool's `inputSchema`, which `tools/list` returns.
+Then one frame an event, each with a `type`:
 
-**`stub_hidden` on the `query` tool:** when `true` and a `mask` is supplied,
-hidden nodes in the mask appear as `{"key":"…","restricted":true}` in node-info and
-neighborhood results. Cypher result rows are always omit-only — `stub_hidden` does not
-change which Cypher rows are returned.
+| `type` | Fields |
+|---|---|
+| `edge_fired` | `rule`, `src_key`, `dst_key`, `edge_type`, `weight` |
+| `edge_retracted` | `rule`, `src_key`, `dst_key`, `edge_type` |
+| `node_inserted` | `label`, `key` |
+| `node_deleted` | `key` |
+| `edge_inserted`, `edge_deleted` | `edge_type`, `src`, `dst` |
+| `prop_set`, `prop_removed` | `key`, `field` |
+| `query_row_added`, `query_row_removed` | `columns`, `row` |
 
-**MCP trust boundary:** the MCP server is a stdio JSON-RPC interface for local trusted
-use. It operates without bearer-token authentication and is not subject to role
-enforcement. All tools have full-access semantics regardless of any role configuration
-on the HTTP server. `role` and `namespace` on `query` and `stats` are therefore a
-caller asking to *be answered as* a tenant, not an enforced boundary — which is also
-why `stats` answers with the whole namespace roster unless one of them is passed.
+Every event but the two query-row ones also carries `commit_seq`, the commit it happened at.
+`weight` is there only when the rule scores its edges; a key-match rule's `edge_fired` has
+none. The values in `row` are in the store's tagged form — `[{"Str": "Ada"}]`, not `["Ada"]`.
+Frames of different kinds are not ordered against each other: a write event may arrive after
+a rule event from a later commit, so order by `commit_seq`.
+
+A consumer that falls behind is not disconnected. It gets `{"type": "lagged", "missed": 12}`
+for the events it did not see, and the stream goes on.
+
+Only writes made through this server process are seen: a commit another process made is
+readable at once and announces nothing. A role-bound token gets 403, because the stream has
+no mask. More in [Subscriptions](subscriptions.md).
 
 ---
 
-## Python bindings
+## docs/site/python.md
+
+# Python guide
 
 Install with `pip install mushroomdb`, or build from source:
 
@@ -6118,7 +6336,7 @@ python -m venv .venv
 .venv/bin/maturin develop
 ```
 
-### Open a database
+## Open a database
 
 ```python
 import mushroomdb
@@ -6134,7 +6352,7 @@ A read-write handle takes the store's cross-process write lock and raises
 `MushroomBusy` if another one already holds it; `read_only=True` never takes the
 lock. See [Concurrency](#concurrency) below.
 
-### Insert nodes
+## Insert nodes
 
 `insert_node(label, key, props, namespace=None)` — same argument order as Rust.
 Raises if the key is already live.
@@ -6150,7 +6368,7 @@ immutable, so `set_prop(key, "ns", …)` afterwards raises. Omitted (or `"defaul
 means the `default` namespace and stores nothing. An invalid name raises `ValueError`;
 a `props["ns"]` disagreeing with the argument raises too.
 
-### Upsert nodes
+## Upsert nodes
 
 `upsert_node(label, key, props)` returns `"inserted"` or `"updated"`.
 
@@ -6165,7 +6383,7 @@ field produces no WAL record — so rules do not re-fire needlessly. An existing
 key under a different label raises `ValueError`: relabelling a node is not an
 upsert.
 
-### Set and remove properties
+## Set and remove properties
 
 ```python
 db.set_prop("alice", "team", "green")
@@ -6177,7 +6395,7 @@ Python has no distinct "null property" and the store has no null `Value`, so
 `None` means absent. Removing a field a rule watches retracts the edges that
 field derived.
 
-### Delete a node
+## Delete a node
 
 ```python
 report = db.delete_node("alice")
@@ -6188,7 +6406,7 @@ Deletes the node and every incident edge, returning counts of the user-inserted
 and rule-derived edges removed. An unknown or already-deleted key raises
 `RuntimeError` (`KeyNotFound`).
 
-### Batch ingest
+## Batch ingest
 
 `ingest_batch(nodes, edges=None)` commits every node and edge in a single WAL
 frame. Each node is a `{key, label, props}` dict; each edge is a
@@ -6206,7 +6424,7 @@ report = db.ingest_batch(nodes)
 A bad edge rejects the entire batch. Keep each call to ≤10,000 nodes: one
 giant WAL frame's fsync cost dominates and negates the batching benefit.
 
-### Create a rule
+## Create a rule
 
 ```python
 db.create_rule({
@@ -6266,7 +6484,7 @@ An undirected Cypher pattern like `MATCH (a)-[:SIMILAR]-(b)` double-counts rows
 because both `a→b` and `b→a` edges exist. Use directed patterns
 (`MATCH (a)-[:SIMILAR]->(b)`) or `RETURN DISTINCT a, b` to avoid duplicates.
 
-### Query
+## Query
 
 ```python
 # params as a dict
@@ -6323,7 +6541,7 @@ The dict keys in each row are the **RETURN aliases** from the query — `p`, `o`
 and `score` in the example above. Bare `RETURN n` yields `{"n": ...}`; `RETURN
 n.age AS age` yields `{"age": ...}`.
 
-### Traversal
+## Traversal
 
 ```python
 edges = db.node_edges("alice")   # [{edge_type, src_key, dst_key, derived}, ...]
@@ -6334,7 +6552,7 @@ neighbors = db.neighbors("alice", "KNOWS", "out")   # one hop, list of keys
 `node_info` returns `None` for an unknown key; `node_edges` raises
 `RuntimeError`. The asymmetry mirrors the Rust API (`Option` vs `Result`).
 
-### Vector search
+## Vector search
 
 `find_similar(field, vector, label=None, k=10, min=0.8, mask=None, where=None, exact=False)`
 returns the `k` nearest nodes to `vector` by cosine similarity on `field`.
@@ -6468,7 +6686,7 @@ the caller's conversion here too — the engine does not speak distance on this
 surface any more than on `find_similar`. Convert after the call if you need a
 distance cut (`keep if 1 - sim < T`); do not bake `T` into `min`.
 
-### Degree
+## Degree
 
 Adjacency is a set: a second `insert_edge` of the same `(edge_type, src, dst)`
 returns `False` and does not increase degree. `degree` is unique-neighbour
@@ -6496,7 +6714,7 @@ This is the read-only subset API. It is not `degree_centrality` (full-graph
 ranking, time-budgeted, not bound in Python) and not a Degree materialized view
 (a write that maintains a property). See [algorithms.md](algorithms.md).
 
-### Rename a node
+## Rename a node
 
 ```python
 db.rename_node("alice", "alice2")
@@ -6505,7 +6723,7 @@ db.rename_node("alice", "alice2")
 Raises `KeyNotFoundError` if the old key does not exist, `DuplicateKeyError` if the
 new key is already taken.
 
-### Insert edge with auto-create
+## Insert edge with auto-create
 
 ```python
 result = db.insert_edge_upsert("KNOWS", "alice", "bob", "Person")
@@ -6515,7 +6733,7 @@ result = db.insert_edge_upsert("KNOWS", "alice", "bob", "Person")
 Missing endpoint nodes are created with the given `placeholder_label`. If the edge
 already exists, `edge_inserted` is `False` (idempotent).
 
-### Explain
+## Explain
 
 ```python
 explanation = db.explain("alice", "acme")
@@ -6524,7 +6742,7 @@ explanation = db.explain("alice", "acme")
 
 `predicate` is the snake_case summary shape that `create_rule` accepts verbatim.
 
-### Stats
+## Stats
 
 ```python
 s = db.stats()
@@ -6535,7 +6753,7 @@ s = db.stats()
 `namespaces` (v0.6.6) lists every namespace with at least one live node, in name
 order, always including `default` — one entry on a store that has never named one.
 
-### Concurrency
+## Concurrency
 
 **One writer at a time across processes.** The store carries an advisory write
 lock. A read-write handle holds it for as long as it is open, so opening a
@@ -6580,7 +6798,7 @@ can observe intermediate states while a batch is being applied. See
 [concurrency.md](concurrency.md) for the full cross-process model and
 [durability.md](durability.md) for the WAL and crash-atomicity guarantees.
 
-### Type stubs
+## Type stubs
 
 The wheel ships `__init__.pyi` (generated from
 `bindings/python/mushroomdb.pyi`) plus a `py.typed` marker, so mypy and
@@ -6588,7 +6806,7 @@ Pyright pick up signatures with no extra configuration. Every method also
 carries a docstring and a `__text_signature__`, so `help(mushroomdb.GraphDb)`
 is useful at the REPL.
 
-### Snapshot
+## Snapshot
 
 ```python
 db.snapshot()  # write V8 (mmap rkyv) snapshot and truncate WAL
@@ -6619,7 +6837,7 @@ full section table and migration notes. 100k nodes (v0.2, ~10M derived edges):
 V8 snapshot open 0.02 s / 31–41 MiB RSS (warm file cache, cold process,
 2026-08-28, Apple M4 Pro).
 
-### Atomic write batches (Rust API)
+## Atomic write batches (Rust API)
 
 `write_batch` is the closure-style entry point for atomic multi-op commits.
 All ops queued inside the closure are validated in order and committed as a
@@ -6662,7 +6880,7 @@ The following ops are supported inside `write_batch`:
 The method-chaining `db.batch()` builder is equivalent; `write_batch` is a
 convenience wrapper that auto-commits.
 
-### Compare-and-set write batches (Rust API)
+## Compare-and-set write batches (Rust API)
 
 `write_batch_cas` is the optimistic-concurrency entry point. All preconditions
 are checked atomically under the write lock before any operation is applied; if
@@ -6709,7 +6927,7 @@ persisted in V8 snapshot section 11 (LAST_CHANGE) and survive restarts.
 `SharedDb::submit_batch_cas` provides the same guarantee over the shared-writer
 async interface. See [timetravel.md](timetravel.md) for the full semantics.
 
-### Exposed surface
+## Exposed surface
 
 Every method the binding exposes, with its signature and docstring, is in the
 [Python API](python-api.md) reference, which is generated from the type stub.
@@ -7050,7 +7268,7 @@ transactions, and subscription events for a peer's writes — a commit absorbed 
 visible on the next read but notifies nobody. Full model:
 [`docs/site/concurrency.md`](concurrency.md).
 
-The HTTP endpoints `serve` answers are in the [API reference](api.md).
+The HTTP endpoints `serve` answers are in the [HTTP API](http.md).
 
 ---
 
@@ -7075,7 +7293,7 @@ db.close()
 ```
 
 This page is the reference. For worked examples — rules, vector search, scoped handles,
-concurrency — see the Python sections of the [API guide](api.md#python-bindings).
+concurrency — see the Python sections of the [Python guide](python.md).
 
 A handle is also a context manager: `with mushroomdb.GraphDb.open(path) as db:` closes it on
 exit.
@@ -9429,6 +9647,84 @@ recovery skips re-derivation. It is deferred because the snapshot path already
 delivers fast recovery for the common case, and the change touches the
 crash-recovery correctness core.
 
+## Backup and export from Rust and the CLI
+
+### Backup (Rust API)
+
+```rust
+let report = db.backup_to(Path::new("/backup/dir"))?;
+// report.files: Vec<String>  — files copied, sorted
+// report.bytes: u64          — total bytes copied
+// report.verified: bool      — true when post-copy CRC check passed
+```
+
+`backup_to` copies the store files and verifies the copy by opening it read-only.
+The `&self` borrow excludes concurrent writers within the same process, but it
+provides **no cross-process guarantee**. Do not call `backup_to` via the Rust API
+against a directory that a separate `mushroomdb serve` process is writing to. Use
+`POST /backup` instead.
+
+### Backup (CLI)
+
+```sh
+mushroomdb backup <db-dir> <backup-dir>
+```
+
+WARNING: unsafe against a concurrently running `mushroomdb serve` process. For
+live-served stores use `POST /backup`.
+
+### Export (Rust API)
+
+```rust
+let nodes: Vec<NodeInfo>     = db.all_nodes_for_export();
+let edges: Vec<ExportEdge>   = db.all_edges_for_export();
+// ExportEdge { edge_type, src, dst, derived: bool, rule: Option<String>, weight: Option<f64> }
+```
+
+Nodes are sorted by key. Edges are sorted by `(edge_type, src, dst)`. Derived
+edges include the rule name in `rule`; manually-written edges have `rule: None`.
+
+### Export (CLI)
+
+```sh
+mushroomdb export <db-dir> <dest> [--format jsonl|parquet|graphml]
+```
+
+Default format: `jsonl`.
+
+**JSONL format** (default): writes `nodes.jsonl`, `edges.jsonl`, and `rules.jsonl`
+to `<dest>` (a directory). Each line is a JSON object. JSONL output is stable,
+deterministic, and byte-identical between two runs on the same store.
+
+**Parquet format** (`--format parquet`): writes `nodes.parquet`, `edges.parquet`,
+and `rules.parquet` to `<dest>` (a directory) with Snappy compression (parquet-rs
+default). Parquet output is **not** byte-identical between parquet-rs library
+versions — use JSONL if you need a stable byte checksum.
+
+**GraphML format** (`--format graphml`): writes a single GraphML file — nodes
+and edges only, since rules have no GraphML analogue — for import into generic
+graph viewers and analysis tools. If `<dest>` is an existing directory, the file
+is `<dest>/graph.graphml`; otherwise `<dest>` is the file path itself. Node
+elements carry a `label` attribute plus every property (lists and maps are
+JSON-encoded as `string`-typed attributes); edge elements carry `type` and
+`derived`, plus `rule` and `weight` when present. `weight` is the creating
+rule's declared `weight_prop`, read off the edge. GraphML output is
+byte-identical between two runs on the same store.
+
+**GraphML attribute types:** `int` properties (mushroomdb's `Value::Int` is a
+64-bit `i64`) declare `attr.type="long"`, not `"int"` — GraphML's informal
+convention treats `"int"` as 32-bit, so `"long"` is the interoperable choice
+for the full range. If nodes disagree on a property's type (one has an int
+under `score`, another a string), the key declares `attr.type="string"` for
+every node rather than risk a value that doesn't fit a narrower type.
+
+**Float handling:** `Value::Float` fields that are NaN or ±Inf are exported as
+JSON `null` (JSONL/Parquet) or an empty `<data>` element (GraphML). Normal
+finite floats round-trip correctly.
+
+**Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is
+the rule name (present for derived edges, null/omitted for manual edges).
+
 ---
 
 ## docs/site/views.md
@@ -9985,7 +10281,7 @@ A **Degree materialized view** is maintained incrementally — every `insert_edg
 
 `degree_centrality` is a one-shot compute: it scans the whole graph on demand and is **not** persisted unless you call `write_scores`. Use it for batch ranking, one-time exports, or feeding `write_scores`.
 
-Python `degree` / `degrees` are the read-only subset API (unique-neighbour count for one key or a caller-supplied set; adjacency is a set), distinct from `degree_centrality` and from Degree views. See [api.md](api.md#degree).
+Python `degree` / `degrees` are the read-only subset API (unique-neighbour count for one key or a caller-supplied set; adjacency is a set), distinct from `degree_centrality` and from Degree views. See [Python guide](python.md#degree).
 
 ## Write-back
 
@@ -10166,7 +10462,7 @@ explicit about:
 They do compose. A scoped handle plus a `where=` argument intersects: the scope
 decides what is visible, the predicate filters within it. On `find_similar`,
 `where=` also changes the kernel — it implies an exact search, which `mask=`
-alone does not. See [api.md](api.md#vector-search).
+alone does not. See the [Python guide](python.md#vector-search).
 
 ---
 
@@ -10181,7 +10477,7 @@ intersects it with any client mask — it can never widen the intersection.
 - Cypher rows referencing hidden nodes are filtered out entirely.
 - Roles without a declared write scope get 403 on all write and analytics endpoints.
 - Roles with a write scope may write within their declared scope — but only to nodes
-  currently in their read mask. See [api.md](api.md#write-scopes-for-role-bound-tokens)
+  currently in their read mask. See [HTTP API](http.md#write-scopes-for-role-bound-tokens)
   for the full write-scope surface, error body shapes, and the threat model.
 - An unknown token or a role name not present in `roles.json` returns 401.
 
@@ -10776,7 +11072,7 @@ in `verified: true`, and a copy that does not verify is one you must not use.
 For a running server, `POST /backup` is the correct path. It holds the read lock
 for the full duration — copies plus verification — so writers block for that
 window and the copy is consistent. It is full-token only; role tokens get 403.
-See [POST /backup](api.md#post-backup).
+See [POST /backup](http.md#post-backup).
 
 Backups are ordinary directories. A rolling scheme that writes one per run into
 a vault directory, optionally with a `latest` symlink or copy, is exactly the

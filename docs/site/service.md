@@ -99,7 +99,7 @@ in `verified: true`, and a copy that does not verify is one you must not use.
 For a running server, `POST /backup` is the correct path. It holds the read lock
 for the full duration — copies plus verification — so writers block for that
 window and the copy is consistent. It is full-token only; role tokens get 403.
-See [POST /backup](api.md#post-backup).
+See [POST /backup](http.md#post-backup).
 
 Backups are ordinary directories. A rolling scheme that writes one per run into
 a vault directory, optionally with a `latest` symlink or copy, is exactly the

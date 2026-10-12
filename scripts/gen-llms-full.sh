@@ -39,6 +39,8 @@ SITE_DOCS=(
     ingest-git.md
     query.md
     api.md
+    http.md
+    python.md
     cli.md
     python-api.md
     subscriptions.md
