@@ -1,0 +1,111 @@
+/* mushroomdb docs — the landing page's palette on mdBook's layout.
+   The values are docs/landing/index.html's; change them in both places. */
+
+:root {
+  --content-max-width: 780px;
+  --mono-font: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html, body, .sidebar, .menu-title {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+.light, html:not(.js) {
+  --bg: #fbfaf8;
+  --fg: #1b1a18;
+  --code-bg: #f3f1ec;
+  --sidebar-bg: #f3f1ec;
+  --sidebar-fg: #1b1a18;
+  --sidebar-non-existant: #a49d92;
+  --sidebar-active: #8a3324;
+  --sidebar-spacer: #e4e0d8;
+  --sidebar-header-border-color: #8a3324;
+  --scrollbar: #a49d92;
+  --icons: #625d55;
+  --icons-hover: #1b1a18;
+  --links: #8a3324;
+  --inline-code-color: #1b1a18;
+  --theme-popup-bg: #ffffff;
+  --theme-popup-border: #e4e0d8;
+  --theme-hover: #f3f1ec;
+  --quote-bg: #f3f1ec;
+  --quote-border: #e4e0d8;
+  --table-border-color: #e4e0d8;
+  --table-header-bg: #f3f1ec;
+  --table-alternate-bg: #f7f5f1;
+  --searchbar-border-color: #e4e0d8;
+  --searchbar-bg: #ffffff;
+  --searchbar-fg: #1b1a18;
+  --searchbar-shadow-color: #e4e0d8;
+  --searchresults-header-fg: #625d55;
+  --searchresults-border-color: #e4e0d8;
+  --searchresults-li-bg: #f3f1ec;
+  --search-mark-bg: #f1d3c9;
+}
+
+.navy {
+  --bg: #14130f;
+  --fg: #ece8e0;
+  --code-bg: #23211c;
+  --sidebar-bg: #1c1b17;
+  --sidebar-fg: #ece8e0;
+  --sidebar-non-existant: #625d55;
+  --sidebar-active: #e58a6d;
+  --sidebar-spacer: #302e28;
+  --sidebar-header-border-color: #e58a6d;
+  --scrollbar: #625d55;
+  --icons: #a49d92;
+  --icons-hover: #ece8e0;
+  --links: #e58a6d;
+  --inline-code-color: #ece8e0;
+  --theme-popup-bg: #1c1b17;
+  --theme-popup-border: #302e28;
+  --theme-hover: #23211c;
+  --quote-bg: #1c1b17;
+  --quote-border: #302e28;
+  --table-border-color: #302e28;
+  --table-header-bg: #23211c;
+  --table-alternate-bg: #1a1915;
+  --searchbar-border-color: #302e28;
+  --searchbar-bg: #1c1b17;
+  --searchbar-fg: #ece8e0;
+  --searchbar-shadow-color: #302e28;
+  --searchresults-header-fg: #a49d92;
+  --searchresults-border-color: #302e28;
+  --searchresults-li-bg: #23211c;
+  --search-mark-bg: #5c3327;
+}
+
+/* Two themes, the two the palette defines. */
+#mdbook-theme-list li:has(> #mdbook-theme-rust),
+#mdbook-theme-list li:has(> #mdbook-theme-coal),
+#mdbook-theme-list li:has(> #mdbook-theme-ayu) {
+  display: none;
+}
+
+html .hljs,
+html :not(pre) > code {
+  background: var(--code-bg);
+}
+html pre > code.hljs {
+  border: 1px solid var(--table-border-color);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+html :not(pre) > code {
+  border-radius: 4px;
+  padding: 0.1em 0.3em;
+}
+
+.menu-title a {
+  color: inherit;
+  text-decoration: none;
+}
+.menu-title a:hover {
+  color: var(--links);
+}
+
+.content img {
+  border: 1px solid var(--table-border-color);
+  border-radius: 10px;
+}

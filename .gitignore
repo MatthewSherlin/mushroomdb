@@ -30,3 +30,6 @@ benchmarks/agent-tasks/results/**
 !benchmarks/agent-tasks/results/**/
 !benchmarks/agent-tasks/results/**/summary*.md
 benchmarks/agent-tasks/__pycache__/
+
+# The site, as scripts/build-site.sh builds it.
+/_site/

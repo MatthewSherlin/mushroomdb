@@ -6,6 +6,12 @@
 <title>mushroomdb — the graph that stays true</title>
 <meta name="description" content="The data layer for agents that reason over entities: an embedded Rust graph database in which a relationship is a schema declaration — write a rule once, and every write derives, maintains and retracts the matching edges." />
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="mushroomdb — the graph that stays true" />
+<meta property="og:description" content="An embedded Rust graph database in which a relationship is a schema declaration: write a rule once, and every write derives, maintains and retracts the matching edges." />
+<meta property="og:url" content="https://matthewsherlin.github.io/mushroomdb/" />
+<meta property="og:image" content="https://matthewsherlin.github.io/mushroomdb/assets/social-preview.png" />
+<meta name="twitter:card" content="summary_large_image" />
 <style>
   :root {
     --bg: #fbfaf8;
@@ -39,7 +45,22 @@
   a { color: var(--accent); }
   img { max-width: 100%; height: auto; display: block; }
 
-  header { padding: 56px 0 8px; text-align: center; }
+  .topbar { display: flex; align-items: center; gap: 22px; padding: 18px 0; font-size: 15px; }
+  .topbar .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; color: var(--ink); text-decoration: none; margin-right: auto; }
+  .topbar .brand img { width: 22px; }
+  .topbar a { text-decoration: none; }
+  .topbar a:hover { text-decoration: underline; }
+  .cta { display: flex; justify-content: center; gap: 12px; margin: 0 0 30px; }
+  .cta a { padding: 9px 18px; border-radius: 8px; border: 1px solid var(--accent); text-decoration: none; font-weight: 600; }
+  .cta a.primary { background: var(--accent); color: var(--bg); }
+  .install { position: relative; }
+  .copy {
+    position: absolute; top: 8px; right: 8px; font: inherit; font-size: 13px;
+    color: var(--muted); background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 3px 9px; cursor: pointer;
+  }
+  .copy:hover { color: var(--ink); }
+  header { padding: 30px 0 8px; text-align: center; }
   header .mark { width: 96px; margin: 0 auto 18px; }
   h1 {
     font-size: 40px; line-height: 1.1; margin: 0 0 14px;
@@ -93,6 +114,14 @@
 
 <div class="wrap">
 
+  <nav class="topbar">
+    <a class="brand" href="./"><img src="assets/mark-small.svg" alt="" />mushroomdb</a>
+    <a href="docs/">Docs</a>
+    <a href="docs/quickstart.html">Quickstart</a>
+    <a href="docs/api.html">Reference</a>
+    <a href="https://github.com/MatthewSherlin/mushroomdb">GitHub</a>
+  </nav>
+
   <header>
     <img class="mark" src="assets/mark-animated.svg" alt="" />
     <h1>mushroomdb</h1>
@@ -104,8 +133,9 @@
       the rule, the score and the values that produced it.
     </p>
     <p class="alpha">Pre-1.0 alpha — APIs and formats may change between minor versions.</p>
-    <div class="install"><pre><code>npx mushroomdb install --db ./memory</code></pre></div>
+    <div class="install"><pre><code id="install-cmd">npx mushroomdb install --db ./memory</code></pre><button class="copy" type="button" data-copy="install-cmd">Copy</button></div>
     <p class="install-note">Writes the <code>/mushroom</code> skill, an MCP server listing the twenty-three-tool association surface, and the session hooks, for Claude Code or Cursor.</p>
+    <p class="cta"><a class="primary" href="docs/quickstart.html">Quickstart</a><a href="docs/">Read the docs</a></p>
     <figure>
       <img src="assets/ingest-git-cascade.gif" alt="A single SET changes one property; the rule fires, new scored edges are derived and the stale ones retracted, inside the same write" />
     </figure>
@@ -173,7 +203,8 @@
 
   <footer>
     <nav>
-      <a href="https://github.com/MatthewSherlin/mushroomdb#readme">README</a>
+      <a href="docs/">Docs</a>
+      <a href="docs/quickstart.html">Quickstart</a>
       <a href="https://github.com/MatthewSherlin/mushroomdb/blob/main/CHANGELOG.md">Changelog</a>
       <a href="https://github.com/MatthewSherlin/mushroomdb">GitHub</a>
       <a href="https://github.com/MatthewSherlin/mushroomdb/issues">Issues</a>
@@ -182,6 +213,19 @@
   </footer>
 
 </div>
+
+<script>
+  // Copy the install command. No clipboard permission, no button: the text is still selectable.
+  document.querySelectorAll("button.copy").forEach((button) => {
+    if (!navigator.clipboard) { button.remove(); return; }
+    button.addEventListener("click", async () => {
+      const source = document.getElementById(button.dataset.copy);
+      await navigator.clipboard.writeText(source.textContent);
+      button.textContent = "Copied";
+      setTimeout(() => { button.textContent = "Copy"; }, 1500);
+    });
+  });
+</script>
 
 </body>
 </html>

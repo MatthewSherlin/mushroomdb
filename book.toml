@@ -1,0 +1,21 @@
+# The documentation site. docs/site/*.md is the source; scripts/build-site.sh
+# is the only thing that should run mdBook, and it pins the version.
+[book]
+title = "mushroomdb"
+description = "The graph that stays true — and knows who's allowed to see it."
+language = "en"
+src = "docs/site"
+
+[build]
+build-dir = "_site/docs"
+create-missing = false
+
+[output.html]
+site-url = "/mushroomdb/docs/"
+git-repository-url = "https://github.com/MatthewSherlin/mushroomdb"
+edit-url-template = "https://github.com/MatthewSherlin/mushroomdb/edit/main/{path}"
+no-section-label = true
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["docs/theme/mushroom.css"]
+additional-js = ["docs/theme/home-link.js"]

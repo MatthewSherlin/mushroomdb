@@ -42,7 +42,7 @@ CLAIM_FILES=(
   .claude-plugin/marketplace.json
   scripts/plugin-templates/plugin.json.tmpl
   scripts/plugin-templates/marketplace.json.tmpl
-  docs/site/index.html
+  docs/landing/index.html
 )
 while IFS= read -r f; do CLAIM_FILES+=("$f"); done < <(ls docs/site/*.md)
 # The skill files carry product-facing copy too — a retired claim reads the same
