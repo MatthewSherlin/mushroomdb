@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import ast
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -72,6 +73,60 @@ def fill(template: str, values: dict[str, str]) -> str:
             raise Problem(f"the template has no `{marker}` line")
         template = template.replace(marker, value)
     return template
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+USAGE_ENTRY = re.compile(r"^  mushroomdb (\S+)")
+USAGE_MARKER = re.compile(r"(?m)^\{\{usage (\S+)\}\}$")
+
+
+def parse_usage(help_text: str) -> tuple[dict[str, list[str]], str]:
+    """The usage entries by subcommand, in order, and the notes under them.
+
+    The help is one block: a `Usage:` line, then an entry per form of each
+    subcommand — `  mushroomdb NAME ...` and any deeper-indented lines that
+    explain it — up to the first blank line. What follows is notes.
+    A subcommand with several forms (`schema apply`, `algo`) has several
+    entries under one name.
+    """
+    lines = [line.rstrip() for line in help_text.splitlines()]
+    if "Usage:" not in lines:
+        raise Problem("the help text has no `Usage:` line")
+    blocks: dict[str, list[list[str]]] = {}
+    current: list[str] | None = None
+    i = lines.index("Usage:") + 1
+    while i < len(lines) and lines[i]:
+        match = USAGE_ENTRY.match(lines[i])
+        if match:
+            current = [lines[i][2:]]
+            blocks.setdefault(match.group(1), []).append(current)
+        elif current is None:
+            raise Problem(f"a usage line comes before any subcommand: {lines[i]!r}")
+        else:
+            current.append(lines[i][2:])
+        i += 1
+    notes = "\n".join(lines[i:]).strip("\n")
+    return {name: ["\n".join(block) for block in forms] for name, forms in blocks.items()}, notes
+
+
+def render_cli(template: str, help_text: str) -> str:
+    entries, notes = parse_usage(help_text)
+    named = USAGE_MARKER.findall(template)
+    missing = [name for name in entries if name not in named]
+    unknown = [name for name in named if name not in entries]
+    if missing:
+        raise Problem(
+            "the CLI lists subcommands scripts/reference/cli.md.tmpl has no `{{usage NAME}}` line for: "
+            + ", ".join(missing)
+        )
+    if unknown:
+        raise Problem(
+            "scripts/reference/cli.md.tmpl has `{{usage NAME}}` lines for subcommands the CLI does not list: "
+            + ", ".join(unknown)
+        )
+    page = USAGE_MARKER.sub(lambda m: fence("\n".join(entries[m.group(1)])), template)
+    return fill(page, {"notes": fence(notes)})
 
 
 # ── Python API ────────────────────────────────────────────────────────────────
@@ -184,6 +239,9 @@ def generate(page: str, binary: str | None) -> str:
     template = (TEMPLATES / f"{page}.md.tmpl").read_text(encoding="utf-8")
     if page == "python-api":
         return render_python(template, parse_stub(STUB.read_text(encoding="utf-8")))
+    if page == "cli":
+        done = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=60, check=True)
+        return render_cli(template, done.stdout)
     raise Problem(f"no generator for the page {page!r}")
 
 

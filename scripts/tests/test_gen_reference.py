@@ -124,6 +124,66 @@ class Python(unittest.TestCase):
             gen.render_python("# T\n\n{{methods}}\n", self.stub, {"All": ["open", "find"]})
 
 
+HELP = """mushroomdb — embedded graph database
+
+Usage:
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080]
+                     --addr is where it listens
+  mushroomdb schema apply <db-dir> <schema.json>
+  mushroomdb schema apply <db-dir> --memory-defaults
+                                   applies the built-in memory schema
+  mushroomdb --version
+
+Default serve address is 127.0.0.1:8080.
+A second line of notes.
+"""
+
+CLI_TEMPLATE = "# CLI\n\n{{usage serve}}\n\nServes.\n\n{{usage schema}}\n\n{{usage --version}}\n\n{{notes}}\n"
+
+
+class Cli(unittest.TestCase):
+    def test_entries_are_read_by_subcommand_with_their_continuation_lines(self):
+        entries, _ = gen.parse_usage(HELP)
+        self.assertEqual(list(entries), ["serve", "schema", "--version"])
+        self.assertEqual(
+            entries["serve"],
+            ["mushroomdb serve <db-dir> [--addr 127.0.0.1:8080]\n                   --addr is where it listens"],
+        )
+
+    def test_a_subcommand_listed_twice_keeps_both_forms(self):
+        entries, _ = gen.parse_usage(HELP)
+        self.assertEqual(len(entries["schema"]), 2)
+        self.assertTrue(entries["schema"][1].endswith("applies the built-in memory schema"))
+
+    def test_the_notes_are_what_follows_the_usage(self):
+        _, notes = gen.parse_usage(HELP)
+        self.assertEqual(notes, "Default serve address is 127.0.0.1:8080.\nA second line of notes.")
+
+    def test_help_with_no_usage_line_fails(self):
+        with self.assertRaises(gen.Problem):
+            gen.parse_usage("mushroomdb\n")
+
+    def test_the_page_carries_each_usage_in_a_text_block(self):
+        page = gen.render_cli(CLI_TEMPLATE, HELP)
+        self.assertIn("```text\nmushroomdb schema apply <db-dir> <schema.json>\nmushroomdb schema apply <db-dir> --memory-defaults\n", page)
+        self.assertIn("Serves.", page)
+        self.assertIn("```text\nDefault serve address is 127.0.0.1:8080.\nA second line of notes.\n```", page)
+        self.assertNotIn("{{", page)
+
+    def test_a_subcommand_the_template_omits_fails_by_name(self):
+        with self.assertRaises(gen.Problem) as raised:
+            gen.render_cli(CLI_TEMPLATE.replace("{{usage schema}}\n\n", ""), HELP)
+        self.assertIn("schema", str(raised.exception))
+
+    def test_a_marker_for_a_subcommand_the_cli_lacks_fails_by_name(self):
+        with self.assertRaises(gen.Problem) as raised:
+            gen.render_cli(CLI_TEMPLATE + "\n{{usage gone}}\n", HELP)
+        self.assertIn("gone", str(raised.exception))
+
+    def test_a_binary_backed_page_without_a_binary_says_what_it_needs(self):
+        self.assertEqual(gen.main(["--check", "cli"]), 1)
+
+
 class RealTree(unittest.TestCase):
     def test_every_method_in_the_real_stub_has_a_group(self):
         stub = gen.parse_stub((ROOT / "bindings" / "python" / "mushroomdb.pyi").read_text(encoding="utf-8"))
