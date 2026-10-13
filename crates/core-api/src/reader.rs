@@ -43,6 +43,12 @@ pub struct CommitDelta {
     pub derived_inserts: Vec<(u32, u32, u32)>,
     /// Rule-derived edge **retractions** this commit: `(etype_sym, src_id, dst_id)`.
     pub derived_deletes: Vec<(u32, u32, u32)>,
+    /// View properties as this commit left them: `(node_id, view_prop, value)`,
+    /// `None` where the view has no value for the node. A view's value is in
+    /// no record — the writer computes it from the edges and properties the
+    /// records change — so the reader is handed the result rather than made
+    /// to recompute it.
+    pub view_values: Vec<(u32, String, Option<Value>)>,
 }
 
 /// Full clone of overlay state captured at fold time.
@@ -510,6 +516,18 @@ impl ReaderSnapshot {
             }
             for &(etype, src, dst) in &delta.derived_deletes {
                 Arc::make_mut(&mut w.topo).remove_edge(etype, src, dst);
+            }
+            for (node, view_prop, value) in &delta.view_values {
+                let props = Arc::make_mut(&mut w.props);
+                match value {
+                    Some(v) => props.set(*node, view_prop, v.clone()),
+                    None => {
+                        // Tombstoned as well as removed, or the snapshot's
+                        // value is read through (mirrors `clear_view_value`).
+                        props.remove(*node, view_prop);
+                        props.record_prop_tombstone(*node, view_prop);
+                    }
+                }
             }
         }
         if !self.deltas.is_empty() {
