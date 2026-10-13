@@ -261,9 +261,10 @@ Wires `DELETE /node/{key}`. Throws `MushroomError` when the node does not exist.
 Wires `GET /node/{key}/edges`. Returns `{ edges: [{ edge_type, src_key, dst_key, derived }] }`.
 Throws `MushroomError` (404) when the key does not exist.
 
-`opts.mask` — node-key allow-list (non-empty string array; no commas in keys).
-Only edges whose src **or** dst is in the list are returned. An empty array
-throws `MushroomError`.
+`opts.mask` — node-key allow-list (non-empty string array; no key that is empty, has
+surrounding whitespace or contains a comma). Only edges whose **other** endpoint is in the
+list are returned; `key` itself need not be. A list or key the server could not read as
+written throws `MushroomError`.
 
 `opts.stub_hidden` — when `true` **and** `mask` is set, edges to masked-out
 endpoints are included; those endpoints appear as
@@ -326,6 +327,11 @@ close on `/watch`, so `close()` resolves within 3 s whether or not the handshake
 
 `opts.onClose` — called once when the WebSocket closes, whether via `handle.close()` or
 because the server dropped the connection. Use it as a signal to reconnect.
+
+Against a server older than 0.8, the `ws` package's socket is force-closed when the 3 s
+bound passes. The standard `WebSocket` has no force-close: `close()` still resolves and
+`onClose` still fires, but the socket can keep a Node process alive until the runtime's
+own close timeout.
 
 ```ts
 import WS from 'ws'; // Node < 21

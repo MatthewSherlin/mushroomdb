@@ -497,9 +497,9 @@ export interface MetricsReport {
  */
 export type PropPredicate =
   /** Match nodes whose `field` equals `eq`. */
-  | { field: string; eq: CellValue }
+  | { field: string; eq: string | number | boolean }
   /** Match nodes whose `field` is one of the values in `in`. */
-  | { field: string; in: CellValue[] };
+  | { field: string; in: (string | number | boolean)[] };
 
 // ---------------------------------------------------------------------------
 // Find similar

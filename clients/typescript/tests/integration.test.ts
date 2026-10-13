@@ -1012,6 +1012,17 @@ describe("nodeEdges mask validation", () => {
     await expect(c.nodeEdges("key", { mask: [] })).rejects.toBeInstanceOf(MushroomError);
   });
 
+  it("an empty or whitespace-padded mask key throws MushroomError", async () => {
+    // The server trims each key: "" and " " leave no mask at all, which
+    // returns every edge, and " lead" silently matches nothing.
+    const c = new MushroomClient("http://example.test");
+    for (const bad of ["", " ", " lead", "lead "]) {
+      await expect(c.nodeEdges("key", { mask: ["ok", bad] })).rejects.toBeInstanceOf(
+        MushroomError,
+      );
+    }
+  });
+
   it("mask key containing a comma throws MushroomError", async () => {
     const c = new MushroomClient("http://example.test");
     await expect(c.nodeEdges("key", { mask: ["ok-key", "bad,key"] })).rejects.toBeInstanceOf(MushroomError);

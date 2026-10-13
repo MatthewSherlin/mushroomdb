@@ -218,9 +218,10 @@ export async function watch(
               // does not answer the close and onclose does not fire until
               // the ws package's own 30 s timeout. Resolve at most 3 s after
               // asking, so a caller talking to one is not left hanging.
-              // terminate() (ws-package-only) force-drops the TCP connection.
-              // doClose() fires onClose and drops all listeners so nothing
-              // keeps the event loop alive.
+              // terminate() (ws-package-only) force-drops the TCP connection;
+              // the standard WebSocket has no equivalent, and its socket can
+              // outlive this until the runtime's own close timeout.
+              // doClose() fires onClose once and drops all listeners.
               const fallback = setTimeout(() => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 (ws as any).terminate?.();

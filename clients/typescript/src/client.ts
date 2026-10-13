@@ -558,10 +558,11 @@ export class MushroomClient {
    *
    * @param key   The node key.
    * @param opts  Optional filters:
-   *   - `mask` — node-key allow-list; only edges whose src **or** dst is in
-   *     the list are returned. Must be non-empty (an empty array throws
-   *     {@link MushroomError}). Node keys must not contain a comma (the server
-   *     splits on commas; use a `query()` with `mask` for keys that do).
+   *   - `mask` — node-key allow-list; only edges whose **other** endpoint is
+   *     in the list are returned (`key` itself need not be). Must be non-empty
+   *     (an empty array throws {@link MushroomError}). A key must not contain
+   *     a comma, be empty, or have surrounding whitespace: the server splits
+   *     on commas and trims (use a `query()` with `mask` for such keys).
    *   - `stub_hidden` — when `true` and `mask` is set, edges to masked-out
    *     endpoints are **included** rather than omitted; those endpoints are
    *     returned as `{ key: string; restricted: true }` stubs rather than
@@ -583,6 +584,13 @@ export class MushroomClient {
         );
       }
       for (const k of opts.mask) {
+        if (k === "" || k !== k.trim()) {
+          throw new MushroomError(
+            `nodeEdges mask key ${JSON.stringify(k)} is empty or has surrounding ` +
+            "whitespace — the server trims each key, so it would match nothing or " +
+            "remove the mask altogether",
+          );
+        }
         if (k.includes(",")) {
           throw new MushroomError(
             `nodeEdges mask key "${k}" contains a comma — the server splits on commas ` +
