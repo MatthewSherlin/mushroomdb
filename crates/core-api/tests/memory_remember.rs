@@ -446,7 +446,7 @@ fn written(db: &GraphDb<core_storage::fs::RealFs>) -> Written {
 /// with a message naming the argument and the position, and nothing written:
 /// not the note, not the entity under an unseen label beside the bad key, not
 /// that label's full-text pair.
-fn assert_every_argument_refuses(name: &str, key: &str) {
+fn assert_every_argument_refuses(name: &str, key: &str, reason: &str) {
     let mut db = store(name);
     remember(&mut db, &input("Ada wrote the first one", &["ada".into()])).unwrap();
     let before = written(&db);
@@ -498,7 +498,7 @@ fn assert_every_argument_refuses(name: &str, key: &str) {
         match refused {
             Err(core_api::GraphError::IngestError { detail }) => assert_eq!(
                 detail,
-                format!("remember: {argument} must not be empty or only whitespace, got {key:?}")
+                format!("remember: {argument} must not be {reason}, got {key:?}")
             ),
             other => panic!("{argument}: expected the empty-key refusal, got {other:?}"),
         }
@@ -510,12 +510,12 @@ fn assert_every_argument_refuses(name: &str, key: &str) {
 
 #[test]
 fn an_empty_key_is_refused_wherever_remember_takes_one() {
-    assert_every_argument_refuses("empty-key", "");
+    assert_every_argument_refuses("empty-key", "", "empty or only whitespace");
 }
 
 #[test]
 fn a_whitespace_only_key_is_refused_the_same_way() {
-    assert_every_argument_refuses("blank-key", " \t\n");
+    assert_every_argument_refuses("blank-key", " \t\n", "empty or only whitespace");
 }
 
 /// The refusal is for a key with nothing in it. A padded key is a different,
@@ -886,4 +886,32 @@ fn a_stub_whose_key_implies_more_aliases_than_the_cap_is_refused() {
     )
     .expect("matched");
     assert_eq!(report.matched, 1);
+}
+
+/// A key of only characters that print as nothing — a zero-width space, a
+/// control character, a byte-order mark — names nothing either (defect 78).
+/// The definition is the digest's: what `sanitize` turns into spaces.
+#[test]
+fn a_key_with_no_visible_character_is_refused_the_same_way() {
+    for (i, key) in ["\u{200b}", "\u{1}", "\u{feff}", " \u{200b}\u{202e}\t"]
+        .iter()
+        .enumerate()
+    {
+        assert_every_argument_refuses(
+            &format!("invisible-key-{i}"),
+            key,
+            "only invisible characters",
+        );
+    }
+}
+
+/// The refusal is for a key with nothing to see in it. One that carries an
+/// invisible character beside text is stored as given, as a padded key is.
+#[test]
+fn a_key_with_an_invisible_character_beside_text_is_still_taken_as_given() {
+    let mut db = store("zero-width-beside-text");
+    let about = vec!["re\u{200b}id".to_string()];
+    let report = remember(&mut db, &input("Reid reviewed the copy", &about)).expect("remember");
+    assert_eq!(report.provisional, about);
+    assert!(db.has_node("re\u{200b}id"));
 }

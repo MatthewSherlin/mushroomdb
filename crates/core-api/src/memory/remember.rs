@@ -212,6 +212,11 @@ pub struct RememberReport {
 /// and a node label (defect 77). `argument` says which argument held it and
 /// is only built for the refusal.
 ///
+/// So is one made only of characters that print as nothing — a zero-width
+/// space, a control character, a byte-order mark (defect 78). `str::trim`
+/// does not count those as whitespace; the definition used is the digest's,
+/// [`crate::digest::sanitize`], which prints each of them as a space.
+///
 /// A value with text between its padding is not this function's business: it
 /// is stored as given.
 fn refuse_blank(value: &str, argument: impl FnOnce() -> String) -> Result<()> {
@@ -219,6 +224,14 @@ fn refuse_blank(value: &str, argument: impl FnOnce() -> String) -> Result<()> {
         return Err(GraphError::IngestError {
             detail: format!(
                 "{} must not be empty or only whitespace, got {value:?}",
+                argument()
+            ),
+        });
+    }
+    if crate::digest::sanitize(value).trim().is_empty() {
+        return Err(GraphError::IngestError {
+            detail: format!(
+                "{} must not be only invisible characters, got {value:?}",
                 argument()
             ),
         });

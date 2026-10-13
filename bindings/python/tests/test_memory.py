@@ -492,3 +492,35 @@ def test_identity_clusters_refuses_a_floor_that_is_not_a_number(db):
     for bad in (float("nan"), float("inf")):
         with pytest.raises(ValueError, match="finite"):
             db.identity_clusters(floor=bad)
+
+
+@pytest.mark.parametrize("key", ["​", "\x01", "﻿", " ​‮\t"])
+def test_a_key_of_only_invisible_characters_is_refused_and_nothing_is_written(db, key):
+    """Defect 78: a zero-width space, a control character or a byte-order mark
+    is not whitespace to `str::trim`, so such a key used to be stubbed."""
+    db.remember("Ada wrote the first one", about=["ada"], ts=TS)
+    before = (db.stats(), db.wal_total_commits())
+    calls = {
+        "remember: about[1]": dict(about=["ada", key]),
+        "remember: facts[0].subject": dict(
+            facts=[{"subject": key, "predicate": "KNOWS", "object": "ada"}]
+        ),
+        "remember: facts[0].object": dict(
+            facts=[{"subject": "ada", "predicate": "KNOWS", "object": key}]
+        ),
+        "remember: entities[1].key": dict(
+            entities=[{"key": "v0.7", "label": "Release"}, {"key": key, "label": "Person"}]
+        ),
+    }
+    for argument, kwargs in calls.items():
+        with pytest.raises(IngestError) as err:
+            db.remember("a note that must not land", ts=TS + 1, **kwargs)
+        assert err.value.detail.startswith(
+            f"{argument} must not be only invisible characters, got "
+        )
+    with pytest.raises(IngestError) as err:
+        db.upsert_entity(key, {"name": "Nobody"}, label="Person")
+    assert err.value.detail.startswith("key must not be only invisible characters, got ")
+
+    assert (db.stats(), db.wal_total_commits()) == before, "a refusal writes nothing"
+    assert db.node_info(key) is None
