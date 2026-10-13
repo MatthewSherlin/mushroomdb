@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A truncating snapshot no longer hands discarded commit numbers to the commits that follow.** `GraphDb::snapshot()`, Python's `snapshot()`, `mushroomdb snapshot --truncate` and `mushroomdb migrate` discard the WAL. They left the store's floor where it was, so the replacement WAL was numbered over the old one: `stats` went on reporting `history: complete (nothing pruned)`, and `asof --commit 3`, `open_at(3)`, `edges_at` and `was_linked` answered a commit number taken before the snapshot with whatever commit now sat at that position — a different graph, with no error. The floor now moves to where the discarded history ended, as it already did when `--retention` pruned an archive. `stats` reports `history: reaches back to commit N`, and a read at a discarded commit is refused as out of range, naming the floor (row 80).
+
+  **This changes commit numbers after a truncating snapshot.** The next commit is numbered on from the old total, where it used to be numbered from 0, and `wal_total_commits()` no longer drops. A caller that relied on "commit 0 is my first write after `snapshot()`" has to add `history_floor`. Archives taken before a truncating snapshot are removed by it: they are below the new floor.
+
+  **A store truncated by 0.7.1 or earlier is not repaired.** It keeps reporting its history as complete, because nothing on disk records how many commits were discarded. Its next truncating snapshot sets the floor correctly from then on.
+
 ## v0.7.1 — four corrections
 
 No new feature and nothing removed. A 0.7.0 store opens unchanged.

@@ -1349,6 +1349,12 @@ class GraphDb:
         directly and skips WAL replay, which is what makes reopening a large
         store quick.
 
+        This discards history: the commits before the snapshot can no longer
+        be read with `query_at`, `edges_at` or `was_linked`. They keep their
+        numbers. `stats()["history_floor"]` moves to where they ended, the next
+        commit is numbered on from there, and a read at a discarded commit
+        raises `CommitOutOfRange`.
+
         A snapshot needs the store's write lock, because it replaces the WAL a
         peer may be appending to. A handle that does not hold the lock raises
         `MushroomBusy` rather than snapshotting around another process's

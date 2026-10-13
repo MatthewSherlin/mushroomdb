@@ -297,9 +297,20 @@ is the state after the first WAL frame.
 **truncates the WAL to empty**. After a snapshot:
 
 - `GraphDb::open()` loads from the snapshot plus any post-snapshot WAL frames.
-- `GraphDb::open_at()` loads from WAL only (snapshot is ignored). Commit 0
-  refers to the first WAL frame after the snapshot. Pre-snapshot history is
-  not available.
+- The commits before the snapshot are discarded, and they keep their numbers.
+  The store's floor moves to where they ended, and the first commit after the
+  snapshot is numbered from there. `GraphDb::open_at()` of a discarded number
+  returns `CommitOutOfRange`, naming the floor; it never answers with a later
+  commit that happens to sit at the same position in the new WAL.
+- `stats` reports the floor (`history_floor`), and the CLI prints it as
+  `history: reaches back to commit N`.
+
+A store truncated by 0.7.1 or an earlier release is the exception. Those
+releases numbered the new WAL from 0 again and left the floor where it was, so
+such a store still reports its history as complete, and a commit number taken
+before the truncation now names a different commit. Nothing on disk records how
+many commits were discarded, so this cannot be repaired on open; the next
+truncating snapshot sets the floor correctly from then on.
 
 `snapshot_with(SnapshotOptions { keep_wal: true })` writes the snapshot but
 leaves the WAL intact, so `open_at` can reach all WAL commits including those
@@ -310,7 +321,7 @@ Choose based on operational priorities:
 | Goal | Method |
 |---|---|
 | Preserve full as-of history | `snapshot_with(keep_wal: true)`; WAL grows until an explicit truncating `snapshot()` |
-| Fast startup, short WAL | `snapshot()` (default); as-of history restarts from that point |
+| Fast startup, short WAL | `snapshot()` (default); as-of history starts from that point, and commit numbers carry on |
 | Both: rolling checkpoints + eventual truncation | `keep_wal=true` for routine checkpoints; standard `snapshot()` when you decide to prune |
 
 **Torn WAL tail:** if the WAL has a partial frame (e.g., after a crash
