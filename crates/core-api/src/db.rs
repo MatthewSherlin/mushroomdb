@@ -394,6 +394,20 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
     }
 }
 
+/// Whether `rec` only declares or withdraws something about the store — a
+/// full-text pair, an equality index, the multiplicity opt-in — and writes no
+/// node, edge or property. These are the records a truncating snapshot
+/// re-emits into its baseline WAL.
+fn is_declaration(rec: &WalRecord) -> bool {
+    matches!(
+        rec,
+        WalRecord::EnableFulltext { .. }
+            | WalRecord::DisableFulltext { .. }
+            | WalRecord::EnableIndex { .. }
+            | WalRecord::DisableIndex { .. }
+    ) || *rec == core_storage::wal::MULTIPLICITY_ENABLED
+}
+
 /// Database-wide counters plus per-rule budget/fire stats.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Stats {
@@ -2772,15 +2786,25 @@ impl<F: Fs> GraphDb<F> {
         // Materialize any state retained in the mmap base before the first
         // frame lands, so a replayed record cannot trip the lazy-init guard and
         // rebuild indexes from an empty graph. Both calls are idempotent.
-        self.ensure_v8_base_sections_loaded();
-        self.engine.consume_retained_state_eager(
-            &self.ids,
-            &self.syms,
-            &self.labels,
-            build_props_view(&self.props, &self.base),
-        );
+        //
+        // Not before a declaration, though. Every truncating snapshot re-emits
+        // one record for each declared pair, so a snapshotted store with any
+        // declaration always has frames to replay; counting those as writes
+        // made every open of such a store pay the scan a store with no
+        // declaration defers to its first write.
+        let mut retained_consumed = false;
         let applied = records.len();
         for rec in records {
+            if !retained_consumed && !is_declaration(&rec) {
+                self.ensure_v8_base_sections_loaded();
+                self.engine.consume_retained_state_eager(
+                    &self.ids,
+                    &self.syms,
+                    &self.labels,
+                    build_props_view(&self.props, &self.base),
+                );
+                retained_consumed = true;
+            }
             self.apply(&rec)?;
             let _ = self.engine.drain_deltas();
             // Track commit_seq during replay so last_change entries are
@@ -3677,7 +3701,12 @@ impl<F: Fs> GraphDb<F> {
         // embedded write after every reopen. Hoisted here the scan sees exactly
         // the persisted state; the record's own hook then files its vector
         // through the ordinary insert path a line later.
-        self.populate_indexes_before_write();
+        //
+        // A declaration writes no node and no edge, and its arm reads no rule
+        // index, so it does not start the scan.
+        if !is_declaration(rec) {
+            self.populate_indexes_before_write();
+        }
         match rec {
             WalRecord::InsertNode { label, key, props } => {
                 let id = Arc::make_mut(&mut self.ids).try_insert(key)?;
@@ -7444,8 +7473,9 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// After this call, every subsequent write to `(label, field)` is reflected
     /// in the index incrementally.  Existing nodes are backfilled immediately.
-    /// The declaration is persisted as a WAL record; the index itself is rebuilt
-    /// from scratch on re-open (no snapshot format changes).
+    /// The declaration is persisted as a WAL record. The index is carried by
+    /// the next snapshot and read from it at open; until then it is rebuilt
+    /// at open from the stored values.
     ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
@@ -10182,6 +10212,16 @@ impl<F: Fs> GraphDb<F> {
     #[doc(hidden)]
     pub fn hnsw_build_count(&self) -> u64 {
         self.engine.hnsw_build_count()
+    }
+
+    /// Whether the rule engine has built its candidate indexes on this handle.
+    ///
+    /// A store opened from a snapshot defers that full node scan until the
+    /// first write or the first read that needs it. Exposed for tests that
+    /// assert an open did not pay for it; not part of the stable surface.
+    #[doc(hidden)]
+    pub fn rule_indexes_populated(&self) -> bool {
+        self.engine.indexes_populated()
     }
 
     /// How many rules this handle still holds a lazily-decoded HNSW graph for.
