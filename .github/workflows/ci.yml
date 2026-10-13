@@ -362,11 +362,13 @@ jobs:
           VERSION=$(node -p "require('./packaging/npm/package.json').version")
           NAME="mushroomdb"
           case "$TARGET" in *windows*) NAME="mushroomdb.exe" ;; esac
-          REL="$RUNNER_TEMP/rel"
-          mkdir -p "$REL" "$RUNNER_TEMP/stage"
-          cp "target/${TARGET}/release/${NAME}" "$RUNNER_TEMP/stage/${NAME}"
+          # Relative paths for tar, as `release.yml` has them: Git Bash's tar
+          # reads `D:\…` as a remote host.
+          mkdir -p smoke-rel smoke-stage
+          REL="smoke-rel"
+          cp "target/${TARGET}/release/${NAME}" "smoke-stage/${NAME}"
           ASSET="mushroomdb-v${VERSION}-${TARGET}.tar.gz"
-          tar -C "$RUNNER_TEMP/stage" -czf "$REL/$ASSET" "$NAME"
+          tar -C smoke-stage -czf "$REL/$ASSET" "$NAME"
           ( cd "$REL" && { sha256sum "$ASSET" 2>/dev/null || shasum -a 256 "$ASSET"; } > SHA256SUMS )
           node -e "
             const http = require('http'), fs = require('fs'), path = require('path');

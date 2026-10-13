@@ -5,9 +5,8 @@ const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
-const os = require("os");
 const path = require("path");
-const { spawnSync } = require("child_process");
+const zlib = require("zlib");
 
 const pkg = require("./package.json");
 const SUPPORTED = [
@@ -73,6 +72,29 @@ function fetchBuffer(url) {
   });
 }
 
+// The bytes of the file named `name` inside a gzipped tarball, or null.
+//
+// Read here and not by running `tar`: there is not always one, and where
+// there are two — Git Bash on Windows puts GNU tar ahead of the system's —
+// the one found first reads a path that starts `C:` as a remote host.
+function fileFromTarball(tarball, name) {
+  const tar = zlib.gunzipSync(tarball);
+  for (let at = 0; at + 512 <= tar.length; ) {
+    const header = tar.subarray(at, at + 512);
+    if (header.every((b) => b === 0)) break;
+    const entry = header.subarray(0, 100).toString("utf8").replace(/\0.*$/, "");
+    const size = parseInt(header.subarray(124, 136).toString("utf8").trim(), 8) || 0;
+    const type = String.fromCharCode(header[156] || 48);
+    const body = at + 512;
+    if ((type === "0" || type === "\0") && path.posix.basename(entry) === name) {
+      if (body + size > tar.length) return null;
+      return tar.subarray(body, body + size);
+    }
+    at = body + Math.ceil(size / 512) * 512;
+  }
+  return null;
+}
+
 function checksumOf(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
@@ -121,20 +143,11 @@ async function main() {
     fail(`checksum mismatch for ${asset}: got ${got} want ${want}`);
   }
 
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mushroomdb-npm-"));
-  const tarPath = path.join(tmp, asset);
-  fs.writeFileSync(tarPath, tarball);
-  const extracted = spawnSync("tar", ["-xzf", tarPath, "-C", tmp], {
-    encoding: "utf8",
-  });
-  if (extracted.status !== 0) {
-    fail(`tar extract failed: ${extracted.stderr || extracted.stdout || extracted.status}`);
-  }
-  const extractedBin = path.join(tmp, binName);
-  if (!fs.existsSync(extractedBin)) {
+  const binary = fileFromTarball(tarball, binName);
+  if (!binary) {
     fail(`tarball ${asset} did not contain ./${binName}`);
   }
-  fs.copyFileSync(extractedBin, dest);
+  fs.writeFileSync(dest, binary);
   fs.chmodSync(dest, 0o755);
   process.stdout.write(`installed ${dest} (${target} ${tag})\n`);
 }
