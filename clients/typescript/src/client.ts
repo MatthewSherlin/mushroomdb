@@ -78,10 +78,12 @@ export type {
   NodeEdgesResult,
   NodeHistoryResult,
   NodeInfo,
+  NodeKeyOrStub,
   PageRankConfig,
   PageRankReport,
   PredicateKind,
   PredicateSummary,
+  PropPredicate,
   QueryResult,
   RuleDef,
   RulePredicate,
@@ -556,9 +558,16 @@ export class MushroomClient {
    *
    * @param key   The node key.
    * @param opts  Optional filters:
-   *   - `mask` — comma-separated allow-list of node keys; only edges whose
-   *     src or dst is in the list are returned.
-   *   - `stub_hidden` — when true, include placeholder-only nodes.
+   *   - `mask` — node-key allow-list; only edges whose src **or** dst is in
+   *     the list are returned. Must be non-empty (an empty array throws
+   *     {@link MushroomError}). Node keys must not contain a comma (the server
+   *     splits on commas; use a `query()` with `mask` for keys that do).
+   *   - `stub_hidden` — when `true` and `mask` is set, edges to masked-out
+   *     endpoints are **included** rather than omitted; those endpoints are
+   *     returned as `{ key: string; restricted: true }` stubs rather than
+   *     plain key strings. Without a mask this option is silently ignored by
+   *     the server. Note that `as_of` (time-travel) does not compose with
+   *     `stub_hidden`; the server rejects that combination.
    */
   async nodeEdges(
     key: string,
@@ -566,7 +575,21 @@ export class MushroomClient {
   ): Promise<NodeEdgesResult> {
     this.checkPathSeg(key);
     const qs = new URLSearchParams();
-    if (opts?.mask) {
+    if (opts?.mask !== undefined) {
+      if (opts.mask.length === 0) {
+        throw new MushroomError(
+          "nodeEdges mask must not be empty — an empty allow-list is ambiguous; " +
+          "omit mask to return all edges, or use query() with mask:[] to hide all nodes",
+        );
+      }
+      for (const k of opts.mask) {
+        if (k.includes(",")) {
+          throw new MushroomError(
+            `nodeEdges mask key "${k}" contains a comma — the server splits on commas ` +
+            "and cannot express a key with one; use query() with mask for such keys",
+          );
+        }
+      }
       qs.set("mask", opts.mask.join(","));
     }
     if (opts?.stub_hidden !== undefined) {
@@ -662,7 +685,7 @@ export class MushroomClient {
    * Wraps `DELETE /edges/{etype}/{src}/{dst}`. Returns silently when the edge
    * does not exist (idempotent — the server answers 200). Throws
    * {@link MushroomError} only when an endpoint node is missing
-   * (404 "node key not found: <key>").
+   * (400 "node key not found: <key>").
    *
    * @param etype  Edge type string.
    * @param src    Source node key.

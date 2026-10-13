@@ -481,6 +481,27 @@ export interface MetricsReport {
 }
 
 // ---------------------------------------------------------------------------
+// Prop predicate (used by find_similar `where` and by role definitions)
+// ---------------------------------------------------------------------------
+
+/**
+ * A property filter accepted by `POST /find_similar`'s `where` field and by
+ * the server's role-definition API.
+ *
+ * Mirrors `core_api::roles::PropPredicate` (a flat struct serialised as a JSON
+ * object with `field` required and exactly one of `eq` or `in`).
+ *
+ * The server also accepts the graph's own tagged Value form for the values:
+ * `{"Str": "x"}`, `{"Int": 3}` and `{"Bool": true}` are equivalent to their
+ * plain scalar counterparts `"x"`, `3` and `true`.
+ */
+export type PropPredicate =
+  /** Match nodes whose `field` equals `eq`. */
+  | { field: string; eq: CellValue }
+  /** Match nodes whose `field` is one of the values in `in`. */
+  | { field: string; in: CellValue[] };
+
+// ---------------------------------------------------------------------------
 // Find similar
 // ---------------------------------------------------------------------------
 
@@ -506,11 +527,17 @@ export interface FindSimilarOptions {
   /** Force exhaustive scan instead of ANN index. */
   exact?: boolean;
   /**
-   * Cypher `WHERE` filter applied after the vector search. Only nodes whose
-   * properties satisfy the expression are included in the result.
-   * Example: `"n.score > 0.9"`.
+   * Property predicate applied after the vector search: only nodes whose
+   * stored value for `field` matches are returned.
+   *
+   * The server accepts two forms — `eq` (single-value equality) and `in`
+   * (set membership). Plain JSON scalars are accepted (`"published"`, `3`,
+   * `true`) as well as the graph's own tagged form (`{"Str":"published"}`).
+   *
+   * @example `{ field: "status", eq: "published" }`
+   * @example `{ field: "status", in: ["draft", "review"] }`
    */
-  where?: string;
+  where?: PropPredicate;
 }
 
 /**
@@ -528,15 +555,40 @@ export interface FindSimilarResult {
 // ---------------------------------------------------------------------------
 
 /**
+ * A node-key endpoint in a masked edge.
+ *
+ * When `nodeEdges` is called with `mask` **and** `stub_hidden: true`, an
+ * endpoint that lies outside the mask is returned as a restricted stub
+ * object rather than a plain string. Without `stub_hidden`, out-of-mask edges
+ * are omitted entirely.
+ *
+ * ```ts
+ * if (typeof edge.dst_key === 'string') {
+ *   // visible endpoint
+ * } else {
+ *   // restricted stub — only the key is known
+ *   console.log(edge.dst_key.key, edge.dst_key.restricted); // true
+ * }
+ * ```
+ */
+export type NodeKeyOrStub = string | { key: string; restricted: true };
+
+/**
  * One edge entry from `GET /node/{key}/edges`.
  *
  * Mirrors `core_api::EdgeInfo` as serialised by
- * `crates/server/src/json.rs::node_edges_json`.
+ * `crates/server/src/json.rs::node_edges_json` (unmasked call) or
+ * `json.rs::masked_edges_json` (call with `mask`/`stub_hidden`).
+ *
+ * When the call is made **without** a mask, `src_key` and `dst_key` are
+ * always plain strings. When `stub_hidden: true` is in use, a masked-out
+ * endpoint is returned as `{ key: string; restricted: true }` — see
+ * {@link NodeKeyOrStub}.
  */
 export interface EdgeInfo {
   edge_type: string;
-  src_key: string;
-  dst_key: string;
+  src_key: NodeKeyOrStub;
+  dst_key: NodeKeyOrStub;
   /** true when this edge was derived by a rule; false when it was asserted. */
   derived: boolean;
 }

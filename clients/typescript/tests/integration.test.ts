@@ -1003,6 +1003,249 @@ describe("wasLinked request", () => {
 });
 
 // ---------------------------------------------------------------------------
+// nodeEdges mask validation — pure unit tests
+// ---------------------------------------------------------------------------
+
+describe("nodeEdges mask validation", () => {
+  it("empty mask array throws MushroomError", async () => {
+    const c = new MushroomClient("http://example.test");
+    await expect(c.nodeEdges("key", { mask: [] })).rejects.toBeInstanceOf(MushroomError);
+  });
+
+  it("mask key containing a comma throws MushroomError", async () => {
+    const c = new MushroomClient("http://example.test");
+    await expect(c.nodeEdges("key", { mask: ["ok-key", "bad,key"] })).rejects.toBeInstanceOf(MushroomError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// nodeEdges mask + stub_hidden — live server
+// ---------------------------------------------------------------------------
+
+describe.skipIf(NO_SERVER)("nodeEdges mask and stub_hidden (live)", () => {
+  it("mask filters returned edges to those involving allowed keys", async () => {
+    const centerKey = `ts-ne-ctr-${Date.now()}`;
+    const nb1Key = `ts-ne-nb1-${Date.now()}`;
+    const nb2Key = `ts-ne-nb2-${Date.now()}`;
+    await client.createNode("TsNeTest", centerKey);
+    await client.createNode("TsNeTest", nb1Key);
+    await client.createNode("TsNeTest", nb2Key);
+    await client.createEdge("NE_LINK", centerKey, nb1Key);
+    await client.createEdge("NE_LINK", centerKey, nb2Key);
+    try {
+      // mask includes centerKey and nb1Key but not nb2Key
+      const result = await client.nodeEdges(centerKey, { mask: [centerKey, nb1Key] });
+      const dstKeys = result.edges.map((e) =>
+        typeof e.dst_key === "string" ? e.dst_key : e.dst_key.key,
+      );
+      expect(dstKeys).toContain(nb1Key);
+      expect(dstKeys).not.toContain(nb2Key);
+    } finally {
+      await client.deleteEdge("NE_LINK", centerKey, nb1Key);
+      await client.deleteEdge("NE_LINK", centerKey, nb2Key);
+      await client.deleteNode(centerKey);
+      await client.deleteNode(nb1Key);
+      await client.deleteNode(nb2Key);
+    }
+  });
+
+  it("stub_hidden:true returns restricted stubs for masked-out endpoints", async () => {
+    const centerKey = `ts-ne-sh-c-${Date.now()}`;
+    const visKey = `ts-ne-sh-v-${Date.now()}`;
+    const hidKey = `ts-ne-sh-h-${Date.now()}`;
+    await client.createNode("TsNeStub", centerKey);
+    await client.createNode("TsNeStub", visKey);
+    await client.createNode("TsNeStub", hidKey);
+    await client.createEdge("SH_LINK", centerKey, visKey);
+    await client.createEdge("SH_LINK", centerKey, hidKey);
+    try {
+      // mask includes center + visKey only; hidKey is outside mask
+      const result = await client.nodeEdges(centerKey, {
+        mask: [centerKey, visKey],
+        stub_hidden: true,
+      });
+      // hidKey edge should appear as a restricted stub
+      const hidEdge = result.edges.find((e) => {
+        const dst = e.dst_key;
+        return typeof dst === "object" && dst.key === hidKey;
+      });
+      expect(hidEdge).toBeDefined();
+      expect(
+        (hidEdge!.dst_key as { key: string; restricted: true }).restricted,
+      ).toBe(true);
+      // visKey edge should still be a plain string
+      const visEdge = result.edges.find((e) => e.dst_key === visKey);
+      expect(visEdge).toBeDefined();
+    } finally {
+      await client.deleteEdge("SH_LINK", centerKey, visKey);
+      await client.deleteEdge("SH_LINK", centerKey, hidKey);
+      await client.deleteNode(centerKey);
+      await client.deleteNode(visKey);
+      await client.deleteNode(hidKey);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findSimilar with where — live server
+// ---------------------------------------------------------------------------
+
+describe.skipIf(NO_SERVER)("findSimilar where (live)", () => {
+  it("where.eq filters results by property equality", async () => {
+    const key1 = `ts-fsw-pub-${Date.now()}`;
+    const key2 = `ts-fsw-dra-${Date.now()}`;
+    const vec = [0.1, 0.2, 0.3];
+    await client.createNode("TsFsWhere", key1, { embedding: vec, status: "pub" });
+    await client.createNode("TsFsWhere", key2, { embedding: vec, status: "dra" });
+    try {
+      const result = await client.findSimilar({
+        field: "embedding",
+        vector: vec,
+        k: 20,
+        min: 0.5,
+        where: { field: "status", eq: "pub" },
+      });
+      const keys = result.hits.map(([k]) => k);
+      expect(keys).toContain(key1);
+      expect(keys).not.toContain(key2);
+    } finally {
+      await client.deleteNode(key1);
+      await client.deleteNode(key2);
+    }
+  });
+
+  it("where.in filters results by set membership", async () => {
+    const key1 = `ts-fswi-a-${Date.now()}`;
+    const key2 = `ts-fswi-b-${Date.now()}`;
+    const key3 = `ts-fswi-c-${Date.now()}`;
+    const vec = [0.1, 0.2, 0.3];
+    await client.createNode("TsFsWhereIn", key1, { embedding: vec, status: "a" });
+    await client.createNode("TsFsWhereIn", key2, { embedding: vec, status: "b" });
+    await client.createNode("TsFsWhereIn", key3, { embedding: vec, status: "c" });
+    try {
+      const result = await client.findSimilar({
+        field: "embedding",
+        vector: vec,
+        k: 20,
+        min: 0.5,
+        where: { field: "status", in: ["a", "b"] },
+      });
+      const keys = result.hits.map(([k]) => k);
+      expect(keys).toContain(key1);
+      expect(keys).toContain(key2);
+      expect(keys).not.toContain(key3);
+    } finally {
+      await client.deleteNode(key1);
+      await client.deleteNode(key2);
+      await client.deleteNode(key3);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// watch onClose callback + terminate() fallback — mock-based
+// ---------------------------------------------------------------------------
+
+describe.skipIf(NO_SERVER)("watch onClose (live — client close)", () => {
+  it("onClose fires exactly once when the caller closes the handle", async () => {
+    let closeCount = 0;
+    const handle = await client.watch(
+      {
+        wsConstructor: WS as unknown as import("../src/ws.js").WsConstructor,
+        onClose: () => { closeCount++; },
+      },
+      () => {},
+    );
+    await handle.close();
+    // Small settling pause — onClose is called synchronously inside doClose()
+    // but may be queued by the ws package's internals.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(closeCount).toBe(1);
+    // A second close() must not fire onClose again.
+    await handle.close();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(closeCount).toBe(1);
+  }, 10_000);
+});
+
+describe("watch onClose — server drop (mock)", () => {
+  it("onClose fires when the server drops the connection after ack", async () => {
+    let closeFired = false;
+    class DropWs {
+      onopen: ((ev: unknown) => void) | null = null;
+      onmessage: ((ev: { data: unknown }) => void) | null = null;
+      onclose: ((ev: unknown) => void) | null = null;
+      onerror: ((ev: unknown) => void) | null = null;
+      constructor(_url: string) {
+        queueMicrotask(() => {
+          this.onopen?.(null);
+          queueMicrotask(() => {
+            this.onmessage?.({ data: JSON.stringify({ subscribed: true }) });
+            // Simulate server dropping the connection immediately after ack.
+            queueMicrotask(() => this.onclose?.(null));
+          });
+        });
+      }
+      send(_data: string): void {}
+      close(): void { /* server already dropped it */ }
+    }
+    const c = new MushroomClient("http://example.test");
+    const handle = await c.watch(
+      {
+        wsConstructor: DropWs as unknown as import("../src/ws.js").WsConstructor,
+        onClose: () => { closeFired = true; },
+      },
+      () => {},
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    expect(closeFired).toBe(true);
+    // close() after server drop must not throw and must not fire onClose again.
+    let secondFire = false;
+    await handle.close();
+    expect(secondFire).toBe(false);
+  });
+});
+
+describe("watch terminate() fallback (mock)", () => {
+  it("close() resolves ~3s, fires onClose, calls terminate() when server never answers", async () => {
+    let closeFired = false;
+    let terminateCalled = false;
+    class NeverClosesWs {
+      onopen: ((ev: unknown) => void) | null = null;
+      onmessage: ((ev: { data: unknown }) => void) | null = null;
+      onclose: ((ev: unknown) => void) | null = null;
+      onerror: ((ev: unknown) => void) | null = null;
+      constructor(_url: string) {
+        queueMicrotask(() => {
+          this.onopen?.(null);
+          queueMicrotask(() =>
+            this.onmessage?.({ data: JSON.stringify({ subscribed: true }) }),
+          );
+        });
+      }
+      send(_data: string): void {}
+      close(): void { /* never answers — onclose is never called */ }
+      terminate(): void { terminateCalled = true; }
+    }
+    const c = new MushroomClient("http://example.test");
+    const handle = await c.watch(
+      {
+        wsConstructor: NeverClosesWs as unknown as import("../src/ws.js").WsConstructor,
+        onClose: () => { closeFired = true; },
+      },
+      () => {},
+    );
+    const t0 = Date.now();
+    await handle.close();
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeGreaterThan(2_900);
+    expect(elapsed).toBeLessThan(4_000);
+    expect(terminateCalled).toBe(true);
+    expect(closeFired).toBe(true);
+  }, 6_000);
+});
+
+// ---------------------------------------------------------------------------
 // watch — constructor token forwarded as ?token=
 // ---------------------------------------------------------------------------
 

@@ -173,6 +173,20 @@ export async function watch(
       closeResolve = res;
     });
 
+    /** Resolve closePromise once, fire onClose once, drop all listeners. */
+    function doClose(): void {
+      const res = closeResolve;
+      if (!res) return; // already called
+      closeResolve = null;
+      // Drop all handlers so nothing keeps the event loop alive.
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      opts.onClose?.();
+      res();
+    }
+
     ws.onopen = () => {
       // /watch sends the ack without a client subscribe message; nothing to send.
     };
@@ -205,10 +219,12 @@ export async function watch(
               // the ws package's own 30 s timeout. Resolve at most 3 s after
               // asking, so a caller talking to one is not left hanging.
               // terminate() (ws-package-only) force-drops the TCP connection.
+              // doClose() fires onClose and drops all listeners so nothing
+              // keeps the event loop alive.
               const fallback = setTimeout(() => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 (ws as any).terminate?.();
-                closeResolve?.();
+                doClose();
               }, 3_000);
               return closePromise.finally(() => clearTimeout(fallback));
             },
@@ -227,10 +243,18 @@ export async function watch(
 
     ws.onerror = (err: unknown) => {
       if (!subscribed) {
-        const detail =
-          err instanceof Error
-            ? err.message
-            : "WebSocket error before watch ack";
+        let detail: string;
+        if (err instanceof Error && err.message) {
+          detail = err.message;
+        } else {
+          // Global WebSocket error events carry no useful status; include the
+          // URL path so the caller can identify the endpoint.
+          try {
+            detail = `${new URL(wsUrl).pathname} failed before watch ack`;
+          } catch {
+            detail = "WebSocket error before watch ack";
+          }
+        }
         reject(new MushroomError(detail));
       }
     };
@@ -238,11 +262,9 @@ export async function watch(
     ws.onclose = () => {
       if (!subscribed) {
         reject(new MushroomError("WebSocket closed before watch ack"));
+        return;
       }
-      closeResolve?.();
-      if (subscribed) {
-        opts.onClose?.();
-      }
+      doClose();
     };
   });
 }

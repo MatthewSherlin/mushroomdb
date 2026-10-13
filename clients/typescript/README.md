@@ -237,6 +237,14 @@ Wires `POST /find_similar`. Approximate nearest-neighbour search over a vector p
 `opts.field` and `opts.vector` are required; `opts.k`, `opts.min`, `opts.label`, `opts.mask`,
 `opts.exact` are optional. Returns `{ hits: [key, score][] }`.
 
+`opts.where` — a `PropPredicate` applied after the search:
+```ts
+// equality
+{ field: 'status', eq: 'published' }
+// set membership
+{ field: 'status', in: ['draft', 'review'] }
+```
+
 ### `client.createNode(label, key, props?, namespace?) → Promise<CreateNodeResult>`
 
 Wires `POST /nodes`. Inserts a node with the given label and key. This is an
@@ -248,10 +256,19 @@ Returns `{ ok, nodes, edges }`.
 
 Wires `DELETE /node/{key}`. Throws `MushroomError` when the node does not exist.
 
-### `client.nodeEdges(key) → Promise<NodeEdgesResult>`
+### `client.nodeEdges(key, opts?) → Promise<NodeEdgesResult>`
 
 Wires `GET /node/{key}/edges`. Returns `{ edges: [{ edge_type, src_key, dst_key, derived }] }`.
 Throws `MushroomError` (404) when the key does not exist.
+
+`opts.mask` — node-key allow-list (non-empty string array; no commas in keys).
+Only edges whose src **or** dst is in the list are returned. An empty array
+throws `MushroomError`.
+
+`opts.stub_hidden` — when `true` **and** `mask` is set, edges to masked-out
+endpoints are included; those endpoints appear as
+`{ key: string; restricted: true }` rather than a plain string. Without `mask`
+this option is silently ignored by the server.
 
 ### `client.nodeHistory(key) → Promise<NodeHistoryResult>`
 
@@ -267,6 +284,10 @@ was added or retracted.
 
 Wires `GET /history/was_linked`. Returns `{ a, b, edge_type, at_commit, linked }` — whether
 the named edge existed at the given commit index.
+
+`atCommit` accepts an integer commit index **or** an RFC 3339 date string
+(`"2026-01-15T00:00:00Z"`); the server resolves the date to the nearest commit at
+or before that instant.
 
 ### `client.createEdge(type, src, dst) → Promise<void>`
 
@@ -302,6 +323,9 @@ lifecycle and ingest events — as an externally-tagged JSON frame.
 
 Returns a handle with `close(): Promise<void>`. A server older than 0.8 does not answer a
 close on `/watch`, so `close()` resolves within 3 s whether or not the handshake completes.
+
+`opts.onClose` — called once when the WebSocket closes, whether via `handle.close()` or
+because the server dropped the connection. Use it as a signal to reconnect.
 
 ```ts
 import WS from 'ws'; // Node < 21
