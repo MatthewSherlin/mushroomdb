@@ -18,10 +18,10 @@ let sub: Subscription = db.subscribe_rule("skill_fit")?;
 // Returns Err(GraphError::RuleNotFound) for unknown rules.
 
 // Subscribe to edge events for all rules.
-let sub = db.subscribe_all_rules();
+let sub = db.subscribe_all_rules()?;
 
 // Subscribe to write events (node/prop mutations).
-let sub = db.subscribe_writes();
+let sub = db.subscribe_writes()?;
 ```
 
 Each call returns a `Subscription` handle. **Dropping it unregisters the subscriber** — the next commit prunes the dead entry; no resources leak.
@@ -44,15 +44,17 @@ if let Some(ev) = sub.recv_timeout(Duration::from_millis(100)) {
 
 ```rust
 pub enum DbEvent {
-    EdgeFired    { rule, src_key, dst_key, edge_type, weight: Option<f64>, commit_seq },
-    EdgeRetracted{ rule, src_key, dst_key, edge_type, commit_seq },
-    NodeInserted { label, key, commit_seq },
-    NodeDeleted  { key, commit_seq },
-    EdgeInserted { edge_type, src, dst, commit_seq },
-    EdgeDeleted  { edge_type, src, dst, commit_seq },
-    PropSet      { key, field, commit_seq },
-    PropRemoved  { key, field, commit_seq },
-    Lagged       { missed },
+    EdgeFired        { rule, src_key, dst_key, edge_type, weight: Option<f64>, commit_seq },
+    EdgeRetracted    { rule, src_key, dst_key, edge_type, commit_seq },
+    NodeInserted     { label, key, commit_seq },
+    NodeDeleted      { key, commit_seq },
+    EdgeInserted     { edge_type, src, dst, commit_seq },
+    EdgeDeleted      { edge_type, src, dst, commit_seq },
+    PropSet          { key, field, commit_seq },
+    PropRemoved      { key, field, commit_seq },
+    Lagged           { missed },
+    QueryRowAdded    { columns: Vec<String>, row: Vec<Option<Value>> },
+    QueryRowRemoved  { columns: Vec<String>, row: Vec<Option<Value>> },
 }
 ```
 
