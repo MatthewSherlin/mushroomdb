@@ -14336,6 +14336,11 @@ struct Overlay {
     /// `OnConflict::Replace` has to compare labels.
     extra_labels: BTreeMap<String, String>,
     deleted_keys: BTreeSet<String>,
+    /// `new key → store key` for every node an earlier op in this batch
+    /// renamed. Such a key is in `extra_keys`, but unlike one a batch inserts
+    /// it has a stored node behind it — under the old key until the batch
+    /// commits — and its properties, label and edges are read through this.
+    renamed_from: BTreeMap<String, String>,
     extra_props: BTreeMap<(String, String), Value>,
     removed_props: BTreeSet<(String, String)>,
     extra_edges: BTreeSet<(String, String, String)>,
@@ -14412,6 +14417,23 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.db.ids.get(key).is_some()
     }
 
+    /// The key the store holds `key`'s node under, or `None` when the batch
+    /// sees no stored node there: `key` is deleted, or was first inserted in
+    /// this batch. A key an earlier op renamed stands for the node still
+    /// stored under its old key.
+    fn store_key<'k>(&'k self, key: &'k str) -> Option<&'k str> {
+        if self.overlay.deleted_keys.contains(key) {
+            return None;
+        }
+        if let Some(origin) = self.overlay.renamed_from.get(key) {
+            return Some(origin.as_str());
+        }
+        if self.overlay.extra_keys.contains(key) {
+            return None;
+        }
+        Some(key)
+    }
+
     fn has_prop(&self, key: &str, field: &str) -> bool {
         if !self.has_key(key) {
             return false;
@@ -14425,10 +14447,10 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         }
         // Fresh identity (first insert in this batch, or delete+reinsert):
         // ignore props still sitting on the soon-to-be-tombstoned slot.
-        if self.overlay.extra_keys.contains(key) {
+        let Some(stored) = self.store_key(key) else {
             return false;
-        }
-        self.db.get_prop(key, field).is_some()
+        };
+        self.db.get_prop(stored, field).is_some()
     }
 
     fn has_edge(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
@@ -14444,14 +14466,10 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             return true;
         }
         // A key created in this batch (including reinsert) has no db edges.
-        if self.overlay.extra_keys.contains(src_key) || self.overlay.extra_keys.contains(dst_key) {
+        let (Some(src_key), Some(dst_key)) = (self.store_key(src_key), self.store_key(dst_key))
+        else {
             return false;
-        }
-        if self.overlay.deleted_keys.contains(src_key)
-            || self.overlay.deleted_keys.contains(dst_key)
-        {
-            return false;
-        }
+        };
         let Some(src) = self.db.ids.get(src_key) else {
             return false;
         };
@@ -14479,14 +14497,10 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     }
 
     fn is_rule_owned(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
-        if self.overlay.extra_keys.contains(src_key) || self.overlay.extra_keys.contains(dst_key) {
+        let (Some(src_key), Some(dst_key)) = (self.store_key(src_key), self.store_key(dst_key))
+        else {
             return false;
-        }
-        if self.overlay.deleted_keys.contains(src_key)
-            || self.overlay.deleted_keys.contains(dst_key)
-        {
-            return false;
-        }
+        };
         let Some(src) = self.db.ids.get(src_key) else {
             return false;
         };
@@ -14695,8 +14709,14 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             return None;
         }
         // Fresh identities created in this batch have no stored label in the
-        // overlay; they cannot be provenance-owned yet either.
-        let id = self.db.ids.get(key)?;
+        // overlay; they cannot be provenance-owned yet either. A key this
+        // batch renamed has its label on the node stored under the old key.
+        let stored = self
+            .overlay
+            .renamed_from
+            .get(key)
+            .map_or(key, String::as_str);
+        let id = self.db.ids.get(stored)?;
         let sym = self.db.labels.get(id as usize).copied()?;
         if sym == u32::MAX {
             return None;
@@ -14853,10 +14873,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         if let Some(v) = self.overlay.extra_props.get(&k) {
             return Some(v.clone());
         }
-        if self.overlay.extra_keys.contains(key) {
-            return None;
-        }
-        self.db.get_prop(key, field)
+        self.db.get_prop(self.store_key(key)?, field)
     }
 
     fn check_create_rule(&self, def: &RuleDef) -> Result<()> {
@@ -14910,6 +14927,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
 
     fn note_insert_node(&mut self, label: &str, key: &str, props: &[(String, Value)]) {
         self.overlay.deleted_keys.remove(key);
+        self.overlay.renamed_from.remove(key);
         self.overlay.extra_keys.insert(key.to_string());
         self.overlay
             .extra_labels
@@ -14957,6 +14975,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
 
     fn note_delete_node(&mut self, key: &str) {
         self.overlay.extra_keys.remove(key);
+        self.overlay.renamed_from.remove(key);
         self.overlay.deleted_keys.insert(key.to_string());
         self.overlay.extra_props.retain(|(k, _), _| k != key);
         self.overlay.removed_props.retain(|(k, _)| k != key);
@@ -14992,6 +15011,14 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     }
 
     fn note_rename_node(&mut self, old: &str, new: &str) {
+        // The stored node `new` will stand for: the one `old` stood for if an
+        // earlier op renamed it here, `old` itself if the store has it, and
+        // none if `old` was first inserted in this batch.
+        let origin = match self.overlay.renamed_from.remove(old) {
+            Some(origin) => Some(origin),
+            None if self.overlay.extra_keys.contains(old) => None,
+            None => Some(old.to_string()),
+        };
         // Mark old as deleted so subsequent batch ops cannot reference it.
         self.overlay.extra_keys.remove(old);
         self.overlay.deleted_keys.insert(old.to_string());
@@ -15026,6 +15053,22 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             .retain(|(k, _)| k.as_str() != old);
         for k in transferred_removed {
             self.overlay.removed_props.insert(k);
+        }
+        if let Some(label) = self.overlay.extra_labels.remove(old) {
+            self.overlay.extra_labels.insert(new_str.clone(), label);
+        }
+        // Edges the batch added or deleted follow the node to its new key.
+        let follow = |k: String| if k == old { new_str.clone() } else { k };
+        self.overlay.extra_edges = std::mem::take(&mut self.overlay.extra_edges)
+            .into_iter()
+            .map(|(t, s, d)| (t, follow(s), follow(d)))
+            .collect();
+        self.overlay.deleted_edges = std::mem::take(&mut self.overlay.deleted_edges)
+            .into_iter()
+            .map(|(t, s, d)| (t, follow(s), follow(d)))
+            .collect();
+        if let Some(origin) = origin {
+            self.overlay.renamed_from.insert(new_str, origin);
         }
     }
 

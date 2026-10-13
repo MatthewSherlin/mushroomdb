@@ -738,3 +738,208 @@ fn the_past_keeps_the_old_key_and_the_old_id() {
         "{hist:?}"
     );
 }
+
+// ── a rename inside a batch: later ops see the node it renamed (row 79) ──────
+
+/// Binding: the cross-namespace edge guard reads a renamed node's namespace
+/// from the store. `[rename a→b, insert_edge(b, d)]` is refused exactly as
+/// `insert_edge(a, d)` is.
+#[test]
+fn a_batch_cannot_rename_its_way_past_the_namespace_guard() {
+    let mut db = GraphDb::open(&tmp("batch-rename-ns")).unwrap();
+    db.insert_node(
+        "Doc",
+        "a",
+        vec![(core_api::NS_PROP.into(), Value::Str("tenant-a".into()))],
+    )
+    .unwrap();
+    db.insert_node("Doc", "d", vec![]).unwrap();
+    assert!(matches!(
+        db.insert_edge("LINKS", "a", "d"),
+        Err(GraphError::CrossNamespace { .. })
+    ));
+
+    let mut batch = db.batch();
+    batch.rename_node("a", "b").insert_edge("LINKS", "b", "d");
+    match batch.commit() {
+        Err(GraphError::CrossNamespace { src_ns, dst_ns, .. }) => {
+            assert_eq!(src_ns, "tenant-a");
+            assert_eq!(dst_ns, core_api::NS_DEFAULT);
+        }
+        other => panic!("expected CrossNamespace, got {other:?}"),
+    }
+    assert!(db.has_node("a"), "a refused batch writes nothing");
+    assert!(!db.has_node("b"));
+}
+
+/// Binding: a removal after a rename in the same batch removes the stored
+/// property.
+#[test]
+fn a_batch_removes_a_stored_prop_from_a_node_it_just_renamed() {
+    let mut db = GraphDb::open(&tmp("batch-rename-remove")).unwrap();
+    db.insert_node(
+        "Person",
+        "a",
+        vec![("name".into(), Value::Str("Ann".into()))],
+    )
+    .unwrap();
+
+    let mut batch = db.batch();
+    batch.rename_node("a", "b").remove_prop("b", "name");
+    batch.commit().unwrap();
+
+    assert_eq!(db.get_prop("b", "name"), None);
+}
+
+/// Binding: two renames in one batch leave what the same two renames as two
+/// commits leave. The node's stored `id` is `b`, so it does not move with the
+/// first rename (it is not the key) and does move with the second (it is).
+#[test]
+fn a_chained_rename_in_one_batch_moves_a_stored_id_as_two_commits_would() {
+    let seed = |db: &mut GraphDb<core_storage::fs::RealFs>| {
+        db.insert_node("Person", "a", vec![("id".into(), Value::Str("b".into()))])
+            .unwrap();
+    };
+
+    let mut two_commits = GraphDb::open(&tmp("batch-rename-chain-2")).unwrap();
+    seed(&mut two_commits);
+    two_commits.rename_node("a", "b").unwrap();
+    two_commits.rename_node("b", "c").unwrap();
+    let expected = two_commits.get_prop("c", "id");
+    assert_eq!(expected, Some(Value::Str("c".into())));
+
+    let mut one_batch = GraphDb::open(&tmp("batch-rename-chain-1")).unwrap();
+    seed(&mut one_batch);
+    let mut batch = one_batch.batch();
+    batch.rename_node("a", "b").rename_node("b", "c");
+    batch.commit().unwrap();
+    assert_eq!(one_batch.get_prop("c", "id"), expected);
+}
+
+/// Binding: a hand-written edge is still there to delete after its endpoint is
+/// renamed in the same batch.
+#[test]
+fn a_batch_deletes_an_edge_of_a_node_it_just_renamed() {
+    let mut db = GraphDb::open(&tmp("batch-rename-edge")).unwrap();
+    db.insert_node("Person", "a", vec![]).unwrap();
+    db.insert_node("Person", "d", vec![]).unwrap();
+    db.insert_edge("KNOWS", "a", "d").unwrap();
+
+    let mut batch = db.batch();
+    batch.rename_node("a", "b").delete_edge("KNOWS", "b", "d");
+    batch.commit().unwrap();
+
+    assert!(db
+        .neighbors("b", "KNOWS", Direction::Out)
+        .unwrap()
+        .is_empty());
+}
+
+/// Binding: an edge that already exists is a duplicate after a rename too.
+#[test]
+fn a_batch_cannot_reinsert_an_edge_of_a_node_it_just_renamed() {
+    let mut db = GraphDb::open(&tmp("batch-rename-dup-edge")).unwrap();
+    db.insert_node("Person", "a", vec![]).unwrap();
+    db.insert_node("Person", "d", vec![]).unwrap();
+    db.insert_edge("KNOWS", "a", "d").unwrap();
+    let direct = db.insert_edge("KNOWS", "a", "d").map(|_| ());
+
+    let mut batch = db.batch();
+    batch.rename_node("a", "b").insert_edge("KNOWS", "b", "d");
+    let batched = batch.commit().map(|_| ());
+
+    assert_eq!(
+        format!("{batched:?}").replace("\"b\"", "\"a\""),
+        format!("{direct:?}"),
+        "the batch and the plain write must agree"
+    );
+}
+
+/// Binding: a node inserted and renamed in the same batch has no store node
+/// behind it, so nothing is read through to a stale key.
+#[test]
+fn a_node_inserted_and_renamed_in_one_batch_reads_only_what_the_batch_wrote() {
+    let mut db = GraphDb::open(&tmp("batch-insert-rename")).unwrap();
+    let mut batch = db.batch();
+    batch
+        .insert_node(
+            "Person",
+            "a",
+            vec![("name".into(), Value::Str("Ann".into()))],
+        )
+        .rename_node("a", "b")
+        .remove_prop("b", "name");
+    batch.commit().unwrap();
+    assert!(db.has_node("b"));
+    assert_eq!(db.get_prop("b", "name"), None);
+}
+
+/// Binding: an edge a rule owns is still rule-owned after its endpoint is
+/// renamed in the same batch — the batch cannot hand-write it.
+#[test]
+fn a_batch_cannot_rename_its_way_past_the_rule_owned_guard() {
+    let mut db = GraphDb::open(&tmp("batch-rename-owned")).unwrap();
+    let tags = || Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]);
+    db.insert_node("A", "a", vec![("tags".into(), tags())])
+        .unwrap();
+    db.insert_node("A", "d", vec![("tags".into(), tags())])
+        .unwrap();
+    db.create_rule(RuleDef {
+        name: "alike".into(),
+        src_label: "A".into(),
+        dst_label: "A".into(),
+        predicate: Predicate::Overlap {
+            field: "tags".into(),
+            min: 0.5,
+        },
+        edge_type: "ALIKE".into(),
+        weight_prop: None,
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    })
+    .unwrap();
+    assert!(matches!(
+        db.delete_edge("ALIKE", "a", "d"),
+        Err(GraphError::RuleOwned { .. })
+    ));
+
+    let mut batch = db.batch();
+    batch.rename_node("a", "b").delete_edge("ALIKE", "b", "d");
+    assert!(
+        matches!(batch.commit(), Err(GraphError::RuleOwned { .. })),
+        "a renamed endpoint must not hide the rule that owns the edge"
+    );
+
+    let mut batch = db.batch();
+    batch.rename_node("a", "b").insert_edge("ALIKE", "b", "d");
+    assert!(
+        matches!(batch.commit(), Err(GraphError::RuleOwned { .. })),
+        "nor let the batch hand-write an edge the rule derives"
+    );
+}
+
+/// Binding: an edge the batch deleted before the rename stays deleted under
+/// the new key, so it can be written again.
+#[test]
+fn an_edge_deleted_before_a_rename_in_the_same_batch_can_be_reinserted_after_it() {
+    let mut db = GraphDb::open(&tmp("batch-delete-rename-insert")).unwrap();
+    db.insert_node("Person", "a", vec![]).unwrap();
+    db.insert_node("Person", "d", vec![]).unwrap();
+    db.insert_edge("KNOWS", "a", "d").unwrap();
+
+    let mut batch = db.batch();
+    batch
+        .delete_edge("KNOWS", "a", "d")
+        .rename_node("a", "b")
+        .insert_edge("KNOWS", "b", "d");
+    batch.commit().unwrap();
+
+    assert_eq!(
+        db.neighbors("b", "KNOWS", Direction::Out).unwrap(),
+        vec!["d".to_string()]
+    );
+}
