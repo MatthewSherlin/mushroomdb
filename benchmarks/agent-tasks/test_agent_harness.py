@@ -1267,6 +1267,14 @@ def test_reprovision_removes_the_install_and_keeps_the_world(tmp_path):
     assert reprovision_association(graph) == []
 
 
+def test_load_tasks_defaults_to_the_suite_the_runner_defaults_to():
+    """The `code` suite is retired; a call that names none must not read it."""
+    import inspect
+    from run import load_tasks
+    assert inspect.signature(load_tasks).parameters["suite"].default == "association"
+    assert load_tasks() == load_tasks("association")
+
+
 def test_load_tasks_reads_the_suites_own_file():
     from run import load_tasks
     code = load_tasks("code")
