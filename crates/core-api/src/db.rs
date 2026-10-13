@@ -2544,6 +2544,7 @@ impl<F: Fs> GraphDb<F> {
             trace_open!("restore_v8_base", _t0);
             db.base = Some(mapped);
             trace_open!("base assigned", _t0);
+            db.drop_edges_of_retired_nodes();
         } else if !snap_header.is_empty() {
             // Legacy V5-V7: full read required for decode.
             let snap_bytes = db.fs.read(FileId::Snapshot)?;
@@ -4491,14 +4492,25 @@ impl<F: Fs> GraphDb<F> {
                 // Collect then remove so neighbor slices stay valid during
                 // iteration. Remove from topo first, then call view maintenance
                 // so Avg/Min/Max recompute sees the correct (reduced) neighbor set.
-                let etypes: Vec<u32> = self.topo.etypes().collect();
+                //
+                // Through the view of the snapshot and what was written since,
+                // not `self.topo` alone: that is only what was written since,
+                // and an edge the snapshot holds was left behind, pointing at
+                // a node that was gone (ledger row 95).
                 let mut doomed = Vec::new();
-                for et in &etypes {
-                    for &dst in self.topo.neighbors(*et, Direction::Out, n).as_ref() {
-                        doomed.push((*et, n, dst));
-                    }
-                    for &src in self.topo.neighbors(*et, Direction::In, n).as_ref() {
-                        doomed.push((*et, src, n));
+                {
+                    let tv = self.topo_view();
+                    let etypes: Vec<u32> = tv.etypes().collect();
+                    for et in &etypes {
+                        for &dst in tv.neighbors(*et, Direction::Out, n).as_ref() {
+                            doomed.push((*et, n, dst));
+                        }
+                        for &src in tv.neighbors(*et, Direction::In, n).as_ref() {
+                            // A self-loop is already listed from its Out side.
+                            if src != n {
+                                doomed.push((*et, src, n));
+                            }
+                        }
                     }
                 }
                 for (et, s, d) in doomed {
@@ -4593,13 +4605,14 @@ impl<F: Fs> GraphDb<F> {
                     return Ok(());
                 }
                 self.view_store
-                    .create_view(
+                    .create_view_over(
                         def,
                         Arc::make_mut(&mut self.props),
                         &build_topo_view(&self.topo, &self.base),
                         &self.ids,
                         &self.syms,
                         &self.labels,
+                        base_columns(&self.base),
                     )
                     .map_err(|e| GraphError::RuleInvalid { detail: e })?;
             }
@@ -4608,6 +4621,11 @@ impl<F: Fs> GraphDb<F> {
                 if !self.view_store.has_view(name) {
                     return Ok(());
                 }
+                let doomed_prop = self
+                    .view_store
+                    .views()
+                    .find(|v| v.name == *name)
+                    .map(|v| (v.label.clone(), v.view_prop.clone()));
                 self.view_store
                     .delete_view(
                         name,
@@ -4617,6 +4635,23 @@ impl<F: Fs> GraphDb<F> {
                         &self.syms,
                     )
                     .map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
+                // `delete_view` clears the view's property from what was
+                // written since the snapshot. A value the snapshot holds is
+                // hidden by a tombstone, or it stays readable on every node
+                // of the label after the view that owned it is gone.
+                if let (Some((label, prop)), true) = (doomed_prop, self.base.is_some()) {
+                    if let Some(label_sym) = self.syms.get(&label) {
+                        for id in 0..self.ids.len() as u32 {
+                            if self.labels.get(id as usize).copied() == Some(label_sym)
+                                && build_props_view(&self.props, &self.base)
+                                    .get(id, &prop)
+                                    .is_some()
+                            {
+                                Arc::make_mut(&mut self.props).record_prop_tombstone(id, &prop);
+                            }
+                        }
+                    }
+                }
             }
             WalRecord::EnableFulltext { label, field } => {
                 // Replay-over-snapshot idempotency: already enabled → skip.
@@ -7492,6 +7527,55 @@ impl<F: Fs> GraphDb<F> {
             label: label.into(),
             field: field.into(),
         })
+    }
+
+    /// Remove every edge the snapshot holds to or from a node that has been
+    /// deleted.
+    ///
+    /// There should be none. Through 0.7.1 a node deleted after a snapshot
+    /// kept the edges that snapshot held (ledger row 95), and the next
+    /// snapshot wrote them into its own base, where they answered a
+    /// neighbour read with `topology id N has no key`. This is what repairs
+    /// such a store: it costs a pass over the id table and nothing more when
+    /// no deleted node has an edge. The removal is in memory until the next
+    /// snapshot, which then no longer carries them.
+    fn drop_edges_of_retired_nodes(&mut self) {
+        let mut doomed = Vec::new();
+        {
+            let tv = self.topo_view();
+            let etypes: Vec<u32> = tv.etypes().collect();
+            for n in 0..self.ids.len() as u32 {
+                if !self.ids.is_tombstoned(n) {
+                    continue;
+                }
+                for et in &etypes {
+                    for &dst in tv.neighbors(*et, Direction::Out, n).as_ref() {
+                        doomed.push((*et, n, dst));
+                    }
+                    for &src in tv.neighbors(*et, Direction::In, n).as_ref() {
+                        if src != n {
+                            doomed.push((*et, src, n));
+                        }
+                    }
+                }
+            }
+        }
+        for (et, s, d) in doomed {
+            Arc::make_mut(&mut self.topo).remove_edge(et, s, d);
+            Arc::make_mut(&mut self.edge_props).remove_edge(et, s, d);
+            self.view_store.on_edge_changed(
+                et,
+                s,
+                d,
+                false,
+                Arc::make_mut(&mut self.props),
+                &build_topo_view(&self.topo, &self.base),
+                &self.ids,
+                &self.syms,
+                &self.labels,
+                base_columns(&self.base),
+            );
+        }
     }
 
     /// Whether `(label, field)` is currently indexed for full-text search.
@@ -13935,18 +14019,18 @@ impl<F: Fs> GraphDb<F> {
                         .map_err(|e| GraphError::Corrupt {
                             detail: format!("v8 snapshot: edge_props raw bytes: {e:?}"),
                         })?;
-                let prov_raw =
-                    old_base
-                        .provenance_raw_bytes()
-                        .map_err(|e| GraphError::Corrupt {
-                            detail: format!("v8 snapshot: provenance raw bytes: {e:?}"),
-                        })?;
                 encode_v8(
                     Some(archived_csr),
                     Some(archived_cols),
                     archived_strings,
                     Some((archived_edge_props, edge_props_raw)),
-                    Some(prov_raw),
+                    // Never the old snapshot's provenance bytes. The encoder
+                    // passes them through when the live map is empty, taking
+                    // empty for "never loaded" — but it is loaded above, so
+                    // empty means every rule's edges are gone, and passing
+                    // the old section through brought them back as owned by
+                    // rules that no longer derive them (ledger row 95).
+                    None,
                     &self.topo,
                     &self.props,
                     &self.ids,

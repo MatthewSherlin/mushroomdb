@@ -189,6 +189,24 @@ impl ViewStore {
         syms: &Interner,
         labels: &[u32],
     ) -> Result<(), String> {
+        self.create_view_over(def, props, topo, ids, syms, labels, None)
+    }
+
+    /// [`Self::create_view`] on a store opened from a snapshot: `base_cols`
+    /// is the snapshot's columns, which the first values of an aggregate view
+    /// have to read. `props` alone holds only what was written since, and a
+    /// view created over it summed nothing for neighbours the snapshot held.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_view_over(
+        &mut self,
+        def: ViewDef,
+        props: &mut ColumnStore,
+        topo: &TopologyView<'_>,
+        ids: &IdMap,
+        syms: &Interner,
+        labels: &[u32],
+        base_cols: Option<BaseColumns<'_>>,
+    ) -> Result<(), String> {
         def.validate()?;
 
         if self.views.contains_key(&def.name) {
@@ -214,7 +232,7 @@ impl ViewStore {
         }
 
         // Backfill: compute initial values for all existing nodes.
-        backfill_view(&def, props, topo, ids, syms, labels);
+        backfill_view(&def, props, topo, ids, syms, labels, base_cols);
 
         self.views.insert(def.name.clone(), def);
         Ok(())
@@ -433,7 +451,7 @@ impl ViewStore {
         labels: &[u32],
     ) {
         for def in self.views.values() {
-            backfill_view(def, props, topo, ids, syms, labels);
+            backfill_view(def, props, topo, ids, syms, labels, None);
         }
     }
 }
@@ -466,6 +484,7 @@ fn backfill_view(
     ids: &IdMap,
     syms: &Interner,
     labels: &[u32],
+    base_cols: Option<BaseColumns<'_>>,
 ) {
     let Some(label_sym) = syms.get(&def.label) else {
         return;
@@ -499,15 +518,12 @@ fn backfill_view(
         if labels.get(id as usize).copied() != Some(label_sym) {
             continue;
         }
-        match compute_view_value(
-            def,
-            id,
-            ColumnsView::owned(&*props),
-            topo,
-            ids,
-            syms,
-            labels,
-        ) {
+        // In a block, so the borrow of `props` ends before the write below.
+        let value = {
+            let pv = build_cols_view(props, base_cols);
+            compute_view_value(def, id, pv, topo, ids, syms, labels)
+        };
+        match value {
             Some(val) => props.set(id, &def.view_prop, val),
             None => {
                 props.remove(id, &def.view_prop);
