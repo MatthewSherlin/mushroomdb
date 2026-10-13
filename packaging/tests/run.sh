@@ -283,6 +283,52 @@ asks_for npm win32 x64 glibc x86_64-pc-windows-msvc
 asks_for sh darwin x86_64 glibc x86_64-apple-darwin
 asks_for sh linux x86_64 musl x86_64-unknown-linux-musl
 
+echo "== the npm package admits every platform install.js has a binary for"
+# npm refuses to install a package on a platform its `os` and `cpu` leave
+# out, before install.js runs: a mapping there with no entry here is a binary
+# `npx` cannot reach.
+node -e '
+  const pkg = require(process.argv[1] + "/package.json");
+  const src = require("fs").readFileSync(process.argv[1] + "/install.js", "utf8");
+  const pairs = [...src.matchAll(/"(darwin|linux|win32)-(x64|arm64)[ "]/g)];
+  if (pairs.length < 5) { console.error("found too few platform mappings in install.js"); process.exit(1); }
+  for (const [, os, cpu] of pairs) {
+    if (!pkg.os.includes(os)) { console.error(`package.json os lacks ${os}`); process.exit(1); }
+    if (!pkg.cpu.includes(cpu)) { console.error(`package.json cpu lacks ${cpu}`); process.exit(1); }
+  }
+' "$NPM"
+
+echo "== npm install.js takes the top-level binary, and refuses an empty one"
+# A release tarball holds the binary at its top level. A file of the same
+# name further down is not it, and a binary of no bytes is not an install.
+ODD="$WORKDIR/rel/odd"
+mkdir -p "$ODD" "$WORKDIR/odd-stage/share/doc"
+printf 'not the binary\n' > "$WORKDIR/odd-stage/share/doc/mushroomdb"
+cp "$WORKDIR/rel/mushroomdb" "$WORKDIR/odd-stage/mushroomdb"
+tar -C "$WORKDIR/odd-stage" -czf "$ODD/${ASSET}" share/doc/mushroomdb mushroomdb
+( cd "$ODD" && { sha256sum "${ASSET}" 2>/dev/null || shasum -a 256 "${ASSET}"; } > SHA256SUMS )
+rm -rf "$NPM/vendor"
+MUSHROOMDB_RELEASE_BASE="$BASE/odd" node "$NPM/install.js" >/dev/null
+out=$(node "$NPM/bin/mushroomdb.js" --help)
+test "$out" = "fake-ok --help" || {
+  echo "install.js took a nested file for the binary: $out" >&2
+  exit 1
+}
+: > "$WORKDIR/odd-stage/mushroomdb"
+rm "$ODD/${ASSET}"
+tar -C "$WORKDIR/odd-stage" -czf "$ODD/${ASSET}" mushroomdb
+( cd "$ODD" && { sha256sum "${ASSET}" 2>/dev/null || shasum -a 256 "${ASSET}"; } > SHA256SUMS )
+rm -rf "$NPM/vendor"
+set +e
+MUSHROOMDB_RELEASE_BASE="$BASE/odd" node "$NPM/install.js" >"$WORKDIR/empty.out" 2>"$WORKDIR/empty.err"
+st=$?
+set -e
+test "$st" -ne 0 || {
+  echo "install.js installed an empty binary" >&2
+  exit 1
+}
+test ! -e "$NPM/vendor/mushroomdb"
+
 echo "== tampered asset: both installers refuse"
 printf x >> "$WORKDIR/rel/${ASSET}"
 TAMPER_DIR="$WORKDIR/prefix-tamper/bin"

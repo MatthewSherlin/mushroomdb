@@ -717,6 +717,14 @@ is Apple Silicon and Linux. `pip install mushroomdb` has wheels for Apple Silico
 glibc Linux targets; elsewhere it builds from source and needs a Rust toolchain. On anything
 else, `cargo install mushroomdb-cli`.
 
+**On Windows the binary is what is supported.** `mushroomdb.exe` and `npx mushroomdb` run a
+store, the MCP server and the HTTP server. `mushroomdb install`, the step below that writes an
+assistant's MCP entry and hooks, has not been run there: the hooks are shell scripts and need a
+POSIX shell, and the search for `node` and `npx` does not look for `.exe` or `.cmd`. Write the
+MCP entry by hand (`npx -y mushroomdb mcp <store>`), or use WSL, where the Linux build applies.
+Keep the store on a local NTFS disk: a snapshot replaces a file the process has mapped, which
+NTFS allows and exFAT, FAT and some network and container mounts do not.
+
 `install` writes an MCP entry that runs `npx -y mushroomdb@<version>`, so the assistant needs
 nothing installed globally and nothing is copied into your home directory. Point it at a local
 build with `--command <path>`. `mushroomdb doctor` verifies the result end to end — config entry,

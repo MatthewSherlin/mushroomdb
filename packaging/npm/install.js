@@ -72,7 +72,7 @@ function fetchBuffer(url) {
   });
 }
 
-// The bytes of the file named `name` inside a gzipped tarball, or null.
+// The bytes of the top-level file named `name` in a gzipped tarball, or null.
 //
 // Read here and not by running `tar`: there is not always one, and where
 // there are two — Git Bash on Windows puts GNU tar ahead of the system's —
@@ -86,7 +86,9 @@ function fileFromTarball(tarball, name) {
     const size = parseInt(header.subarray(124, 136).toString("utf8").trim(), 8) || 0;
     const type = String.fromCharCode(header[156] || 48);
     const body = at + 512;
-    if ((type === "0" || type === "\0") && path.posix.basename(entry) === name) {
+    // The top-level entry only: a file of the same name further down is not
+    // the binary.
+    if ((type === "0" || type === "\0") && (entry === name || entry === `./${name}`)) {
       if (body + size > tar.length) return null;
       return tar.subarray(body, body + size);
     }
@@ -148,6 +150,9 @@ async function main() {
   const binary = fileFromTarball(tarball, binName);
   if (!binary) {
     fail(`tarball ${asset} did not contain ./${binName}`);
+  }
+  if (binary.length === 0) {
+    fail(`tarball ${asset} holds an empty ${binName}`);
   }
   fs.writeFileSync(dest, binary);
   fs.chmodSync(dest, 0o755);

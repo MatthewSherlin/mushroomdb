@@ -323,10 +323,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
         with: { toolchain: "1.92.0" }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
       - run: rustup target add ${{ matrix.target }}
       - if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build -p mushroomdb-cli --bin mushroomdb --release --target ${{ matrix.target }}
+      # The binary a release ships: the UI built and embedded, as
+      # `release.yml` builds it.
+      - run: npm ci
+        working-directory: ui
+      - run: npm run build
+        working-directory: ui
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release --target ${{ matrix.target }}
       - name: demo, query, snapshot, reopen
         shell: bash
         run: |
@@ -348,13 +359,12 @@ jobs:
           "$BIN" query "$DB" "MATCH (p:Person {id: 'smoke'}) RETURN p.name AS name"
           "$BIN" backup "$DB" "$RUNNER_TEMP/smoke-backup"
           "$BIN" stats "$RUNNER_TEMP/smoke-backup"
-      # The launcher end to end, as a release would have it: the tarball
-      # `release.yml` packs, a checksum file, and `install.js` fetching the
-      # asset it picks for this platform from a local server.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - name: pack as a release does, then install through the npm launcher
+      # The launcher end to end, as a user would have it: the tarball
+      # `release.yml` packs, a checksum file, and `npm install` of the packed
+      # package, whose postinstall fetches the asset for this platform from a
+      # local server. Through npm and not `node install.js`, because npm
+      # checks the package's `os` and `cpu` before it runs anything.
+      - name: pack as a release does, then install through npm
         shell: bash
         run: |
           set -euo pipefail
@@ -386,10 +396,15 @@ jobs:
             x86_64-apple-darwin) export MUSHROOMDB_FORCE_ARCH=x64 ;;
             x86_64-unknown-linux-musl) export MUSHROOMDB_FORCE_LIBC=musl ;;
           esac
-          MUSHROOMDB_RELEASE_BASE="http://127.0.0.1:18099" node packaging/npm/install.js
-          node packaging/npm/bin/mushroomdb.js --version
-          node packaging/npm/bin/mushroomdb.js demo "$RUNNER_TEMP/launcher-db"
-          node packaging/npm/bin/mushroomdb.js stats "$RUNNER_TEMP/launcher-db"
+          export MUSHROOMDB_RELEASE_BASE="http://127.0.0.1:18099"
+          ( cd packaging/npm && npm pack --pack-destination ../../smoke-rel >/dev/null )
+          mkdir smoke-app
+          cd smoke-app
+          npm init -y >/dev/null
+          npm install "../smoke-rel/mushroomdb-${VERSION}.tgz"
+          npx --no-install mushroomdb --version
+          npx --no-install mushroomdb demo "$RUNNER_TEMP/launcher-db"
+          npx --no-install mushroomdb stats "$RUNNER_TEMP/launcher-db"
 
   docker:
     needs: [test]
