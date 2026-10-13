@@ -58,7 +58,7 @@ from subjects import (ARM_DISALLOWED, ASSOC_ARMS, ASSOC_SUBJECTS,  # noqa: E402
 # suite is run with and cannot import this module, which imports it.
 
 
-def load_tasks(suite: str = "code") -> dict:
+def load_tasks(suite: str = "association") -> dict:
     """The suite's own task file, parsed.
 
     One reader for both suites, so nothing downstream has to know which file a

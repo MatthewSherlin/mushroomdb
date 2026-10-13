@@ -22,7 +22,7 @@
 
 use crate::memory::identity::{
     aliases_value, derive_aliases, identity_props_after_write, same_as_lost, same_as_pairs,
-    SameAsPair, ALIASES_FIELD,
+    SameAsPair, ALIASES_FIELD, MAX_ALIASES,
 };
 use crate::memory_schema::{NAME_FIELD, PROVISIONAL_LABEL, PROVISIONAL_PROP};
 use crate::{GraphDb, NS_PROP};
@@ -160,7 +160,9 @@ pub struct RememberReport {
     pub note: String,
     /// Entities this call brought into existence.
     pub created: usize,
-    /// `about` keys and entities that already existed.
+    /// `about` keys, entities and fact endpoints that already existed. A key
+    /// is counted once across the three; an `entities` entry is counted each
+    /// time it is listed.
     pub matched: usize,
     /// Derived edges the rules produced for this commit, incident on the
     /// *note* — edges the engine's rule provenance attributes to a rule,
@@ -212,6 +214,11 @@ pub struct RememberReport {
 /// and a node label (defect 77). `argument` says which argument held it and
 /// is only built for the refusal.
 ///
+/// So is one made only of characters that print as nothing — a zero-width
+/// space, a control character, a byte-order mark (defect 78). `str::trim`
+/// does not count those as whitespace; the definition used is the digest's,
+/// [`crate::digest::sanitize`], which prints each of them as a space.
+///
 /// A value with text between its padding is not this function's business: it
 /// is stored as given.
 fn refuse_blank(value: &str, argument: impl FnOnce() -> String) -> Result<()> {
@@ -219,6 +226,14 @@ fn refuse_blank(value: &str, argument: impl FnOnce() -> String) -> Result<()> {
         return Err(GraphError::IngestError {
             detail: format!(
                 "{} must not be empty or only whitespace, got {value:?}",
+                argument()
+            ),
+        });
+    }
+    if crate::digest::sanitize(value).trim().is_empty() {
+        return Err(GraphError::IngestError {
+            detail: format!(
+                "{} must not be only invisible characters, got {value:?}",
                 argument()
             ),
         });
@@ -516,6 +531,12 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         let mut declared_this_call: BTreeSet<&str> = BTreeSet::new();
         for entity in input.entities {
             let label = entity.label.as_str();
+            // A key the store already holds under another label is matched
+            // as it is stored, and this label goes unused (defect 64):
+            // declaring it would spend a pair on a label with no node.
+            if db.node_ref(&entity.key).is_some_and(|n| n.label() != label) {
+                continue;
+            }
             if !declared_this_call.insert(label) {
                 continue;
             }
@@ -721,6 +742,9 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
     //    with no report entry anywhere — up to the same per-commit cap.
     for (k, existed) in fact_endpoints.iter().zip(&fact_endpoint_existed) {
         if *existed {
+            // Matched like an `about` key that exists (defect 48): the list
+            // holds no key `entities` or `about` already counted.
+            report.matched += 1;
             continue;
         }
         if provisional_count < MAX_PROVISIONAL_PER_COMMIT {
@@ -770,14 +794,21 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
 
 /// A provisional stub's properties: its key as its `name`, the
 /// `provisional` mark, and the aliases that name implies.
+///
+/// Every word of the key is an alias, so a long key — a sentence, a URL with
+/// a slug and a query string — implies more than a node may carry
+/// ([`MAX_ALIASES`], defect 53). Such a stub is linked by its whole key alone
+/// and not by its words. It is still written: an unknown subject is never a
+/// reason to lose the note.
 fn stub_props(key: &str) -> Vec<(String, Value)> {
+    let mut aliases = derive_aliases(key, Some(key));
+    if aliases.len() > MAX_ALIASES {
+        aliases = derive_aliases(key, None);
+    }
     vec![
         (NAME_FIELD.to_string(), Value::Str(key.to_string())),
         (PROVISIONAL_PROP.to_string(), Value::Bool(true)),
-        (
-            ALIASES_FIELD.to_string(),
-            aliases_value(&derive_aliases(key, Some(key))),
-        ),
+        (ALIASES_FIELD.to_string(), aliases_value(&aliases)),
     ]
 }
 

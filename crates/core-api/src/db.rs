@@ -4777,10 +4777,23 @@ impl<F: Fs> GraphDb<F> {
         // this same frame, so N duplicates of one pair would otherwise all
         // compute `committed + 1` and the last would win.
         let mut pending_counts: HashMap<(u32, u32, u32), u64> = HashMap::new();
+        // Keys this frame has taken off the node the store holds them on: the
+        // old key of a rename, and a deleted node's. Until the frame inserts
+        // under such a key again it names nothing, and after that it names the
+        // new node — never the stored one, which is what the store alone
+        // would still answer while the frame is being rewritten.
+        let mut freed: std::collections::HashSet<String> = std::collections::HashSet::new();
         let lookup = |ids: &IdMap,
                       pending: &std::collections::HashMap<String, u32>,
+                      freed: &std::collections::HashSet<String>,
                       key: &str|
-         -> Option<u32> { ids.get(key).or_else(|| pending.get(key).copied()) };
+         -> Option<u32> {
+            match pending.get(key) {
+                Some(&id) => Some(id),
+                None if freed.contains(key) => None,
+                None => ids.get(key),
+            }
+        };
         for rec in recs {
             // A duplicate insert's count, resolved here and nowhere else.
             //
@@ -4803,12 +4816,12 @@ impl<F: Fs> GraphDb<F> {
                     if interned.insert(etype) {
                         out.push(intern);
                     }
-                    let src = lookup(&self.ids, &pending, &src_key).ok_or_else(|| {
+                    let src = lookup(&self.ids, &pending, &freed, &src_key).ok_or_else(|| {
                         GraphError::Corrupt {
                             detail: format!("dense WAL rewrite missing src {src_key}"),
                         }
                     })?;
-                    let dst = lookup(&self.ids, &pending, &dst_key).ok_or_else(|| {
+                    let dst = lookup(&self.ids, &pending, &freed, &dst_key).ok_or_else(|| {
                         GraphError::Corrupt {
                             detail: format!("dense WAL rewrite missing dst {dst_key}"),
                         }
@@ -4848,7 +4861,7 @@ impl<F: Fs> GraphDb<F> {
                         }
                         props_id.push((field_id, value));
                     }
-                    if lookup(&self.ids, &pending, &key).is_none() {
+                    if lookup(&self.ids, &pending, &freed, &key).is_none() {
                         pending.insert(key.clone(), next);
                         next = next.checked_add(1).ok_or_else(|| GraphError::Corrupt {
                             detail: "id space exhausted".into(),
@@ -4890,10 +4903,11 @@ impl<F: Fs> GraphDb<F> {
                         }
                         continue;
                     }
-                    let id =
-                        lookup(&self.ids, &pending, &key).ok_or_else(|| GraphError::Corrupt {
+                    let id = lookup(&self.ids, &pending, &freed, &key).ok_or_else(|| {
+                        GraphError::Corrupt {
                             detail: format!("dense WAL rewrite missing key {key}"),
-                        })?;
+                        }
+                    })?;
                     let (field_id, intern) = self.intern_wal(&field);
                     if interned.insert(field_id) {
                         out.push(intern);
@@ -4913,12 +4927,12 @@ impl<F: Fs> GraphDb<F> {
                     if interned.insert(etype) {
                         out.push(intern);
                     }
-                    let src = lookup(&self.ids, &pending, &src_key).ok_or_else(|| {
+                    let src = lookup(&self.ids, &pending, &freed, &src_key).ok_or_else(|| {
                         GraphError::Corrupt {
                             detail: format!("dense WAL rewrite missing src {src_key}"),
                         }
                     })?;
-                    let dst = lookup(&self.ids, &pending, &dst_key).ok_or_else(|| {
+                    let dst = lookup(&self.ids, &pending, &freed, &dst_key).ok_or_else(|| {
                         GraphError::Corrupt {
                             detail: format!("dense WAL rewrite missing dst {dst_key}"),
                         }
@@ -4931,7 +4945,7 @@ impl<F: Fs> GraphDb<F> {
                 } => {
                     // Track the rename in `pending` so subsequent InsertEdge /
                     // SetProp records in this batch can resolve the new key.
-                    let id = lookup(&self.ids, &pending, old_key).ok_or_else(|| {
+                    let id = lookup(&self.ids, &pending, &freed, old_key).ok_or_else(|| {
                         GraphError::Corrupt {
                             detail: format!(
                                 "dense WAL rewrite: RenameNode old key {old_key} not found"
@@ -4939,6 +4953,7 @@ impl<F: Fs> GraphDb<F> {
                         }
                     })?;
                     pending.remove(old_key.as_str());
+                    freed.insert(old_key.clone());
                     pending.insert(new_key.clone(), id);
                     out.push(rec);
                 }
@@ -4984,6 +4999,11 @@ impl<F: Fs> GraphDb<F> {
                     if interned.insert(etype) {
                         out.push(intern);
                     }
+                    out.push(rec);
+                }
+                WalRecord::DeleteNode { ref key } => {
+                    pending.remove(key.as_str());
+                    freed.insert(key.clone());
                     out.push(rec);
                 }
                 other => out.push(other),
@@ -9722,6 +9742,10 @@ impl<F: Fs> GraphDb<F> {
         try_copy("wal.floor")?;
         try_copy("wal.genesis")?;
         try_copy("roles.json")?;
+        // The map from commit to wall-clock time. Without it the copy cannot
+        // resolve a date to a commit, and answers `NoRecordedTime` for history
+        // it holds in full (ledger row 86).
+        try_copy("commit_times.bin")?;
 
         // Copy WAL archives.
         let archives = self.fs.list_archives()?;
@@ -14408,6 +14432,11 @@ struct Overlay {
     /// `OnConflict::Replace` has to compare labels.
     extra_labels: BTreeMap<String, String>,
     deleted_keys: BTreeSet<String>,
+    /// `new key → store key` for every node an earlier op in this batch
+    /// renamed. Such a key is in `extra_keys`, but unlike one a batch inserts
+    /// it has a stored node behind it — under the old key until the batch
+    /// commits — and its properties, label and edges are read through this.
+    renamed_from: BTreeMap<String, String>,
     extra_props: BTreeMap<(String, String), Value>,
     removed_props: BTreeSet<(String, String)>,
     extra_edges: BTreeSet<(String, String, String)>,
@@ -14484,6 +14513,23 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.db.ids.get(key).is_some()
     }
 
+    /// The key the store holds `key`'s node under, or `None` when the batch
+    /// sees no stored node there: `key` is deleted, or was first inserted in
+    /// this batch. A key an earlier op renamed stands for the node still
+    /// stored under its old key.
+    fn store_key<'k>(&'k self, key: &'k str) -> Option<&'k str> {
+        if self.overlay.deleted_keys.contains(key) {
+            return None;
+        }
+        if let Some(origin) = self.overlay.renamed_from.get(key) {
+            return Some(origin.as_str());
+        }
+        if self.overlay.extra_keys.contains(key) {
+            return None;
+        }
+        Some(key)
+    }
+
     fn has_prop(&self, key: &str, field: &str) -> bool {
         if !self.has_key(key) {
             return false;
@@ -14497,10 +14543,10 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         }
         // Fresh identity (first insert in this batch, or delete+reinsert):
         // ignore props still sitting on the soon-to-be-tombstoned slot.
-        if self.overlay.extra_keys.contains(key) {
+        let Some(stored) = self.store_key(key) else {
             return false;
-        }
-        self.db.get_prop(key, field).is_some()
+        };
+        self.db.get_prop(stored, field).is_some()
     }
 
     fn has_edge(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
@@ -14516,14 +14562,10 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             return true;
         }
         // A key created in this batch (including reinsert) has no db edges.
-        if self.overlay.extra_keys.contains(src_key) || self.overlay.extra_keys.contains(dst_key) {
+        let (Some(src_key), Some(dst_key)) = (self.store_key(src_key), self.store_key(dst_key))
+        else {
             return false;
-        }
-        if self.overlay.deleted_keys.contains(src_key)
-            || self.overlay.deleted_keys.contains(dst_key)
-        {
-            return false;
-        }
+        };
         let Some(src) = self.db.ids.get(src_key) else {
             return false;
         };
@@ -14551,14 +14593,10 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     }
 
     fn is_rule_owned(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
-        if self.overlay.extra_keys.contains(src_key) || self.overlay.extra_keys.contains(dst_key) {
+        let (Some(src_key), Some(dst_key)) = (self.store_key(src_key), self.store_key(dst_key))
+        else {
             return false;
-        }
-        if self.overlay.deleted_keys.contains(src_key)
-            || self.overlay.deleted_keys.contains(dst_key)
-        {
-            return false;
-        }
+        };
         let Some(src) = self.db.ids.get(src_key) else {
             return false;
         };
@@ -14767,8 +14805,14 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             return None;
         }
         // Fresh identities created in this batch have no stored label in the
-        // overlay; they cannot be provenance-owned yet either.
-        let id = self.db.ids.get(key)?;
+        // overlay; they cannot be provenance-owned yet either. A key this
+        // batch renamed has its label on the node stored under the old key.
+        let stored = self
+            .overlay
+            .renamed_from
+            .get(key)
+            .map_or(key, String::as_str);
+        let id = self.db.ids.get(stored)?;
         let sym = self.db.labels.get(id as usize).copied()?;
         if sym == u32::MAX {
             return None;
@@ -14925,10 +14969,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         if let Some(v) = self.overlay.extra_props.get(&k) {
             return Some(v.clone());
         }
-        if self.overlay.extra_keys.contains(key) {
-            return None;
-        }
-        self.db.get_prop(key, field)
+        self.db.get_prop(self.store_key(key)?, field)
     }
 
     fn check_create_rule(&self, def: &RuleDef) -> Result<()> {
@@ -14982,6 +15023,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
 
     fn note_insert_node(&mut self, label: &str, key: &str, props: &[(String, Value)]) {
         self.overlay.deleted_keys.remove(key);
+        self.overlay.renamed_from.remove(key);
         self.overlay.extra_keys.insert(key.to_string());
         self.overlay
             .extra_labels
@@ -15029,6 +15071,7 @@ impl<'a, F: Fs> MutPreview<'a, F> {
 
     fn note_delete_node(&mut self, key: &str) {
         self.overlay.extra_keys.remove(key);
+        self.overlay.renamed_from.remove(key);
         self.overlay.deleted_keys.insert(key.to_string());
         self.overlay.extra_props.retain(|(k, _), _| k != key);
         self.overlay.removed_props.retain(|(k, _)| k != key);
@@ -15064,6 +15107,14 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     }
 
     fn note_rename_node(&mut self, old: &str, new: &str) {
+        // The stored node `new` will stand for: the one `old` stood for if an
+        // earlier op renamed it here, `old` itself if the store has it, and
+        // none if `old` was first inserted in this batch.
+        let origin = match self.overlay.renamed_from.remove(old) {
+            Some(origin) => Some(origin),
+            None if self.overlay.extra_keys.contains(old) => None,
+            None => Some(old.to_string()),
+        };
         // Mark old as deleted so subsequent batch ops cannot reference it.
         self.overlay.extra_keys.remove(old);
         self.overlay.deleted_keys.insert(old.to_string());
@@ -15099,6 +15150,22 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         for k in transferred_removed {
             self.overlay.removed_props.insert(k);
         }
+        if let Some(label) = self.overlay.extra_labels.remove(old) {
+            self.overlay.extra_labels.insert(new_str.clone(), label);
+        }
+        // Edges the batch added or deleted follow the node to its new key.
+        let follow = |k: String| if k == old { new_str.clone() } else { k };
+        self.overlay.extra_edges = std::mem::take(&mut self.overlay.extra_edges)
+            .into_iter()
+            .map(|(t, s, d)| (t, follow(s), follow(d)))
+            .collect();
+        self.overlay.deleted_edges = std::mem::take(&mut self.overlay.deleted_edges)
+            .into_iter()
+            .map(|(t, s, d)| (t, follow(s), follow(d)))
+            .collect();
+        if let Some(origin) = origin {
+            self.overlay.renamed_from.insert(new_str, origin);
+        }
     }
 
     fn note_delete_rule(&mut self, name: &str) {
@@ -15109,6 +15176,17 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.overlay.deleted_rules.insert(name.to_string());
         // Treat the deleted rule's current provenance as gone so a later
         // delete_edge of those triples is a no-op (matches sequential).
+        //
+        // Provenance names nodes by the key the store holds them under; the
+        // overlay names them as the batch does. A node an earlier op renamed
+        // is recorded under its new key, or a later read of that key would go
+        // through to the store and find the rule's edge still there.
+        let now: BTreeMap<&str, &str> = self
+            .overlay
+            .renamed_from
+            .iter()
+            .map(|(new, stored)| (stored.as_str(), new.as_str()))
+            .collect();
         if let Some(triples) = self.db.engine.provenance().get(name) {
             for &(et, s, d) in triples {
                 let Some(etype) = self.db.syms.resolve(et) else {
@@ -15120,6 +15198,8 @@ impl<'a, F: Fs> MutPreview<'a, F> {
                 let Some(dst) = self.db.ids.key_of(d) else {
                     continue;
                 };
+                let src = now.get(src).copied().unwrap_or(src);
+                let dst = now.get(dst).copied().unwrap_or(dst);
                 let k = (etype.to_string(), src.to_string(), dst.to_string());
                 self.overlay.extra_edges.remove(&k);
                 self.overlay.deleted_edges.insert(k);

@@ -83,6 +83,19 @@ pub fn is_write_tokens(tokens: &[Tok]) -> bool {
     }
 }
 
+/// `true` or `false` in any case, as the literal it spells; `None` for any
+/// other identifier. A name followed by `.` or `(` is a property reference or
+/// a function call and never reaches this.
+fn bool_literal(name: &str) -> Option<bool> {
+    if name.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if name.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 struct Parser<'a> {
     toks: &'a [Tok],
     pos: usize,
@@ -129,6 +142,25 @@ impl<'a> Parser<'a> {
             }
             _ => Err(self.err(what)),
         }
+    }
+
+    /// `true` and `false` are literals, so neither can name a variable or an
+    /// alias: an expression that mentions the name would read the literal.
+    fn not_reserved(&self, name: &str) -> Result<(), String> {
+        if bool_literal(name).is_some() {
+            return Err(self.err(&format!(
+                "`{name}` is a boolean literal and cannot name a variable or an alias"
+            )));
+        }
+        Ok(())
+    }
+
+    /// An identifier that binds a name: an alias after `AS`.
+    fn binding(&mut self, what: &str) -> Result<String, String> {
+        if let Some(Tok::Ident(s)) = self.peek() {
+            self.not_reserved(s)?;
+        }
+        self.ident(what)
     }
 
     fn query(&mut self) -> Result<Query, String> {
@@ -335,7 +367,7 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Unwind, "expected UNWIND")?;
         let list = self.unwind_expr()?;
         self.expect(&Tok::As, "expected AS after UNWIND expression")?;
-        let alias = self.ident("expected alias identifier after AS")?;
+        let alias = self.binding("expected alias identifier after AS")?;
         Ok(UnwindClause { list, alias })
     }
 
@@ -440,6 +472,7 @@ impl<'a> Parser<'a> {
         let var = match self.peek() {
             Some(Tok::Ident(s)) => {
                 let s = s.clone();
+                self.not_reserved(&s)?;
                 self.pos += 1;
                 Some(s)
             }
@@ -516,6 +549,7 @@ impl<'a> Parser<'a> {
         let var = match self.peek() {
             Some(Tok::Ident(s)) => {
                 let s = s.clone();
+                self.not_reserved(&s)?;
                 self.pos += 1;
                 Some(s)
             }
@@ -959,6 +993,8 @@ impl<'a> Parser<'a> {
                 } else if self.eat(&Tok::Dot) {
                     let field = self.ident("expected field name after '.'")?;
                     Ok(Operand::Prop { var: name, field })
+                } else if let Some(b) = bool_literal(&name) {
+                    Ok(Operand::Lit(Value::Bool(b)))
                 } else {
                     // Bare variable reference (e.g. alias name in WITH … WHERE c > 2).
                     Ok(Operand::Var(name))
@@ -1079,7 +1115,7 @@ impl<'a> Parser<'a> {
                 };
                 self.expect(&Tok::RParen, "expected ')' to close aggregate function")?;
                 let alias = if self.eat(&Tok::As) {
-                    Some(self.ident("expected alias identifier after AS")?)
+                    Some(self.binding("expected alias identifier after AS")?)
                 } else {
                     None
                 };
@@ -1106,7 +1142,7 @@ impl<'a> Parser<'a> {
             other => RetVal::ScalarExpr(other),
         };
         let alias = if self.eat(&Tok::As) {
-            Some(self.ident("expected alias identifier after AS")?)
+            Some(self.binding("expected alias identifier after AS")?)
         } else {
             None
         };
@@ -1235,6 +1271,7 @@ impl<'a> Parser<'a> {
         let var = match self.peek() {
             Some(Tok::Ident(s)) => {
                 let s = s.clone();
+                self.not_reserved(&s)?;
                 self.pos += 1;
                 Some(s)
             }
@@ -1275,7 +1312,7 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    /// Parse a literal value (int, float, or string). Parameters and property
+    /// Parse a literal value (int, float, string, boolean or list). Parameters and property
     /// references are not accepted in write statements (v1 limitation).
     fn literal_value(&mut self, what: &str) -> Result<Value, String> {
         if self.eat(&Tok::Dash) {
@@ -1327,6 +1364,11 @@ impl<'a> Parser<'a> {
                 }
                 Ok(Value::List(items))
             }
+            Some(Tok::Ident(name)) if bool_literal(name).is_some() => {
+                let b = bool_literal(name).unwrap_or_default();
+                self.pos += 1;
+                Ok(Value::Bool(b))
+            }
             Some(Tok::Param(_)) => Err(self.err(&format!(
                 "parameter references are not supported in {what} (v1 limitation: use literals only)"
             ))),
@@ -1376,6 +1418,7 @@ impl<'a> Parser<'a> {
                     Some(Tok::Ident(s)) => s.clone(),
                     _ => unreachable!(),
                 };
+                self.not_reserved(&s)?;
                 self.pos += 1; // consume var name
                 Some(s)
             }

@@ -187,7 +187,7 @@ fn edge_weight(
 
 /// Configuration for [`GraphDb::pagerank`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PageRankConfig {
     /// Damping factor (probability of following an edge, not teleporting).
     /// Default 0.85.
@@ -226,6 +226,23 @@ impl Default for PageRankConfig {
             weight_prop: None,
             min_weight: None,
         }
+    }
+}
+
+impl PageRankConfig {
+    /// Refuse a config [`GraphDb::pagerank`] cannot give a meaningful answer
+    /// for. `damping` is a probability: a NaN makes every score NaN, and a
+    /// value outside 0 to 1 makes the scores something other than a
+    /// distribution. `pagerank` itself returns a report, not a `Result`, so
+    /// a surface that takes a caller's config calls this first.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(0.0..=1.0).contains(&self.damping) {
+            return Err(format!(
+                "damping must be a number from 0 to 1, got {}",
+                self.damping
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -438,7 +455,7 @@ pub(crate) fn pagerank(
 
 /// Configuration for [`GraphDb::connected_components`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WccConfig {
     /// Restrict edges to this type. `None` uses all edge types.
     pub edge_type: Option<String>,
@@ -653,7 +670,7 @@ pub(crate) fn wcc(
 
 /// Configuration for [`GraphDb::degree_centrality`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DegreeConfig {
     /// Restrict edges to this type. `None` counts all edge types.
     pub edge_type: Option<String>,

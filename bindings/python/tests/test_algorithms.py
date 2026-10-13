@@ -95,3 +95,16 @@ def test_budget_ms_defaults_to_no_time_limit(name):
     """
     default = inspect.signature(getattr(GraphDb, name)).parameters["budget_ms"].default
     assert default == 0, f"{name}(budget_ms={default!r}): a wall-clock default is not repeatable"
+
+
+@pytest.mark.parametrize("damping", [float("nan"), float("inf"), -0.1, 1.5])
+def test_a_damping_that_is_not_a_probability_is_a_value_error(star, damping):
+    """A NaN damping used to come back as a NaN score for every node."""
+    with pytest.raises(ValueError, match="damping must be a number from 0 to 1"):
+        star.pagerank(damping=damping)
+
+
+def test_both_ends_of_the_damping_range_are_accepted(star):
+    for damping in (0.0, 1.0):
+        scores = star.pagerank(damping=damping)["scores"]
+        assert all(score == score for _, score in scores)

@@ -10,6 +10,30 @@
   "version": "0.7.1",
   "packages": [
     {
+      "registryType": "npm",
+      "identifier": "mushroomdb",
+      "version": "0.7.1",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp",
+          "valueHint": "subcommand"
+        },
+        {
+          "type": "positional",
+          "description": "Path to the database directory",
+          "isRequired": true,
+          "format": "filepath",
+          "placeholder": "/path/to/your/db",
+          "valueHint": "db_dir"
+        }
+      ]
+    },
+    {
       "registryType": "cargo",
       "identifier": "mushroomdb-cli",
       "version": "0.7.1",

@@ -415,7 +415,7 @@ plus post-copy CRC verification. Writers are blocked for that entire window. For
 stores with large snapshots this may be tens of seconds.
 
 The server copies: `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
-`wal.floor`, `wal.genesis`, and `roles.json`. After the copies complete it opens the
+`wal.floor`, `wal.genesis`, `roles.json` and `commit_times.bin`. After the copies complete it opens the
 backup read-only and runs the CRC verifier.
 
 Responses:
@@ -1085,12 +1085,13 @@ type is in its `delete_edge_types` between two nodes it can see; otherwise 403.
 ### `POST /algo/pagerank`
 
 PageRank over hand-written and derived edges together. The body is a JSON object and may be
-`{}`: every field has a default. It may not be empty, and a field the config does not have is
-ignored without a word, so `max_iter` for `max_iters` runs with the default.
+`{}`: every field has a default. It may not be empty. A field the config does not have is 400
+on all three `/algo` routes, so `max_iter` for `max_iters` is refused and not run with the
+default.
 
 | Field | Default | What it is |
 |---|---|---|
-| `damping` | 0.85 | The damping factor |
+| `damping` | 0.85 | The damping factor, from 0 to 1; anything else is 400 |
 | `max_iters` | 50 | Iterations before giving up |
 | `tol` | 1e-6 | Stop when the scores' total change in one iteration falls below it |
 | `direction` | `"out"` | `"out"`, `"in"` or `"both"` |
@@ -1109,6 +1110,10 @@ A value the config does not accept is 400, and the message names what it would h
 
 ```json
 {"error": "invalid pagerank config: unknown variant `sideways`, expected one of `out`, `in`, `both`"}
+```
+
+```json
+{"error": "invalid pagerank config: unknown field `max_iter`, expected one of `damping`, `max_iters`, `tol`, `edge_type`, `direction`, `budget_ms`, `weight_prop`, `min_weight`"}
 ```
 
 A role-bound token gets 403 on every `/algo` route, because the scan covers the whole graph.

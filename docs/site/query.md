@@ -712,6 +712,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MERGE (n:L {id: 'x'}) RETURN …` | `MERGE (n:Person {id: 'alice'}) RETURN n` — returns node whether created or matched |
 | `CREATE … RETURN …` | `CREATE (n:Person {id: 'alice'}) RETURN n.id, id(n), n.key` — single-statement create + projection |
 | `WHERE … IS NULL / IS NOT NULL` | `WHERE n.score IS NULL`, `WHERE b IS NOT NULL` — null-check predicate; composes with AND/OR |
+| Boolean literals `true` / `false` (any case) | `WHERE n.active = true`, `WHERE n.active <> false`, `MATCH (n {active: true})`, `SET n.active = false`, `RETURN true AS t` — a node with no such property matches neither `= …` nor `<> …`. `true` and `false` are reserved: naming a variable or an alias either one is a parse error. A property or a map key may still be called that (`n.true`) |
 | Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error |
 | Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, `key`, …) | `RETURN abs(n.score), toString(n.weight)` |
 | `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |

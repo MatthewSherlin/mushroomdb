@@ -789,15 +789,22 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
         } else {
             Some(label_str)
         };
-        let k = args
-            .get("k")
-            .and_then(Js::as_u64)
-            .map(|n| n as usize)
-            .unwrap_or(10);
-        let min = args
-            .get("min")
-            .and_then(Js::as_f64)
-            .unwrap_or(core_api::FIND_SIMILAR_DEFAULT_MIN);
+        // Absent or null takes the default; anything else that is not the
+        // number asked for is refused, as HTTP refuses it.
+        let k = match args.get("k") {
+            None | Some(Js::Null) => 10usize,
+            Some(v) => match v.as_u64() {
+                Some(n) => n as usize,
+                None => return CallOutcome::ToolErr("k must be a non-negative integer".into()),
+            },
+        };
+        let min = match args.get("min") {
+            None | Some(Js::Null) => core_api::FIND_SIMILAR_DEFAULT_MIN,
+            Some(v) => match v.as_f64() {
+                Some(n) => n,
+                None => return CallOutcome::ToolErr("min must be a number".into()),
+            },
+        };
         let where_pred = match parse_where_arg(args) {
             Ok(p) => p,
             Err(e) => return CallOutcome::ToolErr(e),
@@ -852,11 +859,13 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
         .get("edge_type")
         .and_then(Js::as_str)
         .unwrap_or("SIMILAR");
-    let limit = args
-        .get("limit")
-        .and_then(Js::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(10);
+    let limit = match args.get("limit") {
+        None | Some(Js::Null) => 10usize,
+        Some(v) => match v.as_u64() {
+            Some(n) => n as usize,
+            None => return CallOutcome::ToolErr("limit must be a non-negative integer".into()),
+        },
+    };
 
     // When a mask is present, a hidden query key behaves identically to a
     // nonexistent key — we do not confirm its existence.
@@ -1350,6 +1359,10 @@ fn graph_tools() -> Vec<Js> {
                             "description": "Edge property that stores the score (default: weight)."
                         },
                         "max_edges": { "type": ["integer", "null"] },
+                        "approximate": {
+                            "type": "boolean",
+                            "description": "Find candidates through the HNSW index instead of comparing every pair (default: false). Only for a VectorSimilar predicate; the edges are approximate, not exact."
+                        },
                         "namespace": {
                             "type": "string",
                             "description": "Scope the rule to one namespace: it sees only that namespace's nodes — source, via hop and destination — so every edge it derives stays inside. Omitted means a global rule, which is the only kind that may derive an edge across a boundary."
@@ -1823,6 +1836,48 @@ mod tests {
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
         assert_eq!(names, ASSOCIATION_TOOLS.to_vec());
+    }
+
+    /// Binding: every argument `suggest_rules` hands back for `create_rule`
+    /// is one `create_rule`'s advertised schema lists. A vector proposal over
+    /// a large label carries `approximate: true`, which the tool accepts.
+    #[test]
+    fn create_rule_advertises_every_argument_a_suggestion_carries() {
+        let def = RuleDef {
+            name: "sim".into(),
+            src_label: "Person".into(),
+            dst_label: "Person".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "SIMILAR".into(),
+            weight_prop: Some("score".into()),
+            max_edges: Some(8),
+            approximate: true,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        };
+        let args = core_api::memory::suggest::create_rule_args(&def);
+        assert_eq!(args["approximate"], json!(true), "{args}");
+
+        let tools = graph_tools();
+        let schema = tools
+            .iter()
+            .find(|t| t["name"] == json!("create_rule"))
+            .expect("create_rule is a graph tool");
+        let advertised = schema["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties");
+        for arg in args.as_object().expect("an object").keys() {
+            assert!(
+                advertised.contains_key(arg),
+                "create_rule's schema does not list {arg:?}, which a suggestion carries"
+            );
+        }
+        assert_eq!(advertised["approximate"]["type"], json!("boolean"));
     }
 
     /// Binding: `pairwise_similar` is advertised on the memory surface
@@ -2531,6 +2586,55 @@ mod tests {
             is_error(&resp),
             "non-string mask element must produce a tool error"
         );
+    }
+
+    /// A `min`, `k` or `limit` that is present and not the number it should be
+    /// is a tool error, as `min` and `k` are over HTTP — never the default
+    /// applied in silence. Absent or null still takes the default.
+    #[test]
+    fn test_find_similar_non_numeric_min_k_or_limit_is_error() {
+        let db = demo_db();
+        for (args, want) in [
+            (
+                json!({ "vector": [1.0, 0.0], "field": "emb", "min": "0.5" }),
+                "min must be a number",
+            ),
+            (
+                json!({ "vector": [1.0, 0.0], "field": "emb", "k": "3" }),
+                "k must be a non-negative integer",
+            ),
+            (
+                json!({ "vector": [1.0, 0.0], "field": "emb", "k": -1 }),
+                "k must be a non-negative integer",
+            ),
+            (
+                json!({ "key": "alice", "limit": "1" }),
+                "limit must be a non-negative integer",
+            ),
+        ] {
+            let resp = tool_call(&db, 1, "find_similar", args.clone());
+            assert!(is_error(&resp), "{args} must be a tool error, got {resp}");
+            assert_eq!(tool_err_text(&resp), want, "for {args}");
+        }
+
+        // Null is absence: the defaults apply and the reply echoes them.
+        let resp = tool_call(
+            &db,
+            2,
+            "find_similar",
+            json!({ "vector": [1.0, 0.0], "field": "emb", "k": null, "min": null }),
+        );
+        assert!(!is_error(&resp), "null takes the default: {resp}");
+        let result = tool_text(&resp);
+        assert_eq!(result["k"], json!(10));
+        assert_eq!(result["min"], json!(core_api::FIND_SIMILAR_DEFAULT_MIN));
+        let resp = tool_call(
+            &db,
+            3,
+            "find_similar",
+            json!({ "key": "alice", "limit": null }),
+        );
+        assert!(!is_error(&resp), "a null limit takes the default: {resp}");
     }
 
     /// Vector-mode `where` eq filters to matching nodes. Default `min` stays 0.8.

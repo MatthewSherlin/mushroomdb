@@ -446,7 +446,7 @@ fn written(db: &GraphDb<core_storage::fs::RealFs>) -> Written {
 /// with a message naming the argument and the position, and nothing written:
 /// not the note, not the entity under an unseen label beside the bad key, not
 /// that label's full-text pair.
-fn assert_every_argument_refuses(name: &str, key: &str) {
+fn assert_every_argument_refuses(name: &str, key: &str, reason: &str) {
     let mut db = store(name);
     remember(&mut db, &input("Ada wrote the first one", &["ada".into()])).unwrap();
     let before = written(&db);
@@ -498,7 +498,7 @@ fn assert_every_argument_refuses(name: &str, key: &str) {
         match refused {
             Err(core_api::GraphError::IngestError { detail }) => assert_eq!(
                 detail,
-                format!("remember: {argument} must not be empty or only whitespace, got {key:?}")
+                format!("remember: {argument} must not be {reason}, got {key:?}")
             ),
             other => panic!("{argument}: expected the empty-key refusal, got {other:?}"),
         }
@@ -510,12 +510,12 @@ fn assert_every_argument_refuses(name: &str, key: &str) {
 
 #[test]
 fn an_empty_key_is_refused_wherever_remember_takes_one() {
-    assert_every_argument_refuses("empty-key", "");
+    assert_every_argument_refuses("empty-key", "", "empty or only whitespace");
 }
 
 #[test]
 fn a_whitespace_only_key_is_refused_the_same_way() {
-    assert_every_argument_refuses("blank-key", " \t\n");
+    assert_every_argument_refuses("blank-key", " \t\n", "empty or only whitespace");
 }
 
 /// The refusal is for a key with nothing in it. A padded key is a different,
@@ -794,4 +794,176 @@ fn a_store_that_already_holds_an_empty_type_edge_and_label_still_opens_and_answe
     .expect("forget removes the empty-label node");
     let stats = db.stats();
     assert_eq!((stats.nodes_live, stats.edges), (3, 1));
+}
+
+/// A stub takes its key as its name, so each word of the key becomes an
+/// alias, and a long key — a sentence, a URL with a slug — implies more than
+/// a node may carry (`MAX_ALIASES`, defect 53). The stub is still written, as
+/// an unknown subject always is, and carries its whole key as its one alias.
+#[test]
+fn a_stub_whose_key_implies_more_aliases_than_the_cap_carries_only_its_key() {
+    use core_api::memory::identity::{ALIASES_FIELD, MAX_ALIASES};
+
+    let mut db = store("stub-alias-cap");
+    let aliases_of =
+        |db: &GraphDb<core_storage::fs::RealFs>, key: &str| match db.get_prop(key, ALIASES_FIELD) {
+            Some(Value::List(aliases)) => aliases,
+            other => panic!("expected {key}'s aliases, got {other:?}"),
+        };
+
+    let words: Vec<String> = (0..32).map(|i| format!("w{i}")).collect();
+    let long = words.join(" ");
+    let url = "https://news.example.com/2026/10/13/a-long-slug-about-graph-databases-and-agent-\
+               memory-that-goes-on-for-quite-a-while-longer-than-anyone-would-type?utm_source=\
+               newsletter&utm_medium=email&utm_campaign=october&ref=home&page=2&sort=new";
+    let report = remember(
+        &mut db,
+        &RememberInput {
+            facts: &[FactIn {
+                subject: url.into(),
+                predicate: "CITES".into(),
+                object: "ada".into(),
+            }],
+            ..input("a note about a long key", std::slice::from_ref(&long))
+        },
+    )
+    .expect("a long key is stubbed, not refused");
+    assert!(report.provisional.contains(&long), "{report:?}");
+    assert!(report.provisional.contains(&url.to_string()), "{report:?}");
+    assert_eq!(aliases_of(&db, &long), vec![Value::Str(long.clone())]);
+    assert_eq!(aliases_of(&db, url), vec![Value::Str(url.to_lowercase())]);
+
+    // One word fewer is exactly the cap — the key is its own canonical name,
+    // so it counts once — and its words are aliases as before.
+    let at_cap = words[..31].join(" ");
+    remember(
+        &mut db,
+        &input("thirty-one words", std::slice::from_ref(&at_cap)),
+    )
+    .expect("at the cap");
+    assert_eq!(aliases_of(&db, &at_cap).len(), MAX_ALIASES);
+}
+
+/// A key of only characters that print as nothing — a zero-width space, a
+/// control character, a byte-order mark — names nothing either (defect 78).
+/// The definition is the digest's: what `sanitize` turns into spaces.
+#[test]
+fn a_key_with_no_visible_character_is_refused_the_same_way() {
+    for (i, key) in ["\u{200b}", "\u{1}", "\u{feff}", " \u{200b}\u{202e}\t"]
+        .iter()
+        .enumerate()
+    {
+        assert_every_argument_refuses(
+            &format!("invisible-key-{i}"),
+            key,
+            "only invisible characters",
+        );
+    }
+}
+
+/// The refusal is for a key with nothing to see in it. One that carries an
+/// invisible character beside text is stored as given, as a padded key is.
+#[test]
+fn a_key_with_an_invisible_character_beside_text_is_still_taken_as_given() {
+    let mut db = store("zero-width-beside-text");
+    let about = vec!["re\u{200b}id".to_string()];
+    let report = remember(&mut db, &input("Reid reviewed the copy", &about)).expect("remember");
+    assert_eq!(report.provisional, about);
+    assert!(db.has_node("re\u{200b}id"));
+}
+
+/// `matched` counts every key the call named that the store already held: a
+/// fact's endpoint as much as an `about` key (defect 48). Each key counts
+/// once, however many arguments name it.
+#[test]
+fn a_fact_endpoint_that_already_exists_is_counted_as_matched() {
+    let mut db = store("matched-fact-endpoints");
+    remember(
+        &mut db,
+        &input("Ada and Bob met", &["ada".into(), "bob".into()]),
+    )
+    .unwrap();
+    let fact = |subject: &str, object: &str| FactIn {
+        subject: subject.into(),
+        predicate: "KNOWS".into(),
+        object: object.into(),
+    };
+
+    // Both endpoints exist; `carol` does not and is stubbed.
+    let facts = [fact("ada", "bob"), fact("bob", "carol")];
+    let report = remember(
+        &mut db,
+        &RememberInput {
+            facts: &facts,
+            ..input("Ada knows Bob, who knows Carol", &[])
+        },
+    )
+    .expect("remember");
+    assert_eq!(report.matched, 2, "{report:?}");
+    assert_eq!(report.provisional, vec!["carol".to_string()]);
+
+    // Named in `about` and in a fact, `ada` is still one match.
+    let facts = [fact("ada", "bob")];
+    let report = remember(
+        &mut db,
+        &RememberInput {
+            facts: &facts,
+            ..input("Ada knows Bob, again", &["ada".into()])
+        },
+    )
+    .expect("remember");
+    assert_eq!(report.matched, 2, "{report:?}");
+}
+
+/// Defect 64: an `entities[]` entry whose key is already stored under a
+/// different label matches the stored node, and its own label is not used —
+/// so full-text is not declared on it. It used to be, at one pair against the
+/// cap for a label with no node in the store. A new key under the same label
+/// in the same call still declares it.
+#[test]
+fn a_label_the_store_disagrees_with_is_not_declared_full_text() {
+    let mut db = store("label-disagrees");
+    db.insert_node(
+        "Person",
+        "ada",
+        vec![(NAME_FIELD.into(), Value::Str("Ada".into()))],
+    )
+    .unwrap();
+    let entity = |key: &str, label: &str| EntityIn {
+        key: key.into(),
+        label: label.into(),
+        props: BTreeMap::from([("role".to_string(), Value::Str("founder".into()))]),
+        aliases: Vec::new(),
+    };
+    let org_name = ("Guild".to_string(), NAME_FIELD.to_string());
+
+    let entities = vec![entity("ada", "Guild")];
+    let report = remember(
+        &mut db,
+        &RememberInput {
+            entities: &entities,
+            ..input("Ada founded it", &[])
+        },
+    )
+    .expect("remember");
+    assert_eq!((report.matched, report.created), (1, 0), "{report:?}");
+    assert_eq!(db.node_info("ada").unwrap().label, "Person");
+    assert!(
+        report.fulltext_declared.is_empty(),
+        "nothing was written under Guild: {report:?}"
+    );
+    assert!(!db.fulltext_pairs().contains(&org_name));
+
+    let entities = vec![entity("ada", "Guild"), entity("masons", "Guild")];
+    let report = remember(
+        &mut db,
+        &RememberInput {
+            entities: &entities,
+            ..input("Ada founded the masons", &[])
+        },
+    )
+    .expect("remember");
+    assert_eq!((report.matched, report.created), (1, 1), "{report:?}");
+    assert_eq!(report.fulltext_declared, vec!["Guild".to_string()]);
+    assert!(db.fulltext_pairs().contains(&org_name));
 }

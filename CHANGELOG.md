@@ -2,8 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- **`true` and `false` are literals in the Cypher subset.** In any case, wherever a literal is read: `WHERE n.active = true`, `WHERE n.active <> false`, `MATCH (n {active: true})`, `RETURN true AS t`, and `CREATE` and `SET` with a boolean value. They used to be read as variable names, so a comparison was an `unbound variable` error and a write was refused; `WHERE n.active`, the bare form, was the only way to ask and still works. A node with no such property matches neither `= …` nor `<> …`. `true` and `false` are reserved: naming a variable or an alias either one is now a parse error (row 63).
+- **`PageRankConfig::validate`**, for an embedded caller that takes a config from somewhere it does not control.
+- **The MCP registry card offers the npm launcher**, so a client that installs from the registry needs no Rust toolchain.
+
+### Changed
+
+- **An `/algo` request with a field the config does not have is 400.** `POST /algo/pagerank`, `/algo/wcc` and `/algo/degree` dropped such a field without a word: `{"weight": "score"}` answered 200 with unweighted scores, and `max_iter` for `max_iters` ran with the default. The message names the field and the ones the route accepts. `{}` is still every default. **A caller that sends a stray field gets 400 where 0.7.1 answered** (row 87).
+- **PageRank refuses a damping that is not a number from 0 to 1.** Python raises `ValueError` and HTTP answers 400. A NaN used to come back as a NaN score for every node (row 75).
+- **Over MCP, `find_similar` refuses a `min`, `k` or `limit` that is not a number.** It used to take the default and echo it, so a caller who sent `"0.5"` got results filtered at 0.8. Absent or null still takes the default (row 74).
+- **`remember` refuses a key, predicate or label made only of invisible characters** — a zero-width space, an ASCII control character, a byte-order mark — as it already refused an empty one, before it writes anything (row 78).
+- **A provisional stub with a long key is linked by its whole key alone.** A stub's aliases are its key and each word of it. A key that implies more than 32 — a sentence, a URL with a slug and a query string — used to get them all, past the cap an entity is held to; it now carries the one (row 53).
+
 ### Fixed
 
+- **A backup carries the commit-time map.** `mushroomdb backup`, `POST /backup` and `GraphDb::backup_to` left `commit_times.bin` behind, and `restore` did not name it, so a restored store had its history and not the map a read by date resolves through. A backup taken by 0.7.1 or earlier does not hold the map and restores without it (row 86).
+- **A batch sees a node it renamed.** After `rename_node(a, b)` in a `BatchBuilder` or a `submit_batch`, the batch's own checks read `b` as a node with no stored properties, label or edges. So `[rename a→b, insert_edge(b, d)]` passed the cross-namespace guard that `insert_edge(a, d)` is refused by; `[rename a→b, delete_edge(b, d)]` deleted an edge a rule owns; `[rename a→b, remove_prop(b, "name")]` returned Ok and removed nothing; and a chain `[a→b, b→c]` left a stored `id` where two separate renames move it. The checks now read through to the stored node. Reachable only from a batch built in Rust: MCP, HTTP, the Python binding and the CLI each send a rename alone (row 79).
+- **A key reused inside a batch names the new node.** A batch that renamed a node away from a key, or deleted it, and then used the key again wrote against the old node: `[delete_node a, insert_node a, set_prop(a, …)]` lost the property, and `[rename a→b, insert_node a, insert_edge(a, c)]` put the edge on `b`. Also only from a batch built in Rust (row 89).
+- **`remember`'s `matched` counts a fact endpoint that already exists**, each key once (row 48).
+- **`remember` no longer declares full-text on an entity label it did not use.** An `entities` entry whose key is already stored under another label is matched as stored; its own label used to be declared anyway, one pair against the cap for a label with no node. The report still does not say the label went unused (row 64).
+- **The MCP `create_rule` schema lists `approximate`**, which the tool accepts and `suggest_rules` can hand back (row 52).
 - **A truncating snapshot no longer hands discarded commit numbers to the commits that follow.** `GraphDb::snapshot()`, Python's `snapshot()`, `mushroomdb snapshot --truncate` and `mushroomdb migrate` discard the WAL. They left the store's floor where it was, so the replacement WAL was numbered over the old one: `stats` went on reporting `history: complete (nothing pruned)`, and `asof --commit 3`, `open_at(3)`, `edges_at` and `was_linked` answered a commit number taken before the snapshot with whatever commit now sat at that position — a different graph, with no error. The floor now moves to where the discarded history ended, as it already did when `--retention` pruned an archive. `stats` reports `history: reaches back to commit N`, and a read at a discarded commit is refused as out of range, naming the floor (row 80).
 
   **This changes commit numbers after a truncating snapshot.** What is written next is numbered above the old total, where it used to be numbered from 0, and `wal_total_commits()` no longer drops. A caller that relied on "commit 0 is my first write after `snapshot()`" must read `history_floor` and count up from it; the first write is not always at the floor, because a store with full-text fields or indexes re-records each declaration first. Archives taken before a truncating snapshot are removed by it: they are below the new floor.

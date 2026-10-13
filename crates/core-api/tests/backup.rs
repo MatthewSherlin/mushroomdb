@@ -174,6 +174,60 @@ fn backup_dest_opens_clean_and_queries_equal() {
 
 // ── test 3: verified flag is true for valid backup ───────────────────────────
 
+/// A backup is the store, and the store can answer "what did this look like
+/// on the 15th?". The file that maps commits to wall-clock time is part of
+/// that. Before this a backup left it behind, and a restored store refused
+/// every date with `NoRecordedTime` until new commits were made (ledger row 86).
+#[test]
+fn a_backup_can_still_answer_a_date() {
+    let dir = tmp("backup-dates-src");
+    let dest = tmp("backup-dates-dst");
+    let day = |date: &str| -> i64 {
+        // Midnight UTC of an ISO date, in milliseconds.
+        let (y, m, d) = (
+            date[0..4].parse::<i64>().unwrap(),
+            date[5..7].parse::<i64>().unwrap(),
+            date[8..10].parse::<i64>().unwrap(),
+        );
+        let (y2, m2) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
+        let days = 365 * y2 + y2 / 4 - y2 / 100 + y2 / 400 + (153 * (m2 - 3) + 2) / 5 + d - 719_469;
+        days * 86_400_000
+    };
+    let expected;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.record_commits_at(Some(day("2026-06-01"))).unwrap();
+        db.insert_node("Person", "a", vec![]).unwrap();
+        db.insert_node("Person", "b", vec![]).unwrap();
+        db.record_commits_at(Some(day("2026-06-15"))).unwrap();
+        db.insert_edge("KNOWS", "a", "b").unwrap();
+        expected = db.resolve_date("2026-06-10").unwrap();
+        assert!(!db.was_linked("a", "b", "KNOWS", expected).unwrap());
+        let report = db.backup_to(&dest).unwrap();
+        assert!(
+            report.files.iter().any(|f| f == "commit_times.bin"),
+            "the commit-time map is part of the backup: {:?}",
+            report.files
+        );
+    }
+    let restored = GraphDb::open(&dest).unwrap();
+    assert_eq!(
+        restored.resolve_date("2026-06-10").unwrap(),
+        expected,
+        "the backup resolves the date to the same commit the store did"
+    );
+    let on_the_20th = restored.resolve_date("2026-06-20").unwrap();
+    assert!(restored.was_linked("a", "b", "KNOWS", on_the_20th).unwrap());
+    drop(restored);
+
+    // And through `restore`, which copies a named list of files: the map has
+    // to be on it, or the seeded store has the history and not the dates.
+    let seeded = tmp("backup-dates-seeded");
+    core_api::restore::restore_if_empty(&seeded, &dest).unwrap();
+    let seeded = GraphDb::open(&seeded).unwrap();
+    assert_eq!(seeded.resolve_date("2026-06-10").unwrap(), expected);
+}
+
 #[test]
 fn backup_verified_is_true() {
     let src = tmp("src3");
