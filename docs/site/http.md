@@ -1091,7 +1091,7 @@ default.
 
 | Field | Default | What it is |
 |---|---|---|
-| `damping` | 0.85 | The damping factor |
+| `damping` | 0.85 | The damping factor, from 0 to 1; anything else is 400 |
 | `max_iters` | 50 | Iterations before giving up |
 | `tol` | 1e-6 | Stop when the scores' total change in one iteration falls below it |
 | `direction` | `"out"` | `"out"`, `"in"` or `"both"` |

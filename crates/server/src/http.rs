@@ -2052,6 +2052,9 @@ async fn algo_pagerank(
         Ok(c) => c,
         Err(e) => return err_response(format!("invalid pagerank config: {e}")),
     };
+    if let Err(e) = config.validate() {
+        return err_response(format!("invalid pagerank config: {e}"));
+    }
     let db = state.db.clone();
     match tokio::task::spawn_blocking(move || db.read().pagerank(&config)).await {
         Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),

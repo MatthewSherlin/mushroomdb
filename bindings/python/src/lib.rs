@@ -1693,7 +1693,8 @@ impl GraphDb {
     /// `direction` is `"out"` (rank flows along each edge, the default),
     /// `"in"` or `"both"`. `edge_type=None` follows every edge type.
     /// `weight_prop` names an edge property to weight by, and `min_weight`
-    /// drops edges below it.
+    /// drops edges below it. `damping` is a probability: a value that is not
+    /// a number from 0 to 1 is a `ValueError`.
     ///
     /// **`budget_ms` defaults to `0` — no time limit.** The engine's own
     /// default is a 5-second wall-clock budget, under which a loaded machine
@@ -1736,6 +1737,7 @@ impl GraphDb {
             weight_prop,
             min_weight,
         };
+        config.validate().map_err(PyValueError::new_err)?;
         let report = py.allow_threads(|| self.with_ref(|db| Ok(db.pagerank(&config))))?;
         let d = PyDict::new(py);
         d.set_item("scores", report.scores)?;

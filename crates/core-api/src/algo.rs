@@ -229,6 +229,23 @@ impl Default for PageRankConfig {
     }
 }
 
+impl PageRankConfig {
+    /// Refuse a config [`GraphDb::pagerank`] cannot give a meaningful answer
+    /// for. `damping` is a probability: a NaN makes every score NaN, and a
+    /// value outside 0 to 1 makes the scores something other than a
+    /// distribution. `pagerank` itself returns a report, not a `Result`, so
+    /// a surface that takes a caller's config calls this first.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(0.0..=1.0).contains(&self.damping) {
+            return Err(format!(
+                "damping must be a number from 0 to 1, got {}",
+                self.damping
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Result of [`GraphDb::pagerank`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageRankReport {
