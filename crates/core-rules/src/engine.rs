@@ -273,6 +273,10 @@ pub struct RuleEngine {
     /// [`RuleEngine::drain_deltas`] immediately after apply to consume live
     /// events or discard replay noise.
     pending_deltas: Vec<EngineEdgeDelta>,
+    /// Edges retracted while handling the node change in progress. Emptied at
+    /// the start of each one and consumed at its end by
+    /// [`reclaim_retracted`](RuleEngine::reclaim_retracted). Never persisted.
+    retracted: Vec<Triple>,
     /// Gate: whether to accumulate [`EngineEdgeDelta`] items during rule
     /// application.
     ///
@@ -1060,6 +1064,7 @@ fn apply_per_src_top_k(
             g.topo.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
             prov.remove(&def.name, (t, s, d), g.ids, g.syms);
+            prov.retracted.push((t, s, d));
         }
     }
 
@@ -1172,6 +1177,10 @@ struct ProvSets<'a> {
     /// Mirror of [`RuleEngine::emit_deltas`]: when `false`, pushes to
     /// `deltas` are skipped entirely (no heap allocation, no String clone).
     emit: bool,
+    /// Edges this rule has just taken out of the topology because it no longer
+    /// desires them. Another rule over the same labels and edge type may: see
+    /// [`RuleEngine::reclaim_retracted`].
+    retracted: &'a mut Vec<Triple>,
 }
 
 impl ProvSets<'_> {
@@ -1286,6 +1295,7 @@ fn apply_desired(
             g.topo.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
             prov.remove(&def.name, (t, s, d), g.ids, g.syms);
+            prov.retracted.push((t, s, d));
         }
     }
 
@@ -2176,6 +2186,7 @@ impl RuleEngine {
             tripped,
             fires,
             pending_deltas: Vec::new(),
+            retracted: Vec::new(),
             emit_deltas: false,
             rebuild_needed: BTreeSet::new(),
             pending_builds: BTreeMap::new(),
@@ -3481,6 +3492,7 @@ impl RuleEngine {
             intern_rule: &mut self.intern_rule,
             deltas: &mut self.pending_deltas,
             emit: self.emit_deltas,
+            retracted: &mut self.retracted,
         };
         if def.via_label.is_some() {
             // Via-hop backfill: bypass the candidate index; use compute_desired_via.
@@ -3573,6 +3585,7 @@ impl RuleEngine {
             intern_rule: &mut self.intern_rule,
             deltas: &mut self.pending_deltas,
             emit: self.emit_deltas,
+            retracted: &mut self.retracted,
         };
         for triple in triples {
             let (t, s, d) = triple;
@@ -3640,6 +3653,10 @@ impl RuleEngine {
 
         let n_label = g.labels.get(n as usize).copied();
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
+        // Only this change's retractions are reclaimed below. A rebuild or a
+        // rule deletion goes through the same two functions and may have left
+        // entries behind.
+        self.retracted.clear();
 
         for rule_name in rule_names {
             let def = self.rules[&rule_name].clone();
@@ -3742,6 +3759,7 @@ impl RuleEngine {
                         intern_rule: &mut self.intern_rule,
                         deltas: &mut self.pending_deltas,
                         emit: self.emit_deltas,
+                        retracted: &mut self.retracted,
                     };
 
                     if as_src {
@@ -3800,6 +3818,7 @@ impl RuleEngine {
                             intern_rule: &mut self.intern_rule,
                             deltas: &mut self.pending_deltas,
                             emit: self.emit_deltas,
+                            retracted: &mut self.retracted,
                         },
                         tripped,
                         g,
@@ -3807,6 +3826,121 @@ impl RuleEngine {
                 }
             }
         }
+
+        let retracted = std::mem::take(&mut self.retracted);
+        if !retracted.is_empty() {
+            self.reclaim_retracted(&retracted, g);
+        }
+    }
+
+    /// Let a rule that still desires an edge take it, when the rule that owned
+    /// it has just retracted it.
+    ///
+    /// Two rules may share a source label, a destination label and an edge
+    /// type. When both desire the same directed edge the engine gives it one
+    /// owner — whichever added it — and the other records nothing, because
+    /// `add_edge` reports the edge as already there. So when the owner's
+    /// predicate stops holding and it removes the edge, the other rule does
+    /// not know it has lost anything: it fires only when a field *it* watches
+    /// changes. The edge stayed gone until that rule was rebuilt, or happened
+    /// to be fired by a write of its own (ledger row 37).
+    ///
+    /// `delete_rule` already handles the same collision, by rebuilding the
+    /// surviving rules of that edge type. This is the incremental equivalent,
+    /// and narrower: each rule over the retracted edge's type is re-evaluated
+    /// for the source nodes that just lost an edge, and only for those. A rule
+    /// that still desires the pair finds the edge absent, adds it, and owns
+    /// it, at its own weight. A rule that does not, changes nothing.
+    ///
+    /// It runs after every rule has handled the change, not inside the loop:
+    /// rules fire in name order, and a rule that sorts before the owner has
+    /// already seen the edge present and recorded nothing by the time the
+    /// owner retracts it.
+    ///
+    /// Candidate indexes are not touched. No property changed for these rules
+    /// that the loop above has not already filed, and re-filing a node in an
+    /// index is not idempotent for every index kind.
+    ///
+    /// Via-hop rules are not re-evaluated here; they take their own path and
+    /// are named in the ledger as what is left.
+    fn reclaim_retracted(&mut self, retracted: &[Triple], g: &mut GraphMut<'_>) {
+        // (edge type, source) pairs that lost an edge, each once, in a stable order.
+        let lost: BTreeSet<(u32, u32)> = retracted.iter().map(|(t, s, _)| (*t, *s)).collect();
+        let rule_names: Vec<String> = self.rules.keys().cloned().collect();
+        for rule_name in rule_names {
+            let def = self.rules[&rule_name].clone();
+            if def.via_label.is_some() || self.pending_builds.contains_key(&rule_name) {
+                continue;
+            }
+            let Some(et) = g.syms.get(&def.edge_type) else {
+                continue;
+            };
+            let src_sym = g.syms.get(&def.src_label);
+            let dst_sym = g.syms.get(&def.dst_label);
+            for &(t, s) in &lost {
+                if t != et {
+                    continue;
+                }
+                let label = g.labels.get(s as usize).copied();
+                let as_src = src_sym.is_some() && label == src_sym;
+                if !as_src || !rule_sees(&def, s, g) {
+                    continue;
+                }
+                if let Some(k) = def.max_edges {
+                    let desired = compute_desired(&def, &self.indexes[&rule_name], s, true, g);
+                    let top_k = filter_src_top_k(desired, k, g.ids);
+                    let mut prov = ProvSets {
+                        set: self.provenance.entry(rule_name.clone()).or_default(),
+                        owned: &mut self.owned,
+                        by_node: &mut self.by_node,
+                        rule_intern: &mut self.rule_intern,
+                        intern_rule: &mut self.intern_rule,
+                        deltas: &mut self.pending_deltas,
+                        emit: self.emit_deltas,
+                        retracted: &mut self.retracted,
+                    };
+                    apply_per_src_top_k(&def, s, top_k, &mut prov, g);
+                } else {
+                    // The same desired set a fire for `s` builds: as a source,
+                    // and as a destination when the rule links a label to
+                    // itself, so that `apply_desired` does not take edges
+                    // *into* `s` for ones it should retract.
+                    let as_dst = dst_sym.is_some() && label == dst_sym;
+                    let mut desired = compute_desired(&def, &self.indexes[&rule_name], s, true, g);
+                    if as_dst {
+                        desired.extend(compute_desired(
+                            &def,
+                            &self.indexes[&rule_name],
+                            s,
+                            false,
+                            g,
+                        ));
+                    }
+                    let tripped = self.tripped.entry(rule_name.clone()).or_default();
+                    apply_desired(
+                        &def,
+                        desired,
+                        Some(s),
+                        &mut ProvSets {
+                            set: self.provenance.entry(rule_name.clone()).or_default(),
+                            owned: &mut self.owned,
+                            by_node: &mut self.by_node,
+                            rule_intern: &mut self.rule_intern,
+                            intern_rule: &mut self.intern_rule,
+                            deltas: &mut self.pending_deltas,
+                            emit: self.emit_deltas,
+                            retracted: &mut self.retracted,
+                        },
+                        tripped,
+                        g,
+                    );
+                }
+            }
+        }
+        // A rule re-evaluated here is already consistent with its own
+        // provenance, so it retracts nothing; what it may have pushed is not
+        // chased further.
+        self.retracted.clear();
     }
 
     /// Inner handler for `on_node_changed` when the rule is a via-hop rule.
@@ -3951,6 +4085,7 @@ impl RuleEngine {
                 intern_rule: &mut self.intern_rule,
                 deltas: &mut self.pending_deltas,
                 emit: self.emit_deltas,
+                retracted: &mut self.retracted,
             };
             for src in affected_srcs {
                 let desired_src =
@@ -3975,6 +4110,7 @@ impl RuleEngine {
                         intern_rule: &mut self.intern_rule,
                         deltas: &mut self.pending_deltas,
                         emit: self.emit_deltas,
+                        retracted: &mut self.retracted,
                     };
                     apply_desired(def, desired_src, Some(src), &mut prov, tripped, g);
                 }
@@ -4087,6 +4223,7 @@ impl RuleEngine {
                     intern_rule: &mut self.intern_rule,
                     deltas: &mut self.pending_deltas,
                     emit: self.emit_deltas,
+                    retracted: &mut self.retracted,
                 };
                 let top_k = filter_src_top_k(desired_src, k, g.ids);
                 apply_per_src_top_k(&def, rule_src, top_k, &mut prov, g);
@@ -4100,6 +4237,7 @@ impl RuleEngine {
                     intern_rule: &mut self.intern_rule,
                     deltas: &mut self.pending_deltas,
                     emit: self.emit_deltas,
+                    retracted: &mut self.retracted,
                 };
                 apply_desired(&def, desired_src, Some(rule_src), &mut prov, tripped, g);
             }
@@ -4209,6 +4347,7 @@ impl RuleEngine {
                     intern_rule: &mut self.intern_rule,
                     deltas: &mut self.pending_deltas,
                     emit: self.emit_deltas,
+                    retracted: &mut self.retracted,
                 }
                 .remove(&rule_name, triple, g.ids, g.syms);
             }
@@ -4238,6 +4377,7 @@ impl RuleEngine {
                 intern_rule: &mut self.intern_rule,
                 deltas: &mut self.pending_deltas,
                 emit: self.emit_deltas,
+                retracted: &mut self.retracted,
             };
             apply_per_src_top_k(&def, src, top_k, &mut prov, g);
         }
@@ -4362,6 +4502,7 @@ impl RuleEngine {
             intern_rule: &mut self.intern_rule,
             deltas: &mut self.pending_deltas,
             emit: self.emit_deltas,
+            retracted: &mut self.retracted,
         };
         if let Some(k) = def.max_edges {
             apply_streaming_rebuild_top_k(&def, k, &self.indexes[name], doomed, &mut prov, g);
@@ -5073,8 +5214,6 @@ mod tests {
     ///
     /// This asserts what should be true, so it fails today.
     #[test]
-    #[ignore = "defect ledger row 37: incremental retraction removes an edge another rule \
-                with the same label pair and edge type still desires; deferred to 0.8"]
     fn an_edge_two_rules_desire_survives_the_owners_retraction() {
         let rule = |name: &str, predicate: Predicate| RuleDef {
             name: name.into(),
@@ -5126,6 +5265,171 @@ mod tests {
             g.edge_props.get(et, a, b, "weight"),
             Some(&Value::Float(1.0)),
             "and it is the claim's edge now, at the claim's weight"
+        );
+    }
+
+    /// The same collision with the roles reversed: the rule that sorts first
+    /// by name owns the edge, and the one that sorts after it takes over.
+    /// Together with the test above this covers both orders the rule loop can
+    /// meet an owner and a claimant in.
+    #[test]
+    fn the_surviving_rule_takes_the_edge_whichever_of_the_two_sorts_first() {
+        let rule = |name: &str, predicate: Predicate| RuleDef {
+            name: name.into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate,
+            edge_type: "SAME".into(),
+            weight_prop: Some("weight".into()),
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        };
+        let mut fx = Fx::new();
+        let a = fx.add(
+            "A",
+            "a",
+            vec![
+                ("tags", tags(&["x", "y", "z"])),
+                ("fk", Value::Str("b".into())),
+            ],
+        );
+        let b = fx.add("A", "b", vec![("tags", tags(&["x", "y"]))]);
+        let et = fx.syms.intern("SAME");
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            // `claim` is created first, so it owns a→b, at 1.0.
+            let claim = Predicate::KeyMatch { field: "fk".into() };
+            eng.create_rule(rule("claim", claim), &mut g).unwrap();
+            let overlap = Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.6,
+            };
+            eng.create_rule(rule("overlap", overlap), &mut g).unwrap();
+            assert_eq!(
+                g.edge_props.get(et, a, b, "weight"),
+                Some(&Value::Float(1.0)),
+                "the claim owns the edge"
+            );
+        }
+        // `a` stops naming `b`. The overlap (2 of 3) still holds.
+        let old = fx.props.get(a, "fk").cloned();
+        fx.props.remove(a, "fk");
+        let mut g = fx.g();
+        eng.on_node_changed(a, Some(("fk", old)), &mut g);
+        assert!(
+            g.topo.neighbors(et, Direction::Out, a).contains(&b),
+            "a→b is still desired by the overlap rule"
+        );
+        let weight = match g.edge_props.get(et, a, b, "weight") {
+            Some(Value::Float(w)) => *w,
+            other => panic!("the overlap rule's weight should be on the edge, got {other:?}"),
+        };
+        assert!(
+            (weight - 2.0 / 3.0).abs() < 1e-9,
+            "it is the overlap's edge now, at the overlap's score, got {weight}"
+        );
+    }
+
+    /// When no other rule desires the edge, a retraction is still a retraction.
+    #[test]
+    fn an_edge_only_its_owner_desired_is_gone_after_the_retraction() {
+        let rule = |name: &str, predicate: Predicate| RuleDef {
+            name: name.into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate,
+            edge_type: "SAME".into(),
+            weight_prop: Some("weight".into()),
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        };
+        let mut fx = Fx::new();
+        let a = fx.add("A", "a", vec![("tags", tags(&["x", "y"]))]);
+        let b = fx.add("A", "b", vec![("tags", tags(&["x", "y"]))]);
+        let et = fx.syms.intern("SAME");
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            let overlap = Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.6,
+            };
+            eng.create_rule(rule("overlap", overlap), &mut g).unwrap();
+            // A second rule over the same labels and edge type that desires nothing here.
+            let claim = Predicate::KeyMatch { field: "fk".into() };
+            eng.create_rule(rule("claim", claim), &mut g).unwrap();
+            assert!(g.topo.neighbors(et, Direction::Out, a).contains(&b));
+        }
+        let old = fx.props.get(a, "tags").cloned();
+        fx.props.set(a, "tags", tags(&["q"]));
+        let mut g = fx.g();
+        eng.on_node_changed(a, Some(("tags", old)), &mut g);
+        assert!(
+            !g.topo.neighbors(et, Direction::Out, a).contains(&b),
+            "nothing desires a→b any more"
+        );
+        assert_eq!(g.edge_props.get(et, a, b, "weight"), None);
+    }
+
+    /// The same takeover when the surviving rule keeps a best-k per source.
+    #[test]
+    fn a_top_k_rule_takes_an_edge_its_sibling_retracted() {
+        let rule = |name: &str, predicate: Predicate, max_edges: Option<u64>| RuleDef {
+            name: name.into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate,
+            edge_type: "SAME".into(),
+            weight_prop: Some("weight".into()),
+            max_edges,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        };
+        let mut fx = Fx::new();
+        let a = fx.add(
+            "A",
+            "a",
+            vec![("tags", tags(&["x", "y"])), ("fk", Value::Str("b".into()))],
+        );
+        let b = fx.add("A", "b", vec![("tags", tags(&["x", "y"]))]);
+        let et = fx.syms.intern("SAME");
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            let overlap = Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.6,
+            };
+            eng.create_rule(rule("overlap", overlap, None), &mut g)
+                .unwrap();
+            let claim = Predicate::KeyMatch { field: "fk".into() };
+            eng.create_rule(rule("claim", claim, Some(4)), &mut g)
+                .unwrap();
+            assert!(g.topo.neighbors(et, Direction::Out, a).contains(&b));
+        }
+        let old = fx.props.get(a, "tags").cloned();
+        fx.props.set(a, "tags", tags(&["q"]));
+        let mut g = fx.g();
+        eng.on_node_changed(a, Some(("tags", old)), &mut g);
+        assert!(
+            g.topo.neighbors(et, Direction::Out, a).contains(&b),
+            "the top-k claim rule still desires a→b and takes it"
+        );
+        assert_eq!(
+            g.edge_props.get(et, a, b, "weight"),
+            Some(&Value::Float(1.0))
         );
     }
 
