@@ -189,6 +189,24 @@ impl ViewStore {
         syms: &Interner,
         labels: &[u32],
     ) -> Result<(), String> {
+        self.create_view_over(def, props, topo, ids, syms, labels, None)
+    }
+
+    /// [`Self::create_view`] on a store opened from a snapshot: `base_cols`
+    /// is the snapshot's columns, which the first values of an aggregate view
+    /// have to read. `props` alone holds only what was written since, and a
+    /// view created over it summed nothing for neighbours the snapshot held.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_view_over(
+        &mut self,
+        def: ViewDef,
+        props: &mut ColumnStore,
+        topo: &TopologyView<'_>,
+        ids: &IdMap,
+        syms: &Interner,
+        labels: &[u32],
+        base_cols: Option<BaseColumns<'_>>,
+    ) -> Result<(), String> {
         def.validate()?;
 
         if self.views.contains_key(&def.name) {
@@ -203,10 +221,15 @@ impl ViewStore {
         // Real-prop collision: any ColumnStore field not owned by a view.
         let view_props: std::collections::HashSet<&str> =
             self.views.values().map(|v| v.view_prop.as_str()).collect();
-        if props
+        // Of what was written since the snapshot only. The whole check —
+        // the snapshot's columns included — is made by the caller before the
+        // record is logged. This is the replay's side of it and stays as
+        // narrow as it was, so a `CreateView` an earlier release logged over
+        // a property its snapshot held does not stop the store opening.
+        let taken = props
             .fields()
-            .any(|f| f == def.view_prop && !view_props.contains(f))
-        {
+            .any(|f| f == def.view_prop && !view_props.contains(f));
+        if taken {
             return Err(format!(
                 "view_prop {:?} conflicts with an existing node property",
                 def.view_prop
@@ -214,7 +237,7 @@ impl ViewStore {
         }
 
         // Backfill: compute initial values for all existing nodes.
-        backfill_view(&def, props, topo, ids, syms, labels);
+        backfill_view(&def, props, topo, ids, syms, labels, base_cols);
 
         self.views.insert(def.name.clone(), def);
         Ok(())
@@ -256,7 +279,7 @@ impl ViewStore {
         if let Some(label_sym) = syms.get(&def.label) {
             for id in 0..ids.len() as u32 {
                 if labels.get(id as usize).copied() == Some(label_sym) {
-                    props.remove(id, &def.view_prop);
+                    clear_view_value(props, id, &def.view_prop);
                 }
             }
         }
@@ -288,6 +311,30 @@ impl ViewStore {
         labels: &[u32],
         base_cols: Option<BaseColumns<'_>>,
     ) {
+        self.on_edge_changed_except(
+            etype, src, dst, inserted, props, topo, ids, syms, labels, base_cols, None,
+        );
+    }
+
+    /// [`Self::on_edge_changed`], leaving the views of `gone` alone. For the
+    /// edges swept with a node that is being deleted: its own view values go
+    /// with it, and recomputing them once for each of its edges made deleting
+    /// a hub quadratic in its degree.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_edge_changed_except(
+        &self,
+        etype: u32,
+        src: u32,
+        dst: u32,
+        inserted: bool,
+        props: &mut ColumnStore,
+        topo: &TopologyView<'_>,
+        ids: &IdMap,
+        syms: &Interner,
+        labels: &[u32],
+        base_cols: Option<BaseColumns<'_>>,
+        gone: Option<u32>,
+    ) {
         for def in self.views.values() {
             let Some(et_sym) = syms.get(def.edge_type()) else {
                 continue;
@@ -308,6 +355,9 @@ impl ViewStore {
                 Direction::Out => dst,
                 Direction::In => src,
             };
+            if gone == Some(subject) {
+                continue;
+            }
             update_node_view(
                 def, subject, neighbor, inserted, props, topo, ids, syms, labels, base_cols,
             );
@@ -363,7 +413,7 @@ impl ViewStore {
                 match val {
                     Some(v) => props.set(subject, &def.view_prop, v),
                     None => {
-                        props.remove(subject, &def.view_prop);
+                        clear_view_value(props, subject, &def.view_prop);
                     }
                 }
             }
@@ -433,7 +483,7 @@ impl ViewStore {
         labels: &[u32],
     ) {
         for def in self.views.values() {
-            backfill_view(def, props, topo, ids, syms, labels);
+            backfill_view(def, props, topo, ids, syms, labels, None);
         }
     }
 }
@@ -441,6 +491,16 @@ impl ViewStore {
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
+
+/// Clear a view's value on `node`: from what was written since the snapshot,
+/// and with a tombstone over whatever the snapshot holds. Without the
+/// tombstone an Avg, Min or Max that has become absent goes on reading as the
+/// snapshot's number. A tombstone over nothing is harmless, and a later
+/// `set` is read before it.
+fn clear_view_value(props: &mut ColumnStore, node: u32, view_prop: &str) {
+    props.remove(node, view_prop);
+    props.record_prop_tombstone(node, view_prop);
+}
 
 /// Build a `ColumnsView` that reads from both overlay props and (when present)
 /// the archived base columns.  Used in update/recompute paths so view values
@@ -466,6 +526,7 @@ fn backfill_view(
     ids: &IdMap,
     syms: &Interner,
     labels: &[u32],
+    base_cols: Option<BaseColumns<'_>>,
 ) {
     let Some(label_sym) = syms.get(&def.label) else {
         return;
@@ -499,18 +560,15 @@ fn backfill_view(
         if labels.get(id as usize).copied() != Some(label_sym) {
             continue;
         }
-        match compute_view_value(
-            def,
-            id,
-            ColumnsView::owned(&*props),
-            topo,
-            ids,
-            syms,
-            labels,
-        ) {
+        // In a block, so the borrow of `props` ends before the write below.
+        let value = {
+            let pv = build_cols_view(props, base_cols);
+            compute_view_value(def, id, pv, topo, ids, syms, labels)
+        };
+        match value {
             Some(val) => props.set(id, &def.view_prop, val),
             None => {
-                props.remove(id, &def.view_prop);
+                clear_view_value(props, id, &def.view_prop);
                 // Degree and Count always yield Some; only Avg/Min/Max
                 // return None when there are no qualifying neighbors.
             }
@@ -676,7 +734,7 @@ fn update_node_view(
             match val {
                 Some(v) => props.set(subject, &def.view_prop, v),
                 None => {
-                    props.remove(subject, &def.view_prop);
+                    clear_view_value(props, subject, &def.view_prop);
                 }
             }
             // Ensure Degree/Count/Sum always have a value even when the

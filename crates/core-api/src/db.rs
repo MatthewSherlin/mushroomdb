@@ -2544,6 +2544,11 @@ impl<F: Fs> GraphDb<F> {
             trace_open!("restore_v8_base", _t0);
             db.base = Some(mapped);
             trace_open!("base assigned", _t0);
+            // Only a snapshot from a writer that could leave a deleted node's
+            // edges behind is searched for them.
+            if !db.base.as_ref().is_some_and(|base| base.edges_swept()) {
+                db.drop_edges_of_retired_nodes();
+            }
         } else if !snap_header.is_empty() {
             // Legacy V5-V7: full read required for decode.
             let snap_bytes = db.fs.read(FileId::Snapshot)?;
@@ -2773,7 +2778,16 @@ impl<F: Fs> GraphDb<F> {
             build_props_view(&self.props, &self.base),
         );
         let applied = records.len();
+        // A live commit turns on the engine's report of the edges its rules
+        // add and retract, which is what keeps a view over a derived edge
+        // type current. Replay has to do the same, or a store with a snapshot
+        // — where nothing recomputes the views afterwards — reopens with the
+        // counts the snapshot had.
+        let emitted_before = self.engine.emit_deltas();
         for (i, rec) in records.into_iter().enumerate() {
+            if !self.view_store.is_empty() && !self.engine.emit_deltas() {
+                self.engine.set_emit_deltas(true);
+            }
             if i >= held || is_declaration(&rec) {
                 self.apply(&rec)?;
             }
@@ -2798,6 +2812,7 @@ impl<F: Fs> GraphDb<F> {
         // Any future as-of replay path (Plan-15 T2) must drain here to feed
         // replaying subscribers; the mechanism is already in place.
         let _ = self.engine.drain_deltas(); // belt-and-braces no-op after loop drain
+        self.engine.set_emit_deltas(emitted_before);
         Ok(applied)
     }
 
@@ -3483,6 +3498,7 @@ impl<F: Fs> GraphDb<F> {
                 if let Some(state) = state {
                     if state.wal_truncated {
                         db.restore_snapshot_state(state)?;
+                        db.drop_edges_of_retired_nodes();
                     } else if base_is_gone {
                         return Err(GraphError::CommitOutOfRange {
                             commit,
@@ -3496,6 +3512,7 @@ impl<F: Fs> GraphDb<F> {
                 if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
                     if state.wal_truncated {
                         db.restore_snapshot_state(state)?;
+                        db.drop_edges_of_retired_nodes();
                     } else if base_is_gone {
                         return Err(GraphError::CommitOutOfRange {
                             commit,
@@ -4491,14 +4508,25 @@ impl<F: Fs> GraphDb<F> {
                 // Collect then remove so neighbor slices stay valid during
                 // iteration. Remove from topo first, then call view maintenance
                 // so Avg/Min/Max recompute sees the correct (reduced) neighbor set.
-                let etypes: Vec<u32> = self.topo.etypes().collect();
+                //
+                // Through the view of the snapshot and what was written since,
+                // not `self.topo` alone: that is only what was written since,
+                // and an edge the snapshot holds was left behind, pointing at
+                // a node that was gone (ledger row 95).
                 let mut doomed = Vec::new();
-                for et in &etypes {
-                    for &dst in self.topo.neighbors(*et, Direction::Out, n).as_ref() {
-                        doomed.push((*et, n, dst));
-                    }
-                    for &src in self.topo.neighbors(*et, Direction::In, n).as_ref() {
-                        doomed.push((*et, src, n));
+                {
+                    let tv = self.topo_view();
+                    let etypes: Vec<u32> = tv.etypes().collect();
+                    for et in &etypes {
+                        for &dst in tv.neighbors(*et, Direction::Out, n).as_ref() {
+                            doomed.push((*et, n, dst));
+                        }
+                        for &src in tv.neighbors(*et, Direction::In, n).as_ref() {
+                            // A self-loop is already listed from its Out side.
+                            if src != n {
+                                doomed.push((*et, src, n));
+                            }
+                        }
                     }
                 }
                 for (et, s, d) in doomed {
@@ -4506,7 +4534,7 @@ impl<F: Fs> GraphDb<F> {
                     Arc::make_mut(&mut self.edge_props).remove_edge(et, s, d);
                     // View maintenance: n's own view values will be cleared by
                     // remove_all below; only update surviving neighbors.
-                    self.view_store.on_edge_changed(
+                    self.view_store.on_edge_changed_except(
                         et,
                         s,
                         d,
@@ -4517,6 +4545,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.syms,
                         &self.labels,
                         base_columns(&self.base),
+                        Some(n),
                     );
                 }
 
@@ -4593,13 +4622,14 @@ impl<F: Fs> GraphDb<F> {
                     return Ok(());
                 }
                 self.view_store
-                    .create_view(
+                    .create_view_over(
                         def,
                         Arc::make_mut(&mut self.props),
                         &build_topo_view(&self.topo, &self.base),
                         &self.ids,
                         &self.syms,
                         &self.labels,
+                        base_columns(&self.base),
                     )
                     .map_err(|e| GraphError::RuleInvalid { detail: e })?;
             }
@@ -4608,6 +4638,11 @@ impl<F: Fs> GraphDb<F> {
                 if !self.view_store.has_view(name) {
                     return Ok(());
                 }
+                let doomed_prop = self
+                    .view_store
+                    .views()
+                    .find(|v| v.name == *name)
+                    .map(|v| (v.label.clone(), v.view_prop.clone()));
                 self.view_store
                     .delete_view(
                         name,
@@ -4617,6 +4652,23 @@ impl<F: Fs> GraphDb<F> {
                         &self.syms,
                     )
                     .map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
+                // `delete_view` clears the view's property from what was
+                // written since the snapshot. A value the snapshot holds is
+                // hidden by a tombstone, or it stays readable on every node
+                // of the label after the view that owned it is gone.
+                if let (Some((label, prop)), true) = (doomed_prop, self.base.is_some()) {
+                    if let Some(label_sym) = self.syms.get(&label) {
+                        for id in 0..self.ids.len() as u32 {
+                            if self.labels.get(id as usize).copied() == Some(label_sym)
+                                && build_props_view(&self.props, &self.base)
+                                    .get(id, &prop)
+                                    .is_some()
+                            {
+                                Arc::make_mut(&mut self.props).record_prop_tombstone(id, &prop);
+                            }
+                        }
+                    }
+                }
             }
             WalRecord::EnableFulltext { label, field } => {
                 // Replay-over-snapshot idempotency: already enabled → skip.
@@ -7409,6 +7461,29 @@ impl<F: Fs> GraphDb<F> {
                 ),
             });
         }
+        // A view cannot take the name of a property nodes already carry —
+        // in the snapshot or written since. Refused here, before the WAL
+        // write: `apply` refuses some of it too, but by then the record is
+        // logged, and the next open replays it and fails.
+        //
+        // "Carry" is a node that reads a value under the name. The column
+        // alone does not count: a snapshot keeps the column of a view that
+        // has since been deleted, with every value in it hidden, and that
+        // name is free.
+        let taken = {
+            let pv = build_props_view(&self.props, &self.base);
+            pv.field_names().contains(&def.view_prop)
+                && (0..self.ids.len() as u32)
+                    .any(|id| !self.ids.is_tombstoned(id) && pv.get(id, &def.view_prop).is_some())
+        };
+        if taken {
+            return Err(GraphError::RuleInvalid {
+                detail: format!(
+                    "view_prop {:?} conflicts with an existing node property",
+                    def.view_prop
+                ),
+            });
+        }
         let def_bytes = bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
             detail: format!("serialize view: {e}"),
         })?;
@@ -7492,6 +7567,55 @@ impl<F: Fs> GraphDb<F> {
             label: label.into(),
             field: field.into(),
         })
+    }
+
+    /// Remove every edge the snapshot holds to or from a node that has been
+    /// deleted.
+    ///
+    /// There should be none. Through 0.7.1 a node deleted after a snapshot
+    /// kept the edges that snapshot held (ledger row 95), and the next
+    /// snapshot wrote them into its own base, where they answered a
+    /// neighbour read with `topology id N has no key`. This is what repairs
+    /// such a store. It asks for the neighbours of every retired id under
+    /// every edge type, which on a store with half a million deleted nodes is
+    /// over a second, so it runs only over a snapshot that does not say its
+    /// writer sweeps them (`MappedBase::edges_swept`). The removal is in
+    /// memory until the next snapshot, which no longer carries them and says
+    /// so.
+    fn drop_edges_of_retired_nodes(&mut self) {
+        let mut doomed = Vec::new();
+        {
+            let tv = self.topo_view();
+            let etypes: Vec<u32> = tv.etypes().collect();
+            for n in self.ids.tombstoned_ids() {
+                for et in &etypes {
+                    for &dst in tv.neighbors(*et, Direction::Out, n).as_ref() {
+                        doomed.push((*et, n, dst));
+                    }
+                    for &src in tv.neighbors(*et, Direction::In, n).as_ref() {
+                        if src != n {
+                            doomed.push((*et, src, n));
+                        }
+                    }
+                }
+            }
+        }
+        for (et, s, d) in doomed {
+            Arc::make_mut(&mut self.topo).remove_edge(et, s, d);
+            Arc::make_mut(&mut self.edge_props).remove_edge(et, s, d);
+            self.view_store.on_edge_changed(
+                et,
+                s,
+                d,
+                false,
+                Arc::make_mut(&mut self.props),
+                &build_topo_view(&self.topo, &self.base),
+                &self.ids,
+                &self.syms,
+                &self.labels,
+                base_columns(&self.base),
+            );
+        }
     }
 
     /// Whether `(label, field)` is currently indexed for full-text search.
@@ -13143,6 +13267,13 @@ impl<F: Fs> GraphDb<F> {
     /// WAL markers appended at firing time (Task 1). `was_linked` reads these markers
     /// and therefore includes derived edges in its point-in-time evaluation,
     /// matching `edge_history`'s fidelity.
+    ///
+    /// ## Which nodes
+    ///
+    /// `a` and `b` name the nodes that hold those keys now, and the answer
+    /// follows each of them back through its renames. A node that held one of
+    /// the keys earlier and was deleted is another node: for a commit at
+    /// which that earlier node was linked, the answer is `false`.
     pub fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> Result<bool> {
         use core_storage::wal::WalRecord;
 
@@ -13976,18 +14107,18 @@ impl<F: Fs> GraphDb<F> {
                         .map_err(|e| GraphError::Corrupt {
                             detail: format!("v8 snapshot: edge_props raw bytes: {e:?}"),
                         })?;
-                let prov_raw =
-                    old_base
-                        .provenance_raw_bytes()
-                        .map_err(|e| GraphError::Corrupt {
-                            detail: format!("v8 snapshot: provenance raw bytes: {e:?}"),
-                        })?;
                 encode_v8(
                     Some(archived_csr),
                     Some(archived_cols),
                     archived_strings,
                     Some((archived_edge_props, edge_props_raw)),
-                    Some(prov_raw),
+                    // Never the old snapshot's provenance bytes. The encoder
+                    // passes them through when the live map is empty, taking
+                    // empty for "never loaded" — but it is loaded above, so
+                    // empty means every rule's edges are gone, and passing
+                    // the old section through brought them back as owned by
+                    // rules that no longer derive them (ledger row 95).
+                    None,
                     &self.topo,
                     &self.props,
                     &self.ids,

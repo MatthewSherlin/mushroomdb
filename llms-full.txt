@@ -7057,7 +7057,7 @@ can still reach pre-snapshot commits. The WAL replay over the snapshot is
 idempotent — no manual recovery is needed. The WAL grows until an explicit
 `snapshot()` (with default `keep_wal: false`) truncates it.
 
-**V9 snapshot format:** mmap-able rkyv sections (13 total); zero-copy open via
+**V9 snapshot format:** mmap-able rkyv sections (14 in all); zero-copy open via
 mmap; no heap allocation for section data. V5–V8 stores are auto-migrated to
 V9 on open; a V9 snapshot cannot be opened by a pre-0.6.5 binary, which refuses
 it with `snapshot: unsupported version 9`. See [`docs/format-stability.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md) for the
@@ -7306,7 +7306,7 @@ Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads 
 mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
 ```
 
-Audit snapshot integrity: CRC32 all 13 sections plus an rkyv structural pass over the mmap'd ones, exit 2 on any mismatch
+Audit snapshot integrity: CRC32 every section plus an rkyv structural pass over the mmap'd ones, exit 2 on any mismatch
 
 ### `migrate`
 
@@ -12358,7 +12358,7 @@ Dependency rule (inward only):
 `bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
 
 Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy`), plus mmap-able
-V9 rkyv snapshots (13 sections: CSR topology, columnar properties, one shared string table for every
+V9 rkyv snapshots (14 sections: CSR topology, columnar properties, one shared string table for every
 string column, HNSW blobs, provenance, IVF state, per-node last-change index, and more — zero-copy,
 no heap allocation on open). V5–V8 stores are auto-migrated to V9 on `GraphDb::open`, keeping the
 original beside the new one as `snapshot.bin.bak` until the next clean open. The upgrade is one-way:
