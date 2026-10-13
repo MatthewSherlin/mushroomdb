@@ -1644,3 +1644,57 @@ fn a_keep_wal_snapshot_indexes_nothing_twice_at_open() {
     assert_eq!(db.fulltext_reindexed_during_open(), 0);
     assert_eq!(observable(&db), before);
 }
+
+/// Binding: a snapshot that kept its WAL has its index read only when the
+/// WAL beside it is the one the snapshot marked. If the WAL has lost its
+/// tail, the whole of what is left replays over the snapshot, and an index
+/// read from the snapshot beforehand is not what that replay produces: here
+/// a replayed insert relabels the node, and the snapshot's posting for the
+/// old label's field stayed searchable.
+#[test]
+fn a_keep_wal_snapshot_whose_wal_lost_its_tail_does_not_keep_its_index() {
+    let dir = tmp_dir();
+    let cut;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_fulltext("Doc", "body").unwrap();
+        db.enable_fulltext("Memo", "title").unwrap();
+        db.insert_node(
+            "Doc",
+            "k",
+            vec![("body".into(), Value::Str("alpha".into()))],
+        )
+        .unwrap();
+        cut = std::fs::metadata(dir.join("wal.bin")).unwrap().len();
+        db.delete_node("k").unwrap();
+        db.insert_node(
+            "Memo",
+            "k",
+            vec![("title".into(), Value::Str("zeta".into()))],
+        )
+        .unwrap();
+        db.snapshot_with(core_api::SnapshotOptions {
+            keep_wal: true,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    let wal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("wal.bin"))
+        .unwrap();
+    wal.set_len(cut).unwrap();
+    drop(wal);
+
+    // In a debug build this open used to stop on the check that a kept index
+    // equals a rebuilt one.
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(!db.fulltext_loaded_from_snapshot());
+    let label = db.node_info("k").map(|n| n.label);
+    if label.as_deref() == Some("Doc") {
+        assert!(
+            db.search("title", "zeta").is_empty(),
+            "k is a Doc again; nothing indexes a Doc's title"
+        );
+    }
+}

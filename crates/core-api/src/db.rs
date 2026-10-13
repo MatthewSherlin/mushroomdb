@@ -2637,9 +2637,6 @@ impl<F: Fs> GraphDb<F> {
         // And only when a rebuild does follow. An index read from the snapshot
         // is kept, so a pair declared after that snapshot is indexed by its
         // own backfill or not at all.
-        db.fulltext_rebuild_follows = !db.fulltext_loaded;
-        db.fulltext_reindexed_a_node = false;
-        db.replaying_at_open = true;
         // Every decoded frame occupies an index, replayed or not: markers
         // are state no-ops but they are not index no-ops.
         let decoded_frames = records.len() as u64;
@@ -2654,7 +2651,23 @@ impl<F: Fs> GraphDb<F> {
             // The mark was taken at the end of a whole WAL, so it ends on a
             // frame boundary; one that does not is not this WAL's.
             .filter(|(len, (_, consumed))| consumed == len)
-            .map_or(0, |(_, (held, _))| held.len());
+            .map(|(_, (held, _))| held.len());
+        let marked_wal_is_here = held.is_some();
+        let held = held.unwrap_or(0);
+        // A snapshot that kept its WAL has its index read on the strength of
+        // its mark. If the WAL beside it is not the one marked — it lost its
+        // tail, or was repaired shorter — the whole of it replays over the
+        // snapshot, and what that produces is not what the index was read
+        // for: a replayed insert can relabel a node and leave a posting under
+        // a field its new label does not index. The index is set aside and
+        // built after the replay, as it was before it could be read.
+        if db.fulltext_loaded && !db.base_wal_truncated && !marked_wal_is_here {
+            db.fulltext = Arc::new(core_storage::fulltext::FulltextIndex::new());
+            db.fulltext_loaded = false;
+        }
+        db.fulltext_rebuild_follows = !db.fulltext_loaded;
+        db.fulltext_reindexed_a_node = false;
+        db.replaying_at_open = true;
         let replayed = db.apply_frames_over(records, held);
         db.fulltext_rebuild_follows = false;
         db.replaying_at_open = false;
