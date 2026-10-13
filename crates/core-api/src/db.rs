@@ -394,6 +394,19 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
     }
 }
 
+/// Whether `rec` only declares or withdraws something about the store — a
+/// full-text pair, an equality index, the multiplicity opt-in — and writes no
+/// node, edge or property.
+fn is_declaration(rec: &WalRecord) -> bool {
+    matches!(
+        rec,
+        WalRecord::EnableFulltext { .. }
+            | WalRecord::DisableFulltext { .. }
+            | WalRecord::EnableIndex { .. }
+            | WalRecord::DisableIndex { .. }
+    ) || *rec == core_storage::wal::MULTIPLICITY_ENABLED
+}
+
 /// Database-wide counters plus per-rule budget/fire stats.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Stats {
@@ -2586,7 +2599,15 @@ impl<F: Fs> GraphDb<F> {
         // Every decoded frame occupies an index, replayed or not: markers
         // are state no-ops but they are not index no-ops.
         let decoded_frames = records.len() as u64;
-        let replayed = db.apply_frames(records);
+        // A snapshot that kept its WAL says how much of it it already holds.
+        // Those frames are counted, and not applied a second time.
+        let held = db
+            .base
+            .as_ref()
+            .and_then(|base| base.wal_mark())
+            .filter(|mark| mark.matches(&bytes))
+            .map_or(0, |mark| decode_all(&bytes[..mark.len as usize]).0.len());
+        let replayed = db.apply_frames_over(records, held);
         db.fulltext_rebuild_follows = false;
         let replayed = replayed?;
         // ── The multiplicity declaration, recovered from the stamp ───────────
@@ -2723,6 +2744,17 @@ impl<F: Fs> GraphDb<F> {
     /// reflected on disk, so they are not news to a subscriber, and draining
     /// inside the loop keeps `pending_deltas` O(1) over a large WAL (I-2).
     fn apply_frames(&mut self, records: Vec<WalRecord>) -> Result<usize> {
+        self.apply_frames_over(records, 0)
+    }
+
+    /// [`Self::apply_frames`] over a base that already holds the first `held`
+    /// records: the state a snapshot that kept its WAL was taken at. Those
+    /// are numbered like any other frame and not applied, because applying a
+    /// write to the state it produced is not always a no-op — an insert
+    /// under a key since renamed or deleted makes a second node. A
+    /// declaration among them is applied all the same: the pairs a store has
+    /// declared are known from the WAL and nowhere else.
+    fn apply_frames_over(&mut self, records: Vec<WalRecord>, held: usize) -> Result<usize> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -2737,8 +2769,10 @@ impl<F: Fs> GraphDb<F> {
             build_props_view(&self.props, &self.base),
         );
         let applied = records.len();
-        for rec in records {
-            self.apply(&rec)?;
+        for (i, rec) in records.into_iter().enumerate() {
+            if i >= held || is_declaration(&rec) {
+                self.apply(&rec)?;
+            }
             let _ = self.engine.drain_deltas();
             // Track commit_seq during replay so last_change entries are
             // consistent with the seqs assigned by log_then_apply_with on
@@ -13754,6 +13788,15 @@ impl<F: Fs> GraphDb<F> {
         // truncating the WAL at the first such frame. The container is
         // identical either way; only these two header bytes move.
         let snapshot_version = core_storage::snapshot::version_for(self.multiplicity);
+        // A snapshot that leaves the WAL where it is records how much of it
+        // it holds, so the next open does not apply those writes again on top
+        // of the state they produced. This handle holds the write lock, so
+        // every byte in the WAL now is a write it has applied.
+        let wal_mark = if opts.keep_wal && !opts.archive_wal {
+            core_storage::v8::WalMark::of(&self.fs.read(FileId::Wal)?).encode()
+        } else {
+            Vec::new()
+        };
         self.ensure_v8_base_sections_loaded();
         // Ensure provenance is decoded before to_persist() clones it.
         self.engine.ensure_provenance_loaded_mut();
@@ -13819,6 +13862,7 @@ impl<F: Fs> GraphDb<F> {
                 wal_truncated: !opts.keep_wal,
                 hnsw: hnsw_state,
                 last_change: self.last_change.clone(),
+                wal_mark: wal_mark.clone(),
             };
             let mut buf: Vec<u8> = Vec::new();
             {
@@ -13918,6 +13962,7 @@ impl<F: Fs> GraphDb<F> {
                 view_defs,
                 hnsw: hnsw_state,
                 last_change: self.last_change.clone(),
+                wal_mark: wal_mark.clone(),
             };
             let mut buf = Vec::new();
             encode_v8(

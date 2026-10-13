@@ -18,6 +18,12 @@
 
 ### Fixed
 
+- **A store that renamed a node and then took a snapshot keeping its WAL opens again.** `mushroomdb snapshot --keep-wal`, `snapshot_with(keep_wal: true)`, the snapshot `enable_multiplicity` takes and an auto-migration all leave the WAL whole, and the next open replayed all of it over the snapshot. After a `rename_node` that open failed with `corrupt data: wal replay RenameNode n→m: duplicate node key: m` and the store did not open again; after a key was deleted and inserted again the store opened holding an older value, with no error. Such a snapshot now records how much of the WAL it holds, and the open does not apply those writes a second time. It is in 0.7.1 and earlier (row 91).
+
+  **A store already in that state is not repaired by upgrading**, because its snapshot carries no such record. If no truncating snapshot was ever taken — the store's history floor was 0 — move `snapshot.bin` aside: the store opens from the WAL alone, and the next snapshot is a good one.
+
+  **The same state can still follow a crash** between a truncating snapshot and the replacement of its WAL, a window two filesystem calls wide. That is not fixed here (row 92).
+
 - **A backup carries the commit-time map.** `mushroomdb backup`, `POST /backup` and `GraphDb::backup_to` left `commit_times.bin` behind, and `restore` did not name it, so a restored store had its history and not the map a read by date resolves through. A backup taken by 0.7.1 or earlier does not hold the map and restores without it (row 86).
 - **A batch sees a node it renamed.** After `rename_node(a, b)` in a `BatchBuilder` or a `submit_batch`, the batch's own checks read `b` as a node with no stored properties, label or edges. So `[rename a→b, insert_edge(b, d)]` passed the cross-namespace guard that `insert_edge(a, d)` is refused by; `[rename a→b, delete_edge(b, d)]` deleted an edge a rule owns; `[rename a→b, remove_prop(b, "name")]` returned Ok and removed nothing; and a chain `[a→b, b→c]` left a stored `id` where two separate renames move it. The checks now read through to the stored node. Reachable only from a batch built in Rust: MCP, HTTP, the Python binding and the CLI each send a rename alone (row 79).
 - **A key reused inside a batch names the new node.** A batch that renamed a node away from a key, or deleted it, and then used the key again wrote against the old node: `[delete_node a, insert_node a, set_prop(a, …)]` lost the property, and `[rename a→b, insert_node a, insert_edge(a, c)]` put the edge on `b`. Also only from a batch built in Rust (row 89).
