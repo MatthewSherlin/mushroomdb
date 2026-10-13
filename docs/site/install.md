@@ -16,6 +16,24 @@ each one leaves out.
 Docker details, `install.sh`, and building the binary with the UI embedded are in
 [CONTRIBUTING.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/CONTRIBUTING.md).
 
+## Platforms
+
+A release carries a native binary for each of these, and `npx mushroomdb` fetches the one for the
+machine it runs on:
+
+| System | Built for |
+|---|---|
+| macOS | Apple Silicon, Intel |
+| Linux | x86_64 with glibc, x86_64 with musl (Alpine), arm64 with glibc |
+| Windows | x86_64 |
+
+The Intel macOS, musl and Windows builds are new after 0.7.2. Each is built on every pull
+request and run through a demo store, a query, three snapshots and a backup; the test suite
+itself runs on Linux and macOS only. `install.sh` covers macOS and Linux. The Homebrew formula
+is Apple Silicon and Linux. `pip install mushroomdb` has wheels for Apple Silicon and the two
+glibc Linux targets; elsewhere it builds from source and needs a Rust toolchain. On anything
+else, `cargo install mushroomdb-cli`.
+
 `install` writes an MCP entry that runs `npx -y mushroomdb@<version>`, so the assistant needs
 nothing installed globally and nothing is copied into your home directory. Point it at a local
 build with `--command <path>`. `mushroomdb doctor` verifies the result end to end — config entry,

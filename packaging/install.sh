@@ -21,7 +21,16 @@ target_for() {
   arch=$2
   case "${os}-${arch}" in
     darwin-arm64|darwin-aarch64) echo aarch64-apple-darwin ;;
-    linux-x64|linux-x86_64) echo x86_64-unknown-linux-gnu ;;
+    darwin-x64|darwin-x86_64) echo x86_64-apple-darwin ;;
+    linux-x64|linux-x86_64)
+      # Alpine and other musl systems take the static build.
+      if [ "${MUSHROOMDB_FORCE_LIBC:-}" = musl ] || [ -f /etc/alpine-release ] \
+        || (ldd --version 2>&1 | grep -qi musl); then
+        echo x86_64-unknown-linux-musl
+      else
+        echo x86_64-unknown-linux-gnu
+      fi
+      ;;
     linux-arm64|linux-aarch64) echo aarch64-unknown-linux-gnu ;;
     *) echo "" ;;
   esac

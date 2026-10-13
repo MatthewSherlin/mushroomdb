@@ -12,13 +12,33 @@ const { spawnSync } = require("child_process");
 const pkg = require("./package.json");
 const SUPPORTED = [
   "darwin-arm64 → aarch64-apple-darwin",
+  "darwin-x64 → x86_64-apple-darwin",
   "linux-x64 → x86_64-unknown-linux-gnu",
+  "linux-x64 with musl → x86_64-unknown-linux-musl",
   "linux-arm64 → aarch64-unknown-linux-gnu",
+  "win32-x64 → x86_64-pc-windows-msvc",
 ];
+
+// Whether this Linux is a musl one (Alpine). Node reports the glibc it runs
+// on; a Node built for musl reports none. MUSHROOMDB_FORCE_LIBC overrides.
+function isMusl() {
+  const forced = process.env.MUSHROOMDB_FORCE_LIBC;
+  if (forced) return forced === "musl";
+  try {
+    const header = process.report.getReport().header;
+    return !header.glibcVersionRuntime;
+  } catch (_) {
+    return false;
+  }
+}
 
 function rustTarget(platform, arch) {
   if (platform === "darwin" && arch === "arm64") return "aarch64-apple-darwin";
-  if (platform === "linux" && arch === "x64") return "x86_64-unknown-linux-gnu";
+  if (platform === "darwin" && arch === "x64") return "x86_64-apple-darwin";
+  if (platform === "win32" && arch === "x64") return "x86_64-pc-windows-msvc";
+  if (platform === "linux" && arch === "x64") {
+    return isMusl() ? "x86_64-unknown-linux-musl" : "x86_64-unknown-linux-gnu";
+  }
   if (platform === "linux" && (arch === "arm64" || arch === "aarch64")) {
     return "aarch64-unknown-linux-gnu";
   }
@@ -84,7 +104,8 @@ async function main() {
     process.env.MUSHROOMDB_RELEASE_BASE ||
     `https://github.com/${repo}/releases/download/${tag}`;
   const vendor = path.join(__dirname, "vendor");
-  const dest = path.join(vendor, "mushroomdb");
+  const binName = platform === "win32" ? "mushroomdb.exe" : "mushroomdb";
+  const dest = path.join(vendor, binName);
   fs.mkdirSync(vendor, { recursive: true });
 
   const tarUrl = `${base.replace(/\/$/, "")}/${asset}`;
@@ -109,9 +130,9 @@ async function main() {
   if (extracted.status !== 0) {
     fail(`tar extract failed: ${extracted.stderr || extracted.stdout || extracted.status}`);
   }
-  const extractedBin = path.join(tmp, "mushroomdb");
+  const extractedBin = path.join(tmp, binName);
   if (!fs.existsSync(extractedBin)) {
-    fail(`tarball ${asset} did not contain ./mushroomdb`);
+    fail(`tarball ${asset} did not contain ./${binName}`);
   }
   fs.copyFileSync(extractedBin, dest);
   fs.chmodSync(dest, 0o755);

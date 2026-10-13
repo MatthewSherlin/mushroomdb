@@ -245,13 +245,43 @@ grep -q "installed " "$WORKDIR/npm-out"
 
 echo "== npm install.js unsupported platform"
 set +e
-MUSHROOMDB_FORCE_OS=win32 MUSHROOMDB_FORCE_ARCH=x64 \
+MUSHROOMDB_FORCE_OS=freebsd MUSHROOMDB_FORCE_ARCH=x64 \
   node "$NPM/install.js" >"$WORKDIR/bad-npm.out" 2>"$WORKDIR/bad-npm.err"
 st=$?
 set -e
 test "$st" -ne 0
-grep -q "unsupported platform: win32-x64" "$WORKDIR/bad-npm.err"
+grep -q "unsupported platform: freebsd-x64" "$WORKDIR/bad-npm.err"
 grep -q "darwin-arm64" "$WORKDIR/bad-npm.err"
+
+echo "== both installers ask for the asset built for the platform"
+# The fake release holds one tarball, the host's. Asking as another platform
+# fails on the fetch, and the failure names the asset that was asked for.
+asks_for() {
+  installer=$1 os=$2 arch=$3 libc=$4 want=$5
+  set +e
+  if [ "$installer" = npm ]; then
+    MUSHROOMDB_RELEASE_BASE="$BASE" MUSHROOMDB_FORCE_OS="$os" MUSHROOMDB_FORCE_ARCH="$arch" \
+      MUSHROOMDB_FORCE_LIBC="$libc" node "$NPM/install.js" >"$WORKDIR/ask.out" 2>&1
+  else
+    MUSHROOMDB_RELEASE_BASE="$BASE" MUSHROOMDB_FORCE_OS="$os" MUSHROOMDB_FORCE_ARCH="$arch" \
+      MUSHROOMDB_FORCE_LIBC="$libc" MUSHROOMDB_INSTALL_DIR="$WORKDIR/ask-bin" \
+      MUSHROOMDB_VERSION="$VERSION" \
+      sh "$ROOT/packaging/install.sh" >"$WORKDIR/ask.out" 2>&1
+  fi
+  set -e
+  if [ "$want" = "$TARGET" ]; then return 0; fi
+  grep -q "mushroomdb-${TAG}-${want}.tar.gz" "$WORKDIR/ask.out" || {
+    echo "$installer as $os-$arch ($libc) did not ask for $want:" >&2
+    cat "$WORKDIR/ask.out" >&2
+    exit 1
+  }
+}
+asks_for npm darwin x64 glibc x86_64-apple-darwin
+asks_for npm linux x64 musl x86_64-unknown-linux-musl
+asks_for npm linux x64 glibc x86_64-unknown-linux-gnu
+asks_for npm win32 x64 glibc x86_64-pc-windows-msvc
+asks_for sh darwin x86_64 glibc x86_64-apple-darwin
+asks_for sh linux x86_64 musl x86_64-unknown-linux-musl
 
 echo "== tampered asset: both installers refuse"
 printf x >> "$WORKDIR/rel/${ASSET}"

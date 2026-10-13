@@ -21,15 +21,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # x86_64-apple-darwin dropped in v0.1.1: hosted macos-13 runners are
-          # chronically starved (v0.1.0 job sat queued past the 24h cap twice).
-          # Intel macOS users build from source; the formula is arm64-only on macOS.
           - os: macos-14
             target: aarch64-apple-darwin
+          # Intel macOS, built on an Apple Silicon runner. The hosted Intel
+          # runners were dropped in v0.1.1 (the v0.1.0 job sat queued past the
+          # 24h cap twice); cross-building needs none. The Homebrew formula is
+          # still arm64-only on macOS.
+          - os: macos-14
+            target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          # Static, for Alpine and images with no glibc.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
@@ -40,6 +48,8 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
       - run: rustup target add ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: npm ci
         working-directory: ui
       - run: npm run build
@@ -52,13 +62,22 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           TARGET="${{ matrix.target }}"
           ASSET="mushroomdb-${TAG}-${TARGET}.tar.gz"
-          BIN="target/${TARGET}/release/mushroomdb"
+          # The binary keeps its own name inside the tarball: `mushroomdb`,
+          # or `mushroomdb.exe` on Windows.
+          NAME="mushroomdb"
+          case "$TARGET" in *windows*) NAME="mushroomdb.exe" ;; esac
+          BIN="target/${TARGET}/release/${NAME}"
           test -f "$BIN"
           chmod +x "$BIN"
-          if command -v strip >/dev/null 2>&1; then strip "$BIN" || true; fi
+          # Not for a cross-built binary: the runner's strip is for its own
+          # architecture, and on Windows the one on PATH is not MSVC's.
+          case "$TARGET" in
+            x86_64-apple-darwin|*windows*) ;;
+            *) if command -v strip >/dev/null 2>&1; then strip "$BIN" || true; fi ;;
+          esac
           STAGE=$(mktemp -d)
-          cp "$BIN" "${STAGE}/mushroomdb"
-          tar -C "$STAGE" -czf "$ASSET" mushroomdb
+          cp "$BIN" "${STAGE}/${NAME}"
+          tar -C "$STAGE" -czf "$ASSET" "$NAME"
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$ASSET" > "${ASSET}.sha256"
           else
@@ -148,7 +167,7 @@ jobs:
 
   # Waits for the release. Until 0.7.1 this job needed nothing, so a tag whose
   # binaries failed to build still moved `:latest`. It now runs only after
-  # `github-release` — which needs all three binaries — has published.
+  # `github-release` — which needs every binary — has published.
   docker:
     needs: [github-release]
     runs-on: ubuntu-latest

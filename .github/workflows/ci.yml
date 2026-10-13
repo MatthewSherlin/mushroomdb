@@ -300,13 +300,13 @@ jobs:
           curl -sf http://127.0.0.1:18080/stats | grep -q nodes_live
           curl -sf http://127.0.0.1:18080/node/person-01 | grep -q person-01
 
-  # The targets a release does not build yet. Each is built here, and the
-  # binary run where the runner can run it, so that adding one to
-  # `release.yml` is a matter of the matrix and not of finding out on a tag
-  # that it does not compile.
+  # The release targets the test jobs above do not cover. Each is built here
+  # and the binary run through a demo store, a query, three snapshots and a
+  # backup, so a tag is not the first time they are compiled or started.
   more-targets:
     name: target-${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: [test]
     strategy:
       fail-fast: false
       matrix:

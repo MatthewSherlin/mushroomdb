@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Three more platforms.** A release now carries binaries for Intel macOS, for x86_64 Linux with musl (Alpine and images with no glibc) and for x86_64 Windows, beside Apple Silicon and the two glibc Linux targets; `npx mushroomdb` and `install.sh` pick the right one. Windows had never been built: the storage layer synced a directory by opening it as a file and flushed the WAL through a read-only handle, both of which Windows refuses. Each new target is built on every pull request and run through a demo store, a query, three snapshots and a backup. The test suite itself still runs on Linux and macOS only, and there are no wheels for the new targets yet.
+
 ## v0.7.2 — corrections, five of them for a store that would not open or answered wrongly
 
 No format version change. A 0.7.1 store opens under 0.7.2, and a 0.7.2 snapshot opens under 0.7.1, which ignores the two optional sections this release adds.
