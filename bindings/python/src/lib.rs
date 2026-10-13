@@ -2511,6 +2511,12 @@ impl GraphDb {
     /// After `snapshot()`, the next `GraphDb.open()` on the same path loads
     /// the snapshot directly and skips WAL replay, making reopen significantly
     /// faster for large databases.
+    ///
+    /// This discards history: the commits before the snapshot can no longer
+    /// be read with `query_at`, `edges_at` or `was_linked`. They keep their
+    /// numbers. `stats()["history_floor"]` moves to where they ended, what is
+    /// written next is numbered above it, and a read at a discarded commit
+    /// raises `CommitOutOfRange`.
     #[pyo3(text_signature = "($self)")]
     fn snapshot(&self) -> PyResult<()> {
         self.with_mut(|db| db.snapshot())

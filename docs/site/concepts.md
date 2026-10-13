@@ -141,10 +141,10 @@ x=proj-02  score=0.5
 x=proj-20  score=0.5
 ```
 
-History can be pruned. A store pruned to a retention limit says so: the oldest commit it still
-holds is its **floor**, and a read from before the floor is refused by name, never answered
-with a guess. Discarding the log outright, with `snapshot --truncate`, is different: commit
-numbers start again from the snapshot, so a number from before it no longer means what it did.
+History can be pruned, and a store says so when it has been. The oldest commit it still holds
+is its **floor**; a read from before the floor is refused by name, never answered with a guess.
+A commit number is never used twice: what is written after a prune is numbered on from where
+the discarded history ended.
 [Time travel](timetravel.md) has the other ways to ask: what edges a node had on a date,
 whether two nodes were linked then, and every change to one node.
 

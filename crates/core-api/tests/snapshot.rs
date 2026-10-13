@@ -1,5 +1,6 @@
 use core_api::{
-    Direction, GraphDb, GraphError, Predicate, RuleDef, SnapshotOptions, Value, ViewDef, ViewSource,
+    Direction, GraphDb, GraphError, OpenOptions, Predicate, RuleDef, SnapshotOptions, Value,
+    ViewDef, ViewSource,
 };
 use core_storage::snapshot::{decode, encode_v6, encode_v7, SnapshotState, VERSION_7};
 use core_storage::wal::decode_all;
@@ -1449,16 +1450,233 @@ fn default_snapshot_truncates_wal_history() {
                                                    // Default snapshot: truncates WAL.
         db.snapshot().unwrap();
         // Post-snapshot writes.
-        db.insert_node("N", "c", vec![]).unwrap(); // new commit 0
+        db.insert_node("N", "c", vec![]).unwrap(); // commit 2: numbering goes on
     }
 
-    // open_at(1) — these were pre-snapshot commits; WAL is now minimal (just
-    // EnableFulltext baseline or empty), so commit 1 no longer exists.
-    // CommitOutOfRange means the history was indeed truncated.
+    // open_at(1) — commit 1 was before the snapshot, which discarded it. It is
+    // below the store's floor, and CommitOutOfRange says so.
     match GraphDb::open_at(&dir, 1) {
         Err(GraphError::CommitOutOfRange { .. }) => {}
         Ok(_) => panic!("expected CommitOutOfRange after default snapshot, got Ok"),
         Err(e) => panic!("expected CommitOutOfRange, got {e:?}"),
+    }
+}
+
+/// A truncating snapshot discards commits. It must not hand their numbers to
+/// the commits that follow: the store's floor moves to where the discarded
+/// history ended, exactly as it does when retention prunes an archive.
+///
+/// Before this the replacement WAL renumbered from the old floor. `stats` went
+/// on saying `history_floor: 0` — "complete, nothing pruned" — and `open_at(3)`
+/// answered with whatever the third commit *after* the snapshot was: a
+/// different graph under a number a caller already held (ledger row 80).
+#[test]
+fn a_truncating_snapshot_does_not_reuse_commit_numbers() {
+    let dir = tmp("snap-truncate-floor");
+    let before;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap(); // commit 0
+        db.insert_node("N", "b", vec![]).unwrap(); // commit 1
+        before = db.wal_total_commits().unwrap();
+        assert_eq!(before, 2);
+        assert_eq!(db.stats().history_floor, 0, "nothing is pruned yet");
+
+        db.snapshot().unwrap();
+        assert_eq!(
+            db.wal_horizon_floor(),
+            before,
+            "the floor is where the discarded history ended"
+        );
+        assert_eq!(db.stats().history_floor, before);
+
+        db.insert_node("N", "c", vec![]).unwrap();
+        assert!(
+            db.wal_total_commits().unwrap() > before,
+            "a commit after the snapshot takes a number above every discarded one"
+        );
+    }
+
+    // The floor is on disk, not only in the handle that moved it.
+    let total = {
+        let db = GraphDb::open(&dir).unwrap();
+        assert_eq!(db.stats().history_floor, before);
+        db.wal_total_commits().unwrap()
+    };
+
+    for discarded in 0..before {
+        match GraphDb::open_at(&dir, discarded) {
+            Err(GraphError::CommitOutOfRange { floor, .. }) => assert_eq!(floor, before),
+            Ok(_) => panic!("commit {discarded} was discarded, and open_at answered for it"),
+            Err(e) => panic!("commit {discarded}: expected CommitOutOfRange, got {e:?}"),
+        }
+    }
+    let latest = GraphDb::open_at(&dir, total - 1).unwrap();
+    assert_eq!(
+        latest.node_count(),
+        3,
+        "the newest commit is the whole graph"
+    );
+}
+
+/// Archives are history too. A truncating snapshot is the one that discards
+/// history, so it takes them with it: the floor moves above them and they are
+/// removed, rather than left on disk under numbers the next commits reuse.
+#[test]
+fn a_truncating_snapshot_takes_earlier_archives_with_it() {
+    let dir = tmp("snap-truncate-archives");
+    let archives = |dir: &std::path::Path| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".archive"))
+            .count()
+    };
+    let before;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: false,
+            archive_wal: true,
+        })
+        .unwrap();
+        assert_eq!(archives(&dir), 1, "the first snapshot archived the WAL");
+        db.insert_node("N", "b", vec![]).unwrap();
+        before = db.wal_total_commits().unwrap();
+
+        db.snapshot().unwrap(); // truncating
+        assert_eq!(db.wal_horizon_floor(), before);
+        assert_eq!(archives(&dir), 0, "the archive is below the floor and gone");
+    }
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.stats().history_floor, before);
+    assert!(db.has_node("a") && db.has_node("b"), "only the past goes");
+    let history = db.node_history("a").unwrap();
+    assert_eq!(history.horizon, before);
+    assert!(
+        history.items.is_empty(),
+        "what happened to `a` was before the floor"
+    );
+}
+
+/// The replacement WAL is not empty when the store has declarations: a
+/// truncating snapshot re-emits one record for each full-text pair, equality
+/// index and the multiplicity opt-in. Those take the first numbers above the
+/// floor, so the first write after the snapshot is not *at* the floor. What is
+/// pinned here is the part a caller can rely on: it is above the floor, and
+/// nothing below the floor answers.
+#[test]
+fn the_first_write_after_a_truncating_snapshot_is_numbered_above_its_declarations() {
+    let dir = tmp("snap-truncate-declarations");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.enable_index("N", "k").unwrap();
+    db.insert_node("N", "a", vec![]).unwrap();
+    db.snapshot().unwrap();
+    let floor = db.wal_horizon_floor();
+    assert_eq!(floor, 2, "the declaration and the insert were discarded");
+
+    db.insert_node("N", "x", vec![]).unwrap();
+    let total = db.wal_total_commits().unwrap();
+    assert_eq!(
+        total,
+        floor + 2,
+        "one re-emitted declaration, then the write: {floor}..{total}"
+    );
+    drop(db);
+
+    let at_declaration = GraphDb::open_at(&dir, floor).unwrap();
+    assert!(
+        !at_declaration.has_node("x"),
+        "the frame at the floor is the declaration, not the write"
+    );
+    assert!(at_declaration.has_node("a"), "on the snapshot's base");
+    let at_write = GraphDb::open_at(&dir, floor + 1).unwrap();
+    assert!(at_write.has_node("x"));
+}
+
+/// A reader that was open across another handle's truncating snapshot, and has
+/// not refreshed, still holds the old floor — and reads its frames fresh from
+/// disk. The two no longer describe the same WAL, so a commit number from
+/// before the snapshot is answered from the new one.
+///
+/// Such a read either refuses or follows the store. It must not answer
+/// `false` for a link that existed at that commit (ledger row 81).
+#[test]
+fn a_reader_that_has_not_refreshed_does_not_answer_a_discarded_commit() {
+    let dir = tmp("snap-truncate-stale-reader");
+    let mut writer = GraphDb::open(&dir).unwrap();
+    writer.insert_node("N", "a", vec![]).unwrap(); // 0
+    writer.insert_node("N", "b", vec![]).unwrap(); // 1
+    writer.insert_edge("KNOWS", "a", "b").unwrap(); // 2
+    writer.insert_node("N", "c", vec![]).unwrap(); // 3
+
+    let reader = GraphDb::open_with_options(
+        &dir,
+        OpenOptions {
+            read_only: true,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(reader.was_linked("a", "b", "KNOWS", 2).unwrap());
+
+    writer.snapshot().unwrap(); // truncating: the floor is now 4
+    writer.insert_node("N", "d", vec![]).unwrap();
+    writer.insert_node("N", "e", vec![]).unwrap();
+    writer.insert_node("N", "f", vec![]).unwrap();
+
+    match reader.was_linked("a", "b", "KNOWS", 2) {
+        Err(GraphError::CommitOutOfRange { .. }) => {}
+        Ok(linked) => assert!(
+            linked,
+            "commit 2 is where a and b were linked; a stale reader answered that they were not"
+        ),
+        Err(e) => panic!("expected a refusal or the right answer, got {e:?}"),
+    }
+}
+
+/// After a truncating snapshot the live WAL does not start at the store's
+/// first commit: it starts at the floor, on the snapshot's base. A later
+/// `keep_wal` snapshot overwrites that base with the state at the head and
+/// records `wal_truncated: false`, so `open_at` replays the WAL prefix over
+/// nothing at all.
+///
+/// The read is refused, or it is right. The base it needed is gone, so
+/// refusing is the honest answer (ledger row 82).
+#[test]
+fn open_at_after_a_keep_wal_snapshot_on_a_truncated_store_is_refused_or_right() {
+    let dir = tmp("snap-truncate-then-keep");
+    let floor;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("N", "a", vec![]).unwrap();
+        db.snapshot().unwrap(); // truncating
+        floor = db.wal_horizon_floor();
+        db.insert_node("N", "b", vec![]).unwrap(); // floor
+        db.insert_node("N", "c", vec![]).unwrap(); // floor + 1
+    }
+    assert_eq!(
+        GraphDb::open_at(&dir, floor).unwrap().node_count(),
+        2,
+        "before the keep_wal snapshot: a from the base, b from the WAL"
+    );
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.snapshot_with(SnapshotOptions {
+            keep_wal: true,
+            archive_wal: false,
+        })
+        .unwrap();
+    }
+    match GraphDb::open_at(&dir, floor) {
+        Err(GraphError::CommitOutOfRange { .. }) => {}
+        Ok(view) => assert_eq!(
+            view.node_count(),
+            2,
+            "at the first commit after the truncation the graph was a and b"
+        ),
+        Err(e) => panic!("expected a refusal or the right answer, got {e:?}"),
     }
 }
 
@@ -1661,15 +1879,17 @@ fn open_at_after_truncating_snapshot_replays_dense_id_records() {
     {
         let mut db = GraphDb::open(&dir).unwrap();
         db.insert_node("N", "pre", vec![]).unwrap();
-        db.snapshot().unwrap(); // truncating: WAL restarts at the snapshot
+        db.snapshot().unwrap(); // truncating: the WAL continues from the floor
         db.insert_node("M", "a", vec![("v".into(), Value::Int(1))])
-            .unwrap(); // commit 0 in the new WAL
-        db.insert_node("M", "b", vec![]).unwrap(); // commit 1
-        db.insert_edge("REL", "a", "b").unwrap(); // commit 2
-        db.set_prop("a", "w", Value::Int(9)).unwrap(); // commit 3
-        db.insert_edge("REL", "pre", "a").unwrap(); // commit 4: pre-snapshot src
+            .unwrap(); // floor + 0
+        db.insert_node("M", "b", vec![]).unwrap(); // floor + 1
+        db.insert_edge("REL", "a", "b").unwrap(); // floor + 2
+        db.set_prop("a", "w", Value::Int(9)).unwrap(); // floor + 3
+        db.insert_edge("REL", "pre", "a").unwrap(); // floor + 4: pre-snapshot src
     }
-    let aof = GraphDb::open_at(&dir, 4).unwrap();
+    let floor = GraphDb::open(&dir).unwrap().wal_horizon_floor();
+    assert_eq!(floor, 1, "the one pre-snapshot commit was discarded");
+    let aof = GraphDb::open_at(&dir, floor + 4).unwrap();
     assert_eq!(
         aof.node_count(),
         3,
@@ -1695,8 +1915,8 @@ fn open_at_after_truncating_snapshot_replays_dense_id_records() {
         vec!["a"],
         "edge from a pre-snapshot node must replay against the snapshot base"
     );
-    // Earlier as-of point: snapshot base + commit 0 only.
-    let aof0 = GraphDb::open_at(&dir, 0).unwrap();
+    // Earlier as-of point: snapshot base + the first commit after it only.
+    let aof0 = GraphDb::open_at(&dir, floor).unwrap();
     assert_eq!(aof0.node_count(), 2, "pre + a");
     assert_eq!(aof0.get_prop("a", "v"), Some(Value::Int(1)));
     assert!(aof0

@@ -291,20 +291,42 @@ the WAL by default instead of discarding it — pass `--truncate` to get the
 discard behaviour. After a truncating snapshot:
 
 - `GraphDb::open()` loads from the snapshot plus any post-snapshot WAL frames.
-- `GraphDb::open_at()` loads from WAL only (snapshot is ignored). Commit 0
-  refers to the first WAL frame after the snapshot. Pre-snapshot history is
-  not available.
+- The commits before the snapshot are discarded, and they keep their numbers.
+  The store's floor moves to where they ended, and everything written after
+  the snapshot is numbered above it. The first write is not always *at* the
+  floor: a store with full-text fields or indexes re-records each of those
+  declarations first, one commit apiece. `GraphDb::open_at()` of a discarded number
+  returns `CommitOutOfRange`, naming the floor; it never answers with a later
+  commit that happens to sit at the same position in the new WAL.
+- `stats` reports the floor (`history_floor`), and the CLI prints it as
+  `history: reaches back to commit N`.
+
+A store truncated by 0.7.1 or an earlier release is the exception. Those
+releases numbered the new WAL from 0 again and left the floor where it was, so
+such a store still reports its history as complete, and a commit number taken
+before the truncation now names a different commit. Nothing on disk records how
+many commits were discarded, so this cannot be repaired on open. Its next
+truncating snapshot stops numbers being reused from then on; a number held
+from before an older truncation can still be answered with the wrong commit.
 
 `snapshot_with(SnapshotOptions { keep_wal: true, archive_wal: false })` writes
 the snapshot but leaves the WAL intact, so `open_at` can reach all WAL commits
 including those before the snapshot.
+
+That holds while the WAL reaches the store's first commit. Once a truncating or
+archiving snapshot has been taken, the WAL starts above it, on that snapshot as
+its base — and a `keep_wal` snapshot replaces the base with the state at the
+head. The commits in the live WAL can then no longer be rebuilt, and `open_at`
+refuses them with `CommitOutOfRange` rather than replay them over nothing.
+History scans (`node_history`, `edge_history`, `was_linked`) are not affected:
+they read the frames, not a rebuilt graph.
 
 Choose based on operational priorities:
 
 | Goal | Method |
 |---|---|
 | Preserve full as-of history | `snapshot_with(keep_wal: true)`; WAL grows until an explicit truncating `snapshot()` |
-| Fast startup, short WAL | `snapshot()` (default); as-of history restarts from that point |
+| Fast startup, short WAL | `snapshot()` (default); as-of history starts from that point, and commit numbers carry on |
 | Both: rolling checkpoints + eventual truncation | `keep_wal=true` for routine checkpoints; standard `snapshot()` when you decide to prune |
 
 **Torn WAL tail:** if the WAL has a partial frame (e.g., after a crash

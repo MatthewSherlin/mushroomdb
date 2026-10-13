@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A truncating snapshot no longer hands discarded commit numbers to the commits that follow.** `GraphDb::snapshot()`, Python's `snapshot()`, `mushroomdb snapshot --truncate` and `mushroomdb migrate` discard the WAL. They left the store's floor where it was, so the replacement WAL was numbered over the old one: `stats` went on reporting `history: complete (nothing pruned)`, and `asof --commit 3`, `open_at(3)`, `edges_at` and `was_linked` answered a commit number taken before the snapshot with whatever commit now sat at that position — a different graph, with no error. The floor now moves to where the discarded history ended, as it already did when `--retention` pruned an archive. `stats` reports `history: reaches back to commit N`, and a read at a discarded commit is refused as out of range, naming the floor (row 80).
+
+  **This changes commit numbers after a truncating snapshot.** What is written next is numbered above the old total, where it used to be numbered from 0, and `wal_total_commits()` no longer drops. A caller that relied on "commit 0 is my first write after `snapshot()`" must read `history_floor` and count up from it; the first write is not always at the floor, because a store with full-text fields or indexes re-records each declaration first. Archives taken before a truncating snapshot are removed by it: they are below the new floor.
+
+  **A store truncated by 0.7.1 or earlier is not repaired.** It keeps reporting its history as complete, because nothing on disk records how many commits were discarded. Its next truncating snapshot stops numbers being reused from then on; a number held from before an older truncation can still be answered with the wrong commit.
+
+- **A handle that has not refreshed no longer answers a history read from the wrong commits.** `was_linked`, `edges_at`, `node_history`, `edge_history` and `wal_total_commits` read the WAL fresh from disk and numbered its frames from the floor the handle had in memory. A reader left open across another process's pruning or truncating snapshot therefore answered `was_linked(a, b, KNOWS, 2)` from a different commit 2. The floor is now read from disk with the frames. A Python reader process, which refreshes only when asked, was the caller most exposed (row 81).
+- **An edge two rules both derive survives when one of them stops.** Two rules may share a source label, a destination label and an edge type. When both wanted the same edge it had one owner, the rule that added it, and when that rule's predicate stopped holding the edge was removed — although the other rule still wanted it. It stayed gone until that rule was rebuilt or one of its own fields was written. Now, in the same write, every rule over that edge type is re-evaluated for the node that lost the edge, and a rule that still wants it takes it, at its own score. While both hold, the edge still carries one rule's score and `explain` names that rule only. It predates 0.7 (row 37).
+- **A past-commit read whose base no longer exists is refused.** After a truncating or archiving snapshot the live WAL starts above the store's first commit, on that snapshot as its base. A later `keep_wal` snapshot overwrote the base with the state at the head, and `open_at`, `asof` and `query_at` then replayed the WAL over nothing: a graph missing everything older than the WAL, with no error. Such a read now answers `CommitOutOfRange`. Reads of a store whose WAL does reach its first commit are unchanged (row 82).
+
 ## v0.7.1 — four corrections
 
 No new feature and nothing removed. A 0.7.0 store opens unchanged.
@@ -596,12 +610,12 @@ Row numbers are rows of the defect ledger, `docs/roadmap/v0.6.10-defects.md`.
   without relabelling. An `Entity`-to-`Entity` claim rule that would close
   this is held pending an engine fix: the engine gives a derived edge one
   owner, so that rule and the existing `Entity` overlap rule would lose each
-  other's links on retraction (row 37, deferred to 0.8).
+  other's links on retraction (row 37, fixed in 0.7.2).
 - **Two rules that share a label pair and an edge type can lose each other's
   edges.** When both derive the same directed edge, one owns it; when the
   owner's predicate stops holding, the edge is removed although the other
   rule still wants it, until that rule is rebuilt or one of its own fields is
-  written. No rule this release ships collides. Row 37, deferred to 0.8.
+  written. No rule this release ships collides. Row 37, fixed in 0.7.2.
 - **Two strangers with one full name of two or more words link.**
   `john-smith-nyc` and
   `john-smith-sf` score 3/5. The link is visible in `remember`'s reply and
