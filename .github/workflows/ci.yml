@@ -348,6 +348,46 @@ jobs:
           "$BIN" query "$DB" "MATCH (p:Person {id: 'smoke'}) RETURN p.name AS name"
           "$BIN" backup "$DB" "$RUNNER_TEMP/smoke-backup"
           "$BIN" stats "$RUNNER_TEMP/smoke-backup"
+      # The launcher end to end, as a release would have it: the tarball
+      # `release.yml` packs, a checksum file, and `install.js` fetching the
+      # asset it picks for this platform from a local server.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: pack as a release does, then install through the npm launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          VERSION=$(node -p "require('./packaging/npm/package.json').version")
+          NAME="mushroomdb"
+          case "$TARGET" in *windows*) NAME="mushroomdb.exe" ;; esac
+          REL="$RUNNER_TEMP/rel"
+          mkdir -p "$REL" "$RUNNER_TEMP/stage"
+          cp "target/${TARGET}/release/${NAME}" "$RUNNER_TEMP/stage/${NAME}"
+          ASSET="mushroomdb-v${VERSION}-${TARGET}.tar.gz"
+          tar -C "$RUNNER_TEMP/stage" -czf "$REL/$ASSET" "$NAME"
+          ( cd "$REL" && { sha256sum "$ASSET" 2>/dev/null || shasum -a 256 "$ASSET"; } > SHA256SUMS )
+          node -e "
+            const http = require('http'), fs = require('fs'), path = require('path');
+            const root = process.argv[1];
+            http.createServer((req, res) => {
+              const f = path.join(root, path.basename(req.url));
+              if (!fs.existsSync(f)) { res.statusCode = 404; return res.end(); }
+              fs.createReadStream(f).pipe(res);
+            }).listen(18099, '127.0.0.1');
+          " "$REL" &
+          server=$!
+          trap 'kill $server' EXIT
+          sleep 2
+          case "$TARGET" in
+            x86_64-apple-darwin) export MUSHROOMDB_FORCE_ARCH=x64 ;;
+            x86_64-unknown-linux-musl) export MUSHROOMDB_FORCE_LIBC=musl ;;
+          esac
+          MUSHROOMDB_RELEASE_BASE="http://127.0.0.1:18099" node packaging/npm/install.js
+          node packaging/npm/bin/mushroomdb.js --version
+          node packaging/npm/bin/mushroomdb.js demo "$RUNNER_TEMP/launcher-db"
+          node packaging/npm/bin/mushroomdb.js stats "$RUNNER_TEMP/launcher-db"
 
   docker:
     needs: [test]
