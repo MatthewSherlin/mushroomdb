@@ -89,6 +89,13 @@ pub const SECTION_LAST_CHANGE: u8 = 11;
 /// rkyv `StringTableData`.  Written from V9 on; absent in V5–V8 snapshots,
 /// where each string column carries its own copy and that copy is authoritative.
 pub const SECTION_STRINGS: u8 = 12;
+/// The full-text index as [`crate::fulltext::FulltextIndex::to_blob`] wrote
+/// it. Opaque here, and versioned and checksummed by the blob itself, so the
+/// index's layout changes without a container change. Written only when a
+/// full-text pair is declared; absent in every snapshot written before it
+/// existed, where the index is rebuilt at open as it always was. A reader
+/// that does not know this id ignores the section.
+pub const SECTION_FULLTEXT: u8 = 13;
 
 /// Total number of canonical section slots (used for atomic check_state array).
 /// Extended from 11 (Task 5: +ivf_state) to 12 (Task 3: +last_change) to 13
@@ -113,6 +120,7 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_PROVENANCE
             | SECTION_IVF_STATE
             | SECTION_STRINGS
+            | SECTION_FULLTEXT
     )
 }
 
@@ -267,6 +275,7 @@ impl MappedBase {
             SECTION_IVF_STATE => "ivf_state",
             SECTION_LAST_CHANGE => "last_change",
             SECTION_STRINGS => "strings",
+            SECTION_FULLTEXT => "fulltext",
             _ => "unknown",
         };
         self.dir
@@ -646,6 +655,19 @@ impl MappedBase {
         self.section_bytes(SECTION_IVF_STATE)
     }
 
+    /// Raw bytes of the full-text index blob (section 13).
+    ///
+    /// Returns `Ok(&[])` when the section is absent: a snapshot written before
+    /// the section existed, by a binary that does not write it, or of a store
+    /// with no full-text pair. The blob carries its own checksum, which
+    /// `FulltextIndex::from_blob` verifies.
+    pub fn fulltext_bytes(&self) -> Result<&[u8]> {
+        if !self.has_section(SECTION_FULLTEXT) {
+            return Ok(&[]);
+        }
+        self.section_bytes(SECTION_FULLTEXT)
+    }
+
     /// Raw bytes for the last-change section (section 11).
     ///
     /// Returns `Ok(&[])` when the section is absent from the directory
@@ -802,6 +824,7 @@ mod tests {
             wal_truncated: false,
             hnsw: BTreeMap::new(),
             last_change: HashMap::new(),
+            fulltext_blob: Vec::new(),
         }
     }
 

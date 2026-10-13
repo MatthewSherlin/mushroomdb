@@ -1602,6 +1602,16 @@ pub struct GraphDb<F: Fs> {
     /// open path and **false** of `refresh()`: refresh applies peer frames and
     /// then only folds, so its backfill is the only thing that indexes them.
     fulltext_rebuild_follows: bool,
+    /// `true` when this handle's full-text index was read from the snapshot
+    /// it opened and nothing replayed over it since has spoiled it, so the
+    /// open did not build it.
+    fulltext_loaded: bool,
+    /// Set by the insert arms of `apply` when they index a node that is
+    /// already indexed under that field. `add_tokens` appends, so that node's
+    /// postings are now doubled: the WAL being replayed holds writes the
+    /// snapshot already has — a `keep_wal` snapshot, or a crash between a
+    /// snapshot and its WAL replacement. The open rebuilds when it sees this.
+    fulltext_reindexed_a_node: bool,
     /// `true` when `commit_times.bin` was present but would not decode.
     ///
     /// Mirrors `roles: None`: a damaged map must not read as "this store
@@ -2354,6 +2364,8 @@ impl<F: Fs> GraphDb<F> {
             commit_times: core_storage::commit_times::CommitTimes::default(),
             commit_times_poisoned: false,
             fulltext_rebuild_follows: false,
+            fulltext_loaded: false,
+            fulltext_reindexed_a_node: false,
             commit_time_override: None,
             roles: Some(vec![]),
             role_masks: Arc::new(crate::mask::RoleMaskCache::new()),
@@ -2426,6 +2438,8 @@ impl<F: Fs> GraphDb<F> {
         self.commit_times = core_storage::commit_times::CommitTimes::default();
         self.commit_times_poisoned = false;
         self.fulltext_rebuild_follows = false;
+        self.fulltext_loaded = false;
+        self.fulltext_reindexed_a_node = false;
         self.commit_time_override = None;
         self.roles = Some(vec![]);
         // A fresh cache, not a cleared one: any reader snapshot still holding
@@ -2531,6 +2545,8 @@ impl<F: Fs> GraphDb<F> {
             trace_open!("restore_v8_base", _t0);
             db.base = Some(mapped);
             trace_open!("base assigned", _t0);
+            db.load_fulltext_from_base();
+            trace_open!("full-text index read from the snapshot", _t0);
         } else if !snap_header.is_empty() {
             // Legacy V5-V7: full read required for decode.
             let snap_bytes = db.fs.read(FileId::Snapshot)?;
@@ -2582,7 +2598,12 @@ impl<F: Fs> GraphDb<F> {
         }
         // Scoped to this call: `refresh()` also replays frames and is *not*
         // followed by a rebuild, so its backfill must still run.
-        db.fulltext_rebuild_follows = true;
+        //
+        // And only when a rebuild does follow. An index read from the snapshot
+        // is kept, so a pair declared after that snapshot is indexed by its
+        // own backfill or not at all.
+        db.fulltext_rebuild_follows = !db.fulltext_loaded;
+        db.fulltext_reindexed_a_node = false;
         // Every decoded frame occupies an index, replayed or not: markers
         // are state no-ops but they are not index no-ops.
         let decoded_frames = records.len() as u64;
@@ -2676,14 +2697,36 @@ impl<F: Fs> GraphDb<F> {
                 &db.labels,
             );
         }
-        // Rebuild full-text index after WAL replay.  Corrects drift from
-        // per-record incremental apply during replay.
-        Arc::make_mut(&mut db.fulltext).rebuild_all(
-            &db.ids,
-            &db.labels,
-            &db.syms,
-            build_props_view(&db.props, &db.base),
-        );
+        // The full-text index after WAL replay. One read from the snapshot has
+        // had the replay applied to it record by record and is kept — unless
+        // the replay indexed a node the snapshot already held, which doubles
+        // that node's postings. Then, and wherever no index was read, it is
+        // built from the declared pairs and the stored values.
+        db.fulltext_loaded = db.fulltext_loaded && !db.fulltext_reindexed_a_node;
+        if db.fulltext_loaded {
+            #[cfg(debug_assertions)]
+            {
+                let mut rebuilt = (*db.fulltext).clone();
+                rebuilt.rebuild_all(
+                    &db.ids,
+                    &db.labels,
+                    &db.syms,
+                    build_props_view(&db.props, &db.base),
+                );
+                debug_assert!(
+                    rebuilt == *db.fulltext,
+                    "the full-text index read from the snapshot is not the one a rebuild gives"
+                );
+            }
+        } else {
+            Arc::make_mut(&mut db.fulltext).rebuild_all(
+                &db.ids,
+                &db.labels,
+                &db.syms,
+                build_props_view(&db.props, &db.base),
+            );
+        }
+        trace_open!("full-text index ready", _t0);
         db.prop_index.rebuild_all(
             &db.ids,
             &db.labels,
@@ -3701,6 +3744,9 @@ impl<F: Fs> GraphDb<F> {
                 if self.fulltext.has_label(label) {
                     for (field, value) in props {
                         if self.fulltext.is_enabled(label, field) {
+                            if self.fulltext.has_doc(id, field) {
+                                self.fulltext_reindexed_a_node = true;
+                            }
                             Arc::make_mut(&mut self.fulltext).add_tokens(id, field, value);
                         }
                     }
@@ -3964,6 +4010,9 @@ impl<F: Fs> GraphDb<F> {
                             continue;
                         };
                         if self.fulltext.is_enabled(&label_str, field) {
+                            if self.fulltext.has_doc(id, field) {
+                                self.fulltext_reindexed_a_node = true;
+                            }
                             Arc::make_mut(&mut self.fulltext).add_tokens(id, field, value);
                         }
                     }
@@ -7434,6 +7483,47 @@ impl<F: Fs> GraphDb<F> {
             label: label.into(),
             field: field.into(),
         })
+    }
+
+    /// Whether this handle read its full-text index from the snapshot it
+    /// opened, and kept it, where it would otherwise have built it from the
+    /// stored values. False for a store with no snapshot or no declared pair,
+    /// for a snapshot written before the index was carried, and for an open
+    /// that had to fall back. The answers are the same either way; this is
+    /// how a test or an operator tells which open they got.
+    pub fn fulltext_loaded_from_snapshot(&self) -> bool {
+        self.fulltext_loaded
+    }
+
+    /// Read the full-text index out of the snapshot this handle just mapped,
+    /// if it carries one that reads back and was built over this id space.
+    /// Anything else leaves the index empty for the rebuild that follows.
+    fn load_fulltext_from_base(&mut self) {
+        let Some(base) = self.base.as_ref() else {
+            return;
+        };
+        let bytes = match base.fulltext_bytes() {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            _ => return,
+        };
+        match core_storage::fulltext::FulltextIndex::from_blob(bytes) {
+            Some((index, node_count)) if node_count as usize == self.ids.len() => {
+                self.fulltext = Arc::new(index);
+                self.fulltext_loaded = true;
+            }
+            _ => eprintln!(
+                "mushroomdb: the snapshot's full-text index could not be read; rebuilding it"
+            ),
+        }
+    }
+
+    /// The full-text index as the bytes a snapshot carries, or nothing when
+    /// no pair is declared.
+    fn fulltext_blob(&self) -> Vec<u8> {
+        if self.fulltext.enabled_pairs().next().is_none() {
+            return Vec::new();
+        }
+        self.fulltext.to_blob(self.ids.len() as u32)
     }
 
     /// Whether `(label, field)` is currently indexed for full-text search.
@@ -13799,6 +13889,7 @@ impl<F: Fs> GraphDb<F> {
                 wal_truncated: !opts.keep_wal,
                 hnsw: hnsw_state,
                 last_change: self.last_change.clone(),
+                fulltext_blob: self.fulltext_blob(),
             };
             let mut buf: Vec<u8> = Vec::new();
             {
@@ -13898,6 +13989,7 @@ impl<F: Fs> GraphDb<F> {
                 view_defs,
                 hnsw: hnsw_state,
                 last_change: self.last_change.clone(),
+                fulltext_blob: self.fulltext_blob(),
             };
             let mut buf = Vec::new();
             encode_v8(

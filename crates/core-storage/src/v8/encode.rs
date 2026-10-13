@@ -27,6 +27,7 @@
 //!  10 = IVF_STATE (bincode BTreeMap<String,PerRuleIvfState>; retained undecoded at open)
 //!  11 = LAST_CHANGE (bincode HashMap<u32,u64>)
 //!  12 = STRINGS (rkyv StringTableData — the one table every Str column indexes; V9 only)
+//!  13 = FULLTEXT (the full-text index's own blob; only when a pair is declared)
 
 use crate::columns::ColumnStore;
 use crate::edge_props::EdgeProps;
@@ -42,9 +43,9 @@ use crate::v8::layout::{
     ViewsSectionData,
 };
 use crate::v8::{
-    HEADER_SIZE, SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_IDS, SECTION_IVF_STATE,
-    SECTION_LAST_CHANGE, SECTION_META, SECTION_PROVENANCE, SECTION_RULES_META, SECTION_STRINGS,
-    SECTION_SYMS, SECTION_TOPOLOGY, SECTION_VIEWS,
+    HEADER_SIZE, SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_FULLTEXT, SECTION_HNSW, SECTION_IDS,
+    SECTION_IVF_STATE, SECTION_LAST_CHANGE, SECTION_META, SECTION_PROVENANCE, SECTION_RULES_META,
+    SECTION_STRINGS, SECTION_SYMS, SECTION_TOPOLOGY, SECTION_VIEWS,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -96,6 +97,11 @@ pub struct V8Meta {
     /// Empty for legacy or freshly-opened stores with no mutations.
     #[serde(skip)]
     pub last_change: HashMap<u32, u64>,
+    /// The full-text index blob, written as section 13. Empty means the
+    /// section is left out: a store with no full-text pair, or a caller that
+    /// has no index to hand over.
+    #[serde(skip)]
+    pub fulltext_blob: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +229,7 @@ pub fn encode_v8<W: Write>(
         })?;
     let last_change_bytes: &[u8] = &last_change_bytes_owned;
 
-    let sections: &[(u8, &[u8])] = &[
+    let mut sections: Vec<(u8, &[u8])> = vec![
         (SECTION_TOPOLOGY, &topo_bytes),
         (SECTION_COLUMNS, &cols_bytes),
         // Next to the columns it belongs to, not appended at the end: the last
@@ -241,12 +247,22 @@ pub fn encode_v8<W: Write>(
         (SECTION_IVF_STATE, ivf_bytes),
         (SECTION_LAST_CHANGE, last_change_bytes),
     ];
+    // After the strings it was built from, and for the same reason not at the
+    // end. Left out entirely when there is nothing to carry, so a store with
+    // no full-text pair writes the bytes it always wrote.
+    if !meta.fulltext_blob.is_empty() {
+        let at = sections
+            .iter()
+            .position(|(id, _)| *id == SECTION_IDS)
+            .unwrap_or(sections.len() - 1);
+        sections.insert(at, (SECTION_FULLTEXT, &meta.fulltext_blob));
+    }
     let n = sections.len();
 
     // 2. Compute section offsets (sections start after the 4 KB header page).
     let mut offsets = Vec::with_capacity(n);
     let mut cur: u64 = HEADER_SIZE as u64;
-    for (_, bytes) in sections {
+    for (_, bytes) in &sections {
         offsets.push(cur);
         cur = align8(cur + bytes.len() as u64);
     }

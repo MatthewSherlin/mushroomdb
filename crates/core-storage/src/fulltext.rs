@@ -422,10 +422,12 @@ const FULLTEXT_BLOB_VERSION: u32 = 1;
 /// k1 = 1.2, b = 0.75  (Okapi BM25 defaults).
 ///
 /// ## WAL / persistence
-/// The index is NOT stored in the V8 snapshot.  It is rebuilt from WAL replay
-/// (EnableFulltext / DisableFulltext records + node property re-indexing) at
-/// open time via [`FulltextIndex::rebuild_all`].  Postings restructuring in v2
-/// has no snapshot format impact.
+/// A snapshot of a store with a declared pair carries the index as a blob
+/// ([`FulltextIndex::to_blob`]), and an open reads it back and applies the WAL
+/// to it. Where there is no blob, or it does not read back, or the WAL
+/// replays writes the snapshot already holds, the index is rebuilt from the
+/// declared pairs and the stored values by [`FulltextIndex::rebuild_all`], as
+/// it was on every open before the blob existed.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct FulltextIndex {
     /// Enabled `(label, field)` pairs.
@@ -632,6 +634,15 @@ impl FulltextIndex {
             },
             node_count,
         ))
+    }
+
+    /// Whether `node_id` already has an entry under `field`. An insert that
+    /// finds one is being applied a second time: [`FulltextIndex::add_tokens`]
+    /// appends, so the node's postings are about to double.
+    pub fn has_doc(&self, node_id: u32, field: &str) -> bool {
+        self.doc_len
+            .get(field)
+            .is_some_and(|lens| lens.contains_key(&node_id))
     }
 
     /// Whether `(label, field)` is currently indexed.
