@@ -264,10 +264,11 @@ fn default_path_no_archives_when_archive_wal_false() {
         "archive_wal=false must not create archive files: {archive_files:?}"
     );
 
-    // No wal.floor sidecar.
+    // The two commits it discarded keep their numbers: the floor records
+    // where they ended, so nothing written later is numbered over them.
     assert!(
-        !dir.join("wal.floor").exists(),
-        "archive_wal=false must not create wal.floor"
+        dir.join("wal.floor").exists(),
+        "a truncating snapshot records its floor"
     );
 
     // Reopen sees the correct node count (snapshot + empty WAL replay).

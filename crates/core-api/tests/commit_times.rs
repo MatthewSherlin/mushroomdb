@@ -517,8 +517,12 @@ fn a_date_reaches_exactly_as_far_as_a_commit_index() {
     db.snapshot().expect("snapshot");
     assert_eq!(
         db.wal_total_commits().expect("total"),
-        0,
-        "a truncating snapshot leaves no reachable commits"
+        db.wal_horizon_floor(),
+        "a truncating snapshot leaves no reachable commits: the floor is the total"
+    );
+    assert!(
+        db.wal_horizon_floor() > 0,
+        "and the commits it discarded keep their numbers, below the floor"
     );
 
     let index_err = db.was_linked("a", "b", "KNOWS", 0).unwrap_err();
@@ -528,11 +532,11 @@ fn a_date_reaches_exactly_as_far_as_a_commit_index() {
         "a commit index must refuse once history is discarded, got {index_err:?}"
     );
     // `NoRecordedTime` joined this list when the truncating snapshot began
-    // clearing the map along with the history it describes. It has to: the
-    // replacement WAL renumbers from the floor, so every surviving entry would
-    // name a frame belonging to some other record — a date resolving onto an
-    // unrelated commit is exactly the silent wrong answer this module exists to
-    // prevent. All three are refusals, which is what this test is about.
+    // clearing the map along with the history it describes. It has to: every
+    // entry it held is for a frame below the floor the snapshot just set, and
+    // a date resolving onto a commit the engine can no longer replay is exactly
+    // the silent wrong answer this module exists to prevent. All three are
+    // refusals, which is what this test is about.
     assert!(
         matches!(
             date_err,

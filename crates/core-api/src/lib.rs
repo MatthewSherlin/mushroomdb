@@ -113,11 +113,12 @@ pub fn is_write_query(cypher: &str) -> std::result::Result<bool, String> {
     Ok(core_query::cypher::is_write_tokens(&toks))
 }
 
-/// Return the number of valid WAL commits in the database at `dir`.
+/// Return the number of valid frames in the live WAL of the database at `dir`.
 ///
-/// Useful for displaying "as-of commit N of M" in CLIs without opening the
-/// full database.  Returns 0 if the WAL file does not exist (e.g., after
-/// `snapshot()` which truncates it to empty).
+/// This is a count of one file, not a commit index: it does not include the
+/// store's history floor or its archives, so it is not the `M` of "as-of
+/// commit N of M". Open the store and call `wal_total_commits` for that.
+/// Returns 0 if the WAL file does not exist.
 pub fn wal_commit_count_at(dir: &std::path::Path) -> crate::Result<u64> {
     let wal_path = dir.join("wal.bin");
     let bytes = match std::fs::read(&wal_path) {
