@@ -3369,6 +3369,89 @@ fn snapshot_size_is_near_the_property_payload() {
     );
 }
 
+/// Binding: opening a snapshotted store does not build the rule engine's
+/// candidate indexes because of the declarations a snapshot re-emits.
+///
+/// Every truncating snapshot writes a baseline WAL holding one record for each
+/// declared full-text pair and equality index. Replaying those used to count
+/// as a write, and the first write after a snapshot open scans every node to
+/// build the indexes rules match through — so a store with any declaration
+/// paid that scan on every open, and one with none did not.
+#[test]
+fn replaying_only_declarations_does_not_build_the_rule_indexes() {
+    let tags = |xs: &[&str]| Value::List(xs.iter().map(|s| Value::Str((*s).into())).collect());
+    let rule = RuleDef {
+        name: "alike".into(),
+        src_label: "Doc".into(),
+        dst_label: "Doc".into(),
+        predicate: Predicate::Overlap {
+            field: "tags".into(),
+            min: 0.5,
+        },
+        edge_type: "ALIKE".into(),
+        weight_prop: Some("score".into()),
+        max_edges: None,
+        approximate: false,
+        via_label: None,
+        via_edge: None,
+        via_dir: None,
+        namespace: None,
+    };
+    let seed = |dir: &std::path::Path, declare: bool| {
+        let mut db = GraphDb::open(dir).unwrap();
+        if declare {
+            db.enable_fulltext("Doc", "body").unwrap();
+            db.enable_index("Doc", "kind").unwrap();
+        }
+        for (key, t) in [("a", ["x", "y"]), ("b", ["x", "y"]), ("c", ["p", "q"])] {
+            db.insert_node(
+                "Doc",
+                key,
+                vec![
+                    ("tags".into(), tags(&t)),
+                    ("body".into(), Value::Str(format!("body of {key}"))),
+                    ("kind".into(), Value::Str("note".into())),
+                ],
+            )
+            .unwrap();
+        }
+        db.create_rule(rule.clone()).unwrap();
+        db.snapshot().unwrap();
+    };
+
+    // The control: no declaration, so the baseline WAL is empty.
+    let plain = tmp("decl-replay-plain");
+    seed(&plain, false);
+    assert!(!GraphDb::open(&plain).unwrap().rule_indexes_populated());
+
+    let dir = tmp("decl-replay");
+    seed(&dir, true);
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert!(
+        !db.rule_indexes_populated(),
+        "a baseline of declarations is not a write"
+    );
+    // Nothing was lost by waiting: the derived edges are there, the
+    // declarations hold, and the first real write still matches through the
+    // indexes it now builds.
+    assert_eq!(
+        db.neighbors("a", "ALIKE", Direction::Out).unwrap(),
+        vec!["b"]
+    );
+    assert!(db.is_fulltext_enabled("Doc", "body"));
+    assert_eq!(db.search("body", "body").len(), 3);
+    db.set_prop("c", "tags", tags(&["x", "y"])).unwrap();
+    assert!(db.rule_indexes_populated());
+    assert_eq!(
+        db.neighbors("a", "ALIKE", Direction::Out).unwrap(),
+        vec!["b", "c"]
+    );
+
+    // A real write in the WAL tail still builds them at open.
+    drop(db);
+    assert!(GraphDb::open(&dir).unwrap().rule_indexes_populated());
+}
+
 // ── a snapshot that keeps its WAL: what it already holds is not replayed ────
 
 fn keep_wal() -> SnapshotOptions {

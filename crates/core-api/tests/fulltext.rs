@@ -1348,3 +1348,353 @@ fn scratch_search_oracle_matches_index_for_list_field() {
         "scratch_search and index must agree on list-boundary phrase behavior"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The index in the snapshot (ledger row 36)
+// ---------------------------------------------------------------------------
+
+/// What every search a caller could tell two stores apart by returns: scores
+/// and all, so a doubled posting or a stale document length shows.
+fn observable(db: &GraphDb<core_storage::fs::RealFs>) -> Vec<(String, Vec<(String, f64)>)> {
+    let mut out = Vec::new();
+    for field in ["body", "title"] {
+        for query in [
+            "rust",
+            "graph",
+            "\"graph database\"",
+            "rust -python",
+            "dat*",
+            "python",
+            "notes",
+            "great",
+            "embedded",
+            "tokyo",
+        ] {
+            out.push((format!("{field}: {query}"), db.search(field, query)));
+        }
+    }
+    out
+}
+
+fn doc(body: &str, title: &str) -> Vec<(String, Value)> {
+    vec![
+        ("body".into(), Value::Str(body.into())),
+        ("title".into(), Value::Str(title.into())),
+    ]
+}
+
+/// Forty documents under one declared pair, with a list value, an empty
+/// string and a number among them.
+fn seed(db: &mut GraphDb<core_storage::fs::RealFs>) {
+    db.enable_fulltext("Doc", "body").unwrap();
+    for i in 0..40 {
+        let body = match i % 4 {
+            0 => "rust is a great language for an embedded graph database",
+            1 => "python django notes",
+            2 => "a graph of data and databases in tokyo",
+            _ => "rust rust rust and python",
+        };
+        db.insert_node("Doc", &format!("d{i}"), doc(body, &format!("notes {i}")))
+            .unwrap();
+    }
+    db.set_prop(
+        "d1",
+        "body",
+        Value::List(vec![
+            Value::Str("rust graph".into()),
+            Value::Str("database".into()),
+        ]),
+    )
+    .unwrap();
+    db.set_prop("d2", "body", Value::Str(String::new()))
+        .unwrap();
+    db.set_prop("d3", "body", Value::Int(7)).unwrap();
+}
+
+/// Binding: after a snapshot the index is read from it, not built again, and
+/// every search answers as it did before the store was closed.
+#[test]
+fn a_snapshotted_index_is_loaded_not_rebuilt() {
+    let dir = tmp_dir();
+    let before = {
+        let mut db = GraphDb::open(&dir).unwrap();
+        seed(&mut db);
+        db.snapshot().unwrap();
+        observable(&db)
+    };
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(
+        db.fulltext_loaded_from_snapshot(),
+        "the snapshot carries the index and nothing replayed could have spoiled it"
+    );
+    assert!(db.is_fulltext_enabled("Doc", "body"));
+    assert_eq!(observable(&db), before);
+}
+
+/// Binding: what is written after the snapshot is applied to the loaded
+/// index — an insert, a rewrite, a removal, a delete, a pair declared late and
+/// a pair withdrawn — and the store answers as one that never closed.
+#[test]
+fn writes_after_the_snapshot_land_on_the_loaded_index() {
+    let dir = tmp_dir();
+    let before = {
+        let mut db = GraphDb::open(&dir).unwrap();
+        seed(&mut db);
+        db.enable_fulltext("Doc", "title").unwrap();
+        db.snapshot().unwrap();
+        db.insert_node(
+            "Doc",
+            "late",
+            doc("a late embedded graph database", "late notes"),
+        )
+        .unwrap();
+        db.set_prop("d0", "body", Value::Str("python only now".into()))
+            .unwrap();
+        db.remove_prop("d4", "body").unwrap();
+        db.delete_node("d5").unwrap();
+        db.insert_node("Doc", "d5", doc("rust again under an old key", "back"))
+            .unwrap();
+        db.disable_fulltext("Doc", "title").unwrap();
+        db.insert_node("Memo", "m0", doc("a memo about rust", "memo"))
+            .unwrap();
+        db.enable_fulltext("Memo", "body").unwrap();
+        observable(&db)
+    };
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(db.fulltext_loaded_from_snapshot());
+    assert!(!db.is_fulltext_enabled("Doc", "title"));
+    assert!(db.is_fulltext_enabled("Memo", "body"));
+    assert_eq!(observable(&db), before);
+
+    // And once more through a second snapshot of the reopened store.
+    let mut db = db;
+    db.snapshot().unwrap();
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(db.fulltext_loaded_from_snapshot());
+    assert_eq!(observable(&db), before);
+}
+
+/// Binding: a snapshot that keeps its WAL carries the index too. The open
+/// does not apply again the writes that snapshot holds, so the index it read
+/// is kept, and what was written after the snapshot lands on it.
+#[test]
+fn a_keep_wal_snapshot_loads_its_index_too() {
+    let dir = tmp_dir();
+    let before = {
+        let mut db = GraphDb::open(&dir).unwrap();
+        seed(&mut db);
+        db.snapshot_with(core_api::SnapshotOptions {
+            keep_wal: true,
+            ..Default::default()
+        })
+        .unwrap();
+        db.insert_node("Doc", "late", doc("a late embedded graph database", "late"))
+            .unwrap();
+        db.set_prop("d0", "body", Value::Str("python only now".into()))
+            .unwrap();
+        observable(&db)
+    };
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(db.fulltext_loaded_from_snapshot());
+    assert_eq!(db.fulltext_reindexed_during_open(), 0);
+    assert_eq!(observable(&db), before);
+}
+
+/// Binding: a blob that does not read back is not trusted and not fatal. The
+/// store opens, builds the index as it used to, and answers the same.
+#[test]
+fn a_damaged_index_blob_is_rebuilt_not_trusted() {
+    let dir = tmp_dir();
+    let before = {
+        let mut db = GraphDb::open(&dir).unwrap();
+        seed(&mut db);
+        db.snapshot().unwrap();
+        observable(&db)
+    };
+    let path = dir.join("snapshot.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let at = bytes
+        .windows(4)
+        .position(|w| w == b"MFTS")
+        .expect("the snapshot carries the index blob");
+    bytes[at + 40] ^= 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(!db.fulltext_loaded_from_snapshot());
+    assert_eq!(observable(&db), before);
+}
+
+/// Binding: a store with no full-text pair writes no index section, so its
+/// snapshot is what it always was.
+#[test]
+fn a_store_with_no_declared_pair_writes_no_index_section() {
+    let dir = tmp_dir();
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("Doc", "d0", doc("rust", "t")).unwrap();
+        db.snapshot().unwrap();
+    }
+    let bytes = std::fs::read(dir.join("snapshot.bin")).unwrap();
+    assert!(!bytes.windows(4).any(|w| w == b"MFTS"));
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(!db.fulltext_loaded_from_snapshot());
+}
+
+/// Binding: a backup of the store carries the index in its snapshot.
+#[test]
+fn a_backup_carries_the_index_in_its_snapshot() {
+    let dir = tmp_dir();
+    let dest = tmp_dir();
+    let before = {
+        let mut db = GraphDb::open(&dir).unwrap();
+        seed(&mut db);
+        db.snapshot().unwrap();
+        db.backup_to(&dest).unwrap();
+        observable(&db)
+    };
+    let db = GraphDb::open(&dest).unwrap();
+    assert!(db.fulltext_loaded_from_snapshot());
+    assert_eq!(observable(&db), before);
+}
+
+/// Binding: a property named twice in one insert is indexed as what is
+/// stored — the last value — live, and after a snapshot and a reopen.
+///
+/// The insert indexed each occurrence on top of the last, so the first
+/// value's words stayed searchable on a node that no longer held them. An
+/// open used to rebuild the index and heal that; a snapshot now carries the
+/// index, so it has to be right when it is written.
+#[test]
+fn a_field_named_twice_in_one_insert_is_indexed_once() {
+    let dir = tmp_dir();
+    let never_closed = {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_fulltext("Doc", "body").unwrap();
+        db.insert_node(
+            "Doc",
+            "a",
+            vec![
+                ("body".into(), Value::Str("alpha beta".into())),
+                ("body".into(), Value::Str("gamma".into())),
+            ],
+        )
+        .unwrap();
+        db.insert_node("Doc", "b", doc("beta gamma", "t")).unwrap();
+        assert_eq!(db.get_prop("a", "body"), Some(Value::Str("gamma".into())));
+        let hits: Vec<String> = db.search("body", "beta").into_iter().map(|h| h.0).collect();
+        assert_eq!(hits, vec!["b"], "a no longer says beta");
+        db.snapshot().unwrap();
+        (db.search("body", "beta"), db.search("body", "gamma"))
+    };
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(db.fulltext_loaded_from_snapshot());
+    assert_eq!(
+        (db.search("body", "beta"), db.search("body", "gamma")),
+        never_closed
+    );
+}
+
+/// Binding: a declared field whose every value has no words — an empty
+/// string — does not make a loaded index differ from a built one. In a debug
+/// build the open compares the two, and it used to panic here on an index
+/// that answered every search correctly.
+#[test]
+fn a_field_with_no_words_in_it_reopens() {
+    let dir = tmp_dir();
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_fulltext("Doc", "body").unwrap();
+        db.enable_fulltext("Doc", "title").unwrap();
+        db.insert_node("Doc", "a", doc("alpha", "")).unwrap();
+        db.insert_node("Doc", "c", doc("gone", "")).unwrap();
+        db.delete_node("c").unwrap();
+        db.snapshot().unwrap();
+    }
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(db.fulltext_loaded_from_snapshot());
+    assert_eq!(db.search("body", "alpha").len(), 1);
+    assert!(db.search("title", "alpha").is_empty());
+}
+
+/// Binding: pairs declared after the data, then a snapshot that keeps its
+/// WAL. Nothing the snapshot holds is indexed a second time at open: this
+/// store used to tokenize every replayed insert and then rebuild the index
+/// on top, twice the work of an open before the index was carried at all.
+#[test]
+fn a_keep_wal_snapshot_indexes_nothing_twice_at_open() {
+    let dir = tmp_dir();
+    let before = {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for i in 0..10 {
+            db.insert_node("Doc", &format!("d{i}"), doc("rust graph database", "notes"))
+                .unwrap();
+        }
+        db.enable_fulltext("Doc", "body").unwrap();
+        db.snapshot_with(core_api::SnapshotOptions {
+            keep_wal: true,
+            ..Default::default()
+        })
+        .unwrap();
+        observable(&db)
+    };
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(db.fulltext_loaded_from_snapshot());
+    assert_eq!(db.fulltext_reindexed_during_open(), 0);
+    assert_eq!(observable(&db), before);
+}
+
+/// Binding: a snapshot that kept its WAL has its index read only when the
+/// WAL beside it is the one the snapshot marked. If the WAL has lost its
+/// tail, the whole of what is left replays over the snapshot, and an index
+/// read from the snapshot beforehand is not what that replay produces: here
+/// a replayed insert relabels the node, and the snapshot's posting for the
+/// old label's field stayed searchable.
+#[test]
+fn a_keep_wal_snapshot_whose_wal_lost_its_tail_does_not_keep_its_index() {
+    let dir = tmp_dir();
+    let cut;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_fulltext("Doc", "body").unwrap();
+        db.enable_fulltext("Memo", "title").unwrap();
+        db.insert_node(
+            "Doc",
+            "k",
+            vec![("body".into(), Value::Str("alpha".into()))],
+        )
+        .unwrap();
+        cut = std::fs::metadata(dir.join("wal.bin")).unwrap().len();
+        db.delete_node("k").unwrap();
+        db.insert_node(
+            "Memo",
+            "k",
+            vec![("title".into(), Value::Str("zeta".into()))],
+        )
+        .unwrap();
+        db.snapshot_with(core_api::SnapshotOptions {
+            keep_wal: true,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+    let wal = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("wal.bin"))
+        .unwrap();
+    wal.set_len(cut).unwrap();
+    drop(wal);
+
+    // In a debug build this open used to stop on the check that a kept index
+    // equals a rebuilt one.
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(!db.fulltext_loaded_from_snapshot());
+    let label = db.node_info("k").map(|n| n.label);
+    if label.as_deref() == Some("Doc") {
+        assert!(
+            db.search("title", "zeta").is_empty(),
+            "k is a Doc again; nothing indexes a Doc's title"
+        );
+    }
+}

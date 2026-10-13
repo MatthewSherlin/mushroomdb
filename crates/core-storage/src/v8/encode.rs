@@ -27,6 +27,7 @@
 //!  10 = IVF_STATE (bincode BTreeMap<String,PerRuleIvfState>; retained undecoded at open)
 //!  11 = LAST_CHANGE (bincode HashMap<u32,u64>)
 //!  12 = STRINGS (rkyv StringTableData — the one table every Str column indexes; V9 only)
+//!  13 = FULLTEXT (the full-text index's own blob; only when a pair is declared)
 
 use crate::columns::ColumnStore;
 use crate::edge_props::EdgeProps;
@@ -42,9 +43,9 @@ use crate::v8::layout::{
     ViewsSectionData,
 };
 use crate::v8::{
-    HEADER_SIZE, SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_IDS, SECTION_IVF_STATE,
-    SECTION_LAST_CHANGE, SECTION_META, SECTION_PROVENANCE, SECTION_RULES_META, SECTION_STRINGS,
-    SECTION_SYMS, SECTION_TOPOLOGY, SECTION_VIEWS, SECTION_WAL_MARK,
+    HEADER_SIZE, SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_FULLTEXT, SECTION_HNSW, SECTION_IDS,
+    SECTION_IVF_STATE, SECTION_LAST_CHANGE, SECTION_META, SECTION_PROVENANCE, SECTION_RULES_META,
+    SECTION_STRINGS, SECTION_SYMS, SECTION_TOPOLOGY, SECTION_VIEWS, SECTION_WAL_MARK,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -96,6 +97,11 @@ pub struct V8Meta {
     /// Empty for legacy or freshly-opened stores with no mutations.
     #[serde(skip)]
     pub last_change: HashMap<u32, u64>,
+    /// The full-text index blob, written as section 13. Empty means the
+    /// section is left out: a store with no full-text pair, or a caller that
+    /// has no index to hand over.
+    #[serde(skip)]
+    pub fulltext_blob: Vec<u8>,
     /// An encoded [`crate::v8::WalMark`], written as section 14. Empty means
     /// the section is left out, which is every snapshot that does not keep
     /// its WAL.
@@ -246,11 +252,14 @@ pub fn encode_v8<W: Write>(
         (SECTION_IVF_STATE, ivf_bytes),
         (SECTION_LAST_CHANGE, last_change_bytes),
     ];
-    // The mark is left out entirely when there is nothing to carry. Neither
-    // of these goes at the end: the last section stays a small,
+    // The optional sections. The index and the mark are left out entirely
+    // when there is nothing to carry, so a store with no full-text pair that
+    // does not keep its WAL writes only the swept marker beside what it
+    // always wrote. None goes at the end: the last section stays a small,
     // eagerly-CRC'd one.
     let swept: &[u8] = crate::v8::SWEPT_MAGIC;
     for (id, bytes) in [
+        (SECTION_FULLTEXT, meta.fulltext_blob.as_slice()),
         (SECTION_WAL_MARK, meta.wal_mark.as_slice()),
         (crate::v8::SECTION_EDGES_SWEPT, swept),
     ] {

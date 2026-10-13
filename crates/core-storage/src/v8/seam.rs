@@ -343,6 +343,7 @@ mod tests {
             wal_truncated: false,
             hnsw: BTreeMap::new(),
             last_change: HashMap::new(),
+            fulltext_blob: Vec::new(),
             wal_mark: Vec::new(),
         }
     }

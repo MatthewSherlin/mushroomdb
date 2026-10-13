@@ -4,7 +4,7 @@
 //! ```text
 //! [0..4]   MAGIC "GDB1"
 //! [4..6]   VERSION = 8 or 9 (u16 LE) — same container, V9 adds section 12
-//! [6..8]   section_count (u16 LE) — 14 since 0.7.2 (15 with a WAL mark)
+//! [6..8]   section_count (u16 LE) — 14 since 0.7.2; one more with a WAL mark, one more with the full-text index
 //! [8..8+16*N] SectionEntry * N  -- {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}
 //! [8+16*N..8+16*N+4]  whole-header CRC32
 //! [..4096]  zero-pad
@@ -89,11 +89,18 @@ pub const SECTION_LAST_CHANGE: u8 = 11;
 /// rkyv `StringTableData`.  Written from V9 on; absent in V5–V8 snapshots,
 /// where each string column carries its own copy and that copy is authoritative.
 pub const SECTION_STRINGS: u8 = 12;
+/// The full-text index as [`crate::fulltext::FulltextIndex::to_blob`] wrote
+/// it. Opaque here, and versioned and checksummed by the blob itself, so the
+/// index's layout changes without a container change. Written only when a
+/// full-text pair is declared; absent in every snapshot written before it
+/// existed, where the index is rebuilt at open as it always was. A reader
+/// that does not know this id ignores the section.
+pub const SECTION_FULLTEXT: u8 = 13;
 /// How much of the live WAL this snapshot already holds: [`WalMark`]. Written
 /// only by a snapshot that keeps its WAL, where the open would otherwise
 /// replay over the snapshot every write the snapshot was made from. Absent
 /// in every other snapshot, and ignored by a reader that does not know the
-/// id. (Id 13 is the full-text index's.)
+/// id.
 pub const SECTION_WAL_MARK: u8 = 14;
 /// Says the writer of this snapshot removes a deleted node's edges from the
 /// snapshot it was working over, so the topology holds no edge to or from a
@@ -269,6 +276,7 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_PROVENANCE
             | SECTION_IVF_STATE
             | SECTION_STRINGS
+            | SECTION_FULLTEXT
             | SECTION_WAL_MARK
             | SECTION_EDGES_SWEPT
     )
@@ -425,6 +433,7 @@ impl MappedBase {
             SECTION_IVF_STATE => "ivf_state",
             SECTION_LAST_CHANGE => "last_change",
             SECTION_STRINGS => "strings",
+            SECTION_FULLTEXT => "fulltext",
             SECTION_WAL_MARK => "wal_mark",
             SECTION_EDGES_SWEPT => "edges_swept",
             _ => "unknown",
@@ -806,6 +815,19 @@ impl MappedBase {
         self.section_bytes(SECTION_IVF_STATE)
     }
 
+    /// Raw bytes of the full-text index blob (section 13).
+    ///
+    /// Returns `Ok(&[])` when the section is absent: a snapshot written before
+    /// the section existed, by a binary that does not write it, or of a store
+    /// with no full-text pair. The blob carries its own checksum, which
+    /// `FulltextIndex::from_blob` verifies.
+    pub fn fulltext_bytes(&self) -> Result<&[u8]> {
+        if !self.has_section(SECTION_FULLTEXT) {
+            return Ok(&[]);
+        }
+        self.section_bytes(SECTION_FULLTEXT)
+    }
+
     /// Whether this snapshot says its topology holds no edge of a deleted
     /// node (section 15). False for a snapshot written before the section
     /// existed, by a binary that does not write it, or with a damaged one.
@@ -983,6 +1005,7 @@ mod tests {
             wal_truncated: false,
             hnsw: BTreeMap::new(),
             last_change: HashMap::new(),
+            fulltext_blob: Vec::new(),
             wal_mark: Vec::new(),
         }
     }

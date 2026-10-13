@@ -405,6 +405,17 @@ fn phrase_matches_pos_map(pos_map: &BTreeMap<String, Vec<u32>>, tokens: &[String
 // FulltextIndex
 // ---------------------------------------------------------------------------
 
+/// Leads every blob [`FulltextIndex::to_blob`] writes.
+const FULLTEXT_BLOB_MAGIC: &[u8; 4] = b"MFTS";
+/// Bump when the blob layout changes, or when the tokenizer, the stemmer or
+/// the position rules change what the same text indexes as: a blob written
+/// under other rules must be rebuilt, not read.
+const FULLTEXT_BLOB_VERSION: u32 = 1;
+/// Most elements a decode reserves room for before it has read them. A count
+/// in the blob is checked against the bytes left, but an element in memory is
+/// larger than its encoding, so the count alone is not a size to allocate.
+const BLOB_PREALLOC: usize = 4096;
+
 /// Incremental inverted index for full-text BM25 search.
 ///
 /// Enabled per `(label, field)` pair via [`FulltextIndex::enable`].
@@ -415,11 +426,13 @@ fn phrase_matches_pos_map(pos_map: &BTreeMap<String, Vec<u32>>, tokens: &[String
 /// k1 = 1.2, b = 0.75  (Okapi BM25 defaults).
 ///
 /// ## WAL / persistence
-/// The index is NOT stored in the V8 snapshot.  It is rebuilt from WAL replay
-/// (EnableFulltext / DisableFulltext records + node property re-indexing) at
-/// open time via [`FulltextIndex::rebuild_all`].  Postings restructuring in v2
-/// has no snapshot format impact.
-#[derive(Debug, Default, Clone)]
+/// A snapshot of a store with a declared pair carries the index as a blob
+/// ([`FulltextIndex::to_blob`]), and an open reads it back and applies the WAL
+/// to it. Where there is no blob, or it does not read back, or the WAL
+/// replays writes the snapshot already holds, the index is rebuilt from the
+/// declared pairs and the stored values by [`FulltextIndex::rebuild_all`], as
+/// it was on every open before the blob existed.
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct FulltextIndex {
     /// Enabled `(label, field)` pairs.
     enabled: BTreeSet<(String, String)>,
@@ -438,6 +451,202 @@ pub struct FulltextIndex {
 impl FulltextIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The whole index as bytes a snapshot can carry: the enabled pairs, the
+    /// postings and the document lengths, with `node_count` — the size of the
+    /// id space they were built over — and a trailing CRC32.
+    ///
+    /// Numbers are LEB128 varints, and node ids and positions are written as
+    /// the gap from the one before, which is what keeps the blob a fraction
+    /// of the text it indexes. The layout is this module's own and carries
+    /// its own version, so the tokenizer or the layout can change without a
+    /// snapshot format change: [`FulltextIndex::from_blob`] refuses a version
+    /// it does not write, and the caller rebuilds.
+    pub fn to_blob(&self, node_count: u32) -> Vec<u8> {
+        fn put(out: &mut Vec<u8>, mut n: u32) {
+            while n >= 0x80 {
+                out.push((n as u8) | 0x80);
+                n >>= 7;
+            }
+            out.push(n as u8);
+        }
+        fn put_str(out: &mut Vec<u8>, s: &str) {
+            put(out, s.len() as u32);
+            out.extend_from_slice(s.as_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(FULLTEXT_BLOB_MAGIC);
+        out.extend_from_slice(&FULLTEXT_BLOB_VERSION.to_le_bytes());
+        put(&mut out, node_count);
+        put(&mut out, self.enabled.len() as u32);
+        for (label, field) in &self.enabled {
+            put_str(&mut out, label);
+            put_str(&mut out, field);
+        }
+        put(&mut out, self.doc_len.len() as u32);
+        for (field, lens) in &self.doc_len {
+            put_str(&mut out, field);
+            put(&mut out, lens.len() as u32);
+            let mut prev = 0;
+            for (&node, &len) in lens {
+                put(&mut out, node - prev);
+                put(&mut out, len);
+                prev = node;
+            }
+        }
+        put(&mut out, self.postings.len() as u32);
+        for (field, tokens) in &self.postings {
+            put_str(&mut out, field);
+            put(&mut out, tokens.len() as u32);
+            for (token, docs) in tokens {
+                put_str(&mut out, token);
+                put(&mut out, docs.len() as u32);
+                let mut prev = 0;
+                for (&node, positions) in docs {
+                    put(&mut out, node - prev);
+                    prev = node;
+                    put(&mut out, positions.len() as u32);
+                    // Positions are ascending for a value indexed once, and
+                    // nothing here relies on it: a gap that would be negative
+                    // wraps, and wraps back on the way in.
+                    let mut prev_pos = 0u32;
+                    for &pos in positions {
+                        put(&mut out, pos.wrapping_sub(prev_pos));
+                        prev_pos = pos;
+                    }
+                }
+            }
+        }
+        let crc = crc32fast::hash(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// Read back what [`FulltextIndex::to_blob`] wrote, with the node count it
+    /// was built over. `None` for anything else: a blob that is cut short, one
+    /// whose checksum does not match, a version this build does not write, or
+    /// a posting for a node outside the id space it claims. A caller that gets
+    /// `None` rebuilds — slower, never wrong.
+    pub fn from_blob(bytes: &[u8]) -> Option<(Self, u32)> {
+        struct Reader<'a> {
+            bytes: &'a [u8],
+            at: usize,
+        }
+        impl Reader<'_> {
+            fn num(&mut self) -> Option<u32> {
+                let mut n = 0u32;
+                for shift in [0, 7, 14, 21, 28] {
+                    let byte = *self.bytes.get(self.at)?;
+                    self.at += 1;
+                    let bits = u32::from(byte & 0x7f);
+                    if shift == 28 && bits > 0x0f {
+                        return None;
+                    }
+                    n |= bits << shift;
+                    if byte & 0x80 == 0 {
+                        return Some(n);
+                    }
+                }
+                None
+            }
+            fn string(&mut self) -> Option<String> {
+                let len = self.num()? as usize;
+                let end = self.at.checked_add(len)?;
+                let raw = self.bytes.get(self.at..end)?;
+                self.at = end;
+                Some(std::str::from_utf8(raw).ok()?.to_string())
+            }
+            /// A count of things that each take at least one byte: one larger
+            /// than what is left is a corrupt blob, not a size to allocate.
+            fn count(&mut self) -> Option<usize> {
+                let n = self.num()? as usize;
+                (n <= self.bytes.len() - self.at).then_some(n)
+            }
+        }
+        let body_len = bytes.len().checked_sub(4)?;
+        let (body, crc) = bytes.split_at(body_len);
+        if crc32fast::hash(body) != u32::from_le_bytes(crc.try_into().ok()?) {
+            return None;
+        }
+        if body.get(..4)? != FULLTEXT_BLOB_MAGIC {
+            return None;
+        }
+        if body.get(4..8)? != FULLTEXT_BLOB_VERSION.to_le_bytes() {
+            return None;
+        }
+        let mut r = Reader { bytes: body, at: 8 };
+        let node_count = r.num()?;
+
+        let mut enabled = BTreeSet::new();
+        for _ in 0..r.count()? {
+            enabled.insert((r.string()?, r.string()?));
+        }
+        // Each level was written in key order, so collecting a `Vec` into a
+        // `BTreeMap` builds it in one pass instead of one insert at a time.
+        let mut doc_len = Vec::new();
+        for _ in 0..r.count()? {
+            let field = r.string()?;
+            let n = r.count()?;
+            let mut lens = Vec::with_capacity(n.min(BLOB_PREALLOC));
+            let mut node = 0u32;
+            for _ in 0..n {
+                node = node.checked_add(r.num()?)?;
+                if node >= node_count {
+                    return None;
+                }
+                lens.push((node, r.num()?));
+            }
+            doc_len.push((field, lens.into_iter().collect::<BTreeMap<_, _>>()));
+        }
+        let mut postings = Vec::new();
+        for _ in 0..r.count()? {
+            let field = r.string()?;
+            let n_tokens = r.count()?;
+            let mut tokens = Vec::with_capacity(n_tokens.min(BLOB_PREALLOC));
+            for _ in 0..n_tokens {
+                let token = r.string()?;
+                let n_docs = r.count()?;
+                let mut docs = Vec::with_capacity(n_docs.min(BLOB_PREALLOC));
+                let mut node = 0u32;
+                for _ in 0..n_docs {
+                    node = node.checked_add(r.num()?)?;
+                    if node >= node_count {
+                        return None;
+                    }
+                    let n_pos = r.count()?;
+                    let mut positions = Vec::with_capacity(n_pos.min(BLOB_PREALLOC));
+                    let mut pos = 0u32;
+                    for _ in 0..n_pos {
+                        pos = pos.wrapping_add(r.num()?);
+                        positions.push(pos);
+                    }
+                    docs.push((node, positions));
+                }
+                tokens.push((token, docs.into_iter().collect::<BTreeMap<_, _>>()));
+            }
+            postings.push((field, tokens.into_iter().collect::<BTreeMap<_, _>>()));
+        }
+        if r.at != body.len() {
+            return None;
+        }
+        Some((
+            Self {
+                enabled,
+                postings: postings.into_iter().collect(),
+                doc_len: doc_len.into_iter().collect(),
+            },
+            node_count,
+        ))
+    }
+
+    /// Whether `node_id` already has an entry under `field`. An insert that
+    /// finds one is being applied a second time: [`FulltextIndex::add_tokens`]
+    /// appends, so the node's postings are about to double.
+    pub fn has_doc(&self, node_id: u32, field: &str) -> bool {
+        self.doc_len
+            .get(field)
+            .is_some_and(|lens| lens.contains_key(&node_id))
     }
 
     /// Whether `(label, field)` is currently indexed.
@@ -499,7 +708,13 @@ impl FulltextIndex {
         let dl_col = self.doc_len.entry(field.to_string()).or_default();
         dl_col.insert(node_id, dl);
 
-        // Update postings.
+        // Update postings. A value with no words in it — an empty string, a
+        // number — adds a document length and no postings column: an empty
+        // column is what `remove_node` leaves behind for nobody, and an index
+        // that has one is not equal to an index that does not.
+        if stemmed.is_empty() {
+            return;
+        }
         let col = self.postings.entry(field.to_string()).or_default();
         for (tok, pos) in stemmed {
             col.entry(tok)
@@ -1202,6 +1417,83 @@ mod tests {
     fn unindexed_field_returns_empty() {
         let idx = FulltextIndex::new();
         assert!(idx.search("notindexed", "anything", 0).is_empty());
+    }
+
+    fn blob_fixture() -> FulltextIndex {
+        let mut idx = FulltextIndex::new();
+        idx.enable("Article", "body");
+        idx.enable("Article", "tags");
+        idx.enable("Person", "bio");
+        idx.add_tokens(0, "body", &Value::Str("the quick brown fox jumps".into()));
+        idx.add_tokens(1, "body", &Value::Str("quick quick répondre 東京".into()));
+        idx.add_tokens(
+            1,
+            "tags",
+            &Value::List(vec![
+                Value::Str("rust db".into()),
+                Value::Str("graphs".into()),
+            ]),
+        );
+        idx.add_tokens(2, "bio", &Value::Int(7));
+        idx.add_tokens(3, "bio", &Value::Str(String::new()));
+        idx
+    }
+
+    #[test]
+    fn a_blob_reads_back_as_the_index_it_was_written_from() {
+        let idx = blob_fixture();
+        let (back, node_count) = FulltextIndex::from_blob(&idx.to_blob(4)).expect("reads back");
+        assert_eq!(node_count, 4);
+        assert_eq!(back, idx);
+        assert_eq!(
+            back.search("body", "quick", 10),
+            idx.search("body", "quick", 10)
+        );
+
+        let empty = FulltextIndex::new();
+        assert_eq!(
+            FulltextIndex::from_blob(&empty.to_blob(0)),
+            Some((empty, 0))
+        );
+    }
+
+    #[test]
+    fn a_blob_that_is_not_exactly_what_was_written_is_refused() {
+        let blob = blob_fixture().to_blob(4);
+        assert!(FulltextIndex::from_blob(&[]).is_none());
+        assert!(FulltextIndex::from_blob(b"MFTS").is_none());
+        // Every truncation, and every single flipped byte.
+        for len in 0..blob.len() {
+            assert!(
+                FulltextIndex::from_blob(&blob[..len]).is_none(),
+                "cut at {len}"
+            );
+        }
+        for i in 0..blob.len() {
+            let mut bad = blob.clone();
+            bad[i] ^= 0x40;
+            assert!(FulltextIndex::from_blob(&bad).is_none(), "flip at {i}");
+        }
+        let mut trailing = blob.clone();
+        trailing.push(0);
+        assert!(FulltextIndex::from_blob(&trailing).is_none());
+    }
+
+    #[test]
+    fn a_blob_naming_a_node_outside_its_id_space_is_refused() {
+        // Node 3 is indexed; a blob claiming three nodes cannot hold it.
+        assert!(FulltextIndex::from_blob(&blob_fixture().to_blob(3)).is_none());
+        assert!(FulltextIndex::from_blob(&blob_fixture().to_blob(4)).is_some());
+    }
+
+    #[test]
+    fn a_blob_of_another_version_is_refused() {
+        let mut blob = blob_fixture().to_blob(4);
+        blob[4..8].copy_from_slice(&(FULLTEXT_BLOB_VERSION + 1).to_le_bytes());
+        let body = blob.len() - 4;
+        let crc = crc32fast::hash(&blob[..body]);
+        blob[body..].copy_from_slice(&crc.to_le_bytes());
+        assert!(FulltextIndex::from_blob(&blob).is_none());
     }
 
     #[test]
