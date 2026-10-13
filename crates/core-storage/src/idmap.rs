@@ -21,6 +21,27 @@ impl IdMap {
         Self::default()
     }
 
+    /// Rebuild the map from what a snapshot holds: every key slot in dense-id
+    /// order, and which of them are retired.
+    ///
+    /// Slot `i` is id `i`, whatever its key. Rebuilding by inserting the keys
+    /// in order instead loses a slot whenever a retired slot's key is one a
+    /// lower, live slot now carries — delete `b`, then rename `a` to `b` —
+    /// because the insert finds the key present and allocates nothing.
+    pub fn from_slots(to_key: Vec<String>, tombstones: BTreeSet<u32>) -> Self {
+        let to_id = to_key
+            .iter()
+            .enumerate()
+            .filter(|(i, key)| !tombstones.contains(&(*i as u32)) && !key.is_empty())
+            .map(|(i, key)| (key.clone(), i as u32))
+            .collect();
+        Self {
+            to_id,
+            to_key,
+            tombstones,
+        }
+    }
+
     /// Convenience wrapper around [`Self::try_insert`] for call-sites that do not
     /// return `Result`.  Panics only when the u32 id space is exhausted (> 4 billion
     /// distinct node keys inserted without restart).  Converting this to return
@@ -133,6 +154,23 @@ mod tests {
         assert_eq!(m.key_of(1), Some("b"));
         assert_eq!(m.key_of(9), None);
         assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn from_slots_keeps_a_live_slot_whose_key_a_later_retired_slot_also_held() {
+        // delete b (id 1), rename a (id 0) to b: slots ["b", "b"], id 1 retired.
+        let mut m = IdMap::new();
+        m.get_or_insert("a");
+        m.get_or_insert("b");
+        m.delete("b");
+        m.rename("a", "b").unwrap();
+        let back = IdMap::from_slots(m.all_keys().to_vec(), BTreeSet::from([1]));
+        assert_eq!(back.len(), 2);
+        assert_eq!(back.live_len(), 1);
+        assert_eq!(back.get("b"), Some(0));
+        assert_eq!(back.key_of(0), Some("b"));
+        assert!(back.is_tombstoned(1));
+        assert!(!back.is_tombstoned(0));
     }
 
     #[test]

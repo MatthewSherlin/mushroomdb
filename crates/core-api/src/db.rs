@@ -394,6 +394,19 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
     }
 }
 
+/// Whether `rec` only declares or withdraws something about the store — a
+/// full-text pair, an equality index, the multiplicity opt-in — and writes no
+/// node, edge or property.
+fn is_declaration(rec: &WalRecord) -> bool {
+    matches!(
+        rec,
+        WalRecord::EnableFulltext { .. }
+            | WalRecord::DisableFulltext { .. }
+            | WalRecord::EnableIndex { .. }
+            | WalRecord::DisableIndex { .. }
+    ) || *rec == core_storage::wal::MULTIPLICITY_ENABLED
+}
+
 /// Database-wide counters plus per-rule budget/fire stats.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Stats {
@@ -2586,7 +2599,19 @@ impl<F: Fs> GraphDb<F> {
         // Every decoded frame occupies an index, replayed or not: markers
         // are state no-ops but they are not index no-ops.
         let decoded_frames = records.len() as u64;
-        let replayed = db.apply_frames(records);
+        // A snapshot that kept its WAL says how much of it it already holds.
+        // Those frames are counted, and not applied a second time.
+        let held = db
+            .base
+            .as_ref()
+            .and_then(|base| base.wal_mark())
+            .filter(|mark| mark.matches(&bytes))
+            .map(|mark| (mark.len as usize, decode_all(&bytes[..mark.len as usize])))
+            // The mark was taken at the end of a whole WAL, so it ends on a
+            // frame boundary; one that does not is not this WAL's.
+            .filter(|(len, (_, consumed))| consumed == len)
+            .map_or(0, |(_, (held, _))| held.len());
+        let replayed = db.apply_frames_over(records, held);
         db.fulltext_rebuild_follows = false;
         let replayed = replayed?;
         // ── The multiplicity declaration, recovered from the stamp ───────────
@@ -2723,6 +2748,17 @@ impl<F: Fs> GraphDb<F> {
     /// reflected on disk, so they are not news to a subscriber, and draining
     /// inside the loop keeps `pending_deltas` O(1) over a large WAL (I-2).
     fn apply_frames(&mut self, records: Vec<WalRecord>) -> Result<usize> {
+        self.apply_frames_over(records, 0)
+    }
+
+    /// [`Self::apply_frames`] over a base that already holds the first `held`
+    /// records: the state a snapshot that kept its WAL was taken at. Those
+    /// are numbered like any other frame and not applied, because applying a
+    /// write to the state it produced is not always a no-op — an insert
+    /// under a key since renamed or deleted makes a second node. A
+    /// declaration among them is applied all the same: the pairs a store has
+    /// declared are known from the WAL and nowhere else.
+    fn apply_frames_over(&mut self, records: Vec<WalRecord>, held: usize) -> Result<usize> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -2737,8 +2773,10 @@ impl<F: Fs> GraphDb<F> {
             build_props_view(&self.props, &self.base),
         );
         let applied = records.len();
-        for rec in records {
-            self.apply(&rec)?;
+        for (i, rec) in records.into_iter().enumerate() {
+            if i >= held || is_declaration(&rec) {
+                self.apply(&rec)?;
+            }
             let _ = self.engine.drain_deltas();
             // Track commit_seq during replay so last_change entries are
             // consistent with the seqs assigned by log_then_apply_with on
@@ -12554,10 +12592,28 @@ impl<F: Fs> GraphDb<F> {
         queried_key: &str,
         floor: u64,
     ) -> Vec<(String, u64, Option<u64>)> {
+        self.key_alias_intervals(frames, queried_key, floor, false)
+    }
+
+    /// [`Self::build_key_alias_intervals`], and with `current_holder_only`
+    /// the queried key itself is bounded too: it counts from the commit the
+    /// node that has it now acquired it. An earlier node that held the same
+    /// key and was deleted is then no part of the answer — neither its edges
+    /// nor its deletion.
+    fn key_alias_intervals(
+        &self,
+        frames: &[core_storage::wal::WalRecord],
+        queried_key: &str,
+        floor: u64,
+        current_holder_only: bool,
+    ) -> Vec<(String, u64, Option<u64>)> {
         use core_storage::wal::WalRecord;
 
         // Pre-pass: build reverse_rename and key_starts maps.
-        let mut reverse_rename: HashMap<String, (String, u64)> = HashMap::new();
+        // Every rename into a key, in commit order. A key can be renamed into
+        // more than once — `a → b`, `b → a`, `a → b` — and which rename led
+        // to the occupancy being followed depends on when.
+        let mut reverse_rename: HashMap<String, Vec<(String, u64)>> = HashMap::new();
         let mut key_starts: HashMap<String, Vec<u64>> = HashMap::new();
 
         for (local_i, frame) in frames.iter().enumerate() {
@@ -12575,7 +12631,10 @@ impl<F: Fs> GraphDb<F> {
                         // new_key came into existence at this commit.
                         key_starts.entry(new_key.clone()).or_default().push(commit);
                         // Record the reverse rename: new_key was introduced by renaming old_key.
-                        reverse_rename.insert(new_key.clone(), (old_key.clone(), commit));
+                        reverse_rename
+                            .entry(new_key.clone())
+                            .or_default()
+                            .push((old_key.clone(), commit));
                     }
                     _ => {}
                 }
@@ -12597,6 +12656,11 @@ impl<F: Fs> GraphDb<F> {
                     .get(&current_key)
                     .and_then(|starts| starts.iter().rev().find(|&&s| s < vu).copied())
                     .unwrap_or(floor)
+            } else if current_holder_only {
+                key_starts
+                    .get(&current_key)
+                    .and_then(|starts| starts.last().copied())
+                    .unwrap_or(floor)
             } else {
                 // Queried key — no upper bound; may have been introduced at any commit.
                 floor
@@ -12604,7 +12668,27 @@ impl<F: Fs> GraphDb<F> {
 
             result.push((current_key.clone(), valid_from, current_valid_until));
 
-            match reverse_rename.get(&current_key) {
+            // The rename that led here: the latest into this key, and for an
+            // alias the latest before the alias stopped being this node's.
+            // Each step goes strictly back in time, so the walk ends — taking
+            // the last rename whatever its commit sent `a → b → a` round for
+            // ever.
+            let led_here = reverse_rename
+                .get(&current_key)
+                .and_then(|renames| {
+                    renames
+                        .iter()
+                        .rev()
+                        .find(|(_, at)| current_valid_until.is_none_or(|until| *at < until))
+                })
+                // And only if that rename is how this occupancy of the key
+                // began. A key renamed into, deleted and inserted fresh
+                // starts a new node at the insert; the older rename led to
+                // the node that was deleted.
+                .filter(|(_, at)| {
+                    (current_valid_until.is_none() && !current_holder_only) || *at == valid_from
+                });
+            match led_here {
                 Some((old_key, rename_commit)) => {
                     current_valid_until = Some(*rename_commit);
                     current_key = old_key.clone();
@@ -13087,14 +13171,23 @@ impl<F: Fs> GraphDb<F> {
 
         // Resolve all historical names for a and b (handles RenameNode in the WAL).
         // Intervals are commit-bounded so recycled keys don't contaminate point-in-time reads.
-        let alias_a = self.build_key_alias_intervals(&frames, a, floor);
-        let alias_b = self.build_key_alias_intervals(&frames, b, floor);
+        let alias_a = self.key_alias_intervals(&frames, a, floor, true);
+        let alias_b = self.key_alias_intervals(&frames, b, floor, true);
+        // The two nodes themselves, when both are live. A record that names
+        // its endpoints by dense id is then matched by id: a retired id keeps
+        // the key it last had, and matching on that string took an earlier,
+        // deleted holder of the key for the node that has it now.
+        let live_ids = self.ids.get(a).zip(self.ids.get(b));
 
         // Local index into surviving frames (0 = first frame of oldest archive).
         let local_commit = at_commit - floor;
 
-        // Replay local frames 0..=local_commit, tracking active edges.
-        let mut active: BTreeSet<(String, String, String)> = BTreeSet::new();
+        // Replay local frames 0..=local_commit, tracking active edges between
+        // the two nodes: the edge type and whether it runs from `a` to `b`.
+        // Tracked by which node, not by the key each record names it with: an
+        // edge written while a node was called one thing and deleted while it
+        // was called another is the same edge.
+        let mut active: BTreeSet<(String, bool)> = BTreeSet::new();
 
         for (local_i, frame) in frames.iter().enumerate().take((local_commit + 1) as usize) {
             let commit = floor + local_i as u64;
@@ -13114,8 +13207,11 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.insert((et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.insert((et.clone(), true));
+                        }
+                        if is_ba {
+                            active.insert((et.clone(), false));
                         }
                     }
                     WalRecord::InsertEdgeId { etype, src, dst } => {
@@ -13126,14 +13222,20 @@ impl<F: Fs> GraphDb<F> {
                         // Use key_of_historical so tombstoned nodes resolve.
                         let src_key = self.ids.key_of_historical(*src);
                         let dst_key = self.ids.key_of_historical(*dst);
-                        let is_ab = src_key == Some(a) && dst_key == Some(b);
-                        let is_ba = src_key == Some(b) && dst_key == Some(a);
-                        if is_ab || is_ba {
-                            active.insert((
-                                etype_str,
-                                src_key.unwrap().to_string(),
-                                dst_key.unwrap().to_string(),
-                            ));
+                        let (is_ab, is_ba) = match live_ids {
+                            Some((id_a, id_b)) => {
+                                (*src == id_a && *dst == id_b, *src == id_b && *dst == id_a)
+                            }
+                            None => (
+                                src_key == Some(a) && dst_key == Some(b),
+                                src_key == Some(b) && dst_key == Some(a),
+                            ),
+                        };
+                        if is_ab {
+                            active.insert((etype_str.clone(), true));
+                        }
+                        if is_ba {
+                            active.insert((etype_str, false));
                         }
                     }
                     WalRecord::DeleteEdge {
@@ -13145,16 +13247,20 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.remove(&(et.clone(), true));
+                        }
+                        if is_ba {
+                            active.remove(&(et.clone(), false));
                         }
                     }
                     WalRecord::DeleteNode { key: k }
                         if Self::aliases_match(&alias_a, k, commit)
                             || Self::aliases_match(&alias_b, k, commit) =>
                     {
-                        // All edges touching the deleted node are gone.
-                        active.retain(|(_, s, d)| s != k && d != k);
+                        // One of the two nodes is gone, and every edge
+                        // between them with it.
+                        active.clear();
                     }
                     WalRecord::DerivedEdgeAdded {
                         edge_type: et,
@@ -13166,8 +13272,11 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.insert((et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.insert((et.clone(), true));
+                        }
+                        if is_ba {
+                            active.insert((et.clone(), false));
                         }
                     }
                     WalRecord::DerivedEdgeRetracted {
@@ -13180,8 +13289,11 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.remove(&(et.clone(), true));
+                        }
+                        if is_ba {
+                            active.remove(&(et.clone(), false));
                         }
                     }
                     _ => {}
@@ -13189,7 +13301,7 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        Ok(active.iter().any(|(et, _, _)| et == edge_type))
+        Ok(active.iter().any(|(et, _)| et == edge_type))
     }
 
     /// Every edge incident to `key` — either endpoint — that existed at WAL
@@ -13754,6 +13866,15 @@ impl<F: Fs> GraphDb<F> {
         // truncating the WAL at the first such frame. The container is
         // identical either way; only these two header bytes move.
         let snapshot_version = core_storage::snapshot::version_for(self.multiplicity);
+        // A snapshot that leaves the WAL where it is records how much of it
+        // it holds, so the next open does not apply those writes again on top
+        // of the state they produced. This handle holds the write lock, so
+        // every byte in the WAL now is a write it has applied.
+        let wal_mark = if opts.keep_wal && !opts.archive_wal {
+            core_storage::v8::WalMark::of(&self.fs.read(FileId::Wal)?).encode()
+        } else {
+            Vec::new()
+        };
         self.ensure_v8_base_sections_loaded();
         // Ensure provenance is decoded before to_persist() clones it.
         self.engine.ensure_provenance_loaded_mut();
@@ -13819,6 +13940,7 @@ impl<F: Fs> GraphDb<F> {
                 wal_truncated: !opts.keep_wal,
                 hnsw: hnsw_state,
                 last_change: self.last_change.clone(),
+                wal_mark: wal_mark.clone(),
             };
             let mut buf: Vec<u8> = Vec::new();
             {
@@ -13918,6 +14040,7 @@ impl<F: Fs> GraphDb<F> {
                 view_defs,
                 hnsw: hnsw_state,
                 last_change: self.last_change.clone(),
+                wal_mark: wal_mark.clone(),
             };
             let mut buf = Vec::new();
             encode_v8(

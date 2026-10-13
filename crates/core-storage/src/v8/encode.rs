@@ -44,7 +44,7 @@ use crate::v8::layout::{
 use crate::v8::{
     HEADER_SIZE, SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_HNSW, SECTION_IDS, SECTION_IVF_STATE,
     SECTION_LAST_CHANGE, SECTION_META, SECTION_PROVENANCE, SECTION_RULES_META, SECTION_STRINGS,
-    SECTION_SYMS, SECTION_TOPOLOGY, SECTION_VIEWS,
+    SECTION_SYMS, SECTION_TOPOLOGY, SECTION_VIEWS, SECTION_WAL_MARK,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -96,6 +96,11 @@ pub struct V8Meta {
     /// Empty for legacy or freshly-opened stores with no mutations.
     #[serde(skip)]
     pub last_change: HashMap<u32, u64>,
+    /// An encoded [`crate::v8::WalMark`], written as section 14. Empty means
+    /// the section is left out, which is every snapshot that does not keep
+    /// its WAL.
+    #[serde(skip)]
+    pub wal_mark: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +228,7 @@ pub fn encode_v8<W: Write>(
         })?;
     let last_change_bytes: &[u8] = &last_change_bytes_owned;
 
-    let sections: &[(u8, &[u8])] = &[
+    let mut sections: Vec<(u8, &[u8])> = vec![
         (SECTION_TOPOLOGY, &topo_bytes),
         (SECTION_COLUMNS, &cols_bytes),
         // Next to the columns it belongs to, not appended at the end: the last
@@ -241,12 +246,22 @@ pub fn encode_v8<W: Write>(
         (SECTION_IVF_STATE, ivf_bytes),
         (SECTION_LAST_CHANGE, last_change_bytes),
     ];
+    // Left out entirely when there is nothing to carry, so a snapshot that
+    // does not keep its WAL is the bytes it always was. Not at the end: the
+    // last section stays a small, eagerly-CRC'd one.
+    if !meta.wal_mark.is_empty() {
+        let at = sections
+            .iter()
+            .position(|(id, _)| *id == SECTION_IDS)
+            .unwrap_or(sections.len() - 1);
+        sections.insert(at, (SECTION_WAL_MARK, &meta.wal_mark));
+    }
     let n = sections.len();
 
     // 2. Compute section offsets (sections start after the 4 KB header page).
     let mut offsets = Vec::with_capacity(n);
     let mut cur: u64 = HEADER_SIZE as u64;
-    for (_, bytes) in sections {
+    for (_, bytes) in &sections {
         offsets.push(cur);
         cur = align8(cur + bytes.len() as u64);
     }
@@ -935,18 +950,13 @@ fn bitmap_for_each<F: FnMut(u32)>(words: &[rkyv::Archived<u64>], mut f: F) {
 
 /// Reconstruct an `IdMap` from archived data.
 pub fn archived_to_idmap(archived: &crate::v8::layout::ArchivedIdMap) -> IdMap {
-    let mut ids = IdMap::new();
     let tombstoned: BTreeSet<u32> = archived.tombstones.iter().map(|t| u32::from(*t)).collect();
-    for (i, key) in archived.to_key.iter().enumerate() {
-        let s = key.as_str();
-        if tombstoned.contains(&(i as u32)) {
-            ids.get_or_insert(s);
-            ids.delete(s);
-        } else if !s.is_empty() {
-            ids.get_or_insert(s);
-        }
-    }
-    ids
+    let to_key: Vec<String> = archived
+        .to_key
+        .iter()
+        .map(|key| key.as_str().to_string())
+        .collect();
+    IdMap::from_slots(to_key, tombstoned)
 }
 
 /// Reconstruct an `Interner` from archived data.

@@ -76,6 +76,7 @@ Section ids (fixed):
 | 10 | IVF_STATE  | bincode `BTreeMap<String, PerRuleIvfState>` (IVF centroid + cluster state per approximate rule) |
 | 11 | LAST_CHANGE | bincode `HashMap<u32, u64>` (per-node-id → last-commit-seq; used for CAS precondition checks) |
 | 12 | STRINGS    | rkyv `StringTableData` — the one table every `ColumnData::Str` in section 1 indexes (V9+; absent in V5–V8, where each column carries its own copy) |
+| 14 | WAL_MARK   | 20 bytes: magic `MWAL`, the length of WAL the snapshot holds (u64 LE), a CRC32 of all of it, a CRC32 of the 16 bytes before. Optional: written only by a snapshot that keeps its WAL (0.7.2+). With it, an open counts the frames the snapshot holds and applies only the declarations among them. A snapshot without it, and a reader that does not know the id, replay the whole WAL over the snapshot. A mark that does not read back is ignored the same way at open, though `verify` reports its section as failed |
 
 Resolution rule for string columns, in one sentence: **if the shared table is
 present it is the table; otherwise the column's own `strings` is.** That is what
@@ -91,7 +92,7 @@ Small sections (IDS=2, SYMS=3, META=4, RULES_META=8, VIEWS=9) validate their CRC
 on first access.
 
 Large sections (TOPOLOGY=0, COLUMNS=1, EDGE_PROPS=5, HNSW=6, PROVENANCE=7,
-IVF_STATE=10, STRINGS=12) **skip** the per-touch CRC on the normal query path. A full-section
+IVF_STATE=10, STRINGS=12, WAL_MARK=14) **skip** the per-touch CRC on the normal query path. A full-section
 hash of hundreds of MiB costs 50–200 ms per section. Section bounds are validated
 at open time; rkyv archived data on the hot path uses `access_unchecked` (O(1)
 root-pointer lookup, no pointer-walk). This is sound for encoder-produced

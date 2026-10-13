@@ -89,6 +89,73 @@ pub const SECTION_LAST_CHANGE: u8 = 11;
 /// rkyv `StringTableData`.  Written from V9 on; absent in V5–V8 snapshots,
 /// where each string column carries its own copy and that copy is authoritative.
 pub const SECTION_STRINGS: u8 = 12;
+/// How much of the live WAL this snapshot already holds: [`WalMark`]. Written
+/// only by a snapshot that keeps its WAL, where the open would otherwise
+/// replay over the snapshot every write the snapshot was made from. Absent
+/// in every other snapshot, and ignored by a reader that does not know the
+/// id. (Id 13 is the full-text index's.)
+pub const SECTION_WAL_MARK: u8 = 14;
+
+/// The leading part of a WAL that a snapshot already holds.
+///
+/// A snapshot that keeps its WAL is the state at the WAL's end, so an open
+/// that replays that WAL over it applies every write a second time — and a
+/// replayed insert of a key since renamed or deleted makes a second node.
+/// The mark says where the snapshot was taken: `len` bytes into the WAL, with
+/// a checksum of every one of them, so that only the WAL the snapshot was
+/// taken beside is skipped into. Every byte, and not a sample: a WAL that
+/// lost its tail and grew past `len` again has new writes inside the old
+/// length, and a mark that still matched would have them skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalMark {
+    /// Bytes of WAL the snapshot holds.
+    pub len: u64,
+    /// CRC32 of those bytes.
+    pub crc: u32,
+}
+
+impl WalMark {
+    const MAGIC: &'static [u8; 4] = b"MWAL";
+
+    /// The mark for a WAL whose bytes are `wal`, all of them held.
+    pub fn of(wal: &[u8]) -> Self {
+        Self {
+            len: wal.len() as u64,
+            crc: crc32fast::hash(wal),
+        }
+    }
+
+    /// Whether `wal` starts with the WAL this mark was taken from.
+    pub fn matches(&self, wal: &[u8]) -> bool {
+        let Ok(len) = usize::try_from(self.len) else {
+            return false;
+        };
+        wal.len() >= len && crc32fast::hash(&wal[..len]) == self.crc
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(20);
+        out.extend_from_slice(Self::MAGIC);
+        out.extend_from_slice(&self.len.to_le_bytes());
+        out.extend_from_slice(&self.crc.to_le_bytes());
+        let crc = crc32fast::hash(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 20 || &bytes[..4] != Self::MAGIC {
+            return None;
+        }
+        if crc32fast::hash(&bytes[..16]) != u32::from_le_bytes(bytes[16..20].try_into().ok()?) {
+            return None;
+        }
+        Some(Self {
+            len: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
+            crc: u32::from_le_bytes(bytes[12..16].try_into().ok()?),
+        })
+    }
+}
 
 /// Total number of canonical section slots (used for atomic check_state array).
 /// Extended from 11 (Task 5: +ivf_state) to 12 (Task 3: +last_change) to 13
@@ -113,6 +180,7 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_PROVENANCE
             | SECTION_IVF_STATE
             | SECTION_STRINGS
+            | SECTION_WAL_MARK
     )
 }
 
@@ -267,6 +335,7 @@ impl MappedBase {
             SECTION_IVF_STATE => "ivf_state",
             SECTION_LAST_CHANGE => "last_change",
             SECTION_STRINGS => "strings",
+            SECTION_WAL_MARK => "wal_mark",
             _ => "unknown",
         };
         self.dir
@@ -646,6 +715,17 @@ impl MappedBase {
         self.section_bytes(SECTION_IVF_STATE)
     }
 
+    /// The WAL mark this snapshot carries (section 14), if it carries one
+    /// that reads back. `None` for a snapshot with no such section and for
+    /// one whose mark is damaged: either way the open replays the whole WAL,
+    /// as it did before the mark existed.
+    pub fn wal_mark(&self) -> Option<WalMark> {
+        if !self.has_section(SECTION_WAL_MARK) {
+            return None;
+        }
+        WalMark::decode(self.section_bytes(SECTION_WAL_MARK).ok()?)
+    }
+
     /// Raw bytes for the last-change section (section 11).
     ///
     /// Returns `Ok(&[])` when the section is absent from the directory
@@ -802,6 +882,7 @@ mod tests {
             wal_truncated: false,
             hnsw: BTreeMap::new(),
             last_change: HashMap::new(),
+            wal_mark: Vec::new(),
         }
     }
 
