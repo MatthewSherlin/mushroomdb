@@ -3557,3 +3557,55 @@ fn a_wal_that_lost_its_tail_and_grew_back_is_not_taken_for_the_one_marked() {
     );
     assert_eq!(db.stats().nodes_live, 406);
 }
+
+/// Binding: a node renamed onto a key that a deleted node once held survives
+/// a snapshot and a reopen.
+///
+/// A snapshot lists every key slot, live and retired, and the reader rebuilt
+/// the key table by inserting them in order. A retired slot whose key a
+/// lower, live slot now carries — delete `b`, rename `a` to `b` — found that
+/// key already present, allocated nothing, and retired the live node in its
+/// place: `corrupt data: v8: labels section has 2 entries but id table has 1
+/// total slots`, at every open after any kind of snapshot.
+#[test]
+fn a_node_renamed_onto_a_retired_key_survives_a_snapshot() {
+    for (name, opts) in [
+        ("truncate", SnapshotOptions::default()),
+        ("keep", keep_wal()),
+        (
+            "archive",
+            SnapshotOptions {
+                archive_wal: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let dir = tmp(&format!("retired-key-{name}"));
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            db.insert_node("A", "a", vec![("n".into(), Value::Int(1))])
+                .unwrap();
+            db.insert_node("A", "b", vec![("n".into(), Value::Int(2))])
+                .unwrap();
+            db.insert_node("A", "c", vec![]).unwrap();
+            db.insert_edge("KNOWS", "c", "a").unwrap();
+            db.delete_node("b").unwrap();
+            db.rename_node("a", "b").unwrap();
+            db.snapshot_with(opts).unwrap();
+        }
+        let mut db = GraphDb::open(&dir).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(db.stats().nodes_live, 2, "{name}");
+        assert_eq!(db.get_prop("b", "n"), Some(Value::Int(1)), "{name}");
+        assert!(!db.has_node("a"), "{name}");
+        assert_eq!(
+            db.neighbors("c", "KNOWS", Direction::Out).unwrap(),
+            vec!["b"],
+            "{name}"
+        );
+        // And the reopened store takes writes and another snapshot.
+        db.insert_node("A", "a", vec![]).unwrap();
+        db.snapshot().unwrap();
+        drop(db);
+        assert_eq!(GraphDb::open(&dir).unwrap().stats().nodes_live, 3, "{name}");
+    }
+}
