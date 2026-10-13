@@ -31,5 +31,5 @@ mushroomdb serve ./db
 ```
 
 Open `http://127.0.0.1:8080/`. The demo graph has 10 Orgs, 20 Projects, 30 People, and 334
-edges — 304 of them derived by seven rule sets. When a token is configured, open
+edges — all 334 derived by seven rule sets. When a token is configured, open
 `http://host:8080/?token=…`.
