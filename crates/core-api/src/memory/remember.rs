@@ -160,7 +160,8 @@ pub struct RememberReport {
     pub note: String,
     /// Entities this call brought into existence.
     pub created: usize,
-    /// `about` keys and entities that already existed.
+    /// `about` keys, entities and fact endpoints that already existed, each
+    /// key counted once.
     pub matched: usize,
     /// Derived edges the rules produced for this commit, incident on the
     /// *note* — edges the engine's rule provenance attributes to a rule,
@@ -774,6 +775,9 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
     //    with no report entry anywhere — up to the same per-commit cap.
     for (k, existed) in fact_endpoints.iter().zip(&fact_endpoint_existed) {
         if *existed {
+            // Matched like an `about` key that exists (defect 48): the list
+            // holds no key `entities` or `about` already counted.
+            report.matched += 1;
             continue;
         }
         if provisional_count < MAX_PROVISIONAL_PER_COMMIT {

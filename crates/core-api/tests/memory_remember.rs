@@ -915,3 +915,46 @@ fn a_key_with_an_invisible_character_beside_text_is_still_taken_as_given() {
     assert_eq!(report.provisional, about);
     assert!(db.has_node("re\u{200b}id"));
 }
+
+/// `matched` counts every key the call named that the store already held: a
+/// fact's endpoint as much as an `about` key (defect 48). Each key counts
+/// once, however many arguments name it.
+#[test]
+fn a_fact_endpoint_that_already_exists_is_counted_as_matched() {
+    let mut db = store("matched-fact-endpoints");
+    remember(
+        &mut db,
+        &input("Ada and Bob met", &["ada".into(), "bob".into()]),
+    )
+    .unwrap();
+    let fact = |subject: &str, object: &str| FactIn {
+        subject: subject.into(),
+        predicate: "KNOWS".into(),
+        object: object.into(),
+    };
+
+    // Both endpoints exist; `carol` does not and is stubbed.
+    let facts = [fact("ada", "bob"), fact("bob", "carol")];
+    let report = remember(
+        &mut db,
+        &RememberInput {
+            facts: &facts,
+            ..input("Ada knows Bob, who knows Carol", &[])
+        },
+    )
+    .expect("remember");
+    assert_eq!(report.matched, 2, "{report:?}");
+    assert_eq!(report.provisional, vec!["carol".to_string()]);
+
+    // Named in `about` and in a fact, `ada` is still one match.
+    let facts = [fact("ada", "bob")];
+    let report = remember(
+        &mut db,
+        &RememberInput {
+            facts: &facts,
+            ..input("Ada knows Bob, again", &["ada".into()])
+        },
+    )
+    .expect("remember");
+    assert_eq!(report.matched, 2, "{report:?}");
+}
