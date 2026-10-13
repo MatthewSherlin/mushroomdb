@@ -57,11 +57,27 @@ async fn write_events(
         return;
     }
     loop {
-        let Some(text) = watch_text(rx.recv().await) else {
-            break;
-        };
-        if socket.send(Message::Text(text.into())).await.is_err() {
-            break;
+        tokio::select! {
+            event = rx.recv() => {
+                let Some(text) = watch_text(event) else {
+                    break;
+                };
+                if socket.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+            // The client sends nothing this endpoint acts on, but the socket
+            // has to be read all the same: reading is what answers a ping and
+            // a close. Unread, a client's close went unanswered and its task
+            // and receiver were held until a later commit's write failed.
+            incoming = socket.recv() => {
+                // A close frame is not the end: the reply to it is sent by
+                // the next read, which then reports the stream finished.
+                match incoming {
+                    Some(Err(_)) | None => break,
+                    Some(Ok(_)) => {}
+                }
+            }
         }
     }
 }

@@ -233,3 +233,30 @@ async fn watch_rejected_write_emits_no_frame_then_next_commit_does() {
     .unwrap();
     assert_eq!(frame, expected);
 }
+
+/// Row 99. A client that closes `/watch` is answered. The server only ever
+/// wrote to the socket, so a close frame went unread: the closing handshake
+/// did not complete, and the connection's task and its place in the event
+/// channel were held until the next commit gave the server something to
+/// write and the write failed. On a store nobody was writing to, that was
+/// until the server stopped.
+#[tokio::test]
+async fn watch_answers_a_client_that_closes_while_nothing_is_written() {
+    use futures_util::SinkExt;
+    let db = SharedDb::open(&tmp("close")).unwrap();
+    let addr = spawn_server(db.clone()).await;
+    let mut ws = connect(addr).await;
+
+    ws.close(None).await.expect("send close");
+    let answered = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) | None => break true,
+                Some(Ok(_)) => continue,
+                Some(Err(_)) => break false,
+            }
+        }
+    })
+    .await;
+    assert_eq!(answered, Ok(true), "the server did not complete the close");
+}
