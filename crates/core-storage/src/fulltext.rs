@@ -411,6 +411,10 @@ const FULLTEXT_BLOB_MAGIC: &[u8; 4] = b"MFTS";
 /// the position rules change what the same text indexes as: a blob written
 /// under other rules must be rebuilt, not read.
 const FULLTEXT_BLOB_VERSION: u32 = 1;
+/// Most elements a decode reserves room for before it has read them. A count
+/// in the blob is checked against the bytes left, but an element in memory is
+/// larger than its encoding, so the count alone is not a size to allocate.
+const BLOB_PREALLOC: usize = 4096;
 
 /// Incremental inverted index for full-text BM25 search.
 ///
@@ -584,7 +588,7 @@ impl FulltextIndex {
         for _ in 0..r.count()? {
             let field = r.string()?;
             let n = r.count()?;
-            let mut lens = Vec::with_capacity(n);
+            let mut lens = Vec::with_capacity(n.min(BLOB_PREALLOC));
             let mut node = 0u32;
             for _ in 0..n {
                 node = node.checked_add(r.num()?)?;
@@ -599,11 +603,11 @@ impl FulltextIndex {
         for _ in 0..r.count()? {
             let field = r.string()?;
             let n_tokens = r.count()?;
-            let mut tokens = Vec::with_capacity(n_tokens);
+            let mut tokens = Vec::with_capacity(n_tokens.min(BLOB_PREALLOC));
             for _ in 0..n_tokens {
                 let token = r.string()?;
                 let n_docs = r.count()?;
-                let mut docs = Vec::with_capacity(n_docs);
+                let mut docs = Vec::with_capacity(n_docs.min(BLOB_PREALLOC));
                 let mut node = 0u32;
                 for _ in 0..n_docs {
                     node = node.checked_add(r.num()?)?;
@@ -611,7 +615,7 @@ impl FulltextIndex {
                         return None;
                     }
                     let n_pos = r.count()?;
-                    let mut positions = Vec::with_capacity(n_pos);
+                    let mut positions = Vec::with_capacity(n_pos.min(BLOB_PREALLOC));
                     let mut pos = 0u32;
                     for _ in 0..n_pos {
                         pos = pos.wrapping_add(r.num()?);
@@ -704,7 +708,13 @@ impl FulltextIndex {
         let dl_col = self.doc_len.entry(field.to_string()).or_default();
         dl_col.insert(node_id, dl);
 
-        // Update postings.
+        // Update postings. A value with no words in it — an empty string, a
+        // number — adds a document length and no postings column: an empty
+        // column is what `remove_node` leaves behind for nobody, and an index
+        // that has one is not equal to an index that does not.
+        if stemmed.is_empty() {
+            return;
+        }
         let col = self.postings.entry(field.to_string()).or_default();
         for (tok, pos) in stemmed {
             col.entry(tok)
