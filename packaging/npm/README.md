@@ -7,7 +7,7 @@ declare a relationship as a rule, once; every write after that derives the match
 them, and retracts them when they stop being true.
 
 This package is the launcher: it downloads the native `mushroomdb` binary for your platform from
-the project's GitHub Releases and runs it. macOS arm64, Linux x86_64 and Linux arm64 are built.
+the project's GitHub Releases and runs it. macOS (Apple Silicon and Intel), Linux x86_64 (glibc and musl), Linux arm64 and Windows x86_64 are built.
 
 ```sh
 npx mushroomdb install --db ./memory   # give Claude Code, Cursor or Codex a memory

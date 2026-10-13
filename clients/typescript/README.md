@@ -286,9 +286,8 @@ Open a `GET /watch` WebSocket and stream raw `MutationEvent`s. The server sends 
 committed mutation — node inserts/deletes, property changes, edge inserts/deletes, rule
 lifecycle and ingest events — as an externally-tagged JSON frame.
 
-Returns a handle with `close(): Promise<void>`. Unlike `/subscribe`, the server loop never
-reads incoming frames, so the close handshake is not guaranteed to complete; `close()` resolves
-within 3 s regardless.
+Returns a handle with `close(): Promise<void>`. A server older than 0.8 does not answer a
+close on `/watch`, so `close()` resolves within 3 s whether or not the handshake completes.
 
 ```ts
 import WS from 'ws'; // Node < 21

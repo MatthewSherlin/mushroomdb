@@ -242,7 +242,6 @@ async fn watch_rejected_write_emits_no_frame_then_next_commit_does() {
 /// until the server stopped.
 #[tokio::test]
 async fn watch_answers_a_client_that_closes_while_nothing_is_written() {
-    use futures_util::SinkExt;
     let db = SharedDb::open(&tmp("close")).unwrap();
     let addr = spawn_server(db.clone()).await;
     let mut ws = connect(addr).await;

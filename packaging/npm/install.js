@@ -5,20 +5,39 @@ const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
 const https = require("https");
-const os = require("os");
 const path = require("path");
-const { spawnSync } = require("child_process");
+const zlib = require("zlib");
 
 const pkg = require("./package.json");
 const SUPPORTED = [
   "darwin-arm64 → aarch64-apple-darwin",
+  "darwin-x64 → x86_64-apple-darwin",
   "linux-x64 → x86_64-unknown-linux-gnu",
+  "linux-x64 with musl → x86_64-unknown-linux-musl",
   "linux-arm64 → aarch64-unknown-linux-gnu",
+  "win32-x64 → x86_64-pc-windows-msvc",
 ];
+
+// Whether this Linux is a musl one (Alpine). Node reports the glibc it runs
+// on; a Node built for musl reports none. MUSHROOMDB_FORCE_LIBC overrides.
+function isMusl() {
+  const forced = process.env.MUSHROOMDB_FORCE_LIBC;
+  if (forced) return forced === "musl";
+  try {
+    const header = process.report.getReport().header;
+    return !header.glibcVersionRuntime;
+  } catch (_) {
+    return false;
+  }
+}
 
 function rustTarget(platform, arch) {
   if (platform === "darwin" && arch === "arm64") return "aarch64-apple-darwin";
-  if (platform === "linux" && arch === "x64") return "x86_64-unknown-linux-gnu";
+  if (platform === "darwin" && arch === "x64") return "x86_64-apple-darwin";
+  if (platform === "win32" && arch === "x64") return "x86_64-pc-windows-msvc";
+  if (platform === "linux" && arch === "x64") {
+    return isMusl() ? "x86_64-unknown-linux-musl" : "x86_64-unknown-linux-gnu";
+  }
   if (platform === "linux" && (arch === "arm64" || arch === "aarch64")) {
     return "aarch64-unknown-linux-gnu";
   }
@@ -53,6 +72,33 @@ function fetchBuffer(url) {
   });
 }
 
+// The bytes of the top-level file named `name` in a gzipped tarball, or null.
+//
+// Read here and not by running `tar`: there is not always one, and where
+// there are two — Git Bash on Windows puts GNU tar ahead of the system's —
+// the one found first reads a path that starts `C:` as a remote host.
+function fileFromTarball(tarball, name) {
+  // Bounded: a release binary is tens of megabytes, and the checksum that
+  // admitted this tarball came from the host that served it.
+  const tar = zlib.gunzipSync(tarball, { maxOutputLength: 512 * 1024 * 1024 });
+  for (let at = 0; at + 512 <= tar.length; ) {
+    const header = tar.subarray(at, at + 512);
+    if (header.every((b) => b === 0)) break;
+    const entry = header.subarray(0, 100).toString("utf8").replace(/\0.*$/, "");
+    const size = parseInt(header.subarray(124, 136).toString("utf8").trim(), 8) || 0;
+    const type = String.fromCharCode(header[156] || 48);
+    const body = at + 512;
+    // The top-level entry only: a file of the same name further down is not
+    // the binary.
+    if ((type === "0" || type === "\0") && (entry === name || entry === `./${name}`)) {
+      if (body + size > tar.length) return null;
+      return tar.subarray(body, body + size);
+    }
+    at = body + Math.ceil(size / 512) * 512;
+  }
+  return null;
+}
+
 function checksumOf(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
 }
@@ -60,7 +106,9 @@ function checksumOf(buf) {
 function expectedChecksum(sums, filename) {
   const lines = sums.split(/\r?\n/);
   for (const line of lines) {
-    const m = line.match(/^([0-9a-fA-F]{64})\s+(\S+)$/);
+    // `sha256sum` marks a file read in binary mode with `*` before its
+    // name, and on Windows that is every file.
+    const m = line.match(/^([0-9a-fA-F]{64})\s+\*?(\S+)$/);
     if (m && path.basename(m[2]) === filename) return m[1].toLowerCase();
   }
   return null;
@@ -84,7 +132,8 @@ async function main() {
     process.env.MUSHROOMDB_RELEASE_BASE ||
     `https://github.com/${repo}/releases/download/${tag}`;
   const vendor = path.join(__dirname, "vendor");
-  const dest = path.join(vendor, "mushroomdb");
+  const binName = platform === "win32" ? "mushroomdb.exe" : "mushroomdb";
+  const dest = path.join(vendor, binName);
   fs.mkdirSync(vendor, { recursive: true });
 
   const tarUrl = `${base.replace(/\/$/, "")}/${asset}`;
@@ -100,20 +149,14 @@ async function main() {
     fail(`checksum mismatch for ${asset}: got ${got} want ${want}`);
   }
 
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mushroomdb-npm-"));
-  const tarPath = path.join(tmp, asset);
-  fs.writeFileSync(tarPath, tarball);
-  const extracted = spawnSync("tar", ["-xzf", tarPath, "-C", tmp], {
-    encoding: "utf8",
-  });
-  if (extracted.status !== 0) {
-    fail(`tar extract failed: ${extracted.stderr || extracted.stdout || extracted.status}`);
+  const binary = fileFromTarball(tarball, binName);
+  if (!binary) {
+    fail(`tarball ${asset} did not contain ./${binName}`);
   }
-  const extractedBin = path.join(tmp, "mushroomdb");
-  if (!fs.existsSync(extractedBin)) {
-    fail(`tarball ${asset} did not contain ./mushroomdb`);
+  if (binary.length === 0) {
+    fail(`tarball ${asset} holds an empty ${binName}`);
   }
-  fs.copyFileSync(extractedBin, dest);
+  fs.writeFileSync(dest, binary);
   fs.chmodSync(dest, 0o755);
   process.stdout.write(`installed ${dest} (${target} ${tag})\n`);
 }

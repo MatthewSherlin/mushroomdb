@@ -194,11 +194,10 @@ export async function watch(
           resolve({
             close(): Promise<void> {
               ws.close();
-              // The /watch server loop (write_events) never reads incoming
-              // frames, so the WebSocket close handshake may not complete and
-              // onclose may not fire until the ws package's own 30 s timeout
-              // expires.  Resolve at most 3 s after requesting a close so
-              // callers are not left hanging.
+              // A server older than 0.8 never reads a /watch socket, so it
+              // does not answer the close and onclose does not fire until
+              // the ws package's own 30 s timeout. Resolve at most 3 s after
+              // asking, so a caller talking to one is not left hanging.
               const fallback = setTimeout(() => closeResolve?.(), 3_000);
               return closePromise.finally(() => clearTimeout(fallback));
             },

@@ -699,6 +699,34 @@ each one leaves out.
 Docker details, `install.sh`, and building the binary with the UI embedded are in
 [CONTRIBUTING.md](https://github.com/MatthewSherlin/mushroomdb/blob/main/CONTRIBUTING.md).
 
+## Platforms
+
+A release carries a native binary for each of these, and `npx mushroomdb` fetches the one for the
+machine it runs on:
+
+| System | Built for |
+|---|---|
+| macOS | Apple Silicon, Intel |
+| Linux | x86_64 with glibc, x86_64 with musl (Alpine), arm64 with glibc |
+| Windows | x86_64 |
+
+The Intel macOS, musl and Windows builds are new after 0.7.2. Each is built on every pull
+request and run through a demo store, a query, three snapshots and a backup; the test suite
+itself runs on Linux and macOS only. `install.sh` covers macOS and Linux. The Homebrew formula
+is Apple Silicon and Linux. `pip install mushroomdb` has wheels for Apple Silicon and the two
+glibc Linux targets; elsewhere it builds from source and needs a Rust toolchain. On anything
+else, `cargo install mushroomdb-cli`.
+
+**On Windows the binary is what is supported.** `mushroomdb.exe` and `npx mushroomdb` are run
+on every pull request through a store's commands and one MCP exchange; `serve` is built and
+not run there. `mushroomdb install`, the step below that writes an
+assistant's MCP entry and hooks, has not been run there: the hooks are shell scripts and need a
+POSIX shell, and the search for `node` and `npx` does not look for `.exe` or `.cmd`. Write the
+MCP entry by hand (`npx -y mushroomdb mcp <store>`; some Windows clients need `cmd /c` in
+front of `npx`), or use WSL, where the Linux build applies.
+Keep the store on a local NTFS disk: a snapshot replaces a file the process has mapped, which
+NTFS allows and exFAT, FAT and some network and container mounts do not.
+
 `install` writes an MCP entry that runs `npx -y mushroomdb@<version>`, so the assistant needs
 nothing installed globally and nothing is copied into your home directory. Point it at a local
 build with `--command <path>`. `mushroomdb doctor` verifies the result end to end — config entry,
