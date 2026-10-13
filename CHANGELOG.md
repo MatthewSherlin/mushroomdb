@@ -8,6 +8,11 @@
 - **`PageRankConfig::validate`**, for an embedded caller that takes a config from somewhere it does not control.
 - **The MCP registry card offers the npm launcher**, so a client that installs from the registry needs no Rust toolchain.
 
+### Performance
+
+- **Opening a snapshotted store no longer rebuilds its full-text index.** A snapshot of a store with a declared pair carries the index, and the open reads it and applies what was written since. Measured on release builds: a 30,000-entity store with three pairs opens in 21 ms where it took 183 ms, and `mushroomdb stats` on a code graph of this repository (11,197 nodes, 13 pairs) takes 30 ms where it took 252 ms. Since 0.7 every new store declares the memory schema's pairs, so every store with text paid the rebuild on every open. The snapshot grows by the index, about a third on the first of those stores, and takes longer to write by the encode (65 ms to 82 ms there). No container version change: 0.7.1 opens such a snapshot, ignores the index and builds its own. A store that has never been snapshotted, or whose snapshot predates this, builds the index at open as before (row 36).
+- **Replaying a snapshot's declarations no longer builds the rule indexes.** Every truncating snapshot re-emits one WAL record for each declared pair, and replaying those counted as a write: a store with any declaration scanned every node at open to build the indexes rules match through, where a store with none defers that to its first write. It was 46 of the remaining 52 ms on the code-graph store above (row 36).
+
 ### Changed
 
 - **An `/algo` request with a field the config does not have is 400.** `POST /algo/pagerank`, `/algo/wcc` and `/algo/degree` dropped such a field without a word: `{"weight": "score"}` answered 200 with unweighted scores, and `max_iter` for `max_iters` ran with the default. The message names the field and the ones the route accepts. `{}` is still every default. **A caller that sends a stray field gets 400 where 0.7.1 answered** (row 87).
@@ -24,6 +29,7 @@
 
   **The same state can still follow a crash** between a truncating snapshot and the replacement of its WAL, a window two filesystem calls wide. That is not fixed here (row 92).
 
+- **An insert that names a property twice indexes the value that is stored.** `insert_node` with the same field twice, or a Cypher `CREATE` with a repeated key, stores the last value and used to index both: the first value's words stayed searchable until the store was next opened.
 - **A backup carries the commit-time map.** `mushroomdb backup`, `POST /backup` and `GraphDb::backup_to` left `commit_times.bin` behind, and `restore` did not name it, so a restored store had its history and not the map a read by date resolves through. A backup taken by 0.7.1 or earlier does not hold the map and restores without it (row 86).
 - **A batch sees a node it renamed.** After `rename_node(a, b)` in a `BatchBuilder` or a `submit_batch`, the batch's own checks read `b` as a node with no stored properties, label or edges. So `[rename a→b, insert_edge(b, d)]` passed the cross-namespace guard that `insert_edge(a, d)` is refused by; `[rename a→b, delete_edge(b, d)]` deleted an edge a rule owns; `[rename a→b, remove_prop(b, "name")]` returned Ok and removed nothing; and a chain `[a→b, b→c]` left a stored `id` where two separate renames move it. The checks now read through to the stored node. Reachable only from a batch built in Rust: MCP, HTTP, the Python binding and the CLI each send a rename alone (row 79).
 - **A key reused inside a batch names the new node.** A batch that renamed a node away from a key, or deleted it, and then used the key again wrote against the old node: `[delete_node a, insert_node a, set_prop(a, …)]` lost the property, and `[rename a→b, insert_node a, insert_edge(a, c)]` put the edge on `b`. Also only from a batch built in Rust (row 89).
