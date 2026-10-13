@@ -276,7 +276,7 @@ pub struct RuleEngine {
     /// Edges retracted while handling the node change in progress. Emptied at
     /// the start of each one and consumed at its end by
     /// [`reclaim_retracted`](RuleEngine::reclaim_retracted). Never persisted.
-    retracted: Vec<Triple>,
+    retracted: Vec<(u32, Triple)>,
     /// Gate: whether to accumulate [`EngineEdgeDelta`] items during rule
     /// application.
     ///
@@ -1064,7 +1064,8 @@ fn apply_per_src_top_k(
             g.topo.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
             prov.remove(&def.name, (t, s, d), g.ids, g.syms);
-            prov.retracted.push((t, s, d));
+            let by = prov.rule_intern.get(&def.name).copied().unwrap_or(u32::MAX);
+            prov.retracted.push((by, (t, s, d)));
         }
     }
 
@@ -1178,9 +1179,10 @@ struct ProvSets<'a> {
     /// `deltas` are skipped entirely (no heap allocation, no String clone).
     emit: bool,
     /// Edges this rule has just taken out of the topology because it no longer
-    /// desires them. Another rule over the same labels and edge type may: see
-    /// [`RuleEngine::reclaim_retracted`].
-    retracted: &'a mut Vec<Triple>,
+    /// desires them, each with the interned id of the rule that did it.
+    /// Another rule over the same labels and edge type may still desire one:
+    /// see [`RuleEngine::reclaim_retracted`].
+    retracted: &'a mut Vec<(u32, Triple)>,
 }
 
 impl ProvSets<'_> {
@@ -1295,7 +1297,8 @@ fn apply_desired(
             g.topo.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
             prov.remove(&def.name, (t, s, d), g.ids, g.syms);
-            prov.retracted.push((t, s, d));
+            let by = prov.rule_intern.get(&def.name).copied().unwrap_or(u32::MAX);
+            prov.retracted.push((by, (t, s, d)));
         }
     }
 
@@ -3847,8 +3850,9 @@ impl RuleEngine {
     ///
     /// `delete_rule` already handles the same collision, by rebuilding the
     /// surviving rules of that edge type. This is the incremental equivalent,
-    /// and narrower: each rule over the retracted edge's type is re-evaluated
-    /// for the source nodes that just lost an edge, and only for those. A rule
+    /// and narrower: each *other* rule over the retracted edge's type is
+    /// re-evaluated for the source nodes that just lost an edge, and only for
+    /// those (see [`reclaim_targets`](Self::reclaim_targets)). A rule
     /// that still desires the pair finds the edge absent, adds it, and owns
     /// it, at its own weight. A rule that does not, changes nothing.
     ///
@@ -3863,33 +3867,47 @@ impl RuleEngine {
     ///
     /// Via-hop rules are not re-evaluated here; they take their own path and
     /// are named in the ledger as what is left.
-    fn reclaim_retracted(&mut self, retracted: &[Triple], g: &mut GraphMut<'_>) {
-        // (edge type, source) pairs that lost an edge, each once, in a stable order.
-        let lost: BTreeSet<(u32, u32)> = retracted.iter().map(|(t, s, _)| (*t, *s)).collect();
-        let rule_names: Vec<String> = self.rules.keys().cloned().collect();
-        for rule_name in rule_names {
+    fn reclaim_retracted(&mut self, retracted: &[(u32, Triple)], g: &mut GraphMut<'_>) {
+        for (rule_name, s) in self.reclaim_targets(retracted, g) {
             let def = self.rules[&rule_name].clone();
-            if def.via_label.is_some() || self.pending_builds.contains_key(&rule_name) {
-                continue;
-            }
-            let Some(et) = g.syms.get(&def.edge_type) else {
-                continue;
-            };
-            let src_sym = g.syms.get(&def.src_label);
-            let dst_sym = g.syms.get(&def.dst_label);
-            for &(t, s) in &lost {
-                if t != et {
-                    continue;
+            let label = g.labels.get(s as usize).copied();
+            if let Some(k) = def.max_edges {
+                let desired = compute_desired(&def, &self.indexes[&rule_name], s, true, g);
+                let top_k = filter_src_top_k(desired, k, g.ids);
+                let mut prov = ProvSets {
+                    set: self.provenance.entry(rule_name.clone()).or_default(),
+                    owned: &mut self.owned,
+                    by_node: &mut self.by_node,
+                    rule_intern: &mut self.rule_intern,
+                    intern_rule: &mut self.intern_rule,
+                    deltas: &mut self.pending_deltas,
+                    emit: self.emit_deltas,
+                    retracted: &mut self.retracted,
+                };
+                apply_per_src_top_k(&def, s, top_k, &mut prov, g);
+            } else {
+                // The same desired set a fire for `s` builds: as a source,
+                // and as a destination when the rule links a label to
+                // itself, so that `apply_desired` does not take edges
+                // *into* `s` for ones it should retract.
+                let dst_sym = g.syms.get(&def.dst_label);
+                let as_dst = dst_sym.is_some() && label == dst_sym;
+                let mut desired = compute_desired(&def, &self.indexes[&rule_name], s, true, g);
+                if as_dst {
+                    desired.extend(compute_desired(
+                        &def,
+                        &self.indexes[&rule_name],
+                        s,
+                        false,
+                        g,
+                    ));
                 }
-                let label = g.labels.get(s as usize).copied();
-                let as_src = src_sym.is_some() && label == src_sym;
-                if !as_src || !rule_sees(&def, s, g) {
-                    continue;
-                }
-                if let Some(k) = def.max_edges {
-                    let desired = compute_desired(&def, &self.indexes[&rule_name], s, true, g);
-                    let top_k = filter_src_top_k(desired, k, g.ids);
-                    let mut prov = ProvSets {
+                let tripped = self.tripped.entry(rule_name.clone()).or_default();
+                apply_desired(
+                    &def,
+                    desired,
+                    Some(s),
+                    &mut ProvSets {
                         set: self.provenance.entry(rule_name.clone()).or_default(),
                         owned: &mut self.owned,
                         by_node: &mut self.by_node,
@@ -3898,49 +3916,54 @@ impl RuleEngine {
                         deltas: &mut self.pending_deltas,
                         emit: self.emit_deltas,
                         retracted: &mut self.retracted,
-                    };
-                    apply_per_src_top_k(&def, s, top_k, &mut prov, g);
-                } else {
-                    // The same desired set a fire for `s` builds: as a source,
-                    // and as a destination when the rule links a label to
-                    // itself, so that `apply_desired` does not take edges
-                    // *into* `s` for ones it should retract.
-                    let as_dst = dst_sym.is_some() && label == dst_sym;
-                    let mut desired = compute_desired(&def, &self.indexes[&rule_name], s, true, g);
-                    if as_dst {
-                        desired.extend(compute_desired(
-                            &def,
-                            &self.indexes[&rule_name],
-                            s,
-                            false,
-                            g,
-                        ));
-                    }
-                    let tripped = self.tripped.entry(rule_name.clone()).or_default();
-                    apply_desired(
-                        &def,
-                        desired,
-                        Some(s),
-                        &mut ProvSets {
-                            set: self.provenance.entry(rule_name.clone()).or_default(),
-                            owned: &mut self.owned,
-                            by_node: &mut self.by_node,
-                            rule_intern: &mut self.rule_intern,
-                            intern_rule: &mut self.intern_rule,
-                            deltas: &mut self.pending_deltas,
-                            emit: self.emit_deltas,
-                            retracted: &mut self.retracted,
-                        },
-                        tripped,
-                        g,
-                    );
+                    },
+                    tripped,
+                    g,
+                );
+            }
+        }
+        // What a re-evaluated rule retracts in turn is not chased further.
+        self.retracted.clear();
+    }
+
+    /// The `(rule, source)` pairs a set of retractions calls for: every rule
+    /// *other than the one that retracted* over the same edge type, whose
+    /// source label the losing node has.
+    ///
+    /// Leaving out the retracting rule is what keeps the common case free. A
+    /// store where no two rules share an edge type gets an empty list however
+    /// many edges one write retracts — and one write can retract thousands,
+    /// when a hub loses a tag. Re-evaluating the rule that has just been
+    /// evaluated, once for every source, turned a 13 ms write into 1.4 s in
+    /// the review of this change.
+    fn reclaim_targets(
+        &self,
+        retracted: &[(u32, Triple)],
+        g: &GraphMut<'_>,
+    ) -> BTreeSet<(String, u32)> {
+        let mut targets = BTreeSet::new();
+        for (rule_name, def) in &self.rules {
+            if def.via_label.is_some() || self.pending_builds.contains_key(rule_name) {
+                continue;
+            }
+            let Some(et) = g.syms.get(&def.edge_type) else {
+                continue;
+            };
+            let src_sym = g.syms.get(&def.src_label);
+            if src_sym.is_none() {
+                continue;
+            }
+            let id = self.rule_intern.get(rule_name).copied();
+            for &(by, (t, s, _)) in retracted {
+                if t != et || id == Some(by) {
+                    continue;
+                }
+                if g.labels.get(s as usize).copied() == src_sym && rule_sees(def, s, g) {
+                    targets.insert((rule_name.clone(), s));
                 }
             }
         }
-        // A rule re-evaluated here is already consistent with its own
-        // provenance, so it retracts nothing; what it may have pushed is not
-        // chased further.
-        self.retracted.clear();
+        targets
     }
 
     /// Inner handler for `on_node_changed` when the rule is a via-hop rule.
@@ -4159,6 +4182,7 @@ impl RuleEngine {
         // Lazy index build: same guard as on_node_changed.  Retained snapshot
         // blobs are consumed to avoid wiping any HNSW graphs.
         self.ensure_indexes_populated(g);
+        self.retracted.clear();
 
         let rule_names: Vec<String> = self.rules.keys().cloned().collect();
         for (rule_idx, rule_name) in rule_names.into_iter().enumerate() {
@@ -4241,6 +4265,13 @@ impl RuleEngine {
                 };
                 apply_desired(&def, desired_src, Some(rule_src), &mut prov, tripped, g);
             }
+        }
+
+        // A via-hop rule stops when its hop edge is deleted; a plain rule over
+        // the same edge type may still desire what it retracted.
+        let retracted = std::mem::take(&mut self.retracted);
+        if !retracted.is_empty() {
+            self.reclaim_retracted(&retracted, g);
         }
     }
 
@@ -5431,6 +5462,60 @@ mod tests {
             g.edge_props.get(et, a, b, "weight"),
             Some(&Value::Float(1.0))
         );
+    }
+
+    /// The second pass is for *other* rules. With one rule there is nobody to
+    /// take a retracted edge, and with two the rule that retracted is not
+    /// asked again. This is the cost guard: re-evaluating the retracting rule
+    /// for every source that lost an edge made a hub's write a hundred times
+    /// slower on a store with a single rule.
+    #[test]
+    fn the_second_pass_never_re_evaluates_the_rule_that_retracted() {
+        let rule = |name: &str, predicate: Predicate| RuleDef {
+            name: name.into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate,
+            edge_type: "SAME".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        };
+        let mut fx = Fx::new();
+        let a = fx.add("A", "a", vec![("tags", tags(&["x", "y"]))]);
+        let b = fx.add("A", "b", vec![("tags", tags(&["x", "y"]))]);
+        let et = fx.syms.intern("SAME");
+        let mut eng = RuleEngine::new();
+        let mut g = fx.g();
+        let overlap = Predicate::Overlap {
+            field: "tags".into(),
+            min: 0.6,
+        };
+        eng.create_rule(rule("overlap", overlap), &mut g).unwrap();
+        let by = eng.rule_intern["overlap"];
+        let retracted = vec![(by, (et, a, b)), (by, (et, b, a))];
+
+        assert!(
+            eng.reclaim_targets(&retracted, &g).is_empty(),
+            "one rule: nothing to re-evaluate, however many edges it retracted"
+        );
+
+        let claim = Predicate::KeyMatch { field: "fk".into() };
+        eng.create_rule(rule("claim", claim), &mut g).unwrap();
+        let targets: Vec<(String, u32)> = eng.reclaim_targets(&retracted, &g).into_iter().collect();
+        assert_eq!(
+            targets,
+            vec![("claim".to_string(), a), ("claim".to_string(), b)],
+            "two rules: the other one, for each source that lost an edge, and not the retractor"
+        );
+
+        // An edge of another type is nobody's business here.
+        let other = g.syms.intern("OTHER");
+        assert!(eng.reclaim_targets(&[(by, (other, a, b))], &g).is_empty());
     }
 
     /// Helper: FieldEqual rule with top-k per-source cap.
