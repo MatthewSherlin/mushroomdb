@@ -4,7 +4,7 @@
 //! ```text
 //! [0..4]   MAGIC "GDB1"
 //! [4..6]   VERSION = 8 or 9 (u16 LE) — same container, V9 adds section 12
-//! [6..8]   section_count (u16 LE) — currently 13
+//! [6..8]   section_count (u16 LE) — 13, or 14 with the full-text index
 //! [8..8+16*N] SectionEntry * N  -- {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}
 //! [8+16*N..8+16*N+4]  whole-header CRC32
 //! [..4096]  zero-pad

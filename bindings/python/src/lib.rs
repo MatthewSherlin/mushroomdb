@@ -1892,8 +1892,10 @@ impl GraphDb {
     /// `False` instead, so a caller that declares its schema at boot can call
     /// this every time.
     ///
-    /// The declaration is logged; the index itself is rebuilt on every open,
-    /// so each declared pair adds to how long the store takes to open.
+    /// The declaration is logged. A snapshot carries the index, and an open
+    /// reads it from there; a store that has not been snapshotted since the
+    /// pair was declared builds the index at open, which takes time in
+    /// proportion to the text.
     ///
     /// ```python
     /// db.enable_fulltext("Doc", "body", if_not_exists=True)

@@ -7057,7 +7057,7 @@ can still reach pre-snapshot commits. The WAL replay over the snapshot is
 idempotent — no manual recovery is needed. The WAL grows until an explicit
 `snapshot()` (with default `keep_wal: false`) truncates it.
 
-**V9 snapshot format:** mmap-able rkyv sections (13 total); zero-copy open via
+**V9 snapshot format:** mmap-able rkyv sections (13, and one more for the full-text index when a pair is declared); zero-copy open via
 mmap; no heap allocation for section data. V5–V8 stores are auto-migrated to
 V9 on open; a V9 snapshot cannot be opened by a pre-0.6.5 binary, which refuses
 it with `snapshot: unsupported version 9`. See [`docs/format-stability.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md) for the
@@ -7306,7 +7306,7 @@ Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads 
 mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
 ```
 
-Audit snapshot integrity: CRC32 all 13 sections plus an rkyv structural pass over the mmap'd ones, exit 2 on any mismatch
+Audit snapshot integrity: CRC32 every section plus an rkyv structural pass over the mmap'd ones, exit 2 on any mismatch
 
 ### `migrate`
 
@@ -8469,8 +8469,10 @@ enabled raises `RuleInvalid`. With `if_not_exists=True` it returns
 `False` instead, so a caller that declares its schema at boot can call
 this every time.
 
-The declaration is logged; the index itself is rebuilt on every open,
-so each declared pair adds to how long the store takes to open.
+The declaration is logged. A snapshot carries the index, and an open
+reads it from there; a store that has not been snapshotted since the
+pair was declared builds the index at open, which takes time in
+proportion to the text.
 
     db.enable_fulltext("Doc", "body", if_not_exists=True)
 
@@ -10011,8 +10013,8 @@ store with per-section CRCs.
 On open, the store is reconstructed as **snapshot (if present) + WAL tail**:
 
 - **With a snapshot** — the V9 image is memory-mapped (open-to-first-query in
-  milliseconds even at 100k nodes; derived edges, HNSW vector indexes, and
-  provenance are all restored from the image), then any WAL frames written after
+  milliseconds even at 100k nodes; derived edges, HNSW vector indexes,
+  provenance and the full-text index are all restored from the image), then any WAL frames written after
   the snapshot are replayed. This is the normal path and it is fast.
 - **WAL-only, from genesis** — if the store has *never* been snapshotted, the
   entire history replays from the beginning. Node/edge/property writes replay
@@ -10465,9 +10467,16 @@ Call `disable_fulltext` to drop the index and stop maintaining it:
 db.disable_fulltext("Article", "bio")?;
 ```
 
-Both declarations are WAL-logged and replayed on open; the index is rebuilt from
-scratch on every open from the WAL-declared pairs, so no snapshot format changes are
-required.
+Both declarations are WAL-logged and replayed on open.
+
+A snapshot carries the index. An open reads it from the snapshot and applies what
+was written since, so a store that has been snapshotted does not pay for its text
+again each time it opens: 30,000 entities under three declared pairs open in
+22 ms, where building the index took 183 ms. A store that has never been
+snapshotted, one whose snapshot was written by 0.7 or earlier, and one whose
+snapshot kept its WAL (`keep_wal`) build the index at open as before, and
+answer the same. The index adds to the snapshot's size: about a third on that
+store.
 
 ## Searching
 
@@ -12358,8 +12367,9 @@ Dependency rule (inward only):
 `bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
 
 Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy`), plus mmap-able
-V9 rkyv snapshots (13 sections: CSR topology, columnar properties, one shared string table for every
-string column, HNSW blobs, provenance, IVF state, per-node last-change index, and more — zero-copy,
+V9 rkyv snapshots (13 sections, and a fourteenth for the full-text index when a pair is declared: CSR
+topology, columnar properties, one shared string table for every string column, HNSW blobs,
+provenance, IVF state, per-node last-change index, and more — zero-copy,
 no heap allocation on open). V5–V8 stores are auto-migrated to V9 on `GraphDb::open`, keeping the
 original beside the new one as `snapshot.bin.bak` until the next clean open. The upgrade is one-way:
 an earlier binary refuses a V9 snapshot with `snapshot: unsupported version 9` rather than reading it
