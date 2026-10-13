@@ -3609,3 +3609,146 @@ fn a_node_renamed_onto_a_retired_key_survives_a_snapshot() {
         assert_eq!(GraphDb::open(&dir).unwrap().stats().nodes_live, 3, "{name}");
     }
 }
+
+// ── a snapshot interrupted before its WAL is replaced (ledger row 92) ───────
+
+/// A store with a rename, a delete and reinsert, and an edge: the writes
+/// that are not safe to apply a second time over the state they produced.
+fn store_with_history_that_does_not_replay_twice(
+    dir: &std::path::Path,
+) -> GraphDb<core_storage::fs::RealFs> {
+    let mut db = GraphDb::open(dir).unwrap();
+    db.enable_fulltext("Doc", "body").unwrap();
+    let doc = |body: &str| vec![("body".into(), Value::Str(body.into()))];
+    db.insert_node("Doc", "n", doc("alpha")).unwrap();
+    db.rename_node("n", "m").unwrap();
+    db.insert_node("Doc", "k", doc("first")).unwrap();
+    db.delete_node("k").unwrap();
+    db.insert_node("Doc", "k", doc("second")).unwrap();
+    db.set_prop("k", "body", Value::Str("final".into()))
+        .unwrap();
+    db.insert_edge("CITES", "m", "k").unwrap();
+    db
+}
+
+fn assert_the_store_is_as_it_was_left(dir: &std::path::Path, what: &str) {
+    let mut db = GraphDb::open(dir).unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert_eq!(db.stats().nodes_live, 2, "{what}");
+    assert!(!db.has_node("n"), "{what}");
+    assert_eq!(
+        db.get_prop("m", "body"),
+        Some(Value::Str("alpha".into())),
+        "{what}"
+    );
+    assert_eq!(
+        db.get_prop("k", "body"),
+        Some(Value::Str("final".into())),
+        "{what}"
+    );
+    assert_eq!(
+        db.neighbors("m", "CITES", Direction::Out).unwrap(),
+        vec!["k"],
+        "{what}"
+    );
+    assert!(db.is_fulltext_enabled("Doc", "body"), "{what}");
+    assert_eq!(db.search("body", "final").len(), 1, "{what}");
+    // It takes writes, a reopen replays them, and a snapshot now completes.
+    db.insert_node("Doc", "later", vec![]).unwrap();
+    drop(db);
+    let mut db = GraphDb::open(dir).unwrap_or_else(|e| panic!("{what}, second open: {e}"));
+    assert_eq!(db.stats().nodes_live, 3, "{what}");
+    db.snapshot().unwrap();
+    drop(db);
+    let db = GraphDb::open(dir).unwrap();
+    assert_eq!(db.stats().nodes_live, 3, "{what}, after the next snapshot");
+    assert_eq!(db.get_prop("k", "body"), Some(Value::Str("final".into())));
+}
+
+/// Binding: a snapshot that stops between writing `snapshot.bin` and
+/// replacing the WAL leaves a store that opens as it was.
+///
+/// In that state the new snapshot sits beside the WAL it was made from, and
+/// the open replayed that WAL over it: a rename before the snapshot ended in
+/// `corrupt data: wal replay RenameNode n→m: duplicate node key: m`, and the
+/// store did not open again. The window is two filesystem calls wide, and
+/// each stop here is one place inside it.
+#[test]
+fn a_snapshot_interrupted_before_its_wal_is_replaced_leaves_a_store_that_opens() {
+    for (name, opts) in [
+        ("truncate", SnapshotOptions::default()),
+        (
+            "archive",
+            SnapshotOptions {
+                archive_wal: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        for stop in [
+            core_api::SnapshotStop::BeforeSnapshotWrite,
+            core_api::SnapshotStop::AfterSnapshotWrite,
+            core_api::SnapshotStop::BeforeWalReplacement,
+            core_api::SnapshotStop::AfterWalReplacement,
+        ] {
+            let what = format!("{name} snapshot stopped {stop:?}");
+            let dir = tmp(&format!("interrupted-{name}-{stop:?}"));
+            {
+                let mut db = store_with_history_that_does_not_replay_twice(&dir);
+                db.stop_next_snapshot(stop);
+                assert!(db.snapshot_with(opts.clone()).is_err(), "{what}");
+            }
+            assert_the_store_is_as_it_was_left(&dir, &what);
+        }
+    }
+}
+
+/// Binding: the same, when the interrupted snapshot was not the store's
+/// first: its WAL then begins with the declarations the earlier snapshot
+/// re-emitted, exactly as the WAL that would have replaced it does.
+#[test]
+fn an_interrupted_second_snapshot_leaves_a_store_that_opens() {
+    let dir = tmp("interrupted-second");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_fulltext("Doc", "body").unwrap();
+        db.snapshot().unwrap();
+        let doc = |body: &str| vec![("body".into(), Value::Str(body.into()))];
+        db.insert_node("Doc", "n", doc("alpha")).unwrap();
+        db.rename_node("n", "m").unwrap();
+        db.insert_node("Doc", "k", doc("first")).unwrap();
+        db.delete_node("k").unwrap();
+        db.insert_node("Doc", "k", doc("second")).unwrap();
+        db.set_prop("k", "body", Value::Str("final".into()))
+            .unwrap();
+        db.insert_edge("CITES", "m", "k").unwrap();
+        db.stop_next_snapshot(core_api::SnapshotStop::AfterSnapshotWrite);
+        assert!(db.snapshot().is_err());
+    }
+    assert_the_store_is_as_it_was_left(&dir, "second snapshot stopped after its write");
+}
+
+/// Binding: a backup of a store whose snapshot was interrupted carries what
+/// says so, and opens as the store does.
+#[test]
+fn a_backup_of_a_store_with_an_interrupted_snapshot_opens() {
+    let dir = tmp("interrupted-backup-src");
+    let dest = tmp("interrupted-backup-dst");
+    {
+        let mut db = store_with_history_that_does_not_replay_twice(&dir);
+        db.stop_next_snapshot(core_api::SnapshotStop::AfterSnapshotWrite);
+        assert!(db.snapshot().is_err());
+    }
+    {
+        let db = GraphDb::open(&dir).unwrap();
+        db.backup_to(&dest).unwrap();
+    }
+    assert_the_store_is_as_it_was_left(&dest, "the backup");
+    let seeded = tmp("interrupted-backup-seeded");
+    {
+        let db = GraphDb::open(&dir).unwrap();
+        let again = tmp("interrupted-backup-dst2");
+        db.backup_to(&again).unwrap();
+        core_api::restore::restore_if_empty(&seeded, &again).unwrap();
+    }
+    assert_the_store_is_as_it_was_left(&seeded, "the restored store");
+}

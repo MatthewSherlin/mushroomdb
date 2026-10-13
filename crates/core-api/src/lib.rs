@@ -37,7 +37,7 @@ pub use db::{
     BatchBuilder, BatchOp, BatchOutcome, DeleteReport, EdgeAt, EdgeInfo, Explanation, ExportEdge,
     FsyncPolicy, GraphDb, MaskedEdge, MaskedNodeResult, MutationEvent, NamespaceStats, NodeInfo,
     NodeRef, OnConflict, OpenOptions, Precondition, PredicateSummary, RuleStats, SlowQueryEntry,
-    SlowQuerySnapshot, SnapshotOptions, Stats, WhatIf, WriteAuthz,
+    SlowQuerySnapshot, SnapshotOptions, SnapshotStop, Stats, WhatIf, WriteAuthz,
     MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT, NS_MAX_LEN, NS_PROP, WRITE_LOCK_WAIT,
 };
 pub use exact_knn::{with_pairwise_caps, PAIRWISE_GRAM_MAX, PAIRWISE_MAX_N};

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A snapshot interrupted before its WAL is replaced leaves a store that opens.** A truncating or archiving snapshot writes `snapshot.bin` and then replaces `wal.bin`. A crash between the two left the new snapshot beside the WAL it was made from, and the next open replayed that WAL over it: after a rename the open failed with `corrupt data: wal replay RenameNode`, and the store did not open again. Such a snapshot now writes a small file, `snapshot.intent`, before it starts and empties it when it has finished, and an open that finds it does not apply the old WAL a second time. A backup carries the file. This was 0.7.2's known limit (row 92).
+
 ## v0.7.2 — corrections, five of them for a store that would not open or answered wrongly
 
 No format version change. A 0.7.1 store opens under 0.7.2, and a 0.7.2 snapshot opens under 0.7.1, which ignores the two optional sections this release adds.

@@ -5756,7 +5756,7 @@ plus post-copy CRC verification. Writers are blocked for that entire window. For
 stores with large snapshots this may be tens of seconds.
 
 The server copies: `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
-`wal.floor`, `wal.genesis`, `roles.json` and `commit_times.bin`. After the copies complete it opens the
+`wal.floor`, `wal.genesis`, `roles.json`, `commit_times.bin` and, when there is one, `snapshot.intent`. After the copies complete it opens the
 backup read-only and runs the CRC verifier.
 
 Responses:
@@ -11737,6 +11737,7 @@ A store is a directory. Mount it; everything below follows from that.
 | `roles.json` | role tokens and their masks | every configured role |
 | `wal.<N>.archive` | the folded WAL each snapshot left behind | `node_history`, `edge_history`, `was_linked` and `asof` reach into that span |
 | `commit_times.bin` | commit → wall-clock sidecar; written atomically as commits land | date-resolution (`at_commit` RFC 3339 form, `resolve_date`, `commit_time_ms`) — a store without it cannot resolve a date to a commit until new commits build a fresh one |
+| `snapshot.intent` | written by a snapshot that replaces the WAL, before it starts; emptied when it has finished | nothing when empty or absent — one with content marks a snapshot that was interrupted before its WAL was replaced, and without it that store replays its old WAL over the new snapshot |
 | `LOCK` | always empty; carries the advisory cross-process write lock | cross-process coordination for handles opened afterwards |
 
 All of them matter. A backup that takes `snapshot.bin` alone is a store with no
@@ -11801,7 +11802,7 @@ mushroomdb backup /data /backups/2026-09-11T02-00Z
 ```
 
 The command copies `snapshot.bin`, `snapshot.bin.bak`, `wal.bin`, `wal.floor`,
-`wal.genesis`, `roles.json`, `commit_times.bin` and every `wal.<N>.archive` into the destination,
+`wal.genesis`, `roles.json`, `commit_times.bin`, `snapshot.intent` when there is one, and every `wal.<N>.archive` into the destination,
 then **verifies**: it CRC-checks the copy and opens it. The printed report ends
 in `verified: true`, and a copy that does not verify is one you must not use.
 

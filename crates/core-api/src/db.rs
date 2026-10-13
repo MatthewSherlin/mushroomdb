@@ -1615,6 +1615,8 @@ pub struct GraphDb<F: Fs> {
     /// open path and **false** of `refresh()`: refresh applies peer frames and
     /// then only folds, so its backfill is the only thing that indexes them.
     fulltext_rebuild_follows: bool,
+    /// Set by [`GraphDb::stop_next_snapshot`]; taken by the next snapshot.
+    snapshot_stop: Option<SnapshotStop>,
     /// `true` when `commit_times.bin` was present but would not decode.
     ///
     /// Mirrors `roles: None`: a damaged map must not read as "this store
@@ -1957,6 +1959,23 @@ pub fn snapshot_version_at(dir: &std::path::Path) -> crate::Result<Option<u16>> 
         Err(e) => return Err(core_storage::GraphError::Io(e)),
     };
     core_storage::snapshot::peek_version(&header[..n])
+}
+
+/// Where [`GraphDb::stop_next_snapshot`] makes the next snapshot fail, leaving
+/// the files as a crash at that point would. For tests of what an interrupted
+/// snapshot leaves behind; not part of the stable surface.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotStop {
+    /// The intent is written; `snapshot.bin` is still the old one.
+    BeforeSnapshotWrite,
+    /// `snapshot.bin` is the new one; nothing else has moved.
+    AfterSnapshotWrite,
+    /// As above, and the history floor has been advanced; the WAL is still
+    /// the one the snapshot was made from.
+    BeforeWalReplacement,
+    /// The WAL is replaced; the intent has not been emptied.
+    AfterWalReplacement,
 }
 
 /// Options for [`GraphDb::snapshot_with`].
@@ -2367,6 +2386,7 @@ impl<F: Fs> GraphDb<F> {
             commit_times: core_storage::commit_times::CommitTimes::default(),
             commit_times_poisoned: false,
             fulltext_rebuild_follows: false,
+            snapshot_stop: None,
             commit_time_override: None,
             roles: Some(vec![]),
             role_masks: Arc::new(crate::mask::RoleMaskCache::new()),
@@ -2606,10 +2626,34 @@ impl<F: Fs> GraphDb<F> {
         let decoded_frames = records.len() as u64;
         // A snapshot that kept its WAL says how much of it it already holds.
         // Those frames are counted, and not applied a second time.
+        //
+        // So does the intent of a snapshot that was to replace its WAL and
+        // did not get that far: the same state, reached by a crash.
+        let intent = db.fs.read(FileId::SnapshotIntent).unwrap_or_default();
+        let interrupted = if intent.is_empty() {
+            None
+        } else {
+            core_storage::v8::SnapshotIntent::decode(&intent)
+                .filter(|i| {
+                    db.fs
+                        .read(FileId::Snapshot)
+                        .is_ok_and(|snapshot| i.names(&snapshot))
+                })
+                .map(|i| i.wal)
+                .filter(|mark| mark.matches(&bytes))
+        };
+        // An intent that is not about this snapshot and this WAL is left over
+        // from a snapshot that finished, or never wrote its snapshot. A
+        // writer clears it before it can append: once new frames follow, a
+        // WAL can come to begin with the bytes an old intent names.
+        if !intent.is_empty() && interrupted.is_none() && repair_wal && !db.read_only {
+            db.fs.write_atomic(FileId::SnapshotIntent, &[])?;
+        }
         let held = db
             .base
             .as_ref()
             .and_then(|base| base.wal_mark())
+            .or(interrupted)
             .filter(|mark| mark.matches(&bytes))
             .map(|mark| (mark.len as usize, decode_all(&bytes[..mark.len as usize])))
             // The mark was taken at the end of a whole WAL, so it ends on a
@@ -7618,6 +7662,13 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
+    /// Make the next snapshot on this handle fail at `at`, leaving the files
+    /// as a crash there would. For tests; not part of the stable surface.
+    #[doc(hidden)]
+    pub fn stop_next_snapshot(&mut self, at: SnapshotStop) {
+        self.snapshot_stop = Some(at);
+    }
+
     /// Whether `(label, field)` is currently indexed for full-text search.
     pub fn is_fulltext_enabled(&self, label: &str, field: &str) -> bool {
         self.fulltext.is_enabled(label, field)
@@ -9908,6 +9959,10 @@ impl<F: Fs> GraphDb<F> {
         // resolve a date to a commit, and answers `NoRecordedTime` for history
         // it holds in full (ledger row 86).
         try_copy("commit_times.bin")?;
+        // Present only on a store whose last WAL-replacing snapshot was
+        // interrupted. Without it the copy is that snapshot beside the WAL it
+        // was made from, with nothing to say so.
+        try_copy("snapshot.intent")?;
 
         // Copy WAL archives.
         let archives = self.fs.list_archives()?;
@@ -14001,10 +14056,21 @@ impl<F: Fs> GraphDb<F> {
         // it holds, so the next open does not apply those writes again on top
         // of the state they produced. This handle holds the write lock, so
         // every byte in the WAL now is a write it has applied.
-        let wal_mark = if opts.keep_wal && !opts.archive_wal {
-            core_storage::v8::WalMark::of(&self.fs.read(FileId::Wal)?).encode()
-        } else {
+        let replaces_wal = opts.archive_wal || !opts.keep_wal;
+        let wal_now = self.fs.read(FileId::Wal)?;
+        let wal_mark = if replaces_wal {
             Vec::new()
+        } else {
+            core_storage::v8::WalMark::of(&wal_now).encode()
+        };
+        let stop = self.snapshot_stop.take();
+        let stopped = |at: SnapshotStop| -> Result<()> {
+            if stop == Some(at) {
+                return Err(GraphError::Io(std::io::Error::other(format!(
+                    "snapshot stopped {at:?} (test hook)"
+                ))));
+            }
+            Ok(())
         };
         self.ensure_v8_base_sections_loaded();
         // Ensure provenance is decoded before to_persist() clones it.
@@ -14128,6 +14194,16 @@ impl<F: Fs> GraphDb<F> {
                 )?;
             }
             core_storage::snapshot::stamp_container_version(&mut buf, snapshot_version)?;
+            if replaces_wal {
+                // Before the snapshot: what is about to be written, and the
+                // WAL it holds. From here until the WAL is replaced a crash
+                // leaves that WAL beside the new snapshot, and this is how
+                // the next open knows not to apply it again (ledger row 92).
+                let intent = core_storage::v8::SnapshotIntent::new(&buf, &wal_now);
+                self.fs
+                    .write_atomic(FileId::SnapshotIntent, &intent.encode())?;
+            }
+            stopped(SnapshotStop::BeforeSnapshotWrite)?;
             self.fs.write_atomic(FileId::Snapshot, &buf)?;
             // Remap the freshly-written snapshot as the new base.
             // C2: use file mmap on RealFs; fall back to from_bytes on SimFs.
@@ -14191,6 +14267,16 @@ impl<F: Fs> GraphDb<F> {
             // drop it before the write to keep the peak window narrow.
             drop(meta);
             core_storage::snapshot::stamp_container_version(&mut buf, snapshot_version)?;
+            if replaces_wal {
+                // Before the snapshot: what is about to be written, and the
+                // WAL it holds. From here until the WAL is replaced a crash
+                // leaves that WAL beside the new snapshot, and this is how
+                // the next open knows not to apply it again (ledger row 92).
+                let intent = core_storage::v8::SnapshotIntent::new(&buf, &wal_now);
+                self.fs
+                    .write_atomic(FileId::SnapshotIntent, &intent.encode())?;
+            }
+            stopped(SnapshotStop::BeforeSnapshotWrite)?;
             self.fs.write_atomic(FileId::Snapshot, &buf)?;
             // Remap the freshly-written V8 snapshot as self.base.
             // On RealFs: drop the encode buffer before mmap to recover ~1.9 GiB.
@@ -14212,6 +14298,7 @@ impl<F: Fs> GraphDb<F> {
             self.props = Arc::new(core_storage::columns::ColumnStore::new());
         }
 
+        stopped(SnapshotStop::AfterSnapshotWrite)?;
         if opts.archive_wal {
             // History-preserving snapshot (Task 4):
             //   1. Snapshot already written above (write_atomic → fsynced).
@@ -14255,6 +14342,7 @@ impl<F: Fs> GraphDb<F> {
                 .copied()
                 .unwrap_or(self.wal_horizon_floor)
                 + live_frames_for_name.len() as u64;
+            stopped(SnapshotStop::BeforeWalReplacement)?;
             self.fs.archive_wal(archive_n)?;
 
             // The replacement WAL goes in **immediately**, with no fallible call
@@ -14460,6 +14548,7 @@ impl<F: Fs> GraphDb<F> {
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
+            stopped(SnapshotStop::BeforeWalReplacement)?;
             self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
             // Every archive now ends at or below the floor. They are the
             // history this snapshot was asked to discard; removing them here is
@@ -14478,6 +14567,12 @@ impl<F: Fs> GraphDb<F> {
             // history the dates addressed.
             self.commit_times = core_storage::commit_times::CommitTimes::default();
             self.rewrite_commit_times();
+        }
+        // The WAL is the one that goes with the snapshot now. The intent has
+        // done its work and must not outlive it.
+        if replaces_wal {
+            stopped(SnapshotStop::AfterWalReplacement)?;
+            self.fs.write_atomic(FileId::SnapshotIntent, &[])?;
         }
         // After snapshot the overlay may have changed (V8 merge path clears
         // self.topo and self.props). Refresh the MVCC fold so future readers
