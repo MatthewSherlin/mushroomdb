@@ -1089,3 +1089,55 @@ fn was_linked_sees_a_delete_made_under_another_of_the_nodes_names() {
         "ffTfT"
     );
 }
+
+/// Binding: `was_linked` asks about the node that has the key now. An
+/// earlier node that once held the same key, and was deleted, is another
+/// node: its deletion does not unlink this one, and its edges are not this
+/// one's.
+#[test]
+fn was_linked_is_not_confused_by_an_earlier_node_that_held_the_key() {
+    // insert e, insert c, link e–c, insert b, delete b, rename e→b, a write.
+    let dir = tmp("linked-earlier-holder");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "e", vec![]).unwrap(); // 0
+    db.insert_node("N", "c", vec![]).unwrap(); // 1
+    db.insert_edge("E", "e", "c").unwrap(); // 2
+    db.insert_node("N", "b", vec![]).unwrap(); // 3
+    db.insert_edge("E", "b", "c").unwrap(); // 4: the earlier b's own edge
+    db.delete_node("b").unwrap(); // 5
+    db.rename_node("e", "b").unwrap(); // 6
+    db.set_prop("c", "n", Value::Int(1)).unwrap(); // 7
+    assert_eq!(db.neighbors("b", "E", Direction::Out).unwrap(), vec!["c"]);
+    let answers: String = (0..db.wal_total_commits().unwrap())
+        .map(|c| {
+            if db.was_linked("b", "c", "E", c).unwrap() {
+                'T'
+            } else {
+                'f'
+            }
+        })
+        .collect();
+    // Linked from the commit e–c was written, and still: deleting the other
+    // b at commit 5 is not this node's deletion.
+    assert_eq!(answers, "ffTTTTTT");
+
+    // A key used again after its holder was deleted has none of that
+    // holder's past: the new `a` was never linked to `c`.
+    let dir = tmp("linked-reused-key");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "a", vec![]).unwrap(); // 0
+    db.insert_node("N", "c", vec![]).unwrap(); // 1
+    db.insert_edge("E", "a", "c").unwrap(); // 2
+    db.delete_node("a").unwrap(); // 3
+    db.insert_node("N", "a", vec![]).unwrap(); // 4
+    let answers: String = (0..db.wal_total_commits().unwrap())
+        .map(|c| {
+            if db.was_linked("a", "c", "E", c).unwrap() {
+                'T'
+            } else {
+                'f'
+            }
+        })
+        .collect();
+    assert_eq!(answers, "fffff");
+}
