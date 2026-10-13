@@ -7,7 +7,8 @@ class Mushroomdb < Formula
   license "Apache-2.0"
 
   on_macos do
-    # No Intel macOS binaries since v0.1.1; build from source on x86_64 Macs.
+    # The formula carries the Apple Silicon binary only; on an Intel Mac use
+    # install.sh or npx, which have one.
     depends_on arch: :arm64
     on_arm do
       url "https://github.com/MatthewSherlin/mushroomdb/releases/download/v__VERSION__/mushroomdb-v__VERSION__-aarch64-apple-darwin.tar.gz"
