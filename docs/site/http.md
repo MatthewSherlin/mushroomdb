@@ -415,7 +415,7 @@ plus post-copy CRC verification. Writers are blocked for that entire window. For
 stores with large snapshots this may be tens of seconds.
 
 The server copies: `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
-`wal.floor`, `wal.genesis`, and `roles.json`. After the copies complete it opens the
+`wal.floor`, `wal.genesis`, `roles.json` and `commit_times.bin`. After the copies complete it opens the
 backup read-only and runs the CRC verifier.
 
 Responses:

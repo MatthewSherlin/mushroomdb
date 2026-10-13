@@ -9699,6 +9699,10 @@ impl<F: Fs> GraphDb<F> {
         try_copy("wal.floor")?;
         try_copy("wal.genesis")?;
         try_copy("roles.json")?;
+        // The map from commit to wall-clock time. Without it the copy cannot
+        // resolve a date to a commit, and answers `NoRecordedTime` for history
+        // it holds in full (ledger row 86).
+        try_copy("commit_times.bin")?;
 
         // Copy WAL archives.
         let archives = self.fs.list_archives()?;
