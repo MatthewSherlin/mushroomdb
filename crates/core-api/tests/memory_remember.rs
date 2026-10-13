@@ -958,3 +958,56 @@ fn a_fact_endpoint_that_already_exists_is_counted_as_matched() {
     .expect("remember");
     assert_eq!(report.matched, 2, "{report:?}");
 }
+
+/// Defect 64: an `entities[]` entry whose key is already stored under a
+/// different label matches the stored node, and its own label is not used —
+/// so full-text is not declared on it. It used to be, at one pair against the
+/// cap for a label with no node in the store. A new key under the same label
+/// in the same call still declares it.
+#[test]
+fn a_label_the_store_disagrees_with_is_not_declared_full_text() {
+    let mut db = store("label-disagrees");
+    db.insert_node(
+        "Person",
+        "ada",
+        vec![(NAME_FIELD.into(), Value::Str("Ada".into()))],
+    )
+    .unwrap();
+    let entity = |key: &str, label: &str| EntityIn {
+        key: key.into(),
+        label: label.into(),
+        props: BTreeMap::from([("role".to_string(), Value::Str("founder".into()))]),
+        aliases: Vec::new(),
+    };
+    let org_name = ("Guild".to_string(), NAME_FIELD.to_string());
+
+    let entities = vec![entity("ada", "Guild")];
+    let report = remember(
+        &mut db,
+        &RememberInput {
+            entities: &entities,
+            ..input("Ada founded it", &[])
+        },
+    )
+    .expect("remember");
+    assert_eq!((report.matched, report.created), (1, 0), "{report:?}");
+    assert_eq!(db.node_info("ada").unwrap().label, "Person");
+    assert!(
+        report.fulltext_declared.is_empty(),
+        "nothing was written under Guild: {report:?}"
+    );
+    assert!(!db.fulltext_pairs().contains(&org_name));
+
+    let entities = vec![entity("ada", "Guild"), entity("masons", "Guild")];
+    let report = remember(
+        &mut db,
+        &RememberInput {
+            entities: &entities,
+            ..input("Ada founded the masons", &[])
+        },
+    )
+    .expect("remember");
+    assert_eq!((report.matched, report.created), (1, 1), "{report:?}");
+    assert_eq!(report.fulltext_declared, vec!["Guild".to_string()]);
+    assert!(db.fulltext_pairs().contains(&org_name));
+}

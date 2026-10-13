@@ -570,6 +570,12 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
         let mut declared_this_call: BTreeSet<&str> = BTreeSet::new();
         for entity in input.entities {
             let label = entity.label.as_str();
+            // A key the store already holds under another label is matched
+            // as it is stored, and this label goes unused (defect 64):
+            // declaring it would spend a pair on a label with no node.
+            if db.node_ref(&entity.key).is_some_and(|n| n.label() != label) {
+                continue;
+            }
             if !declared_this_call.insert(label) {
                 continue;
             }
