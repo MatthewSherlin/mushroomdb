@@ -6425,8 +6425,9 @@ type is in its `delete_edge_types` between two nodes it can see; otherwise 403.
 ### `POST /algo/pagerank`
 
 PageRank over hand-written and derived edges together. The body is a JSON object and may be
-`{}`: every field has a default. It may not be empty, and a field the config does not have is
-ignored without a word, so `max_iter` for `max_iters` runs with the default.
+`{}`: every field has a default. It may not be empty. A field the config does not have is 400
+on all three `/algo` routes, so `max_iter` for `max_iters` is refused and not run with the
+default.
 
 | Field | Default | What it is |
 |---|---|---|
@@ -6449,6 +6450,10 @@ A value the config does not accept is 400, and the message names what it would h
 
 ```json
 {"error": "invalid pagerank config: unknown variant `sideways`, expected one of `out`, `in`, `both`"}
+```
+
+```json
+{"error": "invalid pagerank config: unknown field `max_iter`, expected one of `damping`, `max_iters`, `tol`, `edge_type`, `direction`, `budget_ms`, `weight_prop`, `min_weight`"}
 ```
 
 A role-bound token gets 403 on every `/algo` route, because the scan covers the whole graph.

@@ -187,7 +187,7 @@ fn edge_weight(
 
 /// Configuration for [`GraphDb::pagerank`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PageRankConfig {
     /// Damping factor (probability of following an edge, not teleporting).
     /// Default 0.85.
@@ -438,7 +438,7 @@ pub(crate) fn pagerank(
 
 /// Configuration for [`GraphDb::connected_components`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WccConfig {
     /// Restrict edges to this type. `None` uses all edge types.
     pub edge_type: Option<String>,
@@ -653,7 +653,7 @@ pub(crate) fn wcc(
 
 /// Configuration for [`GraphDb::degree_centrality`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DegreeConfig {
     /// Restrict edges to this type. `None` counts all edge types.
     pub edge_type: Option<String>,

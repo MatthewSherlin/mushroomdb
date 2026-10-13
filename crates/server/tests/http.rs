@@ -6470,3 +6470,70 @@ async fn http_rename_node_moves_a_stored_id() {
     let node = parse_json(&body);
     assert_eq!(node["props"]["id"], json!("alice2"), "{node}");
 }
+
+/// Binding: an `/algo/*` request names only fields the algorithm reads.
+///
+/// A misspelt or unsupported field used to be dropped without a word, so
+/// `{"weight": "score"}` on PageRank answered 200 with unweighted scores and
+/// nothing to say the weighting was never applied.
+#[tokio::test]
+async fn an_algo_request_with_an_unknown_field_is_refused() {
+    let (app, db) = open("algo-unknown-field");
+    seed_person(&db, "alice");
+
+    for route in ["/algo/pagerank", "/algo/wcc", "/algo/degree"] {
+        let req = json_req("POST", route, json!({"weight": "score"}));
+        let (status, body, _) = send(app.clone(), req).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{route}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let msg = parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            msg.contains("unknown field `weight`") && msg.contains("weight_prop"),
+            "{route} must name the field and the ones it accepts: {msg}"
+        );
+    }
+}
+
+/// Binding: every field the three configs document is still accepted, and an
+/// empty body still means the defaults.
+#[tokio::test]
+async fn an_algo_request_with_only_known_fields_is_answered() {
+    let (app, db) = open("algo-known-fields");
+    seed_person(&db, "alice");
+
+    let bodies = [
+        ("/algo/pagerank", json!({})),
+        (
+            "/algo/pagerank",
+            json!({"damping": 0.85, "max_iters": 10, "tol": 1e-6, "edge_type": "KNOWS",
+                   "direction": "out", "budget_ms": 100, "weight_prop": "score", "min_weight": 0.1}),
+        ),
+        ("/algo/wcc", json!({})),
+        (
+            "/algo/wcc",
+            json!({"edge_type": "KNOWS", "budget_ms": 100, "weight_prop": "score", "min_weight": 0.1}),
+        ),
+        ("/algo/degree", json!({})),
+        (
+            "/algo/degree",
+            json!({"edge_type": "KNOWS", "direction": "both", "budget_ms": 100,
+                   "weight_prop": "score", "min_weight": 0.1}),
+        ),
+    ];
+    for (route, body) in bodies {
+        let (status, out, _) = send(app.clone(), json_req("POST", route, body.clone())).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{route} {body}: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+}
