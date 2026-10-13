@@ -22,6 +22,16 @@ To use a checkout instead, while working on the client itself:
 npm install /path/to/graph-db/clients/typescript
 ```
 
+Or add to `package.json`:
+
+```json
+{
+  "dependencies": {
+    "mushroomdb-client": "file:../path/to/graph-db/clients/typescript"
+  }
+}
+```
+
 Node 18+ required. Fetch is built-in. For WebSocket in Node < 21, install `ws`:
 
 ```sh

@@ -1,4 +1,4 @@
-//! cargo run -p core-api --example predicates_ii
+//! cargo run -p mushroomdb --example predicates_ii
 use core_api::{GraphDb, Predicate, RuleDef, Value};
 
 fn list(xs: &[f64]) -> Value {
