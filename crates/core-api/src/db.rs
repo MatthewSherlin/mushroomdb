@@ -2774,7 +2774,16 @@ impl<F: Fs> GraphDb<F> {
             build_props_view(&self.props, &self.base),
         );
         let applied = records.len();
+        // A live commit turns on the engine's report of the edges its rules
+        // add and retract, which is what keeps a view over a derived edge
+        // type current. Replay has to do the same, or a store with a snapshot
+        // — where nothing recomputes the views afterwards — reopens with the
+        // counts the snapshot had.
+        let emitted_before = self.engine.emit_deltas();
         for (i, rec) in records.into_iter().enumerate() {
+            if !self.view_store.is_empty() && !self.engine.emit_deltas() {
+                self.engine.set_emit_deltas(true);
+            }
             if i >= held || is_declaration(&rec) {
                 self.apply(&rec)?;
             }
@@ -2799,6 +2808,7 @@ impl<F: Fs> GraphDb<F> {
         // Any future as-of replay path (Plan-15 T2) must drain here to feed
         // replaying subscribers; the mechanism is already in place.
         let _ = self.engine.drain_deltas(); // belt-and-braces no-op after loop drain
+        self.engine.set_emit_deltas(emitted_before);
         Ok(applied)
     }
 
@@ -7441,6 +7451,21 @@ impl<F: Fs> GraphDb<F> {
                 detail: format!(
                     "view_prop {:?} is already used by view {:?}",
                     def.view_prop, existing
+                ),
+            });
+        }
+        // A view cannot take the name of a property nodes already carry —
+        // in the snapshot or written since. Refused here, before the WAL
+        // write: `apply` refuses it too, but by then the record is logged,
+        // and the next open replays it and fails.
+        if build_props_view(&self.props, &self.base)
+            .field_names()
+            .contains(&def.view_prop)
+        {
+            return Err(GraphError::RuleInvalid {
+                detail: format!(
+                    "view_prop {:?} conflicts with an existing node property",
+                    def.view_prop
                 ),
             });
         }

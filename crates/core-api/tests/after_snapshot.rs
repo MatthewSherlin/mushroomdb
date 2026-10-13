@@ -298,3 +298,151 @@ fn opening_a_store_left_with_a_deleted_nodes_edges_drops_them() {
     assert_eq!(db.stats().edges, 1);
     assert_eq!(db.neighbors("c", "E", Direction::Out).unwrap(), vec!["b"]);
 }
+
+// ── what the review of the above found ──────────────────────────────────────
+
+fn avg_view() -> ViewDef {
+    ViewDef {
+        name: "avg".into(),
+        label: "A".into(),
+        view_prop: "avg".into(),
+        source: ViewSource::NeighborAgg {
+            edge_type: "E".into(),
+            direction: Direction::Out,
+            agg: AggFn::Avg,
+            prop: "score".into(),
+        },
+    }
+}
+
+/// Binding: a view cannot take the name of a property the snapshot holds.
+/// The collision check read only what was written since the snapshot, so the
+/// view was accepted over a real property — and deleting it then removed that
+/// property from every node.
+#[test]
+fn a_view_cannot_be_created_over_a_property_the_snapshot_holds() {
+    let dir = tmp("collision");
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    for k in ["a", "b"] {
+        db.insert_node("A", k, vec![("score".into(), Value::Int(7))])
+            .unwrap();
+    }
+    db.snapshot().unwrap();
+    let refused = db.create_view(ViewDef {
+        name: "clash".into(),
+        label: "A".into(),
+        view_prop: "score".into(),
+        source: ViewSource::Degree {
+            edge_type: "E".into(),
+            direction: Direction::Out,
+        },
+    });
+    assert!(refused.is_err(), "score is a real property: {refused:?}");
+    assert_eq!(db.get_prop("a", "score"), Some(Value::Int(7)));
+    drop(db);
+    let db: Db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.get_prop("b", "score"), Some(Value::Int(7)));
+}
+
+/// Binding: a refused `create_view` leaves nothing behind. The refusal used
+/// to come after the record was written to the WAL, so the store that had
+/// just said no failed its next open replaying it — with or without a
+/// snapshot.
+#[test]
+fn a_refused_view_does_not_stop_the_store_opening() {
+    let dir = tmp("refused-view");
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    db.insert_node("A", "a", vec![("score".into(), Value::Int(7))])
+        .unwrap();
+    let refused = db.create_view(ViewDef {
+        name: "clash".into(),
+        label: "A".into(),
+        view_prop: "score".into(),
+        source: ViewSource::Degree {
+            edge_type: "E".into(),
+            direction: Direction::Out,
+        },
+    });
+    assert!(refused.is_err());
+    drop(db);
+    let db: Db = GraphDb::open(&dir).expect("the store opens after a refused view");
+    assert_eq!(db.get_prop("a", "score"), Some(Value::Int(7)));
+}
+
+/// Binding: an average with nothing left to average is absent, on a store
+/// with a snapshot as on one without. The view cleared its value from what
+/// was written since the snapshot and the snapshot's value read through.
+#[test]
+fn an_aggregate_with_no_neighbours_left_is_absent_after_a_snapshot() {
+    let dir = tmp("avg-absent");
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    db.create_view(avg_view()).unwrap();
+    db.insert_node("A", "a", vec![]).unwrap();
+    for (k, score) in [("b", 4), ("c", 8)] {
+        db.insert_node("A", k, vec![("score".into(), Value::Int(score))])
+            .unwrap();
+        db.insert_edge("E", "a", k).unwrap();
+    }
+    assert_eq!(db.get_prop("a", "avg"), Some(Value::Float(6.0)));
+    db.snapshot().unwrap();
+    db.delete_edge("E", "a", "b").unwrap();
+    db.delete_edge("E", "a", "c").unwrap();
+    assert_eq!(db.get_prop("a", "avg"), None, "the handle that snapshotted");
+    drop(db);
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.get_prop("a", "avg"), None, "after a reopen");
+    db.snapshot().unwrap();
+    drop(db);
+    let db: Db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.get_prop("a", "avg"), None, "after the next snapshot");
+}
+
+/// Binding: a view over an edge type a rule derives is right after a reopen
+/// that replays writes made since the snapshot. The replay does not report
+/// the rule's edge changes to the views, and with a snapshot nothing
+/// recomputed them afterwards.
+#[test]
+fn a_view_over_a_derived_edge_is_right_after_replaying_writes_over_a_snapshot() {
+    let dir = tmp("derived-view");
+    let kind = |k: &str| vec![("kind".into(), Value::Str(k.into()))];
+    let degrees = |db: &Db| -> Vec<Option<Value>> {
+        ["b", "c", "e"]
+            .iter()
+            .map(|k| db.get_prop(k, "deg"))
+            .collect()
+    };
+    let live = {
+        let mut db: Db = GraphDb::open(&dir).unwrap();
+        db.create_rule(same_kind_rule()).unwrap();
+        db.create_view(ViewDef {
+            name: "deg".into(),
+            label: "A".into(),
+            view_prop: "deg".into(),
+            source: ViewSource::Degree {
+                edge_type: "SAME".into(),
+                direction: Direction::Out,
+            },
+        })
+        .unwrap();
+        db.insert_node("A", "a", kind("draft")).unwrap();
+        db.insert_node("A", "b", kind("draft")).unwrap();
+        db.insert_node("A", "c", kind("other")).unwrap();
+        db.insert_node("A", "d", kind("note")).unwrap();
+        db.snapshot().unwrap();
+        db.delete_node("a").unwrap();
+        db.remove_prop("b", "kind").unwrap();
+        db.set_prop("c", "kind", Value::Str("note".into())).unwrap();
+        db.insert_node("A", "e", kind("note")).unwrap();
+        degrees(&db)
+    };
+    assert_eq!(
+        live,
+        vec![
+            Some(Value::Int(0)),
+            Some(Value::Int(2)),
+            Some(Value::Int(2))
+        ]
+    );
+    let db: Db = GraphDb::open(&dir).unwrap();
+    assert_eq!(degrees(&db), live, "after a reopen");
+}

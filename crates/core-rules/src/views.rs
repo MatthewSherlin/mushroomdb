@@ -221,10 +221,15 @@ impl ViewStore {
         // Real-prop collision: any ColumnStore field not owned by a view.
         let view_props: std::collections::HashSet<&str> =
             self.views.values().map(|v| v.view_prop.as_str()).collect();
-        if props
-            .fields()
-            .any(|f| f == def.view_prop && !view_props.contains(f))
-        {
+        // Asked of the snapshot's columns as well as what was written since:
+        // a property every node got before the snapshot is in the first and
+        // not the second, and a view allowed to take its name then owns it —
+        // and deleting the view deletes the property.
+        let taken = !view_props.contains(def.view_prop.as_str())
+            && build_cols_view(props, base_cols)
+                .field_names()
+                .contains(&def.view_prop);
+        if taken {
             return Err(format!(
                 "view_prop {:?} conflicts with an existing node property",
                 def.view_prop
@@ -274,7 +279,7 @@ impl ViewStore {
         if let Some(label_sym) = syms.get(&def.label) {
             for id in 0..ids.len() as u32 {
                 if labels.get(id as usize).copied() == Some(label_sym) {
-                    props.remove(id, &def.view_prop);
+                    clear_view_value(props, id, &def.view_prop);
                 }
             }
         }
@@ -381,7 +386,7 @@ impl ViewStore {
                 match val {
                     Some(v) => props.set(subject, &def.view_prop, v),
                     None => {
-                        props.remove(subject, &def.view_prop);
+                        clear_view_value(props, subject, &def.view_prop);
                     }
                 }
             }
@@ -460,6 +465,16 @@ impl ViewStore {
 // Private helpers
 // ---------------------------------------------------------------------------
 
+/// Clear a view's value on `node`: from what was written since the snapshot,
+/// and with a tombstone over whatever the snapshot holds. Without the
+/// tombstone an Avg, Min or Max that has become absent goes on reading as the
+/// snapshot's number. A tombstone over nothing is harmless, and a later
+/// `set` is read before it.
+fn clear_view_value(props: &mut ColumnStore, node: u32, view_prop: &str) {
+    props.remove(node, view_prop);
+    props.record_prop_tombstone(node, view_prop);
+}
+
 /// Build a `ColumnsView` that reads from both overlay props and (when present)
 /// the archived base columns.  Used in update/recompute paths so view values
 /// that live in the base after a V8 snapshot open are visible alongside
@@ -526,7 +541,7 @@ fn backfill_view(
         match value {
             Some(val) => props.set(id, &def.view_prop, val),
             None => {
-                props.remove(id, &def.view_prop);
+                clear_view_value(props, id, &def.view_prop);
                 // Degree and Count always yield Some; only Avg/Min/Max
                 // return None when there are no qualifying neighbors.
             }
@@ -692,7 +707,7 @@ fn update_node_view(
             match val {
                 Some(v) => props.set(subject, &def.view_prop, v),
                 None => {
-                    props.remove(subject, &def.view_prop);
+                    clear_view_value(props, subject, &def.view_prop);
                 }
             }
             // Ensure Degree/Count/Sum always have a value even when the
