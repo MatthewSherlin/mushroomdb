@@ -300,6 +300,117 @@ jobs:
           curl -sf http://127.0.0.1:18080/stats | grep -q nodes_live
           curl -sf http://127.0.0.1:18080/node/person-01 | grep -q person-01
 
+  # The release targets the test jobs above do not cover. Each is built here
+  # and the binary run through a demo store, a query, three snapshots and a
+  # backup, so a tag is not the first time they are compiled or started.
+  more-targets:
+    name: target-${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: [test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on an Apple Silicon runner: the hosted Intel ones are the
+          # runners that sat queued past the 24h cap in v0.1.0.
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: rustup target add ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # The binary a release ships: the UI built and embedded, as
+      # `release.yml` builds it.
+      - run: npm ci
+        working-directory: ui
+      - run: npm run build
+        working-directory: ui
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb --features embed-ui --release --target ${{ matrix.target }}
+      - name: demo, query, snapshot, reopen
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/mushroomdb"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          DB="$RUNNER_TEMP/smoke-db"
+          "$BIN" --version
+          "$BIN" demo "$DB"
+          "$BIN" query "$DB" "MATCH (p:Person) RETURN count(p) AS people"
+          "$BIN" snapshot "$DB"
+          "$BIN" stats "$DB"
+          "$BIN" verify "$DB"
+          # A write over the snapshot, and a second snapshot over the first:
+          # the one that replaces a file the process has mapped.
+          "$BIN" query "$DB" "CREATE (n:Person {id: 'smoke', name: 'Smoke Test'})"
+          "$BIN" snapshot "$DB" --truncate
+          "$BIN" snapshot "$DB" --keep-wal
+          "$BIN" query "$DB" "MATCH (p:Person {id: 'smoke'}) RETURN p.name AS name"
+          "$BIN" backup "$DB" "$RUNNER_TEMP/smoke-backup"
+          "$BIN" stats "$RUNNER_TEMP/smoke-backup"
+          # One exchange with the MCP server over stdio.
+          # Captured, not piped into grep: under pipefail a grep that has
+          # seen enough closes the pipe and fails the step.
+          tools=$(echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | "$BIN" mcp "$DB")
+          case "$tools" in *'"recall"'*) ;; *) echo "mcp did not list recall" >&2; exit 1 ;; esac
+      # The launcher end to end, as a user would have it: the tarball
+      # `release.yml` packs, a checksum file, and `npm install` of the packed
+      # package, whose postinstall fetches the asset for this platform from a
+      # local server. Through npm and not `node install.js`, because npm
+      # checks the package's `os` and `cpu` before it runs anything.
+      - name: pack as a release does, then install through npm
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          VERSION=$(node -p "require('./packaging/npm/package.json').version")
+          NAME="mushroomdb"
+          case "$TARGET" in *windows*) NAME="mushroomdb.exe" ;; esac
+          # Relative paths for tar, as `release.yml` has them: Git Bash's tar
+          # reads `D:\…` as a remote host.
+          mkdir -p smoke-rel smoke-stage
+          REL="smoke-rel"
+          cp "target/${TARGET}/release/${NAME}" "smoke-stage/${NAME}"
+          ASSET="mushroomdb-v${VERSION}-${TARGET}.tar.gz"
+          tar -C smoke-stage -czf "$REL/$ASSET" "$NAME"
+          ( cd "$REL" && { sha256sum --text "$ASSET" 2>/dev/null || shasum -a 256 "$ASSET"; } > SHA256SUMS )
+          node -e "
+            const http = require('http'), fs = require('fs'), path = require('path');
+            const root = process.argv[1];
+            http.createServer((req, res) => {
+              const f = path.join(root, path.basename(req.url));
+              if (!fs.existsSync(f)) { res.statusCode = 404; return res.end(); }
+              fs.createReadStream(f).pipe(res);
+            }).listen(18099, '127.0.0.1');
+          " "$REL" &
+          server=$!
+          trap 'kill $server' EXIT
+          sleep 2
+          case "$TARGET" in
+            x86_64-apple-darwin) export MUSHROOMDB_FORCE_ARCH=x64 ;;
+            x86_64-unknown-linux-musl) export MUSHROOMDB_FORCE_LIBC=musl ;;
+          esac
+          export MUSHROOMDB_RELEASE_BASE="http://127.0.0.1:18099"
+          ( cd packaging/npm && npm pack --pack-destination ../../smoke-rel >/dev/null )
+          mkdir smoke-app
+          cd smoke-app
+          npm init -y >/dev/null
+          npm install "../smoke-rel/mushroomdb-${VERSION}.tgz"
+          npx --no-install mushroomdb --version
+          npx --no-install mushroomdb demo "$RUNNER_TEMP/launcher-db"
+          npx --no-install mushroomdb stats "$RUNNER_TEMP/launcher-db"
+
   docker:
     needs: [test]
     runs-on: ubuntu-latest

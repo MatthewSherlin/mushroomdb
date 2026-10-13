@@ -5,7 +5,14 @@ const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-const bin = path.resolve(path.join(__dirname, "..", "vendor", "mushroomdb"));
+const bin = path.resolve(
+  path.join(
+    __dirname,
+    "..",
+    "vendor",
+    process.platform === "win32" ? "mushroomdb.exe" : "mushroomdb",
+  ),
+);
 
 // Two flags that answer "where is this package", so an installer can ask once
 // instead of making every invocation pay for `npx`.

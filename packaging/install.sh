@@ -1,7 +1,8 @@
 #!/bin/sh
 # curl-able installer. No sudo. Writes ~/.local/bin/mushroomdb by default.
 # Override: MUSHROOMDB_VERSION, MUSHROOMDB_RELEASE_BASE, MUSHROOMDB_INSTALL_DIR,
-#           MUSHROOMDB_REPO, MUSHROOMDB_FORCE_OS, MUSHROOMDB_FORCE_ARCH.
+#           MUSHROOMDB_REPO, MUSHROOMDB_FORCE_OS, MUSHROOMDB_FORCE_ARCH,
+#           MUSHROOMDB_FORCE_LIBC (musl or glibc, on x86_64 Linux).
 set -eu
 
 REPO="${MUSHROOMDB_REPO:-MatthewSherlin/mushroomdb}"
@@ -21,7 +22,21 @@ target_for() {
   arch=$2
   case "${os}-${arch}" in
     darwin-arm64|darwin-aarch64) echo aarch64-apple-darwin ;;
-    linux-x64|linux-x86_64) echo x86_64-unknown-linux-gnu ;;
+    darwin-x64|darwin-x86_64) echo x86_64-apple-darwin ;;
+    linux-x64|linux-x86_64)
+      # Alpine and other musl systems take the static build.
+      case "${MUSHROOMDB_FORCE_LIBC:-}" in
+        musl) echo x86_64-unknown-linux-musl ;;
+        "")
+          if [ -f /etc/alpine-release ] || (ldd --version 2>&1 | grep -qi musl); then
+            echo x86_64-unknown-linux-musl
+          else
+            echo x86_64-unknown-linux-gnu
+          fi
+          ;;
+        *) echo x86_64-unknown-linux-gnu ;;
+      esac
+      ;;
     linux-arm64|linux-aarch64) echo aarch64-unknown-linux-gnu ;;
     *) echo "" ;;
   esac
@@ -30,8 +45,8 @@ target_for() {
 TARGET=$(target_for "$OS" "$ARCH")
 if [ -z "$TARGET" ]; then
   echo "unsupported platform: ${OS}-${ARCH}" >&2
-  echo "supported: darwin-arm64, linux-x64, linux-arm64" >&2
-  echo "no prebuilt binary for this platform (Intel macOS dropped in v0.1.1) — build from source: cargo build -p mushroomdb-cli --release" >&2
+  echo "supported: darwin-arm64, darwin-x64, linux-x64 (glibc or musl), linux-arm64" >&2
+  echo "no prebuilt binary for this platform — build from source: cargo install mushroomdb-cli" >&2
   exit 1
 fi
 

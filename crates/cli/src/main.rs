@@ -9,6 +9,7 @@ use cli::{
 };
 use core_api::{GraphError, SharedDb};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::{self, IsTerminal as _, Read as _, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -811,8 +812,16 @@ fn run_mcp(db_dir: PathBuf, all_tools: bool) -> Result<(), String> {
 }
 
 fn home_dir() -> PathBuf {
-    // Prefer HOME env var; fall back to /tmp for safety (never panic).
-    std::env::var_os("HOME")
+    home_from(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+}
+
+/// The user's home: `HOME`, then `USERPROFILE` — a native Windows shell sets
+/// only the second — then `/tmp` for safety (never panic). A variable set to
+/// nothing counts as unset.
+fn home_from(home: Option<OsString>, userprofile: Option<OsString>) -> PathBuf {
+    home.into_iter()
+        .chain(userprofile)
+        .find(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
@@ -820,6 +829,25 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::DEFAULT_LOG_FILTER;
+    use std::path::PathBuf;
+
+    #[test]
+    fn home_is_the_user_profile_where_home_is_not_set() {
+        let profile: Option<std::ffi::OsString> = Some("C:\\Users\\me".into());
+        assert_eq!(
+            super::home_from(None, profile.clone()),
+            PathBuf::from("C:\\Users\\me")
+        );
+        assert_eq!(
+            super::home_from(Some("".into()), profile.clone()),
+            PathBuf::from("C:\\Users\\me")
+        );
+        assert_eq!(
+            super::home_from(Some("/home/me".into()), profile),
+            PathBuf::from("/home/me")
+        );
+        assert_eq!(super::home_from(None, None), PathBuf::from("/tmp"));
+    }
 
     /// Binding: the default filter names the target this crate's server
     /// actually logs under.

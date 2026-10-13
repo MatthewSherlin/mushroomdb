@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- **Three more platforms.** A release now carries binaries for Intel macOS, for x86_64 Linux with musl (Alpine and images with no glibc) and for x86_64 Windows, beside Apple Silicon and the two glibc Linux targets; `npx mushroomdb` and `install.sh` pick the right one. Windows had never been built: the storage layer synced a directory by opening it as a file and flushed the WAL through a read-only handle, both of which Windows refuses. Each new target is built on every pull request and run through a demo store, a query, three snapshots and a backup. The test suite itself still runs on Linux and macOS only, and there are no wheels for the new targets yet. On Windows that is the binary and the launcher: `mushroomdb install` has not been run there and the hooks it writes are shell scripts, and a store belongs on a local NTFS disk.
+
 ### Performance
 
 - **Opening a snapshotted store no longer rebuilds its full-text index.** A snapshot of a store with a declared pair carries the index, and the open reads it and applies what was written since. Measured on release builds: a 30,000-entity store with three pairs opens in 21 ms where it took 183 ms, and `mushroomdb stats` on a code graph of this repository (11,197 nodes, 13 pairs) takes 30 ms where it took 252 ms. Since 0.7 every new store declares the memory schema's pairs, so every store with text paid the rebuild on every open. The snapshot grows by the index, about a third on the first of those stores, and takes longer to write by the encode (65 ms to 82 ms there). No container version change: 0.7.1 opens such a snapshot, ignores the index and builds its own. A store that has never been snapshotted, or whose snapshot predates this, builds the index at open as before (row 36).
