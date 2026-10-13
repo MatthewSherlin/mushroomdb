@@ -797,95 +797,51 @@ fn a_store_that_already_holds_an_empty_type_edge_and_label_still_opens_and_answe
 }
 
 /// A stub takes its key as its name, so each word of the key becomes an
-/// alias. A key of more than thirty words would give the stub more aliases
-/// than an entity may carry (`MAX_ALIASES`), and an entity over that cap is
-/// refused; so is the stub (defect 53), before anything is written.
+/// alias, and a long key — a sentence, a URL with a slug — implies more than
+/// a node may carry (`MAX_ALIASES`, defect 53). The stub is still written, as
+/// an unknown subject always is, and carries its whole key as its one alias.
 #[test]
-fn a_stub_whose_key_implies_more_aliases_than_the_cap_is_refused() {
+fn a_stub_whose_key_implies_more_aliases_than_the_cap_carries_only_its_key() {
     use core_api::memory::identity::{ALIASES_FIELD, MAX_ALIASES};
 
     let mut db = store("stub-alias-cap");
-    remember(&mut db, &input("Ada wrote the first one", &["ada".into()])).unwrap();
-    let before = written(&db);
+    let aliases_of =
+        |db: &GraphDb<core_storage::fs::RealFs>, key: &str| match db.get_prop(key, ALIASES_FIELD) {
+            Some(Value::List(aliases)) => aliases,
+            other => panic!("expected {key}'s aliases, got {other:?}"),
+        };
 
     let words: Vec<String> = (0..32).map(|i| format!("w{i}")).collect();
-    let key = words.join(" ");
-    let good = EntityIn {
-        key: "v0.7".into(),
-        label: "Release".into(),
-        props: BTreeMap::new(),
-        aliases: vec![],
-    };
-    let fact = |subject: &str, object: &str| FactIn {
-        subject: subject.into(),
-        predicate: "KNOWS".into(),
-        object: object.into(),
-    };
-    let cases = vec![
-        ("about[1]", vec!["ada".to_string(), key.clone()], vec![]),
-        ("facts[0].subject", vec![], vec![fact(&key, "ada")]),
-        ("facts[0].object", vec![], vec![fact("ada", &key)]),
-    ];
-    for (argument, about, facts) in cases {
-        let refused = remember(
-            &mut db,
-            &RememberInput {
-                entities: std::slice::from_ref(&good),
-                facts: &facts,
-                ..input("a note that must not land", &about)
-            },
-        );
-        match refused {
-            Err(core_api::GraphError::IngestError { detail }) => assert_eq!(
-                detail,
-                format!(
-                    "remember: {argument} would be stubbed with 33 aliases, more than \
-                     {MAX_ALIASES}: its key and each word of it; describe it in entities \
-                     with a name, got {key:?}"
-                )
-            ),
-            other => panic!("{argument}: expected the alias-cap refusal, got {other:?}"),
-        }
-        assert_eq!(written(&db), before, "{argument}: a refusal writes nothing");
-        assert!(!db.has_node(&key), "{argument}: no stub");
-    }
+    let long = words.join(" ");
+    let url = "https://news.example.com/2026/10/13/a-long-slug-about-graph-databases-and-agent-\
+               memory-that-goes-on-for-quite-a-while-longer-than-anyone-would-type?utm_source=\
+               newsletter&utm_medium=email&utm_campaign=october&ref=home&page=2&sort=new";
+    let report = remember(
+        &mut db,
+        &RememberInput {
+            facts: &[FactIn {
+                subject: url.into(),
+                predicate: "CITES".into(),
+                object: "ada".into(),
+            }],
+            ..input("a note about a long key", std::slice::from_ref(&long))
+        },
+    )
+    .expect("a long key is stubbed, not refused");
+    assert!(report.provisional.contains(&long), "{report:?}");
+    assert!(report.provisional.contains(&url.to_string()), "{report:?}");
+    assert_eq!(aliases_of(&db, &long), vec![Value::Str(long.clone())]);
+    assert_eq!(aliases_of(&db, url), vec![Value::Str(url.to_lowercase())]);
 
     // One word fewer is exactly the cap — the key is its own canonical name,
-    // so it counts once — and is stubbed as before.
+    // so it counts once — and its words are aliases as before.
     let at_cap = words[..31].join(" ");
-    let report = remember(
+    remember(
         &mut db,
         &input("thirty-one words", std::slice::from_ref(&at_cap)),
     )
     .expect("at the cap");
-    assert_eq!(report.provisional, vec![at_cap.clone()]);
-    match db.get_prop(&at_cap, ALIASES_FIELD) {
-        Some(Value::List(aliases)) => assert_eq!(aliases.len(), MAX_ALIASES),
-        other => panic!("expected the stub's aliases, got {other:?}"),
-    }
-
-    // The way out the message names: described, the key is one alias.
-    let described = EntityIn {
-        key: key.clone(),
-        label: "Concept".into(),
-        props: BTreeMap::from([(NAME_FIELD.to_string(), Value::Str("Long".into()))]),
-        aliases: vec![],
-    };
-    remember(
-        &mut db,
-        &RememberInput {
-            entities: &[described],
-            ..input("the long key, described", std::slice::from_ref(&key))
-        },
-    )
-    .expect("an entity under the same key is taken");
-    // And once it exists it is matched, not stubbed, so naming it is fine.
-    let report = remember(
-        &mut db,
-        &input("the long key again", std::slice::from_ref(&key)),
-    )
-    .expect("matched");
-    assert_eq!(report.matched, 1);
+    assert_eq!(aliases_of(&db, &at_cap).len(), MAX_ALIASES);
 }
 
 /// A key of only characters that print as nothing — a zero-width space, a

@@ -160,8 +160,9 @@ pub struct RememberReport {
     pub note: String,
     /// Entities this call brought into existence.
     pub created: usize,
-    /// `about` keys, entities and fact endpoints that already existed, each
-    /// key counted once.
+    /// `about` keys, entities and fact endpoints that already existed. A key
+    /// is counted once across the three; an `entities` entry is counted each
+    /// time it is listed.
     pub matched: usize,
     /// Derived edges the rules produced for this commit, incident on the
     /// *note* — edges the engine's rule provenance attributes to a rule,
@@ -238,31 +239,6 @@ fn refuse_blank(value: &str, argument: impl FnOnce() -> String) -> Result<()> {
         });
     }
     Ok(())
-}
-
-/// Refuse a key this call would stub with more aliases than a node may carry
-/// (defect 53). A stub's name is its key ([`stub_props`]), so every word of
-/// the key becomes an alias, and a key of more than thirty words passes
-/// [`MAX_ALIASES`] — the cap an entity's name is already held to. A key
-/// `entities` describes, or one the store already holds, is not stubbed and
-/// is not this function's business.
-fn refuse_stub_over_alias_cap<F: Fs>(
-    db: &GraphDb<F>,
-    key: &str,
-    entities: &[EntityIn],
-    argument: impl FnOnce() -> String,
-) -> Result<()> {
-    let aliases = derive_aliases(key, Some(key)).len();
-    if aliases <= MAX_ALIASES || entities.iter().any(|e| e.key == key) || db.has_node(key) {
-        return Ok(());
-    }
-    Err(GraphError::IngestError {
-        detail: format!(
-            "{} would be stubbed with {aliases} aliases, more than {MAX_ALIASES}: its key \
-             and each word of it; describe it in entities with a name, got {key:?}",
-            argument()
-        ),
-    })
 }
 
 /// Create-or-update one entity, clearing any provisional mark.
@@ -456,8 +432,7 @@ pub fn upsert_entity<F: Fs>(
 /// docs. A key that is empty or only whitespace is one: in `about`, as an
 /// `entities[].key` or as a fact's `subject` or `object` it refuses the
 /// whole call, naming the argument and its position, and nothing is written.
-/// So is an `entities[].label` or a fact's `predicate` with nothing in it,
-/// and a key that would be stubbed with more than `MAX_ALIASES` aliases.
+/// So is an `entities[].label` or a fact's `predicate` with nothing in it.
 ///
 /// The note's key is `"note:"` followed by 16 hex characters of a stable
 /// 64-bit hash of `ts` and `text` (see [`note_key`]), so remembering the
@@ -524,20 +499,6 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
             identity_props_after_write(db, &e.key, &props, &e.aliases)
         })
         .collect::<Result<_>>()?;
-
-    // A stub is held to the same alias cap, and here for the same reason: a
-    // call refused for one declares nothing and writes nothing.
-    for (i, k) in input.about.iter().enumerate() {
-        refuse_stub_over_alias_cap(db, k, input.entities, || format!("remember: about[{i}]"))?;
-    }
-    for (i, fact) in input.facts.iter().enumerate() {
-        refuse_stub_over_alias_cap(db, &fact.subject, input.entities, || {
-            format!("remember: facts[{i}].subject")
-        })?;
-        refuse_stub_over_alias_cap(db, &fact.object, input.entities, || {
-            format!("remember: facts[{i}].object")
-        })?;
-    }
 
     let mut fulltext = db.fulltext_pairs();
     if !fulltext.contains(&("Note".to_string(), "text".to_string())) {
@@ -833,14 +794,21 @@ pub fn remember<F: Fs>(db: &mut GraphDb<F>, input: &RememberInput<'_>) -> Result
 
 /// A provisional stub's properties: its key as its `name`, the
 /// `provisional` mark, and the aliases that name implies.
+///
+/// Every word of the key is an alias, so a long key — a sentence, a URL with
+/// a slug and a query string — implies more than a node may carry
+/// ([`MAX_ALIASES`], defect 53). Such a stub is linked by its whole key alone
+/// and not by its words. It is still written: an unknown subject is never a
+/// reason to lose the note.
 fn stub_props(key: &str) -> Vec<(String, Value)> {
+    let mut aliases = derive_aliases(key, Some(key));
+    if aliases.len() > MAX_ALIASES {
+        aliases = derive_aliases(key, None);
+    }
     vec![
         (NAME_FIELD.to_string(), Value::Str(key.to_string())),
         (PROVISIONAL_PROP.to_string(), Value::Bool(true)),
-        (
-            ALIASES_FIELD.to_string(),
-            aliases_value(&derive_aliases(key, Some(key))),
-        ),
+        (ALIASES_FIELD.to_string(), aliases_value(&aliases)),
     ]
 }
 
