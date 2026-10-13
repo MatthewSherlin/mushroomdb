@@ -144,6 +144,25 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `true` and `false` are literals, so neither can name a variable or an
+    /// alias: an expression that mentions the name would read the literal.
+    fn not_reserved(&self, name: &str) -> Result<(), String> {
+        if bool_literal(name).is_some() {
+            return Err(self.err(&format!(
+                "`{name}` is a boolean literal and cannot name a variable or an alias"
+            )));
+        }
+        Ok(())
+    }
+
+    /// An identifier that binds a name: an alias after `AS`.
+    fn binding(&mut self, what: &str) -> Result<String, String> {
+        if let Some(Tok::Ident(s)) = self.peek() {
+            self.not_reserved(s)?;
+        }
+        self.ident(what)
+    }
+
     fn query(&mut self) -> Result<Query, String> {
         let mut matches = Vec::new();
         while self.peek() == Some(&Tok::Match) {
@@ -348,7 +367,7 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Unwind, "expected UNWIND")?;
         let list = self.unwind_expr()?;
         self.expect(&Tok::As, "expected AS after UNWIND expression")?;
-        let alias = self.ident("expected alias identifier after AS")?;
+        let alias = self.binding("expected alias identifier after AS")?;
         Ok(UnwindClause { list, alias })
     }
 
@@ -453,6 +472,7 @@ impl<'a> Parser<'a> {
         let var = match self.peek() {
             Some(Tok::Ident(s)) => {
                 let s = s.clone();
+                self.not_reserved(&s)?;
                 self.pos += 1;
                 Some(s)
             }
@@ -529,6 +549,7 @@ impl<'a> Parser<'a> {
         let var = match self.peek() {
             Some(Tok::Ident(s)) => {
                 let s = s.clone();
+                self.not_reserved(&s)?;
                 self.pos += 1;
                 Some(s)
             }
@@ -1094,7 +1115,7 @@ impl<'a> Parser<'a> {
                 };
                 self.expect(&Tok::RParen, "expected ')' to close aggregate function")?;
                 let alias = if self.eat(&Tok::As) {
-                    Some(self.ident("expected alias identifier after AS")?)
+                    Some(self.binding("expected alias identifier after AS")?)
                 } else {
                     None
                 };
@@ -1121,7 +1142,7 @@ impl<'a> Parser<'a> {
             other => RetVal::ScalarExpr(other),
         };
         let alias = if self.eat(&Tok::As) {
-            Some(self.ident("expected alias identifier after AS")?)
+            Some(self.binding("expected alias identifier after AS")?)
         } else {
             None
         };
@@ -1250,6 +1271,7 @@ impl<'a> Parser<'a> {
         let var = match self.peek() {
             Some(Tok::Ident(s)) => {
                 let s = s.clone();
+                self.not_reserved(&s)?;
                 self.pos += 1;
                 Some(s)
             }
@@ -1396,6 +1418,7 @@ impl<'a> Parser<'a> {
                     Some(Tok::Ident(s)) => s.clone(),
                     _ => unreachable!(),
                 };
+                self.not_reserved(&s)?;
                 self.pos += 1; // consume var name
                 Some(s)
             }

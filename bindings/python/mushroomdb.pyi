@@ -1145,8 +1145,7 @@ class GraphDb:
         `alias_keys`, a name is empty, only whitespace or only invisible
         characters — a key in
         `about`, an entity's `key` or `label`, or a fact's `subject`,
-        `predicate` or `object` — or a key would be stubbed with more than
-        32 aliases; nothing is written. Its `.detail` is the
+        `predicate` or `object`; nothing is written. Its `.detail` is the
         bare sentence; the message carries an `ingest error: ` prefix in
         front of it.
 
