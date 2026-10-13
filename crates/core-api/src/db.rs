@@ -2635,7 +2635,7 @@ impl<F: Fs> GraphDb<F> {
         //
         // So does the intent of a snapshot that was to replace its WAL and
         // did not get that far: the same state, reached by a crash.
-        let (interrupted, intent_left_over) = db.interrupted_snapshot(&bytes);
+        let (interrupted, intent_left_over) = db.interrupted_snapshot(&bytes)?;
         // An intent that is not about this snapshot and this WAL is left over
         // from a snapshot that finished, or never wrote its snapshot. It has
         // to go before this handle appends: once new frames follow, a WAL can
@@ -3518,7 +3518,7 @@ impl<F: Fs> GraphDb<F> {
             // `keep_wal` one, the state at the END of the live WAL, whatever
             // it says about truncation: no base for a prefix of that WAL.
             let live_wal = db.fs.read(FileId::Wal)?;
-            let snapshot_is_wal_end = db.interrupted_snapshot(&live_wal).0.is_some();
+            let snapshot_is_wal_end = db.interrupted_snapshot(&live_wal)?.0.is_some();
             // Peek 6 bytes (same pattern as open_with).
             let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
             let is_v8 = snap_header.len() >= 6
@@ -7672,42 +7672,57 @@ impl<F: Fs> GraphDb<F> {
     /// names: a snapshot that was to replace its WAL and did not get that
     /// far. The second is `true` when the file holds anything else — an
     /// intent left over, which must not outlive this handle's next append.
-    fn interrupted_snapshot(&self, wal: &[u8]) -> (Option<core_storage::v8::WalMark>, bool) {
-        let (standing, left_over) = self.standing_intent(wal);
-        (standing.map(|i| i.wal), left_over)
+    fn interrupted_snapshot(
+        &self,
+        wal: &[u8],
+    ) -> Result<(Option<core_storage::v8::WalMark>, bool)> {
+        let (standing, left_over) = self.standing_intent(wal)?;
+        Ok((standing.map(|i| i.wal), left_over))
     }
 
     /// The intent in `snapshot.intent` that is true of the snapshot and the
     /// WAL on disk, if one is, and whether the file holds anything that is
     /// not.
-    fn standing_intent(&self, wal: &[u8]) -> (Option<core_storage::v8::SnapshotIntent>, bool) {
-        let bytes = self.fs.read(FileId::SnapshotIntent).unwrap_or_default();
+    ///
+    /// A file that cannot be read is an error, not an absent intent: taking
+    /// it for absent would replay the WAL over the very snapshot the intent
+    /// is there to protect.
+    fn standing_intent(
+        &self,
+        wal: &[u8],
+    ) -> Result<(Option<core_storage::v8::SnapshotIntent>, bool)> {
+        let bytes = self.fs.read(FileId::SnapshotIntent)?;
         if bytes.is_empty() {
-            return (None, false);
+            return Ok((None, false));
         }
-        let intents = core_storage::v8::SnapshotIntent::decode_all(&bytes);
-        let snapshot = if intents.is_empty() {
-            Vec::new()
+        // The WAL is in hand, so it is asked first. Only a record whose mark
+        // it matches is worth reading the whole snapshot for — which leaves a
+        // left-over intent, the usual kind, costing nothing at each open.
+        let candidates: Vec<_> = core_storage::v8::SnapshotIntent::decode_all(&bytes)
+            .into_iter()
+            .filter(|i| {
+                i.wal.matches(wal)
+                    // The mark was taken at the end of a whole WAL.
+                    && decode_all(&wal[..i.wal.len as usize]).1 as u64 == i.wal.len
+            })
+            .collect();
+        let standing = if candidates.is_empty() {
+            None
         } else {
-            self.fs.read(FileId::Snapshot).unwrap_or_default()
+            let snapshot = self.fs.read(FileId::Snapshot)?;
+            candidates.into_iter().find(|i| i.names(&snapshot))
         };
-        let standing = intents.into_iter().find(|i| {
-            i.names(&snapshot)
-                && i.wal.matches(wal)
-                // The mark was taken at the end of a whole WAL.
-                && decode_all(&wal[..i.wal.len as usize]).1 as u64 == i.wal.len
-        });
         // Anything in the file beyond the one standing intent is left over:
         // a record of a snapshot that finished or never landed.
         let left_over = bytes.len() != if standing.is_some() { 32 } else { 0 };
-        (standing, left_over)
+        Ok((standing, left_over))
     }
 
     /// Empty `snapshot.intent` unless it is still true. Called with the write
     /// lock held, before an append.
     fn settle_snapshot_intent(&mut self) -> Result<()> {
         let wal = self.fs.read(FileId::Wal)?;
-        let (standing, left_over) = self.standing_intent(&wal);
+        let (standing, left_over) = self.standing_intent(&wal)?;
         if left_over {
             // Keep the one that is still true, drop the rest.
             let keep = standing.map(|i| i.encode()).unwrap_or_default();
@@ -10014,9 +10029,9 @@ impl<F: Fs> GraphDb<F> {
         // resolve a date to a commit, and answers `NoRecordedTime` for history
         // it holds in full (ledger row 86).
         try_copy("commit_times.bin")?;
-        // Present only on a store whose last WAL-replacing snapshot was
-        // interrupted. Without it the copy is that snapshot beside the WAL it
-        // was made from, with nothing to say so.
+        // Empty unless the store's last WAL-replacing snapshot was
+        // interrupted. Then, without it, the copy is that snapshot beside the
+        // WAL it was made from, with nothing to say so.
         try_copy("snapshot.intent")?;
 
         // Copy WAL archives.
@@ -14119,7 +14134,7 @@ impl<F: Fs> GraphDb<F> {
             core_storage::v8::WalMark::of(&wal_now).encode()
         };
         let standing_intent = if replaces_wal {
-            self.standing_intent(&wal_now).0
+            self.standing_intent(&wal_now)?.0
         } else {
             None
         };
