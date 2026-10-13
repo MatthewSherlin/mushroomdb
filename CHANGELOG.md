@@ -1,6 +1,22 @@
 # Changelog
 
-## Unreleased
+## v0.7.2 — corrections, five of them for a store that would not open or answered wrongly
+
+No format version change. A 0.7.1 store opens under 0.7.2, and a 0.7.2 snapshot opens under 0.7.1, which ignores the two optional sections this release adds.
+
+Most of what is here was found by running the same writes two ways and comparing: one batch against separate commits, a reopened store against the handle that never closed, a handle that snapshots against one that never does. Five entries under Fixed are in 0.7.1 and earlier and are the reason to upgrade:
+
+- deleting a node after a snapshot left its edges behind, and reading a neighbour of it failed (row 95);
+- a rename followed by a snapshot that kept its WAL left a store that did not open again (row 91);
+- a rename onto a key a deleted node once held, followed by any snapshot, did the same (row 94);
+- a history read on a node renamed away and back never returned (row 93);
+- a backup did not carry the map a read by date needs (row 86).
+
+**Before upgrading a store that already will not open**, read the entries for rows 91 and 94: one kind opens again under this release with nothing lost, and one has to be recovered by hand first.
+
+**Known and not fixed**: a crash between a truncating snapshot and the replacement of its WAL, on a store where a node was renamed before the snapshot, leaves a store that does not open. The window is two filesystem calls wide; the recovery is under row 91's entry (row 92).
+
+Several inputs that 0.7.1 accepted are refused; each is under Changed.
 
 ### Added
 
