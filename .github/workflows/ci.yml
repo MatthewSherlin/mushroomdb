@@ -369,7 +369,7 @@ jobs:
           cp "target/${TARGET}/release/${NAME}" "smoke-stage/${NAME}"
           ASSET="mushroomdb-v${VERSION}-${TARGET}.tar.gz"
           tar -C smoke-stage -czf "$REL/$ASSET" "$NAME"
-          ( cd "$REL" && { sha256sum "$ASSET" 2>/dev/null || shasum -a 256 "$ASSET"; } > SHA256SUMS )
+          ( cd "$REL" && { sha256sum --text "$ASSET" 2>/dev/null || shasum -a 256 "$ASSET"; } > SHA256SUMS )
           node -e "
             const http = require('http'), fs = require('fs'), path = require('path');
             const root = process.argv[1];

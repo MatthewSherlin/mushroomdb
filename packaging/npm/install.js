@@ -102,7 +102,9 @@ function checksumOf(buf) {
 function expectedChecksum(sums, filename) {
   const lines = sums.split(/\r?\n/);
   for (const line of lines) {
-    const m = line.match(/^([0-9a-fA-F]{64})\s+(\S+)$/);
+    // `sha256sum` marks a file read in binary mode with `*` before its
+    // name, and on Windows that is every file.
+    const m = line.match(/^([0-9a-fA-F]{64})\s+\*?(\S+)$/);
     if (m && path.basename(m[2]) === filename) return m[1].toLowerCase();
   }
   return null;
