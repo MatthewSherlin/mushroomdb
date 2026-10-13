@@ -14746,25 +14746,9 @@ impl<F: Fs> GraphDb<F> {
                 .copied()
                 .unwrap_or(self.wal_horizon_floor)
                 + live_frames_for_name.len() as u64;
-            stopped(SnapshotStop::BeforeWalReplacement)?;
-            self.fs.archive_wal(archive_n)?;
-
-            // The replacement WAL goes in **immediately**, with no fallible call
-            // between it and the rename above.
-            //
-            // The rename is what removes the store's live declarations — the
-            // multiplicity opt-in, and every `EnableFulltext` / `EnableIndex` —
-            // and this write is what puts them back. Every call that used to sit
-            // in between (the genesis marker, the retention sweep's reads, the
-            // floor write, the archive deletes) was a `?` that could leave the
-            // store with neither, so a single transient `Err` was enough to lose
-            // a declaration that no rebuild can recover (defect #22).
-            //
-            // Ordering alone cannot close the crash window between two
-            // filesystem calls; for the multiplicity declaration the V10 stamp
-            // does that on the open path. What ordering does close is the much
-            // wider window in which an ordinary I/O error did it — and that half
-            // covers all three declarations, not just the one with a stamp.
+            // What the WAL is replaced with: the store's declarations and
+            // nothing else. Built before the rename, because it is also what
+            // says whether there is anything to archive.
             let mut baseline_wal: Vec<u8> = Vec::new();
             // The multiplicity opt-in is a declaration like the two below it,
             // and it is re-emitted for the same reason: truncation must not
@@ -14787,7 +14771,57 @@ impl<F: Fs> GraphDb<F> {
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
-            self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
+            // A WAL that already holds exactly that has had nothing written
+            // to it since the last snapshot put it there, and there is
+            // nothing to archive. Archiving it anyway destroyed history: an
+            // archive is named for the commit it ends at, so with no commit
+            // since the last one this one took the last one's name, and the
+            // rename put an empty file over it — after which the commit
+            // numbers were handed out again and a read by commit answered
+            // with a later state (row 100). The WAL stays where it is; it is
+            // rewritten only if it ends in bytes that are no record. A store
+            // with no archive yet has no name to collide with and is archived
+            // as before.
+            let (baseline_frames, _) = decode_all(&baseline_wal);
+            let nothing_to_archive =
+                live_frames_for_name == baseline_frames && !self.fs.list_archives()?.is_empty();
+            stopped(SnapshotStop::BeforeWalReplacement)?;
+            if nothing_to_archive {
+                if live_wal_bytes_for_name != baseline_wal {
+                    self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
+                }
+            } else {
+                // And never over an archive that exists, whatever led to the
+                // name: a snapshot that cannot be taken costs a longer open,
+                // an archive written over costs the store's history.
+                if existing_archives.contains(&archive_n) {
+                    return Err(GraphError::Corrupt {
+                        detail: format!(
+                            "snapshot: wal.{archive_n}.archive already exists; \
+                             not archiving the WAL over it"
+                        ),
+                    });
+                }
+                self.fs.archive_wal(archive_n)?;
+
+                // The replacement WAL goes in **immediately**, with no fallible call
+                // between it and the rename above.
+                //
+                // The rename is what removes the store's live declarations — the
+                // multiplicity opt-in, and every `EnableFulltext` / `EnableIndex` —
+                // and this write is what puts them back. Every call that used to sit
+                // in between (the genesis marker, the retention sweep's reads, the
+                // floor write, the archive deletes) was a `?` that could leave the
+                // store with neither, so a single transient `Err` was enough to lose
+                // a declaration that no rebuild can recover (defect #22).
+                //
+                // Ordering alone cannot close the crash window between two
+                // filesystem calls; for the multiplicity declaration the V10 stamp
+                // does that on the open path. What ordering does close is the much
+                // wider window in which an ordinary I/O error did it — and that half
+                // covers all three declarations, not just the one with a stamp.
+                self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
+            }
 
             // The genesis marker was written before the snapshot, above.
 

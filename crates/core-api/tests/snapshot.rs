@@ -4098,3 +4098,71 @@ fn an_interrupted_first_archiving_snapshot_does_not_cost_the_reads_by_commit() {
         assert_eq!(people_at(&dir, 1), 2, "{stop:?}: the second commit");
     }
 }
+
+/// Row 100. An archiving snapshot of a store nothing has been written to
+/// since the last one has nothing to archive. It used to archive anyway. An
+/// archive is named for the commit it ends at, so with no commits since the
+/// last one the name was the last one's, and the empty WAL was renamed over
+/// it: the store's history was gone, the commit numbers were handed out
+/// again, and a read by commit answered with a later state — `count = 4` for
+/// a commit at which the store held one node.
+#[test]
+fn an_archiving_snapshot_with_nothing_new_leaves_the_last_archive_alone() {
+    let archive = SnapshotOptions {
+        archive_wal: true,
+        ..Default::default()
+    };
+    let people_at = |dir: &std::path::Path, commit: u64| -> usize {
+        let db = GraphDb::open_at(dir, commit).unwrap_or_else(|e| panic!("open_at({commit}): {e}"));
+        db.query("MATCH (p:Person) RETURN p.id AS id", &BTreeMap::new())
+            .unwrap()
+            .len()
+    };
+    let archives = |dir: &std::path::Path| -> Vec<(String, u64)> {
+        let mut found: Vec<(String, u64)> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".archive"))
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.metadata().unwrap().len(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    for declared in [false, true] {
+        let dir = tmp(&format!("idle-archive-{declared}"));
+        let mut db = GraphDb::open(&dir).unwrap();
+        if declared {
+            // A declaration is re-emitted into the WAL that replaces the
+            // archived one, so this store's WAL is never empty.
+            db.enable_fulltext("Person", "name").unwrap();
+        }
+        let first = usize::from(declared);
+        for key in ["a", "b", "c"] {
+            db.insert_node("Person", key, vec![]).unwrap();
+        }
+        db.snapshot_with(archive.clone()).unwrap();
+        let after_one = archives(&dir);
+        assert_eq!(after_one.len(), 1, "declared={declared}");
+        assert!(after_one[0].1 > 0);
+
+        // Twice more with nothing written, on this handle and on a new one.
+        db.snapshot_with(archive.clone()).unwrap();
+        drop(db);
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.snapshot_with(archive.clone()).unwrap();
+        assert_eq!(archives(&dir), after_one, "declared={declared}");
+        assert_eq!(people_at(&dir, first as u64), 1, "declared={declared}");
+
+        db.insert_node("Person", "d", vec![]).unwrap();
+        drop(db);
+        assert_eq!(people_at(&dir, first as u64), 1, "declared={declared}");
+        assert_eq!(people_at(&dir, first as u64 + 2), 3, "declared={declared}");
+        let db = GraphDb::open(&dir).unwrap();
+        assert_eq!(db.stats().nodes_live, 4, "declared={declared}");
+    }
+}
