@@ -610,9 +610,16 @@ fn topk_field_equal_cap_per_source_and_stats_survive_recovery() {
         let before = db.stats();
         db.snapshot().unwrap();
         drop(db);
-        let after = GraphDb::open(&dir).unwrap();
-        assert_eq!(after.stats(), before);
-        assert_eq!(after.stats(), live);
+        let after = GraphDb::open(&dir).unwrap().stats();
+        // The snapshot truncates, so the one thing that moves is where history
+        // starts. Everything a rule counted is as it was.
+        assert!(after.history_floor > before.history_floor);
+        let unmoved = |mut s: core_api::Stats| {
+            s.history_floor = 0;
+            s
+        };
+        assert_eq!(unmoved(after.clone()), unmoved(before));
+        assert_eq!(unmoved(after), unmoved(live));
     }
 }
 

@@ -14088,6 +14088,28 @@ impl<F: Fs> GraphDb<F> {
             // to truncate it itself. Same-session archives after this point get
             // the conservative answer, exactly as cross-session ones do.
             self.snapshot_preserved_history = false;
+            // The frames this discards keep their numbers. Everything the store
+            // could still address — its archives and the live WAL — ends at
+            // `wal_total_commits()`. That becomes the floor, and the replacement
+            // WAL continues from it, exactly as the archive path's does after a
+            // retention sweep.
+            //
+            // Leaving the floor where it was renumbered the new WAL over the
+            // old one: `stats` reported `history_floor: 0`, which every reader
+            // prints as "complete, nothing pruned", and a commit index a caller
+            // already held resolved to an unrelated frame — a plausible graph,
+            // not an error (ledger row 80).
+            //
+            // The floor is persisted FIRST, for the reason the retention sweep
+            // gives: a crash after it leaves the old WAL and any archives on
+            // disk under a floor that already disowns them. The next open
+            // removes the archives as orphans and replays the WAL over the
+            // snapshot idempotently; no discarded number is ever answered.
+            let discarded_through = self.wal_total_commits()?;
+            if discarded_through > self.wal_horizon_floor {
+                self.fs.write_horizon_floor(discarded_through)?;
+                self.wal_horizon_floor = discarded_through;
+            }
             let mut baseline_wal: Vec<u8> = Vec::new();
             // The multiplicity opt-in is a declaration like the two below it,
             // and it is re-emitted for the same reason: truncation must not
@@ -14111,13 +14133,17 @@ impl<F: Fs> GraphDb<F> {
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
             self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
+            // Every archive now ends at or below the floor. They are the
+            // history this snapshot was asked to discard; removing them here is
+            // what `cleanup_orphaned_archives` would do at the next open.
+            for n in self.fs.list_archives()? {
+                if n <= self.wal_horizon_floor {
+                    self.fs.delete_archive(n)?;
+                }
+            }
             // This branch discards history rather than archiving it: the frames
-            // the map describes are gone and the replacement WAL renumbers from
-            // the floor, so every surviving entry now names a different frame.
-            // Keeping them would resolve a date onto an unrelated commit — and
-            // the stamps written after this point would sit far above the
-            // store's own frame count, which is how the date surface came to
-            // refuse commits the index path served perfectly well.
+            // the map describes are gone, and every entry it holds is below the
+            // floor. A date before the floor has no commit to resolve to.
             //
             // A store that cannot answer a date says so by name
             // (`NoRecordedTime`). That is the honest state after discarding the
@@ -14135,10 +14161,10 @@ impl<F: Fs> GraphDb<F> {
         // like a peer's on the next staleness check and force a needless
         // reload.
         self.wal_consumed = self.fs.wal_len().map_err(GraphError::Io)?;
-        // A snapshot can replace the live WAL with a baseline, which renumbers
-        // every frame after it. Re-derive the frame cursor from what the store
-        // now actually holds rather than carrying the pre-snapshot count
-        // forward — `wal_total_commits` is the same sequence the history
+        // A snapshot can replace the live WAL with a baseline, which has its
+        // own frames. Re-derive the frame cursor from what the store now
+        // actually holds — the floor, plus what is reachable above it — rather
+        // than carrying the pre-snapshot count forward — `wal_total_commits` is the same sequence the history
         // surfaces index, and the snapshot has already paid a far larger cost
         // than one decode.
         self.wal_frames_written = self.wal_total_commits()?;

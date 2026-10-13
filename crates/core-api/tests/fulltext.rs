@@ -665,10 +665,11 @@ fn snapshot_with_no_declarations_stays_clean() {
 /// one EnableFulltext record per enabled pair.  Post-snapshot user writes
 /// follow.  open_at(i) must replay correctly at any position.
 ///
-/// WAL structure after the workload below:
-///   pos 0: EnableFulltext("Article","bio")   ← baseline written by snapshot()
-///   pos 1: InsertNode "a1"
-///   pos 2: InsertNode "a2"
+/// WAL structure after the workload below, counted from the floor the
+/// snapshot set (the commits before it are discarded and keep their numbers):
+///   floor + 0: EnableFulltext("Article","bio")   ← baseline written by snapshot()
+///   floor + 1: InsertNode "a1"
+///   floor + 2: InsertNode "a2"
 #[test]
 fn open_at_works_after_snapshot_with_declarations() {
     let dir = tmp_dir();
@@ -688,26 +689,34 @@ fn open_at_works_after_snapshot_with_declarations() {
             "a1",
             vec![("bio".into(), Value::Str("python".into()))],
         )
-        .unwrap(); // WAL pos 1
+        .unwrap(); // floor + 1
         db.insert_node(
             "Article",
             "a2",
             vec![("bio".into(), Value::Str("rust lang".into()))],
         )
-        .unwrap(); // WAL pos 2
+        .unwrap(); // floor + 2
     }
-    // WAL has exactly 3 records (0..=2).
-    // At every commit, fulltext must be enabled (baseline is always at pos 0).
-    for commit in 0..=2u64 {
+    // The snapshot discarded what came before it; the floor is where that
+    // ended, and the WAL holds exactly 3 records from there (floor..=floor+2).
+    let floor = GraphDb::open(&dir).unwrap().wal_horizon_floor();
+    assert!(floor > 0, "the truncating snapshot moved the floor");
+    // At every commit, fulltext must be enabled (baseline is always first).
+    for commit in floor..=floor + 2 {
         let snap = GraphDb::open_at(&dir, commit).unwrap();
         assert!(
             snap.is_fulltext_enabled("Article", "bio"),
-            "fulltext must be enabled at WAL pos={commit}"
+            "fulltext must be enabled at commit {commit}"
         );
     }
-    // CommitOutOfRange for pos 3 (only 3 records).
+    // CommitOutOfRange one past the end (only 3 records)…
     assert!(matches!(
-        GraphDb::open_at(&dir, 3),
+        GraphDb::open_at(&dir, floor + 3),
+        Err(GraphError::CommitOutOfRange { .. })
+    ));
+    // …and for a number the snapshot discarded.
+    assert!(matches!(
+        GraphDb::open_at(&dir, 0),
         Err(GraphError::CommitOutOfRange { .. })
     ));
     // At pos 2 (all WAL records), the as-of state has:
@@ -716,10 +725,10 @@ fn open_at_works_after_snapshot_with_declarations() {
     //     truncating snapshot IS the WAL-head state)
     //   - a1 with "python" (pos 1)
     //   - a2 with "rust lang" (pos 2)
-    let snap = GraphDb::open_at(&dir, 2).unwrap();
+    let snap = GraphDb::open_at(&dir, floor + 2).unwrap();
     assert!(
         snap.is_fulltext_enabled("Article", "bio"),
-        "fulltext must be enabled at pos=2"
+        "fulltext must be enabled at the last commit"
     );
     let mut hits: Vec<String> = snap
         .search("bio", "rust")

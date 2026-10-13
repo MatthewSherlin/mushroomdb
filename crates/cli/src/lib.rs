@@ -4280,6 +4280,23 @@ mod tests {
             "a pruned store names its floor"
         );
         let _ = std::fs::remove_dir_all(&pruned);
+
+        // A truncating snapshot discards history too, and says so the same way.
+        let truncated = tmp("stats-horizon-truncated");
+        {
+            let mut db = GraphDb::open(&truncated).expect("open");
+            db.insert_node("Person", "a", vec![]).expect("insert");
+            db.insert_node("Person", "b", vec![]).expect("insert");
+        }
+        run_snapshot(&truncated, WalDisposition::Truncate, None).expect("truncate");
+        let stats = read_stats(&truncated).expect("stats");
+        assert_eq!(stats.history_floor, 2, "two commits were discarded");
+        assert!(
+            format_stats(&stats).contains("history: reaches back to commit 2"),
+            "a truncated store names its floor, got:\n{}",
+            format_stats(&stats)
+        );
+        let _ = std::fs::remove_dir_all(&truncated);
     }
 
     #[test]
