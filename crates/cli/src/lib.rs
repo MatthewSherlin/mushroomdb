@@ -112,6 +112,30 @@ pub fn snapshot_shared(db: &SharedDb) -> Result<(), core_api::GraphError> {
     snapshot_automatically(&mut db.write_with_wait(SNAPSHOT_LOCK_WAIT)?)
 }
 
+/// Take the automatic snapshot if the store's WAL has grown past
+/// [`SNAPSHOT_WAL_BYTES`](crate::ingest_git::SNAPSHOT_WAL_BYTES).
+///
+/// For a process that holds a store open without a timer to snapshot on:
+/// `mushroomdb mcp` calls this when it has opened the store and again when
+/// its session ends. `wal.bin` is exactly what the next open replays, so its
+/// length is the measure.
+///
+/// Never fails its caller, for the reason a tick of `--snapshot-every` does
+/// not: a snapshot shortens the next open and nothing else, and what was
+/// written is durable either way. `Busy` — another process holds the write
+/// lock — is skipped without a word; anything else is reported on stderr.
+pub fn snapshot_if_wal_grew(db: &SharedDb, db_dir: &Path) {
+    let grown = std::fs::metadata(db_dir.join("wal.bin"))
+        .is_ok_and(|m| m.len() > crate::ingest_git::SNAPSHOT_WAL_BYTES);
+    if !grown {
+        return;
+    }
+    match snapshot_shared(db) {
+        Ok(()) | Err(core_api::GraphError::Busy { .. }) => {}
+        Err(e) => eprintln!("snapshot skipped: {e}"),
+    }
+}
+
 /// Deterministic demo: 10 Orgs, 20 Projects, 30 People.
 pub const N_ORGS: usize = 10;
 pub const N_PROJECTS: usize = 20;

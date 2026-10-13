@@ -30,6 +30,12 @@ The tooling already bounds WAL-only-from-genesis exposure:
   Measured on a 435-file repository, that is the difference between a 288 ms
   open and a 173 ms one — paid on every hook, every MCP start and every CLI
   call until something snapshots.
+- **`mushroomdb mcp` snapshots a store whose WAL has grown.** When it opens a
+  store whose WAL is past 4 MiB, and again when its session ends, it takes the
+  same snapshot: the WAL is archived, not dropped, so history reads keep their
+  reach. A store used only as an assistant's memory is opened by nothing else,
+  and without this every session replayed everything it had ever written.
+  Skipped when another process holds the write lock.
 - The server **snapshots on graceful shutdown** (SIGINT/SIGTERM), so a clean
   restart always recovers from an image.
 - `mushroomdb serve … --snapshot-every <secs>` snapshots periodically, so even

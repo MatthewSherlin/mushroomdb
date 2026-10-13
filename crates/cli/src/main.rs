@@ -789,13 +789,25 @@ fn run_mcp(db_dir: PathBuf, all_tools: bool) -> Result<(), String> {
             .apply_schema(&core_api::memory_schema::memory_defaults())
             .map_err(|e| e.to_string())?;
     }
+    // Nothing else snapshots a store that is only ever used through this
+    // server, and without one every session replays the store's whole
+    // history to open it. Here as well as at the end of the session: a host
+    // is as likely to kill this process as to close its stdin.
+    cli::snapshot_if_wal_grew(&db, &db_dir);
     let stdin = io::stdin();
     let stdout = io::stdout();
     // The store's path, not just a handle: the `recall` tool names the store
     // by that path when it tells the caller how to fix an unindexed one, and
     // an open database cannot say where it lives.
-    server::run_mcp_stdio_with(db, Some(db_dir), all_tools, stdin.lock(), stdout.lock())
-        .map_err(|e| e.to_string())
+    let served = server::run_mcp_stdio_with(
+        db.clone(),
+        Some(db_dir.clone()),
+        all_tools,
+        stdin.lock(),
+        stdout.lock(),
+    );
+    cli::snapshot_if_wal_grew(&db, &db_dir);
+    served.map_err(|e| e.to_string())
 }
 
 fn home_dir() -> PathBuf {
