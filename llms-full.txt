@@ -421,7 +421,7 @@ Run the two-command flow:
 ```
 
 Open `http://127.0.0.1:8080/` in a browser. The explorer loads the demo
-graph: 10 Orgs, 20 Projects, 30 People, 334 edges (including 7 derived
+graph: 10 Orgs, 20 Projects, 30 People, 334 edges (all derived by 7
 rule sets).
 
 You can combine both commands on one line:
@@ -714,7 +714,7 @@ mushroomdb serve ./db
 ```
 
 Open `http://127.0.0.1:8080/`. The demo graph has 10 Orgs, 20 Projects, 30 People, and 334
-edges — 304 of them derived by seven rule sets. When a token is configured, open
+edges — all 334 derived by seven rule sets. When a token is configured, open
 `http://host:8080/?token=…`.
 
 ---
@@ -1249,7 +1249,7 @@ codex mcp add mushroomdb -- <command> <args…>
 ```
 
 and lets Codex record the server. If the `codex` CLI is not on `PATH`,
-`install` says so and writes nothing. 0.6.0 ships no Codex skill — the MCP tool
+`install` says so and writes nothing. There is no Codex skill file — the MCP tool
 descriptions are what Codex reads.
 
 A Codex-only install writes nothing project-local: no ignore line and no git
@@ -1932,9 +1932,12 @@ pub struct RuleDef {
     pub predicate: Predicate,  // one of the six kinds below
     pub edge_type: String,     // edge type written to the graph
     pub weight_prop: Option<String>, // if Some, score stored as this edge prop
-    pub max_edges: Option<usize>,    // cap on derived edges per rule (recommended)
+    pub max_edges: Option<usize>,    // best k per source node (per-source top-k)
     pub approximate: bool,     // HNSW approximate mode (VectorSimilar only)
     pub namespace: Option<String>,   // None = global; Some(ns) = scoped (see below)
+    pub via_label: Option<String>,   // intermediate-hop label (via-hop rules)
+    pub via_edge: Option<String>,    // edge type to traverse for the via hop
+    pub via_dir: Option<Direction>,  // direction of the via hop (default Out)
 }
 ```
 
@@ -2213,7 +2216,7 @@ path from a full scan to in-tree HNSW (Hierarchical Navigable Small World):
 
 ```rust
 RuleDef {
-    predicate: Predicate::VectorSimilar { field: "embedding".into(), min: 0.85, dims: 1536 },
+    predicate: Predicate::VectorSimilar { field: "embedding".into(), min: 0.85 },
     approximate: true,
     max_edges: Some(1000),
     ..
@@ -2358,12 +2361,6 @@ of the engine, and the clone carries no pending-build state. During a real
 pending build it therefore reports the `gained` edges the rule *would* derive,
 which the live store will not derive until its backfill runs. The preview is
 right about the end state and early about the timing.
-
-**Breaking change in 0.6.6:** code that created a VectorSimilar rule over more
-than 2,048 vectors and immediately asserted an edge count must now pump first.
-This is the vector index's threshold, not the approximate mode's, so an exact
-rule over that many vectors defers too. At or below 2,048 vectors nothing
-changed — one commit, edges present the moment `create_rule` returns.
 
 ### Vector index parameters
 
@@ -2563,10 +2560,10 @@ one disagrees, it re-elects its dimension to the newcomer's and drops the stray.
 Mixed dimensions were never meaningful; this is the version that says so. Re-embed
 a collection with one model rather than mixing two.
 
-**Blob version 3.** The persisted graph carries the slab, so its version is 3.
-Version 2 (0.6.6 before the kernel) and the bare 0.6.5 shape both still load,
-converting the vectors in memory with no vector re-inserted and no distance
-computed. A reader older than this one meeting a v3 blob fails its version check
+**Blob version 4.** The persisted graph carries the slab, so its version is 4.
+Earlier versions (v1–v3) still load, converting the vectors in memory with no
+vector re-inserted and no distance computed. A reader older than this one meeting
+a v4 blob fails its version check
 and leaves that rule on its full-scan fallback — slower, never wrong. The
 snapshot format does not move: it carries the index as opaque bytes.
 
@@ -2811,17 +2808,6 @@ materialization stops after `DEFAULT_MAX_EDGES` (1 000 000) total edges and
 the rule is marked `tripped`. No further edges are added until the rule is
 rebuilt with nodes removed. Use `max_edges: Some(k)` instead when you want
 per-source cardinality control.
-
-> **Breaking change (pre-alpha, since 2026-08-20):** Prior to this release,
-> `max_edges: Some(k)` meant "stop at k total edges globally (global-budget
-> semantics, same as `None` but with a lower cap)." It now means "keep the
-> k best-matching destinations per source node (per-source top-k semantics)."
-> Any snapshot written before this change that contains a rule with
-> `max_edges: Some(k)` will silently switch to per-source top-k semantics
-> on the next open — which may cause up to `src_count × k` edges to be added
-> on the next write where previously the rule was frozen. The `tripped` flag
-> loaded from old snapshots is ignored by the new code path.
-> No migration is provided (pre-alpha policy).
 
 ---
 
@@ -4124,7 +4110,7 @@ want the full distribution; `top_author_id` is its argmax.
 `top_author_id` is whoever has the most commits on that file. Ties break on the
 lexicographically smallest email so repeated runs agree.
 
-## The two rules
+## The two co-change rules
 
 **`co_changed`** — `Overlap { field: "commits", min: 0.25 }`, edge `CO_CHANGED`,
 weight `score`, at most 10 edges per file. Two files link when the jaccard
@@ -5424,7 +5410,11 @@ Role-token behavior per endpoint:
 | `GET /node/{key}` | 200 if visible; 404 if hidden or absent (indistinguishable) |
 | `GET /node/{key}/edges` | 200 if visible; 404 if hidden or absent |
 | `GET /node/{key}/neighborhood` | 200 if visible; 404 if hidden or absent |
+| `GET /node/{key}/history` | 200 with edge-event entries whose `other` endpoint is hidden filtered out; 404 if the target key is hidden or absent |
+| `GET /history/edge` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
+| `GET /history/was_linked` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
 | `POST /find_similar` | 200 — vector search; client `mask` intersects role mask (never widens) |
+| `GET /metrics` | 403 (counters leak graph size beyond the role's subgraph) |
 | `GET /stats` | 403 (counts leak graph size beyond the role's subgraph) |
 | `POST /rules` | 403 (administrative — all role tokens, including write-scoped) |
 | `GET /explain` | 403 (rule explanation reveals hidden-node linkage) |
@@ -5443,15 +5433,16 @@ present in `roles.json` at open time → 401; corrupt `roles.json` → 500 for
 role tokens (full-access token unaffected); empty role → sees zero nodes.
 Role sidecar is stored in `<db-dir>/roles.json` (v1 for read-only roles, v2 when
 any role carries a write scope, v3 when any role carries a `visible_where`
-predicate). A version this binary does not recognise poisons the roles state
-rather than loading it — denying beats over-granting.
+predicate, v4 when any role is bound to one or more namespaces). A version this
+binary does not recognise poisons the roles state rather than loading it —
+denying beats over-granting.
 
 ## Write scopes for role-bound tokens
 
 v0.3 lifts the write ban for roles that explicitly declare write scopes in
 `schema.json`. Roles without a write scope remain read-only.
 
-#### WriteScope schema
+### WriteScope schema
 
 ```rust
 pub struct WriteScope {
@@ -5483,7 +5474,7 @@ Example `schema.json` role definition:
 }
 ```
 
-#### Never-widen for writes
+### Never-widen for writes
 
 No write a role performs may make data visible to itself or any other party that
 was not already visible before the write. Concretely:
@@ -5498,7 +5489,7 @@ was not already visible before the write. Concretely:
 - `/rules`, `/stats`, `/explain`, `/subscribe`, and `/watch` remain 403 for all role
   tokens regardless of write scope.
 
-#### §4.3 Error body shapes
+### Error body shapes
 
 All write denials return 403 with a structured JSON body:
 
@@ -5536,7 +5527,7 @@ exist and the visibility arm only for one that does, so two different strings wo
 turn the pair into an existence oracle. Hidden ≡ absent holds here as everywhere else.
 See [masks.md](masks.md#namespaces).
 
-#### Threat model
+### Threat model
 
 | Capability | v1 (read-only) | v0.3 (with write scope) |
 |---|---|---|
@@ -6700,11 +6691,12 @@ clone = {**base_rule, "name": "skill_fit_v2", "predicate": why[0]["predicate"]}
 db.create_rule(clone)
 ```
 
-**`max_edges` semantics:** Python `None` and a missing key both fill the
-predicate default (32 for scored predicates, 512 for KeyMatch). This is the same
-as HTTP `null` — neither Python nor HTTP can express the Rust `max_edges: None`
-global-budget hatch (1,000,000 per source). Use the Rust API directly if you
-need the uncapped budget.
+**`max_edges` semantics:** a missing key fills the predicate default (32 for
+scored predicates, 512 for KeyMatch), the same as HTTP `null`. Python `None`
+(JSON null) is passed through and leaves `max_edges` as `None` — the Rust
+global-budget hatch (1,000,000 per source). Use HTTP `null` or omit the key
+if you want the capped default; pass `None` explicitly only if you intend the
+uncapped budget.
 
 **Symmetric predicates:** when `src_label == dst_label` (e.g., Person-to-Person
 similarity), the rule fires in **both directions** — a property change on any
@@ -7050,7 +7042,7 @@ the snapshot are no longer reachable via time travel.
 
 ```rust
 use core_api::{SnapshotOptions};
-db.snapshot_with(SnapshotOptions { keep_wal: true })?;
+db.snapshot_with(SnapshotOptions { keep_wal: true, archive_wal: false })?;
 ```
 
 `keep_wal: true` writes the V8 snapshot but leaves the WAL intact. `open_at`
@@ -7081,7 +7073,8 @@ The Rust forms — `write_batch`, and the compare-and-set `write_batch_cas` — 
 [Rust](rust.md#several-writes-as-one) page.
 
 Not yet exposed: `ingest_json` (use `ingest_batch`), auto-FK inference
-(declare `KeyMatch` rules explicitly), `rebuild`.
+(declare `KeyMatch` rules explicitly). `rebuild_rule` (per-rule re-derivation)
+is exposed; a full `rebuild` is not.
 
 ---
 
@@ -7234,9 +7227,9 @@ mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
 mushroomdb algo communities <db-dir> [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]
 ```
 
-PageRank, weakly-connected components, or degree centrality over manual + derived edges. `--weight-prop`/`--min-weight` weight or filter the edge set
+**`pagerank`/`wcc`/`degree`** — PageRank, weakly-connected components, or degree centrality over manual + derived edges. These three subcommands do not accept `--weight-prop` or `--min-weight`.
 
-Louvain communities with per-community cohesion and overall modularity
+**`communities`** — Louvain community detection with per-community cohesion and overall modularity; accepts `--edge-type` (repeatable), `--weight-prop` and `--min-weight`.
 
 ## Build and maintain a store
 
@@ -9369,10 +9362,10 @@ let sub: Subscription = db.subscribe_rule("skill_fit")?;
 // Returns Err(GraphError::RuleNotFound) for unknown rules.
 
 // Subscribe to edge events for all rules.
-let sub = db.subscribe_all_rules();
+let sub = db.subscribe_all_rules()?;
 
 // Subscribe to write events (node/prop mutations).
-let sub = db.subscribe_writes();
+let sub = db.subscribe_writes()?;
 ```
 
 Each call returns a `Subscription` handle. **Dropping it unregisters the subscriber** — the next commit prunes the dead entry; no resources leak.
@@ -9395,15 +9388,17 @@ if let Some(ev) = sub.recv_timeout(Duration::from_millis(100)) {
 
 ```rust
 pub enum DbEvent {
-    EdgeFired    { rule, src_key, dst_key, edge_type, weight: Option<f64>, commit_seq },
-    EdgeRetracted{ rule, src_key, dst_key, edge_type, commit_seq },
-    NodeInserted { label, key, commit_seq },
-    NodeDeleted  { key, commit_seq },
-    EdgeInserted { edge_type, src, dst, commit_seq },
-    EdgeDeleted  { edge_type, src, dst, commit_seq },
-    PropSet      { key, field, commit_seq },
-    PropRemoved  { key, field, commit_seq },
-    Lagged       { missed },
+    EdgeFired        { rule, src_key, dst_key, edge_type, weight: Option<f64>, commit_seq },
+    EdgeRetracted    { rule, src_key, dst_key, edge_type, commit_seq },
+    NodeInserted     { label, key, commit_seq },
+    NodeDeleted      { key, commit_seq },
+    EdgeInserted     { edge_type, src, dst, commit_seq },
+    EdgeDeleted      { edge_type, src, dst, commit_seq },
+    PropSet          { key, field, commit_seq },
+    PropRemoved      { key, field, commit_seq },
+    Lagged           { missed },
+    QueryRowAdded    { columns: Vec<String>, row: Vec<Option<Value>> },
+    QueryRowRemoved  { columns: Vec<String>, row: Vec<Option<Value>> },
 }
 ```
 
@@ -9688,27 +9683,18 @@ Precondition::NodeAbsent { key: "alice".into() }
 
 ### write_batch_cas (Rust API)
 
-```rust
-let seq = db.last_changed("alice").unwrap_or(0);
-
-let result = db.write_batch_cas(
-    vec![Precondition::NodeUnchangedSince { key: "alice".into(), expected: seq }],
-    |b| {
-        b.set_prop("alice", "role", Value::Str("admin".into()));
-    },
-)?;
-// On success: Ok((nodes_written, edges_written))
-// On precondition failure: Err(GraphError::CasConflict { key, expected, actual })
-```
+`write_batch_cas` takes `Vec<Precondition>` and `Vec<BatchOp>` — not a closure.
+See [rust.md § Several writes as one](rust.md#several-writes-as-one) for a
+compilable example using `BatchOp` directly.
 
 All preconditions are checked atomically under the write lock before any
 operation is applied. If any precondition fails, the entire batch is rejected:
 no WAL bytes written, no in-memory state changes.
 
-### submit_batch_cas (SharedDb / async API)
+### submit_batch_cas (SharedDb / synchronous API)
 
 ```rust
-shared_db.submit_batch_cas(preconditions, ops).await?;
+shared_db.submit_batch_cas(preconditions, ops)?;
 ```
 
 The same atomicity guarantee holds: preconditions are evaluated under the same
@@ -9785,16 +9771,19 @@ Every write appends a frame to the WAL. Commits are numbered 0-based: commit 0
 is the state after the first WAL frame.
 
 `GraphDb::snapshot()` writes the current state to `snapshot.bin` and
-**truncates the WAL to empty**. After a snapshot:
+**truncates the WAL to empty** (Rust API default: `SnapshotOptions { keep_wal:
+false, archive_wal: false }`). The CLI command `mushroomdb snapshot` **archives**
+the WAL by default instead of discarding it — pass `--truncate` to get the
+discard behaviour. After a truncating snapshot:
 
 - `GraphDb::open()` loads from the snapshot plus any post-snapshot WAL frames.
 - `GraphDb::open_at()` loads from WAL only (snapshot is ignored). Commit 0
   refers to the first WAL frame after the snapshot. Pre-snapshot history is
   not available.
 
-`snapshot_with(SnapshotOptions { keep_wal: true })` writes the snapshot but
-leaves the WAL intact, so `open_at` can reach all WAL commits including those
-before the snapshot.
+`snapshot_with(SnapshotOptions { keep_wal: true, archive_wal: false })` writes
+the snapshot but leaves the WAL intact, so `open_at` can reach all WAL commits
+including those before the snapshot.
 
 Choose based on operational priorities:
 
@@ -9817,7 +9806,7 @@ use core_api::{GraphDb, GraphError};
 let total = core_api::wal_commit_count_at(&dir)?;
 
 // Open a read-only view at commit 3.
-let db = GraphDb::open_at(&dir, 3)?;
+let mut db = GraphDb::open_at(&dir, 3)?;
 
 // Queries and explain work normally.
 let rs = db.query("MATCH (n:Person) RETURN n", &Default::default())?;
@@ -9974,7 +9963,7 @@ it was pruned.
 
 # Durability and crash recovery
 
-mushroomdb persists with a write-ahead log (WAL) plus periodic V8 snapshots.
+mushroomdb persists with a write-ahead log (WAL) plus periodic V9 snapshots.
 Every committed write is appended to the WAL and fsynced per the configured
 policy; a snapshot is a self-contained, memory-mappable image of the whole
 store with per-section CRCs.
@@ -9983,8 +9972,8 @@ store with per-section CRCs.
 
 On open, the store is reconstructed as **snapshot (if present) + WAL tail**:
 
-- **With a snapshot** — the V8 image is memory-mapped (open-to-first-query in
-  milliseconds even at 100k nodes; derived edges, HNSW/IVF vector indexes, and
+- **With a snapshot** — the V9 image is memory-mapped (open-to-first-query in
+  milliseconds even at 100k nodes; derived edges, HNSW vector indexes, and
   provenance are all restored from the image), then any WAL frames written after
   the snapshot are replayed. This is the normal path and it is fast.
 - **WAL-only, from genesis** — if the store has *never* been snapshotted, the
@@ -10143,15 +10132,17 @@ stamped in the 6-byte header (magic `GDB1` + 2-byte little-endian version).
 | V5 | 0.1.0 | readable | uncompressed bincode + CRC32 header; **no encoder** — only the golden fixture pin covers this format |
 | V6 | 0.1.1 | readable | zstd-compressed V5 payload in a container |
 | V7 | pre-0.2.0 (interim) | readable | zstd(CRC + packed CSR + packed columns + bincode meta) |
-| V8 | 0.2.0+ | default | 4 KB header page + rkyv sections; mmap-able, zero-copy open |
+| V8 | 0.2.0+ | readable | 4 KB header page + rkyv sections; mmap-able, zero-copy open |
+| V9 | 0.6.5+ | **default** | V8 container with one shared string table (section 12); auto-migrated from V5–V8 on open |
+| V10 | 0.6.10+ | readable | V9 container; written only by stores that called `enable_multiplicity()` |
 
-**Patch-stability promise:** a snapshot written by any 0.4.x release opens
-correctly on any other 0.4.x binary without migration.  Format version is only
-bumped on minor or major releases.
+**Patch-stability promise:** a snapshot written by any release in the same minor
+series opens correctly on any other binary in that series without migration.
+Format version is only bumped on minor or major releases.
 
 **What the golden pins prove:** `crates/core-api/tests/fixtures/` contains a
-committed binary fixture for each version (golden_v5.bin … golden_v8.bin).  The
-`golden_v{5..8}_pin` tests in the `snapshot` integration-test suite load each
+committed binary fixture for each version (golden_v5.bin … golden_v9.bin).  The
+`golden_v{5..9}_pin` tests in the `snapshot` integration-test suite load each
 fixture into a real `GraphDb::open()` call and assert node count, edge count, and
 specific property values.  A change to any decoder that silently corrupts data
 will fail its pin, not just the new-data tests.
@@ -10165,14 +10156,6 @@ richer content coverage is not possible without a V5 encoder.
 version pin and every migration path on every CI run.  A failure in that job
 names the format-compat category explicitly rather than surfacing as a generic
 test failure.
-
-## Roadmap
-
-A future optimization can make rule-derived edges first-class replayable WAL
-records (and persist incremental ANN state) so that even WAL-only-from-genesis
-recovery skips re-derivation. It is deferred because the snapshot path already
-delivers fast recovery for the common case, and the change touches the
-crash-recovery correctness core.
 
 ## Backup and export from Rust and the CLI
 
@@ -10251,6 +10234,14 @@ finite floats round-trip correctly.
 
 **Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is
 the rule name (present for derived edges, null/omitted for manual edges).
+
+## Roadmap
+
+A future optimization can make rule-derived edges first-class replayable WAL
+records (and persist incremental ANN state) so that even WAL-only-from-genesis
+recovery skips re-derivation. It is deferred because the snapshot path already
+delivers fast recovery for the common case, and the change touches the
+crash-recovery correctness core.
 
 ---
 
@@ -10377,17 +10368,6 @@ Writing directly to a view-managed property name returns
 let err = db.set_prop("london", "pop", Value::Int(999));
 // err == Err(ViewPropReadOnly { view_name: "city_population" })
 ```
-
-## Breaking Change: Format Version 5
-
-> **Pre-alpha notice.** Snapshot format version 5 (introduced with materialized
-> views) is incompatible with version 4.  A binary built from this commit
-> refuses to open a V4 snapshot with a clear error:
-> `snapshot: unsupported version 4 — V4 snapshot is no longer supported; re-snapshot with a V5 binary`.
->
-> **Rebuild procedure:** delete `snapshot.bin` and re-open the database; the
-> WAL is replayed from scratch and a fresh V5 snapshot is written on the next
-> `snapshot()` call.
 
 ## Persistence
 
@@ -11025,7 +11005,7 @@ Any rules or materialized views that watch the written property will fire immedi
 
 ## HTTP API
 
-All three algorithms are accessible via `POST /algo/{pagerank|wcc|degree}`:
+PageRank, WCC and degree centrality are accessible via `POST /algo/{pagerank|wcc|degree}`. Louvain communities has no HTTP endpoint; use the CLI (`mushroomdb algo communities`) or the Rust API:
 
 ```
 POST /algo/pagerank
@@ -11074,7 +11054,7 @@ mushroomdb algo communities ./db --edge-type IMPORTS --edge-type CO_CHANGED --we
 Algorithms work on read-only as-of instances opened with `GraphDb::open_at`. The topology at the requested commit is used. `write_scores` returns `ReadOnly` on as-of instances.
 
 ```rust
-let asof = GraphDb::open_at(&dir, 5)?;
+let mut asof = GraphDb::open_at(&dir, 5)?;
 let report = asof.pagerank(&PageRankConfig::default()); // works
 asof.write_scores("rank", &report.scores)?;            // Err(ReadOnly)
 ```
@@ -11718,6 +11698,7 @@ A store is a directory. Mount it; everything below follows from that.
 | `wal.genesis` | the marker that lets `asof` replay into the archives | `asof` reach below the last snapshot |
 | `roles.json` | role tokens and their masks | every configured role |
 | `wal.<N>.archive` | the folded WAL each snapshot left behind | `node_history`, `edge_history`, `was_linked` and `asof` reach into that span |
+| `commit_times.bin` | commit → wall-clock sidecar; written atomically as commits land | date-resolution (`at_commit` RFC 3339 form, `resolve_date`, `commit_time_ms`) — a restored store cannot resolve dates until new commits build a fresh sidecar |
 | `LOCK` | always empty; carries the advisory cross-process write lock | cross-process coordination for handles opened afterwards |
 
 All of them matter. A backup that takes `snapshot.bin` alone is a store with no
@@ -11785,6 +11766,12 @@ The command copies `snapshot.bin`, `snapshot.bin.bak`, `wal.bin`, `wal.floor`,
 `wal.genesis`, `roles.json` and every `wal.<N>.archive` into the destination,
 then **verifies**: it CRC-checks the copy and opens it. The printed report ends
 in `verified: true`, and a copy that does not verify is one you must not use.
+
+`commit_times.bin` is **not** copied by a backup. A store restored from a backup
+answers `no_recorded_time` for date-resolution requests (`at_commit` RFC 3339
+strings, `resolve_date`, `commit_time_ms`) until new commits build a fresh
+sidecar. Commit-index–based history (`node_history`, `edge_history`, `was_linked`
+with integer `at_commit`) is unaffected.
 
 > **The CLI form is unsafe against a live `serve`.** It says so in the usage
 > text: the copies are not atomic across processes, so a backup taken while a
@@ -12412,7 +12399,7 @@ Bug class caught: torn WAL commits landing partial node-prop records.
 
 **`recovery_byte_sweep_rules`**
 Runs the full rules workload (KM, OV, DUMMY delete, numeric NW/NZ, geo GEO, exact VEC,
-approximate VAPPROX with IVF; plus batches, ingest with auto-FK, rebuild\_rule, and
+approximate VAPPROX with HNSW; plus batches, ingest with auto-FK, rebuild\_rule, and
 delete\_node of a derived-edge-owning node). Sweeps all byte offsets.
 Bug class caught: rule-engine state diverging from node state after mid-stream crash.
 
@@ -12581,12 +12568,12 @@ payload.
 ## Replay identity tests
 
 **`approximate_wal_replay_identity`**
-Builds 20 nodes with 4 vector clusters, creates an approximate (IVF-Flat) rule, captures
+Builds 20 nodes with 4 vector clusters, creates an approximate (HNSW) rule, captures
 the derived edge set, drops and reopens the database (WAL replay), and asserts the edge
-set is identical. Same rule + same data → same clusters → same edges.
+set is identical. Same rule + same data → same graph → same edges.
 
-Bug class caught: IVF state not persisting across a reopen, or non-deterministic cluster
-assignment on replay.
+Bug class caught: HNSW state not persisting across a reopen, or non-deterministic
+candidate selection on replay.
 
 **`recovery_byte_sweep_rules`** (also a replay identity test)
 At every crash point, `open_with(surviving_state)` re-materializes derived edges from
@@ -12602,13 +12589,13 @@ cargo test -p sim-harness --test oracle_equivalence approximate_wal_replay_ident
 
 ## Recall floors for approximate mode
 
-`VectorSimilar` with `approximate: true` uses IVF-Flat candidate selection. The recall
+`VectorSimilar` with `approximate: true` uses HNSW candidate selection. The recall
 floor constants are binding (declared in `crates/sim-harness/src/lib.rs`; do not lower
 without explicit sign-off):
 
 ```text
-APPROX_RECALL_FLOOR_QUIESCED = 0.90   # fully quiesced: all nodes indexed, IVF fitted
-APPROX_RECALL_FLOOR_RECOVERY = 0.85   # any crash-recovery or early IVF state
+APPROX_RECALL_FLOOR_QUIESCED = 0.90   # fully quiesced: all nodes indexed, HNSW built
+APPROX_RECALL_FLOOR_RECOVERY = 0.85   # any crash-recovery or early HNSW build state
 ```
 
 Tests:
