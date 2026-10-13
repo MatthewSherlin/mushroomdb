@@ -1359,6 +1359,10 @@ fn graph_tools() -> Vec<Js> {
                             "description": "Edge property that stores the score (default: weight)."
                         },
                         "max_edges": { "type": ["integer", "null"] },
+                        "approximate": {
+                            "type": "boolean",
+                            "description": "Find candidates through the HNSW index instead of comparing every pair (default: false). Only for a VectorSimilar predicate; the edges are approximate, not exact."
+                        },
                         "namespace": {
                             "type": "string",
                             "description": "Scope the rule to one namespace: it sees only that namespace's nodes — source, via hop and destination — so every edge it derives stays inside. Omitted means a global rule, which is the only kind that may derive an edge across a boundary."
@@ -1832,6 +1836,48 @@ mod tests {
             .map(|t| t["name"].as_str().expect("name"))
             .collect();
         assert_eq!(names, ASSOCIATION_TOOLS.to_vec());
+    }
+
+    /// Binding: every argument `suggest_rules` hands back for `create_rule`
+    /// is one `create_rule`'s advertised schema lists. A vector proposal over
+    /// a large label carries `approximate: true`, which the tool accepts.
+    #[test]
+    fn create_rule_advertises_every_argument_a_suggestion_carries() {
+        let def = RuleDef {
+            name: "sim".into(),
+            src_label: "Person".into(),
+            dst_label: "Person".into(),
+            predicate: Predicate::VectorSimilar {
+                field: "emb".into(),
+                min: 0.9,
+            },
+            edge_type: "SIMILAR".into(),
+            weight_prop: Some("score".into()),
+            max_edges: Some(8),
+            approximate: true,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        };
+        let args = core_api::memory::suggest::create_rule_args(&def);
+        assert_eq!(args["approximate"], json!(true), "{args}");
+
+        let tools = graph_tools();
+        let schema = tools
+            .iter()
+            .find(|t| t["name"] == json!("create_rule"))
+            .expect("create_rule is a graph tool");
+        let advertised = schema["inputSchema"]["properties"]
+            .as_object()
+            .expect("properties");
+        for arg in args.as_object().expect("an object").keys() {
+            assert!(
+                advertised.contains_key(arg),
+                "create_rule's schema does not list {arg:?}, which a suggestion carries"
+            );
+        }
+        assert_eq!(advertised["approximate"]["type"], json!("boolean"));
     }
 
     /// Binding: `pairwise_similar` is advertised on the memory surface

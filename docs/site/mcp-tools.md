@@ -196,6 +196,7 @@ How should this kind of relationship be derived from now on — declare a rule (
 
 | Argument | Type | Required | What it is |
 |---|---|---|---|
+| `approximate` | boolean | no | Find candidates through the HNSW index instead of comparing every pair (default: false). Only for a VectorSimilar predicate; the edges are approximate, not exact. |
 | `dst_label` | string | yes |  |
 | `edge_type` | string | yes |  |
 | `max_edges` | integer or null | no |  |
