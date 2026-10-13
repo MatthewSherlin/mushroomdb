@@ -4,7 +4,7 @@
 //! ```text
 //! [0..4]   MAGIC "GDB1"
 //! [4..6]   VERSION = 8 or 9 (u16 LE) — same container, V9 adds section 12
-//! [6..8]   section_count (u16 LE) — currently 13
+//! [6..8]   section_count (u16 LE) — 14 since 0.7.2 (15 with a WAL mark)
 //! [8..8+16*N] SectionEntry * N  -- {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}
 //! [8+16*N..8+16*N+4]  whole-header CRC32
 //! [..4096]  zero-pad
@@ -95,6 +95,14 @@ pub const SECTION_STRINGS: u8 = 12;
 /// in every other snapshot, and ignored by a reader that does not know the
 /// id. (Id 13 is the full-text index's.)
 pub const SECTION_WAL_MARK: u8 = 14;
+/// Says the writer of this snapshot removes a deleted node's edges from the
+/// snapshot it was working over, so the topology holds no edge to or from a
+/// retired id. Through 0.7.1 it could (a node deleted after a snapshot kept
+/// the edges that snapshot held), and an open of a snapshot without this
+/// section looks for such edges and drops them. Four bytes, [`SWEPT_MAGIC`].
+pub const SECTION_EDGES_SWEPT: u8 = 15;
+/// The whole payload of [`SECTION_EDGES_SWEPT`].
+pub const SWEPT_MAGIC: &[u8; 4] = b"MSWP";
 
 /// The leading part of a WAL that a snapshot already holds.
 ///
@@ -181,6 +189,7 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_IVF_STATE
             | SECTION_STRINGS
             | SECTION_WAL_MARK
+            | SECTION_EDGES_SWEPT
     )
 }
 
@@ -336,6 +345,7 @@ impl MappedBase {
             SECTION_LAST_CHANGE => "last_change",
             SECTION_STRINGS => "strings",
             SECTION_WAL_MARK => "wal_mark",
+            SECTION_EDGES_SWEPT => "edges_swept",
             _ => "unknown",
         };
         self.dir
@@ -713,6 +723,16 @@ impl MappedBase {
             return Ok(&[]);
         }
         self.section_bytes(SECTION_IVF_STATE)
+    }
+
+    /// Whether this snapshot says its topology holds no edge of a deleted
+    /// node (section 15). False for a snapshot written before the section
+    /// existed, by a binary that does not write it, or with a damaged one.
+    pub fn edges_swept(&self) -> bool {
+        self.has_section(SECTION_EDGES_SWEPT)
+            && self
+                .section_bytes(SECTION_EDGES_SWEPT)
+                .is_ok_and(|bytes| bytes == SWEPT_MAGIC)
     }
 
     /// The WAL mark this snapshot carries (section 14), if it carries one

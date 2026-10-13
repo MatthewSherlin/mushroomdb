@@ -221,14 +221,14 @@ impl ViewStore {
         // Real-prop collision: any ColumnStore field not owned by a view.
         let view_props: std::collections::HashSet<&str> =
             self.views.values().map(|v| v.view_prop.as_str()).collect();
-        // Asked of the snapshot's columns as well as what was written since:
-        // a property every node got before the snapshot is in the first and
-        // not the second, and a view allowed to take its name then owns it —
-        // and deleting the view deletes the property.
-        let taken = !view_props.contains(def.view_prop.as_str())
-            && build_cols_view(props, base_cols)
-                .field_names()
-                .contains(&def.view_prop);
+        // Of what was written since the snapshot only. The whole check —
+        // the snapshot's columns included — is made by the caller before the
+        // record is logged. This is the replay's side of it and stays as
+        // narrow as it was, so a `CreateView` an earlier release logged over
+        // a property its snapshot held does not stop the store opening.
+        let taken = props
+            .fields()
+            .any(|f| f == def.view_prop && !view_props.contains(f));
         if taken {
             return Err(format!(
                 "view_prop {:?} conflicts with an existing node property",
@@ -311,6 +311,30 @@ impl ViewStore {
         labels: &[u32],
         base_cols: Option<BaseColumns<'_>>,
     ) {
+        self.on_edge_changed_except(
+            etype, src, dst, inserted, props, topo, ids, syms, labels, base_cols, None,
+        );
+    }
+
+    /// [`Self::on_edge_changed`], leaving the views of `gone` alone. For the
+    /// edges swept with a node that is being deleted: its own view values go
+    /// with it, and recomputing them once for each of its edges made deleting
+    /// a hub quadratic in its degree.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_edge_changed_except(
+        &self,
+        etype: u32,
+        src: u32,
+        dst: u32,
+        inserted: bool,
+        props: &mut ColumnStore,
+        topo: &TopologyView<'_>,
+        ids: &IdMap,
+        syms: &Interner,
+        labels: &[u32],
+        base_cols: Option<BaseColumns<'_>>,
+        gone: Option<u32>,
+    ) {
         for def in self.views.values() {
             let Some(et_sym) = syms.get(def.edge_type()) else {
                 continue;
@@ -331,6 +355,9 @@ impl ViewStore {
                 Direction::Out => dst,
                 Direction::In => src,
             };
+            if gone == Some(subject) {
+                continue;
+            }
             update_node_view(
                 def, subject, neighbor, inserted, props, topo, ids, syms, labels, base_cols,
             );

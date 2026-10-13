@@ -446,3 +446,121 @@ fn a_view_over_a_derived_edge_is_right_after_replaying_writes_over_a_snapshot() 
     let db: Db = GraphDb::open(&dir).unwrap();
     assert_eq!(degrees(&db), live, "after a reopen");
 }
+
+/// Binding: a snapshot says its writer sweeps a deleted node's edges, and the
+/// search for leftovers at open runs only where a snapshot does not say so.
+/// The fixture from 0.7.1 does not; once this release has opened it, dropped
+/// the edges and taken a snapshot, that snapshot does.
+#[test]
+fn a_snapshot_says_its_edges_were_swept() {
+    let has_mark = |dir: &std::path::Path| {
+        std::fs::read(dir.join("snapshot.bin"))
+            .unwrap()
+            .windows(4)
+            .any(|w| w == b"MSWP")
+    };
+    let dir = tmp("swept-mark");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("snapshot.bin"),
+        include_bytes!("fixtures/dangling_edges_071.bin"),
+    )
+    .unwrap();
+    assert!(!has_mark(&dir));
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.stats().edges, 1);
+    db.snapshot().unwrap();
+    drop(db);
+    assert!(has_mark(&dir));
+    let db: Db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.stats().edges, 1);
+    assert_eq!(db.neighbors("c", "E", Direction::Out).unwrap(), vec!["b"]);
+}
+
+/// Binding: deleting a node that many others point at, on a store with a
+/// snapshot and a view over that edge type, leaves every other node's view
+/// right. (Its own view values go with it; they used to be recomputed once
+/// for each of its edges.)
+#[test]
+fn deleting_a_hub_after_a_snapshot_leaves_its_neighbours_views_right() {
+    let dir = tmp("hub");
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    db.create_view(deg_view()).unwrap();
+    db.insert_node("A", "hub", vec![]).unwrap();
+    for i in 0..200 {
+        let k = format!("n{i}");
+        db.insert_node("A", &k, vec![]).unwrap();
+        db.insert_edge("E", "hub", &k).unwrap();
+        db.insert_edge("E", &k, "hub").unwrap();
+    }
+    db.insert_edge("E", "n0", "n1").unwrap();
+    db.snapshot().unwrap();
+    assert_eq!(db.get_prop("hub", "deg"), Some(Value::Int(200)));
+    assert_eq!(db.get_prop("n0", "deg"), Some(Value::Int(2)));
+    db.delete_node("hub").unwrap();
+    assert_eq!(db.get_prop("n0", "deg"), Some(Value::Int(1)));
+    assert_eq!(db.get_prop("n7", "deg"), Some(Value::Int(0)));
+    assert_eq!(db.stats().edges, 1);
+    drop(db);
+    let db: Db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.get_prop("n0", "deg"), Some(Value::Int(1)));
+    assert_eq!(db.get_prop("n7", "deg"), Some(Value::Int(0)));
+    assert_eq!(db.stats().edges, 1);
+}
+
+/// Binding: a view deleted after a snapshot can be made again straight away.
+/// The name check looked for the column, and the snapshot still has the
+/// column after every value in it is hidden; what makes a name taken is a
+/// node that still reads a value under it.
+#[test]
+fn a_view_deleted_after_a_snapshot_can_be_created_again() {
+    let dir = tmp("recreate");
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    db.create_view(deg_view()).unwrap();
+    db.insert_node("A", "a", vec![]).unwrap();
+    db.insert_node("A", "b", vec![]).unwrap();
+    db.insert_edge("E", "a", "b").unwrap();
+    db.snapshot().unwrap();
+    db.delete_view("deg").unwrap();
+    db.create_view(deg_view()).expect("the name is free again");
+    assert_eq!(db.get_prop("a", "deg"), Some(Value::Int(1)));
+    drop(db);
+    let db: Db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.get_prop("a", "deg"), Some(Value::Int(1)));
+    assert_eq!(db.get_prop("b", "deg"), Some(Value::Int(0)));
+}
+
+/// Binding: replaying a `CreateView` never stops a store opening. The two
+/// stores here were written by a build of the `v0.7.1` tag and open under it:
+///
+/// - `L1`: a view, nodes, a snapshot keeping the WAL, the view deleted, a
+///   second such snapshot. The snapshot still holds the view's column.
+/// - `L3`: a view, nodes, the view deleted, a real property written under the
+///   freed name, a snapshot keeping the WAL.
+///
+/// Both snapshots kept their WAL, so the whole WAL — the `CreateView` in it
+/// included — replays over a snapshot that already has the name. A name check
+/// in the replay that reads the snapshot refuses that record and the open
+/// with it.
+#[test]
+fn a_replayed_create_view_does_not_stop_a_store_from_an_earlier_release_opening() {
+    for (name, snapshot, wal) in [
+        (
+            "L1",
+            &include_bytes!("fixtures/legacy_071/L1.snapshot.bin")[..],
+            &include_bytes!("fixtures/legacy_071/L1.wal.bin")[..],
+        ),
+        (
+            "L3",
+            &include_bytes!("fixtures/legacy_071/L3.snapshot.bin")[..],
+            &include_bytes!("fixtures/legacy_071/L3.wal.bin")[..],
+        ),
+    ] {
+        let dir = tmp(&format!("legacy-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("snapshot.bin"), snapshot).unwrap();
+        std::fs::write(dir.join("wal.bin"), wal).unwrap();
+        let db: Db = GraphDb::open(&dir).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(db.stats().nodes_live > 0, "{name}");
+    }
+}

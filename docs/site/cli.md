@@ -217,7 +217,7 @@ Write `snapshot.bin` and archive the WAL as `wal.<N>.archive`, so history reads 
 mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
 ```
 
-Audit snapshot integrity: CRC32 all 13 sections plus an rkyv structural pass over the mmap'd ones, exit 2 on any mismatch
+Audit snapshot integrity: CRC32 every section plus an rkyv structural pass over the mmap'd ones, exit 2 on any mismatch
 
 ### `migrate`
 

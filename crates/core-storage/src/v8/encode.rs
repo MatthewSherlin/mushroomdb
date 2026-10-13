@@ -246,15 +246,22 @@ pub fn encode_v8<W: Write>(
         (SECTION_IVF_STATE, ivf_bytes),
         (SECTION_LAST_CHANGE, last_change_bytes),
     ];
-    // Left out entirely when there is nothing to carry, so a snapshot that
-    // does not keep its WAL is the bytes it always was. Not at the end: the
-    // last section stays a small, eagerly-CRC'd one.
-    if !meta.wal_mark.is_empty() {
+    // The mark is left out entirely when there is nothing to carry. Neither
+    // of these goes at the end: the last section stays a small,
+    // eagerly-CRC'd one.
+    let swept: &[u8] = crate::v8::SWEPT_MAGIC;
+    for (id, bytes) in [
+        (SECTION_WAL_MARK, meta.wal_mark.as_slice()),
+        (crate::v8::SECTION_EDGES_SWEPT, swept),
+    ] {
+        if bytes.is_empty() {
+            continue;
+        }
         let at = sections
             .iter()
             .position(|(id, _)| *id == SECTION_IDS)
             .unwrap_or(sections.len() - 1);
-        sections.insert(at, (SECTION_WAL_MARK, &meta.wal_mark));
+        sections.insert(at, (id, bytes));
     }
     let n = sections.len();
 

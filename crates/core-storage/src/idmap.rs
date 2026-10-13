@@ -109,6 +109,11 @@ impl IdMap {
         Some(id)
     }
 
+    /// Every retired id, ascending.
+    pub fn tombstoned_ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.tombstones.iter().copied()
+    }
+
     /// Returns `true` if `id` has been retired by a prior `delete` call.
     pub fn is_tombstoned(&self, id: u32) -> bool {
         self.tombstones.contains(&id)

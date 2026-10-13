@@ -2544,7 +2544,11 @@ impl<F: Fs> GraphDb<F> {
             trace_open!("restore_v8_base", _t0);
             db.base = Some(mapped);
             trace_open!("base assigned", _t0);
-            db.drop_edges_of_retired_nodes();
+            // Only a snapshot from a writer that could leave a deleted node's
+            // edges behind is searched for them.
+            if !db.base.as_ref().is_some_and(|base| base.edges_swept()) {
+                db.drop_edges_of_retired_nodes();
+            }
         } else if !snap_header.is_empty() {
             // Legacy V5-V7: full read required for decode.
             let snap_bytes = db.fs.read(FileId::Snapshot)?;
@@ -3494,6 +3498,7 @@ impl<F: Fs> GraphDb<F> {
                 if let Some(state) = state {
                     if state.wal_truncated {
                         db.restore_snapshot_state(state)?;
+                        db.drop_edges_of_retired_nodes();
                     } else if base_is_gone {
                         return Err(GraphError::CommitOutOfRange {
                             commit,
@@ -3507,6 +3512,7 @@ impl<F: Fs> GraphDb<F> {
                 if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
                     if state.wal_truncated {
                         db.restore_snapshot_state(state)?;
+                        db.drop_edges_of_retired_nodes();
                     } else if base_is_gone {
                         return Err(GraphError::CommitOutOfRange {
                             commit,
@@ -4528,7 +4534,7 @@ impl<F: Fs> GraphDb<F> {
                     Arc::make_mut(&mut self.edge_props).remove_edge(et, s, d);
                     // View maintenance: n's own view values will be cleared by
                     // remove_all below; only update surviving neighbors.
-                    self.view_store.on_edge_changed(
+                    self.view_store.on_edge_changed_except(
                         et,
                         s,
                         d,
@@ -4539,6 +4545,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.syms,
                         &self.labels,
                         base_columns(&self.base),
+                        Some(n),
                     );
                 }
 
@@ -7456,12 +7463,20 @@ impl<F: Fs> GraphDb<F> {
         }
         // A view cannot take the name of a property nodes already carry —
         // in the snapshot or written since. Refused here, before the WAL
-        // write: `apply` refuses it too, but by then the record is logged,
-        // and the next open replays it and fails.
-        if build_props_view(&self.props, &self.base)
-            .field_names()
-            .contains(&def.view_prop)
-        {
+        // write: `apply` refuses some of it too, but by then the record is
+        // logged, and the next open replays it and fails.
+        //
+        // "Carry" is a node that reads a value under the name. The column
+        // alone does not count: a snapshot keeps the column of a view that
+        // has since been deleted, with every value in it hidden, and that
+        // name is free.
+        let taken = {
+            let pv = build_props_view(&self.props, &self.base);
+            pv.field_names().contains(&def.view_prop)
+                && (0..self.ids.len() as u32)
+                    .any(|id| !self.ids.is_tombstoned(id) && pv.get(id, &def.view_prop).is_some())
+        };
+        if taken {
             return Err(GraphError::RuleInvalid {
                 detail: format!(
                     "view_prop {:?} conflicts with an existing node property",
@@ -7561,18 +7576,18 @@ impl<F: Fs> GraphDb<F> {
     /// kept the edges that snapshot held (ledger row 95), and the next
     /// snapshot wrote them into its own base, where they answered a
     /// neighbour read with `topology id N has no key`. This is what repairs
-    /// such a store: it costs a pass over the id table and nothing more when
-    /// no deleted node has an edge. The removal is in memory until the next
-    /// snapshot, which then no longer carries them.
+    /// such a store. It asks for the neighbours of every retired id under
+    /// every edge type, which on a store with half a million deleted nodes is
+    /// over a second, so it runs only over a snapshot that does not say its
+    /// writer sweeps them (`MappedBase::edges_swept`). The removal is in
+    /// memory until the next snapshot, which no longer carries them and says
+    /// so.
     fn drop_edges_of_retired_nodes(&mut self) {
         let mut doomed = Vec::new();
         {
             let tv = self.topo_view();
             let etypes: Vec<u32> = tv.etypes().collect();
-            for n in 0..self.ids.len() as u32 {
-                if !self.ids.is_tombstoned(n) {
-                    continue;
-                }
+            for n in self.ids.tombstoned_ids() {
                 for et in &etypes {
                     for &dst in tv.neighbors(*et, Direction::Out, n).as_ref() {
                         doomed.push((*et, n, dst));
@@ -13252,6 +13267,13 @@ impl<F: Fs> GraphDb<F> {
     /// WAL markers appended at firing time (Task 1). `was_linked` reads these markers
     /// and therefore includes derived edges in its point-in-time evaluation,
     /// matching `edge_history`'s fidelity.
+    ///
+    /// ## Which nodes
+    ///
+    /// `a` and `b` name the nodes that hold those keys now, and the answer
+    /// follows each of them back through its renames. A node that held one of
+    /// the keys earlier and was deleted is another node: for a commit at
+    /// which that earlier node was linked, the answer is `false`.
     pub fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> Result<bool> {
         use core_storage::wal::WalRecord;
 
