@@ -1330,9 +1330,10 @@ the same score to two decimals.
 
 Raises `IngestError` when the text is empty or over 4,000 characters,
 the `kind` is unknown, an entity's `props` carry `aliases` or
-`alias_keys`, or a name is empty or only whitespace — a key in
+`alias_keys`, a name is empty or only whitespace — a key in
 `about`, an entity's `key` or `label`, or a fact's `subject`,
-`predicate` or `object`; nothing is written. Its `.detail` is the
+`predicate` or `object` — or a key would be stubbed with more than
+32 aliases; nothing is written. Its `.detail` is the
 bare sentence; the message carries an `ingest error: ` prefix in
 front of it.
 
