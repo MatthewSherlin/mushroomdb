@@ -252,13 +252,16 @@ pub fn encode_v8<W: Write>(
         (SECTION_IVF_STATE, ivf_bytes),
         (SECTION_LAST_CHANGE, last_change_bytes),
     ];
-    // The two optional sections. Each is left out entirely when there is
-    // nothing to carry, so a store with no full-text pair, and a snapshot
-    // that does not keep its WAL, write the bytes they always wrote. Neither
-    // goes at the end: the last section stays a small, eagerly-CRC'd one.
+    // The optional sections. The index and the mark are left out entirely
+    // when there is nothing to carry, so a store with no full-text pair that
+    // does not keep its WAL writes only the swept marker beside what it
+    // always wrote. None goes at the end: the last section stays a small,
+    // eagerly-CRC'd one.
+    let swept: &[u8] = crate::v8::SWEPT_MAGIC;
     for (id, bytes) in [
-        (SECTION_FULLTEXT, &meta.fulltext_blob),
-        (SECTION_WAL_MARK, &meta.wal_mark),
+        (SECTION_FULLTEXT, meta.fulltext_blob.as_slice()),
+        (SECTION_WAL_MARK, meta.wal_mark.as_slice()),
+        (crate::v8::SECTION_EDGES_SWEPT, swept),
     ] {
         if bytes.is_empty() {
             continue;
@@ -963,18 +966,13 @@ fn bitmap_for_each<F: FnMut(u32)>(words: &[rkyv::Archived<u64>], mut f: F) {
 
 /// Reconstruct an `IdMap` from archived data.
 pub fn archived_to_idmap(archived: &crate::v8::layout::ArchivedIdMap) -> IdMap {
-    let mut ids = IdMap::new();
     let tombstoned: BTreeSet<u32> = archived.tombstones.iter().map(|t| u32::from(*t)).collect();
-    for (i, key) in archived.to_key.iter().enumerate() {
-        let s = key.as_str();
-        if tombstoned.contains(&(i as u32)) {
-            ids.get_or_insert(s);
-            ids.delete(s);
-        } else if !s.is_empty() {
-            ids.get_or_insert(s);
-        }
-    }
-    ids
+    let to_key: Vec<String> = archived
+        .to_key
+        .iter()
+        .map(|key| key.as_str().to_string())
+        .collect();
+    IdMap::from_slots(to_key, tombstoned)
 }
 
 /// Reconstruct an `Interner` from archived data.

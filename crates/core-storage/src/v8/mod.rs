@@ -4,7 +4,7 @@
 //! ```text
 //! [0..4]   MAGIC "GDB1"
 //! [4..6]   VERSION = 8 or 9 (u16 LE) — same container, V9 adds section 12
-//! [6..8]   section_count (u16 LE) — 13, or 14 with the full-text index
+//! [6..8]   section_count (u16 LE) — 14 since 0.7.2; one more with a WAL mark, one more with the full-text index
 //! [8..8+16*N] SectionEntry * N  -- {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}
 //! [8+16*N..8+16*N+4]  whole-header CRC32
 //! [..4096]  zero-pad
@@ -102,6 +102,14 @@ pub const SECTION_FULLTEXT: u8 = 13;
 /// in every other snapshot, and ignored by a reader that does not know the
 /// id.
 pub const SECTION_WAL_MARK: u8 = 14;
+/// Says the writer of this snapshot removes a deleted node's edges from the
+/// snapshot it was working over, so the topology holds no edge to or from a
+/// retired id. Through 0.7.1 it could (a node deleted after a snapshot kept
+/// the edges that snapshot held), and an open of a snapshot without this
+/// section looks for such edges and drops them. Four bytes, [`SWEPT_MAGIC`].
+pub const SECTION_EDGES_SWEPT: u8 = 15;
+/// The whole payload of [`SECTION_EDGES_SWEPT`].
+pub const SWEPT_MAGIC: &[u8; 4] = b"MSWP";
 
 /// The leading part of a WAL that a snapshot already holds.
 ///
@@ -109,26 +117,26 @@ pub const SECTION_WAL_MARK: u8 = 14;
 /// that replays that WAL over it applies every write a second time — and a
 /// replayed insert of a key since renamed or deleted makes a second node.
 /// The mark says where the snapshot was taken: `len` bytes into the WAL, with
-/// a checksum of the first [`WalMark::PREFIX`] of them so that a WAL which
-/// is not the one the snapshot was taken beside is not skipped into.
+/// a checksum of every one of them, so that only the WAL the snapshot was
+/// taken beside is skipped into. Every byte, and not a sample: a WAL that
+/// lost its tail and grew past `len` again has new writes inside the old
+/// length, and a mark that still matched would have them skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalMark {
     /// Bytes of WAL the snapshot holds.
     pub len: u64,
-    /// CRC32 of the first `min(len, PREFIX)` bytes of that WAL.
-    pub prefix_crc: u32,
+    /// CRC32 of those bytes.
+    pub crc: u32,
 }
 
 impl WalMark {
-    /// How much of the WAL's start the checksum covers.
-    pub const PREFIX: usize = 1 << 20;
     const MAGIC: &'static [u8; 4] = b"MWAL";
 
     /// The mark for a WAL whose bytes are `wal`, all of them held.
     pub fn of(wal: &[u8]) -> Self {
         Self {
             len: wal.len() as u64,
-            prefix_crc: crc32fast::hash(&wal[..wal.len().min(Self::PREFIX)]),
+            crc: crc32fast::hash(wal),
         }
     }
 
@@ -137,14 +145,14 @@ impl WalMark {
         let Ok(len) = usize::try_from(self.len) else {
             return false;
         };
-        wal.len() >= len && crc32fast::hash(&wal[..len.min(Self::PREFIX)]) == self.prefix_crc
+        wal.len() >= len && crc32fast::hash(&wal[..len]) == self.crc
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(20);
         out.extend_from_slice(Self::MAGIC);
         out.extend_from_slice(&self.len.to_le_bytes());
-        out.extend_from_slice(&self.prefix_crc.to_le_bytes());
+        out.extend_from_slice(&self.crc.to_le_bytes());
         let crc = crc32fast::hash(&out);
         out.extend_from_slice(&crc.to_le_bytes());
         out
@@ -159,7 +167,7 @@ impl WalMark {
         }
         Some(Self {
             len: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
-            prefix_crc: u32::from_le_bytes(bytes[12..16].try_into().ok()?),
+            crc: u32::from_le_bytes(bytes[12..16].try_into().ok()?),
         })
     }
 }
@@ -189,6 +197,7 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_STRINGS
             | SECTION_FULLTEXT
             | SECTION_WAL_MARK
+            | SECTION_EDGES_SWEPT
     )
 }
 
@@ -345,6 +354,7 @@ impl MappedBase {
             SECTION_STRINGS => "strings",
             SECTION_FULLTEXT => "fulltext",
             SECTION_WAL_MARK => "wal_mark",
+            SECTION_EDGES_SWEPT => "edges_swept",
             _ => "unknown",
         };
         self.dir
@@ -735,6 +745,16 @@ impl MappedBase {
             return Ok(&[]);
         }
         self.section_bytes(SECTION_FULLTEXT)
+    }
+
+    /// Whether this snapshot says its topology holds no edge of a deleted
+    /// node (section 15). False for a snapshot written before the section
+    /// existed, by a binary that does not write it, or with a damaged one.
+    pub fn edges_swept(&self) -> bool {
+        self.has_section(SECTION_EDGES_SWEPT)
+            && self
+                .section_bytes(SECTION_EDGES_SWEPT)
+                .is_ok_and(|bytes| bytes == SWEPT_MAGIC)
     }
 
     /// The WAL mark this snapshot carries (section 14), if it carries one

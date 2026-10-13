@@ -170,6 +170,7 @@ fn apply_one(
     edge_props: &mut EdgeProps,
     labels: &mut Vec<u32>,
     fulltext: &mut FulltextIndex,
+    base: &Option<Arc<MappedBase>>,
     rec: &WalRecord,
 ) -> Result<()> {
     match rec {
@@ -281,15 +282,28 @@ fn apply_one(
                 }
                 // Sweep all edges incident on this node to prevent phantom
                 // adjacency. db.rs deletes these edges inline without emitting
-                // DeleteEdge WAL records, so we must mirror that sweep here.
-                let etypes: Vec<u32> = topo.etypes().collect();
+                // DeleteEdge WAL records, so we must mirror that sweep here —
+                // over the snapshot's edges as well as the overlay's, as
+                // db.rs does.
                 let mut doomed = Vec::new();
-                for et in &etypes {
-                    for &dst in topo.neighbors(*et, Direction::Out, node_id).as_ref() {
-                        doomed.push((*et, node_id, dst));
-                    }
-                    for &src in topo.neighbors(*et, Direction::In, node_id).as_ref() {
-                        doomed.push((*et, src, node_id));
+                {
+                    let tv = match base {
+                        None => TopologyView::owned(topo),
+                        Some(b) => match b.topology() {
+                            Ok(archived) => TopologyView::with_base(topo, archived),
+                            Err(_) => TopologyView::owned(topo),
+                        },
+                    };
+                    let etypes: Vec<u32> = tv.etypes().collect();
+                    for et in &etypes {
+                        for &dst in tv.neighbors(*et, Direction::Out, node_id).as_ref() {
+                            doomed.push((*et, node_id, dst));
+                        }
+                        for &src in tv.neighbors(*et, Direction::In, node_id).as_ref() {
+                            if src != node_id {
+                                doomed.push((*et, src, node_id));
+                            }
+                        }
                     }
                 }
                 for (et, s, d) in doomed {
@@ -336,7 +350,7 @@ fn apply_one(
 
         WalRecord::Batch(inner) => {
             for r in inner {
-                apply_one(ids, syms, topo, props, edge_props, labels, fulltext, r)?;
+                apply_one(ids, syms, topo, props, edge_props, labels, fulltext, base, r)?;
             }
         }
 
@@ -487,6 +501,7 @@ impl ReaderSnapshot {
                     Arc::make_mut(&mut w.edge_props),
                     Arc::make_mut(&mut w.labels),
                     Arc::make_mut(&mut w.fulltext),
+                    &self.base,
                     rec,
                 )?;
             }

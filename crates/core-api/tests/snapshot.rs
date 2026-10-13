@@ -3588,3 +3588,107 @@ fn a_keep_wal_snapshot_still_replays_declarations_and_what_came_after() {
         .was_linked("a", "b2", "CITES", db.wal_total_commits().unwrap() - 1)
         .unwrap());
 }
+
+/// Binding: the mark a keep-WAL snapshot carries matches only the WAL it was
+/// taken beside, byte for byte. It used to check the WAL's length and its
+/// first MiB. A larger WAL that lost its tail and then grew past the old
+/// length again — a torn tail repaired at open, then new writes — still
+/// matched, and the new writes lying inside the old length were skipped as
+/// ones the snapshot already held: acknowledged, on disk, and gone at the
+/// next open.
+#[test]
+fn a_wal_that_lost_its_tail_and_grew_back_is_not_taken_for_the_one_marked() {
+    let dir = tmp("keepwal-regrown");
+    let big = "x".repeat(4000);
+    let doc = |body: &str| vec![("body".into(), Value::Str(body.into()))];
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        for i in 0..400 {
+            db.insert_node("Doc", &format!("pad{i}"), doc(&big))
+                .unwrap();
+        }
+        db.snapshot_with(keep_wal()).unwrap();
+    }
+    // Damage one frame well past the first MiB; the open repairs the WAL by
+    // dropping it and what follows.
+    let wal = dir.join("wal.bin");
+    let mut bytes = std::fs::read(&wal).unwrap();
+    assert!(
+        bytes.len() > (1 << 20) + 20_000,
+        "the WAL is {} bytes",
+        bytes.len()
+    );
+    let at = bytes.len() - 9_000;
+    bytes[at] ^= 0xff;
+    std::fs::write(&wal, &bytes).unwrap();
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        assert!(std::fs::metadata(&wal).unwrap().len() < bytes.len() as u64);
+        for i in 0..6 {
+            db.insert_node("Doc", &format!("after{i}"), doc(&big))
+                .unwrap();
+        }
+    }
+    let db = GraphDb::open(&dir).unwrap();
+    let missing: Vec<String> = (0..6)
+        .map(|i| format!("after{i}"))
+        .filter(|k| !db.has_node(k))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "written, acknowledged and lost: {missing:?}"
+    );
+    assert_eq!(db.stats().nodes_live, 406);
+}
+
+/// Binding: a node renamed onto a key that a deleted node once held survives
+/// a snapshot and a reopen.
+///
+/// A snapshot lists every key slot, live and retired, and the reader rebuilt
+/// the key table by inserting them in order. A retired slot whose key a
+/// lower, live slot now carries — delete `b`, rename `a` to `b` — found that
+/// key already present, allocated nothing, and retired the live node in its
+/// place: `corrupt data: v8: labels section has 2 entries but id table has 1
+/// total slots`, at every open after any kind of snapshot.
+#[test]
+fn a_node_renamed_onto_a_retired_key_survives_a_snapshot() {
+    for (name, opts) in [
+        ("truncate", SnapshotOptions::default()),
+        ("keep", keep_wal()),
+        (
+            "archive",
+            SnapshotOptions {
+                archive_wal: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let dir = tmp(&format!("retired-key-{name}"));
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            db.insert_node("A", "a", vec![("n".into(), Value::Int(1))])
+                .unwrap();
+            db.insert_node("A", "b", vec![("n".into(), Value::Int(2))])
+                .unwrap();
+            db.insert_node("A", "c", vec![]).unwrap();
+            db.insert_edge("KNOWS", "c", "a").unwrap();
+            db.delete_node("b").unwrap();
+            db.rename_node("a", "b").unwrap();
+            db.snapshot_with(opts).unwrap();
+        }
+        let mut db = GraphDb::open(&dir).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(db.stats().nodes_live, 2, "{name}");
+        assert_eq!(db.get_prop("b", "n"), Some(Value::Int(1)), "{name}");
+        assert!(!db.has_node("a"), "{name}");
+        assert_eq!(
+            db.neighbors("c", "KNOWS", Direction::Out).unwrap(),
+            vec!["b"],
+            "{name}"
+        );
+        // And the reopened store takes writes and another snapshot.
+        db.insert_node("A", "a", vec![]).unwrap();
+        db.snapshot().unwrap();
+        drop(db);
+        assert_eq!(GraphDb::open(&dir).unwrap().stats().nodes_live, 3, "{name}");
+    }
+}

@@ -2575,6 +2575,11 @@ impl<F: Fs> GraphDb<F> {
             trace_open!("restore_v8_base", _t0);
             db.base = Some(mapped);
             trace_open!("base assigned", _t0);
+            // Only a snapshot from a writer that could leave a deleted node's
+            // edges behind is searched for them.
+            if !db.base.as_ref().is_some_and(|base| base.edges_swept()) {
+                db.drop_edges_of_retired_nodes();
+            }
             db.load_fulltext_from_base();
             trace_open!("full-text index read from the snapshot", _t0);
         } else if !snap_header.is_empty() {
@@ -2645,7 +2650,11 @@ impl<F: Fs> GraphDb<F> {
             .as_ref()
             .and_then(|base| base.wal_mark())
             .filter(|mark| mark.matches(&bytes))
-            .map_or(0, |mark| decode_all(&bytes[..mark.len as usize]).0.len());
+            .map(|mark| (mark.len as usize, decode_all(&bytes[..mark.len as usize])))
+            // The mark was taken at the end of a whole WAL, so it ends on a
+            // frame boundary; one that does not is not this WAL's.
+            .filter(|(len, (_, consumed))| consumed == len)
+            .map_or(0, |(_, (held, _))| held.len());
         let replayed = db.apply_frames_over(records, held);
         db.fulltext_rebuild_follows = false;
         db.replaying_at_open = false;
@@ -2831,7 +2840,16 @@ impl<F: Fs> GraphDb<F> {
         // declaration defers to its first write.
         let mut retained_consumed = false;
         let applied = records.len();
+        // A live commit turns on the engine's report of the edges its rules
+        // add and retract, which is what keeps a view over a derived edge
+        // type current. Replay has to do the same, or a store with a snapshot
+        // — where nothing recomputes the views afterwards — reopens with the
+        // counts the snapshot had.
+        let emitted_before = self.engine.emit_deltas();
         for (i, rec) in records.into_iter().enumerate() {
+            if !self.view_store.is_empty() && !self.engine.emit_deltas() {
+                self.engine.set_emit_deltas(true);
+            }
             // A frame the snapshot already holds is counted and not applied,
             // unless it is a declaration.
             let apply = i >= held || is_declaration(&rec);
@@ -2869,6 +2887,7 @@ impl<F: Fs> GraphDb<F> {
         // Any future as-of replay path (Plan-15 T2) must drain here to feed
         // replaying subscribers; the mechanism is already in place.
         let _ = self.engine.drain_deltas(); // belt-and-braces no-op after loop drain
+        self.engine.set_emit_deltas(emitted_before);
         Ok(applied)
     }
 
@@ -3555,6 +3574,7 @@ impl<F: Fs> GraphDb<F> {
                 if let Some(state) = state {
                     if state.wal_truncated {
                         db.restore_snapshot_state(state)?;
+                        db.drop_edges_of_retired_nodes();
                     } else if base_is_gone {
                         return Err(GraphError::CommitOutOfRange {
                             commit,
@@ -3568,6 +3588,7 @@ impl<F: Fs> GraphDb<F> {
                 if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
                     if state.wal_truncated {
                         db.restore_snapshot_state(state)?;
+                        db.drop_edges_of_retired_nodes();
                     } else if base_is_gone {
                         return Err(GraphError::CommitOutOfRange {
                             commit,
@@ -4571,14 +4592,25 @@ impl<F: Fs> GraphDb<F> {
                 // Collect then remove so neighbor slices stay valid during
                 // iteration. Remove from topo first, then call view maintenance
                 // so Avg/Min/Max recompute sees the correct (reduced) neighbor set.
-                let etypes: Vec<u32> = self.topo.etypes().collect();
+                //
+                // Through the view of the snapshot and what was written since,
+                // not `self.topo` alone: that is only what was written since,
+                // and an edge the snapshot holds was left behind, pointing at
+                // a node that was gone (ledger row 95).
                 let mut doomed = Vec::new();
-                for et in &etypes {
-                    for &dst in self.topo.neighbors(*et, Direction::Out, n).as_ref() {
-                        doomed.push((*et, n, dst));
-                    }
-                    for &src in self.topo.neighbors(*et, Direction::In, n).as_ref() {
-                        doomed.push((*et, src, n));
+                {
+                    let tv = self.topo_view();
+                    let etypes: Vec<u32> = tv.etypes().collect();
+                    for et in &etypes {
+                        for &dst in tv.neighbors(*et, Direction::Out, n).as_ref() {
+                            doomed.push((*et, n, dst));
+                        }
+                        for &src in tv.neighbors(*et, Direction::In, n).as_ref() {
+                            // A self-loop is already listed from its Out side.
+                            if src != n {
+                                doomed.push((*et, src, n));
+                            }
+                        }
                     }
                 }
                 for (et, s, d) in doomed {
@@ -4586,7 +4618,7 @@ impl<F: Fs> GraphDb<F> {
                     Arc::make_mut(&mut self.edge_props).remove_edge(et, s, d);
                     // View maintenance: n's own view values will be cleared by
                     // remove_all below; only update surviving neighbors.
-                    self.view_store.on_edge_changed(
+                    self.view_store.on_edge_changed_except(
                         et,
                         s,
                         d,
@@ -4597,6 +4629,7 @@ impl<F: Fs> GraphDb<F> {
                         &self.syms,
                         &self.labels,
                         base_columns(&self.base),
+                        Some(n),
                     );
                 }
 
@@ -4673,13 +4706,14 @@ impl<F: Fs> GraphDb<F> {
                     return Ok(());
                 }
                 self.view_store
-                    .create_view(
+                    .create_view_over(
                         def,
                         Arc::make_mut(&mut self.props),
                         &build_topo_view(&self.topo, &self.base),
                         &self.ids,
                         &self.syms,
                         &self.labels,
+                        base_columns(&self.base),
                     )
                     .map_err(|e| GraphError::RuleInvalid { detail: e })?;
             }
@@ -4688,6 +4722,11 @@ impl<F: Fs> GraphDb<F> {
                 if !self.view_store.has_view(name) {
                     return Ok(());
                 }
+                let doomed_prop = self
+                    .view_store
+                    .views()
+                    .find(|v| v.name == *name)
+                    .map(|v| (v.label.clone(), v.view_prop.clone()));
                 self.view_store
                     .delete_view(
                         name,
@@ -4697,6 +4736,23 @@ impl<F: Fs> GraphDb<F> {
                         &self.syms,
                     )
                     .map_err(|_| GraphError::RuleNotFound { name: name.clone() })?;
+                // `delete_view` clears the view's property from what was
+                // written since the snapshot. A value the snapshot holds is
+                // hidden by a tombstone, or it stays readable on every node
+                // of the label after the view that owned it is gone.
+                if let (Some((label, prop)), true) = (doomed_prop, self.base.is_some()) {
+                    if let Some(label_sym) = self.syms.get(&label) {
+                        for id in 0..self.ids.len() as u32 {
+                            if self.labels.get(id as usize).copied() == Some(label_sym)
+                                && build_props_view(&self.props, &self.base)
+                                    .get(id, &prop)
+                                    .is_some()
+                            {
+                                Arc::make_mut(&mut self.props).record_prop_tombstone(id, &prop);
+                            }
+                        }
+                    }
+                }
             }
             WalRecord::EnableFulltext { label, field } => {
                 // Replay-over-snapshot idempotency: already enabled → skip.
@@ -7489,6 +7545,29 @@ impl<F: Fs> GraphDb<F> {
                 ),
             });
         }
+        // A view cannot take the name of a property nodes already carry —
+        // in the snapshot or written since. Refused here, before the WAL
+        // write: `apply` refuses some of it too, but by then the record is
+        // logged, and the next open replays it and fails.
+        //
+        // "Carry" is a node that reads a value under the name. The column
+        // alone does not count: a snapshot keeps the column of a view that
+        // has since been deleted, with every value in it hidden, and that
+        // name is free.
+        let taken = {
+            let pv = build_props_view(&self.props, &self.base);
+            pv.field_names().contains(&def.view_prop)
+                && (0..self.ids.len() as u32)
+                    .any(|id| !self.ids.is_tombstoned(id) && pv.get(id, &def.view_prop).is_some())
+        };
+        if taken {
+            return Err(GraphError::RuleInvalid {
+                detail: format!(
+                    "view_prop {:?} conflicts with an existing node property",
+                    def.view_prop
+                ),
+            });
+        }
         let def_bytes = bincode::serialize(&def).map_err(|e| GraphError::Corrupt {
             detail: format!("serialize view: {e}"),
         })?;
@@ -7653,6 +7732,55 @@ impl<F: Fs> GraphDb<F> {
             return Vec::new();
         }
         self.fulltext.to_blob(self.ids.len() as u32)
+    }
+
+    /// Remove every edge the snapshot holds to or from a node that has been
+    /// deleted.
+    ///
+    /// There should be none. Through 0.7.1 a node deleted after a snapshot
+    /// kept the edges that snapshot held (ledger row 95), and the next
+    /// snapshot wrote them into its own base, where they answered a
+    /// neighbour read with `topology id N has no key`. This is what repairs
+    /// such a store. It asks for the neighbours of every retired id under
+    /// every edge type, which on a store with half a million deleted nodes is
+    /// over a second, so it runs only over a snapshot that does not say its
+    /// writer sweeps them (`MappedBase::edges_swept`). The removal is in
+    /// memory until the next snapshot, which no longer carries them and says
+    /// so.
+    fn drop_edges_of_retired_nodes(&mut self) {
+        let mut doomed = Vec::new();
+        {
+            let tv = self.topo_view();
+            let etypes: Vec<u32> = tv.etypes().collect();
+            for n in self.ids.tombstoned_ids() {
+                for et in &etypes {
+                    for &dst in tv.neighbors(*et, Direction::Out, n).as_ref() {
+                        doomed.push((*et, n, dst));
+                    }
+                    for &src in tv.neighbors(*et, Direction::In, n).as_ref() {
+                        if src != n {
+                            doomed.push((*et, src, n));
+                        }
+                    }
+                }
+            }
+        }
+        for (et, s, d) in doomed {
+            Arc::make_mut(&mut self.topo).remove_edge(et, s, d);
+            Arc::make_mut(&mut self.edge_props).remove_edge(et, s, d);
+            self.view_store.on_edge_changed(
+                et,
+                s,
+                d,
+                false,
+                Arc::make_mut(&mut self.props),
+                &build_topo_view(&self.topo, &self.base),
+                &self.ids,
+                &self.syms,
+                &self.labels,
+                base_columns(&self.base),
+            );
+        }
     }
 
     /// Whether `(label, field)` is currently indexed for full-text search.
@@ -12763,10 +12891,28 @@ impl<F: Fs> GraphDb<F> {
         queried_key: &str,
         floor: u64,
     ) -> Vec<(String, u64, Option<u64>)> {
+        self.key_alias_intervals(frames, queried_key, floor, false)
+    }
+
+    /// [`Self::build_key_alias_intervals`], and with `current_holder_only`
+    /// the queried key itself is bounded too: it counts from the commit the
+    /// node that has it now acquired it. An earlier node that held the same
+    /// key and was deleted is then no part of the answer — neither its edges
+    /// nor its deletion.
+    fn key_alias_intervals(
+        &self,
+        frames: &[core_storage::wal::WalRecord],
+        queried_key: &str,
+        floor: u64,
+        current_holder_only: bool,
+    ) -> Vec<(String, u64, Option<u64>)> {
         use core_storage::wal::WalRecord;
 
         // Pre-pass: build reverse_rename and key_starts maps.
-        let mut reverse_rename: HashMap<String, (String, u64)> = HashMap::new();
+        // Every rename into a key, in commit order. A key can be renamed into
+        // more than once — `a → b`, `b → a`, `a → b` — and which rename led
+        // to the occupancy being followed depends on when.
+        let mut reverse_rename: HashMap<String, Vec<(String, u64)>> = HashMap::new();
         let mut key_starts: HashMap<String, Vec<u64>> = HashMap::new();
 
         for (local_i, frame) in frames.iter().enumerate() {
@@ -12784,7 +12930,10 @@ impl<F: Fs> GraphDb<F> {
                         // new_key came into existence at this commit.
                         key_starts.entry(new_key.clone()).or_default().push(commit);
                         // Record the reverse rename: new_key was introduced by renaming old_key.
-                        reverse_rename.insert(new_key.clone(), (old_key.clone(), commit));
+                        reverse_rename
+                            .entry(new_key.clone())
+                            .or_default()
+                            .push((old_key.clone(), commit));
                     }
                     _ => {}
                 }
@@ -12806,6 +12955,11 @@ impl<F: Fs> GraphDb<F> {
                     .get(&current_key)
                     .and_then(|starts| starts.iter().rev().find(|&&s| s < vu).copied())
                     .unwrap_or(floor)
+            } else if current_holder_only {
+                key_starts
+                    .get(&current_key)
+                    .and_then(|starts| starts.last().copied())
+                    .unwrap_or(floor)
             } else {
                 // Queried key — no upper bound; may have been introduced at any commit.
                 floor
@@ -12813,7 +12967,27 @@ impl<F: Fs> GraphDb<F> {
 
             result.push((current_key.clone(), valid_from, current_valid_until));
 
-            match reverse_rename.get(&current_key) {
+            // The rename that led here: the latest into this key, and for an
+            // alias the latest before the alias stopped being this node's.
+            // Each step goes strictly back in time, so the walk ends — taking
+            // the last rename whatever its commit sent `a → b → a` round for
+            // ever.
+            let led_here = reverse_rename
+                .get(&current_key)
+                .and_then(|renames| {
+                    renames
+                        .iter()
+                        .rev()
+                        .find(|(_, at)| current_valid_until.is_none_or(|until| *at < until))
+                })
+                // And only if that rename is how this occupancy of the key
+                // began. A key renamed into, deleted and inserted fresh
+                // starts a new node at the insert; the older rename led to
+                // the node that was deleted.
+                .filter(|(_, at)| {
+                    (current_valid_until.is_none() && !current_holder_only) || *at == valid_from
+                });
+            match led_here {
                 Some((old_key, rename_commit)) => {
                     current_valid_until = Some(*rename_commit);
                     current_key = old_key.clone();
@@ -13268,6 +13442,13 @@ impl<F: Fs> GraphDb<F> {
     /// WAL markers appended at firing time (Task 1). `was_linked` reads these markers
     /// and therefore includes derived edges in its point-in-time evaluation,
     /// matching `edge_history`'s fidelity.
+    ///
+    /// ## Which nodes
+    ///
+    /// `a` and `b` name the nodes that hold those keys now, and the answer
+    /// follows each of them back through its renames. A node that held one of
+    /// the keys earlier and was deleted is another node: for a commit at
+    /// which that earlier node was linked, the answer is `false`.
     pub fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> Result<bool> {
         use core_storage::wal::WalRecord;
 
@@ -13296,14 +13477,23 @@ impl<F: Fs> GraphDb<F> {
 
         // Resolve all historical names for a and b (handles RenameNode in the WAL).
         // Intervals are commit-bounded so recycled keys don't contaminate point-in-time reads.
-        let alias_a = self.build_key_alias_intervals(&frames, a, floor);
-        let alias_b = self.build_key_alias_intervals(&frames, b, floor);
+        let alias_a = self.key_alias_intervals(&frames, a, floor, true);
+        let alias_b = self.key_alias_intervals(&frames, b, floor, true);
+        // The two nodes themselves, when both are live. A record that names
+        // its endpoints by dense id is then matched by id: a retired id keeps
+        // the key it last had, and matching on that string took an earlier,
+        // deleted holder of the key for the node that has it now.
+        let live_ids = self.ids.get(a).zip(self.ids.get(b));
 
         // Local index into surviving frames (0 = first frame of oldest archive).
         let local_commit = at_commit - floor;
 
-        // Replay local frames 0..=local_commit, tracking active edges.
-        let mut active: BTreeSet<(String, String, String)> = BTreeSet::new();
+        // Replay local frames 0..=local_commit, tracking active edges between
+        // the two nodes: the edge type and whether it runs from `a` to `b`.
+        // Tracked by which node, not by the key each record names it with: an
+        // edge written while a node was called one thing and deleted while it
+        // was called another is the same edge.
+        let mut active: BTreeSet<(String, bool)> = BTreeSet::new();
 
         for (local_i, frame) in frames.iter().enumerate().take((local_commit + 1) as usize) {
             let commit = floor + local_i as u64;
@@ -13323,8 +13513,11 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.insert((et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.insert((et.clone(), true));
+                        }
+                        if is_ba {
+                            active.insert((et.clone(), false));
                         }
                     }
                     WalRecord::InsertEdgeId { etype, src, dst } => {
@@ -13335,14 +13528,20 @@ impl<F: Fs> GraphDb<F> {
                         // Use key_of_historical so tombstoned nodes resolve.
                         let src_key = self.ids.key_of_historical(*src);
                         let dst_key = self.ids.key_of_historical(*dst);
-                        let is_ab = src_key == Some(a) && dst_key == Some(b);
-                        let is_ba = src_key == Some(b) && dst_key == Some(a);
-                        if is_ab || is_ba {
-                            active.insert((
-                                etype_str,
-                                src_key.unwrap().to_string(),
-                                dst_key.unwrap().to_string(),
-                            ));
+                        let (is_ab, is_ba) = match live_ids {
+                            Some((id_a, id_b)) => {
+                                (*src == id_a && *dst == id_b, *src == id_b && *dst == id_a)
+                            }
+                            None => (
+                                src_key == Some(a) && dst_key == Some(b),
+                                src_key == Some(b) && dst_key == Some(a),
+                            ),
+                        };
+                        if is_ab {
+                            active.insert((etype_str.clone(), true));
+                        }
+                        if is_ba {
+                            active.insert((etype_str, false));
                         }
                     }
                     WalRecord::DeleteEdge {
@@ -13354,16 +13553,20 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.remove(&(et.clone(), true));
+                        }
+                        if is_ba {
+                            active.remove(&(et.clone(), false));
                         }
                     }
                     WalRecord::DeleteNode { key: k }
                         if Self::aliases_match(&alias_a, k, commit)
                             || Self::aliases_match(&alias_b, k, commit) =>
                     {
-                        // All edges touching the deleted node are gone.
-                        active.retain(|(_, s, d)| s != k && d != k);
+                        // One of the two nodes is gone, and every edge
+                        // between them with it.
+                        active.clear();
                     }
                     WalRecord::DerivedEdgeAdded {
                         edge_type: et,
@@ -13375,8 +13578,11 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.insert((et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.insert((et.clone(), true));
+                        }
+                        if is_ba {
+                            active.insert((et.clone(), false));
                         }
                     }
                     WalRecord::DerivedEdgeRetracted {
@@ -13389,8 +13595,11 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.remove(&(et.clone(), true));
+                        }
+                        if is_ba {
+                            active.remove(&(et.clone(), false));
                         }
                     }
                     _ => {}
@@ -13398,7 +13607,7 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        Ok(active.iter().any(|(et, _, _)| et == edge_type))
+        Ok(active.iter().any(|(et, _)| et == edge_type))
     }
 
     /// Every edge incident to `key` — either endpoint — that existed at WAL
@@ -14074,18 +14283,18 @@ impl<F: Fs> GraphDb<F> {
                         .map_err(|e| GraphError::Corrupt {
                             detail: format!("v8 snapshot: edge_props raw bytes: {e:?}"),
                         })?;
-                let prov_raw =
-                    old_base
-                        .provenance_raw_bytes()
-                        .map_err(|e| GraphError::Corrupt {
-                            detail: format!("v8 snapshot: provenance raw bytes: {e:?}"),
-                        })?;
                 encode_v8(
                     Some(archived_csr),
                     Some(archived_cols),
                     archived_strings,
                     Some((archived_edge_props, edge_props_raw)),
-                    Some(prov_raw),
+                    // Never the old snapshot's provenance bytes. The encoder
+                    // passes them through when the live map is empty, taking
+                    // empty for "never loaded" — but it is loaded above, so
+                    // empty means every rule's edges are gone, and passing
+                    // the old section through brought them back as owned by
+                    // rules that no longer derive them (ledger row 95).
+                    None,
                     &self.topo,
                     &self.props,
                     &self.ids,

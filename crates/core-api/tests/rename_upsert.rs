@@ -943,3 +943,201 @@ fn an_edge_deleted_before_a_rename_in_the_same_batch_can_be_reinserted_after_it(
         vec!["d".to_string()]
     );
 }
+
+/// Binding: a history read on a node renamed away and back again returns.
+///
+/// The reads follow a key back through the renames that led to it. With
+/// `a → b` and then `b → a` each key was the other's predecessor, and the walk
+/// went round for ever: `was_linked`, `node_history`, `edge_history` and
+/// `edges_at` on such a node never came back.
+#[test]
+fn a_history_read_on_a_node_renamed_away_and_back_returns() {
+    let dir = tmp("rename-cycle-history");
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node(
+            "Person",
+            "a",
+            vec![("name".into(), Value::Str("Ann".into()))],
+        )
+        .unwrap();
+        db.insert_node("Person", "x", vec![]).unwrap();
+        db.insert_edge("KNOWS", "x", "a").unwrap();
+        db.rename_node("a", "b").unwrap();
+        db.rename_node("b", "a").unwrap();
+        db.rename_node("a", "b").unwrap();
+        db.rename_node("b", "a").unwrap();
+        let last = db.wal_total_commits().unwrap() - 1;
+        let linked_then = db.was_linked("x", "a", "KNOWS", 1).unwrap();
+        let linked_now = db.was_linked("x", "a", "KNOWS", last).unwrap();
+        let history = db.node_history("a").unwrap().items.len();
+        let _ = done.send((linked_then, linked_now, history));
+    });
+    let (linked_then, linked_now, history) = finished
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the history reads did not return");
+    assert!(!linked_then, "the edge was written at commit 2");
+    assert!(linked_now);
+    assert!(history >= 1, "the node's own insert, at least: {history}");
+}
+
+/// `was_linked(x, <key>)` at every commit, as `T`/`f`, after `steps` on a
+/// store holding nodes `a` (commit 0) and `x` (commit 1).
+fn linked_at_every_commit(name: &str, steps: &[(&str, &str, &str)], key: &str) -> String {
+    let mut db = GraphDb::open(&tmp(name)).unwrap();
+    db.insert_node("Doc", "a", vec![]).unwrap();
+    db.insert_node("Doc", "x", vec![]).unwrap();
+    for (op, from, to) in steps {
+        match *op {
+            "rename" => db.rename_node(from, to).unwrap(),
+            "link" => {
+                db.insert_edge("E", from, to).unwrap();
+            }
+            "unlink" => {
+                db.delete_edge("E", from, to).unwrap();
+            }
+            other => panic!("unknown step {other}"),
+        }
+    }
+    (0..db.wal_total_commits().unwrap())
+        .map(|c| {
+            if db.was_linked("x", key, "E", c).unwrap() {
+                'T'
+            } else {
+                'f'
+            }
+        })
+        .collect()
+}
+
+/// Binding: `was_linked` follows the node, not the name an edge was written
+/// or deleted under. An edge written while the node was `a` and deleted while
+/// it was `b` is gone, whatever the node is called now.
+///
+/// The read kept the edges it had seen by the keys in each record, so a
+/// delete recorded under one name did not remove an edge recorded under
+/// another: after `a → b → a`, and after `a → b → c`, it went on answering
+/// "linked" for an edge that had been deleted.
+#[test]
+fn was_linked_sees_a_delete_made_under_another_of_the_nodes_names() {
+    // commits:                       0 1 2 3 4 5 6
+    //   insert a, insert x, link, rename, unlink, rename, link
+    assert_eq!(
+        linked_at_every_commit(
+            "linked-there-and-back",
+            &[
+                ("link", "x", "a"),
+                ("rename", "a", "b"),
+                ("unlink", "x", "b"),
+                ("rename", "b", "a"),
+                ("link", "x", "a"),
+            ],
+            "a",
+        ),
+        "ffTTffT"
+    );
+    assert_eq!(
+        linked_at_every_commit(
+            "linked-chain",
+            &[
+                ("link", "x", "a"),
+                ("rename", "a", "b"),
+                ("unlink", "x", "b"),
+                ("rename", "b", "c"),
+            ],
+            "c",
+        ),
+        "ffTTff"
+    );
+    assert_eq!(
+        linked_at_every_commit(
+            "linked-round-twice",
+            &[
+                ("link", "x", "a"),
+                ("rename", "a", "b"),
+                ("unlink", "x", "b"),
+                ("rename", "b", "a"),
+                ("rename", "a", "b"),
+                ("link", "x", "b"),
+                ("rename", "b", "a"),
+            ],
+            "a",
+        ),
+        "ffTTfffTT"
+    );
+    // The shapes that were already right.
+    assert_eq!(
+        linked_at_every_commit(
+            "linked-one-rename",
+            &[
+                ("link", "x", "a"),
+                ("rename", "a", "b"),
+                ("unlink", "x", "b"),
+                ("link", "x", "b"),
+            ],
+            "b",
+        ),
+        "ffTTfT"
+    );
+    assert_eq!(
+        linked_at_every_commit(
+            "linked-plain",
+            &[("link", "x", "a"), ("unlink", "x", "a"), ("link", "x", "a")],
+            "a",
+        ),
+        "ffTfT"
+    );
+}
+
+/// Binding: `was_linked` asks about the node that has the key now. An
+/// earlier node that once held the same key, and was deleted, is another
+/// node: its deletion does not unlink this one, and its edges are not this
+/// one's.
+#[test]
+fn was_linked_is_not_confused_by_an_earlier_node_that_held_the_key() {
+    // insert e, insert c, link e–c, insert b, delete b, rename e→b, a write.
+    let dir = tmp("linked-earlier-holder");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "e", vec![]).unwrap(); // 0
+    db.insert_node("N", "c", vec![]).unwrap(); // 1
+    db.insert_edge("E", "e", "c").unwrap(); // 2
+    db.insert_node("N", "b", vec![]).unwrap(); // 3
+    db.insert_edge("E", "b", "c").unwrap(); // 4: the earlier b's own edge
+    db.delete_node("b").unwrap(); // 5
+    db.rename_node("e", "b").unwrap(); // 6
+    db.set_prop("c", "n", Value::Int(1)).unwrap(); // 7
+    assert_eq!(db.neighbors("b", "E", Direction::Out).unwrap(), vec!["c"]);
+    let answers: String = (0..db.wal_total_commits().unwrap())
+        .map(|c| {
+            if db.was_linked("b", "c", "E", c).unwrap() {
+                'T'
+            } else {
+                'f'
+            }
+        })
+        .collect();
+    // Linked from the commit e–c was written, and still: deleting the other
+    // b at commit 5 is not this node's deletion.
+    assert_eq!(answers, "ffTTTTTT");
+
+    // A key used again after its holder was deleted has none of that
+    // holder's past: the new `a` was never linked to `c`.
+    let dir = tmp("linked-reused-key");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.insert_node("N", "a", vec![]).unwrap(); // 0
+    db.insert_node("N", "c", vec![]).unwrap(); // 1
+    db.insert_edge("E", "a", "c").unwrap(); // 2
+    db.delete_node("a").unwrap(); // 3
+    db.insert_node("N", "a", vec![]).unwrap(); // 4
+    let answers: String = (0..db.wal_total_commits().unwrap())
+        .map(|c| {
+            if db.was_linked("a", "c", "E", c).unwrap() {
+                'T'
+            } else {
+                'f'
+            }
+        })
+        .collect();
+    assert_eq!(answers, "fffff");
+}
