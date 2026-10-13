@@ -455,9 +455,6 @@ impl ViewStore {
         syms: &Interner,
         labels: &[u32],
     ) {
-        if !self.views.is_empty() {
-            self.touched.push(node);
-        }
         for def in self.views.values() {
             let Some(label_sym) = syms.get(&def.label) else {
                 continue;
@@ -465,6 +462,7 @@ impl ViewStore {
             if labels.get(node as usize).copied() != Some(label_sym) {
                 continue;
             }
+            self.touched.push(node);
             match &def.source {
                 ViewSource::Degree { .. } => {
                     if props.get(node, &def.view_prop).is_none() {

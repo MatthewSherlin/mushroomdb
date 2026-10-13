@@ -351,3 +351,40 @@ fn a_commit_that_moves_a_view_on_thousands_of_nodes_is_current_in_a_reader() {
         assert_eq!(db.node_info(s).unwrap().props, read);
     }
 }
+
+/// A fold is cheap to take and dear to have taken: it shares the store's
+/// maps with the reader, so the commit after it copies them before it can
+/// write. A bulk load that folded on every batch paid that copy on every
+/// batch, and loaded a tenth as fast.
+fn load_in_batches(db: &mut Db, label: &str, batches: usize, per_batch: usize) {
+    for batch in 0..batches {
+        let mut b = db.batch();
+        for i in 0..per_batch {
+            b.insert_node(label, &format!("{label}-{batch}-{i}"), vec![]);
+        }
+        b.commit().unwrap();
+    }
+}
+
+#[test]
+fn a_bulk_load_of_a_label_no_view_is_on_does_not_fold_on_every_batch() {
+    let dir = tmp("bulk-other");
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    db.create_view(deg_view()).unwrap();
+    load_in_batches(&mut db, "N", 5, 1100);
+    assert_eq!(db.reader().deltas.len(), 5, "one delta for each batch");
+}
+
+#[test]
+fn a_bulk_load_of_a_label_a_view_is_on_does_not_fold_on_every_batch() {
+    let dir = tmp("bulk-viewed");
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    db.create_view(deg_view()).unwrap();
+    load_in_batches(&mut db, "A", 5, 1100);
+    let reader = db.reader();
+    assert_eq!(reader.deltas.len(), 5, "one delta for each batch");
+    for key in ["A-0-0", "A-2-555", "A-4-1099"] {
+        let read = reader.node_info(key).unwrap().props;
+        assert_eq!(read.get("deg"), Some(&Value::Int(0)), "{key}");
+    }
+}

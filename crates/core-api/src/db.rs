@@ -3754,16 +3754,25 @@ impl<F: Fs> GraphDb<F> {
     /// for the reader's delta tail — or `None` when the commit should be
     /// folded instead of described.
     ///
-    /// Creating or deleting a view writes its property on every node of a
-    /// label, and one write to a hub can move a view on every neighbour; a
-    /// delta listing those would be held, and replayed by every reader, until
-    /// the next fold. A fold is a handful of `Arc` clones.
+    /// Folded: a commit that creates or deletes a view, which writes its
+    /// property on every node of a label, and one that moves far more view
+    /// values than it has records — a write to a hub moves a view on every
+    /// neighbour. A delta listing those would be held, and replayed by every
+    /// reader, until the next fold.
+    ///
+    /// Not folded: a commit whose view values are in proportion to its
+    /// records, however many. A bulk load gives each node it inserts a
+    /// starting value, and the reader replays each of those inserts anyway. A
+    /// fold is eight `Arc` clones to take, but it shares the store's maps
+    /// with the reader, so the commit after it copies them in full; a load
+    /// that folded on every batch paid that on every batch.
     fn view_values_of_commit(
         &mut self,
         rec: &WalRecord,
     ) -> Option<Vec<(u32, String, Option<Value>)>> {
-        /// Above this many touched nodes a fold is cheaper than a delta.
-        const MAX_TOUCHED: usize = 1024;
+        /// View values a commit may carry beyond those its own records
+        /// account for.
+        const MAX_BEYOND_RECORDS: usize = 1024;
 
         fn declares_a_view(rec: &WalRecord) -> bool {
             match rec {
@@ -3773,15 +3782,24 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
+        fn leaf_records(rec: &WalRecord) -> usize {
+            match rec {
+                WalRecord::Batch(inner) => inner.iter().map(leaf_records).sum(),
+                _ => 1,
+            }
+        }
+
         let mut touched = self.view_store.take_touched();
         if declares_a_view(rec) {
             return None;
         }
+        if touched.is_empty() {
+            return Some(Vec::new());
+        }
         touched.sort_unstable();
         touched.dedup();
-        if touched.len() > MAX_TOUCHED {
-            return None;
-        }
+        let views = self.view_store.views().count();
+        let budget = MAX_BEYOND_RECORDS + leaf_records(rec).saturating_mul(views);
         let cols = build_props_view(&self.props, &self.base);
         let mut values = Vec::new();
         for &node in &touched {
@@ -3794,6 +3812,9 @@ impl<F: Fs> GraphDb<F> {
             for def in self.view_store.views() {
                 if label.is_none() || self.syms.get(&def.label) != label {
                     continue;
+                }
+                if values.len() == budget {
+                    return None;
                 }
                 let value = cols.get(node, &def.view_prop).map(|v| v.into_value());
                 values.push((node, def.view_prop.clone(), value));
