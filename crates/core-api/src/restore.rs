@@ -32,7 +32,7 @@ pub enum RestoreOutcome {
 ///
 /// Kept in the same order, so a restore writes them the way a backup wrote
 /// them. Archives are found by name at copy time, since their count varies.
-const RESTORE_FILES: [&str; 7] = [
+const RESTORE_FILES: [&str; 8] = [
     "snapshot.bin",
     "snapshot.bin.bak",
     "wal.bin",
@@ -40,6 +40,7 @@ const RESTORE_FILES: [&str; 7] = [
     "wal.genesis",
     "roles.json",
     "commit_times.bin",
+    "snapshot.intent",
 ];
 
 /// Is there a store in `dir` already?
