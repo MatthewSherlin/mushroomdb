@@ -300,6 +300,48 @@ jobs:
           curl -sf http://127.0.0.1:18080/stats | grep -q nodes_live
           curl -sf http://127.0.0.1:18080/node/person-01 | grep -q person-01
 
+  # The targets a release does not build yet. Each is built here, and the
+  # binary run where the runner can run it, so that adding one to
+  # `release.yml` is a matter of the matrix and not of finding out on a tag
+  # that it does not compile.
+  more-targets:
+    name: target-${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: [test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on an Apple Silicon runner: the hosted Intel ones are the
+          # runners that sat queued past the 24h cap in v0.1.0.
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
+      - run: rustup target add ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build -p mushroomdb-cli --bin mushroomdb --release --target ${{ matrix.target }}
+      - name: demo, query, snapshot, reopen
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/mushroomdb"
+          [ -f "$BIN.exe" ] && BIN="$BIN.exe"
+          DB="$RUNNER_TEMP/smoke-db"
+          "$BIN" --version
+          "$BIN" demo "$DB"
+          "$BIN" query "$DB" "MATCH (p:Person) RETURN count(p) AS people"
+          "$BIN" snapshot "$DB"
+          "$BIN" stats "$DB"
+          "$BIN" verify "$DB"
+
   docker:
     needs: [test]
     runs-on: ubuntu-latest
