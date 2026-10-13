@@ -12701,6 +12701,21 @@ impl<F: Fs> GraphDb<F> {
         queried_key: &str,
         floor: u64,
     ) -> Vec<(String, u64, Option<u64>)> {
+        self.key_alias_intervals(frames, queried_key, floor, false)
+    }
+
+    /// [`Self::build_key_alias_intervals`], and with `current_holder_only`
+    /// the queried key itself is bounded too: it counts from the commit the
+    /// node that has it now acquired it. An earlier node that held the same
+    /// key and was deleted is then no part of the answer — neither its edges
+    /// nor its deletion.
+    fn key_alias_intervals(
+        &self,
+        frames: &[core_storage::wal::WalRecord],
+        queried_key: &str,
+        floor: u64,
+        current_holder_only: bool,
+    ) -> Vec<(String, u64, Option<u64>)> {
         use core_storage::wal::WalRecord;
 
         // Pre-pass: build reverse_rename and key_starts maps.
@@ -12750,6 +12765,11 @@ impl<F: Fs> GraphDb<F> {
                     .get(&current_key)
                     .and_then(|starts| starts.iter().rev().find(|&&s| s < vu).copied())
                     .unwrap_or(floor)
+            } else if current_holder_only {
+                key_starts
+                    .get(&current_key)
+                    .and_then(|starts| starts.last().copied())
+                    .unwrap_or(floor)
             } else {
                 // Queried key — no upper bound; may have been introduced at any commit.
                 floor
@@ -12762,12 +12782,21 @@ impl<F: Fs> GraphDb<F> {
             // Each step goes strictly back in time, so the walk ends — taking
             // the last rename whatever its commit sent `a → b → a` round for
             // ever.
-            let led_here = reverse_rename.get(&current_key).and_then(|renames| {
-                renames
-                    .iter()
-                    .rev()
-                    .find(|(_, at)| current_valid_until.is_none_or(|until| *at < until))
-            });
+            let led_here = reverse_rename
+                .get(&current_key)
+                .and_then(|renames| {
+                    renames
+                        .iter()
+                        .rev()
+                        .find(|(_, at)| current_valid_until.is_none_or(|until| *at < until))
+                })
+                // And only if that rename is how this occupancy of the key
+                // began. A key renamed into, deleted and inserted fresh
+                // starts a new node at the insert; the older rename led to
+                // the node that was deleted.
+                .filter(|(_, at)| {
+                    (current_valid_until.is_none() && !current_holder_only) || *at == valid_from
+                });
             match led_here {
                 Some((old_key, rename_commit)) => {
                     current_valid_until = Some(*rename_commit);
@@ -13251,8 +13280,13 @@ impl<F: Fs> GraphDb<F> {
 
         // Resolve all historical names for a and b (handles RenameNode in the WAL).
         // Intervals are commit-bounded so recycled keys don't contaminate point-in-time reads.
-        let alias_a = self.build_key_alias_intervals(&frames, a, floor);
-        let alias_b = self.build_key_alias_intervals(&frames, b, floor);
+        let alias_a = self.key_alias_intervals(&frames, a, floor, true);
+        let alias_b = self.key_alias_intervals(&frames, b, floor, true);
+        // The two nodes themselves, when both are live. A record that names
+        // its endpoints by dense id is then matched by id: a retired id keeps
+        // the key it last had, and matching on that string took an earlier,
+        // deleted holder of the key for the node that has it now.
+        let live_ids = self.ids.get(a).zip(self.ids.get(b));
 
         // Local index into surviving frames (0 = first frame of oldest archive).
         let local_commit = at_commit - floor;
@@ -13297,8 +13331,15 @@ impl<F: Fs> GraphDb<F> {
                         // Use key_of_historical so tombstoned nodes resolve.
                         let src_key = self.ids.key_of_historical(*src);
                         let dst_key = self.ids.key_of_historical(*dst);
-                        let is_ab = src_key == Some(a) && dst_key == Some(b);
-                        let is_ba = src_key == Some(b) && dst_key == Some(a);
+                        let (is_ab, is_ba) = match live_ids {
+                            Some((id_a, id_b)) => {
+                                (*src == id_a && *dst == id_b, *src == id_b && *dst == id_a)
+                            }
+                            None => (
+                                src_key == Some(a) && dst_key == Some(b),
+                                src_key == Some(b) && dst_key == Some(a),
+                            ),
+                        };
                         if is_ab {
                             active.insert((etype_str.clone(), true));
                         }
