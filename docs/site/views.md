@@ -120,17 +120,6 @@ let err = db.set_prop("london", "pop", Value::Int(999));
 // err == Err(ViewPropReadOnly { view_name: "city_population" })
 ```
 
-## Breaking Change: Format Version 5
-
-> **Pre-alpha notice.** Snapshot format version 5 (introduced with materialized
-> views) is incompatible with version 4.  A binary built from this commit
-> refuses to open a V4 snapshot with a clear error:
-> `snapshot: unsupported version 4 — V4 snapshot is no longer supported; re-snapshot with a V5 binary`.
->
-> **Rebuild procedure:** delete `snapshot.bin` and re-open the database; the
-> WAL is replayed from scratch and a fresh V5 snapshot is written on the next
-> `snapshot()` call.
-
 ## Persistence
 
 View **definitions** are WAL-persisted as `CreateView` / `DeleteView`
