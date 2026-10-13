@@ -2,7 +2,7 @@
 //! and explain why two nodes are linked.
 //!
 //! ```text
-//! cargo run -p core-api --example quickstart
+//! cargo run -p mushroomdb --example quickstart
 //! ```
 
 use core_api::{GraphDb, Predicate, RuleDef, Value};

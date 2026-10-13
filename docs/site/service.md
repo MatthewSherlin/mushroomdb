@@ -23,6 +23,7 @@ A store is a directory. Mount it; everything below follows from that.
 | `wal.genesis` | the marker that lets `asof` replay into the archives | `asof` reach below the last snapshot |
 | `roles.json` | role tokens and their masks | every configured role |
 | `wal.<N>.archive` | the folded WAL each snapshot left behind | `node_history`, `edge_history`, `was_linked` and `asof` reach into that span |
+| `commit_times.bin` | commit → wall-clock sidecar; written atomically as commits land | date-resolution (`at_commit` RFC 3339 form, `resolve_date`, `commit_time_ms`) — a restored store cannot resolve dates until new commits build a fresh sidecar |
 | `LOCK` | always empty; carries the advisory cross-process write lock | cross-process coordination for handles opened afterwards |
 
 All of them matter. A backup that takes `snapshot.bin` alone is a store with no
@@ -90,6 +91,12 @@ The command copies `snapshot.bin`, `snapshot.bin.bak`, `wal.bin`, `wal.floor`,
 `wal.genesis`, `roles.json` and every `wal.<N>.archive` into the destination,
 then **verifies**: it CRC-checks the copy and opens it. The printed report ends
 in `verified: true`, and a copy that does not verify is one you must not use.
+
+`commit_times.bin` is **not** copied by a backup. A store restored from a backup
+answers `no_recorded_time` for date-resolution requests (`at_commit` RFC 3339
+strings, `resolve_date`, `commit_time_ms`) until new commits build a fresh
+sidecar. Commit-index–based history (`node_history`, `edge_history`, `was_linked`
+with integer `at_commit`) is unaffected.
 
 > **The CLI form is unsafe against a live `serve`.** It says so in the usage
 > text: the copies are not atomic across processes, so a backup taken while a

@@ -144,11 +144,12 @@ clone = {**base_rule, "name": "skill_fit_v2", "predicate": why[0]["predicate"]}
 db.create_rule(clone)
 ```
 
-**`max_edges` semantics:** Python `None` and a missing key both fill the
-predicate default (32 for scored predicates, 512 for KeyMatch). This is the same
-as HTTP `null` — neither Python nor HTTP can express the Rust `max_edges: None`
-global-budget hatch (1,000,000 per source). Use the Rust API directly if you
-need the uncapped budget.
+**`max_edges` semantics:** a missing key fills the predicate default (32 for
+scored predicates, 512 for KeyMatch), the same as HTTP `null`. Python `None`
+(JSON null) is passed through and leaves `max_edges` as `None` — the Rust
+global-budget hatch (1,000,000 per source). Use HTTP `null` or omit the key
+if you want the capped default; pass `None` explicitly only if you intend the
+uncapped budget.
 
 **Symmetric predicates:** when `src_label == dst_label` (e.g., Person-to-Person
 similarity), the rule fires in **both directions** — a property change on any
@@ -494,7 +495,7 @@ the snapshot are no longer reachable via time travel.
 
 ```rust
 use core_api::{SnapshotOptions};
-db.snapshot_with(SnapshotOptions { keep_wal: true })?;
+db.snapshot_with(SnapshotOptions { keep_wal: true, archive_wal: false })?;
 ```
 
 `keep_wal: true` writes the V8 snapshot but leaves the WAL intact. `open_at`
@@ -525,4 +526,5 @@ The Rust forms — `write_batch`, and the compare-and-set `write_batch_cas` — 
 [Rust](rust.md#several-writes-as-one) page.
 
 Not yet exposed: `ingest_json` (use `ingest_batch`), auto-FK inference
-(declare `KeyMatch` rules explicitly), `rebuild`.
+(declare `KeyMatch` rules explicitly). `rebuild_rule` (per-rule re-derivation)
+is exposed; a full `rebuild` is not.

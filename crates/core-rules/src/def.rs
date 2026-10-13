@@ -18,17 +18,17 @@ pub struct RuleDef {
     /// compat. `#[serde(default)]` cannot help — bincode does not skip
     /// missing positional fields.
     pub max_edges: Option<u64>,
-    /// Opt-in IVF-Flat approximate candidate selection.
+    /// Opt-in HNSW approximate candidate selection.
     ///
     /// `false` (default) → exact `ScanAll` path; semantics and derived edges
     /// are byte-identical to pre-T4 behaviour for all existing rules.
     ///
-    /// `true` → `VectorClusters` candidate path: k-means partitions the dst
-    /// (and src) side at backfill/rebuild time; only members of the P nearest
-    /// clusters are evaluated. Recall ≥ 0.90 quiesced, ≥ 0.85 on any
-    /// crash-recovery state — not exact. Only valid when the predicate is
-    /// `VectorSimilar`-rooted (`VectorSimilar` itself, or `All` whose first
-    /// element is `VectorSimilar`); `validate()` rejects other combinations.
+    /// `true` → HNSW candidate path: an in-tree HNSW graph indexes the dst
+    /// (and src) side; approximate nearest neighbours are evaluated. Recall
+    /// ≥ 0.90 quiesced, ≥ 0.85 on any crash-recovery state — not exact. Only
+    /// valid when the predicate is `VectorSimilar`-rooted (`VectorSimilar`
+    /// itself, or `All` whose first element is `VectorSimilar`);
+    /// `validate()` rejects other combinations.
     ///
     /// APPENDED field — same pre-alpha no-migration ruling as `max_edges`:
     /// WAL/snapshot records written before this field break positional bincode

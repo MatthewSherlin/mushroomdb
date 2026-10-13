@@ -30,9 +30,12 @@ pub struct RuleDef {
     pub predicate: Predicate,  // one of the six kinds below
     pub edge_type: String,     // edge type written to the graph
     pub weight_prop: Option<String>, // if Some, score stored as this edge prop
-    pub max_edges: Option<usize>,    // cap on derived edges per rule (recommended)
+    pub max_edges: Option<usize>,    // best k per source node (per-source top-k)
     pub approximate: bool,     // HNSW approximate mode (VectorSimilar only)
     pub namespace: Option<String>,   // None = global; Some(ns) = scoped (see below)
+    pub via_label: Option<String>,   // intermediate-hop label (via-hop rules)
+    pub via_edge: Option<String>,    // edge type to traverse for the via hop
+    pub via_dir: Option<Direction>,  // direction of the via hop (default Out)
 }
 ```
 
@@ -311,7 +314,7 @@ path from a full scan to in-tree HNSW (Hierarchical Navigable Small World):
 
 ```rust
 RuleDef {
-    predicate: Predicate::VectorSimilar { field: "embedding".into(), min: 0.85, dims: 1536 },
+    predicate: Predicate::VectorSimilar { field: "embedding".into(), min: 0.85 },
     approximate: true,
     max_edges: Some(1000),
     ..
@@ -456,12 +459,6 @@ of the engine, and the clone carries no pending-build state. During a real
 pending build it therefore reports the `gained` edges the rule *would* derive,
 which the live store will not derive until its backfill runs. The preview is
 right about the end state and early about the timing.
-
-**Breaking change in 0.6.6:** code that created a VectorSimilar rule over more
-than 2,048 vectors and immediately asserted an edge count must now pump first.
-This is the vector index's threshold, not the approximate mode's, so an exact
-rule over that many vectors defers too. At or below 2,048 vectors nothing
-changed — one commit, edges present the moment `create_rule` returns.
 
 ### Vector index parameters
 
@@ -661,10 +658,10 @@ one disagrees, it re-elects its dimension to the newcomer's and drops the stray.
 Mixed dimensions were never meaningful; this is the version that says so. Re-embed
 a collection with one model rather than mixing two.
 
-**Blob version 3.** The persisted graph carries the slab, so its version is 3.
-Version 2 (0.6.6 before the kernel) and the bare 0.6.5 shape both still load,
-converting the vectors in memory with no vector re-inserted and no distance
-computed. A reader older than this one meeting a v3 blob fails its version check
+**Blob version 4.** The persisted graph carries the slab, so its version is 4.
+Earlier versions (v1–v3) still load, converting the vectors in memory with no
+vector re-inserted and no distance computed. A reader older than this one meeting
+a v4 blob fails its version check
 and leaves that rule on its full-scan fallback — slower, never wrong. The
 snapshot format does not move: it carries the index as opaque bytes.
 
@@ -909,17 +906,6 @@ materialization stops after `DEFAULT_MAX_EDGES` (1 000 000) total edges and
 the rule is marked `tripped`. No further edges are added until the rule is
 rebuilt with nodes removed. Use `max_edges: Some(k)` instead when you want
 per-source cardinality control.
-
-> **Breaking change (pre-alpha, since 2026-08-20):** Prior to this release,
-> `max_edges: Some(k)` meant "stop at k total edges globally (global-budget
-> semantics, same as `None` but with a lower cap)." It now means "keep the
-> k best-matching destinations per source node (per-source top-k semantics)."
-> Any snapshot written before this change that contains a rule with
-> `max_edges: Some(k)` will silently switch to per-source top-k semantics
-> on the next open — which may cause up to `src_count × k` edges to be added
-> on the next write where previously the rule was frozen. The `tripped` flag
-> loaded from old snapshots is ignored by the new code path.
-> No migration is provided (pre-alpha policy).
 
 ---
 

@@ -145,9 +145,9 @@ mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
 mushroomdb algo communities <db-dir> [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]
 ```
 
-PageRank, weakly-connected components, or degree centrality over manual + derived edges. `--weight-prop`/`--min-weight` weight or filter the edge set
+**`pagerank`/`wcc`/`degree`** — PageRank, weakly-connected components, or degree centrality over manual + derived edges. These three subcommands do not accept `--weight-prop` or `--min-weight`.
 
-Louvain communities with per-community cohesion and overall modularity
+**`communities`** — Louvain community detection with per-community cohesion and overall modularity; accepts `--edge-type` (repeatable), `--weight-prop` and `--min-weight`.
 
 ## Build and maintain a store
 

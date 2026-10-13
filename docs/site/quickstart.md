@@ -179,7 +179,7 @@ Run the two-command flow:
 ```
 
 Open `http://127.0.0.1:8080/` in a browser. The explorer loads the demo
-graph: 10 Orgs, 20 Projects, 30 People, 334 edges (including 7 derived
+graph: 10 Orgs, 20 Projects, 30 People, 334 edges (all derived by 7
 rule sets).
 
 You can combine both commands on one line:

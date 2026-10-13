@@ -1,6 +1,6 @@
 # Durability and crash recovery
 
-mushroomdb persists with a write-ahead log (WAL) plus periodic V8 snapshots.
+mushroomdb persists with a write-ahead log (WAL) plus periodic V9 snapshots.
 Every committed write is appended to the WAL and fsynced per the configured
 policy; a snapshot is a self-contained, memory-mappable image of the whole
 store with per-section CRCs.
@@ -9,8 +9,8 @@ store with per-section CRCs.
 
 On open, the store is reconstructed as **snapshot (if present) + WAL tail**:
 
-- **With a snapshot** — the V8 image is memory-mapped (open-to-first-query in
-  milliseconds even at 100k nodes; derived edges, HNSW/IVF vector indexes, and
+- **With a snapshot** — the V9 image is memory-mapped (open-to-first-query in
+  milliseconds even at 100k nodes; derived edges, HNSW vector indexes, and
   provenance are all restored from the image), then any WAL frames written after
   the snapshot are replayed. This is the normal path and it is fast.
 - **WAL-only, from genesis** — if the store has *never* been snapshotted, the
@@ -169,15 +169,17 @@ stamped in the 6-byte header (magic `GDB1` + 2-byte little-endian version).
 | V5 | 0.1.0 | readable | uncompressed bincode + CRC32 header; **no encoder** — only the golden fixture pin covers this format |
 | V6 | 0.1.1 | readable | zstd-compressed V5 payload in a container |
 | V7 | pre-0.2.0 (interim) | readable | zstd(CRC + packed CSR + packed columns + bincode meta) |
-| V8 | 0.2.0+ | default | 4 KB header page + rkyv sections; mmap-able, zero-copy open |
+| V8 | 0.2.0+ | readable | 4 KB header page + rkyv sections; mmap-able, zero-copy open |
+| V9 | 0.6.5+ | **default** | V8 container with one shared string table (section 12); auto-migrated from V5–V8 on open |
+| V10 | 0.6.10+ | readable | V9 container; written only by stores that called `enable_multiplicity()` |
 
-**Patch-stability promise:** a snapshot written by any 0.4.x release opens
-correctly on any other 0.4.x binary without migration.  Format version is only
-bumped on minor or major releases.
+**Patch-stability promise:** a snapshot written by any release in the same minor
+series opens correctly on any other binary in that series without migration.
+Format version is only bumped on minor or major releases.
 
 **What the golden pins prove:** `crates/core-api/tests/fixtures/` contains a
-committed binary fixture for each version (golden_v5.bin … golden_v8.bin).  The
-`golden_v{5..8}_pin` tests in the `snapshot` integration-test suite load each
+committed binary fixture for each version (golden_v5.bin … golden_v9.bin).  The
+`golden_v{5..9}_pin` tests in the `snapshot` integration-test suite load each
 fixture into a real `GraphDb::open()` call and assert node count, edge count, and
 specific property values.  A change to any decoder that silently corrupts data
 will fail its pin, not just the new-data tests.
@@ -191,14 +193,6 @@ richer content coverage is not possible without a V5 encoder.
 version pin and every migration path on every CI run.  A failure in that job
 names the format-compat category explicitly rather than surfacing as a generic
 test failure.
-
-## Roadmap
-
-A future optimization can make rule-derived edges first-class replayable WAL
-records (and persist incremental ANN state) so that even WAL-only-from-genesis
-recovery skips re-derivation. It is deferred because the snapshot path already
-delivers fast recovery for the common case, and the change touches the
-crash-recovery correctness core.
 
 ## Backup and export from Rust and the CLI
 
@@ -277,3 +271,11 @@ finite floats round-trip correctly.
 
 **Derived edges:** the `derived` field is `true` for rule-derived edges; `rule` is
 the rule name (present for derived edges, null/omitted for manual edges).
+
+## Roadmap
+
+A future optimization can make rule-derived edges first-class replayable WAL
+records (and persist incremental ANN state) so that even WAL-only-from-genesis
+recovery skips re-derivation. It is deferred because the snapshot path already
+delivers fast recovery for the common case, and the change touches the
+crash-recovery correctness core.

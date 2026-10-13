@@ -197,27 +197,18 @@ Precondition::NodeAbsent { key: "alice".into() }
 
 ### write_batch_cas (Rust API)
 
-```rust
-let seq = db.last_changed("alice").unwrap_or(0);
-
-let result = db.write_batch_cas(
-    vec![Precondition::NodeUnchangedSince { key: "alice".into(), expected: seq }],
-    |b| {
-        b.set_prop("alice", "role", Value::Str("admin".into()));
-    },
-)?;
-// On success: Ok((nodes_written, edges_written))
-// On precondition failure: Err(GraphError::CasConflict { key, expected, actual })
-```
+`write_batch_cas` takes `Vec<Precondition>` and `Vec<BatchOp>` — not a closure.
+See [rust.md § Several writes as one](rust.md#several-writes-as-one) for a
+compilable example using `BatchOp` directly.
 
 All preconditions are checked atomically under the write lock before any
 operation is applied. If any precondition fails, the entire batch is rejected:
 no WAL bytes written, no in-memory state changes.
 
-### submit_batch_cas (SharedDb / async API)
+### submit_batch_cas (SharedDb / synchronous API)
 
 ```rust
-shared_db.submit_batch_cas(preconditions, ops).await?;
+shared_db.submit_batch_cas(preconditions, ops)?;
 ```
 
 The same atomicity guarantee holds: preconditions are evaluated under the same
@@ -294,7 +285,10 @@ Every write appends a frame to the WAL. Commits are numbered 0-based: commit 0
 is the state after the first WAL frame.
 
 `GraphDb::snapshot()` writes the current state to `snapshot.bin` and
-**truncates the WAL to empty**. After a snapshot:
+**truncates the WAL to empty** (Rust API default: `SnapshotOptions { keep_wal:
+false, archive_wal: false }`). The CLI command `mushroomdb snapshot` **archives**
+the WAL by default instead of discarding it — pass `--truncate` to get the
+discard behaviour. After a truncating snapshot:
 
 - `GraphDb::open()` loads from the snapshot plus any post-snapshot WAL frames.
 - The commits before the snapshot are discarded, and they keep their numbers.
@@ -315,9 +309,9 @@ many commits were discarded, so this cannot be repaired on open. Its next
 truncating snapshot stops numbers being reused from then on; a number held
 from before an older truncation can still be answered with the wrong commit.
 
-`snapshot_with(SnapshotOptions { keep_wal: true })` writes the snapshot but
-leaves the WAL intact, so `open_at` can reach all WAL commits including those
-before the snapshot.
+`snapshot_with(SnapshotOptions { keep_wal: true, archive_wal: false })` writes
+the snapshot but leaves the WAL intact, so `open_at` can reach all WAL commits
+including those before the snapshot.
 
 Choose based on operational priorities:
 
@@ -340,7 +334,7 @@ use core_api::{GraphDb, GraphError};
 let total = core_api::wal_commit_count_at(&dir)?;
 
 // Open a read-only view at commit 3.
-let db = GraphDb::open_at(&dir, 3)?;
+let mut db = GraphDb::open_at(&dir, 3)?;
 
 // Queries and explain work normally.
 let rs = db.query("MATCH (n:Person) RETURN n", &Default::default())?;
