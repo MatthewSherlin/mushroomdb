@@ -114,7 +114,7 @@ want the full distribution; `top_author_id` is its argmax.
 `top_author_id` is whoever has the most commits on that file. Ties break on the
 lexicographically smallest email so repeated runs agree.
 
-## The two rules
+## The two co-change rules
 
 **`co_changed`** — `Overlap { field: "commits", min: 0.25 }`, edge `CO_CHANGED`,
 weight `score`, at most 10 edges per file. Two files link when the jaccard
