@@ -45,7 +45,7 @@ use crate::v8::layout::{
 use crate::v8::{
     HEADER_SIZE, SECTION_COLUMNS, SECTION_EDGE_PROPS, SECTION_FULLTEXT, SECTION_HNSW, SECTION_IDS,
     SECTION_IVF_STATE, SECTION_LAST_CHANGE, SECTION_META, SECTION_PROVENANCE, SECTION_RULES_META,
-    SECTION_STRINGS, SECTION_SYMS, SECTION_TOPOLOGY, SECTION_VIEWS,
+    SECTION_STRINGS, SECTION_SYMS, SECTION_TOPOLOGY, SECTION_VIEWS, SECTION_WAL_MARK,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -102,6 +102,11 @@ pub struct V8Meta {
     /// has no index to hand over.
     #[serde(skip)]
     pub fulltext_blob: Vec<u8>,
+    /// An encoded [`crate::v8::WalMark`], written as section 14. Empty means
+    /// the section is left out, which is every snapshot that does not keep
+    /// its WAL.
+    #[serde(skip)]
+    pub wal_mark: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -247,15 +252,22 @@ pub fn encode_v8<W: Write>(
         (SECTION_IVF_STATE, ivf_bytes),
         (SECTION_LAST_CHANGE, last_change_bytes),
     ];
-    // After the strings it was built from, and for the same reason not at the
-    // end. Left out entirely when there is nothing to carry, so a store with
-    // no full-text pair writes the bytes it always wrote.
-    if !meta.fulltext_blob.is_empty() {
+    // The two optional sections. Each is left out entirely when there is
+    // nothing to carry, so a store with no full-text pair, and a snapshot
+    // that does not keep its WAL, write the bytes they always wrote. Neither
+    // goes at the end: the last section stays a small, eagerly-CRC'd one.
+    for (id, bytes) in [
+        (SECTION_FULLTEXT, &meta.fulltext_blob),
+        (SECTION_WAL_MARK, &meta.wal_mark),
+    ] {
+        if bytes.is_empty() {
+            continue;
+        }
         let at = sections
             .iter()
             .position(|(id, _)| *id == SECTION_IDS)
             .unwrap_or(sections.len() - 1);
-        sections.insert(at, (SECTION_FULLTEXT, &meta.fulltext_blob));
+        sections.insert(at, (id, bytes));
     }
     let n = sections.len();
 

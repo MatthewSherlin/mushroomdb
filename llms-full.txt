@@ -10066,7 +10066,7 @@ Three flags choose otherwise:
 | Command | `wal.bin` after | History reach |
 |---|---|---|
 | `mushroomdb snapshot <db>` | minimal baseline | everything, through the archives |
-| `mushroomdb snapshot <db> --keep-wal` | left whole | everything, and every open replays all of it |
+| `mushroomdb snapshot <db> --keep-wal` | left whole | everything; an open reads past what the snapshot holds and replays what was written after it |
 | `mushroomdb snapshot <db> --truncate` | minimal baseline | only commits after this point |
 
 `--truncate` is the destructive one and nothing chooses it for you. It discards
@@ -10110,8 +10110,9 @@ before 0.6.5 the same store wrote eight copies of the table and came to 36.8 MB,
 
 Two different things read the WAL tail, and they are easy to confuse.
 
-**Recovery** happens at open. The snapshot is loaded and the whole WAL is
-replayed on top of it. A torn trailing frame — the signature of a crash mid-
+**Recovery** happens at open. The snapshot is loaded and the WAL is replayed
+on top of it — all of it, except the part a snapshot that kept its WAL
+already holds. A torn trailing frame — the signature of a crash mid-
 append — is dropped, and with `repair_wal` on (the default) the valid prefix is
 written back over it. That truncation is correct crash recovery: the frame was
 never fsynced, so no caller was ever told it committed.

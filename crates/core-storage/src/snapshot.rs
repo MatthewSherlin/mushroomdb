@@ -257,6 +257,7 @@ fn encode_v8_from_state(state: &SnapshotState) -> Result<Vec<u8>> {
         hnsw: state.hnsw_state.clone(),
         last_change: HashMap::new(),
         fulltext_blob: Vec::new(),
+        wal_mark: Vec::new(),
     };
     let mut out = Vec::new();
     crate::v8::encode::encode_v8(

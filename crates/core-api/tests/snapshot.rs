@@ -3451,3 +3451,140 @@ fn replaying_only_declarations_does_not_build_the_rule_indexes() {
     drop(db);
     assert!(GraphDb::open(&dir).unwrap().rule_indexes_populated());
 }
+
+// ── a snapshot that keeps its WAL: what it already holds is not replayed ────
+
+fn keep_wal() -> SnapshotOptions {
+    SnapshotOptions {
+        keep_wal: true,
+        ..Default::default()
+    }
+}
+
+/// Binding: a store that renamed a node and then took a snapshot keeping its
+/// WAL opens.
+///
+/// The open replayed the whole WAL over that snapshot. The replayed insert
+/// found the old key gone and made a second node under it, and the replayed
+/// rename then met its own result: `Corrupt: wal replay RenameNode n→m:
+/// duplicate node key: m`, and the store did not open again.
+#[test]
+fn a_rename_before_a_keep_wal_snapshot_does_not_stop_the_store_opening() {
+    let dir = tmp("keepwal-rename");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node(
+            "Doc",
+            "n",
+            vec![("body".into(), Value::Str("alpha".into()))],
+        )
+        .unwrap();
+        db.rename_node("n", "m").unwrap();
+        db.snapshot_with(keep_wal()).unwrap();
+    }
+    for round in 0..2 {
+        let mut db = GraphDb::open(&dir).unwrap_or_else(|e| panic!("open {round}: {e}"));
+        assert!(!db.has_node("n"), "open {round}");
+        assert_eq!(
+            db.get_prop("m", "body"),
+            Some(Value::Str("alpha".into())),
+            "open {round}"
+        );
+        assert_eq!(
+            db.stats().nodes_live,
+            1 + round,
+            "open {round}: no ghost node"
+        );
+        // What is written after the snapshot is replayed as before.
+        db.insert_node("Doc", &format!("later{round}"), vec![])
+            .unwrap();
+    }
+}
+
+/// Binding: a key deleted and inserted again before such a snapshot reads
+/// back as it was left. The replay used to send the later writes to the
+/// retired node, and the reopened store answered with an older value.
+#[test]
+fn a_reinserted_key_before_a_keep_wal_snapshot_reads_back_as_it_was_left() {
+    let dir = tmp("keepwal-reinsert");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node(
+            "Doc",
+            "k",
+            vec![("body".into(), Value::Str("first".into()))],
+        )
+        .unwrap();
+        db.delete_node("k").unwrap();
+        db.insert_node(
+            "Doc",
+            "k",
+            vec![("body".into(), Value::Str("second".into()))],
+        )
+        .unwrap();
+        db.set_prop("k", "body", Value::Str("final".into()))
+            .unwrap();
+        db.snapshot_with(keep_wal()).unwrap();
+    }
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(db.get_prop("k", "body"), Some(Value::Str("final".into())));
+    assert_eq!(db.stats().nodes_live, 1);
+}
+
+/// Binding: skipping what the snapshot holds loses nothing the WAL is kept
+/// for. The declarations in it still take effect, a write after the snapshot
+/// still lands, a later snapshot of the same kind moves the mark, and a read
+/// of a commit from before the snapshot still answers.
+#[test]
+fn a_keep_wal_snapshot_still_replays_declarations_and_what_came_after() {
+    let dir = tmp("keepwal-rest");
+    let before_link;
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.enable_fulltext("Doc", "body").unwrap();
+        db.enable_index("Doc", "kind").unwrap();
+        let doc = |body: &str| {
+            vec![
+                ("body".into(), Value::Str(body.into())),
+                ("kind".into(), Value::Str("note".into())),
+            ]
+        };
+        db.insert_node("Doc", "a", doc("alpha one")).unwrap();
+        db.insert_node("Doc", "b", doc("beta two")).unwrap();
+        before_link = db.wal_total_commits().unwrap() - 1;
+        db.insert_edge("CITES", "a", "b").unwrap();
+        db.rename_node("b", "b2").unwrap();
+        db.snapshot_with(keep_wal()).unwrap();
+        db.insert_node("Doc", "c", doc("gamma three")).unwrap();
+        db.set_prop("a", "body", Value::Str("alpha rewritten".into()))
+            .unwrap();
+        db.snapshot_with(keep_wal()).unwrap();
+        db.insert_node("Doc", "d", doc("delta four")).unwrap();
+        db.delete_node("c").unwrap();
+    }
+    let db = GraphDb::open(&dir).unwrap();
+    assert!(db.is_fulltext_enabled("Doc", "body"));
+    let hits = |q: &str| -> Vec<String> { db.search("body", q).into_iter().map(|h| h.0).collect() };
+    assert_eq!(hits("rewritten"), vec!["a"]);
+    assert_eq!(hits("one"), Vec::<String>::new());
+    assert_eq!(hits("beta"), vec!["b2"]);
+    assert_eq!(hits("delta"), vec!["d"]);
+    assert_eq!(hits("gamma"), Vec::<String>::new());
+    assert_eq!(db.stats().nodes_live, 3);
+    assert_eq!(
+        db.neighbors("a", "CITES", Direction::Out).unwrap(),
+        vec!["b2"]
+    );
+    let by_kind = db
+        .query(
+            "MATCH (n:Doc) WHERE n.kind = 'note' RETURN count(n) AS c",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(by_kind.row(0).to_vec(), vec![Some(Value::Int(3))]);
+    // History from before the first snapshot is still there to read.
+    assert!(!db.was_linked("a", "b2", "CITES", before_link).unwrap());
+    assert!(db
+        .was_linked("a", "b2", "CITES", db.wal_total_commits().unwrap() - 1)
+        .unwrap());
+}

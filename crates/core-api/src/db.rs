@@ -2638,7 +2638,15 @@ impl<F: Fs> GraphDb<F> {
         // Every decoded frame occupies an index, replayed or not: markers
         // are state no-ops but they are not index no-ops.
         let decoded_frames = records.len() as u64;
-        let replayed = db.apply_frames(records);
+        // A snapshot that kept its WAL says how much of it it already holds.
+        // Those frames are counted, and not applied a second time.
+        let held = db
+            .base
+            .as_ref()
+            .and_then(|base| base.wal_mark())
+            .filter(|mark| mark.matches(&bytes))
+            .map_or(0, |mark| decode_all(&bytes[..mark.len as usize]).0.len());
+        let replayed = db.apply_frames_over(records, held);
         db.fulltext_rebuild_follows = false;
         db.replaying_at_open = false;
         let replayed = replayed?;
@@ -2798,6 +2806,17 @@ impl<F: Fs> GraphDb<F> {
     /// reflected on disk, so they are not news to a subscriber, and draining
     /// inside the loop keeps `pending_deltas` O(1) over a large WAL (I-2).
     fn apply_frames(&mut self, records: Vec<WalRecord>) -> Result<usize> {
+        self.apply_frames_over(records, 0)
+    }
+
+    /// [`Self::apply_frames`] over a base that already holds the first `held`
+    /// records: the state a snapshot that kept its WAL was taken at. Those
+    /// are numbered like any other frame and not applied, because applying a
+    /// write to the state it produced is not always a no-op — an insert
+    /// under a key since renamed or deleted makes a second node. A
+    /// declaration among them is applied all the same: the pairs a store has
+    /// declared are known from the WAL and nowhere else.
+    fn apply_frames_over(&mut self, records: Vec<WalRecord>, held: usize) -> Result<usize> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -2812,8 +2831,11 @@ impl<F: Fs> GraphDb<F> {
         // declaration defers to its first write.
         let mut retained_consumed = false;
         let applied = records.len();
-        for rec in records {
-            if !retained_consumed && !is_declaration(&rec) {
+        for (i, rec) in records.into_iter().enumerate() {
+            // A frame the snapshot already holds is counted and not applied,
+            // unless it is a declaration.
+            let apply = i >= held || is_declaration(&rec);
+            if apply && !retained_consumed && !is_declaration(&rec) {
                 self.ensure_v8_base_sections_loaded();
                 self.engine.consume_retained_state_eager(
                     &self.ids,
@@ -2823,7 +2845,9 @@ impl<F: Fs> GraphDb<F> {
                 );
                 retained_consumed = true;
             }
-            self.apply(&rec)?;
+            if apply {
+                self.apply(&rec)?;
+            }
             let _ = self.engine.drain_deltas();
             // Track commit_seq during replay so last_change entries are
             // consistent with the seqs assigned by log_then_apply_with on
@@ -7598,10 +7622,13 @@ impl<F: Fs> GraphDb<F> {
         let Some(base) = self.base.as_ref() else {
             return;
         };
-        // A snapshot that kept its WAL is replayed over in full. Every insert
-        // in that WAL is already in the blob, so reading it would end in a
-        // rebuild anyway — after making each replayed insert tokenize first.
-        if !self.base_wal_truncated {
+        // A snapshot that kept its WAL and carries no mark of how much of it
+        // it holds is replayed over in full. Every insert in that WAL is
+        // already in the blob, so reading it would end in a rebuild anyway —
+        // after making each replayed insert tokenize first. With a mark, the
+        // frames the snapshot holds are not applied again and the index is as
+        // good as any other snapshot's.
+        if !self.base_wal_truncated && base.wal_mark().is_none() {
             return;
         }
         let bytes = match base.fulltext_bytes() {
@@ -13936,6 +13963,15 @@ impl<F: Fs> GraphDb<F> {
         // truncating the WAL at the first such frame. The container is
         // identical either way; only these two header bytes move.
         let snapshot_version = core_storage::snapshot::version_for(self.multiplicity);
+        // A snapshot that leaves the WAL where it is records how much of it
+        // it holds, so the next open does not apply those writes again on top
+        // of the state they produced. This handle holds the write lock, so
+        // every byte in the WAL now is a write it has applied.
+        let wal_mark = if opts.keep_wal && !opts.archive_wal {
+            core_storage::v8::WalMark::of(&self.fs.read(FileId::Wal)?).encode()
+        } else {
+            Vec::new()
+        };
         self.ensure_v8_base_sections_loaded();
         // Ensure provenance is decoded before to_persist() clones it.
         self.engine.ensure_provenance_loaded_mut();
@@ -14002,6 +14038,7 @@ impl<F: Fs> GraphDb<F> {
                 hnsw: hnsw_state,
                 last_change: self.last_change.clone(),
                 fulltext_blob: self.fulltext_blob(),
+                wal_mark: wal_mark.clone(),
             };
             let mut buf: Vec<u8> = Vec::new();
             {
@@ -14102,6 +14139,7 @@ impl<F: Fs> GraphDb<F> {
                 hnsw: hnsw_state,
                 last_change: self.last_change.clone(),
                 fulltext_blob: self.fulltext_blob(),
+                wal_mark: wal_mark.clone(),
             };
             let mut buf = Vec::new();
             encode_v8(

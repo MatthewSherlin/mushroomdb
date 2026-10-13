@@ -1475,11 +1475,11 @@ fn writes_after_the_snapshot_land_on_the_loaded_index() {
     assert_eq!(observable(&db), before);
 }
 
-/// Binding: a snapshot that keeps its WAL is replayed over in full at open,
-/// so its index is built after the replay as it always was, and answers the
-/// same.
+/// Binding: a snapshot that keeps its WAL carries the index too. The open
+/// does not apply again the writes that snapshot holds, so the index it read
+/// is kept, and what was written after the snapshot lands on it.
 #[test]
-fn a_keep_wal_snapshot_falls_back_to_a_rebuild() {
+fn a_keep_wal_snapshot_loads_its_index_too() {
     let dir = tmp_dir();
     let before = {
         let mut db = GraphDb::open(&dir).unwrap();
@@ -1489,13 +1489,15 @@ fn a_keep_wal_snapshot_falls_back_to_a_rebuild() {
             ..Default::default()
         })
         .unwrap();
+        db.insert_node("Doc", "late", doc("a late embedded graph database", "late"))
+            .unwrap();
+        db.set_prop("d0", "body", Value::Str("python only now".into()))
+            .unwrap();
         observable(&db)
     };
     let db = GraphDb::open(&dir).unwrap();
-    assert!(
-        !db.fulltext_loaded_from_snapshot(),
-        "the whole WAL replays over this snapshot"
-    );
+    assert!(db.fulltext_loaded_from_snapshot());
+    assert_eq!(db.fulltext_reindexed_during_open(), 0);
     assert_eq!(observable(&db), before);
 }
 
@@ -1616,12 +1618,12 @@ fn a_field_with_no_words_in_it_reopens() {
     assert!(db.search("title", "alpha").is_empty());
 }
 
-/// Binding: a snapshot that kept its WAL does not have its index read at
-/// all. The whole WAL replays over it, the index is built afterwards as it
-/// always was, and reading the blob first only made every replayed insert
-/// tokenize once for nothing.
+/// Binding: pairs declared after the data, then a snapshot that keeps its
+/// WAL. Nothing the snapshot holds is indexed a second time at open: this
+/// store used to tokenize every replayed insert and then rebuild the index
+/// on top, twice the work of an open before the index was carried at all.
 #[test]
-fn a_keep_wal_snapshot_does_not_read_its_index() {
+fn a_keep_wal_snapshot_indexes_nothing_twice_at_open() {
     let dir = tmp_dir();
     let before = {
         let mut db = GraphDb::open(&dir).unwrap();
@@ -1629,8 +1631,6 @@ fn a_keep_wal_snapshot_does_not_read_its_index() {
             db.insert_node("Doc", &format!("d{i}"), doc("rust graph database", "notes"))
                 .unwrap();
         }
-        // Declared after the data, so the WAL's own inserts index nothing
-        // when they replay — unless the pair is already enabled from a blob.
         db.enable_fulltext("Doc", "body").unwrap();
         db.snapshot_with(core_api::SnapshotOptions {
             keep_wal: true,
@@ -1640,11 +1640,7 @@ fn a_keep_wal_snapshot_does_not_read_its_index() {
         observable(&db)
     };
     let db = GraphDb::open(&dir).unwrap();
-    assert!(!db.fulltext_loaded_from_snapshot());
-    assert_eq!(
-        db.fulltext_reindexed_during_open(),
-        0,
-        "nothing replayed should have met an index read from the snapshot"
-    );
+    assert!(db.fulltext_loaded_from_snapshot());
+    assert_eq!(db.fulltext_reindexed_during_open(), 0);
     assert_eq!(observable(&db), before);
 }
