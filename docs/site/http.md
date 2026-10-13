@@ -71,7 +71,11 @@ Role-token behavior per endpoint:
 | `GET /node/{key}` | 200 if visible; 404 if hidden or absent (indistinguishable) |
 | `GET /node/{key}/edges` | 200 if visible; 404 if hidden or absent |
 | `GET /node/{key}/neighborhood` | 200 if visible; 404 if hidden or absent |
+| `GET /node/{key}/history` | 200 with edge-event entries whose `other` endpoint is hidden filtered out; 404 if the target key is hidden or absent |
+| `GET /history/edge` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
+| `GET /history/was_linked` | 200 if both `a` and `b` are visible; 404 for the first invisible key |
 | `POST /find_similar` | 200 — vector search; client `mask` intersects role mask (never widens) |
+| `GET /metrics` | 403 (counters leak graph size beyond the role's subgraph) |
 | `GET /stats` | 403 (counts leak graph size beyond the role's subgraph) |
 | `POST /rules` | 403 (administrative — all role tokens, including write-scoped) |
 | `GET /explain` | 403 (rule explanation reveals hidden-node linkage) |
@@ -90,15 +94,16 @@ present in `roles.json` at open time → 401; corrupt `roles.json` → 500 for
 role tokens (full-access token unaffected); empty role → sees zero nodes.
 Role sidecar is stored in `<db-dir>/roles.json` (v1 for read-only roles, v2 when
 any role carries a write scope, v3 when any role carries a `visible_where`
-predicate). A version this binary does not recognise poisons the roles state
-rather than loading it — denying beats over-granting.
+predicate, v4 when any role is bound to one or more namespaces). A version this
+binary does not recognise poisons the roles state rather than loading it —
+denying beats over-granting.
 
 ## Write scopes for role-bound tokens
 
 v0.3 lifts the write ban for roles that explicitly declare write scopes in
 `schema.json`. Roles without a write scope remain read-only.
 
-#### WriteScope schema
+### WriteScope schema
 
 ```rust
 pub struct WriteScope {
@@ -130,7 +135,7 @@ Example `schema.json` role definition:
 }
 ```
 
-#### Never-widen for writes
+### Never-widen for writes
 
 No write a role performs may make data visible to itself or any other party that
 was not already visible before the write. Concretely:
@@ -145,7 +150,7 @@ was not already visible before the write. Concretely:
 - `/rules`, `/stats`, `/explain`, `/subscribe`, and `/watch` remain 403 for all role
   tokens regardless of write scope.
 
-#### §4.3 Error body shapes
+### Error body shapes
 
 All write denials return 403 with a structured JSON body:
 
@@ -183,7 +188,7 @@ exist and the visibility arm only for one that does, so two different strings wo
 turn the pair into an existence oracle. Hidden ≡ absent holds here as everywhere else.
 See [masks.md](masks.md#namespaces).
 
-#### Threat model
+### Threat model
 
 | Capability | v1 (read-only) | v0.3 (with write scope) |
 |---|---|---|
