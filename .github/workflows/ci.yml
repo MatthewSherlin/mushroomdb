@@ -341,6 +341,14 @@ jobs:
           "$BIN" snapshot "$DB"
           "$BIN" stats "$DB"
           "$BIN" verify "$DB"
+          # A write over the snapshot, and a second snapshot over the first:
+          # the one that replaces a file the process has mapped.
+          "$BIN" query "$DB" "CREATE (n:Person {id: 'smoke', name: 'Smoke Test'})"
+          "$BIN" snapshot "$DB" --truncate
+          "$BIN" snapshot "$DB" --keep-wal
+          "$BIN" query "$DB" "MATCH (p:Person {id: 'smoke'}) RETURN p.name AS name"
+          "$BIN" backup "$DB" "$RUNNER_TEMP/smoke-backup"
+          "$BIN" stats "$RUNNER_TEMP/smoke-backup"
 
   docker:
     needs: [test]

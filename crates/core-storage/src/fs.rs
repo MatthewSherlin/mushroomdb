@@ -573,9 +573,20 @@ pub fn truncate_wal_at(dir: &std::path::Path, len: u64) -> std::io::Result<()> {
     f.sync_all() // plain sync_all is sufficient for a truncation barrier
 }
 
+/// Make a rename or a new file in `dir` durable.
+///
+/// On Unix that is an fsync of the directory. Windows has no such call — a
+/// directory cannot be opened as a file there (`Access is denied`) — and
+/// NTFS journals the directory entry itself, so there is nothing to do.
+#[cfg(not(windows))]
 fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     let d = File::open(dir)?;
     d.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_dir(_dir: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
