@@ -298,7 +298,7 @@ impl Fs for RealFs {
     }
 
     fn sync(&mut self, file: FileId) -> std::io::Result<()> {
-        let f = File::open(self.path(file))?;
+        let f = open_for_sync(&self.path(file))?;
         full_sync(&f)
     }
 
@@ -545,7 +545,7 @@ fn full_sync(file: &File) -> std::io::Result<()> {
 /// does not exist (nothing to sync).
 pub fn sync_wal_at(dir: &std::path::Path) -> std::io::Result<()> {
     let path = dir.join(FileId::Wal.name());
-    let f = match std::fs::File::open(&path) {
+    let f = match open_for_sync(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
@@ -571,6 +571,18 @@ pub fn truncate_wal_at(dir: &std::path::Path, len: u64) -> std::io::Result<()> {
     };
     f.set_len(len)?;
     f.sync_all() // plain sync_all is sufficient for a truncation barrier
+}
+
+/// Open `path` for the sole purpose of syncing it.
+///
+/// Read-only is enough on Unix. On Windows a flush needs write access to the
+/// handle and fails with `Access is denied` without it.
+fn open_for_sync(path: &std::path::Path) -> std::io::Result<File> {
+    if cfg!(windows) {
+        OpenOptions::new().write(true).open(path)
+    } else {
+        File::open(path)
+    }
 }
 
 /// Make a rename or a new file in `dir` durable.
