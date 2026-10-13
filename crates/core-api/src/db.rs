@@ -3745,6 +3745,82 @@ impl<F: Fs> GraphDb<F> {
         self.fold_overlay = Some(Arc::new(frozen));
         self.delta_tail.clear();
         self.commits_since_fold = 0;
+        // The fold holds every view value as it stands; what replay or a
+        // refresh touched on the way here is not owed to any delta.
+        self.view_store.clear_touched();
+    }
+
+    /// The view properties the commit of `rec` left on the nodes it touched,
+    /// for the reader's delta tail — or `None` when the commit should be
+    /// folded instead of described.
+    ///
+    /// Folded: a commit that creates or deletes a view, which writes its
+    /// property on every node of a label, and one that moves far more view
+    /// values than it has records — a write to a hub moves a view on every
+    /// neighbour. A delta listing those would be held, and replayed by every
+    /// reader, until the next fold.
+    ///
+    /// Not folded: a commit whose view values are in proportion to its
+    /// records, however many. A bulk load gives each node it inserts a
+    /// starting value, and the reader replays each of those inserts anyway. A
+    /// fold is eight `Arc` clones to take, but it shares the store's maps
+    /// with the reader, so the commit after it copies them in full; a load
+    /// that folded on every batch paid that on every batch.
+    fn view_values_of_commit(
+        &mut self,
+        rec: &WalRecord,
+    ) -> Option<Vec<(u32, String, Option<Value>)>> {
+        /// View values a commit may carry beyond those its own records
+        /// account for.
+        const MAX_BEYOND_RECORDS: usize = 1024;
+
+        fn declares_a_view(rec: &WalRecord) -> bool {
+            match rec {
+                WalRecord::CreateView { .. } | WalRecord::DeleteView { .. } => true,
+                WalRecord::Batch(inner) => inner.iter().any(declares_a_view),
+                _ => false,
+            }
+        }
+
+        fn leaf_records(rec: &WalRecord) -> usize {
+            match rec {
+                WalRecord::Batch(inner) => inner.iter().map(leaf_records).sum(),
+                _ => 1,
+            }
+        }
+
+        let mut touched = self.view_store.take_touched();
+        if declares_a_view(rec) {
+            return None;
+        }
+        if touched.is_empty() {
+            return Some(Vec::new());
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        let views = self.view_store.views().count();
+        let budget = MAX_BEYOND_RECORDS + leaf_records(rec).saturating_mul(views);
+        let cols = build_props_view(&self.props, &self.base);
+        let mut values = Vec::new();
+        for &node in &touched {
+            // A node deleted later in the same commit: the reader's replay of
+            // the delete clears its properties, the view's among them.
+            if self.ids.key_of(node).is_none() {
+                continue;
+            }
+            let label = self.labels.get(node as usize).copied();
+            for def in self.view_store.views() {
+                if label.is_none() || self.syms.get(&def.label) != label {
+                    continue;
+                }
+                if values.len() == budget {
+                    return None;
+                }
+                let value = cols.get(node, &def.view_prop).map(|v| v.into_value());
+                values.push((node, def.view_prop.clone(), value));
+            }
+        }
+        Some(values)
     }
 
     /// Capture a lock-free reader snapshot of the current db state.
@@ -3801,6 +3877,7 @@ impl<F: Fs> GraphDb<F> {
             }],
             derived_inserts: Vec::new(),
             derived_deletes: Vec::new(),
+            view_values: Vec::new(),
         }));
     }
 
@@ -5751,14 +5828,19 @@ impl<F: Fs> GraphDb<F> {
                 .filter(|d| !d.fired)
                 .map(|d| (d.etype_sym, d.src_id, d.dst_id))
                 .collect();
+            // `None`: the commit moved more view values than a delta should
+            // carry, so the fold below takes them instead.
+            let view_values = self.view_values_of_commit(&rec);
+            let fold = view_values.is_none();
             let delta = Arc::new(crate::reader::CommitDelta {
                 records: vec![rec.clone()],
                 derived_inserts,
                 derived_deletes,
+                view_values: view_values.unwrap_or_default(),
             });
             self.delta_tail.push(delta);
             self.commits_since_fold += 1;
-            if self.commits_since_fold >= crate::reader::FOLD_EVERY_K {
+            if fold || self.commits_since_fold >= crate::reader::FOLD_EVERY_K {
                 self.fold_now();
             }
         }
