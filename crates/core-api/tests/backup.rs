@@ -218,6 +218,14 @@ fn a_backup_can_still_answer_a_date() {
     );
     let on_the_20th = restored.resolve_date("2026-06-20").unwrap();
     assert!(restored.was_linked("a", "b", "KNOWS", on_the_20th).unwrap());
+    drop(restored);
+
+    // And through `restore`, which copies a named list of files: the map has
+    // to be on it, or the seeded store has the history and not the dates.
+    let seeded = tmp("backup-dates-seeded");
+    core_api::restore::restore_if_empty(&seeded, &dest).unwrap();
+    let seeded = GraphDb::open(&seeded).unwrap();
+    assert_eq!(seeded.resolve_date("2026-06-10").unwrap(), expected);
 }
 
 #[test]
