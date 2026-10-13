@@ -14713,12 +14713,14 @@ impl<F: Fs> GraphDb<F> {
             //      absent.  Reopen: snapshot loaded (full state), no WAL
             //      replay.  Archive is NOT replayed into live state — it is
             //      pre-snapshot by construction.  Safe.
-            //   3. (The genesis marker is written before step 1; see above.)
+            //   3. Write new minimal baseline WAL (write_atomic), with no
+            //      fallible call between it and the rename.
+            //      Crash window C: a crash between the two leaves the new
+            //      archive and no live WAL.  Same as window B — handled above.
             //   4. Prune old archives (retention), update horizon floor.
             //      Pruning invalidates the genesis chain; delete marker.
-            //   5. Write new minimal baseline WAL (write_atomic).
-            //      Crash window C: crash here leaves new archive plus no live
-            //      WAL.  Same as window B — handled above.
+            //   (The genesis marker is written before step 1; see above.
+            //   Steps 2 and 3 are skipped when the WAL holds nothing new.)
             //
             // Sample existing archives BEFORE the rename: the last one names
             // where this one starts.
