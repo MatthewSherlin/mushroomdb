@@ -217,6 +217,17 @@ impl SnapshotIntent {
         out
     }
 
+    /// Every intent in the file. It holds one, or two while a snapshot is
+    /// being written over a store whose last snapshot was itself
+    /// interrupted: the one still standing and the one being attempted.
+    /// A file that is not whole records reads as none.
+    pub fn decode_all(bytes: &[u8]) -> Vec<Self> {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(32) {
+            return Vec::new();
+        }
+        bytes.chunks_exact(32).filter_map(Self::decode).collect()
+    }
+
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != 32 || &bytes[..4] != Self::MAGIC {
             return None;

@@ -7673,31 +7673,45 @@ impl<F: Fs> GraphDb<F> {
     /// far. The second is `true` when the file holds anything else — an
     /// intent left over, which must not outlive this handle's next append.
     fn interrupted_snapshot(&self, wal: &[u8]) -> (Option<core_storage::v8::WalMark>, bool) {
-        let intent = self.fs.read(FileId::SnapshotIntent).unwrap_or_default();
-        if intent.is_empty() {
+        let (standing, left_over) = self.standing_intent(wal);
+        (standing.map(|i| i.wal), left_over)
+    }
+
+    /// The intent in `snapshot.intent` that is true of the snapshot and the
+    /// WAL on disk, if one is, and whether the file holds anything that is
+    /// not.
+    fn standing_intent(&self, wal: &[u8]) -> (Option<core_storage::v8::SnapshotIntent>, bool) {
+        let bytes = self.fs.read(FileId::SnapshotIntent).unwrap_or_default();
+        if bytes.is_empty() {
             return (None, false);
         }
-        let mark = core_storage::v8::SnapshotIntent::decode(&intent)
-            .filter(|i| {
-                self.fs
-                    .read(FileId::Snapshot)
-                    .is_ok_and(|snapshot| i.names(&snapshot))
-            })
-            .map(|i| i.wal)
-            .filter(|mark| mark.matches(wal))
-            // The mark was taken at the end of a whole WAL.
-            .filter(|mark| decode_all(&wal[..mark.len as usize]).1 as u64 == mark.len);
-        let left_over = mark.is_none();
-        (mark, left_over)
+        let intents = core_storage::v8::SnapshotIntent::decode_all(&bytes);
+        let snapshot = if intents.is_empty() {
+            Vec::new()
+        } else {
+            self.fs.read(FileId::Snapshot).unwrap_or_default()
+        };
+        let standing = intents.into_iter().find(|i| {
+            i.names(&snapshot)
+                && i.wal.matches(wal)
+                // The mark was taken at the end of a whole WAL.
+                && decode_all(&wal[..i.wal.len as usize]).1 as u64 == i.wal.len
+        });
+        // Anything in the file beyond the one standing intent is left over:
+        // a record of a snapshot that finished or never landed.
+        let left_over = bytes.len() != if standing.is_some() { 32 } else { 0 };
+        (standing, left_over)
     }
 
     /// Empty `snapshot.intent` unless it is still true. Called with the write
     /// lock held, before an append.
     fn settle_snapshot_intent(&mut self) -> Result<()> {
         let wal = self.fs.read(FileId::Wal)?;
-        let (_, left_over) = self.interrupted_snapshot(&wal);
+        let (standing, left_over) = self.standing_intent(&wal);
         if left_over {
-            self.fs.write_atomic(FileId::SnapshotIntent, &[])?;
+            // Keep the one that is still true, drop the rest.
+            let keep = standing.map(|i| i.encode()).unwrap_or_default();
+            self.fs.write_atomic(FileId::SnapshotIntent, &keep)?;
         }
         self.intent_unsettled = false;
         Ok(())
@@ -14104,6 +14118,11 @@ impl<F: Fs> GraphDb<F> {
         } else {
             core_storage::v8::WalMark::of(&wal_now).encode()
         };
+        let standing_intent = if replaces_wal {
+            self.standing_intent(&wal_now).0
+        } else {
+            None
+        };
         let stop = self.snapshot_stop.take();
         let stopped = |at: SnapshotStop| -> Result<()> {
             if stop == Some(at) {
@@ -14240,9 +14259,17 @@ impl<F: Fs> GraphDb<F> {
                 // WAL it holds. From here until the WAL is replaced a crash
                 // leaves that WAL beside the new snapshot, and this is how
                 // the next open knows not to apply it again (ledger row 92).
-                let intent = core_storage::v8::SnapshotIntent::new(&buf, &wal_now);
-                self.fs
-                    .write_atomic(FileId::SnapshotIntent, &intent.encode())?;
+                //
+                // An intent already standing — the last snapshot was
+                // interrupted too, and this store opens because of it — is
+                // kept beside the new one until the new snapshot is down. If
+                // this attempt fails before then, it is still what names the
+                // snapshot on disk.
+                let mut intent = core_storage::v8::SnapshotIntent::new(&buf, &wal_now).encode();
+                if let Some(standing) = &standing_intent {
+                    intent.extend_from_slice(&standing.encode());
+                }
+                self.fs.write_atomic(FileId::SnapshotIntent, &intent)?;
                 // Until this snapshot empties it. If it does not get that far
                 // and this handle goes on writing, the next append looks at
                 // whether the intent is still true.
@@ -14317,9 +14344,17 @@ impl<F: Fs> GraphDb<F> {
                 // WAL it holds. From here until the WAL is replaced a crash
                 // leaves that WAL beside the new snapshot, and this is how
                 // the next open knows not to apply it again (ledger row 92).
-                let intent = core_storage::v8::SnapshotIntent::new(&buf, &wal_now);
-                self.fs
-                    .write_atomic(FileId::SnapshotIntent, &intent.encode())?;
+                //
+                // An intent already standing — the last snapshot was
+                // interrupted too, and this store opens because of it — is
+                // kept beside the new one until the new snapshot is down. If
+                // this attempt fails before then, it is still what names the
+                // snapshot on disk.
+                let mut intent = core_storage::v8::SnapshotIntent::new(&buf, &wal_now).encode();
+                if let Some(standing) = &standing_intent {
+                    intent.extend_from_slice(&standing.encode());
+                }
+                self.fs.write_atomic(FileId::SnapshotIntent, &intent)?;
                 // Until this snapshot empties it. If it does not get that far
                 // and this handle goes on writing, the next append looks at
                 // whether the intent is still true.

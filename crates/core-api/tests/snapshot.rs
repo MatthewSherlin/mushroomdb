@@ -3846,3 +3846,50 @@ fn a_past_commit_reads_right_on_a_store_with_an_interrupted_snapshot() {
         }
     }
 }
+
+/// Binding: a second snapshot that fails does not undo what the first left
+/// in place. After an interrupted snapshot the intent is what lets the store
+/// open; the next snapshot wrote its own intent over it before its own
+/// `snapshot.bin` was down, and a failure there — a full disk fails the big
+/// write and not the 32-byte one — left the first snapshot beside its WAL
+/// with nothing naming it.
+#[test]
+fn a_second_failed_snapshot_keeps_the_first_ones_intent() {
+    for first in [
+        core_api::SnapshotStop::AfterSnapshotWrite,
+        core_api::SnapshotStop::BeforeWalReplacement,
+    ] {
+        for reopen_between in [false, true] {
+            let what = format!("first stopped {first:?}, reopen between: {reopen_between}");
+            let dir = tmp(&format!("second-failed-{first:?}-{reopen_between}"));
+            let mut db = GraphDb::open(&dir).unwrap();
+            db.insert_node("Doc", "n", vec![("p".into(), Value::Int(1))])
+                .unwrap();
+            db.rename_node("n", "m").unwrap();
+            db.stop_next_snapshot(first);
+            assert!(db.snapshot().is_err(), "{what}");
+            if reopen_between {
+                drop(db);
+                db = GraphDb::open(&dir).unwrap_or_else(|e| panic!("{what}: {e}"));
+            }
+            db.insert_node("Doc", "later", vec![]).unwrap();
+            db.stop_next_snapshot(core_api::SnapshotStop::BeforeSnapshotWrite);
+            assert!(db.snapshot().is_err(), "{what}");
+            drop(db);
+
+            let mut db = GraphDb::open(&dir).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(db.stats().nodes_live, 2, "{what}");
+            assert_eq!(db.get_prop("m", "p"), Some(Value::Int(1)), "{what}");
+            assert!(db.has_node("later") && !db.has_node("n"), "{what}");
+            // And a snapshot that completes puts it all behind.
+            db.snapshot().unwrap();
+            drop(db);
+            let db = GraphDb::open(&dir).unwrap();
+            assert_eq!(
+                db.stats().nodes_live,
+                2,
+                "{what}, after a completed snapshot"
+            );
+        }
+    }
+}
