@@ -191,3 +191,46 @@ fn a_boolean_parameter_compares_like_the_literal() {
         .unwrap();
     assert_eq!(keys(&rs), vec!["off"]);
 }
+
+/// Binding: `true` and `false` cannot name a variable or an alias. Where they
+/// could, the name was read back as the literal in some positions and as the
+/// variable in others: `WITH count(*) AS true RETURN true` answered `true`,
+/// not the count, and `MATCH (true:Item) RETURN true` answered `true` a row.
+#[test]
+fn true_and_false_cannot_name_a_variable_or_an_alias() {
+    let mut db = open_fixture("reserved");
+    for cypher in [
+        "MATCH (n:Item) WITH count(*) AS true RETURN true",
+        "MATCH (n:Item) RETURN n.flag AS false",
+        "MATCH (n:Item) RETURN count(n) AS TRUE",
+        "MATCH (true:Item) RETURN true",
+        "MATCH (a:Item)-[false:REL]->(b:Item) RETURN a",
+        "MATCH (n:Item) UNWIND [1, 2] AS true RETURN true",
+    ] {
+        let err = db
+            .query(cypher, &no_params())
+            .expect_err(cypher)
+            .to_string();
+        assert!(
+            err.contains("is a boolean literal and cannot name a variable or an alias"),
+            "{cypher}: {err}"
+        );
+    }
+    for cypher in [
+        "CREATE (true:Item {id: 'x'})",
+        "MERGE (false:Item {id: 'y'})",
+    ] {
+        let err = db
+            .query_write(cypher, &no_params())
+            .expect_err(cypher)
+            .to_string();
+        assert!(err.contains("is a boolean literal"), "{cypher}: {err}");
+    }
+    // A property or a map key of that name is not a variable.
+    db.query_write("CREATE (n:Item {id: 'z', true: 1})", &no_params())
+        .unwrap();
+    assert_eq!(
+        ask(&db, "MATCH (n:Item) WHERE n.true = 1 RETURN n"),
+        vec!["z"]
+    );
+}
