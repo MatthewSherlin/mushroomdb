@@ -11,6 +11,8 @@
  *   - Linking rules: person-project FIT (overlap), person-org (key-match)
  */
 
+import { existsSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import WS from "ws";
 import { inject, describe, it, expect, beforeAll } from "vitest";
 import { MushroomClient, MushroomError } from "../src/client.js";
@@ -1433,12 +1435,22 @@ describe.skipIf(NO_SERVER)("findSimilar (live)", () => {
 
 describe.skipIf(NO_SERVER)("backup (live)", () => {
   it("backup returns verified:true with a file list", async () => {
+    // The server confines a backup to its backup root, which here is the
+    // directory it was started in — this package's. So: a relative name,
+    // removed afterwards.
     const dest = `ts-backup-${Date.now()}`;
-    const result = await client.backup(dest);
-    expect(result.verified).toBe(true);
-    expect(Array.isArray(result.files)).toBe(true);
-    expect(result.files.length).toBeGreaterThan(0);
-    expect(typeof result.bytes).toBe("number");
+    const onDisk = join(process.cwd(), dest);
+    try {
+      const result = await client.backup(dest);
+      expect(result.verified).toBe(true);
+      expect(result.files.length).toBeGreaterThan(0);
+      expect(result.bytes).toBeGreaterThan(0);
+      for (const file of result.files) {
+        expect(existsSync(join(onDisk, file))).toBe(true);
+      }
+    } finally {
+      rmSync(onDisk, { recursive: true, force: true });
+    }
   });
 });
 
