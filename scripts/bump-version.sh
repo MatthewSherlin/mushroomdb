@@ -91,7 +91,7 @@ while IFS= read -r f; do
   [[ $CHECK -eq 1 ]] || perl -0pi -e 's/(path = "\.\.\/[^"]*", version = ")[^"]*(")/${1}'"$NEW"'${2}/g' "$f"
 done < <(ls crates/*/Cargo.toml bindings/*/Cargo.toml)
 
-# 3. `"version": "X"` in a JSON manifest. `server.json` carries two.
+# 3. `"version": "X"` in a JSON manifest. `server.json` carries three: its own, and one for each package it lists.
 for f in "${json_manifests[@]}"; do
   while IFS= read -r cur; do
     [[ "$cur" == "$NEW" ]] && continue
