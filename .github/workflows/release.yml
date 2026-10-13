@@ -81,11 +81,9 @@ jobs:
           # `--text`, so the line is `<hash>  <name>` on every runner: on
           # Windows the default mode writes `<hash> *<name>`, which a
           # launcher already published does not read.
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum --text "$ASSET" > "${ASSET}.sha256"
-          else
-            shasum -a 256 "$ASSET" > "${ASSET}.sha256"
-          fi
+          # Falling back when `sha256sum` is absent or does not take the
+          # flag, as the pull-request job that rehearses this does.
+          { sha256sum --text "$ASSET" 2>/dev/null || shasum -a 256 "$ASSET"; } > "${ASSET}.sha256"
           mkdir -p dist
           mv "$ASSET" "${ASSET}.sha256" dist/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

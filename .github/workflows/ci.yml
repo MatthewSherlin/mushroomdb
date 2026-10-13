@@ -359,6 +359,11 @@ jobs:
           "$BIN" query "$DB" "MATCH (p:Person {id: 'smoke'}) RETURN p.name AS name"
           "$BIN" backup "$DB" "$RUNNER_TEMP/smoke-backup"
           "$BIN" stats "$RUNNER_TEMP/smoke-backup"
+          # One exchange with the MCP server over stdio.
+          # Captured, not piped into grep: under pipefail a grep that has
+          # seen enough closes the pipe and fails the step.
+          tools=$(echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | "$BIN" mcp "$DB")
+          case "$tools" in *'"recall"'*) ;; *) echo "mcp did not list recall" >&2; exit 1 ;; esac
       # The launcher end to end, as a user would have it: the tarball
       # `release.yml` packs, a checksum file, and `npm install` of the packed
       # package, whose postinstall fetches the asset for this platform from a
