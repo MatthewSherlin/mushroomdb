@@ -1,0 +1,6 @@
+# Templates the CLI embeds with include_str!, and the scripts a release and the
+# hooks run: the same bytes on every checkout, Windows included.
+*.md text eol=lf
+*.mdc text eol=lf
+*.sh text eol=lf
+*.in text eol=lf

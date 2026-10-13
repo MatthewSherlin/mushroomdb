@@ -13,7 +13,7 @@ case "${os}-${arch}" in
   linux-x64|linux-x86_64) TARGET=x86_64-unknown-linux-gnu ;;
   linux-arm64|linux-aarch64) TARGET=aarch64-unknown-linux-gnu ;;
   *)
-    echo "host platform ${os}-${arch} is not one of the three release targets" >&2
+    echo "host platform ${os}-${arch} is not one this script has a fake release for" >&2
     exit 1
     ;;
 esac

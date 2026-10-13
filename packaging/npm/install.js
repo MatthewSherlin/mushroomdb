@@ -78,7 +78,9 @@ function fetchBuffer(url) {
 // there are two — Git Bash on Windows puts GNU tar ahead of the system's —
 // the one found first reads a path that starts `C:` as a remote host.
 function fileFromTarball(tarball, name) {
-  const tar = zlib.gunzipSync(tarball);
+  // Bounded: a release binary is tens of megabytes, and the checksum that
+  // admitted this tarball came from the host that served it.
+  const tar = zlib.gunzipSync(tarball, { maxOutputLength: 512 * 1024 * 1024 });
   for (let at = 0; at + 512 <= tar.length; ) {
     const header = tar.subarray(at, at + 512);
     if (header.every((b) => b === 0)) break;
