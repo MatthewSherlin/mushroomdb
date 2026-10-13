@@ -143,6 +143,12 @@ impl ViewDef {
 pub struct ViewStore {
     /// Ordered by name.
     views: BTreeMap<String, ViewDef>,
+    /// Nodes whose view values incremental maintenance may have written
+    /// since [`Self::take_touched`] was last called. A view's value is in no
+    /// WAL record, so this is the only account of which ones a commit moved;
+    /// the lock-free reader is told from it. May repeat a node, and may name
+    /// one no view applies to.
+    touched: Vec<u32>,
 }
 
 impl ViewStore {
@@ -156,6 +162,17 @@ impl ViewStore {
 
     pub fn is_empty(&self) -> bool {
         self.views.is_empty()
+    }
+
+    /// The nodes incremental maintenance has touched since the last call,
+    /// leaving none recorded.
+    pub fn take_touched(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.touched)
+    }
+
+    /// Forget the touched nodes without reading them.
+    pub fn clear_touched(&mut self) {
+        self.touched.clear();
     }
 
     pub fn has_view(&self, name: &str) -> bool {
@@ -299,7 +316,7 @@ impl ViewStore {
     /// (Avg, Min, Max) see correct neighbor sets.
     #[allow(clippy::too_many_arguments)]
     pub fn on_edge_changed(
-        &self,
+        &mut self,
         etype: u32,
         src: u32,
         dst: u32,
@@ -322,7 +339,7 @@ impl ViewStore {
     /// a hub quadratic in its degree.
     #[allow(clippy::too_many_arguments)]
     pub fn on_edge_changed_except(
-        &self,
+        &mut self,
         etype: u32,
         src: u32,
         dst: u32,
@@ -358,6 +375,7 @@ impl ViewStore {
             if gone == Some(subject) {
                 continue;
             }
+            self.touched.push(subject);
             update_node_view(
                 def, subject, neighbor, inserted, props, topo, ids, syms, labels, base_cols,
             );
@@ -368,7 +386,7 @@ impl ViewStore {
     /// read `field` from neighbors and recomputes values for all subject nodes.
     #[allow(clippy::too_many_arguments)]
     pub fn on_prop_changed(
-        &self,
+        &mut self,
         changed_node: u32,
         field: &str,
         props: &mut ColumnStore,
@@ -402,6 +420,7 @@ impl ViewStore {
                 Direction::In => Direction::Out,
             };
             let subjects: Vec<u32> = topo.neighbors(et_sym, reverse_dir, changed_node).to_vec();
+            self.touched.extend_from_slice(&subjects);
             for subject in subjects {
                 // Full recompute using the full base+overlay props view.
                 // Build the ColumnsView in a block so the immutable borrow of `props`
@@ -430,12 +449,15 @@ impl ViewStore {
     /// that subsequent `on_edge_changed` calls (from derived-edge deltas) can
     /// increment correctly from a known baseline.
     pub fn init_node_views(
-        &self,
+        &mut self,
         node: u32,
         props: &mut ColumnStore,
         syms: &Interner,
         labels: &[u32],
     ) {
+        if !self.views.is_empty() {
+            self.touched.push(node);
+        }
         for def in self.views.values() {
             let Some(label_sym) = syms.get(&def.label) else {
                 continue;
