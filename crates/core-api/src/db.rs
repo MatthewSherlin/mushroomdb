@@ -14305,6 +14305,37 @@ impl<F: Fs> GraphDb<F> {
         // is fully entitled to (defect #23).
         let had_prior_snapshot = self.fs.snapshot_path().map(|p| p.exists()).unwrap_or(false)
             && !self.snapshot_preserved_history;
+        // The genesis marker, for the first archive of a store whose history
+        // has never been cut — written now, before anything is replaced.
+        //
+        // It says that this store's archives and WAL together reach back to
+        // its first write, and that is as true now, with no archive yet, as
+        // it will be when this snapshot has made one. It used to be written
+        // last, after the snapshot, the rename and the new WAL, and a
+        // snapshot interrupted anywhere before that never got another
+        // chance: the next one found the interrupted one's `snapshot.bin`,
+        // could not tell it from a truncating snapshot's, and declined. Every
+        // commit in an archive was `out of range` from then on (row 98).
+        //
+        // Both conditions as before. No archive exists, and no snapshot did
+        // before this one: a truncating snapshot always leaves `snapshot.bin`,
+        // so one found here means the WAL may not start at the beginning, and
+        // the chain is not claimed (never silently wrong data). The exception
+        // is a snapshot this handle took itself with the WAL kept, which
+        // `snapshot_preserved_history` records (defect #23). On SimFs
+        // (`snapshot_path() == None`) there is never a prior snapshot.
+        //
+        // A marker left by a snapshot that then fails is still true. What
+        // makes it false removes it: a truncating snapshot, and a retention
+        // sweep that prunes an archive.
+        if opts.archive_wal
+            && !had_prior_snapshot
+            && !self.archive_genesis_chain
+            && self.fs.list_archives()?.is_empty()
+        {
+            self.fs.write_genesis_marker()?;
+            self.archive_genesis_chain = true;
+        }
         // Which version this store writes. V9 unless it has opted in to
         // multiplicity, in which case V10 — the stamp that makes a reader which
         // does not know WAL discriminant 23 refuse the open instead of
@@ -14600,18 +14631,16 @@ impl<F: Fs> GraphDb<F> {
             //      absent.  Reopen: snapshot loaded (full state), no WAL
             //      replay.  Archive is NOT replayed into live state — it is
             //      pre-snapshot by construction.  Safe.
-            //   3. Optionally write genesis marker (first archive only, no
-            //      prior WAL truncation).
+            //   3. (The genesis marker is written before step 1; see above.)
             //   4. Prune old archives (retention), update horizon floor.
             //      Pruning invalidates the genesis chain; delete marker.
             //   5. Write new minimal baseline WAL (write_atomic).
             //      Crash window C: crash here leaves new archive plus no live
             //      WAL.  Same as window B — handled above.
             //
-            // Sample existing archives BEFORE the rename so we can detect
-            // whether this is the first archive.
+            // Sample existing archives BEFORE the rename: the last one names
+            // where this one starts.
             let existing_archives = self.fs.list_archives()?;
-            let is_first_archive = existing_archives.is_empty();
 
             // Compute a globally-monotonic archive name: the name equals the
             // cumulative end-frame index of the archive in global commit space.
@@ -14678,34 +14707,7 @@ impl<F: Fs> GraphDb<F> {
             }
             self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
 
-            // Genesis marker: written once when the first archive is taken
-            // from a store that has never undergone a WAL-truncating snapshot.
-            // When present, `open_at` may replay archive-resident commits from
-            // empty state (the archive chain covers from global index 0).
-            //
-            // Two conditions must ALL hold:
-            //   1. This is the first archive (existing_archives was empty).
-            //   2. No snapshot.bin existed before this operation (had_prior_snapshot=false).
-            //      A WAL-truncating snapshot (keep_wal=false) always writes snapshot.bin
-            //      before truncating the WAL, so if any prior truncating snapshot was taken
-            //      — even in a previous session — snapshot.bin is present and this condition
-            //      is false.  This subsumes the cross-session truncation case without
-            //      requiring a separate wal.truncated sidecar file.
-            //      For legacy stores (snapshot.bin written by an older code version that
-            //      may have truncated the WAL), the same conservative refusal applies:
-            //      we cannot prove the chain is complete, so we refuse genesis (cost =
-            //      no as-of-through-archives; never silent wrong data).
-            //      The one exception is a snapshot this handle took itself, on a store
-            //      that had none when it opened, with the WAL kept: there the answer is
-            //      known rather than guessed, and `snapshot_preserved_history` says so.
-            //      Without that exception `enable_multiplicity`'s forced keep_wal
-            //      snapshot would disqualify the store forever (defect #23).
-            //      On SimFs (snapshot_path() == None) had_prior_snapshot is always false,
-            //      so SimFs always passes this check.
-            if is_first_archive && !had_prior_snapshot {
-                self.fs.write_genesis_marker()?;
-                self.archive_genesis_chain = true;
-            }
+            // The genesis marker was written before the snapshot, above.
 
             // Retention pruning: keep newest `keep` archives; delete oldest.
             // Pruning is the ONLY deletion site for archives.

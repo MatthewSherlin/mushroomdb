@@ -4049,3 +4049,52 @@ fn a_failed_first_snapshot_keeps_edge_properties() {
         assert_eq!(weight(&db), before, "{name}: after a reopen");
     }
 }
+
+/// Row 98. A store's first archiving snapshot is what makes its archives
+/// readable by commit: it leaves `wal.genesis`, which says they reach back to
+/// the store's first write. The marker used to be written last, after the
+/// snapshot and after the WAL had been archived and replaced, and only when no
+/// snapshot had existed beforehand. A snapshot interrupted anywhere before
+/// that left a store whose next snapshot found the interrupted one's
+/// `snapshot.bin`, took it for a sign that history might already have been
+/// cut, and never wrote the marker: every commit in an archive answered
+/// `out of range` from then on, with nothing lost and nothing to say so.
+#[test]
+fn an_interrupted_first_archiving_snapshot_does_not_cost_the_reads_by_commit() {
+    let archive = SnapshotOptions {
+        archive_wal: true,
+        ..Default::default()
+    };
+    let people_at = |dir: &std::path::Path, commit: u64| -> usize {
+        let db = GraphDb::open_at(dir, commit).unwrap_or_else(|e| panic!("open_at({commit}): {e}"));
+        db.query("MATCH (p:Person) RETURN p.id AS id", &BTreeMap::new())
+            .unwrap()
+            .len()
+    };
+    for stop in [
+        core_api::SnapshotStop::BeforeSnapshotWrite,
+        core_api::SnapshotStop::AfterSnapshotWrite,
+        core_api::SnapshotStop::BeforeWalReplacement,
+        core_api::SnapshotStop::AfterWalReplacement,
+    ] {
+        let dir = tmp(&format!("genesis-{stop:?}"));
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            for key in ["a", "b", "c"] {
+                db.insert_node("Person", key, vec![]).unwrap();
+            }
+            db.stop_next_snapshot(stop);
+            assert!(db.snapshot_with(archive.clone()).is_err(), "{stop:?}");
+        }
+        assert_eq!(people_at(&dir, 1), 2, "{stop:?}: after the interruption");
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            db.insert_node("Person", "d", vec![]).unwrap();
+            db.snapshot_with(archive.clone()).unwrap();
+            db.insert_node("Person", "e", vec![]).unwrap();
+            db.snapshot_with(archive.clone()).unwrap();
+        }
+        assert_eq!(people_at(&dir, 0), 1, "{stop:?}: the first commit");
+        assert_eq!(people_at(&dir, 1), 2, "{stop:?}: the second commit");
+    }
+}
