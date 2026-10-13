@@ -13148,8 +13148,12 @@ impl<F: Fs> GraphDb<F> {
         // Local index into surviving frames (0 = first frame of oldest archive).
         let local_commit = at_commit - floor;
 
-        // Replay local frames 0..=local_commit, tracking active edges.
-        let mut active: BTreeSet<(String, String, String)> = BTreeSet::new();
+        // Replay local frames 0..=local_commit, tracking active edges between
+        // the two nodes: the edge type and whether it runs from `a` to `b`.
+        // Tracked by which node, not by the key each record names it with: an
+        // edge written while a node was called one thing and deleted while it
+        // was called another is the same edge.
+        let mut active: BTreeSet<(String, bool)> = BTreeSet::new();
 
         for (local_i, frame) in frames.iter().enumerate().take((local_commit + 1) as usize) {
             let commit = floor + local_i as u64;
@@ -13169,8 +13173,11 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.insert((et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.insert((et.clone(), true));
+                        }
+                        if is_ba {
+                            active.insert((et.clone(), false));
                         }
                     }
                     WalRecord::InsertEdgeId { etype, src, dst } => {
@@ -13183,12 +13190,11 @@ impl<F: Fs> GraphDb<F> {
                         let dst_key = self.ids.key_of_historical(*dst);
                         let is_ab = src_key == Some(a) && dst_key == Some(b);
                         let is_ba = src_key == Some(b) && dst_key == Some(a);
-                        if is_ab || is_ba {
-                            active.insert((
-                                etype_str,
-                                src_key.unwrap().to_string(),
-                                dst_key.unwrap().to_string(),
-                            ));
+                        if is_ab {
+                            active.insert((etype_str.clone(), true));
+                        }
+                        if is_ba {
+                            active.insert((etype_str, false));
                         }
                     }
                     WalRecord::DeleteEdge {
@@ -13200,16 +13206,20 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.remove(&(et.clone(), true));
+                        }
+                        if is_ba {
+                            active.remove(&(et.clone(), false));
                         }
                     }
                     WalRecord::DeleteNode { key: k }
                         if Self::aliases_match(&alias_a, k, commit)
                             || Self::aliases_match(&alias_b, k, commit) =>
                     {
-                        // All edges touching the deleted node are gone.
-                        active.retain(|(_, s, d)| s != k && d != k);
+                        // One of the two nodes is gone, and every edge
+                        // between them with it.
+                        active.clear();
                     }
                     WalRecord::DerivedEdgeAdded {
                         edge_type: et,
@@ -13221,8 +13231,11 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.insert((et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.insert((et.clone(), true));
+                        }
+                        if is_ba {
+                            active.insert((et.clone(), false));
                         }
                     }
                     WalRecord::DerivedEdgeRetracted {
@@ -13235,8 +13248,11 @@ impl<F: Fs> GraphDb<F> {
                             && Self::aliases_match(&alias_b, dst_key, commit);
                         let is_ba = Self::aliases_match(&alias_b, src_key, commit)
                             && Self::aliases_match(&alias_a, dst_key, commit);
-                        if is_ab || is_ba {
-                            active.remove(&(et.clone(), src_key.clone(), dst_key.clone()));
+                        if is_ab {
+                            active.remove(&(et.clone(), true));
+                        }
+                        if is_ba {
+                            active.remove(&(et.clone(), false));
                         }
                     }
                     _ => {}
@@ -13244,7 +13260,7 @@ impl<F: Fs> GraphDb<F> {
             }
         }
 
-        Ok(active.iter().any(|(et, _, _)| et == edge_type))
+        Ok(active.iter().any(|(et, _)| et == edge_type))
     }
 
     /// Every edge incident to `key` — either endpoint — that existed at WAL

@@ -981,3 +981,111 @@ fn a_history_read_on_a_node_renamed_away_and_back_returns() {
     assert!(linked_now);
     assert!(history >= 1, "the node's own insert, at least: {history}");
 }
+
+/// `was_linked(x, <key>)` at every commit, as `T`/`f`, after `steps` on a
+/// store holding nodes `a` (commit 0) and `x` (commit 1).
+fn linked_at_every_commit(name: &str, steps: &[(&str, &str, &str)], key: &str) -> String {
+    let mut db = GraphDb::open(&tmp(name)).unwrap();
+    db.insert_node("Doc", "a", vec![]).unwrap();
+    db.insert_node("Doc", "x", vec![]).unwrap();
+    for (op, from, to) in steps {
+        match *op {
+            "rename" => db.rename_node(from, to).unwrap(),
+            "link" => {
+                db.insert_edge("E", from, to).unwrap();
+            }
+            "unlink" => {
+                db.delete_edge("E", from, to).unwrap();
+            }
+            other => panic!("unknown step {other}"),
+        }
+    }
+    (0..db.wal_total_commits().unwrap())
+        .map(|c| {
+            if db.was_linked("x", key, "E", c).unwrap() {
+                'T'
+            } else {
+                'f'
+            }
+        })
+        .collect()
+}
+
+/// Binding: `was_linked` follows the node, not the name an edge was written
+/// or deleted under. An edge written while the node was `a` and deleted while
+/// it was `b` is gone, whatever the node is called now.
+///
+/// The read kept the edges it had seen by the keys in each record, so a
+/// delete recorded under one name did not remove an edge recorded under
+/// another: after `a → b → a`, and after `a → b → c`, it went on answering
+/// "linked" for an edge that had been deleted.
+#[test]
+fn was_linked_sees_a_delete_made_under_another_of_the_nodes_names() {
+    // commits:                       0 1 2 3 4 5 6
+    //   insert a, insert x, link, rename, unlink, rename, link
+    assert_eq!(
+        linked_at_every_commit(
+            "linked-there-and-back",
+            &[
+                ("link", "x", "a"),
+                ("rename", "a", "b"),
+                ("unlink", "x", "b"),
+                ("rename", "b", "a"),
+                ("link", "x", "a"),
+            ],
+            "a",
+        ),
+        "ffTTffT"
+    );
+    assert_eq!(
+        linked_at_every_commit(
+            "linked-chain",
+            &[
+                ("link", "x", "a"),
+                ("rename", "a", "b"),
+                ("unlink", "x", "b"),
+                ("rename", "b", "c"),
+            ],
+            "c",
+        ),
+        "ffTTff"
+    );
+    assert_eq!(
+        linked_at_every_commit(
+            "linked-round-twice",
+            &[
+                ("link", "x", "a"),
+                ("rename", "a", "b"),
+                ("unlink", "x", "b"),
+                ("rename", "b", "a"),
+                ("rename", "a", "b"),
+                ("link", "x", "b"),
+                ("rename", "b", "a"),
+            ],
+            "a",
+        ),
+        "ffTTfffTT"
+    );
+    // The shapes that were already right.
+    assert_eq!(
+        linked_at_every_commit(
+            "linked-one-rename",
+            &[
+                ("link", "x", "a"),
+                ("rename", "a", "b"),
+                ("unlink", "x", "b"),
+                ("link", "x", "b"),
+            ],
+            "b",
+        ),
+        "ffTTfT"
+    );
+    assert_eq!(
+        linked_at_every_commit(
+            "linked-plain",
+            &[("link", "x", "a"), ("unlink", "x", "a"), ("link", "x", "a")],
+            "a",
+        ),
+        "ffTfT"
+    );
+}
