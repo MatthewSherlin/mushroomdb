@@ -977,6 +977,8 @@ fn self_handshake(
 ) -> Result<HandshakeOk, String> {
     let mut child = Command::new(command)
         .args(args)
+        // The handshake reads; it must not be what snapshots the store.
+        .env(crate::NO_AUTO_SNAPSHOT_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

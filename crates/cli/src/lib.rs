@@ -112,6 +112,15 @@ pub fn snapshot_shared(db: &SharedDb) -> Result<(), core_api::GraphError> {
     snapshot_automatically(&mut db.write_with_wait(SNAPSHOT_LOCK_WAIT)?)
 }
 
+/// Set, to anything, in the environment of a `mushroomdb mcp` that must not
+/// snapshot the store it opens.
+///
+/// `mushroomdb doctor` sets it on the server it starts to see whether it
+/// answers: a diagnostic does not rewrite what it diagnoses, and doctor kills
+/// that server two seconds after closing its stdin, which is no time to be
+/// halfway through a snapshot.
+pub const NO_AUTO_SNAPSHOT_ENV: &str = "MUSHROOMDB_NO_AUTO_SNAPSHOT";
+
 /// Take the automatic snapshot if the store's WAL has grown past
 /// [`SNAPSHOT_WAL_BYTES`](crate::ingest_git::SNAPSHOT_WAL_BYTES).
 ///
@@ -124,7 +133,11 @@ pub fn snapshot_shared(db: &SharedDb) -> Result<(), core_api::GraphError> {
 /// not: a snapshot shortens the next open and nothing else, and what was
 /// written is durable either way. `Busy` — another process holds the write
 /// lock — is skipped without a word; anything else is reported on stderr.
+/// [`NO_AUTO_SNAPSHOT_ENV`] turns it off.
 pub fn snapshot_if_wal_grew(db: &SharedDb, db_dir: &Path) {
+    if std::env::var_os(NO_AUTO_SNAPSHOT_ENV).is_some_and(|v| !v.is_empty()) {
+        return;
+    }
     let grown = std::fs::metadata(db_dir.join("wal.bin"))
         .is_ok_and(|m| m.len() > crate::ingest_git::SNAPSHOT_WAL_BYTES);
     if !grown {

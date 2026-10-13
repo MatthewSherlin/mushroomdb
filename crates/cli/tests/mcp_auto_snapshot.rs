@@ -49,9 +49,14 @@ struct Session {
 
 impl Session {
     fn start(dir: &Path) -> Self {
+        Self::start_with_env(dir, &[])
+    }
+
+    fn start_with_env(dir: &Path, env: &[(&str, &str)]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
             .arg("mcp")
             .arg(dir)
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -195,4 +200,51 @@ fn a_session_that_grows_the_wal_snapshots_when_it_ends() {
     assert!(wal_len(&store.0) < SNAPSHOT_WAL_BYTES);
     assert_eq!(archives(&store.0), 1);
     assert_eq!(node_count(&store.0), 6000);
+}
+
+/// `mushroomdb doctor` starts the configured server to see that it answers,
+/// and gives it two seconds after closing its stdin before killing it. A
+/// diagnostic must not rewrite the store it is diagnosing, and must not be
+/// what interrupts a snapshot: it sets `MUSHROOMDB_NO_AUTO_SNAPSHOT`.
+#[test]
+fn a_session_told_not_to_snapshot_leaves_a_grown_store_as_it_is() {
+    let store = TempStore::new("told-not-to");
+    fill(&store.0, 6000);
+    let before = wal_len(&store.0);
+    assert!(before > SNAPSHOT_WAL_BYTES, "the setup's WAL");
+
+    let mut session = Session::start_with_env(&store.0, &[(cli::NO_AUTO_SNAPSHOT_ENV, "1")]);
+    assert!(session.call(&tools_list())["result"].is_object());
+    session.end();
+
+    assert!(!store.0.join("snapshot.bin").exists());
+    assert_eq!(archives(&store.0), 0);
+    assert_eq!(wal_len(&store.0), before);
+}
+
+/// Another process holding the store's write lock is not an error and not a
+/// wait worth reporting: the session serves, says nothing, and leaves the
+/// snapshot to whoever opens the store next.
+#[test]
+fn a_session_skips_the_snapshot_while_another_process_holds_the_write_lock() {
+    let store = TempStore::new("busy");
+    fill(&store.0, 6000);
+    let holder = GraphDb::open(&store.0).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mushroomdb"))
+        .arg("mcp")
+        .arg(&store.0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{}", tools_list()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    drop(holder);
+
+    assert!(out.status.success(), "exit {}", out.status);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"tools\""));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "", "said something");
+    assert!(!store.0.join("snapshot.bin").exists());
 }

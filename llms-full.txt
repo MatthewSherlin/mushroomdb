@@ -3343,9 +3343,9 @@ mushroomdb mcp <db-dir>
 Runs a newline-delimited JSON-RPC 2.0 loop on stdio. No `Content-Length`
 framing.
 
-When it opens a store whose WAL has grown past 4 MiB, and again when stdin
-closes, the server takes a snapshot so that the next open does not replay the
-store's whole history. The WAL is archived beside the snapshot; see
+When it opens a store whose WAL has grown past 4 MiB, before its first answer,
+the server takes a snapshot so that the next open does not replay the store's
+whole history; it checks the same thing again when stdin closes. The WAL is archived beside the snapshot; see
 [Keeping recovery fast](durability.md#keeping-recovery-fast).
 
 Handshake:
@@ -10040,9 +10040,10 @@ The tooling already bounds WAL-only-from-genesis exposure:
 - **`mushroomdb mcp` snapshots a store whose WAL has grown.** When it opens a
   store whose WAL is past 4 MiB, and again when its session ends, it takes the
   same snapshot: the WAL is archived, not dropped, so history reads keep their
-  reach. A store used only as an assistant's memory is opened by nothing else,
-  and without this every session replayed everything it had ever written.
-  Skipped when another process holds the write lock.
+  reach. A store used only as an assistant's memory is snapshotted by nothing
+  else, and without this every open replayed everything it had ever written.
+  The one at open runs before the server's first answer. Skipped when another
+  process holds the write lock, and by the server `mushroomdb doctor` starts.
 - The server **snapshots on graceful shutdown** (SIGINT/SIGTERM), so a clean
   restart always recovers from an image.
 - `mushroomdb serve … --snapshot-every <secs>` snapshots periodically, so even
