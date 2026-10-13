@@ -14319,12 +14319,15 @@ impl<F: Fs> GraphDb<F> {
             //   • self.topo.clone()      (~topology HashMap footprint)
             //   • self.props.clone()     (~column-store footprint)
             //   • encode_v8_from_state V8Meta secondary clones (labels, edge_props, …)
-            let meta = V8Meta {
+            let mut meta = V8Meta {
                 labels: (*self.labels).clone(),
                 wal_truncated: !opts.keep_wal,
-                // Move edge_props out so the large overlay is freed when meta
-                // drops at end of this block (self.edge_props is now empty; reads
-                // after base assignment go through the mmap'd base section).
+                // Moved, not cloned, for the encode — and moved straight back
+                // below, before anything that can fail. They are released
+                // only once the new snapshot is mapped and reads go through
+                // it. Left out of the handle across the write, a snapshot
+                // that failed there went on with no edge properties at all,
+                // and the next one that worked wrote that down.
                 edge_props: std::mem::take(Arc::make_mut(&mut self.edge_props)),
                 rule_defs,
                 provenance,
@@ -14337,7 +14340,7 @@ impl<F: Fs> GraphDb<F> {
                 wal_mark: wal_mark.clone(),
             };
             let mut buf = Vec::new();
-            encode_v8(
+            let encoded = encode_v8(
                 None,
                 None,
                 None,
@@ -14349,10 +14352,10 @@ impl<F: Fs> GraphDb<F> {
                 &self.syms,
                 &meta,
                 &mut buf,
-            )?;
-            // meta (and the moved edge_props inside it) is no longer needed;
-            // drop it before the write to keep the peak window narrow.
+            );
+            self.edge_props = Arc::new(std::mem::take(&mut meta.edge_props));
             drop(meta);
+            encoded?;
             core_storage::snapshot::stamp_container_version(&mut buf, snapshot_version)?;
             if replaces_wal {
                 // Before the snapshot: what is about to be written, and the
@@ -14392,7 +14395,7 @@ impl<F: Fs> GraphDb<F> {
             self.base = Some(Arc::new(new_base));
             // Free the large heap-allocated decoded state — all data is now in the
             // mmap'd base.  Mirrors the V8 merge-snapshot path (see above).
-            // self.edge_props was already moved into meta and is effectively empty.
+            self.edge_props = Arc::new(Default::default());
             self.topo = Arc::new(Topology::new());
             self.props = Arc::new(core_storage::columns::ColumnStore::new());
         }

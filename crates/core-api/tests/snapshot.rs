@@ -3893,3 +3893,76 @@ fn a_second_failed_snapshot_keeps_the_first_ones_intent() {
         }
     }
 }
+
+/// Binding: a store's first snapshot failing does not lose edge properties.
+///
+/// The first snapshot moved the edge properties out of the handle to encode
+/// them, before the write that could fail. When it did — a full disk — the
+/// handle went on with none: a rule's weights read as absent, and the next
+/// snapshot that worked wrote that down.
+#[test]
+fn a_failed_first_snapshot_keeps_edge_properties() {
+    for (name, opts) in [
+        ("truncate", SnapshotOptions::default()),
+        ("keep", keep_wal()),
+        (
+            "archive",
+            SnapshotOptions {
+                archive_wal: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let dir = tmp(&format!("first-snapshot-edge-props-{name}"));
+        let tags = || Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]);
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("A", "a", vec![("tags".into(), tags())])
+            .unwrap();
+        db.insert_node("A", "b", vec![("tags".into(), tags())])
+            .unwrap();
+        db.create_rule(RuleDef {
+            name: "alike".into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min: 0.5,
+            },
+            edge_type: "ALIKE".into(),
+            weight_prop: Some("score".into()),
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        })
+        .unwrap();
+        let weight = |db: &GraphDb<core_storage::fs::RealFs>| {
+            let rows = db
+                .query(
+                    "MATCH (a:A {id: 'a'})-[r:ALIKE]->(b:A {id: 'b'}) RETURN r.score AS score",
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1, "the derived edge is there");
+            rows.row(0)[0].clone()
+        };
+        let before = weight(&db);
+        assert!(before.is_some(), "{name}: the rule writes a weight");
+
+        db.stop_next_snapshot(core_api::SnapshotStop::BeforeSnapshotWrite);
+        assert!(db.snapshot_with(opts.clone()).is_err(), "{name}");
+        assert_eq!(weight(&db), before, "{name}: on the handle that failed");
+
+        db.snapshot_with(opts.clone()).unwrap();
+        assert_eq!(
+            weight(&db),
+            before,
+            "{name}: after the snapshot that worked"
+        );
+        drop(db);
+        let db = GraphDb::open(&dir).unwrap();
+        assert_eq!(weight(&db), before, "{name}: after a reopen");
+    }
+}
