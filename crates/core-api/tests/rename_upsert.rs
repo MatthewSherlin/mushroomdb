@@ -943,3 +943,41 @@ fn an_edge_deleted_before_a_rename_in_the_same_batch_can_be_reinserted_after_it(
         vec!["d".to_string()]
     );
 }
+
+/// Binding: a history read on a node renamed away and back again returns.
+///
+/// The reads follow a key back through the renames that led to it. With
+/// `a → b` and then `b → a` each key was the other's predecessor, and the walk
+/// went round for ever: `was_linked`, `node_history`, `edge_history` and
+/// `edges_at` on such a node never came back.
+#[test]
+fn a_history_read_on_a_node_renamed_away_and_back_returns() {
+    let dir = tmp("rename-cycle-history");
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node(
+            "Person",
+            "a",
+            vec![("name".into(), Value::Str("Ann".into()))],
+        )
+        .unwrap();
+        db.insert_node("Person", "x", vec![]).unwrap();
+        db.insert_edge("KNOWS", "x", "a").unwrap();
+        db.rename_node("a", "b").unwrap();
+        db.rename_node("b", "a").unwrap();
+        db.rename_node("a", "b").unwrap();
+        db.rename_node("b", "a").unwrap();
+        let last = db.wal_total_commits().unwrap() - 1;
+        let linked_then = db.was_linked("x", "a", "KNOWS", 1).unwrap();
+        let linked_now = db.was_linked("x", "a", "KNOWS", last).unwrap();
+        let history = db.node_history("a").unwrap().items.len();
+        let _ = done.send((linked_then, linked_now, history));
+    });
+    let (linked_then, linked_now, history) = finished
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the history reads did not return");
+    assert!(!linked_then, "the edge was written at commit 2");
+    assert!(linked_now);
+    assert!(history >= 1, "the node's own insert, at least: {history}");
+}
