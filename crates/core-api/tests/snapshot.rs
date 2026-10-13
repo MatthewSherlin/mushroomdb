@@ -3752,3 +3752,97 @@ fn a_backup_of_a_store_with_an_interrupted_snapshot_opens() {
     }
     assert_the_store_is_as_it_was_left(&seeded, "the restored store");
 }
+
+/// Binding: an intent left over by a snapshot that replaced its WAL and did
+/// not get to empty the file does not outlive the handle's next write.
+///
+/// The snapshot fails at its last step; the handle is alive and goes on
+/// writing. Here it makes the same three writes again, so the new WAL comes
+/// to begin with the very bytes the intent names — and an open that still
+/// believed the intent skipped them: written, acknowledged, and gone.
+#[test]
+fn a_left_over_intent_does_not_skip_writes_made_after_it() {
+    for (name, opts) in [
+        ("truncate", SnapshotOptions::default()),
+        (
+            "archive",
+            SnapshotOptions {
+                archive_wal: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let dir = tmp(&format!("left-over-intent-{name}"));
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            db.insert_node("A", "a", vec![("p".into(), Value::Int(1))])
+                .unwrap();
+            db.insert_node("A", "b", vec![("p".into(), Value::Int(2))])
+                .unwrap();
+            db.snapshot_with(opts.clone()).unwrap();
+            let round = |db: &mut GraphDb<core_storage::fs::RealFs>| {
+                db.delete_node("b").unwrap();
+                db.rename_node("a", "b").unwrap();
+                db.insert_node("A", "a", vec![]).unwrap();
+            };
+            round(&mut db);
+            db.stop_next_snapshot(core_api::SnapshotStop::AfterWalReplacement);
+            assert!(db.snapshot_with(opts.clone()).is_err(), "{name}");
+            round(&mut db);
+            assert_eq!(db.get_prop("b", "p"), None, "{name}: live");
+        }
+        let db = GraphDb::open(&dir).unwrap();
+        assert_eq!(db.stats().nodes_live, 2, "{name}");
+        assert_eq!(db.get_prop("b", "p"), None, "{name}: after a reopen");
+        assert_eq!(db.get_prop("a", "p"), None, "{name}: after a reopen");
+    }
+}
+
+/// Binding: a read of a past commit on a store whose snapshot was interrupted
+/// answers as the same store with no snapshot does, or is refused. The
+/// snapshot there is the state at the end of the WAL; taken as the base of a
+/// prefix of it, it answered the first commits with nodes from the future
+/// and failed the rest.
+#[test]
+fn a_past_commit_reads_right_on_a_store_with_an_interrupted_snapshot() {
+    let keys_at =
+        |dir: &std::path::Path, commit: u64| -> std::result::Result<Vec<String>, String> {
+            let db = GraphDb::open_at(dir, commit).map_err(|e| e.to_string())?;
+            let mut keys: Vec<String> = ["n", "m", "k"]
+                .iter()
+                .filter(|k| db.has_node(k))
+                .map(|k| format!("{k}={:?}", db.get_prop(k, "body")))
+                .collect();
+            keys.sort();
+            Ok(keys)
+        };
+    let plain = tmp("asof-plain");
+    let total = {
+        let db = store_with_history_that_does_not_replay_twice(&plain);
+        db.wal_total_commits().unwrap()
+    };
+    for stop in [
+        core_api::SnapshotStop::AfterSnapshotWrite,
+        core_api::SnapshotStop::BeforeWalReplacement,
+    ] {
+        let dir = tmp(&format!("asof-interrupted-{stop:?}"));
+        {
+            let mut db = store_with_history_that_does_not_replay_twice(&dir);
+            db.stop_next_snapshot(stop);
+            assert!(db.snapshot().is_err());
+        }
+        for commit in 0..total {
+            match keys_at(&dir, commit) {
+                Ok(keys) => assert_eq!(
+                    Ok(keys),
+                    keys_at(&plain, commit),
+                    "{stop:?}, commit {commit}"
+                ),
+                Err(e) => assert!(
+                    e.contains("out of range") || e.contains("OutOfRange") || e.contains("floor"),
+                    "{stop:?}, commit {commit}: a past commit is answered right or refused by name, got {e}"
+                ),
+            }
+        }
+    }
+}

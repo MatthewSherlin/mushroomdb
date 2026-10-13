@@ -1615,6 +1615,11 @@ pub struct GraphDb<F: Fs> {
     /// open path and **false** of `refresh()`: refresh applies peer frames and
     /// then only folds, so its backfill is the only thing that indexes them.
     fulltext_rebuild_follows: bool,
+    /// `true` when `snapshot.intent` may hold something that is no longer
+    /// true: this handle found one that did not match, or a snapshot of its
+    /// own wrote one and did not get to empty it. Settled, under the write
+    /// lock, before the next append.
+    intent_unsettled: bool,
     /// Set by [`GraphDb::stop_next_snapshot`]; taken by the next snapshot.
     snapshot_stop: Option<SnapshotStop>,
     /// `true` when `commit_times.bin` was present but would not decode.
@@ -2386,6 +2391,7 @@ impl<F: Fs> GraphDb<F> {
             commit_times: core_storage::commit_times::CommitTimes::default(),
             commit_times_poisoned: false,
             fulltext_rebuild_follows: false,
+            intent_unsettled: false,
             snapshot_stop: None,
             commit_time_override: None,
             roles: Some(vec![]),
@@ -2629,26 +2635,15 @@ impl<F: Fs> GraphDb<F> {
         //
         // So does the intent of a snapshot that was to replace its WAL and
         // did not get that far: the same state, reached by a crash.
-        let intent = db.fs.read(FileId::SnapshotIntent).unwrap_or_default();
-        let interrupted = if intent.is_empty() {
-            None
-        } else {
-            core_storage::v8::SnapshotIntent::decode(&intent)
-                .filter(|i| {
-                    db.fs
-                        .read(FileId::Snapshot)
-                        .is_ok_and(|snapshot| i.names(&snapshot))
-                })
-                .map(|i| i.wal)
-                .filter(|mark| mark.matches(&bytes))
-        };
+        let (interrupted, intent_left_over) = db.interrupted_snapshot(&bytes);
         // An intent that is not about this snapshot and this WAL is left over
-        // from a snapshot that finished, or never wrote its snapshot. A
-        // writer clears it before it can append: once new frames follow, a
-        // WAL can come to begin with the bytes an old intent names.
-        if !intent.is_empty() && interrupted.is_none() && repair_wal && !db.read_only {
-            db.fs.write_atomic(FileId::SnapshotIntent, &[])?;
-        }
+        // from a snapshot that finished, or never wrote its snapshot. It has
+        // to go before this handle appends: once new frames follow, a WAL can
+        // come to begin with the bytes an old intent names. It goes at the
+        // first append and not here, because only an appender holds the write
+        // lock, and a handle without it may be looking at a peer's snapshot
+        // half way through.
+        db.intent_unsettled = intent_left_over;
         let held = db
             .base
             .as_ref()
@@ -3519,6 +3514,11 @@ impl<F: Fs> GraphDb<F> {
             // with a graph missing everything older than the WAL. The base is
             // gone, so the read is refused (ledger row 82).
             let base_is_gone = db.wal_horizon_floor > 0 || total_archive_frames > 0;
+            // A snapshot interrupted before its WAL was replaced is, like a
+            // `keep_wal` one, the state at the END of the live WAL, whatever
+            // it says about truncation: no base for a prefix of that WAL.
+            let live_wal = db.fs.read(FileId::Wal)?;
+            let snapshot_is_wal_end = db.interrupted_snapshot(&live_wal).0.is_some();
             // Peek 6 bytes (same pattern as open_with).
             let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
             let is_v8 = snap_header.len() >= 6
@@ -3540,7 +3540,7 @@ impl<F: Fs> GraphDb<F> {
                     core_storage::snapshot::decode(&snap_bytes)?
                 };
                 if let Some(state) = state {
-                    if state.wal_truncated {
+                    if state.wal_truncated && !snapshot_is_wal_end {
                         db.restore_snapshot_state(state)?;
                         db.drop_edges_of_retired_nodes();
                     } else if base_is_gone {
@@ -3554,7 +3554,7 @@ impl<F: Fs> GraphDb<F> {
             } else if !snap_header.is_empty() {
                 let snap_bytes = db.fs.read(FileId::Snapshot)?;
                 if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
-                    if state.wal_truncated {
+                    if state.wal_truncated && !snapshot_is_wal_end {
                         db.restore_snapshot_state(state)?;
                         db.drop_edges_of_retired_nodes();
                     } else if base_is_gone {
@@ -5512,6 +5512,9 @@ impl<F: Fs> GraphDb<F> {
              a previous apply arm may have accumulated deltas before erroring; \
              the caller must drain_deltas() on any error path before returning"
         );
+        if self.intent_unsettled {
+            self.settle_snapshot_intent()?;
+        }
         let frame = encode_record(&rec);
         self.fs.append(FileId::Wal, &frame)?;
         // The cursor advances by exactly the bytes appended: these frames are
@@ -7660,6 +7663,44 @@ impl<F: Fs> GraphDb<F> {
                 base_columns(&self.base),
             );
         }
+    }
+
+    /// What `snapshot.intent` says about the snapshot and the WAL on disk.
+    ///
+    /// The first value is the WAL that the snapshot already holds, when the
+    /// intent names this snapshot and `wal` begins with exactly the WAL it
+    /// names: a snapshot that was to replace its WAL and did not get that
+    /// far. The second is `true` when the file holds anything else — an
+    /// intent left over, which must not outlive this handle's next append.
+    fn interrupted_snapshot(&self, wal: &[u8]) -> (Option<core_storage::v8::WalMark>, bool) {
+        let intent = self.fs.read(FileId::SnapshotIntent).unwrap_or_default();
+        if intent.is_empty() {
+            return (None, false);
+        }
+        let mark = core_storage::v8::SnapshotIntent::decode(&intent)
+            .filter(|i| {
+                self.fs
+                    .read(FileId::Snapshot)
+                    .is_ok_and(|snapshot| i.names(&snapshot))
+            })
+            .map(|i| i.wal)
+            .filter(|mark| mark.matches(wal))
+            // The mark was taken at the end of a whole WAL.
+            .filter(|mark| decode_all(&wal[..mark.len as usize]).1 as u64 == mark.len);
+        let left_over = mark.is_none();
+        (mark, left_over)
+    }
+
+    /// Empty `snapshot.intent` unless it is still true. Called with the write
+    /// lock held, before an append.
+    fn settle_snapshot_intent(&mut self) -> Result<()> {
+        let wal = self.fs.read(FileId::Wal)?;
+        let (_, left_over) = self.interrupted_snapshot(&wal);
+        if left_over {
+            self.fs.write_atomic(FileId::SnapshotIntent, &[])?;
+        }
+        self.intent_unsettled = false;
+        Ok(())
     }
 
     /// Make the next snapshot on this handle fail at `at`, leaving the files
@@ -14202,6 +14243,10 @@ impl<F: Fs> GraphDb<F> {
                 let intent = core_storage::v8::SnapshotIntent::new(&buf, &wal_now);
                 self.fs
                     .write_atomic(FileId::SnapshotIntent, &intent.encode())?;
+                // Until this snapshot empties it. If it does not get that far
+                // and this handle goes on writing, the next append looks at
+                // whether the intent is still true.
+                self.intent_unsettled = true;
             }
             stopped(SnapshotStop::BeforeSnapshotWrite)?;
             self.fs.write_atomic(FileId::Snapshot, &buf)?;
@@ -14275,6 +14320,10 @@ impl<F: Fs> GraphDb<F> {
                 let intent = core_storage::v8::SnapshotIntent::new(&buf, &wal_now);
                 self.fs
                     .write_atomic(FileId::SnapshotIntent, &intent.encode())?;
+                // Until this snapshot empties it. If it does not get that far
+                // and this handle goes on writing, the next append looks at
+                // whether the intent is still true.
+                self.intent_unsettled = true;
             }
             stopped(SnapshotStop::BeforeSnapshotWrite)?;
             self.fs.write_atomic(FileId::Snapshot, &buf)?;
@@ -14573,6 +14622,7 @@ impl<F: Fs> GraphDb<F> {
         if replaces_wal {
             stopped(SnapshotStop::AfterWalReplacement)?;
             self.fs.write_atomic(FileId::SnapshotIntent, &[])?;
+            self.intent_unsettled = false;
         }
         // After snapshot the overlay may have changed (V8 merge path clears
         // self.topo and self.props). Refresh the MVCC fold so future readers
