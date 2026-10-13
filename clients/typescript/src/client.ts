@@ -15,12 +15,21 @@
 import {
   MushroomError,
   type AlgoReport,
+  type BackupReport,
+  type CreateNodeResult,
   type DegreeConfig,
   type DegreeReport,
+  type EdgeHistoryResult,
   type Explanation,
+  type FindSimilarOptions,
+  type FindSimilarResult,
+  type HealthReport,
   type IngestReport,
   type IngestRequest,
+  type MetricsReport,
   type Neighborhood,
+  type NodeEdgesResult,
+  type NodeHistoryResult,
   type NodeInfo,
   type PageRankConfig,
   type PageRankReport,
@@ -28,28 +37,46 @@ import {
   type RuleDef,
   type Stats,
   type SuggestReport,
+  type WasLinkedResult,
   type WccConfig,
   type WccReport,
 } from "./types.js";
 import {
   subscribe as wsSubscribe,
+  watch as wsWatch,
+  type MutationEvent,
   type SubscribeHandle,
   type SubscribeOptions,
+  type WatchHandle,
+  type WatchOptions,
   type WsConstructor,
 } from "./ws.js";
 
 export type {
   AlgoDir,
   AlgoReport,
+  BackupReport,
   CellValue,
+  CreateNodeResult,
   DegreeConfig,
   DegreeReport,
+  EdgeHistoryEntry,
+  EdgeHistoryResult,
+  EdgeInfo,
   Explanation,
+  FindSimilarOptions,
+  FindSimilarResult,
+  HealthReport,
+  HistoryChange,
+  HistoryEntry,
   IngestEdge,
   IngestOptions,
   IngestReport,
   IngestRequest,
+  MetricsReport,
   Neighborhood,
+  NodeEdgesResult,
+  NodeHistoryResult,
   NodeInfo,
   PageRankConfig,
   PageRankReport,
@@ -60,8 +87,10 @@ export type {
   RulePredicate,
   RuleStats,
   RuleSuggestion,
+  SlowQueryEntry,
   Stats,
   SuggestReport,
+  WasLinkedResult,
   WccConfig,
   WccReport,
 } from "./types.js";
@@ -83,6 +112,22 @@ export type QueryParams = Record<string, string | number | boolean>;
 export interface QueryOptions {
   /** Bound parameters. Values must be JSON scalars (string | number | boolean). */
   params?: QueryParams;
+  /**
+   * Time-travel: run the query against the graph as it existed at this WAL
+   * commit index (read-only). Obtain a commit index from `metrics().commit_seq`
+   * or from `wasLinked()` results.
+   */
+  as_of?: number;
+  /**
+   * Node-key allow-list: restrict visible nodes to these keys. The query sees
+   * only nodes whose key is in this set. Makes the query read-only.
+   */
+  mask?: string[];
+  /**
+   * Namespace to restrict results to. Intersects with `mask` and any role.
+   * Makes the query read-only.
+   */
+  namespace?: string;
 }
 
 /**
@@ -175,6 +220,9 @@ export class MushroomClient {
       body: JSON.stringify({
         cypher,
         ...(opts?.params ? { params: opts.params } : {}),
+        ...(opts?.as_of !== undefined ? { as_of: opts.as_of } : {}),
+        ...(opts?.mask ? { mask: opts.mask } : {}),
+        ...(opts?.namespace ? { namespace: opts.namespace } : {}),
       }),
     });
   }
@@ -367,6 +415,319 @@ export class MushroomClient {
     return this.fetchJson<Neighborhood>(path);
   }
 
+  /**
+   * Get server liveness.
+   *
+   * Wraps `GET /health`. An unauthenticated caller receives only `{ ok: true }`.
+   * A full-access token also receives `nodes`, `edges` and `addr`.
+   */
+  async health(): Promise<HealthReport> {
+    const resp = await fetch(this.url("/health"), {
+      headers: {
+        Accept: "application/json",
+        ...this.authHeaders(),
+      },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const body: any = await resp.json();
+    if (!resp.ok) {
+      const detail: string =
+        typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
+      throw new MushroomError(detail);
+    }
+    return body as HealthReport;
+  }
+
+  /**
+   * Get server-wide runtime metrics.
+   *
+   * Wraps `GET /metrics`. Returns node/edge counts, WAL size, RSS, uptime
+   * and a slow-query ring buffer. Requires a full-access token; role-bound
+   * tokens receive 403.
+   */
+  async metrics(): Promise<MetricsReport> {
+    return this.fetchJson<MetricsReport>("/metrics");
+  }
+
+  /**
+   * Vector kNN search.
+   *
+   * Wraps `POST /find_similar`. Returns up to `k` nodes whose stored value for
+   * `field` has cosine similarity ≥ `min` to the query `vector`. Results are
+   * sorted by similarity descending.
+   *
+   * @param opts  Query options — `field` and `vector` are required.
+   * @returns     `{ hits: [node_key, similarity][] }`
+   */
+  async findSimilar(opts: FindSimilarOptions): Promise<FindSimilarResult> {
+    return this.fetchJson<FindSimilarResult>("/find_similar", {
+      method: "POST",
+      body: JSON.stringify(opts),
+    });
+  }
+
+  /**
+   * Create or upsert a node.
+   *
+   * Wraps `POST /nodes`. The node is identified by `key`; if it already exists
+   * it is updated in place. Returns counts of nodes and edges created.
+   *
+   * @param label  Node label.
+   * @param key    Node key — must be unique within the label.
+   * @param props  Optional property map. Null values are silently dropped.
+   * @param namespace  Optional namespace to assign the node to.
+   */
+  async createNode(
+    label: string,
+    key: string,
+    props?: Record<string, import("./types.js").CellValue>,
+    namespace?: string,
+  ): Promise<CreateNodeResult> {
+    return this.fetchJson<CreateNodeResult>("/nodes", {
+      method: "POST",
+      body: JSON.stringify({
+        label,
+        key,
+        ...(props ? { props } : {}),
+        ...(namespace ? { namespace } : {}),
+      }),
+    });
+  }
+
+  /**
+   * Delete a node by key.
+   *
+   * Wraps `DELETE /node/{key}`. The dense id is freed; all edges attached to
+   * this node are also removed. Throws {@link MushroomError} when the key does
+   * not exist.
+   *
+   * @param key  The node key to delete.
+   */
+  async deleteNode(key: string): Promise<void> {
+    const resp = await fetch(this.url(`/node/${encodeURIComponent(key)}`), {
+      method: "DELETE",
+      headers: {
+        Accept: "application/json",
+        ...this.authHeaders(),
+      },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const body: any = await resp.json();
+    if (!resp.ok) {
+      const detail: string =
+        typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
+      throw new MushroomError(detail);
+    }
+  }
+
+  /**
+   * List all edges attached to a node.
+   *
+   * Wraps `GET /node/{key}/edges`. Returns both asserted and derived edges in
+   * both directions. Throws {@link MushroomError} (404) when the key does not
+   * exist.
+   *
+   * @param key  The node key.
+   */
+  async nodeEdges(key: string): Promise<NodeEdgesResult> {
+    const resp = await fetch(
+      this.url(`/node/${encodeURIComponent(key)}/edges`),
+      {
+        headers: {
+          Accept: "application/json",
+          ...this.authHeaders(),
+        },
+      },
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const body: any = await resp.json();
+    if (resp.status === 404) {
+      const detail: string =
+        typeof body?.error === "string" ? body.error : "key not found";
+      throw new MushroomError(detail);
+    }
+    if (!resp.ok) {
+      const detail: string =
+        typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
+      throw new MushroomError(detail);
+    }
+    return body as NodeEdgesResult;
+  }
+
+  /**
+   * Get WAL change history for a node.
+   *
+   * Wraps `GET /node/{key}/history`. Returns the sequence of WAL entries that
+   * touched this node, oldest first. Throws {@link MushroomError} (404) when
+   * the key does not exist.
+   *
+   * @param key  The node key.
+   */
+  async nodeHistory(key: string): Promise<NodeHistoryResult> {
+    const resp = await fetch(
+      this.url(`/node/${encodeURIComponent(key)}/history`),
+      {
+        headers: {
+          Accept: "application/json",
+          ...this.authHeaders(),
+        },
+      },
+    );
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const body: any = await resp.json();
+    if (resp.status === 404) {
+      const detail: string =
+        typeof body?.error === "string" ? body.error : "key not found";
+      throw new MushroomError(detail);
+    }
+    if (!resp.ok) {
+      const detail: string =
+        typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
+      throw new MushroomError(detail);
+    }
+    return body as NodeHistoryResult;
+  }
+
+  /**
+   * Get edge lifecycle between two nodes.
+   *
+   * Wraps `GET /history/edge?a=&b=`. Returns every time an edge was added or
+   * retracted between `a` and `b` (in either direction, any edge type).
+   *
+   * @param a  Key of the first node.
+   * @param b  Key of the second node.
+   */
+  async edgeHistory(a: string, b: string): Promise<EdgeHistoryResult> {
+    const qs = new URLSearchParams({ a, b });
+    return this.fetchJson<EdgeHistoryResult>(`/history/edge?${qs.toString()}`);
+  }
+
+  /**
+   * Point-in-time edge check.
+   *
+   * Wraps `GET /history/was_linked?a=&b=&edge_type=&at_commit=`. Returns
+   * whether any edge of `edgeType` existed between `a` and `b` at the given
+   * WAL commit index. Throws {@link MushroomError} (400) when `atCommit` is
+   * outside the visible horizon.
+   *
+   * @param a         Key of the first node.
+   * @param b         Key of the second node.
+   * @param edgeType  The edge type to check.
+   * @param atCommit  WAL commit index to query at.
+   */
+  async wasLinked(
+    a: string,
+    b: string,
+    edgeType: string,
+    atCommit: number,
+  ): Promise<WasLinkedResult> {
+    const qs = new URLSearchParams({
+      a,
+      b,
+      edge_type: edgeType,
+      at_commit: String(atCommit),
+    });
+    return this.fetchJson<WasLinkedResult>(
+      `/history/was_linked?${qs.toString()}`,
+    );
+  }
+
+  /**
+   * Create an explicit edge.
+   *
+   * Wraps `POST /edges`. Both endpoint nodes must already exist; use
+   * {@link upsertEdge} to auto-create missing endpoints.
+   *
+   * @param type  Edge type string.
+   * @param src   Source node key.
+   * @param dst   Destination node key.
+   */
+  async createEdge(type: string, src: string, dst: string): Promise<void> {
+    await this.fetchJson("/edges", {
+      method: "POST",
+      body: JSON.stringify({ type, src, dst }),
+    });
+  }
+
+  /**
+   * Delete an explicit edge.
+   *
+   * Wraps `DELETE /edges/{etype}/{src}/{dst}`. Throws {@link MushroomError}
+   * when the edge does not exist.
+   *
+   * @param etype  Edge type string.
+   * @param src    Source node key.
+   * @param dst    Destination node key.
+   */
+  async deleteEdge(etype: string, src: string, dst: string): Promise<void> {
+    await this.fetchJson(
+      `/edges/${encodeURIComponent(etype)}/${encodeURIComponent(src)}/${encodeURIComponent(dst)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  /**
+   * Set a property on a node.
+   *
+   * Wraps `PUT /node/{key}/prop/{field}`. Creates the property if absent,
+   * replaces its value if present. The value must be a non-null scalar, array
+   * or object; a null value is rejected with 400.
+   *
+   * @param key    Node key.
+   * @param field  Property field name.
+   * @param value  New property value (non-null).
+   */
+  async setNodeProp(
+    key: string,
+    field: string,
+    value: import("./types.js").CellValue,
+  ): Promise<void> {
+    await this.fetchJson(
+      `/node/${encodeURIComponent(key)}/prop/${encodeURIComponent(field)}`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ value }),
+      },
+    );
+  }
+
+  /**
+   * Remove a property from a node.
+   *
+   * Wraps `DELETE /node/{key}/prop/{field}`. Succeeds even when the property
+   * does not exist (the server is idempotent on prop removal).
+   *
+   * @param key    Node key.
+   * @param field  Property field name to remove.
+   */
+  async removeNodeProp(key: string, field: string): Promise<void> {
+    await this.fetchJson(
+      `/node/${encodeURIComponent(key)}/prop/${encodeURIComponent(field)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  /**
+   * Trigger a consistent backup of the database.
+   *
+   * Wraps `POST /backup`. The server holds a read lock for the duration of
+   * the file copies. `dest` is a path relative to the backup root
+   * (`MUSHROOMDB_BACKUP_DIR`, or the server's working directory); `..`
+   * segments are rejected. Requires a full-access token.
+   *
+   * When `verified` is false in the response, the server answered 500 and
+   * throws {@link MushroomError}; the backup was written but the post-copy
+   * verification failed.
+   *
+   * @param dest  Destination directory name or relative path.
+   */
+  async backup(dest: string): Promise<BackupReport> {
+    return this.fetchJson<BackupReport>("/backup", {
+      method: "POST",
+      body: JSON.stringify({ dest }),
+    });
+  }
+
   // -------------------------------------------------------------------------
   // WebSocket
   // -------------------------------------------------------------------------
@@ -407,6 +768,50 @@ export class MushroomClient {
     }
     return wsSubscribe(url, opts, onEvent);
   }
+
+  /**
+   * Subscribe to the raw mutation event stream over WebSocket (`GET /watch`).
+   *
+   * The server sends `{"subscribed":true}` immediately after the upgrade; no
+   * client subscribe message is required. After that, {@link MutationEvent}
+   * frames arrive for every write to the store.
+   *
+   * Unlike `/subscribe`, the `/watch` stream carries every mutation (nodes,
+   * edges, rules, batches, ingests) without filtering.
+   *
+   * **No auto-reconnect in v1.** Reconnect manually when the connection drops.
+   *
+   * **Always await `handle.close()`** to avoid dangling handles in tests.
+   *
+   * **Node.js < 21**: pass `wsConstructor` — see {@link WatchOptions}.
+   *
+   * @example
+   * ```ts
+   * import WS from 'ws';
+   * const handle = await client.watch(
+   *   { wsConstructor: WS as WsConstructor },
+   *   (ev) => console.log(ev),
+   * );
+   * await handle.close();
+   * ```
+   */
+  watch(
+    opts: WatchOptions,
+    onEvent: (event: MutationEvent) => void,
+  ): Promise<WatchHandle> {
+    let url = this.wsUrl("/watch");
+    if (this.token) {
+      url += `?token=${encodeURIComponent(this.token)}`;
+    }
+    return wsWatch(url, opts, onEvent);
+  }
 }
 
-export type { SubscribeHandle, SubscribeOptions, WsConstructor };
+export type {
+  MutationEvent,
+  SubscribeHandle,
+  SubscribeOptions,
+  WatchHandle,
+  WatchOptions,
+  WsConstructor,
+};

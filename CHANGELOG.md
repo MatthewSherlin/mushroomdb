@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- **The TypeScript client now wraps every HTTP and WebSocket route the server exposes.** Fifteen methods are new: `health`, `metrics`, `findSimilar`, `createNode`, `deleteNode`, `nodeEdges`, `nodeHistory`, `edgeHistory`, `wasLinked`, `createEdge`, `deleteEdge`, `setNodeProp`, `removeNodeProp`, `backup`, and `watch`. `query` gains `as_of`, `mask` and `namespace` options for time-travel, key-masking and namespace-scoped reads. `watch` streams the raw `MutationEvent` log over `GET /watch`; close resolves within 3 s even when the server-side loop does not echo the close frame.
+
 ### Performance
 
 - **Opening a snapshotted store no longer rebuilds its full-text index.** A snapshot of a store with a declared pair carries the index, and the open reads it and applies what was written since. Measured on release builds: a 30,000-entity store with three pairs opens in 21 ms where it took 183 ms, and `mushroomdb stats` on a code graph of this repository (11,197 nodes, 13 pairs) takes 30 ms where it took 252 ms. Since 0.7 every new store declares the memory schema's pairs, so every store with text paid the rebuild on every open. The snapshot grows by the index, about a third on the first of those stores, and takes longer to write by the encode (65 ms to 82 ms there). No container version change: 0.7.1 opens such a snapshot, ignores the index and builds its own. A store that has never been snapshotted, or whose snapshot predates this, builds the index at open as before (row 36).

@@ -55,18 +55,26 @@ Each method calls one route. The route's page has the request and the response i
 | `client.renameNode(` | Change a node's key | [`POST /nodes/{key}/rename`](http.md#post-nodeskeyrename) |
 | `client.upsertEdge(` | Create an edge, and its endpoints if they are missing | [`POST /edges/upsert`](http.md#post-edgesupsert) |
 | `client.subscribe(` | Stream rule and write events | [`GET /subscribe`](http.md#get-subscribe) |
+| `client.health(` | Server liveness and node/edge counts (when authenticated) | [`GET /health`](http.md#get-health) |
+| `client.metrics(` | Detailed runtime metrics including slow-query log | [`GET /metrics`](http.md#get-metrics) |
+| `client.findSimilar(` | Approximate nearest-neighbour vector search | [`POST /find_similar`](http.md#post-find_similar) |
+| `client.createNode(` | Insert a node by label and key | [`POST /nodes`](http.md#post-nodes) |
+| `client.deleteNode(` | Remove a node; throws when it does not exist | [`DELETE /node/{key}`](http.md#delete-nodekey) |
+| `client.nodeEdges(` | All edges attached to a node | [`GET /node/{key}/edges`](http.md#get-nodekeyedges) |
+| `client.nodeHistory(` | Per-commit change log for a node | [`GET /node/{key}/history`](http.md#get-nodekeyhistory) |
+| `client.edgeHistory(` | Edge presence log between two nodes | [`GET /history/edge`](http.md#get-historyedge) |
+| `client.wasLinked(` | Whether two nodes were linked at a given commit | [`GET /history/was_linked`](http.md#get-historywas_linked) |
+| `client.createEdge(` | Insert an explicit (non-derived) edge | [`POST /edges`](http.md#post-edges) |
+| `client.deleteEdge(` | Remove an explicit edge | [`DELETE /edges/{etype}/{src}/{dst}`](http.md#delete-edgesetypesrcdst) |
+| `client.setNodeProp(` | Set or overwrite one property on a node | [`PUT /node/{key}/prop/{field}`](http.md#put-nodekeypropfield) |
+| `client.removeNodeProp(` | Delete one property from a node | [`DELETE /node/{key}/prop/{field}`](http.md#delete-nodekeypropfield) |
+| `client.backup(` | Copy the store to a directory and verify it | [`POST /backup`](http.md#post-backup) |
+| `client.watch(` | Stream the raw mutation log over WebSocket | [`GET /watch`](http.md#get-watch) |
 
 ## What it does not wrap
 
-Fifteen of the server's routes have no method on the client. For these, call the route with
-`fetch`; the [HTTP API](http.md) page has each request and response.
-
-- Reading: `GET /health`, `GET /metrics`, `GET /node/{key}/edges`, `GET /node/{key}/history`,
-  `GET /history/edge`, `GET /history/was_linked`, `POST /find_similar`
-- Writing: `POST /nodes`, `DELETE /node/{key}`, `PUT` and `DELETE /node/{key}/prop/{field}`,
-  `POST /edges`, `DELETE /edges/{etype}/{src}/{dst}`
-- Operating: `POST /backup`
-- Streaming: `GET /watch`
+All HTTP routes and WebSocket endpoints have a method on the client. For a route listed in the
+[HTTP API](http.md) that is not in the table above, use `fetch` directly.
 
 Creating a node, setting a property and deleting can also be done through `client.query`, with
 a Cypher `CREATE`, `SET` or `DELETE`.

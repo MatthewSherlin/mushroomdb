@@ -211,6 +211,106 @@ All config fields are optional; server defaults apply.
 
 Open a WebSocket subscription. Returns a handle with `close(): Promise<void>`.
 
+### `client.health() → Promise<HealthReport>`
+
+Wires `GET /health`. Returns `{ ok, nodes?, edges?, addr? }`. Full node/edge counts are
+only included when the client carries a valid full-access token.
+
+### `client.metrics() → Promise<MetricsReport>`
+
+Wires `GET /metrics`. Returns live runtime counters — node/edge counts, WAL size, RSS,
+uptime — and a configurable slow-query log. Requires full-access auth.
+
+### `client.findSimilar(opts) → Promise<FindSimilarResult>`
+
+Wires `POST /find_similar`. Approximate nearest-neighbour search over a vector property.
+`opts.field` and `opts.vector` are required; `opts.k`, `opts.min`, `opts.label`, `opts.mask`,
+`opts.exact` are optional. Returns `{ hits: [key, score][] }`.
+
+### `client.createNode(label, key, props?) → Promise<CreateNodeResult>`
+
+Wires `POST /nodes`. Inserts a node with the given label and key. Optional `props` map sets
+initial properties. Returns `{ ok, nodes, edges }`.
+
+### `client.deleteNode(key) → Promise<void>`
+
+Wires `DELETE /node/{key}`. Throws `MushroomError` when the node does not exist.
+
+### `client.nodeEdges(key) → Promise<NodeEdgesResult>`
+
+Wires `GET /node/{key}/edges`. Returns `{ edges: [{ edge_type, src_key, dst_key, derived }] }`.
+Throws `MushroomError` (404) when the key does not exist.
+
+### `client.nodeHistory(key, opts?) → Promise<NodeHistoryResult>`
+
+Wires `GET /node/{key}/history`. Returns a per-commit change log: insertions, property
+changes and edge events. `opts.limit` caps the returned history rows; `opts.after` paginates.
+Throws `MushroomError` (404) when the key does not exist.
+
+### `client.edgeHistory(a, b, opts?) → Promise<EdgeHistoryResult>`
+
+Wires `GET /history/edge?a=&b=`. Returns every commit where an edge between the two nodes
+was added or retracted. `opts.edge_type`, `opts.limit`, `opts.after` narrow or paginate.
+
+### `client.wasLinked(a, b, edgeType, atCommit) → Promise<WasLinkedResult>`
+
+Wires `GET /history/was_linked`. Returns `{ a, b, edge_type, at_commit, linked }` — whether
+the named edge existed at the given commit index.
+
+### `client.createEdge(type, src, dst) → Promise<void>`
+
+Wires `POST /edges`. Inserts an explicit (non-derived) edge. Both endpoint nodes must already
+exist; the call throws `MushroomError` if either is missing.
+
+### `client.deleteEdge(type, src, dst) → Promise<void>`
+
+Wires `DELETE /edges/{etype}/{src}/{dst}`. Removes an explicit edge.
+
+### `client.setNodeProp(key, field, value) → Promise<void>`
+
+Wires `PUT /node/{key}/prop/{field}`. Sets or overwrites one property. `value` must be a
+JSON-serialisable scalar (`string | number | boolean`); `null` is rejected by the server.
+
+### `client.removeNodeProp(key, field) → Promise<void>`
+
+Wires `DELETE /node/{key}/prop/{field}`. Removes the named property from the node.
+
+### `client.backup(dest) → Promise<BackupReport>`
+
+Wires `POST /backup`. Copies the store to `dest` (a server-side path) and verifies it.
+Returns `{ files, bytes, verified }`. Throws `MushroomError` when verification fails.
+
+### `client.watch(opts, onEvent) → Promise<WatchHandle>`
+
+Open a `GET /watch` WebSocket and stream raw `MutationEvent`s. The server sends every
+committed mutation — node inserts/deletes, property changes, edge inserts/deletes, rule
+lifecycle and ingest events — as an externally-tagged JSON frame.
+
+Returns a handle with `close(): Promise<void>`. Unlike `/subscribe`, the server loop never
+reads incoming frames, so the close handshake is not guaranteed to complete; `close()` resolves
+within 3 s regardless.
+
+```ts
+import WS from 'ws'; // Node < 21
+import type { WsConstructor, MutationEvent } from 'mushroomdb-client';
+
+const handle = await client.watch(
+  { wsConstructor: WS as unknown as WsConstructor },
+  (ev: MutationEvent) => {
+    if ('node_inserted' in ev) {
+      console.log('new node:', ev.node_inserted.key);
+    }
+  },
+);
+
+// ... do work ...
+
+await handle.close();
+```
+
+A `{ lagged: N }` frame means the broadcast channel overflowed and `N` events were dropped;
+re-read any state your consumer depends on to recover.
+
 ---
 
 ## Error handling
@@ -273,8 +373,8 @@ await client.query("CREATE (n:Widget {id: 'w1', name: 'Sprocket'})");
 
 | Feature | Browser | Node 18+ |
 |---------|---------|----------|
-| `query`, `ingest`, `stats`, `suggest`, `algo`, `explain`, `createRule`, `renameNode`, `upsertEdge`, `node`, `neighborhood` | Yes (uses `fetch`) | Yes |
-| `subscribe` | Yes (uses global `WebSocket`) | Requires `wsConstructor` option + `ws` package |
+| `query`, `ingest`, `stats`, `suggest`, `algo`, `explain`, `createRule`, `renameNode`, `upsertEdge`, `node`, `neighborhood`, `health`, `metrics`, `findSimilar`, `createNode`, `deleteNode`, `nodeEdges`, `nodeHistory`, `edgeHistory`, `wasLinked`, `createEdge`, `deleteEdge`, `setNodeProp`, `removeNodeProp`, `backup` | Yes (uses `fetch`) | Yes |
+| `subscribe`, `watch` | Yes (uses global `WebSocket`) | Requires `wsConstructor` option + `ws` package |
 
 ---
 
