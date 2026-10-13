@@ -121,6 +121,12 @@ export interface WatchOptions {
    * ```
    */
   wsConstructor?: WsConstructor;
+  /**
+   * Called when the WebSocket connection closes after the watch has been
+   * acknowledged — whether cleanly (after the caller calls `handle.close()`)
+   * or because the server dropped it. Use this as a signal to reconnect.
+   */
+  onClose?: () => void;
 }
 
 /** Handle returned by {@link watch}. Identical interface to {@link SubscribeHandle}. */
@@ -198,7 +204,12 @@ export async function watch(
               // does not answer the close and onclose does not fire until
               // the ws package's own 30 s timeout. Resolve at most 3 s after
               // asking, so a caller talking to one is not left hanging.
-              const fallback = setTimeout(() => closeResolve?.(), 3_000);
+              // terminate() (ws-package-only) force-drops the TCP connection.
+              const fallback = setTimeout(() => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                (ws as any).terminate?.();
+                closeResolve?.();
+              }, 3_000);
               return closePromise.finally(() => clearTimeout(fallback));
             },
           });
@@ -216,19 +227,22 @@ export async function watch(
 
     ws.onerror = (err: unknown) => {
       if (!subscribed) {
-        reject(
+        const detail =
           err instanceof Error
-            ? err
-            : new Error("WebSocket error before watch ack"),
-        );
+            ? err.message
+            : "WebSocket error before watch ack";
+        reject(new MushroomError(detail));
       }
     };
 
     ws.onclose = () => {
       if (!subscribed) {
-        reject(new Error("WebSocket closed before watch ack"));
+        reject(new MushroomError("WebSocket closed before watch ack"));
       }
       closeResolve?.();
+      if (subscribed) {
+        opts.onClose?.();
+      }
     };
   });
 }

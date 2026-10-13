@@ -73,17 +73,27 @@ Each method calls one route. The route's page has the request and the response i
 
 ## What it does not wrap
 
-All HTTP routes and WebSocket endpoints have a method on the client. For a route listed in the
-[HTTP API](http.md) that is not in the table above, use `fetch` directly.
+All HTTP routes and WebSocket endpoints have a method on the client.
 
 Creating a node, setting a property and deleting can also be done through `client.query`, with
 a Cypher `CREATE`, `SET` or `DELETE`.
 
+## Query options
+
+`client.query(cypher, opts?)` accepts three optional fields beyond `params`:
+
+| Option | Type | What it does |
+|---|---|---|
+| `as_of` | `number` | Time-travel: run the query on the graph as it was at this WAL commit index (0 to `commit_seq − 1`, read-only). A commit index from a `nodeHistory`/`edgeHistory` entry is the usual source. |
+| `mask` | `string[]` | Node-key allow-list: the query sees only nodes whose key is in this set. Makes the query read-only. |
+| `namespace` | `string` | Restrict results to this namespace, intersecting with `mask` and any role. Makes the query read-only. |
+
 ## Errors
 
 A response that is not a success throws `MushroomError`. Its `detail`, which is also its
-`message`, is what the server said went wrong. The few failures the server answers without a
-JSON body — a path that is not a route, say — surface as the JSON parse error instead.
+`message`, is what the server said went wrong. Empty or plain-text error bodies (e.g. 404
+with no JSON, or 413) surface as `MushroomError("HTTP <status>")` rather than a raw parse
+error.
 
 ```ts
 import { MushroomError } from 'mushroomdb-client';

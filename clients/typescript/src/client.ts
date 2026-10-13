@@ -114,8 +114,11 @@ export interface QueryOptions {
   params?: QueryParams;
   /**
    * Time-travel: run the query against the graph as it existed at this WAL
-   * commit index (read-only). Obtain a commit index from `metrics().commit_seq`
-   * or from `wasLinked()` results.
+   * commit index (read-only). Valid values are `0` to `commit_seq − 1`
+   * inclusive; passing `commit_seq` itself yields a range error. Obtain a
+   * commit index from the `commit` field of a `nodeHistory`/`edgeHistory`
+   * entry, or compute `(await client.metrics()).commit_seq - 1` for the most
+   * recent committed state.
    */
   as_of?: number;
   /**
@@ -173,7 +176,40 @@ export class MushroomClient {
   }
 
   /**
+   * Validate a single URL path segment (a node key, edge type, or property
+   * field name that will be percent-encoded into a URL path).
+   *
+   * Rejects `.` and `..` because fetch normalises those path segments away
+   * (`/node/./edges` becomes `/node/edges`, silently querying the wrong route).
+   * Encoding them as `%2E` / `%2E%2E` does not help — fetch normalises those
+   * too. Also catches lone-surrogate strings, which would throw a raw
+   * `URIError` from `encodeURIComponent`; re-throws as {@link MushroomError}.
+   *
+   * @throws {@link MushroomError}
+   */
+  private checkPathSeg(seg: string): void {
+    if (seg === "." || seg === "..") {
+      throw new MushroomError(
+        `"${seg}" is not a valid path segment — fetch normalises it away`,
+      );
+    }
+    try {
+      encodeURIComponent(seg);
+    } catch {
+      // encodeURIComponent throws URIError for lone Unicode surrogates.
+      throw new MushroomError(
+        "key or field name contains an invalid Unicode character (lone surrogate)",
+      );
+    }
+  }
+
+  /**
    * Execute a fetch and decode the JSON body.
+   *
+   * Reads the response as text first so that an empty or plain-text error body
+   * (e.g. HTTP 404 with `content-length: 0`, or a 408/413/415 plain-text body)
+   * produces `MushroomError("HTTP <status>")` instead of a raw `SyntaxError`.
+   *
    * Throws {@link MushroomError} on non-2xx responses.
    */
   private async fetchJson<T>(
@@ -189,8 +225,14 @@ export class MushroomClient {
         ...(init?.headers ?? {}),
       },
     });
+    const text = await resp.text();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const body: any = await resp.json();
+    let body: any;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
+    }
     if (!resp.ok) {
       const detail: string =
         typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
@@ -330,6 +372,7 @@ export class MushroomClient {
    * @throws {@link MushroomError} on `KeyNotFound` (old key) or `DuplicateKey` (new key taken).
    */
   async renameNode(oldKey: string, newKey: string): Promise<void> {
+    this.checkPathSeg(oldKey);
     await this.fetchJson(`/nodes/${encodeURIComponent(oldKey)}/rename`, {
       method: "POST",
       body: JSON.stringify({ new_key: newKey }),
@@ -375,16 +418,23 @@ export class MushroomClient {
    * (unknown key). Other HTTP errors throw {@link MushroomError}.
    */
   async node(key: string): Promise<NodeInfo | null> {
+    this.checkPathSeg(key);
     const resp = await fetch(this.url(`/node/${encodeURIComponent(key)}`), {
       headers: {
         Accept: "application/json",
         ...this.authHeaders(),
       },
     });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const body: any = await resp.json();
     if (resp.status === 404) {
       return null;
+    }
+    const text = await resp.text();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let body: any;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = null;
     }
     if (!resp.ok) {
       const detail: string =
@@ -404,6 +454,7 @@ export class MushroomClient {
     key: string,
     opts?: { depth?: number },
   ): Promise<Neighborhood> {
+    this.checkPathSeg(key);
     const qs = new URLSearchParams();
     if (opts?.depth !== undefined) {
       qs.set("depth", String(opts.depth));
@@ -422,20 +473,7 @@ export class MushroomClient {
    * A full-access token also receives `nodes`, `edges` and `addr`.
    */
   async health(): Promise<HealthReport> {
-    const resp = await fetch(this.url("/health"), {
-      headers: {
-        Accept: "application/json",
-        ...this.authHeaders(),
-      },
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const body: any = await resp.json();
-    if (!resp.ok) {
-      const detail: string =
-        typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
-      throw new MushroomError(detail);
-    }
-    return body as HealthReport;
+    return this.fetchJson<HealthReport>("/health");
   }
 
   /**
@@ -467,13 +505,14 @@ export class MushroomClient {
   }
 
   /**
-   * Create or upsert a node.
+   * Create a new node.
    *
-   * Wraps `POST /nodes`. The node is identified by `key`; if it already exists
-   * it is updated in place. Returns counts of nodes and edges created.
+   * Wraps `POST /nodes`. This is an **insert**, not an upsert. If a node with
+   * the same `key` already exists the server responds with 400
+   * "duplicate node key: <key>" and this method throws {@link MushroomError}.
    *
    * @param label  Node label.
-   * @param key    Node key — must be unique within the label.
+   * @param key    Node key — must be unique in the store.
    * @param props  Optional property map. Null values are silently dropped.
    * @param namespace  Optional namespace to assign the node to.
    */
@@ -504,20 +543,8 @@ export class MushroomClient {
    * @param key  The node key to delete.
    */
   async deleteNode(key: string): Promise<void> {
-    const resp = await fetch(this.url(`/node/${encodeURIComponent(key)}`), {
-      method: "DELETE",
-      headers: {
-        Accept: "application/json",
-        ...this.authHeaders(),
-      },
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const body: any = await resp.json();
-    if (!resp.ok) {
-      const detail: string =
-        typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
-      throw new MushroomError(detail);
-    }
+    this.checkPathSeg(key);
+    await this.fetchJson(`/node/${encodeURIComponent(key)}`, { method: "DELETE" });
   }
 
   /**
@@ -527,31 +554,27 @@ export class MushroomClient {
    * both directions. Throws {@link MushroomError} (404) when the key does not
    * exist.
    *
-   * @param key  The node key.
+   * @param key   The node key.
+   * @param opts  Optional filters:
+   *   - `mask` — comma-separated allow-list of node keys; only edges whose
+   *     src or dst is in the list are returned.
+   *   - `stub_hidden` — when true, include placeholder-only nodes.
    */
-  async nodeEdges(key: string): Promise<NodeEdgesResult> {
-    const resp = await fetch(
-      this.url(`/node/${encodeURIComponent(key)}/edges`),
-      {
-        headers: {
-          Accept: "application/json",
-          ...this.authHeaders(),
-        },
-      },
-    );
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const body: any = await resp.json();
-    if (resp.status === 404) {
-      const detail: string =
-        typeof body?.error === "string" ? body.error : "key not found";
-      throw new MushroomError(detail);
+  async nodeEdges(
+    key: string,
+    opts?: { mask?: string[]; stub_hidden?: boolean },
+  ): Promise<NodeEdgesResult> {
+    this.checkPathSeg(key);
+    const qs = new URLSearchParams();
+    if (opts?.mask) {
+      qs.set("mask", opts.mask.join(","));
     }
-    if (!resp.ok) {
-      const detail: string =
-        typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
-      throw new MushroomError(detail);
+    if (opts?.stub_hidden !== undefined) {
+      qs.set("stub_hidden", String(opts.stub_hidden));
     }
-    return body as NodeEdgesResult;
+    const query = qs.toString();
+    const path = `/node/${encodeURIComponent(key)}/edges${query ? `?${query}` : ""}`;
+    return this.fetchJson<NodeEdgesResult>(path);
   }
 
   /**
@@ -564,28 +587,10 @@ export class MushroomClient {
    * @param key  The node key.
    */
   async nodeHistory(key: string): Promise<NodeHistoryResult> {
-    const resp = await fetch(
-      this.url(`/node/${encodeURIComponent(key)}/history`),
-      {
-        headers: {
-          Accept: "application/json",
-          ...this.authHeaders(),
-        },
-      },
+    this.checkPathSeg(key);
+    return this.fetchJson<NodeHistoryResult>(
+      `/node/${encodeURIComponent(key)}/history`,
     );
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const body: any = await resp.json();
-    if (resp.status === 404) {
-      const detail: string =
-        typeof body?.error === "string" ? body.error : "key not found";
-      throw new MushroomError(detail);
-    }
-    if (!resp.ok) {
-      const detail: string =
-        typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
-      throw new MushroomError(detail);
-    }
-    return body as NodeHistoryResult;
   }
 
   /**
@@ -613,13 +618,15 @@ export class MushroomClient {
    * @param a         Key of the first node.
    * @param b         Key of the second node.
    * @param edgeType  The edge type to check.
-   * @param atCommit  WAL commit index to query at.
+   * @param atCommit  WAL commit index (integer) or an RFC 3339 date string
+   *                  (e.g. `"2026-01-01T00:00:00Z"`); the server resolves the
+   *                  date to the nearest commit at or before that time.
    */
   async wasLinked(
     a: string,
     b: string,
     edgeType: string,
-    atCommit: number,
+    atCommit: number | string,
   ): Promise<WasLinkedResult> {
     const qs = new URLSearchParams({
       a,
@@ -652,14 +659,19 @@ export class MushroomClient {
   /**
    * Delete an explicit edge.
    *
-   * Wraps `DELETE /edges/{etype}/{src}/{dst}`. Throws {@link MushroomError}
-   * when the edge does not exist.
+   * Wraps `DELETE /edges/{etype}/{src}/{dst}`. Returns silently when the edge
+   * does not exist (idempotent — the server answers 200). Throws
+   * {@link MushroomError} only when an endpoint node is missing
+   * (404 "node key not found: <key>").
    *
    * @param etype  Edge type string.
    * @param src    Source node key.
    * @param dst    Destination node key.
    */
   async deleteEdge(etype: string, src: string, dst: string): Promise<void> {
+    this.checkPathSeg(etype);
+    this.checkPathSeg(src);
+    this.checkPathSeg(dst);
     await this.fetchJson(
       `/edges/${encodeURIComponent(etype)}/${encodeURIComponent(src)}/${encodeURIComponent(dst)}`,
       { method: "DELETE" },
@@ -682,6 +694,8 @@ export class MushroomClient {
     field: string,
     value: import("./types.js").CellValue,
   ): Promise<void> {
+    this.checkPathSeg(key);
+    this.checkPathSeg(field);
     await this.fetchJson(
       `/node/${encodeURIComponent(key)}/prop/${encodeURIComponent(field)}`,
       {
@@ -701,6 +715,8 @@ export class MushroomClient {
    * @param field  Property field name to remove.
    */
   async removeNodeProp(key: string, field: string): Promise<void> {
+    this.checkPathSeg(key);
+    this.checkPathSeg(field);
     await this.fetchJson(
       `/node/${encodeURIComponent(key)}/prop/${encodeURIComponent(field)}`,
       { method: "DELETE" },

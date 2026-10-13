@@ -505,6 +505,12 @@ export interface FindSimilarOptions {
   mask?: string[];
   /** Force exhaustive scan instead of ANN index. */
   exact?: boolean;
+  /**
+   * Cypher `WHERE` filter applied after the vector search. Only nodes whose
+   * properties satisfy the expression are included in the result.
+   * Example: `"n.score > 0.9"`.
+   */
+  where?: string;
 }
 
 /**
@@ -642,8 +648,9 @@ export interface WasLinkedResult {
 /**
  * Response from `POST /nodes`.
  *
- * `nodes` is 1 when a new node was created; 0 when an existing node was
- * updated (upsert). `edges` is always 0 for this endpoint.
+ * `nodes` is 1 when the node was created. A duplicate key yields a 400 error
+ * instead of returning 0 — `POST /nodes` is an insert, not an upsert.
+ * `edges` is always 0 for this endpoint.
  */
 export interface CreateNodeResult {
   ok: boolean;

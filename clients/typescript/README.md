@@ -153,6 +153,16 @@ acquires the write lock automatically. Returns `{ columns: string[], rows: CellV
 `opts.params` — bound parameters; values must be JSON scalars
 (`string | number | boolean`).
 
+`opts.as_of` — time-travel: run the query on the graph as it was at this WAL
+commit index (0 to `commit_seq − 1` inclusive, read-only). Obtain a commit
+index from the `commit` field of a `nodeHistory`/`edgeHistory` entry.
+
+`opts.mask` — node-key allow-list: restrict visible nodes to these keys.
+Makes the query read-only.
+
+`opts.namespace` — restrict results to this namespace, intersecting with
+`mask` and any role. Makes the query read-only.
+
 ### `client.ingest(req) → Promise<IngestReport>`
 
 Bulk-ingest nodes and optional edges. `req.label`, `req.rows` are required.
@@ -227,10 +237,12 @@ Wires `POST /find_similar`. Approximate nearest-neighbour search over a vector p
 `opts.field` and `opts.vector` are required; `opts.k`, `opts.min`, `opts.label`, `opts.mask`,
 `opts.exact` are optional. Returns `{ hits: [key, score][] }`.
 
-### `client.createNode(label, key, props?) → Promise<CreateNodeResult>`
+### `client.createNode(label, key, props?, namespace?) → Promise<CreateNodeResult>`
 
-Wires `POST /nodes`. Inserts a node with the given label and key. Optional `props` map sets
-initial properties. Returns `{ ok, nodes, edges }`.
+Wires `POST /nodes`. Inserts a node with the given label and key. This is an
+**insert**, not an upsert — a duplicate key throws `MushroomError`. Optional
+`props` map sets initial properties. Optional `namespace` scopes the node.
+Returns `{ ok, nodes, edges }`.
 
 ### `client.deleteNode(key) → Promise<void>`
 
@@ -241,16 +253,15 @@ Wires `DELETE /node/{key}`. Throws `MushroomError` when the node does not exist.
 Wires `GET /node/{key}/edges`. Returns `{ edges: [{ edge_type, src_key, dst_key, derived }] }`.
 Throws `MushroomError` (404) when the key does not exist.
 
-### `client.nodeHistory(key, opts?) → Promise<NodeHistoryResult>`
+### `client.nodeHistory(key) → Promise<NodeHistoryResult>`
 
 Wires `GET /node/{key}/history`. Returns a per-commit change log: insertions, property
-changes and edge events. `opts.limit` caps the returned history rows; `opts.after` paginates.
-Throws `MushroomError` (404) when the key does not exist.
+changes and edge events. Throws `MushroomError` (404) when the key does not exist.
 
-### `client.edgeHistory(a, b, opts?) → Promise<EdgeHistoryResult>`
+### `client.edgeHistory(a, b) → Promise<EdgeHistoryResult>`
 
 Wires `GET /history/edge?a=&b=`. Returns every commit where an edge between the two nodes
-was added or retracted. `opts.edge_type`, `opts.limit`, `opts.after` narrow or paginate.
+was added or retracted.
 
 ### `client.wasLinked(a, b, edgeType, atCommit) → Promise<WasLinkedResult>`
 
@@ -264,12 +275,15 @@ exist; the call throws `MushroomError` if either is missing.
 
 ### `client.deleteEdge(type, src, dst) → Promise<void>`
 
-Wires `DELETE /edges/{etype}/{src}/{dst}`. Removes an explicit edge.
+Wires `DELETE /edges/{etype}/{src}/{dst}`. Returns silently when the edge does
+not exist (idempotent). Throws `MushroomError` only when an endpoint node is
+missing.
 
 ### `client.setNodeProp(key, field, value) → Promise<void>`
 
-Wires `PUT /node/{key}/prop/{field}`. Sets or overwrites one property. `value` must be a
-JSON-serialisable scalar (`string | number | boolean`); `null` is rejected by the server.
+Wires `PUT /node/{key}/prop/{field}`. Sets or overwrites one property. `value`
+must be JSON-serialisable; scalars (`string | number | boolean`), arrays, and
+objects are all accepted. `null` is rejected by the server.
 
 ### `client.removeNodeProp(key, field) → Promise<void>`
 
