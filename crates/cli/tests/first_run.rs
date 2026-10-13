@@ -157,12 +157,9 @@ fn remembering_about_an_unknown_subject_succeeds() {
                     "text":"Reid reviewed the launch copy","about":["reid"]}}}),
             serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
                 "name":"query","arguments":{
-                    // `WHERE n.provisional` (truthy), not `= true`: the
-                    // engine's Cypher has no boolean-literal comparison (an
-                    // unrelated, pre-existing gap — `n.flag = true` is an
-                    // "unbound variable `true`" error), and a standalone
-                    // boolean predicate is the documented way to ask this
-                    // (`core-query/src/cypher/parser.rs`, `Expr::Truthy`).
+                    // `WHERE n.provisional` (truthy) is the documented way
+                    // to ask this; `= true` means the same since boolean
+                    // literals landed (`core-api/tests/cypher_booleans.rs`).
                     "cypher":"MATCH (n) WHERE n.provisional RETURN count(n) AS c"}}}),
         ],
     );

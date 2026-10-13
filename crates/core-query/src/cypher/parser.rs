@@ -83,6 +83,19 @@ pub fn is_write_tokens(tokens: &[Tok]) -> bool {
     }
 }
 
+/// `true` or `false` in any case, as the literal it spells; `None` for any
+/// other identifier. A name followed by `.` or `(` is a property reference or
+/// a function call and never reaches this.
+fn bool_literal(name: &str) -> Option<bool> {
+    if name.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if name.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 struct Parser<'a> {
     toks: &'a [Tok],
     pos: usize,
@@ -959,6 +972,8 @@ impl<'a> Parser<'a> {
                 } else if self.eat(&Tok::Dot) {
                     let field = self.ident("expected field name after '.'")?;
                     Ok(Operand::Prop { var: name, field })
+                } else if let Some(b) = bool_literal(&name) {
+                    Ok(Operand::Lit(Value::Bool(b)))
                 } else {
                     // Bare variable reference (e.g. alias name in WITH … WHERE c > 2).
                     Ok(Operand::Var(name))
@@ -1275,7 +1290,7 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
-    /// Parse a literal value (int, float, or string). Parameters and property
+    /// Parse a literal value (int, float, string, boolean or list). Parameters and property
     /// references are not accepted in write statements (v1 limitation).
     fn literal_value(&mut self, what: &str) -> Result<Value, String> {
         if self.eat(&Tok::Dash) {
@@ -1326,6 +1341,11 @@ impl<'a> Parser<'a> {
                     }
                 }
                 Ok(Value::List(items))
+            }
+            Some(Tok::Ident(name)) if bool_literal(name).is_some() => {
+                let b = bool_literal(name).unwrap_or_default();
+                self.pos += 1;
+                Ok(Value::Bool(b))
             }
             Some(Tok::Param(_)) => Err(self.err(&format!(
                 "parameter references are not supported in {what} (v1 limitation: use literals only)"

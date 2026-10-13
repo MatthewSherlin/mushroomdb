@@ -2,6 +2,11 @@
 
 **Filed 2026-09-30. Pre-existing; not introduced by any v0.7 work.**
 
+**Fixed 2026-10-13.** `true` and `false`, in any case, are literals wherever a literal is read:
+`WHERE`, `RETURN`, a `MATCH` property map, and the `CREATE` / `SET` write path. Both call sites
+below got the arm; `<>` needed nothing of its own. Pinned by
+`crates/core-api/tests/cypher_booleans.rs`. The rest of this note is the record of the defect.
+
 Filed as its own document rather than inside a release's leftovers list, deliberately: this is a
 query-language defect with no relationship to the memory write path, and folding it into
 "v0.7 plan 1 leftovers" is how it would stay invisible for another three releases.
