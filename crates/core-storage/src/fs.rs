@@ -19,6 +19,13 @@ pub enum FileId {
     /// the store as it always did. See [`crate::commit_times`] for why the map
     /// is not a WAL record.
     CommitTimes,
+    /// What a snapshot that replaces its WAL writes before it starts and
+    /// empties when it has finished: which snapshot it is writing and which
+    /// WAL it was made from ([`crate::v8::SnapshotIntent`]). Present and
+    /// matching, it means the snapshot was written and its WAL was not yet
+    /// replaced, and the open does not apply that WAL's frames a second time.
+    /// A release that does not know this file does not read it.
+    SnapshotIntent,
 }
 
 impl FileId {
@@ -29,6 +36,7 @@ impl FileId {
             FileId::SnapshotBak => "snapshot.bin.bak",
             FileId::Roles => "roles.json",
             FileId::CommitTimes => "commit_times.bin",
+            FileId::SnapshotIntent => "snapshot.intent",
         }
     }
 }

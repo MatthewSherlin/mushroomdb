@@ -396,7 +396,8 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
 
 /// Whether `rec` only declares or withdraws something about the store — a
 /// full-text pair, an equality index, the multiplicity opt-in — and writes no
-/// node, edge or property.
+/// node, edge or property. These are the records a truncating snapshot
+/// re-emits into its baseline WAL.
 fn is_declaration(rec: &WalRecord) -> bool {
     matches!(
         rec,
@@ -1615,6 +1616,33 @@ pub struct GraphDb<F: Fs> {
     /// open path and **false** of `refresh()`: refresh applies peer frames and
     /// then only folds, so its backfill is the only thing that indexes them.
     fulltext_rebuild_follows: bool,
+    /// `true` when this handle's full-text index was read from the snapshot
+    /// it opened and nothing replayed over it since has spoiled it, so the
+    /// open did not build it.
+    fulltext_loaded: bool,
+    /// Set by the insert arms of `apply` when they index a node that is
+    /// already indexed under that field. `add_tokens` appends, so that node's
+    /// postings are now doubled: the WAL being replayed holds writes the
+    /// snapshot already has — a `keep_wal` snapshot, or a crash between a
+    /// snapshot and its WAL replacement. The open rebuilds when it sees this.
+    fulltext_reindexed_a_node: bool,
+    /// Whether the snapshot this handle opened replaced its WAL when it was
+    /// written. One that kept it (`keep_wal`) has the whole WAL replayed over
+    /// it at open, and its index is built after that replay, not read.
+    base_wal_truncated: bool,
+    /// How often that happened during this handle's open. Tests read it.
+    fulltext_reindexed_at_open: u64,
+    /// `true` only while `load_from_disk` replays the WAL. A node indexed
+    /// twice there is a sign the index must be rebuilt, and is left for the
+    /// rebuild; anywhere else it is corrected on the spot.
+    replaying_at_open: bool,
+    /// `true` when `snapshot.intent` may hold something that is no longer
+    /// true: this handle found one that did not match, or a snapshot of its
+    /// own wrote one and did not get to empty it. Settled, under the write
+    /// lock, before the next append.
+    intent_unsettled: bool,
+    /// Set by [`GraphDb::stop_next_snapshot`]; taken by the next snapshot.
+    snapshot_stop: Option<SnapshotStop>,
     /// `true` when `commit_times.bin` was present but would not decode.
     ///
     /// Mirrors `roles: None`: a damaged map must not read as "this store
@@ -1957,6 +1985,23 @@ pub fn snapshot_version_at(dir: &std::path::Path) -> crate::Result<Option<u16>> 
         Err(e) => return Err(core_storage::GraphError::Io(e)),
     };
     core_storage::snapshot::peek_version(&header[..n])
+}
+
+/// Where [`GraphDb::stop_next_snapshot`] makes the next snapshot fail, leaving
+/// the files as a crash at that point would. For tests of what an interrupted
+/// snapshot leaves behind; not part of the stable surface.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotStop {
+    /// The intent is written; `snapshot.bin` is still the old one.
+    BeforeSnapshotWrite,
+    /// `snapshot.bin` is the new one; nothing else has moved.
+    AfterSnapshotWrite,
+    /// As above, and the history floor has been advanced; the WAL is still
+    /// the one the snapshot was made from.
+    BeforeWalReplacement,
+    /// The WAL is replaced; the intent has not been emptied.
+    AfterWalReplacement,
 }
 
 /// Options for [`GraphDb::snapshot_with`].
@@ -2367,6 +2412,13 @@ impl<F: Fs> GraphDb<F> {
             commit_times: core_storage::commit_times::CommitTimes::default(),
             commit_times_poisoned: false,
             fulltext_rebuild_follows: false,
+            fulltext_loaded: false,
+            fulltext_reindexed_a_node: false,
+            base_wal_truncated: false,
+            fulltext_reindexed_at_open: 0,
+            replaying_at_open: false,
+            intent_unsettled: false,
+            snapshot_stop: None,
             commit_time_override: None,
             roles: Some(vec![]),
             role_masks: Arc::new(crate::mask::RoleMaskCache::new()),
@@ -2439,6 +2491,11 @@ impl<F: Fs> GraphDb<F> {
         self.commit_times = core_storage::commit_times::CommitTimes::default();
         self.commit_times_poisoned = false;
         self.fulltext_rebuild_follows = false;
+        self.fulltext_loaded = false;
+        self.fulltext_reindexed_a_node = false;
+        self.base_wal_truncated = false;
+        self.fulltext_reindexed_at_open = 0;
+        self.replaying_at_open = false;
         self.commit_time_override = None;
         self.roles = Some(vec![]);
         // A fresh cache, not a cleared one: any reader snapshot still holding
@@ -2549,6 +2606,8 @@ impl<F: Fs> GraphDb<F> {
             if !db.base.as_ref().is_some_and(|base| base.edges_swept()) {
                 db.drop_edges_of_retired_nodes();
             }
+            db.load_fulltext_from_base();
+            trace_open!("full-text index read from the snapshot", _t0);
         } else if !snap_header.is_empty() {
             // Legacy V5-V7: full read required for decode.
             let snap_bytes = db.fs.read(FileId::Snapshot)?;
@@ -2600,24 +2659,57 @@ impl<F: Fs> GraphDb<F> {
         }
         // Scoped to this call: `refresh()` also replays frames and is *not*
         // followed by a rebuild, so its backfill must still run.
-        db.fulltext_rebuild_follows = true;
+        //
+        // And only when a rebuild does follow. An index read from the snapshot
+        // is kept, so a pair declared after that snapshot is indexed by its
+        // own backfill or not at all.
         // Every decoded frame occupies an index, replayed or not: markers
         // are state no-ops but they are not index no-ops.
         let decoded_frames = records.len() as u64;
         // A snapshot that kept its WAL says how much of it it already holds.
         // Those frames are counted, and not applied a second time.
+        //
+        // So does the intent of a snapshot that was to replace its WAL and
+        // did not get that far: the same state, reached by a crash.
+        let (interrupted, intent_left_over) = db.interrupted_snapshot(&bytes)?;
+        // An intent that is not about this snapshot and this WAL is left over
+        // from a snapshot that finished, or never wrote its snapshot. It has
+        // to go before this handle appends: once new frames follow, a WAL can
+        // come to begin with the bytes an old intent names. It goes at the
+        // first append and not here, because only an appender holds the write
+        // lock, and a handle without it may be looking at a peer's snapshot
+        // half way through.
+        db.intent_unsettled = intent_left_over;
         let held = db
             .base
             .as_ref()
             .and_then(|base| base.wal_mark())
+            .or(interrupted)
             .filter(|mark| mark.matches(&bytes))
             .map(|mark| (mark.len as usize, decode_all(&bytes[..mark.len as usize])))
             // The mark was taken at the end of a whole WAL, so it ends on a
             // frame boundary; one that does not is not this WAL's.
             .filter(|(len, (_, consumed))| consumed == len)
-            .map_or(0, |(_, (held, _))| held.len());
+            .map(|(_, (held, _))| held.len());
+        let marked_wal_is_here = held.is_some();
+        let held = held.unwrap_or(0);
+        // A snapshot that kept its WAL has its index read on the strength of
+        // its mark. If the WAL beside it is not the one marked — it lost its
+        // tail, or was repaired shorter — the whole of it replays over the
+        // snapshot, and what that produces is not what the index was read
+        // for: a replayed insert can relabel a node and leave a posting under
+        // a field its new label does not index. The index is set aside and
+        // built after the replay, as it was before it could be read.
+        if db.fulltext_loaded && !db.base_wal_truncated && !marked_wal_is_here {
+            db.fulltext = Arc::new(core_storage::fulltext::FulltextIndex::new());
+            db.fulltext_loaded = false;
+        }
+        db.fulltext_rebuild_follows = !db.fulltext_loaded;
+        db.fulltext_reindexed_a_node = false;
+        db.replaying_at_open = true;
         let replayed = db.apply_frames_over(records, held);
         db.fulltext_rebuild_follows = false;
+        db.replaying_at_open = false;
         let replayed = replayed?;
         // ── The multiplicity declaration, recovered from the stamp ───────────
         //
@@ -2706,14 +2798,36 @@ impl<F: Fs> GraphDb<F> {
                 &db.labels,
             );
         }
-        // Rebuild full-text index after WAL replay.  Corrects drift from
-        // per-record incremental apply during replay.
-        Arc::make_mut(&mut db.fulltext).rebuild_all(
-            &db.ids,
-            &db.labels,
-            &db.syms,
-            build_props_view(&db.props, &db.base),
-        );
+        // The full-text index after WAL replay. One read from the snapshot has
+        // had the replay applied to it record by record and is kept — unless
+        // the replay indexed a node the snapshot already held, which doubles
+        // that node's postings. Then, and wherever no index was read, it is
+        // built from the declared pairs and the stored values.
+        db.fulltext_loaded = db.fulltext_loaded && !db.fulltext_reindexed_a_node;
+        if db.fulltext_loaded {
+            #[cfg(debug_assertions)]
+            {
+                let mut rebuilt = (*db.fulltext).clone();
+                rebuilt.rebuild_all(
+                    &db.ids,
+                    &db.labels,
+                    &db.syms,
+                    build_props_view(&db.props, &db.base),
+                );
+                debug_assert!(
+                    rebuilt == *db.fulltext,
+                    "the full-text index read from the snapshot is not the one a rebuild gives"
+                );
+            }
+        } else {
+            Arc::make_mut(&mut db.fulltext).rebuild_all(
+                &db.ids,
+                &db.labels,
+                &db.syms,
+                build_props_view(&db.props, &db.base),
+            );
+        }
+        trace_open!("full-text index ready", _t0);
         db.prop_index.rebuild_all(
             &db.ids,
             &db.labels,
@@ -2762,7 +2876,8 @@ impl<F: Fs> GraphDb<F> {
     /// write to the state it produced is not always a no-op — an insert
     /// under a key since renamed or deleted makes a second node. A
     /// declaration among them is applied all the same: the pairs a store has
-    /// declared are known from the WAL and nowhere else.
+    /// declared are known from the WAL — and, when a snapshot carries a
+    /// full-text index that is read, from that index too.
     fn apply_frames_over(&mut self, records: Vec<WalRecord>, held: usize) -> Result<usize> {
         if records.is_empty() {
             return Ok(0);
@@ -2770,13 +2885,13 @@ impl<F: Fs> GraphDb<F> {
         // Materialize any state retained in the mmap base before the first
         // frame lands, so a replayed record cannot trip the lazy-init guard and
         // rebuild indexes from an empty graph. Both calls are idempotent.
-        self.ensure_v8_base_sections_loaded();
-        self.engine.consume_retained_state_eager(
-            &self.ids,
-            &self.syms,
-            &self.labels,
-            build_props_view(&self.props, &self.base),
-        );
+        //
+        // Not before a declaration, though. Every truncating snapshot re-emits
+        // one record for each declared pair, so a snapshotted store with any
+        // declaration always has frames to replay; counting those as writes
+        // made every open of such a store pay the scan a store with no
+        // declaration defers to its first write.
+        let mut retained_consumed = false;
         let applied = records.len();
         // A live commit turns on the engine's report of the edges its rules
         // add and retract, which is what keeps a view over a derived edge
@@ -2788,7 +2903,20 @@ impl<F: Fs> GraphDb<F> {
             if !self.view_store.is_empty() && !self.engine.emit_deltas() {
                 self.engine.set_emit_deltas(true);
             }
-            if i >= held || is_declaration(&rec) {
+            // A frame the snapshot already holds is counted and not applied,
+            // unless it is a declaration.
+            let apply = i >= held || is_declaration(&rec);
+            if apply && !retained_consumed && !is_declaration(&rec) {
+                self.ensure_v8_base_sections_loaded();
+                self.engine.consume_retained_state_eager(
+                    &self.ids,
+                    &self.syms,
+                    &self.labels,
+                    build_props_view(&self.props, &self.base),
+                );
+                retained_consumed = true;
+            }
+            if apply {
                 self.apply(&rec)?;
             }
             let _ = self.engine.drain_deltas();
@@ -3157,6 +3285,7 @@ impl<F: Fs> GraphDb<F> {
         .map_err(|e| GraphError::Corrupt {
             detail: format!("v8: meta decode: {e:?}"),
         })?;
+        self.base_wal_truncated = meta.wal_truncated;
         self.labels = Arc::new(meta.labels);
         // Cross-section label integrity: labels must cover every id slot (live
         // and tombstoned), every non-sentinel sym must be within the interner's
@@ -3475,6 +3604,11 @@ impl<F: Fs> GraphDb<F> {
             // with a graph missing everything older than the WAL. The base is
             // gone, so the read is refused (ledger row 82).
             let base_is_gone = db.wal_horizon_floor > 0 || total_archive_frames > 0;
+            // A snapshot interrupted before its WAL was replaced is, like a
+            // `keep_wal` one, the state at the END of the live WAL, whatever
+            // it says about truncation: no base for a prefix of that WAL.
+            let live_wal = db.fs.read(FileId::Wal)?;
+            let snapshot_is_wal_end = db.interrupted_snapshot(&live_wal)?.0.is_some();
             // Peek 6 bytes (same pattern as open_with).
             let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
             let is_v8 = snap_header.len() >= 6
@@ -3496,7 +3630,7 @@ impl<F: Fs> GraphDb<F> {
                     core_storage::snapshot::decode(&snap_bytes)?
                 };
                 if let Some(state) = state {
-                    if state.wal_truncated {
+                    if state.wal_truncated && !snapshot_is_wal_end {
                         db.restore_snapshot_state(state)?;
                         db.drop_edges_of_retired_nodes();
                     } else if base_is_gone {
@@ -3510,7 +3644,7 @@ impl<F: Fs> GraphDb<F> {
             } else if !snap_header.is_empty() {
                 let snap_bytes = db.fs.read(FileId::Snapshot)?;
                 if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
-                    if state.wal_truncated {
+                    if state.wal_truncated && !snapshot_is_wal_end {
                         db.restore_snapshot_state(state)?;
                         db.drop_edges_of_retired_nodes();
                     } else if base_is_gone {
@@ -3689,7 +3823,12 @@ impl<F: Fs> GraphDb<F> {
         // embedded write after every reopen. Hoisted here the scan sees exactly
         // the persisted state; the record's own hook then files its vector
         // through the ordinary insert path a line later.
-        self.populate_indexes_before_write();
+        //
+        // A declaration writes no node and no edge, and its arm reads no rule
+        // index, so it does not start the scan.
+        if !is_declaration(rec) {
+            self.populate_indexes_before_write();
+        }
         match rec {
             WalRecord::InsertNode { label, key, props } => {
                 let id = Arc::make_mut(&mut self.ids).try_insert(key)?;
@@ -3756,6 +3895,7 @@ impl<F: Fs> GraphDb<F> {
                 if self.fulltext.has_label(label) {
                     for (field, value) in props {
                         if self.fulltext.is_enabled(label, field) {
+                            self.unindex_before_reindexing(id, field);
                             Arc::make_mut(&mut self.fulltext).add_tokens(id, field, value);
                         }
                     }
@@ -4015,10 +4155,12 @@ impl<F: Fs> GraphDb<F> {
                 }
                 if self.fulltext.has_label(&label_str) {
                     for (field_sym, value) in props {
-                        let Some(field) = self.syms.resolve(*field_sym) else {
+                        let Some(field) = self.syms.resolve(*field_sym).map(str::to_string) else {
                             continue;
                         };
+                        let field = field.as_str();
                         if self.fulltext.is_enabled(&label_str, field) {
+                            self.unindex_before_reindexing(id, field);
                             Arc::make_mut(&mut self.fulltext).add_tokens(id, field, value);
                         }
                     }
@@ -5468,6 +5610,9 @@ impl<F: Fs> GraphDb<F> {
              a previous apply arm may have accumulated deltas before erroring; \
              the caller must drain_deltas() on any error path before returning"
         );
+        if self.intent_unsettled {
+            self.settle_snapshot_intent()?;
+        }
         let frame = encode_record(&rec);
         self.fs.append(FileId::Wal, &frame)?;
         // The cursor advances by exactly the bytes appended: these frames are
@@ -7528,8 +7673,9 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// After this call, every subsequent write to `(label, field)` is reflected
     /// in the index incrementally.  Existing nodes are backfilled immediately.
-    /// The declaration is persisted as a WAL record; the index itself is rebuilt
-    /// from scratch on re-open (no snapshot format changes).
+    /// The declaration is persisted as a WAL record. The index is carried by
+    /// the next snapshot and read from it at open; until then it is rebuilt
+    /// at open from the stored values.
     ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
@@ -7567,6 +7713,86 @@ impl<F: Fs> GraphDb<F> {
             label: label.into(),
             field: field.into(),
         })
+    }
+
+    /// Whether this handle read its full-text index from the snapshot it
+    /// opened, and kept it, where it would otherwise have built it from the
+    /// stored values. False for a store with no snapshot or no declared pair,
+    /// for a snapshot written before the index was carried, and for an open
+    /// that had to fall back. The answers are the same either way; this is
+    /// how a test or an operator tells which open they got.
+    pub fn fulltext_loaded_from_snapshot(&self) -> bool {
+        self.fulltext_loaded
+    }
+
+    /// Called by the insert arms of `apply` before they index `field` on
+    /// `id`. `add_tokens` appends, so a node already indexed under the field
+    /// has to be cleared first or its old words stay searchable.
+    ///
+    /// Live, that is one insert naming a property twice: the last value is
+    /// what is stored, and it is what is indexed. At open it means the WAL
+    /// holds a write the loaded index already has; the index is rebuilt after
+    /// the replay, and clearing one node at a time here would only add a walk
+    /// of the vocabulary for every such insert, so it is counted and left.
+    fn unindex_before_reindexing(&mut self, id: u32, field: &str) {
+        if !self.fulltext.has_doc(id, field) {
+            return;
+        }
+        if self.replaying_at_open {
+            self.fulltext_reindexed_a_node = true;
+            self.fulltext_reindexed_at_open += 1;
+        } else {
+            Arc::make_mut(&mut self.fulltext).remove_node_field(id, field);
+        }
+    }
+
+    /// How many times the replay at open indexed a node that was already
+    /// indexed under that field. Non-zero means the WAL held writes the
+    /// loaded index already had, and the open rebuilt it. Exposed for tests;
+    /// not part of the stable surface.
+    #[doc(hidden)]
+    pub fn fulltext_reindexed_during_open(&self) -> u64 {
+        self.fulltext_reindexed_at_open
+    }
+
+    /// Read the full-text index out of the snapshot this handle just mapped,
+    /// if it carries one that reads back and was built over this id space.
+    /// Anything else leaves the index empty for the rebuild that follows.
+    fn load_fulltext_from_base(&mut self) {
+        let Some(base) = self.base.as_ref() else {
+            return;
+        };
+        // A snapshot that kept its WAL and carries no mark of how much of it
+        // it holds is replayed over in full. Every insert in that WAL is
+        // already in the blob, so reading it would end in a rebuild anyway —
+        // after making each replayed insert tokenize first. With a mark, the
+        // frames the snapshot holds are not applied again and the index is as
+        // good as any other snapshot's.
+        if !self.base_wal_truncated && base.wal_mark().is_none() {
+            return;
+        }
+        let bytes = match base.fulltext_bytes() {
+            Ok(bytes) if !bytes.is_empty() => bytes,
+            _ => return,
+        };
+        match core_storage::fulltext::FulltextIndex::from_blob(bytes) {
+            Some((index, node_count)) if node_count as usize == self.ids.len() => {
+                self.fulltext = Arc::new(index);
+                self.fulltext_loaded = true;
+            }
+            _ => eprintln!(
+                "mushroomdb: the snapshot's full-text index could not be read; rebuilding it"
+            ),
+        }
+    }
+
+    /// The full-text index as the bytes a snapshot carries, or nothing when
+    /// no pair is declared.
+    fn fulltext_blob(&self) -> Vec<u8> {
+        if self.fulltext.enabled_pairs().next().is_none() {
+            return Vec::new();
+        }
+        self.fulltext.to_blob(self.ids.len() as u32)
     }
 
     /// Remove every edge the snapshot holds to or from a node that has been
@@ -7616,6 +7842,80 @@ impl<F: Fs> GraphDb<F> {
                 base_columns(&self.base),
             );
         }
+    }
+
+    /// What `snapshot.intent` says about the snapshot and the WAL on disk.
+    ///
+    /// The first value is the WAL that the snapshot already holds, when the
+    /// intent names this snapshot and `wal` begins with exactly the WAL it
+    /// names: a snapshot that was to replace its WAL and did not get that
+    /// far. The second is `true` when the file holds anything else — an
+    /// intent left over, which must not outlive this handle's next append.
+    fn interrupted_snapshot(
+        &self,
+        wal: &[u8],
+    ) -> Result<(Option<core_storage::v8::WalMark>, bool)> {
+        let (standing, left_over) = self.standing_intent(wal)?;
+        Ok((standing.map(|i| i.wal), left_over))
+    }
+
+    /// The intent in `snapshot.intent` that is true of the snapshot and the
+    /// WAL on disk, if one is, and whether the file holds anything that is
+    /// not.
+    ///
+    /// A file that cannot be read is an error, not an absent intent: taking
+    /// it for absent would replay the WAL over the very snapshot the intent
+    /// is there to protect.
+    fn standing_intent(
+        &self,
+        wal: &[u8],
+    ) -> Result<(Option<core_storage::v8::SnapshotIntent>, bool)> {
+        let bytes = self.fs.read(FileId::SnapshotIntent)?;
+        if bytes.is_empty() {
+            return Ok((None, false));
+        }
+        // The WAL is in hand, so it is asked first. Only a record whose mark
+        // it matches is worth reading the whole snapshot for — which leaves a
+        // left-over intent, the usual kind, costing nothing at each open.
+        let candidates: Vec<_> = core_storage::v8::SnapshotIntent::decode_all(&bytes)
+            .into_iter()
+            .filter(|i| {
+                i.wal.matches(wal)
+                    // The mark was taken at the end of a whole WAL.
+                    && decode_all(&wal[..i.wal.len as usize]).1 as u64 == i.wal.len
+            })
+            .collect();
+        let standing = if candidates.is_empty() {
+            None
+        } else {
+            let snapshot = self.fs.read(FileId::Snapshot)?;
+            candidates.into_iter().find(|i| i.names(&snapshot))
+        };
+        // Anything in the file beyond the one standing intent is left over:
+        // a record of a snapshot that finished or never landed.
+        let left_over = bytes.len() != if standing.is_some() { 32 } else { 0 };
+        Ok((standing, left_over))
+    }
+
+    /// Empty `snapshot.intent` unless it is still true. Called with the write
+    /// lock held, before an append.
+    fn settle_snapshot_intent(&mut self) -> Result<()> {
+        let wal = self.fs.read(FileId::Wal)?;
+        let (standing, left_over) = self.standing_intent(&wal)?;
+        if left_over {
+            // Keep the one that is still true, drop the rest.
+            let keep = standing.map(|i| i.encode()).unwrap_or_default();
+            self.fs.write_atomic(FileId::SnapshotIntent, &keep)?;
+        }
+        self.intent_unsettled = false;
+        Ok(())
+    }
+
+    /// Make the next snapshot on this handle fail at `at`, leaving the files
+    /// as a crash there would. For tests; not part of the stable surface.
+    #[doc(hidden)]
+    pub fn stop_next_snapshot(&mut self, at: SnapshotStop) {
+        self.snapshot_stop = Some(at);
     }
 
     /// Whether `(label, field)` is currently indexed for full-text search.
@@ -9908,6 +10208,10 @@ impl<F: Fs> GraphDb<F> {
         // resolve a date to a commit, and answers `NoRecordedTime` for history
         // it holds in full (ledger row 86).
         try_copy("commit_times.bin")?;
+        // Empty unless the store's last WAL-replacing snapshot was
+        // interrupted. Then, without it, the copy is that snapshot beside the
+        // WAL it was made from, with nothing to say so.
+        try_copy("snapshot.intent")?;
 
         // Copy WAL archives.
         let archives = self.fs.list_archives()?;
@@ -10274,6 +10578,16 @@ impl<F: Fs> GraphDb<F> {
     #[doc(hidden)]
     pub fn hnsw_build_count(&self) -> u64 {
         self.engine.hnsw_build_count()
+    }
+
+    /// Whether the rule engine has built its candidate indexes on this handle.
+    ///
+    /// A store opened from a snapshot defers that full node scan until the
+    /// first write or the first read that needs it. Exposed for tests that
+    /// assert an open did not pay for it; not part of the stable surface.
+    #[doc(hidden)]
+    pub fn rule_indexes_populated(&self) -> bool {
+        self.engine.indexes_populated()
     }
 
     /// How many rules this handle still holds a lazily-decoded HNSW graph for.
@@ -14001,10 +14315,26 @@ impl<F: Fs> GraphDb<F> {
         // it holds, so the next open does not apply those writes again on top
         // of the state they produced. This handle holds the write lock, so
         // every byte in the WAL now is a write it has applied.
-        let wal_mark = if opts.keep_wal && !opts.archive_wal {
-            core_storage::v8::WalMark::of(&self.fs.read(FileId::Wal)?).encode()
-        } else {
+        let replaces_wal = opts.archive_wal || !opts.keep_wal;
+        let wal_now = self.fs.read(FileId::Wal)?;
+        let wal_mark = if replaces_wal {
             Vec::new()
+        } else {
+            core_storage::v8::WalMark::of(&wal_now).encode()
+        };
+        let standing_intent = if replaces_wal {
+            self.standing_intent(&wal_now)?.0
+        } else {
+            None
+        };
+        let stop = self.snapshot_stop.take();
+        let stopped = |at: SnapshotStop| -> Result<()> {
+            if stop == Some(at) {
+                return Err(GraphError::Io(std::io::Error::other(format!(
+                    "snapshot stopped {at:?} (test hook)"
+                ))));
+            }
+            Ok(())
         };
         self.ensure_v8_base_sections_loaded();
         // Ensure provenance is decoded before to_persist() clones it.
@@ -14071,6 +14401,7 @@ impl<F: Fs> GraphDb<F> {
                 wal_truncated: !opts.keep_wal,
                 hnsw: hnsw_state,
                 last_change: self.last_change.clone(),
+                fulltext_blob: self.fulltext_blob(),
                 wal_mark: wal_mark.clone(),
             };
             let mut buf: Vec<u8> = Vec::new();
@@ -14128,6 +14459,28 @@ impl<F: Fs> GraphDb<F> {
                 )?;
             }
             core_storage::snapshot::stamp_container_version(&mut buf, snapshot_version)?;
+            if replaces_wal {
+                // Before the snapshot: what is about to be written, and the
+                // WAL it holds. From here until the WAL is replaced a crash
+                // leaves that WAL beside the new snapshot, and this is how
+                // the next open knows not to apply it again (ledger row 92).
+                //
+                // An intent already standing — the last snapshot was
+                // interrupted too, and this store opens because of it — is
+                // kept beside the new one until the new snapshot is down. If
+                // this attempt fails before then, it is still what names the
+                // snapshot on disk.
+                let mut intent = core_storage::v8::SnapshotIntent::new(&buf, &wal_now).encode();
+                if let Some(standing) = &standing_intent {
+                    intent.extend_from_slice(&standing.encode());
+                }
+                self.fs.write_atomic(FileId::SnapshotIntent, &intent)?;
+                // Until this snapshot empties it. If it does not get that far
+                // and this handle goes on writing, the next append looks at
+                // whether the intent is still true.
+                self.intent_unsettled = true;
+            }
+            stopped(SnapshotStop::BeforeSnapshotWrite)?;
             self.fs.write_atomic(FileId::Snapshot, &buf)?;
             // Remap the freshly-written snapshot as the new base.
             // C2: use file mmap on RealFs; fall back to from_bytes on SimFs.
@@ -14156,12 +14509,15 @@ impl<F: Fs> GraphDb<F> {
             //   • self.topo.clone()      (~topology HashMap footprint)
             //   • self.props.clone()     (~column-store footprint)
             //   • encode_v8_from_state V8Meta secondary clones (labels, edge_props, …)
-            let meta = V8Meta {
+            let mut meta = V8Meta {
                 labels: (*self.labels).clone(),
                 wal_truncated: !opts.keep_wal,
-                // Move edge_props out so the large overlay is freed when meta
-                // drops at end of this block (self.edge_props is now empty; reads
-                // after base assignment go through the mmap'd base section).
+                // Moved, not cloned, for the encode — and moved straight back
+                // below, before anything that can fail. They are released
+                // only once the new snapshot is mapped and reads go through
+                // it. Left out of the handle across the write, a snapshot
+                // that failed there went on with no edge properties at all,
+                // and the next one that worked wrote that down.
                 edge_props: std::mem::take(Arc::make_mut(&mut self.edge_props)),
                 rule_defs,
                 provenance,
@@ -14171,10 +14527,11 @@ impl<F: Fs> GraphDb<F> {
                 view_defs,
                 hnsw: hnsw_state,
                 last_change: self.last_change.clone(),
+                fulltext_blob: self.fulltext_blob(),
                 wal_mark: wal_mark.clone(),
             };
             let mut buf = Vec::new();
-            encode_v8(
+            let encoded = encode_v8(
                 None,
                 None,
                 None,
@@ -14186,11 +14543,33 @@ impl<F: Fs> GraphDb<F> {
                 &self.syms,
                 &meta,
                 &mut buf,
-            )?;
-            // meta (and the moved edge_props inside it) is no longer needed;
-            // drop it before the write to keep the peak window narrow.
+            );
+            self.edge_props = Arc::new(std::mem::take(&mut meta.edge_props));
             drop(meta);
+            encoded?;
             core_storage::snapshot::stamp_container_version(&mut buf, snapshot_version)?;
+            if replaces_wal {
+                // Before the snapshot: what is about to be written, and the
+                // WAL it holds. From here until the WAL is replaced a crash
+                // leaves that WAL beside the new snapshot, and this is how
+                // the next open knows not to apply it again (ledger row 92).
+                //
+                // An intent already standing — the last snapshot was
+                // interrupted too, and this store opens because of it — is
+                // kept beside the new one until the new snapshot is down. If
+                // this attempt fails before then, it is still what names the
+                // snapshot on disk.
+                let mut intent = core_storage::v8::SnapshotIntent::new(&buf, &wal_now).encode();
+                if let Some(standing) = &standing_intent {
+                    intent.extend_from_slice(&standing.encode());
+                }
+                self.fs.write_atomic(FileId::SnapshotIntent, &intent)?;
+                // Until this snapshot empties it. If it does not get that far
+                // and this handle goes on writing, the next append looks at
+                // whether the intent is still true.
+                self.intent_unsettled = true;
+            }
+            stopped(SnapshotStop::BeforeSnapshotWrite)?;
             self.fs.write_atomic(FileId::Snapshot, &buf)?;
             // Remap the freshly-written V8 snapshot as self.base.
             // On RealFs: drop the encode buffer before mmap to recover ~1.9 GiB.
@@ -14207,11 +14586,12 @@ impl<F: Fs> GraphDb<F> {
             self.base = Some(Arc::new(new_base));
             // Free the large heap-allocated decoded state — all data is now in the
             // mmap'd base.  Mirrors the V8 merge-snapshot path (see above).
-            // self.edge_props was already moved into meta and is effectively empty.
+            self.edge_props = Arc::new(Default::default());
             self.topo = Arc::new(Topology::new());
             self.props = Arc::new(core_storage::columns::ColumnStore::new());
         }
 
+        stopped(SnapshotStop::AfterSnapshotWrite)?;
         if opts.archive_wal {
             // History-preserving snapshot (Task 4):
             //   1. Snapshot already written above (write_atomic → fsynced).
@@ -14255,6 +14635,7 @@ impl<F: Fs> GraphDb<F> {
                 .copied()
                 .unwrap_or(self.wal_horizon_floor)
                 + live_frames_for_name.len() as u64;
+            stopped(SnapshotStop::BeforeWalReplacement)?;
             self.fs.archive_wal(archive_n)?;
 
             // The replacement WAL goes in **immediately**, with no fallible call
@@ -14460,6 +14841,7 @@ impl<F: Fs> GraphDb<F> {
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
+            stopped(SnapshotStop::BeforeWalReplacement)?;
             self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
             // Every archive now ends at or below the floor. They are the
             // history this snapshot was asked to discard; removing them here is
@@ -14478,6 +14860,13 @@ impl<F: Fs> GraphDb<F> {
             // history the dates addressed.
             self.commit_times = core_storage::commit_times::CommitTimes::default();
             self.rewrite_commit_times();
+        }
+        // The WAL is the one that goes with the snapshot now. The intent has
+        // done its work and must not outlive it.
+        if replaces_wal {
+            stopped(SnapshotStop::AfterWalReplacement)?;
+            self.fs.write_atomic(FileId::SnapshotIntent, &[])?;
+            self.intent_unsettled = false;
         }
         // After snapshot the overlay may have changed (V8 merge path clears
         // self.topo and self.props). Refresh the MVCC fold so future readers

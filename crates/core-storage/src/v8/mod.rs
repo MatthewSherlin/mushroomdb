@@ -4,7 +4,7 @@
 //! ```text
 //! [0..4]   MAGIC "GDB1"
 //! [4..6]   VERSION = 8 or 9 (u16 LE) — same container, V9 adds section 12
-//! [6..8]   section_count (u16 LE) — 14 since 0.7.2 (15 with a WAL mark)
+//! [6..8]   section_count (u16 LE) — 14 since 0.7.2; one more with a WAL mark, one more with the full-text index
 //! [8..8+16*N] SectionEntry * N  -- {id:u8, _pad:[u8;3], offset:u32, len:u32, crc32:u32}
 //! [8+16*N..8+16*N+4]  whole-header CRC32
 //! [..4096]  zero-pad
@@ -89,11 +89,18 @@ pub const SECTION_LAST_CHANGE: u8 = 11;
 /// rkyv `StringTableData`.  Written from V9 on; absent in V5–V8 snapshots,
 /// where each string column carries its own copy and that copy is authoritative.
 pub const SECTION_STRINGS: u8 = 12;
+/// The full-text index as [`crate::fulltext::FulltextIndex::to_blob`] wrote
+/// it. Opaque here, and versioned and checksummed by the blob itself, so the
+/// index's layout changes without a container change. Written only when a
+/// full-text pair is declared; absent in every snapshot written before it
+/// existed, where the index is rebuilt at open as it always was. A reader
+/// that does not know this id ignores the section.
+pub const SECTION_FULLTEXT: u8 = 13;
 /// How much of the live WAL this snapshot already holds: [`WalMark`]. Written
 /// only by a snapshot that keeps its WAL, where the open would otherwise
 /// replay over the snapshot every write the snapshot was made from. Absent
 /// in every other snapshot, and ignored by a reader that does not know the
-/// id. (Id 13 is the full-text index's.)
+/// id.
 pub const SECTION_WAL_MARK: u8 = 14;
 /// Says the writer of this snapshot removes a deleted node's edges from the
 /// snapshot it was working over, so the topology holds no edge to or from a
@@ -165,6 +172,87 @@ impl WalMark {
     }
 }
 
+/// What a snapshot that replaces its WAL leaves beside it while it works.
+///
+/// Such a snapshot writes `snapshot.bin` and then replaces `wal.bin`, two
+/// steps a crash can fall between. What is left then is the new snapshot
+/// beside the WAL it was made from, and replaying that WAL over it applies
+/// every write a second time (see [`WalMark`]). The intent names the
+/// snapshot being written, by length and checksum, and the WAL it holds. An
+/// open that finds it, with that snapshot and that WAL on disk, counts the
+/// WAL's frames and does not apply them.
+///
+/// It is a file of its own and not a section of the snapshot because it has
+/// to stop being true: once the WAL is replaced the new WAL can begin with
+/// the very bytes the old one did — the same declarations, then the same
+/// writes made again — and a mark that outlived the swap would skip those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotIntent {
+    /// Length of the snapshot being written.
+    pub snapshot_len: u64,
+    /// CRC32 of the snapshot being written.
+    pub snapshot_crc: u32,
+    /// The WAL that snapshot holds.
+    pub wal: WalMark,
+}
+
+impl SnapshotIntent {
+    const MAGIC: &'static [u8; 4] = b"MINT";
+
+    pub fn new(snapshot: &[u8], wal: &[u8]) -> Self {
+        Self {
+            snapshot_len: snapshot.len() as u64,
+            snapshot_crc: crc32fast::hash(snapshot),
+            wal: WalMark::of(wal),
+        }
+    }
+
+    /// Whether `snapshot` is the one this intent was written for.
+    pub fn names(&self, snapshot: &[u8]) -> bool {
+        snapshot.len() as u64 == self.snapshot_len && crc32fast::hash(snapshot) == self.snapshot_crc
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32);
+        out.extend_from_slice(Self::MAGIC);
+        out.extend_from_slice(&self.snapshot_len.to_le_bytes());
+        out.extend_from_slice(&self.snapshot_crc.to_le_bytes());
+        out.extend_from_slice(&self.wal.len.to_le_bytes());
+        out.extend_from_slice(&self.wal.crc.to_le_bytes());
+        let crc = crc32fast::hash(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// Every intent in the file. It holds one, or two while a snapshot is
+    /// being written over a store whose last snapshot was itself
+    /// interrupted: the one still standing and the one being attempted.
+    /// A file that is not whole records reads as none.
+    pub fn decode_all(bytes: &[u8]) -> Vec<Self> {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(32) {
+            return Vec::new();
+        }
+        bytes.chunks_exact(32).filter_map(Self::decode).collect()
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 32 || &bytes[..4] != Self::MAGIC {
+            return None;
+        }
+        if crc32fast::hash(&bytes[..28]) != u32::from_le_bytes(bytes[28..32].try_into().ok()?) {
+            return None;
+        }
+        Some(Self {
+            snapshot_len: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
+            snapshot_crc: u32::from_le_bytes(bytes[12..16].try_into().ok()?),
+            wal: WalMark {
+                len: u64::from_le_bytes(bytes[16..24].try_into().ok()?),
+                crc: u32::from_le_bytes(bytes[24..28].try_into().ok()?),
+            },
+        })
+    }
+}
+
 /// Total number of canonical section slots (used for atomic check_state array).
 /// Extended from 11 (Task 5: +ivf_state) to 12 (Task 3: +last_change) to 13
 /// (v0.6.5: +strings).
@@ -188,6 +276,7 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_PROVENANCE
             | SECTION_IVF_STATE
             | SECTION_STRINGS
+            | SECTION_FULLTEXT
             | SECTION_WAL_MARK
             | SECTION_EDGES_SWEPT
     )
@@ -344,6 +433,7 @@ impl MappedBase {
             SECTION_IVF_STATE => "ivf_state",
             SECTION_LAST_CHANGE => "last_change",
             SECTION_STRINGS => "strings",
+            SECTION_FULLTEXT => "fulltext",
             SECTION_WAL_MARK => "wal_mark",
             SECTION_EDGES_SWEPT => "edges_swept",
             _ => "unknown",
@@ -725,6 +815,19 @@ impl MappedBase {
         self.section_bytes(SECTION_IVF_STATE)
     }
 
+    /// Raw bytes of the full-text index blob (section 13).
+    ///
+    /// Returns `Ok(&[])` when the section is absent: a snapshot written before
+    /// the section existed, by a binary that does not write it, or of a store
+    /// with no full-text pair. The blob carries its own checksum, which
+    /// `FulltextIndex::from_blob` verifies.
+    pub fn fulltext_bytes(&self) -> Result<&[u8]> {
+        if !self.has_section(SECTION_FULLTEXT) {
+            return Ok(&[]);
+        }
+        self.section_bytes(SECTION_FULLTEXT)
+    }
+
     /// Whether this snapshot says its topology holds no edge of a deleted
     /// node (section 15). False for a snapshot written before the section
     /// existed, by a binary that does not write it, or with a damaged one.
@@ -902,6 +1005,7 @@ mod tests {
             wal_truncated: false,
             hnsw: BTreeMap::new(),
             last_change: HashMap::new(),
+            fulltext_blob: Vec::new(),
             wal_mark: Vec::new(),
         }
     }

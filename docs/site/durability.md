@@ -10,8 +10,8 @@ store with per-section CRCs.
 On open, the store is reconstructed as **snapshot (if present) + WAL tail**:
 
 - **With a snapshot** — the V9 image is memory-mapped (open-to-first-query in
-  milliseconds even at 100k nodes; derived edges, HNSW vector indexes, and
-  provenance are all restored from the image), then any WAL frames written after
+  milliseconds even at 100k nodes; derived edges, HNSW vector indexes,
+  provenance and the full-text index are all restored from the image), then any WAL frames written after
   the snapshot are replayed. This is the normal path and it is fast.
 - **WAL-only, from genesis** — if the store has *never* been snapshotted, the
   entire history replays from the beginning. Node/edge/property writes replay

@@ -21,8 +21,9 @@ Dependency rule (inward only):
 `bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
 
 Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy`), plus mmap-able
-V9 rkyv snapshots (14 sections: CSR topology, columnar properties, one shared string table for every
-string column, HNSW blobs, provenance, IVF state, per-node last-change index, and more — zero-copy,
+V9 rkyv snapshots (14 sections, one more for the full-text index when a pair is declared and one more when the snapshot kept its WAL: CSR
+topology, columnar properties, one shared string table for every string column, HNSW blobs,
+provenance, IVF state, per-node last-change index, and more — zero-copy,
 no heap allocation on open). V5–V8 stores are auto-migrated to V9 on `GraphDb::open`, keeping the
 original beside the new one as `snapshot.bin.bak` until the next clean open. The upgrade is one-way:
 an earlier binary refuses a V9 snapshot with `snapshot: unsupported version 9` rather than reading it

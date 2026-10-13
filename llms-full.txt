@@ -5774,7 +5774,7 @@ plus post-copy CRC verification. Writers are blocked for that entire window. For
 stores with large snapshots this may be tens of seconds.
 
 The server copies: `snapshot.bin`, `wal.bin`, all `wal.<N>.archive` files,
-`wal.floor`, `wal.genesis`, `roles.json` and `commit_times.bin`. After the copies complete it opens the
+`wal.floor`, `wal.genesis`, `roles.json`, `commit_times.bin` and, when there is one, `snapshot.intent`. After the copies complete it opens the
 backup read-only and runs the CRC verifier.
 
 Responses:
@@ -7075,7 +7075,7 @@ can still reach pre-snapshot commits. The WAL replay over the snapshot is
 idempotent — no manual recovery is needed. The WAL grows until an explicit
 `snapshot()` (with default `keep_wal: false`) truncates it.
 
-**V9 snapshot format:** mmap-able rkyv sections (14 in all); zero-copy open via
+**V9 snapshot format:** mmap-able rkyv sections (14, one more for the full-text index when a pair is declared, one more when the snapshot kept its WAL); zero-copy open via
 mmap; no heap allocation for section data. V5–V8 stores are auto-migrated to
 V9 on open; a V9 snapshot cannot be opened by a pre-0.6.5 binary, which refuses
 it with `snapshot: unsupported version 9`. See [`docs/format-stability.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md) for the
@@ -7288,7 +7288,7 @@ Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHAN
 mushroomdb schema apply <db-dir> <schema.json>
 mushroomdb schema apply <db-dir> --memory-defaults
                                  applies the built-in memory schema to an existing store;
-                                 full-text on a populated store rebuilds the index at every open from here on
+                                 full-text on a populated store builds the index at each open until the next snapshot carries it
 mushroomdb schema apply <db-dir> --memory-identity
                                  adds the identity preset: sixteen SAME_AS rules over each entity's aliases;
                                  says what it will backfill, then backfills
@@ -8487,8 +8487,10 @@ enabled raises `RuleInvalid`. With `if_not_exists=True` it returns
 `False` instead, so a caller that declares its schema at boot can call
 this every time.
 
-The declaration is logged; the index itself is rebuilt on every open,
-so each declared pair adds to how long the store takes to open.
+The declaration is logged. A snapshot carries the index, and an open
+reads it from there; a pair declared since the last snapshot is
+indexed again at each open until the next one, which takes time in
+proportion to that pair's text.
 
     db.enable_fulltext("Doc", "body", if_not_exists=True)
 
@@ -10028,8 +10030,8 @@ store with per-section CRCs.
 On open, the store is reconstructed as **snapshot (if present) + WAL tail**:
 
 - **With a snapshot** — the V9 image is memory-mapped (open-to-first-query in
-  milliseconds even at 100k nodes; derived edges, HNSW vector indexes, and
-  provenance are all restored from the image), then any WAL frames written after
+  milliseconds even at 100k nodes; derived edges, HNSW vector indexes,
+  provenance and the full-text index are all restored from the image), then any WAL frames written after
   the snapshot are replayed. This is the normal path and it is fast.
 - **WAL-only, from genesis** — if the store has *never* been snapshotted, the
   entire history replays from the beginning. Node/edge/property writes replay
@@ -10483,9 +10485,15 @@ Call `disable_fulltext` to drop the index and stop maintaining it:
 db.disable_fulltext("Article", "bio")?;
 ```
 
-Both declarations are WAL-logged and replayed on open; the index is rebuilt from
-scratch on every open from the WAL-declared pairs, so no snapshot format changes are
-required.
+Both declarations are WAL-logged and replayed on open.
+
+A snapshot carries the index. An open reads it from the snapshot and applies what
+was written since, so a store that has been snapshotted does not pay for its text
+again each time it opens: 30,000 entities under three declared pairs open in
+21 ms, where building the index took 183 ms. A store that has never been
+snapshotted, and one whose snapshot was written by 0.7 or earlier, build the
+index at open as before, and answer the same. The index adds to the snapshot's
+size: about a third on that store.
 
 ## Searching
 
@@ -11755,6 +11763,7 @@ A store is a directory. Mount it; everything below follows from that.
 | `roles.json` | role tokens and their masks | every configured role |
 | `wal.<N>.archive` | the folded WAL each snapshot left behind | `node_history`, `edge_history`, `was_linked` and `asof` reach into that span |
 | `commit_times.bin` | commit → wall-clock sidecar; written atomically as commits land | date-resolution (`at_commit` RFC 3339 form, `resolve_date`, `commit_time_ms`) — a store without it cannot resolve a date to a commit until new commits build a fresh one |
+| `snapshot.intent` | written by a snapshot that replaces the WAL, before it starts; emptied when it has finished | nothing when empty or absent, which is its usual state — content that names the snapshot and the WAL on disk marks a snapshot that was interrupted before its WAL was replaced, and without it that store replays its old WAL over the new snapshot; any other content is left over and is emptied at the next write |
 | `LOCK` | always empty; carries the advisory cross-process write lock | cross-process coordination for handles opened afterwards |
 
 All of them matter. A backup that takes `snapshot.bin` alone is a store with no
@@ -11819,7 +11828,7 @@ mushroomdb backup /data /backups/2026-09-11T02-00Z
 ```
 
 The command copies `snapshot.bin`, `snapshot.bin.bak`, `wal.bin`, `wal.floor`,
-`wal.genesis`, `roles.json`, `commit_times.bin` and every `wal.<N>.archive` into the destination,
+`wal.genesis`, `roles.json`, `commit_times.bin`, `snapshot.intent` when there is one, and every `wal.<N>.archive` into the destination,
 then **verifies**: it CRC-checks the copy and opens it. The printed report ends
 in `verified: true`, and a copy that does not verify is one you must not use.
 
@@ -12376,8 +12385,9 @@ Dependency rule (inward only):
 `bindings/server/cli → core-api → {core-query, core-rules} → core-storage`
 
 Storage uses a dense-id WAL with per-commit fsync (configurable via `FsyncPolicy`), plus mmap-able
-V9 rkyv snapshots (14 sections: CSR topology, columnar properties, one shared string table for every
-string column, HNSW blobs, provenance, IVF state, per-node last-change index, and more — zero-copy,
+V9 rkyv snapshots (14 sections, one more for the full-text index when a pair is declared and one more when the snapshot kept its WAL: CSR
+topology, columnar properties, one shared string table for every string column, HNSW blobs,
+provenance, IVF state, per-node last-change index, and more — zero-copy,
 no heap allocation on open). V5–V8 stores are auto-migrated to V9 on `GraphDb::open`, keeping the
 original beside the new one as `snapshot.bin.bak` until the next clean open. The upgrade is one-way:
 an earlier binary refuses a V9 snapshot with `snapshot: unsupported version 9` rather than reading it
