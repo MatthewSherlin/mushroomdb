@@ -4166,3 +4166,50 @@ fn an_archiving_snapshot_with_nothing_new_leaves_the_last_archive_alone() {
         assert_eq!(db.stats().nodes_live, 4, "declared={declared}");
     }
 }
+
+/// A kill between the WAL's rename to its archive and the write of the WAL
+/// that replaces it leaves the archive and an empty or missing `wal.bin`. On
+/// a store with a declaration the replacement is not empty, so the WAL did
+/// not look like "nothing new" — and the guard against renaming over an
+/// archive then refused every snapshot, as `corrupt data`, until something
+/// was written. There is nothing to archive there either; the snapshot puts
+/// the declarations back in place.
+#[test]
+fn a_snapshot_after_a_kill_before_the_replacement_wal_succeeds_on_a_declared_store() {
+    let archive = SnapshotOptions {
+        archive_wal: true,
+        ..Default::default()
+    };
+    for missing in [false, true] {
+        let dir = tmp(&format!("declared-no-wal-{missing}"));
+        {
+            let mut db = GraphDb::open(&dir).unwrap();
+            db.enable_fulltext("Person", "name").unwrap();
+            for key in ["a", "b", "c"] {
+                db.insert_node("Person", key, vec![]).unwrap();
+            }
+            db.snapshot_with(archive.clone()).unwrap();
+        }
+        let archived = std::fs::metadata(dir.join("wal.4.archive")).unwrap().len();
+        if missing {
+            std::fs::remove_file(dir.join("wal.bin")).unwrap();
+        } else {
+            std::fs::write(dir.join("wal.bin"), b"").unwrap();
+        }
+        for _ in 0..2 {
+            let mut db = GraphDb::open(&dir).unwrap();
+            db.snapshot_with(archive.clone())
+                .unwrap_or_else(|e| panic!("missing={missing}: {e}"));
+            assert!(db.is_fulltext_enabled("Person", "name"));
+        }
+        assert_eq!(
+            std::fs::metadata(dir.join("wal.4.archive")).unwrap().len(),
+            archived,
+            "missing={missing}"
+        );
+        // The declaration is back in the live WAL, not only in the snapshot.
+        assert!(std::fs::metadata(dir.join("wal.bin")).unwrap().len() > 0);
+        let then = GraphDb::open_at(&dir, 1).unwrap();
+        assert_eq!(then.stats().nodes_live, 1, "missing={missing}");
+    }
+}

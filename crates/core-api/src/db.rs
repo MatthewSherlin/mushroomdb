@@ -14785,8 +14785,15 @@ impl<F: Fs> GraphDb<F> {
             // with no archive yet has no name to collide with and is archived
             // as before.
             let (baseline_frames, _) = decode_all(&baseline_wal);
-            let nothing_to_archive =
-                live_frames_for_name == baseline_frames && !self.fs.list_archives()?.is_empty();
+            //
+            // An empty WAL has nothing to archive whatever the replacement
+            // holds: it is what a kill between the rename and the write of
+            // the replacement leaves, and on a store with a declaration it is
+            // not the replacement. The rewrite below puts the declarations
+            // back.
+            let nothing_to_archive = (live_frames_for_name.is_empty()
+                || live_frames_for_name == baseline_frames)
+                && !self.fs.list_archives()?.is_empty();
             stopped(SnapshotStop::BeforeWalReplacement)?;
             if nothing_to_archive {
                 if live_wal_bytes_for_name != baseline_wal {
