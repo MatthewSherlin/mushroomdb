@@ -68,9 +68,9 @@ Three flags choose otherwise:
 | `mushroomdb snapshot <db> --truncate` | minimal baseline | only commits after this point |
 
 `--truncate` is the destructive one and nothing chooses it for you. It discards
-the tail and deletes the `wal.genesis` marker, which is what allows `asof` to
-replay archive-resident commits, so any archives an earlier snapshot left become
-unreachable too.
+the tail, deletes any archives an earlier snapshot left, and moves the store's
+floor to where that history ended, so the commits it discarded keep their
+numbers and are refused by name from then on.
 
 **Disk.** One snapshot moves bytes rather than adding them: the archive holds
 what `wal.bin` was holding anyway. A *series* of them accumulates, because each

@@ -298,8 +298,10 @@ is the state after the first WAL frame.
 
 - `GraphDb::open()` loads from the snapshot plus any post-snapshot WAL frames.
 - The commits before the snapshot are discarded, and they keep their numbers.
-  The store's floor moves to where they ended, and the first commit after the
-  snapshot is numbered from there. `GraphDb::open_at()` of a discarded number
+  The store's floor moves to where they ended, and everything written after
+  the snapshot is numbered above it. The first write is not always *at* the
+  floor: a store with full-text fields or indexes re-records each of those
+  declarations first, one commit apiece. `GraphDb::open_at()` of a discarded number
   returns `CommitOutOfRange`, naming the floor; it never answers with a later
   commit that happens to sit at the same position in the new WAL.
 - `stats` reports the floor (`history_floor`), and the CLI prints it as
@@ -309,8 +311,9 @@ A store truncated by 0.7.1 or an earlier release is the exception. Those
 releases numbered the new WAL from 0 again and left the floor where it was, so
 such a store still reports its history as complete, and a commit number taken
 before the truncation now names a different commit. Nothing on disk records how
-many commits were discarded, so this cannot be repaired on open; the next
-truncating snapshot sets the floor correctly from then on.
+many commits were discarded, so this cannot be repaired on open. Its next
+truncating snapshot stops numbers being reused from then on; a number held
+from before an older truncation can still be answered with the wrong commit.
 
 `snapshot_with(SnapshotOptions { keep_wal: true })` writes the snapshot but
 leaves the WAL intact, so `open_at` can reach all WAL commits including those

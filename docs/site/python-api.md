@@ -156,8 +156,8 @@ store quick.
 
 This discards history: the commits before the snapshot can no longer
 be read with `query_at`, `edges_at` or `was_linked`. They keep their
-numbers. `stats()["history_floor"]` moves to where they ended, the next
-commit is numbered on from there, and a read at a discarded commit
+numbers. `stats()["history_floor"]` moves to where they ended, what is
+written next is numbered above it, and a read at a discarded commit
 raises `CommitOutOfRange`.
 
 A snapshot needs the store's write lock, because it replaces the WAL a

@@ -3411,6 +3411,17 @@ impl<F: Fs> GraphDb<F> {
             // Base state: a truncating snapshot (wal_truncated=true) compacts
             // all pre-truncation / pre-archive commits.  Dense-id records in
             // the live WAL reference ids/interns that the snapshot provides.
+            //
+            // A `keep_wal` snapshot records `wal_truncated=false`: it is the
+            // state at the head, not at the start of the WAL, so it is no base
+            // for a prefix. That is right when the live WAL reaches the store's
+            // first commit and can be replayed from nothing. It is wrong when
+            // the WAL starts above that — the floor has moved, or archives sit
+            // in front of it — because the snapshot that *was* its base has
+            // been overwritten. Replaying the prefix over nothing then answers
+            // with a graph missing everything older than the WAL. The base is
+            // gone, so the read is refused (ledger row 82).
+            let base_is_gone = db.wal_horizon_floor > 0 || total_archive_frames > 0;
             // Peek 6 bytes (same pattern as open_with).
             let snap_header = db.fs.read_prefix(FileId::Snapshot, 6)?;
             let is_v8 = snap_header.len() >= 6
@@ -3434,6 +3445,12 @@ impl<F: Fs> GraphDb<F> {
                 if let Some(state) = state {
                     if state.wal_truncated {
                         db.restore_snapshot_state(state)?;
+                    } else if base_is_gone {
+                        return Err(GraphError::CommitOutOfRange {
+                            commit,
+                            total,
+                            floor: db.wal_horizon_floor,
+                        });
                     }
                 }
             } else if !snap_header.is_empty() {
@@ -3441,6 +3458,12 @@ impl<F: Fs> GraphDb<F> {
                 if let Some(state) = core_storage::snapshot::decode(&snap_bytes)? {
                     if state.wal_truncated {
                         db.restore_snapshot_state(state)?;
+                    } else if base_is_gone {
+                        return Err(GraphError::CommitOutOfRange {
+                            commit,
+                            total,
+                            floor: db.wal_horizon_floor,
+                        });
                     }
                 }
             }
@@ -12448,8 +12471,12 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// Returns the horizon floor when all surviving history is empty.
     pub fn wal_total_commits(&self) -> Result<u64> {
+        // The floor that belongs with these frames: both are read from disk
+        // here. A handle that has not refreshed since another process moved
+        // the floor would otherwise number new frames from its old one (row 81).
+        let floor = self.fs.read_horizon_floor()?;
         let (frames, _) = self.all_frames()?;
-        Ok(self.wal_horizon_floor + frames.len() as u64)
+        Ok(floor + frames.len() as u64)
     }
 
     /// The global frame index of the first commit reachable through surviving
@@ -12501,6 +12528,7 @@ impl<F: Fs> GraphDb<F> {
         &self,
         frames: &[core_storage::wal::WalRecord],
         queried_key: &str,
+        floor: u64,
     ) -> Vec<(String, u64, Option<u64>)> {
         use core_storage::wal::WalRecord;
 
@@ -12509,7 +12537,7 @@ impl<F: Fs> GraphDb<F> {
         let mut key_starts: HashMap<String, Vec<u64>> = HashMap::new();
 
         for (local_i, frame) in frames.iter().enumerate() {
-            let commit = self.wal_horizon_floor + local_i as u64;
+            let commit = floor + local_i as u64;
             let records: &[WalRecord] = match frame {
                 WalRecord::Batch(inner) => inner.as_slice(),
                 single => std::slice::from_ref(single),
@@ -12544,10 +12572,10 @@ impl<F: Fs> GraphDb<F> {
                 key_starts
                     .get(&current_key)
                     .and_then(|starts| starts.iter().rev().find(|&&s| s < vu).copied())
-                    .unwrap_or(self.wal_horizon_floor)
+                    .unwrap_or(floor)
             } else {
                 // Queried key — no upper bound; may have been introduced at any commit.
-                self.wal_horizon_floor
+                floor
             };
 
             result.push((current_key.clone(), valid_from, current_valid_until));
@@ -12591,16 +12619,20 @@ impl<F: Fs> GraphDb<F> {
         use crate::history::{HistoryChange, HistoryEntry, HistoryResult};
         use core_storage::wal::WalRecord;
 
+        // The floor that belongs with these frames: both are read from disk
+        // here. A handle that has not refreshed since another process moved
+        // the floor would otherwise number new frames from its old one (row 81).
+        let floor = self.fs.read_horizon_floor()?;
         let (frames, _) = self.all_frames()?;
-        let total_commits = self.wal_horizon_floor + frames.len() as u64;
+        let total_commits = floor + frames.len() as u64;
 
         // Resolve commit-bounded alias intervals for `key` (handles renames in the WAL).
-        let alias_intervals = self.build_key_alias_intervals(&frames, key);
+        let alias_intervals = self.build_key_alias_intervals(&frames, key, floor);
 
         let mut out: Vec<HistoryEntry> = Vec::new();
 
         for (local_i, frame) in frames.iter().enumerate() {
-            let commit = self.wal_horizon_floor + local_i as u64;
+            let commit = floor + local_i as u64;
             // Collect the inner records to process — Batch is one commit, single records are one commit.
             let records: &[WalRecord] = match frame {
                 WalRecord::Batch(inner) => inner.as_slice(),
@@ -12761,7 +12793,7 @@ impl<F: Fs> GraphDb<F> {
         Ok(HistoryResult {
             items: out,
             total_commits,
-            horizon: self.wal_horizon_floor,
+            horizon: floor,
         })
     }
 
@@ -12805,13 +12837,17 @@ impl<F: Fs> GraphDb<F> {
         use crate::history::{EdgeEvent, EdgeHistoryEvent, HistoryResult};
         use core_storage::wal::WalRecord;
 
+        // The floor that belongs with these frames: both are read from disk
+        // here. A handle that has not refreshed since another process moved
+        // the floor would otherwise number new frames from its old one (row 81).
+        let floor = self.fs.read_horizon_floor()?;
         let (frames, _) = self.all_frames()?;
-        let total_commits = self.wal_horizon_floor + frames.len() as u64;
+        let total_commits = floor + frames.len() as u64;
 
         // Resolve all historical names for a and b (handles RenameNode in the WAL).
         // Intervals are commit-bounded so recycled keys don't contaminate histories.
-        let alias_a = self.build_key_alias_intervals(&frames, a);
-        let alias_b = self.build_key_alias_intervals(&frames, b);
+        let alias_a = self.build_key_alias_intervals(&frames, a, floor);
+        let alias_b = self.build_key_alias_intervals(&frames, b, floor);
 
         // Active edges between a and b tracked as (edge_type, src_key, dst_key, is_derived).
         // The is_derived flag is used by the DeleteNode sweep: manual edges are
@@ -12822,7 +12858,7 @@ impl<F: Fs> GraphDb<F> {
         let mut out: Vec<EdgeHistoryEvent> = Vec::new();
 
         for (local_i, frame) in frames.iter().enumerate() {
-            let commit = self.wal_horizon_floor + local_i as u64;
+            let commit = floor + local_i as u64;
             let records: &[WalRecord] = match frame {
                 WalRecord::Batch(inner) => inner.as_slice(),
                 single => std::slice::from_ref(single),
@@ -12980,7 +13016,7 @@ impl<F: Fs> GraphDb<F> {
         Ok(HistoryResult {
             items: out,
             total_commits,
-            horizon: self.wal_horizon_floor,
+            horizon: floor,
         })
     }
 
@@ -13002,38 +13038,42 @@ impl<F: Fs> GraphDb<F> {
     pub fn was_linked(&self, a: &str, b: &str, edge_type: &str, at_commit: u64) -> Result<bool> {
         use core_storage::wal::WalRecord;
 
+        // The floor that belongs with these frames: both are read from disk
+        // here. A handle that has not refreshed since another process moved
+        // the floor would otherwise number new frames from its old one (row 81).
+        let floor = self.fs.read_horizon_floor()?;
         let (frames, _) = self.all_frames()?;
-        let total_commits = self.wal_horizon_floor + frames.len() as u64;
+        let total_commits = floor + frames.len() as u64;
 
         // Horizon floor: commits in pruned archives are unreachable.
-        if at_commit < self.wal_horizon_floor {
+        if at_commit < floor {
             return Err(GraphError::CommitOutOfRange {
                 commit: at_commit,
                 total: total_commits,
-                floor: self.wal_horizon_floor,
+                floor,
             });
         }
         if at_commit >= total_commits {
             return Err(GraphError::CommitOutOfRange {
                 commit: at_commit,
                 total: total_commits,
-                floor: self.wal_horizon_floor,
+                floor,
             });
         }
 
         // Resolve all historical names for a and b (handles RenameNode in the WAL).
         // Intervals are commit-bounded so recycled keys don't contaminate point-in-time reads.
-        let alias_a = self.build_key_alias_intervals(&frames, a);
-        let alias_b = self.build_key_alias_intervals(&frames, b);
+        let alias_a = self.build_key_alias_intervals(&frames, a, floor);
+        let alias_b = self.build_key_alias_intervals(&frames, b, floor);
 
         // Local index into surviving frames (0 = first frame of oldest archive).
-        let local_commit = at_commit - self.wal_horizon_floor;
+        let local_commit = at_commit - floor;
 
         // Replay local frames 0..=local_commit, tracking active edges.
         let mut active: BTreeSet<(String, String, String)> = BTreeSet::new();
 
         for (local_i, frame) in frames.iter().enumerate().take((local_commit + 1) as usize) {
-            let commit = self.wal_horizon_floor + local_i as u64;
+            let commit = floor + local_i as u64;
             let records: &[WalRecord] = match frame {
                 WalRecord::Batch(inner) => inner.as_slice(),
                 single => std::slice::from_ref(single),
@@ -13165,20 +13205,22 @@ impl<F: Fs> GraphDb<F> {
     pub fn edges_at(&self, key: &str, commit: u64) -> Result<Vec<EdgeAt>> {
         use core_storage::wal::WalRecord;
 
+        // Floor and frames from the same read of the disk (row 81).
+        let floor = self.fs.read_horizon_floor()?;
         let (frames, _) = self.all_frames()?;
-        let total_commits = self.wal_horizon_floor + frames.len() as u64;
+        let total_commits = floor + frames.len() as u64;
 
         // Horizon floor: commits in pruned archives are unreachable.
-        if commit < self.wal_horizon_floor || commit >= total_commits {
+        if commit < floor || commit >= total_commits {
             return Err(GraphError::CommitOutOfRange {
                 commit,
                 total: total_commits,
-                floor: self.wal_horizon_floor,
+                floor,
             });
         }
 
         // Commit-bounded historical names of `key` (handles RenameNode).
-        let alias = self.build_key_alias_intervals(&frames, key);
+        let alias = self.build_key_alias_intervals(&frames, key, floor);
 
         // Forward rename chain, for reporting endpoints under their current
         // names: old key → [(commit, new key)] in ascending commit order.
@@ -13186,7 +13228,7 @@ impl<F: Fs> GraphDb<F> {
         // a rename after `commit` still changes what the node is called today.
         let mut renames: HashMap<String, Vec<(u64, String)>> = HashMap::new();
         for (local_i, frame) in frames.iter().enumerate() {
-            let c = self.wal_horizon_floor + local_i as u64;
+            let c = floor + local_i as u64;
             let records: &[WalRecord] = match frame {
                 WalRecord::Batch(inner) => inner.as_slice(),
                 single => std::slice::from_ref(single),
@@ -13225,13 +13267,13 @@ impl<F: Fs> GraphDb<F> {
             cur
         };
 
-        let local_commit = commit - self.wal_horizon_floor;
+        let local_commit = commit - floor;
         // (edge_type, src_key, dst_key) → (derived, rule)
         let mut active: BTreeMap<(String, String, String), (bool, Option<String>)> =
             BTreeMap::new();
 
         for (local_i, frame) in frames.iter().enumerate().take((local_commit + 1) as usize) {
-            let c = self.wal_horizon_floor + local_i as u64;
+            let c = floor + local_i as u64;
             let records: &[WalRecord] = match frame {
                 WalRecord::Batch(inner) => inner.as_slice(),
                 single => std::slice::from_ref(single),
@@ -14104,7 +14146,15 @@ impl<F: Fs> GraphDb<F> {
             // gives: a crash after it leaves the old WAL and any archives on
             // disk under a floor that already disowns them. The next open
             // removes the archives as orphans and replays the WAL over the
-            // snapshot idempotently; no discarded number is ever answered.
+            // snapshot idempotently. No number from before the snapshot is
+            // answered in that state: all of them are below the floor.
+            //
+            // What that state does do is count the old WAL's frames again,
+            // above the floor, until the next truncating snapshot — the same
+            // history under new numbers, and a total inflated by its length.
+            // Never a reused number, but not the original ones either. Closing
+            // that needs the floor to land with the snapshot in one write,
+            // which is a format change (ledger row 80, "what is left").
             let discarded_through = self.wal_total_commits()?;
             if discarded_through > self.wal_horizon_floor {
                 self.fs.write_horizon_floor(discarded_through)?;
@@ -14162,11 +14212,11 @@ impl<F: Fs> GraphDb<F> {
         // reload.
         self.wal_consumed = self.fs.wal_len().map_err(GraphError::Io)?;
         // A snapshot can replace the live WAL with a baseline, which has its
-        // own frames. Re-derive the frame cursor from what the store now
-        // actually holds — the floor, plus what is reachable above it — rather
-        // than carrying the pre-snapshot count forward — `wal_total_commits` is the same sequence the history
-        // surfaces index, and the snapshot has already paid a far larger cost
-        // than one decode.
+        // own frames. Re-derive the frame cursor from what the store now holds
+        // (the floor, plus what is reachable above it) rather than carrying
+        // the pre-snapshot count forward. `wal_total_commits` is the same
+        // sequence the history surfaces index, and the snapshot has already
+        // paid a far larger cost than one decode.
         self.wal_frames_written = self.wal_total_commits()?;
         self.snapshot_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
         Ok(())
