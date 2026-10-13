@@ -539,7 +539,7 @@ pub enum CandidateSpec<'a> {
     Hnsw {
         field: &'a str,
         /// Number of approximate candidates to return; typically
-        /// `max(max_edges, 64)` from the owning `RuleDef`.
+        /// `max(max_edges, 128)` from the owning `RuleDef`.
         k: usize,
         /// `Some(min)` for an exact rule: widen the beam until its worst hit
         /// falls below `min`, so a qualifying node cannot be sitting outside a
@@ -611,7 +611,7 @@ pub fn candidate_spec(p: &Predicate) -> CandidateSpec<'_> {
 /// conjuncts still probe their indexes.
 ///
 /// `k` is the number of HNSW candidates to return; callers should use
-/// `max(max_edges, 64)` from the owning `RuleDef`.  Use the public
+/// `max(max_edges, 128)` from the owning `RuleDef`.  Use the public
 /// zero-argument wrapper (`candidate_spec_approx`) for tests that don't
 /// need a specific k (defaults to 64).
 ///

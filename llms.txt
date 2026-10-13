@@ -163,7 +163,7 @@ let history = db.node_history("alice")?;
 let diff = db.apply_schema(&schema)?;  // SchemaDiff { created, updated, unchanged }
 
 // Hybrid search (fulltext + vector via RRF)
-let hits = db.search_hybrid("rust graph", "bio", Some(&embedding), "embedding", Some("Person"), 10)?;
+let hits = db.search_hybrid("bio", "rust graph", "embedding", &embedding, Some("Person"), 10);
 
 // Subscribe to query results (incremental, allowlisted Cypher subset)
 let sub = db.subscribe_query("MATCH (p:Person)-[:FIT]->(o:Org) RETURN p, o LIMIT 20")?;
@@ -260,7 +260,7 @@ Endpoints that remain 403 for all role tokens regardless of write scope:
 `POST /rules`, `GET /stats`, `GET /explain`, `GET /suggest`, `GET /algo/*`,
 `GET /subscribe`, `GET /watch`, `POST /nodes/{key}/rename`, `POST /backup`.
 
-Error bodies for write denials follow §4.3 — see `docs/site/http.md` for the
+Error bodies for write denials are documented in `docs/site/http.md` (section "Limits, errors and request ids") — see it for the
 full list. Hidden nodes are indistinguishable from absent nodes in all write
 responses.
 
@@ -290,7 +290,7 @@ Claude Desktop config (Claude Code and Cursor should use the plugin or
 
 Predicates compose via `All(...)` (AND, score = min) and `Any(...)` (OR, score = max), nestable to depth 4.
 
-`approximate: true` on `VectorSimilar` uses in-tree HNSW (recall min 0.90, mean 0.998 at 5k/dim 1536, fixed-seed probe).
+`approximate: true` on `VectorSimilar` uses in-tree HNSW (recall floor 0.90 min / 0.95 mean at 5k × dim 1536, fixed-seed probe; CI gates measured 1.0000/1.0000).
 
 ## Cypher key idiom
 

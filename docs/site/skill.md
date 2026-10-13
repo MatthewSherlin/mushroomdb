@@ -302,7 +302,7 @@ codex mcp add mushroomdb -- <command> <args…>
 ```
 
 and lets Codex record the server. If the `codex` CLI is not on `PATH`,
-`install` says so and writes nothing. 0.6.0 ships no Codex skill — the MCP tool
+`install` says so and writes nothing. There is no Codex skill file — the MCP tool
 descriptions are what Codex reads.
 
 A Codex-only install writes nothing project-local: no ignore line and no git

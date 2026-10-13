@@ -134,7 +134,7 @@ Any rules or materialized views that watch the written property will fire immedi
 
 ## HTTP API
 
-All three algorithms are accessible via `POST /algo/{pagerank|wcc|degree}`:
+PageRank, WCC and degree centrality are accessible via `POST /algo/{pagerank|wcc|degree}`. Louvain communities has no HTTP endpoint; use the CLI (`mushroomdb algo communities`) or the Rust API:
 
 ```
 POST /algo/pagerank
@@ -183,7 +183,7 @@ mushroomdb algo communities ./db --edge-type IMPORTS --edge-type CO_CHANGED --we
 Algorithms work on read-only as-of instances opened with `GraphDb::open_at`. The topology at the requested commit is used. `write_scores` returns `ReadOnly` on as-of instances.
 
 ```rust
-let asof = GraphDb::open_at(&dir, 5)?;
+let mut asof = GraphDb::open_at(&dir, 5)?;
 let report = asof.pagerank(&PageRankConfig::default()); // works
 asof.write_scores("rank", &report.scores)?;            // Err(ReadOnly)
 ```

@@ -53,7 +53,7 @@ Bug class caught: torn WAL commits landing partial node-prop records.
 
 **`recovery_byte_sweep_rules`**
 Runs the full rules workload (KM, OV, DUMMY delete, numeric NW/NZ, geo GEO, exact VEC,
-approximate VAPPROX with IVF; plus batches, ingest with auto-FK, rebuild\_rule, and
+approximate VAPPROX with HNSW; plus batches, ingest with auto-FK, rebuild\_rule, and
 delete\_node of a derived-edge-owning node). Sweeps all byte offsets.
 Bug class caught: rule-engine state diverging from node state after mid-stream crash.
 
@@ -222,12 +222,12 @@ payload.
 ## Replay identity tests
 
 **`approximate_wal_replay_identity`**
-Builds 20 nodes with 4 vector clusters, creates an approximate (IVF-Flat) rule, captures
+Builds 20 nodes with 4 vector clusters, creates an approximate (HNSW) rule, captures
 the derived edge set, drops and reopens the database (WAL replay), and asserts the edge
-set is identical. Same rule + same data → same clusters → same edges.
+set is identical. Same rule + same data → same graph → same edges.
 
-Bug class caught: IVF state not persisting across a reopen, or non-deterministic cluster
-assignment on replay.
+Bug class caught: HNSW state not persisting across a reopen, or non-deterministic
+candidate selection on replay.
 
 **`recovery_byte_sweep_rules`** (also a replay identity test)
 At every crash point, `open_with(surviving_state)` re-materializes derived edges from
@@ -243,13 +243,13 @@ cargo test -p sim-harness --test oracle_equivalence approximate_wal_replay_ident
 
 ## Recall floors for approximate mode
 
-`VectorSimilar` with `approximate: true` uses IVF-Flat candidate selection. The recall
+`VectorSimilar` with `approximate: true` uses HNSW candidate selection. The recall
 floor constants are binding (declared in `crates/sim-harness/src/lib.rs`; do not lower
 without explicit sign-off):
 
 ```text
-APPROX_RECALL_FLOOR_QUIESCED = 0.90   # fully quiesced: all nodes indexed, IVF fitted
-APPROX_RECALL_FLOOR_RECOVERY = 0.85   # any crash-recovery or early IVF state
+APPROX_RECALL_FLOOR_QUIESCED = 0.90   # fully quiesced: all nodes indexed, HNSW built
+APPROX_RECALL_FLOOR_RECOVERY = 0.85   # any crash-recovery or early HNSW build state
 ```
 
 Tests:
