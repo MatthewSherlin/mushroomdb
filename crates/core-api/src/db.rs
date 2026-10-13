@@ -2606,7 +2606,11 @@ impl<F: Fs> GraphDb<F> {
             .as_ref()
             .and_then(|base| base.wal_mark())
             .filter(|mark| mark.matches(&bytes))
-            .map_or(0, |mark| decode_all(&bytes[..mark.len as usize]).0.len());
+            .map(|mark| (mark.len as usize, decode_all(&bytes[..mark.len as usize])))
+            // The mark was taken at the end of a whole WAL, so it ends on a
+            // frame boundary; one that does not is not this WAL's.
+            .filter(|(len, (_, consumed))| consumed == len)
+            .map_or(0, |(_, (held, _))| held.len());
         let replayed = db.apply_frames_over(records, held);
         db.fulltext_rebuild_follows = false;
         let replayed = replayed?;
@@ -12591,7 +12595,10 @@ impl<F: Fs> GraphDb<F> {
         use core_storage::wal::WalRecord;
 
         // Pre-pass: build reverse_rename and key_starts maps.
-        let mut reverse_rename: HashMap<String, (String, u64)> = HashMap::new();
+        // Every rename into a key, in commit order. A key can be renamed into
+        // more than once — `a → b`, `b → a`, `a → b` — and which rename led
+        // to the occupancy being followed depends on when.
+        let mut reverse_rename: HashMap<String, Vec<(String, u64)>> = HashMap::new();
         let mut key_starts: HashMap<String, Vec<u64>> = HashMap::new();
 
         for (local_i, frame) in frames.iter().enumerate() {
@@ -12609,7 +12616,10 @@ impl<F: Fs> GraphDb<F> {
                         // new_key came into existence at this commit.
                         key_starts.entry(new_key.clone()).or_default().push(commit);
                         // Record the reverse rename: new_key was introduced by renaming old_key.
-                        reverse_rename.insert(new_key.clone(), (old_key.clone(), commit));
+                        reverse_rename
+                            .entry(new_key.clone())
+                            .or_default()
+                            .push((old_key.clone(), commit));
                     }
                     _ => {}
                 }
@@ -12638,7 +12648,18 @@ impl<F: Fs> GraphDb<F> {
 
             result.push((current_key.clone(), valid_from, current_valid_until));
 
-            match reverse_rename.get(&current_key) {
+            // The rename that led here: the latest into this key, and for an
+            // alias the latest before the alias stopped being this node's.
+            // Each step goes strictly back in time, so the walk ends — taking
+            // the last rename whatever its commit sent `a → b → a` round for
+            // ever.
+            let led_here = reverse_rename.get(&current_key).and_then(|renames| {
+                renames
+                    .iter()
+                    .rev()
+                    .find(|(_, at)| current_valid_until.is_none_or(|until| *at < until))
+            });
+            match led_here {
                 Some((old_key, rename_commit)) => {
                     current_valid_until = Some(*rename_commit);
                     current_key = old_key.clone();

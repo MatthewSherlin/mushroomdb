@@ -102,26 +102,26 @@ pub const SECTION_WAL_MARK: u8 = 14;
 /// that replays that WAL over it applies every write a second time — and a
 /// replayed insert of a key since renamed or deleted makes a second node.
 /// The mark says where the snapshot was taken: `len` bytes into the WAL, with
-/// a checksum of the first [`WalMark::PREFIX`] of them so that a WAL which
-/// is not the one the snapshot was taken beside is not skipped into.
+/// a checksum of every one of them, so that only the WAL the snapshot was
+/// taken beside is skipped into. Every byte, and not a sample: a WAL that
+/// lost its tail and grew past `len` again has new writes inside the old
+/// length, and a mark that still matched would have them skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalMark {
     /// Bytes of WAL the snapshot holds.
     pub len: u64,
-    /// CRC32 of the first `min(len, PREFIX)` bytes of that WAL.
-    pub prefix_crc: u32,
+    /// CRC32 of those bytes.
+    pub crc: u32,
 }
 
 impl WalMark {
-    /// How much of the WAL's start the checksum covers.
-    pub const PREFIX: usize = 1 << 20;
     const MAGIC: &'static [u8; 4] = b"MWAL";
 
     /// The mark for a WAL whose bytes are `wal`, all of them held.
     pub fn of(wal: &[u8]) -> Self {
         Self {
             len: wal.len() as u64,
-            prefix_crc: crc32fast::hash(&wal[..wal.len().min(Self::PREFIX)]),
+            crc: crc32fast::hash(wal),
         }
     }
 
@@ -130,14 +130,14 @@ impl WalMark {
         let Ok(len) = usize::try_from(self.len) else {
             return false;
         };
-        wal.len() >= len && crc32fast::hash(&wal[..len.min(Self::PREFIX)]) == self.prefix_crc
+        wal.len() >= len && crc32fast::hash(&wal[..len]) == self.crc
     }
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(20);
         out.extend_from_slice(Self::MAGIC);
         out.extend_from_slice(&self.len.to_le_bytes());
-        out.extend_from_slice(&self.prefix_crc.to_le_bytes());
+        out.extend_from_slice(&self.crc.to_le_bytes());
         let crc = crc32fast::hash(&out);
         out.extend_from_slice(&crc.to_le_bytes());
         out
@@ -152,7 +152,7 @@ impl WalMark {
         }
         Some(Self {
             len: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
-            prefix_crc: u32::from_le_bytes(bytes[12..16].try_into().ok()?),
+            crc: u32::from_le_bytes(bytes[12..16].try_into().ok()?),
         })
     }
 }
