@@ -519,9 +519,9 @@ fn run_serve(
         // invocation is merely reopening (or one `--demo-if-empty` /
         // `--restore-from` already populated above, in which case this is
         // already `true` and nothing here re-declares anything). Declaring
-        // full-text on a populated store rebuilds the index at open (227 ms
-        // vs. 3.8 ms with none, ledger row 36), so an existing store is never
-        // touched here.
+        // full-text on a populated store builds the index at each open until
+        // a snapshot carries it (ledger row 36), and changes what an existing
+        // store indexes, so an existing store is never touched here.
         let is_new_store = !core_api::restore::holds_a_store(&db_dir);
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
         if is_new_store {
@@ -776,9 +776,10 @@ fn run_mcp(db_dir: PathBuf, all_tools: bool) -> Result<(), String> {
     // `holds_a_store` (the same predicate `restore_if_empty` gates on) must be
     // checked before `open` creates the directory's files — it is what tells
     // a brand-new store from one this invocation is merely reopening. Declaring
-    // full-text on a populated store rebuilds the index at open (227 ms vs.
-    // 3.8 ms with none, ledger row 36), so an existing store is never touched
-    // here; only a store this call is creating gets the memory schema.
+    // full-text on a populated store builds the index at each open until a
+    // snapshot carries it (ledger row 36), and changes what an existing store
+    // indexes, so an existing store is never touched here; only a store this
+    // call is creating gets the memory schema.
     let is_new_store = !core_api::restore::holds_a_store(&db_dir);
     let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
     if is_new_store {

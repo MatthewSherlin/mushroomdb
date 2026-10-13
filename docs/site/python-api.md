@@ -1052,9 +1052,9 @@ enabled raises `RuleInvalid`. With `if_not_exists=True` it returns
 this every time.
 
 The declaration is logged. A snapshot carries the index, and an open
-reads it from there; a store that has not been snapshotted since the
-pair was declared builds the index at open, which takes time in
-proportion to the text.
+reads it from there; a pair declared since the last snapshot is
+indexed again at each open until the next one, which takes time in
+proportion to that pair's text.
 
     db.enable_fulltext("Doc", "body", if_not_exists=True)
 

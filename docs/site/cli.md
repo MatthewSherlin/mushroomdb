@@ -181,7 +181,7 @@ Graph a git repository: `Author`, `Commit`, `File`, `Symbol` nodes plus `CO_CHAN
 mushroomdb schema apply <db-dir> <schema.json>
 mushroomdb schema apply <db-dir> --memory-defaults
                                  applies the built-in memory schema to an existing store;
-                                 full-text on a populated store rebuilds the index at every open from here on
+                                 full-text on a populated store builds the index at each open until the next snapshot carries it
 mushroomdb schema apply <db-dir> --memory-identity
                                  adds the identity preset: sixteen SAME_AS rules over each entity's aliases;
                                  says what it will backfill, then backfills

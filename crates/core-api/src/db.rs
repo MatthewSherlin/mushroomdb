@@ -2837,7 +2837,8 @@ impl<F: Fs> GraphDb<F> {
     /// write to the state it produced is not always a no-op — an insert
     /// under a key since renamed or deleted makes a second node. A
     /// declaration among them is applied all the same: the pairs a store has
-    /// declared are known from the WAL and nowhere else.
+    /// declared are known from the WAL — and, when a snapshot carries a
+    /// full-text index that is read, from that index too.
     fn apply_frames_over(&mut self, records: Vec<WalRecord>, held: usize) -> Result<usize> {
         if records.is_empty() {
             return Ok(0);

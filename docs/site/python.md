@@ -503,7 +503,7 @@ can still reach pre-snapshot commits. The WAL replay over the snapshot is
 idempotent — no manual recovery is needed. The WAL grows until an explicit
 `snapshot()` (with default `keep_wal: false`) truncates it.
 
-**V9 snapshot format:** mmap-able rkyv sections (14, and one more for the full-text index when a pair is declared); zero-copy open via
+**V9 snapshot format:** mmap-able rkyv sections (14, one more for the full-text index when a pair is declared, one more when the snapshot kept its WAL); zero-copy open via
 mmap; no heap allocation for section data. V5–V8 stores are auto-migrated to
 V9 on open; a V9 snapshot cannot be opened by a pre-0.6.5 binary, which refuses
 it with `snapshot: unsupported version 9`. See [`docs/format-stability.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/docs/format-stability.md) for the

@@ -25,7 +25,7 @@ Both declarations are WAL-logged and replayed on open.
 A snapshot carries the index. An open reads it from the snapshot and applies what
 was written since, so a store that has been snapshotted does not pay for its text
 again each time it opens: 30,000 entities under three declared pairs open in
-22 ms, where building the index took 183 ms. A store that has never been
+21 ms, where building the index took 183 ms. A store that has never been
 snapshotted, and one whose snapshot was written by 0.7 or earlier, build the
 index at open as before, and answer the same. The index adds to the snapshot's
 size: about a third on that store.
