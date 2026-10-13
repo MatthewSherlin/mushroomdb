@@ -9805,6 +9805,14 @@ from before an older truncation can still be answered with the wrong commit.
 the snapshot but leaves the WAL intact, so `open_at` can reach all WAL commits
 including those before the snapshot.
 
+That holds while the WAL reaches the store's first commit. Once a truncating or
+archiving snapshot has been taken, the WAL starts above it, on that snapshot as
+its base — and a `keep_wal` snapshot replaces the base with the state at the
+head. The commits in the live WAL can then no longer be rebuilt, and `open_at`
+refuses them with `CommitOutOfRange` rather than replay them over nothing.
+History scans (`node_history`, `edge_history`, `was_linked`) are not affected:
+they read the frames, not a rebuilt graph.
+
 Choose based on operational priorities:
 
 | Goal | Method |
