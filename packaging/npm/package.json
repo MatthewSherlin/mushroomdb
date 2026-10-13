@@ -1,6 +1,6 @@
 {
   "name": "mushroomdb",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Embedded graph database for agents: declare a relationship as a rule, and the edges maintain themselves. This package launches the native binary.",
   "mcpName": "io.github.MatthewSherlin/mushroomdb",
   "homepage": "https://matthewsherlin.github.io/mushroomdb/",
