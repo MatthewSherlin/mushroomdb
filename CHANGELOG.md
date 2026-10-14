@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.8.1 — four CI gate fixes
+
+No format version change. No behavioral change to any public API.
+
+### Fixed (CI and gate)
+
+- **`scripts/ignored-test-census.sh` now fails a build on an unaccounted-for `#[ignore]`d test.** The script exited 0 unconditionally, so a test added as `#[ignore]` with no intent to ever run it was invisible to CI. Three bugs in the script are fixed in the same pass: a comment line containing `#[ignore` no longer counts as an ignored test (was matched by the old `grep`); the window that hunts the test name after `#[ignore]` scans forward past stacked attributes, replacing the old fixed three-line window; and a 24-entry allow-list (`scripts/ignored-tests-allowed.txt`) names every currently never-run test with a one-line reason. The step is wired into the `plugin-validate` CI job (row 46).
+- **The store-creation census now covers the Python binding and every other crate.** `crates/cli/tests/store_creation_schema.rs` scanned only `crates/cli/src/*.rs`; it now scans `crates/*/src/` and `bindings/*/src/`. The Python binding's `GraphDb.open` is the caller's responsibility for schema; that decision is recorded in the allow-list entry for ledger row 55 (row 55).
+- **`scripts/check-claims.sh` catches three more classes of stale claim.** It now scans `bindings/python/README.md`; it strips `/* */` block comments before matching, so a retired claim quoted in a comment does not trip the gate; and it matches spelled-out tool counts (`eleven tools`, `seventeen above`, etc.) as well as numerals, since word-form counts go stale just as numerals do when the tool list changes. Five source files that held a matching phrase were updated in the same pass (row 56).
+- **The skill's byte-cap test now renders a realistic store path.** The budget test used a 17-byte path (`./mushroom-memory`) while `install` writes the store's absolute path; with six occurrences of the placeholder the template overflowed the 6,000-byte cap at any path of 24 bytes or more. Five of the six CLI command examples now use the literal `'<db>'` rather than the expanded path, cutting the per-byte cost from 6× to 1×. The test renders a 102-byte path; both variants pass (row 68).
+
 ## v0.8.0 — faster opens, three more platforms, and two snapshot defects in 0.7.2 fixed
 
 No format version change. A 0.7.2 store opens under 0.8.0, and a 0.8.0 snapshot opens under 0.7.2, which ignores the full-text index the snapshot now carries and builds its own.
