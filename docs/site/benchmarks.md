@@ -25,7 +25,8 @@ the medians of three above: backfill 8.611 s for 0.6.12 against 8.584 s for this
 tree is
 [`mushroomdb-10k-0.7.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/benchmarks/results/mushroomdb-10k-0.7.md). Rows 8–9:
 [`dogfood/results/scale-100k.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-100k.md), warm file cache, cold process;
-cold-cache was not measured.
+cold-cache was not measured. A memory-shaped run to 1,000,000 nodes on the 0.8.0 wheel — ingest, `remember`, `recall`, open from a snapshot and from the WAL — is
+[`dogfood/results/scale-memory-1m.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-memory-1m.md).
 
 Runs from 2026-08-21 and 2026-08-24 reported 2.85–3.51 s for the rule backfill. That was a
 different workload: before v0.2.0 a rule without an explicit `max_edges` stopped at a global cap,

@@ -3,7 +3,6 @@
 ## Machine / date
 
 - **Date:** 2026-10-14 (runs: 13:43, 13:46, 13:54 UTC−0)
-- **Host:** Matthews-MacBook-Pro.local
 - **OS:** macOS-15.7.3-arm64-arm-64bit-Mach-O
 - **CPU:** Apple M4 Pro (12 cores, arm64)
 - **RAM:** 24.00 GiB
@@ -136,8 +135,7 @@ provenance + full-text index.
 | 1,000,000 | 11.261 s | 5.645 s | 1.179 s | 9.6× |
 
 At 1M nodes the snapshot open (1.2 s) is 9.6× faster than WAL reopen (11.3 s).
-The benefit narrows as the full-text index dominates open time, but snapshot open
-remains substantially cheaper across the full range tested.
+The ratio falls as the store grows: 18× at 100k, 11× at 300k.
 
 Snapshot store size is compact: 209 MiB for 1M nodes, 1.64M structural edges, 1M
 derived edges, 10k `remember` provenance records, and the full-text index.
@@ -158,8 +156,12 @@ derived edges at all three scales.
 | 300,000 | 2.309 s | True | 1,000,000 |
 | 1,000,000 | 2.922 s | True | 1,000,000 |
 
-Rule fire time increases modestly with node count (indexed FieldEqual fast path)
-but is bounded by the same 1M cap at all scales.
+The rule trips its budget at every scale: a tripped rule stops deriving, so the
+store holds 1,000,000 of the edges the rule would derive and `stats` reports it
+tripped. These timings are therefore the time to reach the cap, not to derive the
+rule's whole edge set, and the same is true of every later phase's view of
+`same_team`. A rule meant to be complete at this size needs `max_edges` per source
+or a narrower predicate.
 
 ---
 
@@ -169,9 +171,9 @@ but is bounded by the same 1M cap at all scales.
   `MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k RETURN key(q) AS dst`
   logged a slow-query warning at 281 ms (threshold 250 ms) at scale=1M.
   At 100k this query ran in 18.70 ms; at 300k, 80.32 ms; at 1M, 281.55 ms.
-  The latency scales ~linearly with Person count (not with edges), suggesting
-  the key-equality filter is not short-circuiting the label scan before the
-  traversal.  Logged, not blocking — results were correct.
+  The latency grows with the number of Person nodes, which suggests the
+  `key(p) = $k` filter is applied after a scan of the label rather than as a
+  lookup; not investigated further here. Results were correct. Ledger row 102.
 
 ---
 
@@ -179,23 +181,25 @@ but is bounded by the same 1M cap at all scales.
 
 **Shows:**
 - Bulk ingest throughput and peak RSS at 100k, 300k, 1M memory-schema entities
-  with Zipf-distributed text (realistic full-text postings, no embeddings).
-- Per-call `remember` write-path latency (~20 ms p50 at all scales —
-  dominated by WAL fsync, not index size).
+  with Zipf-distributed synthetic text (no embeddings).
+- Per-call `remember` write-path latency: 13.9 ms p50 at 100k, 21.3 ms at 300k,
+  22.2 ms at 1M. Each call commits durably; how much of that is the fsync was not
+  measured.
 - `recall` latency across four query shapes (the primary assistant read path):
   rare-word queries stay sub-millisecond; common-word queries scale ~10× over
   the 10× node range.
-- Open-after-snapshot vs WAL-only reopen at each scale, confirming 0.8's
-  full-text-in-snapshot delivers 9.6–18× faster cold start.
+- Open after a snapshot against a WAL-only reopen at each scale: 9.6× to 18×
+  faster. The snapshot open skips the WAL replay, the rule re-firing and (since
+  0.8) the full-text rebuild; this run does not separate the three.
 - `node_info`, `node_edges`, Cypher aggregate, and `set_prop` as single-node
   operations across the full scale range.
-- Peak RSS bounded: 2.65 GiB at 1M nodes (well within typical server headroom).
+- Peak RSS: 2.65 GiB at 1M nodes, across every phase.
 
 **Does not show:**
 - Semantic / vector similarity (no embeddings in this workload).
 - Multi-process or HTTP access.
 - Production hardware (local embedded, Apple M-series, warm disk cache).
-- Multi-rule or high-fanout-rule backfill.
+- Multi-rule backfill, or a rule that derives its whole edge set at this size: the one rule here trips its budget.
 - Real assistant text (synthetic Zipf vocabulary, 3000-word corpus).
 
 ---
