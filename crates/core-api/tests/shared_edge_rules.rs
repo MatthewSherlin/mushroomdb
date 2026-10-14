@@ -234,11 +234,10 @@ fn a_via_rules_edge_is_taken_by_a_plain_rule_when_the_hop_node_changes() {
     );
 }
 
-/// The reverse is not fixed: a plain rule owns the edge, a via-hop rule wants
-/// it too, and the plain rule stops. The second pass does not re-evaluate
-/// via-hop rules.
+/// The reverse: a plain rule owns the edge, a via-hop rule wants it too, and
+/// the plain rule stops. The second pass skipped via-hop rules (ledger row
+/// 84); it now re-evaluates them along their hop.
 #[test]
-#[ignore = "ledger row 84: a via-hop rule does not take an edge a plain rule retracted"]
 fn a_via_rule_takes_an_edge_a_plain_rule_retracted() {
     let dir = tmp("plain-stops-via-wants");
     let mut db = GraphDb::open(&dir).unwrap();
@@ -490,13 +489,14 @@ fn one_rule_alone_always_matches_a_fresh_build() {
     assert_eq!(fuzz("single-topk", &top_k, &["A"], 0..10, 40), AGREES);
 }
 
-/// Not fixed. A top-k rule whose best match is owned by another rule records
-/// nothing for that source, so when that match goes away the source is not
-/// recomputed and the rule's next-best edge is missing until a rebuild.
-/// Nothing is retracted on the shared edge, so the second pass has nothing to
-/// see.
+/// Ledger row 83. A top-k rule whose best match is owned by another rule
+/// records nothing for that source, and gives up its own next-best edge. When
+/// that match went away — a changed tag, or the destination deleted — the
+/// source was found through the rule's provenance alone, was not recomputed,
+/// and the next-best edge stayed missing until a rebuild. Nothing is retracted
+/// on the shared edge, so the second pass has nothing to see; the sources are
+/// now found through the edges into the destination instead.
 #[test]
-#[ignore = "ledger row 83: a top-k rule beside another rule over the same edge loses its fallback"]
 fn a_top_k_rule_beside_a_sibling_always_matches_a_fresh_build() {
     let rules = vec![
         rule("claim", "A", "A", claim(), None),
