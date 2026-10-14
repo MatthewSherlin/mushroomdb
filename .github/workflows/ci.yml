@@ -457,11 +457,35 @@ jobs:
         with:
           name: bench-results
           path: results.json
-      - name: compare against baseline (enforcing; baseline from run 34880373108, ubuntu-latest, 2026-09-14)
+      # Two gates, and a change fails only if it fails both.
+      #
+      # The stored baseline was measured once, on one runner, and the runners
+      # differ: on identical code the median ingest has measured 0.56 s and
+      # 1.33 s, and the median snapshot write 0.97 s and 1.37 s. Against the
+      # baseline alone, a slow runner failed a change that touched no engine
+      # code. So a metric past its threshold here is measured again on the
+      # base commit — the pull request's base, or main's previous tip — on this
+      # same runner, and the change fails only if it is slower than that by
+      # the same thresholds. A real regression is slower than its base on any
+      # runner; a slow runner is slow for both.
+      - name: compare against baseline (baseline from run 34880373108, ubuntu-latest, 2026-09-14)
+        id: stored
+        continue-on-error: true
         run: |
           set -euo pipefail
           python3 benchmarks/ci/compare.py results.json benchmarks/baselines/ci.json \
             --threshold 0.15
+      - name: past the stored baseline — measure the base commit on this runner
+        if: steps.stored.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$BASE" ]; then BASE=$(git rev-parse HEAD^1); fi
+          git fetch --no-tags --depth=1 origin "$BASE"
+          git worktree add --detach "$RUNNER_TEMP/base" "$BASE"
+          (cd "$RUNNER_TEMP/base" && bash benchmarks/ci/run.sh --output "$GITHUB_WORKSPACE/base.json")
+          echo "[bench] this change against $BASE, both measured on this runner:"
+          python3 benchmarks/ci/compare.py results.json base.json --threshold 0.15
 
   # SDK-level MCP handshake: speaks to a real `mushroomdb mcp <db>` process
   # on an empty store — a memory store, so the association tools —
