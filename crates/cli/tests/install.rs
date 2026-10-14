@@ -74,11 +74,27 @@ fn fake_exe(dir: &Path, bytes: &[u8]) -> PathBuf {
 }
 
 /// Write an executable shell script named `name` into `dir`.
+///
+/// The file that is executed is written by `cp`, not by this process. Tests
+/// run on threads, and a thread that forks to spawn a process while another
+/// holds a script open for writing hands the child that descriptor; until
+/// the child execs, running the script fails with `Text file busy`
+/// (`ETXTBSY`). That failed `codex_platform_calls_codex_mcp_add` on CI.
+/// Written by another process, the executable's inode is never open for
+/// writing in this one.
 #[cfg(unix)]
 fn fake_program(dir: &Path, name: &str, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     let p = dir.join(name);
-    fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+    let draft = dir.join(format!(".{name}.draft"));
+    fs::write(&draft, format!("#!/bin/sh\n{body}")).unwrap();
+    let copied = std::process::Command::new("cp")
+        .arg(&draft)
+        .arg(&p)
+        .status()
+        .unwrap();
+    assert!(copied.success(), "cp {} {}", draft.display(), p.display());
+    fs::remove_file(&draft).unwrap();
     fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
     p
 }
