@@ -1407,6 +1407,42 @@ fn pair_still_desired(def: &RuleDef, s: u32, d: u32, g: &GraphMut<'_>) -> bool {
     .is_some()
 }
 
+/// Whether `def`'s predicate held for `(s, d)` with `d` as it was before
+/// `changed` — the field that changed, and its previous value — or as it is,
+/// when nothing changed.
+///
+/// One evaluation, no index probe. A top-k rule's best match for `s` could
+/// only have been `d` if this held, so a source it does not hold for has
+/// nothing to lose when `d` changes (ledger row 83's guard).
+fn pair_matched_before(
+    def: &RuleDef,
+    s: u32,
+    d: u32,
+    changed: Option<(&str, &Option<Value>)>,
+    g: &GraphMut<'_>,
+) -> bool {
+    let (Some(s_key), Some(d_key)) = (g.ids.key_of(s), g.ids.key_of(d)) else {
+        return false;
+    };
+    let s_get = |f: &str| g.props.get(s, f).map(|vr| vr.into_value());
+    let d_get = |f: &str| match changed {
+        Some((field, old)) if f == field => old.clone(),
+        _ => g.props.get(d, f).map(|vr| vr.into_value()),
+    };
+    evaluate(
+        &def.predicate,
+        &NodeView {
+            key: s_key,
+            props: &s_get,
+        },
+        &NodeView {
+            key: d_key,
+            props: &d_get,
+        },
+    )
+    .is_some()
+}
+
 /// Count desired `(src, dst)` pairs up to `limit + 1`; returns as soon as the
 /// threshold is crossed.  Peak additional memory: O(max-candidates-per-src).
 /// Used in `rebuild` to detect the over-budget case without materialising the
@@ -3743,13 +3779,42 @@ impl RuleEngine {
                     let et = g.syms.intern(&def.edge_type);
                     let affected_srcs_for_n_dst: BTreeSet<u32> = if as_dst {
                         let rid = self.rule_intern.get(&def.name).copied();
-                        self.by_node
+                        let mut srcs: BTreeSet<u32> = self
+                            .by_node
                             .get(&n)
                             .into_iter()
                             .flatten()
                             .filter(|(r, t, _s, d)| Some(*r) == rid && *t == et && *d == n)
                             .map(|(_, _, s, _)| *s)
-                            .collect()
+                            .collect();
+                        // And every source with the edge into `n` whatever
+                        // owns it. A top-k rule whose best match is an edge
+                        // another rule already owns records nothing for it —
+                        // the edge is there — and gives up its own next-best
+                        // edge. Found through this rule's provenance alone,
+                        // such a source was not re-evaluated when `n` stopped
+                        // matching, and the next-best edge stayed missing
+                        // until a rebuild (ledger row 83). The edge in the
+                        // graph is the only trace of that choice; bounded by
+                        // `n`'s in-degree over this edge type.
+                        // Only a source for which `n` was a match before
+                        // this change can have lost it; one predicate
+                        // evaluation each, so a hub the rule never matched
+                        // costs no re-evaluation of its in-neighbours.
+                        let src_sym = g.syms.get(&def.src_label);
+                        let before = changed.as_ref().map(|(f, old)| (*f, old));
+                        let in_srcs: Vec<u32> =
+                            g.neighbors(et, core_storage::Direction::In, n).to_vec();
+                        for s in in_srcs {
+                            if !srcs.contains(&s)
+                                && g.labels.get(s as usize).copied() == src_sym
+                                && rule_sees(&def, s, g)
+                                && pair_matched_before(&def, s, n, before, g)
+                            {
+                                srcs.insert(s);
+                            }
+                        }
+                        srcs
                     } else {
                         BTreeSet::new()
                     };
@@ -3865,13 +3930,56 @@ impl RuleEngine {
     /// that the loop above has not already filed, and re-filing a node in an
     /// index is not idempotent for every index kind.
     ///
-    /// Via-hop rules are not re-evaluated here; they take their own path and
-    /// are named in the ledger as what is left.
+    /// A via-hop rule is re-evaluated along its hop, as when the source itself
+    /// changes (ledger row 84).
     fn reclaim_retracted(&mut self, retracted: &[(u32, Triple)], g: &mut GraphMut<'_>) {
         for (rule_name, s) in self.reclaim_targets(retracted, g) {
             let def = self.rules[&rule_name].clone();
             let label = g.labels.get(s as usize).copied();
-            if let Some(k) = def.max_edges {
+            if def.via_label.is_some() {
+                // A via-hop rule's desired set for `s` is computed along its
+                // hop, exactly as when `s` itself changes (ledger row 84).
+                let doomed = self.doomed;
+                let mut desired = compute_desired_via(
+                    &def,
+                    self.indexes.get(&rule_name),
+                    ViaAnchor::Src(s),
+                    doomed,
+                    g,
+                );
+                // As a destination too, when the rule links a label to itself:
+                // the retract set below is every edge of the rule touching `s`,
+                // so without these the edges *into* `s` would go.
+                let dst_sym = g.syms.get(&def.dst_label);
+                if def.max_edges.is_none() && dst_sym.is_some() && label == dst_sym {
+                    desired.extend(compute_desired_via(
+                        &def,
+                        self.indexes.get(&rule_name),
+                        ViaAnchor::Dst(s),
+                        doomed,
+                        g,
+                    ));
+                }
+                let mut prov = ProvSets {
+                    set: self.provenance.entry(rule_name.clone()).or_default(),
+                    owned: &mut self.owned,
+                    by_node: &mut self.by_node,
+                    rule_intern: &mut self.rule_intern,
+                    intern_rule: &mut self.intern_rule,
+                    deltas: &mut self.pending_deltas,
+                    emit: self.emit_deltas,
+                    retracted: &mut self.retracted,
+                };
+                if let Some(k) = def.max_edges {
+                    let top_k = filter_src_top_k(desired, k, g.ids);
+                    apply_per_src_top_k(&def, s, top_k, &mut prov, g);
+                } else {
+                    let tripped = self.tripped.entry(rule_name.clone()).or_default();
+                    if !*tripped {
+                        apply_desired(&def, desired, Some(s), &mut prov, tripped, g);
+                    }
+                }
+            } else if let Some(k) = def.max_edges {
                 let desired = compute_desired(&def, &self.indexes[&rule_name], s, true, g);
                 let top_k = filter_src_top_k(desired, k, g.ids);
                 let mut prov = ProvSets {
@@ -3943,7 +4051,7 @@ impl RuleEngine {
     ) -> BTreeSet<(String, u32)> {
         let mut targets = BTreeSet::new();
         for (rule_name, def) in &self.rules {
-            if def.via_label.is_some() || self.pending_builds.contains_key(rule_name) {
+            if self.pending_builds.contains_key(rule_name) {
                 continue;
             }
             let Some(et) = g.syms.get(&def.edge_type) else {
@@ -4351,7 +4459,7 @@ impl RuleEngine {
         // Collect srcs that need top-k backfill BEFORE retracting provenance.
         // For top-k rules: when n is a dst, the src loses one from its top-k
         // and needs the next-best candidate added.
-        let topk_backfill: Vec<(String, u32)> = touching
+        let mut topk_backfill: BTreeSet<(String, u32)> = touching
             .iter()
             .filter_map(|(rule_name, triple)| {
                 let &(_, s, d) = triple;
@@ -4364,6 +4472,35 @@ impl RuleEngine {
                 }
             })
             .collect();
+        // And the sources whose edge into `n` another rule owns: a top-k rule
+        // whose best match was that edge recorded nothing for it and gave up
+        // its own next-best, and has no provenance here to say so (ledger row
+        // 83). Read from the graph while the edges are still in it.
+        for (rule_name, def) in &self.rules {
+            if def.max_edges.is_none() || def.via_label.is_some() {
+                continue;
+            }
+            if self.pending_builds.contains_key(rule_name) {
+                continue;
+            }
+            let dst_sym = g.syms.get(&def.dst_label);
+            if dst_sym.is_none() || n_label != dst_sym {
+                continue;
+            }
+            let Some(et) = g.syms.get(&def.edge_type) else {
+                continue;
+            };
+            let src_sym = g.syms.get(&def.src_label);
+            for s in g.neighbors(et, core_storage::Direction::In, n).iter() {
+                if *s != n
+                    && g.labels.get(*s as usize).copied() == src_sym
+                    && rule_sees(def, *s, g)
+                    && pair_matched_before(def, *s, n, None, g)
+                {
+                    topk_backfill.insert((rule_name.clone(), *s));
+                }
+            }
+        }
 
         for (rule_name, triple) in touching {
             let (t, s, d) = triple;

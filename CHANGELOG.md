@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A top-k rule keeps its next-best edge when its best match was another rule's.** Two rules over the same labels and edge type, one of them top-k: when the top-k rule's best match for a source was an edge the other rule already owned, it recorded nothing and dropped its own next-best edge, and when that match went away — a changed property or the destination deleted — the next-best edge stayed missing until `rebuild_rule`. Not yet for a via-hop top-k rule (row 83, in part).
+- **A via-hop rule takes back an edge another rule gave up.** When a plain rule stopped deriving an edge that a via-hop rule over the same edge type also derives, the edge was removed and not added back; the via-hop rule is now re-evaluated for that source (row 84, in part).
+
 ## v0.8.0 — faster opens, three more platforms, and two snapshot defects in 0.7.2 fixed
 
 No format version change. A 0.7.2 store opens under 0.8.0, and a 0.8.0 snapshot opens under 0.7.2, which ignores the full-text index the snapshot now carries and builds its own.
