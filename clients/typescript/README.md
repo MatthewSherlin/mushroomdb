@@ -153,6 +153,16 @@ acquires the write lock automatically. Returns `{ columns: string[], rows: CellV
 `opts.params` — bound parameters; values must be JSON scalars
 (`string | number | boolean`).
 
+`opts.as_of` — time-travel: run the query on the graph as it was at this WAL
+commit index (0 to `commit_seq − 1` inclusive, read-only). Obtain a commit
+index from the `commit` field of a `nodeHistory`/`edgeHistory` entry.
+
+`opts.mask` — node-key allow-list: restrict visible nodes to these keys.
+Makes the query read-only.
+
+`opts.namespace` — restrict results to this namespace, intersecting with
+`mask` and any role. Makes the query read-only.
+
 ### `client.ingest(req) → Promise<IngestReport>`
 
 Bulk-ingest nodes and optional edges. `req.label`, `req.rows` are required.
@@ -210,6 +220,139 @@ All config fields are optional; server defaults apply.
 ### `client.subscribe(opts, onEvent) → Promise<SubscribeHandle>`
 
 Open a WebSocket subscription. Returns a handle with `close(): Promise<void>`.
+
+### `client.health() → Promise<HealthReport>`
+
+Wires `GET /health`. Returns `{ ok, nodes?, edges?, addr? }`. Full node/edge counts are
+only included when the client carries a valid full-access token.
+
+### `client.metrics() → Promise<MetricsReport>`
+
+Wires `GET /metrics`. Returns live runtime counters — node/edge counts, WAL size, RSS,
+uptime — and a configurable slow-query log. Requires full-access auth.
+
+### `client.findSimilar(opts) → Promise<FindSimilarResult>`
+
+Wires `POST /find_similar`. Approximate nearest-neighbour search over a vector property.
+`opts.field` and `opts.vector` are required; `opts.k`, `opts.min`, `opts.label`, `opts.mask`,
+`opts.exact` are optional. Returns `{ hits: [key, score][] }`.
+
+`opts.where` — a `PropPredicate` applied after the search:
+```ts
+// equality
+{ field: 'status', eq: 'published' }
+// set membership
+{ field: 'status', in: ['draft', 'review'] }
+```
+
+### `client.createNode(label, key, props?, namespace?) → Promise<CreateNodeResult>`
+
+Wires `POST /nodes`. Inserts a node with the given label and key. This is an
+**insert**, not an upsert — a duplicate key throws `MushroomError`. Optional
+`props` map sets initial properties. Optional `namespace` scopes the node.
+Returns `{ ok, nodes, edges }`.
+
+### `client.deleteNode(key) → Promise<void>`
+
+Wires `DELETE /node/{key}`. Throws `MushroomError` when the node does not exist.
+
+### `client.nodeEdges(key, opts?) → Promise<NodeEdgesResult>`
+
+Wires `GET /node/{key}/edges`. Returns `{ edges: [{ edge_type, src_key, dst_key, derived }] }`.
+Throws `MushroomError` (404) when the key does not exist.
+
+`opts.mask` — node-key allow-list (non-empty string array; no key that is empty, has
+surrounding whitespace or contains a comma). Only edges whose **other** endpoint is in the
+list are returned; `key` itself need not be. A list or key the server could not read as
+written throws `MushroomError`.
+
+`opts.stub_hidden` — when `true` **and** `mask` is set, edges to masked-out
+endpoints are included; those endpoints appear as
+`{ key: string; restricted: true }` rather than a plain string. Without `mask`
+this option is silently ignored by the server.
+
+### `client.nodeHistory(key) → Promise<NodeHistoryResult>`
+
+Wires `GET /node/{key}/history`. Returns a per-commit change log: insertions, property
+changes and edge events. Throws `MushroomError` (404) when the key does not exist.
+
+### `client.edgeHistory(a, b) → Promise<EdgeHistoryResult>`
+
+Wires `GET /history/edge?a=&b=`. Returns every commit where an edge between the two nodes
+was added or retracted.
+
+### `client.wasLinked(a, b, edgeType, atCommit) → Promise<WasLinkedResult>`
+
+Wires `GET /history/was_linked`. Returns `{ a, b, edge_type, at_commit, linked }` — whether
+the named edge existed at the given commit index.
+
+`atCommit` accepts an integer commit index **or** an RFC 3339 date string
+(`"2026-01-15T00:00:00Z"`); the server resolves the date to the nearest commit at
+or before that instant.
+
+### `client.createEdge(type, src, dst) → Promise<void>`
+
+Wires `POST /edges`. Inserts an explicit (non-derived) edge. Both endpoint nodes must already
+exist; the call throws `MushroomError` if either is missing.
+
+### `client.deleteEdge(type, src, dst) → Promise<void>`
+
+Wires `DELETE /edges/{etype}/{src}/{dst}`. Returns silently when the edge does
+not exist (idempotent). Throws `MushroomError` only when an endpoint node is
+missing.
+
+### `client.setNodeProp(key, field, value) → Promise<void>`
+
+Wires `PUT /node/{key}/prop/{field}`. Sets or overwrites one property. `value`
+must be JSON-serialisable; scalars (`string | number | boolean`), arrays, and
+objects are all accepted. `null` is rejected by the server.
+
+### `client.removeNodeProp(key, field) → Promise<void>`
+
+Wires `DELETE /node/{key}/prop/{field}`. Removes the named property from the node.
+
+### `client.backup(dest) → Promise<BackupReport>`
+
+Wires `POST /backup`. Copies the store to `dest` (a server-side path) and verifies it.
+Returns `{ files, bytes, verified }`. Throws `MushroomError` when verification fails.
+
+### `client.watch(opts, onEvent) → Promise<WatchHandle>`
+
+Open a `GET /watch` WebSocket and stream raw `MutationEvent`s. The server sends every
+committed mutation — node inserts/deletes, property changes, edge inserts/deletes, rule
+lifecycle and ingest events — as an externally-tagged JSON frame.
+
+Returns a handle with `close(): Promise<void>`. A server older than 0.8 does not answer a
+close on `/watch`, so `close()` resolves within 3 s whether or not the handshake completes.
+
+`opts.onClose` — called once when the WebSocket closes, whether via `handle.close()` or
+because the server dropped the connection. Use it as a signal to reconnect.
+
+Against a server older than 0.8, the `ws` package's socket is force-closed when the 3 s
+bound passes. The standard `WebSocket` has no force-close: `close()` still resolves and
+`onClose` still fires, but the socket can keep a Node process alive until the runtime's
+own close timeout.
+
+```ts
+import WS from 'ws'; // Node < 21
+import type { WsConstructor, MutationEvent } from 'mushroomdb-client';
+
+const handle = await client.watch(
+  { wsConstructor: WS as unknown as WsConstructor },
+  (ev: MutationEvent) => {
+    if ('node_inserted' in ev) {
+      console.log('new node:', ev.node_inserted.key);
+    }
+  },
+);
+
+// ... do work ...
+
+await handle.close();
+```
+
+A `{ lagged: N }` frame means the broadcast channel overflowed and `N` events were dropped;
+re-read any state your consumer depends on to recover.
 
 ---
 
@@ -273,8 +416,8 @@ await client.query("CREATE (n:Widget {id: 'w1', name: 'Sprocket'})");
 
 | Feature | Browser | Node 18+ |
 |---------|---------|----------|
-| `query`, `ingest`, `stats`, `suggest`, `algo`, `explain`, `createRule`, `renameNode`, `upsertEdge`, `node`, `neighborhood` | Yes (uses `fetch`) | Yes |
-| `subscribe` | Yes (uses global `WebSocket`) | Requires `wsConstructor` option + `ws` package |
+| `query`, `ingest`, `stats`, `suggest`, `algo`, `explain`, `createRule`, `renameNode`, `upsertEdge`, `node`, `neighborhood`, `health`, `metrics`, `findSimilar`, `createNode`, `deleteNode`, `nodeEdges`, `nodeHistory`, `edgeHistory`, `wasLinked`, `createEdge`, `deleteEdge`, `setNodeProp`, `removeNodeProp`, `backup` | Yes (uses `fetch`) | Yes |
+| `subscribe`, `watch` | Yes (uses global `WebSocket`) | Requires `wsConstructor` option + `ws` package |
 
 ---
 

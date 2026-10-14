@@ -13,9 +13,9 @@ import { MushroomClient } from "../src/index";
 const here = dirname(fileURLToPath(import.meta.url));
 const page = readFileSync(join(here, "../../../docs/site/typescript.md"), "utf8");
 
-// `private` is a compile-time word in TypeScript: these four are on the
-// prototype at run time, and are not part of what a caller uses.
-const PRIVATE = ["url", "wsUrl", "authHeaders", "fetchJson"];
+// `private` is a compile-time word in TypeScript: these are on the
+// prototype at run time, but are not part of what a caller uses.
+const PRIVATE = ["url", "wsUrl", "authHeaders", "fetchJson", "checkPathSeg"];
 
 const methods = Object.getOwnPropertyNames(MushroomClient.prototype)
   .filter((name) => name !== "constructor" && !PRIVATE.includes(name))

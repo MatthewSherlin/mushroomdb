@@ -429,6 +429,340 @@ export type DbEvent =
     };
 
 // ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+/**
+ * Response from `GET /health`.
+ *
+ * Unauthenticated callers receive only `{ ok: true }`. A full-access token
+ * also receives `nodes`, `edges` and `addr`.
+ */
+export interface HealthReport {
+  ok: boolean;
+  nodes?: number;
+  edges?: number;
+  addr?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+/**
+ * One entry in the slow-query ring buffer from `GET /metrics`.
+ */
+export interface SlowQueryEntry {
+  ms: number;
+  query: string;
+  at_commit: number;
+}
+
+/**
+ * Response from `GET /metrics`.
+ *
+ * Mirrors the JSON object emitted by `crates/server/src/http.rs::metrics`.
+ * `wal_size_bytes` and `rss_bytes` are null when the value is unavailable
+ * (non-Linux/macOS platforms or a filesystem error reading the WAL size).
+ */
+export interface MetricsReport {
+  nodes_live: number;
+  nodes_tombstoned: number;
+  edges: number;
+  commit_seq: number;
+  wal_size_bytes: number | null;
+  rss_bytes: number | null;
+  uptime_s: number;
+  slow_queries: {
+    threshold_ms: number;
+    count: number;
+    last: SlowQueryEntry[];
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Prop predicate (used by find_similar `where` and by role definitions)
+// ---------------------------------------------------------------------------
+
+/**
+ * A property filter accepted by `POST /find_similar`'s `where` field and by
+ * the server's role-definition API.
+ *
+ * Mirrors `core_api::roles::PropPredicate` (a flat struct serialised as a JSON
+ * object with `field` required and exactly one of `eq` or `in`).
+ *
+ * The server also accepts the graph's own tagged Value form for the values:
+ * `{"Str": "x"}`, `{"Int": 3}` and `{"Bool": true}` are equivalent to their
+ * plain scalar counterparts `"x"`, `3` and `true`.
+ */
+export type PropPredicate =
+  /** Match nodes whose `field` equals `eq`. */
+  | { field: string; eq: string | number | boolean }
+  /** Match nodes whose `field` is one of the values in `in`. */
+  | { field: string; in: (string | number | boolean)[] };
+
+// ---------------------------------------------------------------------------
+// Find similar
+// ---------------------------------------------------------------------------
+
+/**
+ * Options for `POST /find_similar`.
+ *
+ * `field` and `vector` are required. All other fields are optional and apply
+ * server defaults when absent.
+ */
+export interface FindSimilarOptions {
+  /** The vector property field to search. */
+  field: string;
+  /** Query vector — must be the same dimensionality as the stored vectors. */
+  vector: number[];
+  /** Maximum number of results (default: 10). */
+  k?: number;
+  /** Minimum cosine similarity threshold (default: 0.8). */
+  min?: number;
+  /** Restrict results to nodes of this label. */
+  label?: string;
+  /** Node-key allow-list — restrict to these nodes. */
+  mask?: string[];
+  /** Force exhaustive scan instead of ANN index. */
+  exact?: boolean;
+  /**
+   * Property predicate applied after the vector search: only nodes whose
+   * stored value for `field` matches are returned.
+   *
+   * The server accepts two forms — `eq` (single-value equality) and `in`
+   * (set membership). Plain JSON scalars are accepted (`"published"`, `3`,
+   * `true`) as well as the graph's own tagged form (`{"Str":"published"}`).
+   *
+   * @example `{ field: "status", eq: "published" }`
+   * @example `{ field: "status", in: ["draft", "review"] }`
+   */
+  where?: PropPredicate;
+}
+
+/**
+ * Response from `POST /find_similar`.
+ *
+ * `hits` is an array of `[node_key, similarity_score]` pairs sorted by score
+ * descending. Scores are cosine similarities in [min, 1.0].
+ */
+export interface FindSimilarResult {
+  hits: [string, number][];
+}
+
+// ---------------------------------------------------------------------------
+// Node edges
+// ---------------------------------------------------------------------------
+
+/**
+ * A node-key endpoint in a masked edge.
+ *
+ * When `nodeEdges` is called with `mask` **and** `stub_hidden: true`, an
+ * endpoint that lies outside the mask is returned as a restricted stub
+ * object rather than a plain string. Without `stub_hidden`, out-of-mask edges
+ * are omitted entirely.
+ *
+ * ```ts
+ * if (typeof edge.dst_key === 'string') {
+ *   // visible endpoint
+ * } else {
+ *   // restricted stub — only the key is known
+ *   console.log(edge.dst_key.key, edge.dst_key.restricted); // true
+ * }
+ * ```
+ */
+export type NodeKeyOrStub = string | { key: string; restricted: true };
+
+/**
+ * One edge entry from `GET /node/{key}/edges`.
+ *
+ * Mirrors `core_api::EdgeInfo` as serialised by
+ * `crates/server/src/json.rs::node_edges_json` (unmasked call) or
+ * `json.rs::masked_edges_json` (call with `mask`/`stub_hidden`).
+ *
+ * When the call is made **without** a mask, `src_key` and `dst_key` are
+ * always plain strings. When `stub_hidden: true` is in use, a masked-out
+ * endpoint is returned as `{ key: string; restricted: true }` — see
+ * {@link NodeKeyOrStub}.
+ */
+export interface EdgeInfo {
+  edge_type: string;
+  src_key: NodeKeyOrStub;
+  dst_key: NodeKeyOrStub;
+  /** true when this edge was derived by a rule; false when it was asserted. */
+  derived: boolean;
+}
+
+/**
+ * Response from `GET /node/{key}/edges`.
+ */
+export interface NodeEdgesResult {
+  edges: EdgeInfo[];
+}
+
+// ---------------------------------------------------------------------------
+// Node history
+// ---------------------------------------------------------------------------
+
+/**
+ * One change entry in a node's history.
+ *
+ * Mirrors `core_api::HistoryChange` via
+ * `crates/server/src/json.rs::history_change_json`.
+ * The `"type"` field is the discriminant.
+ */
+export type HistoryChange =
+  | { type: "NodeInserted"; label: string }
+  | { type: "PropSet"; field: string; value: CellValue }
+  | { type: "PropRemoved"; field: string }
+  | { type: "EdgeAdded"; edge_type: string; other: string; outgoing: boolean }
+  | { type: "EdgeRemoved"; edge_type: string; other: string; outgoing: boolean }
+  | { type: "NodeDeleted" };
+
+/**
+ * One commit entry in a node's history from `GET /node/{key}/history`.
+ *
+ * Mirrors `crates/server/src/json.rs::history_entry_json`.
+ */
+export interface HistoryEntry {
+  commit: number;
+  change: HistoryChange;
+}
+
+/**
+ * Response from `GET /node/{key}/history`.
+ *
+ * `horizon` is the oldest commit history can reach; events before it were
+ * pruned and are not in `history`.
+ */
+export interface NodeHistoryResult {
+  key: string;
+  history: HistoryEntry[];
+  /** Total WAL commits in the store. */
+  total_commits: number;
+  /** Oldest commit visible in history. Events before this were pruned. */
+  horizon: number;
+}
+
+// ---------------------------------------------------------------------------
+// Edge history
+// ---------------------------------------------------------------------------
+
+/**
+ * One event in the lifecycle of an edge from `GET /history/edge?a=&b=`.
+ *
+ * Mirrors `core_api::EdgeHistoryEvent` as serialised by
+ * `crates/server/src/json.rs::edge_history_result_json`.
+ */
+export interface EdgeHistoryEntry {
+  edge_type: string;
+  commit: number;
+  event: "Added" | "Retracted";
+  /** Rule that derived this edge, or null for an asserted edge. */
+  rule: string | null;
+}
+
+/**
+ * Response from `GET /history/edge?a=&b=`.
+ */
+export interface EdgeHistoryResult {
+  a: string;
+  b: string;
+  events: EdgeHistoryEntry[];
+  /** Total WAL commits in the store. */
+  total_commits: number;
+  /** Oldest commit visible in history. Events before this were pruned. */
+  horizon: number;
+}
+
+// ---------------------------------------------------------------------------
+// Was linked
+// ---------------------------------------------------------------------------
+
+/**
+ * Response from `GET /history/was_linked?a=&b=&edge_type=&at_commit=`.
+ *
+ * `linked` is true when any edge of `edge_type` existed between `a` and `b`
+ * (in either direction) at the given commit.
+ */
+export interface WasLinkedResult {
+  a: string;
+  b: string;
+  edge_type: string;
+  at_commit: number;
+  linked: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Create node result
+// ---------------------------------------------------------------------------
+
+/**
+ * Response from `POST /nodes`.
+ *
+ * `nodes` is 1 when the node was created. A duplicate key yields a 400 error
+ * instead of returning 0 — `POST /nodes` is an insert, not an upsert.
+ * `edges` is always 0 for this endpoint.
+ */
+export interface CreateNodeResult {
+  ok: boolean;
+  nodes: number;
+  edges: number;
+}
+
+// ---------------------------------------------------------------------------
+// Backup
+// ---------------------------------------------------------------------------
+
+/**
+ * Response from `POST /backup`.
+ *
+ * Mirrors `BackupReportJson` from `crates/server/src/http.rs`.
+ * When `verified` is false the server answers 500 — the backup was written
+ * but the post-copy verification failed; inspect `files` and `bytes`.
+ */
+export interface BackupReport {
+  /** Names of the files copied into the backup directory. */
+  files: string[];
+  /** Total bytes written. */
+  bytes: number;
+  /** true when the copy was verified by re-reading the destination. */
+  verified: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Mutation events (GET /watch WebSocket)
+// ---------------------------------------------------------------------------
+
+/**
+ * A mutation event delivered over the `/watch` WebSocket.
+ *
+ * Mirrors `core_api::MutationEvent` — serialised as externally-tagged
+ * snake_case JSON (`{"node_inserted":{"label":"A","key":"k"}}`).
+ *
+ * The `lagged` variant (`{"lagged": N}`) is not produced by serde but by the
+ * WebSocket handler; it means the broadcast channel overflowed by N events.
+ * Re-read any state your consumer depends on to recover consistency.
+ *
+ * **Note:** The `/watch` stream is the raw mutation log, distinct from the
+ * filtered post-commit subscription on `/subscribe`. Every write to the store
+ * appears here; `/subscribe` lets callers filter by rule or write type.
+ */
+export type MutationEvent =
+  | { node_inserted: { label: string; key: string } }
+  | { prop_set: { key: string; field: string } }
+  | { prop_removed: { key: string; field: string } }
+  | { edge_inserted: { edge_type: string; src: string; dst: string } }
+  | { edge_deleted: { edge_type: string; src: string; dst: string } }
+  | { node_deleted: { key: string } }
+  | { rule_created: { name: string } }
+  | { rule_deleted: { name: string } }
+  | { rule_rebuilt: { name: string } }
+  | { batch_applied: { ops: number } }
+  | { ingested: { label: string; inserted: number } }
+  | { lagged: number };
+
+// ---------------------------------------------------------------------------
 // Subscribe message (sent by client → server)
 // ---------------------------------------------------------------------------
 

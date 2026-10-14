@@ -33,9 +33,9 @@
  */
 
 import { MushroomError } from "./types.js";
-import type { DbEvent, SubscribeMessage } from "./types.js";
+import type { DbEvent, MutationEvent, SubscribeMessage } from "./types.js";
 
-export type { DbEvent };
+export type { DbEvent, MutationEvent };
 
 /**
  * Minimal WebSocket-like interface required by subscribe().
@@ -105,6 +105,169 @@ function resolveWsConstructor(opt?: WsConstructor): WsConstructor {
       "In Node.js < 21, install the `ws` package and pass " +
       "`wsConstructor: WS as WsConstructor` in the options.",
   );
+}
+
+/** Options for {@link watch}. */
+export interface WatchOptions {
+  /**
+   * Custom WebSocket constructor.
+   *
+   * **Node.js only** — required when `globalThis.WebSocket` is not available
+   * (Node < 21). Example:
+   *
+   * ```ts
+   * import WS from 'ws';
+   * { wsConstructor: WS as WsConstructor }
+   * ```
+   */
+  wsConstructor?: WsConstructor;
+  /**
+   * Called when the WebSocket connection closes after the watch has been
+   * acknowledged — whether cleanly (after the caller calls `handle.close()`)
+   * or because the server dropped it. Use this as a signal to reconnect.
+   */
+  onClose?: () => void;
+}
+
+/** Handle returned by {@link watch}. Identical interface to {@link SubscribeHandle}. */
+export interface WatchHandle {
+  /**
+   * Close the WebSocket connection.
+   *
+   * Returns a promise that resolves when the connection is fully closed.
+   * Always await this in tests to avoid dangling handles.
+   */
+  close(): Promise<void>;
+}
+
+/**
+ * Open a `GET /watch` WebSocket and begin streaming {@link MutationEvent}s.
+ *
+ * The `/watch` stream is the raw mutation log. The server sends
+ * `{"subscribed":true}` immediately after the upgrade (no client message
+ * required), then streams one JSON frame per mutation event.
+ *
+ * A `{"lagged": N}` frame means the broadcast channel overflowed; N events
+ * were dropped. Re-read any state your consumer depends on to recover.
+ *
+ * **No auto-reconnect in v1.** When the connection drops, no further events
+ * are delivered.
+ *
+ * @param wsUrl   Full WebSocket URL, e.g. `ws://127.0.0.1:8080/watch`.
+ * @param opts    Optional `wsConstructor` for Node.js < 21.
+ * @param onEvent Callback invoked for each {@link MutationEvent}.
+ */
+export async function watch(
+  wsUrl: string,
+  opts: WatchOptions,
+  onEvent: (event: MutationEvent) => void,
+): Promise<WatchHandle> {
+  const WS = resolveWsConstructor(opts.wsConstructor);
+  const ws = new WS(wsUrl);
+
+  return new Promise<WatchHandle>((resolve, reject) => {
+    let subscribed = false;
+    let closeResolve: (() => void) | null = null;
+
+    const closePromise = new Promise<void>((res) => {
+      closeResolve = res;
+    });
+
+    /** Resolve closePromise once, fire onClose once, drop all listeners. */
+    function doClose(): void {
+      const res = closeResolve;
+      if (!res) return; // already called
+      closeResolve = null;
+      // Drop all handlers so nothing keeps the event loop alive.
+      ws.onopen = null;
+      ws.onmessage = null;
+      ws.onerror = null;
+      ws.onclose = null;
+      opts.onClose?.();
+      res();
+    }
+
+    ws.onopen = () => {
+      // /watch sends the ack without a client subscribe message; nothing to send.
+    };
+
+    ws.onmessage = (ev: { data: unknown }) => {
+      let text: string;
+      try {
+        text = dataToString(ev.data);
+      } catch {
+        return;
+      }
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        return;
+      }
+
+      const frame = parsed as Record<string, unknown>;
+
+      if (!subscribed) {
+        if (frame["subscribed"] === true) {
+          subscribed = true;
+          resolve({
+            close(): Promise<void> {
+              ws.close();
+              // A server older than 0.8 never reads a /watch socket, so it
+              // does not answer the close and onclose does not fire until
+              // the ws package's own 30 s timeout. Resolve at most 3 s after
+              // asking, so a caller talking to one is not left hanging.
+              // terminate() (ws-package-only) force-drops the TCP connection;
+              // the standard WebSocket has no equivalent, and its socket can
+              // outlive this until the runtime's own close timeout.
+              // doClose() fires onClose once and drops all listeners.
+              const fallback = setTimeout(() => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                (ws as any).terminate?.();
+                doClose();
+              }, 3_000);
+              return closePromise.finally(() => clearTimeout(fallback));
+            },
+          });
+        } else if (typeof frame["error"] === "string") {
+          reject(new MushroomError(frame["error"] as string));
+          ws.close();
+        } else {
+          reject(new Error("Unexpected watch response: " + text));
+          ws.close();
+        }
+      } else {
+        onEvent(frame as unknown as MutationEvent);
+      }
+    };
+
+    ws.onerror = (err: unknown) => {
+      if (!subscribed) {
+        let detail: string;
+        if (err instanceof Error && err.message) {
+          detail = err.message;
+        } else {
+          // Global WebSocket error events carry no useful status; include the
+          // URL path so the caller can identify the endpoint.
+          try {
+            detail = `${new URL(wsUrl).pathname} failed before watch ack`;
+          } catch {
+            detail = "WebSocket error before watch ack";
+          }
+        }
+        reject(new MushroomError(detail));
+      }
+    };
+
+    ws.onclose = () => {
+      if (!subscribed) {
+        reject(new MushroomError("WebSocket closed before watch ack"));
+        return;
+      }
+      doClose();
+    };
+  });
 }
 
 /**
