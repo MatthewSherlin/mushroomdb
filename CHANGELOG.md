@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## v0.8.0 — faster opens, three more platforms, and two snapshot defects in 0.7.2 fixed
+
+No format version change. A 0.7.2 store opens under 0.8.0, and a 0.8.0 snapshot opens under 0.7.2, which ignores the full-text index the snapshot now carries and builds its own.
+
+**Upgrade if you snapshot a store with no full-text pair, property index or multiplicity declared.** In 0.7.2 and earlier, an archiving snapshot taken with nothing written since the last one — `mushroomdb snapshot` twice, a `serve --snapshot-every` tick on an idle store, a graceful shutdown just after a snapshot — wrote an empty file over the previous WAL archive: its history was lost, and reads by date could answer an old commit with a later state. A store created by `mushroomdb mcp` or `serve` since 0.7 declares the memory schema and was not exposed. What was lost is not recoverable (row 100).
+
+The rest of what is here:
+
+- a store with text opens about nine times faster once it has a snapshot;
+- `mushroomdb mcp` snapshots a store whose WAL has grown;
+- binaries for Intel macOS, musl Linux and Windows;
+- a TypeScript client that wraps every route;
+- five more corrections, three of them to snapshots.
+
+Each engine change was given to an independent reviewer that ran the same writes two ways and compared the answers; what each review found, and what was done about it, is in the defect ledger row named beside the entry.
 
 ### Added
 
