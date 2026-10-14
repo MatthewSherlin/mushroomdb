@@ -1407,6 +1407,42 @@ fn pair_still_desired(def: &RuleDef, s: u32, d: u32, g: &GraphMut<'_>) -> bool {
     .is_some()
 }
 
+/// Whether `def`'s predicate held for `(s, d)` with `d` as it was before
+/// `changed` — the field that changed, and its previous value — or as it is,
+/// when nothing changed.
+///
+/// One evaluation, no index probe. A top-k rule's best match for `s` could
+/// only have been `d` if this held, so a source it does not hold for has
+/// nothing to lose when `d` changes (ledger row 83's guard).
+fn pair_matched_before(
+    def: &RuleDef,
+    s: u32,
+    d: u32,
+    changed: Option<(&str, &Option<Value>)>,
+    g: &GraphMut<'_>,
+) -> bool {
+    let (Some(s_key), Some(d_key)) = (g.ids.key_of(s), g.ids.key_of(d)) else {
+        return false;
+    };
+    let s_get = |f: &str| g.props.get(s, f).map(|vr| vr.into_value());
+    let d_get = |f: &str| match changed {
+        Some((field, old)) if f == field => old.clone(),
+        _ => g.props.get(d, f).map(|vr| vr.into_value()),
+    };
+    evaluate(
+        &def.predicate,
+        &NodeView {
+            key: s_key,
+            props: &s_get,
+        },
+        &NodeView {
+            key: d_key,
+            props: &d_get,
+        },
+    )
+    .is_some()
+}
+
 /// Count desired `(src, dst)` pairs up to `limit + 1`; returns as soon as the
 /// threshold is crossed.  Peak additional memory: O(max-candidates-per-src).
 /// Used in `rebuild` to detect the over-budget case without materialising the
@@ -3761,12 +3797,21 @@ impl RuleEngine {
                         // until a rebuild (ledger row 83). The edge in the
                         // graph is the only trace of that choice; bounded by
                         // `n`'s in-degree over this edge type.
+                        // Only a source for which `n` was a match before
+                        // this change can have lost it; one predicate
+                        // evaluation each, so a hub the rule never matched
+                        // costs no re-evaluation of its in-neighbours.
                         let src_sym = g.syms.get(&def.src_label);
-                        for s in g.neighbors(et, core_storage::Direction::In, n).iter() {
-                            if g.labels.get(*s as usize).copied() == src_sym
-                                && rule_sees(&def, *s, g)
+                        let before = changed.as_ref().map(|(f, old)| (*f, old));
+                        let in_srcs: Vec<u32> =
+                            g.neighbors(et, core_storage::Direction::In, n).to_vec();
+                        for s in in_srcs {
+                            if !srcs.contains(&s)
+                                && g.labels.get(s as usize).copied() == src_sym
+                                && rule_sees(&def, s, g)
+                                && pair_matched_before(&def, s, n, before, g)
                             {
-                                srcs.insert(*s);
+                                srcs.insert(s);
                             }
                         }
                         srcs
@@ -3895,13 +3940,26 @@ impl RuleEngine {
                 // A via-hop rule's desired set for `s` is computed along its
                 // hop, exactly as when `s` itself changes (ledger row 84).
                 let doomed = self.doomed;
-                let desired = compute_desired_via(
+                let mut desired = compute_desired_via(
                     &def,
                     self.indexes.get(&rule_name),
                     ViaAnchor::Src(s),
                     doomed,
                     g,
                 );
+                // As a destination too, when the rule links a label to itself:
+                // the retract set below is every edge of the rule touching `s`,
+                // so without these the edges *into* `s` would go.
+                let dst_sym = g.syms.get(&def.dst_label);
+                if def.max_edges.is_none() && dst_sym.is_some() && label == dst_sym {
+                    desired.extend(compute_desired_via(
+                        &def,
+                        self.indexes.get(&rule_name),
+                        ViaAnchor::Dst(s),
+                        doomed,
+                        g,
+                    ));
+                }
                 let mut prov = ProvSets {
                     set: self.provenance.entry(rule_name.clone()).or_default(),
                     owned: &mut self.owned,
@@ -4434,7 +4492,10 @@ impl RuleEngine {
             };
             let src_sym = g.syms.get(&def.src_label);
             for s in g.neighbors(et, core_storage::Direction::In, n).iter() {
-                if *s != n && g.labels.get(*s as usize).copied() == src_sym && rule_sees(def, *s, g)
+                if *s != n
+                    && g.labels.get(*s as usize).copied() == src_sym
+                    && rule_sees(def, *s, g)
+                    && pair_matched_before(def, *s, n, None, g)
                 {
                     topk_backfill.insert((rule_name.clone(), *s));
                 }

@@ -263,6 +263,55 @@ fn a_via_rule_takes_an_edge_a_plain_rule_retracted() {
     );
 }
 
+/// The second pass, re-evaluating a via-hop rule that links a label to
+/// itself, must keep the edges *into* the source. Its first form computed the
+/// source's outgoing desired set only, against a retract set of every edge of
+/// the rule touching the source, so `x->s` went when `s` was reclaimed — an
+/// edge `main` had right. Found by the review of row 84's fix.
+#[test]
+fn a_self_label_via_rule_reclaimed_for_a_source_keeps_the_edges_into_it() {
+    let build = |name: &str, with_fk: bool| -> (std::path::PathBuf, Db) {
+        let dir = tmp(name);
+        let mut db = GraphDb::open(&dir).unwrap();
+        let mut s_props = vec![("tags".into(), tags(&["x", "y"]))];
+        if with_fk {
+            s_props.push(("fk".into(), Value::Str("t".into())));
+        }
+        db.insert_node("P", "s", s_props).unwrap();
+        for k in ["t", "x"] {
+            db.insert_node("P", k, vec![("tags".into(), tags(&["x", "y"]))])
+                .unwrap();
+        }
+        db.insert_node("O", "o", vec![("tags".into(), tags(&["x", "y"]))])
+            .unwrap();
+        db.insert_edge("WORKS_AT", "s", "o").unwrap();
+        db.insert_edge("WORKS_AT", "x", "o").unwrap();
+        db.create_rule(rule("aclaim", "P", "P", claim(), None))
+            .unwrap();
+        let mut via = rule("via", "P", "P", overlap(0.6), None);
+        via.via_label = Some("O".into());
+        via.via_edge = Some("WORKS_AT".into());
+        via.via_dir = Some(Direction::Out);
+        db.create_rule(via).unwrap();
+        (dir, db)
+    };
+    let edges = |db: &Db| -> Vec<String> {
+        let mut out = Vec::new();
+        for k in ["s", "t", "x"] {
+            for d in db.neighbors(k, "SAME", Direction::Out).unwrap() {
+                out.push(format!("{k}->{d}"));
+            }
+        }
+        out.sort();
+        out
+    };
+    let (_d1, mut live) = build("self-via-live", true);
+    live.remove_prop("s", "fk").unwrap();
+    let (_d2, fresh) = build("self-via-fresh", false);
+    assert_eq!(edges(&live), edges(&fresh));
+    assert!(edges(&live).contains(&"x->s".to_string()));
+}
+
 // ---------------------------------------------------------------------------
 // Against a fresh build
 // ---------------------------------------------------------------------------
@@ -495,7 +544,8 @@ fn one_rule_alone_always_matches_a_fresh_build() {
 /// source was found through the rule's provenance alone, was not recomputed,
 /// and the next-best edge stayed missing until a rebuild. Nothing is retracted
 /// on the shared edge, so the second pass has nothing to see; the sources are
-/// now found through the edges into the destination instead.
+/// now found through the edges into the destination as well. A via-hop top-k
+/// rule still has the defect; this test has none.
 #[test]
 fn a_top_k_rule_beside_a_sibling_always_matches_a_fresh_build() {
     let rules = vec![
