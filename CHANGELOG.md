@@ -5,6 +5,9 @@
 ### Fixed
 
 - **A top-k rule keeps its next-best edge when its best match was another rule's.** Two rules over the same labels and edge type, one of them top-k: when the top-k rule's best match for a source was an edge the other rule already owned, it recorded nothing and dropped its own next-best edge, and when that match went away — a changed property or the destination deleted — the next-best edge stayed missing until `rebuild_rule`. Not yet for a via-hop top-k rule (row 83, in part).
+- **Deleting a top-k rule's best match promotes the next one.** A KeyMatch top-k rule whose source named the deleted node chose it again: the rule's edge count included an edge the graph did not have, and the next-best match was not taken (row 106).
+- **Deleting a via node removes the edges derived through it.** A via-hop rule's edge stayed after the node it hopped through was deleted (row 104).
+- **A via-hop rule that links a label to itself derives the edge into a new node.** Inserting nodes in one order derived the edge and in the other did not (row 105).
 - **A via-hop rule takes back an edge another rule gave up.** When a plain rule stopped deriving an edge that a via-hop rule over the same edge type also derives, the edge was removed and not added back; the via-hop rule is now re-evaluated for that source (row 84, in part).
 
 ## v0.8.0 — faster opens, three more platforms, and two snapshot defects in 0.7.2 fixed

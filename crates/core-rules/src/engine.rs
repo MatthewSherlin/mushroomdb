@@ -3933,7 +3933,13 @@ impl RuleEngine {
     /// A via-hop rule is re-evaluated along its hop, as when the source itself
     /// changes (ledger row 84).
     fn reclaim_retracted(&mut self, retracted: &[(u32, Triple)], g: &mut GraphMut<'_>) {
+        let doomed = self.doomed;
         for (rule_name, s) in self.reclaim_targets(retracted, g) {
+            // Nothing is reclaimed for, or onto, a node being deleted: a rule
+            // that finds candidates by key still sees it (ledger row 106).
+            if Some(s) == doomed {
+                continue;
+            }
             let def = self.rules[&rule_name].clone();
             let label = g.labels.get(s as usize).copied();
             if def.via_label.is_some() {
@@ -3980,7 +3986,10 @@ impl RuleEngine {
                     }
                 }
             } else if let Some(k) = def.max_edges {
-                let desired = compute_desired(&def, &self.indexes[&rule_name], s, true, g);
+                let mut desired = compute_desired(&def, &self.indexes[&rule_name], s, true, g);
+                if let Some(gone) = doomed {
+                    desired.retain(|&(_, d), _| d != gone);
+                }
                 let top_k = filter_src_top_k(desired, k, g.ids);
                 let mut prov = ProvSets {
                     set: self.provenance.entry(rule_name.clone()).or_default(),
@@ -4009,6 +4018,9 @@ impl RuleEngine {
                         false,
                         g,
                     ));
+                }
+                if let Some(gone) = doomed {
+                    desired.retain(|&(a, b), _| a != gone && b != gone);
                 }
                 let tripped = self.tripped.entry(rule_name.clone()).or_default();
                 apply_desired(
@@ -4229,9 +4241,25 @@ impl RuleEngine {
             let budget = edge_budget(def);
             // Apply per-src so each affected src retracts its stale edges and
             // adds its new desired edges independently.
+            // A rule that links a label to itself retracts, for `src`, every
+            // edge of the rule touching it — into `src` as well as out — so
+            // the edges into it have to be in the desired set too, or an edge
+            // another source has just derived into `src` goes again and the
+            // result depends on the order the sources are taken in (ledger
+            // row 105; the second pass had the same shape, row 84).
+            let self_label = src_sym.is_some() && src_sym == dst_sym;
             for src in affected_srcs {
-                let desired_src =
+                let mut desired_src =
                     compute_desired_via(def, rule_index, ViaAnchor::Src(src), doomed, g);
+                if self_label && g.labels.get(src as usize).copied() == dst_sym {
+                    desired_src.extend(compute_desired_via(
+                        def,
+                        rule_index,
+                        ViaAnchor::Dst(src),
+                        doomed,
+                        g,
+                    ));
+                }
                 if !*tripped {
                     let mut prov = ProvSets {
                         set: self.provenance.entry(rule_name.to_string()).or_default(),
@@ -4343,8 +4371,22 @@ impl RuleEngine {
 
             // Recompute derived edges for rule_src — its via-hop set just changed.
             *self.fires.entry(rule_name.clone()).or_default() += 1;
-            let desired_src =
+            let mut desired_src =
                 compute_desired_via(&def, None, ViaAnchor::Src(rule_src), self.doomed, g);
+            // The edges into `rule_src` as well, for a rule that links a label
+            // to itself: `apply_desired` retracts every edge of the rule that
+            // touches it (ledger row 105).
+            let dst_sym = g.syms.get(&def.dst_label);
+            if def.max_edges.is_none() && dst_sym.is_some() && g.syms.get(&def.src_label) == dst_sym
+            {
+                desired_src.extend(compute_desired_via(
+                    &def,
+                    None,
+                    ViaAnchor::Dst(rule_src),
+                    self.doomed,
+                    g,
+                ));
+            }
 
             if let Some(k) = def.max_edges {
                 let mut prov = ProvSets {
@@ -4411,6 +4453,8 @@ impl RuleEngine {
     fn on_node_removed_inner(&mut self, n: u32, g: &mut GraphMut<'_>) {
         // Ensure provenance is decoded before diffing against existing edges.
         self.ensure_provenance_loaded_mut();
+        // Only this delete's retractions are reclaimed at the end.
+        self.retracted.clear();
         // Lazy index build: same guard as on_node_changed.  Top-k backfill
         // compute_desired consults the candidate index; an empty index would
         // silently produce no backfill.  Consume retained snapshot blobs here
@@ -4502,6 +4546,38 @@ impl RuleEngine {
             }
         }
 
+        // Sources that hop through `n`, for every via-hop rule `n` is a via
+        // node of. The edges such a rule derived through `n` touch neither
+        // end at `n`, so the retraction above never sees them; the sources
+        // are evaluated again below, with `n` out of the hop (ledger row 104).
+        // Read while the hop edges are still in the graph.
+        let mut via_srcs: BTreeSet<(String, u32)> = BTreeSet::new();
+        for (rule_name, def) in &self.rules {
+            let (Some(via_label), Some(via_edge)) = (&def.via_label, &def.via_edge) else {
+                continue;
+            };
+            if self.pending_builds.contains_key(rule_name) {
+                continue;
+            }
+            let via_sym = g.syms.get(via_label);
+            if via_sym.is_none() || n_label != via_sym {
+                continue;
+            }
+            let Some(hop) = g.syms.get(via_edge) else {
+                continue;
+            };
+            let back = match def.via_dir.unwrap_or(core_storage::Direction::Out) {
+                core_storage::Direction::Out => core_storage::Direction::In,
+                core_storage::Direction::In => core_storage::Direction::Out,
+            };
+            let src_sym = g.syms.get(&def.src_label);
+            for s in g.neighbors(hop, back, n).iter() {
+                if *s != n && g.labels.get(*s as usize).copied() == src_sym {
+                    via_srcs.insert((rule_name.clone(), *s));
+                }
+            }
+        }
+
         for (rule_name, triple) in touching {
             let (t, s, d) = triple;
             g.topo.remove_edge(t, s, d);
@@ -4531,11 +4607,19 @@ impl RuleEngine {
                                             // Via-hop rules cannot be evaluated through the candidate index; the
                                             // index path would return nothing and retract this source's whole
                                             // set. `self.doomed` keeps the node being deleted out of the result.
-            let desired_src = if def.via_edge.is_some() {
+            let mut desired_src = if def.via_edge.is_some() {
                 compute_desired_via(&def, None, ViaAnchor::Src(src), self.doomed, g)
             } else {
                 compute_desired(&def, &self.indexes[&rule_name], src, true, g)
             };
+            // Not the node being deleted. The index path leaves it out because
+            // it has left the index, but a KeyMatch rule finds its candidates
+            // by key, and the doomed node still answers to its key here: it
+            // was re-picked, its edge re-added with provenance, and the delete
+            // then swept the edge and left the provenance (ledger row 106).
+            if let Some(gone) = self.doomed {
+                desired_src.retain(|&(_, d), _| d != gone);
+            }
             let top_k = filter_src_top_k(desired_src, k, g.ids);
             let mut prov = ProvSets {
                 set: self.provenance.entry(rule_name.clone()).or_default(),
@@ -4548,6 +4632,49 @@ impl RuleEngine {
                 retracted: &mut self.retracted,
             };
             apply_per_src_top_k(&def, src, top_k, &mut prov, g);
+        }
+
+        for (rule_name, src) in via_srcs {
+            let def = self.rules[&rule_name].clone();
+            let doomed = self.doomed;
+            let mut desired = compute_desired_via(&def, None, ViaAnchor::Src(src), doomed, g);
+            let mut prov = ProvSets {
+                set: self.provenance.entry(rule_name.clone()).or_default(),
+                owned: &mut self.owned,
+                by_node: &mut self.by_node,
+                rule_intern: &mut self.rule_intern,
+                intern_rule: &mut self.intern_rule,
+                deltas: &mut self.pending_deltas,
+                emit: self.emit_deltas,
+                retracted: &mut self.retracted,
+            };
+            if let Some(k) = def.max_edges {
+                let top_k = filter_src_top_k(desired, k, g.ids);
+                apply_per_src_top_k(&def, src, top_k, &mut prov, g);
+            } else {
+                // The edges into `src` too, for a rule that links a label to
+                // itself (rows 84 and 105).
+                let dst_sym = g.syms.get(&def.dst_label);
+                if dst_sym.is_some() && g.syms.get(&def.src_label) == dst_sym {
+                    desired.extend(compute_desired_via(
+                        &def,
+                        None,
+                        ViaAnchor::Dst(src),
+                        doomed,
+                        g,
+                    ));
+                }
+                let tripped = self.tripped.entry(rule_name.clone()).or_default();
+                apply_desired(&def, desired, Some(src), &mut prov, tripped, g);
+            }
+        }
+
+        // What those re-evaluations retracted, another rule over the same edge
+        // type may still want: the second pass, as after any other change
+        // (row 37). Edges into the node being deleted are left out of it.
+        let retracted = std::mem::take(&mut self.retracted);
+        if !retracted.is_empty() {
+            self.reclaim_retracted(&retracted, g);
         }
     }
 
