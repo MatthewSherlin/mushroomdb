@@ -515,6 +515,11 @@ mushroomdb mcp <db-dir>
 Runs a newline-delimited JSON-RPC 2.0 loop on stdio. No `Content-Length`
 framing.
 
+When it opens a store whose WAL has grown past 4 MiB, before its first answer,
+the server takes a snapshot so that the next open does not replay the store's
+whole history; it checks the same thing again when stdin closes. The WAL is archived beside the snapshot; see
+[Keeping recovery fast](durability.md#keeping-recovery-fast).
+
 Handshake:
 
 ```text

@@ -66,9 +66,12 @@ fn opts_archive() -> SnapshotOptions {
 /// no live declaration at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailAt {
-    /// `write_genesis_marker` — one of the six `?` calls between the rename and
-    /// the baseline write.
-    GenesisMarker,
+    /// The retention sweep's `list_archives`, once the WAL has been renamed
+    /// away — one of the fallible calls that used to sit between the rename
+    /// and the baseline write. It was `write_genesis_marker` until row 98
+    /// moved that write to before the snapshot; the store keeps a retention
+    /// bound in these tests so that the sweep runs.
+    AfterRename,
     /// The baseline WAL write itself, the last call in the sequence.
     BaselineWal,
     /// The `append` of `MULTIPLICITY_ENABLED` itself, inside
@@ -153,6 +156,9 @@ impl Fs for FailOnce {
         self.inner.write_atomic(file, data)
     }
     fn list_archives(&self) -> std::io::Result<Vec<u64>> {
+        if self.archived.get() && self.should_fail(FailAt::AfterRename) {
+            return Err(Self::err());
+        }
         self.inner.list_archives()
     }
     fn read_archive(&self, n: u64) -> std::io::Result<Vec<u8>> {
@@ -176,9 +182,6 @@ impl Fs for FailOnce {
         self.inner.has_genesis_marker()
     }
     fn write_genesis_marker(&mut self) -> std::io::Result<()> {
-        if self.should_fail(FailAt::GenesisMarker) {
-            return Err(Self::err());
-        }
         self.inner.write_genesis_marker()
     }
     fn delete_genesis_marker(&mut self) -> std::io::Result<()> {
@@ -226,8 +229,8 @@ fn has_discriminant_23(bytes: &[u8]) -> bool {
 /// Two things answer it, and they answer different halves.
 ///
 /// The **baseline write now comes first**, with no fallible call between it and
-/// the rename, so an ordinary `Err` anywhere later — `FailAt::GenesisMarker` and
-/// the five others like it — cannot lose any declaration, including the two
+/// the rename, so an ordinary `Err` anywhere later — `FailAt::AfterRename` and
+/// the others like it — cannot lose any declaration, including the two
 /// (`EnableFulltext`, `EnableIndex`) that have no stamp to fall back on.
 ///
 /// The **V10 stamp** closes what ordering cannot: the crash between the rename
@@ -242,8 +245,9 @@ fn a_failed_archive_cannot_opt_the_store_back_out() {
     // lost the declaration, or this test would pass on ordering alone and say
     // nothing about the stamp.
     let mut saw_lost_declaration = 0usize;
-    for at in [FailAt::GenesisMarker, FailAt::BaselineWal] {
+    for at in [FailAt::AfterRename, FailAt::BaselineWal] {
         let mut db = GraphDb::open_with(FailOnce::new(at)).unwrap();
+        db.set_wal_archive_retention(Some(8));
         db.insert_node("N", "a", vec![]).unwrap();
         db.insert_node("N", "b", vec![]).unwrap();
         db.enable_multiplicity().unwrap();
@@ -296,7 +300,7 @@ fn a_failed_archive_cannot_opt_the_store_back_out() {
     assert_eq!(
         saw_lost_declaration, 1,
         "exactly one target must reach the lost-declaration state: \
-         GenesisMarker is saved by the reordered baseline write, BaselineWal is \
+         AfterRename is saved by the reordered baseline write, BaselineWal is \
          not and is what exercises the V10 stamp"
     );
 }
@@ -306,7 +310,8 @@ fn a_failed_archive_cannot_opt_the_store_back_out() {
 /// no snapshot stamp behind them and that no `open` can recover.
 #[test]
 fn a_failure_after_the_rename_keeps_the_index_declarations_too() {
-    let mut db = GraphDb::open_with(FailOnce::new(FailAt::GenesisMarker)).unwrap();
+    let mut db = GraphDb::open_with(FailOnce::new(FailAt::AfterRename)).unwrap();
+    db.set_wal_archive_retention(Some(8));
     db.insert_node("N", "a", vec![]).unwrap();
     db.enable_fulltext("N", "body").unwrap();
     db.enable_index("N", "tag").unwrap();
@@ -318,7 +323,7 @@ fn a_failure_after_the_rename_keeps_the_index_declarations_too() {
     let reopened = GraphDb::open_with(survivor).unwrap();
     assert!(
         reopened.is_fulltext_enabled("N", "body"),
-        "the full-text declaration must survive a failed genesis-marker write"
+        "the full-text declaration must survive a failure after the rename"
     );
     assert!(
         reopened.is_index_enabled("N", "tag"),
