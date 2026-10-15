@@ -476,17 +476,22 @@ fn topology_merge_to_csr(base: &crate::v8::layout::ArchivedCsr, overlay: &Topolo
         })
         .collect();
 
-    // Merged edge count = base - tombstones + overlay.
-    let base_count = u64::from(base.edge_count);
-    let overlay_count = overlay.edge_count();
-    // Count unique tombstones (out-direction is the canonical set).
-    let tombstone_count: u64 = overlay
-        .out_tombstones
-        .values()
-        .flat_map(|m| m.values())
-        .map(|s| s.len() as u64)
+    // Count edges from the merged out-adjacency rows that the loop above just
+    // built rather than carrying the arithmetic forward from the base header.
+    // The arithmetic is wrong when the base header counts an edge the overlay
+    // duplicated before row 103's fix (ledger row 107), or when a tombstone
+    // covered an absent edge — the subtraction would then undercount.  Counting
+    // directly from the rows is always right and requires no special casing.
+    let edge_count: u64 = etypes
+        .iter()
+        .map(|e| {
+            e.out_adj
+                .rows
+                .iter()
+                .map(|r| r.neighbors.len() as u64)
+                .sum::<u64>()
+        })
         .sum();
-    let edge_count = base_count.saturating_sub(tombstone_count) + overlay_count;
 
     CsrData { etypes, edge_count }
 }

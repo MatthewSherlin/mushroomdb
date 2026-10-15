@@ -28,8 +28,9 @@ mp-test = []
 # reader's delta tail so the `Corrupt` arm of the scoped reader is reachable
 # from an integration test in a *different* crate (`crates/server/tests`),
 # where `#[cfg(test)]` cannot reach. A hook that corrupts a store has no place
-# in the shipped surface: never enabled by a normal build.
-test-hooks = []
+# in the shipped surface: never enabled by a normal build. It turns on the rule
+# engine's hooks too: `inject_double_ownership_for_test` here calls the engine's.
+test-hooks = ["core-rules/test-hooks"]
 
 [dependencies]
 core-storage = { package = "mushroomdb-storage", path = "../core-storage", version = "0.8.1" }

@@ -226,6 +226,19 @@ impl Topology {
         self.edge_count
     }
 
+    /// Number of base-edge tombstones in this overlay.
+    ///
+    /// Each tombstone records a deletion of an edge that lives in the
+    /// snapshot base, not in the overlay itself.  Used in the corrected
+    /// edge-count path that repairs a damaged base header (ledger row 107).
+    pub fn tombstone_count(&self) -> u64 {
+        self.out_tombstones
+            .values()
+            .flat_map(|m| m.values())
+            .map(|s| s.len() as u64)
+            .sum()
+    }
+
     /// Edge-type ids present in the graph, sorted ascending.
     /// `by_type` stays a `HashMap` (smaller than a BTreeMap migrate; snapshot encoding unchanged);
     /// this method collect+sorts keys so iteration is deterministic.
