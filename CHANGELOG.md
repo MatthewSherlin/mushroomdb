@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A store snapshotted while two rules owned one edge is repaired on open.** On stores written
+  before 0.8.1 (row 103) where a snapshot was taken while two rules both owned the same edge: the
+  double ownership survived in the snapshot's provenance section, the edge count in the snapshot
+  header was one too high per affected edge, and a write that caused the second rule to retract
+  silently removed the edge even though the first rule still wanted it. Opening such a store now
+  deduplicates provenance before any write, keeping the first owner in alphabetical rule-name order.
+  The snapshot encoder recounts `edge_count` from the merged CSR rows instead of carrying the header
+  value forward arithmetically, so every new snapshot's header is correct. `stats().edges` and
+  `edge_count()` use the row count rather than the header on stores with a V8 base (row 107).
+
 ## v0.8.1 — six rule engine corrections
 
 No format version change. A 0.8.0 store opens under 0.8.1, and a 0.8.1 store opens under 0.8.0.
