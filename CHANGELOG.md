@@ -11,7 +11,7 @@
   to retract silently removed the edge even though the first rule still wanted it. The first write
   after opening such a store now deduplicates provenance, keeping the first owner in byte order on
   rule name; until that write, `stats().rules`, `explain`, and `open_at` still show both owners.
-  The deduped edge keeps the dropped rule's weight property until that source node is next written.
+  The deduped edge keeps the dropped rule's weight property until the edge is next re-derived.
   The snapshot encoder recounts `edge_count` from the merged CSR rows instead of carrying the header
   value forward arithmetically, so every new snapshot's header is correct. `stats().edges` and
   `edge_count()` use the row count rather than the header on stores with a V8 base. Stores where
