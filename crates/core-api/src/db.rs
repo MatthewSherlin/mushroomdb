@@ -3930,6 +3930,10 @@ impl<F: Fs> GraphDb<F> {
         src_key: &str,
         dst_key: &str,
     ) {
+        // Load the V8 base sections first: without this the engine's retained
+        // provenance bytes are not yet populated, so the mutation call below would
+        // find nothing to decode and the injection would be silently discarded.
+        self.ensure_v8_base_sections_loaded();
         // Materialize provenance into live fields so the injection is visible to
         // subsequent writes and to the snapshot encoder.
         self.engine.ensure_provenance_loaded_mut();
@@ -3946,6 +3950,20 @@ impl<F: Fs> GraphDb<F> {
         // base copy (from the prior snapshot) plus this overlay copy — making the
         // next snapshot's header one too high per duplicated edge.
         Arc::make_mut(&mut self.topo).add_edge(etype, src, dst);
+    }
+
+    /// The raw `edge_count` field from the current V8 snapshot header, without
+    /// the `corrected_edge_count` row-walk fix applied.  On a store snapshotted
+    /// before the encoder fix (ledger row 107), this returns the inflated value.
+    /// Used by tests to assert that new snapshots are written with the correct
+    /// header value (proving the encoder fix is needed independently of the
+    /// db.rs count fix).
+    #[doc(hidden)]
+    pub fn snapshot_header_edge_count_for_test(&self) -> Option<u64> {
+        self.base
+            .as_ref()
+            .and_then(|b| b.topology().ok())
+            .map(|t| u64::from(t.edge_count))
     }
 
     /// Total number of WAL commits at the time [`open_at`] was called.
