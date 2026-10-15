@@ -56,7 +56,7 @@ The 14 graph tools below are prefixed `Advanced:`.
 ## Repository as a data source
 
 `ingest-git` is supported as a data source. Its store is an ordinary memory
-store: the same twenty-three tools, the same brief, `query` and `recall` over the
+store: the same tools, the same brief, `query` and `recall` over the
 repository as entities. The code-graph door — seven MCP tools, four install
 hooks and ten CLI subcommands that read a repository back as a *code graph* —
 was removed in 0.7; to keep it, pin `mushroomdb@0.6.x`.

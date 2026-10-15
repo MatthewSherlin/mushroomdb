@@ -2135,7 +2135,9 @@ fn the_cli_skills_cypher_rows_run_as_a_shell_runs_them() {
             .split('`')
             .skip(1)
             .step_by(2)
-            .map(str::to_string)
+            // `<db>` is the literal placeholder the CLI table uses for the store
+            // path; replace it with the actual path so the extracted command runs.
+            .map(|s| s.replace("<db>", &db_dir.to_string_lossy()))
             .collect()
     };
     let sh = |command: &str| {
