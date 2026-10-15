@@ -3046,6 +3046,11 @@ impl RuleEngine {
     /// No-op if bytes have already been consumed or were never stored.
     /// Must be called under `&mut self` before any operation that reads or
     /// diffs against `self.provenance`, `self.owned`, or `self.by_node`.
+    ///
+    /// Deduplicate on load: any triple held by more than one rule keeps only
+    /// the first owner in rule-name order (BTree iteration order), which is how
+    /// a fresh build assigns ownership.  This repairs stores snapshotted while
+    /// row 103's double-ownership was live (ledger row 107).
     pub fn ensure_provenance_loaded_mut(&mut self) {
         let bytes = match self
             .retained_provenance_bytes
@@ -3056,7 +3061,20 @@ impl RuleEngine {
             Some(b) => b,
             None => return,
         };
-        let prov = decode_provenance_bytes(&bytes);
+        let mut prov = decode_provenance_bytes(&bytes);
+
+        // Repair: for each triple present in more than one rule's set, keep only
+        // the first owner (BTree key order = alphabetical rule-name order).
+        // A fresh derivation would give the edge to whichever rule fired first,
+        // which in BTree order is the same as alphabetical; this pass is therefore
+        // idempotent against a store that was never damaged.
+        {
+            let mut seen: std::collections::BTreeSet<Triple> = std::collections::BTreeSet::new();
+            for set in prov.values_mut() {
+                set.retain(|triple| seen.insert(*triple));
+            }
+        }
+
         for set in prov.values() {
             self.owned.extend(set.iter().copied());
         }
@@ -3065,6 +3083,42 @@ impl RuleEngine {
         self.by_node = by_node;
         self.rule_intern = rule_intern;
         self.intern_rule = intern_rule;
+    }
+
+    /// Inject a triple into a second rule's provenance, bypassing `GraphMut::add_edge`'s
+    /// base check.  This puts the engine into the state row 103's fix prevents: two
+    /// rules' provenance sets both hold the same triple.  Call `GraphDb::snapshot` after
+    /// this to persist the damaged state for a row-107 repair test.
+    ///
+    /// Panics if `rule_name` is not a live rule.  Must be called after provenance is
+    /// loaded (i.e. after the first mutation or after an explicit `ensure_provenance_loaded_mut`).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn inject_double_ownership_for_test(
+        &mut self,
+        rule_name: &str,
+        etype: u32,
+        src: u32,
+        dst: u32,
+    ) {
+        // The engine must have provenance in its live fields, not still in bytes.
+        assert!(
+            self.retained_provenance_bytes
+                .lock()
+                .expect("lock poisoned")
+                .is_none(),
+            "inject_double_ownership_for_test: call ensure_provenance_loaded_mut first"
+        );
+        let triple = (etype, src, dst);
+        // Insert into the named rule's provenance set.  The triple is already in
+        // `owned` (another rule holds it); that set is a union so no change there.
+        self.provenance
+            .entry(rule_name.to_string())
+            .or_default()
+            .insert(triple);
+        // by_node tracks the rule-id entry; add one for this rule as well.
+        let rid = intern_rule(&mut self.rule_intern, &mut self.intern_rule, rule_name);
+        touch_insert(&mut self.by_node, rid, triple);
     }
 
     /// Eagerly consume retained snapshot state before WAL replay.

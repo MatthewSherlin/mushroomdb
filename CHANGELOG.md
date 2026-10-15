@@ -4,6 +4,20 @@
 
 ### Fixed
 
+- **A store snapshotted while two rules owned one edge is repaired at the first write after open.**
+  On stores written before 0.8.1 (row 103) where a snapshot was taken while two rules both owned
+  the same edge: the double ownership survived in the snapshot's provenance section, the edge count
+  in the snapshot header was one too high per affected edge, and a write that caused the second rule
+  to retract silently removed the edge even though the first rule still wanted it. The first write
+  after opening such a store now deduplicates provenance, keeping the first owner in byte order on
+  rule name; until that write, `stats().rules`, `explain`, and `open_at` still show both owners.
+  The deduped edge keeps the dropped rule's weight property until the edge is next re-derived.
+  The snapshot encoder recounts `edge_count` from the merged CSR rows instead of carrying the header
+  value forward arithmetically, so every new snapshot's header is correct. `stats().edges` and
+  `edge_count()` use the row count rather than the header on stores with a V8 base. Stores where
+  the edge was already lost before this release (the losing write ran on 0.8.0 or 0.8.1) are not
+  repaired; delete and recreate both rules to restore those edges (row 111 will reconcile at the
+  first write automatically) (row 107).
 - **A via-hop top-k rule keeps its next-best edge when its best match was another rule's.** The fix 0.8.1 made for plain top-k rules, now for a via-hop one: when its best match was an edge another rule owned and that match went away — a changed property or the destination deleted — the next-best edge stayed missing until `rebuild_rule` (row 83).
 
 ## v0.8.1 — six rule engine corrections

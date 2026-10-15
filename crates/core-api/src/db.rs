@@ -1837,6 +1837,17 @@ pub struct GraphDb<F: Fs> {
     /// pinned to one commit, so it is never stale and never refreshes — later
     /// commits by any process are deliberately invisible to it.
     pinned: bool,
+    /// Correct edge count for the V8 base, computed at open by summing the
+    /// out-row lengths of every etype in the base CSR.
+    ///
+    /// The snapshot header's `edge_count` field is arithmetic carried forward
+    /// from the previous snapshot, and is wrong on stores snapshotted while two
+    /// rules owned one edge (ledger row 107).  This field replaces it in
+    /// `edge_count()` and `stats()` so the reading path is correct even before
+    /// the store takes a new snapshot.
+    ///
+    /// `None` on stores with no V8 base (WAL-only or V5/V7 snapshot opens).
+    base_edge_count_from_rows: Option<u64>,
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -2461,6 +2472,7 @@ impl<F: Fs> GraphDb<F> {
             holds_lifetime_lock: false,
             lock_denied: false,
             pinned: false,
+            base_edge_count_from_rows: None,
         }
     }
 
@@ -2525,6 +2537,7 @@ impl<F: Fs> GraphDb<F> {
         self.wal_consumed = 0;
         self.wal_frames_written = 0;
         self.snapshot_ident = None;
+        self.base_edge_count_from_rows = None;
     }
 
     /// Load the snapshot base and replay the WAL into an empty handle — the
@@ -3389,6 +3402,25 @@ impl<F: Fs> GraphDb<F> {
             },
             other => other,
         })?;
+
+        // Count edges from the base CSR's actual out-rows rather than trusting
+        // the snapshot header's `edge_count` field, which is wrong on stores
+        // snapshotted while two rules owned one edge (ledger row 107).  The
+        // topology section is already mmap'd; this is a single pass over the
+        // row-length fields with no heap allocation.
+        self.base_edge_count_from_rows = mapped.topology().ok().map(|csr| {
+            csr.etypes
+                .iter()
+                .map(|e| {
+                    e.out_adj
+                        .rows
+                        .iter()
+                        .map(|r| r.neighbors.len() as u64)
+                        .sum::<u64>()
+                })
+                .sum::<u64>()
+        });
+
         Ok(())
     }
 
@@ -3879,6 +3911,59 @@ impl<F: Fs> GraphDb<F> {
             derived_deletes: Vec::new(),
             view_values: Vec::new(),
         }));
+    }
+
+    /// Inject a triple into a second rule's provenance, bypassing `GraphMut::add_edge`'s
+    /// base check, and add the edge to the overlay topology so the next snapshot will
+    /// double-count it in its header.  Together these reproduce the damaged state that
+    /// row 103's fix prevents: two rules each holding the same triple, and an
+    /// `edge_count` that is one too high per duplicated edge.  Call `snapshot()` after
+    /// this to persist the damage for a row-107 repair test.
+    ///
+    /// Panics if either key is not live in this store.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn inject_double_ownership_for_test(
+        &mut self,
+        rule_name: &str,
+        edge_type: &str,
+        src_key: &str,
+        dst_key: &str,
+    ) {
+        // Load the V8 base sections first: without this the engine's retained
+        // provenance bytes are not yet populated, so the mutation call below would
+        // find nothing to decode and the injection would be silently discarded.
+        self.ensure_v8_base_sections_loaded();
+        // Materialize provenance into live fields so the injection is visible to
+        // subsequent writes and to the snapshot encoder.
+        self.engine.ensure_provenance_loaded_mut();
+        let etype = Arc::make_mut(&mut self.syms).intern(edge_type);
+        let src = self.ids.get(src_key).unwrap_or_else(|| {
+            panic!("inject_double_ownership_for_test: src key {src_key:?} not found")
+        });
+        let dst = self.ids.get(dst_key).unwrap_or_else(|| {
+            panic!("inject_double_ownership_for_test: dst key {dst_key:?} not found")
+        });
+        self.engine
+            .inject_double_ownership_for_test(rule_name, etype, src, dst);
+        // Add the edge to the overlay topology so topology_merge_to_csr counts the
+        // base copy (from the prior snapshot) plus this overlay copy — making the
+        // next snapshot's header one too high per duplicated edge.
+        Arc::make_mut(&mut self.topo).add_edge(etype, src, dst);
+    }
+
+    /// The raw `edge_count` field from the current V8 snapshot header, without
+    /// the `corrected_edge_count` row-walk fix applied.  On a store snapshotted
+    /// before the encoder fix (ledger row 107), this returns the inflated value.
+    /// Used by tests to assert that new snapshots are written with the correct
+    /// header value (proving the encoder fix is needed independently of the
+    /// db.rs count fix).
+    #[doc(hidden)]
+    pub fn snapshot_header_edge_count_for_test(&self) -> Option<u64> {
+        self.base
+            .as_ref()
+            .and_then(|b| b.topology().ok())
+            .map(|t| u64::from(t.edge_count))
     }
 
     /// Total number of WAL commits at the time [`open_at`] was called.
@@ -14212,7 +14297,53 @@ impl<F: Fs> GraphDb<F> {
     }
 
     pub fn edge_count(&self) -> u64 {
-        self.topo_view().edge_count()
+        self.corrected_edge_count()
+    }
+
+    /// Total edge count, using the base CSR's actual row lengths when available
+    /// (rather than the snapshot header's `edge_count` field, which is wrong on
+    /// stores snapshotted while two rules owned one edge — ledger row 107).
+    fn corrected_edge_count(&self) -> u64 {
+        match self.base_edge_count_from_rows {
+            // V8 base open: use the count we walked from the CSR rows at open.
+            // Subtract tombstones (overlay deletions of base edges) and add the
+            // overlay's own edges, exactly as TopologyView::edge_count does but
+            // with the correct base count rather than the snapshot header's.
+            Some(base_rows) => {
+                let tombstones = self.topo.tombstone_count();
+                base_rows.saturating_sub(tombstones) + self.topo.edge_count()
+            }
+            // No V8 base (WAL-only store or not yet refreshed): fall back to the
+            // full topology view, which uses the snapshot header's count.  The
+            // header is correct on stores that were never double-owned, so this
+            // path is safe for every store that has not gone through row-107 damage.
+            None => self.topo_view().edge_count(),
+        }
+    }
+
+    /// Re-walk the current base CSR's out-rows to refresh `base_edge_count_from_rows`.
+    ///
+    /// Called after every snapshot write so the cached count stays aligned with the
+    /// new base.  Without this, `corrected_edge_count` would carry the count from
+    /// the previous open while the overlay (reset to empty by `snapshot_with`) is
+    /// no longer the full topology.
+    fn refresh_base_edge_count(&mut self) {
+        self.base_edge_count_from_rows =
+            self.base
+                .as_ref()
+                .and_then(|b| b.topology().ok())
+                .map(|csr| {
+                    csr.etypes
+                        .iter()
+                        .map(|e| {
+                            e.out_adj
+                                .rows
+                                .iter()
+                                .map(|r| r.neighbors.len() as u64)
+                                .sum::<u64>()
+                        })
+                        .sum::<u64>()
+                });
     }
 
     /// Live/tombstone/edge counts plus per-rule provenance size, trip latch,
@@ -14240,7 +14371,7 @@ impl<F: Fs> GraphDb<F> {
         Stats {
             nodes_live: self.ids.live_len(),
             nodes_tombstoned: self.ids.len() - self.ids.live_len(),
-            edges: self.topo_view().edge_count(),
+            edges: self.corrected_edge_count(),
             rules,
             chain_truncations: self.engine.chain_truncations(),
             history_floor: self.wal_horizon_floor,
@@ -14609,6 +14740,9 @@ impl<F: Fs> GraphDb<F> {
             // Clear the overlay and prop tombstones — all data is now in the new base.
             self.topo = Arc::new(Topology::new());
             self.props = Arc::new(core_storage::columns::ColumnStore::new());
+            // Keep the cached edge count aligned with the new base so that
+            // corrected_edge_count() is correct for the rest of this session.
+            self.refresh_base_edge_count();
         } else {
             // Legacy path (V5–V7 stores without a V8 base).
             //
@@ -14702,6 +14836,9 @@ impl<F: Fs> GraphDb<F> {
             self.edge_props = Arc::new(Default::default());
             self.topo = Arc::new(Topology::new());
             self.props = Arc::new(core_storage::columns::ColumnStore::new());
+            // Keep the cached edge count aligned with the new base (same as the
+            // V8 merge path above).
+            self.refresh_base_edge_count();
         }
 
         stopped(SnapshotStop::AfterSnapshotWrite)?;

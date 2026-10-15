@@ -761,3 +761,333 @@ fn a_via_hop_top_k_rule_beside_another_rule_keeps_its_fallback() {
         assert_eq!(got, want, "delete={delete}");
     }
 }
+
+/// Ledger row 107. A store snapshotted while two rules owned one edge keeps
+/// both owners and a wrong `edge_count` header.  The review table (reproduced
+/// as assertions below) shows what breaks on the damaged store; the fix is:
+///
+/// (a) deduplicate provenance at the first write – keeping the first owner in
+///     BTree (byte order on rule name) order – so every triple has exactly one
+///     owner before any subsequent write happens, and
+/// (b) recount `edge_count` in the snapshot encoder by summing the merged
+///     CSR rows directly rather than carrying the header value forward
+///     arithmetically.
+///
+/// The `inject_double_ownership_for_test` hook writes a second rule's claim
+/// onto an edge that is already in the base CSR, then takes a snapshot that
+/// double-counts that edge in the header – reproducing the state that row 103
+/// created on stores written before 0.8.1.
+///
+/// Requires `--features test-hooks` (same gate as the hook on `GraphDb`).
+#[cfg(feature = "test-hooks")]
+#[test]
+fn damaged_store_opened_by_fixed_code_deduplicates_and_recounts() {
+    // Two overlap rules that both fire on n1→n2 (Jaccard = 0.5 ≥ both
+    // thresholds).  "owner1" sorts before "owner2", so the dedup pass keeps
+    // "owner1" as the sole owner on a damaged store.
+    let rules = [
+        rule("owner1", "A", "A", overlap(0.3), None),
+        rule("owner2", "A", "A", overlap(0.5), None),
+    ];
+    let dir = tmp("row107");
+
+    // ── Step 1: build a clean store; both rules derive n1→n2 and n2→n1 ──────
+    let mut db = GraphDb::open(&dir).unwrap();
+    for rd in &rules {
+        db.create_rule(rd.clone()).unwrap();
+    }
+    // tags: Jaccard(n1, n2) = |{x,y}| / |{x,y,z,w}| = 2/4 = 0.5 ≥ both thresholds
+    db.insert_node("A", "n1", vec![("tags".into(), tags(&["x", "y", "z"]))])
+        .unwrap();
+    db.insert_node("A", "n2", vec![("tags".into(), tags(&["x", "y", "w"]))])
+        .unwrap();
+
+    // Both directed edges are derived; each is owned by exactly one rule.
+    let out_n1_clean = db.neighbors("n1", "SAME", Direction::Out).unwrap();
+    let out_n2_clean = db.neighbors("n2", "SAME", Direction::Out).unwrap();
+    assert_eq!(out_n1_clean, vec!["n2"], "clean store: n1→n2 derived");
+    assert_eq!(out_n2_clean, vec!["n1"], "clean store: n2→n1 derived");
+
+    // ── Step 2: snapshot to move the edges into the base CSR ─────────────────
+    db.snapshot().unwrap();
+    drop(db);
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // ── Step 3: inject double ownership on n1→n2 only ────────────────────────
+    // This replicates the pre-0.8.1 condition: "owner2" claims an edge that
+    // "owner1" already owns in the base.  The overlay now has a second copy of
+    // n1→n2, so the next snapshot's header will read edge_count = 3 (one too
+    // many: n1→n2 counted once from base + once from overlay, plus n2→n1).
+    db.inject_double_ownership_for_test("owner2", "SAME", "n1", "n2");
+
+    // ── Step 4: snapshot while double ownership is live ───────────────────────
+    // The encoder's pre-fix arithmetic would carry this inflated count forward.
+    // The fix (recount from merged rows) produces the correct count of 2.
+    db.snapshot().unwrap();
+    drop(db);
+
+    // ── Step 5: open the damaged store ───────────────────────────────────────
+    // With the fix: dedup at the first write removes "owner2"'s duplicate
+    // claim; the corrected_edge_count() path gives the right answer at open.
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // (a) Both edges are still readable – the topology itself is correct.
+    assert_eq!(
+        db.neighbors("n1", "SAME", Direction::Out).unwrap(),
+        vec!["n2"],
+        "damaged store (fixed): n1→n2 is readable after open"
+    );
+    assert_eq!(
+        db.neighbors("n2", "SAME", Direction::Out).unwrap(),
+        vec!["n1"],
+        "damaged store (fixed): n2→n1 is readable after open"
+    );
+
+    // (b) stats().edges must equal the actual neighbor count – not the inflated
+    //     header value.  This covers the review table row:
+    //     "snapshotted, open → edge_count wrong (pre-fix) → correct (post-fix)".
+    let stats_at_open = db.stats();
+    let edge_count_open = stats_at_open.edges;
+    let actual_open: u64 = ["n1", "n2"]
+        .iter()
+        .map(|k| db.neighbors(k, "SAME", Direction::Out).unwrap().len() as u64)
+        .sum();
+    assert_eq!(
+        edge_count_open, actual_open,
+        "damaged store (fixed): stats().edges equals actual neighbor count at open"
+    );
+
+    // (c) Per-rule edge counts at open.  The dedup pass runs lazily at the
+    //     first *write*, not at open, so stats().rules still reflects the
+    //     duplicated state here: owner1 sees 2, owner2 still sees its injected
+    //     duplicate claim of 1.  This is intentional and documented behaviour.
+    let owner1_at_open = stats_at_open
+        .rules
+        .iter()
+        .find(|r| r.name == "owner1")
+        .expect("owner1 present");
+    let owner2_at_open = stats_at_open
+        .rules
+        .iter()
+        .find(|r| r.name == "owner2")
+        .expect("owner2 present");
+    assert_eq!(
+        owner1_at_open.edges, 2,
+        "at open: owner1 reports 2 edges (n1→n2 and n2→n1)"
+    );
+    assert_eq!(
+        owner2_at_open.edges, 1,
+        "at open: owner2 still reports its duplicate claim (dedup deferred to first write)"
+    );
+
+    // ── Step 6: the write that used to lose n1→n2 ────────────────────────────
+    // Change n2's tags so "owner2" no longer qualifies (Jaccard drops to
+    // 1/3 < 0.5) but "owner1" still does (1/3 ≥ 0.3).
+    //
+    // Pre-fix flow with double ownership:
+    //   owner2 retracts n1→n2 → g.topo.remove_edge runs unconditionally →
+    //   reclaim_retracted(owner1) finds prov.contains(triple)=true → skips →
+    //   edge gone from topology forever.
+    //
+    // Post-fix flow after dedup (runs at the start of this write):
+    //   owner2 has no claim on n1→n2; only owner1 does →
+    //   owner2's retract loop finds nothing to retract → edge untouched.
+    db.set_prop("n2", "tags", tags(&["y"])).unwrap();
+
+    // n1→n2: owner1 still wants it (Jaccard(["x","y","z"], ["y"]) = 1/3 ≥ 0.3)
+    assert_eq!(
+        db.neighbors("n1", "SAME", Direction::Out).unwrap(),
+        vec!["n2"],
+        "damaged store (fixed): n1→n2 survives the write that used to lose it"
+    );
+    // n2→n1: same Jaccard from n2's side (1/3 ≥ 0.3) → owner1 still wants it.
+    // Only the n1→n2 edge was double-owned; n2→n1 was always single-owned.
+    assert_eq!(
+        db.neighbors("n2", "SAME", Direction::Out).unwrap(),
+        vec!["n1"],
+        "damaged store (fixed): n2→n1 survives (owner1 threshold 0.3 ≤ 1/3)"
+    );
+
+    // stats().edges still agrees with the actual topology after the write.
+    let stats_after_write = db.stats();
+    let edge_count_after_write = stats_after_write.edges;
+    let actual_after_write: u64 = ["n1", "n2"]
+        .iter()
+        .map(|k| db.neighbors(k, "SAME", Direction::Out).unwrap().len() as u64)
+        .sum();
+    assert_eq!(
+        edge_count_after_write, actual_after_write,
+        "damaged store (fixed): stats().edges equals actual count after write"
+    );
+
+    // Per-rule counts after the write: dedup has now run (inside
+    // ensure_provenance_loaded_mut), so owner2's duplicate claim is gone.
+    let owner1_after = stats_after_write
+        .rules
+        .iter()
+        .find(|r| r.name == "owner1")
+        .expect("owner1 present");
+    let owner2_after = stats_after_write
+        .rules
+        .iter()
+        .find(|r| r.name == "owner2")
+        .expect("owner2 present");
+    assert_eq!(
+        owner1_after.edges, 2,
+        "after write: owner1 still owns n1→n2 and n2→n1"
+    );
+    assert_eq!(
+        owner2_after.edges, 0,
+        "after write: owner2 has 0 edges (dedup removed its duplicate claim)"
+    );
+
+    // ── Step 7: snapshot the repaired state and reopen ───────────────────────
+    // The encoder now recounts from the merged CSR rows, so the new snapshot's
+    // header is correct regardless of the old header's value.
+    db.snapshot().unwrap();
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+
+    assert_eq!(
+        db.neighbors("n1", "SAME", Direction::Out).unwrap(),
+        vec!["n2"],
+        "damaged store (fixed): n1→n2 present after snapshot of repaired state"
+    );
+    let edge_count_after_snap = db.stats().edges;
+    let actual_after_snap: u64 = ["n1", "n2"]
+        .iter()
+        .map(|k| db.neighbors(k, "SAME", Direction::Out).unwrap().len() as u64)
+        .sum();
+    assert_eq!(
+        edge_count_after_snap, actual_after_snap,
+        "damaged store (fixed): stats().edges equals actual count after snapshot round-trip"
+    );
+
+    // The encoder fix: the snapshot that was written in Step 4 (damaged state)
+    // must have a correct header value.  Without the encoder fix, the arithmetic
+    // path (base_count + overlay_count - tombstones) inflates the count by one
+    // for every edge the overlay duplicated from the base — giving 3, not 2.
+    // This assertion reads the raw header value directly (bypassing the
+    // corrected_edge_count row-walk) so it fails if only the encoder is reverted.
+    assert_eq!(
+        db.snapshot_header_edge_count_for_test(),
+        Some(2),
+        "encoder fix: snapshot header edge_count must equal the actual merged row count (2)"
+    );
+}
+
+/// Ledger row 107 — real v0.8.0 fixture.
+///
+/// This store was written by `z1_prefix(&dir, true)` running against the v0.8.0
+/// tag (which had the row-103 bug).  It has two overlap rules — `topk1`
+/// (min=0.3, k=1) and `topk2` (min=0.5, k=2) — over nodes `n0` (tags: x,y,w)
+/// and `n5` (tags: x,y,z).  Jaccard = 0.5, so both thresholds fire.  The
+/// second snapshot was taken after deleting `n6`; at that point the row-103 bug
+/// let both rules claim n0→n5 and n5→n0, inflating the snapshot header's
+/// `edge_count` to 4 (two actual edges, four ownership records).
+///
+/// This test is the proof that the `corrected_edge_count` row-walk fix
+/// (db.rs) is needed independently of the encoder fix: the encoder fix cannot
+/// retroactively correct a snapshot header written by old code, but the row-walk
+/// reads the CSR adjacency data directly and always gives the correct answer.
+#[test]
+fn real_v080_damaged_store_is_repaired_on_open() {
+    // Write the fixture files to a fresh tmpdir.
+    let dir = tmp("row107-v080");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("snapshot.bin"),
+        &include_bytes!("fixtures/v080_snapshotted/snapshot.bin")[..],
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("wal.bin"),
+        &include_bytes!("fixtures/v080_snapshotted/wal.bin")[..],
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("wal.floor"),
+        &include_bytes!("fixtures/v080_snapshotted/wal.floor")[..],
+    )
+    .unwrap();
+
+    // ── Open the damaged store with the fixed code ────────────────────────────
+    let mut db = GraphDb::open(&dir).unwrap();
+
+    // (a) Both edges are readable — topology itself is correct.
+    let n0_out = db.neighbors("n0", "SAME", Direction::Out).unwrap();
+    let n5_out = db.neighbors("n5", "SAME", Direction::Out).unwrap();
+    assert_eq!(n0_out, vec!["n5"], "v080 fixture: n0→n5 readable at open");
+    assert_eq!(n5_out, vec!["n0"], "v080 fixture: n5→n0 readable at open");
+
+    // (b) stats().edges must equal the actual neighbor count.
+    //     The snapshot header says edge_count = 4; the corrected_edge_count
+    //     row-walk gives 2.  This assertion fails if the db.rs fix is reverted.
+    let actual: u64 = ["n0", "n5"]
+        .iter()
+        .map(|k| db.neighbors(k, "SAME", Direction::Out).unwrap().len() as u64)
+        .sum();
+    assert_eq!(
+        db.stats().edges,
+        actual,
+        "v080 fixture: stats().edges must equal actual neighbor count (2), not header (4)"
+    );
+    assert_eq!(actual, 2, "v080 fixture: exactly 2 edges present");
+
+    // (c) The snapshot header itself records the old (wrong) value — 4.
+    //     This is the value the db.rs fix must compensate for.
+    assert_eq!(
+        db.snapshot_header_edge_count_for_test(),
+        Some(4),
+        "v080 fixture: snapshot header is 4 (inflated by row-107 bug)"
+    );
+
+    // ── The write that used to lose n0→n5 ────────────────────────────────────
+    // Drop n5's tags to ["x"]: Jaccard(n0, n5) = |{x}|/|{x,y,z,w}| = 1/3.
+    // topk1 threshold 0.3: 1/3 ≥ 0.3 → topk1 still wants n0→n5.
+    // topk2 threshold 0.5: 1/3 < 0.5 → topk2 stops wanting n0→n5.
+    // Without dedup, topk2's retract would wipe n0→n5 before topk1 could
+    // re-add it; with dedup, topk2 has no claim and the edge is untouched.
+    db.set_prop("n5", "tags", tags(&["x"])).unwrap();
+
+    assert_eq!(
+        db.neighbors("n0", "SAME", Direction::Out).unwrap(),
+        vec!["n5"],
+        "v080 fixture: n0→n5 survives the write that used to lose it"
+    );
+    let actual_after: u64 = ["n0", "n5"]
+        .iter()
+        .map(|k| db.neighbors(k, "SAME", Direction::Out).unwrap().len() as u64)
+        .sum();
+    assert_eq!(
+        db.stats().edges,
+        actual_after,
+        "v080 fixture: stats().edges equals actual count after write"
+    );
+
+    // ── Snapshot round-trip ───────────────────────────────────────────────────
+    db.snapshot().unwrap();
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+
+    assert_eq!(
+        db.neighbors("n0", "SAME", Direction::Out).unwrap(),
+        vec!["n5"],
+        "v080 fixture: n0→n5 present after snapshot round-trip"
+    );
+    let actual_snap: u64 = ["n0", "n5"]
+        .iter()
+        .map(|k| db.neighbors(k, "SAME", Direction::Out).unwrap().len() as u64)
+        .sum();
+    assert_eq!(
+        db.stats().edges,
+        actual_snap,
+        "v080 fixture: stats().edges equals actual count after snapshot round-trip"
+    );
+    // The encoder fix: the new snapshot has a correct header.
+    assert_eq!(
+        db.snapshot_header_edge_count_for_test(),
+        Some(actual_snap),
+        "v080 fixture: snapshot round-trip writes a correct header"
+    );
+}
