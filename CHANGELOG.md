@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.8.1 — six rule engine corrections
+
+No format version change. A 0.8.0 store opens under 0.8.1, and a 0.8.1 store opens under 0.8.0.
+
+**Upgrade if two of your rules derive the same edge type.** Every entry under Fixed is a rule-engine defect in 0.8.0 and earlier, found by running the same writes against a fresh build of the same nodes and comparing. Two of them left `stats` counting derived edges that `neighbors` and queries did not return (rows 103 and 106), one deleted an edge you had written yourself (row 103), and the others left an edge missing or one that should have gone (rows 83, 84, 104, 105). A store that 0.8.0 snapshotted while two rules owned one edge is not repaired by this release: its edge count can stay too high, and the repair is owed to 0.8.2 (row 107). A store whose double ownership is still only in its WAL is repaired when 0.8.1 opens it.
+
+Also here: the skill an assistant reads names the store's path once and fits its budget on a long path, and a memory-shaped run to 1,000,000 nodes is published in `dogfood/results/scale-memory-1m.md`.
+
 
 ### Changed
 
