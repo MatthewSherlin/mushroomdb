@@ -555,3 +555,105 @@ fn a_top_k_rule_beside_a_sibling_always_matches_a_fresh_build() {
     ];
     assert_eq!(fuzz("with-topk", &rules, &["A"], 0..20, 40), AGREES);
 }
+
+/// Ledger row 106. Deleting the node a KeyMatch top-k rule's source names
+/// re-picked that node: the backfill that finds the source's next-best match
+/// read its candidates by key, and the node being deleted still answers to
+/// its key at that point. The edge went back in with its provenance, the
+/// delete then swept it from the graph, and `stats` counted an edge
+/// `neighbors` did not return — where the next-best was there to be taken.
+#[test]
+fn deleting_a_top_k_rules_best_match_promotes_the_next_one() {
+    for k in [1u64, 2] {
+        let dir = tmp(&format!("topk-delete-{k}"));
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.create_rule(rule(
+            "tk",
+            "A",
+            "A",
+            Predicate::KeyMatch {
+                field: "fkl".into(),
+            },
+            Some(k),
+        ))
+        .unwrap();
+        for key in ["n0", "n7"] {
+            db.insert_node("A", key, vec![]).unwrap();
+        }
+        let fks = Value::List(vec![Value::Str("n7".into()), Value::Str("n0".into())]);
+        db.insert_node("A", "s", vec![("fkl".into(), fks)]).unwrap();
+        db.delete_node("n0").unwrap();
+
+        assert_eq!(
+            db.neighbors("s", "SAME", Direction::Out).unwrap(),
+            vec!["n7".to_string()],
+            "k={k}"
+        );
+        let derived: u64 = db.stats().rules.iter().map(|r| r.edges).sum();
+        assert_eq!(derived, 1, "k={k}: the count agrees with the graph");
+    }
+}
+
+/// Ledger row 105. A via-hop rule that links a label to itself, inserting a
+/// second node that hops nowhere: the edge into the new node from a source
+/// that reaches it was derived and then retracted again when the new node
+/// was evaluated as a source, because that evaluation's desired set held its
+/// outgoing edges only. Whether the edge survived depended on the order the
+/// nodes were evaluated in.
+#[test]
+fn a_self_label_via_rule_derives_the_edge_into_a_new_node() {
+    let dir = tmp("self-via-insert");
+    let mut db = GraphDb::open(&dir).unwrap();
+    let mut via = rule("via", "P", "P", overlap(0.6), None);
+    via.via_label = Some("O".into());
+    via.via_edge = Some("WORKS_AT".into());
+    via.via_dir = Some(Direction::Out);
+    db.create_rule(via).unwrap();
+    db.insert_node("P", "n0", vec![("tags".into(), tags(&["y", "w"]))])
+        .unwrap();
+    db.insert_node("O", "n2", vec![("tags".into(), tags(&["y", "z", "w"]))])
+        .unwrap();
+    db.insert_edge("WORKS_AT", "n0", "n2").unwrap();
+    db.insert_node("P", "n5", vec![("tags".into(), tags(&["y", "z"]))])
+        .unwrap();
+    let live = db.neighbors("n0", "SAME", Direction::Out).unwrap();
+    db.rebuild_rule("via").unwrap();
+    let rebuilt = db.neighbors("n0", "SAME", Direction::Out).unwrap();
+    assert_eq!(live, rebuilt);
+    assert!(live.contains(&"n5".to_string()), "{live:?}");
+}
+
+/// Ledger row 104. Deleting a via-hop rule's via node left the edge the rule
+/// had derived through it: the delete retracts edges *touching* the deleted
+/// node, and the via node is on neither end of the edge it carried. The
+/// sources that hopped through it are now evaluated again without it.
+#[test]
+fn deleting_a_via_node_retracts_the_edges_derived_through_it() {
+    for k in [None, Some(1u64)] {
+        let dir = tmp(&format!("via-node-delete-{k:?}"));
+        let mut db = GraphDb::open(&dir).unwrap();
+        let mut via = rule("via", "P", "T", overlap(0.3), k);
+        via.via_label = Some("O".into());
+        via.via_edge = Some("WORKS_AT".into());
+        via.via_dir = Some(Direction::Out);
+        db.create_rule(via).unwrap();
+        db.insert_node("O", "o", vec![("tags".into(), tags(&["x", "y", "w"]))])
+            .unwrap();
+        db.insert_node("P", "p", vec![("tags".into(), tags(&["x"]))])
+            .unwrap();
+        db.insert_node("T", "t", vec![("tags".into(), tags(&["x", "y", "z"]))])
+            .unwrap();
+        db.insert_edge("WORKS_AT", "p", "o").unwrap();
+        assert_eq!(
+            db.neighbors("p", "SAME", Direction::Out).unwrap(),
+            vec!["t".to_string()],
+            "k={k:?}: the fixture derives p->t through o"
+        );
+        db.delete_node("o").unwrap();
+        assert_eq!(
+            db.neighbors("p", "SAME", Direction::Out).unwrap(),
+            Vec::<String>::new(),
+            "k={k:?}"
+        );
+    }
+}
