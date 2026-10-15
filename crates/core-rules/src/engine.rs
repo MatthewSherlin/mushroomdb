@@ -1270,6 +1270,39 @@ fn apply_desired(
     tripped: &mut bool,
     g: &mut GraphMut<'_>,
 ) {
+    apply_desired_scoped(def, desired, retract_touching, false, prov, tripped, g);
+}
+
+/// [`apply_desired`] for a desired set that holds `src`'s outgoing edges only:
+/// it retracts only edges *from* `src`.
+///
+/// A via-hop rule's desired set for a source is computed from the source
+/// outwards. For a rule that links a label to itself the edges of the rule
+/// touching `src` include the ones *into* it, and diffing those against an
+/// outgoing set retracted them — an edge another source had just derived into
+/// `src` went again (ledger rows 84 and 105). Putting the incoming edges into
+/// the desired set instead meant scanning every source for each one, which
+/// made a write to a via node quadratic in its sources.
+fn apply_desired_from(
+    def: &RuleDef,
+    desired: BTreeMap<(u32, u32), f64>,
+    src: u32,
+    prov: &mut ProvSets<'_>,
+    tripped: &mut bool,
+    g: &mut GraphMut<'_>,
+) {
+    apply_desired_scoped(def, desired, Some(src), true, prov, tripped, g);
+}
+
+fn apply_desired_scoped(
+    def: &RuleDef,
+    desired: BTreeMap<(u32, u32), f64>,
+    retract_touching: Option<u32>,
+    outgoing_only: bool,
+    prov: &mut ProvSets<'_>,
+    tripped: &mut bool,
+    g: &mut GraphMut<'_>,
+) {
     let budget = edge_budget(def);
     let et = g.syms.intern(&def.edge_type);
 
@@ -1286,7 +1319,7 @@ fn apply_desired(
                 .get(&n)
                 .into_iter()
                 .flatten()
-                .filter(|(r, t, _, _)| Some(*r) == rid && *t == et)
+                .filter(|(r, t, s, _)| Some(*r) == rid && *t == et && (!outgoing_only || *s == n))
                 .map(|(_, t, s, d)| (*t, *s, *d))
                 .collect()
         }
@@ -3946,26 +3979,13 @@ impl RuleEngine {
                 // A via-hop rule's desired set for `s` is computed along its
                 // hop, exactly as when `s` itself changes (ledger row 84).
                 let doomed = self.doomed;
-                let mut desired = compute_desired_via(
+                let desired = compute_desired_via(
                     &def,
                     self.indexes.get(&rule_name),
                     ViaAnchor::Src(s),
                     doomed,
                     g,
                 );
-                // As a destination too, when the rule links a label to itself:
-                // the retract set below is every edge of the rule touching `s`,
-                // so without these the edges *into* `s` would go.
-                let dst_sym = g.syms.get(&def.dst_label);
-                if def.max_edges.is_none() && dst_sym.is_some() && label == dst_sym {
-                    desired.extend(compute_desired_via(
-                        &def,
-                        self.indexes.get(&rule_name),
-                        ViaAnchor::Dst(s),
-                        doomed,
-                        g,
-                    ));
-                }
                 let mut prov = ProvSets {
                     set: self.provenance.entry(rule_name.clone()).or_default(),
                     owned: &mut self.owned,
@@ -3982,7 +4002,7 @@ impl RuleEngine {
                 } else {
                     let tripped = self.tripped.entry(rule_name.clone()).or_default();
                     if !*tripped {
-                        apply_desired(&def, desired, Some(s), &mut prov, tripped, g);
+                        apply_desired_from(&def, desired, s, &mut prov, tripped, g);
                     }
                 }
             } else if let Some(k) = def.max_edges {
@@ -4241,25 +4261,13 @@ impl RuleEngine {
             let budget = edge_budget(def);
             // Apply per-src so each affected src retracts its stale edges and
             // adds its new desired edges independently.
-            // A rule that links a label to itself retracts, for `src`, every
-            // edge of the rule touching it — into `src` as well as out — so
-            // the edges into it have to be in the desired set too, or an edge
-            // another source has just derived into `src` goes again and the
-            // result depends on the order the sources are taken in (ledger
-            // row 105; the second pass had the same shape, row 84).
-            let self_label = src_sym.is_some() && src_sym == dst_sym;
+            // Only the source's outgoing edges are retracted: its desired set
+            // is computed from it outwards, and for a rule that links a label
+            // to itself the edges into it belong to the other sources (ledger
+            // row 105; `apply_desired_from`).
             for src in affected_srcs {
-                let mut desired_src =
+                let desired_src =
                     compute_desired_via(def, rule_index, ViaAnchor::Src(src), doomed, g);
-                if self_label && g.labels.get(src as usize).copied() == dst_sym {
-                    desired_src.extend(compute_desired_via(
-                        def,
-                        rule_index,
-                        ViaAnchor::Dst(src),
-                        doomed,
-                        g,
-                    ));
-                }
                 if !*tripped {
                     let mut prov = ProvSets {
                         set: self.provenance.entry(rule_name.to_string()).or_default(),
@@ -4271,7 +4279,7 @@ impl RuleEngine {
                         emit: self.emit_deltas,
                         retracted: &mut self.retracted,
                     };
-                    apply_desired(def, desired_src, Some(src), &mut prov, tripped, g);
+                    apply_desired_from(def, desired_src, src, &mut prov, tripped, g);
                 }
                 // If budget was just tripped inside apply_desired, stop adding
                 // but continue retracting stale edges for already-processed srcs
@@ -4371,22 +4379,8 @@ impl RuleEngine {
 
             // Recompute derived edges for rule_src — its via-hop set just changed.
             *self.fires.entry(rule_name.clone()).or_default() += 1;
-            let mut desired_src =
+            let desired_src =
                 compute_desired_via(&def, None, ViaAnchor::Src(rule_src), self.doomed, g);
-            // The edges into `rule_src` as well, for a rule that links a label
-            // to itself: `apply_desired` retracts every edge of the rule that
-            // touches it (ledger row 105).
-            let dst_sym = g.syms.get(&def.dst_label);
-            if def.max_edges.is_none() && dst_sym.is_some() && g.syms.get(&def.src_label) == dst_sym
-            {
-                desired_src.extend(compute_desired_via(
-                    &def,
-                    None,
-                    ViaAnchor::Dst(rule_src),
-                    self.doomed,
-                    g,
-                ));
-            }
 
             if let Some(k) = def.max_edges {
                 let mut prov = ProvSets {
@@ -4413,7 +4407,7 @@ impl RuleEngine {
                     emit: self.emit_deltas,
                     retracted: &mut self.retracted,
                 };
-                apply_desired(&def, desired_src, Some(rule_src), &mut prov, tripped, g);
+                apply_desired_from(&def, desired_src, rule_src, &mut prov, tripped, g);
             }
         }
 
@@ -4637,7 +4631,17 @@ impl RuleEngine {
         for (rule_name, src) in via_srcs {
             let def = self.rules[&rule_name].clone();
             let doomed = self.doomed;
-            let mut desired = compute_desired_via(&def, None, ViaAnchor::Src(src), doomed, g);
+            // Through the rule's index, as any other re-evaluation of a via
+            // source: without it every source scanned every destination,
+            // and deleting a via node that 50,000 sources hop through took
+            // minutes.
+            let desired = compute_desired_via(
+                &def,
+                self.indexes.get(&rule_name),
+                ViaAnchor::Src(src),
+                doomed,
+                g,
+            );
             let mut prov = ProvSets {
                 set: self.provenance.entry(rule_name.clone()).or_default(),
                 owned: &mut self.owned,
@@ -4652,20 +4656,8 @@ impl RuleEngine {
                 let top_k = filter_src_top_k(desired, k, g.ids);
                 apply_per_src_top_k(&def, src, top_k, &mut prov, g);
             } else {
-                // The edges into `src` too, for a rule that links a label to
-                // itself (rows 84 and 105).
-                let dst_sym = g.syms.get(&def.dst_label);
-                if dst_sym.is_some() && g.syms.get(&def.src_label) == dst_sym {
-                    desired.extend(compute_desired_via(
-                        &def,
-                        None,
-                        ViaAnchor::Dst(src),
-                        doomed,
-                        g,
-                    ));
-                }
                 let tripped = self.tripped.entry(rule_name.clone()).or_default();
-                apply_desired(&def, desired, Some(src), &mut prov, tripped, g);
+                apply_desired_from(&def, desired, src, &mut prov, tripped, g);
             }
         }
 
