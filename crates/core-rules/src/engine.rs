@@ -4258,6 +4258,25 @@ impl RuleEngine {
                 .map(|(_, _, s, _)| *s)
                 .collect();
             affected_srcs.extend(old_srcs);
+            // A top-k rule's best match may be an edge into `n` another rule
+            // owns: it records nothing for it and gives up its next-best, so
+            // its provenance does not lead back to the source when `n` stops
+            // matching. The edge in the graph does (ledger row 83, the
+            // via-hop half; the plain path has done this since 0.8.1).
+            // Bounded by `n`'s in-degree over the rule's edge type, and only
+            // for top-k rules: a plain rule keeps no next-best to lose.
+            if def.max_edges.is_some() {
+                let src_label_sym = g.syms.get(&def.src_label);
+                let in_srcs: Vec<u32> = g.neighbors(et, core_storage::Direction::In, n).to_vec();
+                for s in in_srcs {
+                    if s != n
+                        && g.labels.get(s as usize).copied() == src_label_sym
+                        && rule_sees(def, s, g)
+                    {
+                        affected_srcs.insert(s);
+                    }
+                }
+            }
         }
 
         // For each affected src, compute desired_via(Src) and apply.
@@ -4542,7 +4561,7 @@ impl RuleEngine {
         // its own next-best, and has no provenance here to say so (ledger row
         // 83). Read from the graph while the edges are still in it.
         for (rule_name, def) in &self.rules {
-            if def.max_edges.is_none() || def.via_label.is_some() {
+            if def.max_edges.is_none() {
                 continue;
             }
             if self.pending_builds.contains_key(rule_name) {
@@ -4560,7 +4579,10 @@ impl RuleEngine {
                 if *s != n
                     && g.labels.get(*s as usize).copied() == src_sym
                     && rule_sees(def, *s, g)
-                    && pair_matched_before(def, *s, n, None, g)
+                    // A via-hop rule's predicate holds between a via node
+                    // and the destination, not the source; it is not
+                    // guarded here (row 83's via-hop half).
+                    && (def.via_label.is_some() || pair_matched_before(def, *s, n, None, g))
                 {
                     topk_backfill.insert((rule_name.clone(), *s));
                 }

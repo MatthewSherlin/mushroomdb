@@ -719,3 +719,45 @@ fn top_k_rules_edges_are_readable_after_a_snapshot_round_trip() {
         .sum::<u64>();
     assert_eq!(counted, present, "every edge a rule counts is in the graph");
 }
+
+/// Ledger row 83, the via-hop half. A via-hop top-k rule whose best match is
+/// an edge another rule owns records nothing for it and gives up its own
+/// next-best; when that match stops matching, or is deleted, the next-best
+/// has to come back. `p->t1` is the claim rule's; the via-hop top-k rule
+/// would take `p->t1` and, with it gone, `p->t2`.
+#[test]
+fn a_via_hop_top_k_rule_beside_another_rule_keeps_its_fallback() {
+    for delete in [false, true] {
+        let dir = tmp(&format!("via-topk-fallback-{delete}"));
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("P", "p", vec![("fk".into(), Value::Str("t1".into()))])
+            .unwrap();
+        db.insert_node("O", "o", vec![("tags".into(), tags(&["x", "y"]))])
+            .unwrap();
+        db.insert_node("T", "t1", vec![("tags".into(), tags(&["x", "y"]))])
+            .unwrap();
+        db.insert_node("T", "t2", vec![("tags".into(), tags(&["x"]))])
+            .unwrap();
+        db.insert_edge("WORKS_AT", "p", "o").unwrap();
+        db.create_rule(rule("aclaim", "P", "T", claim(), None))
+            .unwrap();
+        let mut via = rule("viatopk", "P", "T", overlap(0.3), Some(1));
+        via.via_label = Some("O".into());
+        via.via_edge = Some("WORKS_AT".into());
+        via.via_dir = Some(Direction::Out);
+        db.create_rule(via).unwrap();
+        if delete {
+            db.delete_node("t1").unwrap();
+        } else {
+            db.set_prop("t1", "tags", tags(&["q"])).unwrap();
+        }
+        let mut got = db.neighbors("p", "SAME", Direction::Out).unwrap();
+        got.sort();
+        let want: Vec<String> = if delete {
+            vec!["t2".into()]
+        } else {
+            vec!["t1".into(), "t2".into()]
+        };
+        assert_eq!(got, want, "delete={delete}");
+    }
+}

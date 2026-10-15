@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A via-hop top-k rule keeps its next-best edge when its best match was another rule's.** The fix 0.8.1 made for plain top-k rules, now for a via-hop one: when its best match was an edge another rule owned and that match went away — a changed property or the destination deleted — the next-best edge stayed missing until `rebuild_rule` (row 83).
+
 ## v0.8.1 — six rule engine corrections
 
 No format version change. A 0.8.0 store opens under 0.8.1, and a 0.8.1 store opens under 0.8.0.
