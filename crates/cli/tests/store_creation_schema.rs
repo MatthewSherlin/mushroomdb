@@ -423,15 +423,16 @@ fn applying_the_schema_twice_is_not_an_error() {
 // The census
 // ---------------------------------------------------------------------------
 
-/// Every spelling of "open a store" in the CLI crate. A prefix match, so
+/// Every spelling of "open a store" across the workspace.  A prefix match, so
 /// `GraphDb::open` also covers `open_with_options`, `open_at` and
 /// `open_unlocked`, and `SharedDb::open` every `SharedDb` constructor.
-const OPENS: [&str; 2] = ["GraphDb::open", "SharedDb::open"];
+/// `CoreDb::open` catches the Python binding's `GraphDb as CoreDb` import alias.
+const OPENS: [&str; 3] = ["GraphDb::open", "SharedDb::open", "CoreDb::open"];
 
 /// Functions that open a store read-write with no schema, on purpose. Each is
-/// a general-purpose command whose documented behaviour is to operate on
-/// whatever store it is pointed at; giving it a memory schema would change what
-/// the command means. A name here that no longer exists fails the census.
+/// either a general-purpose command whose documented behaviour is to operate on
+/// whatever store it is pointed at, or an internal implementation that the CLI
+/// and bindings share. A name here that no longer exists fails the census.
 const ALLOWLIST: &[(&str, &str)] = &[
     (
         "run_query",
@@ -474,6 +475,18 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "check_store_and_lock",
         "doctor's write-lock probe, run only after the read-only open above \
          it succeeded on the same store; drops the handle unwritten",
+    ),
+    (
+        "open",
+        "SharedDb::open's low-level implementation (wraps GraphDb::open_unlocked \
+         into a multi-reader handle; callers that create a store apply the schema) \
+         and the Python binding's GraphDb.open (schema is the caller's \
+         responsibility — ledger row 55)",
+    ),
+    (
+        "open_with_test_sync",
+        "test-only SharedDb constructor for injecting a WAL sync function; \
+         applies no schema because callers configure the store separately",
     ),
 ];
 
@@ -556,21 +569,62 @@ fn opens_read_only(lines: &[&str], i: usize) -> bool {
 }
 
 fn census() -> (Vec<Site>, Vec<String>) {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&src)
-        .expect("read src")
-        .map(|e| e.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .collect();
-    files.sort();
+    // The census walks the workspace root rather than only the CLI crate's src/
+    // so that a store opened in another crate or binding is also counted.
+    // CARGO_MANIFEST_DIR = <workspace>/crates/cli → two levels up = workspace.
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent() // <workspace>/crates/cli → <workspace>/crates
+        .and_then(|p| p.parent()) // <workspace>/crates → <workspace>
+        .expect("CARGO_MANIFEST_DIR must be at least two levels deep");
+
+    // Collect the direct *.rs children of a src/ directory, paired with their
+    // workspace-relative paths.  Nested module directories are deliberately
+    // excluded — the same scope the original scan used for crates/cli/src/.
+    let collect_src = |dir: &Path, prefix: &str| -> Vec<(PathBuf, String)> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .map(|p| {
+                let fname = p.file_name().unwrap().to_string_lossy().to_string();
+                (p, format!("{prefix}/{fname}"))
+            })
+            .collect()
+    };
+
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    if let Ok(crates) = std::fs::read_dir(workspace.join("crates")) {
+        for e in crates.filter_map(|e| e.ok()) {
+            let name = e.file_name().to_string_lossy().to_string();
+            files.extend(collect_src(
+                &e.path().join("src"),
+                &format!("crates/{name}/src"),
+            ));
+        }
+    }
+    if let Ok(bindings) = std::fs::read_dir(workspace.join("bindings")) {
+        for e in bindings.filter_map(|e| e.ok()) {
+            let name = e.file_name().to_string_lossy().to_string();
+            files.extend(collect_src(
+                &e.path().join("src"),
+                &format!("bindings/{name}/src"),
+            ));
+        }
+    }
+    files.sort_by(|(_, a), (_, b)| a.cmp(b));
+
     assert!(
-        files.iter().any(|p| p.ends_with("install.rs")),
-        "the census must see install.rs"
+        files
+            .iter()
+            .any(|(_, rel)| rel == "crates/cli/src/install.rs"),
+        "the census must see crates/cli/src/install.rs"
     );
+
     let mut sites = Vec::new();
     let mut functions = Vec::new();
-    for path in files {
-        let rel = path.file_name().unwrap().to_string_lossy().to_string();
+    for (path, rel) in files {
         let text = std::fs::read_to_string(&path).expect("read source");
         let lines: Vec<&str> = text.lines().collect();
         let mut i = 0;
@@ -636,13 +690,10 @@ fn census() -> (Vec<Site>, Vec<String>) {
 ///
 /// **Known blind spots.** The tree is clean of each today; none is guarded:
 ///
-/// - It reads only the top-level `crates/cli/src/*.rs` files. A nested module
-///   (`src/foo/bar.rs`) is not scanned.
+/// - It reads only the direct `*.rs` children of each crate's `src/` directory.
+///   A file in a nested module directory (`src/foo/bar.rs`) is not scanned.
 /// - It matches the spellings in [`OPENS`] by text, so it does not see an open
-///   through an alias (`type Db = GraphDb<…>; Db::open(…)`) or through a
-///   turbofish (`GraphDb::<F>::open`).
-/// - It sees the CLI crate alone. A store created outside it — the Python
-///   binding's, for one — is not counted.
+///   through an alias it does not know (e.g., turbofish `GraphDb::<F>::open`).
 #[test]
 fn every_store_creating_call_site_applies_a_schema() {
     let (sites, functions) = census();
@@ -668,7 +719,9 @@ fn every_store_creating_call_site_applies_a_schema() {
         );
     }
     assert!(
-        !sites.iter().any(|s| s.at.starts_with("install.rs:")),
+        !sites
+            .iter()
+            .any(|s| s.at.contains("crates/cli/src/install.rs:")),
         "install.rs opens a store — this plan says it does not:\n{listing}"
     );
     for (name, reason) in ALLOWLIST {

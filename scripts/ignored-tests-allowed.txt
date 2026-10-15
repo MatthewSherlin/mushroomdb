@@ -1,0 +1,61 @@
+# Allow-list for #[ignore]d tests that are intentionally never run by any CI
+# workflow.  One entry per line:
+#
+#   crate/path/to/file.rs::fn_name — reason
+#
+# The reason is taken verbatim from the #[ignore = "…"] string or from the
+# test's doc comment.  "no reason given in the source" means neither was
+# present.  Add a new entry here (with a one-line reason) rather than leaving
+# a never-run ignored test invisible.
+
+# hnsw_scale.rs — gated on MUSHROOMDB_BENCH_HNSW=1; too slow for CI
+core-rules/tests/hnsw_scale.rs::adjacency_bytes_per_node_is_within_the_ceiling — slow: builds a 50k-vector index; set MUSHROOMDB_BENCH_HNSW=1
+core-rules/tests/hnsw_scale.rs::total_bytes_per_node_is_within_the_ceiling — slow: builds a 50k-vector index; set MUSHROOMDB_BENCH_HNSW=1
+core-rules/tests/hnsw_scale.rs::build_growth_2k_to_10k_is_under_8x — slow: builds a 50k-vector index; set MUSHROOMDB_BENCH_HNSW=1
+core-rules/tests/hnsw_scale.rs::build_growth_10k_to_50k_is_under_8x — slow: builds a 50k-vector index; set MUSHROOMDB_BENCH_HNSW=1
+core-rules/tests/hnsw_scale.rs::build_50k_is_under_300s — slow: builds a 50k-vector index; set MUSHROOMDB_BENCH_HNSW=1
+core-rules/tests/hnsw_scale.rs::update_cost_2k_to_50k_is_under_3x — slow: builds a 50k-vector index; set MUSHROOMDB_BENCH_HNSW=1
+core-rules/tests/hnsw_scale.rs::update_50k_is_under_25ms — slow: builds a 50k-vector index; set MUSHROOMDB_BENCH_HNSW=1
+core-rules/tests/hnsw_scale.rs::hnsw_memory_per_node_5k_1536 — slow: builds a 5k-vector index at 1536-D
+
+# hnsw.rs — slow unit tests
+core-rules/src/hnsw.rs::remove_is_not_a_full_scan — slow: builds a 5k index
+
+# engine.rs — forks ps; result is environment-dependent
+core-rules/src/engine.rs::streaming_peak_transient_bound — forks ps, environment-dependent
+
+# mcp.rs — very large store; too slow for CI
+server/tests/mcp.rs::analyze_and_suggest_stay_bounded_on_a_100k_node_store — builds a 100,000-node store; run in release with --ignored
+
+# group_commit.rs — throughput benches; machine-dependent output
+core-api/tests/group_commit.rs::group_commit_throughput_bench — no reason given in the source
+core-api/tests/group_commit.rs::group_commit_simfs_amortization_bench — no reason given in the source
+
+# rbac.rs — measurement only, nothing is asserted
+core-api/tests/rbac.rs::mask_memo_cost_before_and_after — measurement, printed not asserted
+
+# mvcc.rs — wall-clock sensitive stress test
+core-api/tests/mvcc.rs::mvcc_concurrent_reads_during_writes — stress test, wall-clock sensitive
+
+# query.rs — rule backfill is too slow at this scale
+core-api/tests/query.rs::harness_industry_alignment_timing — rule backfill takes ~2–5 s at this scale
+
+# memory_brief.rs — timing probe; requires MUSHROOMDB_BENCH_STORE env var
+core-api/tests/memory_brief.rs::memory_brief_bench_on_large_store — no reason given in the source
+
+# shared_edge_rules.rs — known defects tracked in the ledger
+core-api/tests/shared_edge_rules.rs::a_via_rule_takes_an_edge_a_plain_rule_retracted — ledger row 84: a via-hop rule does not take an edge a plain rule retracted
+core-api/tests/shared_edge_rules.rs::a_top_k_rule_beside_a_sibling_always_matches_a_fresh_build — ledger row 83: a top-k rule beside another rule over the same edge loses its fallback
+
+# mask_bench.rs — large store; machine-dependent timings
+core-api/tests/mask_bench.rs::mask_paths_measured — builds a 200k-node store and prints machine-dependent timings; run it with --ignored
+
+# edges_at.rs — timing probes; require MUSHROOMDB_BENCH_STORE env var
+core-api/tests/edges_at.rs::edges_at_bench_on_large_store — timing probe on a real store; requires MUSHROOMDB_BENCH_STORE env var
+core-api/tests/edges_at.rs::what_if_bench_on_large_store — timing probe for what_if_set_prop; requires MUSHROOMDB_BENCH_STORE env var
+
+# hnsw_open.rs — timing bench; gated on MUSHROOM_BENCH_HNSW_OPEN=1
+core-api/tests/hnsw_open.rs::bench_open_2k_embeddings — timing bench: set MUSHROOM_BENCH_HNSW_OPEN=1
+
+# f9_bench.rs — very slow; asserts nothing
+core-api/tests/f9_bench.rs::f9_measure — a ~13-minute benchmark that asserts nothing; run it with --ignored

@@ -464,7 +464,7 @@ the rendered digest for the report.
 Every tool's arguments, with their types and which are required, are in the generated
 [MCP tools](mcp-tools.md) reference. The tables here say what each tool is for.
 
-The fourteen tools below are the graph API itself. Their `tools/list`
+The graph tools below are the graph API itself. Their `tools/list`
 descriptions all begin `Advanced:`, which marks them as the lower-level surface
 beneath the task tools above.
 
