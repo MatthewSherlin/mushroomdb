@@ -180,14 +180,12 @@ fn project_install_writes_npx_entry_and_hooks() {
         ])
     );
 
-    // The skill is rendered with the same command, pre-quoted so a copy-paste
-    // line works under a path with a space in it.
+    // The skill is rendered with the npx command.  The db path uses the `<db>`
+    // placeholder (ledger row 68: five of six occurrences replaced to keep the
+    // rendered skill under 6,000 bytes at long absolute paths).
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
     assert!(
-        skill.contains(&format!(
-            "npx -y mushroomdb@{VERSION} ingest-git '{}' .",
-            db.display()
-        )),
+        skill.contains(&format!("npx -y mushroomdb@{VERSION} ingest-git '<db>' .")),
         "skill bootstrap does not use the npx command"
     );
     assert!(!skill.contains("{{BIN}}"), "unsubstituted BIN placeholder");
@@ -758,14 +756,13 @@ fn explicit_command_is_used_verbatim_and_shell_quoted() {
         format!("'{}' recall '{}'", bin.display(), db.display())
     );
 
-    // Skill: the same quoted form, so its copy-paste lines survive the space.
+    // Skill: the binary is quoted for its space; the db path is a `<db>`
+    // placeholder (five of the six path occurrences in the template were
+    // replaced with the literal `<db>` to keep the rendered skill under the
+    // 6,000-byte cap at long absolute paths — ledger row 68).
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
     assert!(
-        skill.contains(&format!(
-            "'{}' ingest-git '{}' .",
-            bin.display(),
-            db.display()
-        )),
+        skill.contains(&format!("'{}' ingest-git '<db>' .", bin.display())),
         "skill bootstrap is not shell-safe"
     );
 }
@@ -791,12 +788,14 @@ fn on_path_real_binary_keeps_bare_name() {
         serde_json::json!(["mcp", db.to_str().unwrap()])
     );
 
-    // A bare name needs no quoting anywhere.
+    // A bare name needs no quoting anywhere.  The db path uses the `<db>`
+    // placeholder (ledger row 68: five of six occurrences replaced to keep the
+    // rendered skill under 6,000 bytes at long absolute paths).
     let skill = read(&root, ".claude/skills/mushroom/SKILL.md");
-    assert!(skill.contains(&format!("mushroomdb ingest-git '{}' .", db.display())));
+    assert!(skill.contains("mushroomdb ingest-git '<db>' ."));
     assert!(!skill.contains("{{BIN}}"));
     let rules = read(&root, ".cursor/rules/mushroom.mdc");
-    assert!(rules.contains(&format!("mushroomdb ingest-git '{}' .", db.display())));
+    assert!(rules.contains("mushroomdb ingest-git '<db>' ."));
     assert!(!rules.contains("{{BIN}}"));
     let s: serde_json::Value = serde_json::from_str(&read(&root, ".claude/settings.json")).unwrap();
     assert_eq!(
@@ -2698,13 +2697,24 @@ fn every_delivery_variant_names_every_tool_and_fits_the_budget() {
     )
     .expect("skill template");
 
+    // A realistic absolute store path: install writes the real absolute path,
+    // not a relative one, so the budget must hold at production-length paths.
+    // `./mushroom-memory` is 17 bytes — a path of 24 bytes or more was already
+    // over the old cap (6 repetitions × 6 extra bytes each = 36).
+    let long_db = "/Users/alice-the-developer/work/projects/very-interesting-project/services/backend-api/mushroom-memory";
+    assert!(
+        long_db.len() >= 100,
+        "test path must be at least 100 bytes to stress the cap, got {}",
+        long_db.len()
+    );
+
     for delivery in [Delivery::Mcp, Delivery::Cli, Delivery::Both] {
         let label = format!("{delivery:?}").to_lowercase();
         // Rendered the way the plugin copy is, which is the longest `{{BIN}}`
         // any variant ever carries and so the only worst case worth budgeting.
         let skill = cli::install::render_template(
             &template,
-            "./mushroom-memory",
+            long_db,
             &format!("npx -y mushroomdb@{VERSION}"),
             delivery,
         )

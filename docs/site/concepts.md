@@ -210,7 +210,7 @@ Three ways to find a node without knowing its key.
 | tripped | Of a rule: it reached its ceiling on derived edges and stopped adding more |
 | auto-FK | A `KeyMatch` rule made for you at ingest, when a field ending in `_id` holds another label's keys |
 | top-k, `max_edges` | Keep only the k best-scoring edges for each source node |
-| task tools, graph tools | Over MCP: the eleven tools that answer a question in prose, and the fourteen that reach the store directly |
+| task tools, graph tools | Over MCP: the task tools that answer a question in prose, and the graph tools that reach the store directly |
 | the brief | The store's schema in one block, given to an assistant when a session starts |
 | the digest | The short text a task tool answers with |
 | provisional | Of an entity: created because something mentioned it, before anything described it |

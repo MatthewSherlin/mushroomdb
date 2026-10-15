@@ -43,6 +43,10 @@ CLAIM_FILES=(
   scripts/plugin-templates/plugin.json.tmpl
   scripts/plugin-templates/marketplace.json.tmpl
   docs/landing/index.html
+  # The Python binding ships product-facing prose: README and type-stub docs.
+  # Not scanning bindings/ is the same blind spot as not scanning the plugin —
+  # a retired claim in a binding README is just as visible to a reader.
+  bindings/python/README.md
 )
 while IFS= read -r f; do CLAIM_FILES+=("$f"); done < <(ls docs/site/*.md)
 # The skill files carry product-facing copy too — a retired claim reads the same
@@ -64,6 +68,10 @@ CLAIM_PATTERNS=(
   # A release named in prose. No scan can keep "vX.Y.Z is the current release"
   # current, and it went stale twice; name the releases page instead.
   'v?[0-9]+\.[0-9]+\.[0-9]+[[:space:]]+is[[:space:]]+the[[:space:]]+current[[:space:]]+release'
+  # Spelled-out tool counts become stale when the tool list changes, the same
+  # way a numeral would.  "Seventeen tools" (or "twenty-three above") in a
+  # product file cannot be kept current by tooling, so it should never appear.
+  '(eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty-[a-z]+|thirty)[[:space:]]+(tools?|above)'
 )
 
 GREP_PATTERNS=(
@@ -74,11 +82,17 @@ GREP_PATTERNS=(
 # Two hand-unrolled scans rather than one generic function taking array names:
 # `local -n` (nameref) needs bash 4.3+, and stock macOS `/bin/bash` is 3.2.57.
 scan_claim_files() {
-  local f p
+  local f p stripped
   for f in "${CLAIM_FILES[@]}"; do
     [[ -f "$f" ]] || continue
+    # Strip /* ... */ block comment interiors before scanning so that
+    # deprecated or archived text inside a CSS, JS or similar comment does not
+    # fire the gate.  Newlines inside a block comment are preserved so that
+    # grep's -n line numbers remain correct.
+    stripped="$(perl -0777 -pe \
+      's{/\*.*?\*/}{ my $s=$&; $s=~s/[^\n]//g; $s }ges' "$f")"
     for p in "${CLAIM_PATTERNS[@]}"; do
-      if grep -nEi "$p" "$f"; then
+      if printf '%s\n' "$stripped" | grep -nEi "$p"; then
         echo "check-claims.sh: $f matches the retired-claim pattern /$p/" >&2
         fail=1
       fi

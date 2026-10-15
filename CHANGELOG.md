@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **The skill names the store's path once.** The skill an assistant re-reads on every turn spelled the store's absolute path out six times, so on a typical project path it ran past its 6,000-byte budget; the commands it shows now write the store as `'<db>'` and the path is given once. The test that holds the skill to its budget renders a 102-byte path where it rendered a 17-byte one (row 68).
+
 ### Fixed
 
 - **A top-k rule keeps its next-best edge when its best match was another rule's.** Two rules over the same labels and edge type, one of them top-k: when the top-k rule's best match for a source was an edge the other rule already owned, it recorded nothing and dropped its own next-best edge, and when that match went away — a changed property or the destination deleted — the next-best edge stayed missing until `rebuild_rule`. Not yet for a via-hop top-k rule (row 83, in part).

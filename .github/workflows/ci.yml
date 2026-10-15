@@ -22,9 +22,9 @@ jobs:
       - run: target/debug/examples/embed_basics
       - run: target/debug/examples/embed_batch
       - run: target/debug/examples/embed_shared
-      # Informational, never a failure: prints how many #[ignore]d tests exist
-      # against how many any workflow actually names. Added because 20 of 28
-      # ran nowhere, including every memory-ceiling and scale-growth assertion.
+      # Counts #[ignore]d tests against how many any workflow actually names.
+      # Exits 1 if a test is neither named in a workflow nor listed in
+      # scripts/ignored-tests-allowed.txt. Added because 20 of 28 ran nowhere.
       - run: bash scripts/ignored-test-census.sh
       # Multi-process suite: spawns the `mp_worker` helper binary, which only
       # exists behind the `mp-test` feature (so a plain workspace test run never
@@ -569,6 +569,10 @@ jobs:
       # release plan. It also now refuses a DEFERRED row whose target release
       # has already shipped, which row 36 had done for two tags.
       - run: bash scripts/check-defect-ledger.sh
+      # Every #[ignore]d test must be either named in a workflow or listed in
+      # scripts/ignored-tests-allowed.txt with a one-line reason.  Catches a
+      # test added as #[ignore] with no intent to ever run it.
+      - run: bash scripts/ignored-test-census.sh
 
   # The published site, built exactly as pages.yml builds it. Without this a
   # page that does not render, or a landing-page link to nothing, is found by
