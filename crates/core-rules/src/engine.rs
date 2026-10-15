@@ -154,13 +154,19 @@ impl GraphMut<'_> {
     /// edge was counted twice, and when the second rule let go of it the edge
     /// went from the graph while the first rule still counted it (ledger row
     /// 103). Every derived-edge insert in the engine goes through here.
+    ///
+    /// A binary search of the base row and a tombstone lookup, not a merge of
+    /// the row: building the merged row for each insert made re-deriving a
+    /// hub's out-edges after a snapshot quadratic in its degree.
     pub fn add_edge(&mut self, etype: u32, src: u32, dst: u32) -> bool {
-        if self.base_topo.is_some()
-            && self
-                .neighbors(etype, core_storage::Direction::Out, src)
-                .contains(&dst)
-        {
-            return false;
+        if let Some(base) = self.base_topo {
+            let tombstoned = self
+                .topo
+                .out_tombstones_for(etype, src)
+                .is_some_and(|t| t.contains(&dst));
+            if !tombstoned && core_storage::v8::seam::base_has_out_edge(base, etype, src, dst) {
+                return false;
+            }
         }
         self.topo.add_edge(etype, src, dst)
     }

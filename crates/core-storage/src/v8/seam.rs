@@ -189,6 +189,17 @@ fn archived_csr_row(
     Some(&adj.rows[row_pos])
 }
 
+/// Whether the snapshot's base holds the edge `src -> dst` of `etype`, by a
+/// binary search of `src`'s sorted out-row. Overlay tombstones are the
+/// caller's to check: this reads the base alone.
+pub fn base_has_out_edge(base: &ArchivedCsr, etype: u32, src: u32, dst: u32) -> bool {
+    archived_csr_row(base, etype, Direction::Out, src).is_some_and(|row| {
+        row.neighbors
+            .binary_search_by_key(&dst, |n| u32::from(*n))
+            .is_ok()
+    })
+}
+
 /// Archived neighbour count without collecting ids.
 fn archived_row_degree(base: &ArchivedCsr, etype: u32, dir: Direction, v: u32) -> usize {
     archived_csr_row(base, etype, dir, v)
