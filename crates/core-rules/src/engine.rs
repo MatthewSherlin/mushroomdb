@@ -144,6 +144,33 @@ pub struct GraphMut<'a> {
 }
 
 impl GraphMut<'_> {
+    /// Add a derived edge, reporting whether it was not there before —
+    /// counting the snapshot's edges as well as the overlay's.
+    ///
+    /// `Topology::add_edge` looks at the overlay alone. On a store opened from
+    /// a snapshot, an edge one rule derived before the snapshot lives in the
+    /// base, so a second rule over the same edge type that desires it was told
+    /// it was new: it recorded the edge as its own beside the first rule, the
+    /// edge was counted twice, and when the second rule let go of it the edge
+    /// went from the graph while the first rule still counted it (ledger row
+    /// 103). Every derived-edge insert in the engine goes through here.
+    ///
+    /// A binary search of the base row and a tombstone lookup, not a merge of
+    /// the row: building the merged row for each insert made re-deriving a
+    /// hub's out-edges after a snapshot quadratic in its degree.
+    pub fn add_edge(&mut self, etype: u32, src: u32, dst: u32) -> bool {
+        if let Some(base) = self.base_topo {
+            let tombstoned = self
+                .topo
+                .out_tombstones_for(etype, src)
+                .is_some_and(|t| t.contains(&dst));
+            if !tombstoned && core_storage::v8::seam::base_has_out_edge(base, etype, src, dst) {
+                return false;
+            }
+        }
+        self.topo.add_edge(etype, src, dst)
+    }
+
     /// Neighbours of `v` over `(etype, dir)`, merging the snapshot base with
     /// the post-snapshot overlay and subtracting the overlay's tombstones.
     ///
@@ -1074,7 +1101,7 @@ fn apply_per_src_top_k(
         let triple = (et, *s, *d);
         let already = prov.contains(&triple);
         if !already {
-            let newly = g.topo.add_edge(et, *s, *d);
+            let newly = g.add_edge(et, *s, *d);
             if newly {
                 prov.insert(&def.name, triple, g.ids, g.syms);
             }
@@ -1343,7 +1370,7 @@ fn apply_desired_scoped(
                 *tripped = true;
                 continue;
             }
-            let newly = g.topo.add_edge(et, s, d);
+            let newly = g.add_edge(et, s, d);
             if newly {
                 prov.insert(&def.name, triple, g.ids, g.syms);
             }
@@ -1552,7 +1579,7 @@ fn apply_streaming_create(
                     *tripped = true;
                     break 'outer;
                 }
-                let newly = g.topo.add_edge(et, s, d);
+                let newly = g.add_edge(et, s, d);
                 if newly {
                     prov.insert(&def.name, triple, g.ids, g.syms);
                 }
@@ -1722,7 +1749,7 @@ fn apply_via_rebuild(
         for ((s, d), score) in desired {
             let triple = (et, s, d);
             let already = prov.contains(&triple);
-            if !already && g.topo.add_edge(et, s, d) {
+            if !already && g.add_edge(et, s, d) {
                 prov.insert(&def.name, triple, g.ids, g.syms);
             }
             // Only weight edges this rule owns; a pre-existing user edge is not
@@ -1800,7 +1827,7 @@ fn apply_streaming_rebuild(
             let triple = (et, s, d);
             let already = prov.contains(&triple);
             if !already {
-                let newly = g.topo.add_edge(et, s, d);
+                let newly = g.add_edge(et, s, d);
                 if newly {
                     prov.insert(&def.name, triple, g.ids, g.syms);
                 }
@@ -3593,7 +3620,7 @@ impl RuleEngine {
                                 *tripped = true;
                                 break 'via_outer;
                             }
-                            let newly = g.topo.add_edge(et, s, d);
+                            let newly = g.add_edge(et, s, d);
                             if newly {
                                 prov.insert(&name, triple, g.ids, g.syms);
                             }

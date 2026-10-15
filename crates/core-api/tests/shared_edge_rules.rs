@@ -657,3 +657,65 @@ fn deleting_a_via_node_retracts_the_edges_derived_through_it() {
         );
     }
 }
+
+/// Ledger row 103. Two top-k rules over one edge type, a snapshot and a
+/// reopen around a delete: the rules' derived edges were counted and not
+/// returned. A fresh build of the same nodes has `n0->n5` and `n5->n0`.
+#[test]
+fn top_k_rules_edges_are_readable_after_a_snapshot_round_trip() {
+    let rules = [
+        rule("topk1", "A", "A", overlap(0.3), Some(1)),
+        rule("topk2", "A", "A", overlap(0.5), Some(2)),
+    ];
+    let dir = tmp("row103");
+    let snapshot_and_reopen = |db: Db| -> Db {
+        let mut db = db;
+        db.snapshot().unwrap();
+        drop(db);
+        GraphDb::open(&dir).unwrap()
+    };
+    let mut db = GraphDb::open(&dir).unwrap();
+    for rd in &rules {
+        db.create_rule(rd.clone()).unwrap();
+    }
+    db.insert_node("A", "n0", vec![("tags".into(), tags(&["x", "y", "w"]))])
+        .unwrap();
+    db.insert_node("A", "n5", vec![("tags".into(), tags(&["x", "y", "z"]))])
+        .unwrap();
+    db.insert_node(
+        "A",
+        "n6",
+        vec![
+            ("tags".into(), tags(&["x", "y", "z"])),
+            ("fk".into(), Value::Str("n5".into())),
+        ],
+    )
+    .unwrap();
+    let mut db = snapshot_and_reopen(db);
+    db.delete_node("n6").unwrap();
+    let mut db = snapshot_and_reopen(db);
+    db.set_prop("n5", "tags", tags(&["x"])).unwrap();
+
+    let odir = tmp("row103-oracle");
+    let mut o = GraphDb::open(&odir).unwrap();
+    o.insert_node("A", "n0", vec![("tags".into(), tags(&["x", "y", "w"]))])
+        .unwrap();
+    o.insert_node("A", "n5", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    for rd in &rules {
+        o.create_rule(rd.clone()).unwrap();
+    }
+    for k in ["n0", "n5"] {
+        assert_eq!(
+            db.neighbors(k, "SAME", Direction::Out).unwrap(),
+            o.neighbors(k, "SAME", Direction::Out).unwrap(),
+            "{k}"
+        );
+    }
+    let counted: u64 = db.stats().rules.iter().map(|r| r.edges).sum();
+    let present = ["n0", "n5"]
+        .iter()
+        .map(|k| db.neighbors(k, "SAME", Direction::Out).unwrap().len() as u64)
+        .sum::<u64>();
+    assert_eq!(counted, present, "every edge a rule counts is in the graph");
+}
