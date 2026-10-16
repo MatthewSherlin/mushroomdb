@@ -2,7 +2,7 @@
 ///
 /// Pins the semantics of enable_fulltext, disable_fulltext, and search.
 /// Each test documents the stable, observable behavior.
-use core_api::{GraphDb, GraphError, Value};
+use mushroomdb::{GraphDb, GraphError, Value};
 use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
@@ -1484,7 +1484,7 @@ fn a_keep_wal_snapshot_loads_its_index_too() {
     let before = {
         let mut db = GraphDb::open(&dir).unwrap();
         seed(&mut db);
-        db.snapshot_with(core_api::SnapshotOptions {
+        db.snapshot_with(mushroomdb::SnapshotOptions {
             keep_wal: true,
             ..Default::default()
         })
@@ -1632,7 +1632,7 @@ fn a_keep_wal_snapshot_indexes_nothing_twice_at_open() {
                 .unwrap();
         }
         db.enable_fulltext("Doc", "body").unwrap();
-        db.snapshot_with(core_api::SnapshotOptions {
+        db.snapshot_with(mushroomdb::SnapshotOptions {
             keep_wal: true,
             ..Default::default()
         })
@@ -1673,7 +1673,7 @@ fn a_keep_wal_snapshot_whose_wal_lost_its_tail_does_not_keep_its_index() {
             vec![("title".into(), Value::Str("zeta".into()))],
         )
         .unwrap();
-        db.snapshot_with(core_api::SnapshotOptions {
+        db.snapshot_with(mushroomdb::SnapshotOptions {
             keep_wal: true,
             ..Default::default()
         })

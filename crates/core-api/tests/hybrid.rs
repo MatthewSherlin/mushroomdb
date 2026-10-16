@@ -22,7 +22,7 @@
 //!
 //!   Final order: both > v_only > t_only
 
-use core_api::{GraphDb, Value};
+use mushroomdb::{GraphDb, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};

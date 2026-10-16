@@ -21,7 +21,7 @@
 use axum::body::Body;
 use axum::http::Request;
 use axum::Router;
-use core_api::SharedDb;
+use mushroomdb::SharedDb;
 use proptest::prelude::*;
 use server::router;
 use std::panic::{catch_unwind, AssertUnwindSafe};

@@ -7,7 +7,7 @@ use cli::{
     run_schema_apply_memory_identity, run_snapshot, run_suggest, run_verify, usage, Command,
     ServeUi,
 };
-use core_api::{GraphError, SharedDb};
+use mushroomdb::{GraphError, SharedDb};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal as _, Read as _, Write};
@@ -523,13 +523,13 @@ fn run_serve(
         // full-text on a populated store builds the index at each open until
         // a snapshot carries it (ledger row 36), and changes what an existing
         // store indexes, so an existing store is never touched here.
-        let is_new_store = !core_api::restore::holds_a_store(&db_dir);
+        let is_new_store = !mushroomdb::restore::holds_a_store(&db_dir);
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
         if is_new_store {
             // The first store most HTTP callers open. Declare the memory
             // schema before the first write so `recall` can answer on it.
             db.write()
-                .apply_schema(&core_api::memory_schema::memory_defaults())
+                .apply_schema(&mushroomdb::memory_schema::memory_defaults())
                 .map_err(|e| e.to_string())?;
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -781,13 +781,13 @@ fn run_mcp(db_dir: PathBuf, all_tools: bool) -> Result<(), String> {
     // snapshot carries it (ledger row 36), and changes what an existing store
     // indexes, so an existing store is never touched here; only a store this
     // call is creating gets the memory schema.
-    let is_new_store = !core_api::restore::holds_a_store(&db_dir);
+    let is_new_store = !mushroomdb::restore::holds_a_store(&db_dir);
     let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
     if is_new_store {
         // The first store most MCP hosts open. Declare the memory schema
         // before the first write so `recall` can answer on it from the start.
         db.write()
-            .apply_schema(&core_api::memory_schema::memory_defaults())
+            .apply_schema(&mushroomdb::memory_schema::memory_defaults())
             .map_err(|e| e.to_string())?;
     }
     // Nothing else snapshots a store that is only ever used through this

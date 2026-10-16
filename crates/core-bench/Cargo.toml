@@ -7,7 +7,7 @@ publish = false
 autolib = false
 
 [dependencies]
-core-api = { package = "mushroomdb", path = "../core-api" }
+mushroomdb = { path = "../core-api" }
 core-storage = { package = "mushroomdb-storage", path = "../core-storage" }
 
 [dev-dependencies]

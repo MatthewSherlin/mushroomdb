@@ -8,7 +8,7 @@
 ///   (c) FieldEqual:    category (low card, shared values) |  model (only in Product)
 ///   (d) NumericWithin: score ranges overlap               |  weight ranges don't overlap
 ///   (e) VectorSimilar: embedding dim-4 matches            |  emb_short dim mismatch (2 vs 3)
-use core_api::{
+use mushroomdb::{
     GraphDb, Predicate, RuleDef, RuleSuggestion, SuggestConfig, SuggestReport, Value,
     DEFAULT_SCORED_TOP_K, SUGGEST_DEFAULT_SEED,
 };

@@ -4,8 +4,8 @@
 //!
 //! Deterministic: a seeded generator, so the same arguments build the same
 //! store. Refuses a directory that already exists.
-use core_api::memory_schema::memory_defaults;
-use core_api::{GraphDb, Value};
+use mushroomdb::memory_schema::memory_defaults;
+use mushroomdb::{GraphDb, Value};
 
 const PEOPLE: usize = 1_000;
 const VOCABULARY: usize = 2_000;

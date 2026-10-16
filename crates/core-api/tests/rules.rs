@@ -1,10 +1,10 @@
-use core_api::{
-    wal_commit_count_at, Direction, GraphDb, GraphError, MutationEvent, Predicate,
-    PredicateSummary, RuleDef, Value,
-};
 use core_rules::with_ivf_drift_rebuild;
 use core_storage::fs::{FileId, Fs, RealFs};
 use core_storage::wal::{decode_all, WalRecord};
+use mushroomdb::{
+    wal_commit_count_at, Direction, GraphDb, GraphError, MutationEvent, Predicate,
+    PredicateSummary, RuleDef, Value,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -226,7 +226,7 @@ fn explain_reports_rule_provenance_and_weights() {
 
 #[test]
 fn explain_high_degree_hub_returns_only_the_pair() {
-    use core_api::{AutoFk, IngestOptions};
+    use mushroomdb::{AutoFk, IngestOptions};
     use std::collections::BTreeMap;
     let dir = tmp("explain-hub");
     let mut db = GraphDb::open(&dir).unwrap();
@@ -1255,7 +1255,7 @@ fn via_hop_new_via_node_insert_after_rule_creation() {
 /// live node, retracted per element when the element goes away.
 #[test]
 fn ingest_json_list_fk_plus_keymatch_rule_yields_edges() {
-    use core_api::{AutoFk, EdgeEvent, IngestOptions};
+    use mushroomdb::{AutoFk, EdgeEvent, IngestOptions};
     let dir = tmp("rules-list-fk");
     let mut db = GraphDb::open(&dir).unwrap();
     let opts = IngestOptions {
@@ -1424,7 +1424,7 @@ fn explain_reports_keymatch_for_list_edge() {
 /// branch the other list tests exercise.
 #[test]
 fn list_fk_fires_per_element_at_the_default_cap() {
-    use core_api::{EdgeEvent, DEFAULT_KEYMATCH_TOP_K};
+    use mushroomdb::{EdgeEvent, DEFAULT_KEYMATCH_TOP_K};
     let dir = tmp("rules-list-default-cap");
     let mut db = GraphDb::open(&dir).unwrap();
     for k in ["a.rs", "b.rs", "c.rs"] {
@@ -1806,7 +1806,7 @@ fn edge_set(db: &GraphDb<RealFs>, et: &str, n: usize) -> Vec<(String, String)> {
     out
 }
 
-fn building_of(db: &GraphDb<RealFs>, rule: &str) -> Option<core_api::BuildProgress> {
+fn building_of(db: &GraphDb<RealFs>, rule: &str) -> Option<mushroomdb::BuildProgress> {
     db.stats()
         .rules
         .iter()
@@ -2413,7 +2413,7 @@ fn pump_index_build_is_refused_read_only() {
             .unwrap();
         db.snapshot().unwrap();
     }
-    let opts = core_api::OpenOptions {
+    let opts = mushroomdb::OpenOptions {
         read_only: true,
         ..Default::default()
     };

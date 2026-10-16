@@ -22,7 +22,7 @@
 //! irrecoverable from the export. Stores that need exact float fidelity
 //! should use the binary backup command instead of export.
 
-use core_api::{ExportEdge, NodeInfo, RuleDef, Value};
+use mushroomdb::{ExportEdge, NodeInfo, RuleDef, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Write as _;

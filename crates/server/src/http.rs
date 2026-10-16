@@ -4,7 +4,7 @@
 //! # Single-sink design
 //!
 //! The HTTP router is the designated broadcast producer. [`router`] installs
-//! one `broadcast::Sender` as the [`core_api::GraphDb`] event sink. MCP and
+//! one `broadcast::Sender` as the [`mushroomdb::GraphDb`] event sink. MCP and
 //! CLI mutations on the same [`SharedDb`] fire into that same sink (one
 //! producer, many `/watch` subscribers). A second [`router`] call replaces
 //! the sink and terminates every existing subscriber with
@@ -23,7 +23,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use core_api::{
+use mushroomdb::{
     is_write_query, json_to_rows, json_to_value, AsOfScope, AutoFk, BackupReport, BatchOp,
     DegreeConfig, Dir, GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig,
     PropPredicate, ResultSet, SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
@@ -43,7 +43,7 @@ use tower_http::services::ServeDir;
 /// [`tokio::sync::broadcast::error::RecvError::Closed`].
 ///
 /// Installing the watch sink replaces any previously installed
-/// [`core_api::GraphDb::set_event_sink`]. The sink only
+/// [`mushroomdb::GraphDb::set_event_sink`]. The sink only
 /// `broadcast::Sender::send`s (non-blocking) and never re-enters `db`.
 ///
 /// # Blocking
@@ -784,7 +784,7 @@ async fn health(
 async fn blocking_write<T, F>(f: F) -> std::result::Result<T, Response>
 where
     T: Send + 'static,
-    F: FnOnce() -> core_api::Result<T> + Send + 'static,
+    F: FnOnce() -> mushroomdb::Result<T> + Send + 'static,
 {
     match tokio::task::spawn_blocking(f).await {
         Ok(Ok(v)) => Ok(v),
@@ -1765,8 +1765,8 @@ async fn node_info(
             }
         };
         return match g.node_info_masked(&key, &mask) {
-            Some(core_api::MaskedNodeResult::Visible(info)) => json_ok(node_info_json(&info)),
-            Some(core_api::MaskedNodeResult::Restricted) => {
+            Some(mushroomdb::MaskedNodeResult::Visible(info)) => json_ok(node_info_json(&info)),
+            Some(mushroomdb::MaskedNodeResult::Restricted) => {
                 json_ok(crate::json::stub_node_json(&key))
             }
             None => key_not_found(key),
@@ -1936,7 +1936,7 @@ async fn neighborhood(
 
 /// `POST /find_similar` — vector kNN. First-class read, not `/algo/*`, so a
 /// role token is allowed and a client `mask` intersects the role (never widens).
-/// Default `min` is `core_api::FIND_SIMILAR_DEFAULT_MIN` (0.8), as on MCP and
+/// Default `min` is `mushroomdb::FIND_SIMILAR_DEFAULT_MIN` (0.8), as on MCP and
 /// in the Python binding. It was 0.0 here through 0.6.
 async fn find_similar(
     State(state): State<AppState>,
@@ -1959,7 +1959,7 @@ async fn find_similar(
         },
     };
     let min = match body.get("min") {
-        None | Some(Js::Null) => core_api::FIND_SIMILAR_DEFAULT_MIN,
+        None | Some(Js::Null) => mushroomdb::FIND_SIMILAR_DEFAULT_MIN,
         Some(v) => match v.as_f64() {
             Some(n) => n,
             None => return err_response("min must be a number"),
@@ -2482,8 +2482,8 @@ async fn node_history_handler(
         // Filter EdgeAdded/EdgeRemoved entries whose `other` endpoint is hidden.
         // A role token must not learn about hidden nodes via edge history events —
         // mirrors the same protection in `node_edges` (http.rs ~978-989).
-        use core_api::HistoryChange;
-        let visible = core_api::HistoryResult {
+        use mushroomdb::HistoryChange;
+        let visible = mushroomdb::HistoryResult {
             total_commits: result.total_commits,
             horizon: result.horizon,
             items: result
@@ -2876,7 +2876,7 @@ impl<'a> From<&'a BackupReport> for BackupReportJson<'a> {
 mod tests {
     use super::*;
     use crate::json::result_set_json;
-    use core_api::{DegreeConfig, PageRankConfig, ResultSet, Value, WccConfig};
+    use mushroomdb::{DegreeConfig, PageRankConfig, ResultSet, Value, WccConfig};
 
     #[test]
     fn nan_float_cell_serializes_as_null() {

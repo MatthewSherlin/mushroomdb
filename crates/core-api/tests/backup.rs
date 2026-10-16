@@ -1,6 +1,6 @@
 //! Tests for `GraphDb::backup_to` (Task 4: consistent online backup).
 
-use core_api::{
+use mushroomdb::{
     BackupReport, Direction, GraphDb, Predicate, RoleDef, RuleDef, Schema, SnapshotOptions, Value,
 };
 use std::path::PathBuf;
@@ -223,7 +223,7 @@ fn a_backup_can_still_answer_a_date() {
     // And through `restore`, which copies a named list of files: the map has
     // to be on it, or the seeded store has the history and not the dates.
     let seeded = tmp("backup-dates-seeded");
-    core_api::restore::restore_if_empty(&seeded, &dest).unwrap();
+    mushroomdb::restore::restore_if_empty(&seeded, &dest).unwrap();
     let seeded = GraphDb::open(&seeded).unwrap();
     assert_eq!(seeded.resolve_date("2026-06-10").unwrap(), expected);
 }

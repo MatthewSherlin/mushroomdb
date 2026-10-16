@@ -52,7 +52,7 @@ use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use core_api::{DbEvent, Subscription};
+use mushroomdb::{DbEvent, Subscription};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;

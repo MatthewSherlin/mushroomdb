@@ -6,8 +6,8 @@
 //! `delete_rule`, and the top-k backfill a node deletion triggers — has to take
 //! the via path, or it computes an empty desired set and retracts edges the rule
 //! legitimately owns.
-use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
 use core_storage::fs::RealFs;
+use mushroomdb::{Direction, GraphDb, Predicate, RuleDef, Value};
 
 type Db = GraphDb<RealFs>;
 

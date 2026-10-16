@@ -1,6 +1,6 @@
 //! The default memory schema: what a memory store is created knowing.
-use core_api::memory_schema::{memory_defaults, MEMORY_ENTITY_LABELS};
-use core_api::GraphDb;
+use mushroomdb::memory_schema::{memory_defaults, MEMORY_ENTITY_LABELS};
+use mushroomdb::GraphDb;
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -84,9 +84,9 @@ fn index_pairs_lists_every_equality_index_sorted() {
 /// framing line to the one caller that stamps it.
 #[test]
 fn the_schema_report_counts_provisional_nodes_and_is_unframed() {
-    use core_api::memory::brief::BriefOptions;
-    use core_api::memory::remember::{remember, RememberInput};
-    use core_api::memory::schema::{provisional_keys, render_schema, schema_report};
+    use mushroomdb::memory::brief::BriefOptions;
+    use mushroomdb::memory::remember::{remember, RememberInput};
+    use mushroomdb::memory::schema::{provisional_keys, render_schema, schema_report};
 
     let mut db = GraphDb::open(&tmp("report")).unwrap();
     db.apply_schema(&memory_defaults()).unwrap();
@@ -116,7 +116,7 @@ fn the_schema_report_counts_provisional_nodes_and_is_unframed() {
         "{text}"
     );
     assert!(
-        !text.contains(core_api::digest::UNTRUSTED_FRAMING),
+        !text.contains(mushroomdb::digest::UNTRUSTED_FRAMING),
         "render_schema must not frame: {text}"
     );
 }
@@ -125,8 +125,8 @@ fn the_schema_report_counts_provisional_nodes_and_is_unframed() {
 /// store whose names are long would otherwise render without limit.
 #[test]
 fn the_rendered_schema_is_capped_in_bytes_and_says_so() {
-    use core_api::memory::brief::BriefOptions;
-    use core_api::memory::schema::{render_schema, schema_report, SCHEMA_MAX_BYTES};
+    use mushroomdb::memory::brief::BriefOptions;
+    use mushroomdb::memory::schema::{render_schema, schema_report, SCHEMA_MAX_BYTES};
 
     let mut db = GraphDb::open(&tmp("schema-cap")).unwrap();
     // Twenty labels of 700 characters each: 14 KB of label lines alone.
@@ -158,8 +158,8 @@ fn the_rendered_schema_is_capped_in_bytes_and_says_so() {
 /// whose first entry was that line does not stay behind with nothing under it.
 #[test]
 fn a_schema_cut_leaves_no_heading_without_entries() {
-    use core_api::memory::brief::BriefOptions;
-    use core_api::memory::schema::{render_schema, schema_report, SCHEMA_MAX_BYTES};
+    use mushroomdb::memory::brief::BriefOptions;
+    use mushroomdb::memory::schema::{render_schema, schema_report, SCHEMA_MAX_BYTES};
 
     let mut db = GraphDb::open(&tmp("schema-heading")).unwrap();
     // Sixteen labels of 703 characters: about 11.4 KB of label lines, which

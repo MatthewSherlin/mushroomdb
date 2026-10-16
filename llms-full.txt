@@ -7081,7 +7081,7 @@ the snapshot are no longer reachable via time travel.
 **Keep WAL (Rust API):**
 
 ```rust
-use core_api::{SnapshotOptions};
+use mushroomdb::{SnapshotOptions};
 db.snapshot_with(SnapshotOptions { keep_wal: true, archive_wal: false })?;
 ```
 
@@ -9016,8 +9016,8 @@ built on the crate this page describes.
 cargo add mushroomdb
 ```
 
-The crate is installed as `mushroomdb` and imported as `core_api`: you write
-`use core_api::GraphDb;`. It needs Rust 1.92 or later. Every public item is on
+The crate is installed and imported as `mushroomdb`: you write
+`use mushroomdb::GraphDb;`. It needs Rust 1.92 or later. Every public item is on
 [docs.rs](https://docs.rs/mushroomdb); this page is the handful you start with.
 
 The examples here are not written for the page. Each is part of a program under
@@ -9238,7 +9238,7 @@ log. [Durability](durability.md) has what a crash can and cannot lose.
 
 ## Errors
 
-A call that can fail returns `core_api::Result<T>`. The variants of `GraphError` worth matching
+A call that can fail returns `mushroomdb::Result<T>`. The variants of `GraphError` worth matching
 on:
 
 | Variant | Means |
@@ -9740,7 +9740,7 @@ and do **not** update `last_changed`.
 ### Precondition types
 
 ```rust
-use core_api::Precondition;
+use mushroomdb::Precondition;
 
 // Fails if the node was modified since `expected` (or does not exist).
 Precondition::NodeUnchangedSince { key: "alice".into(), expected: seq }
@@ -9890,10 +9890,10 @@ valid frames are counted. No error is returned; the valid prefix is replayed.
 ### Rust API
 
 ```rust
-use core_api::{GraphDb, GraphError};
+use mushroomdb::{GraphDb, GraphError};
 
 // Count total WAL commits without opening the db.
-let total = core_api::wal_commit_count_at(&dir)?;
+let total = mushroomdb::wal_commit_count_at(&dir)?;
 
 // Open a read-only view at commit 3.
 let mut db = GraphDb::open_at(&dir, 3)?;
@@ -9946,7 +9946,7 @@ keeping old WAL files as numbered sidecars instead of deleting them.
 ### Enabling archives
 
 ```rust
-use core_api::{SnapshotOptions, GraphDb};
+use mushroomdb::{SnapshotOptions, GraphDb};
 
 db.snapshot_with(SnapshotOptions {
     keep_wal: false,   // truncating snapshot (default)
@@ -10378,7 +10378,7 @@ edges.
 ## Quick Start
 
 ```rust
-use core_api::{AggFn, Direction, GraphDb, Value, ViewDef, ViewSource};
+use mushroomdb::{AggFn, Direction, GraphDb, Value, ViewDef, ViewSource};
 
 let mut db = GraphDb::open(&dir)?;
 

@@ -10,7 +10,7 @@ use cli::doctor::{run_doctor_with, DoctorOpts};
 use cli::install::{
     run_install_with, Delivery, Externals, InstallOpts, McpCommand, Platform, Scope,
 };
-use core_api::GraphDb;
+use mushroomdb::GraphDb;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -642,7 +642,7 @@ fn doctor_store_check_counts_namespaces() {
         .insert_node(
             "Doc",
             "a1",
-            vec![("ns".into(), core_api::Value::Str("tenant-a".into()))],
+            vec![("ns".into(), mushroomdb::Value::Str("tenant-a".into()))],
         )
         .expect("insert");
     drop(store);

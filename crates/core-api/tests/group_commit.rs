@@ -16,8 +16,8 @@
 //! 13. direct_write_before_group_survives_group_fsync_failure — F1(c) concurrent variant
 //! 14. write_batch_strict_always_fsyncs — N single-op + one 5-op batch → correct fsync count
 
-use core_api::{BatchOp, FsyncPolicy, GraphDb, MutationEvent, SharedDb};
 use core_storage::fs::{FileId, Fs, FsIntrospect};
+use mushroomdb::{BatchOp, FsyncPolicy, GraphDb, MutationEvent, SharedDb};
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
@@ -1051,7 +1051,7 @@ fn concurrent_overlapping_key_inserts_land_exactly_once() {
 /// lost edges, no stale index entries, no panics.
 #[test]
 fn concurrent_writes_keep_rules_and_index_consistent() {
-    use core_api::{Predicate, RuleDef};
+    use mushroomdb::{Predicate, RuleDef};
     use std::collections::BTreeMap;
 
     let dir = tmp("conc-rules-index");
@@ -1091,7 +1091,7 @@ fn concurrent_writes_keep_rules_and_index_consistent() {
             db_t.submit_batch(vec![BatchOp::InsertNode {
                 label: "Talent".into(),
                 key: format!("t{i}"),
-                props: vec![("city".into(), core_api::Value::Str("austin".into()))],
+                props: vec![("city".into(), mushroomdb::Value::Str("austin".into()))],
             }])
             .unwrap();
         }
@@ -1104,7 +1104,7 @@ fn concurrent_writes_keep_rules_and_index_consistent() {
             db_c.submit_batch(vec![BatchOp::InsertNode {
                 label: "Company".into(),
                 key: format!("c{i}"),
-                props: vec![("city".into(), core_api::Value::Str("austin".into()))],
+                props: vec![("city".into(), mushroomdb::Value::Str("austin".into()))],
             }])
             .unwrap();
         }

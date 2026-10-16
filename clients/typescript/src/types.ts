@@ -50,7 +50,7 @@ export interface QueryResult {
 /**
  * Per-rule statistics.
  *
- * Mirrors `core_api::db::RuleStats`.
+ * Mirrors `mushroomdb::db::RuleStats`.
  */
 export interface RuleStats {
   name: string;
@@ -63,7 +63,7 @@ export interface RuleStats {
 /**
  * Database-wide counters returned by `GET /stats`.
  *
- * Mirrors `core_api::db::Stats`.
+ * Mirrors `mushroomdb::db::Stats`.
  */
 export interface Stats {
   nodes_live: number;
@@ -79,7 +79,7 @@ export interface Stats {
 /**
  * Options for `POST /ingest`.
  *
- * Mirrors `core_api::IngestOptions` (serialised by `crates/server/src/http.rs::ingest_options`).
+ * Mirrors `mushroomdb::IngestOptions` (serialised by `crates/server/src/http.rs::ingest_options`).
  */
 export interface IngestOptions {
   /** Name of the field to use as the node key. Defaults to "key". */
@@ -153,7 +153,7 @@ export interface PredicateSummary {
 /**
  * One rule-derived edge between two nodes from `GET /explain?a=&b=`.
  *
- * Mirrors `core_api::db::Explanation`.
+ * Mirrors `mushroomdb::db::Explanation`.
  */
 export interface Explanation {
   rule: string;
@@ -251,14 +251,14 @@ export interface SuggestReport {
 /**
  * Edge direction for graph algorithms.
  *
- * Mirrors `core_api::algo::AlgoDir` (serialises as lowercase string).
+ * Mirrors `mushroomdb::algo::AlgoDir` (serialises as lowercase string).
  */
 export type AlgoDir = "out" | "in" | "both";
 
 /**
  * Config for `POST /algo/pagerank`.
  *
- * Mirrors `core_api::algo::PageRankConfig`. All fields are optional — the
+ * Mirrors `mushroomdb::algo::PageRankConfig`. All fields are optional — the
  * server applies defaults (damping=0.85, max_iters=50, tol=1e-6,
  * edge_type=null, direction="out", budget_ms=5000).
  */
@@ -274,7 +274,7 @@ export interface PageRankConfig {
 /**
  * Result of `POST /algo/pagerank`.
  *
- * Mirrors `core_api::algo::PageRankReport`.
+ * Mirrors `mushroomdb::algo::PageRankReport`.
  */
 export interface PageRankReport {
   /** [node_key, score] pairs, sorted by score descending (ties: key asc). */
@@ -286,7 +286,7 @@ export interface PageRankReport {
 /**
  * Config for `POST /algo/wcc`.
  *
- * Mirrors `core_api::algo::WccConfig`. Defaults: edge_type=null, budget_ms=5000.
+ * Mirrors `mushroomdb::algo::WccConfig`. Defaults: edge_type=null, budget_ms=5000.
  */
 export interface WccConfig {
   edge_type?: string | null;
@@ -296,7 +296,7 @@ export interface WccConfig {
 /**
  * Result of `POST /algo/wcc`.
  *
- * Mirrors `core_api::algo::WccReport`.
+ * Mirrors `mushroomdb::algo::WccReport`.
  */
 export interface WccReport {
   /** [node_key, component_id] pairs. component_id is the smallest key in the component. */
@@ -307,7 +307,7 @@ export interface WccReport {
 /**
  * Config for `POST /algo/degree`.
  *
- * Mirrors `core_api::algo::DegreeConfig`. Defaults: edge_type=null, direction="both", budget_ms=5000.
+ * Mirrors `mushroomdb::algo::DegreeConfig`. Defaults: edge_type=null, direction="both", budget_ms=5000.
  */
 export interface DegreeConfig {
   edge_type?: string | null;
@@ -318,7 +318,7 @@ export interface DegreeConfig {
 /**
  * Result of `POST /algo/degree`.
  *
- * Mirrors `core_api::algo::DegreeReport`.
+ * Mirrors `mushroomdb::algo::DegreeReport`.
  */
 export interface DegreeReport {
   /**
@@ -349,7 +349,7 @@ export type AlgoReport = PageRankReport | WccReport | DegreeReport;
 /**
  * A post-commit event delivered over the `/subscribe` WebSocket.
  *
- * Mirrors `core_api::subscription::DbEvent` — serialised as internally-tagged
+ * Mirrors `mushroomdb::subscription::DbEvent` — serialised as internally-tagged
  * JSON with `"type"` as the discriminant.
  *
  * All variants except `lagged` carry `commit_seq: number` (Rust: `u64`).
@@ -488,7 +488,7 @@ export interface MetricsReport {
  * A property filter accepted by `POST /find_similar`'s `where` field and by
  * the server's role-definition API.
  *
- * Mirrors `core_api::roles::PropPredicate` (a flat struct serialised as a JSON
+ * Mirrors `mushroomdb::roles::PropPredicate` (a flat struct serialised as a JSON
  * object with `field` required and exactly one of `eq` or `in`).
  *
  * The server also accepts the graph's own tagged Value form for the values:
@@ -576,7 +576,7 @@ export type NodeKeyOrStub = string | { key: string; restricted: true };
 /**
  * One edge entry from `GET /node/{key}/edges`.
  *
- * Mirrors `core_api::EdgeInfo` as serialised by
+ * Mirrors `mushroomdb::EdgeInfo` as serialised by
  * `crates/server/src/json.rs::node_edges_json` (unmasked call) or
  * `json.rs::masked_edges_json` (call with `mask`/`stub_hidden`).
  *
@@ -607,7 +607,7 @@ export interface NodeEdgesResult {
 /**
  * One change entry in a node's history.
  *
- * Mirrors `core_api::HistoryChange` via
+ * Mirrors `mushroomdb::HistoryChange` via
  * `crates/server/src/json.rs::history_change_json`.
  * The `"type"` field is the discriminant.
  */
@@ -651,7 +651,7 @@ export interface NodeHistoryResult {
 /**
  * One event in the lifecycle of an edge from `GET /history/edge?a=&b=`.
  *
- * Mirrors `core_api::EdgeHistoryEvent` as serialised by
+ * Mirrors `mushroomdb::EdgeHistoryEvent` as serialised by
  * `crates/server/src/json.rs::edge_history_result_json`.
  */
 export interface EdgeHistoryEntry {
@@ -737,7 +737,7 @@ export interface BackupReport {
 /**
  * A mutation event delivered over the `/watch` WebSocket.
  *
- * Mirrors `core_api::MutationEvent` — serialised as externally-tagged
+ * Mirrors `mushroomdb::MutationEvent` — serialised as externally-tagged
  * snake_case JSON (`{"node_inserted":{"label":"A","key":"k"}}`).
  *
  * The `lagged` variant (`{"lagged": N}`) is not produced by serde but by the

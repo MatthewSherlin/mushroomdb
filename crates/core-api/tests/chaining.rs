@@ -1,9 +1,9 @@
 //! Rule chaining: a derived edge feeding a via-hop rule re-derives that rule's
 //! edges in the same write, deterministically, with a depth cap and no cycles.
-use core_api::{
+use core_storage::fs::RealFs;
+use mushroomdb::{
     Direction, EdgeEvent, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource,
 };
-use core_storage::fs::RealFs;
 
 type Db = GraphDb<RealFs>;
 
@@ -304,7 +304,7 @@ fn depth_cap_terminates_long_chains() {
     // past the level-0 retract, and terminates.
     db.set_prop("n0", "next_id", Value::Str("none".into()))
         .unwrap();
-    for lvl in 0..=core_api::MAX_CHAIN_DEPTH {
+    for lvl in 0..=mushroomdb::MAX_CHAIN_DEPTH {
         assert!(
             db.neighbors("n0", &format!("E{lvl}"), Direction::Out)
                 .unwrap()
@@ -329,7 +329,7 @@ fn depth_cap_terminates_long_chains() {
     // and truncates in the same place.
     db.set_prop("n0", "next_id", Value::Str("n1".into()))
         .unwrap();
-    for lvl in 0..=core_api::MAX_CHAIN_DEPTH {
+    for lvl in 0..=mushroomdb::MAX_CHAIN_DEPTH {
         assert!(
             !db.neighbors("n0", &format!("E{lvl}"), Direction::Out)
                 .unwrap()

@@ -1,6 +1,6 @@
 /// Tests for rename_node, InsertEdgeUpsert, and reader.rs MVCC coherence for
 /// RenameNode — see Task 2 brief.
-use core_api::{
+use mushroomdb::{
     Direction, EdgeEvent, GraphDb, GraphError, HistoryChange, Predicate, RuleDef, SharedDb, Value,
 };
 use std::collections::BTreeMap;
@@ -133,7 +133,7 @@ fn rename_node_reader_coherence() {
     let keys: Vec<String> = (0..rs.len())
         .filter_map(|i| {
             rs.row(i).first().and_then(|c| c.as_ref()).and_then(|v| {
-                if let core_api::Value::Str(s) = v {
+                if let mushroomdb::Value::Str(s) = v {
                     Some(s.clone())
                 } else {
                     None
@@ -167,7 +167,7 @@ fn rename_node_history_follows_by_id() {
         hist.iter().any(|e| {
             matches!(
                 &e.change,
-                core_api::HistoryChange::EdgeAdded { edge_type, .. } if edge_type == "KNOWS"
+                mushroomdb::HistoryChange::EdgeAdded { edge_type, .. } if edge_type == "KNOWS"
             )
         }),
         "history of alice2 should include the KNOWS EdgeAdded event: {hist:?}"
@@ -292,7 +292,7 @@ fn insert_edge_upsert_rules_fire_on_placeholder() {
     // Verify that on_node_changed fires for placeholder nodes: when a rule is
     // configured for "Placeholder" nodes and props are set in the same batch
     // as the upsert, derived edges appear.
-    use core_api::{Predicate, RuleDef};
+    use mushroomdb::{Predicate, RuleDef};
     let dir = tmp("upsert-rules");
     let mut db = GraphDb::open(&dir).unwrap();
     // Rule: link Placeholder nodes that have the same "kind" field value.
@@ -558,13 +558,13 @@ fn node_history_alias_multi_hop_reuse() {
 
 /// A `Person` whose key is also stored as its `id` property — what
 /// `upsert_entity`'s create path and a Cypher `CREATE {id: …}` write.
-fn person_with_id(db: &mut GraphDb<core_api::RealFs>, key: &str) {
+fn person_with_id(db: &mut GraphDb<mushroomdb::RealFs>, key: &str) {
     db.insert_node("Person", key, vec![("id".into(), Value::Str(key.into()))])
         .unwrap();
 }
 
 /// `(key(n), n.id)` for every `Person` matching `where_clause`.
-fn key_and_id(db: &GraphDb<core_api::RealFs>, where_clause: &str) -> Vec<(String, String)> {
+fn key_and_id(db: &GraphDb<mushroomdb::RealFs>, where_clause: &str) -> Vec<(String, String)> {
     let cypher = format!("MATCH (n:Person) WHERE {where_clause} RETURN key(n), n.id");
     let rs = db.query(&cypher, &BTreeMap::new()).unwrap();
     (0..rs.len())
@@ -681,7 +681,7 @@ fn rename_through_the_group_commit_queue_moves_the_id_too() {
     db.write()
         .insert_node("Person", "q1", vec![("id".into(), Value::Str("q1".into()))])
         .unwrap();
-    db.submit_batch(vec![core_api::BatchOp::RenameNode {
+    db.submit_batch(vec![mushroomdb::BatchOp::RenameNode {
         old_key: "q1".into(),
         new_key: "q2".into(),
     }])
@@ -750,7 +750,7 @@ fn a_batch_cannot_rename_its_way_past_the_namespace_guard() {
     db.insert_node(
         "Doc",
         "a",
-        vec![(core_api::NS_PROP.into(), Value::Str("tenant-a".into()))],
+        vec![(mushroomdb::NS_PROP.into(), Value::Str("tenant-a".into()))],
     )
     .unwrap();
     db.insert_node("Doc", "d", vec![]).unwrap();
@@ -764,7 +764,7 @@ fn a_batch_cannot_rename_its_way_past_the_namespace_guard() {
     match batch.commit() {
         Err(GraphError::CrossNamespace { src_ns, dst_ns, .. }) => {
             assert_eq!(src_ns, "tenant-a");
-            assert_eq!(dst_ns, core_api::NS_DEFAULT);
+            assert_eq!(dst_ns, mushroomdb::NS_DEFAULT);
         }
         other => panic!("expected CrossNamespace, got {other:?}"),
     }

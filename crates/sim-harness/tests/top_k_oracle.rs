@@ -1,3 +1,4 @@
+use core_rules::index::{cluster_k, probe_count};
 /// DST (Derived-Set Test) oracle sweep for top-k per-source rule semantics.
 ///
 /// Invariant (per brief): at every quiescent point, the engine's derived set
@@ -12,8 +13,7 @@
 /// Plan 13 T2 extension: includes an `Any(FieldEqual, NumericWithin)` rule
 /// (k=2) so that composed-predicate Any semantics are covered by the oracle
 /// sweep alongside the original scalar predicates.
-use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
-use core_rules::index::{cluster_k, probe_count};
+use mushroomdb::{Direction, GraphDb, Predicate, RuleDef, Value};
 use proptest::prelude::*;
 use sim_harness::{Oracle, SimFs, APPROX_RECALL_FLOOR_QUIESCED};
 use std::collections::BTreeSet;

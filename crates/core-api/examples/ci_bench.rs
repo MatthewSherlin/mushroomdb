@@ -25,7 +25,7 @@
 //! `benchmarks/ci/compare.py`.  Numbers are local-machine samples, not baselines;
 //! see `benchmarks/README.md` for how baselines are captured on CI runners.
 
-use core_api::{default_max_edges, GraphDb, IngestOptions, Predicate, RuleDef};
+use mushroomdb::{default_max_edges, GraphDb, IngestOptions, Predicate, RuleDef};
 use std::collections::BTreeMap;
 use std::time::Instant;
 

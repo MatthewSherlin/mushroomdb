@@ -7,7 +7,7 @@ mod mcp_tasks;
 mod subscribe;
 mod ws;
 
-use core_api::{MutationEvent, SharedDb};
+use mushroomdb::{MutationEvent, SharedDb};
 
 pub use mcp::{run_mcp_stdio, run_mcp_stdio_with, ASSOCIATION_TOOLS};
 

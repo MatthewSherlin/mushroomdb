@@ -1,12 +1,12 @@
 //! The store's rule proposals, filtered: nothing over a field the store
 //! writes for itself, and arguments `create_rule` accepts unchanged on every
 //! surface. Moved out of `crates/server` in 0.7.
-use core_api::memory::remember::{describe_entity, remember, RememberInput};
-use core_api::memory::suggest::{
+use mushroomdb::memory::remember::{describe_entity, remember, RememberInput};
+use mushroomdb::memory::suggest::{
     create_rule_args, filtered_suggestions, round_to, BOOKKEEPING_FIELDS,
 };
-use core_api::memory_schema::memory_defaults;
-use core_api::{GraphDb, Predicate, RuleDef, Value};
+use mushroomdb::memory_schema::memory_defaults;
+use mushroomdb::{GraphDb, Predicate, RuleDef, Value};
 use std::collections::BTreeSet;
 
 fn tmp(name: &str) -> std::path::PathBuf {

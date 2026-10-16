@@ -6,7 +6,7 @@
 //! 3. Chain-depth bound — delta tail length ≤ K−1 between folds.
 //! 4. Concurrency gate — concurrent reads and writes do not corrupt state (#[ignore]).
 
-use core_api::{SharedDb, FOLD_EVERY_K};
+use mushroomdb::{SharedDb, FOLD_EVERY_K};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -60,7 +60,7 @@ fn epoch_isolation_snapshot_excludes_post_snapshot_writes() {
     let rs = snap.query("MATCH (n:Person) RETURN n", &params).unwrap();
     assert_eq!(rs.len(), 1, "snapshot should see exactly 1 Person (alice)");
     let key_val = rs.row(0)[0].as_ref().and_then(|v| {
-        if let core_api::Value::Str(s) = v {
+        if let mushroomdb::Value::Str(s) = v {
             Some(s.as_str())
         } else {
             None
@@ -262,7 +262,7 @@ fn mvcc_concurrent_reads_during_writes() {
         let snap = db.reader();
         let _ = snap
             .query("MATCH (n:Node) RETURN n", &params)
-            .unwrap_or_else(|_| core_api::ResultSet::new(vec![]));
+            .unwrap_or_else(|_| mushroomdb::ResultSet::new(vec![]));
         baseline_times_us.push(t.elapsed().as_micros());
     }
     let single_p95 = percentile(&baseline_times_us, 95);
@@ -282,7 +282,7 @@ fn mvcc_concurrent_reads_during_writes() {
                 let snap = db.reader();
                 let _ = snap
                     .query("MATCH (n:Node) RETURN n", &params)
-                    .unwrap_or_else(|_| core_api::ResultSet::new(vec![]));
+                    .unwrap_or_else(|_| mushroomdb::ResultSet::new(vec![]));
                 times.push(t.elapsed().as_micros());
             }
             times
@@ -334,14 +334,14 @@ fn mvcc_concurrent_reads_during_writes() {
                 let snap = db.reader();
                 let rs = snap
                     .query("MATCH (n:Node) RETURN n", &params)
-                    .unwrap_or_else(|_| core_api::ResultSet::new(vec![]));
+                    .unwrap_or_else(|_| mushroomdb::ResultSet::new(vec![]));
                 times.push(t.elapsed().as_micros());
 
                 // Build the set of visible keys from this snapshot.
                 let visible: std::collections::HashSet<String> = (0..rs.len())
                     .filter_map(|r| {
                         rs.row(r)[0].as_ref().and_then(|v| {
-                            if let core_api::Value::Str(s) = v {
+                            if let mushroomdb::Value::Str(s) = v {
                                 Some(s.clone())
                             } else {
                                 None
@@ -414,7 +414,7 @@ fn reader_remove_prop_over_v8_base_does_not_resurrect() {
             .insert_node(
                 "Person",
                 "ada",
-                vec![("score".into(), core_api::Value::Int(42))],
+                vec![("score".into(), mushroomdb::Value::Int(42))],
             )
             .unwrap();
         db.write().snapshot().unwrap();

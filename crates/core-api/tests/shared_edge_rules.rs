@@ -9,8 +9,8 @@
 //!
 //! The differential tests and most of the cases here were written by the
 //! review of the fix, as experiments, and kept.
-use core_api::{Direction, FsyncPolicy, GraphDb, Predicate, RuleDef, Value};
 use core_storage::fs::RealFs;
+use mushroomdb::{Direction, FsyncPolicy, GraphDb, Predicate, RuleDef, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 type Db = GraphDb<RealFs>;

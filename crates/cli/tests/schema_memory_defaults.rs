@@ -1,7 +1,7 @@
 //! `schema apply --memory-defaults` upgrades an existing store on request —
 //! and only on request.
 use cli::run_schema_apply_memory_defaults;
-use core_api::GraphDb;
+use mushroomdb::GraphDb;
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()

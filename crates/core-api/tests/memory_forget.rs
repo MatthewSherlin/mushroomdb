@@ -1,10 +1,10 @@
 //! `forget` at the layer it lives in: a node, one property or one fact, and a
 //! report of what is left behind. The MCP tool renders this report; the
 //! Python binding returns it. Moved out of `crates/server` in 0.7.
-use core_api::memory::forget::{forget, ForgetTarget, FORGET_NOTE_LIST};
-use core_api::memory::remember::{remember, RememberInput};
-use core_api::memory_schema::memory_defaults;
-use core_api::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value};
+use mushroomdb::memory::forget::{forget, ForgetTarget, FORGET_NOTE_LIST};
+use mushroomdb::memory::remember::{remember, RememberInput};
+use mushroomdb::memory_schema::memory_defaults;
+use mushroomdb::{Direction, GraphDb, GraphError, Predicate, RuleDef, Value};
 
 type Db = GraphDb<core_storage::fs::RealFs>;
 

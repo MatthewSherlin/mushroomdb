@@ -23,7 +23,7 @@ use crate::install::{
     RETIRED_GIT_HOOK_SUBCOMMAND, RETIRED_HOOK_SUBCOMMANDS, SERVER_NAME,
 };
 use crate::CliError;
-use core_api::{GraphDb, GraphError, OpenOptions};
+use mushroomdb::{GraphDb, GraphError, OpenOptions};
 use serde_json::Value as Js;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};

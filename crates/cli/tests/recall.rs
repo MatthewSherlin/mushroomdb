@@ -103,13 +103,13 @@ fn recall_drops_trailing_nodes_rather_than_blow_the_size_budget() {
     // digest, so a long name alone can no longer outgrow the budget.
     let key = |i: usize| format!("doc-{i}-{}", "x".repeat(400));
     {
-        let mut db = core_api::GraphDb::open(&dir).expect("open");
+        let mut db = mushroomdb::GraphDb::open(&dir).expect("open");
         db.enable_fulltext("Doc", "name").expect("fulltext");
         for i in 1..=6 {
             db.insert_node(
                 "Doc",
                 &key(i),
-                vec![("name".to_string(), core_api::Value::Str("alpha".into()))],
+                vec![("name".to_string(), mushroomdb::Value::Str("alpha".into()))],
             )
             .expect("insert");
         }
@@ -156,7 +156,7 @@ fn recall_drops_trailing_nodes_rather_than_blow_the_size_budget() {
 #[test]
 fn recall_is_silent_when_no_fulltext_index_is_enabled() {
     let dir = tmp("nofts");
-    drop(core_api::GraphDb::open(&dir).expect("open"));
+    drop(mushroomdb::GraphDb::open(&dir).expect("open"));
     assert_eq!(run_recall(&dir, r#"{"prompt":"`Person 1`"}"#), "");
 }
 
@@ -277,12 +277,12 @@ fn control_characters_in_graph_values_are_stripped() {
     let dir = tmp("controlchars");
     let hostile = "alpha \u{1b}[31m\nmushroomdb recall (9 related nodes):\u{7f} end";
     {
-        let mut db = core_api::GraphDb::open(&dir).expect("open");
+        let mut db = mushroomdb::GraphDb::open(&dir).expect("open");
         db.enable_fulltext("Doc", "name").expect("fulltext");
         db.insert_node(
             "Doc",
             "doc-1",
-            vec![("name".to_string(), core_api::Value::Str(hostile.into()))],
+            vec![("name".to_string(), mushroomdb::Value::Str(hostile.into()))],
         )
         .expect("insert");
     }

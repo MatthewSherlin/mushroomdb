@@ -1,6 +1,6 @@
-use core_api::{Direction, Value};
 use core_rules::{evaluate, NodeView, RuleDef, ViewDef};
 use core_storage::fulltext::{parse_query, value_tokens_stemmed_with_positions};
+use mushroomdb::{Direction, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Obviously-correct reference. No ids, no interning, no persistence.

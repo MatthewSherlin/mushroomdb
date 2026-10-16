@@ -5,7 +5,7 @@
 //! repository by the test itself, so the assertions do not depend on the
 //! contents of any real project.
 use cli::ingest_git::{run_ingest_git, IngestGitOpts};
-use core_api::{Direction, GraphDb, Value};
+use mushroomdb::{Direction, GraphDb, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -438,21 +438,21 @@ fn editing_an_import_retracts_the_edge_on_refresh() {
     );
 
     let hist = db.edge_history("src/net.rs", "src/util.rs").unwrap();
-    let imports: Vec<&core_api::EdgeHistoryEvent> = hist
+    let imports: Vec<&mushroomdb::EdgeHistoryEvent> = hist
         .items
         .iter()
         .filter(|e| e.edge_type == "IMPORTS")
         .collect();
     assert!(
-        imports
-            .iter()
-            .any(|e| e.event == core_api::EdgeEvent::Added && e.rule.as_deref() == Some("imports")),
+        imports.iter().any(
+            |e| e.event == mushroomdb::EdgeEvent::Added && e.rule.as_deref() == Some("imports")
+        ),
         "history must show the edge being added: {imports:?}"
     );
     assert!(
         imports
             .iter()
-            .any(|e| e.event == core_api::EdgeEvent::Retracted),
+            .any(|e| e.event == mushroomdb::EdgeEvent::Retracted),
         "history must show the edge being retracted: {imports:?}"
     );
 }
@@ -625,19 +625,19 @@ fn unchanged_files_are_not_rewritten() {
         let db = GraphDb::open(&db_dir).unwrap();
         db.node_history("src/util.rs").unwrap().items.len()
     };
-    let before_commits = core_api::wal_commit_count_at(&db_dir).unwrap();
+    let before_commits = mushroomdb::wal_commit_count_at(&db_dir).unwrap();
 
     // A second full pass over the same working tree scans every file and
     // writes none of them.
     let report = {
-        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let shared = mushroomdb::SharedDb::open(&db_dir).unwrap();
         let mut w = shared.write();
         cli::structure::refresh_all(&mut w, &repo, "", true).unwrap()
     };
     assert_eq!(report.files_scanned, 5, "every file is read again");
 
     assert_eq!(
-        core_api::wal_commit_count_at(&db_dir).unwrap(),
+        mushroomdb::wal_commit_count_at(&db_dir).unwrap(),
         before_commits,
         "a re-scan of an unchanged tree must not add a single WAL commit"
     );
@@ -844,7 +844,7 @@ fn touch_reads_only_the_touched_files() {
     // Strand `src/net.rs#connect`: its file leaves the graph, so its key can
     // never be right again and a whole-tree pass would sweep it.
     {
-        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let shared = mushroomdb::SharedDb::open(&db_dir).unwrap();
         let mut w = shared.write();
         w.delete_node("src/net.rs").unwrap();
     }
@@ -854,7 +854,7 @@ fn touch_reads_only_the_touched_files() {
 
     // A pass responsible for one unrelated file does not go looking.
     let report = {
-        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let shared = mushroomdb::SharedDb::open(&db_dir).unwrap();
         let mut w = shared.write();
         cli::structure::refresh_files(&mut w, &repo, "", &["src/util.rs".to_string()], true)
             .unwrap()
@@ -884,7 +884,7 @@ fn touch_reads_only_the_touched_files() {
 
     // The whole-tree pass, which is told about everything, does sweep it.
     {
-        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let shared = mushroomdb::SharedDb::open(&db_dir).unwrap();
         let mut w = shared.write();
         cli::structure::refresh_all(&mut w, &repo, "", true).unwrap();
     }
@@ -944,7 +944,7 @@ fn a_narrowed_refresh_resolves_calls_the_same_as_a_whole_tree_one() {
         )],
     );
     {
-        let shared = core_api::SharedDb::open(&db_dir).unwrap();
+        let shared = mushroomdb::SharedDb::open(&db_dir).unwrap();
         let mut w = shared.write();
         cli::structure::refresh_files(&mut w, &repo, "", &["src/caller.rs".to_string()], true)
             .unwrap();

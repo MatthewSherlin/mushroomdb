@@ -8,9 +8,9 @@
 //! `read_contention_4r1w`, `read_contention_16r1w`,
 //! `backfill_field_equal_5k`.
 
-use core_api::{AutoFk, Dir, GraphDb, IngestOptions, Predicate, RuleDef, SharedDb, Value};
 use core_storage::RealFs;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use mushroomdb::{AutoFk, Dir, GraphDb, IngestOptions, Predicate, RuleDef, SharedDb, Value};
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::path::PathBuf;

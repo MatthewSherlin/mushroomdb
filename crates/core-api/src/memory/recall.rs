@@ -265,7 +265,7 @@ fn topic_query(topic: &str) -> (Vec<String>, String) {
 ///
 /// `key`, `label` and `summary` are stored content, unsanitized: only
 /// [`recall_digest`] passes them through [`sanitize`]. A caller rendering
-/// them into an assistant's context owes `core_api::digest::sanitize`.
+/// them into an assistant's context owes `mushroomdb::digest::sanitize`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct RecallHit {
     pub key: String,

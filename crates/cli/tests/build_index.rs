@@ -4,7 +4,7 @@
 //! edges exist and reports progress instead; this command is how an operator
 //! finishes the job before traffic arrives.
 use cli::{build_index_on, run_build_index};
-use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
+use mushroomdb::{Direction, GraphDb, Predicate, RuleDef, Value};
 use std::path::PathBuf;
 
 fn tmp(name: &str) -> PathBuf {
@@ -47,7 +47,7 @@ fn sim_rule() -> RuleDef {
     }
 }
 
-fn seed(dir: &std::path::Path, n: usize, batch: Option<usize>) -> GraphDb<core_api::RealFs> {
+fn seed(dir: &std::path::Path, n: usize, batch: Option<usize>) -> GraphDb<mushroomdb::RealFs> {
     let mut db = GraphDb::open(dir).unwrap();
     for i in 0..n {
         db.insert_node("V", &format!("v{i}"), vec![("emb".into(), slice_emb(i))])
@@ -133,7 +133,7 @@ fn build_index_finishes_a_snapshotted_mid_build_store() {
 }
 
 /// Every derived `SIM` edge as a sorted flat list.
-fn edge_set(db: &GraphDb<core_api::RealFs>, n: usize) -> Vec<(String, String)> {
+fn edge_set(db: &GraphDb<mushroomdb::RealFs>, n: usize) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for i in 0..n {
         let k = format!("v{i}");

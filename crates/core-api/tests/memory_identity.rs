@@ -1,11 +1,11 @@
 //! Identity: every entity carries a normalised alias list, so a `SAME_AS`
 //! rule has something to compare that both sides wrote the same way.
-use core_api::memory::identity::{derive_aliases, ALIASES_FIELD, MAX_ALIASES};
-use core_api::memory::remember::{
+use mushroomdb::memory::identity::{derive_aliases, ALIASES_FIELD, MAX_ALIASES};
+use mushroomdb::memory::remember::{
     describe_entity, describe_entity_with_aliases, remember, EntityIn, RememberInput,
 };
-use core_api::memory_schema::memory_defaults;
-use core_api::{GraphDb, Value};
+use mushroomdb::memory_schema::memory_defaults;
+use mushroomdb::{GraphDb, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -128,7 +128,7 @@ fn describing_with_the_same_inputs_leaves_the_list_alone() {
         "describing again must not create anything"
     );
     assert_eq!(
-        core_api::memory::identity::aliases_after_write(&db, "reid", &[], &[]).unwrap(),
+        mushroomdb::memory::identity::aliases_after_write(&db, "reid", &[], &[]).unwrap(),
         None,
         "nothing to rewrite"
     );
@@ -204,7 +204,7 @@ fn upgraded_node(name: &str, key: &str, aliases: Value) -> GraphDb<core_storage:
     db
 }
 
-fn set_role(db: &mut GraphDb<core_storage::fs::RealFs>, key: &str) -> core_api::Result<()> {
+fn set_role(db: &mut GraphDb<core_storage::fs::RealFs>, key: &str) -> mushroomdb::Result<()> {
     describe_entity(
         db,
         key,
@@ -292,7 +292,7 @@ fn moved_items_join_the_declared_list_and_the_move_is_made_once() {
         Some(str_list(&["Matt", "matt", "sherl"]))
     );
     assert_eq!(
-        core_api::memory::identity::identity_props_after_write(&db, "matthew-sherlin", &[], &[])
+        mushroomdb::memory::identity::identity_props_after_write(&db, "matthew-sherlin", &[], &[])
             .unwrap(),
         Vec::<(String, Value)>::new(),
         "nothing left to move or rewrite"
@@ -445,7 +445,7 @@ fn the_backfill_moves_nothing_from_a_list_a_stale_name_derived() {
     .unwrap();
     db.set_prop("ms", "name", Value::Str("Matt".into()))
         .unwrap();
-    let backfill = core_api::memory::identity::aliases_to_backfill(&db).unwrap();
+    let backfill = mushroomdb::memory::identity::aliases_to_backfill(&db).unwrap();
     assert_eq!(backfill.len(), 1);
     assert_eq!(
         backfill[0].props,
@@ -530,7 +530,7 @@ fn a_user_list_shaped_like_the_stores_own_is_read_as_the_stores() {
 /// `aliases` list is not given one.
 #[test]
 fn forgetting_the_name_rewrites_aliases_from_the_key_alone() {
-    use core_api::memory::identity::identity_props_after_forgetting_name;
+    use mushroomdb::memory::identity::identity_props_after_forgetting_name;
     let mut db = store("forget-name");
     describe_entity_with_aliases(
         &mut db,
@@ -594,7 +594,8 @@ fn a_list_the_store_wrote_is_left_byte_identical() {
     let first = aliases_of(&db, "Matthew-Sherlin");
     assert!(first.contains(&"matthew-sherlin".to_string()), "{first:?}");
     assert_eq!(
-        core_api::memory::identity::aliases_after_write(&db, "Matthew-Sherlin", &[], &[]).unwrap(),
+        mushroomdb::memory::identity::aliases_after_write(&db, "Matthew-Sherlin", &[], &[])
+            .unwrap(),
         None,
         "nothing to rewrite"
     );
@@ -648,11 +649,11 @@ fn a_remember_refused_for_aliases_declares_no_fulltext() {
 
 // ── the identity preset ─────────────────────────────────────────────────────
 
-use core_api::memory::identity::{
+use mushroomdb::memory::identity::{
     same_as_pairs, SameAsPair, ALIAS_KEYS_FIELD, MAX_ALIAS_KEYS, SAME_AS_EDGE, SAME_AS_FLOOR,
 };
-use core_api::memory_schema::memory_identity;
-use core_api::Predicate;
+use mushroomdb::memory_schema::memory_identity;
+use mushroomdb::Predicate;
 
 fn identity_store(name: &str) -> GraphDb<core_storage::fs::RealFs> {
     let mut db = store(name);
@@ -664,7 +665,7 @@ fn remember_people(
     db: &mut GraphDb<core_storage::fs::RealFs>,
     text: &str,
     people: Vec<EntityIn>,
-) -> core_api::memory::remember::RememberReport {
+) -> mushroomdb::memory::remember::RememberReport {
     remember(db, &note(text, &[], &people)).unwrap()
 }
 
@@ -773,7 +774,7 @@ fn the_preset_is_sixteen_global_rules_eleven_over_aliases_and_five_over_alias_ke
     }
     for r in s.rules.iter().filter(|r| r.name.contains("claim")) {
         assert!(
-            core_api::is_keymatch_rooted(&r.predicate),
+            mushroomdb::is_keymatch_rooted(&r.predicate),
             "{} must take the FK fast path",
             r.name
         );
@@ -932,7 +933,7 @@ fn the_reader_survives_the_preset_on_an_empty_store() {
 
 // ── resolution: complete linkage ────────────────────────────────────────────
 
-use core_api::memory::identity::identity_clusters;
+use mushroomdb::memory::identity::identity_clusters;
 
 /// A node whose name is `words`, so its alias set is its key, that name and
 /// each word: twelve aliases for ten words.
@@ -1371,7 +1372,7 @@ fn alias_keys_accumulate_across_writes_and_a_repeat_writes_nothing() {
     // A write that declares nothing, or only what is already held, leaves it.
     describe_entity(&mut db, "matthew-sherlin", None, &[]).unwrap();
     assert_eq!(
-        core_api::memory::identity::alias_keys_after_write(
+        mushroomdb::memory::identity::alias_keys_after_write(
             &db,
             "matthew-sherlin",
             &[],
@@ -1607,7 +1608,7 @@ fn a_decomposed_name_yields_the_same_aliases_as_its_composed_form() {
     let composed = "Émile Zola";
     assert_ne!(decomposed, composed, "the fixture must differ in bytes");
     assert_eq!(
-        core_api::memory::identity::canonical(decomposed),
+        mushroomdb::memory::identity::canonical(decomposed),
         "émile zola"
     );
     assert_eq!(
@@ -1724,7 +1725,7 @@ fn a_padded_keys_alias_is_its_lowercased_key_and_is_stable() {
     assert_eq!(aliases_of(&db, " Matt "), strings(&[" matt "]));
     assert_eq!(db.get_prop(" Matt ", "alias_keys"), None);
     assert_eq!(
-        core_api::memory::identity::aliases_after_write(&db, " Matt ", &[], &[]).unwrap(),
+        mushroomdb::memory::identity::aliases_after_write(&db, " Matt ", &[], &[]).unwrap(),
         None,
         "stable"
     );
@@ -1926,7 +1927,7 @@ fn the_alias_keys_foreign_value_refusal_reads_as_one_sentence() {
     )
     .unwrap();
     let err = set_role(&mut db, "as-int").unwrap_err();
-    let core_api::GraphError::IngestError { detail } = err else {
+    let mushroomdb::GraphError::IngestError { detail } = err else {
         panic!("expected an ingest error, got {err:?}");
     };
     assert_eq!(

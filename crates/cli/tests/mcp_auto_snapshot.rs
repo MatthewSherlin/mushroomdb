@@ -13,7 +13,7 @@
 //!
 //! [`SNAPSHOT_WAL_BYTES`]: cli::ingest_git::SNAPSHOT_WAL_BYTES
 use cli::ingest_git::SNAPSHOT_WAL_BYTES;
-use core_api::{GraphDb, Value};
+use mushroomdb::{GraphDb, Value};
 use serde_json::{json, Value as Js};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};

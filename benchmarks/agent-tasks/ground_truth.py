@@ -344,7 +344,7 @@ def r1_change_3(repo: Path) -> dict:
 
 
 SANITIZE_IMPORT = re.compile(
-    r"use\s+(?:crate|core_api)::repograph::(?:render::)?"
+    r"use\s+(?:crate|mushroomdb)::repograph::(?:render::)?"
     r"(?:\{[^}]*\bsanitize\b[^}]*\}|sanitize\b)",
     re.S,
 )
@@ -354,7 +354,7 @@ def r1_blast_1(repo: Path) -> dict:
     """Blast radius of `render::sanitize`.
 
     A file is in it when it imports *this* `sanitize` — `crate::repograph::
-    render::sanitize` or the `core_api::repograph::{...}` re-export — and does
+    render::sanitize` or the `mushroomdb::repograph::{...}` re-export — and does
     not define one of its own. Three other places in the workspace define a
     same-named function, and the test fixtures define a fourth; none of them
     is reached by a signature change here.

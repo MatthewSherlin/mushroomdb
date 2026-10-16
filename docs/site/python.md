@@ -494,7 +494,7 @@ the snapshot are no longer reachable via time travel.
 **Keep WAL (Rust API):**
 
 ```rust
-use core_api::{SnapshotOptions};
+use mushroomdb::{SnapshotOptions};
 db.snapshot_with(SnapshotOptions { keep_wal: true, archive_wal: false })?;
 ```
 

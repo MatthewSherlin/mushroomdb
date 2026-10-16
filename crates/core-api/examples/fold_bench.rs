@@ -5,7 +5,7 @@
 //! and the accrued overlay; after it, eight `Arc::clone`s.
 //!
 //! Run: `cargo run --release -p mushroomdb --example fold_bench`
-use core_api::{SharedDb, FOLD_EVERY_K};
+use mushroomdb::{SharedDb, FOLD_EVERY_K};
 use std::time::Instant;
 
 fn main() {

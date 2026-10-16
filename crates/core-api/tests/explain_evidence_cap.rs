@@ -1,6 +1,6 @@
 //! An evidence line is bounded in length, not only the digest in lines.
-use core_api::explain_digest::{explain_with_evidence, render_explain, MAX_EVIDENCE_CHARS};
-use core_api::{GraphDb, Predicate, RuleDef, Value};
+use mushroomdb::explain_digest::{explain_with_evidence, render_explain, MAX_EVIDENCE_CHARS};
+use mushroomdb::{GraphDb, Predicate, RuleDef, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()

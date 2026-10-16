@@ -12,8 +12,8 @@
 //! code-graph-only and 0.7's removal retires it.
 //!
 //! Run: `cargo run --release -p mushroomdb --example entity_open_bench`
-use core_api::GraphDb;
 use core_storage::types::Value;
+use mushroomdb::GraphDb;
 use std::time::Instant;
 
 fn main() {

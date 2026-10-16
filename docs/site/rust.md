@@ -7,8 +7,8 @@ built on the crate this page describes.
 cargo add mushroomdb
 ```
 
-The crate is installed as `mushroomdb` and imported as `core_api`: you write
-`use core_api::GraphDb;`. It needs Rust 1.92 or later. Every public item is on
+The crate is installed and imported as `mushroomdb`: you write
+`use mushroomdb::GraphDb;`. It needs Rust 1.92 or later. Every public item is on
 [docs.rs](https://docs.rs/mushroomdb); this page is the handful you start with.
 
 The examples here are not written for the page. Each is part of a program under
@@ -229,7 +229,7 @@ log. [Durability](durability.md) has what a crash can and cannot lose.
 
 ## Errors
 
-A call that can fail returns `core_api::Result<T>`. The variants of `GraphError` worth matching
+A call that can fail returns `mushroomdb::Result<T>`. The variants of `GraphError` worth matching
 on:
 
 | Variant | Means |

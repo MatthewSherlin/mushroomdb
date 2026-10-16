@@ -1,10 +1,10 @@
 //! One store, several threads: `SharedDb`.
 //! Quoted on docs/site/rust.md. Run: cargo run -p mushroomdb --example embed_shared
 
-use core_api::{BatchOp, SharedDb, Value};
+use mushroomdb::{BatchOp, SharedDb, Value};
 use std::collections::BTreeMap;
 
-fn main() -> core_api::Result<()> {
+fn main() -> mushroomdb::Result<()> {
     let dir = std::env::temp_dir().join(format!("mushroomdb-embed-shared-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 

@@ -1,4 +1,4 @@
-use core_api::{BatchOp, GraphDb, GraphError, Precondition, SharedDb, Value};
+use mushroomdb::{BatchOp, GraphDb, GraphError, Precondition, SharedDb, Value};
 use std::sync::{Arc, Barrier};
 use std::thread;
 

@@ -13,7 +13,7 @@
 //! regression in surface selection, tool listing or install wiring fails here
 //! too. It must never assert against a list this file declares: the 0.6.12
 //! version of that idea passed with its bug reintroduced.
-use core_api::GraphDb;
+use mushroomdb::GraphDb;
 use serde_json::Value as Js;
 use std::io::Write;
 use std::path::PathBuf;

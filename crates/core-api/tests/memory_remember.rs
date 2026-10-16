@@ -1,9 +1,9 @@
 //! remember: a fact may arrive before its subject, and the caller is told
 //! what the store did with it.
-use core_api::memory::recall::{recall_digest, RecallOutcome};
-use core_api::memory::remember::{describe_entity, remember, EntityIn, FactIn, RememberInput};
-use core_api::memory_schema::{memory_defaults, NAME_FIELD, PROVISIONAL_PROP};
-use core_api::{GraphDb, Value};
+use mushroomdb::memory::recall::{recall_digest, RecallOutcome};
+use mushroomdb::memory::remember::{describe_entity, remember, EntityIn, FactIn, RememberInput};
+use mushroomdb::memory_schema::{memory_defaults, NAME_FIELD, PROVISIONAL_PROP};
+use mushroomdb::{GraphDb, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -372,15 +372,15 @@ fn the_caller_owns_the_timestamp() {
 /// A store ingest-git wrote before 0.7 carries `about_<label>` rules: KeyMatch
 /// on `Note.about`, deriving the `ABOUT` edges `remember` also writes itself.
 /// Built here with the rule's own shape rather than from `repograph::rules`.
-fn about_file_rule() -> core_api::RuleDef {
-    let predicate = core_api::Predicate::KeyMatch {
+fn about_file_rule() -> mushroomdb::RuleDef {
+    let predicate = mushroomdb::Predicate::KeyMatch {
         field: "about".into(),
     };
-    core_api::RuleDef {
+    mushroomdb::RuleDef {
         name: "about_file".into(),
         src_label: "Note".into(),
         dst_label: "File".into(),
-        max_edges: Some(core_api::default_max_edges(&predicate)),
+        max_edges: Some(mushroomdb::default_max_edges(&predicate)),
         predicate,
         edge_type: "ABOUT".into(),
         weight_prop: None,
@@ -496,7 +496,7 @@ fn assert_every_argument_refuses(name: &str, key: &str, reason: &str) {
             },
         );
         match refused {
-            Err(core_api::GraphError::IngestError { detail }) => assert_eq!(
+            Err(mushroomdb::GraphError::IngestError { detail }) => assert_eq!(
                 detail,
                 format!("remember: {argument} must not be {reason}, got {key:?}")
             ),
@@ -537,7 +537,7 @@ fn describing_an_empty_key_is_refused() {
     let before = written(&db);
     for key in ["", "  "] {
         match describe_entity(&mut db, key, Some("Person"), &[]) {
-            Err(core_api::GraphError::IngestError { detail }) => {
+            Err(mushroomdb::GraphError::IngestError { detail }) => {
                 assert_eq!(
                     detail,
                     format!("key must not be empty or only whitespace, got {key:?}")
@@ -555,9 +555,9 @@ fn describing_an_empty_key_is_refused() {
 /// reopens, and `recall`, `schema` and `stats` answer with it present.
 #[test]
 fn a_store_that_already_holds_an_empty_key_node_still_opens_and_answers() {
-    use core_api::memory::brief::BriefOptions;
-    use core_api::memory::recall::recall_rows;
-    use core_api::memory::schema::{provisional_keys, render_schema, schema_report};
+    use mushroomdb::memory::brief::BriefOptions;
+    use mushroomdb::memory::recall::recall_rows;
+    use mushroomdb::memory::schema::{provisional_keys, render_schema, schema_report};
 
     let path = tmp("legacy-empty-key");
     {
@@ -670,7 +670,7 @@ fn assert_a_blank_predicate_or_label_refuses(name: &str, blank: &str) {
             },
         );
         match refused {
-            Err(core_api::GraphError::IngestError { detail }) => assert_eq!(
+            Err(mushroomdb::GraphError::IngestError { detail }) => assert_eq!(
                 detail,
                 format!("remember: {argument} must not be empty or only whitespace, got {blank:?}")
             ),
@@ -700,7 +700,7 @@ fn describing_under_an_empty_label_is_refused() {
     let before = written(&db);
     for label in ["", "  "] {
         match describe_entity(&mut db, "widget", Some(label), &[]) {
-            Err(core_api::GraphError::IngestError { detail }) => assert_eq!(
+            Err(mushroomdb::GraphError::IngestError { detail }) => assert_eq!(
                 detail,
                 format!("label must not be empty or only whitespace, got {label:?}")
             ),
@@ -717,10 +717,10 @@ fn describing_under_an_empty_label_is_refused() {
 /// reopens and `recall`, `schema` and `stats` answer with them present.
 #[test]
 fn a_store_that_already_holds_an_empty_type_edge_and_label_still_opens_and_answers() {
-    use core_api::memory::brief::BriefOptions;
-    use core_api::memory::forget::{forget, ForgetTarget};
-    use core_api::memory::recall::recall_rows;
-    use core_api::memory::schema::{render_schema, schema_report};
+    use mushroomdb::memory::brief::BriefOptions;
+    use mushroomdb::memory::forget::{forget, ForgetTarget};
+    use mushroomdb::memory::recall::recall_rows;
+    use mushroomdb::memory::schema::{render_schema, schema_report};
 
     let path = tmp("legacy-empty-type");
     {
@@ -802,7 +802,7 @@ fn a_store_that_already_holds_an_empty_type_edge_and_label_still_opens_and_answe
 /// an unknown subject always is, and carries its whole key as its one alias.
 #[test]
 fn a_stub_whose_key_implies_more_aliases_than_the_cap_carries_only_its_key() {
-    use core_api::memory::identity::{ALIASES_FIELD, MAX_ALIASES};
+    use mushroomdb::memory::identity::{ALIASES_FIELD, MAX_ALIASES};
 
     let mut db = store("stub-alias-cap");
     let aliases_of =

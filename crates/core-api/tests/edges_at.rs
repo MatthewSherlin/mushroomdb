@@ -1,6 +1,6 @@
 //! `edges_at` — every edge incident to a node at one WAL commit, from one scan.
 
-use core_api::{GraphDb, GraphError, OpenOptions, Predicate, RuleDef, Value};
+use mushroomdb::{GraphDb, GraphError, OpenOptions, Predicate, RuleDef, Value};
 use std::collections::BTreeSet;
 
 fn tmp(name: &str) -> std::path::PathBuf {

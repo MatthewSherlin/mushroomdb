@@ -55,14 +55,14 @@ use code_extract::{
     call_lookup_names, extract, indexed_under, resolve_call, resolve_import, resolve_mention,
     CallScope, FileFacts, SymbolIndex, MAX_FILE_BYTES,
 };
-use core_api::{default_max_edges, BatchOp, Predicate, RuleDef, Value};
+use mushroomdb::{default_max_edges, BatchOp, Predicate, RuleDef, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// `GraphDb` over the real filesystem, named without spelling out `RealFs` —
-/// which `core-api` does not re-export. Both an open [`core_api::GraphDb`] and
-/// a [`core_api::WriteGuard`] (through its `Deref`) are one of these.
-pub type Db = <core_api::WriteGuard<'static> as std::ops::Deref>::Target;
+/// which `core-api` does not re-export. Both an open [`mushroomdb::GraphDb`] and
+/// a [`mushroomdb::WriteGuard`] (through its `Deref`) are one of these.
+pub type Db = <mushroomdb::WriteGuard<'static> as std::ops::Deref>::Target;
 
 /// Most `Symbol` nodes kept for one file. A generated or vendored file can
 /// define tens of thousands; past this the file is still hashed and its
@@ -191,8 +191,8 @@ fn key_rule(name: &str, src: &str, dst: &str, field: &str, edge: &str) -> RuleDe
 /// applied once, to a store `ingest-git` is creating; an existing store is
 /// never re-declared on.
 #[must_use]
-pub fn ingest_git_schema() -> core_api::schema::Schema {
-    let mut schema = core_api::memory_schema::memory_defaults();
+pub fn ingest_git_schema() -> mushroomdb::schema::Schema {
+    let mut schema = mushroomdb::memory_schema::memory_defaults();
     schema.rules.extend(rules());
     for (label, field) in FULLTEXT {
         schema
@@ -214,10 +214,10 @@ pub fn ingest_git_schema() -> core_api::schema::Schema {
 /// rather than handed whole to `apply_schema`, which deletes and recreates a
 /// live rule whose definition differs.
 #[must_use]
-pub fn missing_structure_schema(w: &Db) -> core_api::schema::Schema {
+pub fn missing_structure_schema(w: &Db) -> mushroomdb::schema::Schema {
     let live: BTreeSet<String> = w.rules().into_iter().map(|r| r.name).collect();
     let declared = w.fulltext_pairs();
-    core_api::schema::Schema {
+    mushroomdb::schema::Schema {
         rules: rules()
             .into_iter()
             .filter(|r| !live.contains(&r.name))

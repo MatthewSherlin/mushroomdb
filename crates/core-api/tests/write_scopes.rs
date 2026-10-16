@@ -76,7 +76,7 @@
 //!   are masked on read:
 //!     test_rules_fire_but_hidden_edges_masked
 
-use core_api::{
+use mushroomdb::{
     schema::Schema, BatchOp, Direction, GraphDb, GraphError, Predicate, RoleDef, RuleDef, Value,
     WriteScope, MERGE_CREATE_NEEDS_ONE_NAMESPACE,
 };
@@ -145,12 +145,12 @@ fn open_with_writer(name: &str) -> (GraphDb<core_storage::fs::RealFs>, std::path
 }
 
 /// Build WriteAuthz for "writer" from the live DB state.
-fn writer_authz(db: &mut GraphDb<core_storage::fs::RealFs>) -> core_api::WriteAuthz {
+fn writer_authz(db: &mut GraphDb<core_storage::fs::RealFs>) -> mushroomdb::WriteAuthz {
     let roles = db.roles();
     let def = roles.iter().find(|r| r.name == "writer").unwrap();
     let scope = def.write.clone().unwrap();
     let mask = db.mask_for_role("writer").unwrap();
-    core_api::WriteAuthz {
+    mushroomdb::WriteAuthz {
         role: "writer".into(),
         scope,
         mask,
@@ -313,7 +313,7 @@ fn test_update_scope_denied() {
     let def = roles.iter().find(|r| r.name == "reader_writer").unwrap();
     let scope = def.write.clone().unwrap();
     let mask = db.mask_for_role("reader_writer").unwrap();
-    let authz = core_api::WriteAuthz {
+    let authz = mushroomdb::WriteAuthz {
         role: "reader_writer".into(),
         scope,
         mask,
@@ -793,7 +793,7 @@ fn test_merge_on_create_set_with_role_authz() {
     // ON CREATE SET on the batch-created node must STILL succeed (ruling §3.5).
     let dir2 = tmp("merge-on-create-set-create-only");
     let mut db2 = GraphDb::open(&dir2).unwrap();
-    let schema = core_api::schema::Schema {
+    let schema = mushroomdb::schema::Schema {
         fulltext: vec![],
         indexes: vec![],
         rules: vec![],
@@ -1176,7 +1176,7 @@ fn test_delete_recreate_setprop_respects_update_labels() {
     // Role: can delete+create "MyLabel" but has EMPTY update_labels.
     let dir = tmp("delete-recreate-setprop");
     let mut db = GraphDb::open(&dir).unwrap();
-    let schema = core_api::schema::Schema {
+    let schema = mushroomdb::schema::Schema {
         fulltext: vec![],
         indexes: vec![],
         rules: vec![],
@@ -1201,7 +1201,7 @@ fn test_delete_recreate_setprop_respects_update_labels() {
 
     let roles = db.roles();
     let def = roles.iter().find(|r| r.name == "delcreate").unwrap();
-    let authz = core_api::WriteAuthz {
+    let authz = mushroomdb::WriteAuthz {
         role: "delcreate".into(),
         scope: def.write.clone().unwrap(),
         mask: db.mask_for_role("delcreate").unwrap(),
@@ -1420,7 +1420,7 @@ fn test_predicate_narrows_the_write_target_set() {
     .unwrap();
     db.apply_schema(&Schema {
         roles: vec![RoleDef {
-            visible_where: Some(core_api::PropPredicate {
+            visible_where: Some(mushroomdb::PropPredicate {
                 field: "status".into(),
                 eq: None,
                 in_: Some(vec![Value::Str("published".into())]),
@@ -1434,7 +1434,7 @@ fn test_predicate_narrows_the_write_target_set() {
     let authz = {
         let roles = db.roles();
         let def = roles.iter().find(|r| r.name == "writer").unwrap();
-        core_api::WriteAuthz {
+        mushroomdb::WriteAuthz {
             role: "writer".into(),
             scope: def.write.clone().unwrap(),
             mask: db.mask_for_role("writer").unwrap(),
@@ -1504,7 +1504,7 @@ fn open_with_tenant_writer(name: &str) -> (GraphDb<core_storage::fs::RealFs>, st
 }
 
 fn ns_prop(n: &str) -> (String, Value) {
-    (core_api::NS_PROP.to_string(), Value::Str(n.to_string()))
+    (mushroomdb::NS_PROP.to_string(), Value::Str(n.to_string()))
 }
 
 /// A role bound to a namespace may only create inside it. The never-widen rule

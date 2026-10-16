@@ -618,7 +618,7 @@ fn describe_missing_stores(stores: &[(Platform, StoreRef)]) -> String {
     paths.dedup();
     paths
         .into_iter()
-        .filter(|p| !core_api::restore::holds_a_store(p))
+        .filter(|p| !mushroomdb::restore::holds_a_store(p))
         .map(|p| {
             format!(
                 "  note   no store at {} yet — the first `mushroomdb mcp`, `serve` or \

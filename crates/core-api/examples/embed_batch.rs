@@ -1,9 +1,9 @@
 //! Several writes as one commit, and a write that is refused if a node moved.
 //! Quoted on docs/site/rust.md. Run: cargo run -p mushroomdb --example embed_batch
 
-use core_api::{BatchOp, GraphDb, GraphError, Precondition, Value};
+use mushroomdb::{BatchOp, GraphDb, GraphError, Precondition, Value};
 
-fn main() -> core_api::Result<()> {
+fn main() -> mushroomdb::Result<()> {
     let dir = std::env::temp_dir().join(format!("mushroomdb-embed-batch-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut db = GraphDb::open(&dir)?;

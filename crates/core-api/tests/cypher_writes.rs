@@ -4,7 +4,7 @@
 //! `insert_node` / `set_prop` / `delete_edge` / `insert_edge` so the rule
 //! engine fires and the WAL logs everything.
 
-use core_api::{GraphDb, GraphError, Predicate, RuleDef, Value};
+use mushroomdb::{GraphDb, GraphError, Predicate, RuleDef, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -115,7 +115,7 @@ fn create_node_and_edge() {
     assert!(db.has_node("alice"));
     assert!(db.has_node("bob"));
     let nbrs = db
-        .neighbors("alice", "KNOWS", core_api::Direction::Out)
+        .neighbors("alice", "KNOWS", mushroomdb::Direction::Out)
         .unwrap();
     assert!(nbrs.contains(&"bob".to_string()));
 }
@@ -388,7 +388,7 @@ fn delete_manual_edge() {
         .unwrap();
     db.insert_edge("KNOWS", "a", "b").unwrap();
     assert!(db
-        .neighbors("a", "KNOWS", core_api::Direction::Out)
+        .neighbors("a", "KNOWS", mushroomdb::Direction::Out)
         .unwrap()
         .contains(&"b".to_string()));
 
@@ -400,7 +400,7 @@ fn delete_manual_edge() {
         .unwrap();
     assert_eq!(rs.get(0, "deleted"), Some(&Value::Int(1)));
     assert!(db
-        .neighbors("a", "KNOWS", core_api::Direction::Out)
+        .neighbors("a", "KNOWS", mushroomdb::Direction::Out)
         .unwrap()
         .is_empty());
 }
@@ -681,7 +681,7 @@ fn delete_edge_survives_wal_replay() {
     assert!(db2.has_node("a"));
     assert!(db2.has_node("b"));
     let nbrs = db2
-        .neighbors("a", "KNOWS", core_api::Direction::Out)
+        .neighbors("a", "KNOWS", mushroomdb::Direction::Out)
         .unwrap_or_default();
     assert!(
         !nbrs.contains(&"b".to_string()),

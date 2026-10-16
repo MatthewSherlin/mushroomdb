@@ -4,7 +4,7 @@
 //! store it merely reopens is never silently upgraded — declaring full-text
 //! on a populated store rebuilds the index at open (227 ms vs. 3.8 ms with
 //! none, ledger row 36).
-use core_api::GraphDb;
+use mushroomdb::GraphDb;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};

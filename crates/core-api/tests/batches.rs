@@ -1,8 +1,8 @@
-use core_api::{
-    AutoFk, Direction, FsyncPolicy, GraphDb, GraphError, IngestOptions, Predicate, RuleDef, Value,
-};
 use core_storage::fs::{FileId, Fs, FsIntrospect};
 use core_storage::wal::{decode_all, WalRecord};
+use mushroomdb::{
+    AutoFk, Direction, FsyncPolicy, GraphDb, GraphError, IngestOptions, Predicate, RuleDef, Value,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 fn tmp(name: &str) -> std::path::PathBuf {

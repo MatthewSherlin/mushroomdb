@@ -1,8 +1,8 @@
 //! recall matches language. The 0.6.12 implementation matched identifiers, so
 //! a human name — the commonest subject in a memory store — was unreachable.
-use core_api::memory::recall::{recall_digest, recall_rows, RecallOutcome};
-use core_api::memory_schema::memory_defaults;
-use core_api::{GraphDb, Value};
+use mushroomdb::memory::recall::{recall_digest, recall_rows, RecallOutcome};
+use mushroomdb::memory_schema::memory_defaults;
+use mushroomdb::{GraphDb, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -218,7 +218,7 @@ fn a_long_prompt_is_capped_before_it_becomes_a_query() {
         recall_digest(&db, &format!("{long} matthew"), "store", 4000),
         RecallOutcome::NoMatch | RecallOutcome::Hits(_)
     ));
-    assert_eq!(core_api::memory::recall::MAX_QUERY_TERMS, 24);
+    assert_eq!(mushroomdb::memory::recall::MAX_QUERY_TERMS, 24);
 }
 
 #[test]
@@ -538,7 +538,7 @@ fn store_with_only_note_text(name: &str) -> GraphDb<core_storage::fs::RealFs> {
 
 #[test]
 fn a_store_past_its_first_note_names_the_entity_fields_recall_cannot_search() {
-    use core_api::memory::recall::unindexed_memory_fields;
+    use mushroomdb::memory::recall::unindexed_memory_fields;
     let mut db = store_with_only_note_text("unindexed");
     assert_eq!(unindexed_memory_fields(&db), vec![pair("Person", "name")]);
 
@@ -580,7 +580,7 @@ fn a_store_past_its_first_note_names_the_entity_fields_recall_cannot_search() {
 
 #[test]
 fn a_store_with_its_own_schema_and_no_memory_labels_is_not_told_to_apply_the_defaults() {
-    use core_api::memory::recall::unindexed_memory_fields;
+    use mushroomdb::memory::recall::unindexed_memory_fields;
     let mut db = GraphDb::open(&tmp("own-schema")).unwrap();
     db.enable_fulltext("Doc", "body").unwrap();
     db.insert_node(
@@ -626,7 +626,7 @@ fn named_person(db: &mut GraphDb<core_storage::fs::RealFs>, key: &str) {
 /// not named: the notice is advice, and silence is the cheaper mistake.
 #[test]
 fn a_field_carried_only_beyond_the_scan_bound_is_not_named() {
-    use core_api::memory::recall::{unindexed_memory_fields, UNINDEXED_SCAN_LIMIT};
+    use mushroomdb::memory::recall::{unindexed_memory_fields, UNINDEXED_SCAN_LIMIT};
     let mut db = GraphDb::open(&tmp("beyond-bound")).unwrap();
     db.enable_fulltext("Note", "text").unwrap();
     unnamed_people(&mut db, "early", UNINDEXED_SCAN_LIMIT);
@@ -638,7 +638,7 @@ fn a_field_carried_only_beyond_the_scan_bound_is_not_named() {
 /// number of nodes after it, or last of the nodes the check reads.
 #[test]
 fn a_field_carried_inside_the_scan_bound_is_named_however_many_nodes_lack_it() {
-    use core_api::memory::recall::{unindexed_memory_fields, UNINDEXED_SCAN_LIMIT};
+    use mushroomdb::memory::recall::{unindexed_memory_fields, UNINDEXED_SCAN_LIMIT};
     let mut first = GraphDb::open(&tmp("bound-first")).unwrap();
     first.enable_fulltext("Note", "text").unwrap();
     named_person(&mut first, "p1");

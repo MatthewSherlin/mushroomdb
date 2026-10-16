@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **The Rust library is now imported as `mushroomdb`, not `core_api`.** The
+  library name inside the crate has been corrected to match the crate's package
+  name. An embedded Rust user changes one line in `Cargo.toml` and one import
+  prefix in their code:
+
+  Before:
+  ```toml
+  # Cargo.toml — the old dep key gave the extern name "core_api"
+  core-api = { package = "mushroomdb", path = "…", version = "0.8.2" }
+  ```
+  ```rust
+  use core_api::GraphDb;
+  ```
+
+  After:
+  ```toml
+  mushroomdb = { path = "…", version = "0.9.0" }
+  ```
+  ```rust
+  use mushroomdb::GraphDb;
+  ```
+
+  Nothing changes for the CLI, the MCP server, HTTP, Python, or TypeScript
+  users, and the on-disk format is identical.
+
 ## v0.8.2 — two more rule engine corrections, and a repair for stores 0.8.0 damaged
 
 No format version change. A 0.8.1 store opens under 0.8.2, and a 0.8.2 snapshot opens under 0.8.1 and 0.8.0.

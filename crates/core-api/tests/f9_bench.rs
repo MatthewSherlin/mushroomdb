@@ -15,9 +15,9 @@
 //! twice, snapshotted and reopened so the mmap'd-base branch is the one taken,
 //! 5 reps, median — see `docs/roadmap/v0.6.10-defects.md` #29 for the numbers
 //! and what changed between them.
-use core_api::algo::AlgoDir;
-use core_api::GraphDb;
 use core_storage::fs::RealFs;
+use mushroomdb::algo::AlgoDir;
+use mushroomdb::GraphDb;
 
 type Db = GraphDb<RealFs>;
 

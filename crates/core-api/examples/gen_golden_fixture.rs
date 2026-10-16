@@ -11,7 +11,7 @@
 //! failing pin test, which exists precisely to catch unintended byte-format
 //! drift.
 
-use core_api::{GraphDb, Value};
+use mushroomdb::{GraphDb, Value};
 
 fn main() {
     let out = std::env::args()

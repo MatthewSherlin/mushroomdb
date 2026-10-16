@@ -1,14 +1,14 @@
 //! The smallest embedding of mushroomdb: nodes, one rule, a query, and why.
 //! Quoted on docs/site/rust.md. Run: cargo run -p mushroomdb --example embed_basics
 
-use core_api::{GraphDb, Predicate, RuleDef, Value};
+use mushroomdb::{GraphDb, Predicate, RuleDef, Value};
 use std::collections::BTreeMap;
 
 fn skills(items: &[&str]) -> Value {
     Value::List(items.iter().map(|s| Value::Str((*s).into())).collect())
 }
 
-fn main() -> core_api::Result<()> {
+fn main() -> mushroomdb::Result<()> {
     let dir = std::env::temp_dir().join(format!("mushroomdb-embed-basics-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 

@@ -1,5 +1,5 @@
 //! cargo run -p mushroomdb --example predicates_ii
-use core_api::{GraphDb, Predicate, RuleDef, Value};
+use mushroomdb::{GraphDb, Predicate, RuleDef, Value};
 
 fn list(xs: &[f64]) -> Value {
     Value::List(xs.iter().copied().map(Value::Float).collect())

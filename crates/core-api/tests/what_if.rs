@@ -1,7 +1,7 @@
 //! `what_if_set_prop` — the derived edges a prop change would add or remove,
 //! without committing anything.
 
-use core_api::{GraphDb, GraphError, Predicate, RuleDef, Value};
+use mushroomdb::{GraphDb, GraphError, Predicate, RuleDef, Value};
 use std::collections::BTreeSet;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -92,7 +92,7 @@ fn real_diff(
     )
 }
 
-fn as_triples(edges: &[core_api::EdgeAt]) -> BTreeSet<Triple> {
+fn as_triples(edges: &[mushroomdb::EdgeAt]) -> BTreeSet<Triple> {
     edges
         .iter()
         .map(|e| (e.edge_type.clone(), e.src_key.clone(), e.dst_key.clone()))
@@ -179,7 +179,7 @@ fn what_if_set_prop_on_a_read_only_handle_works() {
     seed(&dir);
     let db = GraphDb::open_with_options(
         &dir,
-        core_api::OpenOptions {
+        mushroomdb::OpenOptions {
             auto_migrate: false,
             repair_wal: false,
             read_only: true,

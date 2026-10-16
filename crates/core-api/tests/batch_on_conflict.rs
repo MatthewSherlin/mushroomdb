@@ -4,7 +4,7 @@
 //! content without wiping it first. `OnConflict` says what a taken key means:
 //! refuse the frame (today's answer), leave the stored node alone, or make its
 //! properties exactly the supplied ones.
-use core_api::{BatchOp, Direction, GraphDb, GraphError, OnConflict, Value, ViewDef, ViewSource};
+use mushroomdb::{BatchOp, Direction, GraphDb, GraphError, OnConflict, Value, ViewDef, ViewSource};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!(

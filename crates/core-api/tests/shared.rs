@@ -1,4 +1,4 @@
-use core_api::SharedDb;
+use mushroomdb::SharedDb;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;

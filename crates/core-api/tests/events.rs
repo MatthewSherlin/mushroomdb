@@ -1,4 +1,4 @@
-use core_api::{
+use mushroomdb::{
     AutoFk, DbEvent, GraphDb, GraphError, IngestOptions, MutationEvent, Predicate, RuleDef,
     Subscription, Value,
 };
@@ -837,12 +837,12 @@ fn query_sub_skips_unrelated_label_commit() {
         .subscribe_query("MATCH (n:Person) RETURN n")
         .expect("subscribe_query must succeed");
 
-    let before = core_api::query_sub_exec_count();
+    let before = mushroomdb::query_sub_exec_count();
 
     // Org insert — no overlap with Person scan.
     db.insert_node("Org", "acme", vec![]).unwrap();
 
-    let after = core_api::query_sub_exec_count();
+    let after = mushroomdb::query_sub_exec_count();
     assert_eq!(
         after - before,
         0,
@@ -865,11 +865,11 @@ fn query_sub_still_fires_on_matching_label() {
         .subscribe_query("MATCH (n:Person) RETURN n")
         .expect("subscribe_query must succeed");
 
-    let before = core_api::query_sub_exec_count();
+    let before = mushroomdb::query_sub_exec_count();
 
     db.insert_node("Person", "bob", vec![]).unwrap();
 
-    let after = core_api::query_sub_exec_count();
+    let after = mushroomdb::query_sub_exec_count();
     assert_eq!(
         after - before,
         1,
@@ -899,11 +899,11 @@ fn query_sub_does_not_skip_on_edge_commit() {
         .subscribe_query("MATCH (n:Person) RETURN n")
         .expect("subscribe_query must succeed");
 
-    let before = core_api::query_sub_exec_count();
+    let before = mushroomdb::query_sub_exec_count();
 
     db.insert_edge("WORKS_AT", "alice", "acme").unwrap();
 
-    let after = core_api::query_sub_exec_count();
+    let after = mushroomdb::query_sub_exec_count();
     assert_eq!(
         after - before,
         1,
@@ -929,13 +929,13 @@ fn query_sub_does_not_skip_on_rule_delta() {
         .subscribe_query("MATCH (n:Person) RETURN n")
         .expect("subscribe_query must succeed");
 
-    let before = core_api::query_sub_exec_count();
+    let before = mushroomdb::query_sub_exec_count();
 
     // Insert another A node — the overlap rule fires → engine_deltas non-empty.
     db.insert_node("A", "n3", vec![("tags".into(), tags(&["x"]))])
         .unwrap();
 
-    let after = core_api::query_sub_exec_count();
+    let after = mushroomdb::query_sub_exec_count();
     assert_eq!(
         after - before,
         1,
@@ -958,12 +958,12 @@ fn query_sub_does_not_skip_with_expand() {
         .subscribe_query("MATCH (a:Person)-[r:KNOWS]->(b:Org) RETURN a")
         .expect("single-hop Expand must be accepted");
 
-    let before = core_api::query_sub_exec_count();
+    let before = mushroomdb::query_sub_exec_count();
 
     // Insert a Thing node — touches neither Person nor Org.
     db.insert_node("Thing", "gadget", vec![]).unwrap();
 
-    let after = core_api::query_sub_exec_count();
+    let after = mushroomdb::query_sub_exec_count();
     assert_eq!(
         after - before,
         1,

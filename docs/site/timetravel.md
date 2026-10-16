@@ -186,7 +186,7 @@ and do **not** update `last_changed`.
 ### Precondition types
 
 ```rust
-use core_api::Precondition;
+use mushroomdb::Precondition;
 
 // Fails if the node was modified since `expected` (or does not exist).
 Precondition::NodeUnchangedSince { key: "alice".into(), expected: seq }
@@ -336,10 +336,10 @@ valid frames are counted. No error is returned; the valid prefix is replayed.
 ### Rust API
 
 ```rust
-use core_api::{GraphDb, GraphError};
+use mushroomdb::{GraphDb, GraphError};
 
 // Count total WAL commits without opening the db.
-let total = core_api::wal_commit_count_at(&dir)?;
+let total = mushroomdb::wal_commit_count_at(&dir)?;
 
 // Open a read-only view at commit 3.
 let mut db = GraphDb::open_at(&dir, 3)?;
@@ -392,7 +392,7 @@ keeping old WAL files as numbered sidecars instead of deleting them.
 ### Enabling archives
 
 ```rust
-use core_api::{SnapshotOptions, GraphDb};
+use mushroomdb::{SnapshotOptions, GraphDb};
 
 db.snapshot_with(SnapshotOptions {
     keep_wal: false,   // truncating snapshot (default)

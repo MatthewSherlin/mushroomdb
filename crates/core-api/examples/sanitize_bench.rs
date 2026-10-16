@@ -21,7 +21,7 @@
 //! than trusting the absolute microseconds, and expect the *ordering* to hold
 //! while the magnitudes move.
 
-use core_api::digest::sanitize;
+use mushroomdb::digest::sanitize;
 use std::time::Instant;
 
 /// 0.6.8: ASCII controls only.

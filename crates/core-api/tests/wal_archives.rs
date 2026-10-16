@@ -11,7 +11,7 @@
 //! - Pruned-archive horizon honesty: CommitOutOfRange, not silently wrong
 //! - Crash-window op-mode sweep: any crash point reopens cleanly
 
-use core_api::{EdgeEvent, GraphDb, GraphError, HistoryChange, SnapshotOptions, Value};
+use mushroomdb::{EdgeEvent, GraphDb, GraphError, HistoryChange, SnapshotOptions, Value};
 use sim_harness::SimFs;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -902,7 +902,7 @@ fn horizon_is_reported_by_every_history_read() {
 }
 
 /// Minimal workload that exercises the archive_wal snapshot path.
-fn archive_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn archive_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     db.insert_node("N", "x", vec![])?;
     db.insert_node("N", "y", vec![])?;
     db.insert_edge("E", "x", "y")?;
@@ -916,7 +916,7 @@ fn archive_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::R
 
 /// Workload that exercises the retention-prune path (two archives with
 /// retention=1, causing the first to be pruned when the second is taken).
-fn archive_prune_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn archive_prune_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     db.set_wal_archive_retention(Some(1));
     // First archive: 2 frames.
     db.insert_node("N", "x", vec![])?; // commit 0

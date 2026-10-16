@@ -1,4 +1,4 @@
-use core_api::{GraphDb, Value};
+use mushroomdb::{GraphDb, Value};
 use std::collections::BTreeMap;
 
 fn m(pairs: &[(&str, Value)]) -> Value {

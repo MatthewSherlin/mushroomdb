@@ -1,4 +1,4 @@
-use core_api::{EdgeInfo, GraphDb, GraphError, NodeInfo, Predicate, RuleDef, Value};
+use mushroomdb::{EdgeInfo, GraphDb, GraphError, NodeInfo, Predicate, RuleDef, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {

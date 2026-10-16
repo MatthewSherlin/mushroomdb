@@ -272,7 +272,7 @@ fn the_brief_of_a_store_past_its_first_note_names_the_fields_recall_cannot_searc
     );
     assert!(!out.contains("no text index"), "{out:?}");
     assert!(
-        out.len() <= core_api::memory::brief::MAX_BRIEF_BYTES,
+        out.len() <= mushroomdb::memory::brief::MAX_BRIEF_BYTES,
         "an ordinary store's brief holds the notice inside the cap: {} bytes",
         out.len()
     );

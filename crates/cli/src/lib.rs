@@ -11,18 +11,18 @@ pub mod install;
 pub mod recall;
 pub mod structure;
 
+use export::ExportFormat;
 #[cfg(test)]
-use core_api::restore::holds_a_store;
+use mushroomdb::restore::holds_a_store;
 /// Re-exported where it has always been named: `cli::RestoreOutcome`.
-pub use core_api::restore::RestoreOutcome;
-use core_api::schema::Schema;
-use core_api::{
+pub use mushroomdb::restore::RestoreOutcome;
+use mushroomdb::schema::Schema;
+use mushroomdb::{
     default_max_edges, is_write_query, valid_namespace, AlgoDir, BackupReport, DegreeConfig,
     Explanation, GraphDb, IngestOptions, LouvainConfig, PageRankConfig, Predicate, RealFs,
     ResultSet, RuleDef, RuleSuggestion, SharedDb, SnapshotOptions, Stats, Value, WccConfig,
     WriteGuard, NS_MAX_LEN,
 };
-use export::ExportFormat;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -84,7 +84,7 @@ pub const AUTO_SNAPSHOT_RETENTION: Option<u32> = None;
 /// # Errors
 ///
 /// Whatever writing the snapshot returned.
-pub fn snapshot_automatically(db: &mut WriteGuard<'_>) -> Result<(), core_api::GraphError> {
+pub fn snapshot_automatically(db: &mut WriteGuard<'_>) -> Result<(), mushroomdb::GraphError> {
     db.set_wal_archive_retention(AUTO_SNAPSHOT_RETENTION);
     db.snapshot_with(AUTOMATIC_SNAPSHOT)
 }
@@ -108,7 +108,7 @@ pub const SNAPSHOT_LOCK_WAIT: Duration = Duration::from_millis(500);
 /// # Errors
 ///
 /// Whatever taking the write lock or writing the snapshot returned.
-pub fn snapshot_shared(db: &SharedDb) -> Result<(), core_api::GraphError> {
+pub fn snapshot_shared(db: &SharedDb) -> Result<(), mushroomdb::GraphError> {
     snapshot_automatically(&mut db.write_with_wait(SNAPSHOT_LOCK_WAIT)?)
 }
 
@@ -144,7 +144,7 @@ pub fn snapshot_if_wal_grew(db: &SharedDb, db_dir: &Path) {
         return;
     }
     match snapshot_shared(db) {
-        Ok(()) | Err(core_api::GraphError::Busy { .. }) => {}
+        Ok(()) | Err(mushroomdb::GraphError::Busy { .. }) => {}
         Err(e) => eprintln!("snapshot skipped: {e}"),
     }
 }
@@ -443,8 +443,8 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
-impl From<core_api::GraphError> for CliError {
-    fn from(e: core_api::GraphError) -> Self {
+impl From<mushroomdb::GraphError> for CliError {
+    fn from(e: mushroomdb::GraphError) -> Self {
         CliError(e.to_string())
     }
 }
@@ -1393,8 +1393,8 @@ fn parse_snapshot(args: &[&str]) -> Result<Command, String> {
 ///   prints `migrated V<from> -> V<current>`.
 /// - WAL-only stores (no snapshot) are treated as needing a fresh snapshot.
 pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
-    let current = core_api::SNAPSHOT_VERSION;
-    let from_ver = core_api::snapshot_version_at(db_dir)?;
+    let current = mushroomdb::SNAPSHOT_VERSION;
+    let from_ver = mushroomdb::snapshot_version_at(db_dir)?;
 
     // `>=`, not `==`: a store that has opted in to multiplicity writes V10, a
     // version above the default this binary writes. It is already current —
@@ -1417,7 +1417,7 @@ pub fn run_migrate(db_dir: &Path) -> Result<String, CliError> {
     // the truncating snapshot (CLI migrate always truncates the WAL).
     let mut db = GraphDb::open_with_options(
         db_dir,
-        core_api::OpenOptions {
+        mushroomdb::OpenOptions {
             auto_migrate: false,
             ..Default::default()
         },
@@ -1446,7 +1446,7 @@ pub fn run_verify(db_dir: &Path) -> Result<String, CliError> {
             db_dir.display()
         )));
     }
-    let results = core_api::verify_snapshot(db_dir)
+    let results = mushroomdb::verify_snapshot(db_dir)
         .map_err(|e| CliError(format!("verify: cannot open snapshot: {e}")))?;
     let mut any_fail = false;
     let mut out = String::new();
@@ -1727,14 +1727,14 @@ pub fn run_schema_apply(db_dir: &Path, schema_file: &Path) -> Result<String, Cli
 
 /// `mushroomdb schema apply <db> --memory-defaults`
 ///
-/// Applies `core_api::memory_schema::memory_defaults()`. Kept separate from
+/// Applies `mushroomdb::memory_schema::memory_defaults()`. Kept separate from
 /// `run_schema_apply` because it takes no schema file, and separate from
 /// `open` because declaring full-text on a populated store rebuilds the index
 /// at open — the caller is told what it will cost before it happens.
 pub fn run_schema_apply_memory_defaults(db_dir: &Path) -> Result<String, CliError> {
     let mut db = GraphDb::open(db_dir)?;
     let before = db.stats();
-    let diff = db.apply_schema(&core_api::memory_schema::memory_defaults())?;
+    let diff = db.apply_schema(&mushroomdb::memory_schema::memory_defaults())?;
     let mut out = String::new();
     if diff.created.is_empty() && diff.updated.is_empty() {
         let _ = writeln!(out, "schema apply: already current, nothing to do");
@@ -1761,7 +1761,7 @@ pub fn run_schema_apply_memory_defaults(db_dir: &Path) -> Result<String, CliErro
 
 /// `mushroomdb schema apply <db> --memory-identity`
 ///
-/// Applies `core_api::memory_schema::memory_identity()` — opt-in, because a
+/// Applies `mushroomdb::memory_schema::memory_identity()` — opt-in, because a
 /// store never gains a rule silently. What it will do is measured and stated
 /// first, in the same output, before anything is written: how many entity
 /// nodes the rules will compare, and how many need an `aliases` list written
@@ -1776,12 +1776,12 @@ pub fn run_schema_apply_memory_defaults(db_dir: &Path) -> Result<String, CliErro
 /// earlier eleven rules, this adds the five claim rules and leaves the rest
 /// unchanged.
 pub fn run_schema_apply_memory_identity(db_dir: &Path) -> Result<String, CliError> {
-    use core_api::memory::identity::{
+    use mushroomdb::memory::identity::{
         aliases_to_backfill, entity_node_count, write_aliases, ALIASES_FIELD, ALIAS_KEYS_FIELD,
         SAME_AS_EDGE,
     };
     let mut db = GraphDb::open(db_dir)?;
-    let preset = core_api::memory_schema::memory_identity();
+    let preset = mushroomdb::memory_schema::memory_identity();
     let entity_nodes = entity_node_count(&db);
     let backfill = aliases_to_backfill(&db)?;
     let mut out = String::new();
@@ -1916,16 +1916,16 @@ pub fn run_backup(db_dir: &Path, dest: &Path) -> Result<BackupReport, CliError> 
     Ok(db.backup_to(dest)?)
 }
 
-/// [`core_api::restore::restore_if_empty`], in the CLI's error type.
+/// [`mushroomdb::restore::restore_if_empty`], in the CLI's error type.
 ///
 /// The implementation moved down into `core-api` in v0.6.10 so the Python
 /// binding could reach it without taking a dependency on this crate; the
 /// semantics, the messages and [`RestoreOutcome`] are unchanged. The engine
-/// carries the message inside [`core_api::GraphError::Io`], whose own `Display`
+/// carries the message inside [`mushroomdb::GraphError::Io`], whose own `Display`
 /// adds a prefix — unwrapped here, so `serve` prints what it always printed.
 pub fn restore_if_empty(db_dir: &Path, from: &Path) -> Result<RestoreOutcome, CliError> {
-    core_api::restore::restore_if_empty(db_dir, from).map_err(|e| match e {
-        core_api::GraphError::Io(io) => CliError(io.to_string()),
+    mushroomdb::restore::restore_if_empty(db_dir, from).map_err(|e| match e {
+        mushroomdb::GraphError::Io(io) => CliError(io.to_string()),
         other => CliError(other.to_string()),
     })
 }
@@ -2127,11 +2127,12 @@ fn parse_algo_dir(val: &str) -> Result<AlgoDir, String> {
 pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
     let db = open_for_reading(db_dir)?;
     let reach = reach_line(db_dir);
-    let b = core_api::memory::brief::brief(&db, &core_api::memory::brief::BriefOptions::default());
-    let mut text = core_api::memory::brief::render(&b, &reach);
+    let b =
+        mushroomdb::memory::brief::brief(&db, &mushroomdb::memory::brief::BriefOptions::default());
+    let mut text = mushroomdb::memory::brief::render(&b, &reach);
     // An empty store's line names how to fill it, and `render` cannot know
     // which doors this install opened. A cli-only install gets the shell form.
-    if text == core_api::memory::brief::EMPTY_BRIEF
+    if text == mushroomdb::memory::brief::EMPTY_BRIEF
         && matches!(install::delivery_for_store(db_dir), install::Delivery::Cli)
     {
         text = empty_brief_cli(db_dir);
@@ -2156,19 +2157,19 @@ pub fn run_brief(db_dir: &Path) -> Result<String, CliError> {
     // already in it stay unsearchable by name. That store gets the second
     // notice, naming the fields. A store with no node under a memory label
     // gets neither: the defaults would index nothing there.
-    let store = core_api::digest::sanitize(&install::sh_quote(&db_dir.to_string_lossy()));
+    let store = mushroomdb::digest::sanitize(&install::sh_quote(&db_dir.to_string_lossy()));
     let notice = if db.fulltext_pairs().is_empty() {
         Some(format!(
             "no text index: recall cannot match anything here. \
              Run: mushroomdb schema apply {store} --memory-defaults\n"
         ))
     } else {
-        let unindexed = core_api::memory::recall::unindexed_memory_fields(&db);
+        let unindexed = mushroomdb::memory::recall::unindexed_memory_fields(&db);
         (!unindexed.is_empty()).then(|| {
             format!(
                 "text index incomplete: recall does not search {}. \
                  Run: mushroomdb schema apply {store} --memory-defaults\n",
-                core_api::memory::recall::unindexed_fields_list(&unindexed)
+                mushroomdb::memory::recall::unindexed_fields_list(&unindexed)
             )
         })
     };
@@ -2221,7 +2222,7 @@ fn reach_line(db_dir: &Path) -> String {
     let tools = format!(
         "explain_association <a> <b>{sep}query '<cypher>' (MCP tools; add role: <name> \
          or namespace: <ns> to narrow what it sees){sep}or:",
-        sep = core_api::digest::SEP
+        sep = mushroomdb::digest::SEP
     );
     let shell = format!("{bin} query {db} \"<cypher>\" ({SHELL_QUOTING_RULE})");
     match install::delivery_for_store(db_dir) {
@@ -2232,7 +2233,7 @@ fn reach_line(db_dir: &Path) -> String {
 
 /// An empty store's brief for an install that registered no MCP server.
 ///
-/// [`core_api::memory::brief::EMPTY_BRIEF`] offers `remember`,
+/// [`mushroomdb::memory::brief::EMPTY_BRIEF`] offers `remember`,
 /// `upsert_entity` and `ingest_json`, which are MCP tools; a `--delivery cli`
 /// session has a shell and nothing else. This is the same offer in the one
 /// form that session can act on — a `query` with a `CREATE`, the write the
@@ -2251,8 +2252,8 @@ fn reach_line(db_dir: &Path) -> String {
 fn empty_brief_cli(db_dir: &Path) -> String {
     // Sanitized as the reach line is: `render` returned a constant for this
     // store, so nothing downstream sanitizes what is built here.
-    let bin = core_api::digest::sanitize(&install::detect_mcp_command(None).shell());
-    let db = core_api::digest::sanitize(&install::sh_quote(&db_dir.to_string_lossy()));
+    let bin = mushroomdb::digest::sanitize(&install::detect_mcp_command(None).shell());
+    let db = mushroomdb::digest::sanitize(&install::sh_quote(&db_dir.to_string_lossy()));
     format!(
         "mushroomdb brief — empty store; offer to fill it: {bin} query {db} \
          \"CREATE (n:Note {{id: 'note:<fresh-id>', text: '<the fact>'}})\" writes a fact; \
@@ -2275,7 +2276,7 @@ fn open_for_reading(db_dir: &Path) -> Result<structure::Db, CliError> {
     }
     Ok(GraphDb::open_with_options(
         db_dir,
-        core_api::OpenOptions {
+        mushroomdb::OpenOptions {
             auto_migrate: false,
             repair_wal: false,
             read_only: true,
@@ -2292,11 +2293,11 @@ fn open_for_reading(db_dir: &Path) -> Result<structure::Db, CliError> {
 /// included: the rule names and matched values are graph content.
 pub fn run_why(db_dir: &Path, a: &str, b: &str) -> Result<String, CliError> {
     let db = open_for_reading(db_dir)?;
-    let explained = core_api::explain_digest::explain_with_evidence(&db, a, b)?;
+    let explained = mushroomdb::explain_digest::explain_with_evidence(&db, a, b)?;
     Ok(format!(
         "{}{}",
-        core_api::digest::UNTRUSTED_FRAMING,
-        core_api::explain_digest::render_explain(a, b, &explained)
+        mushroomdb::digest::UNTRUSTED_FRAMING,
+        mushroomdb::explain_digest::render_explain(a, b, &explained)
     ))
 }
 
@@ -2351,7 +2352,7 @@ pub fn run_algo(
     }
 }
 
-fn format_pagerank(report: &core_api::PageRankReport, top: usize) -> String {
+fn format_pagerank(report: &mushroomdb::PageRankReport, top: usize) -> String {
     let mut buf = String::new();
     let _ = writeln!(buf, "== pagerank (converged={}) ==", report.converged);
     let rows = if top == 0 {
@@ -2365,7 +2366,7 @@ fn format_pagerank(report: &core_api::PageRankReport, top: usize) -> String {
     buf
 }
 
-fn format_wcc(report: &core_api::WccReport, top: usize) -> String {
+fn format_wcc(report: &mushroomdb::WccReport, top: usize) -> String {
     let mut buf = String::new();
     let _ = writeln!(buf, "== wcc (truncated={}) ==", report.truncated);
     let rows = if top == 0 {
@@ -2379,7 +2380,7 @@ fn format_wcc(report: &core_api::WccReport, top: usize) -> String {
     buf
 }
 
-fn format_degree(report: &core_api::DegreeReport, top: usize) -> String {
+fn format_degree(report: &mushroomdb::DegreeReport, top: usize) -> String {
     let mut buf = String::new();
     let _ = writeln!(
         buf,
@@ -2399,7 +2400,7 @@ fn format_degree(report: &core_api::DegreeReport, top: usize) -> String {
 
 /// One line per community: id, size, cohesion, first 3 members.
 /// Prints `(truncated)` in the header when the time budget fired.
-fn format_communities(report: &core_api::CommunityReport, top: usize) -> String {
+fn format_communities(report: &mushroomdb::CommunityReport, top: usize) -> String {
     let mut buf = String::new();
     let trunc = if report.truncated { " (truncated)" } else { "" };
     let _ = writeln!(
@@ -2582,7 +2583,7 @@ pub fn run_demo(dir: &Path) -> Result<DemoOutcome, CliError> {
         let mut w = db.write();
         // A demo store is the first store most readers open. Declare the
         // memory schema before the first write so `recall` can answer on it.
-        w.apply_schema(&core_api::memory_schema::memory_defaults())?;
+        w.apply_schema(&mushroomdb::memory_schema::memory_defaults())?;
         for (label, json) in [
             ("Org", org_json()),
             ("Project", project_json()),
@@ -3016,7 +3017,7 @@ mod tests {
         let mut out = BTreeSet::new();
         for i in 1..=N_ORGS {
             let src = format!("org-{i:02}");
-            if let Ok(nbrs) = g.neighbors(&src, etype, core_api::Direction::Out) {
+            if let Ok(nbrs) = g.neighbors(&src, etype, mushroomdb::Direction::Out) {
                 for dst in nbrs {
                     out.insert((src.clone(), dst));
                 }
@@ -3024,7 +3025,7 @@ mod tests {
         }
         for i in 1..=N_PEOPLE {
             let src = format!("person-{i:02}");
-            if let Ok(nbrs) = g.neighbors(&src, etype, core_api::Direction::Out) {
+            if let Ok(nbrs) = g.neighbors(&src, etype, mushroomdb::Direction::Out) {
                 for dst in nbrs {
                     out.insert((src.clone(), dst));
                 }
@@ -4061,7 +4062,7 @@ mod tests {
             let mut db = GraphDb::open(&dir).expect("open");
             db.insert_node("Person", "alice", vec![]).expect("insert");
         }
-        let before = core_api::wal_commit_count_at(&dir).expect("count");
+        let before = mushroomdb::wal_commit_count_at(&dir).expect("count");
         assert!(before > 0, "the insert is a commit");
 
         // Exactly the call `serve` makes on a tick and on shutdown.
@@ -5035,7 +5036,7 @@ mod tests {
 
     #[test]
     fn run_export_graphml_escapes_and_lists() {
-        use core_api::{GraphDb, Value};
+        use mushroomdb::{GraphDb, Value};
         let src = tmp("cli-export-gml-esc-src");
         let dst_dir = tmp("cli-export-gml-esc-dst");
         let dst = dst_dir.join("graph.graphml");
@@ -5091,7 +5092,7 @@ mod tests {
     /// risking a value that doesn't fit it.
     #[test]
     fn run_export_graphml_mixed_type_prop_declares_string() {
-        use core_api::{GraphDb, Value};
+        use mushroomdb::{GraphDb, Value};
         let src = tmp("cli-export-gml-mixed-src");
         let dst_dir = tmp("cli-export-gml-mixed-dst");
         let dst = dst_dir.join("graph.graphml");
@@ -5235,7 +5236,7 @@ mod tests {
     /// The NaN field must be serialised as JSON null (lossy but safe).
     #[test]
     fn run_export_jsonl_nan_float_becomes_null() {
-        use core_api::{GraphDb, Value};
+        use mushroomdb::{GraphDb, Value};
         let src = tmp("cli-export-nan-src");
         let dst = tmp("cli-export-nan-dst");
 
@@ -5571,7 +5572,7 @@ mod tests {
             db.insert_node("Doc", key, props).expect("insert");
         }
         db.apply_schema(&Schema {
-            roles: vec![core_api::RoleDef {
+            roles: vec![mushroomdb::RoleDef {
                 name: "a-reader".into(),
                 keys: vec![],
                 labels: vec!["Doc".into()],

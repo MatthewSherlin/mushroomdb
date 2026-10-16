@@ -4,10 +4,10 @@
 //! caches for the whole of it, so it is byte-stable for a given store by
 //! contract, not by luck. That makes it the one thing in this move with an
 //! exact oracle: the same store must render the same bytes it rendered before.
-use core_api::digest::UNTRUSTED_FRAMING;
-use core_api::memory::brief::{brief, render, BriefOptions, MAX_BRIEF_BYTES};
-use core_api::memory_schema::memory_defaults;
-use core_api::{GraphDb, Value};
+use mushroomdb::digest::UNTRUSTED_FRAMING;
+use mushroomdb::memory::brief::{brief, render, BriefOptions, MAX_BRIEF_BYTES};
+use mushroomdb::memory_schema::memory_defaults;
+use mushroomdb::{GraphDb, Value};
 use std::time::Duration;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -153,13 +153,13 @@ fn brief_on_a_store_with_no_files_still_says_how_to_reach_it() {
     db.insert_node(
         "Person",
         "person:1",
-        vec![("name".into(), core_api::Value::Str("Ada".to_string()))],
+        vec![("name".into(), mushroomdb::Value::Str("Ada".to_string()))],
     )
     .expect("a node that is not a file");
     db.insert_node(
         "Person",
         "person:2",
-        vec![("name".into(), core_api::Value::Str("Grace".to_string()))],
+        vec![("name".into(), mushroomdb::Value::Str("Grace".to_string()))],
     )
     .expect("another");
     db.insert_edge("KNOWS", "person:1", "person:2")
@@ -200,9 +200,9 @@ fn brief_on_a_store_with_no_files_still_says_how_to_reach_it() {
 ///
 /// `person:ada` is deliberately the alphabetically first `Person`, so the
 /// worked calls that name "a key with edges" name a key the test can predict.
-fn seeded_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::RealFs> {
-    use core_api::schema::Schema;
-    use core_api::{Predicate, RoleDef, RuleDef, Value};
+fn seeded_memory_store(name: &str) -> mushroomdb::GraphDb<core_storage::fs::RealFs> {
+    use mushroomdb::schema::Schema;
+    use mushroomdb::{Predicate, RoleDef, RuleDef, Value};
 
     let dir = tmp(name);
     let mut db = open(&dir);
@@ -295,9 +295,9 @@ fn seeded_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::RealFs
 /// rather than their single-type `edge_type:` fallback.
 fn seeded_memory_store_with_two_source_edge_types(
     name: &str,
-) -> core_api::GraphDb<core_storage::fs::RealFs> {
-    use core_api::schema::Schema;
-    use core_api::{Predicate, RuleDef, Value};
+) -> mushroomdb::GraphDb<core_storage::fs::RealFs> {
+    use mushroomdb::schema::Schema;
+    use mushroomdb::{Predicate, RuleDef, Value};
 
     let dir = tmp(name);
     let mut db = open(&dir);
@@ -683,9 +683,9 @@ fn memory_brief_bench_on_large_store() {
     };
 
     let t0 = std::time::Instant::now();
-    let db = core_api::GraphDb::open_with_options(
+    let db = mushroomdb::GraphDb::open_with_options(
         std::path::Path::new(&path),
-        core_api::OpenOptions {
+        mushroomdb::OpenOptions {
             auto_migrate: false,
             repair_wal: false,
             read_only: true,
@@ -768,7 +768,7 @@ fn a_memory_brief_is_byte_stable_and_within_budget() {
 /// the session a round trip.
 #[test]
 fn a_wide_memory_schema_is_counted_off_and_keeps_every_worked_call() {
-    use core_api::Value;
+    use mushroomdb::Value;
 
     let dir = tmp("brief-memory-wide");
     let mut db = open(&dir);
@@ -835,7 +835,7 @@ fn a_wide_memory_schema_is_counted_off_and_keeps_every_worked_call() {
 /// come off from the end with the brief saying it was truncated.
 #[test]
 fn a_brief_of_very_long_names_is_still_capped_at_four_thousand_bytes() {
-    use core_api::Value;
+    use mushroomdb::Value;
 
     let dir = tmp("brief-memory-long-names");
     let mut db = open(&dir);
@@ -926,7 +926,7 @@ fn a_brief_of_very_long_names_is_still_capped_at_four_thousand_bytes() {
 /// exists: it is the `how many` recipe).
 #[test]
 fn a_store_with_a_single_edge_type_omits_the_linked_by_all_of_recipe() {
-    use core_api::Value;
+    use mushroomdb::Value;
 
     let dir = tmp("brief-memory-single-edge-type");
     let mut db = open(&dir);
@@ -960,9 +960,9 @@ fn a_store_with_a_single_edge_type_omits_the_linked_by_all_of_recipe() {
 ///
 /// Picking the role and the probe label independently rendered
 /// `MATCH (n:Talent) … role: client`, which answers zero rows.
-fn role_scoped_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::RealFs> {
-    use core_api::schema::Schema;
-    use core_api::{Predicate, RoleDef, RuleDef, Value};
+fn role_scoped_memory_store(name: &str) -> mushroomdb::GraphDb<core_storage::fs::RealFs> {
+    use mushroomdb::schema::Schema;
+    use mushroomdb::{Predicate, RoleDef, RuleDef, Value};
 
     let dir = tmp(name);
     let mut db = open(&dir);
@@ -1044,7 +1044,7 @@ fn role_scoped_memory_store(name: &str) -> core_api::GraphDb<core_storage::fs::R
 /// the recipe names one, is resolved to its mask and the query runs under it —
 /// which is what the session copying the line will experience.
 fn run_recipe_cypher(
-    db: &core_api::GraphDb<core_storage::fs::RealFs>,
+    db: &mushroomdb::GraphDb<core_storage::fs::RealFs>,
     call: &str,
 ) -> Option<core_query::ResultSet> {
     let params = std::collections::BTreeMap::new();
@@ -1187,7 +1187,7 @@ fn a_memory_brief_out_of_budget_is_partial_rather_than_late() {
 /// and not about how fast the machine running the tests happens to be.
 #[test]
 fn a_partial_schema_renders_its_counts_as_lower_bounds() {
-    use core_api::memory::brief::{EdgeTypeBrief, LabelBrief, Recipe, SchemaBrief};
+    use mushroomdb::memory::brief::{EdgeTypeBrief, LabelBrief, Recipe, SchemaBrief};
 
     let schema = SchemaBrief {
         nodes: 7,
@@ -1245,7 +1245,7 @@ fn a_partial_schema_renders_its_counts_as_lower_bounds() {
 /// numbers.
 #[test]
 fn the_brief_hides_the_embedding_prop() {
-    use core_api::Value;
+    use mushroomdb::Value;
 
     let dir = tmp("brief-embedding");
     let mut db = open(&dir);

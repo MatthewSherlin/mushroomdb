@@ -19,8 +19,8 @@
 //! `arguments`, and every `GraphError` from core-api (bad Cypher, ingest
 //! shape, unknown key, …).
 
-use core_api::digest::UNTRUSTED_FRAMING;
-use core_api::{Direction, SharedDb, Value, ViewDef, ViewSource};
+use mushroomdb::digest::UNTRUSTED_FRAMING;
+use mushroomdb::{Direction, SharedDb, Value, ViewDef, ViewSource};
 use serde_json::{json, Value as Js};
 use server::run_mcp_stdio;
 use std::collections::BTreeSet;
@@ -302,11 +302,11 @@ fn tools_call_happy_path_for_each_tool() {
         w.insert_node("Person", "p2", vec![("id".into(), Value::Str("p2".into()))])
             .unwrap();
         w.insert_edge("KNOWS", "p1", "p2").unwrap();
-        w.create_rule(core_api::RuleDef {
+        w.create_rule(mushroomdb::RuleDef {
             name: "works_at".into(),
             src_label: "Person".into(),
             dst_label: "Org".into(),
-            predicate: core_api::Predicate::KeyMatch {
+            predicate: mushroomdb::Predicate::KeyMatch {
                 field: "org_id".into(),
             },
             edge_type: "WORKS_AT".into(),
@@ -419,11 +419,11 @@ fn node_info_and_edges_tool_parity() {
     {
         let mut w = db.write();
         w.insert_node("Org", "acme", vec![]).unwrap();
-        w.create_rule(core_api::RuleDef {
+        w.create_rule(mushroomdb::RuleDef {
             name: "works_at".into(),
             src_label: "Person".into(),
             dst_label: "Org".into(),
-            predicate: core_api::Predicate::KeyMatch {
+            predicate: mushroomdb::Predicate::KeyMatch {
                 field: "org_id".into(),
             },
             edge_type: "WORKS_AT".into(),
@@ -1114,13 +1114,13 @@ fn code_touched(i: usize) -> Vec<&'static str> {
 ///
 /// Recreated here rather than imported: core-api's fixture is a private module
 /// of its own test crates, and the server crate cannot reach into it.
-fn code_rules() -> Vec<core_api::RuleDef> {
-    fn key_rule(name: &str, src: &str, dst: &str, field: &str, edge: &str) -> core_api::RuleDef {
-        let predicate = core_api::Predicate::KeyMatch {
+fn code_rules() -> Vec<mushroomdb::RuleDef> {
+    fn key_rule(name: &str, src: &str, dst: &str, field: &str, edge: &str) -> mushroomdb::RuleDef {
+        let predicate = mushroomdb::Predicate::KeyMatch {
             field: field.into(),
         };
-        let max_edges = Some(core_api::default_max_edges(&predicate));
-        core_api::RuleDef {
+        let max_edges = Some(mushroomdb::default_max_edges(&predicate));
+        mushroomdb::RuleDef {
             name: name.into(),
             src_label: src.into(),
             dst_label: dst.into(),
@@ -1162,11 +1162,11 @@ fn code_rules() -> Vec<core_api::RuleDef> {
     ];
     // No `about_*` rules: ingest-git stopped declaring them in 0.7, because
     // `remember` inserts its own ABOUT edges and a rule would own them.
-    let co = core_api::Predicate::Overlap {
+    let co = mushroomdb::Predicate::Overlap {
         field: "commits".into(),
         min: 0.25,
     };
-    out.push(core_api::RuleDef {
+    out.push(mushroomdb::RuleDef {
         name: "co_changed".into(),
         src_label: "File".into(),
         dst_label: "File".into(),
@@ -1180,7 +1180,7 @@ fn code_rules() -> Vec<core_api::RuleDef> {
         via_dir: None,
         namespace: None,
     });
-    out.push(core_api::RuleDef {
+    out.push(mushroomdb::RuleDef {
         name: "knows".into(),
         src_label: "Author".into(),
         dst_label: "File".into(),
@@ -1191,7 +1191,7 @@ fn code_rules() -> Vec<core_api::RuleDef> {
         approximate: false,
         via_label: Some("File".into()),
         via_edge: Some("TOP_AUTHOR".into()),
-        via_dir: Some(core_api::Direction::In),
+        via_dir: Some(mushroomdb::Direction::In),
         namespace: None,
     });
     out
@@ -1576,11 +1576,11 @@ fn association_store(name: &str) -> SharedDb {
             ],
         )
         .unwrap();
-        w.create_rule(core_api::RuleDef {
+        w.create_rule(mushroomdb::RuleDef {
             name: "works_at".into(),
             src_label: "Person".into(),
             dst_label: "Org".into(),
-            predicate: core_api::Predicate::KeyMatch {
+            predicate: mushroomdb::Predicate::KeyMatch {
                 field: "org_id".into(),
             },
             edge_type: "WORKS_AT".into(),
@@ -1675,7 +1675,7 @@ fn evidence_store(name: &str) -> SharedDb {
         )
         .unwrap();
         let rule =
-            |name: &str, edge_type: &str, predicate: core_api::Predicate| core_api::RuleDef {
+            |name: &str, edge_type: &str, predicate: mushroomdb::Predicate| mushroomdb::RuleDef {
                 name: name.into(),
                 src_label: "Talent".into(),
                 dst_label: "Company".into(),
@@ -1692,7 +1692,7 @@ fn evidence_store(name: &str) -> SharedDb {
         w.create_rule(rule(
             "specialty_match",
             "SPECIALTY_MATCH",
-            core_api::Predicate::Overlap {
+            mushroomdb::Predicate::Overlap {
                 field: "specialties".into(),
                 min: 0.2,
             },
@@ -1701,7 +1701,7 @@ fn evidence_store(name: &str) -> SharedDb {
         w.create_rule(rule(
             "industry_alignment",
             "INDUSTRY_ALIGNMENT",
-            core_api::Predicate::FieldEqual {
+            mushroomdb::Predicate::FieldEqual {
                 field: "industry".into(),
             },
         ))
@@ -1709,7 +1709,7 @@ fn evidence_store(name: &str) -> SharedDb {
         w.create_rule(rule(
             "location_fit",
             "LOCATION_FIT",
-            core_api::Predicate::GeoRadius {
+            mushroomdb::Predicate::GeoRadius {
                 field: "location".into(),
                 km: 50.0,
             },
@@ -1718,7 +1718,7 @@ fn evidence_store(name: &str) -> SharedDb {
         w.create_rule(rule(
             "size_fit",
             "SIZE_FIT",
-            core_api::Predicate::NumericWithin {
+            mushroomdb::Predicate::NumericWithin {
                 field: "size_bucket".into(),
                 tolerance: 2.0,
             },
@@ -1887,15 +1887,15 @@ fn composed_predicate_evidence_lists_every_branch() {
             ],
         )
         .unwrap();
-        w.create_rule(core_api::RuleDef {
+        w.create_rule(mushroomdb::RuleDef {
             name: "fit".into(),
             src_label: "Talent".into(),
             dst_label: "Company".into(),
-            predicate: core_api::Predicate::All(vec![
-                core_api::Predicate::FieldEqual {
+            predicate: mushroomdb::Predicate::All(vec![
+                mushroomdb::Predicate::FieldEqual {
                     field: "industry".into(),
                 },
-                core_api::Predicate::Overlap {
+                mushroomdb::Predicate::Overlap {
                     field: "specialties".into(),
                     min: 0.2,
                 },
@@ -1973,19 +1973,19 @@ fn any_predicate_evidence_lists_only_the_satisfied_branches() {
             node("Architecture", 9, vec!["d", "e", "f", "g"]),
         )
         .unwrap();
-        w.create_rule(core_api::RuleDef {
+        w.create_rule(mushroomdb::RuleDef {
             name: "fit_any".into(),
             src_label: "Talent".into(),
             dst_label: "Company".into(),
-            predicate: core_api::Predicate::Any(vec![
-                core_api::Predicate::FieldEqual {
+            predicate: mushroomdb::Predicate::Any(vec![
+                mushroomdb::Predicate::FieldEqual {
                     field: "industry".into(),
                 },
-                core_api::Predicate::NumericWithin {
+                mushroomdb::Predicate::NumericWithin {
                     field: "size_bucket".into(),
                     tolerance: 2.0,
                 },
-                core_api::Predicate::Overlap {
+                mushroomdb::Predicate::Overlap {
                     field: "specialties".into(),
                     min: 0.5,
                 },
@@ -2112,11 +2112,11 @@ fn wide_store(name: &str, n: usize) -> SharedDb {
             )
             .unwrap();
         }
-        w.create_rule(core_api::RuleDef {
+        w.create_rule(mushroomdb::RuleDef {
             name: "any_org".into(),
             src_label: "Person".into(),
             dst_label: "Org".into(),
-            predicate: core_api::Predicate::FieldEqual {
+            predicate: mushroomdb::Predicate::FieldEqual {
                 field: "sector".into(),
             },
             edge_type: "IN_SECTOR".into(),
@@ -3015,11 +3015,11 @@ fn what_if_store(name: &str) -> (SharedDb, PathBuf) {
             w.insert_node("Org", org, vec![("id".into(), Value::Str(org.into()))])
                 .unwrap();
         }
-        w.create_rule(core_api::RuleDef {
+        w.create_rule(mushroomdb::RuleDef {
             name: "works_at".into(),
             src_label: "Person".into(),
             dst_label: "Org".into(),
-            predicate: core_api::Predicate::KeyMatch {
+            predicate: mushroomdb::Predicate::KeyMatch {
                 field: "org_id".into(),
             },
             edge_type: "WORKS_AT".into(),
@@ -3313,11 +3313,11 @@ fn what_if_grouped_view_never_truncates_away_the_gained_section() {
             )
             .unwrap();
         }
-        w.create_rule(core_api::RuleDef {
+        w.create_rule(mushroomdb::RuleDef {
             name: "any_org".into(),
             src_label: "Person".into(),
             dst_label: "Org".into(),
-            predicate: core_api::Predicate::FieldEqual {
+            predicate: mushroomdb::Predicate::FieldEqual {
                 field: "sector".into(),
             },
             edge_type: "IN_SECTOR".into(),
@@ -3569,8 +3569,8 @@ fn roles_store(name: &str) -> SharedDb {
             w.insert_node("Talent", key, vec![("id".into(), Value::Str(key.into()))])
                 .unwrap();
         }
-        w.apply_schema(&core_api::Schema {
-            roles: vec![core_api::RoleDef {
+        w.apply_schema(&mushroomdb::Schema {
+            roles: vec![mushroomdb::RoleDef {
                 name: "client".into(),
                 keys: vec![],
                 labels: vec!["Company".into()],
@@ -3643,8 +3643,8 @@ fn query_as_of_composes_with_a_role_and_a_mask() {
         let at = w.wal_total_commits().unwrap() - 1;
         w.insert_node("Public", "p2", vec![]).unwrap();
         w.insert_node("Secret", "s1", vec![]).unwrap();
-        w.apply_schema(&core_api::Schema {
-            roles: vec![core_api::RoleDef {
+        w.apply_schema(&mushroomdb::Schema {
+            roles: vec![mushroomdb::RoleDef {
                 name: "reader".into(),
                 keys: vec![],
                 labels: vec!["Public".into()],
@@ -3926,12 +3926,12 @@ fn remember_writes_note_and_stubs_unknown_about() {
     );
     let g = db.read();
     assert_eq!(
-        g.get_prop("zzz.rs", core_api::memory_schema::PROVISIONAL_PROP),
+        g.get_prop("zzz.rs", mushroomdb::memory_schema::PROVISIONAL_PROP),
         Some(Value::Bool(true)),
         "an unknown about key must land as a provisional entity"
     );
     assert_eq!(
-        g.get_prop("no/such.rs", core_api::memory_schema::PROVISIONAL_PROP),
+        g.get_prop("no/such.rs", mushroomdb::memory_schema::PROVISIONAL_PROP),
         Some(Value::Bool(true)),
         "an unknown about key must land as a provisional entity"
     );
@@ -4208,12 +4208,12 @@ fn query_with_a_role_honours_a_visible_where_predicate() {
         // No status at all: absent is not a match.
         w.insert_node("Doc", "d3", vec![("id".into(), Value::Str("d3".into()))])
             .unwrap();
-        w.apply_schema(&core_api::Schema {
-            roles: vec![core_api::RoleDef {
+        w.apply_schema(&mushroomdb::Schema {
+            roles: vec![mushroomdb::RoleDef {
                 name: "publisher".into(),
                 keys: vec![],
                 labels: vec!["Doc".into()],
-                visible_where: Some(core_api::PropPredicate {
+                visible_where: Some(mushroomdb::PropPredicate {
                     field: "status".into(),
                     eq: None,
                     in_: Some(vec![Value::Str("published".into())]),
@@ -4271,9 +4271,9 @@ fn ns_store(name: &str) -> SharedDb {
             }
             w.insert_node("Doc", key, props).unwrap();
         }
-        w.apply_schema(&core_api::Schema {
+        w.apply_schema(&mushroomdb::Schema {
             roles: vec![
-                core_api::RoleDef {
+                mushroomdb::RoleDef {
                     name: "a-reader".into(),
                     keys: vec![],
                     labels: vec!["Doc".into()],
@@ -4281,7 +4281,7 @@ fn ns_store(name: &str) -> SharedDb {
                     namespaces: Some(vec!["tenant-a".into()]),
                     write: None,
                 },
-                core_api::RoleDef {
+                mushroomdb::RoleDef {
                     name: "everyone".into(),
                     keys: vec![],
                     labels: vec!["Doc".into()],
@@ -5017,7 +5017,7 @@ fn remember_entities_names_the_label_correctly_the_first_time() {
         "an entity named at first mention must be created under the label given, not `Entity`"
     );
     assert_eq!(
-        g.get_prop("matthew", core_api::memory_schema::PROVISIONAL_PROP),
+        g.get_prop("matthew", mushroomdb::memory_schema::PROVISIONAL_PROP),
         None,
         "a described entity must never be marked provisional"
     );
@@ -5143,18 +5143,18 @@ fn every_tool_the_skill_names_is_advertised() {
 fn memory_store(name: &str) -> SharedDb {
     let db = open(name);
     db.write()
-        .apply_schema(&core_api::memory_schema::memory_defaults())
+        .apply_schema(&mushroomdb::memory_schema::memory_defaults())
         .unwrap();
     db
 }
 
 /// A rule over `name`, written straight to the store as a test fixture.
-fn same_name_rule() -> core_api::RuleDef {
-    core_api::RuleDef {
+fn same_name_rule() -> mushroomdb::RuleDef {
+    mushroomdb::RuleDef {
         name: "same_name".into(),
         src_label: "Person".into(),
         dst_label: "Person".into(),
-        predicate: core_api::Predicate::FieldEqual {
+        predicate: mushroomdb::Predicate::FieldEqual {
             field: "name".into(),
         },
         edge_type: "SAME_NAME".into(),
@@ -5433,7 +5433,7 @@ fn forgetting_a_fact_retracts_the_edge_and_names_the_notes_behind_it() {
     assert!(text.contains("1 note(s) still say it"), "{text}");
     assert!(
         db.read()
-            .neighbors("matthew", "WANTS", core_api::Direction::Out)
+            .neighbors("matthew", "WANTS", mushroomdb::Direction::Out)
             .unwrap()
             .is_empty(),
         "the edge is gone"
@@ -5461,7 +5461,7 @@ fn forgetting_a_rule_owned_fact_is_refused_with_the_rule_named() {
     assert!(err.contains("Nothing was written"), "{err}");
     assert_eq!(
         db.read()
-            .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+            .neighbors("a", "SAME_NAME", mushroomdb::Direction::Out)
             .unwrap(),
         vec!["b".to_string()]
     );
@@ -5497,7 +5497,7 @@ fn forgetting_a_property_a_rule_reads_reports_the_derived_edges_it_retracts() {
     }
     assert_eq!(
         db.read()
-            .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+            .neighbors("a", "SAME_NAME", mushroomdb::Direction::Out)
             .unwrap(),
         vec!["b".to_string()],
         "precondition: the rule linked them"
@@ -5515,11 +5515,11 @@ fn forgetting_a_property_a_rule_reads_reports_the_derived_edges_it_retracts() {
     assert!(!text.contains("0 derived edge(s) retracted"), "{text}");
     let g = db.read();
     assert!(g
-        .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+        .neighbors("a", "SAME_NAME", mushroomdb::Direction::Out)
         .unwrap()
         .is_empty());
     assert!(g
-        .neighbors("b", "SAME_NAME", core_api::Direction::Out)
+        .neighbors("b", "SAME_NAME", mushroomdb::Direction::Out)
         .unwrap()
         .is_empty());
 }
@@ -5550,7 +5550,7 @@ fn forgetting_a_property_no_rule_reads_reports_no_derived_edges() {
     assert!(!text.contains("derived edge(s) retracted"), "{text}");
     assert_eq!(
         db.read()
-            .neighbors("a", "SAME_NAME", core_api::Direction::Out)
+            .neighbors("a", "SAME_NAME", mushroomdb::Direction::Out)
             .unwrap(),
         vec!["b".to_string()]
     );
@@ -6074,7 +6074,7 @@ fn remember_entities_and_stubs_carry_aliases() {
 fn identity_store(name: &str) -> SharedDb {
     let db = memory_store(name);
     db.write()
-        .apply_schema(&core_api::memory_schema::memory_identity())
+        .apply_schema(&mushroomdb::memory_schema::memory_identity())
         .unwrap();
     db
 }
@@ -6774,7 +6774,7 @@ fn suggest_rules_offers_the_identity_preset_until_it_is_applied() {
         "{report}"
     );
     db.write()
-        .apply_schema(&core_api::memory_schema::memory_identity())
+        .apply_schema(&mushroomdb::memory_schema::memory_identity())
         .unwrap();
     let report = task_report(db, "suggest_rules", json!({}));
     assert!(report["identity_preset"].is_null(), "{report}");
@@ -7048,7 +7048,7 @@ fn recall_names_the_entity_fields_a_store_without_the_defaults_does_not_search()
 
     // The command it names ends it, and the person is found.
     db.write()
-        .apply_schema(&core_api::memory_schema::memory_defaults())
+        .apply_schema(&mushroomdb::memory_schema::memory_defaults())
         .unwrap();
     let (res, out) = exchange_at(db, Some(dir), &recall(5, "pat doe"));
     assert!(res.is_ok(), "{res:?}");

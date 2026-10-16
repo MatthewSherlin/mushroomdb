@@ -2,11 +2,11 @@
 //!
 //! Nested-loop cosine lives **in this file**. Do not call `exact_knn::`.
 
-use core_api::{
+use core_storage::fs::RealFs;
+use mushroomdb::{
     with_pairwise_caps, GraphDb, GraphError, NodeMask, Predicate, PropPredicate, RuleDef, Value,
     PAIRWISE_MAX_N,
 };
-use core_storage::fs::RealFs;
 
 type Db = GraphDb<RealFs>;
 

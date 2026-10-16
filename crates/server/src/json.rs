@@ -1,9 +1,9 @@
 //! Shared JSON wire shapes for HTTP (`?format=json`) and MCP tool payloads.
 //!
-//! Cells are untagged JSON scalars (the inverse of [`core_api::json_to_value`]),
+//! Cells are untagged JSON scalars (the inverse of [`mushroomdb::json_to_value`]),
 //! not `Value`'s internally-tagged serde form.
 
-use core_api::{
+use mushroomdb::{
     default_max_edges, json_to_value, EdgeEvent, EdgeHistoryEvent, EdgeInfo, HistoryChange,
     HistoryEntry, HistoryResult, MaskedEdge, NodeInfo, ResultSet, RuleDef, Value,
 };
@@ -255,10 +255,10 @@ pub(crate) fn node_history_json(key: &str, result: &HistoryResult<HistoryEntry>)
 pub(crate) fn namespace_arg(v: Option<&Js>) -> Result<Option<String>, String> {
     match v {
         None | Some(Js::Null) => Ok(None),
-        Some(Js::String(s)) if core_api::valid_namespace(s) => Ok(Some(s.clone())),
+        Some(Js::String(s)) if mushroomdb::valid_namespace(s) => Ok(Some(s.clone())),
         Some(Js::String(s)) => Err(format!(
             "namespace {s:?} is not a valid namespace name — 1 to {} characters of [A-Za-z0-9_.-]",
-            core_api::NS_MAX_LEN
+            mushroomdb::NS_MAX_LEN
         )),
         Some(_) => Err("namespace must be a string naming a namespace".into()),
     }
@@ -291,7 +291,7 @@ pub(crate) fn stamp_namespace_row(
     row: &mut BTreeMap<String, Value>,
     namespace: &str,
 ) -> Result<(), String> {
-    match row.get(core_api::NS_PROP) {
+    match row.get(mushroomdb::NS_PROP) {
         Some(Value::Str(s)) if s == namespace => Ok(()),
         Some(existing) => Err(format!(
             "ns is {existing:?} but the call names namespace {namespace:?}; a node is created in \
@@ -299,7 +299,7 @@ pub(crate) fn stamp_namespace_row(
         )),
         None => {
             row.insert(
-                core_api::NS_PROP.to_string(),
+                mushroomdb::NS_PROP.to_string(),
                 Value::Str(namespace.to_string()),
             );
             Ok(())

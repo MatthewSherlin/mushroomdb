@@ -7,8 +7,8 @@
 //! that graph with the persisted blob. The build is superlinear in the number
 //! of embeddings and its result was discarded every time.
 
-use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
 use core_storage::fs::RealFs;
+use mushroomdb::{Direction, GraphDb, Predicate, RuleDef, Value};
 
 type Db = GraphDb<RealFs>;
 

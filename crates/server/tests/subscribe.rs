@@ -13,8 +13,8 @@
 //! test here verifies the subscribe-message + event-payload wire format.
 #![allow(deprecated)] // serve() used for test convenience; production code uses serve_with_role_tokens
 
-use core_api::{Predicate, RuleDef, SharedDb, Value};
 use futures_util::{SinkExt, StreamExt};
+use mushroomdb::{Predicate, RuleDef, SharedDb, Value};
 use serde_json::Value as Json;
 use server::serve;
 use std::net::SocketAddr;
