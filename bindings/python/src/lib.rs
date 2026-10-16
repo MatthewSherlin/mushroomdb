@@ -1,3 +1,6 @@
+// `core_api` is the engine crate (`mushroomdb` on crates.io) under its old
+// library name: this extension module is itself named `mushroomdb`, so the
+// dependency keeps another name here. See `Cargo.toml`.
 use core_api::restore::{restore_if_empty, RestoreOutcome};
 use core_api::{
     default_max_edges, valid_namespace, AlgoDir, AsOfScope, Direction, EdgeAt, Explanation,
