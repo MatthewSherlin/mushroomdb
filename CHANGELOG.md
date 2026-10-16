@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## v0.8.2 — two more rule engine corrections, and a repair for stores 0.8.0 damaged
+
+No format version change. A 0.8.1 store opens under 0.8.2, and a 0.8.2 snapshot opens under 0.8.1 and 0.8.0.
+
+**Upgrade if two of your rules derive the same edge type and you snapshot.** 0.8.1 stopped a second rule from taking an edge another rule had derived before a snapshot; this release repairs a store 0.8.0 had already snapshotted in that state, at the first write after it opens, and counts every snapshot's edges from its rows so a wrong count corrects itself at the next snapshot (row 107). A store in which 0.8.0 had already lost such an edge is not repaired: delete and recreate both rules to restore it (row 111). It also closes the last case of a top-k rule losing its next-best edge beside another rule (row 83).
+
 
 ### Fixed
 

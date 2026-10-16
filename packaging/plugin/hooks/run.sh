@@ -31,7 +31,7 @@
 # scripts/render-plugin.sh.
 set -u
 
-VERSION='0.8.1'
+VERSION='0.8.2'
 PKG="mushroomdb@${VERSION}"
 CACHE_DIR="${CLAUDE_PLUGIN_DATA:-}"
 if [ -z "$CACHE_DIR" ] && [ -n "${HOME:-}" ]; then
