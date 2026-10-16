@@ -17,8 +17,8 @@
 //! 9.  `a_user_edge_may_not_cross_a_namespace`
 //! 19. `merge_creates_inside_a_single_namespace_role`
 
-use core_api::schema::Schema;
-use core_api::{
+use mushroomdb::schema::Schema;
+use mushroomdb::{
     valid_namespace, GraphDb, GraphError, Predicate, RoleDef, RuleDef, Value, WriteScope,
     MERGE_CREATE_NEEDS_ONE_NAMESPACE, NS_DEFAULT, NS_PROP,
 };
@@ -296,7 +296,7 @@ fn write_role(name: &str, labels: &[&str], namespaces: Option<&[&str]>) -> RoleD
 }
 
 /// Keys a role can actually read, via the masked query path, sorted.
-fn role_keys(db: &GraphDb<core_api::RealFs>, name: &str) -> Vec<String> {
+fn role_keys(db: &GraphDb<mushroomdb::RealFs>, name: &str) -> Vec<String> {
     let mask = db.mask_for_role(name).unwrap();
     let rs = db
         .query_masked("MATCH (n) RETURN n", &no_params(), &mask)
@@ -312,7 +312,7 @@ fn role_keys(db: &GraphDb<core_api::RealFs>, name: &str) -> Vec<String> {
 }
 
 /// Keys the MVCC reader's twin resolver gives the same role, sorted.
-fn reader_role_keys(db: &GraphDb<core_api::RealFs>, name: &str) -> Vec<String> {
+fn reader_role_keys(db: &GraphDb<mushroomdb::RealFs>, name: &str) -> Vec<String> {
     let reader = db.reader();
     let mask = reader.mask_for_role(name).unwrap();
     let rs = reader
@@ -425,7 +425,7 @@ fn namespaces_compose_with_visible_where() {
     db.insert_node("Other", "wrong-label", vec![published(), ns("x")])
         .unwrap();
 
-    let pred = core_api::PropPredicate {
+    let pred = mushroomdb::PropPredicate {
         field: "status".into(),
         eq: Some(Value::Str("published".into())),
         in_: None,
@@ -602,11 +602,11 @@ fn tag_rule(name: &str, namespace: Option<&str>) -> RuleDef {
 }
 
 /// Every `TAGGED` pair in the store, sorted.
-fn tagged_pairs(db: &GraphDb<core_api::RealFs>) -> Vec<(String, String)> {
+fn tagged_pairs(db: &GraphDb<mushroomdb::RealFs>) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for src in ["p1", "p2", "p3"] {
         for dst in db
-            .neighbors(src, "TAGGED", core_api::Direction::Out)
+            .neighbors(src, "TAGGED", mushroomdb::Direction::Out)
             .unwrap()
         {
             out.push((src.to_string(), dst));
@@ -617,7 +617,7 @@ fn tagged_pairs(db: &GraphDb<core_api::RealFs>) -> Vec<(String, String)> {
 }
 
 /// Six nodes that all satisfy the predicate, three in `x` and three in `y`.
-fn two_tenant_store(dir: &std::path::Path) -> GraphDb<core_api::RealFs> {
+fn two_tenant_store(dir: &std::path::Path) -> GraphDb<mushroomdb::RealFs> {
     let mut db = GraphDb::open(dir).unwrap();
     let tag = || ("tag".to_string(), Value::Str("t".into()));
     db.insert_node("Person", "p1", vec![tag(), ns("x")])
@@ -920,7 +920,7 @@ fn a_global_rules_crossing_edge_is_invisible_to_a_namespaced_role() {
     db.create_rule(tag_rule("global", None)).unwrap();
     // The rule really does cross: p1 (x) → o2 (y).
     assert!(db
-        .neighbors("p1", "TAGGED", core_api::Direction::Out)
+        .neighbors("p1", "TAGGED", mushroomdb::Direction::Out)
         .unwrap()
         .contains(&"o2".to_string()));
 
@@ -989,13 +989,13 @@ fn a_view_may_not_write_the_namespace_property() {
     let dir = tmp("view-ns");
     let mut db = GraphDb::open(&dir).unwrap();
     let err = db
-        .create_view(core_api::ViewDef {
+        .create_view(mushroomdb::ViewDef {
             name: "ns-view".into(),
             label: "Doc".into(),
             view_prop: NS_PROP.into(),
-            source: core_api::ViewSource::Degree {
+            source: mushroomdb::ViewSource::Degree {
                 edge_type: "LINKS".into(),
-                direction: core_api::Direction::Out,
+                direction: mushroomdb::Direction::Out,
             },
         })
         .expect_err("a view over the reserved namespace property must be refused");
@@ -1039,11 +1039,11 @@ fn a_namespaced_vector_rule_never_pairs_across_namespaces() {
         }
     }
     /// Every `NEAR` pair over the fixture, sorted.
-    fn near_pairs(db: &GraphDb<core_api::RealFs>, keys: &[&str]) -> Vec<(String, String)> {
+    fn near_pairs(db: &GraphDb<mushroomdb::RealFs>, keys: &[&str]) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for src in keys {
             for dst in db
-                .neighbors(src, "NEAR", core_api::Direction::Out)
+                .neighbors(src, "NEAR", mushroomdb::Direction::Out)
                 .unwrap_or_default()
             {
                 out.push((src.to_string(), dst));
@@ -1327,7 +1327,7 @@ fn a_sliced_build_files_only_its_own_namespace() {
         );
 
         // Pump to completion, keeping the progress of the call that finished it.
-        let mut finished: Vec<core_api::BuildProgress> = Vec::new();
+        let mut finished: Vec<mushroomdb::BuildProgress> = Vec::new();
         loop {
             let (done, outstanding) = db.pump_index_build_reporting().unwrap();
             finished.extend(done);
@@ -1398,7 +1398,7 @@ fn a_sliced_build_files_only_its_own_namespace() {
         for i in 0..12 {
             let k = key_of(i);
             for d in db
-                .neighbors(&k, "SIM", core_api::Direction::Out)
+                .neighbors(&k, "SIM", mushroomdb::Direction::Out)
                 .unwrap_or_default()
             {
                 got.push((k.clone(), d));
@@ -1417,7 +1417,7 @@ fn a_sliced_build_files_only_its_own_namespace() {
 // ---------------------------------------------------------------------------
 
 /// Keys a namespace mask admits, read through whichever handle built it.
-fn mask_keys(rs: core_api::ResultSet) -> Vec<String> {
+fn mask_keys(rs: mushroomdb::ResultSet) -> Vec<String> {
     let mut keys: Vec<String> = (0..rs.len())
         .filter_map(|i| match rs.row(i)[0].as_ref() {
             Some(Value::Str(s)) => Some(s.clone()),
@@ -1428,7 +1428,7 @@ fn mask_keys(rs: core_api::ResultSet) -> Vec<String> {
     keys
 }
 
-fn live_ns_keys(db: &GraphDb<core_api::RealFs>, namespace: &str) -> Vec<String> {
+fn live_ns_keys(db: &GraphDb<mushroomdb::RealFs>, namespace: &str) -> Vec<String> {
     let mask = db.mask_for_namespace(namespace);
     mask_keys(
         db.query_masked("MATCH (n) RETURN n", &no_params(), &mask)
@@ -1436,7 +1436,7 @@ fn live_ns_keys(db: &GraphDb<core_api::RealFs>, namespace: &str) -> Vec<String> 
     )
 }
 
-fn reader_ns_keys(db: &GraphDb<core_api::RealFs>, namespace: &str) -> Vec<String> {
+fn reader_ns_keys(db: &GraphDb<mushroomdb::RealFs>, namespace: &str) -> Vec<String> {
     let reader = db.reader();
     let mask = reader.mask_for_namespace(namespace).unwrap();
     mask_keys(

@@ -5,7 +5,7 @@
 //! cargo run -p mushroomdb --example quickstart
 //! ```
 
-use core_api::{GraphDb, Predicate, RuleDef, Value};
+use mushroomdb::{GraphDb, Predicate, RuleDef, Value};
 use std::collections::BTreeMap;
 
 fn tags(items: &[&str]) -> Value {

@@ -1,4 +1,4 @@
-use core_api::{GraphDb, GraphError, IngestOptions, Predicate, ResultSet, RuleDef, Value};
+use mushroomdb::{GraphDb, GraphError, IngestOptions, Predicate, ResultSet, RuleDef, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -293,7 +293,7 @@ fn harness_industry_alignment_timing() {
     let mut db = GraphDb::open(&dir).expect("open");
     let opts = IngestOptions {
         key_field: "id".into(),
-        auto_fk: core_api::AutoFk::Off,
+        auto_fk: mushroomdb::AutoFk::Off,
     };
 
     // Ingest Talent and Company nodes with an industry tag.

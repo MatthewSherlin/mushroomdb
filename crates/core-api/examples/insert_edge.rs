@@ -1,5 +1,5 @@
 //! One-shot user-edge insert for e2e setup. HTTP `/ingest` is nodes-only.
-use core_api::GraphDb;
+use mushroomdb::GraphDb;
 use std::env;
 use std::path::PathBuf;
 

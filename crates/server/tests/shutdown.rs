@@ -6,7 +6,7 @@
 //! notify fires between the predicate check and the wait, it is lost and
 //! `DrainHandle::drop` blocks forever on `join()`.  macOS thread-startup
 //! timing enters this window reliably; Linux rarely does.
-use core_api::SharedDb;
+use mushroomdb::SharedDb;
 use std::path::PathBuf;
 
 fn tmp_shutdown(index: usize) -> PathBuf {

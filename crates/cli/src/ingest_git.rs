@@ -24,7 +24,7 @@
 //! resumes from its own `GitSync` marker.
 use crate::structure;
 use crate::CliError;
-use core_api::{
+use mushroomdb::{
     default_max_edges, Direction, GraphError, IngestOptions, Predicate, ResultSet, RuleDef,
     SharedDb, Value, WriteGuard, WRITE_LOCK_WAIT,
 };
@@ -1162,7 +1162,7 @@ pub fn run_ingest_git(db_dir: &Path, opts: &IngestGitOpts) -> Result<IngestGitRe
     // directory's files: after the open it would always answer "existing".
     // A run that finds nothing to write leaves the WAL empty, which this
     // still reads as new, so the schema lands with the first run that writes.
-    let is_new_store = !core_api::restore::holds_a_store(db_dir);
+    let is_new_store = !mushroomdb::restore::holds_a_store(db_dir);
     let db = SharedDb::open(db_dir)?;
     let mut report = IngestGitReport {
         submodules: units.len() - 1,

@@ -20,8 +20,8 @@
 //! Clock: std::time::Instant (monotonic, ~ns resolution on Apple Silicon).
 #![allow(deprecated)] // serve() used for test convenience; production code uses serve_with_role_tokens
 
-use core_api::{DbEvent, SharedDb};
 use futures_util::{SinkExt, StreamExt};
+use mushroomdb::{DbEvent, SharedDb};
 use server::serve;
 use std::net::SocketAddr;
 use std::path::PathBuf;

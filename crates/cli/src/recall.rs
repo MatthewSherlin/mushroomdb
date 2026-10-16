@@ -10,14 +10,14 @@
 //! `mod::name`, a snake_case or backticked word — and said nothing otherwise.
 //! On a memory store, whose prompts are sentences about people and projects,
 //! that was silence on every prompt. The digest itself is
-//! [`core_api::memory::recall::recall_digest`], which has no identifier gate.
+//! [`mushroomdb::memory::recall::recall_digest`], which has no identifier gate.
 //!
 //! The dirty-working-tree nudge — what the changed files reach, who owns them,
 //! which learned concepts went stale — read edges only `ingest-git` writes. It
 //! left with the rest of the code-graph door in 0.7.
 use crate::hook::{cut_to, open_for_hook};
-use core_api::digest::{MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING};
-use core_api::memory::recall::{recall_digest, RecallOutcome};
+use mushroomdb::digest::{MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING};
+use mushroomdb::memory::recall::{recall_digest, RecallOutcome};
 use std::path::Path;
 
 /// Extract the prompt text from a hook payload. Accepts `prompt`,

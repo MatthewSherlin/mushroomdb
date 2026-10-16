@@ -1,6 +1,6 @@
 //! explain() must report a score for every derived edge, including rules that
 //! store no weight property (KeyMatch / FieldEqual with weight_prop: None).
-use core_api::{GraphDb, Predicate, RuleDef, Value};
+use mushroomdb::{GraphDb, Predicate, RuleDef, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()

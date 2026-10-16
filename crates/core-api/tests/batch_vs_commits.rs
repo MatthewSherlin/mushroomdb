@@ -7,8 +7,8 @@
 //! Each case here commits a short op list once as one batch and once op by
 //! op, and asks for the same store either way — and the same store again
 //! after a reopen. The harness came out of the review of ledger row 79.
-use core_api::{Direction, GraphDb, OnConflict, Predicate, RuleDef, Value};
 use core_storage::fs::RealFs;
+use mushroomdb::{Direction, GraphDb, OnConflict, Predicate, RuleDef, Value};
 
 type Db = GraphDb<RealFs>;
 
@@ -33,7 +33,7 @@ fn own(p: &[(&'static str, Value)]) -> Vec<(String, Value)> {
     p.iter().map(|(f, v)| (f.to_string(), v.clone())).collect()
 }
 
-fn queue(b: &mut core_api::BatchBuilder<'_, RealFs>, op: &Op) {
+fn queue(b: &mut mushroomdb::BatchBuilder<'_, RealFs>, op: &Op) {
     match op {
         Op::Rename(o, n) => b.rename_node(o, n),
         Op::Insert(l, k, p) => b.insert_node(l, k, own(p)),

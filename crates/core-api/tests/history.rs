@@ -1,4 +1,4 @@
-use core_api::{EdgeEvent, GraphDb, GraphError, HistoryChange, Predicate, RuleDef, Value};
+use mushroomdb::{EdgeEvent, GraphDb, GraphError, HistoryChange, Predicate, RuleDef, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-history-{}-{}", name, std::process::id()));

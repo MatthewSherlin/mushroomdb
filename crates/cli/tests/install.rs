@@ -506,7 +506,7 @@ fn install_says_nothing_about_a_store_that_exists() {
     let home = temp_dir("notice-exists-home");
     let db = root.join("memory");
     {
-        let mut store = core_api::GraphDb::open(&db).expect("create store");
+        let mut store = mushroomdb::GraphDb::open(&db).expect("create store");
         store.insert_node("Person", "p1", vec![]).expect("write");
     }
     let out = install_on_path(&root, &home, &claude_project_opts(&db)).expect("install failed");

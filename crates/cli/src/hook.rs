@@ -25,9 +25,9 @@ pub(crate) fn open_for_hook(db_dir: &Path) -> Option<crate::structure::Db> {
     if !db_dir.exists() {
         return None;
     }
-    core_api::GraphDb::open_with_options(
+    mushroomdb::GraphDb::open_with_options(
         db_dir,
-        core_api::OpenOptions {
+        mushroomdb::OpenOptions {
             auto_migrate: false,
             repair_wal: false,
             read_only: true,

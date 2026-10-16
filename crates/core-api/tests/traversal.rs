@@ -1,4 +1,4 @@
-use core_api::{CmpOp, Dir, Filter, GraphDb, Predicate, ResultSet, RuleDef, Value};
+use mushroomdb::{CmpOp, Dir, Filter, GraphDb, Predicate, ResultSet, RuleDef, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-trav-{}-{}", name, std::process::id()));

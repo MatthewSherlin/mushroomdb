@@ -128,7 +128,7 @@ Reference: docs/site/ingest-git.md
 ## Key API (Rust)
 
 ```rust
-use core_api::{GraphDb, RuleDef, Predicate};
+use mushroomdb::{GraphDb, RuleDef, Predicate};
 
 let mut db = GraphDb::open(&path)?;
 

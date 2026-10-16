@@ -1,4 +1,4 @@
-use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
+use mushroomdb::{Direction, GraphDb, Predicate, RuleDef, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {

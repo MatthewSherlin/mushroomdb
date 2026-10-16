@@ -2,7 +2,7 @@
 ///
 /// Tests use `set_slow_query_threshold_ms` instead of env vars to avoid
 /// process-global state races with parallel test threads.
-use core_api::{GraphDb, Value};
+use mushroomdb::{GraphDb, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {

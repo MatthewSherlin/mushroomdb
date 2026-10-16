@@ -4,7 +4,7 @@
 //! install's git hooks looks for them, and the version string.
 use cli::ingest_git::{run_ingest_git, IngestGitOpts};
 use cli::{resolve_auto_db, version_string};
-use core_api::{Direction, GraphDb};
+use mushroomdb::{Direction, GraphDb};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

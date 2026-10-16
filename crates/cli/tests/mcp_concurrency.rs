@@ -20,7 +20,7 @@
 //!
 //! Plain `std::net` rather than an HTTP client crate: one request per
 //! connection, `Connection: close`, and the status line is all that is read.
-use core_api::GraphDb;
+use mushroomdb::GraphDb;
 use serde_json::{json, Value as Js};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;

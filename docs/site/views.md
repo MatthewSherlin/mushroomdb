@@ -31,7 +31,7 @@ edges.
 ## Quick Start
 
 ```rust
-use core_api::{AggFn, Direction, GraphDb, Value, ViewDef, ViewSource};
+use mushroomdb::{AggFn, Direction, GraphDb, Value, ViewDef, ViewSource};
 
 let mut db = GraphDb::open(&dir)?;
 

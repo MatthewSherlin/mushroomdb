@@ -10,7 +10,7 @@
 //! current VERSION (timed).  `open` just opens (timed).  Wrap either mode in
 //! `/usr/bin/time -l` to capture peak RSS.
 
-use core_api::GraphDb;
+use mushroomdb::GraphDb;
 use std::time::Instant;
 
 fn main() {

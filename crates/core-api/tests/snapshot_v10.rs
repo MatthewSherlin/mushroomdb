@@ -22,8 +22,8 @@
 //!      `crates/sim-harness/tests/multiplicity_crash_window.rs` covers the same
 //!      ordering at every interruption point).
 
-use core_api::{AlgoDir, GraphDb, OpenOptions, RealFs, SnapshotOptions};
 use core_storage::{decode_all, WalRecord};
+use mushroomdb::{AlgoDir, GraphDb, OpenOptions, RealFs, SnapshotOptions};
 
 type Db = GraphDb<RealFs>;
 
@@ -48,7 +48,7 @@ fn tmp(name: &str) -> std::path::PathBuf {
 }
 
 fn snap_version(dir: &std::path::Path) -> Option<u16> {
-    core_api::snapshot_version_at(dir).expect("peek snapshot version")
+    mushroomdb::snapshot_version_at(dir).expect("peek snapshot version")
 }
 
 fn wal_bytes(dir: &std::path::Path) -> Vec<u8> {
@@ -175,7 +175,7 @@ fn a_store_that_never_opts_in_still_writes_v9() {
     );
     // And the binary still advertises 9 as the version it writes by default.
     assert_eq!(Db::format_version(), 9);
-    assert_eq!(core_api::SNAPSHOT_VERSION, 9);
+    assert_eq!(mushroomdb::SNAPSHOT_VERSION, 9);
 
     // Reopening reads it back whole.
     let db = GraphDb::open(&dir).unwrap();

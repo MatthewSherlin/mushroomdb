@@ -11,14 +11,14 @@
 //! filesystem call the opt-in makes, and check the surviving store never holds
 //! a discriminant-23 record without a V10 snapshot in front of it.
 
-use core_api::GraphDb;
 use core_storage::fs::{FileId, Fs};
 use core_storage::{decode_all, WalRecord};
+use mushroomdb::GraphDb;
 use sim_harness::SimFs;
 
 /// Insert a node, opt in, then write a duplicate edge so the WAL carries both
 /// the declaration and a real count.
-fn workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn workload<F: Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     db.insert_node("N", "a", vec![])?;
     db.insert_node("N", "b", vec![])?;
     db.enable_multiplicity()?;

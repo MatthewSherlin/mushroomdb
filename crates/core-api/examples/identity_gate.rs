@@ -13,10 +13,10 @@
 //!
 //! Prints the summary as Markdown on stdout. Exits 1 when a floor is missed,
 //! so a run that fails cannot be mistaken for one that passed.
-use core_api::memory::identity::{identity_clusters, same_as_pairs, SAME_AS_FLOOR};
-use core_api::memory::remember::{remember, EntityIn, RememberInput};
-use core_api::memory_schema::{memory_defaults, memory_identity};
-use core_api::{GraphDb, Value};
+use mushroomdb::memory::identity::{identity_clusters, same_as_pairs, SAME_AS_FLOOR};
+use mushroomdb::memory::remember::{remember, EntityIn, RememberInput};
+use mushroomdb::memory_schema::{memory_defaults, memory_identity};
+use mushroomdb::{GraphDb, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The pre-registered floors. Changing one after the first run is an

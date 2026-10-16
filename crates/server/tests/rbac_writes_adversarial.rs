@@ -20,7 +20,9 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use core_api::{schema::Schema, BatchOp, Predicate, RoleDef, RuleDef, SharedDb, Value, WriteScope};
+use mushroomdb::{
+    schema::Schema, BatchOp, Predicate, RoleDef, RuleDef, SharedDb, Value, WriteScope,
+};
 use serde_json::{json, Value as Json};
 use server::router_with_role_tokens;
 use std::path::PathBuf;

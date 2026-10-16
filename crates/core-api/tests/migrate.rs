@@ -1,4 +1,4 @@
-use core_api::{Direction, GraphDb, OpenOptions, Value};
+use mushroomdb::{Direction, GraphDb, OpenOptions, Value};
 
 fn store_from_fixture(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-migrate-{}-{}", name, std::process::id()));
@@ -20,7 +20,7 @@ fn v5_store_auto_migrates_on_open_with_bak() {
     }
     // On-disk snapshot is now current VERSION; .bak holds the old bytes.
     assert_eq!(
-        core_api::snapshot_version_at(&dir).unwrap(),
+        mushroomdb::snapshot_version_at(&dir).unwrap(),
         Some(core_storage::snapshot::VERSION),
         "snapshot must be rewritten to current VERSION after migration"
     );
@@ -111,7 +111,7 @@ fn wal_preserved_by_auto_migrate() {
         // db drops here — WAL is fsynced on each mutation, so "extra" is durable.
     }
     // Verify there is at least one WAL commit before migration.
-    let wal_count_before = core_api::wal_commit_count_at(&dir).unwrap();
+    let wal_count_before = mushroomdb::wal_commit_count_at(&dir).unwrap();
     assert!(
         wal_count_before > 0,
         "WAL must have at least one commit before migration"
@@ -127,7 +127,7 @@ fn wal_preserved_by_auto_migrate() {
     );
 
     // WAL commit count must not have dropped to zero (keep_wal preserved WAL).
-    let wal_count_after = core_api::wal_commit_count_at(&dir).unwrap();
+    let wal_count_after = mushroomdb::wal_commit_count_at(&dir).unwrap();
     assert!(
         wal_count_after > 0,
         "WAL commit count must remain > 0 after auto-migrate (keep_wal)"
@@ -156,7 +156,7 @@ fn v7_store_auto_migrates_to_v9_with_bak() {
     }
     // On-disk snapshot is now V9; .bak holds the original V7 bytes.
     assert_eq!(
-        core_api::snapshot_version_at(&dir).unwrap(),
+        mushroomdb::snapshot_version_at(&dir).unwrap(),
         Some(core_storage::snapshot::VERSION),
         "snapshot must be rewritten to V9 after migration"
     );
@@ -207,7 +207,7 @@ fn v8_store_auto_migrates_to_v9_with_bak() {
     }
     // On-disk snapshot is now V9; .bak holds the original V8 bytes.
     assert_eq!(
-        core_api::snapshot_version_at(&dir).unwrap(),
+        mushroomdb::snapshot_version_at(&dir).unwrap(),
         Some(core_storage::snapshot::VERSION),
         "snapshot must be rewritten to V9 after migration"
     );
@@ -269,14 +269,14 @@ fn v8_string_props_survive_the_migration_to_v9() {
         }
     }
     assert_eq!(
-        core_api::snapshot_version_at(&dir).unwrap(),
+        mushroomdb::snapshot_version_at(&dir).unwrap(),
         Some(8),
         "the store must still be V8 before the migrating open"
     );
     // Migrating open rewrites the snapshot at V9.
     drop(GraphDb::open(&dir).unwrap());
     assert_eq!(
-        core_api::snapshot_version_at(&dir).unwrap(),
+        mushroomdb::snapshot_version_at(&dir).unwrap(),
         Some(core_storage::snapshot::VERSION),
         "the migrating open must rewrite the snapshot at V9"
     );

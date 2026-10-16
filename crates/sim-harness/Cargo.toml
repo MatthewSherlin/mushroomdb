@@ -6,7 +6,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-core-api = { package = "mushroomdb", path = "../core-api" }
+mushroomdb = { path = "../core-api" }
 core-rules = { package = "mushroomdb-rules", path = "../core-rules" }
 core-storage = { package = "mushroomdb-storage", path = "../core-storage" }
 

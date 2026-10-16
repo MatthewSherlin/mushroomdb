@@ -16,8 +16,8 @@
 //!
 //! Exit codes: `0` success, `3` [`GraphError::Busy`], `1` any other failure.
 
-use core_api::{BatchOp, GraphDb, OpenOptions, SharedDb, SnapshotOptions};
 use core_storage::GraphError;
+use mushroomdb::{BatchOp, GraphDb, OpenOptions, SharedDb, SnapshotOptions};
 use std::path::Path;
 use std::time::Duration;
 
@@ -38,7 +38,7 @@ fn chunk_ops(prefix: &str, lo: usize, hi: usize) -> Vec<BatchOp> {
         .map(|k| BatchOp::InsertNode {
             label: "Person".into(),
             key: format!("{prefix}-{k}"),
-            props: vec![("team".into(), core_api::Value::Str(prefix.into()))],
+            props: vec![("team".into(), mushroomdb::Value::Str(prefix.into()))],
         })
         .collect()
 }

@@ -1,6 +1,6 @@
 #![cfg(feature = "tls")]
 
-use core_api::SharedDb;
+use mushroomdb::SharedDb;
 use std::collections::HashMap;
 
 fn tmp_tls(name: &str) -> std::path::PathBuf {

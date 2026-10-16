@@ -76,9 +76,9 @@ fn own_fulltext() -> Vec<(String, String)> {
 
 /// A store opened read-only, for asking what it declares.
 fn open_read_only(db: &Path) -> cli::structure::Db {
-    core_api::GraphDb::open_with_options(
+    mushroomdb::GraphDb::open_with_options(
         db,
-        core_api::OpenOptions {
+        mushroomdb::OpenOptions {
             auto_migrate: false,
             repair_wal: false,
             read_only: true,
@@ -198,7 +198,7 @@ fn ingest_git_into_an_empty_repository_still_declares_on_the_first_real_run() {
     let repo = empty_repo();
     ingest_git(&db, &repo);
     assert!(
-        !core_api::restore::holds_a_store(&db),
+        !mushroomdb::restore::holds_a_store(&db),
         "a run over an empty repository wrote a store"
     );
 
@@ -236,12 +236,12 @@ fn ingest_git_never_applies_the_memory_defaults_to_a_store_it_did_not_create() {
     // pairs and indexes the memory defaults add that ingest-git never does.
     let db = tmp("existing");
     add_person(&db, "Quillfeather");
-    assert!(core_api::restore::holds_a_store(&db));
+    assert!(mushroomdb::restore::holds_a_store(&db));
     ingest_git(&db, &scratch_repo());
 
     let store = open_read_only(&db);
     let pairs = store.fulltext_pairs();
-    let defaults = core_api::memory_schema::memory_defaults();
+    let defaults = mushroomdb::memory_schema::memory_defaults();
     let own = own_fulltext();
     let memory_only: Vec<&(String, String)> = defaults
         .fulltext

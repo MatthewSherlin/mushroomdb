@@ -11,8 +11,8 @@
 //!     `k` hits, in brute-force order; at the beam cap the path falls back to
 //!     the exhaustive masked scan.
 
-use core_api::{GraphDb, NodeMask, Predicate, RuleDef, Value};
 use core_storage::fs::RealFs;
+use mushroomdb::{GraphDb, NodeMask, Predicate, RuleDef, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()

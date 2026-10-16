@@ -9,7 +9,7 @@
 //! Two handles on one store directory: a writer, and a reader that refreshes.
 //!
 //! Run: `cargo run --release -p mushroomdb --example refresh_bench`
-use core_api::{GraphDb, OpenOptions};
+use mushroomdb::{GraphDb, OpenOptions};
 use std::time::Instant;
 
 fn main() {

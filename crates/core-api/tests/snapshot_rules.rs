@@ -15,8 +15,8 @@
 //! two-rule chain. Each case: seed → assert E₀ → snapshot → reopen → assert
 //! E₀ (still, including provenance) → mutate → assert E₀ \ R, where R is a
 //! non-empty, strict subset of E₀.
-use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
 use core_storage::fs::RealFs;
+use mushroomdb::{Direction, GraphDb, Predicate, RuleDef, Value};
 
 type Db = GraphDb<RealFs>;
 

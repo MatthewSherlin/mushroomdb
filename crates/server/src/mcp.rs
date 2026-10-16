@@ -51,7 +51,7 @@ use crate::json::{
     edge_history_result_json, namespace_arg, node_history_json, node_info_json, params_from_json,
     parse_ingest_edges, result_set_json, rule_def_from_json, stamp_namespace, stamp_namespace_row,
 };
-use core_api::{
+use mushroomdb::{
     json_to_rows, json_to_value, memory, AsOfScope, AutoFk, GraphError, IngestOptions, MaskMode,
     NodeMask, PropPredicate, SharedDb, Value,
 };
@@ -368,7 +368,7 @@ fn tool_query(db: &SharedDb, args: &Js) -> CallOutcome {
         };
     }
 
-    let is_write = match core_api::is_write_query(cypher) {
+    let is_write = match mushroomdb::is_write_query(cypher) {
         Ok(b) => b,
         Err(e) => return CallOutcome::ToolErr(e),
     };
@@ -799,7 +799,7 @@ fn tool_find_similar(db: &SharedDb, args: &Js) -> CallOutcome {
             },
         };
         let min = match args.get("min") {
-            None | Some(Js::Null) => core_api::FIND_SIMILAR_DEFAULT_MIN,
+            None | Some(Js::Null) => mushroomdb::FIND_SIMILAR_DEFAULT_MIN,
             Some(v) => match v.as_f64() {
                 Some(n) => n,
                 None => return CallOutcome::ToolErr("min must be a number".into()),
@@ -1635,7 +1635,7 @@ fn write_json(writer: &mut impl Write, value: &Js) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_api::{AutoFk, IngestOptions, Predicate, RuleDef, Value};
+    use mushroomdb::{AutoFk, IngestOptions, Predicate, RuleDef, Value};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1860,7 +1860,7 @@ mod tests {
             via_dir: None,
             namespace: None,
         };
-        let args = core_api::memory::suggest::create_rule_args(&def);
+        let args = mushroomdb::memory::suggest::create_rule_args(&def);
         assert_eq!(args["approximate"], json!(true), "{args}");
 
         let tools = graph_tools();
@@ -2477,7 +2477,7 @@ mod tests {
         );
         assert_eq!(
             result["min"],
-            json!(core_api::FIND_SIMILAR_DEFAULT_MIN),
+            json!(mushroomdb::FIND_SIMILAR_DEFAULT_MIN),
             "the reply echoes the floor it applied"
         );
 
@@ -2627,7 +2627,7 @@ mod tests {
         assert!(!is_error(&resp), "null takes the default: {resp}");
         let result = tool_text(&resp);
         assert_eq!(result["k"], json!(10));
-        assert_eq!(result["min"], json!(core_api::FIND_SIMILAR_DEFAULT_MIN));
+        assert_eq!(result["min"], json!(mushroomdb::FIND_SIMILAR_DEFAULT_MIN));
         let resp = tool_call(
             &db,
             3,

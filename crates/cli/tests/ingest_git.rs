@@ -1,7 +1,7 @@
 //! ingest-git builds a codebase graph from git history and keeps it current
 //! across re-runs (adds, modifies, deletes, renames) so derived edges retract.
 use cli::ingest_git::{run_ingest_git, IngestGitOpts};
-use core_api::{Direction, GraphDb};
+use mushroomdb::{Direction, GraphDb};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -183,7 +183,7 @@ fn sync_marker(db_dir: &Path) -> String {
         .node_ref("__mushroomdb_git_sync__")
         .and_then(|n| n.prop("sha"));
     match sha {
-        Some(core_api::Value::Str(s)) => s,
+        Some(mushroomdb::Value::Str(s)) => s,
         other => panic!("no sync marker sha: {other:?}"),
     }
 }
@@ -305,7 +305,7 @@ fn rerun_is_incremental_and_delete_retracts_edges() {
         db.query("MATCH (c:Commit) RETURN count(*) AS n", &Default::default())
             .unwrap()
             .get(0, "n"),
-        Some(&core_api::Value::Int(5))
+        Some(&mushroomdb::Value::Int(5))
     );
     drop(db);
     assert_marker_covers_everything_ingested(&db_dir, &repo);
@@ -331,12 +331,12 @@ fn rename_keeps_history_and_moves_edges() {
     let n = db.node_ref("src/domain/model.rs").unwrap();
     assert_eq!(
         n.prop("n_commits"),
-        Some(core_api::Value::Int(4)),
+        Some(mushroomdb::Value::Int(4)),
         "history follows the rename"
     );
     assert_eq!(
         n.prop("id"),
-        Some(core_api::Value::Str("src/domain/model.rs".to_string())),
+        Some(mushroomdb::Value::Str("src/domain/model.rs".to_string())),
         "the id property follows the key"
     );
 }
@@ -413,8 +413,8 @@ fn rename_then_delete_in_one_window_leaves_no_phantom_node() {
         .unwrap();
     for i in 0..touched.len() {
         let id = touched.get(i, "id").cloned();
-        assert_ne!(id, Some(core_api::Value::Str("src/api.rs".into())));
-        assert_ne!(id, Some(core_api::Value::Str("src/renamed.rs".into())));
+        assert_ne!(id, Some(mushroomdb::Value::Str("src/api.rs".into())));
+        assert_ne!(id, Some(mushroomdb::Value::Str("src/renamed.rs".into())));
     }
     // Exactly one File node per live path, and no id/key disagreement.
     let files = db
@@ -460,12 +460,12 @@ fn chained_rename_in_one_window_collapses_to_one_move() {
     let n = db.node_ref("src/domain/model.rs").unwrap();
     assert_eq!(
         n.prop("n_commits"),
-        Some(core_api::Value::Int(5)),
+        Some(mushroomdb::Value::Int(5)),
         "3 original commits plus both moves"
     );
     assert_eq!(
         n.prop("id"),
-        Some(core_api::Value::Str("src/domain/model.rs".to_string()))
+        Some(mushroomdb::Value::Str("src/domain/model.rs".to_string()))
     );
     assert_eq!(
         db.neighbors("src/api.rs", "CO_CHANGED", Direction::Out)
@@ -500,12 +500,12 @@ fn rename_that_swaps_back_in_one_window_is_not_a_move() {
     let n = db.node_ref("src/model.rs").unwrap();
     assert_eq!(
         n.prop("n_commits"),
-        Some(core_api::Value::Int(5)),
+        Some(mushroomdb::Value::Int(5)),
         "both moves still count as commits touching the file"
     );
     assert_eq!(
         n.prop("id"),
-        Some(core_api::Value::Str("src/model.rs".to_string()))
+        Some(mushroomdb::Value::Str("src/model.rs".to_string()))
     );
 }
 
@@ -557,16 +557,16 @@ fn rename_onto_a_just_deleted_path_replaces_the_old_node() {
     let n = db.node_ref("src/api.rs").unwrap();
     assert_eq!(
         n.prop("n_commits"),
-        Some(core_api::Value::Int(2)),
+        Some(mushroomdb::Value::Int(2)),
         "readme's own commit plus the move, not the old api.rs history"
     );
     assert_eq!(
         n.prop("id"),
-        Some(core_api::Value::Str("src/api.rs".to_string()))
+        Some(mushroomdb::Value::Str("src/api.rs".to_string()))
     );
     assert_eq!(
         n.prop("top_author_id"),
-        Some(core_api::Value::Str("bob@x.test".to_string())),
+        Some(mushroomdb::Value::Str("bob@x.test".to_string())),
         "ownership came across with the node, it is not the old api.rs owner"
     );
     let files = db
@@ -591,7 +591,7 @@ fn a_repo_file_named_head_does_not_collide_with_the_sync_marker() {
     assert_eq!(head_file.label(), "File");
     assert_eq!(
         head_file.prop("path"),
-        Some(core_api::Value::Str("HEAD".to_string()))
+        Some(mushroomdb::Value::Str("HEAD".to_string()))
     );
     assert!(
         head_file.prop("sha").is_none(),
@@ -603,9 +603,11 @@ fn a_repo_file_named_head_does_not_collide_with_the_sync_marker() {
     assert_eq!(marker.label(), "GitSync");
     assert_eq!(
         marker.prop("id"),
-        Some(core_api::Value::Str("__mushroomdb_git_sync__".to_string()))
+        Some(mushroomdb::Value::Str(
+            "__mushroomdb_git_sync__".to_string()
+        ))
     );
-    assert!(matches!(marker.prop("sha"), Some(core_api::Value::Str(s)) if s.len() == 40));
+    assert!(matches!(marker.prop("sha"), Some(mushroomdb::Value::Str(s)) if s.len() == 40));
     drop(db);
 
     // The marker is found again, so the rerun is incremental and writes nothing.
@@ -727,9 +729,12 @@ fn non_ascii_paths_are_stored_unescaped() {
     let n = db.node_ref("src/café.rs").unwrap();
     assert_eq!(
         n.prop("path"),
-        Some(core_api::Value::Str("src/café.rs".to_string()))
+        Some(mushroomdb::Value::Str("src/café.rs".to_string()))
     );
-    assert_eq!(n.prop("ext"), Some(core_api::Value::Str("rs".to_string())));
+    assert_eq!(
+        n.prop("ext"),
+        Some(mushroomdb::Value::Str("rs".to_string()))
+    );
 }
 
 /// An initialised repository with no commits reports zeros and writes nothing.
@@ -812,7 +817,7 @@ fn ownership_flips_across_incremental_runs() {
             .node_ref("src/api.rs")
             .unwrap()
             .prop("top_author_id"),
-        Some(core_api::Value::Str("alice@x.test".to_string())),
+        Some(mushroomdb::Value::Str("alice@x.test".to_string())),
         "alice owns the file after her three commits"
     );
 
@@ -835,7 +840,7 @@ fn ownership_flips_across_incremental_runs() {
         .prop("top_author_id");
     assert_eq!(
         incremental_top,
-        Some(core_api::Value::Str("bob@x.test".to_string())),
+        Some(mushroomdb::Value::Str("bob@x.test".to_string())),
         "bob has 4 commits to alice's 3, so ownership must move to bob"
     );
 
@@ -849,7 +854,7 @@ fn ownership_flips_across_incremental_runs() {
         full_node.prop("top_author_id"),
         "incremental sync must agree with a full ingest of the same repo"
     );
-    assert_eq!(full_node.prop("n_commits"), Some(core_api::Value::Int(7)));
+    assert_eq!(full_node.prop("n_commits"), Some(mushroomdb::Value::Int(7)));
 
     // TOP_AUTHOR is an auto-FK on top_author_id, so the edge must follow.
     let db = GraphDb::open(&db_dir).unwrap();
@@ -898,7 +903,7 @@ fn author_name_is_the_majority_variant() {
     };
     assert_eq!(
         name(&db_dir),
-        Some(core_api::Value::Str("Ada Lovelace".to_string())),
+        Some(mushroomdb::Value::Str("Ada Lovelace".to_string())),
         "3 commits to 1, so the short spelling is the display name"
     );
 
@@ -926,7 +931,7 @@ fn author_name_is_the_majority_variant() {
         assert!(run_ingest_git(&db_dir, &opts(&repo)).unwrap().incremental);
         assert_eq!(
             name(&db_dir),
-            Some(core_api::Value::Str((*want).to_string())),
+            Some(mushroomdb::Value::Str((*want).to_string())),
             "{why}"
         );
     }
@@ -945,9 +950,9 @@ fn author_name_is_the_majority_variant() {
     };
     assert_eq!(
         counts(&db_dir),
-        Some(core_api::Value::List(vec![
-            core_api::Value::Str("Ada M. Lovelace\t4".to_string()),
-            core_api::Value::Str("Ada Lovelace\t3".to_string()),
+        Some(mushroomdb::Value::List(vec![
+            mushroomdb::Value::Str("Ada M. Lovelace\t4".to_string()),
+            mushroomdb::Value::Str("Ada Lovelace\t3".to_string()),
         ])),
         "the distribution accumulates across syncs, in first-seen order"
     );
@@ -995,7 +1000,7 @@ fn legacy_store_recovers_the_majority_name_on_first_sync() {
         db.set_prop(
             "ada@x.test",
             "name",
-            core_api::Value::Str("Ada M. Lovelace".to_string()),
+            mushroomdb::Value::Str("Ada M. Lovelace".to_string()),
         )
         .unwrap();
         assert!(db.remove_prop("ada@x.test", "name_counts").unwrap());
@@ -1015,14 +1020,14 @@ fn legacy_store_recovers_the_majority_name_on_first_sync() {
     let author = db.node_ref("ada@x.test").unwrap();
     assert_eq!(
         author.prop("name"),
-        Some(core_api::Value::Str("Ada Lovelace".to_string())),
+        Some(mushroomdb::Value::Str("Ada Lovelace".to_string())),
         "6 commits to 1: the recovered majority wins on the first sync"
     );
     assert_eq!(
         author.prop("name_counts"),
-        Some(core_api::Value::List(vec![
-            core_api::Value::Str("Ada M. Lovelace\t1".to_string()),
-            core_api::Value::Str("Ada Lovelace\t6".to_string()),
+        Some(mushroomdb::Value::List(vec![
+            mushroomdb::Value::Str("Ada M. Lovelace\t1".to_string()),
+            mushroomdb::Value::Str("Ada Lovelace\t6".to_string()),
         ])),
         "the whole history, counted once — the window is not added on top"
     );
@@ -1136,7 +1141,7 @@ fn seed_repo_with_submodule() -> PathBuf {
 fn marker(db_dir: &Path, key: &str) -> Option<String> {
     let db = GraphDb::open(db_dir).unwrap();
     match db.node_ref(key).and_then(|n| n.prop("sha")) {
-        Some(core_api::Value::Str(s)) => Some(s),
+        Some(mushroomdb::Value::Str(s)) => Some(s),
         _ => None,
     }
 }
@@ -1192,12 +1197,12 @@ fn mailmap_merges_two_emails_into_one_author() {
     assert_eq!(a.label(), "Author");
     assert_eq!(
         a.prop("name"),
-        Some(core_api::Value::Str("Alice Example".to_string())),
+        Some(mushroomdb::Value::Str("Alice Example".to_string())),
         "the mailmap name wins over the raw commit name"
     );
     assert_eq!(
         db.node_ref("src/api.rs").unwrap().prop("top_author_id"),
-        Some(core_api::Value::Str("alice@x.test".to_string())),
+        Some(mushroomdb::Value::Str("alice@x.test".to_string())),
         "both commits count towards the canonical identity"
     );
 }
@@ -1256,7 +1261,7 @@ fn recurse_submodules_prefixes_keys_and_keeps_separate_sync_markers() {
         db.node_ref("vendor/lib/src/lib.rs")
             .unwrap()
             .prop("n_commits"),
-        Some(core_api::Value::Int(2)),
+        Some(mushroomdb::Value::Int(2)),
         "the submodule file keeps its cumulative history"
     );
     drop(db);
@@ -1402,24 +1407,24 @@ fn prs_from_fake_gh_link_merge_and_squash_commits() {
     let db = GraphDb::open(&db_dir).unwrap();
     let pr = db.node_ref("pr:7").expect("pr:7 exists");
     assert_eq!(pr.label(), "PR");
-    assert_eq!(pr.prop("number"), Some(core_api::Value::Int(7)));
+    assert_eq!(pr.prop("number"), Some(mushroomdb::Value::Int(7)));
     assert_eq!(
         pr.prop("title"),
-        Some(core_api::Value::Str("Add the feature".to_string()))
+        Some(mushroomdb::Value::Str("Add the feature".to_string()))
     );
     assert_eq!(
         pr.prop("url"),
-        Some(core_api::Value::Str(
+        Some(mushroomdb::Value::Str(
             "https://example.test/pr/7".to_string()
         ))
     );
     assert_eq!(
         pr.prop("merged_at"),
-        Some(core_api::Value::Str("2026-01-02T00:00:00Z".to_string()))
+        Some(mushroomdb::Value::Str("2026-01-02T00:00:00Z".to_string()))
     );
     assert_eq!(
         pr.prop("author_login"),
-        Some(core_api::Value::Str("bobby".to_string()))
+        Some(mushroomdb::Value::Str("bobby".to_string()))
     );
 
     // Merge commit: linked by sha.
@@ -1429,7 +1434,7 @@ fn prs_from_fake_gh_link_merge_and_squash_commits() {
     );
     assert_eq!(
         db.node_ref(&merge_sha).unwrap().prop("pr_id"),
-        Some(core_api::Value::Str("pr:7".to_string()))
+        Some(mushroomdb::Value::Str("pr:7".to_string()))
     );
     assert_eq!(
         db.neighbors(&merge_sha, "PR", Direction::Out).unwrap(),
@@ -1444,7 +1449,7 @@ fn prs_from_fake_gh_link_merge_and_squash_commits() {
     );
     assert_eq!(
         db.node_ref(&squash_sha).unwrap().prop("pr_id"),
-        Some(core_api::Value::Str("pr:42".to_string()))
+        Some(mushroomdb::Value::Str("pr:42".to_string()))
     );
 
     // A commit belonging to no pull request stays unlinked.
@@ -1479,15 +1484,15 @@ fn gitsync_records_repo_and_flags() {
     assert_eq!(m.label(), "GitSync");
     assert_eq!(
         m.prop("repo"),
-        Some(core_api::Value::Str(
+        Some(mushroomdb::Value::Str(
             canonical(&repo).to_string_lossy().to_string()
         )),
         "the repository path is absolute"
     );
-    assert_eq!(m.prop("recurse"), Some(core_api::Value::Bool(true)));
-    assert_eq!(m.prop("prs"), Some(core_api::Value::Bool(false)));
-    assert_eq!(m.prop("structure"), Some(core_api::Value::Bool(false)));
-    assert_eq!(m.prop("docs"), Some(core_api::Value::Bool(true)));
+    assert_eq!(m.prop("recurse"), Some(mushroomdb::Value::Bool(true)));
+    assert_eq!(m.prop("prs"), Some(mushroomdb::Value::Bool(false)));
+    assert_eq!(m.prop("structure"), Some(mushroomdb::Value::Bool(false)));
+    assert_eq!(m.prop("docs"), Some(mushroomdb::Value::Bool(true)));
     drop(db);
 
     // Re-running with the same flags and no new commits still writes nothing.
@@ -1504,7 +1509,7 @@ fn gitsync_records_repo_and_flags() {
             .node_ref("__mushroomdb_git_sync__")
             .unwrap()
             .prop("structure"),
-        Some(core_api::Value::Bool(true))
+        Some(mushroomdb::Value::Bool(true))
     );
 }
 
@@ -1525,7 +1530,7 @@ fn gitsync_stamps_when_the_store_last_took_data() {
         .unwrap()
         .prop("synced_at")
     {
-        Some(core_api::Value::Int(at)) => at,
+        Some(mushroomdb::Value::Int(at)) => at,
         other => panic!("synced_at must be an integer, got {other:?}"),
     };
 
@@ -1665,7 +1670,7 @@ fn an_incremental_run_writes_only_what_the_commit_touched() {
     assert!(!full.incremental);
     assert_eq!(full.files, 20, "the full run does write every file");
 
-    let before = core_api::wal_commit_count_at(&db_dir).unwrap();
+    let before = mushroomdb::wal_commit_count_at(&db_dir).unwrap();
 
     // One commit, one file.
     commit(
@@ -1681,7 +1686,7 @@ fn an_incremental_run_writes_only_what_the_commit_touched() {
         "an incremental run reports the files it wrote, not every file it knows"
     );
 
-    let delta = core_api::wal_commit_count_at(&db_dir).unwrap() - before;
+    let delta = mushroomdb::wal_commit_count_at(&db_dir).unwrap() - before;
     assert!(
         delta <= 8,
         "a one-file commit appended {delta} WAL commits; batched it is six, and \
@@ -1719,7 +1724,7 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
     let text = cli::run_brief(&db_dir).expect("brief");
     assert_eq!(text, cli::run_brief(&db_dir).expect("brief"));
     assert!(
-        text.len() <= core_api::memory::brief::MAX_BRIEF_BYTES,
+        text.len() <= mushroomdb::memory::brief::MAX_BRIEF_BYTES,
         "{} bytes",
         text.len()
     );
@@ -1727,7 +1732,7 @@ fn brief_is_byte_stable_within_budget_and_silent_without_a_store() {
     // with the marker every digest rendered out of a store opens with — inside
     // the budget asserted above, not on top of it.
     assert!(
-        text.starts_with(core_api::digest::UNTRUSTED_FRAMING),
+        text.starts_with(mushroomdb::digest::UNTRUSTED_FRAMING),
         "{text}"
     );
     // Since 0.7 an ingested store gets the same brief as any memory store: a
@@ -1876,7 +1881,7 @@ fn the_reach_line_names_only_tools_its_surface_lists() {
     fn tools_named_in(reach: &str) -> Vec<String> {
         let mcp_half = reach.split(" or: ").next().expect("split yields one part");
         mcp_half
-            .split(core_api::digest::SEP)
+            .split(mushroomdb::digest::SEP)
             .filter_map(|clause| clause.split_whitespace().next())
             .filter(|word| {
                 !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase() || c == '_')
@@ -2091,7 +2096,7 @@ fn an_empty_store_brief_on_a_cli_delivery_install_names_no_mcp_tool() {
     assert!(out.status.success(), "{out:?}");
     let text = cli::run_brief(&bare).expect("brief");
     assert!(
-        text.starts_with(core_api::memory::brief::EMPTY_BRIEF),
+        text.starts_with(mushroomdb::memory::brief::EMPTY_BRIEF),
         "{text}"
     );
 }

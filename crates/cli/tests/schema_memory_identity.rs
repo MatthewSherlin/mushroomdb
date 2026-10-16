@@ -1,7 +1,7 @@
 //! `schema apply --memory-identity` adds the identity preset on request, and
 //! says what it will backfill before it does.
 use cli::{parse_args, run_schema_apply_memory_identity};
-use core_api::{GraphDb, Value};
+use mushroomdb::{GraphDb, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -131,10 +131,10 @@ fn a_store_with_the_eleven_rule_preset_gains_the_five_claim_rules() {
     let dir = pre_alias_store("upgrade");
     {
         let mut db = GraphDb::open(&dir).unwrap();
-        let mut eleven = core_api::memory_schema::memory_identity();
+        let mut eleven = mushroomdb::memory_schema::memory_identity();
         eleven
             .rules
-            .retain(|r| matches!(r.predicate, core_api::Predicate::Overlap { .. }));
+            .retain(|r| matches!(r.predicate, mushroomdb::Predicate::Overlap { .. }));
         assert_eq!(eleven.rules.len(), 11);
         db.apply_schema(&eleven).unwrap();
     }
@@ -153,7 +153,7 @@ fn a_store_with_the_eleven_rule_preset_gains_the_five_claim_rules() {
     let mut db = GraphDb::open(&dir).unwrap();
     assert_eq!(db.rules().len(), 16);
     let about = vec!["matt".to_string()];
-    core_api::memory::remember::describe_entity_with_aliases(
+    mushroomdb::memory::remember::describe_entity_with_aliases(
         &mut db,
         "matthew-sherlin",
         None,
@@ -161,9 +161,9 @@ fn a_store_with_the_eleven_rule_preset_gains_the_five_claim_rules() {
         &about,
     )
     .unwrap();
-    let report = core_api::memory::remember::remember(
+    let report = mushroomdb::memory::remember::remember(
         &mut db,
-        &core_api::memory::remember::RememberInput {
+        &mushroomdb::memory::remember::RememberInput {
             text: "Matt owns 0.7",
             about: &about,
             kind: "note",

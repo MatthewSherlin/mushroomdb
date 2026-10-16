@@ -29,9 +29,9 @@
 //! * **#34** — the rollback was never reliable: append precedes fsync, so a
 //!   failed barrier leaves the declaration durable with no archive in sight.
 
-use core_api::{AlgoDir, GraphDb, SnapshotOptions};
 use core_storage::fs::{FileId, Fs};
 use core_storage::{decode_all, WalRecord};
+use mushroomdb::{AlgoDir, GraphDb, SnapshotOptions};
 use sim_harness::SimFs;
 use std::cell::Cell;
 

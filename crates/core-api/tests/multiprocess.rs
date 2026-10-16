@@ -26,10 +26,10 @@
 //! 11. refresh_on_unchanged_store_is_zero_cost
 //! 12. read_sees_a_peer_commit_that_lands_microseconds_later
 
-use core_api::{GraphDb, OpenOptions, Predicate, RuleDef, SharedDb, Value};
 use core_storage::fs::{FileId, Fs, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
 use core_storage::GraphError;
+use mushroomdb::{GraphDb, OpenOptions, Predicate, RuleDef, SharedDb, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -160,7 +160,7 @@ fn two_writers_serialise_without_corruption() {
 
     // `verify` passes on the resulting store.
     db.snapshot().unwrap();
-    for (_, name, _, res) in core_api::verify_snapshot(&d).unwrap() {
+    for (_, name, _, res) in mushroomdb::verify_snapshot(&d).unwrap() {
         assert!(res.is_ok(), "section {name} failed verification: {res:?}");
     }
     drop(db);

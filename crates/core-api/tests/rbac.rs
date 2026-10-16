@@ -19,8 +19,8 @@
 //! W6. unknown version (>2) still poisons
 //! W7. zero-byte file is still healthy-empty
 
-use core_api::schema::Schema;
-use core_api::{GraphDb, PropPredicate, RoleDef, Value, WriteScope};
+use mushroomdb::schema::Schema;
+use mushroomdb::{GraphDb, PropPredicate, RoleDef, Value, WriteScope};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -405,7 +405,7 @@ fn roles_checked_fails_loud_where_roles_answers_empty() {
         .roles_checked()
         .expect_err("a poisoned sidecar must not read as 'no roles are defined'");
     assert!(
-        matches!(err, core_api::GraphError::Corrupt { .. }),
+        matches!(err, mushroomdb::GraphError::Corrupt { .. }),
         "expected the poison error, got {err:?}"
     );
     assert_eq!(
@@ -1731,7 +1731,7 @@ fn a_stale_snapshot_cannot_publish_its_mask_after_a_role_edit() {
 /// An as-of read applies the current predicate to the historical graph.
 #[test]
 fn visible_where_applies_to_an_as_of_read() {
-    use core_api::AsOfScope;
+    use mushroomdb::AsOfScope;
 
     let dir = tmp("predicate-asof");
     let _ = std::fs::remove_dir_all(&dir);

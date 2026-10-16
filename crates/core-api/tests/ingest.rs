@@ -1,8 +1,8 @@
-use core_api::{
+use core_storage::fs::{FileId, Fs, RealFs};
+use mushroomdb::{
     AutoFk, Direction, FkSkip, GraphDb, GraphError, IngestOptions, IngestReport, Predicate, Value,
     DEFAULT_KEYMATCH_TOP_K,
 };
-use core_storage::fs::{FileId, Fs, RealFs};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

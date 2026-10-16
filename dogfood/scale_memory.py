@@ -68,7 +68,7 @@ RSS_GUARD_BYTES = 18 * 1024 ** 3
 # Guard: stop before a scale step if free disk is below this.
 DISK_GUARD_BYTES = 5 * 1024 ** 3
 
-# Memory schema full-text pairs (core_api::memory_schema::memory_defaults).
+# Memory schema full-text pairs (mushroomdb::memory_schema::memory_defaults).
 ENTITY_LABELS = ("Person", "Org", "Project", "Concept", "Event")
 FULLTEXT_PAIRS: tuple[tuple[str, str], ...] = (
     *tuple((lbl, "name") for lbl in ENTITY_LABELS),

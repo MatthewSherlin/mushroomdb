@@ -12,7 +12,7 @@
 //! serve full-token client masks, where the caller already knows the key
 //! exists. That difference is the whole reason these methods exist.
 
-use core_api::{
+use mushroomdb::{
     with_pairwise_caps, AlgoDir, Dir, Explanation, GraphDb, GraphError, NodeMask, Predicate,
     RealFs, RuleDef, Value, NS_PROP,
 };
@@ -221,10 +221,10 @@ fn via_namespaced(name: &str) -> (std::path::PathBuf, GraphDb<RealFs>) {
 }
 
 /// The `key` column of a neighborhood result, in row order.
-fn keys_of(rs: &core_api::ResultSet) -> Vec<String> {
+fn keys_of(rs: &mushroomdb::ResultSet) -> Vec<String> {
     (0..rs.len())
         .map(|i| match rs.row(i)[0].as_ref() {
-            Some(core_api::Value::Str(s)) => s.clone(),
+            Some(mushroomdb::Value::Str(s)) => s.clone(),
             other => panic!("the key column must be a string, got {other:?}"),
         })
         .collect()
@@ -316,7 +316,7 @@ fn scoped_neighborhood_on_a_hidden_subject_is_key_not_found() {
 }
 
 /// The reader-snapshot twins carry the same contract. HTTP's role branches read
-/// from a [`core_api::ReaderSnapshot`], not a `GraphDb`, so a contract that
+/// from a [`mushroomdb::ReaderSnapshot`], not a `GraphDb`, so a contract that
 /// lived only on `GraphDb` would leave the RBAC path still hand-rolled.
 #[test]
 fn scoped_reads_on_a_reader_snapshot_honour_the_same_contract() {
@@ -460,7 +460,7 @@ fn scoped_explain_omits_a_path_through_a_hidden_node() {
     let hides_via = NodeMask::from_keys(&db, ["alice", "proj_a"]);
     assert_eq!(
         db.explain_scoped("alice", "proj_a", &hides_via).unwrap(),
-        Vec::<core_api::Explanation>::new(),
+        Vec::<mushroomdb::Explanation>::new(),
         "the only evidence runs through hidden `techcorp`"
     );
 
@@ -840,14 +840,14 @@ fn the_hybrid_path_advises_a_call_the_hybrid_caller_can_make() {
     let mask = NodeMask::from_keys(&db, visible.iter().map(String::as_str));
     let q = [1.0_f64, 0.0];
 
-    core_api::ambiguous_exactness_warns_reset();
+    mushroomdb::ambiguous_exactness_warns_reset();
     db.search_hybrid_scoped("body", "unique", "emb", &q, Some("Item"), 3, &mask);
     assert_eq!(
-        core_api::ambiguous_exactness_warns(),
+        mushroomdb::ambiguous_exactness_warns(),
         1,
         "a masked hybrid search rides the same approximate leg, and says so"
     );
-    let hybrid = core_api::ambiguous_exactness_last_warning()
+    let hybrid = mushroomdb::ambiguous_exactness_last_warning()
         .expect("the warning that was counted must also have been recorded");
     assert!(
         !hybrid.contains("pass exact=True or a where= predicate"),
@@ -864,9 +864,10 @@ fn the_hybrid_path_advises_a_call_the_hybrid_caller_can_make() {
 
     // The direct call keeps the original advice: `exact` and `where` really are
     // its own parameters, so naming them is the whole point.
-    core_api::ambiguous_exactness_warns_reset();
+    mushroomdb::ambiguous_exactness_warns_reset();
     db.find_similar_vector_masked("emb", Some("Item"), &q, 3, 0.0, &mask);
-    let direct = core_api::ambiguous_exactness_last_warning().expect("the direct line is recorded");
+    let direct =
+        mushroomdb::ambiguous_exactness_last_warning().expect("the direct line is recorded");
     assert!(
         direct.contains("pass exact=True or a where= predicate"),
         "`find_similar` does take both, so its advice is unchanged: {direct}"
@@ -876,14 +877,14 @@ fn the_hybrid_path_advises_a_call_the_hybrid_caller_can_make() {
     // warned first must not silence the hybrid line that carries the other
     // advice. Both have now warned, so both are silent from here.
     assert_eq!(
-        core_api::ambiguous_exactness_warns(),
+        mushroomdb::ambiguous_exactness_warns(),
         1,
         "the direct line is not suppressed by the hybrid one"
     );
     db.search_hybrid_scoped("body", "unique", "emb", &q, Some("Item"), 3, &mask);
     db.find_similar_vector_masked("emb", Some("Item"), &q, 3, 0.0, &mask);
     assert_eq!(
-        core_api::ambiguous_exactness_warns(),
+        mushroomdb::ambiguous_exactness_warns(),
         1,
         "and neither repeats on the same index"
     );
@@ -931,12 +932,12 @@ fn a_masked_search_without_exact_warns_once() {
     let mask = NodeMask::from_keys(&db, visible.iter().map(String::as_str));
     let q = [1.0_f64, 0.0];
 
-    core_api::ambiguous_exactness_warns_reset();
+    mushroomdb::ambiguous_exactness_warns_reset();
 
     // An unmasked search is unambiguous: approximate is what it has always been.
     db.find_similar_vector("emb", Some("V"), &q, 3, 0.0);
     assert_eq!(
-        core_api::ambiguous_exactness_warns(),
+        mushroomdb::ambiguous_exactness_warns(),
         0,
         "only a masked call is ambiguous"
     );
@@ -945,21 +946,21 @@ fn a_masked_search_without_exact_warns_once() {
     db.find_similar_vector_filtered("emb", Some("V"), &q, 3, 0.0, Some(&mask), None, true)
         .unwrap();
     assert_eq!(
-        core_api::ambiguous_exactness_warns(),
+        mushroomdb::ambiguous_exactness_warns(),
         0,
         "`exact=True` already names the choice"
     );
 
     db.find_similar_vector_masked("emb", Some("V"), &q, 3, 0.0, &mask);
     assert_eq!(
-        core_api::ambiguous_exactness_warns(),
+        mushroomdb::ambiguous_exactness_warns(),
         1,
         "a masked, non-exact search over an indexed field explains itself"
     );
 
     db.find_similar_vector_masked("emb", Some("V"), &q, 3, 0.0, &mask);
     assert_eq!(
-        core_api::ambiguous_exactness_warns(),
+        mushroomdb::ambiguous_exactness_warns(),
         1,
         "once per index — a per-call line would be noise a caller learns to skip"
     );
@@ -979,7 +980,7 @@ fn scoped_query_at_answers_the_as_of_graph_through_the_handles_scope() {
     db.insert_node("Doc", "hidden", vec![]).unwrap();
     db.insert_node("Doc", "late", vec![]).unwrap();
 
-    let scope = core_api::Scope::new(None, None, Some(vec!["a".into(), "late".into()])).unwrap();
+    let scope = mushroomdb::Scope::new(None, None, Some(vec!["a".into(), "late".into()])).unwrap();
     let params = std::collections::BTreeMap::new();
     let q = "MATCH (n:Doc) RETURN key(n) AS k ORDER BY k";
     let newest = db.wal_total_commits().unwrap() - 1;
@@ -1007,7 +1008,7 @@ fn scoped_query_at_refuses_a_write_statement() {
     let dir = tmp("query-at-scope-write");
     let mut db = GraphDb::open(&dir).unwrap();
     db.insert_node("Doc", "a", vec![]).unwrap();
-    let scope = core_api::Scope::new(None, None, Some(vec!["a".into()])).unwrap();
+    let scope = mushroomdb::Scope::new(None, None, Some(vec!["a".into()])).unwrap();
     let params = std::collections::BTreeMap::new();
 
     let err = db

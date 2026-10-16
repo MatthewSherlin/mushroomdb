@@ -1,4 +1,6 @@
-use core_api::{Dir, Direction, GraphDb, GraphError, Predicate, ResultSet, RuleDef, Stats, Value};
+use mushroomdb::{
+    Dir, Direction, GraphDb, GraphError, Predicate, ResultSet, RuleDef, Stats, Value,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -614,7 +616,7 @@ fn topk_field_equal_cap_per_source_and_stats_survive_recovery() {
         // The snapshot truncates, so the one thing that moves is where history
         // starts. Everything a rule counted is as it was.
         assert!(after.history_floor > before.history_floor);
-        let unmoved = |mut s: core_api::Stats| {
+        let unmoved = |mut s: mushroomdb::Stats| {
             s.history_floor = 0;
             s
         };
@@ -773,8 +775,8 @@ fn stats_live_and_tombstoned_after_delete_node() {
             rules: vec![],
             chain_truncations: 0,
             history_floor: 0,
-            namespaces: vec![core_api::NamespaceStats {
-                name: core_api::NS_DEFAULT.to_string(),
+            namespaces: vec![mushroomdb::NamespaceStats {
+                name: mushroomdb::NS_DEFAULT.to_string(),
                 nodes_live: 2,
             }],
         }

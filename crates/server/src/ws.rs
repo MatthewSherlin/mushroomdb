@@ -13,7 +13,7 @@ use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use core_api::MutationEvent;
+use mushroomdb::MutationEvent;
 use serde_json::json;
 use tokio::sync::broadcast::error::RecvError;
 

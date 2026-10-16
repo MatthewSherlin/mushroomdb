@@ -13,8 +13,8 @@
 //! asked for the feature, not by everyone who took a patch release —
 //! `multiplicity_off_writes_no_new_record` is what holds that line.
 
-use core_api::{AlgoDir, GraphDb, GraphError, NodeMask, RealFs, Value};
 use core_storage::{decode_all, WalRecord};
+use mushroomdb::{AlgoDir, GraphDb, GraphError, NodeMask, RealFs, Value};
 use serde::Deserialize;
 
 type Db = GraphDb<RealFs>;
@@ -549,7 +549,7 @@ fn replay_over_a_kept_wal_does_not_double_count() {
     for _ in 0..2 {
         assert!(!db.insert_edge("E", "a", "b").unwrap());
     }
-    db.snapshot_with(core_api::SnapshotOptions {
+    db.snapshot_with(mushroomdb::SnapshotOptions {
         keep_wal: true,
         ..Default::default()
     })
@@ -790,12 +790,12 @@ fn a_reader_snapshot_carries_the_count() {
 /// because it is load-bearing, and pinned only as far as the fixture reaches.
 #[test]
 fn a_rule_claiming_the_reserved_count_name_cannot_collide_with_it() {
-    fn same_rule() -> core_api::RuleDef {
-        core_api::RuleDef {
+    fn same_rule() -> mushroomdb::RuleDef {
+        mushroomdb::RuleDef {
             name: "same".into(),
             src_label: "Person".into(),
             dst_label: "Org".into(),
-            predicate: core_api::Predicate::FieldEqual {
+            predicate: mushroomdb::Predicate::FieldEqual {
                 field: "industry".into(),
             },
             edge_type: "SAME".into(),

@@ -41,21 +41,21 @@
 //! whatever its writers put there: an `ingest-git` store carries author names,
 //! paths, commit subjects and doc comments, and a memory store carries notes.
 //! [`ok`] therefore stamps every reply with
-//! [`core_api::digest::UNTRUSTED_FRAMING`], the same marker the prompt hook
+//! [`mushroomdb::digest::UNTRUSTED_FRAMING`], the same marker the prompt hook
 //! and the session brief put on theirs, so an assistant is told to read the
 //! lines under it as data before it reads any of them. The renderers already
 //! sanitize each line; the framing is what says whose words they are.
 
 use crate::mcp::{graph_err_msg, CallOutcome};
-use core_api::digest::{self, MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING};
-use core_api::explain_digest::{explain_with_evidence, predicate_summary, render_explain};
-use core_api::memory::forget::{forget, ForgetReport, ForgetTarget, FORGET_SHAPE};
-use core_api::memory::remember::{
+use mushroomdb::digest::{self, MAX_OUTPUT_BYTES, UNTRUSTED_FRAMING};
+use mushroomdb::explain_digest::{explain_with_evidence, predicate_summary, render_explain};
+use mushroomdb::memory::forget::{forget, ForgetReport, ForgetTarget, FORGET_SHAPE};
+use mushroomdb::memory::remember::{
     dedup_keep_order, remember, unix_now_secs, EntityIn, FactIn, RememberInput, DEFAULT_NOTE_KIND,
     NOTE_KINDS,
 };
-use core_api::memory::suggest::{filtered_suggestions, round_to, Suggestion, BOOKKEEPING_FIELDS};
-use core_api::{json_to_value, Dir, Explanation, GraphError, SharedDb, Value};
+use mushroomdb::memory::suggest::{filtered_suggestions, round_to, Suggestion, BOOKKEEPING_FIELDS};
+use mushroomdb::{json_to_value, Dir, Explanation, GraphError, SharedDb, Value};
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -1148,11 +1148,11 @@ fn tool_neighborhood(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
 /// another label is how a two-hop question reaches the label it asked about,
 /// and refusing to walk through it would answer a different question. So the
 /// walk is whole and the answer is the nodes of that label it reached.
-fn keeping_label(rs: core_api::ResultSet, label: Option<&str>) -> core_api::ResultSet {
+fn keeping_label(rs: mushroomdb::ResultSet, label: Option<&str>) -> mushroomdb::ResultSet {
     let Some(label) = label else {
         return rs;
     };
-    let mut out = core_api::ResultSet::new(rs.columns().to_vec());
+    let mut out = mushroomdb::ResultSet::new(rs.columns().to_vec());
     for i in 0..rs.len() {
         if rs.get(i, "label") == Some(&Value::Str(label.to_string())) {
             out.push_row(rs.row(i).to_vec());
@@ -1166,7 +1166,7 @@ fn keeping_label(rs: core_api::ResultSet, label: Option<&str>) -> core_api::Resu
 /// One edge in an `edges_at` or `what_if` reply, as a document: the same
 /// shape whichever tool built it, so a caller reading `json: true` sees one
 /// edge schema across both.
-fn edge_at_json(e: &core_api::EdgeAt) -> Js {
+fn edge_at_json(e: &mushroomdb::EdgeAt) -> Js {
     json!({
         "edge_type": e.edge_type,
         "src": e.src_key,
@@ -1197,11 +1197,11 @@ struct EdgeAtGroup {
 /// `(edge_type, src_key, dst_key)` by the engine — by edge type, keeping at
 /// most `limit` per type for the digest.
 fn edges_at_groups(
-    edges: Vec<core_api::EdgeAt>,
+    edges: Vec<mushroomdb::EdgeAt>,
     key: &str,
     limit: usize,
 ) -> (usize, Vec<EdgeAtGroup>) {
-    let mut by_type: BTreeMap<String, Vec<core_api::EdgeAt>> = BTreeMap::new();
+    let mut by_type: BTreeMap<String, Vec<mushroomdb::EdgeAt>> = BTreeMap::new();
     let mut total = 0usize;
     for e in edges {
         total += 1;
@@ -1281,7 +1281,7 @@ fn render_edges_at(key: &str, at: u64, total: usize, groups: &[EdgeAtGroup]) -> 
 /// (an unrecognized key and a recognized one with nothing at `at` look
 /// identical here, matching `edges_at`'s own "unknown key is not an error"
 /// contract).
-fn canonical_self(edges: &[core_api::EdgeAt], key: &str) -> String {
+fn canonical_self(edges: &[mushroomdb::EdgeAt], key: &str) -> String {
     let mut candidates: Option<BTreeSet<&str>> = None;
     for e in edges {
         let this_edge: BTreeSet<&str> = if e.src_key == e.dst_key {
@@ -1415,7 +1415,7 @@ fn tool_edges_at(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     // argument the tool accepts has to mean the same thing in every form of
     // its reply.
     let mut filter = LabelFilter::new(db, label);
-    let edges: Vec<core_api::EdgeAt> = edges
+    let edges: Vec<mushroomdb::EdgeAt> = edges
         .into_iter()
         .filter(|e| {
             let outgoing = e.src_key == self_key;
@@ -1480,7 +1480,7 @@ struct WhatIfGroup {
 /// Group `edges` by type, incident edges first within each group — the ones
 /// that touch `key` are the answer to the question asked; edges churned
 /// elsewhere are secondary and sort after them, in the engine's own order.
-fn what_if_groups(edges: &[core_api::EdgeAt], key: &str) -> Vec<WhatIfGroup> {
+fn what_if_groups(edges: &[mushroomdb::EdgeAt], key: &str) -> Vec<WhatIfGroup> {
     let mut by_type: BTreeMap<String, Vec<WhatIfLine>> = BTreeMap::new();
     for e in edges {
         let outgoing = e.src_key == key;
@@ -1589,7 +1589,7 @@ fn what_if_header(
 /// to "which partners does this cost me". An edge the change churns elsewhere
 /// in the graph has no partner to name, so it is written out as the pair it
 /// is, rather than being dropped from a reply that counts it.
-fn what_if_partners(edges: &[core_api::EdgeAt], key: &str) -> Vec<String> {
+fn what_if_partners(edges: &[mushroomdb::EdgeAt], key: &str) -> Vec<String> {
     let mut set: BTreeSet<String> = BTreeSet::new();
     for e in edges {
         if e.src_key == key {
@@ -1610,8 +1610,8 @@ fn render_what_if_keys_only(
     field: &str,
     value: &Js,
     edge_type: &str,
-    lost: &[core_api::EdgeAt],
-    gained: &[core_api::EdgeAt],
+    lost: &[mushroomdb::EdgeAt],
+    gained: &[mushroomdb::EdgeAt],
     limit: usize,
 ) -> String {
     let mut out = what_if_header(key, field, value, lost.len(), gained.len());
@@ -1682,7 +1682,7 @@ fn tool_what_if(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     // included. An edge the change churns elsewhere in the graph has no
     // partner to carry a label, so a labelled call leaves it out.
     let mut filter = LabelFilter::new(db, label);
-    let mut pick = |edges: &'_ [core_api::EdgeAt]| -> Vec<core_api::EdgeAt> {
+    let mut pick = |edges: &'_ [mushroomdb::EdgeAt]| -> Vec<mushroomdb::EdgeAt> {
         edges
             .iter()
             .filter(|e| edge_type.is_none_or(|t| e.edge_type == t))
@@ -1697,7 +1697,7 @@ fn tool_what_if(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let lost = pick(&wi.lost);
     let gained = pick(&wi.gained);
 
-    let doc = |edges: &[core_api::EdgeAt]| -> Vec<Js> {
+    let doc = |edges: &[mushroomdb::EdgeAt]| -> Vec<Js> {
         edges
             .iter()
             .take(limit)
@@ -1747,27 +1747,27 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
     // is never dropped to make room for it.
     let (outcome, incomplete) = {
         let g = db.read();
-        let unindexed = core_api::memory::recall::unindexed_memory_fields(&*g);
+        let unindexed = mushroomdb::memory::recall::unindexed_memory_fields(&*g);
         let incomplete = if unindexed.is_empty() {
             String::new()
         } else {
             format!(
                 "text index incomplete: recall does not search {}. \
                  Run `mushroomdb schema apply {} --memory-defaults`.\n",
-                core_api::memory::recall::unindexed_fields_list(&unindexed),
+                mushroomdb::memory::recall::unindexed_fields_list(&unindexed),
                 digest::sanitize(&label)
             )
         };
         let outcome =
-            core_api::memory::recall::recall_digest(&*g, &topic, &label, MAX_OUTPUT_BYTES);
+            mushroomdb::memory::recall::recall_digest(&*g, &topic, &label, MAX_OUTPUT_BYTES);
         (outcome, incomplete)
     };
     let (digest, text) = match outcome {
-        core_api::memory::recall::RecallOutcome::Hits(d) => {
+        mushroomdb::memory::recall::RecallOutcome::Hits(d) => {
             let d = d + &incomplete;
             (d.clone(), d)
         }
-        core_api::memory::recall::RecallOutcome::NoMatch => (
+        mushroomdb::memory::recall::RecallOutcome::NoMatch => (
             String::new(),
             format!(
                 "mushroomdb recall — nothing matches {}\n{incomplete}",
@@ -1782,7 +1782,7 @@ fn tool_recall(db: &SharedDb, db_dir: Option<&Path>, args: &Js, json_out: bool) 
         // name (the in-process `SharedDb` case, `db_dir: None`), where that
         // really is the best available answer. Sanitized as the line above
         // and the digest's header are: the path is the caller's.
-        core_api::memory::recall::RecallOutcome::NoIndex => (
+        mushroomdb::memory::recall::RecallOutcome::NoIndex => (
             String::new(),
             format!(
                 "mushroomdb recall — this store has no text index, so no topic can \
@@ -2051,7 +2051,7 @@ pub(crate) const SAME_AS_LOST_REMEDY: &str =
 
 /// The `SAME_AS` links a write retracted, for a json reply: the first
 /// [`SAME_AS_LOST_LIST`], scores at the precision the text prints.
-pub(crate) fn same_as_lost_json(lost: &[core_api::memory::identity::SameAsPair]) -> Js {
+pub(crate) fn same_as_lost_json(lost: &[mushroomdb::memory::identity::SameAsPair]) -> Js {
     Js::Array(
         lost.iter()
             .take(SAME_AS_LOST_LIST)
@@ -2063,7 +2063,7 @@ pub(crate) fn same_as_lost_json(lost: &[core_api::memory::identity::SameAsPair])
 /// The one line `remember` prints when its write retracted `SAME_AS` links:
 /// how many, the first [`SAME_AS_LOST_LIST`] with the score each had, and the
 /// remedy. `None` when nothing was lost.
-fn same_as_lost_line(lost: &[core_api::memory::identity::SameAsPair]) -> Option<String> {
+fn same_as_lost_line(lost: &[mushroomdb::memory::identity::SameAsPair]) -> Option<String> {
     if lost.is_empty() {
         return None;
     }
@@ -2106,14 +2106,14 @@ const SCHEMA_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
 fn tool_schema(db: &SharedDb, json_out: bool) -> CallOutcome {
     let report = {
         let g = db.read();
-        core_api::memory::schema::schema_report(
+        mushroomdb::memory::schema::schema_report(
             &g,
-            &core_api::memory::brief::BriefOptions {
+            &mushroomdb::memory::brief::BriefOptions {
                 budget: SCHEMA_BUDGET,
             },
         )
     };
-    ok(json_out, &report, core_api::memory::schema::render_schema)
+    ok(json_out, &report, mushroomdb::memory::schema::render_schema)
 }
 
 // ── forget ───────────────────────────────────────────────────────────────────
@@ -2290,10 +2290,10 @@ struct IdentityPresetOut {
 /// assistant relays. Names the real store path when the server knows it, as
 /// `recall`'s own `schema apply` hint does.
 fn identity_preset_offer(
-    g: &core_api::GraphDb<core_api::RealFs>,
+    g: &mushroomdb::GraphDb<mushroomdb::RealFs>,
     db_dir: Option<&Path>,
 ) -> Option<IdentityPresetOut> {
-    use core_api::memory::identity::{entity_node_count, SAME_AS_EDGE};
+    use mushroomdb::memory::identity::{entity_node_count, SAME_AS_EDGE};
     if g.rules().iter().any(|r| r.edge_type == SAME_AS_EDGE) {
         return None;
     }
@@ -2455,7 +2455,7 @@ fn sample(members: &[String]) -> String {
 
 /// One ranked node line: rank, key, label, value, and its summary when it has one.
 fn node_row(
-    g: &core_api::GraphDb<core_api::RealFs>,
+    g: &mushroomdb::GraphDb<mushroomdb::RealFs>,
     rank: usize,
     key: &str,
     value: &str,
@@ -2522,7 +2522,7 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let (text, doc) = match kind.as_str() {
         "central" | "degree" => {
             let (scores, header): (Vec<(String, String)>, String) = if kind == "central" {
-                let config = core_api::PageRankConfig {
+                let config = mushroomdb::PageRankConfig {
                     edge_type: edge_type.clone(),
                     budget_ms: 0,
                     ..Default::default()
@@ -2541,7 +2541,7 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
                     format!("PageRank over {over}, following edge direction, {note}"),
                 )
             } else {
-                let r = g.degree_centrality(&core_api::DegreeConfig {
+                let r = g.degree_centrality(&mushroomdb::DegreeConfig {
                     edge_type: edge_type.clone(),
                     budget_ms: 0,
                     ..Default::default()
@@ -2571,7 +2571,7 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             )
         }
         "components" => {
-            let r = g.connected_components(&core_api::WccConfig {
+            let r = g.connected_components(&mushroomdb::WccConfig {
                 edge_type: edge_type.clone(),
                 budget_ms: 0,
                 ..Default::default()
@@ -2612,7 +2612,7 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             )
         }
         "identities" => {
-            use core_api::memory::identity::{identity_clusters, SAME_AS_FLOOR};
+            use mushroomdb::memory::identity::{identity_clusters, SAME_AS_FLOOR};
             let r = identity_clusters(&g, SAME_AS_FLOOR);
             let mut text = format!(
                 "mushroomdb analyze identities — {} identit(ies) over {} linked node(s), \
@@ -2647,7 +2647,7 @@ fn tool_analyze(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
             )
         }
         _ => {
-            let r = g.communities(&core_api::LouvainConfig {
+            let r = g.communities(&mushroomdb::LouvainConfig {
                 edge_types: edge_type.clone().into_iter().collect(),
                 budget_ms: 0,
                 ..Default::default()
@@ -3050,8 +3050,8 @@ mod tests {
         assert!(header.contains("time budget"), "{text}");
     }
 
-    fn edge_at(edge_type: &str, src: &str, dst: &str) -> core_api::EdgeAt {
-        core_api::EdgeAt {
+    fn edge_at(edge_type: &str, src: &str, dst: &str) -> mushroomdb::EdgeAt {
+        mushroomdb::EdgeAt {
             edge_type: edge_type.into(),
             src_key: src.into(),
             dst_key: dst.into(),

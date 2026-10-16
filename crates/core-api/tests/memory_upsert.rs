@@ -1,10 +1,10 @@
 //! The entity upsert's policy, at the layer every surface calls: `id` never
 //! comes from `props`, a create needs a label, an update never changes one,
 //! and a namespace a node is already in is not an update.
-use core_api::memory::identity::{same_as_pairs, SameAsPair, ALIASES_FIELD, ALIAS_KEYS_FIELD};
-use core_api::memory::remember::{remember, upsert_entity, RememberInput};
-use core_api::memory_schema::{memory_defaults, memory_identity};
-use core_api::{GraphDb, GraphError, Value};
+use mushroomdb::memory::identity::{same_as_pairs, SameAsPair, ALIASES_FIELD, ALIAS_KEYS_FIELD};
+use mushroomdb::memory::remember::{remember, upsert_entity, RememberInput};
+use mushroomdb::memory_schema::{memory_defaults, memory_identity};
+use mushroomdb::{GraphDb, GraphError, Value};
 use std::collections::BTreeMap;
 
 type Db = GraphDb<core_storage::fs::RealFs>;

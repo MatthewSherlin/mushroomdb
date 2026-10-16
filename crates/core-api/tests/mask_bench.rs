@@ -44,8 +44,8 @@
 //! in [`core_query::VisibleSet`] is five processes of 51 repetitions, medians of
 //! the medians, and anything quoted from this file should be read the same way.
 
-use core_api::{Dir, GraphDb, NodeMask, Value};
 use core_storage::fs::RealFs;
+use mushroomdb::{Dir, GraphDb, NodeMask, Value};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 

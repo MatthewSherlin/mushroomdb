@@ -13,7 +13,7 @@
 /// - delete_view removes values cleanly
 /// - Snapshot+WAL round-trip preserves views
 /// - DST oracle: quiescent value == scratch recompute
-use core_api::{
+use mushroomdb::{
     AggFn, BatchOp, Direction, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource,
 };
 

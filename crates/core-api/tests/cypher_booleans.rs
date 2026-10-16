@@ -4,7 +4,7 @@
 //! was an "unbound variable 'true'" error and the bare truthy form
 //! (`WHERE n.flag`) was the only way to ask.
 
-use core_api::{GraphDb, ResultSet, Value};
+use mushroomdb::{GraphDb, ResultSet, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {

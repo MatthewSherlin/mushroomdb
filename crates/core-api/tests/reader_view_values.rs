@@ -9,7 +9,7 @@
 //!
 //! Each test makes fewer commits than a fold takes, so the reader has to get
 //! the value from the commits themselves.
-use core_api::{AggFn, Direction, GraphDb, Predicate, RuleDef, Value, ViewDef, ViewSource};
+use mushroomdb::{AggFn, Direction, GraphDb, Predicate, RuleDef, Value, ViewDef, ViewSource};
 use std::path::PathBuf;
 
 type Db = GraphDb<core_storage::fs::RealFs>;

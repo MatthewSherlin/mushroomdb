@@ -4,8 +4,8 @@
 //! all-unchanged AND emits zero new WAL commits; updating a rule definition
 //! triggers an update entry.
 
-use core_api::schema::Schema;
-use core_api::{Direction, GraphDb, Predicate, RuleDef, ViewDef, ViewSource};
+use mushroomdb::schema::Schema;
+use mushroomdb::{Direction, GraphDb, Predicate, RuleDef, ViewDef, ViewSource};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -96,7 +96,7 @@ fn apply_schema_is_idempotent_and_diffs() {
 
     // Record WAL commits before second apply. Drop and reopen to flush.
     drop(db);
-    let commits_before = core_api::wal_commit_count_at(&dir).unwrap();
+    let commits_before = mushroomdb::wal_commit_count_at(&dir).unwrap();
 
     let mut db = GraphDb::open(&dir).unwrap();
 
@@ -112,7 +112,7 @@ fn apply_schema_is_idempotent_and_diffs() {
 
     // Zero WAL writes: drop and reopen to flush, then count.
     drop(db);
-    let commits_after = core_api::wal_commit_count_at(&dir).unwrap();
+    let commits_after = mushroomdb::wal_commit_count_at(&dir).unwrap();
     assert_eq!(
         commits_after, commits_before,
         "unchanged apply must emit zero WAL commits (before={commits_before}, after={commits_after})"
@@ -250,7 +250,7 @@ fn apply_schema_invalid_rule_update_is_rejected_before_mutation() {
     db.apply_schema(&schema_v1).unwrap();
 
     drop(db);
-    let commits_before = core_api::wal_commit_count_at(&dir).unwrap();
+    let commits_before = mushroomdb::wal_commit_count_at(&dir).unwrap();
     let mut db = GraphDb::open(&dir).unwrap();
 
     // Build a changed rule with an invalid definition (empty edge_type fails validate()).
@@ -280,7 +280,7 @@ fn apply_schema_invalid_rule_update_is_rejected_before_mutation() {
 
     // Zero new WAL commits — no mutation was made.
     drop(db);
-    let commits_after = core_api::wal_commit_count_at(&dir).unwrap();
+    let commits_after = mushroomdb::wal_commit_count_at(&dir).unwrap();
     assert_eq!(
         commits_after, commits_before,
         "invalid update must not emit any WAL commits (before={commits_before}, after={commits_after})"
@@ -305,7 +305,7 @@ fn apply_schema_invalid_view_update_is_rejected_before_mutation() {
     db.apply_schema(&schema_v1).unwrap();
 
     drop(db);
-    let commits_before = core_api::wal_commit_count_at(&dir).unwrap();
+    let commits_before = mushroomdb::wal_commit_count_at(&dir).unwrap();
     let mut db = GraphDb::open(&dir).unwrap();
 
     // Build a changed view with an invalid definition (empty name fails validate()).
@@ -338,7 +338,7 @@ fn apply_schema_invalid_view_update_is_rejected_before_mutation() {
 
     // Zero new WAL commits.
     drop(db);
-    let commits_after = core_api::wal_commit_count_at(&dir).unwrap();
+    let commits_after = mushroomdb::wal_commit_count_at(&dir).unwrap();
     assert_eq!(
         commits_after, commits_before,
         "invalid view update must not emit any WAL commits (before={commits_before}, after={commits_after})"

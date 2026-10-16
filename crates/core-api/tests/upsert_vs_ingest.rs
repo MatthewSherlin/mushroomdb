@@ -6,10 +6,10 @@
 //!
 //! Found: they agree on all of it. The upsert stores one field more, the
 //! `aliases` it derives from the name, and that is by design.
-use core_api::memory::identity::ALIASES_FIELD;
-use core_api::memory::remember::upsert_entity;
-use core_api::memory_schema::memory_defaults;
-use core_api::{AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, Value};
+use mushroomdb::memory::identity::ALIASES_FIELD;
+use mushroomdb::memory::remember::upsert_entity;
+use mushroomdb::memory_schema::memory_defaults;
+use mushroomdb::{AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, Value};
 use std::collections::BTreeMap;
 
 type Db = GraphDb<core_storage::fs::RealFs>;

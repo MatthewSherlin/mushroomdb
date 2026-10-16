@@ -11,7 +11,7 @@ description = "Embedded graph database with Cypher queries, rule triggers, and A
 readme = "../../README.md"
 
 [lib]
-name = "core_api"
+name = "mushroomdb"
 
 # Helper process spawned by `tests/multiprocess.rs`.  Gated behind `mp-test` so
 # a plain `cargo build` / `cargo test --workspace` never builds it; the

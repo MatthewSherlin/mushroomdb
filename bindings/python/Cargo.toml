@@ -15,6 +15,10 @@ name = "mushroomdb"
 crate-type = ["cdylib"]
 
 [dependencies]
+# Imported as `core_api`, the engine crate's old library name, on purpose:
+# this crate's own library is `mushroomdb` (it is what Python imports), and a
+# crate cannot depend on another under its own name. Everywhere else the
+# engine is `mushroomdb`.
 core-api = { package = "mushroomdb", path = "../../crates/core-api", version = "0.8.2" }
 core-storage = { package = "mushroomdb-storage", path = "../../crates/core-storage", version = "0.8.2" }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }

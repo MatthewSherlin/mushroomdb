@@ -8,7 +8,7 @@
 ///   5. Any with max_edges (top-k): branch-score changes cause evict/backfill.
 ///   6. Snapshot V4 round-trip: RuleDef with Any survives snapshot + WAL replay.
 ///   7. Bincode backward-compat: old (pre-Any) records still decode.
-use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
+use mushroomdb::{Direction, GraphDb, Predicate, RuleDef, Value};
 
 // ---------------------------------------------------------------------------
 // Helpers

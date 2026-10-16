@@ -1,6 +1,6 @@
 //! A single ingest that both creates a rule (auto-FK) and inserts user edges of a
 //! not-yet-interned type must produce a WAL frame that replays identically.
-use core_api::{Direction, GraphDb, IngestOptions, Value};
+use mushroomdb::{Direction, GraphDb, IngestOptions, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {

@@ -14,8 +14,8 @@
 //! If any of these fails **before** Task 14, stop: that is a pre-existing
 //! isolation bug and a much larger finding than the fold.
 
-use core_api::{SharedDb, FOLD_EVERY_K};
 use core_storage::types::Value;
+use mushroomdb::{SharedDb, FOLD_EVERY_K};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -29,7 +29,7 @@ fn tmp(name: &str) -> PathBuf {
 /// Row count is the isolation signal: a snapshot that saw a later write would
 /// answer with more rows. `ResultSet` exposes `len()` and keeps its rows private,
 /// which is enough — these tests are about *whether* a write leaked, not which.
-fn count(rs: &core_api::ResultSet) -> usize {
+fn count(rs: &mushroomdb::ResultSet) -> usize {
     rs.len()
 }
 

@@ -17,7 +17,7 @@
 //!
 //! Found by a probe that ran the same writes through a handle that snapshots
 //! and one that never does.
-use core_api::{AggFn, Direction, GraphDb, Predicate, RuleDef, Value, ViewDef, ViewSource};
+use mushroomdb::{AggFn, Direction, GraphDb, Predicate, RuleDef, Value, ViewDef, ViewSource};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 

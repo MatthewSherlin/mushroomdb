@@ -6,8 +6,8 @@
 //! (receiver already exists). Tests wait for that ack before writing.
 #![allow(deprecated)] // serve() used for test convenience; production code uses serve_with_role_tokens
 
-use core_api::{MutationEvent, SharedDb, Value};
 use futures_util::StreamExt;
+use mushroomdb::{MutationEvent, SharedDb, Value};
 use serde_json::Value as Json;
 use server::serve;
 use std::net::SocketAddr;
@@ -161,7 +161,7 @@ async fn watch_receives_batch_inner_then_summary() {
 /// Binding: ingest_with_edges is one batch: inner events then Ingested.
 #[tokio::test]
 async fn watch_ingest_with_edges_emits_inner_then_ingested() {
-    use core_api::IngestOptions;
+    use mushroomdb::IngestOptions;
     use std::collections::BTreeMap;
 
     let db = SharedDb::open(&tmp("ingest-watch")).unwrap();
@@ -176,7 +176,7 @@ async fn watch_ingest_with_edges_emits_inner_then_ingested() {
             "Person",
             vec![row],
             &IngestOptions {
-                auto_fk: core_api::AutoFk::Off,
+                auto_fk: mushroomdb::AutoFk::Off,
                 ..IngestOptions::default()
             },
             &[("KNOWS".into(), "a".into(), "b".into())],

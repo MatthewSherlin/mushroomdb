@@ -1,4 +1,4 @@
-use core_api::{GraphDb, MaskMode, MaskedNodeResult, NodeMask, Value};
+use mushroomdb::{GraphDb, MaskMode, MaskedNodeResult, NodeMask, Value};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -398,7 +398,7 @@ fn stub_bfs_does_not_expand_through_hidden_node_in_either_mode() {
     // Omit mode: B is hidden → A cannot reach C, BFS returns empty.
     let mask_omit = NodeMask::from_keys(&db, ["a", "c"]);
     let rs_omit = db
-        .neighborhood_masked("a", 2, None, core_api::Dir::Out, &mask_omit)
+        .neighborhood_masked("a", 2, None, mushroomdb::Dir::Out, &mask_omit)
         .unwrap();
     assert_eq!(
         rs_omit.len(),
@@ -410,7 +410,7 @@ fn stub_bfs_does_not_expand_through_hidden_node_in_either_mode() {
     // so C does not appear in the result.
     let mask_stub = NodeMask::from_keys(&db, ["a", "c"]).with_mode(MaskMode::Stub);
     let rs_stub = db
-        .neighborhood_masked("a", 2, None, core_api::Dir::Out, &mask_stub)
+        .neighborhood_masked("a", 2, None, mushroomdb::Dir::Out, &mask_stub)
         .unwrap();
 
     let has_c = (0..rs_stub.len()).any(|i| {

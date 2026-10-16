@@ -9,7 +9,7 @@
 //! behind: the next `Intern` the writer logged — any new field, label or edge
 //! type — failed with "mvcc delta intern mismatch", and every `reader()`
 //! snapshot failed with it until the next fold, up to 63 commits later.
-use core_api::{GraphDb, Predicate, RuleDef, Value};
+use mushroomdb::{GraphDb, Predicate, RuleDef, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()

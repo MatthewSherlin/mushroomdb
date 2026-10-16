@@ -1,8 +1,8 @@
-use core_api::{
+use core_storage::fs::Fs;
+use mushroomdb::{
     AggFn, AutoFk, Direction, GraphDb, IngestOptions, Predicate, RuleDef, RuleStats,
     SnapshotOptions, Stats, Value, ViewDef, ViewSource,
 };
-use core_storage::fs::Fs;
 use sim_harness::{Oracle, SimFs, APPROX_RECALL_FLOOR_RECOVERY};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,7 +14,7 @@ fn no_params_map() -> BTreeMap<String, Value> {
 const FT_WORKLOAD_QUERIES: &[&str] = &["rust", "graph OR storage", "embed*", "rust OR graph"];
 
 /// Original workload: 20 nodes + chain edges + one mid-workload snapshot.
-fn workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn workload<F: Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     for i in 0..20 {
         db.insert_node("N", &format!("n{i}"), vec![("i".into(), Value::Int(i))])?;
         if i > 0 {
@@ -137,7 +137,7 @@ fn emb(xs: &[f64]) -> Value {
 ///     prop-update rule-fire path post-snapshot).
 ///   * Plan 4 tail: delete_edge, remove_prop, a 3-op batch, ingest+auto-FK,
 ///     WAL-logged rebuild_rule, then delete_node of n6 (derived OV + KM).
-fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn workload_with_rules<F: Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     // --- 6 L0 nodes ---
     let l0_tags: &[&[&str]] = &[
         &["alpha", "beta"],
@@ -733,7 +733,7 @@ fn cypher_write_dst_byte_sweep() {
         BTreeMap::new()
     }
 
-    fn cypher_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    fn cypher_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
         // Three single-op Batch frames:
         db.query_write("CREATE (a:Person {id: 'dst_alice'})", &no_params())?;
         db.query_write("CREATE (b:Person {id: 'dst_bob'})", &no_params())?;
@@ -964,7 +964,7 @@ fn assert_delete_heavy_invariants(recovered: &mut GraphDb<SimFs>, label: &str) {
 ///
 /// Interleaving: insert 6, create rules, insert 6 more, then alternate
 /// set_prop + delete so each delete removes a top-candidate for the remaining.
-fn delete_heavy_workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn delete_heavy_workload<F: Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     // Insert first 6 nodes: d0..d5 with shared tag "alpha" and unique tags.
     let pairs: &[(&str, &[&str])] = &[
         ("d0", &["alpha", "beta"]),
@@ -1164,7 +1164,7 @@ fn write_batch_large_frame_dst_byte_sweep() {
         Value::List(xs.iter().map(|s| Value::Str((*s).into())).collect())
     }
 
-    fn workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    fn workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
         // Pre-state: 3 nodes + 1 rule
         db.insert_node(
             "S",
@@ -1361,7 +1361,9 @@ fn write_batch_composition_sweep() {
         Value::List(xs.iter().map(|s| Value::Str((*s).into())).collect())
     }
 
-    fn composition_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    fn composition_workload<F: core_storage::fs::Fs>(
+        db: &mut GraphDb<F>,
+    ) -> mushroomdb::Result<()> {
         // Phase 1: write_batch — 5 nodes
         db.write_batch(|b| {
             b.insert_node("C", "c0", vec![("tags".into(), tags_v(&["x", "y"]))]);
@@ -1504,7 +1506,7 @@ const VIEW_WORKLOAD_KEYS: &[&str] = &["vn0", "vn1", "vn2", "vn3", "vn4", "vn5"];
 ///
 /// Creates a V5 snapshot containing view_defs.  Post-snapshot ops exercise
 /// the incremental-maintenance path after snapshot reload.
-fn workload_with_views<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn workload_with_views<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     // 5 nodes with a "score" prop.
     let base_keys = &VIEW_WORKLOAD_KEYS[..5];
     for (i, key) in base_keys.iter().enumerate() {
@@ -1618,7 +1620,7 @@ fn recovery_byte_sweep_views() {
 
 /// Fulltext workload: enable indexing, insert nodes with text fields,
 /// update and delete some, then verify index == scratch scan on recovery.
-fn workload_with_fulltext<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn workload_with_fulltext<F: Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     // Enable index on (Article, bio) before any inserts.
     db.enable_fulltext("Article", "bio")?;
 
@@ -1667,7 +1669,7 @@ fn workload_with_fulltext<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
 
 /// Fulltext workload that includes a mid-stream snapshot, exercising the
 /// crash window between snapshot write and WAL baseline rewrite.
-fn workload_with_fulltext_and_snapshot<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn workload_with_fulltext_and_snapshot<F: Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     db.enable_fulltext("Article", "bio")?;
     db.insert_node(
         "Article",
@@ -1792,7 +1794,7 @@ fn recovery_byte_sweep_fulltext_with_snapshot() {
 /// crash points in the CREATE...RETURN workload.
 #[test]
 fn create_return_wal_durability_byte_sweep() {
-    fn create_return_workload<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+    fn create_return_workload<F: Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
         // Single Batch frame: InsertNode only (no edges).
         // The RETURN projection is a read-only operation after WAL commit.
         db.query_write("CREATE (n:Widget {id: 'cr_w1'}) RETURN n", &no_params_map())?;
@@ -1843,7 +1845,7 @@ fn create_return_wal_durability_byte_sweep() {
 // ---------------------------------------------------------------------------
 
 /// Workload that writes V6 snapshots mid-stream (used by DST sweeps).
-fn v6_snapshot_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn v6_snapshot_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     for i in 0..10u32 {
         db.insert_node(
             "S",
@@ -1934,7 +1936,7 @@ fn v6_snapshot_dst_op_sweep() {
 // ---------------------------------------------------------------------------
 
 /// Workload that exercises the keep_wal=true snapshot path.
-fn keep_wal_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn keep_wal_workload<F: core_storage::fs::Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     db.insert_node("KW", "kw0", vec![("v".into(), Value::Int(0))])?;
     db.insert_node("KW", "kw1", vec![("v".into(), Value::Int(1))])?;
     db.insert_edge("KWE", "kw0", "kw1")?;
@@ -2044,7 +2046,7 @@ fn keep_wal_dst_op_sweep() {
 /// WAL-logged). If recovery replays SetProp and reads `old_value` from the
 /// overlay (empty after V8 open) rather than from the base, it sees old=None,
 /// the retraction is not triggered, and the KM edge survives incorrectly.
-fn workload_with_v8_setprop_retract<F: Fs>(db: &mut GraphDb<F>) -> core_api::Result<()> {
+fn workload_with_v8_setprop_retract<F: Fs>(db: &mut GraphDb<F>) -> mushroomdb::Result<()> {
     db.insert_node(
         "P",
         "src",

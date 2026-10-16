@@ -12,7 +12,7 @@
 //! graph. Non-empty derived-edge equality is pinned by
 //! `overlap_rule_equality_on_nonempty_derived_sets`.
 
-use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
+use mushroomdb::{Direction, GraphDb, Predicate, RuleDef, Value};
 use proptest::prelude::*;
 use sim_harness::SimFs;
 use std::collections::{BTreeMap, BTreeSet};
@@ -107,7 +107,7 @@ fn params_for(key: &str) -> BTreeMap<String, Value> {
     p
 }
 
-fn row_key_set(rs: &core_api::ResultSet, col: &str) -> Result<BTreeSet<String>, String> {
+fn row_key_set(rs: &mushroomdb::ResultSet, col: &str) -> Result<BTreeSet<String>, String> {
     let mut out = BTreeSet::new();
     for i in 0..rs.len() {
         match rs.get(i, col) {

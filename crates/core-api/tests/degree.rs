@@ -1,7 +1,7 @@
 //! Unique degree / typed incidence readout (sidecar exact-reads Task 4).
 
-use core_api::{AlgoDir, Direction, GraphDb, GraphError, PropPredicate, Value};
 use core_storage::fs::RealFs;
+use mushroomdb::{AlgoDir, Direction, GraphDb, GraphError, PropPredicate, Value};
 
 type Db = GraphDb<RealFs>;
 

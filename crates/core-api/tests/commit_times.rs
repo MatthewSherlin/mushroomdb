@@ -6,8 +6,8 @@
 //! time, and a hole does not announce itself — it resolves a date to the wrong
 //! commit and returns a plausible graph.
 
-use core_api::{GraphDb, Predicate, RuleDef, Value};
 use core_storage::types::GraphError;
+use mushroomdb::{GraphDb, Predicate, RuleDef, Value};
 use std::path::PathBuf;
 
 /// A rule that fires on every pair of `T` nodes sharing a `tag`.
@@ -415,7 +415,7 @@ fn a_read_only_handle_refuses_to_assert_a_time() {
     }
     let mut ro = GraphDb::open_with_options(
         &dir,
-        core_api::OpenOptions {
+        mushroomdb::OpenOptions {
             read_only: true,
             ..Default::default()
         },
@@ -576,10 +576,10 @@ fn a_date_of_now_reaches_the_newest_commit_when_rules_fire() {
 
     // `edges_at` reports both directions, so the live comparison must too.
     let live = db
-        .neighbors("n0", "LINKED", core_api::Direction::Out)
+        .neighbors("n0", "LINKED", mushroomdb::Direction::Out)
         .expect("out")
         .len()
-        + db.neighbors("n0", "LINKED", core_api::Direction::In)
+        + db.neighbors("n0", "LINKED", mushroomdb::Direction::In)
             .expect("in")
             .len();
     assert!(live > 0, "the rule must actually derive edges");

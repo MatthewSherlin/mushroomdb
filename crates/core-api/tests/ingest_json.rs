@@ -1,5 +1,5 @@
-use core_api::{Direction, FkSkip, GraphDb, GraphError, IngestOptions, Value};
 use core_storage::fs::RealFs;
+use mushroomdb::{Direction, FkSkip, GraphDb, GraphError, IngestOptions, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-{}-{}", name, std::process::id()));

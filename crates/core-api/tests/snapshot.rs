@@ -1,10 +1,10 @@
-use core_api::{
-    Direction, GraphDb, GraphError, OpenOptions, Predicate, RuleDef, SnapshotOptions, Value,
-    ViewDef, ViewSource,
-};
 use core_storage::snapshot::{decode, encode_v6, encode_v7, SnapshotState, VERSION_7};
 use core_storage::wal::decode_all;
 use core_storage::{ColumnStore, EdgeProps, IdMap, Interner, Topology};
+use mushroomdb::{
+    Direction, GraphDb, GraphError, OpenOptions, Predicate, RuleDef, SnapshotOptions, Value,
+    ViewDef, ViewSource,
+};
 use std::collections::BTreeMap;
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -2043,7 +2043,7 @@ fn build_v8_equiv_graph(dir: &std::path::Path) -> Vec<(&'static str, Vec<Vec<Opt
     // Collect ground-truth results for the query battery before snapshot.
     let p = BTreeMap::new();
 
-    let rows = |rs: core_api::ResultSet| -> Vec<Vec<Option<Value>>> {
+    let rows = |rs: mushroomdb::ResultSet| -> Vec<Vec<Option<Value>>> {
         (0..rs.len()).map(|i| rs.row(i).to_vec()).collect()
     };
 
@@ -2119,7 +2119,7 @@ fn v8_cypher_query_battery_survives_roundtrip() {
     let db2 = GraphDb::open(&dir).unwrap();
     let p = BTreeMap::new();
 
-    let rows2 = |rs: core_api::ResultSet| -> Vec<Vec<Option<Value>>> {
+    let rows2 = |rs: mushroomdb::ResultSet| -> Vec<Vec<Option<Value>>> {
         (0..rs.len()).map(|i| rs.row(i).to_vec()).collect()
     };
 
@@ -2728,7 +2728,7 @@ fn verify_snapshot_structural_pass_and_corruption_detection() {
     }
 
     // Healthy snapshot: verify (bounds + CRC + structural) succeeds.
-    let results = core_api::verify_snapshot(&dir).expect("healthy snapshot must verify");
+    let results = mushroomdb::verify_snapshot(&dir).expect("healthy snapshot must verify");
     assert!(
         results.iter().all(|(_, _, _, r)| r.is_ok()),
         "every section CRC must be OK on a healthy snapshot"
@@ -2745,7 +2745,7 @@ fn verify_snapshot_structural_pass_and_corruption_detection() {
     // Corruption must be detected by *some* layer — a bounds/structural failure
     // (outer Err) or a per-section CRC mismatch (Err entry) — never a silent
     // pass into UB.
-    let detected = match core_api::verify_snapshot(&dir) {
+    let detected = match mushroomdb::verify_snapshot(&dir) {
         Err(_) => true,
         Ok(results) => results.iter().any(|(_, _, _, r)| r.is_err()),
     };
@@ -2792,7 +2792,7 @@ fn verify_rejects_a_corrupted_string_table() {
         core_storage::snapshot::VERSION,
         "the store must be at the current version before corrupting it"
     );
-    core_api::verify_snapshot(&dir).expect("a healthy V9 snapshot must verify");
+    mushroomdb::verify_snapshot(&dir).expect("a healthy V9 snapshot must verify");
 
     // Locate section 12 in the directory.
     let section_count = u16::from_le_bytes([healthy[6], healthy[7]]) as usize;
@@ -2815,7 +2815,7 @@ fn verify_rejects_a_corrupted_string_table() {
         let mut bytes = healthy.clone();
         bytes[off + byte] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
-        if let Err(e) = core_api::verify_snapshot(&dir) {
+        if let Err(e) = mushroomdb::verify_snapshot(&dir) {
             assert!(
                 format!("{e:?}").contains("strings"),
                 "the strings structural pass must be what rejects it; got {e:?}"
@@ -3165,9 +3165,9 @@ fn a_read_only_handle_reads_list_props_from_a_snapshot_and_writes_nothing() {
 
     let mut ro = GraphDb::open_with_options(
         &dir,
-        core_api::OpenOptions {
+        mushroomdb::OpenOptions {
             read_only: true,
-            ..core_api::OpenOptions::default()
+            ..mushroomdb::OpenOptions::default()
         },
     )
     .unwrap();
@@ -3319,9 +3319,9 @@ fn a_v8_snapshot_still_reads_its_properties() {
     // Read-only so the auto-migrate rewrite does not turn it into V9 under us.
     let db = GraphDb::open_with_options(
         &dir,
-        core_api::OpenOptions {
+        mushroomdb::OpenOptions {
             read_only: true,
-            ..core_api::OpenOptions::default()
+            ..mushroomdb::OpenOptions::default()
         },
     )
     .unwrap();
@@ -3768,10 +3768,10 @@ fn a_snapshot_interrupted_before_its_wal_is_replaced_leaves_a_store_that_opens()
         ),
     ] {
         for stop in [
-            core_api::SnapshotStop::BeforeSnapshotWrite,
-            core_api::SnapshotStop::AfterSnapshotWrite,
-            core_api::SnapshotStop::BeforeWalReplacement,
-            core_api::SnapshotStop::AfterWalReplacement,
+            mushroomdb::SnapshotStop::BeforeSnapshotWrite,
+            mushroomdb::SnapshotStop::AfterSnapshotWrite,
+            mushroomdb::SnapshotStop::BeforeWalReplacement,
+            mushroomdb::SnapshotStop::AfterWalReplacement,
         ] {
             let what = format!("{name} snapshot stopped {stop:?}");
             let dir = tmp(&format!("interrupted-{name}-{stop:?}"));
@@ -3804,7 +3804,7 @@ fn an_interrupted_second_snapshot_leaves_a_store_that_opens() {
         db.set_prop("k", "body", Value::Str("final".into()))
             .unwrap();
         db.insert_edge("CITES", "m", "k").unwrap();
-        db.stop_next_snapshot(core_api::SnapshotStop::AfterSnapshotWrite);
+        db.stop_next_snapshot(mushroomdb::SnapshotStop::AfterSnapshotWrite);
         assert!(db.snapshot().is_err());
     }
     assert_the_store_is_as_it_was_left(&dir, "second snapshot stopped after its write");
@@ -3818,7 +3818,7 @@ fn a_backup_of_a_store_with_an_interrupted_snapshot_opens() {
     let dest = tmp("interrupted-backup-dst");
     {
         let mut db = store_with_history_that_does_not_replay_twice(&dir);
-        db.stop_next_snapshot(core_api::SnapshotStop::AfterSnapshotWrite);
+        db.stop_next_snapshot(mushroomdb::SnapshotStop::AfterSnapshotWrite);
         assert!(db.snapshot().is_err());
     }
     {
@@ -3831,7 +3831,7 @@ fn a_backup_of_a_store_with_an_interrupted_snapshot_opens() {
         let db = GraphDb::open(&dir).unwrap();
         let again = tmp("interrupted-backup-dst2");
         db.backup_to(&again).unwrap();
-        core_api::restore::restore_if_empty(&seeded, &again).unwrap();
+        mushroomdb::restore::restore_if_empty(&seeded, &again).unwrap();
     }
     assert_the_store_is_as_it_was_left(&seeded, "the restored store");
 }
@@ -3869,7 +3869,7 @@ fn a_left_over_intent_does_not_skip_writes_made_after_it() {
                 db.insert_node("A", "a", vec![]).unwrap();
             };
             round(&mut db);
-            db.stop_next_snapshot(core_api::SnapshotStop::AfterWalReplacement);
+            db.stop_next_snapshot(mushroomdb::SnapshotStop::AfterWalReplacement);
             assert!(db.snapshot_with(opts.clone()).is_err(), "{name}");
             round(&mut db);
             assert_eq!(db.get_prop("b", "p"), None, "{name}: live");
@@ -3905,8 +3905,8 @@ fn a_past_commit_reads_right_on_a_store_with_an_interrupted_snapshot() {
         db.wal_total_commits().unwrap()
     };
     for stop in [
-        core_api::SnapshotStop::AfterSnapshotWrite,
-        core_api::SnapshotStop::BeforeWalReplacement,
+        mushroomdb::SnapshotStop::AfterSnapshotWrite,
+        mushroomdb::SnapshotStop::BeforeWalReplacement,
     ] {
         let dir = tmp(&format!("asof-interrupted-{stop:?}"));
         {
@@ -3939,8 +3939,8 @@ fn a_past_commit_reads_right_on_a_store_with_an_interrupted_snapshot() {
 #[test]
 fn a_second_failed_snapshot_keeps_the_first_ones_intent() {
     for first in [
-        core_api::SnapshotStop::AfterSnapshotWrite,
-        core_api::SnapshotStop::BeforeWalReplacement,
+        mushroomdb::SnapshotStop::AfterSnapshotWrite,
+        mushroomdb::SnapshotStop::BeforeWalReplacement,
     ] {
         for reopen_between in [false, true] {
             let what = format!("first stopped {first:?}, reopen between: {reopen_between}");
@@ -3956,7 +3956,7 @@ fn a_second_failed_snapshot_keeps_the_first_ones_intent() {
                 db = GraphDb::open(&dir).unwrap_or_else(|e| panic!("{what}: {e}"));
             }
             db.insert_node("Doc", "later", vec![]).unwrap();
-            db.stop_next_snapshot(core_api::SnapshotStop::BeforeSnapshotWrite);
+            db.stop_next_snapshot(mushroomdb::SnapshotStop::BeforeSnapshotWrite);
             assert!(db.snapshot().is_err(), "{what}");
             drop(db);
 
@@ -4034,7 +4034,7 @@ fn a_failed_first_snapshot_keeps_edge_properties() {
         let before = weight(&db);
         assert!(before.is_some(), "{name}: the rule writes a weight");
 
-        db.stop_next_snapshot(core_api::SnapshotStop::BeforeSnapshotWrite);
+        db.stop_next_snapshot(mushroomdb::SnapshotStop::BeforeSnapshotWrite);
         assert!(db.snapshot_with(opts.clone()).is_err(), "{name}");
         assert_eq!(weight(&db), before, "{name}: on the handle that failed");
 
@@ -4072,10 +4072,10 @@ fn an_interrupted_first_archiving_snapshot_does_not_cost_the_reads_by_commit() {
             .len()
     };
     for stop in [
-        core_api::SnapshotStop::BeforeSnapshotWrite,
-        core_api::SnapshotStop::AfterSnapshotWrite,
-        core_api::SnapshotStop::BeforeWalReplacement,
-        core_api::SnapshotStop::AfterWalReplacement,
+        mushroomdb::SnapshotStop::BeforeSnapshotWrite,
+        mushroomdb::SnapshotStop::AfterSnapshotWrite,
+        mushroomdb::SnapshotStop::BeforeWalReplacement,
+        mushroomdb::SnapshotStop::AfterWalReplacement,
     ] {
         let dir = tmp(&format!("genesis-{stop:?}"));
         {

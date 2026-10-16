@@ -8,11 +8,11 @@
 //! - pending_delta_count == 0 after open_at (mirror of T1's post-loop assert)
 //! - Commit out of range returns CommitOutOfRange
 
-use core_api::{
+use core_storage::wal::wal_commits;
+use mushroomdb::{
     AsOfScope, Direction, GraphDb, GraphError, IngestOptions, Predicate, ResultSet, RoleDef,
     RuleDef, Schema, Value,
 };
-use core_storage::wal::wal_commits;
 use std::path::PathBuf;
 
 fn tmp(name: &str) -> PathBuf {

@@ -4,7 +4,7 @@
 //! round-trips, collision errors, determinism pins, and a property-based WCC
 //! test with an independent BFS reference.
 
-use core_api::{
+use mushroomdb::{
     AlgoDir, DegreeConfig, GraphDb, GraphError, LouvainConfig, PageRankConfig, Predicate, RuleDef,
     Value, WccConfig,
 };
@@ -241,7 +241,7 @@ fn algos_see_derived_edges_after_snapshot_reopen() {
     );
 
     // WCC: the two nodes must land in a single component via the derived edges.
-    let wcc = db.connected_components(&core_api::WccConfig::default());
+    let wcc = db.connected_components(&mushroomdb::WccConfig::default());
     let distinct_components: BTreeSet<_> = wcc.components.iter().map(|(_, c)| c.clone()).collect();
     assert_eq!(
         distinct_components.len(),
@@ -784,7 +784,7 @@ fn write_scores_roundtrip() {
 
 #[test]
 fn write_scores_refuses_view_managed_prop() {
-    use core_api::{ViewDef, ViewSource};
+    use mushroomdb::{ViewDef, ViewSource};
     let dir = tmp("ws-collision");
     let mut db = open(&dir);
     insert_node(&mut db, "N", "x");
@@ -795,7 +795,7 @@ fn write_scores_refuses_view_managed_prop() {
         view_prop: "my_degree".into(),
         source: ViewSource::Degree {
             edge_type: "E".into(),
-            direction: core_api::Direction::Out,
+            direction: mushroomdb::Direction::Out,
         },
     })
     .expect("create_view");
@@ -815,7 +815,7 @@ fn write_scores_refuses_view_managed_prop() {
 
 #[test]
 fn write_scores_refuses_view_name_collision() {
-    use core_api::{ViewDef, ViewSource};
+    use mushroomdb::{ViewDef, ViewSource};
     let dir = tmp("ws-name-collision");
     let mut db = open(&dir);
     insert_node(&mut db, "N", "x");
@@ -826,7 +826,7 @@ fn write_scores_refuses_view_name_collision() {
         view_prop: "some_prop".into(),
         source: ViewSource::Degree {
             edge_type: "E".into(),
-            direction: core_api::Direction::Out,
+            direction: mushroomdb::Direction::Out,
         },
     })
     .expect("create_view");
@@ -942,7 +942,7 @@ fn wcc_edge_type_filter_nonexistent() {
 fn pagerank_on_demo_graph() {
     // Build the full demo (matching cli::run_demo schema) to exercise PageRank
     // on a realistic mixed manual+derived topology.
-    use core_api::IngestOptions;
+    use mushroomdb::IngestOptions;
     let dir = tmp("pr-demo");
     let mut db = GraphDb::open(&dir).unwrap();
     let opts = IngestOptions::default();

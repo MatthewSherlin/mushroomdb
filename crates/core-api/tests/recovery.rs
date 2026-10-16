@@ -1,4 +1,4 @@
-use core_api::{Direction, GraphDb, GraphError, Value};
+use mushroomdb::{Direction, GraphDb, GraphError, Value};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("graphdb-{}-{}", name, std::process::id()));
@@ -124,7 +124,7 @@ fn repair_wal_false_leaves_a_torn_wal_on_disk() {
     {
         let db = GraphDb::open_with_options(
             &dir,
-            core_api::OpenOptions {
+            mushroomdb::OpenOptions {
                 auto_migrate: false,
                 repair_wal: false,
                 ..Default::default()
@@ -153,6 +153,6 @@ fn repair_wal_false_leaves_a_torn_wal_on_disk() {
 /// `OpenOptions::default()` keeps repairing the WAL: the new flag is additive.
 #[test]
 fn open_options_default_repairs_the_wal() {
-    assert!(core_api::OpenOptions::default().repair_wal);
-    assert!(core_api::OpenOptions::default().auto_migrate);
+    assert!(mushroomdb::OpenOptions::default().repair_wal);
+    assert!(mushroomdb::OpenOptions::default().auto_migrate);
 }

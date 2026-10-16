@@ -1,4 +1,4 @@
-use core_api::{
+use mushroomdb::{
     AggFn, Direction, GraphDb, GraphError, Predicate, RuleDef, Value, ViewDef, ViewSource,
 };
 use proptest::prelude::*;
@@ -643,7 +643,7 @@ fn apply_oracle_leaf(oracle: &mut Oracle, op: &Op) -> Result<(), String> {
     }
 }
 
-fn queue_batch_op(b: &mut core_api::BatchBuilder<'_, SimFs>, op: &Op) {
+fn queue_batch_op(b: &mut mushroomdb::BatchBuilder<'_, SimFs>, op: &Op) {
     match op {
         Op::InsertNode(n) => {
             let key = format!("k{n}");

@@ -11,8 +11,8 @@
 //!    arriving *first* would otherwise elect the stride and refuse the whole
 //!    corpus, leaving a non-empty index that answers nothing.
 
-use core_api::{Direction, GraphDb, Predicate, RuleDef, Value};
 use core_storage::fs::RealFs;
+use mushroomdb::{Direction, GraphDb, Predicate, RuleDef, Value};
 
 type Db = GraphDb<RealFs>;
 

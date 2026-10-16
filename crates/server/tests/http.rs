@@ -4,7 +4,7 @@ use arrow_ipc::reader::StreamReader;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use core_api::{
+use mushroomdb::{
     json_to_value, schema::Schema, Direction, Explanation, FkSkip, IngestReport, Predicate,
     PredicateSummary, RoleDef, RuleDef, RuleStats, SharedDb, SnapshotOptions, Stats, Value,
     ViewDef, ViewSource, WriteScope, MERGE_CREATE_NEEDS_ONE_NAMESPACE,
@@ -622,7 +622,7 @@ async fn ingest_many_rows_is_one_wal_commit() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(core_api::wal_commit_count_at(&dir).unwrap(), 1);
+    assert_eq!(mushroomdb::wal_commit_count_at(&dir).unwrap(), 1);
     assert_eq!(db.read().node_count(), 3);
 }
 
@@ -916,11 +916,11 @@ async fn node_edges_json_shape_user_and_derived() {
     {
         let mut w = db.write();
         w.insert_node("Org", "acme", vec![]).unwrap();
-        w.create_rule(core_api::RuleDef {
+        w.create_rule(mushroomdb::RuleDef {
             name: "works_at".into(),
             src_label: "Person".into(),
             dst_label: "Org".into(),
-            predicate: core_api::Predicate::KeyMatch {
+            predicate: mushroomdb::Predicate::KeyMatch {
                 field: "org_id".into(),
             },
             edge_type: "WORKS_AT".into(),
@@ -1048,7 +1048,7 @@ async fn http_find_similar_exact_agrees_with_python_shape() {
 }
 
 /// Binding (plan 4, PD-1): a `POST /find_similar` that names no `min` applies
-/// `core_api::FIND_SIMILAR_DEFAULT_MIN`, the same floor MCP and the Python
+/// `mushroomdb::FIND_SIMILAR_DEFAULT_MIN`, the same floor MCP and the Python
 /// binding apply. `mid` scores 0.6 — between the old HTTP default (0.0) and
 /// the unified one (0.8) — so it is the hit that tells them apart.
 #[tokio::test]
@@ -1080,7 +1080,7 @@ async fn http_find_similar_defaults_min_to_the_shared_constant() {
         keys_for(&parse_json(&body)),
         vec!["close"],
         "no min named: only the hit at or above {} survives",
-        core_api::FIND_SIMILAR_DEFAULT_MIN
+        mushroomdb::FIND_SIMILAR_DEFAULT_MIN
     );
 
     // Naming it still reaches everything, in score order.
@@ -4942,7 +4942,7 @@ async fn concurrent_role_writers_fifo_serialize() {
     let h1 = std::thread::spawn(move || {
         db1.submit_batch_authz(
             "agent".into(),
-            vec![core_api::BatchOp::InsertNode {
+            vec![mushroomdb::BatchOp::InsertNode {
                 label: "AgentNote".into(),
                 key: "conc-1".into(),
                 props: vec![],
@@ -4952,7 +4952,7 @@ async fn concurrent_role_writers_fifo_serialize() {
     let h2 = std::thread::spawn(move || {
         db2.submit_batch_authz(
             "agent".into(),
-            vec![core_api::BatchOp::InsertNode {
+            vec![mushroomdb::BatchOp::InsertNode {
                 label: "AgentNote".into(),
                 key: "conc-2".into(),
                 props: vec![],
@@ -5235,7 +5235,7 @@ async fn busy_write_is_503_with_retry_after() {
     let app = router(db);
 
     // Peer holds the store's write lock for as long as this handle lives.
-    let peer = core_api::GraphDb::open(&dir).unwrap();
+    let peer = mushroomdb::GraphDb::open(&dir).unwrap();
 
     let res = app
         .oneshot(json_req(
@@ -5305,7 +5305,7 @@ fn open_predicate_rbac(name: &str) -> (Router, SharedDb) {
                 name: "publisher".into(),
                 keys: vec![],
                 labels: vec!["Doc".into()],
-                visible_where: Some(core_api::PropPredicate {
+                visible_where: Some(mushroomdb::PropPredicate {
                     field: "status".into(),
                     eq: None,
                     in_: Some(vec![Value::Str("published".into())]),
