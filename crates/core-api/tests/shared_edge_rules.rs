@@ -1196,4 +1196,25 @@ fn the_first_write_after_open_restores_the_edges_080_had_lost() {
         "after a WAL reopen: {}",
         stats_line(&db)
     );
+
+    // And an as-of handle at the last commit reads what the live handle did.
+    let commit = db.wal_total_commits().unwrap() - 1;
+    let at: Db = GraphDb::open_at(&dir, commit).unwrap();
+    assert_eq!(dump(&at, &["n0", "n5"]), repaired, "open_at({commit})");
+    assert_eq!(
+        at.stats().edges,
+        3,
+        "open_at({commit}): {}",
+        stats_line(&at)
+    );
+}
+
+/// A node deleted as the first write counts only the edges the graph holds:
+/// the hand-written one, and none of the two 0.8.0 lost.
+#[test]
+fn deleting_a_node_first_on_a_store_that_lost_edges_counts_its_hand_written_edge() {
+    let (mut db, _) = open_v080_lost_edge_store("row111-delete");
+    let report = db.delete_node("n0").unwrap();
+    assert_eq!((report.manual_edges, report.derived_edges), (1, 0));
+    assert_eq!(db.stats().edges, 0, "{}", stats_line(&db));
 }

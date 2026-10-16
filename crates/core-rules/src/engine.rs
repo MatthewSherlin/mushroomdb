@@ -3179,27 +3179,33 @@ impl RuleEngine {
     /// and re-evaluates its source against every rule over its edge type, so
     /// the edges a fresh store would derive are derived.
     ///
-    /// Runs once per open, on a store opened from a snapshot, at the first
-    /// commit that is not a declaration: the caller runs it there both live
-    /// and in WAL replay, so a reopen repeats it at the same point.
+    /// Runs once per handle, at the first commit that is not a declaration:
+    /// the caller runs it there live, in WAL replay and in an as-of handle's
+    /// replay, so every way of reading a commit sees the same graph. The
+    /// snapshot may be a mapped base or, in an as-of handle, decoded into the
+    /// overlay; a store with no snapshot has nothing to find, and pays one
+    /// scan of its provenance.
     pub fn reconcile_lost_provenance(&mut self, g: &mut GraphMut<'_>) {
         if self.lost_provenance_reconciled {
             return;
         }
         self.lost_provenance_reconciled = true;
-        let Some(base) = g.base_topo else {
-            return;
-        };
         self.ensure_provenance_loaded_mut();
         let in_graph = |g: &GraphMut<'_>, (t, s, d): Triple| {
+            if g.topo
+                .neighbors(t, core_storage::Direction::Out, s)
+                .contains(&d)
+            {
+                return true;
+            }
+            let Some(base) = g.base_topo else {
+                return false;
+            };
             let tombstoned = g
                 .topo
                 .out_tombstones_for(t, s)
                 .is_some_and(|ts| ts.contains(&d));
-            g.topo
-                .neighbors(t, core_storage::Direction::Out, s)
-                .contains(&d)
-                || (!tombstoned && core_storage::v8::seam::base_has_out_edge(base, t, s, d))
+            !tombstoned && core_storage::v8::seam::base_has_out_edge(base, t, s, d)
         };
         let lost: Vec<(String, Triple)> = self
             .provenance

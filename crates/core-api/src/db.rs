@@ -3618,6 +3618,10 @@ impl<F: Fs> GraphDb<F> {
             // from an empty database state.  Archives must be replayed in order
             // so that dense-id intern tables are built up correctly.
             for rec in archive_frames_all.into_iter().take((local + 1) as usize) {
+                // The repair a live commit ran before this one (ledger row 111).
+                if !is_declaration(&rec) {
+                    db.reconcile_lost_provenance();
+                }
                 db.apply(&rec)?;
                 let _ = db.engine.drain_deltas();
             }
@@ -3694,6 +3698,10 @@ impl<F: Fs> GraphDb<F> {
             // else: snap_header empty = no snapshot file.
             let live_local = local - total_archive_frames;
             for rec in live_records.into_iter().take((live_local + 1) as usize) {
+                // The repair a live commit ran before this one (ledger row 111).
+                if !is_declaration(&rec) {
+                    db.reconcile_lost_provenance();
+                }
                 db.apply(&rec)?;
                 let _ = db.engine.drain_deltas();
             }
@@ -5693,8 +5701,9 @@ impl<F: Fs> GraphDb<F> {
     /// Run the engine's one repair of a snapshot whose provenance counts edges
     /// its graph does not hold (ledger row 111), with the view maintenance the
     /// edges it gives back call for. Called before the first commit that is
-    /// not a declaration, live and in WAL replay alike, so a reopen repeats
-    /// the repair at the same point; a no-op after the first call.
+    /// not a declaration — live, in WAL replay and in an as-of handle's replay
+    /// — so every handle repeats the repair at the same point; a no-op after
+    /// the first call.
     fn reconcile_lost_provenance(&mut self) {
         let cursor = self.engine.pending_delta_count();
         let mut eng = std::mem::take(&mut self.engine);
@@ -7435,15 +7444,19 @@ impl<F: Fs> GraphDb<F> {
             .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
 
         // Count edges before the delete is applied so we can report counts.
+        // Only the derived edges the graph holds: on a store where 0.8.0 lost
+        // an edge a rule still counts (ledger row 111), the report is computed
+        // before the commit's repair, and the lost edge is no edge to remove.
+        let tv = self.topo_view();
         let derived_set: BTreeSet<(u32, u32, u32)> = self
             .engine
             .provenance_touching(id)
             .map(|(_, etype, src, dst)| (etype, src, dst))
+            .filter(|&(etype, src, dst)| tv.neighbors(etype, Direction::Out, src).contains(&dst))
             .collect();
         let derived_edges = derived_set.len() as u64;
 
         let mut total_topo = 0u64;
-        let tv = self.topo_view();
         for et in tv.etypes() {
             total_topo += tv.neighbors(et, Direction::Out, id).len() as u64
                 + tv.neighbors(et, Direction::In, id).len() as u64;
