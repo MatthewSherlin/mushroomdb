@@ -110,20 +110,36 @@ jobs:
       - name: publish crates in dependency order (idempotent)
         run: |
           set -u
+          # A crate that depends on one published a moment earlier can find
+          # the index does not list it yet: crates.io's sparse index is cached
+          # for up to ten minutes, and cargo stops waiting for a new version
+          # sooner than that. v0.8.2's run failed `mushroomdb-cli` twice on
+          # `failed to select a version for the requirement
+          # mushroomdb-extract = "^0.8.2"` and published on the third attempt.
+          # So that error is retried, every two minutes for up to fourteen.
           for c in mushroomdb-storage mushroomdb-rules mushroomdb-query \
                    mushroomdb mushroomdb-arrow mushroomdb-server \
                    mushroomdb-extract mushroomdb-cli; do
             echo "── publishing $c ──"
-            if out=$(cargo publish -p "$c" 2>&1); then
-              echo "$out" | tail -3
-            else
+            attempt=1
+            while :; do
+              if out=$(cargo publish -p "$c" 2>&1); then
+                echo "$out" | tail -3
+                break
+              fi
               echo "$out"
               if echo "$out" | grep -q "already exists\|already uploaded"; then
                 echo "$c: this version is already on the index — skipping"
-              else
-                exit 1
+                break
               fi
-            fi
+              if echo "$out" | grep -q "failed to select a version" && [ "$attempt" -lt 8 ]; then
+                echo "$c: a dependency is not on the index yet — waiting (attempt $attempt of 8)"
+                attempt=$((attempt + 1))
+                sleep 120
+                continue
+              fi
+              exit 1
+            done
             sleep 30
           done
 
