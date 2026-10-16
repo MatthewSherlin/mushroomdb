@@ -2929,6 +2929,9 @@ impl<F: Fs> GraphDb<F> {
                 );
                 retained_consumed = true;
             }
+            if apply && !is_declaration(&rec) {
+                self.reconcile_lost_provenance();
+            }
             if apply {
                 self.apply(&rec)?;
             }
@@ -3615,6 +3618,10 @@ impl<F: Fs> GraphDb<F> {
             // from an empty database state.  Archives must be replayed in order
             // so that dense-id intern tables are built up correctly.
             for rec in archive_frames_all.into_iter().take((local + 1) as usize) {
+                // The repair a live commit ran before this one (ledger row 111).
+                if !is_declaration(&rec) {
+                    db.reconcile_lost_provenance();
+                }
                 db.apply(&rec)?;
                 let _ = db.engine.drain_deltas();
             }
@@ -3691,6 +3698,10 @@ impl<F: Fs> GraphDb<F> {
             // else: snap_header empty = no snapshot file.
             let live_local = local - total_archive_frames;
             for rec in live_records.into_iter().take((live_local + 1) as usize) {
+                // The repair a live commit ran before this one (ledger row 111).
+                if !is_declaration(&rec) {
+                    db.reconcile_lost_provenance();
+                }
                 db.apply(&rec)?;
                 let _ = db.engine.drain_deltas();
             }
@@ -5677,6 +5688,57 @@ impl<F: Fs> GraphDb<F> {
         self.commit_times.time_of(commit)
     }
 
+    /// Read the snapshot's provenance into the engine, for a check or report
+    /// that reads which rule owns an edge before the commit does. On the first
+    /// write after a clean open, `ensure_provenance_loaded_mut` alone finds no
+    /// bytes to decode, because the snapshot's sections are not read yet, and
+    /// the store looks as if no rule owns anything (ledger rows 108 and 110).
+    fn load_provenance_for_write(&mut self) {
+        self.ensure_v8_base_sections_loaded();
+        self.engine.ensure_provenance_loaded_mut();
+    }
+
+    /// Run the engine's one repair of a snapshot whose provenance counts edges
+    /// its graph does not hold (ledger row 111), with the view maintenance the
+    /// edges it gives back call for. Called before the first commit that is
+    /// not a declaration — live, in WAL replay and in an as-of handle's replay
+    /// — so every handle repeats the repair at the same point; a no-op after
+    /// the first call.
+    fn reconcile_lost_provenance(&mut self) {
+        let cursor = self.engine.pending_delta_count();
+        let mut eng = std::mem::take(&mut self.engine);
+        {
+            let mut gm = make_graph_mut(
+                &self.ids,
+                Arc::make_mut(&mut self.syms),
+                &self.labels,
+                build_props_view(&self.props, &self.base),
+                Arc::make_mut(&mut self.topo),
+                &self.base,
+                Arc::make_mut(&mut self.edge_props),
+            );
+            eng.reconcile_lost_provenance(&mut gm);
+        }
+        self.engine = eng;
+        if !self.view_store.is_empty() {
+            let new_deltas: Vec<_> = self.engine.pending_deltas_since(cursor).to_vec();
+            for d in &new_deltas {
+                self.view_store.on_edge_changed(
+                    d.etype_sym,
+                    d.src_id,
+                    d.dst_id,
+                    d.fired,
+                    Arc::make_mut(&mut self.props),
+                    &build_topo_view(&self.topo, &self.base),
+                    &self.ids,
+                    &self.syms,
+                    &self.labels,
+                    base_columns(&self.base),
+                );
+            }
+        }
+    }
+
     fn log_then_apply(&mut self, rec: WalRecord) -> Result<()> {
         self.log_then_apply_with(rec, None, self.fsync)
     }
@@ -5811,6 +5873,9 @@ impl<F: Fs> GraphDb<F> {
         // SAFETY: raw pointer into self; guard dropped within this frame.
         let _emit_guard = RestoreEmitDeltas(&mut self.engine as *mut _, original_emit);
 
+        if !is_declaration(&rec) {
+            self.reconcile_lost_provenance();
+        }
         let apply_result = self.apply(&rec);
         // For Batch frames, post-validation apply must be infallible (see above).
         // A debug_assert here catches any future change that makes apply fallible
@@ -6785,7 +6850,7 @@ impl<F: Fs> GraphDb<F> {
         }
         // Ensure provenance is decoded before MutPreview accesses it
         // (note_delete_rule / is_rule_owned may call engine.provenance()).
-        self.engine.ensure_provenance_loaded_mut();
+        self.load_provenance_for_write();
 
         // ── Authz pre-check ──────────────────────────────────────────────────
         // Evaluate the decision table per-op BEFORE MutPreview so that a denial
@@ -7258,6 +7323,7 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        self.load_provenance_for_write();
         if !MutPreview::new(self).prepare_insert_edge(edge_type, src_key, dst_key)? {
             // The pair exists. The only thing left to record is that it was
             // asked for again, and only where the store asked to be told.
@@ -7347,6 +7413,7 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        self.load_provenance_for_write();
         if !MutPreview::new(self).prepare_delete_edge(edge_type, src_key, dst_key)? {
             return Ok(false);
         }
@@ -7370,22 +7437,26 @@ impl<F: Fs> GraphDb<F> {
             return Err(GraphError::ReadOnly);
         }
         // Provenance must be loaded before we query provenance_touching.
-        self.engine.ensure_provenance_loaded_mut();
+        self.load_provenance_for_write();
         let id = self
             .ids
             .get(key)
             .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
 
         // Count edges before the delete is applied so we can report counts.
+        // Only the derived edges the graph holds: on a store where 0.8.0 lost
+        // an edge a rule still counts (ledger row 111), the report is computed
+        // before the commit's repair, and the lost edge is no edge to remove.
+        let tv = self.topo_view();
         let derived_set: BTreeSet<(u32, u32, u32)> = self
             .engine
             .provenance_touching(id)
             .map(|(_, etype, src, dst)| (etype, src, dst))
+            .filter(|&(etype, src, dst)| tv.neighbors(etype, Direction::Out, src).contains(&dst))
             .collect();
         let derived_edges = derived_set.len() as u64;
 
         let mut total_topo = 0u64;
-        let tv = self.topo_view();
         for et in tv.etypes() {
             total_topo += tv.neighbors(et, Direction::Out, id).len() as u64
                 + tv.neighbors(et, Direction::In, id).len() as u64;
