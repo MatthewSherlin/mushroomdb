@@ -273,7 +273,36 @@ impl Topology {
     ///   will subtract it from the base CSR.  The tombstone is harmless if the edge does
     ///   not exist in the base CSR either.
     pub fn remove_edge(&mut self, etype: u32, src: u32, dst: u32) -> RemoveEdgeOutcome {
-        let found_in_overlay = (|| {
+        if self.remove_overlay_edge(etype, src, dst) {
+            return RemoveEdgeOutcome::RemovedFromOverlay;
+        }
+        // The edge was not in the overlay (may be present only in the mmap'd base
+        // CSR).  Record a tombstone so `TopologyView::neighbors` can subtract it
+        // from the base when merging overlay + base for reads and for snapshot-merge.
+        self.out_tombstones
+            .entry(etype)
+            .or_default()
+            .entry(src)
+            .or_default()
+            .insert(dst);
+        self.in_tombstones
+            .entry(etype)
+            .or_default()
+            .entry(dst)
+            .or_default()
+            .insert(src);
+        RemoveEdgeOutcome::TombstonedBase
+    }
+
+    /// Remove an edge from the overlay alone, recording no tombstone. Returns
+    /// whether the overlay held it; `edge_count` is decremented if so.
+    ///
+    /// For a caller that knows the base does not hold the edge: a tombstone
+    /// over an edge the base lacks reads nothing wrong, but it is counted as a
+    /// removed base edge, so the live edge count would read one low until the
+    /// next snapshot (ledger row 109).
+    pub fn remove_overlay_edge(&mut self, etype: u32, src: u32, dst: u32) -> bool {
+        (|| {
             let adj = self.by_type.get_mut(&etype)?;
             let dsts = adj.out.get_mut(&src)?;
             if !dsts.remove(dst) {
@@ -290,28 +319,7 @@ impl Topology {
             self.edge_count -= 1;
             Some(())
         })()
-        .is_some();
-
-        if !found_in_overlay {
-            // The edge was not in the overlay (may be present only in the mmap'd base
-            // CSR).  Record a tombstone so `TopologyView::neighbors` can subtract it
-            // from the base when merging overlay + base for reads and for snapshot-merge.
-            self.out_tombstones
-                .entry(etype)
-                .or_default()
-                .entry(src)
-                .or_default()
-                .insert(dst);
-            self.in_tombstones
-                .entry(etype)
-                .or_default()
-                .entry(dst)
-                .or_default()
-                .insert(src);
-            RemoveEdgeOutcome::TombstonedBase
-        } else {
-            RemoveEdgeOutcome::RemovedFromOverlay
-        }
+        .is_some()
     }
 
     /// Return the set of `dst` ids tombstoned for `(etype, Direction::Out, src)`.
@@ -629,5 +637,17 @@ mod tests {
         assert_eq!(back.neighbors(0, Direction::Out, 5).as_ref(), &[9]);
         assert_eq!(back.neighbors(0, Direction::In, 9).as_ref(), &[5]);
         assert_eq!(back.etypes().collect::<Vec<_>>(), vec![0, 2]);
+    }
+
+    #[test]
+    fn remove_overlay_edge_records_no_tombstone_for_an_edge_the_overlay_lacks() {
+        let mut t = Topology::new();
+        t.add_edge(0, 1, 2);
+        assert!(!t.remove_overlay_edge(0, 1, 3));
+        assert_eq!(t.tombstone_count(), 0);
+        assert!(t.out_tombstones_for(0, 1).is_none_or(|s| s.is_empty()));
+        assert!(t.remove_overlay_edge(0, 1, 2));
+        assert_eq!(t.edge_count(), 0);
+        assert_eq!(t.tombstone_count(), 0);
     }
 }

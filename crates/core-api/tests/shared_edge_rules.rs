@@ -1091,3 +1091,109 @@ fn real_v080_damaged_store_is_repaired_on_open() {
         "v080 fixture: snapshot round-trip writes a correct header"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A store in which 0.8.0 had already lost the edge
+// ---------------------------------------------------------------------------
+
+/// `lost080`: written by the real 0.8.0 release. Rules `topk1` (overlap ≥ 0.3,
+/// one edge each) and `topk2` (overlap ≥ 0.5, two each); nodes `n0` and `n5`,
+/// whose tags overlap at 0.5. Before its snapshot, 0.8.0 let the second rule
+/// claim `n0→n5` and `n5→n0` beside the first and then let go of them, which
+/// took the edges out of the graph while the first rule still counted them.
+/// It then wrote a user edge `LINK n0→n5`. The snapshot holds that: provenance
+/// names an owner for each `SAME` edge, the graph holds neither, and the
+/// `LINK` edge is the one edge it does hold.
+fn open_v080_lost_edge_store(tag: &str) -> (Db, std::path::PathBuf) {
+    let dir = tmp(tag);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, bytes) in [
+        (
+            "snapshot.bin",
+            &include_bytes!("fixtures/v080_lost_edge/snapshot.bin")[..],
+        ),
+        (
+            "wal.bin",
+            &include_bytes!("fixtures/v080_lost_edge/wal.bin")[..],
+        ),
+        (
+            "wal.floor",
+            &include_bytes!("fixtures/v080_lost_edge/wal.floor")[..],
+        ),
+        (
+            "commit_times.bin",
+            &include_bytes!("fixtures/v080_lost_edge/commit_times.bin")[..],
+        ),
+    ] {
+        std::fs::write(dir.join(name), bytes).unwrap();
+    }
+    (GraphDb::open(&dir).unwrap(), dir)
+}
+
+fn same_edges_present(db: &Db) -> u64 {
+    ["n0", "n5"]
+        .iter()
+        .map(|k| db.neighbors(k, "SAME", Direction::Out).unwrap().len() as u64)
+        .sum()
+}
+
+/// A rule's retraction of an edge the graph does not hold must not count as
+/// the removal of an edge (ledger row 109).
+#[test]
+fn retracting_an_edge_the_graph_does_not_hold_leaves_the_edge_count_right() {
+    let (mut db, _) = open_v080_lost_edge_store("row109");
+    db.set_prop("n5", "tags", tags(&["q"])).unwrap();
+    assert_eq!(same_edges_present(&db), 0);
+    assert_eq!(
+        db.neighbors("n0", "LINK", Direction::Out).unwrap(),
+        vec!["n5"]
+    );
+    assert_eq!(db.stats().edges, 1, "{}", stats_line(&db));
+}
+
+/// The first write after open gives back the edges 0.8.0 had lost, and the
+/// store then reads the same as one built fresh from its nodes and rules
+/// (ledger row 111).
+#[test]
+fn the_first_write_after_open_restores_the_edges_080_had_lost() {
+    let (mut db, dir) = open_v080_lost_edge_store("row111");
+    assert_eq!(same_edges_present(&db), 0, "the store as 0.8.0 left it");
+
+    db.insert_node("B", "unrelated", vec![]).unwrap();
+    let repaired = dump(&db, &["n0", "n5"]);
+    assert_eq!(same_edges_present(&db), 2, "{repaired:?}");
+    assert_eq!(db.stats().edges, 3, "{}", stats_line(&db));
+
+    let fresh_dir = tmp("row111-fresh");
+    let mut fresh: Db = GraphDb::open(&fresh_dir).unwrap();
+    for r in db.rules() {
+        fresh.create_rule(r).unwrap();
+    }
+    for k in ["n0", "n5"] {
+        let tags = db.get_prop(k, "tags").unwrap();
+        fresh
+            .insert_node("A", k, vec![("tags".into(), tags)])
+            .unwrap();
+    }
+    fresh.insert_edge("LINK", "n0", "n5").unwrap();
+    assert_eq!(repaired, dump(&fresh, &["n0", "n5"]));
+    let owned = |db: &Db| -> Vec<(String, u64)> {
+        db.stats()
+            .rules
+            .into_iter()
+            .map(|r| (r.name, r.edges))
+            .collect()
+    };
+    assert_eq!(owned(&db), owned(&fresh));
+
+    // The repair is the same when the write is replayed from the WAL.
+    drop(db);
+    let db: Db = GraphDb::open(&dir).unwrap();
+    assert_eq!(dump(&db, &["n0", "n5"]), repaired, "after a WAL reopen");
+    assert_eq!(
+        db.stats().edges,
+        3,
+        "after a WAL reopen: {}",
+        stats_line(&db)
+    );
+}

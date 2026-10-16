@@ -171,6 +171,26 @@ impl GraphMut<'_> {
         self.topo.add_edge(etype, src, dst)
     }
 
+    /// Remove a derived edge, recording a tombstone only when the snapshot
+    /// holds the edge.
+    ///
+    /// `Topology::remove_edge` tombstones any edge the overlay lacks. A
+    /// retraction can name an edge the graph holds nowhere — a store in which
+    /// 0.8.0 had already lost an edge one rule still owned — and a tombstone
+    /// over it is counted as a removed snapshot edge, so the edge count read
+    /// one low per such retraction until the next snapshot (ledger row 109).
+    /// Every derived-edge removal in the engine goes through here.
+    pub fn remove_edge(&mut self, etype: u32, src: u32, dst: u32) {
+        match self.base_topo {
+            Some(base) if !core_storage::v8::seam::base_has_out_edge(base, etype, src, dst) => {
+                self.topo.remove_overlay_edge(etype, src, dst);
+            }
+            _ => {
+                self.topo.remove_edge(etype, src, dst);
+            }
+        }
+    }
+
     /// Neighbours of `v` over `(etype, dir)`, merging the snapshot base with
     /// the post-snapshot overlay and subtracting the overlay's tombstones.
     ///
@@ -349,6 +369,9 @@ pub struct RuleEngine {
     /// mutation call when this is `false`, the full O(n) scan runs (first-write
     /// cost), consuming and replacing `retained_hnsw_blobs`.
     indexes_populated: bool,
+    /// Whether [`RuleEngine::reconcile_lost_provenance`] has run for this
+    /// handle's snapshot. It runs at most once per open.
+    lost_provenance_reconciled: bool,
     /// Raw HNSW blobs retained from the last snapshot, not yet deserialized.
     ///
     /// Populated by `store_snapshot_state`.  Consumed (deserialized into each
@@ -1088,7 +1111,7 @@ fn apply_per_src_top_k(
     // Retract (src, dst) pairs no longer in the top-k.
     for (t, s, d) in current {
         if !desired_from_src.contains_key(&(s, d)) {
-            g.topo.remove_edge(t, s, d);
+            g.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
             prov.remove(&def.name, (t, s, d), g.ids, g.syms);
             let by = prov.rule_intern.get(&def.name).copied().unwrap_or(u32::MAX);
@@ -1354,7 +1377,7 @@ fn apply_desired_scoped(
 
     for (t, s, d) in current {
         if !desired.contains_key(&(s, d)) {
-            g.topo.remove_edge(t, s, d);
+            g.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
             prov.remove(&def.name, (t, s, d), g.ids, g.syms);
             let by = prov.rule_intern.get(&def.name).copied().unwrap_or(u32::MAX);
@@ -1798,7 +1821,7 @@ fn apply_via_rebuild(
         for triple in current {
             let (t, s, d) = triple;
             if !desired.contains_key(&(s, d)) {
-                g.topo.remove_edge(t, s, d);
+                g.remove_edge(t, s, d);
                 g.edge_props.remove_edge(t, s, d);
                 prov.remove(&def.name, triple, g.ids, g.syms);
             }
@@ -1862,7 +1885,7 @@ fn apply_streaming_rebuild(
         .collect();
     for (t, s, d) in current {
         if !pair_still_desired(def, s, d, g) {
-            g.topo.remove_edge(t, s, d);
+            g.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
             prov.remove(&def.name, (t, s, d), g.ids, g.syms);
         }
@@ -2352,6 +2375,7 @@ impl RuleEngine {
             // consume_retained_state_eager (WAL-present open) or rely on the
             // lazy init in the mutation hooks (clean open, first-write cost).
             indexes_populated: false,
+            lost_provenance_reconciled: false,
             retained_hnsw_blobs: Mutex::new(BTreeMap::new()),
             retained_ivf_bytes: Mutex::new(None),
             retained_node_count: AtomicU32::new(0),
@@ -3142,6 +3166,68 @@ impl RuleEngine {
         self.intern_rule = intern_rule;
     }
 
+    /// Give back the derived edges a snapshot's provenance counts and its graph
+    /// does not hold.
+    ///
+    /// Before 0.8.1 a second rule over the same edge type could claim an edge
+    /// the first rule had derived before a snapshot, and when it let go, the
+    /// edge left the graph while the first rule still counted it (ledger row
+    /// 103). A store snapshotted after that holds an owner for an edge that is
+    /// not there; no later write puts it back, because the owner believes it
+    /// already has it (ledger row 111). This drops each such triple from
+    /// provenance, recording no retraction — there is no edge to retract —
+    /// and re-evaluates its source against every rule over its edge type, so
+    /// the edges a fresh store would derive are derived.
+    ///
+    /// Runs once per open, on a store opened from a snapshot, at the first
+    /// commit that is not a declaration: the caller runs it there both live
+    /// and in WAL replay, so a reopen repeats it at the same point.
+    pub fn reconcile_lost_provenance(&mut self, g: &mut GraphMut<'_>) {
+        if self.lost_provenance_reconciled {
+            return;
+        }
+        self.lost_provenance_reconciled = true;
+        let Some(base) = g.base_topo else {
+            return;
+        };
+        self.ensure_provenance_loaded_mut();
+        let in_graph = |g: &GraphMut<'_>, (t, s, d): Triple| {
+            let tombstoned = g
+                .topo
+                .out_tombstones_for(t, s)
+                .is_some_and(|ts| ts.contains(&d));
+            g.topo
+                .neighbors(t, core_storage::Direction::Out, s)
+                .contains(&d)
+                || (!tombstoned && core_storage::v8::seam::base_has_out_edge(base, t, s, d))
+        };
+        let lost: Vec<(String, Triple)> = self
+            .provenance
+            .iter()
+            .flat_map(|(rule, set)| set.iter().map(move |&tr| (rule, tr)))
+            .filter(|&(_, tr)| !in_graph(g, tr))
+            .map(|(rule, tr)| (rule.clone(), tr))
+            .collect();
+        if lost.is_empty() {
+            return;
+        }
+        self.ensure_indexes_populated(g);
+        for (rule, triple) in &lost {
+            if let Some(set) = self.provenance.get_mut(rule) {
+                set.remove(triple);
+            }
+            self.owned.remove(triple);
+            let rid = intern_rule(&mut self.rule_intern, &mut self.intern_rule, rule);
+            touch_remove(&mut self.by_node, rid, *triple);
+        }
+        // Re-evaluated as a retraction by no rule, so that every rule over the
+        // edge type is a target — the owner included.
+        let as_retracted: Vec<(u32, Triple)> = lost.iter().map(|&(_, tr)| (u32::MAX, tr)).collect();
+        let scope = self.begin_chain();
+        self.reclaim_retracted(&as_retracted, g);
+        self.end_chain(scope, g);
+    }
+
     /// Inject a triple into a second rule's provenance, bypassing `GraphMut::add_edge`'s
     /// base check.  This puts the engine into the state row 103's fix prevents: two
     /// rules' provenance sets both hold the same triple.  Call `GraphDb::snapshot` after
@@ -3799,7 +3885,7 @@ impl RuleEngine {
         };
         for triple in triples {
             let (t, s, d) = triple;
-            g.topo.remove_edge(t, s, d);
+            g.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
             sets.remove(name, triple, g.ids, g.syms);
         }
@@ -4741,7 +4827,7 @@ impl RuleEngine {
 
         for (rule_name, triple) in touching {
             let (t, s, d) = triple;
-            g.topo.remove_edge(t, s, d);
+            g.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
             if let Some(set) = self.provenance.get_mut(&rule_name) {
                 ProvSets {

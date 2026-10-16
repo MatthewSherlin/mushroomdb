@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A store in which 0.8.0 had already lost a derived edge gets it back at the first write after open.** Before 0.8.1, a second rule over the same edge type could take an edge from the first and then let it go, removing the edge while the first rule still counted it (row 103). 0.8.2 repaired stores snapshotted while both rules held the edge, but not ones where the edge was already gone: the rule counted an edge the graph did not hold, and no later write brought it back. The first write after open now drops what a rule counts and the graph does not hold, and re-derives those sources, so the store reads as one built fresh from its nodes and rules. Until that write, reads show the store as it was opened. Deleting and recreating both rules is no longer needed (row 111).
+- **`stats().edges` no longer reads low after a rule lets go of an edge the graph did not hold.** Each such retraction counted as a removed edge until the next snapshot (row 109).
+- **The first write after opening a snapshotted store sees which rule owns an edge.** On that write, `insert_edge` of an edge a rule derived answered `Ok(false)` instead of refusing it as rule-owned, in a batch as well, and `delete_node` reported the deleted node's rule-derived edges as manual (rows 108, 110).
+
 ## v0.9.0 — the Rust library is `mushroomdb`
 
 No format version change, and nothing changes for the CLI, the MCP server, HTTP, Python or TypeScript: a 0.8.2 store opens under 0.9.0 and the other way round. The minor version moves because one thing breaks for an embedded Rust user, below.
