@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.9.0 — the Rust library is `mushroomdb`
+
+No format version change, and nothing changes for the CLI, the MCP server, HTTP, Python or TypeScript: a 0.8.2 store opens under 0.9.0 and the other way round. The minor version moves because one thing breaks for an embedded Rust user, below.
+
 
 ### Changed
 
