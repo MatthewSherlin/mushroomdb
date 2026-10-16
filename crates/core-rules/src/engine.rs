@@ -1503,6 +1503,63 @@ fn pair_matched_before(
     .is_some()
 }
 
+/// The via-hop counterpart of [`pair_matched_before`]: whether `def`'s
+/// predicate held between some via node of `s` and `d`, with `d` as it was
+/// before `changed` (or as it is, when nothing changed).
+///
+/// A via-hop top-k rule could only have had `d` among `s`'s best matches if
+/// this held, so a source it does not hold for has nothing to lose when `d`
+/// changes or goes. Without it, a destination with 50,000 incoming edges cost
+/// a full re-evaluation of every one of their sources on each write — 388 ms
+/// against 34 ms before row 83's via-hop fix; with it, 61 ms.
+fn via_pair_matched_before(
+    def: &RuleDef,
+    s: u32,
+    d: u32,
+    changed: Option<(&str, &Option<Value>)>,
+    g: &GraphMut<'_>,
+) -> bool {
+    let (Some(via_label), Some(via_edge)) = (def.via_label.as_deref(), def.via_edge.as_deref())
+    else {
+        return false;
+    };
+    let (Some(via_sym), Some(via_et), Some(d_key)) =
+        (g.syms.get(via_label), g.syms.get(via_edge), g.ids.key_of(d))
+    else {
+        return false;
+    };
+    let d_get = |f: &str| match changed {
+        Some((field, old)) if f == field => old.clone(),
+        _ => g.props.get(d, f).map(|vr| vr.into_value()),
+    };
+    let dir = def.via_dir.unwrap_or(core_storage::Direction::Out);
+    for &v in g.neighbors(via_et, dir, s).iter() {
+        if g.labels.get(v as usize).copied() != Some(via_sym) || !rule_sees(def, v, g) {
+            continue;
+        }
+        let Some(v_key) = g.ids.key_of(v) else {
+            continue;
+        };
+        let v_get = |f: &str| g.props.get(v, f).map(|vr| vr.into_value());
+        if evaluate(
+            &def.predicate,
+            &NodeView {
+                key: v_key,
+                props: &v_get,
+            },
+            &NodeView {
+                key: d_key,
+                props: &d_get,
+            },
+        )
+        .is_some()
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Count desired `(src, dst)` pairs up to `limit + 1`; returns as soon as the
 /// threshold is crossed.  Peak additional memory: O(max-candidates-per-src).
 /// Used in `rebuild` to detect the over-budget case without materialising the
@@ -4326,6 +4383,13 @@ impl RuleEngine {
                     if s != n
                         && g.labels.get(s as usize).copied() == src_label_sym
                         && rule_sees(def, s, g)
+                        && via_pair_matched_before(
+                            def,
+                            s,
+                            n,
+                            changed.as_ref().map(|(f, v)| (*f, v)),
+                            g,
+                        )
                     {
                         affected_srcs.insert(s);
                     }
@@ -4634,9 +4698,9 @@ impl RuleEngine {
                     && g.labels.get(*s as usize).copied() == src_sym
                     && rule_sees(def, *s, g)
                     // A via-hop rule's predicate holds between a via node
-                    // and the destination, not the source; it is not
-                    // guarded here (row 83's via-hop half).
-                    && (def.via_label.is_some() || pair_matched_before(def, *s, n, None, g))
+                    // and the destination, so its guard asks the source's
+                    // via nodes (row 83's via-hop half).
+                    && (if def.via_label.is_some() { via_pair_matched_before(def, *s, n, None, g) } else { pair_matched_before(def, *s, n, None, g) })
                 {
                     topk_backfill.insert((rule_name.clone(), *s));
                 }
