@@ -18,6 +18,7 @@
   the edge was already lost before this release (the losing write ran on 0.8.0 or 0.8.1) are not
   repaired; delete and recreate both rules to restore those edges (row 111 will reconcile at the
   first write automatically) (row 107).
+- **A via-hop top-k rule keeps its next-best edge when its best match was another rule's.** The fix 0.8.1 made for plain top-k rules, now for a via-hop one: when its best match was an edge another rule owned and that match went away — a changed property or the destination deleted — the next-best edge stayed missing until `rebuild_rule` (row 83).
 
 ## v0.8.1 — six rule engine corrections
 
