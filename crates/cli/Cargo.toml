@@ -16,6 +16,10 @@ name = "cli"
 [[bin]]
 name = "mushroomdb"
 path = "src/main.rs"
+# The engine's library is also named `mushroomdb`; documenting this binary as
+# well writes both to `target/doc/mushroomdb/` and the binary's page replaces
+# the library's.
+doc = false
 
 [features]
 default = []

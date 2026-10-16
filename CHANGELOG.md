@@ -4,30 +4,12 @@
 
 ### Changed
 
-- **The Rust library is now imported as `mushroomdb`, not `core_api`.** The
-  library name inside the crate has been corrected to match the crate's package
-  name. An embedded Rust user changes one line in `Cargo.toml` and one import
-  prefix in their code:
+- **The Rust library is imported as `mushroomdb`, not `core_api`.** The crate on crates.io has always been `mushroomdb`, but its library was named `core_api`, so a project that ran `cargo add mushroomdb` had to write `use core_api::…`. It is `use mushroomdb::…` now. What to change depends on how your `Cargo.toml` names the dependency:
 
-  Before:
-  ```toml
-  # Cargo.toml — the old dep key gave the extern name "core_api"
-  core-api = { package = "mushroomdb", path = "…", version = "0.8.2" }
-  ```
-  ```rust
-  use core_api::GraphDb;
-  ```
+  - `mushroomdb = "0.8"` (what `cargo add mushroomdb` writes): bump the version to `0.9`, and change `core_api::` to `mushroomdb::` in your code. This is the change that breaks.
+  - `core-api = { package = "mushroomdb", … }`: bump the version; nothing else. The dependency key sets the name you import it under, so `use core_api::…` keeps working. Rename the key to `mushroomdb` and your imports to `mushroomdb::` when it suits you.
 
-  After:
-  ```toml
-  mushroomdb = { path = "…", version = "0.9.0" }
-  ```
-  ```rust
-  use mushroomdb::GraphDb;
-  ```
-
-  Nothing changes for the CLI, the MCP server, HTTP, Python, or TypeScript
-  users, and the on-disk format is identical.
+  Nothing changes for the CLI, the MCP server, HTTP, Python or TypeScript, and the on-disk format is identical: no store, WAL, snapshot or response carries the library's name.
 
 ## v0.8.2 — two more rule engine corrections, and a repair for stores 0.8.0 damaged
 
