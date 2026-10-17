@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`rebuild_rule` no longer drops an edge another rule still desires.** When a rule was explicitly rebuilt (or rebuilt after index drift), `apply_streaming_rebuild` and `apply_via_rebuild` retracted stale edges but did not push them to the reclaim queue, so a competing rule never got the chance to take them. The fix adds the push; the second-pass reclaim now fires for rebuild the same way it already did for incremental writes (row 84).
+- **An `open_at` handle on a store snapshotted while two rules both owned the same edge now shows one owner, not two.** The row 107 dedup ran on the first write (via `ensure_provenance_loaded_mut`) but not when the provenance was decoded for an as-of handle via `from_persist`. The fix calls `dedup_provenance` inside `from_persist` (row 112).
+- **`forget` of a property no longer misreports the derived-edge count on a store row 111 repaired.** Before the fix, the snapshot's provenance was decoded into the as-of handle but not reconciled, so the derived-edge count it saw could differ from the live count. The fix runs row 111's repair before computing the report (row 115).
+- **`delete_node` counts the correct number of derived edges when the deleted node is only a via-hop.** `provenance_touching` found edges where the node is src or dst, but missed edges where the node is the via hop. The fix counts the edges the apply's own deltas retracted instead (row 50).
+
 ## v0.9.1 — stores 0.8.0 had damaged get their edges back
 
 No format version change. A 0.9.0 store opens under 0.9.1, and a 0.9.1 snapshot opens under 0.9.0.

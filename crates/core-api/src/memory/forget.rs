@@ -183,6 +183,13 @@ pub fn forget<F: Fs>(db: &mut GraphDb<F>, target: &ForgetTarget) -> Result<Forge
             // Removing a property re-runs rule retraction, so a rule that read
             // it drops the edges it derived. Compare the node's derived edges
             // either side of the write to say how many went.
+            //
+            // On a store where 0.8.0 lost derived edges, the first write
+            // triggers `reconcile_lost_provenance` *inside* the commit, so a
+            // "before" snapshot taken just before that commit sees no edges.
+            // Reconcile here, before the snapshot, so both sides see the
+            // repaired state (ledger row 115).
+            db.ensure_reconcile_for_report();
             let before = derived_edges_on(db, key)?;
             // A name's words live in `aliases`. When the name goes, the list is
             // rewritten from the key alone in the same commit, so the words

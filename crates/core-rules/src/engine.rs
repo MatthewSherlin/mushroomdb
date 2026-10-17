@@ -1155,6 +1155,18 @@ type ByNodeRebuild = (
     Vec<String>,
 );
 
+/// Remove triples held by more than one rule, keeping only the first owner in
+/// rule-name (BTree key) order.  Called from both provenance load paths so a
+/// snapshot written while row 103's double-ownership was live is repaired
+/// whether it is decoded lazily at first write or eagerly by `from_persist`.
+/// Idempotent against stores that were never damaged.
+fn dedup_provenance(prov: &mut BTreeMap<String, BTreeSet<Triple>>) {
+    let mut seen: BTreeSet<Triple> = BTreeSet::new();
+    for set in prov.values_mut() {
+        set.retain(|triple| seen.insert(*triple));
+    }
+}
+
 fn rebuild_by_node(provenance: &BTreeMap<String, BTreeSet<Triple>>) -> ByNodeRebuild {
     let mut by_node = BTreeMap::new();
     let mut intern = BTreeMap::new();
@@ -1824,6 +1836,10 @@ fn apply_via_rebuild(
                 g.remove_edge(t, s, d);
                 g.edge_props.remove_edge(t, s, d);
                 prov.remove(&def.name, triple, g.ids, g.syms);
+                // Signal the second-pass reclaim so another rule over the same
+                // edge type can take the edge (ledger row 84).
+                let by = prov.rule_intern.get(&def.name).copied().unwrap_or(u32::MAX);
+                prov.retracted.push((by, triple));
             }
         }
         for ((s, d), score) in desired {
@@ -1888,6 +1904,10 @@ fn apply_streaming_rebuild(
             g.remove_edge(t, s, d);
             g.edge_props.remove_edge(t, s, d);
             prov.remove(&def.name, (t, s, d), g.ids, g.syms);
+            // Signal the second-pass reclaim so another rule over the same
+            // edge type can take the edge (ledger row 84).
+            let by = prov.rule_intern.get(&def.name).copied().unwrap_or(u32::MAX);
+            prov.retracted.push((by, (t, s, d)));
         }
     }
 
@@ -2332,10 +2352,14 @@ impl RuleEngine {
     /// Reconstruct engine from a snapshot.  Caller must call `reindex_all` after.
     pub fn from_persist(
         rules: Vec<RuleDef>,
-        prov: BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
+        mut prov: BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
         tripped: BTreeMap<String, bool>,
         fires: BTreeMap<String, u64>,
     ) -> Self {
+        // Repair double-owned triples the same way `ensure_provenance_loaded_mut`
+        // does for the bytes path (ledger row 107).  An as-of handle decoded into
+        // its overlay arrives here, not through the bytes path.
+        dedup_provenance(&mut prov);
         let mut owned = BTreeSet::new();
         for set in prov.values() {
             owned.extend(set.iter().copied());
@@ -3144,17 +3168,9 @@ impl RuleEngine {
         };
         let mut prov = decode_provenance_bytes(&bytes);
 
-        // Repair: for each triple present in more than one rule's set, keep only
-        // the first owner (BTree key order = alphabetical rule-name order).
-        // A fresh derivation would give the edge to whichever rule fired first,
-        // which in BTree order is the same as alphabetical; this pass is therefore
+        // Repair double-owned triples (ledger row 107). `dedup_provenance` is
         // idempotent against a store that was never damaged.
-        {
-            let mut seen: std::collections::BTreeSet<Triple> = std::collections::BTreeSet::new();
-            for set in prov.values_mut() {
-                set.retain(|triple| seen.insert(*triple));
-            }
-        }
+        dedup_provenance(&mut prov);
 
         for set in prov.values() {
             self.owned.extend(set.iter().copied());
@@ -3214,23 +3230,120 @@ impl RuleEngine {
             .filter(|&(_, tr)| !in_graph(g, tr))
             .map(|(rule, tr)| (rule.clone(), tr))
             .collect();
-        if lost.is_empty() {
+        if !lost.is_empty() {
+            self.ensure_indexes_populated(g);
+            for (rule, triple) in &lost {
+                if let Some(set) = self.provenance.get_mut(rule) {
+                    set.remove(triple);
+                }
+                self.owned.remove(triple);
+                let rid = intern_rule(&mut self.rule_intern, &mut self.intern_rule, rule);
+                touch_remove(&mut self.by_node, rid, *triple);
+            }
+            // Re-evaluated as a retraction by no rule, so that every rule over
+            // the edge type is a target — the owner included.
+            let as_retracted: Vec<(u32, Triple)> =
+                lost.iter().map(|&(_, tr)| (u32::MAX, tr)).collect();
+            let scope = self.begin_chain();
+            self.reclaim_retracted(&as_retracted, g);
+            self.end_chain(scope, g);
+        }
+
+        // Row 113: give back edges absent from both the graph and provenance
+        // because 0.8.0 double-ownership let a second rule retract them while
+        // the first still counted them.  For each top-k rule, any source whose
+        // provenance edge count is below its cap is re-evaluated to fill the gap.
+        self.fill_undertopk_sources(g);
+    }
+
+    /// Re-evaluate top-k rules for every source that has fewer edges in
+    /// provenance than its cap.  Indexes must already be populated when any
+    /// such source exists; this function populates them if needed.
+    ///
+    /// Called once from `reconcile_lost_provenance` to repair stores where
+    /// 0.8.0's double-ownership took an edge out of both the graph and
+    /// provenance (ledger row 113).  Idempotent on a store that was never
+    /// damaged: every source holds exactly k edges, so the scan produces no
+    /// work.
+    fn fill_undertopk_sources(&mut self, g: &mut GraphMut<'_>) {
+        let doomed = self.doomed;
+        // Collect (rule_name, src) pairs where prov count < k.
+        let mut to_fill: Vec<(String, u32)> = Vec::new();
+        for (rule_name, def) in &self.rules {
+            let Some(k) = def.max_edges else {
+                continue;
+            };
+            if self.pending_builds.contains_key(rule_name) {
+                continue;
+            }
+            let Some(et) = g.syms.get(&def.edge_type) else {
+                continue;
+            };
+            let Some(src_sym) = g.syms.get(&def.src_label) else {
+                continue;
+            };
+            // Count how many edges each source currently owns under this rule.
+            let mut src_counts: BTreeMap<u32, u64> = BTreeMap::new();
+            if let Some(set) = self.provenance.get(rule_name) {
+                for &(t, s, _) in set {
+                    if t == et {
+                        *src_counts.entry(s).or_default() += 1;
+                    }
+                }
+            }
+            for id in 0..g.ids.len() as u32 {
+                if g.labels.get(id as usize).copied() != Some(src_sym) {
+                    continue;
+                }
+                if !rule_sees(def, id, g) {
+                    continue;
+                }
+                let count = src_counts.get(&id).copied().unwrap_or(0);
+                if count < k {
+                    to_fill.push((rule_name.clone(), id));
+                }
+            }
+        }
+        if to_fill.is_empty() {
             return;
         }
+        // Indexes must be populated before `compute_desired` can run.
         self.ensure_indexes_populated(g);
-        for (rule, triple) in &lost {
-            if let Some(set) = self.provenance.get_mut(rule) {
-                set.remove(triple);
-            }
-            self.owned.remove(triple);
-            let rid = intern_rule(&mut self.rule_intern, &mut self.intern_rule, rule);
-            touch_remove(&mut self.by_node, rid, *triple);
-        }
-        // Re-evaluated as a retraction by no rule, so that every rule over the
-        // edge type is a target — the owner included.
-        let as_retracted: Vec<(u32, Triple)> = lost.iter().map(|&(_, tr)| (u32::MAX, tr)).collect();
         let scope = self.begin_chain();
-        self.reclaim_retracted(&as_retracted, g);
+        for (rule_name, s) in &to_fill {
+            if Some(*s) == doomed {
+                continue;
+            }
+            let def = self.rules[rule_name].clone();
+            let k = def.max_edges.unwrap();
+            let desired = if def.via_label.is_some() {
+                compute_desired_via(
+                    &def,
+                    self.indexes.get(rule_name),
+                    ViaAnchor::Src(*s),
+                    doomed,
+                    g,
+                )
+            } else {
+                compute_desired(&def, &self.indexes[rule_name], *s, true, g)
+            };
+            let top_k = filter_src_top_k(desired, k, g.ids);
+            let mut prov = ProvSets {
+                set: self.provenance.entry(rule_name.clone()).or_default(),
+                owned: &mut self.owned,
+                by_node: &mut self.by_node,
+                rule_intern: &mut self.rule_intern,
+                intern_rule: &mut self.intern_rule,
+                deltas: &mut self.pending_deltas,
+                emit: self.emit_deltas,
+                retracted: &mut self.retracted,
+            };
+            apply_per_src_top_k(&def, *s, top_k, &mut prov, g);
+        }
+        let retracted = std::mem::take(&mut self.retracted);
+        if !retracted.is_empty() {
+            self.reclaim_retracted(&retracted, g);
+        }
         self.end_chain(scope, g);
     }
 
@@ -5040,26 +5153,37 @@ impl RuleEngine {
         // evaluated between the via node and the dst, which the candidate index
         // cannot express.
         let doomed = self.doomed;
-        let mut prov = ProvSets {
-            set: self.provenance.get_mut(name).unwrap(),
-            owned: &mut self.owned,
-            by_node: &mut self.by_node,
-            rule_intern: &mut self.rule_intern,
-            intern_rule: &mut self.intern_rule,
-            deltas: &mut self.pending_deltas,
-            emit: self.emit_deltas,
-            retracted: &mut self.retracted,
-        };
-        if let Some(k) = def.max_edges {
-            apply_streaming_rebuild_top_k(&def, k, &self.indexes[name], doomed, &mut prov, g);
-        } else {
-            let tripped = self.tripped.get_mut(name).unwrap();
-            if def.via_edge.is_some() {
-                apply_via_rebuild(&def, doomed, &mut prov, tripped, g);
+        {
+            let mut prov = ProvSets {
+                set: self.provenance.get_mut(name).unwrap(),
+                owned: &mut self.owned,
+                by_node: &mut self.by_node,
+                rule_intern: &mut self.rule_intern,
+                intern_rule: &mut self.intern_rule,
+                deltas: &mut self.pending_deltas,
+                emit: self.emit_deltas,
+                retracted: &mut self.retracted,
+            };
+            if let Some(k) = def.max_edges {
+                apply_streaming_rebuild_top_k(&def, k, &self.indexes[name], doomed, &mut prov, g);
             } else {
-                apply_streaming_rebuild(&def, &self.indexes[name], &mut prov, tripped, g);
+                let tripped = self.tripped.get_mut(name).unwrap();
+                if def.via_edge.is_some() {
+                    apply_via_rebuild(&def, doomed, &mut prov, tripped, g);
+                } else {
+                    apply_streaming_rebuild(&def, &self.indexes[name], &mut prov, tripped, g);
+                }
             }
+        } // prov released here, freeing &mut self.retracted for the reclaim pass
+
+        // Give back any edge the rebuild retracted to another rule over the
+        // same edge type that still desires it (ledger row 84).  Consistent
+        // with the same pass in `on_node_changed` and `on_node_removed`.
+        let retracted = std::mem::take(&mut self.retracted);
+        if !retracted.is_empty() {
+            self.reclaim_retracted(&retracted, g);
         }
+
         let fires = self.fires.entry(name.to_string()).or_default();
         bump_fires_for_participants(&def, g, fires);
 
@@ -6031,6 +6155,90 @@ mod tests {
         // An edge of another type is nobody's business here.
         let other = g.syms.intern("OTHER");
         assert!(eng.reclaim_targets(&[(by, (other, a, b))], &g).is_empty());
+    }
+
+    /// When a rebuild finds edges in a rule's provenance that the rule no
+    /// longer desires, it must push them to `retracted` so the second-pass
+    /// reclaim can give them to a competing rule (ledger row 84, rebuild path).
+    ///
+    /// The stale-provenance state is created by changing props directly
+    /// (bypassing `on_node_changed`), which the incremental path would have
+    /// handled but `rebuild_inner` must handle on its own.
+    #[test]
+    fn rebuild_retract_pushes_to_retracted_so_reclaim_fires() {
+        let mk = |name: &str, min: f64| RuleDef {
+            name: name.into(),
+            src_label: "A".into(),
+            dst_label: "A".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min,
+            },
+            edge_type: "SAME".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        };
+        let mut fx = Fx::new();
+        // `overlap_hi` sorts before `overlap_lo` alphabetically; it will own
+        // the edge when both rules desire it.
+        let a = fx.add("A", "a", vec![("tags", tags(&["x", "y", "z", "w"]))]);
+        let b = fx.add("A", "b", vec![("tags", tags(&["x", "y", "z", "w"]))]);
+        let et = fx.syms.intern("SAME");
+        let mut eng = RuleEngine::new();
+        {
+            let mut g = fx.g();
+            eng.create_rule(mk("overlap_hi", 0.6), &mut g).unwrap();
+            eng.create_rule(mk("overlap_lo", 0.3), &mut g).unwrap();
+            // Jaccard = 1.0: both rules desire a→b; overlap_hi takes it first.
+            eng.on_node_changed(a, None, &mut g);
+            assert!(g.topo.neighbors(et, Direction::Out, a).contains(&b));
+        }
+        // Confirm overlap_hi owns a→b and overlap_lo does not.
+        assert!(
+            eng.provenance()["overlap_hi"].contains(&(et, a, b)),
+            "overlap_hi must own a→b after backfill"
+        );
+        assert!(
+            !eng.provenance()
+                .get("overlap_lo")
+                .is_some_and(|s| s.contains(&(et, a, b))),
+            "overlap_lo must not own a→b when overlap_hi got there first"
+        );
+
+        // Drop b's tags so Jaccard(a,b) = 0.4 — overlap_hi (min=0.6) would
+        // retract on rebuild; overlap_lo (min=0.3) still desires the edge.
+        // Do this WITHOUT calling on_node_changed, creating stale provenance.
+        fx.props.set(b, "tags", tags(&["x", "y"]));
+
+        // Rebuild overlap_hi.  apply_streaming_rebuild finds a→b in
+        // overlap_hi's provenance, Jaccard=0.4 < 0.6, retracts.  With the
+        // row 84 fix it pushes to `retracted`; reclaim_retracted then fires
+        // overlap_lo for src a, and overlap_lo takes the edge.
+        {
+            let mut g = fx.g();
+            eng.rebuild("overlap_hi", &mut g).unwrap();
+            assert!(
+                g.topo.neighbors(et, Direction::Out, a).contains(&b),
+                "a→b must still be in the graph after rebuild: overlap_lo reclaimed it"
+            );
+        }
+        assert!(
+            !eng.provenance()
+                .get("overlap_hi")
+                .is_some_and(|s| s.contains(&(et, a, b))),
+            "overlap_hi must not own a→b after rebuild retracts it"
+        );
+        assert!(
+            eng.provenance()
+                .get("overlap_lo")
+                .is_some_and(|s| s.contains(&(et, a, b))),
+            "overlap_lo must own a→b after the reclaim pass"
+        );
     }
 
     /// Helper: FieldEqual rule with top-k per-source cap.
