@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.9.1 — stores 0.8.0 had damaged get their edges back
+
+No format version change. A 0.9.0 store opens under 0.9.1, and a 0.9.1 snapshot opens under 0.9.0.
+
+**Upgrade if a store was written by 0.8.0 with two rules over one edge type and a snapshot.** 0.8.2 repaired such stores where both rules still held the edge; this release repairs the ones where 0.8.0 had already lost it, at the first write after open (row 111). It also fixes three smaller things a first write after open got wrong on a snapshotted store (rows 108–110).
 
 ### Fixed
 
