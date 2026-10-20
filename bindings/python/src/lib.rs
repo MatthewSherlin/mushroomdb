@@ -11,7 +11,10 @@ use core_api::{
 use core_storage::fs::RealFs;
 use pyo3::exceptions::{PyBaseException, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySequence, PyString, PyTuple};
+use pyo3::types::{
+    PyBool, PyByteArray, PyBytes, PyDict, PyFloat, PyInt, PyList, PyMemoryView, PySequence,
+    PyString, PyTuple,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -3090,6 +3093,38 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_instance_of::<PyString>() {
         return Ok(Value::Str(obj.extract()?));
     }
+    if obj.is_instance_of::<PyBytes>() || obj.is_instance_of::<PyByteArray>() {
+        return Ok(Value::Binary(obj.extract()?));
+    }
+    if obj.is_instance_of::<PyMemoryView>() {
+        return Ok(Value::Binary(obj.call_method0("tobytes")?.extract()?));
+    }
+    if let Ok(duration) = obj.extract::<Duration>() {
+        return Ok(Value::Duration {
+            months: duration.months,
+            days: duration.days,
+            nanos: duration.nanos,
+        });
+    }
+    let datetime = PyModule::import(obj.py(), "datetime")?;
+    // `datetime.datetime` is a `datetime.date`, so it is asked first.
+    if obj.is_instance(&datetime.getattr("datetime")?)? {
+        return datetime_from_py(obj);
+    }
+    if obj.is_instance(&datetime.getattr("date")?)? {
+        let days = days_from_civil(
+            obj.getattr("year")?.extract()?,
+            obj.getattr("month")?.extract()?,
+            obj.getattr("day")?.extract()?,
+        );
+        return Ok(Value::Date(days as i32));
+    }
+    if obj.is_instance(&datetime.getattr("timedelta")?)? {
+        return Err(PyTypeError::new_err(
+            "a datetime.timedelta cannot be stored: a Duration keeps months, days and nanoseconds \
+             apart, which a timedelta cannot express. Use mushroomdb.Duration(months=, days=, nanos=)",
+        ));
+    }
     if let Ok(list) = obj.downcast::<PyList>() {
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
@@ -3108,7 +3143,7 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::Map(map));
     }
     Err(PyTypeError::new_err(format!(
-        "cannot convert {} to Value (need str, int, float, bool, list, or dict)",
+        "cannot convert {} to Value (need str, int, float, bool, bytes, date, datetime, Duration, list, or dict)",
         obj.get_type().name()?
     )))
 }
@@ -3134,19 +3169,196 @@ fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
             Ok(dict.into_any())
         }
         Value::Binary(bytes) => Ok(pyo3::types::PyBytes::new(py, bytes).into_any()),
-        // Until the Python temporal types land, a date, time or duration
-        // reads as its ISO 8601 text.
-        Value::Date(_)
-        | Value::LocalDateTime(_)
-        | Value::DateTime { .. }
-        | Value::Duration { .. } => {
-            let text = core_storage::tagged_text(v)
-                .map_err(PyValueError::new_err)?
-                .map(|(_, text)| text)
-                .unwrap_or_default();
-            Ok(text.into_pyobject(py)?.into_any())
+        Value::Date(days) => {
+            let (year, month, day) = civil_from_days(i64::from(*days));
+            let year = python_year(year, "Date")?;
+            PyModule::import(py, "datetime")?
+                .getattr("date")?
+                .call1((year, month, day))
+        }
+        Value::LocalDateTime(micros) => datetime_to_py(py, *micros, None),
+        Value::DateTime {
+            micros_utc,
+            offset_seconds,
+        } => {
+            if offset_seconds.unsigned_abs() > MAX_OFFSET_SECONDS {
+                return Err(PyValueError::new_err(format!(
+                    "DateTime offset {offset_seconds}s is outside +-18:00"
+                )));
+            }
+            let local = micros_utc
+                .checked_add(i64::from(*offset_seconds) * MICROS_PER_SECOND)
+                .ok_or_else(|| {
+                    PyValueError::new_err("DateTime is outside Python's datetime range")
+                })?;
+            datetime_to_py(py, local, Some(*offset_seconds))
+        }
+        Value::Duration {
+            months,
+            days,
+            nanos,
+        } => Ok(Bound::new(
+            py,
+            Duration {
+                months: *months,
+                days: *days,
+                nanos: *nanos,
+            },
+        )?
+        .into_any()),
+    }
+}
+
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SECOND;
+/// The widest UTC offset a `DateTime` carries: 18:00.
+const MAX_OFFSET_SECONDS: u32 = 18 * 3600;
+
+/// A span of time as the engine keeps it: calendar months, days and
+/// nanoseconds, independent of each other. A month is not 30 days and a day is
+/// not 24 hours, which is why this is not `datetime.timedelta`.
+#[pyclass(name = "Duration", frozen, eq, hash, module = "mushroomdb")]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Duration {
+    #[pyo3(get)]
+    months: i32,
+    #[pyo3(get)]
+    days: i32,
+    #[pyo3(get)]
+    nanos: i64,
+}
+
+#[pymethods]
+impl Duration {
+    #[new]
+    #[pyo3(signature = (months = 0, days = 0, nanos = 0))]
+    fn new(months: i32, days: i32, nanos: i64) -> Self {
+        Duration {
+            months,
+            days,
+            nanos,
         }
     }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Duration(months={}, days={}, nanos={})",
+            self.months, self.days, self.nanos
+        )
+    }
+}
+
+/// Proleptic Gregorian `(year, month, day)` of a day count since 1970-01-01.
+fn civil_from_days(days: i64) -> (i64, u8, u8) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u8;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    } as u8;
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// Day count since 1970-01-01 of a proleptic Gregorian date.
+fn days_from_civil(year: i64, month: u8, day: u8) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month_index = i64::from(if month > 2 { month - 3 } else { month + 9 });
+    let day_of_year = (153 * month_index + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// `year` as a Python year, or a `ValueError` naming the type that has none.
+fn python_year(year: i64, type_name: &str) -> PyResult<i32> {
+    if (1..=9999).contains(&year) {
+        Ok(year as i32)
+    } else {
+        Err(PyValueError::new_err(format!(
+            "{type_name} has year {year}, outside Python's datetime range (years 1 to 9999)"
+        )))
+    }
+}
+
+/// A `datetime.datetime` for `local_micros` since 1970-01-01T00:00:00 of
+/// wall-clock time, with a fixed UTC offset when `offset_seconds` is given.
+fn datetime_to_py<'py>(
+    py: Python<'py>,
+    local_micros: i64,
+    offset_seconds: Option<i32>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let type_name = if offset_seconds.is_some() {
+        "DateTime"
+    } else {
+        "LocalDateTime"
+    };
+    let (year, month, day) = civil_from_days(local_micros.div_euclid(MICROS_PER_DAY));
+    let year = python_year(year, type_name)?;
+    let micros_of_day = local_micros.rem_euclid(MICROS_PER_DAY);
+    let seconds_of_day = micros_of_day / MICROS_PER_SECOND;
+    let micro = micros_of_day % MICROS_PER_SECOND;
+    let (hour, minute, second) = (
+        seconds_of_day / 3600,
+        seconds_of_day % 3600 / 60,
+        seconds_of_day % 60,
+    );
+    let datetime = PyModule::import(py, "datetime")?;
+    let tzinfo = match offset_seconds {
+        None => py.None().into_bound(py),
+        Some(seconds) => {
+            let delta = datetime
+                .getattr("timedelta")?
+                .call1((0, i64::from(seconds)))?;
+            datetime.getattr("timezone")?.call1((delta,))?
+        }
+    };
+    datetime
+        .getattr("datetime")?
+        .call1((year, month, day, hour, minute, second, micro, tzinfo))
+}
+
+/// The `Value` for a `datetime.datetime`: `LocalDateTime` when it is naive,
+/// `DateTime` with its offset when it is aware. Refuses a value the engine
+/// cannot hold exactly instead of rounding it.
+fn datetime_from_py(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    let field = |name: &str| obj.getattr(name)?.extract::<i64>();
+    let days = days_from_civil(field("year")?, field("month")? as u8, field("day")? as u8);
+    let local_micros = days
+        .checked_mul(MICROS_PER_DAY)
+        .and_then(|us| us.checked_add(field("hour").ok()? * 3600 * MICROS_PER_SECOND))
+        .and_then(|us| us.checked_add(field("minute").ok()? * 60 * MICROS_PER_SECOND))
+        .and_then(|us| us.checked_add(field("second").ok()? * MICROS_PER_SECOND))
+        .and_then(|us| us.checked_add(field("microsecond").ok()?))
+        .ok_or_else(|| PyValueError::new_err("datetime is outside the engine's range"))?;
+    let offset = obj.call_method0("utcoffset")?;
+    if offset.is_none() {
+        return Ok(Value::LocalDateTime(local_micros));
+    }
+    let seconds = offset.getattr("days")?.extract::<i64>()? * 86_400
+        + offset.getattr("seconds")?.extract::<i64>()?;
+    if offset.getattr("microseconds")?.extract::<i64>()? != 0 {
+        return Err(PyValueError::new_err(
+            "datetime has a UTC offset with a fractional second, which a DateTime cannot hold exactly",
+        ));
+    }
+    if seconds.unsigned_abs() > u64::from(MAX_OFFSET_SECONDS) {
+        return Err(PyValueError::new_err(format!(
+            "datetime has UTC offset {seconds}s, outside the +-18:00 a DateTime holds"
+        )));
+    }
+    Ok(Value::DateTime {
+        micros_utc: local_micros - seconds * MICROS_PER_SECOND,
+        offset_seconds: seconds as i32,
+    })
 }
 
 /// A `serde_json::Value` as the object Python's `json.loads` would build:
@@ -3597,9 +3809,33 @@ engine_errors! {
     TimeBeforeFloor, "time_before_floor", "The date predates the oldest commit time the store still records. Carries `.floor_ms` and `.floor_commit`, the oldest entry the map can answer from. Retrying with an earlier instant fails the same way.";
 }
 
+/// Test hook: convert `value` to the engine's `Value` and straight back.
+///
+/// Exercises the same two conversions a write and a read use, without the
+/// engine's V11 write refusal in between. Not part of the supported API.
+#[pyfunction]
+fn _value_roundtrip<'py>(
+    py: Python<'py>,
+    value: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    value_to_py(py, &py_to_value(value)?)
+}
+
+/// Test hook: the ISO 8601 or base64 text the engine prints for `value`, with
+/// its wire tag, or `None` for a type that has none.
+#[pyfunction]
+fn _value_tagged_text(value: &Bound<'_, PyAny>) -> PyResult<Option<(String, String)>> {
+    core_storage::tagged_text(&py_to_value(value)?)
+        .map(|tagged| tagged.map(|(tag, text)| (tag.to_string(), text)))
+        .map_err(PyValueError::new_err)
+}
+
 #[pymodule]
 fn mushroomdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GraphDb>()?;
+    m.add_class::<Duration>()?;
+    m.add_function(wrap_pyfunction!(_value_roundtrip, m)?)?;
+    m.add_function(wrap_pyfunction!(_value_tagged_text, m)?)?;
     register_errors(m)?;
     Ok(())
 }

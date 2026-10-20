@@ -276,6 +276,14 @@ class ReviewFindings(unittest.TestCase):
             gen.parse_stub(source)
         self.assertIn("Report", str(raised.exception))
 
+    def test_a_value_class_is_listed_under_types_with_its_constructor(self):
+        source = 'class Duration:\n    """A span."""\n\n    months: int\n    def __init__(self, months: int = 0) -> None: ...\n\nclass GraphDb:\n    def close(self) -> None: ...\n'
+        stub = gen.parse_stub(source)
+        self.assertEqual(stub["classes"], [("Duration", "A span.", [("months", "int")], "months: int = 0")])
+        page = gen.render_python("{{types}}\n{{methods}}\n{{errors}}", stub, {"All": ["close"]})
+        self.assertIn("```python\nclass Duration(months: int = 0)\n```", page)
+        self.assertIn("Fields: `months: int`.", page)
+
     def test_an_error_two_levels_down_is_still_an_error(self):
         source = 'class MushroomError(RuntimeError):\n    """Base."""\n\nclass Busy(MushroomError):\n    """Busy."""\n\nclass VeryBusy(Busy):\n    """Very."""\n'
         self.assertEqual([e[0] for e in gen.parse_stub(source)["errors"]], ["MushroomError", "Busy", "VeryBusy"])
