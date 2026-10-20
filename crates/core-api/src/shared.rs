@@ -126,6 +126,7 @@
 use crate::db::{
     BatchOp, FsyncPolicy, Precondition, WriteAuthz, LOCK_POLL_INTERVAL, WRITE_LOCK_WAIT,
 };
+use crate::durable_wal::{DurableWal, WalPosition};
 use crate::reader::ReaderSnapshot;
 use crate::transaction::Transaction;
 use crate::GraphDb;
@@ -366,6 +367,12 @@ pub struct SharedDb {
     /// across the drain thread and direct writers.  See module-level doc for
     /// the required acquisition order.
     wal_mu: Arc<Mutex<()>>,
+    /// The handle's durable-WAL cell, read without any of the locks above.
+    durable_wal: DurableWal,
+    /// Where this handle's WAL lives, and how it is fsynced: for vouching
+    /// for WAL bytes it applied but did not write (see
+    /// [`durable_wal_position`](SharedDb::durable_wal_position)).
+    vouch: Arc<(std::path::PathBuf, SyncWalFn)>,
 }
 
 const _: () = {
@@ -411,6 +418,8 @@ impl SharedDb {
         dir: std::path::PathBuf,
         sync_fn: SyncWalFn,
     ) -> Self {
+        let durable_wal = db.durable_wal();
+        let vouch = Arc::new((dir.clone(), Arc::clone(&sync_fn)));
         let inner = Arc::new(RwLock::new(db));
         let queue = WriteQueue::new();
         let wal_mu = Arc::new(Mutex::new(()));
@@ -421,6 +430,7 @@ impl SharedDb {
         let drain_dir = Arc::clone(&dir_arc);
         let drain_wal_mu = Arc::clone(&wal_mu);
         let drain_sync_fn = Arc::clone(&sync_fn);
+        let drain_durable = durable_wal.clone();
 
         let handle = thread::Builder::new()
             .name("groupcommit-drain".into())
@@ -431,6 +441,7 @@ impl SharedDb {
                     drain_dir,
                     drain_wal_mu,
                     drain_sync_fn,
+                    drain_durable,
                 )
             })
             .expect("failed to spawn group-commit drain thread");
@@ -443,7 +454,44 @@ impl SharedDb {
                 handle: Some(handle),
             }),
             wal_mu,
+            durable_wal,
+            vouch,
         }
+    }
+
+    /// How much of the live WAL is known to be on stable storage: only bytes
+    /// an fsync has covered, ending on a frame boundary, with a generation
+    /// that changes whenever `wal.bin` is replaced. See [`WalPosition`].
+    ///
+    /// Takes none of the handle's locks — not the RwLock, not the WAL mutex —
+    /// so polling it never delays a reader or a writer. This is what a backup
+    /// reads instead of the file's length, which counts bytes still in the
+    /// page cache.
+    ///
+    /// WAL bytes this handle applied without writing them itself — what its
+    /// open replayed, or what a refresh absorbed from another process — are
+    /// fsynced once here, on the caller's thread and holding none of the
+    /// handle's locks, before they count as durable. An open that nobody asks
+    /// about this pays no fsync.
+    pub fn durable_wal_position(&self) -> WalPosition {
+        if let Some((generation, len, frames)) = self.durable_wal.unvouched() {
+            // A failed fsync leaves the position where it is; the next call
+            // tries again, and this handle's next write's fsync covers it.
+            let (dir, sync_fn) = &*self.vouch;
+            if sync_fn(dir).is_ok() {
+                self.durable_wal.vouch(generation, len, frames);
+            }
+        }
+        self.durable_wal.get()
+    }
+
+    /// Catch up with another process's commits or snapshot, if there are any.
+    ///
+    /// The same metadata-only check every read makes. For a reader that does
+    /// not otherwise read — the backup worker, when the disk shows a snapshot
+    /// this handle has not seen.
+    pub fn refresh_if_stale_now(&self) {
+        self.refresh_if_stale();
     }
 
     /// Check whether another process has committed, and if so absorb its
@@ -815,6 +863,7 @@ fn drain_loop(
     dir: Arc<std::path::PathBuf>,
     wal_mu: Arc<Mutex<()>>,
     sync_fn: SyncWalFn,
+    durable_wal: DurableWal,
 ) {
     loop {
         // Wait for work (or shutdown with empty queue).
@@ -918,6 +967,10 @@ fn drain_loop(
         // subscription notifications only fire after the group fsync (R2:
         // durability before notification).  For Relaxed policy events fire
         // immediately (no fsync to wait for).
+        // Where the group ends: the fsync below covers exactly this much. Set
+        // under the write guard, with wal_mu held, so nothing can append
+        // between there and the fsync.
+        let post_group: (u64, u64);
         let (results, should_sync): (Vec<Result<Applied>>, bool) = {
             let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
             let sync_needed = db.fsync_policy() != FsyncPolicy::Relaxed;
@@ -999,6 +1052,7 @@ fn drain_loop(
             if !pending_non_cas.is_empty() {
                 r.extend(uncounted(db.commit_group_nosync(pending_non_cas)));
             }
+            post_group = (db.wal_consumed(), db.wal_frames_written());
             (r, sync_needed)
             // ← RwLock write guard released here; wal_mu still held
         };
@@ -1051,6 +1105,11 @@ fn drain_loop(
                 ))));
             }
             return; // drain loop exits; no further groups accepted
+        }
+
+        // The group's frames are on stable storage now.
+        if should_sync && results.iter().any(|r| r.is_ok()) {
+            durable_wal.synced(post_group.0, post_group.1);
         }
 
         // ── Step 5: Flush deferred events AFTER successful fsync (R2) ────────

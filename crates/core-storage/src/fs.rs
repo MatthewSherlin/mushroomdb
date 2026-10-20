@@ -116,6 +116,18 @@ pub trait Fs {
         Ok(self.read(FileId::Wal)?.len() as u64)
     }
 
+    /// Identity of the WAL *file* — which file `wal.bin` names, not what is
+    /// in it — or `None` when there is none or it cannot be told.
+    ///
+    /// A snapshot replaces `wal.bin` by a rename, so the identity changes
+    /// even when the new file's length happens to exceed the old cursor.
+    /// Metadata-only, like [`wal_len`](Fs::wal_len).
+    ///
+    /// Default: `None` (an in-memory store has one WAL for its whole life).
+    fn wal_ident(&self) -> std::io::Result<Option<u64>> {
+        Ok(None)
+    }
+
     /// Read `file` from byte offset `from` to the end.
     ///
     /// Returns an empty `Vec` when `from` is at or past the end of the file.
@@ -403,6 +415,14 @@ impl Fs for RealFs {
         }
     }
 
+    fn wal_ident(&self) -> std::io::Result<Option<u64>> {
+        match std::fs::metadata(self.path(FileId::Wal)) {
+            Ok(m) => Ok(file_ident(&m)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn read_range(&self, file: FileId, from: u64) -> std::io::Result<Vec<u8>> {
         use std::io::{Read as _, Seek as _, SeekFrom};
         let mut f = match File::open(self.path(file)) {
@@ -524,6 +544,21 @@ impl Fs for RealFs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// The inode number on Unix; `None` elsewhere, where the standard library
+/// offers no stable equivalent.
+pub fn file_ident(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
     }
 }
 

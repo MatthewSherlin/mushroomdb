@@ -12,6 +12,7 @@ members = [
     "crates/core-bench",
     "crates/code-extract",
     "crates/bolt",
+    "crates/backup",
 ]
 
 [workspace.package]
