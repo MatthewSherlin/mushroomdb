@@ -4,7 +4,16 @@
 # persistent disk attaches to one instance, and a second writer on the same
 # store contends for the write lock. Do not enable autoscaling.
 #
-# Secret values are entered in the Render dashboard (sync: false); none live in this file.
+# Secret values are entered in the Render dashboard (sync: false); none live in
+# this file.
+#
+# VOLUME OWNERSHIP (UNVERIFIED without a real deploy): the image runs as uid
+# 65532, not root, and the server needs /data writable by that uid. A Render
+# disk may mount root-owned, and the image has no shell to chown with. Symptom:
+# serve fails at start - today with the message `store is busy: write lock held`
+# (HO-12b will name the real cause). Action: after the first deploy, check the
+# service logs for that message. No in-image fix or Render setting is known; if
+# it appears, report it so the template can change.
 services:
   - type: web
     name: mushroomdb
