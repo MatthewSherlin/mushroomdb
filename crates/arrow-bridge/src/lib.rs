@@ -1,8 +1,11 @@
 //! Convert [`core_query::ResultSet`] to Arrow RecordBatches and IPC stream bytes.
 
-use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    ArrayRef, BooleanArray, Date32Array, DurationMicrosecondArray, Float64Array, Int64Array,
+    LargeBinaryArray, RecordBatch, StringArray, TimestampMicrosecondArray,
+};
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use core_query::{ResultSet, Value};
 use std::sync::Arc;
 
@@ -14,6 +17,11 @@ enum ColKind {
     Bool,
     Str,
     Utf8,
+    Date,
+    LocalDateTime,
+    DateTime,
+    Duration,
+    Binary,
 }
 
 fn observe(kind: ColKind, v: &Value) -> ColKind {
@@ -23,6 +31,13 @@ fn observe(kind: ColKind, v: &Value) -> ColKind {
         (ColKind::Int, Value::Float(_)) | (ColKind::Float, Value::Int(_)) => ColKind::Float,
         (ColKind::Empty | ColKind::Bool, Value::Bool(_)) => ColKind::Bool,
         (ColKind::Empty | ColKind::Str, Value::Str(_)) => ColKind::Str,
+        (ColKind::Empty | ColKind::Date, Value::Date(_)) => ColKind::Date,
+        (ColKind::Empty | ColKind::LocalDateTime, Value::LocalDateTime(_)) => {
+            ColKind::LocalDateTime
+        }
+        (ColKind::Empty | ColKind::DateTime, Value::DateTime { .. }) => ColKind::DateTime,
+        (ColKind::Empty | ColKind::Duration, Value::Duration { .. }) => ColKind::Duration,
+        (ColKind::Empty | ColKind::Binary, Value::Binary(_)) => ColKind::Binary,
         (ColKind::Utf8, _) => ColKind::Utf8,
         (_, Value::List(_)) => ColKind::Utf8,
         _ => ColKind::Utf8,
@@ -44,8 +59,32 @@ fn data_type(kind: ColKind) -> DataType {
         ColKind::Int => DataType::Int64,
         ColKind::Float => DataType::Float64,
         ColKind::Bool => DataType::Boolean,
+        ColKind::Date => DataType::Date32,
+        ColKind::LocalDateTime => DataType::Timestamp(TimeUnit::Microsecond, None),
+        // Arrow carries one time zone per column, so a DateTime column is
+        // always UTC: values are UTC instants and each value's own offset is
+        // dropped. LOSSY: per-value offsets are not representable.
+        ColKind::DateTime => {
+            DataType::Timestamp(TimeUnit::Microsecond, Some(DATETIME_COLUMN_TZ.into()))
+        }
+        ColKind::Duration => DataType::Duration(TimeUnit::Microsecond),
+        ColKind::Binary => DataType::LargeBinary,
         ColKind::Empty | ColKind::Str | ColKind::Utf8 => DataType::Utf8,
     }
+}
+
+const DATETIME_COLUMN_TZ: &str = "+00:00";
+
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+/// Microseconds of a duration as Arrow `Duration(Microsecond)` holds it.
+/// LOSSY: months lost in Arrow Duration(Microsecond) (a month has no fixed
+/// length), and nanoseconds below one microsecond are truncated. Saturates at
+/// the `i64` bounds rather than wrapping.
+fn duration_micros(_months: i32, days: i32, nanos: i64) -> i64 {
+    i64::from(days)
+        .saturating_mul(MICROS_PER_DAY)
+        .saturating_add(nanos / 1_000)
 }
 
 fn canonical_display(v: &Value) -> String {
@@ -120,6 +159,65 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
                 .collect();
             Arc::new(BooleanArray::from(vals))
         }
+        ColKind::Date => {
+            let vals: Vec<Option<i32>> = (0..rs.len())
+                .map(|i| {
+                    rs.row(i)[col].as_ref().map(|v| match v {
+                        Value::Date(d) => *d,
+                        other => unreachable!("date column saw {other:?}"),
+                    })
+                })
+                .collect();
+            Arc::new(Date32Array::from(vals))
+        }
+        ColKind::LocalDateTime => {
+            let vals: Vec<Option<i64>> = (0..rs.len())
+                .map(|i| {
+                    rs.row(i)[col].as_ref().map(|v| match v {
+                        Value::LocalDateTime(us) => *us,
+                        other => unreachable!("local datetime column saw {other:?}"),
+                    })
+                })
+                .collect();
+            Arc::new(TimestampMicrosecondArray::from(vals))
+        }
+        ColKind::DateTime => {
+            let vals: Vec<Option<i64>> = (0..rs.len())
+                .map(|i| {
+                    rs.row(i)[col].as_ref().map(|v| match v {
+                        Value::DateTime { micros_utc, .. } => *micros_utc,
+                        other => unreachable!("datetime column saw {other:?}"),
+                    })
+                })
+                .collect();
+            Arc::new(TimestampMicrosecondArray::from(vals).with_timezone(DATETIME_COLUMN_TZ))
+        }
+        ColKind::Duration => {
+            let vals: Vec<Option<i64>> = (0..rs.len())
+                .map(|i| {
+                    rs.row(i)[col].as_ref().map(|v| match v {
+                        Value::Duration {
+                            months,
+                            days,
+                            nanos,
+                        } => duration_micros(*months, *days, *nanos),
+                        other => unreachable!("duration column saw {other:?}"),
+                    })
+                })
+                .collect();
+            Arc::new(DurationMicrosecondArray::from(vals))
+        }
+        ColKind::Binary => {
+            let vals: Vec<Option<&[u8]>> = (0..rs.len())
+                .map(|i| {
+                    rs.row(i)[col].as_ref().map(|v| match v {
+                        Value::Binary(b) => b.as_slice(),
+                        other => unreachable!("binary column saw {other:?}"),
+                    })
+                })
+                .collect();
+            Arc::new(LargeBinaryArray::from(vals))
+        }
         ColKind::Empty | ColKind::Str | ColKind::Utf8 => {
             let vals: Vec<Option<String>> = (0..rs.len())
                 .map(|i| rs.row(i)[col].as_ref().map(canonical_display))
@@ -134,6 +232,13 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
 /// Policy: all-Int → Int64; any Float among only numerics → Float64;
 /// Bool → Boolean; Str → Utf8; List or mixed types → Utf8 via canonical
 /// display; all-null → Utf8 nulls. Null cells stay null.
+///
+/// Format-V11 types: all-Date → Date32; all-LocalDateTime →
+/// Timestamp(µs, no zone); all-DateTime → Timestamp(µs, "+00:00") holding UTC
+/// instants (per-value offsets dropped, lossy); all-Duration →
+/// Duration(µs) (months dropped and sub-µs nanos truncated, lossy);
+/// all-Binary → LargeBinary. A column mixing these with other types falls
+/// back to Utf8 text like any other mixed column.
 pub fn to_record_batch(rs: &ResultSet) -> Result<RecordBatch, String> {
     let kinds: Vec<ColKind> = (0..rs.columns().len())
         .map(|c| infer_column(rs, c))
@@ -164,4 +269,148 @@ pub fn to_ipc_bytes(rs: &ResultSet) -> Result<Vec<u8>, String> {
         writer.finish().map_err(|e| e.to_string())?;
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::Array;
+
+    fn one_column(values: Vec<Option<Value>>) -> RecordBatch {
+        let mut rs = ResultSet::new(vec!["c".into()]);
+        for v in values {
+            rs.push_row(vec![v]);
+        }
+        to_record_batch(&rs).unwrap()
+    }
+
+    #[test]
+    fn test_arrow_date32_mapping() {
+        // Value::Date(19737) is 2024-01-15 (days since epoch).
+        let v = Value::Date(19737_i32);
+        assert!(matches!(observe(ColKind::Empty, &v), ColKind::Date));
+        let b = one_column(vec![Some(v), None]);
+        assert_eq!(b.schema().field(0).data_type(), &DataType::Date32);
+        let a = b.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
+        assert_eq!(a.value(0), 19737);
+        assert!(a.is_null(1));
+    }
+
+    #[test]
+    fn test_arrow_binary_mapping() {
+        let v = Value::Binary(vec![1, 2, 3]);
+        assert!(matches!(observe(ColKind::Empty, &v), ColKind::Binary));
+        let b = one_column(vec![Some(v), Some(Value::Binary(vec![])), None]);
+        assert_eq!(b.schema().field(0).data_type(), &DataType::LargeBinary);
+        let a = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .unwrap();
+        assert_eq!(a.value(0), &[1, 2, 3]);
+        assert_eq!(a.value(1), &[] as &[u8]);
+        assert!(a.is_null(2));
+    }
+
+    #[test]
+    fn test_arrow_local_datetime_mapping() {
+        let b = one_column(vec![Some(Value::LocalDateTime(-5)), None]);
+        assert_eq!(
+            b.schema().field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        let a = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(a.value(0), -5);
+    }
+
+    #[test]
+    fn test_arrow_datetime_mixed_offsets_become_utc_instants() {
+        // Same instant written with two offsets: the column is UTC and both
+        // cells are the identical UTC microseconds (offsets are dropped).
+        let utc = 1_700_000_000_000_000_i64;
+        let b = one_column(vec![
+            Some(Value::DateTime {
+                micros_utc: utc,
+                offset_seconds: 0,
+            }),
+            Some(Value::DateTime {
+                micros_utc: utc,
+                offset_seconds: -5 * 3600,
+            }),
+        ]);
+        assert_eq!(
+            b.schema().field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into()))
+        );
+        let a = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(a.value(0), utc);
+        assert_eq!(a.value(1), utc);
+    }
+
+    #[test]
+    fn test_arrow_duration_is_lossy_documented() {
+        let b = one_column(vec![
+            Some(Value::Duration {
+                months: 0,
+                days: 2,
+                nanos: 1_500,
+            }),
+            // months are dropped, sub-microsecond nanos truncated
+            Some(Value::Duration {
+                months: 14,
+                days: 0,
+                nanos: 999,
+            }),
+            Some(Value::Duration {
+                months: 0,
+                days: -1,
+                nanos: 0,
+            }),
+            None,
+        ]);
+        assert_eq!(
+            b.schema().field(0).data_type(),
+            &DataType::Duration(TimeUnit::Microsecond)
+        );
+        let a = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<DurationMicrosecondArray>()
+            .unwrap();
+        assert_eq!(a.value(0), 2 * 86_400_000_000 + 1);
+        assert_eq!(a.value(1), 0);
+        assert_eq!(a.value(2), -86_400_000_000);
+        assert!(a.is_null(3));
+    }
+
+    #[test]
+    fn test_arrow_duration_extremes_saturate() {
+        assert_eq!(duration_micros(0, i32::MAX, i64::MAX), i64::MAX);
+        assert_eq!(duration_micros(0, i32::MIN, i64::MIN), i64::MIN);
+    }
+
+    #[test]
+    fn test_arrow_mixed_v11_column_falls_back_to_text() {
+        let b = one_column(vec![Some(Value::Date(19737)), Some(Value::Int(1))]);
+        assert_eq!(b.schema().field(0).data_type(), &DataType::Utf8);
+        let a = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(a.value(0), "2024-01-15");
+        let b = one_column(vec![Some(Value::Date(0)), Some(Value::LocalDateTime(0))]);
+        assert_eq!(b.schema().field(0).data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_arrow_v11_ipc_roundtrip_bytes_nonempty() {
+        let mut rs = ResultSet::new(vec!["b".into(), "d".into()]);
+        rs.push_row(vec![Some(Value::Binary(vec![9])), Some(Value::Date(1))]);
+        assert!(!to_ipc_bytes(&rs).unwrap().is_empty());
+    }
 }
