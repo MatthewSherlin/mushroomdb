@@ -1727,6 +1727,10 @@ const SCALAR_FUNCS: &[&str] = &[
     "pi",
     "e",
     "rand",
+    "toBoolean",
+    "toBooleanOrNull",
+    "toIntegerOrNull",
+    "toFloatOrNull",
 ];
 
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
@@ -2076,6 +2080,9 @@ fn eval_func(
         | "atan" | "atan2" | "pi" | "e" | "rand" => {
             eval_math_scalar(&norm, name, args, view, vars, row, params)
         }
+        "toboolean" | "tobooleanornull" | "tointegerornull" | "tofloatornull" => {
+            eval_convert_scalar(&norm, name, args, view, vars, row, params)
+        }
         _ => Err(format!(
             "unknown function `{name}`; supported: {}",
             SCALAR_FUNCS.join(", ")
@@ -2260,6 +2267,41 @@ fn eval_math_scalar(
         "e" => Some(Value::Float(std::f64::consts::E)),
         "rand" => Some(Value::Float(rand::random::<f64>())),
         _ => return Err(format!("unknown math function `{name}`")),
+    })
+}
+
+/// Type-conversion functions (QL-03d). Every failure to convert is null.
+fn eval_convert_scalar(
+    norm: &str,
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    let a = resolve_fn_args(name, args, 1..=1, view, vars, row, params)?;
+    Ok(match norm {
+        "toboolean" | "tobooleanornull" => match &a[0] {
+            Some(Value::Bool(b)) => Some(Value::Bool(*b)),
+            Some(Value::Int(n)) => Some(Value::Bool(*n != 0)),
+            Some(Value::Str(s)) if s.eq_ignore_ascii_case("true") => Some(Value::Bool(true)),
+            Some(Value::Str(s)) if s.eq_ignore_ascii_case("false") => Some(Value::Bool(false)),
+            _ => None,
+        },
+        "tointegerornull" => match &a[0] {
+            Some(Value::Int(n)) => Some(Value::Int(*n)),
+            Some(Value::Float(f)) if f.is_finite() => Some(Value::Int(*f as i64)),
+            Some(Value::Str(s)) => s.parse::<i64>().ok().map(Value::Int),
+            _ => None,
+        },
+        "tofloatornull" => match &a[0] {
+            Some(Value::Float(f)) => Some(Value::Float(*f)),
+            Some(Value::Int(n)) => Some(Value::Float(*n as f64)),
+            Some(Value::Str(s)) => s.parse::<f64>().ok().map(Value::Float),
+            _ => None,
+        },
+        _ => return Err(format!("unknown conversion function `{name}`")),
     })
 }
 
@@ -9431,5 +9473,59 @@ LIMIT 10";
         assert_eq!(eval("2 ^ 10"), Some(Value::Float(1024.0)));
         assert_eq!(eval("n.nope % 3"), None);
         assert_eq!(eval("2 ^ n.nope"), None);
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is the brief's literal, not an attempt at pi
+    fn ql03d_conversion_values() {
+        assert_eq!(eval("toBoolean(\"true\")"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(\"false\")"), Some(Value::Bool(false)));
+        assert_eq!(eval("toBoolean(\"TRUE\")"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(true)"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(1)"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(0)"), Some(Value::Bool(false)));
+        assert_eq!(eval("toBooleanOrNull(\"false\")"), Some(Value::Bool(false)));
+        assert_eq!(eval("toBooleanOrNull(1)"), Some(Value::Bool(true)));
+        assert_eq!(eval("toIntegerOrNull(\"42\")"), Some(Value::Int(42)));
+        assert_eq!(eval("toIntegerOrNull(7)"), Some(Value::Int(7)));
+        assert_eq!(eval("toIntegerOrNull(3.9)"), Some(Value::Int(3)));
+        assert_eq!(eval("toFloatOrNull(\"3.14\")"), Some(Value::Float(3.14)));
+        assert_eq!(eval("toFloatOrNull(2)"), Some(Value::Float(2.0)));
+        assert_eq!(eval("toFloatOrNull(2.5)"), Some(Value::Float(2.5)));
+    }
+
+    #[test]
+    fn ql03d_conversion_failures_null_and_type_mismatch_are_null() {
+        for f in [
+            "toBoolean",
+            "toBooleanOrNull",
+            "toIntegerOrNull",
+            "toFloatOrNull",
+        ] {
+            assert_eq!(eval(&format!("{f}(n.nope)")), None, "{f}(n.nope)");
+            assert_eq!(eval(&format!("{f}($l)")), None, "{f}(list)");
+        }
+        assert_eq!(eval("toBoolean(\"maybe\")"), None);
+        assert_eq!(eval("toBooleanOrNull(\"x\")"), None);
+        assert_eq!(eval("toBooleanOrNull(1.5)"), None);
+        assert_eq!(eval("toIntegerOrNull(\"abc\")"), None);
+        assert_eq!(eval("toIntegerOrNull(true)"), None);
+        assert_eq!(eval("toFloatOrNull(\"x\")"), None);
+        assert_eq!(eval("toFloatOrNull(true)"), None);
+    }
+
+    #[test]
+    fn ql03d_arity_errors_and_names_are_listed() {
+        assert!(eval_err("toBoolean()").contains("toBoolean() requires"));
+        assert!(eval_err("toFloatOrNull(1, 2)").contains("toFloatOrNull() requires"));
+        let unknown = eval_err("nosuchfn(1)");
+        for f in [
+            "toBoolean",
+            "toBooleanOrNull",
+            "toIntegerOrNull",
+            "toFloatOrNull",
+        ] {
+            assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
+        }
     }
 }
