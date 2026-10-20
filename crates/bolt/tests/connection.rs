@@ -253,7 +253,7 @@ fn illegal_messages_in_ready_are_protocol_violations() {
 
 #[test]
 fn legal_messages_not_built_yet_say_so() {
-    for kind in [MessageKind::Run, MessageKind::Begin, MessageKind::Route] {
+    for kind in [MessageKind::Run, MessageKind::Begin] {
         let mut conn = ready();
         let out = conn.handle(other(kind));
         assert_eq!(
@@ -854,4 +854,74 @@ async fn wire_long_pipeline_is_handled_in_order() {
         .await
         .unwrap();
     task.await.unwrap().unwrap();
+}
+
+fn routed() -> Connection {
+    use bolt::messages::route::RoutingConfig;
+    let routing = RoutingConfig::new(
+        "0.0.0.0:7687".parse().unwrap(),
+        Some("db.example.test"),
+        "mushroomdb",
+    )
+    .unwrap();
+    let mut conn = connection(Duration::from_secs(30)).with_routing(Some(routing));
+    conn.handle(hello("basic", FULL));
+    conn
+}
+
+fn route_message(db: PackValue) -> ClientMessage {
+    ClientMessage::decode(&message_bytes(
+        bolt::messages::TAG_ROUTE,
+        vec![PackValue::Map(vec![]), PackValue::List(vec![]), db],
+    ))
+    .unwrap()
+}
+
+#[test]
+fn route_answers_in_ready_and_stays_ready() {
+    let mut conn = routed();
+    let out = conn.handle(route_message(PackValue::String("mushroomdb".into())));
+    let [ServerMessage::Success(meta)] = out.as_slice() else {
+        panic!("{out:?}")
+    };
+    assert_eq!(meta[0].0, "rt");
+    let text = format!("{:?}", meta[0].1);
+    assert_eq!(text.matches("db.example.test:7687").count(), 3);
+    assert!(!text.contains("0.0.0.0"));
+    assert_eq!(conn.state().name(), "Ready");
+    // Null and the drivers' default name also select the store.
+    for db in [PackValue::Null, PackValue::String("neo4j".into())] {
+        assert!(matches!(
+            conn.handle(route_message(db)).as_slice(),
+            [ServerMessage::Success(_)]
+        ));
+    }
+}
+
+#[test]
+fn route_for_an_unknown_database_fails_and_reset_recovers() {
+    let mut conn = routed();
+    let out = conn.handle(route_message(PackValue::String("other".into())));
+    assert_eq!(
+        failure_code(&out),
+        "Neo.ClientError.Database.DatabaseNotFound"
+    );
+    assert_eq!(conn.state().name(), "Failed");
+    conn.handle(ClientMessage::Reset);
+    assert_eq!(conn.state().name(), "Ready");
+}
+
+#[test]
+fn a_malformed_route_is_a_violation() {
+    let mut conn = routed();
+    let out = conn.handle(other(MessageKind::Route));
+    assert_eq!(failure_code(&out), "Neo.ClientError.Request.Invalid");
+    assert!(conn.is_defunct());
+}
+
+#[test]
+fn route_without_routing_config_is_not_supported() {
+    let mut conn = ready();
+    let out = conn.handle(route_message(PackValue::Null));
+    assert_eq!(failure_code(&out), "Neo.DatabaseError.General.UnknownError");
 }
