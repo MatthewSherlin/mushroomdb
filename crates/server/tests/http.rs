@@ -6796,6 +6796,7 @@ async fn bad_tagged_payloads_are_errors_naming_the_field() {
         "a refused write appended to the WAL"
     );
     assert_eq!(db.read().node_count(), 1);
+}
 
 // ---- CORS (HO-03) ----
 
