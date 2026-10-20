@@ -881,6 +881,27 @@ impl<'a> ColumnsView<'a> {
         }
     }
 
+    /// Every property of node `id`, by field name: overlay first, then the
+    /// archived base, with the same precedence and tombstone masking as
+    /// [`ColumnsView::get`]. One pass over the columns, allocating only for
+    /// the fields the node actually has.
+    pub fn props_of(&self, id: u32) -> std::collections::BTreeMap<String, Value> {
+        let mut out = std::collections::BTreeMap::new();
+        let base_names = self
+            .base
+            .into_iter()
+            .flat_map(|b| b.fields.iter().map(|e| e.name.as_str()));
+        for field in self.overlay.fields().chain(base_names) {
+            if out.contains_key(field) {
+                continue;
+            }
+            if let Some(v) = self.get(id, field) {
+                out.insert(field.to_string(), v.into_value());
+            }
+        }
+        out
+    }
+
     /// Return the raw `f64` vector for `(id, field)` from the archived base.
     ///
     /// Returns `None` when:

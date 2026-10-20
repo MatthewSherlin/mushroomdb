@@ -2108,15 +2108,6 @@ fn eval_func(
 /// and the list would otherwise be allocated before anything could stop it.
 const RANGE_MAX_ELEMENTS: u128 = 10_000_000;
 
-/// A stored value that is a vector (a non-empty list of floats). Vectors are
-/// embeddings for similarity search, not data to hand back from `keys` or
-/// `properties`: the snapshot writer makes the same call when it packs a
-/// column of them.
-fn is_vector_value(v: &Value) -> bool {
-    matches!(v, Value::List(items) if !items.is_empty()
-        && items.iter().all(|i| matches!(i, Value::Float(_))))
-}
-
 /// `range(start, end, step)` with an inclusive end. Null or non-integer
 /// arguments are null; a zero step is an error.
 fn eval_range(a: &[Option<Value>; 3], has_step: bool) -> Result<Option<Value>, String> {
@@ -2149,8 +2140,9 @@ fn eval_range(a: &[Option<Value>; 3], has_step: bool) -> Result<Option<Value>, S
     Ok(Some(Value::List(items)))
 }
 
-/// The properties of a node, relationship or map, vectors left out, in key
-/// order. `None` is null: a null or unmatched binding, a node the scope's
+/// The properties of a node, relationship or map, in key order. Nothing is
+/// left out: a vector-valued property (an embedding) is a list of floats like
+/// any other and appears like any other list. `None` is null: a null or unmatched binding, a node the scope's
 /// mask hides, or an argument that has no properties.
 fn properties_of_arg(
     arg: &Operand,
@@ -2169,23 +2161,13 @@ fn properties_of_arg(
                 if !view.visible(*id) {
                     return Ok(None);
                 }
-                // `field_names` is sorted and de-duplicated, and `get` applies
-                // the tombstones, so a removed property does not show.
-                let props = view
-                    .props
-                    .field_names()
-                    .into_iter()
-                    .filter_map(|field| {
-                        let value = view.prop(*id, &field)?.into_value();
-                        (!is_vector_value(&value)).then_some((field, value))
-                    })
-                    .collect();
+                // One pass over the columns; only fields this node has are
+                // allocated, and tombstoned ones do not show.
+                let props = view.props.props_of(*id);
                 return Ok(Some(props));
             }
             Some(Cell::Rel(e)) => {
-                let mut props = view.edge_props.props_of(e.etype, e.src, e.dst);
-                props.retain(|_, v| !is_vector_value(v));
-                return Ok(Some(props));
+                return Ok(Some(view.edge_props.props_of(e.etype, e.src, e.dst)));
             }
             Some(Cell::Path(_)) | None => return Ok(None),
             Some(Cell::Scalar(_)) => {}
@@ -9838,11 +9820,12 @@ LIMIT 10";
     fn ql03c_keys_and_properties_of_a_node() {
         let fx = props_fixture();
         let view = fx.view();
-        // Vector property `embedding` is left out; the list of mixed values stays.
+        // Every property shows, a vector-valued one like any other list.
         assert_eq!(
             run_one(&view, "MATCH (n:P) WHERE n.name = \"x\" RETURN keys(n)"),
             vec![vec![Some(Value::List(vec![
                 s("age"),
+                s("embedding"),
                 s("name"),
                 s("tags")
             ]))]]
@@ -9854,9 +9837,32 @@ LIMIT 10";
             ),
             vec![vec![Some(Value::Map(BTreeMap::from([
                 ("age".to_string(), i(30)),
+                ("embedding".to_string(), Value::List(vec![f(0.5), f(1.5)])),
                 ("name".to_string(), s("x")),
                 ("tags".to_string(), Value::List(vec![s("t"), i(1)])),
             ])))]]
+        );
+    }
+
+    #[test]
+    fn ql03c_an_all_float_list_appears_in_keys_and_properties() {
+        let mut fx = Fx::new();
+        fx.add(
+            "P",
+            "a",
+            vec![("coords", Value::List(vec![f(1.5), f(2.5)]))],
+        );
+        let view = fx.view();
+        assert_eq!(
+            run_one(&view, "MATCH (n:P) RETURN keys(n), properties(n), n.coords"),
+            vec![vec![
+                Some(Value::List(vec![s("coords")])),
+                Some(Value::Map(BTreeMap::from([(
+                    "coords".to_string(),
+                    Value::List(vec![f(1.5), f(2.5)])
+                )]))),
+                Some(Value::List(vec![f(1.5), f(2.5)])),
+            ]]
         );
     }
 
@@ -9866,14 +9872,14 @@ LIMIT 10";
         let view = fx.view();
         assert_eq!(
             run_one(&view, "MATCH (a:P)-[r:KNOWS]->(b:P) RETURN keys(r)"),
-            vec![vec![Some(Value::List(vec![s("since")]))]]
+            vec![vec![Some(Value::List(vec![s("since"), s("vec")]))]]
         );
         assert_eq!(
             run_one(&view, "MATCH (a:P)-[r:KNOWS]->(b:P) RETURN properties(r)"),
-            vec![vec![Some(Value::Map(BTreeMap::from([(
-                "since".to_string(),
-                i(2020)
-            )])))]]
+            vec![vec![Some(Value::Map(BTreeMap::from([
+                ("since".to_string(), i(2020)),
+                ("vec".to_string(), Value::List(vec![f(1.0)])),
+            ])))]]
         );
     }
 
