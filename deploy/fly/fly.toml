@@ -8,13 +8,15 @@
 #
 # `app` must be globally unique on Fly; `fly launch --copy-config` prompts for it.
 #
-# VOLUME OWNERSHIP: the image runs as uid 65532 (not root). The server needs
-# /data writable by that uid. Fly mounts new volumes root-owned, and the image
-# has no shell to chown with. Check the first deploy's logs: an unwritable data
-# dir surfaces as "store is busy: write lock held by another process" (a
-# misleading message, tracked as a follow-up). If you see it, see
-# docs/site self-host guide (HO-16) for the ownership step. UNVERIFIED without
-# a real deploy.
+# VOLUME OWNERSHIP (UNVERIFIED without a real deploy): the image runs as uid
+# 65532, not root, and the server needs /data writable by that uid. A new Fly
+# volume may be root-owned. No in-image fix is known: the image has no shell, so
+# there is nothing to chown with. If the volume is root-owned, serve fails at
+# start - today with the message `store is busy: write lock held` (HO-12b will
+# name the real cause). Workaround you can try: run a one-off root machine on the
+# same volume (for example `fly machine run debian:bookworm-slim --volume
+# mushroomdb_data:/data --command "chown -R 65532:65532 /data"`), then deploy.
+# That command is untested here.
 
 app = "mushroomdb"
 primary_region = "iad"
