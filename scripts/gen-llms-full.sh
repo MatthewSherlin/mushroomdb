@@ -27,6 +27,7 @@ README="$REPO_ROOT/README.md"
 # Ordered list of site docs — index first, then feature docs, then reference
 SITE_DOCS=(
     index.md
+    get-started.md
     quickstart.md
     install.md
     concepts.md
@@ -78,6 +79,13 @@ done
 # and under --check, so a new page cannot be missing from the output unseen.
 EXCLUDED_DOCS=(
     panic-policy.md   # an internal policy for contributors, not product reference
+    get-started-rust.md        # stub until PS-5 fills it
+    get-started-python.md      # stub until PS-5 fills it
+    get-started-typescript.md  # stub until PS-5 fills it
+    get-started-docker.md      # stub until PS-5 fills it
+    get-started-bolt.md        # stub until the Bolt server lands
+    drivers-bolt.md            # placeholder until the Bolt server lands
+    transactions.md            # placeholder until transactions land
     SUMMARY.md        # the rendered site's sidebar: a list of links, not a page
 )
 

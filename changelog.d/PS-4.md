@@ -1,0 +1,1 @@
+- **Docs site, graph-first**: the sidebar now leads with Get started and the data-model, Cypher, indexes and deploy sections; agent memory and MCP is its own later section. No page was removed.

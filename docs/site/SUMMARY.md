@@ -2,53 +2,88 @@
 
 [Introduction](index.md)
 
-# Start
+# Get started
 
-- [Quickstart](quickstart.md)
+- [Get started](get-started.md)
+- [Rust](get-started-rust.md)
+- [Python](get-started-python.md)
+- [TypeScript](get-started-typescript.md)
+- [Docker](get-started-docker.md)
+- [An existing Cypher app, over Bolt](get-started-bolt.md)
 - [Install](install.md)
+
+# Data model
+
 - [Concepts](concepts.md)
-- [Plugin, skill and hooks](skill.md)
 
-# Guides
+# Cypher reference
 
-- [Agent memory](mcp.md)
-- [Python guide](python.md)
-- [Rules](rules.md)
 - [Query](query.md)
-- [Time travel](timetravel.md)
-- [Access control](masks.md)
+
+# Drivers and Bolt
+
+- [Drivers and Bolt (placeholder)](drivers-bolt.md)
+
+# Transactions
+
+- [Transactions (placeholder)](transactions.md)
+
+# Indexes and constraints
+
+- [Indexes](indexes.md)
 - [Full-text search](fulltext.md)
 - [Vector search](vector.md)
-- [Indexes](indexes.md)
-- [Views](views.md)
-- [Subscriptions](subscriptions.md)
-- [Algorithms](algorithms.md)
-- [Rule suggestion](suggest.md)
+
+# Import and export
+
 - [Git ingest](ingest-git.md)
 
-# Reference
-
-- [CLI](cli.md)
-- [MCP tools](mcp-tools.md)
-- [Overview](api.md)
-- [HTTP API](http.md)
-- [Python API](python-api.md)
-- [Rust](rust.md)
-- [TypeScript client](typescript.md)
-
-# Operate
+# Deploy and backup
 
 - [Running as a service](service.md)
 - [Deployment](deployment.md)
 - [Durability](durability.md)
-- [Concurrency](concurrency.md)
 - [Several processes, one store](multiprocess.md)
-- [Known limits](limits.md)
+
+# Performance
+
 - [Benchmarks](benchmarks.md)
+- [Known limits](limits.md)
+
+# Data safety
+
+- [Concurrency](concurrency.md)
+- [Panic policy](panic-policy.md)
+- [Testing](testing.md)
+
+# Superpowers
+
+- [Rules](rules.md)
+- [Time travel](timetravel.md)
+- [Access control](masks.md)
+- [Subscriptions](subscriptions.md)
+- [Rule suggestion](suggest.md)
+- [Algorithms](algorithms.md)
+- [Views](views.md)
+
+# Agent memory and MCP
+
+- [Quickstart](quickstart.md)
+- [Agent memory](mcp.md)
+- [MCP tools](mcp-tools.md)
+- [Plugin, skill and hooks](skill.md)
 - [The association benchmark](association-bench.md)
+
+# Reference
+
+- [CLI](cli.md)
+- [Overview](api.md)
+- [HTTP API](http.md)
+- [Python guide](python.md)
+- [Python API](python-api.md)
+- [Rust](rust.md)
+- [TypeScript client](typescript.md)
 
 # Project
 
 - [Architecture and roadmap](architecture.md)
-- [Testing](testing.md)
-- [Panic policy](panic-policy.md)

@@ -553,6 +553,9 @@ jobs:
       # The link gate, shown failing on what it guards: a page the sidebar
       # omits, and a site page linking a file the published site does not have.
       - run: bash scripts/tests/test-check-links.sh
+      # No page the sidebar listed before may go missing from it.
+      - run: bash scripts/check-summary-pages.sh
+      - run: bash scripts/tests/test-check-summary-pages.sh
       # llms-full.txt is generated from the README and docs/site. Until 0.7 it
       # was regenerated only by a version bump, so it drifted between releases
       # with nothing to say so.
