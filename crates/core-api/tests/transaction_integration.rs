@@ -507,6 +507,49 @@ fn rule_derived_edges_are_not_visible_inside_tx() {
     assert!(!db.reader().query(derived, &p()).unwrap().is_empty());
 }
 
+/// A transaction's read-your-own-writes view keeps the committed tail's
+/// rule-derived edges exactly as a plain reader sees them (TX-1 × TX-6).
+#[test]
+fn committed_derived_edges_read_the_same_inside_a_tx_with_writes() {
+    let dir = tmp("derived-in-tx");
+    let db = SharedDb::open(&dir).unwrap();
+    db.write()
+        .create_rule(RuleDef {
+            name: "same_tags".into(),
+            src_label: "P".into(),
+            dst_label: "P".into(),
+            predicate: Predicate::Overlap {
+                field: "tags".into(),
+                min: 1.0,
+            },
+            edge_type: "SAME".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        })
+        .unwrap();
+    let mut setup = db.begin_transaction();
+    setup
+        .execute("CREATE (a:P {id: 'a', tags: ['t']})", &p())
+        .unwrap();
+    setup
+        .execute("CREATE (b:P {id: 'b', tags: ['t']})", &p())
+        .unwrap();
+    setup.commit().unwrap();
+
+    let derived = "MATCH (a:P)-[:SAME]->(b:P) RETURN a.id AS s, b.id AS d";
+    let outside = dump_rows(&db.reader().query(derived, &p()).unwrap());
+    assert!(!outside.is_empty(), "the rule derived nothing: vacuous");
+    let mut tx = db.begin_transaction();
+    tx.execute("CREATE (c:P {id: 'c'})", &p()).unwrap();
+    let inside = dump_rows(&tx.execute(derived, &p()).unwrap());
+    assert_eq!(inside, outside);
+}
+
 #[test]
 fn unsupported_write_form_is_refused_and_buffers_nothing() {
     let dir = tmp("unsupported");

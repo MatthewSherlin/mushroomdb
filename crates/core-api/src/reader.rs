@@ -987,6 +987,9 @@ impl ReaderSnapshot {
             Arc::clone(&self.frozen),
             self.base.clone(),
             deltas,
+            // The private delta carries no derived changes (rules fire at
+            // commit only), so the committed tail's derived set is still exact.
+            Arc::clone(&self.tail_derived),
             self.version,
             Arc::new(RoleMaskCache::new()),
         )
