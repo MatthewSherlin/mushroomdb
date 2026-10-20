@@ -2,10 +2,10 @@
 
 use cli::{
     format_backup, format_demo, format_stats, format_suggest, install, maybe_run_demo_if_empty,
-    parse_args, read_stats, run_algo, run_asof, run_backup, run_build_index, run_demo, run_export,
-    run_migrate, run_query, run_schema_apply, run_schema_apply_memory_defaults,
-    run_schema_apply_memory_identity, run_snapshot, run_suggest, run_verify, usage, Command,
-    ServeUi,
+    parse_args, read_stats, resolve_statement, run_algo, run_asof, run_backup, run_build_index,
+    run_demo, run_export, run_migrate, run_query, run_schema_apply,
+    run_schema_apply_memory_defaults, run_schema_apply_memory_identity, run_snapshot, run_suggest,
+    run_verify, usage, Command, ServeUi,
 };
 use mushroomdb::{GraphError, SharedDb};
 use std::collections::HashMap;
@@ -236,14 +236,24 @@ fn main() -> ExitCode {
             commit,
             at,
             query,
+            file,
+            stdin,
             namespace,
-        }) => match run_asof(
-            &db_dir,
-            commit,
-            at.as_deref(),
+        }) => match resolve_statement(
             query.as_deref(),
-            namespace.as_deref(),
-        ) {
+            file.as_deref(),
+            stdin,
+            &mut std::io::stdin(),
+        )
+        .and_then(|statement| {
+            run_asof(
+                &db_dir,
+                commit,
+                at.as_deref(),
+                statement.as_deref(),
+                namespace.as_deref(),
+            )
+        }) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -276,9 +286,19 @@ fn main() -> ExitCode {
         Ok(Command::Query {
             db_dir,
             cypher,
+            file,
+            stdin,
             role,
             namespace,
-        }) => match run_query(&db_dir, &cypher, role.as_deref(), namespace.as_deref()) {
+        }) => match resolve_statement(Some(&cypher), file.as_deref(), stdin, &mut std::io::stdin())
+            .and_then(|statement| {
+                run_query(
+                    &db_dir,
+                    statement.as_deref().unwrap_or_default(),
+                    role.as_deref(),
+                    namespace.as_deref(),
+                )
+            }) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
