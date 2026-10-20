@@ -4,8 +4,8 @@
 //! not `Value`'s internally-tagged serde form.
 
 use mushroomdb::{
-    default_max_edges, json_to_value, EdgeEvent, EdgeHistoryEvent, EdgeInfo, HistoryChange,
-    HistoryEntry, HistoryResult, MaskedEdge, NodeInfo, ResultSet, RuleDef, Value,
+    default_max_edges, json_to_value, tagged_json, EdgeEvent, EdgeHistoryEvent, EdgeInfo,
+    HistoryChange, HistoryEntry, HistoryResult, MaskedEdge, NodeInfo, ResultSet, RuleDef, Value,
 };
 use serde_json::{json, Value as Js};
 use std::collections::BTreeMap;
@@ -26,6 +26,11 @@ pub(crate) fn value_to_json(v: &Value) -> Js {
                 .collect();
             Js::Object(obj)
         }
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        | Value::Binary(_) => tagged_json(v).unwrap_or(Js::Null),
     }
 }
 
@@ -316,4 +321,53 @@ pub(crate) fn rule_def_from_json(v: Js) -> Result<RuleDef, String> {
         def.weight_prop = Some("weight".into());
     }
     Ok(def)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::value_to_json;
+    use mushroomdb::{json_to_value, Value};
+    use serde_json::json;
+
+    /// Every format-V11 type prints in its tagged wire form, and that form
+    /// parses back to the same value.
+    #[test]
+    fn test_value_json_roundtrip() {
+        let cases = [
+            (Value::Date(19_737), json!({"$date": "2024-01-15"})),
+            (
+                Value::LocalDateTime(1_705_322_096_789_012),
+                json!({"$ldt": "2024-01-15T12:34:56.789012"}),
+            ),
+            (
+                Value::DateTime {
+                    micros_utc: 1_705_302_296_789_012,
+                    offset_seconds: 19_800,
+                },
+                json!({"$dt": "2024-01-15T12:34:56.789012+05:30"}),
+            ),
+            (
+                Value::Duration {
+                    months: 14,
+                    days: 3,
+                    nanos: 14_706_789_000_000,
+                },
+                json!({"$dur": "P1Y2M3DT4H5M6.789S"}),
+            ),
+            (
+                Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+                json!({"$binary": "3q2+7w=="}),
+            ),
+        ];
+        for (value, wire) in cases {
+            assert_eq!(value_to_json(&value), wire);
+            assert_eq!(json_to_value(wire), Some(value));
+        }
+        // Nested in a list, each keeps its form.
+        let list = Value::List(vec![Value::Date(0), Value::Binary(vec![])]);
+        assert_eq!(
+            value_to_json(&list),
+            json!([{"$date": "1970-01-01"}, {"$binary": ""}])
+        );
+    }
 }

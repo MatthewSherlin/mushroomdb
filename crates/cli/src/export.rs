@@ -80,6 +80,11 @@ fn value_to_json(v: &Value) -> serde_json::Value {
                 .map(|(k, v)| (k.clone(), value_to_json(v)))
                 .collect(),
         ),
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        | Value::Binary(_) => mushroomdb::tagged_json(v).unwrap_or(serde_json::Value::Null),
     }
 }
 
@@ -326,6 +331,12 @@ fn value_gml_type(v: &Value) -> GmlType {
         Value::Float(_) => GmlType::Double,
         Value::Bool(_) => GmlType::Boolean,
         Value::Str(_) | Value::List(_) | Value::Map(_) => GmlType::String,
+        // Tagged JSON text until GraphML gets typed temporal attributes.
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        | Value::Binary(_) => GmlType::String,
     }
 }
 
@@ -590,4 +601,25 @@ pub fn write_graphml(
 
     std::fs::write(&file_path, out)?;
     Ok(file_path)
+}
+
+#[cfg(test)]
+mod v11_value_tests {
+    use super::{value_gml_text, value_gml_type, value_to_json, GmlType};
+    use mushroomdb::{json_to_value, Value};
+    use serde_json::json;
+
+    /// Export writes the tagged wire form, so an exported store re-imports
+    /// with its types intact.
+    #[test]
+    fn export_writes_the_tagged_form_that_reimports() {
+        let date = Value::Date(19_737);
+        assert_eq!(value_to_json(&date), json!({"$date": "2024-01-15"}));
+        assert_eq!(json_to_value(value_to_json(&date)), Some(date.clone()));
+        let blob = Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(json_to_value(value_to_json(&blob)), Some(blob.clone()));
+        // GraphML carries the tagged JSON text in a string attribute.
+        assert!(matches!(value_gml_type(&date), GmlType::String));
+        assert_eq!(value_gml_text(&date), r#"{"$date":"2024-01-15"}"#);
+    }
 }

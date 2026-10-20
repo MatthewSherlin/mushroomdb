@@ -31,6 +31,10 @@ fn is_orderable_pair(lhs: &Value, rhs: &Value) -> bool {
             Value::Int(_) | Value::Float(_),
             Value::Int(_) | Value::Float(_)
         ) | (Value::Str(_), Value::Str(_))
+            | (Value::Date(_), Value::Date(_))
+            | (Value::LocalDateTime(_), Value::LocalDateTime(_))
+            | (Value::DateTime { .. }, Value::DateTime { .. })
+            | (Value::Binary(_), Value::Binary(_))
     )
 }
 
@@ -253,5 +257,46 @@ mod tests {
         };
         assert!(eval_filter(&ne_age, &get_ada));
         assert!(!eval_filter(&ne_same, &get_ada));
+    }
+
+    #[test]
+    fn new_types_compare_within_their_own_type() {
+        let lt = CmpOp::Lt;
+        assert!(eval_cmp(&lt, &Value::Date(1), &Value::Date(2)));
+        assert!(eval_cmp(
+            &lt,
+            &Value::LocalDateTime(1),
+            &Value::LocalDateTime(2)
+        ));
+        let early = Value::DateTime {
+            micros_utc: 1,
+            offset_seconds: 3_600,
+        };
+        let late = Value::DateTime {
+            micros_utc: 2,
+            offset_seconds: 0,
+        };
+        assert!(eval_cmp(&lt, &early, &late));
+        assert!(eval_cmp(
+            &lt,
+            &Value::Binary(vec![0]),
+            &Value::Binary(vec![1])
+        ));
+        // Across types, and on durations (not totally ordered), `<` is false.
+        assert!(!eval_cmp(&lt, &Value::Date(1), &Value::LocalDateTime(2)));
+        assert!(!eval_cmp(&lt, &Value::Date(1), &Value::Int(2)));
+        let d = |months| Value::Duration {
+            months,
+            days: 0,
+            nanos: 0,
+        };
+        assert!(!eval_cmp(&lt, &d(1), &d(2)));
+        assert!(eval_cmp(&CmpOp::Eq, &d(1), &d(1)));
+        // `=` on DateTime is the UTC instant.
+        let same_instant = Value::DateTime {
+            micros_utc: 2,
+            offset_seconds: -3_600,
+        };
+        assert!(eval_cmp(&CmpOp::Eq, &late, &same_instant));
     }
 }

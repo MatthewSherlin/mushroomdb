@@ -75,6 +75,13 @@ pub struct IngestReport {
 /// **Behavior change from pre-Map:** JSON objects previously returned `None`
 /// (treated as a skipped/error field by `ingest_json`). They now produce
 /// `Value::Map` so nested objects are stored faithfully.
+///
+/// An object with exactly one key that is a type tag and a string value is
+/// the typed form of a format-V11 value: `{"$date": "2024-01-15"}`,
+/// `{"$ldt": …}`, `{"$dt": …}`, `{"$dur": …}` and `{"$binary": "<base64>"}`
+/// (see [`tagged_json`], the inverse). A bare string is always [`Value::Str`],
+/// never a date. A tagged object whose text does not parse stays the
+/// [`Value::Map`] it was before these types existed.
 pub fn json_to_value(v: serde_json::Value) -> Option<Value> {
     match v {
         serde_json::Value::Null => None,
@@ -89,6 +96,9 @@ pub fn json_to_value(v: serde_json::Value) -> Option<Value> {
             Some(Value::List(out))
         }
         serde_json::Value::Object(obj) => {
+            if let Some(typed) = tagged_object_value(&obj) {
+                return Some(typed);
+            }
             let mut map = std::collections::BTreeMap::new();
             for (k, v) in obj {
                 if let Some(val) = json_to_value(v) {
@@ -98,6 +108,27 @@ pub fn json_to_value(v: serde_json::Value) -> Option<Value> {
             Some(Value::Map(map))
         }
     }
+}
+
+/// The typed value a single-key tagged object names, if it is one.
+fn tagged_object_value(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Value> {
+    if obj.len() != 1 {
+        return None;
+    }
+    let (tag, text) = obj.iter().next()?;
+    core_storage::value_from_tagged_text(tag, text.as_str()?)
+}
+
+/// The tagged JSON object of a format-V11 value — `{"$date": "2024-01-15"}` —
+/// or `None` for the types JSON carries untagged.
+///
+/// The inverse of the tagged-object branch of [`json_to_value`]. Every JSON
+/// encoder of `Value` calls this, so they all write the one form it reads.
+pub fn tagged_json(v: &Value) -> Option<serde_json::Value> {
+    let (tag, text) = core_storage::tagged_text(v)?;
+    let mut obj = serde_json::Map::with_capacity(1);
+    obj.insert(tag.to_string(), serde_json::Value::String(text));
+    Some(serde_json::Value::Object(obj))
 }
 
 fn number_to_value(n: &serde_json::Number) -> Option<Value> {
@@ -361,4 +392,89 @@ fn infer_auto_fk<F: Fs>(
     }
 
     (new_rules, skipped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{json_to_value, tagged_json};
+    use core_storage::Value;
+    use serde_json::json;
+
+    #[test]
+    fn test_value_json_roundtrip() {
+        // Date: 2024-01-15 = days 19737 since 1970-01-01.
+        let date = Value::Date(19_737);
+        let j = tagged_json(&date).unwrap();
+        assert_eq!(j, json!({"$date": "2024-01-15"}));
+        assert_eq!(json_to_value(j), Some(date));
+        // Binary: base64 roundtrip.
+        let bin = Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let j = tagged_json(&bin).unwrap();
+        assert_eq!(j, json!({"$binary": "3q2+7w=="}));
+        assert_eq!(json_to_value(j), Some(bin));
+    }
+
+    #[test]
+    fn every_tagged_form_parses_to_its_type() {
+        let cases = [
+            (json!({"$date": "2024-01-15"}), Value::Date(19_737)),
+            (
+                json!({"$ldt": "2024-01-15T12:34:56.789012"}),
+                Value::LocalDateTime(1_705_322_096_789_012),
+            ),
+            (
+                json!({"$dt": "2024-01-15T12:34:56.789012+05:30"}),
+                Value::DateTime {
+                    micros_utc: 1_705_302_296_789_012,
+                    offset_seconds: 19_800,
+                },
+            ),
+            (
+                json!({"$dur": "P1Y2M3DT4H5M6.789S"}),
+                Value::Duration {
+                    months: 14,
+                    days: 3,
+                    nanos: 14_706_789_000_000,
+                },
+            ),
+            (json!({"$binary": ""}), Value::Binary(vec![])),
+        ];
+        for (j, want) in cases {
+            assert_eq!(json_to_value(j.clone()).as_ref(), Some(&want), "{j}");
+            assert_eq!(tagged_json(&want), Some(j));
+        }
+        // Tagged values nest inside lists and maps like any other value.
+        assert_eq!(
+            json_to_value(json!([{"$date": "1970-01-01"}, {"k": {"$binary": "AA=="}}])),
+            Some(Value::List(vec![
+                Value::Date(0),
+                Value::Map([("k".to_string(), Value::Binary(vec![0]))].into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn bare_strings_and_near_miss_objects_keep_their_old_meaning() {
+        // A bare ISO string is a string, never a date.
+        assert_eq!(
+            json_to_value(json!("2024-01-15")),
+            Some(Value::Str("2024-01-15".into()))
+        );
+        // Not a tagged form: two keys, a non-string payload, an unknown tag,
+        // or text that does not parse. Each stays the map it always was.
+        for j in [
+            json!({"$date": "2024-01-15", "x": 1}),
+            json!({"$date": 19737}),
+            json!({"$time": "12:00"}),
+            json!({"$date": "not-a-date"}),
+            json!({"$binary": "not base64!"}),
+        ] {
+            assert!(
+                matches!(json_to_value(j.clone()), Some(Value::Map(_))),
+                "{j}"
+            );
+        }
+        // Untagged types have no tagged form.
+        assert_eq!(tagged_json(&Value::Int(1)), None);
+    }
 }

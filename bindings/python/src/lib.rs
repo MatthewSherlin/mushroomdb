@@ -3133,6 +3133,18 @@ fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
             }
             Ok(dict.into_any())
         }
+        Value::Binary(bytes) => Ok(pyo3::types::PyBytes::new(py, bytes).into_any()),
+        // Until the Python temporal types land, a date, time or duration
+        // reads as its ISO 8601 text.
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. } => {
+            let text = core_storage::tagged_text(v)
+                .map(|(_, text)| text)
+                .unwrap_or_default();
+            Ok(text.into_pyobject(py)?.into_any())
+        }
     }
 }
 

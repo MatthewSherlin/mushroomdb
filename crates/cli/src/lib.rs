@@ -2980,6 +2980,13 @@ fn fmt_value(v: &Value) -> String {
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        | Value::Binary(_) => mushroomdb::tagged_text(v)
+            .map(|(_, text)| text)
+            .unwrap_or_default(),
     }
 }
 

@@ -72,6 +72,15 @@ fn canonical_display(v: &Value) -> String {
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
+        // Until typed Arrow columns exist, a format-V11 value is its ISO 8601
+        // (or base64) text in a Utf8 column.
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        | Value::Binary(_) => core_query::tagged_text(v)
+            .map(|(_, text)| text)
+            .unwrap_or_default(),
     }
 }
 

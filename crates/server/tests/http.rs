@@ -6579,3 +6579,113 @@ async fn a_pagerank_damping_outside_zero_to_one_is_refused() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Format-V11 values (0.10 TY-1): the JSON wire forms parse and print, but until
+// the V11 format lands no write may store one — every HTTP write path refuses
+// it before anything reaches the WAL.
+// ---------------------------------------------------------------------------
+
+const V11_DATE_REFUSAL: &str = "not supported in mushroomdb 0.10 yet: Date values cannot be \
+                                stored until the V11 format lands";
+
+fn wal_bytes(dir: &std::path::Path) -> Vec<u8> {
+    std::fs::read(dir.join("wal.bin")).unwrap_or_default()
+}
+
+async fn assert_v11_write_refused(name: &str, uri: &str, body: Json) {
+    let dir = tmp(name);
+    let db = SharedDb::open(&dir).unwrap();
+    seed_person(&db, "alice");
+    let before = wal_bytes(&dir);
+    let (status, resp, _) = send(router(db.clone()), json_req("POST", uri, body)).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    let err = parse_json(&resp)["error"].as_str().unwrap().to_string();
+    assert!(err.contains(V11_DATE_REFUSAL), "{err}");
+    assert_eq!(
+        wal_bytes(&dir),
+        before,
+        "a refused write appended to the WAL"
+    );
+    assert_eq!(db.read().node_count(), 1);
+}
+
+#[tokio::test]
+async fn ingest_with_a_tagged_date_is_refused_and_writes_nothing() {
+    assert_v11_write_refused(
+        "v11-ingest",
+        "/ingest",
+        json!({
+            "label": "Person",
+            "rows": [{"id": "bob", "born": {"$date": "2024-01-15"}}],
+            "options": {"auto_fk": "off"}
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn create_node_with_a_tagged_date_is_refused_and_writes_nothing() {
+    assert_v11_write_refused(
+        "v11-create-node",
+        "/nodes",
+        json!({"label": "Person", "key": "bob", "props": {"born": {"$date": "2024-01-15"}}}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cypher_set_with_a_tagged_date_param_is_refused_and_writes_nothing() {
+    assert_v11_write_refused(
+        "v11-cypher-set",
+        "/query",
+        json!({
+            "cypher": "MATCH (n:Person) WHERE n.id = 'alice' SET n.born = $d",
+            "params": {"d": {"$date": "2024-01-15"}}
+        }),
+    )
+    .await;
+}
+
+/// The read path is open: a tagged parameter comes back in its tagged form.
+#[tokio::test]
+async fn query_returns_tagged_params_in_their_wire_form() {
+    let (app, db) = open("v11-query-roundtrip");
+    seed_person(&db, "alice");
+    let wire = json!([
+        {"$date": "2024-01-15"},
+        {"$ldt": "2024-01-15T12:34:56.789012"},
+        {"$dt": "2024-01-15T12:34:56.789012+05:30"},
+        {"$dur": "P1Y2M3DT4H5M6.789S"},
+        {"$binary": "3q2+7w=="},
+    ]);
+    for form in wire.as_array().unwrap() {
+        let (status, body, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/query?format=json",
+                json!({"cypher": "MATCH (n:Person) RETURN $d AS d", "params": {"d": form}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(&parse_json(&body)["rows"][0][0], form);
+    }
+    // A bare ISO string stays a string.
+    let (_, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": "MATCH (n:Person) RETURN $d AS d", "params": {"d": "2024-01-15"}}),
+        ),
+    )
+    .await;
+    assert_eq!(parse_json(&body)["rows"][0][0], json!("2024-01-15"));
+}
