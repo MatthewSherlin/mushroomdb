@@ -38,6 +38,7 @@ SITE_DOCS=(
     mcp-tools.md
     association-bench.md
     ingest-git.md
+    bolt.md
     query.md
     api.md
     http.md
