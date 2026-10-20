@@ -24,7 +24,16 @@
 //!   set.
 //! - **Edges** have no precondition of their own. An edge read or written puts
 //!   both endpoint keys in the set, which is enough because `last_change`
-//!   advances both endpoints on every edge insert and delete.
+//!   advances both endpoints on every explicit edge insert and delete.
+//!   A `DETACH DELETE` is the exception: the WAL holds only the `DeleteNode`,
+//!   and the edges it removes implicitly advance no neighbour's
+//!   `last_change`. So a transaction that read or wrote only a neighbour `y`
+//!   of a node another writer detach-deleted still commits — allowed under
+//!   snapshot isolation, because it never read the removed edge (reading the
+//!   edge would have put the deleted node itself in the set, and that node is
+//!   gone). Pinned by `neighbour_of_concurrent_detach_delete_does_not_conflict`.
+//!   A transaction's *own* `DETACH DELETE` records both endpoints of every edge
+//!   it removes, so a concurrent write to such a neighbour does conflict with it.
 //! - **A key absent at BEGIN** is recorded with `expected = 0`, so another
 //!   writer inserting that key before the commit is a conflict.
 //! - **Write skew through a label scan is possible.** A read records the keys
@@ -92,10 +101,15 @@ use crate::shared::SharedDb;
 /// isolation model and the supported statements.
 ///
 /// Obtained from [`SharedDb::begin_transaction`]. Holds no lock: other readers
-/// and writers proceed while it is open. Dropping it without calling
+/// and writers proceed while it is open. Owns a clone of the [`SharedDb`]
+/// handle, so it carries no lifetime and is `Send`: it can be stored and
+/// moved between threads while open. Dropping it without calling
 /// [`commit`](Self::commit) is a rollback.
-pub struct Transaction<'db> {
-    db: &'db SharedDb,
+pub struct Transaction {
+    /// A clone of the handle BEGIN ran on — cheap (`Arc`s), and what lets a
+    /// transaction outlive the borrow it was opened from: a server's map of
+    /// open transactions, a Python object, a Bolt connection.
+    db: SharedDb,
     /// Mutations to submit at COMMIT, in statement order.
     buffer: Vec<BatchOp>,
     /// The state every statement reads, frozen at BEGIN.
@@ -110,6 +124,11 @@ pub struct Transaction<'db> {
     /// `base_snap` plus `records`; `None` while nothing is buffered.
     overlay: Option<ReaderSnapshot>,
 }
+
+const _: () = {
+    fn assert_send<T: Send>() {}
+    let _ = assert_send::<Transaction>;
+};
 
 /// One statement's effect, held until the statement has fully succeeded.
 #[derive(Default)]
@@ -273,8 +292,8 @@ fn keys_in(rs: &ResultSet, vars: &[String], out: &mut Vec<String>) {
     }
 }
 
-impl<'db> Transaction<'db> {
-    pub(crate) fn new(db: &'db SharedDb, base_snap: ReaderSnapshot, base_store: StoreId) -> Self {
+impl Transaction {
+    pub(crate) fn new(db: SharedDb, base_snap: ReaderSnapshot, base_store: StoreId) -> Self {
         Self {
             db,
             buffer: Vec::new(),
