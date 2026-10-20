@@ -9,6 +9,7 @@
 
 pub mod hello;
 pub mod reset;
+pub mod route;
 
 use crate::error::BoltError;
 use crate::packstream::{self, PackStruct, PackValue};

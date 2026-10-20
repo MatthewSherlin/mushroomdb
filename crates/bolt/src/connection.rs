@@ -36,7 +36,9 @@ use crate::framing;
 use crate::handshake;
 use crate::messages::hello::{hello_success, Identity, TokenAuthenticator};
 use crate::messages::reset::reset_success;
+use crate::messages::route::{requested_database, RoutingConfig};
 use crate::messages::{ClientMessage, MessageKind, ServerMessage};
+use crate::packstream::PackValue;
 
 /// Default idle limit for an open transaction.
 pub const DEFAULT_TX_TIMEOUT: Duration = Duration::from_secs(30);
@@ -113,6 +115,9 @@ pub struct Connection {
     /// The failure to report for the next request after the connection failed
     /// without a request to answer (a transaction timeout).
     pending_failure: Option<BoltError>,
+    /// Answers `ROUTE` and database selection; `ROUTE` is not supported
+    /// without it.
+    routing: Option<RoutingConfig>,
 }
 
 impl Connection {
@@ -130,7 +135,14 @@ impl Connection {
             connection_id,
             version,
             pending_failure: None,
+            routing: None,
         }
+    }
+
+    /// Sets the routing config that answers `ROUTE`.
+    pub fn with_routing(mut self, routing: Option<RoutingConfig>) -> Self {
+        self.routing = routing;
+        self
     }
 
     pub fn state(&self) -> &ConnectionState {
@@ -322,6 +334,9 @@ impl Connection {
                 "HELLO is not allowed in state {}",
                 self.state.name()
             ))),
+            ClientMessage::Other(MessageKind::Route, fields) if self.allows(MessageKind::Route) => {
+                self.handle_route(&fields)
+            }
             ClientMessage::Other(kind, _) => {
                 if self.allows(kind) {
                     self.fail(BoltError::NotSupported(format!(
@@ -334,6 +349,24 @@ impl Connection {
                     )))
                 }
             }
+        }
+    }
+
+    /// `ROUTE`: answers from the routing config and stays in `Ready`. A
+    /// malformed request is a protocol violation; an unknown database fails.
+    fn handle_route(&mut self, fields: &[PackValue]) -> Vec<ServerMessage> {
+        let Some(routing) = self.routing.clone() else {
+            return self.fail(BoltError::NotSupported(
+                "ROUTE is not supported on this listener".into(),
+            ));
+        };
+        let requested = match requested_database(fields) {
+            Ok(requested) => requested,
+            Err(err) => return self.violate(err),
+        };
+        match routing.route(requested.as_deref()) {
+            Ok(reply) => vec![reply],
+            Err(err) => self.fail(err),
         }
     }
 
@@ -375,6 +408,8 @@ pub struct ConnectionConfig {
     /// unauthenticated client sends needs more, and each connection buffers up
     /// to this much.
     pub pre_auth_max_message_bytes: usize,
+    /// Answers `ROUTE`. `None` leaves `ROUTE` unsupported.
+    pub routing: Option<RoutingConfig>,
 }
 
 impl Default for ConnectionConfig {
@@ -386,6 +421,7 @@ impl Default for ConnectionConfig {
             write_timeout: Duration::from_secs(30),
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             pre_auth_max_message_bytes: DEFAULT_PRE_AUTH_MAX_MESSAGE_BYTES,
+            routing: None,
         }
     }
 }
@@ -448,7 +484,8 @@ where
         return Ok(());
     };
 
-    let mut connection = Connection::new(authenticator, config.tx_timeout, connection_id, version);
+    let mut connection = Connection::new(authenticator, config.tx_timeout, connection_id, version)
+        .with_routing(config.routing.clone());
     let mut buf: Vec<u8> = Vec::new();
     // When the bytes now in `buf` began to wait for the rest of their message.
     let mut partial_since: Option<tokio::time::Instant> = None;

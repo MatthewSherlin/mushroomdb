@@ -13,12 +13,13 @@
 //! 3. **Delta chain bounded**: at most `FOLD_EVERY_K − 1` deltas in the tail
 //!    (fold resets the counter synchronously on the write path).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use core_query::cypher::{execute, is_write_tokens, lex, parse, plan, Params};
 use core_query::{expand, neighborhood, Dir, GraphView, ResultSet};
 use core_storage::fulltext::FulltextIndex;
+use core_storage::v8::seam::{ArchivedNeighbor, DerivedBits};
 use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::v8::MappedBase;
 use core_storage::wal::WalRecord;
@@ -51,6 +52,376 @@ pub struct CommitDelta {
     pub view_values: Vec<(u32, String, Option<Value>)>,
 }
 
+/// An edge as the rule engine owns it: `(etype_sym, src_id, dst_id)`.
+pub type DerivedTriple = (u32, u32, u32);
+
+/// Layers a fold carries before it compacts them into one.
+const MAX_DERIVED_LAYERS: usize = 8;
+
+/// Node lists longer than this are kept sorted and searched; shorter ones are
+/// scanned, which is faster and needs no sort at build.
+const SCAN_LIMIT: usize = 8;
+
+/// The derived triples touching each node, as two flat arrays (compressed rows):
+/// `entries[offsets[n]..offsets[n + 1]]` is every triple with `n` as its source
+/// or its destination, a triple listed under both. Built by counting, with no
+/// per-node allocation and no hashing; a `node_edges` call reads one row.
+struct NodeIndex {
+    offsets: Vec<u32>,
+    entries: Vec<DerivedTriple>,
+}
+
+impl NodeIndex {
+    fn empty() -> Self {
+        Self {
+            offsets: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    fn build(triples: &[DerivedTriple]) -> Self {
+        let Some(max_node) = triples.iter().map(|&(_, src, dst)| src.max(dst)).max() else {
+            return Self::empty();
+        };
+        let rows = max_node as usize + 1;
+        let mut offsets = vec![0u32; rows + 1];
+        for &(_, src, dst) in triples {
+            offsets[src as usize + 1] += 1;
+            if dst != src {
+                offsets[dst as usize + 1] += 1;
+            }
+        }
+        for row in 0..rows {
+            offsets[row + 1] += offsets[row];
+        }
+        let mut next = offsets.clone();
+        let mut entries = vec![(0, 0, 0); offsets[rows] as usize];
+        for &triple @ (_, src, dst) in triples {
+            entries[next[src as usize] as usize] = triple;
+            next[src as usize] += 1;
+            if dst != src {
+                entries[next[dst as usize] as usize] = triple;
+                next[dst as usize] += 1;
+            }
+        }
+        for row in 0..rows {
+            let (from, to) = (offsets[row] as usize, offsets[row + 1] as usize);
+            if to - from > SCAN_LIMIT {
+                entries[from..to].sort_unstable();
+            }
+        }
+        Self { offsets, entries }
+    }
+
+    fn row(&self, node: u32) -> &[DerivedTriple] {
+        let node = node as usize;
+        match (self.offsets.get(node), self.offsets.get(node + 1)) {
+            (Some(&from), Some(&to)) => &self.entries[from as usize..to as usize],
+            _ => &[],
+        }
+    }
+}
+
+fn row_contains(row: &[DerivedTriple], triple: DerivedTriple) -> bool {
+    if row.len() <= SCAN_LIMIT {
+        row.contains(&triple)
+    } else {
+        row.binary_search(&triple).is_ok()
+    }
+}
+
+/// A set of changes to which edges are derived — `true` where a rule owns the
+/// triple afterwards, `false` where none does — grouped by node, so that a
+/// `node_edges` call finds a node's changes with one search however many edges
+/// the node has. The nodes are a sorted array, searched in place: for the few
+/// nodes a commit touches that beats hashing, and a read probes up to 63 of
+/// these.
+///
+/// One per commit (in its [`CommitDelta`]) and one per fold layer.
+#[derive(Default)]
+pub struct DerivedChanges {
+    /// Nodes with changes, ascending.
+    nodes: Vec<u32>,
+    /// `entries[starts[i]..starts[i + 1]]` are the changes touching `nodes[i]`,
+    /// ascending by triple; a triple is listed under both of its endpoints.
+    starts: Vec<u32>,
+    entries: Vec<(DerivedTriple, bool)>,
+    /// Distinct triples.
+    count: usize,
+}
+
+impl DerivedChanges {
+    /// Index a net set of changes: one final state per triple.
+    pub fn from_net(net: &HashMap<DerivedTriple, bool>) -> Self {
+        let mut pairs: Vec<(u32, DerivedTriple, bool)> = Vec::with_capacity(net.len() * 2);
+        for (&triple, &state) in net {
+            pairs.push((triple.1, triple, state));
+            if triple.2 != triple.1 {
+                pairs.push((triple.2, triple, state));
+            }
+        }
+        pairs.sort_unstable_by_key(|&(node, triple, _)| (node, triple));
+        let mut nodes = Vec::new();
+        let mut starts = Vec::new();
+        let mut entries = Vec::with_capacity(pairs.len());
+        for (node, triple, state) in pairs {
+            if nodes.last() != Some(&node) {
+                nodes.push(node);
+                starts.push(entries.len() as u32);
+            }
+            entries.push((triple, state));
+        }
+        starts.push(entries.len() as u32);
+        Self {
+            nodes,
+            starts,
+            entries,
+            count: net.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// The changes touching `node`, sorted by triple.
+    fn for_node(&self, node: u32) -> &[(DerivedTriple, bool)] {
+        match self.nodes.binary_search(&node) {
+            Ok(i) => &self.entries[self.starts[i] as usize..self.starts[i + 1] as usize],
+            Err(_) => &[],
+        }
+    }
+
+    fn net(&self) -> HashMap<DerivedTriple, bool> {
+        let mut net = HashMap::with_capacity(self.count);
+        for (i, &node) in self.nodes.iter().enumerate() {
+            let row = &self.entries[self.starts[i] as usize..self.starts[i + 1] as usize];
+            net.extend(row.iter().filter(|(t, _)| t.1 == node).copied());
+        }
+        net
+    }
+}
+
+enum DerivedRoot {
+    /// Taken from the engine's provenance when the fold was built.
+    Index(NodeIndex),
+    /// The snapshot base. Its derived-bits section answers for each edge in
+    /// place; a snapshot that predates the section is answered from a table
+    /// built from its PROVENANCE section by the first read that needs it.
+    Base(OnceLock<NodeIndex>),
+}
+
+/// A [`DerivedRoot`] resolved against the base it reads.
+enum RootRef<'a> {
+    Empty,
+    Table(&'a NodeIndex),
+    Bits(DerivedBits<'a>, &'a MappedBase),
+}
+
+impl RootRef<'_> {
+    fn contains(&self, triple: DerivedTriple) -> bool {
+        match self {
+            RootRef::Empty => false,
+            RootRef::Table(index) => row_contains(index.row(triple.1), triple),
+            RootRef::Bits(bits, base) => base
+                .topology()
+                .is_ok_and(|csr| bits.edge_is_derived(csr, triple.0, triple.1, triple.2)),
+        }
+    }
+}
+
+/// Multiplicative hash for node ids: they are small integers already spread by
+/// allocation order, so SipHash's cost buys nothing here.
+#[derive(Default, Clone, Copy)]
+struct NodeHasher(u64);
+
+impl std::hash::Hasher for NodeHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 = (self.0 << 8) | u64::from(byte);
+        }
+    }
+
+    fn write_u32(&mut self, node: u32) {
+        self.0 = u64::from(node).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type NodeHashBuilder = std::hash::BuildHasherDefault<NodeHasher>;
+
+/// The derived-edge changes of the unfolded delta tail, in one index: what every
+/// commit since the last fold left each triple as, grouped by node, so a read
+/// asks for the tail's state with one lookup instead of one per commit.
+///
+/// The writer appends each commit's changes as the commit is recorded and
+/// starts over at a fold, where the changes move into the fold's layers.
+#[derive(Default, Clone)]
+pub struct TailDerived {
+    rows: HashMap<u32, Arc<[(DerivedTriple, bool)]>, NodeHashBuilder>,
+    /// One bit per node below [`TAIL_BITMAP_NODES`] that has a row, so a read
+    /// of a node the tail never touched — nearly every read — is one load from
+    /// a few kilobytes that stay in cache, not a probe of `rows`.
+    touched: Vec<u64>,
+}
+
+/// Node ids at and above this are not in [`TailDerived::touched`]; they are
+/// always looked up in the map.
+const TAIL_BITMAP_NODES: u32 = 1 << 20;
+
+impl TailDerived {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Lay one commit's changes over the tail's: a later commit overrides an
+    /// earlier one's state of the same triple.
+    pub fn append(&mut self, changes: &DerivedChanges) {
+        for (i, &node) in changes.nodes.iter().enumerate() {
+            let new = &changes.entries[changes.starts[i] as usize..changes.starts[i + 1] as usize];
+            let row: Arc<[(DerivedTriple, bool)]> = match self.rows.get(&node) {
+                None => Arc::from(new),
+                Some(old) => {
+                    let mut merged = Vec::with_capacity(old.len() + new.len());
+                    let (mut o, mut n) = (0, 0);
+                    while o < old.len() && n < new.len() {
+                        match old[o].0.cmp(&new[n].0) {
+                            std::cmp::Ordering::Less => {
+                                merged.push(old[o]);
+                                o += 1;
+                            }
+                            std::cmp::Ordering::Greater => {
+                                merged.push(new[n]);
+                                n += 1;
+                            }
+                            std::cmp::Ordering::Equal => {
+                                merged.push(new[n]);
+                                o += 1;
+                                n += 1;
+                            }
+                        }
+                    }
+                    merged.extend_from_slice(&old[o..]);
+                    merged.extend_from_slice(&new[n..]);
+                    Arc::from(merged)
+                }
+            };
+            if node < TAIL_BITMAP_NODES {
+                let word = node as usize / 64;
+                if self.touched.len() <= word {
+                    self.touched.resize(word + 1, 0);
+                }
+                self.touched[word] |= 1 << (node % 64);
+            }
+            self.rows.insert(node, row);
+        }
+    }
+
+    fn row(&self, node: u32) -> &[(DerivedTriple, bool)] {
+        if node < TAIL_BITMAP_NODES {
+            let untouched = self
+                .touched
+                .get(node as usize / 64)
+                .is_none_or(|word| word >> (node % 64) & 1 == 0);
+            if untouched {
+                return &[];
+            }
+        }
+        self.rows.get(&node).map_or(&[], |row| row)
+    }
+}
+
+/// The rule-derived edges as of a fold: what `node_edges` consults to say
+/// whether an edge is derived. The reader holds no rule engine, so the writer
+/// hands it the answer.
+///
+/// A root, taken when the state is loaded, under a few layers of changes, one
+/// per fold since. A fold on the write path costs what its commits changed, not
+/// the size of the store's provenance, and when the root is the snapshot base's
+/// PROVENANCE section it is read where it lies.
+#[derive(Clone)]
+pub struct DerivedEdges {
+    root: Arc<DerivedRoot>,
+    /// Oldest first; a later layer overrides an earlier one and the root.
+    layers: Vec<Arc<DerivedChanges>>,
+}
+
+impl DerivedEdges {
+    /// A root taken from the engine's live provenance.
+    pub fn from_triples(triples: impl IntoIterator<Item = DerivedTriple>) -> Self {
+        let triples: Vec<DerivedTriple> = triples.into_iter().collect();
+        Self {
+            root: Arc::new(DerivedRoot::Index(NodeIndex::build(&triples))),
+            layers: Vec::new(),
+        }
+    }
+
+    /// A root that is the provenance section of the base the fold is taken over.
+    pub fn from_base() -> Self {
+        Self {
+            root: Arc::new(DerivedRoot::Base(OnceLock::new())),
+            layers: Vec::new(),
+        }
+    }
+
+    fn root_ref<'a>(&'a self, base: &'a Option<Arc<MappedBase>>) -> RootRef<'a> {
+        match self.root.as_ref() {
+            DerivedRoot::Index(index) => RootRef::Table(index),
+            DerivedRoot::Base(table) => {
+                let Some(base) = base else {
+                    return RootRef::Empty;
+                };
+                if let Some(bits) = base.derived_bits() {
+                    return RootRef::Bits(bits, base);
+                }
+                RootRef::Table(table.get_or_init(|| {
+                    let bytes = base.provenance_raw_bytes().unwrap_or_default();
+                    core_storage::v8::encode::provenance_triples(bytes)
+                        .map_or_else(NodeIndex::empty, |triples| NodeIndex::build(&triples))
+                }))
+            }
+        }
+    }
+
+    /// The next fold's derived edges: these, with `changes` (each triple's final
+    /// state since the last fold) laid over them.
+    ///
+    /// Past [`MAX_DERIVED_LAYERS`] the layers are merged, and what the merge
+    /// leaves that the root already says is dropped, so the layers hold the
+    /// difference from the root and no more.
+    pub fn extended(
+        &self,
+        changes: HashMap<DerivedTriple, bool>,
+        base: &Option<Arc<MappedBase>>,
+    ) -> Self {
+        let mut next = self.clone();
+        if changes.is_empty() {
+            return next;
+        }
+        if next.layers.len() < MAX_DERIVED_LAYERS {
+            next.layers
+                .push(Arc::new(DerivedChanges::from_net(&changes)));
+            return next;
+        }
+        let mut merged = HashMap::new();
+        for layer in &next.layers {
+            merged.extend(layer.net());
+        }
+        merged.extend(changes);
+        let root = self.root_ref(base);
+        merged.retain(|&triple, &mut state| state != root.contains(triple));
+        next.layers = if merged.is_empty() {
+            Vec::new()
+        } else {
+            vec![Arc::new(DerivedChanges::from_net(&merged))]
+        };
+        next
+    }
+}
+
 /// Full clone of overlay state captured at fold time.
 ///
 /// The V8 mmap base is not cloned here; it is `Arc`-shared in `ReaderSnapshot`.
@@ -64,6 +435,8 @@ pub struct FrozenOverlay {
     pub edge_props: Arc<EdgeProps>,
     pub roles: Option<Arc<Vec<RoleDef>>>,
     pub fulltext: Arc<FulltextIndex>,
+    /// Which edges in `topo` (and the base under it) a rule derived.
+    pub derived: DerivedEdges,
 }
 
 /// Lock-free reader snapshot: frozen overlay + optional V8 base + pending delta tail.
@@ -81,6 +454,8 @@ pub struct ReaderSnapshot {
     pub base: Option<Arc<MappedBase>>,
     /// Commits since the last fold, in arrival order. Length ≤ `FOLD_EVERY_K − 1`.
     pub deltas: Vec<Arc<CommitDelta>>,
+    /// The derived-edge changes of `deltas`, indexed by node.
+    tail_derived: Arc<TailDerived>,
     /// The store's `commit_seq` when this snapshot was taken — the version key
     /// for the shared role-mask memo. The effective state (frozen + deltas) is
     /// exactly the state the live handle had at this commit.
@@ -540,6 +915,28 @@ impl ReaderSnapshot {
         Ok(w)
     }
 
+    /// What the delta tail, the fold's layers and its root say about which of
+    /// `node`'s edges are derived.
+    fn derived_lookup(&self, node: u32) -> DerivedLookup<'_> {
+        let derived = &self.frozen.derived;
+        let mut layers = Vec::new();
+        for layer in derived.layers.iter().rev() {
+            let list = layer.for_node(node);
+            if !list.is_empty() {
+                layers.push(list);
+            }
+        }
+        DerivedLookup {
+            tail: self.tail_derived.row(node),
+            layers,
+            root: match derived.root_ref(&self.base) {
+                RootRef::Empty => RootRow::Row(&[]),
+                RootRef::Table(index) => RootRow::Row(index.row(node)),
+                RootRef::Bits(bits, _) => RootRow::Bits(bits),
+            },
+        }
+    }
+
     /// Construct a `ReaderSnapshot` from its constituent parts.
     ///
     /// Used by [`crate::db::GraphDb::reader`] — the only site that builds a
@@ -548,6 +945,7 @@ impl ReaderSnapshot {
         frozen: Arc<FrozenOverlay>,
         base: Option<Arc<MappedBase>>,
         deltas: Vec<Arc<CommitDelta>>,
+        tail_derived: Arc<TailDerived>,
         version: u64,
         role_masks: Arc<RoleMaskCache>,
     ) -> Self {
@@ -555,6 +953,7 @@ impl ReaderSnapshot {
             frozen,
             base,
             deltas,
+            tail_derived,
             version,
             role_masks,
             cache: OnceLock::new(),
@@ -588,6 +987,9 @@ impl ReaderSnapshot {
             Arc::clone(&self.frozen),
             self.base.clone(),
             deltas,
+            // The private delta carries no derived changes (rules fire at
+            // commit only), so the committed tail's derived set is still exact.
+            Arc::clone(&self.tail_derived),
             self.version,
             Arc::new(RoleMaskCache::new()),
         )
@@ -725,12 +1127,13 @@ impl ReaderSnapshot {
         node_info_from(key, self.effective().ok()?, &self.base)
     }
 
-    /// Every directed edge incident on `key`. `derived` is always `false` since
-    /// the reader snapshot has no rule engine.
+    /// Every directed edge incident on `key`. `derived` is exactly what
+    /// [`GraphDb::node_edges`](crate::GraphDb::node_edges) reports: whether a
+    /// rule owns the edge.
     ///
     /// Unknown key → `Err(GraphError::KeyNotFound)`.
     pub fn node_edges(&self, key: &str) -> Result<Vec<EdgeInfo>> {
-        node_edges_from(key, self.effective()?, &self.base)
+        node_edges_from(key, self.effective()?, &self.base, self)
     }
 
     /// BFS neighborhood expansion restricted to `mask`-visible nodes.
@@ -765,8 +1168,7 @@ impl ReaderSnapshot {
     /// dropped — a visible node must not become a window onto its hidden
     /// neighbours.
     ///
-    /// `derived` is always `false`, as it is on [`Self::node_edges`]: a snapshot
-    /// carries no rule engine.
+    /// `derived` is reported as [`Self::node_edges`] reports it.
     ///
     /// Hidden or unknown `key` → [`GraphError::KeyNotFound`].
     pub fn node_edges_scoped(&self, key: &str, mask: &NodeMask) -> Result<Vec<EdgeInfo>> {
@@ -774,7 +1176,7 @@ impl ReaderSnapshot {
         if !state.ids.get(key).is_some_and(|id| mask.contains_id(id)) {
             return Err(GraphError::KeyNotFound { key: key.into() });
         }
-        let edges = node_edges_from(key, state, &self.base)?;
+        let edges = node_edges_from(key, state, &self.base, self)?;
         Ok(edges
             .into_iter()
             .filter(|e| {
@@ -841,15 +1243,54 @@ fn node_info_from(
     })
 }
 
+/// How the fold's root answers for one node's edges.
+enum RootRow<'a> {
+    /// The derived triples the root holds for the node.
+    Row(&'a [DerivedTriple]),
+    /// The snapshot's derived bits, read at each edge's own place in its row.
+    Bits(DerivedBits<'a>),
+}
+
+/// [`ReaderSnapshot::derived_lookup`]'s answer for one node.
+struct DerivedLookup<'a> {
+    /// The unfolded tail's changes touching the node.
+    tail: &'a [(DerivedTriple, bool)],
+    /// The fold's layers' changes, newest first.
+    layers: Vec<&'a [(DerivedTriple, bool)]>,
+    root: RootRow<'a>,
+}
+
+impl DerivedLookup<'_> {
+    /// `slot` is the edge's entry in the base CSR row it came from, when it
+    /// came from one: where the snapshot's derived bits say whether it is
+    /// derived.
+    fn is_derived(&self, triple: DerivedTriple, slot: Option<&ArchivedNeighbor>) -> bool {
+        if let Ok(i) = self.tail.binary_search_by_key(&triple, |&(t, _)| t) {
+            return self.tail[i].1;
+        }
+        for list in &self.layers {
+            if let Ok(i) = list.binary_search_by_key(&triple, |&(t, _)| t) {
+                return list[i].1;
+            }
+        }
+        match &self.root {
+            RootRow::Row(row) => row_contains(row, triple),
+            RootRow::Bits(bits) => slot.is_some_and(|slot| bits.is_derived(slot)),
+        }
+    }
+}
+
 fn node_edges_from(
     key: &str,
     state: &FrozenOverlay,
     base: &Option<Arc<MappedBase>>,
+    snapshot: &ReaderSnapshot,
 ) -> Result<Vec<EdgeInfo>> {
     let id = state
         .ids
         .get(key)
         .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+    let derived = snapshot.derived_lookup(id);
     let tv = build_tv(&state.topo, base);
     let mut edges = Vec::new();
     for etype in tv.etypes() {
@@ -861,7 +1302,24 @@ fn node_edges_from(
             })?
             .to_string();
         for dir in [Direction::Out, Direction::In] {
-            for &nbr in tv.neighbors(etype, dir, id).as_ref() {
+            let (neighbors, base_row) = tv.neighbors_with_base_row(etype, dir, id);
+            // Both lists ascend, so each neighbour's entry in the base row is
+            // found by walking the row once alongside.
+            let mut row_at = 0;
+            for &nbr in neighbors.as_ref() {
+                let slot = match (&derived.root, base_row) {
+                    (RootRow::Bits(_), Some(row)) => {
+                        while row_at < row.len() && u32::from(row[row_at]) < nbr {
+                            row_at += 1;
+                        }
+                        row.get(row_at).filter(|entry| u32::from(**entry) == nbr)
+                    }
+                    _ => None,
+                };
+                let (src_id, dst_id) = match dir {
+                    Direction::Out => (id, nbr),
+                    Direction::In => (nbr, id),
+                };
                 let (src_key, dst_key) = match dir {
                     Direction::Out => (
                         key.to_string(),
@@ -888,7 +1346,7 @@ fn node_edges_from(
                     edge_type: edge_type.clone(),
                     src_key,
                     dst_key,
-                    derived: false,
+                    derived: derived.is_derived((etype, src_id, dst_id), slot),
                 });
             }
         }

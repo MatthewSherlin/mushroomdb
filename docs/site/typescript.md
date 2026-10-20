@@ -118,6 +118,32 @@ a Cypher `CREATE`, `SET` or `DELETE`.
 | `mask` | `string[]` | Node-key allow-list: the query sees only nodes whose key is in this set. Makes the query read-only. |
 | `namespace` | `string` | Restrict results to this namespace, intersecting with `mask` and any role. Makes the query read-only. |
 
+## Dates, durations and binary
+
+Five value types travel as one-key JSON objects, and a `CellValue` can be any of them:
+
+| Type | Form | Example |
+|---|---|---|
+| Date | `{ $date }` | `{ $date: '2024-01-15' }` |
+| Local date-time | `{ $ldt }` | `{ $ldt: '2024-01-15T12:34:56.789012' }` |
+| Date-time | `{ $dt }` | `{ $dt: '2024-01-15T12:34:56.789012+05:30' }` |
+| Duration | `{ $dur }` | `{ $dur: 'P1Y2M3DT4H5M6.789S' }` |
+| Binary | `{ $binary }` | `{ $binary: '3q2+7w==' }` (base64, at most 1 MiB) |
+
+The text is ISO 8601, and a date-time keeps the UTC offset it was written with (within ±18:00).
+`asDate`, `asLocalDateTime`, `asDateTime`, `asDuration` and `asBinary` narrow a cell to its text, or
+return `undefined` for any other cell; `binaryBytes` decodes a binary cell to a `Uint8Array`.
+
+```ts
+import { asDate } from 'mushroomdb-client';
+
+const { rows } = await client.query('MATCH (e:Event) RETURN e.on AS on');
+const day = asDate(rows[0][0]); // '2024-01-15', or undefined if the cell is not a date
+```
+
+These types are not yet storable: a write that carries one is refused, naming the type, until the
+format that holds them lands.
+
 ## Errors
 
 A response that is not a success throws `MushroomError`. Its `detail`, which is also its

@@ -180,6 +180,11 @@ fn main() -> ExitCode {
                      (see SECURITY.md)",
                 );
             }
+            // Fail before the store is opened: a bad origin list must not be
+            // discovered after a long restore or open.
+            if let Err(e) = server::cors_layer_from_env() {
+                return fail(&e);
+            }
             // Merge --role-token flags with MUSHROOMDB_ROLE_TOKENS env var.
             // Format: "TOKEN1:ROLE1,TOKEN2:ROLE2". Flag entries win over env on
             // collision (flags are inserted last; HashMap retains last writer).

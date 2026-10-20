@@ -39,6 +39,11 @@ TEMPLATES = ROOT / "scripts" / "reference"
 SITE = ROOT / "docs" / "site"
 STUB = ROOT / "bindings" / "python" / "mushroomdb.pyi"
 
+#: Value classes the stub may declare besides `GraphDb` and the errors. Each is
+#: listed under Types; a class not named here is refused, so a new one is a
+#: decision and not a silent omission.
+VALUE_CLASSES = {"Duration"}
+
 PAGES = ("cli", "mcp-tools", "python-api")
 BINARY_PAGES = ("cli", "mcp-tools")
 
@@ -255,6 +260,8 @@ def parse_stub(source: str) -> dict:
     errors:  (name, base, docstring, [(field, annotation)]) — `code` left out,
              every class has it
     methods: (name, signature, docstring) — `__dunder__` methods left out
+    classes: (name, docstring, [(field, annotation)], init signature) — the
+             value classes in VALUE_CLASSES
 
     Anything else the stub holds is refused by name. A page that quietly left
     out a module-level function, an `async def` or the second of two
@@ -264,7 +271,7 @@ def parse_stub(source: str) -> dict:
     tree = ast.parse(source)
     lines = source.splitlines()
     segment = lambda node: ast.get_source_segment(source, node) or ""
-    aliases, errors, methods = [], [], []
+    aliases, errors, methods, classes = [], [], [], []
     error_names = {"MushroomError"}
     for i, node in enumerate(tree.body):
         if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -292,6 +299,17 @@ def parse_stub(source: str) -> dict:
                 text = "\n".join(lines[first - 1 : body.lineno - 1] + [lines[body.lineno - 1][: body.col_offset]])
                 signature = re.sub(r"(?m)^    ", "", text).rstrip().removesuffix(":")
                 methods.append((fn.name, signature, ast.get_docstring(fn) or ""))
+        elif isinstance(node, ast.ClassDef) and node.name in VALUE_CLASSES:
+            fields = [
+                (f.target.id, segment(f.annotation))
+                for f in node.body
+                if isinstance(f, ast.AnnAssign) and isinstance(f.target, ast.Name)
+            ]
+            init = next((f for f in node.body if isinstance(f, ast.FunctionDef) and f.name == "__init__"), None)
+            params = ""
+            if init is not None:
+                params = re.sub(r"(?<=\w)=", " = ", ast.unparse(init.args).removeprefix("self, ").removeprefix("self"))
+            classes.append((node.name, ast.get_docstring(node) or "", fields, params))
         elif isinstance(node, ast.ClassDef):
             base = segment(node.bases[0]) if node.bases else ""
             if node.name not in error_names and base not in error_names:
@@ -309,7 +327,7 @@ def parse_stub(source: str) -> dict:
         else:
             name = getattr(node, "name", None) or type(node).__name__
             raise Problem(f"the stub has a top-level `{name}` the Python page has no section for (line {node.lineno})")
-    return {"aliases": aliases, "errors": errors, "methods": methods}
+    return {"aliases": aliases, "errors": errors, "methods": methods, "classes": classes}
 
 
 def render_python(template: str, stub: dict, groups: dict[str, list[str]] = GROUPS) -> str:
@@ -329,6 +347,14 @@ def render_python(template: str, stub: dict, groups: dict[str, list[str]] = GROU
         f"### `{name}`\n\n{fence(f'{name} = {value}', 'python')}\n\n{escape_html(doc)}".rstrip()
         for name, value, doc in stub["aliases"]
     )
+    value_classes = "\n\n".join(
+        f"### `{name}`\n\n{fence(f'class {name}({params})', 'python')}\n\n"
+        + (f"Fields: {', '.join(f'`{field}: {annotation}`' for field, annotation in fields)}.\n\n" if fields else "")
+        + escape_html(doc)
+        for name, doc, fields, params in stub["classes"]
+    )
+    if value_classes:
+        types = f"{types}\n\n{value_classes}"
     sections = []
     for title, members in groups.items():
         parts = [f"## {title}"]

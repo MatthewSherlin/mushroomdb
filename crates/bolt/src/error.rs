@@ -9,6 +9,8 @@
 
 use mushroomdb::GraphError;
 
+use crate::packstream::PackValue;
+
 const CLIENT: &str = "Neo.ClientError";
 const TRANSIENT: &str = "Neo.TransientError";
 const DATABASE: &str = "Neo.DatabaseError";
@@ -106,19 +108,58 @@ impl std::fmt::Display for BoltError {
 
 impl std::error::Error for BoltError {}
 
+/// Fixed text for failures whose engine message can carry a path or other
+/// internal detail. The detail stays in the server's own logs.
+const UNAVAILABLE_MESSAGE: &str = "the database is temporarily unavailable; retry the transaction";
+const INTERNAL_MESSAGE: &str = "an internal database error occurred";
+const CONFLICT_MESSAGE: &str =
+    "the transaction conflicted with a concurrent write; retry the transaction";
+
+/// The mapping is exhaustive on purpose: a new `GraphError` variant must fail
+/// to compile here until someone decides its class.
+///
+/// `ConstraintViolation` (from the constraints work) does not exist on this
+/// base; when it lands, its arm is `ConstraintValidation`.
 impl From<GraphError> for BoltError {
     fn from(err: GraphError) -> Self {
-        let message = err.to_string();
         match err {
-            GraphError::CasConflict { .. } => BoltError::Conflict(message),
-            GraphError::Io(_) | GraphError::Busy { .. } => BoltError::Unavailable(message),
-            GraphError::QueryError { .. } => BoltError::SyntaxError(message),
-            GraphError::DuplicateKey { .. } => BoltError::ConstraintValidation(message),
+            // Transient: the driver retries.
+            GraphError::CasConflict { .. } => BoltError::Conflict(CONFLICT_MESSAGE.into()),
+            GraphError::Io(_) | GraphError::Busy { .. } => {
+                BoltError::Unavailable(UNAVAILABLE_MESSAGE.into())
+            }
+            // Database errors: a fault in the store, not in the request. The
+            // message is fixed so a path or file detail cannot reach a client.
+            GraphError::Corrupt { .. } => BoltError::Internal(INTERNAL_MESSAGE.into()),
+            // Client errors whose text is about the request, not the host.
+            GraphError::QueryError { .. } => BoltError::SyntaxError(err.to_string()),
+            GraphError::DuplicateKey { .. }
+            | GraphError::NamespaceImmutable { .. }
+            | GraphError::CrossNamespace { .. } => BoltError::ConstraintValidation(err.to_string()),
             GraphError::RoleWriteDenied { .. }
             | GraphError::ReadOnly
-            | GraphError::MaskedReadOnly => BoltError::Forbidden(message),
-            _ => BoltError::Internal(message),
+            | GraphError::MaskedReadOnly => BoltError::Forbidden(err.to_string()),
+            GraphError::KeyNotFound { .. }
+            | GraphError::RuleInvalid { .. }
+            | GraphError::RuleOwned { .. }
+            | GraphError::RuleNotFound { .. }
+            | GraphError::IngestError { .. }
+            | GraphError::CommitOutOfRange { .. }
+            | GraphError::ViewPropReadOnly { .. }
+            | GraphError::CommitTimeNotMonotonic { .. }
+            | GraphError::NoRecordedTime
+            | GraphError::TimeBeforeFloor { .. } => BoltError::Invalid(err.to_string()),
         }
+    }
+}
+
+impl BoltError {
+    /// The `{code, message}` map a `FAILURE` carries.
+    pub fn to_pack(&self) -> PackValue {
+        PackValue::Map(vec![
+            ("code".into(), PackValue::String(self.code())),
+            ("message".into(), PackValue::String(self.message())),
+        ])
     }
 }
 
@@ -126,36 +167,155 @@ impl From<GraphError> for BoltError {
 mod tests {
     use super::*;
 
+    const CLIENT_ERROR: &str = "Neo.ClientError";
+    const TRANSIENT_ERROR: &str = "Neo.TransientError";
+
+    /// One of every `GraphError` variant, with the code it must map to. The
+    /// `match` has no wildcard, so adding a variant fails to compile here.
+    fn expected(err: &GraphError) -> &'static str {
+        match err {
+            GraphError::CasConflict { .. } => "Neo.TransientError.Transaction.DeadlockDetected",
+            GraphError::Io(_) | GraphError::Busy { .. } => {
+                "Neo.TransientError.General.DatabaseUnavailable"
+            }
+            GraphError::Corrupt { .. } => "Neo.DatabaseError.General.UnknownError",
+            GraphError::QueryError { .. } => "Neo.ClientError.Statement.SyntaxError",
+            GraphError::DuplicateKey { .. }
+            | GraphError::NamespaceImmutable { .. }
+            | GraphError::CrossNamespace { .. } => {
+                "Neo.ClientError.Schema.ConstraintValidationFailed"
+            }
+            GraphError::RoleWriteDenied { .. }
+            | GraphError::ReadOnly
+            | GraphError::MaskedReadOnly => "Neo.ClientError.Security.Forbidden",
+            GraphError::KeyNotFound { .. }
+            | GraphError::RuleInvalid { .. }
+            | GraphError::RuleOwned { .. }
+            | GraphError::RuleNotFound { .. }
+            | GraphError::IngestError { .. }
+            | GraphError::CommitOutOfRange { .. }
+            | GraphError::ViewPropReadOnly { .. }
+            | GraphError::CommitTimeNotMonotonic { .. }
+            | GraphError::NoRecordedTime
+            | GraphError::TimeBeforeFloor { .. } => "Neo.ClientError.Request.Invalid",
+        }
+    }
+
+    fn every_variant(secret: &str) -> Vec<GraphError> {
+        let s = || secret.to_string();
+        vec![
+            GraphError::KeyNotFound { key: "k".into() },
+            GraphError::DuplicateKey { key: "k".into() },
+            GraphError::Io(std::io::Error::other(s())),
+            GraphError::Corrupt { detail: s() },
+            GraphError::RuleInvalid { detail: "d".into() },
+            GraphError::RuleOwned { detail: "d".into() },
+            GraphError::RuleNotFound { name: "n".into() },
+            GraphError::QueryError { detail: "d".into() },
+            GraphError::IngestError { detail: "d".into() },
+            GraphError::ReadOnly,
+            GraphError::CommitOutOfRange {
+                commit: 9,
+                total: 3,
+                floor: 0,
+            },
+            GraphError::ViewPropReadOnly {
+                view_name: "v".into(),
+            },
+            GraphError::CasConflict {
+                key: "k".into(),
+                expected: 1,
+                actual: 2,
+            },
+            GraphError::MaskedReadOnly,
+            GraphError::CommitTimeNotMonotonic {
+                supplied_ms: 1,
+                newest_ms: 2,
+            },
+            GraphError::NoRecordedTime,
+            GraphError::TimeBeforeFloor {
+                floor_ms: 1,
+                floor_commit: 2,
+            },
+            GraphError::RoleWriteDenied { reason: "r".into() },
+            GraphError::Busy { holder: Some(1) },
+            GraphError::NamespaceImmutable {
+                key: "k".into(),
+                from: "a".into(),
+                to: "b".into(),
+            },
+            GraphError::CrossNamespace {
+                src: "a".into(),
+                src_ns: "x".into(),
+                dst: "b".into(),
+                dst_ns: "y".into(),
+            },
+        ]
+    }
+
     #[test]
-    fn engine_errors_map_to_the_documented_codes() {
+    fn every_engine_error_maps_to_its_documented_code_and_class() {
+        for err in every_variant("x") {
+            let want = expected(&err);
+            let label = format!("{err:?}");
+            let mapped = BoltError::from(err);
+            assert_eq!(mapped.code(), want, "{label}");
+            let class = if want.starts_with(TRANSIENT_ERROR) {
+                Classification::Transient
+            } else if want.starts_with(CLIENT_ERROR) {
+                Classification::Client
+            } else {
+                Classification::Database
+            };
+            assert_eq!(mapped.classification(), class, "{label}");
+        }
+    }
+
+    #[test]
+    fn only_conflict_and_unavailable_are_retried_by_drivers() {
+        let retried: Vec<_> = every_variant("x")
+            .into_iter()
+            .map(|e| (format!("{e:?}"), BoltError::from(e)))
+            .filter(|(_, mapped)| mapped.classification() == Classification::Transient)
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(retried.len(), 3, "{retried:?}");
+        assert!(retried
+            .iter()
+            .all(|e| e.starts_with("CasConflict") || e.starts_with("Io") || e.starts_with("Busy")));
+    }
+
+    #[test]
+    fn host_detail_never_reaches_the_message() {
+        let secret = "/var/lib/mushroomdb/secret-token-abc/wal.log";
+        for err in every_variant(secret) {
+            let mapped = BoltError::from(err);
+            assert!(
+                !mapped.message().contains(secret) && !mapped.message().contains("secret-token"),
+                "{mapped}"
+            );
+        }
         let conflict = BoltError::from(GraphError::CasConflict {
-            key: "k".into(),
+            key: "hidden-node".into(),
             expected: 1,
             actual: 2,
         });
-        assert_eq!(
-            conflict.code(),
-            "Neo.TransientError.Transaction.DeadlockDetected"
-        );
-        assert_eq!(conflict.classification(), Classification::Transient);
+        assert!(!conflict.message().contains("hidden-node"));
+    }
 
-        let io = BoltError::from(GraphError::Io(std::io::Error::other("disk")));
-        assert_eq!(io.code(), "Neo.TransientError.General.DatabaseUnavailable");
-        let busy = BoltError::from(GraphError::Busy { holder: None });
-        assert_eq!(busy.classification(), Classification::Transient);
-
-        let query = BoltError::from(GraphError::QueryError { detail: "x".into() });
-        assert_eq!(query.code(), "Neo.ClientError.Statement.SyntaxError");
-        let denied = BoltError::from(GraphError::RoleWriteDenied { reason: "r".into() });
-        assert_eq!(denied.code(), "Neo.ClientError.Security.Forbidden");
-        let dup = BoltError::from(GraphError::DuplicateKey { key: "k".into() });
+    #[test]
+    fn to_pack_is_a_code_and_message_map() {
+        let err = BoltError::from(GraphError::Busy { holder: None });
         assert_eq!(
-            dup.code(),
-            "Neo.ClientError.Schema.ConstraintValidationFailed"
+            err.to_pack(),
+            PackValue::Map(vec![
+                (
+                    "code".into(),
+                    PackValue::String("Neo.TransientError.General.DatabaseUnavailable".into())
+                ),
+                ("message".into(), PackValue::String(err.message())),
+            ])
         );
-        let other = BoltError::from(GraphError::Corrupt { detail: "c".into() });
-        assert_eq!(other.code(), "Neo.DatabaseError.General.UnknownError");
-        assert_eq!(other.classification(), Classification::Database);
     }
 
     #[test]

@@ -29,7 +29,7 @@ serde_json = { workspace = true }
 # `fs` serves the embedded UI. `timeout` and `limit` are the 0.6.12 hardening:
 # before it the server had no request timeout, no concurrency limit and no rate
 # limit of any kind — the only backstop was a 64 MiB body cap.
-tower-http = { version = "0.6", default-features = false, features = ["fs", "timeout", "limit"] }
+tower-http = { version = "0.6", default-features = false, features = ["fs", "timeout", "limit", "cors"] }
 # Concurrency limiting and load shedding live in `tower`, not `tower-http`.
 # It was already here as a dev-dependency for the oneshot `ServiceExt`; 0.6.12
 # needs it in the shipped build.

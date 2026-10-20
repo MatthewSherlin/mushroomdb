@@ -62,3 +62,6 @@ core-api/tests/f9_bench.rs::f9_measure — a ~13-minute benchmark that asserts n
 
 # transaction_integration.rs — commit-cost bench; machine-dependent timings
 core-api/tests/transaction_integration.rs::bench_tx_commit_vs_write_batch — measurement by hand: prints tx-commit vs write_batch timings (release, --ignored), nothing asserted
+
+# reader_derived.rs — reader derived-flag timing probe (TX-6); machine-dependent
+core-api/tests/reader_derived.rs::reader_derived_bench — measurement by hand: prints reader node_edges timings with and without section 17 (release, --ignored), nothing asserted

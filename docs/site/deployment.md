@@ -100,6 +100,30 @@ or terminate TLS at a reverse proxy (see docs/site/deployment.md)
 
 ---
 
+## Browser access (CORS)
+
+A web page on another origin can call the HTTP API only if the server says so.
+Set `MUSHROOMDB_CORS_ORIGINS` beside `MUSHROOMDB_TOKEN` and `MUSHROOMDB_ROLE_TOKENS`:
+
+```text
+MUSHROOMDB_CORS_ORIGINS=https://app.example.com,http://localhost:3000
+```
+
+- **Unset or blank:** no CORS headers are sent, exactly as before.
+- **An explicit list:** comma-separated `scheme://host[:port]` origins, with no path,
+  trailing slash or wildcard. Only those origins are allowed, and credentials
+  (the `Authorization` header, cookies) are allowed with them.
+- **`*`:** any origin is allowed, and credentials are never sent, because browsers
+  reject `*` combined with credentials. A page on another origin cannot use a
+  cookie or a header token that way. `*` cannot be mixed with other entries.
+- **Preflight:** the browser's `OPTIONS` request needs no token, because browsers
+  send none on a preflight. It grants nothing: the request that follows is still
+  authenticated.
+- **Invalid values:** `serve` exits with status 1 and a message before it opens the store.
+- **`/watch` is not covered.** CORS does not govern WebSocket upgrades, so this
+  setting does not protect `/watch` or `/subscribe` from a page on another origin;
+  the token does.
+
 ## Loopback-first posture
 
 mushroomdb defaults to `127.0.0.1:8080` and refuses to bind a non-loopback
