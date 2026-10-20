@@ -1,9 +1,14 @@
 # Changelog
 
-## Unreleased
+## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
+
+No format version change. A 0.9.1 store opens under 0.9.2, and a 0.9.2 snapshot opens under 0.9.1: the one addition, an optional snapshot section (16), is ignored by 0.9.1.
+
+**Upgrade if a store was written by 0.8.0 with a top-k rule beside another rule over the same edge type.** 0.9.1 left a top-k edge that 0.8.0 removed while no rule counted it missing until its source changed; it now comes back at the first write after open (row 113). A snapshot also records that the repair has run, so a store with top-k rules — every agent-memory store — does not pay for it at every open (row 116). Four smaller corrections follow (rows 50, 84, 112, 115).
 
 ### Fixed
 
+- **A top-k edge that 0.8.0 removed while no rule counted it comes back at the first write after open.** 0.9.1's repair found only edges a rule still counted, so this case needed a change to the source or `rebuild_rule`. The first write after open now re-evaluates every top-k source holding fewer than its cap (row 113).
 - **`rebuild_rule` no longer drops an edge another rule still desires.** When a rule was explicitly rebuilt (or rebuilt after index drift), `apply_streaming_rebuild` and `apply_via_rebuild` retracted stale edges but did not push them to the reclaim queue, so a competing rule never got the chance to take them. The fix adds the push; the second-pass reclaim now fires for rebuild the same way it already did for incremental writes (row 84).
 - **An `open_at` handle on a store snapshotted while two rules both owned the same edge now shows one owner, not two.** The row 107 dedup ran on the first write (via `ensure_provenance_loaded_mut`) but not when the provenance was decoded for an as-of handle via `from_persist`. The fix calls `dedup_provenance` inside `from_persist` (row 112).
 - **`forget` of a property no longer misreports the derived-edge count on a store row 111 repaired.** Before the fix, the snapshot's provenance was decoded into the as-of handle but not reconciled, so the derived-edge count it saw could differ from the live count. The fix runs row 111's repair before computing the report (row 115).
