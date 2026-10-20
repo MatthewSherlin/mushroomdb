@@ -1,6 +1,6 @@
 //! Connection actor: auth, RESET, GOODBYE, state machine, read loop.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -79,10 +79,44 @@ impl OpenTransaction for FakeTx {
     fn rollback(self: Box<Self>) {
         self.rolled_back.store(true, Ordering::SeqCst);
     }
+
+    fn execute(
+        &mut self,
+        _cypher: &str,
+        _params: &BTreeMap<String, Value>,
+    ) -> Result<Box<dyn ResultCursor>, BoltError> {
+        Err(BoltError::NotSupported("fake transaction".into()))
+    }
 }
 
 struct FakeCursor;
-impl ResultCursor for FakeCursor {}
+impl ResultCursor for FakeCursor {
+    fn fields(&self) -> &[String] {
+        &[]
+    }
+
+    fn take(
+        &mut self,
+        _limit: Option<usize>,
+        _version: (u8, u8),
+    ) -> Result<Vec<Vec<PackValue>>, BoltError> {
+        Err(BoltError::NotSupported("fake cursor".into()))
+    }
+
+    fn discard(&mut self, _limit: Option<usize>) {}
+
+    fn has_more(&self) -> bool {
+        true
+    }
+
+    fn summary(&self) -> Vec<(String, PackValue)> {
+        Vec::new()
+    }
+}
+
+fn stream_all() -> Vec<PackValue> {
+    vec![PackValue::Map(vec![("n".into(), PackValue::Int(-1))])]
+}
 
 fn fake_tx(db_key: &str) -> (Box<FakeTx>, Arc<AtomicBool>) {
     let flag = Arc::new(AtomicBool::new(false));
@@ -305,9 +339,20 @@ fn streaming_allows_pull_and_discard_only() {
             "{kind:?}"
         );
     }
+    // The fake cursor cannot produce rows, so a PULL fails on its merits.
+    let out = streaming().handle(ClientMessage::Other(MessageKind::Pull, stream_all()));
+    assert_eq!(failure_code(&out), "Neo.DatabaseError.General.UnknownError");
+    // A DISCARD it can do; the fake still has rows, so the stream stays open.
+    let mut conn = streaming();
+    let out = conn.handle(ClientMessage::Other(MessageKind::Discard, stream_all()));
+    assert!(matches!(out.as_slice(), [ServerMessage::Success(_)]));
+    assert_eq!(conn.state().name(), "Streaming");
+    // A PULL or DISCARD that is not shaped as one is a protocol violation.
     for kind in [MessageKind::Pull, MessageKind::Discard] {
-        let out = streaming().handle(other(kind));
-        assert_eq!(failure_code(&out), "Neo.DatabaseError.General.UnknownError");
+        let mut conn = streaming();
+        let out = conn.handle(other(kind));
+        assert_eq!(failure_code(&out), "Neo.ClientError.Request.Invalid");
+        assert!(conn.is_defunct());
     }
 }
 
@@ -927,4 +972,60 @@ fn route_without_routing_config_is_not_supported() {
     let mut conn = ready();
     let out = conn.handle(route_message(PackValue::Null));
     assert_eq!(failure_code(&out), "Neo.DatabaseError.General.UnknownError");
+}
+
+#[test]
+fn run_selects_a_database_through_the_real_routing_config() {
+    use bolt::messages::route::{RoutingConfig, DRIVER_DEFAULT_DATABASE};
+    use bolt::messages::run::QueryService;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    let routing = RoutingConfig::new(
+        "0.0.0.0:7687".parse().unwrap(),
+        Some("db.example.test"),
+        "mushroomdb",
+    )
+    .unwrap();
+    let service = Arc::new(QueryService::for_routing(db, routing.clone()));
+    let connected = || {
+        let mut conn = connection(Duration::from_secs(30))
+            .with_routing(Some(routing.clone()))
+            .with_query_service(service.clone());
+        conn.handle(hello("basic", FULL));
+        conn
+    };
+    let run = |db: Option<PackValue>| {
+        let extra = db
+            .map(|db| vec![("db".to_string(), db)])
+            .unwrap_or_default();
+        ClientMessage::Other(
+            MessageKind::Run,
+            vec![
+                PackValue::String("MATCH (n) RETURN COUNT(n)".into()),
+                PackValue::Map(vec![]),
+                PackValue::Map(extra),
+            ],
+        )
+    };
+    for selected in [
+        None,
+        Some(PackValue::Null),
+        Some(PackValue::String(String::new())),
+        Some(PackValue::String(DRIVER_DEFAULT_DATABASE.into())),
+        Some(PackValue::String("mushroomdb".into())),
+    ] {
+        let out = connected().handle(run(selected.clone()));
+        assert!(
+            matches!(out.as_slice(), [ServerMessage::Success(_)]),
+            "{selected:?}: {out:?}"
+        );
+    }
+    // An unknown name fails with the code ROUTE gives it.
+    let mut conn = connected();
+    let by_run = failure_code(&conn.handle(run(Some(PackValue::String("other".into())))));
+    let mut conn = connected();
+    let by_route = failure_code(&conn.handle(route_message(PackValue::String("other".into()))));
+    assert_eq!(by_run, "Neo.ClientError.Database.DatabaseNotFound");
+    assert_eq!(by_run, by_route);
 }

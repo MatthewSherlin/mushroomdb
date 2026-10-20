@@ -21,13 +21,19 @@
 //! while earlier messages are still queued interrupts them: they are `IGNORED`
 //! and the `RESET` returns the connection to `Ready`.
 //!
-//! Handlers for `RUN`, `PULL`, `DISCARD`, `BEGIN`, `COMMIT`, `ROLLBACK` and
-//! `ROUTE` belong to later tasks. Until they land, those messages are checked
-//! for legality in the current state and then answered with a not-supported
-//! `FAILURE`.
+//! `RUN`, `PULL` and `DISCARD` are handled here, through the
+//! [`QueryService`] a connection is given with [`Connection::with_query_service`]
+//! (see `messages::run`), and `ROUTE` through the [`RoutingConfig`] in its
+//! config. `BEGIN`, `COMMIT` and `ROLLBACK` belong to later tasks. Until they
+//! land, those messages are checked for legality in the current state and then
+//! answered with a not-supported `FAILURE`. A connection with no query service
+//! answers `RUN` the same way.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use mushroomdb::Value;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -37,6 +43,7 @@ use crate::handshake;
 use crate::messages::hello::{hello_success, Identity, TokenAuthenticator};
 use crate::messages::reset::reset_success;
 use crate::messages::route::{requested_database, RoutingConfig};
+use crate::messages::run::{QueryService, RunRequest, StreamRequest};
 use crate::messages::{ClientMessage, MessageKind, ServerMessage};
 use crate::packstream::PackValue;
 
@@ -53,27 +60,59 @@ pub const DEFAULT_PRE_AUTH_MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// buffer; `rollback` is the explicit form.
 pub trait OpenTransaction: Send {
     fn rollback(self: Box<Self>);
+
+    /// Runs one statement in the transaction and returns its rows.
+    fn execute(
+        &mut self,
+        cypher: &str,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<Box<dyn ResultCursor>, BoltError>;
 }
 
 /// An open result cursor. Dropping it closes it.
-pub trait ResultCursor: Send {}
+pub trait ResultCursor: Send {
+    /// The column names, as `RUN` reports them.
+    fn fields(&self) -> &[String];
+
+    /// Removes up to `limit` rows (all of them for `None`) and returns them as
+    /// `RECORD` fields. `version` is the negotiated Bolt version, which picks
+    /// some value encodings. Fails, leaving the cursor to be dropped, for a row
+    /// the wire format cannot carry.
+    fn take(
+        &mut self,
+        limit: Option<usize>,
+        version: (u8, u8),
+    ) -> Result<Vec<Vec<PackValue>>, BoltError>;
+
+    /// Drops up to `limit` rows (all of them for `None`).
+    fn discard(&mut self, limit: Option<usize>);
+
+    fn has_more(&self) -> bool;
+
+    /// The metadata for the `SUCCESS` that ends the stream.
+    fn summary(&self) -> Vec<(String, PackValue)>;
+}
 
 /// Where a connection is in the protocol.
 pub enum ConnectionState {
     /// Before `HELLO`.
     NotAuthenticated,
     Ready,
-    /// An auto-commit result is open.
+    /// An auto-commit result is open. `last_activity` is the last message
+    /// received; the idle limit counts from it, as it does for a transaction.
     Streaming {
         cursor: Box<dyn ResultCursor>,
+        last_activity: Instant,
     },
     /// Between `BEGIN` and `COMMIT`/`ROLLBACK`. `last_activity` is the last
-    /// message received; the idle limit counts from it.
+    /// message received; the idle limit counts from it. `cursors` are the
+    /// results still open, by `qid` (they are handed out in increasing order,
+    /// so the last key is the latest).
     InTx {
         tx: Box<dyn OpenTransaction>,
         opened_at: Instant,
         last_activity: Instant,
-        cursor: Option<Box<dyn ResultCursor>>,
+        cursors: BTreeMap<i64, Box<dyn ResultCursor>>,
     },
     /// A request failed; only `RESET` and `GOODBYE` are acted on.
     Failed,
@@ -89,7 +128,7 @@ impl ConnectionState {
             ConnectionState::NotAuthenticated => "NotAuthenticated",
             ConnectionState::Ready => "Ready",
             ConnectionState::Streaming { .. } => "Streaming",
-            ConnectionState::InTx { cursor: None, .. } => "InTx",
+            ConnectionState::InTx { cursors, .. } if cursors.is_empty() => "InTx",
             ConnectionState::InTx { .. } => "InTxStreaming",
             ConnectionState::Failed => "Failed",
             ConnectionState::Interrupted => "Interrupted",
@@ -118,6 +157,9 @@ pub struct Connection {
     /// Answers `ROUTE` and database selection; `ROUTE` is not supported
     /// without it.
     routing: Option<RoutingConfig>,
+    service: Option<Arc<QueryService>>,
+    /// The `qid` handed out for the last statement run in a transaction.
+    last_qid: i64,
 }
 
 impl Connection {
@@ -136,12 +178,20 @@ impl Connection {
             version,
             pending_failure: None,
             routing: None,
+            service: None,
+            last_qid: -1,
         }
     }
 
     /// Sets the routing config that answers `ROUTE`.
     pub fn with_routing(mut self, routing: Option<RoutingConfig>) -> Self {
         self.routing = routing;
+        self
+    }
+
+    /// Gives the connection a store to run `RUN` against.
+    pub fn with_query_service(mut self, service: Arc<QueryService>) -> Self {
+        self.service = Some(service);
         self
     }
 
@@ -177,7 +227,7 @@ impl Connection {
             tx,
             opened_at: now,
             last_activity: now,
-            cursor: None,
+            cursors: BTreeMap::new(),
         };
         Ok(())
     }
@@ -191,7 +241,10 @@ impl Connection {
         if !matches!(self.state, ConnectionState::Ready) {
             return Err(cursor);
         }
-        self.state = ConnectionState::Streaming { cursor };
+        self.state = ConnectionState::Streaming {
+            cursor,
+            last_activity: Instant::now(),
+        };
         Ok(())
     }
 
@@ -210,19 +263,28 @@ impl Connection {
         }
     }
 
-    /// Rolls back a transaction that has been idle past the limit. Called on
-    /// every message and by the one-second ticker. Returns whether it expired
-    /// one; the client learns of it as the `FAILURE` to its next request.
+    /// Rolls back a transaction, or closes an auto-commit result, that has been
+    /// idle past the limit. Called on every message and by the one-second
+    /// ticker. Returns whether it expired one; the client learns of it as the
+    /// `FAILURE` to its next request.
     pub fn check_timeout(&mut self, now: Instant) -> bool {
-        let expired = matches!(
-            &self.state,
-            ConnectionState::InTx { last_activity, .. }
-                if now.saturating_duration_since(*last_activity) >= self.tx_timeout
-        );
+        let idle = |last: &Instant| now.saturating_duration_since(*last) >= self.tx_timeout;
+        let failure = match &self.state {
+            ConnectionState::InTx { last_activity, .. } if idle(last_activity) => {
+                Some(BoltError::TransactionTimedOut)
+            }
+            ConnectionState::Streaming { last_activity, .. } if idle(last_activity) => {
+                Some(BoltError::Invalid(
+                    "the result was idle past its timeout and has been closed".into(),
+                ))
+            }
+            _ => None,
+        };
+        let expired = failure.is_some();
         if expired {
             self.discard_work();
             self.state = ConnectionState::Failed;
-            self.pending_failure = Some(BoltError::TransactionTimedOut);
+            self.pending_failure = failure;
         }
         expired
     }
@@ -316,7 +378,9 @@ impl Connection {
     }
 
     fn handle_active(&mut self, msg: ClientMessage, now: Instant) -> Vec<ServerMessage> {
-        if let ConnectionState::InTx { last_activity, .. } = &mut self.state {
+        if let ConnectionState::InTx { last_activity, .. }
+        | ConnectionState::Streaming { last_activity, .. } = &mut self.state
+        {
             *last_activity = now;
         }
         match msg {
@@ -337,16 +401,20 @@ impl Connection {
             ClientMessage::Other(MessageKind::Route, fields) if self.allows(MessageKind::Route) => {
                 self.handle_route(&fields)
             }
-            ClientMessage::Other(kind, _) => {
-                if self.allows(kind) {
-                    self.fail(BoltError::NotSupported(format!(
-                        "{kind:?} is not supported yet"
-                    )))
-                } else {
-                    self.violate(BoltError::Invalid(format!(
+            ClientMessage::Other(kind, fields) => {
+                if !self.allows(kind) {
+                    return self.violate(BoltError::Invalid(format!(
                         "{kind:?} is not allowed in state {}",
                         self.state.name()
-                    )))
+                    )));
+                }
+                match kind {
+                    MessageKind::Run => self.handle_run(fields),
+                    MessageKind::Pull => self.handle_stream(fields, false),
+                    MessageKind::Discard => self.handle_stream(fields, true),
+                    _ => self.fail(BoltError::NotSupported(format!(
+                        "{kind:?} is not supported yet"
+                    ))),
                 }
             }
         }
@@ -370,23 +438,134 @@ impl Connection {
         }
     }
 
+    fn handle_run(&mut self, fields: Vec<PackValue>) -> Vec<ServerMessage> {
+        let (Some(service), Some(identity)) = (self.service.clone(), self.identity.clone()) else {
+            return self.fail(BoltError::NotSupported(
+                "RUN is not supported on a connection with no database".into(),
+            ));
+        };
+        let request = match RunRequest::from_fields(fields) {
+            Ok(request) => request,
+            Err(err) => return self.violate(err),
+        };
+        let started = Instant::now();
+        let in_tx = matches!(self.state, ConnectionState::InTx { .. });
+        let opened = match &mut self.state {
+            ConnectionState::Ready => service.run_auto_commit(&identity, &request),
+            ConnectionState::InTx { tx, .. } => service.run_in_tx(&identity, tx.as_mut(), &request),
+            _ => unreachable!("RUN is checked against the state before it is handled"),
+        };
+        let cursor = match opened {
+            Ok(cursor) => cursor,
+            Err(err) => return self.fail(err),
+        };
+        let fields = cursor
+            .fields()
+            .iter()
+            .map(|name| PackValue::String(name.clone()))
+            .collect();
+        let mut meta = vec![
+            ("fields".to_string(), PackValue::List(fields)),
+            (
+                "t_first".to_string(),
+                PackValue::Int(elapsed_millis(started)),
+            ),
+        ];
+        if in_tx {
+            self.last_qid += 1;
+            let qid = self.last_qid;
+            meta.push(("qid".to_string(), PackValue::Int(qid)));
+            if let ConnectionState::InTx { cursors, .. } = &mut self.state {
+                cursors.insert(qid, cursor);
+            }
+        } else {
+            self.state = ConnectionState::Streaming {
+                cursor,
+                last_activity: Instant::now(),
+            };
+        }
+        vec![ServerMessage::Success(meta)]
+    }
+
+    /// `PULL` (`discard` false) and `DISCARD` (true).
+    ///
+    /// In a transaction `qid` names one of the open results and `-1` the latest
+    /// one. A `qid` that is not open is a request fault: a `FAILURE`, which per
+    /// the Bolt state machine moves the connection to `FAILED`, so the
+    /// transaction is rolled back like it is for any other failed request.
+    fn handle_stream(&mut self, fields: Vec<PackValue>, discard: bool) -> Vec<ServerMessage> {
+        let request = match StreamRequest::from_fields(fields) {
+            Ok(Ok(request)) => request,
+            Ok(Err(err)) => return self.fail(err),
+            Err(err) => return self.violate(err),
+        };
+        let version = self.version;
+        let mut tx_qid = None;
+        let cursor = match &mut self.state {
+            ConnectionState::Streaming { cursor, .. } if request.qid == -1 => Some(cursor),
+            ConnectionState::InTx { cursors, .. } => {
+                let qid = if request.qid == -1 {
+                    cursors.keys().next_back().copied()
+                } else {
+                    Some(request.qid)
+                };
+                qid.and_then(|qid| {
+                    tx_qid = Some(qid);
+                    cursors.get_mut(&qid)
+                })
+            }
+            _ => None,
+        };
+        let Some(cursor) = cursor else {
+            return self.fail(BoltError::Invalid(format!(
+                "no open result has qid {}",
+                request.qid
+            )));
+        };
+        let mut out = Vec::new();
+        if discard {
+            cursor.discard(request.limit);
+        } else {
+            match cursor.take(request.limit, version) {
+                Ok(rows) => out.extend(rows.into_iter().map(ServerMessage::Record)),
+                Err(err) => return self.fail(err),
+            }
+        }
+        if cursor.has_more() {
+            out.push(ServerMessage::Success(vec![(
+                "has_more".to_string(),
+                PackValue::Bool(true),
+            )]));
+            return out;
+        }
+        let meta = cursor.summary();
+        match (&mut self.state, tx_qid) {
+            (ConnectionState::InTx { cursors, .. }, Some(qid)) => {
+                cursors.remove(&qid);
+            }
+            (state, _) => *state = ConnectionState::Ready,
+        }
+        out.push(ServerMessage::Success(meta));
+        out
+    }
+
     /// Whether the Bolt state machine accepts `kind` in the current state.
     fn allows(&self, kind: MessageKind) -> bool {
         use MessageKind::*;
         match &self.state {
             ConnectionState::Ready => matches!(kind, Run | Begin | Route),
             ConnectionState::Streaming { .. } => matches!(kind, Pull | Discard),
-            ConnectionState::InTx { cursor: None, .. } => {
+            ConnectionState::InTx { cursors, .. } if cursors.is_empty() => {
                 matches!(kind, Run | Commit | Rollback)
             }
-            ConnectionState::InTx {
-                cursor: Some(_), ..
-            } => {
-                matches!(kind, Run | Pull | Discard)
-            }
+            ConnectionState::InTx { .. } => matches!(kind, Run | Pull | Discard),
             _ => false,
         }
     }
+}
+
+fn elapsed_millis(since: Instant) -> i64 {
+    i64::try_from(since.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
 
 /// Settings for [`serve_connection`].
@@ -453,10 +632,26 @@ fn timed_out(what: &str) -> std::io::Error {
 /// Returns `Ok` when the client says `GOODBYE`, disconnects, or the connection
 /// becomes defunct, and a `TimedOut` error when a deadline passes.
 pub async fn serve_connection<S>(
+    stream: S,
+    authenticator: Arc<TokenAuthenticator>,
+    connection_id: String,
+    config: ConnectionConfig,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    serve_connection_with(stream, authenticator, connection_id, config, None).await
+}
+
+/// [`serve_connection`] with a store for `RUN` to run against. Messages are
+/// then handled on a blocking thread, because a statement can wait on a write
+/// lock, an fsync or a bookmark.
+pub async fn serve_connection_with<S>(
     mut stream: S,
     authenticator: Arc<TokenAuthenticator>,
     connection_id: String,
     config: ConnectionConfig,
+    service: Option<Arc<QueryService>>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -484,8 +679,12 @@ where
         return Ok(());
     };
 
+    let blocking = service.is_some();
     let mut connection = Connection::new(authenticator, config.tx_timeout, connection_id, version)
         .with_routing(config.routing.clone());
+    if let Some(service) = service {
+        connection = connection.with_query_service(service);
+    }
     let mut buf: Vec<u8> = Vec::new();
     // When the bytes now in `buf` began to wait for the rest of their message.
     let mut partial_since: Option<tokio::time::Instant> = None;
@@ -555,19 +754,38 @@ where
         {
             connection.interrupt();
         }
-        let mut responses = Vec::new();
-        for item in decoded {
-            responses.extend(match item {
-                Ok(message) => connection.handle(message),
-                Err(err) => connection.handle_malformed(err),
-            });
-        }
+        let (returned, responses) = if blocking {
+            tokio::task::spawn_blocking(move || {
+                let responses = handle_batch(&mut connection, decoded);
+                (connection, responses)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        } else {
+            let responses = handle_batch(&mut connection, decoded);
+            (connection, responses)
+        };
+        connection = returned;
         send(&mut stream, &responses, config.write_timeout).await?;
         if connection.is_defunct() {
             let _ = stream.shutdown().await;
             return Ok(());
         }
     }
+}
+
+fn handle_batch(
+    connection: &mut Connection,
+    decoded: Vec<Result<ClientMessage, BoltError>>,
+) -> Vec<ServerMessage> {
+    let mut responses = Vec::new();
+    for item in decoded {
+        responses.extend(match item {
+            Ok(message) => connection.handle(message),
+            Err(err) => connection.handle_malformed(err),
+        });
+    }
+    responses
 }
 
 async fn send<S: AsyncWrite + Unpin>(
