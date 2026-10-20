@@ -6691,11 +6691,39 @@ async fn cors_explicit_origin_allows_credentials_and_only_listed_origins() {
     let h = res.headers();
     assert_eq!(h["access-control-allow-origin"], "https://app.example");
     assert_eq!(h["access-control-allow-credentials"], "true");
+    let vary = res.headers().get_all("vary");
+    assert!(vary
+        .iter()
+        .any(|v| v.to_str().unwrap().to_ascii_lowercase().contains("origin")));
     let res = app
         .oneshot(preflight("https://evil.example"))
         .await
         .unwrap();
-    assert!(res.headers().get("access-control-allow-origin").is_none());
+    for name in [
+        "access-control-allow-origin",
+        "access-control-allow-credentials",
+        "access-control-allow-methods",
+        "access-control-allow-headers",
+    ] {
+        assert!(
+            res.headers().get(name).is_none(),
+            "{name} on disallowed origin"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cors_401_to_disallowed_origin_has_no_cors_headers() {
+    let app = cors_app(Some("https://app.example"), Some("secret"), "cors-401");
+    let mut req = json_req("POST", "/query", json!({"cypher": "MATCH (n) RETURN n"}));
+    req.headers_mut()
+        .insert("origin", "https://evil.example".parse().unwrap());
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert!(res
+        .headers()
+        .keys()
+        .all(|k| !k.as_str().starts_with("access-control-")));
 }
 
 #[tokio::test]

@@ -55,6 +55,11 @@ use tower_http::services::ServeDir;
 /// `tokio::task::spawn_blocking` and drop the write guard before `.await`.
 /// Reads stay on the worker (neighborhood is µs). `suggest` and `algo`
 /// already use the blocking pool.
+///
+/// Every `router_*` entry point reads `MUSHROOMDB_CORS_ORIGINS` (except
+/// [`router_with_cors`], which takes the layer explicitly). Fail-fast on an
+/// invalid value holds only for the CLI; a library caller gets CORS off and an
+/// error log. Validate with [`crate::cors_layer_from_env`] first to fail early.
 pub fn router(db: SharedDb) -> Router {
     router_with_auth(db, None)
 }
@@ -711,6 +716,8 @@ fn build_app(
     )
 }
 
+/// Reads `MUSHROOMDB_CORS_ORIGINS`. An invalid value does not fail here: the CLI
+/// validates before opening the store; other callers get CORS off plus an error log.
 fn build_app_with_ready(
     db: SharedDb,
     token: Option<String>,
@@ -867,7 +874,9 @@ fn build_app_with_cors(
     // Outermost: a preflight is answered here, before auth (it carries no
     // credentials), and a 401 still gets CORS headers so a page can read it.
     match cors {
-        Some(cors) => app.layer(cors),
+        Some(cors) => app
+            .layer(cors)
+            .layer(middleware::from_fn(crate::cors::strip_unless_allowed)),
         None => app,
     }
 }

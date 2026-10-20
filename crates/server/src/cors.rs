@@ -60,6 +60,32 @@ pub fn parse_cors_origins(spec: &str) -> Result<Option<CorsLayer>, String> {
     ))
 }
 
+/// Drop every `Access-Control-*` header from a response the CORS layer did not
+/// allow. `tower-http` adds the static ones (credentials, methods, headers) to
+/// a disallowed origin's response too; they are inert without
+/// `Access-Control-Allow-Origin`, but a response to a stranger should say nothing.
+pub(crate) async fn strip_unless_allowed(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut res = next.run(req).await;
+    if !res
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    {
+        let doomed: Vec<HeaderName> = res
+            .headers()
+            .keys()
+            .filter(|k| k.as_str().starts_with("access-control-"))
+            .cloned()
+            .collect();
+        for name in doomed {
+            res.headers_mut().remove(name);
+        }
+    }
+    res
+}
+
 /// Read and parse [`CORS_ORIGINS_ENV`] from the process environment.
 pub fn cors_layer_from_env() -> Result<Option<CorsLayer>, String> {
     match std::env::var(CORS_ORIGINS_ENV) {
