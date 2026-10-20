@@ -788,8 +788,50 @@ export interface SubscribeMessage {
  * WebSocket handshake fails.
  */
 export class MushroomError extends Error {
-  constructor(public readonly detail: string) {
+  constructor(
+    public readonly detail: string,
+    /** HTTP status of the response that caused the error, when there was one. */
+    public readonly status?: number,
+  ) {
     super(detail);
     this.name = "MushroomError";
   }
+}
+
+/**
+ * A transaction commit failed because a node it read or wrote changed after
+ * the transaction began (HTTP 409). The transaction is over; retry the whole
+ * unit of work from `begin`. {@link MushroomClient.transaction} does not
+ * retry for you.
+ */
+export class TransactionConflictError extends MushroomError {
+  constructor(detail: string, status?: number) {
+    super(detail, status);
+    this.name = "TransactionConflictError";
+  }
+}
+
+/**
+ * The server no longer knows the transaction: its time to live ran out, it was
+ * already finished, or the server restarted (HTTP 404 or 410 on a `/tx/{id}`
+ * route). Nothing the transaction buffered was committed.
+ */
+export class TransactionExpiredError extends MushroomError {
+  constructor(detail: string, status?: number) {
+    super(detail, status);
+    this.name = "TransactionExpiredError";
+  }
+}
+
+/** Response of `POST /tx/begin`. */
+export interface TxBeginResponse {
+  tx_id: string;
+  /** Expiry time as the server reports it (opaque to the client). */
+  expires_at: string | number;
+}
+
+/** Response of `POST /tx/{tx_id}/commit`. */
+export interface TxCommitResponse {
+  /** The commit number of the transaction's one WAL frame. */
+  bookmark: number;
 }
