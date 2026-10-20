@@ -15078,7 +15078,7 @@ impl<F: Fs> GraphDb<F> {
             // A WAL with no bytes at all has nothing to archive even with no
             // archive yet: a store that has never committed has no `wal.bin`,
             // and renaming it failed with "No such file" after the snapshot
-            // intent was written (ledger row 118).
+            // intent was written (ledger row 119).
             let nothing_to_archive = live_wal_bytes_for_name.is_empty()
                 || ((live_frames_for_name.is_empty() || live_frames_for_name == baseline_frames)
                     && !self.fs.list_archives()?.is_empty());
@@ -15513,7 +15513,7 @@ impl Overlay {
     ///
     /// A range lookup on the ordered `(key, field)` pairs, not a `retain`:
     /// `retain` walks every overlay entry, so a batch of N ops cost O(N²)
-    /// (ledger row 117). Same entries, O(log N + entries of this key).
+    /// (ledger row 118). Same entries, O(log N + entries of this key).
     fn take_props_of(&mut self, key: &str) -> Vec<(String, Value)> {
         let pairs: Vec<(String, String)> = self
             .extra_props

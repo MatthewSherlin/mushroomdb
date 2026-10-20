@@ -436,7 +436,7 @@ fn random_op(r: &mut Rng, present: &mut Vec<&'static str>) -> Op {
     Op::EdgeUpsert("KNOWS", r.pick(&KEYS), r.pick(&KEYS))
 }
 
-/// Binding (ledger row 117): the overlay a batch keeps for validation is
+/// Binding (ledger row 118): the overlay a batch keeps for validation is
 /// looked up by key, not walked. Random batches over five keys, so the same
 /// key is inserted, set, deleted, renamed, upserted (Replace and Skip) and
 /// inserted again inside one batch, beside the `same` and `via` rules, must
@@ -461,7 +461,7 @@ fn random_batches_with_key_reuse_agree_with_separate_commits() {
     );
 }
 
-/// The shape row 117 names: insert, set, delete, insert of one key.
+/// The shape row 118 names: insert, set, delete, insert of one key.
 #[test]
 fn insert_set_delete_insert_of_one_key_agrees() {
     let accepted = assert_all_agree(

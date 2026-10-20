@@ -1,4 +1,4 @@
-//! A snapshot of a store that has never committed (ledger row 118).
+//! A snapshot of a store that has never committed (ledger row 119).
 //!
 //! `snapshot_with(archive_wal)` renamed `wal.bin` to an archive even when
 //! there was no `wal.bin`, so the first snapshot of a fresh store failed with
