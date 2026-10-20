@@ -14,6 +14,8 @@
 
 import {
   MushroomError,
+  TransactionConflictError,
+  TransactionExpiredError,
   type AlgoReport,
   type BackupReport,
   type CreateNodeResult,
@@ -37,6 +39,8 @@ import {
   type RuleDef,
   type Stats,
   type SuggestReport,
+  type TxBeginResponse,
+  type TxCommitResponse,
   type WasLinkedResult,
   type WccConfig,
   type WccReport,
@@ -96,7 +100,8 @@ export type {
   WccConfig,
   WccReport,
 } from "./types.js";
-export { MushroomError };
+export { MushroomError, TransactionConflictError, TransactionExpiredError };
+export type { TxBeginResponse, TxCommitResponse };
 
 /** Optional constructor flags for {@link MushroomClient}. */
 export interface ClientOptions {
@@ -133,6 +138,97 @@ export interface QueryOptions {
    * Makes the query read-only.
    */
   namespace?: string;
+}
+
+/**
+ * An open interactive transaction. Obtained from
+ * {@link MushroomClient.beginTransaction} or passed to the callback of
+ * {@link MushroomClient.transaction}.
+ *
+ * Statements run against a snapshot frozen at begin, with the transaction's own
+ * writes visible. Nothing reaches the store until {@link TxHandle.commit}.
+ */
+export class TxHandle {
+  /** Server-assigned transaction id. */
+  readonly txId: string;
+  /** Expiry time as the server reported it at begin. */
+  readonly expiresAt: string | number;
+  private finished = false;
+
+  /** @internal Use {@link MushroomClient.beginTransaction}. */
+  constructor(
+    txId: string,
+    expiresAt: string | number,
+    private readonly call: <T>(suffix: string, init?: RequestInit) => Promise<T>,
+  ) {
+    this.txId = txId;
+    this.expiresAt = expiresAt;
+  }
+
+  /** True once the transaction has been committed, rolled back, or has failed to commit. */
+  get isFinished(): boolean {
+    return this.finished;
+  }
+
+  private assertOpen(): void {
+    if (this.finished) {
+      throw new MushroomError(`transaction ${this.txId} is already finished`);
+    }
+  }
+
+  /**
+   * Run one Cypher statement inside the transaction
+   * (`POST /tx/{tx_id}/run`).
+   *
+   * @throws {@link TransactionExpiredError} when the server no longer knows the transaction.
+   */
+  async execute(cypher: string, params?: QueryParams): Promise<QueryResult> {
+    this.assertOpen();
+    return this.call<QueryResult>("/run", {
+      method: "POST",
+      body: JSON.stringify({ cypher, params: params ?? {} }),
+    });
+  }
+
+  /**
+   * Commit (`POST /tx/{tx_id}/commit`). Resolves to the bookmark: the commit
+   * number of the one WAL frame the transaction wrote.
+   *
+   * @throws {@link TransactionConflictError} when a node the transaction read or wrote changed since begin.
+   * @throws {@link TransactionExpiredError} when the transaction expired before the commit.
+   */
+  async commit(): Promise<number> {
+    this.assertOpen();
+    try {
+      const out = await this.call<TxCommitResponse>("/commit", { method: "POST" });
+      this.finished = true;
+      return out.bookmark;
+    } catch (err) {
+      // A conflict or an unknown id ends the transaction on the server too.
+      if (
+        err instanceof TransactionConflictError ||
+        err instanceof TransactionExpiredError
+      ) {
+        this.finished = true;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Discard everything the transaction buffered (`POST /tx/{tx_id}/rollback`).
+   * Rolling back a transaction that already expired is not an error.
+   */
+  async rollback(): Promise<void> {
+    if (this.finished) return;
+    this.finished = true;
+    try {
+      await this.call<unknown>("/rollback", { method: "POST" });
+    } catch (err) {
+      if (err instanceof TransactionExpiredError) return;
+      throw err;
+    }
+  }
 }
 
 /**
@@ -238,7 +334,7 @@ export class MushroomClient {
     if (!resp.ok) {
       const detail: string =
         typeof body?.error === "string" ? body.error : `HTTP ${resp.status}`;
-      throw new MushroomError(detail);
+      throw new MushroomError(detail, resp.status);
     }
     return body as T;
   }
@@ -773,6 +869,87 @@ export class MushroomClient {
       method: "POST",
       body: JSON.stringify({ dest }),
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // Transactions
+  // -------------------------------------------------------------------------
+
+  /**
+   * Run one request against a transaction route and map its failures: HTTP 409
+   * becomes {@link TransactionConflictError}, 404 and 410 become
+   * {@link TransactionExpiredError}.
+   */
+  private async txJson<T>(path: string, init?: RequestInit): Promise<T> {
+    try {
+      return await this.fetchJson<T>(path, init);
+    } catch (err) {
+      if (err instanceof MushroomError) {
+        if (err.status === 409) {
+          throw new TransactionConflictError(err.detail, err.status);
+        }
+        if (err.status === 404 || err.status === 410) {
+          throw new TransactionExpiredError(err.detail, err.status);
+        }
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Begin an interactive transaction (`POST /tx/begin`).
+   *
+   * Prefer {@link MushroomClient.transaction}, which commits or rolls back for
+   * you. With this form, always end the handle with `commit()` or `rollback()`;
+   * an abandoned transaction is rolled back by the server when it expires.
+   *
+   * @example
+   * ```ts
+   * const tx = await client.beginTransaction();
+   * await tx.execute("CREATE (:Person {id: $id})", { id: "p1" });
+   * const bookmark = await tx.commit();
+   * ```
+   */
+  async beginTransaction(): Promise<TxHandle> {
+    const begun = await this.txJson<TxBeginResponse>("/tx/begin", {
+      method: "POST",
+    });
+    const base = `/tx/${encodeURIComponent(begun.tx_id)}`;
+    return new TxHandle(
+      begun.tx_id,
+      begun.expires_at,
+      <T>(suffix: string, init?: RequestInit): Promise<T> =>
+        this.txJson<T>(`${base}${suffix}`, init),
+    );
+  }
+
+  /**
+   * Run `fn` inside a transaction. The transaction commits when `fn` resolves
+   * and rolls back when it throws; the error is rethrown unchanged. If `fn`
+   * commits or rolls back itself, nothing more is done.
+   *
+   * A commit conflict throws {@link TransactionConflictError}; the callback is
+   * not retried.
+   *
+   * @returns what `fn` returned.
+   */
+  async transaction<T>(fn: (tx: TxHandle) => Promise<T>): Promise<T> {
+    const tx = await this.beginTransaction();
+    let result: T;
+    try {
+      result = await fn(tx);
+    } catch (err) {
+      try {
+        await tx.rollback();
+      } catch {
+        // The callback's error is the one the caller needs.
+      }
+      throw err;
+    }
+    if (!tx.isFinished) {
+      await tx.commit();
+    }
+    return result;
   }
 
   // -------------------------------------------------------------------------

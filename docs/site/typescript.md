@@ -69,7 +69,37 @@ Each method calls one route. The route's page has the request and the response i
 | `client.setNodeProp(` | Set or overwrite one property on a node | [`PUT /node/{key}/prop/{field}`](http.md#put-nodekeypropfield) |
 | `client.removeNodeProp(` | Delete one property from a node | [`DELETE /node/{key}/prop/{field}`](http.md#delete-nodekeypropfield) |
 | `client.backup(` | Copy the store to a directory and verify it | [`POST /backup`](http.md#post-backup) |
+| `client.beginTransaction(` | Open a transaction and return its handle | `POST /tx/begin` |
+| `client.transaction(` | Run a callback in a transaction; commit when it resolves, roll back when it throws | `POST /tx/begin`, `POST /tx/{tx_id}/commit`, `POST /tx/{tx_id}/rollback` |
 | `client.watch(` | Stream the raw mutation log over WebSocket | [`GET /watch`](http.md#get-watch) |
+
+## Transactions
+
+```ts
+import { TransactionConflictError } from 'mushroomdb-client';
+
+// The callback form commits when the callback resolves and rolls back,
+// rethrowing, when it throws.
+const bookmark = await client.transaction(async (tx) => {
+  await tx.execute('CREATE (:Person {id: $id})', { id: 'p1' });
+  const seen = await tx.execute('MATCH (p:Person {id: $id}) RETURN p.id AS id', { id: 'p1' });
+  return seen.rows.length; // sees its own write
+});
+
+// The explicit form.
+const tx = await client.beginTransaction();
+try {
+  await tx.execute('CREATE (:Person {id: $id})', { id: 'p2' });
+  const commitNumber = await tx.commit();
+} catch (err) {
+  if (err instanceof TransactionConflictError) {
+    // a node it read or wrote changed after begin: retry the whole unit of work
+  }
+  await tx.rollback();
+}
+```
+
+`tx.execute(cypher, params?)` returns the same `{ columns, rows }` as `client.query`. `tx.commit()` resolves to the commit number. A conflict at commit throws `TransactionConflictError`; a transaction the server no longer knows (expired, finished, or lost in a restart) throws `TransactionExpiredError`. Both extend `MushroomError`. The client does not retry.
 
 ## What it does not wrap
 

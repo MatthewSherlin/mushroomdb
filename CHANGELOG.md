@@ -4,6 +4,7 @@
 
 ### Added
 
+- **Interactive transactions in the TypeScript client.** `client.transaction(async tx => …)` commits when the callback resolves and rolls back, rethrowing, when it throws; `client.beginTransaction()` returns a `TxHandle` with `execute`, `commit` (resolves to the commit number) and `rollback`. A commit conflict throws `TransactionConflictError`; a transaction the server no longer knows throws `TransactionExpiredError`. Both extend `MushroomError`, which now carries the HTTP `status`. Built against the `/tx/*` routes, which land with the server work.
 - **Interactive transactions in the Rust API.** `SharedDb::begin_transaction()` returns an owned, `Send` `Transaction` (it holds its own clone of the handle, so it can be stored or moved between threads while open): `execute` runs Cypher against a snapshot frozen at BEGIN with the transaction's own writes visible, `commit` submits everything as one WAL `Batch` frame (one commit number) and returns that number, and `rollback` (or dropping it) writes nothing. Isolation is snapshot isolation: a commit fails with `CasConflict` when any node it read or wrote changed after BEGIN; write skew through a label scan is possible. Rule-derived edges from a transaction's own writes appear only after it commits. `MATCH … SET … RETURN` is not supported inside a transaction yet and is refused.
 
 ## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
