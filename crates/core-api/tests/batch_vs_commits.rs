@@ -131,7 +131,7 @@ fn dump(db: &Db) -> String {
 ///
 /// `None` when the batch and the separate commits agree; otherwise how they
 /// differ.
-fn run_case(ops: &[Op], base: &std::path::Path) -> Option<String> {
+fn run_case(ops: &[Op], base: &std::path::Path) -> (Option<String>, bool) {
     let mut one = seed(&base.join("one"));
     let mut b = one.batch();
     for op in ops {
@@ -159,7 +159,7 @@ fn run_case(ops: &[Op], base: &std::path::Path) -> Option<String> {
         }
     }
     let verdict = match (&batched, &seq_err) {
-        (Err(_), Some(_)) => return None,
+        (Err(_), Some(_)) => return (None, false),
         (Err(e), None) => format!("batch REFUSED ({e:?}) but separate commits all succeed"),
         (Ok(_), Some(e)) => format!("batch ACCEPTED but separate commits fail at {e}"),
         (Ok(o), None) => {
@@ -167,33 +167,51 @@ fn run_case(ops: &[Op], base: &std::path::Path) -> Option<String> {
             let counts_b = (o.row_errors.len(), o.skipped, o.replaced);
             let counts_s = (rows, skipped, replaced);
             // Reopen: what the WAL replays must be what the handle held.
+            let commits = one.commit_seq();
             drop(one);
             let reopened = dump(&GraphDb::open(&base.join("one")).unwrap());
-            if x != reopened {
+            // And the last commit read back through `open_at`.
+            // `commit_seq` can undercount the frames on disk, so walk up from
+            // it to the last commit `open_at` accepts.
+            let mut last = commits.saturating_sub(1);
+            while GraphDb::open_at(&base.join("one"), last + 1).is_ok() {
+                last += 1;
+            }
+            let as_of = GraphDb::open_at(&base.join("one"), last)
+                .map(|db| dump(&db))
+                .unwrap_or_else(|e| format!("open_at failed: {e:?}"));
+            if x != as_of {
+                format!("OPEN_AT differs\n   live  {x}\n   as_of {as_of}")
+            } else if x != reopened {
                 format!("REOPEN differs\n   live   {x}\n   reopen {reopened}")
             } else if x != y {
                 format!("STATE differs\n   batch {x}\n   seq   {y}")
             } else if counts_b != counts_s {
                 format!("COUNTS differ batch {counts_b:?} seq {counts_s:?}")
             } else {
-                return None;
+                return (None, true);
             }
         }
     };
-    Some(format!("{ops:?}\n   {verdict}"))
+    (Some(format!("{ops:?}\n   {verdict}")), batched.is_ok())
 }
 
-fn assert_all_agree(name: &str, cases: Vec<Vec<Op>>) {
+/// Returns how many cases the batch accepted (the rest were refused alike).
+fn assert_all_agree(name: &str, cases: Vec<Vec<Op>>) -> usize {
     let base = std::env::temp_dir().join(format!(
         "mdb-batch-vs-commits-{name}-{}",
         std::process::id()
     ));
-    let differing: Vec<String> = cases
-        .iter()
-        .filter_map(|ops| run_case(ops, &base))
-        .collect();
+    let mut differing = Vec::new();
+    let mut accepted = 0;
+    for ops in &cases {
+        let (diff, ok) = run_case(ops, &base);
+        accepted += usize::from(ok);
+        differing.extend(diff);
+    }
     let _ = std::fs::remove_dir_all(&base);
     assert!(differing.is_empty(), "\n{}", differing.join("\n"));
+    accepted
 }
 
 fn s(x: &str) -> Value {
@@ -334,4 +352,144 @@ fn renames_beside_other_ops_agree_with_separate_commits() {
             ],
         ],
     );
+}
+
+/// A small deterministic generator, so a failing case can be rerun.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn pick<T: Copy>(&mut self, items: &[T]) -> T {
+        items[(self.next() % items.len() as u64) as usize]
+    }
+}
+
+/// One op that is mostly valid against `present`, the keys the batch has
+/// left standing so far (which it updates), so most batches are accepted and
+/// the overlay is exercised rather than the refusal path.
+fn random_op(r: &mut Rng, present: &mut Vec<&'static str>) -> Op {
+    let absent: Vec<&'static str> = KEYS
+        .iter()
+        .copied()
+        .filter(|k| !present.contains(k))
+        .collect();
+    let label = r.pick(&["P", "Q"]);
+    let props = |r: &mut Rng| {
+        let mut p = Vec::new();
+        if r.next().is_multiple_of(2) {
+            p.push(("g", Value::Int((r.next() % 2 + 1) as i64)));
+        }
+        if r.next().is_multiple_of(3) {
+            p.push(("name", Value::Str("n".into())));
+        }
+        p
+    };
+    for _ in 0..8 {
+        match r.next() % 10 {
+            0 | 1 if !absent.is_empty() => {
+                let k = r.pick(&absent);
+                present.push(k);
+                return Op::Insert(label, k, props(r));
+            }
+            2 | 3 if !present.is_empty() || !absent.is_empty() => {
+                // Replace/Skip over a taken key, or a fresh one.
+                let k = r.pick(&KEYS);
+                if !present.contains(&k) {
+                    present.push(k);
+                }
+                return Op::Upsert(label, k, props(r), r.next().is_multiple_of(2));
+            }
+            4 | 5 if !present.is_empty() => {
+                let value = if r.next().is_multiple_of(3) {
+                    Value::Str("y".into())
+                } else {
+                    Value::Int((r.next() % 2 + 1) as i64)
+                };
+                return Op::Set(r.pick(present), r.pick(&["g", "name"]), value);
+            }
+            6 if !present.is_empty() => {
+                return Op::Rm(r.pick(present), r.pick(&["g", "name"]));
+            }
+            7 if !present.is_empty() => {
+                let k = r.pick(present);
+                present.retain(|p| *p != k);
+                return Op::DelNode(k);
+            }
+            8 if !present.is_empty() && !absent.is_empty() => {
+                let (old, new) = (r.pick(present), r.pick(&absent));
+                present.retain(|p| *p != old);
+                present.push(new);
+                return Op::Rename(old, new);
+            }
+            9 if present.len() >= 2 => {
+                return Op::InsEdge("KNOWS", r.pick(present), r.pick(present));
+            }
+            _ => {}
+        }
+    }
+    Op::EdgeUpsert("KNOWS", r.pick(&KEYS), r.pick(&KEYS))
+}
+
+/// Binding (ledger row 117): the overlay a batch keeps for validation is
+/// looked up by key, not walked. Random batches over five keys, so the same
+/// key is inserted, set, deleted, renamed, upserted (Replace and Skip) and
+/// inserted again inside one batch, beside the `same` and `via` rules, must
+/// leave the store separate commits leave: live, after a reopen, and read back
+/// at the last commit through `open_at`.
+#[test]
+fn random_batches_with_key_reuse_agree_with_separate_commits() {
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let cases: Vec<Vec<Op>> = (0..300)
+        .map(|_| {
+            let len = 2 + (rng.next() % 8) as usize;
+            let mut present = vec!["a", "c", "d"];
+            (0..len)
+                .map(|_| random_op(&mut rng, &mut present))
+                .collect()
+        })
+        .collect();
+    let accepted = assert_all_agree("random", cases);
+    assert!(
+        accepted >= 100,
+        "only {accepted} of 300 random batches were accepted; the generator no longer reaches the overlay"
+    );
+}
+
+/// The shape row 117 names: insert, set, delete, insert of one key.
+#[test]
+fn insert_set_delete_insert_of_one_key_agrees() {
+    let accepted = assert_all_agree(
+        "isdi",
+        vec![
+            vec![
+                Op::Insert("P", "b", vec![("g", Value::Int(1))]),
+                Op::Set("b", "name", s("x")),
+                Op::DelNode("b"),
+                Op::Insert("P", "b", vec![("g", Value::Int(2))]),
+            ],
+            vec![
+                Op::Insert("P", "b", vec![("g", Value::Int(1))]),
+                Op::Set("b", "g", Value::Int(2)),
+                Op::Rm("b", "g"),
+                Op::DelNode("b"),
+                Op::Insert("Q", "b", vec![]),
+                Op::Upsert("P", "b", vec![("g", Value::Int(1))], true),
+            ],
+            vec![
+                Op::Upsert("P", "a", vec![("g", Value::Int(2))], true),
+                Op::Set("a", "name", s("z")),
+                Op::DelNode("a"),
+                Op::Upsert("P", "a", vec![], false),
+                Op::Rename("a", "e"),
+                Op::Insert("P", "a", vec![("g", Value::Int(1))]),
+            ],
+        ],
+    );
+    assert_eq!(accepted, 3);
 }

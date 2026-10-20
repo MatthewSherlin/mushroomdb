@@ -15074,9 +15074,14 @@ impl<F: Fs> GraphDb<F> {
             // the replacement leaves, and on a store with a declaration it is
             // not the replacement. The rewrite below puts the declarations
             // back.
-            let nothing_to_archive = (live_frames_for_name.is_empty()
-                || live_frames_for_name == baseline_frames)
-                && !self.fs.list_archives()?.is_empty();
+            //
+            // A WAL with no bytes at all has nothing to archive even with no
+            // archive yet: a store that has never committed has no `wal.bin`,
+            // and renaming it failed with "No such file" after the snapshot
+            // intent was written (ledger row 118).
+            let nothing_to_archive = live_wal_bytes_for_name.is_empty()
+                || ((live_frames_for_name.is_empty() || live_frames_for_name == baseline_frames)
+                    && !self.fs.list_archives()?.is_empty());
             stopped(SnapshotStop::BeforeWalReplacement)?;
             if nothing_to_archive {
                 if live_wal_bytes_for_name != baseline_wal {
@@ -15501,6 +15506,44 @@ struct Overlay {
     /// sees only the rules already committed to the engine. Keyed by name so a
     /// later `DeleteRule` in the same batch drops the arc with the rule.
     extra_rule_arcs: BTreeMap<String, (String, String)>,
+}
+
+impl Overlay {
+    /// Remove and return every overlay prop of `key`.
+    ///
+    /// A range lookup on the ordered `(key, field)` pairs, not a `retain`:
+    /// `retain` walks every overlay entry, so a batch of N ops cost O(N²)
+    /// (ledger row 117). Same entries, O(log N + entries of this key).
+    fn take_props_of(&mut self, key: &str) -> Vec<(String, Value)> {
+        let pairs: Vec<(String, String)> = self
+            .extra_props
+            .range((key.to_string(), String::new())..)
+            .take_while(|((k, _), _)| k == key)
+            .map(|(pair, _)| pair.clone())
+            .collect();
+        pairs
+            .into_iter()
+            .filter_map(|pair| {
+                let value = self.extra_props.remove(&pair)?;
+                Some((pair.1, value))
+            })
+            .collect()
+    }
+
+    /// Remove and return every removed-prop tombstone of `key` (range lookup;
+    /// see [`Overlay::take_props_of`]).
+    fn take_removed_props_of(&mut self, key: &str) -> Vec<String> {
+        let pairs: Vec<(String, String)> = self
+            .removed_props
+            .range((key.to_string(), String::new())..)
+            .take_while(|(k, _)| k == key)
+            .cloned()
+            .collect();
+        for pair in &pairs {
+            self.removed_props.remove(pair);
+        }
+        pairs.into_iter().map(|(_, field)| field).collect()
+    }
 }
 
 /// Read-only view of live db state plus a batch overlay. Shared by single-op
@@ -16081,30 +16124,8 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.overlay
             .extra_labels
             .insert(key.to_string(), label.to_string());
-        // A range lookup on the ordered `(key, field)` pairs, not a `retain`:
-        // `retain` walks every overlay entry, so a batch of N inserts cost
-        // O(N²) here (200k nodes in 50k batches spent over 90% of its time in
-        // it). Same entries removed, in O(log N + entries of this key).
-        let stale: Vec<(String, String)> = self
-            .overlay
-            .extra_props
-            .range((key.to_string(), String::new())..)
-            .take_while(|((k, _), _)| k == key)
-            .map(|(pair, _)| pair.clone())
-            .collect();
-        for pair in stale {
-            self.overlay.extra_props.remove(&pair);
-        }
-        let stale: Vec<(String, String)> = self
-            .overlay
-            .removed_props
-            .range((key.to_string(), String::new())..)
-            .take_while(|(k, _)| k == key)
-            .cloned()
-            .collect();
-        for pair in stale {
-            self.overlay.removed_props.remove(&pair);
-        }
+        self.overlay.take_props_of(key);
+        self.overlay.take_removed_props_of(key);
         for (field, value) in props {
             self.overlay
                 .extra_props
@@ -16148,8 +16169,8 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.overlay.extra_keys.remove(key);
         self.overlay.renamed_from.remove(key);
         self.overlay.deleted_keys.insert(key.to_string());
-        self.overlay.extra_props.retain(|(k, _), _| k != key);
-        self.overlay.removed_props.retain(|(k, _)| k != key);
+        self.overlay.take_props_of(key);
+        self.overlay.take_removed_props_of(key);
         self.overlay
             .extra_edges
             .retain(|(_, s, d)| s != key && d != key);
@@ -16196,34 +16217,16 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         // Mark new as extra so subsequent batch ops can reference it.
         self.overlay.deleted_keys.remove(new);
         self.overlay.extra_keys.insert(new.to_string());
-        // Migrate any overlay props from old key to new key.
         let new_str = new.to_string();
-        let transferred: Vec<((String, String), Value)> = self
-            .overlay
-            .extra_props
-            .iter()
-            .filter(|((k, _), _)| k.as_str() == old)
-            .map(|((_, f), v)| ((new_str.clone(), f.clone()), v.clone()))
-            .collect();
-        self.overlay
-            .extra_props
-            .retain(|(k, _), _| k.as_str() != old);
-        for (k, v) in transferred {
-            self.overlay.extra_props.insert(k, v);
+        // Migrate any overlay props from old key to new key.
+        for (field, value) in self.overlay.take_props_of(old) {
+            self.overlay
+                .extra_props
+                .insert((new.to_string(), field), value);
         }
         // Migrate removed_props.
-        let transferred_removed: Vec<(String, String)> = self
-            .overlay
-            .removed_props
-            .iter()
-            .filter(|(k, _)| k.as_str() == old)
-            .map(|(_, f)| (new_str.clone(), f.clone()))
-            .collect();
-        self.overlay
-            .removed_props
-            .retain(|(k, _)| k.as_str() != old);
-        for k in transferred_removed {
-            self.overlay.removed_props.insert(k);
+        for field in self.overlay.take_removed_props_of(old) {
+            self.overlay.removed_props.insert((new.to_string(), field));
         }
         if let Some(label) = self.overlay.extra_labels.remove(old) {
             self.overlay.extra_labels.insert(new_str.clone(), label);

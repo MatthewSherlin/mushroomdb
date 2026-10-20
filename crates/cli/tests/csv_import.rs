@@ -3,7 +3,7 @@
 //! Pinned here: the loaded graph, every error with its file and line, the
 //! differential against the engine's own incremental ingest (including after a
 //! reopen), a process abort mid-import, and (ignored) the throughput.
-use cli::import::{run_import, run_import_with_progress, ImportOptions};
+use cli::import::{import_into, run_import, run_import_with_progress, ImportOptions};
 use mushroomdb::{
     default_max_edges, AutoFk, GraphDb, IngestOptions, Predicate, RealFs, RuleDef, Value,
 };
@@ -48,6 +48,26 @@ fn same_city_rule() -> RuleDef {
         via_dir: None,
         namespace: None,
     }
+}
+
+/// The same city across one `KNOWS` hop.
+fn via_city_rule() -> RuleDef {
+    let predicate = Predicate::FieldEqual {
+        field: "city".into(),
+    };
+    RuleDef {
+        name: "via_city".into(),
+        max_edges: Some(default_max_edges(&predicate)),
+        predicate,
+        edge_type: "VIA_CITY".into(),
+        via_label: Some("Person".into()),
+        via_edge: Some("KNOWS".into()),
+        ..same_city_rule()
+    }
+}
+
+fn both_rules() -> [RuleDef; 2] {
+    [same_city_rule(), via_city_rule()]
 }
 
 const NODES: &str =
@@ -337,7 +357,9 @@ fn generated_csv(people: usize) -> (String, String) {
 fn incremental(dir: &Path, nodes_csv: &str, rels_csv: &str, rule_first: bool) -> GraphDb<RealFs> {
     let mut db = GraphDb::open(dir).unwrap();
     if rule_first {
-        db.create_rule(same_city_rule()).unwrap();
+        for rule in both_rules() {
+            db.create_rule(rule).unwrap();
+        }
     }
     let mut r = csv::Reader::from_reader(nodes_csv.as_bytes());
     let header = r.headers().unwrap().clone();
@@ -369,7 +391,9 @@ fn incremental(dir: &Path, nodes_csv: &str, rels_csv: &str, rule_first: bool) ->
         db.insert_edge(&rec[2], &rec[0], &rec[1]).unwrap();
     }
     if !rule_first {
-        db.create_rule(same_city_rule()).unwrap();
+        for rule in both_rules() {
+            db.create_rule(rule).unwrap();
+        }
     }
     db
 }
@@ -392,29 +416,43 @@ fn csv_import_equals_incremental_ingest_including_derived_edges_and_reopen() {
     );
     drop(reference);
 
-    // (a) bulk import into a store that already holds the rule: it fires per batch.
+    assert!(
+        want.1.iter().any(|e| e.contains("VIA_CITY")),
+        "the fixture must derive via-hop edges"
+    );
+
+    // (a) bulk import into a store that already holds both rules: they fire
+    // per batch. Read while the importing handle is live, after a snapshot of
+    // it, and after a reopen.
     let a = dir.join("bulk-rule-first");
-    {
-        let mut db = GraphDb::open(&a).unwrap();
-        db.create_rule(same_city_rule()).unwrap();
-    }
     let o = ImportOptions {
         batch_size: 64,
         ..opts()
     };
-    run_import(&a, Some(&nodes), Some(&rels), &o).unwrap();
+    {
+        let mut db = GraphDb::open(&a).unwrap();
+        for rule in both_rules() {
+            db.create_rule(rule).unwrap();
+        }
+        import_into(&mut db, Some(&nodes), Some(&rels), &o, &mut |_| {}).unwrap();
+        assert_eq!(dump(&db), want, "rule first, live");
+        db.snapshot_with(cli::AUTOMATIC_SNAPSHOT).unwrap();
+        assert_eq!(dump(&db), want, "rule first, after its snapshot");
+    }
     assert_eq!(
         dump(&GraphDb::open(&a).unwrap()),
         want,
         "rule first, after reopen"
     );
 
-    // (b) bulk import with no rules, then the rule: one backfill at the end.
+    // (b) bulk import with no rules, then the rules: one backfill at the end.
     let b = dir.join("bulk-backfill");
     run_import(&b, Some(&nodes), Some(&rels), &o).unwrap();
     {
         let mut db = GraphDb::open(&b).unwrap();
-        db.create_rule(same_city_rule()).unwrap();
+        for rule in both_rules() {
+            db.create_rule(rule).unwrap();
+        }
         assert_eq!(dump(&db), want, "backfill, never closed");
     }
     assert_eq!(
@@ -428,9 +466,136 @@ fn csv_import_equals_incremental_ingest_including_derived_edges_and_reopen() {
     run_import(&c, Some(&nodes), Some(&rels), &opts()).unwrap();
     {
         let mut db = GraphDb::open(&c).unwrap();
-        db.create_rule(same_city_rule()).unwrap();
+        for rule in both_rules() {
+            db.create_rule(rule).unwrap();
+        }
     }
     assert_eq!(dump(&GraphDb::open(&c).unwrap()), want, "one batch");
+}
+
+#[test]
+fn csv_import_header_only_files_import_nothing_and_leave_no_intent() {
+    let dir = tmp("headeronly");
+    let n = write(&dir, "n.csv", ":ID,:LABEL\n");
+    let r = write(&dir, "r.csv", ":START_ID,:END_ID,:TYPE\n");
+    let report = run_import(&dir.join("db"), Some(&n), Some(&r), &opts()).unwrap();
+    assert_eq!(
+        (report.nodes_inserted, report.edges_inserted, report.batches),
+        (0, 0, 0)
+    );
+    let intent = std::fs::read(dir.join("db").join("snapshot.intent")).unwrap_or_default();
+    assert!(intent.is_empty(), "no snapshot intent left behind");
+    assert_eq!(GraphDb::open(&dir.join("db")).unwrap().node_count(), 0);
+}
+
+#[test]
+fn csv_import_a_different_array_delimiter_cannot_smuggle_a_multi_label() {
+    let dir = tmp("labeldelim");
+    let o = ImportOptions {
+        array_delimiter: b'|' as char,
+        ..opts()
+    };
+    let e = import_err(&dir, ":ID,:LABEL\n1,Person;Employee\n", None, &o);
+    assert!(
+        e.contains("n.csv:2:") && e.contains("more than one label"),
+        "{e}"
+    );
+    let e = import_err(&dir, ":ID,:LABEL\n1,Person|Employee\n", None, &o);
+    assert!(
+        e.contains("n.csv:2:") && e.contains("more than one label"),
+        "{e}"
+    );
+}
+
+#[test]
+fn csv_import_id_spaces_are_refused_with_the_file_and_line() {
+    let dir = tmp("idspace");
+    let e = import_err(&dir, "personId:ID(People),:LABEL\n1,P\n", None, &opts());
+    assert!(
+        e.contains("n.csv:1:") && e.contains("id spaces are not supported in mushroomdb 0.10"),
+        "{e}"
+    );
+    let e = import_err(
+        &dir,
+        ":ID,:LABEL\n1,P\n",
+        Some(":START_ID(People),:END_ID,:TYPE\n"),
+        &opts(),
+    );
+    assert!(e.contains("r.csv:1:") && e.contains("id spaces"), "{e}");
+}
+
+/// Nodes in one city with a rule over them, so `SAME_CITY` between two of
+/// them is rule-owned and a by-hand insert of it is refused by the engine.
+fn store_with_rule_owned_edge(dir: &Path) -> PathBuf {
+    let db_dir = dir.join("db");
+    let nodes = write(
+        dir,
+        "n.csv",
+        "id:ID,:LABEL,city\na,Person,x\nb,Person,x\nc,Person,y\nd,Person,y\n",
+    );
+    let mut db = GraphDb::open(&db_dir).unwrap();
+    db.create_rule(same_city_rule()).unwrap();
+    import_into(&mut db, Some(&nodes), None, &opts(), &mut |_| {}).unwrap();
+    assert!(db.edge_count() >= 1, "SAME_CITY a-b is derived");
+    drop(db);
+    db_dir
+}
+
+#[test]
+fn csv_import_strict_mode_commits_no_part_of_a_failing_edge_batch() {
+    let dir = tmp("strictedges");
+    let db_dir = store_with_rule_owned_edge(&dir);
+    let before = GraphDb::open(&db_dir).unwrap().edge_count();
+    // Batches of two: [KNOWS a-c, KNOWS a-d] commit, then [KNOWS c-d, SAME_CITY
+    // a-b] is refused whole, so c-d must not be there.
+    let rels = write(
+        &dir,
+        "r.csv",
+        ":START_ID,:END_ID,:TYPE\na,c,KNOWS\na,d,KNOWS\nc,d,KNOWS\na,b,SAME_CITY\n",
+    );
+    let o = ImportOptions {
+        batch_size: 2,
+        ..opts()
+    };
+    let mut batches = 0;
+    let mut db = GraphDb::open(&db_dir).unwrap();
+    let e = import_into(&mut db, None, Some(&rels), &o, &mut |p| {
+        batches = p.batches_committed
+    })
+    .unwrap_err()
+    .0;
+    assert!(e.contains("r.csv:4:") && e.contains("rejected"), "{e}");
+    assert!(e.contains("2 edges in 1 committed batches"), "{e}");
+    assert_eq!(batches, 1, "only the first batch committed");
+    assert_eq!(
+        db.edge_count(),
+        before + 2,
+        "the first batch stays, none of the second"
+    );
+    drop(db);
+    assert_eq!(GraphDb::open(&db_dir).unwrap().edge_count(), before + 2);
+}
+
+#[test]
+fn csv_import_ignore_errors_skips_the_failing_edge_and_counts_one_batch() {
+    let dir = tmp("ignoreedges");
+    let db_dir = store_with_rule_owned_edge(&dir);
+    let rels = write(
+        &dir,
+        "r.csv",
+        ":START_ID,:END_ID,:TYPE\na,c,KNOWS\na,b,SAME_CITY\nc,d,KNOWS\n",
+    );
+    let o = ImportOptions {
+        ignore_errors: true,
+        ..opts()
+    };
+    let mut db = GraphDb::open(&db_dir).unwrap();
+    let report = import_into(&mut db, None, Some(&rels), &o, &mut |_| {}).unwrap();
+    assert_eq!(
+        (report.edges_inserted, report.rows_skipped, report.batches),
+        (2, 1, 1)
+    );
+    assert!(report.errors[0].contains("r.csv:3:"), "{:?}", report.errors);
 }
 
 // ---------------------------------------------------------------- crash safety

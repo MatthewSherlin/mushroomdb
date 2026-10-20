@@ -180,8 +180,18 @@ fn parse_column(cell: &str, index: usize, warnings: &mut Vec<String>) -> Result<
     let name = &cell[..colon];
     let suffix = &cell[colon + 1..];
     let upper = suffix.to_ascii_uppercase();
-    // `:ID(Space)` names an id space; every id here lives in one key space.
     let special = upper.split('(').next().unwrap_or("");
+    // `:ID(Space)` names an id space, so the same id can be a different node
+    // in each. Every id here lives in one key space; reading the column as a
+    // plain `:ID` would refuse the repeats as duplicates, with the wrong reason.
+    if matches!(special, "ID" | "START_ID" | "END_ID") && upper.contains('(') {
+        return Err(format!(
+            "column {} `{cell}`: id spaces are not supported in mushroomdb 0.10; \
+             use `{}` and keep ids unique across the whole file",
+            index + 1,
+            &cell[..colon + 1 + special.len()]
+        ));
+    }
     match special {
         "ID" => return Ok(Column::Id(name.to_string())),
         "LABEL" if name.is_empty() => return Ok(Column::Label),
@@ -370,7 +380,7 @@ pub fn parse_node_row(
     if label.is_empty() {
         return Err("empty :LABEL".to_string());
     }
-    if label.contains(array_delimiter) {
+    if label.contains(array_delimiter) || label.contains(';') {
         return Err(format!(
             "`{label}` has more than one label; mushroomdb stores one label per node"
         ));
@@ -720,17 +730,37 @@ fn flush_edges(
             run.report.edges_inserted += inserted;
             run.committed();
         }
-        Err(_) => {
-            // The engine rejects a batch whole. Name the row that did it:
-            // a row that fails alone is the bad one, the rest are retried.
+        Err(batch_err) => {
+            let first = edges.first().map_or(0, |e| e.3);
+            let last = edges.last().map_or(0, |e| e.3);
+            if !run.opts.ignore_errors {
+                // The engine rejected the batch whole and nothing of it was
+                // committed; strict mode does not go looking for which row.
+                run.bad_row(
+                    file,
+                    first,
+                    &format!(
+                        "the batch of {} relationships (lines {first}-{last}) was rejected: \
+                         {batch_err}",
+                        edges.len()
+                    ),
+                )?;
+                return Ok(());
+            }
+            // Under `--ignore-errors`, find the rows that fail alone, skip them,
+            // and count what the rest add as one batch.
+            let mut any = false;
             for edge in &edges {
                 match commit_edges(db, std::slice::from_ref(edge)) {
                     Ok(inserted) => {
                         run.report.edges_inserted += inserted;
-                        run.committed();
+                        any = true;
                     }
                     Err(e) => run.bad_row(file, edge.3, &e.to_string())?,
                 }
+            }
+            if any {
+                run.committed();
             }
         }
     }
@@ -756,6 +786,23 @@ pub fn run_import_with_progress(
     opts: &ImportOptions,
     on_batch: &mut dyn FnMut(&BatchProgress),
 ) -> Result<ImportReport, CliError> {
+    check_inputs(nodes_csv, rels_csv, opts)?;
+    let mut db = GraphDb::open(db_dir)?;
+    let report = import_into(&mut db, nodes_csv, rels_csv, opts, on_batch)?;
+    // One snapshot, last. History-preserving, like every snapshot the engine
+    // takes on its own: a bulk load must not erase how the store got here.
+    // Nothing committed (a header-only file) means nothing to fold in.
+    if report.batches > 0 {
+        db.snapshot_with(crate::AUTOMATIC_SNAPSHOT)?;
+    }
+    Ok(report)
+}
+
+fn check_inputs(
+    nodes_csv: Option<&Path>,
+    rels_csv: Option<&Path>,
+    opts: &ImportOptions,
+) -> Result<(), CliError> {
     if nodes_csv.is_none() && rels_csv.is_none() {
         return Err(CliError(
             "import needs --nodes <file>, --relationships <file>, or both".into(),
@@ -772,21 +819,31 @@ pub fn run_import_with_progress(
     for path in nodes_csv.iter().chain(rels_csv.iter()) {
         check_file_quoting(path, opts)?;
     }
-    let mut db = GraphDb::open(db_dir)?;
+    Ok(())
+}
+
+/// The import itself, on a store the caller holds open and takes the snapshot
+/// of: [`run_import_with_progress`] is this plus the open and the snapshot.
+/// Public so a test can read the store while the importing handle is live.
+pub fn import_into(
+    db: &mut GraphDb<RealFs>,
+    nodes_csv: Option<&Path>,
+    rels_csv: Option<&Path>,
+    opts: &ImportOptions,
+    on_batch: &mut dyn FnMut(&BatchProgress),
+) -> Result<ImportReport, CliError> {
+    check_inputs(nodes_csv, rels_csv, opts)?;
     let mut run = Run {
         opts,
         report: ImportReport::default(),
         on_batch,
     };
     if let Some(path) = nodes_csv {
-        import_nodes(&mut db, path, &mut run)?;
+        import_nodes(db, path, &mut run)?;
     }
     if let Some(path) = rels_csv {
-        import_rels(&mut db, path, &mut run)?;
+        import_rels(db, path, &mut run)?;
     }
-    // One snapshot, last. History-preserving, like every snapshot the engine
-    // takes on its own: a bulk load must not erase how the store got here.
-    db.snapshot_with(crate::AUTOMATIC_SNAPSHOT)?;
     Ok(run.report)
 }
 
@@ -844,8 +901,30 @@ mod tests {
     fn csv_import_unnamed_id_column_keys_as_id() {
         let s = parse_node_header(&rec(&[":ID", ":LABEL"])).unwrap();
         assert_eq!(s.key_field, "id");
-        let s = parse_node_header(&rec(&[":ID(People)", ":LABEL"])).unwrap();
-        assert_eq!(s.key_field, "id");
+    }
+
+    #[test]
+    fn csv_import_id_spaces_are_refused_clearly() {
+        for header in [
+            rec(&["personId:ID(People)", ":LABEL"]),
+            rec(&[":ID(People)", ":LABEL"]),
+        ] {
+            let e = parse_node_header(&header).unwrap_err();
+            assert!(
+                e.contains("id spaces are not supported in mushroomdb 0.10"),
+                "{e}"
+            );
+        }
+        for header in [
+            rec(&[":START_ID(People)", ":END_ID", ":TYPE"]),
+            rec(&[":START_ID", ":END_ID(People)", ":TYPE"]),
+        ] {
+            let e = parse_rel_header(&header).unwrap_err();
+            assert!(
+                e.contains("id spaces are not supported in mushroomdb 0.10"),
+                "{e}"
+            );
+        }
     }
 
     #[test]
