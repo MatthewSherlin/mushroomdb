@@ -128,6 +128,8 @@ fn canonical_display(v: &Value) -> String {
         | Value::DateTime { .. }
         | Value::Duration { .. }
         | Value::Binary(_) => core_query::v11_display_text(v).unwrap_or_default(),
+        // A null list element or map value (a top-level null is a null cell).
+        Value::Null => "null".to_string(),
     }
 }
 

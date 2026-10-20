@@ -320,6 +320,9 @@ impl Column {
                 present: Bitmap::default(),
                 live: 0,
             },
+            // Never reached: every write path refuses a null value before it
+            // gets here (see `Value::contains_null`). Mixed is the safe home.
+            Value::Null => Column::Mixed(HashMap::new()),
         };
         col.set(node, value, intern);
         col
@@ -1350,6 +1353,17 @@ mod tests {
         assert_eq!(name.get(1), None);
         assert_eq!(age.get(2), Some(&Value::Int(36)));
         assert_eq!(missing.get(0), None);
+    }
+
+    #[test]
+    fn a_null_value_is_never_encoded_into_a_column() {
+        // The write path refuses a null before it reaches the store. If one
+        // got into a column anyway, encoding the store fails instead of
+        // writing bytes no release can decode.
+        let mut store = ColumnStore::default();
+        store.set(0, "tags", Value::List(vec![Value::Int(1), Value::Null]));
+        assert!(store.is_mixed("tags"));
+        assert!(bincode::serialize(&store).is_err());
     }
 
     #[test]

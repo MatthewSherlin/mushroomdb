@@ -3242,6 +3242,8 @@ fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
             },
         )?
         .into_any()),
+        // A null list element or map value.
+        Value::Null => Ok(py.None().into_bound(py)),
     }
 }
 

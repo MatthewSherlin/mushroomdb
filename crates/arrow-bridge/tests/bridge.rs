@@ -241,3 +241,30 @@ fn v11_values_are_utf8_text() {
         ]
     );
 }
+
+/// A null element inside a list (or a null map value) renders as `null` in
+/// the list's canonical text; the cell itself is not null.
+#[test]
+fn null_list_element_renders_as_null() {
+    let mut rs = ResultSet::new(vec!["l".into(), "m".into()]);
+    rs.push_row(vec![
+        cell(Value::List(vec![Value::Int(1), Value::Null])),
+        cell(Value::Map(
+            [("a".to_string(), Value::Null)].into_iter().collect(),
+        )),
+    ]);
+    let batch = to_record_batch(&rs).unwrap();
+    let l = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert!(!l.is_null(0));
+    assert_eq!(l.value(0), "[1, null]");
+    let m = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(m.value(0), "{a: null}");
+}

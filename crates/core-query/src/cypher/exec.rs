@@ -680,7 +680,7 @@ fn execute_inner(
                         }
                     };
                     match list_val {
-                        None => {} // null → 0 rows (openCypher)
+                        None | Some(Value::Null) => {} // null → 0 rows (openCypher)
                         Some(Value::List(items_list)) => {
                             // Empty list → 0 rows (openCypher)
                             for item_val in items_list {
@@ -688,7 +688,9 @@ fn execute_inner(
                                     return Err(row_cap_err(cap));
                                 }
                                 let mut new_row = row.clone();
-                                new_row[alias_slot] = Some(Cell::Scalar(item_val));
+                                // A null element binds the alias to null.
+                                new_row[alias_slot] =
+                                    crate::value_ops::element(item_val).map(Cell::Scalar);
                                 new_rows.push(new_row);
                             }
                         }
@@ -698,7 +700,7 @@ fn execute_inner(
                                 Value::Float(_) => "Float",
                                 Value::Str(_) => "Str",
                                 Value::Bool(_) => "Bool",
-                                Value::List(_) => unreachable!(),
+                                Value::List(_) | Value::Null => unreachable!(),
                                 Value::Map(_) => "Map",
                                 Value::Date(_) => "Date",
                                 Value::LocalDateTime(_) => "LocalDateTime",
@@ -2243,8 +2245,11 @@ fn eval_list_scalar(
         return Ok(None);
     };
     Ok(match norm {
-        "head" => list.into_iter().next(),
-        "last" => list.into_iter().next_back(),
+        "head" => list.into_iter().next().and_then(crate::value_ops::element),
+        "last" => list
+            .into_iter()
+            .next_back()
+            .and_then(crate::value_ops::element),
         _ => Some(Value::List(list.into_iter().skip(1).collect())), // tail
     })
 }
@@ -2482,10 +2487,6 @@ fn eval_convert_scalar(
     })
 }
 
-/// `Value` has no null variant, so a list or map literal cannot hold one.
-const NULL_IN_LITERAL: &str =
-    "a list or map literal cannot contain null (an element evaluated to null)";
-
 fn resolve_operand(
     view: &GraphView,
     vars: &VarTable,
@@ -2494,9 +2495,11 @@ fn resolve_operand(
     params: &Params,
 ) -> Result<Option<Value>, String> {
     match operand {
+        // `null` parses to `Lit(Value::Null)`; as a query value it is `None`.
+        Operand::Lit(Value::Null) => Ok(None),
         Operand::Lit(v) => Ok(Some(v.clone())),
         Operand::Param(name) => match params.0.get(name) {
-            Some(v) => Ok(Some(v.clone())),
+            Some(v) => Ok(crate::value_ops::element(v.clone())),
             None => Err(format!("missing parameter `{name}`")),
         },
         Operand::Prop { var, field } => resolve_prop(view, vars, row, var, field),
@@ -2523,25 +2526,20 @@ fn resolve_operand(
             let idx_val = resolve_operand(view, vars, row, index, params)?;
             Ok(crate::value_ops::index_list(base_val, idx_val))
         }
+        // A null element or value is kept, as `Value::Null`.
         Operand::ListLit(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                match resolve_operand(view, vars, row, item, params)? {
-                    Some(v) => out.push(v),
-                    None => return Err(NULL_IN_LITERAL.to_string()),
-                }
+                let v = resolve_operand(view, vars, row, item, params)?;
+                out.push(crate::value_ops::into_element(v));
             }
             Ok(Some(Value::List(out)))
         }
         Operand::MapLit(entries) => {
             let mut out = BTreeMap::new();
             for (key, value) in entries {
-                match resolve_operand(view, vars, row, value, params)? {
-                    Some(v) => {
-                        out.insert(key.clone(), v);
-                    }
-                    None => return Err(NULL_IN_LITERAL.to_string()),
-                }
+                let v = resolve_operand(view, vars, row, value, params)?;
+                out.insert(key.clone(), crate::value_ops::into_element(v));
             }
             Ok(Some(Value::Map(out)))
         }
@@ -4705,6 +4703,7 @@ fn eval_expr(
                     | Value::DateTime { .. }
                     | Value::Duration { .. },
                 ) => true,
+                Some(Value::Null) => false,
             })
         }
         Expr::IsNull(op) => {
@@ -10134,12 +10133,10 @@ LIMIT 10";
     }
 
     #[test]
-    fn ql16_null_inside_a_literal_is_a_named_error() {
-        // `Value` has no null variant, so a list or map cannot hold one.
-        for expr in ["[1, n.nope]", "{a: n.nope}"] {
-            let msg = eval_err(expr);
-            assert!(msg.contains("null"), "{expr}: {msg}");
-        }
+    fn ql17_null_inside_a_literal_is_kept() {
+        // Replaces QL-16's refusal: a missing property is a null element.
+        assert_eq!(eval("[1, n.nope]"), Some(list_of(vec![i(1), Value::Null])));
+        assert_eq!(eval("{a: n.nope}"), Some(map_of(vec![("a", Value::Null)])));
     }
 
     fn five_node_fixture() -> Fx {
@@ -10246,5 +10243,212 @@ LIMIT 10";
         // A `$p` read only inside a literal must still be reported missing.
         let msg = eval_err("[$nope]");
         assert!(msg.contains("nope"), "{msg}");
+    }
+
+    // ── QL-17: null literal, nulls in lists and maps, MATCH-less queries ─────
+
+    /// Run a whole query against an empty graph.
+    fn run_empty(src: &str) -> ResultSet {
+        let fx = Fx::new();
+        run(&fx.view(), src, &BTreeMap::new()).unwrap_or_else(|e| panic!("`{src}` failed: {e}"))
+    }
+
+    #[test]
+    fn ql17_null_literal() {
+        assert_eq!(eval("null"), None);
+        assert_eq!(eval("NULL"), None);
+        assert_eq!(eval("Null"), None);
+        let rs = run_empty("RETURN null AS v");
+        assert_eq!(rows_of(&rs), vec![vec![None]]);
+    }
+
+    #[test]
+    fn ql17_null_as_a_list_element_and_map_value() {
+        assert_eq!(
+            eval("[1, null, 'a']"),
+            Some(list_of(vec![i(1), Value::Null, s("a")]))
+        );
+        assert_eq!(
+            eval("{a: null, b: 1}"),
+            Some(map_of(vec![("a", Value::Null), ("b", i(1))]))
+        );
+        // A non-constant list keeps its null too.
+        assert_eq!(
+            eval("[1 + 1, null]"),
+            Some(list_of(vec![i(2), Value::Null]))
+        );
+        assert_eq!(
+            eval("[[null]]"),
+            Some(list_of(vec![list_of(vec![Value::Null])]))
+        );
+    }
+
+    #[test]
+    fn ql17_list_functions_see_null_elements() {
+        assert_eq!(eval("size([null])"), Some(i(1)));
+        assert_eq!(eval("size([null, null])"), Some(i(2)));
+        assert_eq!(eval("head([null, 1])"), None);
+        assert_eq!(eval("last([1, null])"), None);
+        assert_eq!(eval("tail([null, 1])"), int_list(&[1]));
+        assert_eq!(eval("[null, 1][0]"), None);
+        assert_eq!(eval("[null, 1][1]"), Some(i(1)));
+        assert_eq!(eval("keys({a: null})"), Some(list_of(vec![s("a")])));
+        assert_eq!(
+            eval("properties({a: null})"),
+            Some(map_of(vec![("a", Value::Null)]))
+        );
+    }
+
+    #[test]
+    fn ql17_keys_of_a_map_literal_are_sorted() {
+        // `Value::Map` is a BTreeMap: keys come back in key order, not in the
+        // order the literal wrote them.
+        assert_eq!(
+            eval("keys({b: 1, a: 2})"),
+            Some(list_of(vec![s("a"), s("b")]))
+        );
+    }
+
+    #[test]
+    fn ql17_null_in_null_out_still_holds() {
+        for expr in [
+            "null + 1",
+            "1 - null",
+            "toUpper(null)",
+            "size(null)",
+            "head(null)",
+            "abs(null)",
+            "coalesce(null, null)",
+            "null[0]",
+            "[1, 2][null]",
+        ] {
+            assert_eq!(eval(expr), None, "{expr}");
+        }
+        assert_eq!(eval("coalesce(null, 2)"), Some(i(2)));
+    }
+
+    #[test]
+    fn ql17_is_null_on_literals_and_elements() {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]);
+        let count = |src: &str| run(&fx.view(), src, &BTreeMap::new()).unwrap().len();
+        assert_eq!(count("MATCH (n:N) WHERE null IS NULL RETURN n"), 1);
+        assert_eq!(count("MATCH (n:N) WHERE null IS NOT NULL RETURN n"), 0);
+        assert_eq!(count("MATCH (n:N) WHERE [null, 1][0] IS NULL RETURN n"), 1);
+        assert_eq!(
+            count("MATCH (n:N) WHERE [null, 1][1] IS NOT NULL RETURN n"),
+            1
+        );
+        assert_eq!(count("MATCH (n:N) WHERE head([null]) IS NULL RETURN n"), 1);
+        // Three-valued comparison: null = null is null, which WHERE drops.
+        assert_eq!(count("MATCH (n:N) WHERE null = null RETURN n"), 0);
+        assert_eq!(count("MATCH (n:N) WHERE null <> null RETURN n"), 0);
+        assert_eq!(count("MATCH (n:N) WHERE 1 IN [null, 1] RETURN n"), 1);
+        assert_eq!(count("MATCH (n:N) WHERE 2 IN [null, 1] RETURN n"), 0);
+    }
+
+    #[test]
+    fn ql17_missing_property_inside_a_returned_list() {
+        let mut fx = Fx::new();
+        fx.add("L", "a", vec![("x", i(5))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) RETURN [n.x, n.missing] AS l",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "l"), Some(&list_of(vec![i(5), Value::Null])));
+    }
+
+    #[test]
+    fn ql17_unwind_binds_a_null_element_to_null() {
+        let rs = run_empty("UNWIND [1, null, 3] AS x RETURN x");
+        assert_eq!(col(&rs, "x"), vec![Some(i(1)), None, Some(i(3))]);
+        let rs = run_empty("UNWIND [1, null] AS x WITH x WHERE x IS NULL RETURN x");
+        assert_eq!(rs.len(), 1);
+        let rs = run_empty("UNWIND null AS x RETURN x");
+        assert_eq!(rs.len(), 0);
+    }
+
+    #[test]
+    fn ql17_queries_without_match() {
+        let rs = run_empty("RETURN 1 + 1 AS x");
+        assert_eq!(rows_of(&rs), vec![vec![Some(i(2))]]);
+        let rs = run_empty("UNWIND [1, 2, 3] AS x RETURN x");
+        assert_eq!(col(&rs, "x"), vec![Some(i(1)), Some(i(2)), Some(i(3))]);
+        let rs = run_empty("WITH 1 AS a RETURN a");
+        assert_eq!(col(&rs, "a"), vec![Some(i(1))]);
+        let rs = run_empty("UNWIND [] AS x RETURN x");
+        assert_eq!(rs.len(), 0);
+        let rs = run_empty("RETURN [1, null] AS l, {a: null} AS m");
+        assert_eq!(rs.get(0, "l"), Some(&list_of(vec![i(1), Value::Null])));
+        assert_eq!(rs.get(0, "m"), Some(&map_of(vec![("a", Value::Null)])));
+    }
+
+    #[test]
+    fn ql17_match_less_queries_compose() {
+        let rs = run_empty("UNWIND [3, 1, 2] AS x RETURN x ORDER BY x DESC LIMIT 2");
+        assert_eq!(col(&rs, "x"), vec![Some(i(3)), Some(i(2))]);
+        // count(x) skips the null element; count(*) does not.
+        let rs = run_empty("UNWIND [1, null, 3] AS x RETURN count(*) AS c, count(x) AS n");
+        assert_eq!(rows_of(&rs), vec![vec![Some(i(3)), Some(i(2))]]);
+        let rs = run_empty("RETURN count(*) AS c");
+        assert_eq!(rows_of(&rs), vec![vec![Some(i(1))]]);
+        let rs = run_empty("UNWIND [1, 2, 2] AS x RETURN DISTINCT x");
+        assert_eq!(rs.len(), 2);
+        let rs = run_empty("WITH [1, 2] AS l UNWIND l AS x RETURN x");
+        assert_eq!(col(&rs, "x"), vec![Some(i(1)), Some(i(2))]);
+        let rs = run_empty("RETURN 1 AS x LIMIT 1");
+        assert_eq!(col(&rs, "x"), vec![Some(i(1))]);
+        let rs = run_empty("RETURN 1 AS x SKIP 1");
+        assert_eq!(rs.len(), 0);
+        // A MATCH-less query can still read the graph after a WITH.
+        let mut fx = Fx::new();
+        fx.add("L", "a", vec![("x", i(7))]);
+        let rs = run(
+            &fx.view(),
+            "WITH 7 AS v MATCH (n:L) WHERE n.x = v RETURN n.x AS x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "x"), vec![Some(i(7))]);
+    }
+
+    #[test]
+    fn ql17_a_match_less_query_ignores_the_graph() {
+        // One row, not one row per node.
+        let mut fx = Fx::new();
+        for n in 0..5 {
+            fx.add("L", &format!("n{n}"), vec![]);
+        }
+        let rs = run(&fx.view(), "RETURN 1 AS x", &BTreeMap::new()).unwrap();
+        assert_eq!(rs.len(), 1);
+    }
+
+    #[test]
+    fn ql17_null_cannot_name_a_variable() {
+        for src in [
+            "MATCH (null:L) RETURN 1 AS x",
+            "UNWIND [1] AS null RETURN 1 AS x",
+            "RETURN 1 AS null",
+        ] {
+            let err = parse(&lex(src).unwrap()).expect_err(src);
+            assert!(err.contains("null literal"), "{src}: {err}");
+        }
+    }
+
+    #[test]
+    fn ql17_null_as_a_property_name_still_works() {
+        let mut fx = Fx::new();
+        fx.add("L", "a", vec![("null", i(1))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) RETURN n.null AS a, n.`null` AS b, {`null`: n.null} AS m",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "a"), Some(&i(1)));
+        assert_eq!(rs.get(0, "b"), Some(&i(1)));
+        assert_eq!(rs.get(0, "m"), Some(&map_of(vec![("null", i(1))])));
     }
 }

@@ -39,6 +39,39 @@ pub enum Value {
     },
     /// Byte blob, no encoding assumed. JSON form `{"$binary": "<base64>"}`.
     Binary(Vec<u8>),
+    /// Null as an element of a list or a value of a map, produced only by
+    /// query evaluation (`[1, null]`, `{a: n.missing}`). A top-level query
+    /// null is still `Option<Value>::None`. It is never stored: every write
+    /// path refuses a value that contains it. Last in the enum so the serde
+    /// tags of the variants above it do not move.
+    ///
+    /// Serde skips it in both directions, so every encoder that writes a
+    /// `Value` to disk (the WAL, the mixed column blob, a snapshot) fails on
+    /// it instead of writing a tag no earlier release can read, and no decoder
+    /// will produce it from bytes.
+    #[serde(skip)]
+    Null,
+}
+
+impl Value {
+    /// True if this value is [`Value::Null`] or holds one at any depth. A
+    /// write path refuses such a value: a stored property can never be null.
+    pub fn contains_null(&self) -> bool {
+        match self {
+            Value::Null => true,
+            Value::List(items) => items.iter().any(Value::contains_null),
+            Value::Map(map) => map.values().any(Value::contains_null),
+            Value::Int(_)
+            | Value::Float(_)
+            | Value::Str(_)
+            | Value::Bool(_)
+            | Value::Date(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime { .. }
+            | Value::Duration { .. }
+            | Value::Binary(_) => false,
+        }
+    }
 }
 
 /// Largest accepted [`Value::Binary`] payload: 1 MiB.
@@ -76,6 +109,7 @@ impl ValueKey {
             // A duration is not totally ordered (a month against 30 days is
             // indeterminate), so it has no index key.
             Value::Duration { .. } => None,
+            Value::Null => None,
         }
     }
 }
@@ -96,6 +130,7 @@ pub fn v11_only_type(v: &Value) -> Option<&'static str> {
         Value::DateTime { .. } => Some("DateTime"),
         Value::Duration { .. } => Some("Duration"),
         Value::Binary(_) => Some("Binary"),
+        Value::Null => None,
     }
 }
 
@@ -596,7 +631,8 @@ pub fn tagged_text(v: &Value) -> std::result::Result<Option<(&'static str, Strin
         | Value::Str(_)
         | Value::Bool(_)
         | Value::List(_)
-        | Value::Map(_) => return Ok(None),
+        | Value::Map(_)
+        | Value::Null => return Ok(None),
         Value::Date(days) => (TAG_DATE, date_to_iso8601(*days)),
         Value::LocalDateTime(us) => (TAG_LOCAL_DATETIME, local_datetime_to_iso8601(*us)),
         Value::DateTime {
@@ -1062,6 +1098,36 @@ mod tests {
             bincode::serialize(&Value::Int(7)).unwrap(),
             vec![0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn null_is_refused_by_every_serde_encoder_and_never_decoded() {
+        // The WAL, the mixed column blob and the snapshot all encode `Value`
+        // through serde; none of them can write a null.
+        assert!(bincode::serialize(&Value::Null).is_err());
+        assert!(bincode::serialize(&Value::List(vec![Value::Int(1), Value::Null])).is_err());
+        let map: BTreeMap<String, Value> = [("a".to_string(), Value::Null)].into();
+        assert!(bincode::serialize(&Value::Map(map)).is_err());
+        // Tag 6 (the position Null would take) is not a readable value, as it
+        // was not before the variant existed.
+        let bytes = [6u8, 0, 0, 0];
+        assert!(bincode::deserialize::<Value>(&bytes).is_err());
+        // The tags of the variants that are stored did not move.
+        assert_eq!(
+            bincode::serialize(&Value::Bool(true)).unwrap(),
+            vec![3, 0, 0, 0, 1]
+        );
+    }
+
+    #[test]
+    fn contains_null_looks_at_every_depth() {
+        assert!(Value::Null.contains_null());
+        assert!(Value::List(vec![Value::Int(1), Value::Null]).contains_null());
+        let inner: BTreeMap<String, Value> =
+            [("b".to_string(), Value::List(vec![Value::Null]))].into();
+        assert!(Value::List(vec![Value::Map(inner)]).contains_null());
+        assert!(!Value::List(vec![Value::Int(1), Value::List(vec![])]).contains_null());
+        assert!(!Value::Str("null".into()).contains_null());
     }
 
     #[test]

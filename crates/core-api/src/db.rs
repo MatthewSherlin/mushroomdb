@@ -945,10 +945,12 @@ fn eval_set_return_operand<F: Fs>(
     params: &BTreeMap<String, Value>,
 ) -> Result<Option<Value>> {
     match op {
+        // `null` parses to `Lit(Value::Null)`; as a query value it is `None`.
+        Operand::Lit(Value::Null) => Ok(None),
         Operand::Lit(v) => Ok(Some(v.clone())),
         Operand::Param(name) => params.get(name).cloned().ok_or_else(|| GraphError::QueryError {
             detail: format!("missing parameter `{name}`"),
-        }).map(Some),
+        }).map(core_query::value_ops::element),
         Operand::Var(name) if rel_vars.iter().any(|r| r == name) => Err(GraphError::QueryError {
             detail: format!(
                 "cannot return relationship variable '{name}' bare; return its properties ({name}.field) instead"
@@ -999,36 +1001,44 @@ fn eval_set_return_operand<F: Fs>(
             let idx_val = eval_set_return_operand(db, match_rs, row, rel_vars, index, params)?;
             Ok(core_query::value_ops::index_list(base_val, idx_val))
         }
+        // A null element or value is kept, as `Value::Null`.
         Operand::ListLit(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                match eval_set_return_operand(db, match_rs, row, rel_vars, item, params)? {
-                    Some(v) => out.push(v),
-                    None => return Err(literal_null_error()),
-                }
+                let v = eval_set_return_operand(db, match_rs, row, rel_vars, item, params)?;
+                out.push(core_query::value_ops::into_element(v));
             }
             Ok(Some(Value::List(out)))
         }
         Operand::MapLit(entries) => {
             let mut out = BTreeMap::new();
             for (key, value) in entries {
-                match eval_set_return_operand(db, match_rs, row, rel_vars, value, params)? {
-                    Some(v) => {
-                        out.insert(key.clone(), v);
-                    }
-                    None => return Err(literal_null_error()),
-                }
+                let v = eval_set_return_operand(db, match_rs, row, rel_vars, value, params)?;
+                out.insert(key.clone(), core_query::value_ops::into_element(v));
             }
             Ok(Some(Value::Map(out)))
         }
     }
 }
 
-/// `Value` has no null variant, so a list or map literal cannot hold one.
-fn literal_null_error() -> GraphError {
-    GraphError::QueryError {
-        detail: "a list or map literal cannot contain null (an element evaluated to null)".into(),
+/// The start of the error a write gets when a property value holds a null.
+const NULL_PROPERTY_ERROR: &str = "a property value cannot contain null";
+
+/// A stored property is never null, at any depth: `[1, null]` and
+/// `{a: null}` exist only as query results. Checked on the dense-rewrite
+/// seam every node insert and property write passes through (contract C2),
+/// before anything reaches the WAL. Storing a list or map property that holds
+/// a null is not supported in 0.10.
+fn refuse_null_property(key: &str, field: &str, value: &Value) -> Result<()> {
+    if value.contains_null() {
+        return Err(GraphError::QueryError {
+            detail: format!(
+                "{NULL_PROPERTY_ERROR}: property `{field}` of node `{key}` holds a null \
+                 (a list or map property with a null element cannot be stored)"
+            ),
+        });
     }
+    Ok(())
 }
 
 fn eval_set_return_expr<F: Fs>(
@@ -1091,6 +1101,7 @@ fn eval_set_return_expr<F: Fs>(
                     | Value::DateTime { .. }
                     | Value::Duration { .. },
                 ) => true,
+                Some(Value::Null) => false,
             })
         }
         Expr::IsNull(op) => {
@@ -5407,6 +5418,9 @@ impl<F: Fs> GraphDb<F> {
             };
             match rec {
                 WalRecord::InsertNode { label, key, props } => {
+                    for (field, value) in &props {
+                        refuse_null_property(&key, field, value)?;
+                    }
                     // Namespace validation and normalisation, on the one seam
                     // every user-visible node insert passes through: insert_node,
                     // a batch, ingest, Cypher CREATE and MERGE all arrive here
@@ -5438,6 +5452,7 @@ impl<F: Fs> GraphDb<F> {
                     });
                 }
                 WalRecord::SetProp { key, field, value } => {
+                    refuse_null_property(&key, &field, &value)?;
                     // A namespace is set at insert and fixed after: the write is
                     // refused when it would move the node, and dropped when it
                     // names the namespace the node is already in. Checked here

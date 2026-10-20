@@ -34,6 +34,8 @@ pub(crate) fn value_to_json(v: &Value) -> Js {
         // the server can carry: params are parsed from JSON, which refuses one,
         // and the store holds no format-V11 value. No tag is written for it.
         | Value::Binary(_) => tagged_json(v).ok().flatten().unwrap_or(Js::Null),
+        // A null list element or map value.
+        Value::Null => Js::Null,
     }
 }
 

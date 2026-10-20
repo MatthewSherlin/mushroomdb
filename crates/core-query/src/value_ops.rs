@@ -56,6 +56,8 @@ fn class_rank(v: &Value) -> u8 {
         Value::Binary(_) => 8,
         // Map sorts after all other types.
         Value::Map(_) => 9,
+        // A null element sorts after everything, as a null row value does.
+        Value::Null => 10,
     }
 }
 
@@ -131,6 +133,7 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
             },
         ) => (m1, d1, n1).cmp(&(m2, d2, n2)),
         (Value::Binary(x), Value::Binary(y)) => x.cmp(y),
+        (Value::Null, Value::Null) => Ordering::Equal,
         _ => unreachable!("same class rank implies matching variants"),
     }
 }
@@ -171,7 +174,24 @@ pub fn index_list(base: Option<Value>, index: Option<Value>) -> Option<Value> {
     if pos < 0 || pos >= len {
         return None;
     }
-    items.into_iter().nth(pos as usize)
+    items.into_iter().nth(pos as usize).and_then(element)
+}
+
+/// A list element or map value read out as a query value: a
+/// [`Value::Null`] element is query null (`None`). Every place that takes an
+/// element out of a list goes through this, so `Some(Value::Null)` never
+/// reaches a row, a comparison or `IS NULL`.
+pub fn element(v: Value) -> Option<Value> {
+    match v {
+        Value::Null => None,
+        other => Some(other),
+    }
+}
+
+/// A query value stored as a list element or map value: query null becomes
+/// [`Value::Null`].
+pub fn into_element(v: Option<Value>) -> Value {
+    v.unwrap_or(Value::Null)
 }
 
 #[cfg(test)]

@@ -3096,6 +3096,8 @@ fn fmt_value(v: &Value) -> String {
         | Value::DateTime { .. }
         | Value::Duration { .. }
         | Value::Binary(_) => mushroomdb::v11_display_text(v).unwrap_or_default(),
+        // A null list element or map value.
+        Value::Null => "null".to_string(),
     }
 }
 

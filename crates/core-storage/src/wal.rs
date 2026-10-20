@@ -883,6 +883,20 @@ mod tests {
     /// **If this test fails you have broken every existing database file.**
     /// WAL variants must ONLY be appended — never reordered or inserted.
     #[test]
+    #[should_panic(expected = "walrecord serialize cannot fail")]
+    fn a_null_value_is_never_encoded_into_a_frame() {
+        // The write path refuses a null before it reaches the encoder; if one
+        // ever got this far the encoder stops rather than write bytes no
+        // release can decode.
+        let rec = WalRecord::SetPropId {
+            id: 0,
+            field: 0,
+            value: Value::List(vec![Value::Int(1), Value::Null]),
+        };
+        let _ = encode_record(&rec);
+    }
+
+    #[test]
     fn set_edge_count_discriminant_pinned() {
         let r = WalRecord::SetEdgeCount {
             etype: 1,
