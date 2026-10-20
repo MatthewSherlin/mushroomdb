@@ -472,7 +472,7 @@ Usage:
   mushroomdb query <db-dir> [--query \"MATCH ...\"|--file <path>|--stdin] [--role <name>] [--namespace <ns>] <cypher…>
                      --file reads the statement from a file and --stdin from standard input,
                      so a quote or a backslash needs no shell escaping; a trailing newline
-                     is dropped, and the statement comes from only one of the three places
+                     and one trailing `;` are dropped, and the statement comes from only one of the three places
                      --role answers as one of the store's roles and --namespace from one
                      namespace; together they intersect, so neither ever widens the other
                      and either one makes the query a read
@@ -1287,13 +1287,24 @@ pub fn resolve_statement(
                 .map_err(|e| CliError(format!("cannot read the statement from stdin: {e}")))?;
             text
         }
-        (None, false) => return Ok(inline.map(str::to_string)),
+        (None, false) => match inline {
+            Some(statement) => return Ok(Some(tidy_statement(statement).to_string())),
+            None => return Ok(None),
+        },
     };
-    let statement = text.trim_end();
+    let statement = tidy_statement(&text);
     if statement.trim().is_empty() {
         return Err(CliError("the Cypher statement is empty".to_string()));
     }
     Ok(Some(statement.to_string()))
+}
+
+/// One leading byte-order mark, trailing whitespace and one trailing `;` are
+/// not part of the statement: an editor, a pipe and a pasted line put them
+/// there, and the lexer has no use for any of them.
+fn tidy_statement(text: &str) -> &str {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text).trim_end();
+    text.strip_suffix(';').unwrap_or(text).trim_end()
 }
 
 fn parse_query(args: &[&str]) -> Result<Command, String> {
@@ -5847,6 +5858,17 @@ mod tests {
             resolve_statement(None, None, false, &mut unused).unwrap(),
             None
         );
+
+        // A byte-order mark and one trailing semicolon are not the statement,
+        // whichever way it arrives.
+        let mut bom: &[u8] = b"\xEF\xBB\xBFMATCH (n) RETURN n;  \n";
+        let got = resolve_statement(None, None, true, &mut bom).expect("bom");
+        assert_eq!(got.as_deref(), Some("MATCH (n) RETURN n"));
+        let got = resolve_statement(Some("MATCH (n) RETURN n ; "), None, false, &mut unused)
+            .expect("inline semicolon");
+        assert_eq!(got.as_deref(), Some("MATCH (n) RETURN n"));
+        let got = resolve_statement(Some("RETURN ';;'"), None, false, &mut unused).unwrap();
+        assert_eq!(got.as_deref(), Some("RETURN ';;'"));
 
         let mut blank: &[u8] = b" \n";
         assert!(resolve_statement(None, None, true, &mut blank).is_err());

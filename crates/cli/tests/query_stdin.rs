@@ -157,3 +157,49 @@ fn two_sources_and_empty_input_are_refused() {
     assert!(!empty.status.success());
     assert!(String::from_utf8_lossy(&empty.stderr).contains("empty"));
 }
+
+#[test]
+fn bom_and_trailing_semicolon_are_not_part_of_the_statement() {
+    let root = temp_dir("bom");
+    let db = store(&root);
+    let file = root.join("q.cyp");
+    std::fs::write(
+        &file,
+        b"\xEF\xBB\xBFMATCH (n:Person) RETURN count(n) AS c;\n",
+    )
+    .unwrap();
+    let from_file = stdout(&run(
+        &[
+            "query",
+            db.to_str().unwrap(),
+            "--file",
+            file.to_str().unwrap(),
+        ],
+        None,
+    ));
+    let from_stdin = stdout(&run(
+        &["query", db.to_str().unwrap(), "--stdin"],
+        Some("MATCH (n:Person) RETURN count(n) AS c ;  \n"),
+    ));
+    let inline = stdout(&run(
+        &[
+            "query",
+            db.to_str().unwrap(),
+            "MATCH (n:Person) RETURN count(n) AS c;",
+        ],
+        None,
+    ));
+    assert!(from_file.contains('2'), "{from_file}");
+    assert_eq!(from_stdin, from_file);
+    assert_eq!(inline, from_file);
+}
+
+/// `asof` without a statement prints only the as-of header, as it always did.
+#[test]
+fn asof_without_a_statement_prints_only_the_header() {
+    let root = temp_dir("asof-none");
+    let db = store(&root);
+    let out = stdout(&run(&["asof", db.to_str().unwrap(), "--commit", "1"], None));
+    assert!(out.starts_with("as-of commit 1 of "), "{out}");
+    assert_eq!(out.lines().count(), 1, "{out}");
+}

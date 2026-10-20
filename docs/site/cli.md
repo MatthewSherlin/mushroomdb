@@ -94,7 +94,7 @@ Start a stdio MCP JSON-RPC server for agent tools. `--all-tools` lists all 25 se
 mushroomdb query <db-dir> [--query "MATCH ..."|--file <path>|--stdin] [--role <name>] [--namespace <ns>] <cypher…>
                    --file reads the statement from a file and --stdin from standard input,
                    so a quote or a backslash needs no shell escaping; a trailing newline
-                   is dropped, and the statement comes from only one of the three places
+                   and one trailing `;` are dropped, and the statement comes from only one of the three places
                    --role answers as one of the store's roles and --namespace from one
                    namespace; together they intersect, so neither ever widens the other
                    and either one makes the query a read
