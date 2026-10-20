@@ -120,6 +120,17 @@ pub const SWEPT_MAGIC: &[u8; 4] = b"MSWP";
 pub const SECTION_PROV_RECONCILED: u8 = 16;
 /// The whole payload of [`SECTION_PROV_RECONCILED`].
 pub const RECONCILED_MAGIC: &[u8; 4] = b"MREC";
+/// Which of the snapshot's edges a rule derived: [`DERIVED_BITS_MAGIC`], then
+/// one bit per `u32` of the TOPOLOGY section (bit `i` is byte `i / 8`, bit
+/// `i % 8`, of the bytes after the magic). Bit `i` is set when the four bytes
+/// at offset `4 * i` of the TOPOLOGY section are a neighbour entry — in an
+/// out-row or an in-row — of an edge some rule owns. Written by a snapshot
+/// whose state has at least one such edge, and left out otherwise. A reader
+/// that does not know the id ignores it; a snapshot without it is read by
+/// building the answer from PROVENANCE instead.
+pub const SECTION_DERIVED_BITS: u8 = 17;
+/// The first four bytes of [`SECTION_DERIVED_BITS`].
+pub const DERIVED_BITS_MAGIC: &[u8; 4] = b"MDRV";
 
 /// The leading part of a WAL that a snapshot already holds.
 ///
@@ -290,6 +301,7 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_WAL_MARK
             | SECTION_EDGES_SWEPT
             | SECTION_PROV_RECONCILED
+            | SECTION_DERIVED_BITS
     )
 }
 
@@ -297,6 +309,13 @@ fn is_large_section(id: u8) -> bool {
 const STATE_UNCHECKED: u8 = 0;
 const STATE_OK: u8 = 1;
 const STATE_BAD: u8 = 2;
+
+/// Byte ranges of the derived-bits section's bits and of the topology section.
+#[derive(Clone, Copy)]
+struct DerivedBitsAt {
+    bits: (usize, usize),
+    topology_start: usize,
+}
 
 #[derive(Clone, Copy)]
 struct SectionEntry {
@@ -320,6 +339,8 @@ pub struct MappedBase {
     check_state: [AtomicU8; V8_MAGIC_SECTION_COUNT],
     /// One decode per `Mixed` column, for the life of this mapping.
     mixed: crate::v8::seam::MixedCache,
+    /// Where section 17's bits and the topology section start, found once.
+    derived_bits: std::sync::OnceLock<Option<DerivedBitsAt>>,
 }
 
 impl MappedBase {
@@ -342,6 +363,7 @@ impl MappedBase {
             dir,
             check_state: std::array::from_fn(|_| AtomicU8::new(STATE_UNCHECKED)),
             mixed: Default::default(),
+            derived_bits: Default::default(),
         })
     }
 
@@ -357,6 +379,7 @@ impl MappedBase {
             dir,
             check_state: std::array::from_fn(|_| AtomicU8::new(STATE_UNCHECKED)),
             mixed: Default::default(),
+            derived_bits: Default::default(),
         })
     }
 
@@ -448,6 +471,7 @@ impl MappedBase {
             SECTION_WAL_MARK => "wal_mark",
             SECTION_EDGES_SWEPT => "edges_swept",
             SECTION_PROV_RECONCILED => "prov_reconciled",
+            SECTION_DERIVED_BITS => "derived_bits",
             _ => "unknown",
         };
         self.dir
@@ -493,6 +517,61 @@ impl MappedBase {
                 }
             })
             .collect()
+    }
+
+    /// Section 17 as a reader of [`seam::DerivedBits`](crate::v8::seam::DerivedBits),
+    /// or `None` when the snapshot has none (it predates the section, or no
+    /// edge in it is derived) or the section is malformed. Found once; each
+    /// later call is a copy of two numbers.
+    pub fn derived_bits(&self) -> Option<crate::v8::seam::DerivedBits<'_>> {
+        let at = self
+            .derived_bits
+            .get_or_init(|| {
+                let section = |id| self.dir.iter().find(|e| e.id == id);
+                let bits = section(SECTION_DERIVED_BITS)?;
+                let topology = section(SECTION_TOPOLOGY)?;
+                let start = bits.offset as usize;
+                let end = start.checked_add(bits.len as usize)?;
+                let payload = self.backing.get(start..end)?;
+                self.backing.get(
+                    topology.offset as usize..(topology.offset as usize + topology.len as usize),
+                )?;
+                // What the writer wrote for this topology: the magic and one
+                // bit per `u32` of it, rounded up to a byte.
+                let expected = DERIVED_BITS_MAGIC.len() + topology.len as usize / 32 + 1;
+                let problem = if !payload.starts_with(DERIVED_BITS_MAGIC) {
+                    Some("bad magic".to_string())
+                } else if payload.len() != expected {
+                    Some(format!(
+                        "length {} where the topology needs {expected}",
+                        payload.len()
+                    ))
+                } else if crc32fast::hash(payload) != bits.crc32 {
+                    Some("CRC mismatch".to_string())
+                } else {
+                    None
+                };
+                if let Some(problem) = problem {
+                    // Wrong bits would give wrong answers, never an error:
+                    // set the section aside and read PROVENANCE instead.
+                    eprintln!(
+                        "mushroomdb: snapshot section 17 (derived_bits) is unusable \
+                         ({problem}); reading derived edges from provenance instead. \
+                         `mushroomdb verify` reports the section"
+                    );
+                    return None;
+                }
+                Some(DerivedBitsAt {
+                    bits: (start + DERIVED_BITS_MAGIC.len(), end),
+                    topology_start: topology.offset as usize,
+                })
+            })
+            .as_ref()?;
+        let base_address = self.backing.as_ptr() as usize;
+        Some(crate::v8::seam::DerivedBits {
+            bits: self.backing.get(at.bits.0..at.bits.1)?,
+            topology_start: base_address + at.topology_start,
+        })
     }
 
     /// Return the raw bytes for `section_id`, validating its CRC32 lazily.

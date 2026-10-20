@@ -76,7 +76,7 @@ fn decode_ivf_bytes_to_export(bytes: &[u8]) -> BTreeMap<String, RuleIvfExport> {
         })
         .collect()
 }
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::{Mutex, OnceLock};
 
@@ -296,12 +296,46 @@ struct LazyProvenance {
     intern_rule: Vec<String>,
 }
 
+/// The triples some rule owns, and a journal of how that set has moved.
+///
+/// The journal holds each triple's *final* state since it was last taken
+/// (`true` = owned, `false` = retracted), so it is bounded by the distinct
+/// triples that changed, not by how many times they changed. A reader's view
+/// of which edges are derived is kept current from it.
+#[derive(Debug, Default)]
+struct OwnedTriples {
+    set: BTreeSet<Triple>,
+    journal: HashMap<Triple, bool>,
+}
+
+impl OwnedTriples {
+    fn insert(&mut self, triple: Triple) -> bool {
+        self.journal.insert(triple, true);
+        self.set.insert(triple)
+    }
+
+    fn remove(&mut self, triple: &Triple) -> bool {
+        self.journal.insert(*triple, false);
+        self.set.remove(triple)
+    }
+
+    fn contains(&self, triple: &Triple) -> bool {
+        self.set.contains(triple)
+    }
+
+    /// Load triples that are already part of the state the journal is kept
+    /// relative to (a snapshot's provenance): not a change.
+    fn load(&mut self, triples: impl IntoIterator<Item = Triple>) {
+        self.set.extend(triples);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RuleEngine {
     rules: BTreeMap<String, RuleDef>,
     indexes: BTreeMap<String, RuleIndex>,
     provenance: BTreeMap<String, BTreeSet<Triple>>,
-    owned: BTreeSet<Triple>,
+    owned: OwnedTriples,
     /// Derived reverse index: node → provenance triples that touch it.
     /// Never serialized; rebuilt from `provenance` on persist-restore.
     by_node: BTreeMap<u32, BTreeSet<Touch>>,
@@ -1233,7 +1267,7 @@ fn resolve_by_node(
 /// through [`ProvSets::insert`] / [`ProvSets::remove`].
 struct ProvSets<'a> {
     set: &'a mut BTreeSet<Triple>,
-    owned: &'a mut BTreeSet<Triple>,
+    owned: &'a mut OwnedTriples,
     by_node: &'a mut BTreeMap<u32, BTreeSet<Touch>>,
     rule_intern: &'a mut BTreeMap<String, u32>,
     intern_rule: &'a mut Vec<String>,
@@ -2247,6 +2281,21 @@ impl RuleEngine {
         }
     }
 
+    /// The triples whose ownership changed since the last call, each with its
+    /// final state (`true` = some rule owns it, `false` = none does). Relative to
+    /// the provenance the engine was built from.
+    pub fn take_derived_changes(&mut self) -> HashMap<(u32, u32, u32), bool> {
+        std::mem::take(&mut self.owned.journal)
+    }
+
+    /// Every triple any rule owns, from the live provenance.
+    ///
+    /// Empty while provenance bytes are still retained: the caller reads those
+    /// from the snapshot they came from (see [`Self::provenance_is_retained`]).
+    pub fn derived_triples(&self) -> BTreeSet<(u32, u32, u32)> {
+        self.provenance.values().flatten().copied().collect()
+    }
+
     /// O(degree) reverse-index lookup: every provenance triple that touches `node`.
     ///
     /// Dispatches to the lazy-decoded or live index depending on whether
@@ -2364,9 +2413,9 @@ impl RuleEngine {
         // does for the bytes path (ledger row 107).  An as-of handle decoded into
         // its overlay arrives here, not through the bytes path.
         dedup_provenance(&mut prov);
-        let mut owned = BTreeSet::new();
+        let mut owned = OwnedTriples::default();
         for set in prov.values() {
-            owned.extend(set.iter().copied());
+            owned.load(set.iter().copied());
         }
         let indexes = rules
             .iter()
@@ -3178,7 +3227,7 @@ impl RuleEngine {
         dedup_provenance(&mut prov);
 
         for set in prov.values() {
-            self.owned.extend(set.iter().copied());
+            self.owned.load(set.iter().copied());
         }
         let (by_node, rule_intern, intern_rule) = rebuild_by_node(&prov);
         self.provenance = prov;
