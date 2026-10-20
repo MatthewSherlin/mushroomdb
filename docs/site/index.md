@@ -1,9 +1,12 @@
 # mushroomdb
 
-mushroomdb is the data layer for agents that reason over entities. It is an embedded Rust graph
-database in which a relationship is a schema declaration: write a rule once, and every write
+mushroomdb is an embedded graph database for any app that needs a graph — and a memory layer for AI
+agents. A relationship is a schema declaration: write a rule once, and every write
 derives, maintains and **retracts** the matching edges, each one carrying the rule, the score and
 the values that produced it.
+
+It speaks [Cypher](query.md), keeps [time-travel history](timetravel.md), and searches by
+[full text](fulltext.md) and [vector similarity](vector.md).
 
 ---
 
@@ -55,13 +58,6 @@ Pre-1.0 alpha — APIs and formats may change between minor versions. Single
 writer, no multi-statement transactions. Toolchain pinned to Rust 1.92.0.
 
 The current release is on the [releases page](https://github.com/MatthewSherlin/mushroomdb/releases).
-The shortest way in is the Claude Code plugin — `claude plugin marketplace add
-MatthewSherlin/mushroomdb` then `claude plugin install mushroom@mushroomdb`, and type
-`/mushroom:mushroom` in a repository. Or run `npx mushroomdb install`, which writes the
-`/mushroom` skill, the MCP server entry, and the session-start and prompt hooks for Claude Code
-or Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`) and PyPI
-(`pip install mushroomdb`) packages are published at the same version; which path gives you what
-is in the [Install](install.md) table.
 
 ---
 
@@ -106,3 +102,15 @@ Reference:
 - [Running several processes against one store](multiprocess.md)
 - [Deployment](deployment.md)
 - [Testing](testing.md)
+
+---
+
+## Install for an AI agent
+
+The shortest way in is the Claude Code plugin — `claude plugin marketplace add
+MatthewSherlin/mushroomdb` then `claude plugin install mushroom@mushroomdb`, and type
+`/mushroom:mushroom` in a repository. Or run `npx mushroomdb install`, which writes the
+`/mushroom` skill, the MCP server entry, and the session-start and prompt hooks for Claude Code
+or Cursor. The crates.io (`cargo install mushroomdb-cli`, `cargo add mushroomdb`) and PyPI
+(`pip install mushroomdb`) packages are published at the same version; which path gives you what
+is in the [Install](install.md) table.

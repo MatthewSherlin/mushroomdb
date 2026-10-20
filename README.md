@@ -8,9 +8,11 @@
 [![PyPI](https://img.shields.io/pypi/v/mushroomdb?logo=python&logoColor=white&label=PyPI)](https://pypi.org/project/mushroomdb/)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-**The graph that stays true — and knows who's allowed to see it.**
+**An embedded graph database — Cypher queries, self-maintaining rule-derived edges, time travel, and a memory layer for AI agents.**
 
-mushroomdb is an embedded graph database for agents and apps that reason over entities. You
+Single file. Zero server. Opens in 20 ms ([measured on a 100,000-node snapshot](https://matthewsherlin.github.io/mushroomdb/docs/benchmarks.html)).
+
+mushroomdb is an embedded graph database for any app that reasons over entities. You
 declare a relationship as a rule, once. Every write after that derives the matching edges, scores
 them, and retracts them when they stop being true. It is a directory on disk: no account, no
 server to run, no model call in the write path.

@@ -48,7 +48,9 @@ CLAIM_FILES=(
   # a retired claim in a binding README is just as visible to a reader.
   bindings/python/README.md
 )
-while IFS= read -r f; do CLAIM_FILES+=("$f"); done < <(ls docs/site/*.md)
+while IFS= read -r f; do CLAIM_FILES+=("$f"); done < <(find docs/site -name '*.md' | sort)
+# Pages under integrations/ carry product-facing copy too.
+while IFS= read -r f; do CLAIM_FILES+=("$f"); done < <(find integrations -name '*.md' 2>/dev/null | sort)
 # The skill files carry product-facing copy too — a retired claim reads the same
 # in a skill as it does in the README — so they take both scans, not just the
 # grep-redirect one below.
