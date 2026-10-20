@@ -28,7 +28,8 @@ pub use core_rules::{
 };
 pub use core_storage::fs::RealFs;
 pub use core_storage::{
-    tagged_text, value_from_tagged_text, Direction, GraphError, Result, Value, BINARY_MAX_BYTES,
+    tagged_text, v11_display_text, value_from_tagged_text, Direction, GraphError, Result, Value,
+    BINARY_MAX_BYTES,
 };
 pub use db::{
     ambiguous_exactness_last_warning, ambiguous_exactness_warns, ambiguous_exactness_warns_reset,

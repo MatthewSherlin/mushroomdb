@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(cmp_optional(Some(&a), Some(&a), true), Equal);
     }
 
-    fn dt(micros_utc: i64, offset_seconds: i16) -> Value {
+    fn dt(micros_utc: i64, offset_seconds: i32) -> Value {
         Value::DateTime {
             micros_utc,
             offset_seconds,

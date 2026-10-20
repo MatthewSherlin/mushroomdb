@@ -689,12 +689,13 @@ fn tool_upsert_entity(db: &SharedDb, args: &Js) -> CallOutcome {
             continue;
         }
         match json_to_value(json_val.clone()) {
-            Some(v) => {
+            Ok(Some(v)) => {
                 row.insert(field.clone(), v);
             }
-            None => {
+            Ok(None) => {
                 return CallOutcome::ToolErr(format!("prop {field} is not a supported value type"))
             }
+            Err(e) => return CallOutcome::ToolErr(format!("prop {field}: {e}")),
         }
     }
     if let Some(ns) = namespace.as_deref() {
@@ -2311,6 +2312,28 @@ mod tests {
         // Verify node exists
         let info = tool_text(&tool_call(&db, 2, "node_info", json!({ "key": "carol" })));
         assert_eq!(info["props"]["name"], "Carol");
+    }
+
+    #[test]
+    fn upsert_entity_refuses_a_bad_tagged_value_naming_the_prop() {
+        let db = demo_db();
+        let before = db.read().node_count();
+        for (payload, reason) in [
+            (json!({"$date": "2023-02-29"}), "is not an ISO 8601 date"),
+            (json!({"$binary": 7}), "payload must be a string"),
+        ] {
+            let resp = tool_call(
+                &db,
+                1,
+                "upsert_entity",
+                json!({"key": "carol", "label": "Person", "props": {"born": payload}}),
+            );
+            assert!(is_error(&resp));
+            let err = tool_err_text(&resp);
+            assert!(err.contains("prop born: $"), "{err}");
+            assert!(err.contains(reason), "{err}");
+        }
+        assert_eq!(db.read().node_count(), before);
     }
 
     #[test]

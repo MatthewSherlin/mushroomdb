@@ -1473,7 +1473,7 @@ fn wire_types_serialize() {
     }
     assert_eq!(
         json_to_value(json!("p1")),
-        Some(Value::Str("p1".into())),
+        Ok(Some(Value::Str("p1".into()))),
         "params reuse json_to_value"
     );
 }
@@ -6688,4 +6688,79 @@ async fn query_returns_tagged_params_in_their_wire_form() {
     )
     .await;
     assert_eq!(parse_json(&body)["rows"][0][0], json!("2024-01-15"));
+}
+
+/// A known tag with a bad or non-string payload is a 400 naming the field and
+/// the reason, on every JSON entry path — never a stored map.
+#[tokio::test]
+async fn bad_tagged_payloads_are_errors_naming_the_field() {
+    let dir = tmp("v11-bad-tags");
+    let db = SharedDb::open(&dir).unwrap();
+    seed_person(&db, "alice");
+    let before = wal_bytes(&dir);
+    let app = router(db.clone());
+    for (payload, reason) in [
+        (json!({"$date": "2024-1-5"}), "is not an ISO 8601 date"),
+        (json!({"$dt": "2024-01-15T12:00:00+19:00"}), "within ±18:00"),
+        (json!({"$binary": "Zm9vYg"}), "padded standard base64"),
+        (json!({"$dur": 5}), "payload must be a string"),
+    ] {
+        // Query params.
+        let (status, body, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/query?format=json",
+                json!({"cypher": "MATCH (n:Person) RETURN $d AS d", "params": {"d": payload.clone()}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = parse_json(&body)["error"].as_str().unwrap().to_string();
+        assert!(
+            err.contains(r#"param "d": $"#) && err.contains(reason),
+            "{err}"
+        );
+        // Node props.
+        let (status, body, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/nodes",
+                json!({"label": "Person", "key": "bob", "props": {"born": payload.clone()}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let err = parse_json(&body)["error"].as_str().unwrap().to_string();
+        assert!(
+            err.contains(r#"props "born": $"#) && err.contains(reason),
+            "{err}"
+        );
+        // Ingest: the row is refused with an error naming the field.
+        let (status, body, _) = send(
+            app.clone(),
+            json_req(
+                "POST",
+                "/ingest",
+                json!({"label": "Person", "rows": [{"id": "bob", "born": payload.clone()}],
+                       "options": {"auto_fk": "off"}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let report = parse_json(&body);
+        assert_eq!(report["inserted"], json!(0));
+        let err = report["row_errors"][0][1].as_str().unwrap().to_string();
+        assert!(
+            err.contains(r#"field "born": $"#) && err.contains(reason),
+            "{err}"
+        );
+    }
+    assert_eq!(
+        wal_bytes(&dir),
+        before,
+        "a refused write appended to the WAL"
+    );
+    assert_eq!(db.read().node_count(), 1);
 }

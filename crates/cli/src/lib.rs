@@ -2984,9 +2984,7 @@ fn fmt_value(v: &Value) -> String {
         | Value::LocalDateTime(_)
         | Value::DateTime { .. }
         | Value::Duration { .. }
-        | Value::Binary(_) => mushroomdb::tagged_text(v)
-            .map(|(_, text)| text)
-            .unwrap_or_default(),
+        | Value::Binary(_) => mushroomdb::v11_display_text(v).unwrap_or_default(),
     }
 }
 

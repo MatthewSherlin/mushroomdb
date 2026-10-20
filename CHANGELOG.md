@@ -12,7 +12,6 @@
 
 - **A JSON object `{"$date": …}`, `{"$ldt": …}`, `{"$dt": …}`, `{"$dur": …}` or `{"$binary": …}` is now a typed value, and a write that would store one is refused until the V11 format lands.** Through 0.9.x such an object was stored as a map. It now parses to a Date, LocalDateTime, DateTime, Duration or Binary value (ISO 8601 text, base64 for binary), and a query that takes one as a parameter returns it in the same form. Any write that would store one fails with `not supported in mushroomdb 0.10 yet: <type> values cannot be stored until the V11 format lands` and writes nothing, so the store stays readable by 0.9.x. A bare string is still a string, and a tagged object whose text does not parse is still a map. A store that already holds such a map exports it in that form, which now re-imports as the typed value. Role predicates (`visible_where`) refuse the new types.
 - **Rust: `Value` has five new variants** (`Date`, `LocalDateTime`, `DateTime`, `Duration`, `Binary`), so an exhaustive `match` on it needs new arms. `tagged_text` and `tagged_json` give their wire forms.
-
 ## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
 
 No format version change. A 0.9.1 store opens under 0.9.2, and a 0.9.2 snapshot opens under 0.9.1: the one addition, an optional snapshot section (16), is ignored by 0.9.1.

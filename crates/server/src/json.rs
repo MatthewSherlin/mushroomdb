@@ -30,7 +30,10 @@ pub(crate) fn value_to_json(v: &Value) -> Js {
         | Value::LocalDateTime(_)
         | Value::DateTime { .. }
         | Value::Duration { .. }
-        | Value::Binary(_) => tagged_json(v).unwrap_or(Js::Null),
+        // `Err` is a DateTime offset outside ±18:00, which no value reaching
+        // the server can carry: params are parsed from JSON, which refuses one,
+        // and the store holds no format-V11 value. No tag is written for it.
+        | Value::Binary(_) => tagged_json(v).ok().flatten().unwrap_or(Js::Null),
     }
 }
 
@@ -117,7 +120,7 @@ pub(crate) fn params_from_json(v: Option<&Js>) -> Result<BTreeMap<String, Value>
         .ok_or_else(|| "params must be an object".to_string())?;
     let mut out = BTreeMap::new();
     for (k, val) in obj {
-        match json_to_value(val.clone()) {
+        match json_to_value(val.clone()).map_err(|e| format!("param {k:?}: {e}"))? {
             Some(mapped) => {
                 out.insert(k.clone(), mapped);
             }
@@ -361,7 +364,7 @@ mod tests {
         ];
         for (value, wire) in cases {
             assert_eq!(value_to_json(&value), wire);
-            assert_eq!(json_to_value(wire), Some(value));
+            assert_eq!(json_to_value(wire), Ok(Some(value)));
         }
         // Nested in a list, each keeps its form.
         let list = Value::List(vec![Value::Date(0), Value::Binary(vec![])]);

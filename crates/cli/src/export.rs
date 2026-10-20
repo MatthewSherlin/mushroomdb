@@ -84,7 +84,12 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         | Value::LocalDateTime(_)
         | Value::DateTime { .. }
         | Value::Duration { .. }
-        | Value::Binary(_) => mushroomdb::tagged_json(v).unwrap_or(serde_json::Value::Null),
+        // `Err` is a DateTime offset outside ±18:00, which the store never
+        // holds (it holds no format-V11 value); no tag is written for it.
+        | Value::Binary(_) => mushroomdb::tagged_json(v)
+            .ok()
+            .flatten()
+            .unwrap_or(serde_json::Value::Null),
     }
 }
 
@@ -615,9 +620,9 @@ mod v11_value_tests {
     fn export_writes_the_tagged_form_that_reimports() {
         let date = Value::Date(19_737);
         assert_eq!(value_to_json(&date), json!({"$date": "2024-01-15"}));
-        assert_eq!(json_to_value(value_to_json(&date)), Some(date.clone()));
+        assert_eq!(json_to_value(value_to_json(&date)), Ok(Some(date.clone())));
         let blob = Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        assert_eq!(json_to_value(value_to_json(&blob)), Some(blob.clone()));
+        assert_eq!(json_to_value(value_to_json(&blob)), Ok(Some(blob.clone())));
         // GraphML carries the tagged JSON text in a string attribute.
         assert!(matches!(value_gml_type(&date), GmlType::String));
         assert_eq!(value_gml_text(&date), r#"{"$date":"2024-01-15"}"#);

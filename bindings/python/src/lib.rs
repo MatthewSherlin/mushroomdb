@@ -3141,6 +3141,7 @@ fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
         | Value::DateTime { .. }
         | Value::Duration { .. } => {
             let text = core_storage::tagged_text(v)
+                .map_err(PyValueError::new_err)?
                 .map(|(_, text)| text)
                 .unwrap_or_default();
             Ok(text.into_pyobject(py)?.into_any())

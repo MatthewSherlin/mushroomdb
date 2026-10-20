@@ -78,9 +78,7 @@ fn canonical_display(v: &Value) -> String {
         | Value::LocalDateTime(_)
         | Value::DateTime { .. }
         | Value::Duration { .. }
-        | Value::Binary(_) => core_query::tagged_text(v)
-            .map(|(_, text)| text)
-            .unwrap_or_default(),
+        | Value::Binary(_) => core_query::v11_display_text(v).unwrap_or_default(),
     }
 }
 

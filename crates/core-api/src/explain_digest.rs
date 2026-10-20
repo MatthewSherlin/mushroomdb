@@ -66,7 +66,12 @@ fn value_to_json(v: &Value) -> Js {
         | Value::LocalDateTime(_)
         | Value::DateTime { .. }
         | Value::Duration { .. }
-        | Value::Binary(_) => crate::ingest::tagged_json(v).unwrap_or(Js::Null),
+        // `Err` is a DateTime offset outside ±18:00, which the store never
+        // holds (it holds no format-V11 value); no tag is written for it.
+        | Value::Binary(_) => crate::ingest::tagged_json(v)
+            .ok()
+            .flatten()
+            .unwrap_or(Js::Null),
     }
 }
 

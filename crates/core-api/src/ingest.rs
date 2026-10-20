@@ -64,71 +64,90 @@ pub struct IngestReport {
 
 /// Convert a JSON value to a stored [`Value`].
 ///
-/// JSON `null` returns `None` so the caller can skip the field (not an error).
-/// Integral numbers become [`Value::Int`]; other numbers become [`Value::Float`].
-/// Arrays become [`Value::List`] by recursing through this function. If any
-/// element is JSON `null` the entire array field returns `None` and the caller
-/// silently skips the field (same null-drop policy as top-level fields). JSON
-/// objects become [`Value::Map`] recursively; `null` values inside an object
-/// are silently omitted from the map.
+/// JSON `null` returns `Ok(None)` so the caller can skip the field (not an
+/// error). Integral numbers become [`Value::Int`]; other numbers become
+/// [`Value::Float`]. Arrays become [`Value::List`] by recursing through this
+/// function. If any element is JSON `null` the entire array field is `Ok(None)`
+/// and the caller silently skips the field (same null-drop policy as top-level
+/// fields). JSON objects become [`Value::Map`] recursively; `null` values
+/// inside an object are silently omitted from the map.
 ///
 /// **Behavior change from pre-Map:** JSON objects previously returned `None`
 /// (treated as a skipped/error field by `ingest_json`). They now produce
 /// `Value::Map` so nested objects are stored faithfully.
 ///
-/// An object with exactly one key that is a type tag and a string value is
-/// the typed form of a format-V11 value: `{"$date": "2024-01-15"}`,
+/// An object with exactly one key that is one of the five type tags is the
+/// typed form of a format-V11 value: `{"$date": "2024-01-15"}`,
 /// `{"$ldt": …}`, `{"$dt": …}`, `{"$dur": …}` and `{"$binary": "<base64>"}`
-/// (see [`tagged_json`], the inverse). A bare string is always [`Value::Str`],
-/// never a date. A tagged object whose text does not parse stays the
-/// [`Value::Map`] it was before these types existed.
-pub fn json_to_value(v: serde_json::Value) -> Option<Value> {
-    match v {
+/// (see [`tagged_json`], the inverse). Its payload must be a string in the
+/// tag's form; anything else is an `Err` naming the tag and the reason, never
+/// a map — the caller adds the field name. A bare string is always
+/// [`Value::Str`], never a date. Objects with other `$` keys, or with more
+/// than one key, are maps as before.
+pub fn json_to_value(v: serde_json::Value) -> std::result::Result<Option<Value>, String> {
+    Ok(match v {
         serde_json::Value::Null => None,
         serde_json::Value::Bool(b) => Some(Value::Bool(b)),
         serde_json::Value::Number(n) => number_to_value(&n),
         serde_json::Value::String(s) => Some(Value::Str(s)),
         serde_json::Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(json_to_value(item)?);
+            for (i, item) in items.into_iter().enumerate() {
+                match json_to_value(item).map_err(|e| format!("item {i}: {e}"))? {
+                    Some(v) => out.push(v),
+                    None => return Ok(None),
+                }
             }
             Some(Value::List(out))
         }
         serde_json::Value::Object(obj) => {
             if let Some(typed) = tagged_object_value(&obj) {
-                return Some(typed);
+                return typed.map(Some);
             }
             let mut map = std::collections::BTreeMap::new();
             for (k, v) in obj {
-                if let Some(val) = json_to_value(v) {
+                let val = json_to_value(v).map_err(|e| format!("key {k:?}: {e}"))?;
+                if let Some(val) = val {
                     map.insert(k, val);
                 }
             }
             Some(Value::Map(map))
         }
-    }
+    })
 }
 
-/// The typed value a single-key tagged object names, if it is one.
-fn tagged_object_value(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Value> {
+/// The typed value a single-key tagged object names, or `None` when the object
+/// is not one (more than one key, or a key that is not one of the five tags).
+fn tagged_object_value(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<std::result::Result<Value, String>> {
     if obj.len() != 1 {
         return None;
     }
-    let (tag, text) = obj.iter().next()?;
-    core_storage::value_from_tagged_text(tag, text.as_str()?)
+    let (tag, payload) = obj.iter().next()?;
+    if !core_storage::V11_TAGS.contains(&tag.as_str()) {
+        return None;
+    }
+    Some(match payload.as_str() {
+        Some(text) => core_storage::value_from_tagged_text(tag, text),
+        None => Err(format!("{tag} payload must be a string, not {payload}")),
+    })
 }
 
-/// The tagged JSON object of a format-V11 value — `{"$date": "2024-01-15"}` —
-/// or `None` for the types JSON carries untagged.
+/// The tagged JSON object of a format-V11 value — `Ok(Some({"$date":
+/// "2024-01-15"}))` — or `Ok(None)` for the types JSON carries untagged.
 ///
 /// The inverse of the tagged-object branch of [`json_to_value`]. Every JSON
 /// encoder of `Value` calls this, so they all write the one form it reads.
-pub fn tagged_json(v: &Value) -> Option<serde_json::Value> {
-    let (tag, text) = core_storage::tagged_text(v)?;
+/// `Err` is a value with no text (a `DateTime` offset outside ±18:00, see
+/// [`core_storage::tagged_text`]); no tag is written for it.
+pub fn tagged_json(v: &Value) -> std::result::Result<Option<serde_json::Value>, String> {
+    let Some((tag, text)) = core_storage::tagged_text(v)? else {
+        return Ok(None);
+    };
     let mut obj = serde_json::Map::with_capacity(1);
     obj.insert(tag.to_string(), serde_json::Value::String(text));
-    Some(serde_json::Value::Object(obj))
+    Ok(Some(serde_json::Value::Object(obj)))
 }
 
 fn number_to_value(n: &serde_json::Number) -> Option<Value> {
@@ -148,7 +167,7 @@ fn object_to_row(
 ) -> std::result::Result<BTreeMap<String, Value>, String> {
     let mut row = BTreeMap::new();
     for (k, v) in obj {
-        if let Some(val) = json_to_value(v.clone()) {
+        if let Some(val) = json_to_value(v.clone()).map_err(|e| format!("field {k:?}: {e}"))? {
             row.insert(k.clone(), val);
         }
     }
@@ -396,7 +415,7 @@ fn infer_auto_fk<F: Fs>(
 
 #[cfg(test)]
 mod tests {
-    use super::{json_to_value, tagged_json};
+    use super::{json_to_rows, json_to_value, tagged_json};
     use core_storage::Value;
     use serde_json::json;
 
@@ -404,14 +423,14 @@ mod tests {
     fn test_value_json_roundtrip() {
         // Date: 2024-01-15 = days 19737 since 1970-01-01.
         let date = Value::Date(19_737);
-        let j = tagged_json(&date).unwrap();
+        let j = tagged_json(&date).unwrap().unwrap();
         assert_eq!(j, json!({"$date": "2024-01-15"}));
-        assert_eq!(json_to_value(j), Some(date));
+        assert_eq!(json_to_value(j), Ok(Some(date)));
         // Binary: base64 roundtrip.
         let bin = Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]);
-        let j = tagged_json(&bin).unwrap();
+        let j = tagged_json(&bin).unwrap().unwrap();
         assert_eq!(j, json!({"$binary": "3q2+7w=="}));
-        assert_eq!(json_to_value(j), Some(bin));
+        assert_eq!(json_to_value(j), Ok(Some(bin)));
     }
 
     #[test]
@@ -430,6 +449,13 @@ mod tests {
                 },
             ),
             (
+                json!({"$dt": "2024-01-15T12:00:00+14:00"}),
+                Value::DateTime {
+                    micros_utc: 1_705_269_600_000_000,
+                    offset_seconds: 50_400,
+                },
+            ),
+            (
                 json!({"$dur": "P1Y2M3DT4H5M6.789S"}),
                 Value::Duration {
                     months: 14,
@@ -440,41 +466,118 @@ mod tests {
             (json!({"$binary": ""}), Value::Binary(vec![])),
         ];
         for (j, want) in cases {
-            assert_eq!(json_to_value(j.clone()).as_ref(), Some(&want), "{j}");
-            assert_eq!(tagged_json(&want), Some(j));
+            assert_eq!(json_to_value(j.clone()), Ok(Some(want.clone())), "{j}");
+            assert_eq!(tagged_json(&want), Ok(Some(j)));
         }
         // Tagged values nest inside lists and maps like any other value.
         assert_eq!(
             json_to_value(json!([{"$date": "1970-01-01"}, {"k": {"$binary": "AA=="}}])),
-            Some(Value::List(vec![
+            Ok(Some(Value::List(vec![
                 Value::Date(0),
                 Value::Map([("k".to_string(), Value::Binary(vec![0]))].into()),
-            ]))
+            ])))
         );
     }
 
     #[test]
-    fn bare_strings_and_near_miss_objects_keep_their_old_meaning() {
+    fn a_bad_payload_under_a_known_tag_is_an_error_never_a_map() {
+        let bad = [
+            ("$date", json!("2024-1-5"), "an ISO 8601 date"),
+            ("$date", json!("2023-02-29"), "an ISO 8601 date"),
+            (
+                "$ldt",
+                json!("2024-01-15T12:00:00Z"),
+                "an ISO 8601 local date-time",
+            ),
+            (
+                "$dt",
+                json!("2024-01-15T12:00:00"),
+                "an ISO 8601 date-time with an offset",
+            ),
+            ("$dt", json!("2024-01-15T12:00:00+18:30"), "within ±18:00"),
+            ("$dur", json!("P1D2M"), "an ISO 8601 duration"),
+            ("$binary", json!("Zm9vYg"), "padded standard base64"),
+        ];
+        for (tag, payload, expects) in bad {
+            let err = json_to_value(json!({ tag: payload.clone() })).unwrap_err();
+            assert!(
+                err.starts_with(&format!("{tag} payload {payload}")),
+                "{err}"
+            );
+            assert!(err.contains(expects), "{err}");
+        }
+        // A payload that is not a string, under every tag.
+        for tag in core_storage::V11_TAGS {
+            for payload in [json!(19737), json!(null), json!(["x"]), json!({"a": 1})] {
+                let err = json_to_value(json!({ tag: payload.clone() })).unwrap_err();
+                assert_eq!(
+                    err,
+                    format!("{tag} payload must be a string, not {payload}")
+                );
+            }
+        }
+        // Nested, the error says where.
+        let err = json_to_value(json!({"meta": [1, {"$date": "x"}]})).unwrap_err();
+        assert!(
+            err.starts_with(r#"key "meta": item 1: $date payload"#),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn bare_strings_and_other_objects_keep_their_old_meaning() {
         // A bare ISO string is a string, never a date.
         assert_eq!(
             json_to_value(json!("2024-01-15")),
-            Some(Value::Str("2024-01-15".into()))
+            Ok(Some(Value::Str("2024-01-15".into())))
         );
-        // Not a tagged form: two keys, a non-string payload, an unknown tag,
-        // or text that does not parse. Each stays the map it always was.
+        // Not a tagged form: two keys, or a `$` key that is not one of the
+        // five tags. Each stays the map it always was.
         for j in [
             json!({"$date": "2024-01-15", "x": 1}),
-            json!({"$date": 19737}),
+            json!({"$date": "not-a-date", "x": 1}),
             json!({"$time": "12:00"}),
-            json!({"$date": "not-a-date"}),
-            json!({"$binary": "not base64!"}),
+            json!({"$ref": 7}),
         ] {
             assert!(
-                matches!(json_to_value(j.clone()), Some(Value::Map(_))),
+                matches!(json_to_value(j.clone()), Ok(Some(Value::Map(_)))),
                 "{j}"
             );
         }
         // Untagged types have no tagged form.
-        assert_eq!(tagged_json(&Value::Int(1)), None);
+        assert_eq!(tagged_json(&Value::Int(1)), Ok(None));
+    }
+
+    #[test]
+    fn a_datetime_with_no_text_has_no_tag() {
+        let bad = Value::DateTime {
+            micros_utc: 0,
+            offset_seconds: 64_801,
+        };
+        assert!(tagged_json(&bad).unwrap_err().contains("outside ±18:00"));
+    }
+
+    #[test]
+    fn ingest_rows_report_a_bad_tag_as_a_row_error_naming_the_field() {
+        let rows = json_to_rows(&json!([
+            {"id": "a", "born": {"$date": "2024-1-5"}},
+            {"id": "b"},
+        ]))
+        .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        let report = rows.into_report(super::IngestReport {
+            inserted: 1,
+            row_errors: vec![],
+            rules_created: vec![],
+            skipped_fk_fields: vec![],
+            edges_inserted: 0,
+        });
+        assert_eq!(report.row_errors.len(), 1);
+        let (index, msg) = &report.row_errors[0];
+        assert_eq!(*index, 0);
+        assert_eq!(
+            msg,
+            r#"field "born": $date payload "2024-1-5" is not an ISO 8601 date (YYYY-MM-DD)"#
+        );
     }
 }

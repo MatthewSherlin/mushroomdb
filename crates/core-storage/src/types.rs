@@ -22,11 +22,12 @@ pub enum Value {
     LocalDateTime(i64),
     /// An instant plus the UTC offset it was written with. The offset is kept
     /// so the value prints back as written; equality and ordering in queries
-    /// and in index keys use `micros_utc` only.
+    /// and in index keys use `micros_utc` only. A valid offset is within
+    /// ±18:00 ([`MAX_OFFSET_SECONDS`]).
     /// JSON form `{"$dt": "2024-01-15T12:34:56.789012+05:30"}`.
     DateTime {
         micros_utc: i64,
-        offset_seconds: i16,
+        offset_seconds: i32,
     },
     /// openCypher duration: months, days and nanoseconds are independent and
     /// never normalized against each other (a month is not 30 days). Not
@@ -110,79 +111,226 @@ pub fn v11_type_refusal(type_name: &str) -> String {
 // ---------------------------------------------------------------------------
 // Text forms of the V11 types: ISO 8601 and base64.
 //
-// Calendar arithmetic and ISO 8601 date / date-time parsing come from `time`,
-// whose range is the years -9999..=9999. A value outside that range can be
-// built in Rust but has no ISO text; it prints as a labelled out-of-range
-// string, never a panic. ISO 8601 durations and base64 are hand-written: `time`
-// has no duration text form, and base64 is not worth a dependency.
+// All hand-written, std only. Calendar arithmetic is the proleptic Gregorian
+// civil-day algorithm over i64, so every representable `Date`, `LocalDateTime`
+// and `DateTime` instant has text, and that text parses back to the same value:
+// years 0000–9999 print as four digits, every other year in the signed
+// expanded form ISO 8601 allows (`-000001`, `+010000`). The one value that has
+// no text is a `DateTime` whose offset is outside ±18:00; its printer returns
+// an error rather than text that would not parse back.
+//
+// Accepted input is the ISO 8601 extended format these printers write:
+// `YYYY-MM-DD`, `THH:MM[:SS[.fffffffff]]`, and an offset `Z`, `±HH:MM` or
+// `±HH:MM:SS`. Basic (`20240115`), week and ordinal forms are refused.
 // ---------------------------------------------------------------------------
 
-/// Julian day number of 1970-01-01.
-const UNIX_EPOCH_JULIAN_DAY: i32 = 2_440_588;
 const MICROS_PER_SECOND: i64 = 1_000_000;
 const SECONDS_PER_DAY: i64 = 86_400;
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 const NANOS_PER_MINUTE: i64 = 60 * NANOS_PER_SECOND;
 const NANOS_PER_HOUR: i64 = 60 * NANOS_PER_MINUTE;
 
-fn date_from_days(days: i32) -> Option<time::Date> {
-    let julian = days.checked_add(UNIX_EPOCH_JULIAN_DAY)?;
-    time::Date::from_julian_day(julian).ok()
+/// The widest UTC offset a `DateTime` may carry: ±18:00, in seconds.
+pub const MAX_OFFSET_SECONDS: i32 = 18 * 3600;
+
+fn is_leap_year(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
-/// `YYYY-MM-DD`; years before 0 use the signed six-digit ISO form `-YYYYYY`.
-fn format_date(date: time::Date) -> String {
-    let (year, month, day) = date.to_calendar_date();
-    let month = u8::from(month);
-    if year < 0 {
-        format!("-{:06}-{month:02}-{day:02}", -year)
-    } else {
-        format!("{year:04}-{month:02}-{day:02}")
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
     }
+}
+
+/// Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant's
+/// `days_from_civil`).
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = i64::from(month);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The proleptic Gregorian date of a day count since 1970-01-01 (H. Hinnant's
+/// `civil_from_days`).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+fn format_civil(days: i64) -> String {
+    let (year, month, day) = civil_from_days(days);
+    let year = if (0..=9999).contains(&year) {
+        format!("{year:04}")
+    } else if year < 0 {
+        format!("-{:06}", year.unsigned_abs())
+    } else {
+        format!("+{year:06}")
+    };
+    format!("{year}-{month:02}-{day:02}")
+}
+
+/// Exactly `n` ASCII digits at the start of `s`, and the rest.
+fn fixed_digits(s: &str, n: usize) -> Option<(u32, &str)> {
+    let digits = s.get(..n)?;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((digits.parse().ok()?, &s[n..]))
+}
+
+/// `[±]YYYY…-MM-DD` at the start of `s`: days since the epoch, and the rest.
+fn parse_civil(s: &str) -> Option<(i64, &str)> {
+    let (sign, rest) = match s.as_bytes().first()? {
+        b'+' => (1, &s[1..]),
+        b'-' => (-1, &s[1..]),
+        _ => (0, s),
+    };
+    let year_len = rest.bytes().take_while(u8::is_ascii_digit).count();
+    // Unsigned years are exactly four digits; signed (expanded) ones at least
+    // four. Twelve digits is far past any representable value.
+    if (sign == 0 && year_len != 4) || !(4..=12).contains(&year_len) {
+        return None;
+    }
+    let magnitude: i64 = rest[..year_len].parse().ok()?;
+    let year = if sign < 0 { -magnitude } else { magnitude };
+    let rest = rest[year_len..].strip_prefix('-')?;
+    let (month, rest) = fixed_digits(rest, 2)?;
+    let rest = rest.strip_prefix('-')?;
+    let (day, rest) = fixed_digits(rest, 2)?;
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return None;
+    }
+    Some((days_from_civil(year, month, day), rest))
+}
+
+/// `HH:MM[:SS[.f…]]` at the start of `s`: nanoseconds since midnight, and the
+/// rest.
+fn parse_time_of_day(s: &str) -> Option<(i64, &str)> {
+    let (hour, rest) = fixed_digits(s, 2)?;
+    let rest = rest.strip_prefix(':')?;
+    let (minute, mut rest) = fixed_digits(rest, 2)?;
+    let mut second = 0;
+    let mut frac_nanos = 0i64;
+    if let Some(after) = rest.strip_prefix(':') {
+        let (sec, after) = fixed_digits(after, 2)?;
+        second = sec;
+        rest = after;
+        if let Some(after) = rest.strip_prefix(['.', ',']) {
+            let len = after.bytes().take_while(u8::is_ascii_digit).count();
+            if len == 0 || len > 9 {
+                return None;
+            }
+            let digits: i64 = after[..len].parse().ok()?;
+            frac_nanos = digits * 10i64.pow(9 - len as u32);
+            rest = &after[len..];
+        }
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let secs = i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+    Some((secs * NANOS_PER_SECOND + frac_nanos, rest))
+}
+
+/// `Z`, `±HH:MM` or `±HH:MM:SS`, the whole of `s`, within ±18:00.
+fn parse_offset(s: &str) -> Option<i32> {
+    if s == "Z" {
+        return Some(0);
+    }
+    let (negative, rest) = match s.as_bytes().first()? {
+        b'+' => (false, &s[1..]),
+        b'-' => (true, &s[1..]),
+        _ => return None,
+    };
+    let (hours, rest) = fixed_digits(rest, 2)?;
+    let rest = rest.strip_prefix(':')?;
+    let (minutes, rest) = fixed_digits(rest, 2)?;
+    let seconds = match rest.strip_prefix(':') {
+        Some(after) => {
+            let (secs, after) = fixed_digits(after, 2)?;
+            if !after.is_empty() {
+                return None;
+            }
+            secs
+        }
+        None if rest.is_empty() => 0,
+        None => return None,
+    };
+    if minutes > 59 || seconds > 59 {
+        return None;
+    }
+    let total = i32::try_from(hours * 3600 + minutes * 60 + seconds).ok()?;
+    if total > MAX_OFFSET_SECONDS {
+        return None;
+    }
+    Some(if negative { -total } else { total })
+}
+
+/// Microseconds since the epoch as `…THH:MM:SS[.ffffff]`. Total over i128, so
+/// a local time past the i64 range (a `DateTime` near its limit plus its
+/// offset) still prints.
+fn format_local_micros(micros: i128) -> String {
+    let micros_per_day = i128::from(SECONDS_PER_DAY * MICROS_PER_SECOND);
+    let days = micros.div_euclid(micros_per_day) as i64;
+    let of_day = micros.rem_euclid(micros_per_day) as i64;
+    let sub = of_day % MICROS_PER_SECOND;
+    let sod = of_day / MICROS_PER_SECOND;
+    let (h, m, s) = (sod / 3600, sod / 60 % 60, sod % 60);
+    let date = format_civil(days);
+    if sub == 0 {
+        format!("{date}T{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{date}T{h:02}:{m:02}:{s:02}.{sub:06}")
+    }
+}
+
+/// `date T time` at the start of `s`: local microseconds since the epoch
+/// (sub-microsecond digits truncated toward the earlier instant), and the rest.
+fn parse_local_micros(s: &str) -> Option<(i128, &str)> {
+    let (days, rest) = parse_civil(s)?;
+    let rest = rest.strip_prefix('T')?;
+    let (nanos_of_day, rest) = parse_time_of_day(rest)?;
+    let micros = i128::from(days) * i128::from(SECONDS_PER_DAY * MICROS_PER_SECOND)
+        + i128::from(nanos_of_day.div_euclid(1_000));
+    Some((micros, rest))
 }
 
 /// Days since 1970-01-01 as an ISO 8601 date, `2024-01-15`.
 pub fn date_to_iso8601(days: i32) -> String {
-    match date_from_days(days) {
-        Some(date) => format_date(date),
-        None => format!("date out of range ({days} days from 1970-01-01)"),
-    }
+    format_civil(i64::from(days))
 }
 
 /// An ISO 8601 date to days since 1970-01-01.
 ///
 /// Refuses anything carrying a time of day: a date is only a date.
 pub fn iso8601_to_date(s: &str) -> Option<i32> {
-    if s.contains(['T', 't']) {
-        return None;
+    match parse_civil(s)? {
+        (days, "") => i32::try_from(days).ok(),
+        _ => None,
     }
-    let date =
-        time::Date::parse(s, &time::format_description::well_known::Iso8601::DEFAULT).ok()?;
-    Some(date.to_julian_day() - UNIX_EPOCH_JULIAN_DAY)
-}
-
-/// Microseconds since the epoch as `YYYY-MM-DDTHH:MM:SS[.ffffff]`, or `None`
-/// outside the calendar range.
-fn format_local_micros(micros: i64) -> Option<String> {
-    let secs = micros.div_euclid(MICROS_PER_SECOND);
-    let sub = micros.rem_euclid(MICROS_PER_SECOND);
-    let days = i32::try_from(secs.div_euclid(SECONDS_PER_DAY)).ok()?;
-    let sod = secs.rem_euclid(SECONDS_PER_DAY);
-    let date = format_date(date_from_days(days)?);
-    let (h, m, s) = (sod / 3600, sod / 60 % 60, sod % 60);
-    Some(if sub == 0 {
-        format!("{date}T{h:02}:{m:02}:{s:02}")
-    } else {
-        format!("{date}T{h:02}:{m:02}:{s:02}.{sub:06}")
-    })
 }
 
 /// Microseconds since 1970-01-01T00:00:00 (no zone) as an ISO 8601 local
 /// date-time, `2024-01-15T12:34:56.789012`. Whole seconds print without a
 /// fraction.
 pub fn local_datetime_to_iso8601(micros: i64) -> String {
-    format_local_micros(micros)
-        .unwrap_or_else(|| format!("local datetime out of range ({micros} µs from 1970-01-01)"))
+    format_local_micros(i128::from(micros))
 }
 
 /// An ISO 8601 date-time with no offset to microseconds since the epoch.
@@ -190,48 +338,49 @@ pub fn local_datetime_to_iso8601(micros: i64) -> String {
 /// Refuses input that carries an offset or `Z` — that is a `DateTime`.
 /// Sub-microsecond digits are truncated toward the earlier instant.
 pub fn iso8601_to_local_datetime(s: &str) -> Option<i64> {
-    use time::format_description::well_known::Iso8601;
-    if time::OffsetDateTime::parse(s, &Iso8601::DEFAULT).is_ok() {
-        return None;
+    match parse_local_micros(s)? {
+        (micros, "") => i64::try_from(micros).ok(),
+        _ => None,
     }
-    let dt = time::PrimitiveDateTime::parse(s, &Iso8601::DEFAULT).ok()?;
-    nanos_to_micros_floor(dt.assume_utc().unix_timestamp_nanos())
-}
-
-fn nanos_to_micros_floor(nanos: i128) -> Option<i64> {
-    i64::try_from(nanos.div_euclid(1_000)).ok()
 }
 
 /// An instant plus its offset as an ISO 8601 date-time with offset,
-/// `2024-01-15T12:34:56.789012+05:30`. UTC prints as `+00:00`.
-pub fn datetime_to_iso8601(micros_utc: i64, offset_seconds: i16) -> String {
-    let local = micros_utc.checked_add(i64::from(offset_seconds) * MICROS_PER_SECOND);
-    let Some(local) = local.and_then(format_local_micros) else {
-        return format!(
-            "datetime out of range ({micros_utc} µs from 1970-01-01 UTC, offset {offset_seconds} s)"
-        );
-    };
+/// `2024-01-15T12:34:56.789012+05:30`. UTC prints as `+00:00`; an offset with
+/// seconds prints them, `+05:30:15`, and parses back.
+///
+/// An offset outside ±18:00 is not a valid `DateTime` and has no text: this
+/// returns an error rather than something [`iso8601_to_datetime`] refuses.
+pub fn datetime_to_iso8601(
+    micros_utc: i64,
+    offset_seconds: i32,
+) -> std::result::Result<String, String> {
+    if offset_seconds.unsigned_abs() > MAX_OFFSET_SECONDS.unsigned_abs() {
+        return Err(format!(
+            "DateTime offset of {offset_seconds} s is outside ±18:00"
+        ));
+    }
+    let local = i128::from(micros_utc) + i128::from(offset_seconds) * i128::from(MICROS_PER_SECOND);
     let sign = if offset_seconds < 0 { '-' } else { '+' };
     let off = offset_seconds.unsigned_abs();
     let (h, m, s) = (off / 3600, off / 60 % 60, off % 60);
-    if s == 0 {
+    let local = format_local_micros(local);
+    Ok(if s == 0 {
         format!("{local}{sign}{h:02}:{m:02}")
     } else {
         format!("{local}{sign}{h:02}:{m:02}:{s:02}")
-    }
+    })
 }
 
 /// An ISO 8601 date-time with an offset (or `Z`) to
 /// `(micros_utc, offset_seconds)`.
 ///
-/// Refuses input with no offset — that is a `LocalDateTime` — and offsets that
-/// do not fit `offset_seconds: i16` (beyond ±9:06:07).
-pub fn iso8601_to_datetime(s: &str) -> Option<(i64, i16)> {
-    let dt =
-        time::OffsetDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
-            .ok()?;
-    let offset = i16::try_from(dt.offset().whole_seconds()).ok()?;
-    Some((nanos_to_micros_floor(dt.unix_timestamp_nanos())?, offset))
+/// Refuses input with no offset — that is a `LocalDateTime` — and offsets
+/// outside ±18:00.
+pub fn iso8601_to_datetime(s: &str) -> Option<(i64, i32)> {
+    let (local, rest) = parse_local_micros(s)?;
+    let offset = parse_offset(rest)?;
+    let utc = local - i128::from(offset) * i128::from(MICROS_PER_SECOND);
+    Some((i64::try_from(utc).ok()?, offset))
 }
 
 /// An openCypher duration as ISO 8601, `P1Y2M3DT4H5M6.789S`; zero is `PT0S`.
@@ -423,42 +572,67 @@ pub const TAG_DURATION: &str = "$dur";
 /// JSON tag of a [`Value::Binary`]: `{"$binary": "<base64>"}`.
 pub const TAG_BINARY: &str = "$binary";
 
-/// The wire tag and text of a format-V11 value — `("$date", "2024-01-15")` —
-/// or `None` for the types JSON carries untagged.
+/// The five wire tags, in `Value` order.
+pub const V11_TAGS: [&str; 5] = [
+    TAG_DATE,
+    TAG_LOCAL_DATETIME,
+    TAG_DATETIME,
+    TAG_DURATION,
+    TAG_BINARY,
+];
+
+/// The wire tag and text of a format-V11 value — `Ok(Some(("$date",
+/// "2024-01-15")))` — or `Ok(None)` for the types JSON carries untagged.
 ///
 /// One place names the tags and the text forms, so every encoder (HTTP and
 /// MCP JSON, export, CLI and Arrow text) writes the same thing and
-/// [`value_from_tagged_text`] reads all of it back.
-pub fn tagged_text(v: &Value) -> Option<(&'static str, String)> {
-    match v {
+/// [`value_from_tagged_text`] reads all of it back. Every representable value
+/// has text except a `DateTime` whose offset is outside ±18:00, which is an
+/// `Err` naming why: no encoder ever writes a tag that would not parse back.
+pub fn tagged_text(v: &Value) -> std::result::Result<Option<(&'static str, String)>, String> {
+    Ok(Some(match v {
         Value::Int(_)
         | Value::Float(_)
         | Value::Str(_)
         | Value::Bool(_)
         | Value::List(_)
-        | Value::Map(_) => None,
-        Value::Date(days) => Some((TAG_DATE, date_to_iso8601(*days))),
-        Value::LocalDateTime(us) => Some((TAG_LOCAL_DATETIME, local_datetime_to_iso8601(*us))),
+        | Value::Map(_) => return Ok(None),
+        Value::Date(days) => (TAG_DATE, date_to_iso8601(*days)),
+        Value::LocalDateTime(us) => (TAG_LOCAL_DATETIME, local_datetime_to_iso8601(*us)),
         Value::DateTime {
             micros_utc,
             offset_seconds,
-        } => Some((
+        } => (
             TAG_DATETIME,
-            datetime_to_iso8601(*micros_utc, *offset_seconds),
-        )),
+            datetime_to_iso8601(*micros_utc, *offset_seconds)?,
+        ),
         Value::Duration {
             months,
             days,
             nanos,
-        } => Some((TAG_DURATION, duration_to_iso8601(*months, *days, *nanos))),
-        Value::Binary(bytes) => Some((TAG_BINARY, base64_encode(bytes))),
+        } => (TAG_DURATION, duration_to_iso8601(*months, *days, *nanos)),
+        Value::Binary(bytes) => (TAG_BINARY, base64_encode(bytes)),
+    }))
+}
+
+/// The text a format-V11 value displays as — its ISO 8601 or base64 form,
+/// without the tag — or `None` for the other types.
+///
+/// For human-facing output (CLI tables, Arrow text columns). A `DateTime` with
+/// no valid text displays as `<invalid DateTime: …>`; wire encoders use
+/// [`tagged_text`] instead, which reports that as an error.
+pub fn v11_display_text(v: &Value) -> Option<String> {
+    match tagged_text(v) {
+        Ok(tagged) => tagged.map(|(_, text)| text),
+        Err(reason) => Some(format!("<invalid DateTime: {reason}>")),
     }
 }
 
-/// The value a wire tag and its text name, or `None` when the tag is not one
-/// of the five or the text does not parse.
-pub fn value_from_tagged_text(tag: &str, text: &str) -> Option<Value> {
-    match tag {
+/// The value a wire tag and its text name.
+///
+/// `Err` says why not: an unknown tag, or text that is not the tag's form.
+pub fn value_from_tagged_text(tag: &str, text: &str) -> std::result::Result<Value, String> {
+    let parsed = match tag {
         TAG_DATE => iso8601_to_date(text).map(Value::Date),
         TAG_LOCAL_DATETIME => iso8601_to_local_datetime(text).map(Value::LocalDateTime),
         TAG_DATETIME => {
@@ -473,7 +647,25 @@ pub fn value_from_tagged_text(tag: &str, text: &str) -> Option<Value> {
             nanos,
         }),
         TAG_BINARY => base64_decode(text).map(Value::Binary),
-        _ => None,
+        _ => return Err(format!("{tag} is not a value tag")),
+    };
+    parsed.ok_or_else(|| format!("{tag} payload {text:?} is not {}", tag_expects(tag)))
+}
+
+/// What a tag's text must be, for error messages.
+fn tag_expects(tag: &str) -> &'static str {
+    match tag {
+        TAG_DATE => "an ISO 8601 date (YYYY-MM-DD)",
+        TAG_LOCAL_DATETIME => {
+            "an ISO 8601 local date-time with no offset (YYYY-MM-DDTHH:MM:SS[.f])"
+        }
+        TAG_DATETIME => {
+            "an ISO 8601 date-time with an offset within ±18:00 \
+             (YYYY-MM-DDTHH:MM:SS[.f]±HH:MM, or Z)"
+        }
+        TAG_DURATION => "an ISO 8601 duration (such as P1Y2M3DT4H5M6.789S) that fits its fields",
+        TAG_BINARY => "padded standard base64",
+        _ => "a known form",
     }
 }
 
@@ -1017,14 +1209,39 @@ mod tests {
         assert_eq!(date_to_iso8601(0), "1970-01-01");
         assert_eq!(date_to_iso8601(-1), "1969-12-31");
         assert_eq!(iso8601_to_date("1969-12-31"), Some(-1));
-        // Year 1 BCE is ISO year 0; earlier years use the signed six-digit form.
+        assert_eq!(iso8601_to_date("2024-02-29"), Some(19_782));
+        assert_eq!(iso8601_to_date("2000-02-29"), Some(11_016));
+        // Year 1 BCE is ISO year 0; years outside 0000–9999 use the signed
+        // expanded form.
         assert_eq!(date_to_iso8601(-719_528), "0000-01-01");
         let neg = iso8601_to_date("-000001-01-01").unwrap();
         assert_eq!(date_to_iso8601(neg), "-000001-01-01");
-        // Edges of the representable range roundtrip.
-        for s in ["-009999-01-01", "9999-12-31"] {
-            assert_eq!(date_to_iso8601(iso8601_to_date(s).unwrap()), s);
+        assert_eq!(date_to_iso8601(2_932_897), "+010000-01-01");
+        // A signed four-digit year parses too; it prints in the canonical form.
+        assert_eq!(iso8601_to_date("+2024-01-15"), Some(19_737));
+    }
+
+    #[test]
+    fn every_date_prints_and_parses_back() {
+        for days in [
+            i32::MIN,
+            i32::MIN + 1,
+            -719_529,
+            -1,
+            0,
+            19_737,
+            2_932_896,
+            i32::MAX - 1,
+            i32::MAX,
+        ] {
+            let text = date_to_iso8601(days);
+            assert_eq!(iso8601_to_date(&text), Some(days), "{text}");
         }
+        assert_eq!(date_to_iso8601(i32::MAX), "+5881580-07-11");
+        assert_eq!(date_to_iso8601(i32::MIN), "-5877641-06-23");
+        // One day past the field's range does not fit and is refused.
+        assert_eq!(iso8601_to_date("+5881580-07-12"), None);
+        assert_eq!(iso8601_to_date("-5877641-06-22"), None);
     }
 
     #[test]
@@ -1033,15 +1250,20 @@ mod tests {
             "",
             "not-a-date",
             "2024-13-01",
+            "2024-00-10",
             "2024-02-30",
+            "2023-02-29",
+            "1900-02-29",
+            "2024-1-5",
+            "20240115",
+            "02024-01-15",
             "2024-01-15T00:00",
             "2024-01-15T12:00:00Z",
             " 2024-01-15",
+            "2024-01-15 ",
         ] {
             assert_eq!(iso8601_to_date(bad), None, "{bad:?}");
         }
-        // Out of the supported range: a defined fallback, never a panic.
-        assert!(date_to_iso8601(i32::MAX).contains("out of range"));
     }
 
     #[test]
@@ -1055,9 +1277,14 @@ mod tests {
             iso8601_to_local_datetime("2024-01-15T12:34:56.789012"),
             Some(micros)
         );
-        // Whole seconds print without a fraction; parsing accepts both.
+        // Whole seconds print without a fraction; parsing accepts both, and
+        // a time without seconds.
         assert_eq!(local_datetime_to_iso8601(0), "1970-01-01T00:00:00");
         assert_eq!(iso8601_to_local_datetime("1970-01-01T00:00:00"), Some(0));
+        assert_eq!(
+            iso8601_to_local_datetime("1970-01-01T00:01"),
+            Some(60_000_000)
+        );
         // Before the epoch: floor, so the fraction stays non-negative.
         assert_eq!(local_datetime_to_iso8601(-1), "1969-12-31T23:59:59.999999");
         assert_eq!(
@@ -1069,6 +1296,14 @@ mod tests {
             iso8601_to_local_datetime("1969-12-31T23:59:59.9999995"),
             Some(-1)
         );
+        for micros in [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX] {
+            let text = local_datetime_to_iso8601(micros);
+            assert_eq!(iso8601_to_local_datetime(&text), Some(micros), "{text}");
+        }
+        assert_eq!(
+            local_datetime_to_iso8601(i64::MAX),
+            "+294247-01-10T04:00:54.775807"
+        );
     }
 
     #[test]
@@ -1078,11 +1313,17 @@ mod tests {
             "2024-01-15T12:34:56Z",
             "2024-01-15",
             "2024-01-15 12:34:56",
+            "2024-01-15T24:00:00",
+            "2024-01-15T12:60:00",
+            "2024-01-15T12:00:60",
+            "2024-01-15T12:00:00.",
+            "2024-01-15T12:00:00.1234567890",
+            "2024-01-15T12",
+            "+294247-01-10T04:00:54.775808",
             "garbage",
         ] {
             assert_eq!(iso8601_to_local_datetime(bad), None, "{bad:?}");
         }
-        assert!(local_datetime_to_iso8601(i64::MAX).contains("out of range"));
     }
 
     #[test]
@@ -1092,31 +1333,92 @@ mod tests {
         assert_eq!(off, 19_800);
         // 12:34:56.789012 at +05:30 is 07:04:56.789012 UTC.
         assert_eq!(micros, 1_705_302_296_789_012);
-        assert_eq!(datetime_to_iso8601(micros, off), s);
+        assert_eq!(datetime_to_iso8601(micros, off).unwrap(), s);
         // Same instant, different offsets: same micros_utc.
         let a = iso8601_to_datetime("2024-01-15T12:00:00+00:00").unwrap();
         let b = iso8601_to_datetime("2024-01-15T07:00:00-05:00").unwrap();
         assert_eq!(a.0, b.0);
         assert_ne!(a.1, b.1);
-        assert_eq!(datetime_to_iso8601(b.0, b.1), "2024-01-15T07:00:00-05:00");
+        assert_eq!(
+            datetime_to_iso8601(b.0, b.1).unwrap(),
+            "2024-01-15T07:00:00-05:00"
+        );
         // `Z` parses as +00:00 and prints as +00:00.
         let z = iso8601_to_datetime("2024-01-15T12:00:00Z").unwrap();
         assert_eq!(z, a);
-        assert_eq!(datetime_to_iso8601(z.0, z.1), "2024-01-15T12:00:00+00:00");
+        assert_eq!(
+            datetime_to_iso8601(z.0, z.1).unwrap(),
+            "2024-01-15T12:00:00+00:00"
+        );
     }
 
     #[test]
-    fn datetime_iso8601_refuses_missing_or_unrepresentable_offset() {
+    fn datetime_offsets_cover_every_real_zone_up_to_eighteen_hours() {
+        for (text, secs) in [
+            ("+10:00", 36_000),
+            ("+12:45", 45_900),
+            ("+14:00", 50_400),
+            ("-10:00", -36_000),
+            ("-12:00", -43_200),
+            ("+18:00", 64_800),
+            ("-18:00", -64_800),
+        ] {
+            let s = format!("2024-01-15T12:00:00{text}");
+            let (micros, off) = iso8601_to_datetime(&s).unwrap();
+            assert_eq!(off, secs, "{s}");
+            assert_eq!(datetime_to_iso8601(micros, off).unwrap(), s);
+        }
+        for bad in [
+            "+18:01",
+            "-18:00:01",
+            "+19:00",
+            "+05:60",
+            "+05",
+            "+0530",
+            "+05:30:60",
+        ] {
+            let s = format!("2024-01-15T12:00:00{bad}");
+            assert_eq!(iso8601_to_datetime(&s), None, "{s}");
+        }
         assert_eq!(iso8601_to_datetime("2024-01-15T12:00:00"), None);
         assert_eq!(iso8601_to_datetime("2024-01-15"), None);
-        // offset_seconds is i16 (contract C3): ±9:06:07 is the widest it holds.
-        assert_eq!(
-            iso8601_to_datetime("2024-01-15T12:00:00+09:00").unwrap().1,
-            32_400
-        );
-        assert_eq!(iso8601_to_datetime("2024-01-15T12:00:00+10:00"), None);
-        assert_eq!(iso8601_to_datetime("2024-01-15T12:00:00-10:00"), None);
-        assert!(datetime_to_iso8601(i64::MAX, 0).contains("out of range"));
+    }
+
+    #[test]
+    fn datetime_offsets_with_seconds_print_and_parse_back() {
+        let s = "2024-01-15T12:00:00+05:30:15";
+        let (micros, off) = iso8601_to_datetime(s).unwrap();
+        assert_eq!(off, 19_815);
+        assert_eq!(datetime_to_iso8601(micros, off).unwrap(), s);
+        // Every valid offset, at a step that covers odd seconds, round-trips.
+        for off in (-MAX_OFFSET_SECONDS..=MAX_OFFSET_SECONDS).step_by(997) {
+            let text = datetime_to_iso8601(1_000_000_007, off).unwrap();
+            assert_eq!(
+                iso8601_to_datetime(&text),
+                Some((1_000_000_007, off)),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_valid_datetime_prints_and_parses_back() {
+        // The local time of an instant near the i64 limit, shifted by its
+        // offset, is past the i64 range; it still prints, and parses back.
+        for (micros, off) in [
+            (i64::MAX, MAX_OFFSET_SECONDS),
+            (i64::MIN, -MAX_OFFSET_SECONDS),
+            (i64::MAX, -MAX_OFFSET_SECONDS),
+            (i64::MIN, 0),
+            (-1, 1),
+        ] {
+            let text = datetime_to_iso8601(micros, off).unwrap();
+            assert_eq!(iso8601_to_datetime(&text), Some((micros, off)), "{text}");
+        }
+        // An offset outside ±18:00 has no text: an error, never a bad tag.
+        let err = datetime_to_iso8601(0, MAX_OFFSET_SECONDS + 1).unwrap_err();
+        assert!(err.contains("outside ±18:00"), "{err}");
+        assert!(datetime_to_iso8601(0, i32::MIN).is_err());
     }
 
     #[test]
@@ -1237,15 +1539,27 @@ mod tests {
             },
             Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]),
         ];
-        let tags = ["$date", "$ldt", "$dt", "$dur", "$binary"];
-        for (v, want_tag) in vals.iter().zip(tags) {
-            let (tag, text) = tagged_text(v).unwrap();
+        for (v, want_tag) in vals.iter().zip(V11_TAGS) {
+            let (tag, text) = tagged_text(v).unwrap().unwrap();
             assert_eq!(tag, want_tag);
-            assert_eq!(value_from_tagged_text(tag, &text).as_ref(), Some(v));
+            assert_eq!(value_from_tagged_text(tag, &text).as_ref(), Ok(v));
         }
-        assert_eq!(tagged_text(&Value::Str("2024-01-15".into())), None);
-        assert_eq!(value_from_tagged_text("$date", "nope"), None);
-        assert_eq!(value_from_tagged_text("$time", "12:00"), None);
+        assert_eq!(tagged_text(&Value::Str("2024-01-15".into())), Ok(None));
+        let err = value_from_tagged_text("$date", "2024-1-5").unwrap_err();
+        assert_eq!(
+            err,
+            r#"$date payload "2024-1-5" is not an ISO 8601 date (YYYY-MM-DD)"#
+        );
+        for tag in V11_TAGS {
+            assert!(value_from_tagged_text(tag, "nope!").is_err(), "{tag}");
+        }
+        assert!(value_from_tagged_text("$time", "12:00").is_err());
+        // A DateTime with no valid text is an error, not a tag.
+        let bad = Value::DateTime {
+            micros_utc: 0,
+            offset_seconds: MAX_OFFSET_SECONDS + 1,
+        };
+        assert!(tagged_text(&bad).is_err());
     }
 
     #[test]
