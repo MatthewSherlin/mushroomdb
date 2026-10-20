@@ -1,5 +1,6 @@
 #![deny(clippy::await_holding_lock)]
 
+mod cors;
 mod http;
 mod json;
 mod mcp;
@@ -64,12 +65,15 @@ struct AppState {
     ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+pub use cors::{cors_layer_from_env, parse_cors_origins, CORS_ORIGINS_ENV};
+
 #[allow(deprecated)]
 pub use http::{
-    router, router_with_auth, router_with_ready_flag, router_with_role_tokens, router_with_ui,
-    router_with_ui_tls, serve, serve_with_role_tokens, serve_with_role_tokens_and_shutdown,
-    serve_with_role_tokens_and_shutdown_with_ready_flag, serve_with_shutdown, serve_with_ui,
-    serve_with_ui_and_role_tokens, serve_with_ui_and_role_tokens_and_shutdown,
+    router, router_with_auth, router_with_cors, router_with_ready_flag, router_with_role_tokens,
+    router_with_ui, router_with_ui_tls, serve, serve_with_role_tokens,
+    serve_with_role_tokens_and_shutdown, serve_with_role_tokens_and_shutdown_with_ready_flag,
+    serve_with_shutdown, serve_with_ui, serve_with_ui_and_role_tokens,
+    serve_with_ui_and_role_tokens_and_shutdown,
     serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag,
 };
 #[cfg(feature = "embed-ui")]

@@ -93,6 +93,26 @@ pub fn router_with_ready_flag(
     )
 }
 
+/// [`router_with_auth`] with an explicit CORS layer (see [`crate::parse_cors_origins`]).
+/// `None` adds no CORS headers. The other routers read `MUSHROOMDB_CORS_ORIGINS`
+/// instead; this one ignores the environment.
+pub fn router_with_cors(
+    db: SharedDb,
+    token: Option<String>,
+    cors: Option<tower_http::cors::CorsLayer>,
+) -> Router {
+    build_app_with_cors(
+        db,
+        token,
+        HashMap::new(),
+        UiFallback::None,
+        default_advertise_addr(),
+        false,
+        Arc::new(AtomicBool::new(true)),
+        cors,
+    )
+}
+
 /// [`router`] with a full-access token and a map of role-bound tokens.
 ///
 /// Role-bound tokens (`role_tokens`: bearer → role name) receive masked reads
@@ -700,6 +720,26 @@ fn build_app_with_ready(
     tls_active: bool,
     ready: Arc<AtomicBool>,
 ) -> Router {
+    // The CLI validates the variable before it opens the store; an invalid value
+    // reaching here (library use) fails closed: no CORS, and an error logged.
+    let cors = crate::cors::cors_layer_from_env().unwrap_or_else(|e| {
+        tracing::error!("{e}; CORS disabled");
+        None
+    });
+    build_app_with_cors(db, token, role_tokens, ui, addr, tls_active, ready, cors)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_app_with_cors(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    ui: UiFallback,
+    addr: SocketAddr,
+    tls_active: bool,
+    ready: Arc<AtomicBool>,
+    cors: Option<tower_http::cors::CorsLayer>,
+) -> Router {
     debug_assert!(
         !db.read().has_event_sink(),
         "router() must be called at most once per SharedDb; a second call \
@@ -815,14 +855,21 @@ fn build_app_with_ready(
         #[cfg(feature = "embed-ui")]
         UiFallback::Embedded => app.fallback(embedded_fallback),
     };
-    app.layer(middleware::from_fn_with_state(state, auth_middleware))
+    let app = app
+        .layer(middleware::from_fn_with_state(state, auth_middleware))
         // Outside auth, so a 401 is logged too — an unauthenticated flood is
         // exactly the thing an operator needs to see.
         .layer(middleware::from_fn(log_middleware))
         // Cap request bodies (default axum limit is only 2 MiB; we allow larger
         // ingest batches but reject multi-GB bodies that would OOM the collector
         // before any handler runs).
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES));
+    // Outermost: a preflight is answered here, before auth (it carries no
+    // credentials), and a 401 still gets CORS headers so a page can read it.
+    match cors {
+        Some(cors) => app.layer(cors),
+        None => app,
+    }
 }
 
 /// Maximum accepted HTTP request body size (64 MiB). Large enough for batched
