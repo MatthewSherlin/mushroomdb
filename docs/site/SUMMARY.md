@@ -35,6 +35,7 @@
 - [Python API](python-api.md)
 - [Rust](rust.md)
 - [TypeScript client](typescript.md)
+- [Bolt protocol](bolt.md)
 
 # Operate
 
