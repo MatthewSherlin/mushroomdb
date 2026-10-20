@@ -42,6 +42,12 @@ const NS_DEFAULT_IDX: u32 = 0;
 /// [`GraphDb::enable_multiplicity`]. The engine owns the name: Cypher `SET` on
 /// it is refused, as the other reserved names are.
 pub const EDGE_COUNT_PROP: &str = "count";
+
+/// The conflict-set entry of a key that changed between a transaction's BEGIN
+/// and the moment the transaction first touched it. No node's `last_change`
+/// is ever `u64::MAX`, so a `NodeUnchangedSince` carrying it always fails —
+/// the same sentinel `Precondition::NodeAbsent` reports as `expected`.
+pub(crate) const TX_CHANGED_SINCE_BEGIN: u64 = u64::MAX;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -788,7 +794,7 @@ pub struct EdgeTypeCensus {
 }
 
 /// Construct the standard write-query result set (columns: created, properties_set, deleted).
-fn write_result_set() -> ResultSet {
+pub(crate) fn write_result_set() -> ResultSet {
     ResultSet::new(vec![
         "created".into(),
         "properties_set".into(),
@@ -796,7 +802,10 @@ fn write_result_set() -> ResultSet {
     ])
 }
 
-fn resolve_merge_set_value(op: &Operand, params: &BTreeMap<String, Value>) -> Result<Value> {
+pub(crate) fn resolve_merge_set_value(
+    op: &Operand,
+    params: &BTreeMap<String, Value>,
+) -> Result<Value> {
     match op {
         Operand::Lit(v) => Ok(v.clone()),
         Operand::Param(name) => params
@@ -846,7 +855,7 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
     }
 }
 
-fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
+pub(crate) fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
     let mut out = Vec::new();
     for item in items {
         match &item.value {
@@ -867,13 +876,13 @@ fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
     out
 }
 
-fn add_var(out: &mut Vec<String>, v: &str) {
+pub(crate) fn add_var(out: &mut Vec<String>, v: &str) {
     if !out.iter().any(|x| x == v) {
         out.push(v.to_string());
     }
 }
 
-fn pattern_node_vars(pats: &[Pattern]) -> Vec<String> {
+pub(crate) fn pattern_node_vars(pats: &[Pattern]) -> Vec<String> {
     let mut out = Vec::new();
     for p in pats {
         if let Some(v) = &p.start.var {
@@ -888,7 +897,7 @@ fn pattern_node_vars(pats: &[Pattern]) -> Vec<String> {
     out
 }
 
-fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
+pub(crate) fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
     let mut out = Vec::new();
     for p in pats {
         for (rel, _) in &p.chain {
@@ -902,7 +911,7 @@ fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
     out
 }
 
-fn rel_type_alias(var: &str) -> String {
+pub(crate) fn rel_type_alias(var: &str) -> String {
     format!("__rt_{var}")
 }
 
@@ -1035,6 +1044,14 @@ fn eval_set_return_expr<F: Fs>(
                 Some(Value::Str(s)) => !s.is_empty(),
                 Some(Value::List(v)) => !v.is_empty(),
                 Some(Value::Map(m)) => !m.is_empty(),
+                Some(Value::Binary(b)) => !b.is_empty(),
+                // A temporal value is a present value, never "empty".
+                Some(
+                    Value::Date(_)
+                    | Value::LocalDateTime(_)
+                    | Value::DateTime { .. }
+                    | Value::Duration { .. },
+                ) => true,
             })
         }
         Expr::IsNull(op) => {
@@ -1091,6 +1108,15 @@ fn eval_set_return_arith(
                     }
                     a.checked_div(b).unwrap_or(i64::MAX)
                 }
+                ArithOp::Mod => {
+                    if b == 0 {
+                        return Err(GraphError::QueryError {
+                            detail: "division by zero".into(),
+                        });
+                    }
+                    a.checked_rem(b).unwrap_or(0)
+                }
+                ArithOp::Pow => return Ok(Some(Value::Float((a as f64).powf(b as f64)))),
             };
             Ok(Some(Value::Int(result)))
         }
@@ -1125,6 +1151,8 @@ fn eval_set_return_arith(
                     }
                     a / b
                 }
+                ArithOp::Mod => a % b,
+                ArithOp::Pow => a.powf(b),
             };
             Ok(Some(Value::Float(result)))
         }
@@ -5181,7 +5209,23 @@ impl<F: Fs> GraphDb<F> {
     /// carries [`PlannedRec::DuplicateCount`] entries — the shape a batch
     /// produces, where a duplicate's count can only be named once this pass has
     /// assigned the frame's own ids.
+    ///
+    /// This is the one function every value-carrying WAL record passes through
+    /// on its way to the WAL — `insert_node` and `set_prop` via `log_dense`,
+    /// every batch, ingest and Cypher write via `commit_logged_batch` — so it
+    /// is where a format-V11 value is refused (see [`v11_only_value`]). The
+    /// check runs first, before anything is interned, so a refused write
+    /// leaves no state behind. Replay never comes here.
     fn rewrite_wal_dense_planned(&mut self, recs: Vec<PlannedRec>) -> Result<Vec<WalRecord>> {
+        for rec in &recs {
+            if let PlannedRec::Rec(rec) = rec {
+                if let Some(type_name) = v11_only_value(rec) {
+                    return Err(GraphError::QueryError {
+                        detail: core_storage::v11_type_refusal(type_name),
+                    });
+                }
+            }
+        }
         let syms_checkpoint = self.syms.len();
         let result = self.rewrite_wal_dense_inner(recs);
         if result.is_err() {
@@ -5889,6 +5933,12 @@ impl<F: Fs> GraphDb<F> {
         if self.intent_unsettled {
             self.settle_snapshot_intent()?;
         }
+        // Backstop for the refusal in `rewrite_wal_dense_planned`: a path that
+        // reached the WAL without passing through it would show up here.
+        debug_assert!(
+            v11_only_value(&rec).is_none(),
+            "a format-V11 value reached the WAL append without the dense rewrite"
+        );
         let frame = encode_record(&rec);
         self.fs.append(FileId::Wal, &frame)?;
         // The cursor advances by exactly the bytes appended: these frames are
@@ -13029,6 +13079,49 @@ impl<F: Fs> GraphDb<F> {
         self.last_change.get(&id).copied()
     }
 
+    /// The `last_change` commit `key` had in the reader snapshot a transaction
+    /// began from, worked out from this live handle.
+    ///
+    /// Used by [`crate::Transaction`] to build its conflict set lazily, when it
+    /// first touches a key, without copying the whole `last_change` map at
+    /// BEGIN. `base_version` and `base_store` are the snapshot's `commit_seq`
+    /// and store identity; `in_base` says whether the key was live in it.
+    ///
+    /// The answer is exact whenever the key has not changed since the
+    /// snapshot: no commit after `base_version` touched it, so its live entry
+    /// is the snapshot's. When it has changed — a commit after `base_version`
+    /// touched it, it was deleted, or it was inserted — the snapshot's value
+    /// is no longer recoverable, and the answer is [`TX_CHANGED_SINCE_BEGIN`],
+    /// which no live entry ever equals, so the commit fails as a conflict. A
+    /// handle that reloaded from disk since the snapshot (another process
+    /// snapshotted) renumbers nothing that persisted but can reseed
+    /// `commit_seq`, so a reload answers "changed" for every key: conservative,
+    /// never a missed conflict.
+    pub(crate) fn tx_base_last_change(
+        &self,
+        key: &str,
+        base_version: u64,
+        base_store: crate::mask::StoreId,
+        in_base: bool,
+    ) -> u64 {
+        if self.store_id != base_store {
+            return TX_CHANGED_SINCE_BEGIN;
+        }
+        match self.ids.get(key) {
+            // Absent now and at BEGIN: `NodeUnchangedSince { expected: 0 }`
+            // conflicts with any insert that lands before the commit.
+            None if !in_base => 0,
+            // Deleted since BEGIN.
+            None => TX_CHANGED_SINCE_BEGIN,
+            // Inserted since BEGIN.
+            Some(_) if !in_base => TX_CHANGED_SINCE_BEGIN,
+            Some(id) => match self.last_change.get(&id).copied().unwrap_or(0) {
+                seq if seq > base_version => TX_CHANGED_SINCE_BEGIN,
+                seq => seq,
+            },
+        }
+    }
+
     /// Which loaded store this handle is.
     ///
     /// Paired with [`commit_seq`](GraphDb::commit_seq) it identifies a graph
@@ -15382,6 +15475,48 @@ pub struct BatchOutcome {
 /// produces a [`BatchOutcome`].
 fn inserted_pair(outcome: BatchOutcome) -> (usize, usize) {
     (outcome.nodes_inserted, outcome.edges_inserted)
+}
+
+/// The first format-V11 value type (`Date`, `LocalDateTime`, `DateTime`,
+/// `Duration`, `Binary`) a WAL record would write, at any depth.
+///
+/// Until the V11 format lands, no such value may reach the WAL: a 0.9.x reader
+/// cannot decode the frame and stops replaying there, silently losing every
+/// later commit, while the store carries no stamp telling it to refuse. The
+/// match names every record kind so a new kind that carries a value cannot be
+/// added without deciding here.
+fn v11_only_value(rec: &WalRecord) -> Option<&'static str> {
+    match rec {
+        WalRecord::InsertNode { props, .. } => props
+            .iter()
+            .find_map(|(_, v)| core_storage::v11_only_type(v)),
+        WalRecord::InsertNodeId { props, .. } => props
+            .iter()
+            .find_map(|(_, v)| core_storage::v11_only_type(v)),
+        WalRecord::SetProp { value, .. } | WalRecord::SetPropId { value, .. } => {
+            core_storage::v11_only_type(value)
+        }
+        WalRecord::Batch(inner) => inner.iter().find_map(v11_only_value),
+        WalRecord::InsertEdge { .. }
+        | WalRecord::CreateRule { .. }
+        | WalRecord::DeleteRule { .. }
+        | WalRecord::RemoveProp { .. }
+        | WalRecord::DeleteEdge { .. }
+        | WalRecord::DeleteNode { .. }
+        | WalRecord::RebuildRule { .. }
+        | WalRecord::CreateView { .. }
+        | WalRecord::DeleteView { .. }
+        | WalRecord::EnableFulltext { .. }
+        | WalRecord::DisableFulltext { .. }
+        | WalRecord::InsertEdgeId { .. }
+        | WalRecord::Intern { .. }
+        | WalRecord::DerivedEdgeAdded { .. }
+        | WalRecord::DerivedEdgeRetracted { .. }
+        | WalRecord::RenameNode { .. }
+        | WalRecord::EnableIndex { .. }
+        | WalRecord::DisableIndex { .. }
+        | WalRecord::SetEdgeCount { .. } => None,
+    }
 }
 
 /// One entry of a frame the validate pass has decided on, before

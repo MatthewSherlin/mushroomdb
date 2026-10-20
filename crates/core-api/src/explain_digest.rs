@@ -62,6 +62,16 @@ fn value_to_json(v: &Value) -> Js {
                 .collect();
             Js::Object(obj)
         }
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        // `Err` is a DateTime offset outside ±18:00, which the store never
+        // holds (it holds no format-V11 value); no tag is written for it.
+        | Value::Binary(_) => crate::ingest::tagged_json(v)
+            .ok()
+            .flatten()
+            .unwrap_or(Js::Null),
     }
 }
 
@@ -259,6 +269,13 @@ fn scalar_token(v: &Value) -> Option<(u8, String)> {
         Value::Float(f) => Some((2, format!("{f}"))),
         Value::Bool(b) => Some((3, b.to_string())),
         Value::List(_) | Value::Map(_) => None,
+        // Same keys as `ValueKey`: a DateTime is its instant, and a Duration
+        // is not a token.
+        Value::Date(d) => Some((4, d.to_string())),
+        Value::LocalDateTime(us) => Some((5, us.to_string())),
+        Value::DateTime { micros_utc, .. } => Some((6, micros_utc.to_string())),
+        Value::Binary(bytes) => Some((7, core_storage::types::base64_encode(bytes))),
+        Value::Duration { .. } => None,
     }
 }
 

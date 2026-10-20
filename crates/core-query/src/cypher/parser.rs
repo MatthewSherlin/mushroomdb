@@ -39,6 +39,11 @@ pub struct UnionQuery {
     pub all_flags: Vec<bool>,
 }
 
+/// True if `tok` is the identifier `word`, compared case-insensitively.
+pub(crate) fn kw(tok: Option<&Tok>, word: &str) -> bool {
+    matches!(tok, Some(Tok::Ident(s)) if s.eq_ignore_ascii_case(word))
+}
+
 /// Parse a read query, accepting a `UNION` / `UNION ALL` chain.
 pub fn parse_read(tokens: &[Tok]) -> Result<UnionQuery, String> {
     let mut p = Parser {
@@ -246,7 +251,16 @@ impl<'a> Parser<'a> {
 
     /// True if the next token is the `UNION` keyword (an ordinary identifier).
     fn peek_is_union(&self) -> bool {
-        matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("union"))
+        self.peek_kw("union")
+    }
+
+    /// True if the next token is the word `word`, in any case. Words such as
+    /// `UNION`, `REMOVE`, `FOREACH`, `EXISTS`, `CALL` and `EXPLAIN` are lexed as
+    /// plain identifiers; a parser position where a clause or statement can
+    /// start (or `EXISTS {` in an expression) asks `peek_kw` and treats the word
+    /// as a keyword only there. Everywhere else it stays a name.
+    fn peek_kw(&self, word: &str) -> bool {
+        kw(self.peek(), word)
     }
 
     /// Named errors for still-unsupported Cypher forms (`UNION`, `CASE`).
@@ -815,12 +829,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // ── Arithmetic expression parsing (precedence: * / > + -) ──────────────
+    // ── Arithmetic expression parsing (precedence: ^ > * / % > + -) ──────────────
     //
     // Grammar:
     //   arith_expr  = arith_add
     //   arith_add   = arith_mul ((+ | -) arith_mul)*
-    //   arith_mul   = arith_unary ((* | /) arith_unary)*
+    //   arith_mul   = arith_pow ((* | / | %) arith_pow)*
+    //   arith_pow   = arith_unary (^ arith_unary)*
     //   arith_unary = - arith_atom | arith_atom
     //   arith_atom  = literal | param | ident | ident.field | ident(args…) | (arith_add)
 
@@ -851,18 +866,36 @@ impl<'a> Parser<'a> {
 
     /// Parse a multiplicative-level arithmetic expression.
     fn arith_mul(&mut self) -> Result<Operand, String> {
-        let mut left = self.arith_unary()?;
+        let mut left = self.arith_pow()?;
         loop {
             let op = if self.eat(&Tok::Star) {
                 ArithOp::Mul
             } else if self.eat(&Tok::Slash) {
                 ArithOp::Div
+            } else if self.eat(&Tok::Percent) {
+                ArithOp::Mod
             } else {
                 break;
             };
-            let right = self.arith_unary()?;
+            let right = self.arith_pow()?;
             left = Operand::BinArith {
                 op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// Parse an exponentiation-level expression: `^` binds tighter than `*`,
+    /// is left-associative (`2^3^2` is `(2^3)^2`), and takes unary-minus
+    /// operands (`-2^2` is `(-2)^2`).
+    fn arith_pow(&mut self) -> Result<Operand, String> {
+        let mut left = self.arith_unary()?;
+        while self.eat(&Tok::Caret) {
+            let right = self.arith_unary()?;
+            left = Operand::BinArith {
+                op: ArithOp::Pow,
                 left: Box::new(left),
                 right: Box::new(right),
             };
@@ -1788,6 +1821,73 @@ mod tests {
 
     fn parse_src(src: &str) -> Result<Query, String> {
         parse(&lex(src)?)
+    }
+
+    /// Parse `RETURN <expr> AS v` and give back the scalar expression.
+    fn return_expr(expr: &str) -> Operand {
+        use crate::cypher::ast::RetVal;
+        let q = parse_src(&format!("MATCH (n) RETURN {expr} AS v")).unwrap();
+        match q.returns.into_iter().next().unwrap().value {
+            RetVal::ScalarExpr(op) => op,
+            other => panic!("expected a scalar expression, got {other:?}"),
+        }
+    }
+
+    fn bin(op: crate::cypher::ast::ArithOp, l: Operand, r: Operand) -> Operand {
+        Operand::BinArith {
+            op,
+            left: Box::new(l),
+            right: Box::new(r),
+        }
+    }
+
+    fn int(n: i64) -> Operand {
+        Operand::Lit(Value::Int(n))
+    }
+
+    #[test]
+    fn modulo_shares_a_level_with_mul_and_div_left_associative() {
+        use crate::cypher::ast::ArithOp::{Div, Mod, Mul};
+        assert_eq!(return_expr("7 % 3"), bin(Mod, int(7), int(3)));
+        assert_eq!(
+            return_expr("10 % 4 * 2"),
+            bin(Mul, bin(Mod, int(10), int(4)), int(2))
+        );
+        assert_eq!(
+            return_expr("10 * 4 % 3 / 2"),
+            bin(Div, bin(Mod, bin(Mul, int(10), int(4)), int(3)), int(2))
+        );
+    }
+
+    #[test]
+    fn caret_binds_tighter_than_mul_and_is_left_associative() {
+        use crate::cypher::ast::ArithOp::{Add, Mul, Pow};
+        assert_eq!(return_expr("2 ^ 8"), bin(Pow, int(2), int(8)));
+        assert_eq!(
+            return_expr("2 ^ 3 ^ 2"),
+            bin(Pow, bin(Pow, int(2), int(3)), int(2))
+        );
+        assert_eq!(
+            return_expr("2 * 3 ^ 2"),
+            bin(Mul, int(2), bin(Pow, int(3), int(2)))
+        );
+        assert_eq!(
+            return_expr("1 + 2 ^ 3"),
+            bin(Add, int(1), bin(Pow, int(2), int(3)))
+        );
+        // unary minus binds tighter than ^: -2^2 is (-2)^2
+        assert_eq!(return_expr("-2 ^ 2"), bin(Pow, int(-2), int(2)));
+    }
+
+    #[test]
+    fn words_that_became_keywords_still_parse_as_names() {
+        for src in [
+            "MATCH (call:Remove) WHERE call.exists = 1 RETURN call.explain AS foreach",
+            "MATCH (n:Exists {call: 1, Remove: 2})-[r:FOREACH]->(m) RETURN n.Call, r, m",
+            "MATCH (n) WITH n AS explain RETURN explain.remove",
+        ] {
+            parse_src(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+        }
     }
 
     fn prop(var: &str, field: &str) -> Operand {

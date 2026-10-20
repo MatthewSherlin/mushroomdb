@@ -127,6 +127,7 @@ use crate::db::{
     BatchOp, FsyncPolicy, Precondition, WriteAuthz, LOCK_POLL_INTERVAL, WRITE_LOCK_WAIT,
 };
 use crate::reader::ReaderSnapshot;
+use crate::transaction::Transaction;
 use crate::GraphDb;
 use core_storage::sync_wal_at;
 use core_storage::truncate_wal_at;
@@ -163,12 +164,36 @@ struct Submission {
     /// non-empty for `submit_batch_cas` calls.  The drain thread checks these
     /// under the same write guard as the batch apply (no TOCTOU).
     preconds: Vec<Precondition>,
+    /// Apply on the compare-and-set path even when `preconds` is empty, so the
+    /// submission is applied alone and its commit number can be read back.
+    /// Set by [`SharedDb::submit_batch_cas_with_seq`].
+    own_commit: bool,
     /// Role name for role-scoped write authz.  `Some` only for
     /// `submit_batch_authz` calls; `None` for full-authority submissions.
     /// The drain thread resolves mask + scope under `inner.write()` (§5 lock
     /// discipline: authz check and mutation share one guard lifetime).
     authz_role: Option<String>,
-    done: std::sync::mpsc::SyncSender<Result<(usize, usize)>>,
+    done: std::sync::mpsc::SyncSender<Result<Applied>>,
+}
+
+/// What the drain thread reports back for one submission.
+struct Applied {
+    /// `(nodes_inserted, edges_inserted)`.
+    inserted: (usize, usize),
+    /// The store's `commit_seq` read under the same write guard, straight
+    /// after this submission applied. Recorded for CAS submissions only —
+    /// non-CAS submissions are coalesced, and one call applies several, so
+    /// there is no per-submission number to read — and `None` elsewhere.
+    commit_seq: Option<u64>,
+}
+
+impl Applied {
+    fn uncounted(inserted: (usize, usize)) -> Self {
+        Self {
+            inserted,
+            commit_seq: None,
+        }
+    }
 }
 
 // ── WriteQueue ────────────────────────────────────────────────────────────────
@@ -643,14 +668,11 @@ impl SharedDb {
         self.queue.enqueue(Submission {
             ops,
             preconds: Vec::new(),
+            own_commit: false,
             authz_role: None,
             done: tx,
         });
-        rx.recv().unwrap_or_else(|_| {
-            Err(GraphError::Io(std::io::Error::other(
-                "group-commit drain thread terminated unexpectedly",
-            )))
-        })
+        receive(rx).map(|a| a.inserted)
     }
 
     /// Like [`submit_batch`] but with compare-and-set preconditions.
@@ -666,6 +688,23 @@ impl SharedDb {
         preconds: Vec<Precondition>,
         ops: Vec<BatchOp>,
     ) -> Result<(usize, usize)> {
+        self.submit_batch_cas_with_seq(preconds, ops)
+            .map(|(inserted, _)| inserted)
+    }
+
+    /// [`submit_batch_cas`](Self::submit_batch_cas), also returning the commit
+    /// number this batch landed at.
+    ///
+    /// The number is read by the drain thread under the same write guard that
+    /// applied the batch, so it is this batch's and no one else's — reading
+    /// [`reader`](Self::reader)`().version` afterwards would race every other
+    /// writer. An all-noop batch writes no frame and returns the number of the
+    /// commit it found in place.
+    pub(crate) fn submit_batch_cas_with_seq(
+        &self,
+        preconds: Vec<Precondition>,
+        ops: Vec<BatchOp>,
+    ) -> Result<((usize, usize), u64)> {
         if let Some(msg) = self.queue.degraded_message() {
             return Err(GraphError::Io(std::io::Error::other(msg)));
         }
@@ -673,14 +712,29 @@ impl SharedDb {
         self.queue.enqueue(Submission {
             ops,
             preconds,
+            own_commit: true,
             authz_role: None,
             done: tx,
         });
-        rx.recv().unwrap_or_else(|_| {
-            Err(GraphError::Io(std::io::Error::other(
-                "group-commit drain thread terminated unexpectedly",
-            )))
-        })
+        let applied = receive(rx)?;
+        let seq = applied.commit_seq.ok_or_else(|| {
+            GraphError::Io(std::io::Error::other(
+                "group-commit drain thread reported no commit number for a CAS submission",
+            ))
+        })?;
+        Ok((applied.inserted, seq))
+    }
+
+    /// Open an interactive transaction over this store.
+    ///
+    /// Takes no lock beyond the instant it needs to freeze a
+    /// [`ReaderSnapshot`]; see [`Transaction`] for the isolation model.
+    pub fn begin_transaction(&self) -> Transaction {
+        let (base_snap, base_store) = {
+            let db = self.read();
+            (db.reader(), db.store_id())
+        };
+        Transaction::new(self.clone(), base_snap, base_store)
     }
 
     /// Like [`submit_batch`] but with role-scoped write authorization.
@@ -704,15 +758,21 @@ impl SharedDb {
         self.queue.enqueue(Submission {
             ops,
             preconds: Vec::new(),
+            own_commit: false,
             authz_role: Some(role),
             done: tx,
         });
-        rx.recv().unwrap_or_else(|_| {
-            Err(GraphError::Io(std::io::Error::other(
-                "group-commit drain thread terminated unexpectedly",
-            )))
-        })
+        receive(rx).map(|a| a.inserted)
     }
+}
+
+/// Wait for the drain thread's answer to one submission.
+fn receive(rx: std::sync::mpsc::Receiver<Result<Applied>>) -> Result<Applied> {
+    rx.recv().unwrap_or_else(|_| {
+        Err(GraphError::Io(std::io::Error::other(
+            "group-commit drain thread terminated unexpectedly",
+        )))
+    })
 }
 
 // ── Drain thread ──────────────────────────────────────────────────────────────
@@ -740,6 +800,15 @@ fn poll_cross_process_lock(inner: &Arc<RwLock<GraphDb<RealFs>>>, wait: Duration)
     }
 }
 
+/// A submission's `(preconds, own_commit, ops, authz_role)`, taken out of the
+/// group so the group itself can still be signalled afterwards.
+type Extracted = (Vec<Precondition>, bool, Vec<BatchOp>, Option<String>);
+
+/// Results of a coalesced apply, which carry no per-submission commit number.
+fn uncounted(results: Vec<Result<(usize, usize)>>) -> impl Iterator<Item = Result<Applied>> {
+    results.into_iter().map(|r| r.map(Applied::uncounted))
+}
+
 fn drain_loop(
     inner: Arc<RwLock<GraphDb<RealFs>>>,
     queue: Arc<WriteQueue>,
@@ -756,11 +825,12 @@ fn drain_loop(
 
         // Extract ops, preconditions, and authz_role together; keep alignment
         // with group index.
-        let submissions: Vec<(Vec<Precondition>, Vec<BatchOp>, Option<String>)> = group
+        let submissions: Vec<Extracted> = group
             .iter_mut()
             .map(|s| {
                 (
                     std::mem::take(&mut s.preconds),
+                    s.own_commit,
                     std::mem::take(&mut s.ops),
                     s.authz_role.take(),
                 )
@@ -848,7 +918,7 @@ fn drain_loop(
         // subscription notifications only fire after the group fsync (R2:
         // durability before notification).  For Relaxed policy events fire
         // immediately (no fsync to wait for).
-        let (results, should_sync): (Vec<Result<(usize, usize)>>, bool) = {
+        let (results, should_sync): (Vec<Result<Applied>>, bool) = {
             let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
             let sync_needed = db.fsync_policy() != FsyncPolicy::Relaxed;
             if sync_needed {
@@ -863,17 +933,17 @@ fn drain_loop(
             // AFTER all prior submissions in the group have been applied (no
             // TOCTOU); they are processed individually between coalesced non-CAS
             // runs.
-            let mut r: Vec<Result<(usize, usize)>> = Vec::with_capacity(submissions.len());
+            let mut r: Vec<Result<Applied>> = Vec::with_capacity(submissions.len());
             let mut pending_non_cas: Vec<Vec<BatchOp>> = Vec::new();
 
-            for (preconds, ops, authz_role) in submissions {
+            for (preconds, own_commit, ops, authz_role) in submissions {
                 if let Some(role) = authz_role {
                     // Authz submission: process individually (breaks coalescing).
                     // Flush accumulated non-CAS batch first so authz evaluation
                     // sees their writes already applied.
                     if !pending_non_cas.is_empty() {
                         let batch = std::mem::take(&mut pending_non_cas);
-                        r.extend(db.commit_group_nosync(batch));
+                        r.extend(uncounted(db.commit_group_nosync(batch)));
                     }
                     // Resolve WriteAuthz under the write guard (§5 lock discipline:
                     // scope + mask resolved in the same guard as the mutation;
@@ -899,8 +969,8 @@ fn drain_loop(
                         let authz = WriteAuthz { role, scope, mask };
                         db.write_batch_authz_nosync(Some(&authz), ops)
                     })();
-                    r.push(result);
-                } else if preconds.is_empty() {
+                    r.push(result.map(Applied::uncounted));
+                } else if preconds.is_empty() && !own_commit {
                     // Non-CAS: accumulate for a batched commit_group_nosync call.
                     pending_non_cas.push(ops);
                 } else {
@@ -908,7 +978,7 @@ fn drain_loop(
                     // evaluation sees their writes already applied.
                     if !pending_non_cas.is_empty() {
                         let batch = std::mem::take(&mut pending_non_cas);
-                        r.extend(db.commit_group_nosync(batch));
+                        r.extend(uncounted(db.commit_group_nosync(batch)));
                     }
                     let result = match db.check_preconditions(&preconds) {
                         Ok(()) => db
@@ -918,12 +988,16 @@ fn drain_loop(
                             .unwrap_or(Ok((0, 0))),
                         Err(e) => Err(e),
                     };
-                    r.push(result);
+                    // Read under the guard that applied it: this batch's number.
+                    r.push(result.map(|inserted| Applied {
+                        inserted,
+                        commit_seq: Some(db.commit_seq()),
+                    }));
                 }
             }
             // Flush any remaining non-CAS submissions.
             if !pending_non_cas.is_empty() {
-                r.extend(db.commit_group_nosync(pending_non_cas));
+                r.extend(uncounted(db.commit_group_nosync(pending_non_cas)));
             }
             (r, sync_needed)
             // ← RwLock write guard released here; wal_mu still held

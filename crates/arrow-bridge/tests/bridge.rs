@@ -200,3 +200,44 @@ fn empty_result_set_preserves_schema() {
     assert_eq!(ipc.schema().field(0).data_type(), &DataType::Utf8);
     assert_eq!(ipc.schema().field(1).data_type(), &DataType::Utf8);
 }
+
+/// Until typed Arrow columns exist, format-V11 values are a Utf8 column of
+/// their ISO 8601 / base64 text — never a panic.
+#[test]
+fn v11_values_are_utf8_text() {
+    let mut rs = ResultSet::new(vec!["v".into()]);
+    for v in [
+        Value::Date(19_737),
+        Value::LocalDateTime(1_705_322_096_789_012),
+        Value::DateTime {
+            micros_utc: 1_705_302_296_789_012,
+            offset_seconds: 19_800,
+        },
+        Value::Duration {
+            months: 14,
+            days: 3,
+            nanos: 14_706_789_000_000,
+        },
+        Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+    ] {
+        rs.push_row(vec![cell(v)]);
+    }
+    let batch = to_record_batch(&rs).unwrap();
+    assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let got: Vec<&str> = (0..col.len()).map(|i| col.value(i)).collect();
+    assert_eq!(
+        got,
+        [
+            "2024-01-15",
+            "2024-01-15T12:34:56.789012",
+            "2024-01-15T12:34:56.789012+05:30",
+            "P1Y2M3DT4H5M6.789S",
+            "3q2+7w==",
+        ]
+    );
+}

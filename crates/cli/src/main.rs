@@ -2,10 +2,10 @@
 
 use cli::{
     format_backup, format_demo, format_stats, format_suggest, install, maybe_run_demo_if_empty,
-    parse_args, read_stats, run_algo, run_asof, run_backup, run_build_index, run_demo, run_export,
-    run_migrate, run_query, run_schema_apply, run_schema_apply_memory_defaults,
-    run_schema_apply_memory_identity, run_snapshot, run_suggest, run_verify, usage, Command,
-    ServeUi,
+    parse_args, read_stats, resolve_statement, run_algo, run_asof, run_backup, run_build_index,
+    run_demo, run_export, run_migrate, run_query, run_schema_apply,
+    run_schema_apply_memory_defaults, run_schema_apply_memory_identity, run_snapshot, run_suggest,
+    run_verify, usage, Command, ServeUi,
 };
 use mushroomdb::{GraphError, SharedDb};
 use std::collections::HashMap;
@@ -14,6 +14,8 @@ use std::io::{self, IsTerminal as _, Read as _, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The default log filter.
@@ -43,13 +45,45 @@ fn init_logging() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_env("MUSHROOMDB_LOG")
         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    let format = match parse_log_format(std::env::var("MUSHROOMDB_LOG_FORMAT").ok().as_deref()) {
+        Ok(format) => format,
+        Err(message) => {
+            // A hosted deployment that typo'd the format must not silently ship
+            // text to a collector expecting JSON: refuse to start.
+            eprintln!("error: {message}");
+            std::process::exit(2);
+        }
+    };
     // `try_init` rather than `init`: a second call must not panic the server,
     // and an embedder that already installed a subscriber keeps theirs.
-    let _ = fmt()
+    let builder = fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_writer(std::io::stderr)
-        .try_init();
+        .with_writer(std::io::stderr);
+    let _ = match format {
+        LogFormat::Text => builder.try_init(),
+        LogFormat::Json => builder.json().try_init(),
+    };
+}
+
+/// Log output format, chosen by `MUSHROOMDB_LOG_FORMAT`.
+#[derive(Debug, PartialEq, Eq)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+/// `unset`/empty/`text` -> text (today's output); `json` -> newline-delimited
+/// JSON; anything else is an error naming the accepted values.
+fn parse_log_format(value: Option<&str>) -> Result<LogFormat, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(LogFormat::Text),
+        Some(v) if v.eq_ignore_ascii_case("text") => Ok(LogFormat::Text),
+        Some(v) if v.eq_ignore_ascii_case("json") => Ok(LogFormat::Json),
+        Some(other) => Err(format!(
+            "MUSHROOMDB_LOG_FORMAT={other:?} is not recognised; use \"text\" (the default) or \"json\""
+        )),
+    }
 }
 
 fn main() -> ExitCode {
@@ -128,6 +162,13 @@ fn main() -> ExitCode {
             tls_cert,
             tls_key,
         }) => {
+            // Before anything touches the store (restore, demo, open).
+            if let Err(message) =
+                parse_log_format(std::env::var("MUSHROOMDB_LOG_FORMAT").ok().as_deref())
+            {
+                eprintln!("error: {message}");
+                return ExitCode::from(2);
+            }
             let token = token.filter(|s| !s.is_empty()).or_else(|| {
                 std::env::var("MUSHROOMDB_TOKEN")
                     .ok()
@@ -236,14 +277,24 @@ fn main() -> ExitCode {
             commit,
             at,
             query,
+            file,
+            stdin,
             namespace,
-        }) => match run_asof(
-            &db_dir,
-            commit,
-            at.as_deref(),
+        }) => match resolve_statement(
             query.as_deref(),
-            namespace.as_deref(),
-        ) {
+            file.as_deref(),
+            stdin,
+            &mut std::io::stdin(),
+        )
+        .and_then(|statement| {
+            run_asof(
+                &db_dir,
+                commit,
+                at.as_deref(),
+                statement.as_deref(),
+                namespace.as_deref(),
+            )
+        }) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -276,9 +327,19 @@ fn main() -> ExitCode {
         Ok(Command::Query {
             db_dir,
             cypher,
+            file,
+            stdin,
             role,
             namespace,
-        }) => match run_query(&db_dir, &cypher, role.as_deref(), namespace.as_deref()) {
+        }) => match resolve_statement(Some(&cypher), file.as_deref(), stdin, &mut std::io::stdin())
+            .and_then(|statement| {
+                run_query(
+                    &db_dir,
+                    statement.as_deref().unwrap_or_default(),
+                    role.as_deref(),
+                    namespace.as_deref(),
+                )
+            }) {
             Ok(out) => {
                 print!("{out}");
                 ExitCode::SUCCESS
@@ -524,6 +585,8 @@ fn run_serve(
         // a snapshot carries it (ledger row 36), and changes what an existing
         // store indexes, so an existing store is never touched here.
         let is_new_store = !mushroomdb::restore::holds_a_store(&db_dir);
+        // `GET /ready` answers 503 until the store is open and its schema is in.
+        let ready_flag = Arc::new(AtomicBool::new(false));
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
         if is_new_store {
             // The first store most HTTP callers open. Declare the memory
@@ -532,6 +595,7 @@ fn run_serve(
                 .apply_schema(&mushroomdb::memory_schema::memory_defaults())
                 .map_err(|e| e.to_string())?;
         }
+        ready_flag.store(true, Ordering::Release);
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Some(period) = snapshot_every {
             let db_snap = db.clone();
@@ -624,7 +688,7 @@ fn run_serve(
             if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
                 #[cfg(feature = "tls")]
                 {
-                    return server::serve_tls_with_shutdown(
+                    return server::serve_tls_with_shutdown_with_ready_flag(
                         db_serve,
                         addr,
                         tx,
@@ -633,12 +697,23 @@ fn run_serve(
                         token,
                         role_tokens,
                         stop_rx,
+                        ready_flag,
                     )
                     .await;
                 }
                 #[cfg(not(feature = "tls"))]
                 {
-                    let _ = (cert, key, db_serve, addr, tx, token, role_tokens, stop_rx);
+                    let _ = (
+                        cert,
+                        key,
+                        db_serve,
+                        addr,
+                        tx,
+                        token,
+                        role_tokens,
+                        stop_rx,
+                        ready_flag,
+                    );
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
                         "this binary was built without TLS support; \
@@ -649,7 +724,7 @@ fn run_serve(
             }
             match ui {
                 ServeUi::Filesystem(dir) => {
-                    server::serve_with_ui_and_role_tokens_and_shutdown(
+                    server::serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
                         db_serve,
                         addr,
                         tx,
@@ -657,42 +732,46 @@ fn run_serve(
                         token,
                         role_tokens,
                         stop_rx,
+                        ready_flag,
                     )
                     .await
                 }
                 ServeUi::None => {
-                    server::serve_with_role_tokens_and_shutdown(
+                    server::serve_with_role_tokens_and_shutdown_with_ready_flag(
                         db_serve,
                         addr,
                         tx,
                         token,
                         role_tokens,
                         stop_rx,
+                        ready_flag,
                     )
                     .await
                 }
                 ServeUi::Embedded => {
                     #[cfg(feature = "embed-ui")]
                     {
-                        server::serve_with_embedded_ui_and_shutdown(
+                        server::serve_with_embedded_ui_and_shutdown_with_ready_flag(
                             db_serve,
                             addr,
                             tx,
                             token,
                             role_tokens,
                             stop_rx,
+                            ready_flag,
                         )
                         .await
                     }
                     #[cfg(not(feature = "embed-ui"))]
                     {
-                        server::serve_with_role_tokens_and_shutdown(
+                        server::serve_with_role_tokens_and_shutdown_with_ready_flag(
                             db_serve,
                             addr,
                             tx,
                             token,
                             role_tokens,
                             stop_rx,
+                            ready_flag,
                         )
                         .await
                     }
@@ -828,7 +907,7 @@ fn home_from(home: Option<OsString>, userprofile: Option<OsString>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_LOG_FILTER;
+    use super::{parse_log_format, LogFormat, DEFAULT_LOG_FILTER};
     use std::path::PathBuf;
 
     #[test]
@@ -864,6 +943,15 @@ mod tests {
             "the default filter {DEFAULT_LOG_FILTER:?} does not name the \
              server's log target {root:?}, so nothing it logs would appear"
         );
+    }
+
+    #[test]
+    fn log_format_values() {
+        assert_eq!(parse_log_format(None), Ok(LogFormat::Text));
+        assert_eq!(parse_log_format(Some("")), Ok(LogFormat::Text));
+        assert_eq!(parse_log_format(Some("text")), Ok(LogFormat::Text));
+        assert_eq!(parse_log_format(Some("JSON")), Ok(LogFormat::Json));
+        assert!(parse_log_format(Some("yaml")).unwrap_err().contains("yaml"));
     }
 
     /// The filter parses. An unparseable default falls back to silence.

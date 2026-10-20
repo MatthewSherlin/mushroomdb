@@ -18,6 +18,25 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
                     .zip(y.iter())
                     .all(|((k1, v1), (k2, v2))| k1 == k2 && values_equal(v1, v2))
         }
+        (Value::Date(x), Value::Date(y)) => x == y,
+        (Value::LocalDateTime(x), Value::LocalDateTime(y)) => x == y,
+        // The same instant is the same DateTime whatever offset it was written
+        // with: the offset is display-only.
+        (Value::DateTime { micros_utc: x, .. }, Value::DateTime { micros_utc: y, .. }) => x == y,
+        // Component-wise: one month is not 30 days.
+        (
+            Value::Duration {
+                months: m1,
+                days: d1,
+                nanos: n1,
+            },
+            Value::Duration {
+                months: m2,
+                days: d2,
+                nanos: n2,
+            },
+        ) => (m1, d1, n1) == (m2, d2, n2),
+        (Value::Binary(x), Value::Binary(y)) => x == y,
         _ => false,
     }
 }
@@ -28,8 +47,15 @@ fn class_rank(v: &Value) -> u8 {
         Value::Str(_) => 1,
         Value::Bool(_) => 2,
         Value::List(_) => 3,
+        // Each temporal type is its own class: a Date never compares with a
+        // DateTime by implicit coercion.
+        Value::Date(_) => 4,
+        Value::LocalDateTime(_) => 5,
+        Value::DateTime { .. } => 6,
+        Value::Duration { .. } => 7,
+        Value::Binary(_) => 8,
         // Map sorts after all other types.
-        Value::Map(_) => 4,
+        Value::Map(_) => 9,
     }
 }
 
@@ -76,6 +102,35 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
             }
             x.len().cmp(&y.len())
         }
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::LocalDateTime(x), Value::LocalDateTime(y)) => x.cmp(y),
+        // By instant; the offset only breaks ties so a sort is stable.
+        (
+            Value::DateTime {
+                micros_utc: x,
+                offset_seconds: ox,
+            },
+            Value::DateTime {
+                micros_utc: y,
+                offset_seconds: oy,
+            },
+        ) => (x, ox).cmp(&(y, oy)),
+        // Durations are not totally ordered, so `<` refuses them
+        // (`filter::is_orderable_pair`); this component-wise order exists only
+        // so ORDER BY over a duration column is deterministic.
+        (
+            Value::Duration {
+                months: m1,
+                days: d1,
+                nanos: n1,
+            },
+            Value::Duration {
+                months: m2,
+                days: d2,
+                nanos: n2,
+            },
+        ) => (m1, d1, n1).cmp(&(m2, d2, n2)),
+        (Value::Binary(x), Value::Binary(y)) => x.cmp(y),
         _ => unreachable!("same class rank implies matching variants"),
     }
 }
@@ -231,5 +286,84 @@ mod tests {
         assert_eq!(cmp_optional(Some(&a), Some(&b), true), Greater);
         assert_eq!(cmp_optional(Some(&a), Some(&a), false), Equal);
         assert_eq!(cmp_optional(Some(&a), Some(&a), true), Equal);
+    }
+
+    fn dt(micros_utc: i64, offset_seconds: i32) -> Value {
+        Value::DateTime {
+            micros_utc,
+            offset_seconds,
+        }
+    }
+
+    fn dur(months: i32, days: i32, nanos: i64) -> Value {
+        Value::Duration {
+            months,
+            days,
+            nanos,
+        }
+    }
+
+    #[test]
+    fn new_types_equality() {
+        assert!(values_equal(&Value::Date(5), &Value::Date(5)));
+        assert!(!values_equal(&Value::Date(5), &Value::Date(6)));
+        assert!(values_equal(
+            &Value::LocalDateTime(7),
+            &Value::LocalDateTime(7)
+        ));
+        // DateTime: the same instant at two offsets is equal.
+        assert!(values_equal(&dt(1_000, 0), &dt(1_000, -18_000)));
+        assert!(!values_equal(&dt(1_000, 0), &dt(1_001, 0)));
+        // Duration: component-wise, a month is not 30 days.
+        assert!(values_equal(&dur(1, 2, 3), &dur(1, 2, 3)));
+        assert!(!values_equal(&dur(1, 0, 0), &dur(0, 30, 0)));
+        assert!(values_equal(
+            &Value::Binary(vec![1, 2]),
+            &Value::Binary(vec![1, 2])
+        ));
+        // No implicit coercion between types.
+        assert!(!values_equal(&Value::Date(0), &Value::LocalDateTime(0)));
+        assert!(!values_equal(&Value::Date(0), &Value::Int(0)));
+        assert!(!values_equal(&dt(0, 0), &Value::LocalDateTime(0)));
+        assert!(!values_equal(
+            &Value::Binary(b"a".to_vec()),
+            &Value::Str("a".into())
+        ));
+    }
+
+    #[test]
+    fn new_types_ordering_never_panics_and_is_total() {
+        let all = [
+            Value::Int(0),
+            Value::Str("a".into()),
+            Value::Bool(true),
+            Value::List(vec![]),
+            Value::Date(1),
+            Value::LocalDateTime(1),
+            dt(1, 0),
+            dur(0, 0, 1),
+            Value::Binary(vec![1]),
+            Value::Map(Default::default()),
+        ];
+        // Every pair compares without panicking; distinct types are ordered
+        // by class, and the order is antisymmetric.
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(cmp_values(a, b), i.cmp(&j), "{a:?} vs {b:?}");
+            }
+        }
+        assert_eq!(cmp_values(&Value::Date(-1), &Value::Date(0)), Less);
+        assert_eq!(
+            cmp_values(&Value::LocalDateTime(9), &Value::LocalDateTime(2)),
+            Greater
+        );
+        // DateTime orders by instant; the offset only breaks ties.
+        assert_eq!(cmp_values(&dt(1, 3_600), &dt(2, 0)), Less);
+        assert_eq!(cmp_values(&dt(1, 0), &dt(1, 3_600)), Less);
+        assert_eq!(
+            cmp_values(&Value::Binary(vec![0, 9]), &Value::Binary(vec![1])),
+            Less
+        );
+        assert_eq!(cmp_values(&dur(1, 0, 0), &dur(0, 99, 0)), Greater);
     }
 }

@@ -561,6 +561,46 @@ impl ReaderSnapshot {
         }
     }
 
+    /// This snapshot with `records` layered on top as one more, private,
+    /// uncommitted delta — the read-your-own-writes view of a transaction.
+    ///
+    /// The records go through the same [`apply_one`] path the committed delta
+    /// tail does, so an uncommitted insert, property write or delete reads
+    /// exactly as it will once committed — except for what only the writer
+    /// computes: rule-derived edges and view values from these records are not
+    /// in the delta (rules fire at commit only).
+    ///
+    /// The result carries a fresh role-mask memo, never the shared one: it
+    /// keeps this snapshot's `version`, and a mask memoised against uncommitted
+    /// state under a committed version would be served to every other reader
+    /// of that version.
+    pub(crate) fn with_private_delta(&self, records: Vec<WalRecord>) -> ReaderSnapshot {
+        let mut deltas = self.deltas.clone();
+        if !records.is_empty() {
+            deltas.push(Arc::new(CommitDelta {
+                records,
+                derived_inserts: Vec::new(),
+                derived_deletes: Vec::new(),
+                view_values: Vec::new(),
+            }));
+        }
+        ReaderSnapshot::new(
+            Arc::clone(&self.frozen),
+            self.base.clone(),
+            deltas,
+            self.version,
+            Arc::new(RoleMaskCache::new()),
+        )
+    }
+
+    /// Run `f` over an unmasked [`GraphView`] of this snapshot's effective
+    /// state.
+    pub(crate) fn with_view<R>(&self, f: impl FnOnce(&GraphView<'_>) -> R) -> Result<R> {
+        let state = self.effective()?;
+        let view = make_view(state, &self.base, None);
+        Ok(f(&view))
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /// Return a reference to the current effective state.

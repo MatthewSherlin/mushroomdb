@@ -302,6 +302,10 @@ pub enum Command {
         at: Option<String>,
         /// Optional Cypher read query to execute against the as-of view.
         query: Option<String>,
+        /// Read the Cypher statement from this file instead of `--query`.
+        file: Option<PathBuf>,
+        /// Read the Cypher statement from standard input instead of `--query`.
+        stdin: bool,
         /// Read only this namespace, as it was at that commit.
         namespace: Option<String>,
     },
@@ -331,6 +335,10 @@ pub enum Command {
         db_dir: PathBuf,
         /// Positional after dir (remaining args joined), or `--query`.
         cypher: String,
+        /// Read the statement from this file (`--file`), instead of `cypher`.
+        file: Option<PathBuf>,
+        /// Read the statement from standard input (`--stdin`), instead of `cypher`.
+        stdin: bool,
         /// Answer as one of the store's roles: only the nodes it may see.
         role: Option<String>,
         /// Answer from one namespace only. Intersects `role` — never widens it.
@@ -461,6 +469,64 @@ pub fn usage() -> &'static str {
 mushroomdb — embedded graph database
 
 Usage:
+  mushroomdb query <db-dir> [--query \"MATCH ...\"|--file <path>|--stdin] [--role <name>] [--namespace <ns>] <cypher…>
+                     --file reads the statement from a file and --stdin from standard input,
+                     so a quote or a backslash needs no shell escaping; a trailing newline
+                     and one trailing `;` are dropped, and the statement comes from only one of the three places
+                     --role answers as one of the store's roles and --namespace from one
+                     namespace; together they intersect, so neither ever widens the other
+                     and either one makes the query a read
+  mushroomdb asof <db-dir> --commit N|--at <date> [--query \"MATCH ...\"|--file <path>|--stdin] [--namespace <ns>]
+                     --at takes an RFC 3339 date (2026-06-19, or 2026-06-19T12:00:00Z)
+                     and resolves to the last commit at or before it; exactly one of
+                     --commit and --at
+  mushroomdb stats <db-dir>
+  mushroomdb why <db-dir> <a> <b>
+                                   every rule edge between two keys with the evidence that
+                                   derived it, or a note that there is none
+  mushroomdb suggest <db-dir>
+  mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
+  mushroomdb algo wcc <db-dir> [--top N]
+  mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
+  mushroomdb algo communities <db-dir> [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]
+  mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
+  mushroomdb snapshot <db-dir> [--keep-wal|--truncate] [--retention N]
+                     folds the WAL into snapshot.bin and archives it as wal.<N>.archive,
+                     so node_history, edge_history, was_linked and asof keep reaching it;
+                     --truncate discards it instead, --keep-wal leaves wal.bin whole
+  mushroomdb build-index <db-dir> [--rule <name>]
+                     drives a rule's vector index to completion a slice at a time, for an
+                     operator who wants the build finished before traffic arrives; a rule
+                     created over a large corpus derives no edges until its index is whole
+  mushroomdb migrate <db-dir>
+  mushroomdb schema apply <db-dir> <schema.json>
+  mushroomdb schema apply <db-dir> --memory-defaults
+                                   applies the built-in memory schema to an existing store;
+                                   full-text on a populated store builds the index at each open until the next snapshot carries it
+  mushroomdb schema apply <db-dir> --memory-identity
+                                   adds the identity preset: sixteen SAME_AS rules over each entity's aliases;
+                                   says what it will backfill, then backfills
+  mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
+                                      WARNING: unsafe against a concurrently running serve process;
+                                      use POST /backup on the HTTP server for live-serve backups
+  mushroomdb export <db-dir> <dest> --format jsonl|parquet|graphml   export all data
+                                      graphml writes one file: <dest>/graph.graphml if <dest> is an
+                                      existing directory, otherwise <dest> is the file path itself
+                                      (nodes + edges only; rules have no GraphML analogue)
+  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
+                     --restore-from seeds an empty <db-dir> from the newest backup under <dir>
+                     (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
+                     --tls-cert and --tls-key go together and need a build with the `tls` feature
+  mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]... [--max-commits-per-file N]
+                        [--recurse-submodules] [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]
+                                   graph a git repo (authors, commits, files, symbols, imports, calls, mentions); re-run to sync
+                                   --recurse-submodules also walks each initialised submodule
+                                   --prs links merged pull requests via gh (skipped when gh is unavailable)
+                                   --no-structure skips the working-tree pass (no hashes, symbols, imports or calls)
+                                   --no-docs skips Markdown bodies, headings and mentions
+                                   --ensure-gitignore adds the database directory to the repo's .gitignore
+                                   with no --exclude the defaults apply: target/ node_modules/ dist/ .git/ *.lock *.min.js
+  mushroomdb demo <db-dir>
   mushroomdb install [--platform claude-code|cursor|codex|all] [--project|--user] [--db <path>]
                      [--command <path>] [--no-prewarm] [--delivery cli|mcp|both]
                      [--always-load|--no-always-load]
@@ -480,68 +546,13 @@ Usage:
   mushroomdb doctor [--project|--user] [--platform claude-code|cursor|codex|all]
                      verify an install: config entry, store, hooks, and a real stdio
                      handshake with the configured MCP command; exits 1 on any `fail`
-  mushroomdb serve <db-dir> [--addr 127.0.0.1:8080] [--token <secret>] [--role-token TOKEN:ROLE] [--ui <dist-dir>] [--no-ui] [--demo-if-empty] [--snapshot-every <secs>] [--restore-from <dir>] [--tls-cert <pem> --tls-key <pem>]
-                     --restore-from seeds an empty <db-dir> from the newest backup under <dir>
-                     (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
-                     --tls-cert and --tls-key go together and need a build with the `tls` feature
   mushroomdb mcp <db-dir>|--auto [--all-tools]
                      --all-tools lists every served tool; the default lists the association tools on every store,
                      a store `ingest-git` built included (the rest stay callable, just unlisted)
-  mushroomdb stats <db-dir>
-  mushroomdb demo <db-dir>
   mushroomdb recall <db-dir>|--auto   hook body: reads a prompt payload on stdin, prints related graph facts
   mushroomdb brief <db-dir>|--auto    hook body: the store's schema in one block — labels,
                                       edge types, history depth, roles and one worked call per
                                       question kind; byte-stable, so a session host caches it once
-  mushroomdb why <db-dir> <a> <b>
-                                   every rule edge between two keys with the evidence that
-                                   derived it, or a note that there is none
-  mushroomdb suggest <db-dir>
-  mushroomdb asof <db-dir> --commit N|--at <date> [--query \"MATCH ...\"] [--namespace <ns>]
-                     --at takes an RFC 3339 date (2026-06-19, or 2026-06-19T12:00:00Z)
-                     and resolves to the last commit at or before it; exactly one of
-                     --commit and --at
-  mushroomdb query <db-dir> [--query \"MATCH ...\"] [--role <name>] [--namespace <ns>] <cypher…>
-                     --role answers as one of the store's roles and --namespace from one
-                     namespace; together they intersect, so neither ever widens the other
-                     and either one makes the query a read
-  mushroomdb snapshot <db-dir> [--keep-wal|--truncate] [--retention N]
-                     folds the WAL into snapshot.bin and archives it as wal.<N>.archive,
-                     so node_history, edge_history, was_linked and asof keep reaching it;
-                     --truncate discards it instead, --keep-wal leaves wal.bin whole
-  mushroomdb build-index <db-dir> [--rule <name>]
-                     drives a rule's vector index to completion a slice at a time, for an
-                     operator who wants the build finished before traffic arrives; a rule
-                     created over a large corpus derives no edges until its index is whole
-  mushroomdb migrate <db-dir>
-  mushroomdb verify <db-dir>       validate CRC32 integrity of every snapshot section
-  mushroomdb backup <db-dir> <dest>   process-local consistent copy of the database to <dest>
-                                      WARNING: unsafe against a concurrently running serve process;
-                                      use POST /backup on the HTTP server for live-serve backups
-  mushroomdb export <db-dir> <dest> --format jsonl|parquet|graphml   export all data
-                                      graphml writes one file: <dest>/graph.graphml if <dest> is an
-                                      existing directory, otherwise <dest> is the file path itself
-                                      (nodes + edges only; rules have no GraphML analogue)
-  mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]... [--max-commits-per-file N]
-                        [--recurse-submodules] [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]
-                                   graph a git repo (authors, commits, files, symbols, imports, calls, mentions); re-run to sync
-                                   --recurse-submodules also walks each initialised submodule
-                                   --prs links merged pull requests via gh (skipped when gh is unavailable)
-                                   --no-structure skips the working-tree pass (no hashes, symbols, imports or calls)
-                                   --no-docs skips Markdown bodies, headings and mentions
-                                   --ensure-gitignore adds the database directory to the repo's .gitignore
-                                   with no --exclude the defaults apply: target/ node_modules/ dist/ .git/ *.lock *.min.js
-  mushroomdb schema apply <db-dir> <schema.json>
-  mushroomdb schema apply <db-dir> --memory-defaults
-                                   applies the built-in memory schema to an existing store;
-                                   full-text on a populated store builds the index at each open until the next snapshot carries it
-  mushroomdb schema apply <db-dir> --memory-identity
-                                   adds the identity preset: sixteen SAME_AS rules over each entity's aliases;
-                                   says what it will backfill, then backfills
-  mushroomdb algo pagerank <db-dir> [--top N] [--dir out|in|both]
-  mushroomdb algo wcc <db-dir> [--top N]
-  mushroomdb algo degree <db-dir> [--top N] [--dir out|in|both]
-  mushroomdb algo communities <db-dir> [--edge-type T]... [--weight-prop P] [--min-weight X] [--top N]
   mushroomdb --version
   mushroomdb --help
 
@@ -1075,11 +1086,26 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
     let mut commit: Option<u64> = None;
     let mut at: Option<String> = None;
     let mut query: Option<String> = None;
+    let mut file: Option<PathBuf> = None;
+    let mut stdin = false;
     let mut namespace: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--at" {
+        if a == "--file" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --file".to_string())?;
+            file = Some(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--file=") {
+            file = Some(PathBuf::from(val));
+            i += 1;
+        } else if a == "--stdin" {
+            stdin = true;
+            i += 1;
+        } else if a == "--at" {
             let val = args
                 .get(i + 1)
                 .copied()
@@ -1149,11 +1175,14 @@ fn parse_asof(args: &[&str]) -> Result<Command, String> {
         }
         _ => {}
     }
+    check_statement_sources("asof", query.is_some(), file.is_some(), stdin)?;
     Ok(Command::AsOf {
         db_dir,
         commit,
         at,
         query,
+        file,
+        stdin,
         namespace,
     })
 }
@@ -1221,16 +1250,88 @@ fn check_namespace(namespace: Option<&str>) -> Result<Option<&str>, CliError> {
     }
 }
 
+/// A statement comes from one place: the command line, `--file` or `--stdin`.
+/// Two sources is a refusal, never a precedence rule.
+fn check_statement_sources(
+    command: &str,
+    inline: bool,
+    file: bool,
+    stdin: bool,
+) -> Result<(), String> {
+    if [inline, file, stdin].iter().filter(|given| **given).count() > 1 {
+        return Err(format!(
+            "{command}: give the Cypher statement one way — on the command line, \
+             with --file <path>, or with --stdin — not several"
+        ));
+    }
+    Ok(())
+}
+
+/// The statement a `query` or `asof` was given: `inline` as it came, or the
+/// text of `--file` or of standard input. A file or pipe ends in a newline the
+/// editor or `echo` put there, which is not part of the statement, so trailing
+/// whitespace is dropped.
+pub fn resolve_statement(
+    inline: Option<&str>,
+    file: Option<&Path>,
+    stdin: bool,
+    input: &mut dyn std::io::Read,
+) -> Result<Option<String>, CliError> {
+    let text = match (file, stdin) {
+        (Some(path), _) => std::fs::read_to_string(path)
+            .map_err(|e| CliError(format!("cannot read --file {}: {e}", path.display())))?,
+        (None, true) => {
+            let mut text = String::new();
+            input
+                .read_to_string(&mut text)
+                .map_err(|e| CliError(format!("cannot read the statement from stdin: {e}")))?;
+            text
+        }
+        (None, false) => match inline {
+            Some(statement) => return Ok(Some(tidy_statement(statement).to_string())),
+            None => return Ok(None),
+        },
+    };
+    let statement = tidy_statement(&text);
+    if statement.trim().is_empty() {
+        return Err(CliError("the Cypher statement is empty".to_string()));
+    }
+    Ok(Some(statement.to_string()))
+}
+
+/// One leading byte-order mark, trailing whitespace and one trailing `;` are
+/// not part of the statement: an editor, a pipe and a pasted line put them
+/// there, and the lexer has no use for any of them.
+fn tidy_statement(text: &str) -> &str {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text).trim_end();
+    text.strip_suffix(';').unwrap_or(text).trim_end()
+}
+
 fn parse_query(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut query_flag: Option<String> = None;
     let mut role: Option<String> = None;
     let mut namespace: Option<String> = None;
+    let mut file: Option<PathBuf> = None;
+    let mut stdin = false;
     let mut cypher_parts: Vec<&str> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = args[i];
-        if a == "--query" {
+        if a == "--file" {
+            let val = args
+                .get(i + 1)
+                .copied()
+                .ok_or_else(|| "missing value for --file".to_string())?;
+            file = Some(PathBuf::from(val));
+            i += 2;
+        } else if let Some(val) = a.strip_prefix("--file=") {
+            file = Some(PathBuf::from(val));
+            i += 1;
+        } else if a == "--stdin" {
+            stdin = true;
+            i += 1;
+        } else if a == "--query" {
             let val = args
                 .get(i + 1)
                 .copied()
@@ -1271,7 +1372,15 @@ fn parse_query(args: &[&str]) -> Result<Command, String> {
         }
     }
     let db_dir = db_dir.ok_or_else(|| "query requires <db-dir>".to_string())?;
-    let cypher = if let Some(q) = query_flag {
+    check_statement_sources(
+        "query",
+        query_flag.is_some() || !cypher_parts.is_empty(),
+        file.is_some(),
+        stdin,
+    )?;
+    let cypher = if file.is_some() || stdin {
+        String::new()
+    } else if let Some(q) = query_flag {
         if !cypher_parts.is_empty() {
             return Err(
                 "query: pass Cypher as remaining arguments or --query, not both".to_string(),
@@ -1287,6 +1396,8 @@ fn parse_query(args: &[&str]) -> Result<Command, String> {
     Ok(Command::Query {
         db_dir,
         cypher,
+        file,
+        stdin,
         role,
         namespace,
     })
@@ -2980,6 +3091,11 @@ fn fmt_value(v: &Value) -> String {
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        | Value::Binary(_) => mushroomdb::v11_display_text(v).unwrap_or_default(),
     }
 }
 
@@ -5653,6 +5769,121 @@ mod tests {
         assert!(parse_args(&["query", "/tmp/db", "--namespace"]).is_err());
         assert!(parse_args(&["query", "/tmp/db", "--role"]).is_err());
         assert!(usage().contains("--namespace <ns>"));
+    }
+
+    /// `query` and `asof` take the statement from `--file` or `--stdin`, and
+    /// refuse a second source rather than pick one.
+    #[test]
+    fn parse_query_and_asof_take_a_file_or_stdin() {
+        let Ok(Command::Query {
+            cypher,
+            file,
+            stdin,
+            ..
+        }) = parse_args(&["query", "/tmp/db", "--file", "/tmp/q.cyp"])
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(cypher, "");
+        assert_eq!(file, Some(PathBuf::from("/tmp/q.cyp")));
+        assert!(!stdin);
+
+        let Ok(Command::Query { file, stdin, .. }) = parse_args(&["query", "/tmp/db", "--stdin"])
+        else {
+            panic!("expected Query");
+        };
+        assert_eq!(file, None);
+        assert!(stdin);
+
+        let Ok(Command::AsOf {
+            commit,
+            query,
+            file,
+            stdin,
+            ..
+        }) = parse_args(&["asof", "/tmp/db", "--commit", "1", "--file=/tmp/q.cyp"])
+        else {
+            panic!("expected AsOf");
+        };
+        assert_eq!(commit, Some(1));
+        assert_eq!(query, None);
+        assert_eq!(file, Some(PathBuf::from("/tmp/q.cyp")));
+        assert!(!stdin);
+
+        let Ok(Command::AsOf { stdin, .. }) =
+            parse_args(&["asof", "/tmp/db", "--commit", "1", "--stdin"])
+        else {
+            panic!("expected AsOf");
+        };
+        assert!(stdin);
+
+        for args in [
+            &["query", "/tmp/db", "--stdin", "--file", "/tmp/q"][..],
+            &["query", "/tmp/db", "--stdin", "MATCH (n) RETURN n"],
+            &[
+                "query",
+                "/tmp/db",
+                "--file",
+                "/tmp/q",
+                "--query",
+                "MATCH (n) RETURN n",
+            ],
+            &[
+                "asof",
+                "/tmp/db",
+                "--commit",
+                "1",
+                "--stdin",
+                "--query",
+                "MATCH (n) RETURN n",
+            ],
+            &[
+                "asof", "/tmp/db", "--commit", "1", "--stdin", "--file", "/tmp/q",
+            ],
+            &["query", "/tmp/db", "--file"],
+        ] {
+            assert!(parse_args(args).is_err(), "{args:?} should be refused");
+        }
+        assert!(usage().contains("--file <path>|--stdin"));
+    }
+
+    /// The trailing newline a file or pipe ends in is not part of the
+    /// statement; an empty one is refused.
+    #[test]
+    fn resolve_statement_drops_the_trailing_newline() {
+        let mut piped: &[u8] = b"MATCH (n) RETURN count(n)\n\n";
+        let got = resolve_statement(None, None, true, &mut piped).expect("stdin");
+        assert_eq!(got.as_deref(), Some("MATCH (n) RETURN count(n)"));
+
+        let mut unused: &[u8] = b"";
+        let inline = resolve_statement(Some("MATCH (n) RETURN n"), None, false, &mut unused)
+            .expect("inline");
+        assert_eq!(inline.as_deref(), Some("MATCH (n) RETURN n"));
+        assert_eq!(
+            resolve_statement(None, None, false, &mut unused).unwrap(),
+            None
+        );
+
+        // A byte-order mark and one trailing semicolon are not the statement,
+        // whichever way it arrives.
+        let mut bom: &[u8] = b"\xEF\xBB\xBFMATCH (n) RETURN n;  \n";
+        let got = resolve_statement(None, None, true, &mut bom).expect("bom");
+        assert_eq!(got.as_deref(), Some("MATCH (n) RETURN n"));
+        let got = resolve_statement(Some("MATCH (n) RETURN n ; "), None, false, &mut unused)
+            .expect("inline semicolon");
+        assert_eq!(got.as_deref(), Some("MATCH (n) RETURN n"));
+        let got = resolve_statement(Some("RETURN ';;'"), None, false, &mut unused).unwrap();
+        assert_eq!(got.as_deref(), Some("RETURN ';;'"));
+
+        let mut blank: &[u8] = b" \n";
+        assert!(resolve_statement(None, None, true, &mut blank).is_err());
+        assert!(resolve_statement(
+            None,
+            Some(Path::new("/nonexistent/q.cyp")),
+            false,
+            &mut unused
+        )
+        .is_err());
     }
 
     /// `query --role` answers as that role, `--namespace` narrows, and the two

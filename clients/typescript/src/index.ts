@@ -4,7 +4,13 @@
  * Entry point re-exports everything callers need.
  */
 
-export { MushroomClient, MushroomError } from "./client.js";
+export {
+  MushroomClient,
+  MushroomError,
+  TransactionConflictError,
+  TransactionExpiredError,
+  TxHandle,
+} from "./client.js";
 export type {
   AlgoDir,
   AlgoReport,
@@ -47,6 +53,8 @@ export type {
   SlowQueryEntry,
   Stats,
   SuggestReport,
+  TxBeginResponse,
+  TxCommitResponse,
   WasLinkedResult,
   WccConfig,
   WccReport,

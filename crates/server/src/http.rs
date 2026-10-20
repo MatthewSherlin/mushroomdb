@@ -32,6 +32,8 @@ use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tower_http::services::ServeDir;
 
 /// Build the HTTP router over `db`. Read endpoints take the read lock;
@@ -70,6 +72,24 @@ pub fn router_with_auth(db: SharedDb, token: Option<String>) -> Router {
         UiFallback::None,
         default_advertise_addr(),
         false,
+    )
+}
+
+/// [`router_with_auth`] whose `GET /ready` follows `ready`: 503 while it is
+/// false, 200 once it is true. Every other router is ready as soon as it is built.
+pub fn router_with_ready_flag(
+    db: SharedDb,
+    token: Option<String>,
+    ready: Arc<AtomicBool>,
+) -> Router {
+    build_app_with_ready(
+        db,
+        token,
+        HashMap::new(),
+        UiFallback::None,
+        default_advertise_addr(),
+        false,
+        ready,
     )
 }
 
@@ -215,6 +235,7 @@ pub async fn serve(
         token,
         HashMap::new(),
         None,
+        Arc::new(AtomicBool::new(true)),
     )
     .await
 }
@@ -230,7 +251,17 @@ pub async fn serve_with_role_tokens(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
 ) -> std::io::Result<()> {
-    serve_inner(db, addr, ready, UiFallback::None, token, role_tokens, None).await
+    serve_inner(
+        db,
+        addr,
+        ready,
+        UiFallback::None,
+        token,
+        role_tokens,
+        None,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
 }
 
 /// [`serve`] plus a UI dist directory mounted behind the API routes.
@@ -257,6 +288,7 @@ pub async fn serve_with_ui(
         token,
         HashMap::new(),
         None,
+        Arc::new(AtomicBool::new(true)),
     )
     .await
 }
@@ -278,6 +310,7 @@ pub async fn serve_with_ui_and_role_tokens(
         token,
         role_tokens,
         None,
+        Arc::new(AtomicBool::new(true)),
     )
     .await
 }
@@ -302,6 +335,7 @@ pub async fn serve_with_embedded_ui(
         token,
         role_tokens,
         None,
+        Arc::new(AtomicBool::new(true)),
     )
     .await
 }
@@ -334,6 +368,7 @@ pub async fn serve_with_shutdown(
         token,
         HashMap::new(),
         Some(shutdown),
+        Arc::new(AtomicBool::new(true)),
     )
     .await
 }
@@ -347,6 +382,29 @@ pub async fn serve_with_role_tokens_and_shutdown(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    serve_with_role_tokens_and_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+}
+
+/// [`serve_with_role_tokens_and_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_role_tokens_and_shutdown_with_ready_flag(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    ready_flag: Arc<AtomicBool>,
+) -> std::io::Result<()> {
     serve_inner(
         db,
         addr,
@@ -355,6 +413,7 @@ pub async fn serve_with_role_tokens_and_shutdown(
         token,
         role_tokens,
         Some(shutdown),
+        ready_flag,
     )
     .await
 }
@@ -369,6 +428,31 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        ui_dir,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+}
+
+/// [`serve_with_ui_and_role_tokens_and_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    ui_dir: PathBuf,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    ready_flag: Arc<AtomicBool>,
+) -> std::io::Result<()> {
     serve_inner(
         db,
         addr,
@@ -377,6 +461,7 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown(
         token,
         role_tokens,
         Some(shutdown),
+        ready_flag,
     )
     .await
 }
@@ -391,6 +476,30 @@ pub async fn serve_with_embedded_ui_and_shutdown(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    serve_with_embedded_ui_and_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+}
+
+/// [`serve_with_embedded_ui_and_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[cfg(feature = "embed-ui")]
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_with_embedded_ui_and_shutdown_with_ready_flag(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    ready_flag: Arc<AtomicBool>,
+) -> std::io::Result<()> {
     serve_inner(
         db,
         addr,
@@ -399,6 +508,7 @@ pub async fn serve_with_embedded_ui_and_shutdown(
         token,
         role_tokens,
         Some(shutdown),
+        ready_flag,
     )
     .await
 }
@@ -410,6 +520,7 @@ enum UiFallback {
     Embedded,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_inner(
     db: SharedDb,
     addr: SocketAddr,
@@ -418,6 +529,7 @@ async fn serve_inner(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+    ready_flag: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
@@ -425,7 +537,7 @@ async fn serve_inner(
         // Caller dropped the readiness receiver; still serve.
         eprintln!("serve: readiness receiver dropped before bind notify");
     }
-    let app = build_app(db, token, role_tokens, ui, local, false);
+    let app = build_app_with_ready(db, token, role_tokens, ui, local, false, ready_flag);
     match shutdown {
         None => axum::serve(listener, app).await,
         // Stop accepting, then let every request already in flight finish.
@@ -491,6 +603,34 @@ pub async fn serve_tls_with_shutdown(
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    serve_tls_with_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        cert_path,
+        key_path,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+}
+
+/// [`serve_tls_with_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[cfg(feature = "tls")]
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_tls_with_shutdown_with_ready_flag(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    ready_flag: Arc<AtomicBool>,
+) -> std::io::Result<()> {
     let config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
@@ -500,7 +640,15 @@ pub async fn serve_tls_with_shutdown(
     if ready.send(local).is_err() {
         eprintln!("serve_tls: readiness receiver dropped before bind notify");
     }
-    let app = build_app(db, token, role_tokens, UiFallback::None, local, true);
+    let app = build_app_with_ready(
+        db,
+        token,
+        role_tokens,
+        UiFallback::None,
+        local,
+        true,
+        ready_flag,
+    );
     let handle = axum_server::Handle::new();
     tokio::spawn({
         let handle = handle.clone();
@@ -532,6 +680,26 @@ fn build_app(
     addr: SocketAddr,
     tls_active: bool,
 ) -> Router {
+    build_app_with_ready(
+        db,
+        token,
+        role_tokens,
+        ui,
+        addr,
+        tls_active,
+        Arc::new(AtomicBool::new(true)),
+    )
+}
+
+fn build_app_with_ready(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    ui: UiFallback,
+    addr: SocketAddr,
+    tls_active: bool,
+    ready: Arc<AtomicBool>,
+) -> Router {
     debug_assert!(
         !db.read().has_event_sink(),
         "router() must be called at most once per SharedDb; a second call \
@@ -553,9 +721,11 @@ fn build_app(
         addr,
         tls_active,
         started_at: std::time::Instant::now(),
+        ready,
     };
     let app = Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready_handler))
         .route("/query", post(query))
         .route("/stats", get(stats))
         .route("/metrics", get(metrics))
@@ -755,6 +925,18 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120)
 /// plausible operator workload and well below what would exhaust the process.
 const MAX_CONCURRENT_REQUESTS: usize = 256;
 
+/// Readiness for a container platform. Needs no token and says nothing about
+/// the graph.
+async fn ready_handler(State(state): State<AppState>) -> Response {
+    if state.ready.load(Ordering::Acquire) {
+        json_ok(json!({ "ok": true }))
+    } else {
+        let mut response = json_ok(json!({ "ok": false, "reason": "not ready" }));
+        *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        response
+    }
+}
+
 async fn health(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
@@ -814,6 +996,10 @@ async fn auth_middleware(State(state): State<AppState>, mut req: Request, next: 
     // token was refused the same counters by `/metrics` and `/stats` on the
     // stated grounds that counters leak graph size. Two endpoints, one
     // disclosure, opposite policies.
+    if req.method() == Method::GET && req.uri().path() == "/ready" {
+        req.extensions_mut().insert(AuthIdentity::Anonymous);
+        return next.run(req).await;
+    }
     if req.method() == Method::GET && req.uri().path() == "/health" {
         let full = state
             .token
@@ -2126,7 +2312,7 @@ fn props_from_json_obj(v: &serde_json::Value) -> Result<Vec<(String, Value)>, St
     };
     let mut out = Vec::with_capacity(obj.len());
     for (k, val) in obj {
-        if let Some(v) = json_to_value(val.clone()) {
+        if let Some(v) = json_to_value(val.clone()).map_err(|e| format!("props {k:?}: {e}"))? {
             out.push((k.clone(), v));
         }
     }
@@ -2414,9 +2600,11 @@ async fn set_node_prop(
     Path((key, field)): Path<(String, String)>,
     Json(body): Json<Js>,
 ) -> Response {
-    let value = match body.get("value").and_then(|v| json_to_value(v.clone())) {
-        Some(v) => v,
-        None => {
+    let parsed = body.get("value").map(|v| json_to_value(v.clone()));
+    let value = match parsed {
+        Some(Err(e)) => return err_response(format!("value: {e}")),
+        Some(Ok(Some(v))) => v,
+        Some(Ok(None)) | None => {
             return err_response(
                 "request body must be a JSON object with a \"value\" field, \
                  e.g. {\"value\": \"SanFrancisco\"} or {\"value\": [\"a\", \"b\"]}",

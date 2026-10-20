@@ -58,6 +58,7 @@ Role-token behavior per endpoint:
 | Endpoint | Role-token response |
 |---|---|
 | `GET /health` | 200 `{"ok":true}` — reachable without a credential, and discloses nothing beyond liveness to anyone but a full-access token |
+| `GET /ready` | 200 `{"ok":true}` — reachable without a credential, like `/health` |
 | `POST /query` (read) | 200 — rows filtered to visible nodes; client `mask` intersects role mask (never widens) |
 | `POST /query` (write: `CREATE`/`SET`/`DELETE`/`MERGE`) | 200 if in write scope + target visible; 403 with reason otherwise |
 | `POST /nodes` | 200 if `label` in `create_labels`; 403 with scope reason otherwise |
@@ -259,6 +260,7 @@ may not see and a key that does not exist are told apart for no one.
 | Method | Path | What it does |
 |---|---|---|
 | `GET` | [`/health`](#get-health) | Liveness; with the full-access token, node and edge counts |
+| `GET` | [`/ready`](#get-ready) | Readiness for a container platform; 503 until the store is open |
 | `GET` | [`/stats`](#get-stats) | Node, edge and rule counts |
 | `GET` | [`/metrics`](#get-metrics) | Process and store metrics, as JSON |
 | `POST` | [`/backup`](#post-backup) | A verified copy of the store, taken while it serves |
@@ -307,6 +309,18 @@ it is serving:
 
 A role-bound token, a wrong token and no token all get `{"ok": true}` and nothing more: the
 counts say how big the graph is, and `/stats` refuses a role the same counts.
+
+### `GET /ready`
+
+Readiness. It needs no token and never answers 401, so a container platform can gate traffic
+on it. The server opens the store before it binds, so a running server answers 200:
+
+```json
+{"ok": true}
+```
+
+Until the server is ready to serve, the answer is 503 and the body is `{"ok": false, "reason": "not ready"}`.
+Use `/health` to ask whether the process is alive and `/ready` to ask whether to send it requests.
 
 ### `GET /stats`
 
@@ -520,6 +534,18 @@ snapshots (see the horizon and retention sections in
 send `as_of`.
 
 Default response: Arrow IPC stream (`application/vnd.apache.arrow.stream`).
+
+Arrow column types for the date, time and binary value types. A column
+becomes one of these only when every non-null value in it has that type; a
+column that mixes types is Utf8 text.
+
+| Value type | Arrow type | Loss |
+|---|---|---|
+| `Date` | `Date32` | none |
+| `LocalDateTime` | `Timestamp(microsecond)`, no zone | none |
+| `DateTime` | `Timestamp(microsecond, "+00:00")` | Arrow holds one zone per column, so each value is its UTC instant and its own offset is dropped |
+| `Duration` | `Duration(microsecond)` | nanoseconds below one microsecond are truncated; a column with any non-zero month is Utf8 ISO 8601 text instead, because a month has no fixed length |
+| `Binary` | `LargeBinary` | none |
 
 Add `?format=json` for a JSON response:
 
