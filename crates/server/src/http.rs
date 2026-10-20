@@ -395,6 +395,7 @@ pub async fn serve_with_role_tokens_and_shutdown(
 }
 
 /// [`serve_with_role_tokens_and_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with_role_tokens_and_shutdown_with_ready_flag(
     db: SharedDb,
     addr: SocketAddr,
@@ -441,6 +442,7 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown(
 }
 
 /// [`serve_with_ui_and_role_tokens_and_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
     db: SharedDb,
     addr: SocketAddr,
@@ -488,6 +490,7 @@ pub async fn serve_with_embedded_ui_and_shutdown(
 
 /// [`serve_with_embedded_ui_and_shutdown`] whose `GET /ready` follows `ready_flag`.
 #[cfg(feature = "embed-ui")]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with_embedded_ui_and_shutdown_with_ready_flag(
     db: SharedDb,
     addr: SocketAddr,
@@ -517,6 +520,7 @@ enum UiFallback {
     Embedded,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_inner(
     db: SharedDb,
     addr: SocketAddr,
@@ -615,6 +619,7 @@ pub async fn serve_tls_with_shutdown(
 
 /// [`serve_tls_with_shutdown`] whose `GET /ready` follows `ready_flag`.
 #[cfg(feature = "tls")]
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_tls_with_shutdown_with_ready_flag(
     db: SharedDb,
     addr: SocketAddr,
