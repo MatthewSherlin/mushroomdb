@@ -1323,6 +1323,11 @@ dependencies = [
 [[package]]
 name = "mushroomdb-bolt"
 version = "0.9.2"
+dependencies = [
+ "mushroomdb",
+ "tempfile",
+ "tokio",
+]
 
 [[package]]
 name = "mushroomdb-cli"
