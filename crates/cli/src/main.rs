@@ -160,6 +160,13 @@ fn main() -> ExitCode {
             tls_cert,
             tls_key,
         }) => {
+            // Before anything touches the store (restore, demo, open).
+            if let Err(message) =
+                parse_log_format(std::env::var("MUSHROOMDB_LOG_FORMAT").ok().as_deref())
+            {
+                eprintln!("error: {message}");
+                return ExitCode::from(2);
+            }
             let token = token.filter(|s| !s.is_empty()).or_else(|| {
                 std::env::var("MUSHROOMDB_TOKEN")
                     .ok()
@@ -898,7 +905,6 @@ mod tests {
         );
     }
 
-    /// The filter parses. An unparseable default falls back to silence.
     #[test]
     fn log_format_values() {
         assert_eq!(parse_log_format(None), Ok(LogFormat::Text));
@@ -908,6 +914,7 @@ mod tests {
         assert!(parse_log_format(Some("yaml")).unwrap_err().contains("yaml"));
     }
 
+    /// The filter parses. An unparseable default falls back to silence.
     #[test]
     fn default_filter_parses() {
         use tracing_subscriber::EnvFilter;
