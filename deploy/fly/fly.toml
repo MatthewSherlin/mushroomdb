@@ -6,13 +6,21 @@
 #   fly secrets set MUSHROOMDB_TOKEN=<set-me>
 #   fly deploy
 #
-# Replace <owner> in [build] with the GitHub owner of the published image.
+# `app` must be globally unique on Fly; `fly launch --copy-config` prompts for it.
+#
+# VOLUME OWNERSHIP: the image runs as uid 65532 (not root). The server needs
+# /data writable by that uid. Fly mounts new volumes root-owned, and the image
+# has no shell to chown with. Check the first deploy's logs: an unwritable data
+# dir surfaces as "store is busy: write lock held by another process" (a
+# misleading message, tracked as a follow-up). If you see it, see
+# docs/site self-host guide (HO-16) for the ownership step. UNVERIFIED without
+# a real deploy.
 
 app = "mushroomdb"
 primary_region = "iad"
 
 [build]
-  image = "ghcr.io/<owner>/mushroomdb:latest"
+  image = "ghcr.io/matthewsherlin/mushroomdb:latest"
 
 [env]
   # Non-secret settings only. Secrets (never put values here):
@@ -23,7 +31,12 @@ primary_region = "iad"
   # and in `fly secrets` once the backup worker (HO-07) ships. Nothing in this
   # file configures backup yet.
 
+[processes]
+  # Explicit command: no --demo-if-empty, so a production volume is never seeded.
+  app = "serve /data --addr 0.0.0.0:8080 --snapshot-every 300"
+
 [[services]]
+  processes = ["app"]
   protocol = "tcp"
   internal_port = 8080
   [[services.ports]]

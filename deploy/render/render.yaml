@@ -4,21 +4,25 @@
 # persistent disk attaches to one instance, and a second writer on the same
 # store contends for the write lock. Do not enable autoscaling.
 #
-# Replace <owner> with the GitHub owner of the published image. Secret values
-# are entered in the Render dashboard (sync: false); none live in this file.
+# Secret values are entered in the Render dashboard (sync: false); none live in this file.
 services:
   - type: web
     name: mushroomdb
     runtime: image
     image:
-      url: ghcr.io/<owner>/mushroomdb:latest
+      url: ghcr.io/matthewsherlin/mushroomdb:latest
     numInstances: 1
+    # Explicit command: no --demo-if-empty, so a production disk is never seeded.
+    dockerCommand: serve /data --addr 0.0.0.0:8080 --snapshot-every 300
     disk:
       name: mushroomdb-data
       mountPath: /data
       sizeGB: 10
+    # Render probes the port named by PORT; the server binds 8080 (--addr above).
     healthCheckPath: /ready
     envVars:
+      - key: PORT
+        value: "8080"
       - key: MUSHROOMDB_TOKEN
         sync: false
       - key: MUSHROOMDB_LOG_FORMAT

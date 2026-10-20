@@ -3,14 +3,12 @@
 #
 #   MUSHROOMDB_TOKEN=<set-me> docker compose up
 #
-# Replace <owner> with the GitHub owner of the published image.
-#
 # SINGLE WRITER - replicas must be 1. Do not use `docker compose up --scale
 # mushroomdb=N`: a second writer on the same /data volume fails to take the
 # write lock.
 services:
   mushroomdb:
-    image: ghcr.io/<owner>/mushroomdb:latest
+    image: ghcr.io/matthewsherlin/mushroomdb:latest
     ports:
       - "8080:8080"
       # The Bolt port (7687) is added by HO-15; it is intentionally absent here.
@@ -28,6 +26,9 @@ services:
       AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       # TODO(HO-14/HO-15): backup and restore-on-boot variables go here once the
       # backup worker (HO-07) ships. Nothing in this file configures backup yet.
+    # Local development: explicit command, no --demo-if-empty. For a throwaway
+    # demo store, append "--demo-if-empty" here. Production never does.
+    restart: unless-stopped
     command: ["serve", "/data", "--addr", "0.0.0.0:8080", "--snapshot-every", "300"]
     depends_on:
       minio:
@@ -37,7 +38,7 @@ services:
   # remove this service. The default credentials below are for local use only;
   # override them with MINIO_ROOT_USER / MINIO_ROOT_PASSWORD in the environment.
   minio:
-    image: minio/minio:latest
+    image: minio/minio:latest   # dev-only default; pin a tag for anything shared
     ports:
       - "9000:9000"
       - "9001:9001"
