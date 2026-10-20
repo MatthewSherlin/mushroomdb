@@ -6593,7 +6593,7 @@ async fn ready_returns_503_before_open_and_200_after() {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         parse_json(&body),
-        json!({"ok": false, "reason": "replaying"})
+        json!({"ok": false, "reason": "not ready"})
     );
 
     ready.store(true, std::sync::atomic::Ordering::Release);

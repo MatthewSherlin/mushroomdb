@@ -629,7 +629,7 @@ fn run_serve(
             if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
                 #[cfg(feature = "tls")]
                 {
-                    return server::serve_tls_with_shutdown(
+                    return server::serve_tls_with_shutdown_with_ready_flag(
                         db_serve,
                         addr,
                         tx,
@@ -665,7 +665,7 @@ fn run_serve(
             }
             match ui {
                 ServeUi::Filesystem(dir) => {
-                    server::serve_with_ui_and_role_tokens_and_shutdown(
+                    server::serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
                         db_serve,
                         addr,
                         tx,
@@ -678,7 +678,7 @@ fn run_serve(
                     .await
                 }
                 ServeUi::None => {
-                    server::serve_with_role_tokens_and_shutdown(
+                    server::serve_with_role_tokens_and_shutdown_with_ready_flag(
                         db_serve,
                         addr,
                         tx,
@@ -692,7 +692,7 @@ fn run_serve(
                 ServeUi::Embedded => {
                     #[cfg(feature = "embed-ui")]
                     {
-                        server::serve_with_embedded_ui_and_shutdown(
+                        server::serve_with_embedded_ui_and_shutdown_with_ready_flag(
                             db_serve,
                             addr,
                             tx,
@@ -705,7 +705,7 @@ fn run_serve(
                     }
                     #[cfg(not(feature = "embed-ui"))]
                     {
-                        server::serve_with_role_tokens_and_shutdown(
+                        server::serve_with_role_tokens_and_shutdown_with_ready_flag(
                             db_serve,
                             addr,
                             tx,

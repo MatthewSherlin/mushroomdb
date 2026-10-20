@@ -381,6 +381,27 @@ pub async fn serve_with_role_tokens_and_shutdown(
     token: Option<String>,
     role_tokens: HashMap<String, String>,
     shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    serve_with_role_tokens_and_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+}
+
+/// [`serve_with_role_tokens_and_shutdown`] whose `GET /ready` follows `ready_flag`.
+pub async fn serve_with_role_tokens_and_shutdown_with_ready_flag(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
     ready_flag: Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     serve_inner(
@@ -398,6 +419,29 @@ pub async fn serve_with_role_tokens_and_shutdown(
 
 /// [`serve_with_ui_and_role_tokens`] that stops gracefully. See [`serve_with_shutdown`].
 pub async fn serve_with_ui_and_role_tokens_and_shutdown(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    ui_dir: PathBuf,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        ui_dir,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+}
+
+/// [`serve_with_ui_and_role_tokens_and_shutdown`] whose `GET /ready` follows `ready_flag`.
+pub async fn serve_with_ui_and_role_tokens_and_shutdown_with_ready_flag(
     db: SharedDb,
     addr: SocketAddr,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
@@ -423,6 +467,28 @@ pub async fn serve_with_ui_and_role_tokens_and_shutdown(
 /// [`serve_with_embedded_ui`] that stops gracefully. See [`serve_with_shutdown`].
 #[cfg(feature = "embed-ui")]
 pub async fn serve_with_embedded_ui_and_shutdown(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    serve_with_embedded_ui_and_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+}
+
+/// [`serve_with_embedded_ui_and_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[cfg(feature = "embed-ui")]
+pub async fn serve_with_embedded_ui_and_shutdown_with_ready_flag(
     db: SharedDb,
     addr: SocketAddr,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
@@ -524,6 +590,32 @@ pub async fn serve_tls(
 /// stuck request hold a restart open forever.
 #[cfg(feature = "tls")]
 pub async fn serve_tls_with_shutdown(
+    db: SharedDb,
+    addr: SocketAddr,
+    ready: tokio::sync::oneshot::Sender<SocketAddr>,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    serve_tls_with_shutdown_with_ready_flag(
+        db,
+        addr,
+        ready,
+        cert_path,
+        key_path,
+        token,
+        role_tokens,
+        shutdown,
+        Arc::new(AtomicBool::new(true)),
+    )
+    .await
+}
+
+/// [`serve_tls_with_shutdown`] whose `GET /ready` follows `ready_flag`.
+#[cfg(feature = "tls")]
+pub async fn serve_tls_with_shutdown_with_ready_flag(
     db: SharedDb,
     addr: SocketAddr,
     ready: tokio::sync::oneshot::Sender<SocketAddr>,
@@ -834,7 +926,7 @@ async fn ready_handler(State(state): State<AppState>) -> Response {
     if state.ready.load(Ordering::Acquire) {
         json_ok(json!({ "ok": true }))
     } else {
-        let mut response = json_ok(json!({ "ok": false, "reason": "replaying" }));
+        let mut response = json_ok(json!({ "ok": false, "reason": "not ready" }));
         *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
         response
     }

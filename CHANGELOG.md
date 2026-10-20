@@ -10,7 +10,7 @@
 
 ### Added
 
-- **`GET /ready` readiness endpoint.** It answers 200 `{"ok":true}` once the store is open and 503 before, needs no token, and sits beside `/health` for container platforms. `serve_with_role_tokens_and_shutdown`, `serve_with_ui_and_role_tokens_and_shutdown`, `serve_with_embedded_ui_and_shutdown` and `serve_tls_with_shutdown` take a trailing `Arc<AtomicBool>` ready flag (HO-02).
+- **`GET /ready` readiness endpoint.** It answers 200 `{"ok":true}` once the store is open and 503 before, needs no token, and sits beside `/health` for container platforms. Each graceful-shutdown serve entry point gains a `_with_ready_flag` sibling taking the flag; the originals keep their signatures and are ready at once. (HO-02).
 
 ## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
 

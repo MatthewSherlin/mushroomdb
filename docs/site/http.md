@@ -319,7 +319,7 @@ on it. The server opens the store before it binds, so a running server answers 2
 {"ok": true}
 ```
 
-Until the server reports itself ready the answer is 503 with `{"ok": false, "reason": "replaying"}`.
+Until the server is ready to serve, the answer is 503 and the body is `{"ok": false, "reason": "not ready"}`.
 Use `/health` to ask whether the process is alive and `/ready` to ask whether to send it requests.
 
 ### `GET /stats`
