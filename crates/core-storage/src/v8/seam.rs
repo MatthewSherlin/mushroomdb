@@ -1048,6 +1048,38 @@ impl<'a> EdgePropsView<'a> {
             bincode::deserialize(entry.props_blob.as_slice()).ok()?;
         props.get(field).cloned()
     }
+
+    /// Every property of the edge `(etype, src, dst)`, with the same
+    /// precedence as [`EdgePropsView::get`]: a tombstone hides all of it, an
+    /// overlay value wins over the archived one, and archived fields the
+    /// overlay does not set still show.
+    pub fn props_of(
+        &self,
+        etype: u32,
+        src: u32,
+        dst: u32,
+    ) -> std::collections::BTreeMap<String, Value> {
+        if self.overlay.is_tombstoned(etype, src, dst) {
+            return std::collections::BTreeMap::new();
+        }
+        let mut out: std::collections::BTreeMap<String, Value> = self
+            .base
+            .and_then(|base| {
+                let i = base
+                    .entries
+                    .binary_search_by(|e| {
+                        let key = (u32::from(e.etype), u32::from(e.src), u32::from(e.dst));
+                        key.cmp(&(etype, src, dst))
+                    })
+                    .ok()?;
+                bincode::deserialize(base.entries[i].props_blob.as_slice()).ok()
+            })
+            .unwrap_or_default();
+        if let Some(overlay) = self.overlay.props_of(etype, src, dst) {
+            out.extend(overlay.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        out
+    }
 }
 
 /// Test whether bit `id` is set in an archived bitmap (slice of `Archived<u64>`).
