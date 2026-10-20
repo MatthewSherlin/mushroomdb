@@ -43,13 +43,45 @@ fn init_logging() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_env("MUSHROOMDB_LOG")
         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    let format = match parse_log_format(std::env::var("MUSHROOMDB_LOG_FORMAT").ok().as_deref()) {
+        Ok(format) => format,
+        Err(message) => {
+            // A hosted deployment that typo'd the format must not silently ship
+            // text to a collector expecting JSON: refuse to start.
+            eprintln!("error: {message}");
+            std::process::exit(2);
+        }
+    };
     // `try_init` rather than `init`: a second call must not panic the server,
     // and an embedder that already installed a subscriber keeps theirs.
-    let _ = fmt()
+    let builder = fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .with_writer(std::io::stderr)
-        .try_init();
+        .with_writer(std::io::stderr);
+    let _ = match format {
+        LogFormat::Text => builder.try_init(),
+        LogFormat::Json => builder.json().try_init(),
+    };
+}
+
+/// Log output format, chosen by `MUSHROOMDB_LOG_FORMAT`.
+#[derive(Debug, PartialEq, Eq)]
+enum LogFormat {
+    Text,
+    Json,
+}
+
+/// `unset`/empty/`text` -> text (today's output); `json` -> newline-delimited
+/// JSON; anything else is an error naming the accepted values.
+fn parse_log_format(value: Option<&str>) -> Result<LogFormat, String> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(LogFormat::Text),
+        Some(v) if v.eq_ignore_ascii_case("text") => Ok(LogFormat::Text),
+        Some(v) if v.eq_ignore_ascii_case("json") => Ok(LogFormat::Json),
+        Some(other) => Err(format!(
+            "MUSHROOMDB_LOG_FORMAT={other:?} is not recognised; use \"text\" (the default) or \"json\""
+        )),
+    }
 }
 
 fn main() -> ExitCode {
@@ -828,7 +860,7 @@ fn home_from(home: Option<OsString>, userprofile: Option<OsString>) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_LOG_FILTER;
+    use super::{parse_log_format, LogFormat, DEFAULT_LOG_FILTER};
     use std::path::PathBuf;
 
     #[test]
@@ -867,6 +899,15 @@ mod tests {
     }
 
     /// The filter parses. An unparseable default falls back to silence.
+    #[test]
+    fn log_format_values() {
+        assert_eq!(parse_log_format(None), Ok(LogFormat::Text));
+        assert_eq!(parse_log_format(Some("")), Ok(LogFormat::Text));
+        assert_eq!(parse_log_format(Some("text")), Ok(LogFormat::Text));
+        assert_eq!(parse_log_format(Some("JSON")), Ok(LogFormat::Json));
+        assert!(parse_log_format(Some("yaml")).unwrap_err().contains("yaml"));
+    }
+
     #[test]
     fn default_filter_parses() {
         use tracing_subscriber::EnvFilter;

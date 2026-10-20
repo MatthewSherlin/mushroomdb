@@ -12022,6 +12022,10 @@ wrong place for a credential.
 debugging, with no rebuild. Logs go to **stderr**; the `listening on http://…`
 line stays on stdout, where it has always been.
 
+`MUSHROOMDB_LOG_FORMAT=json` writes one JSON object per line on stderr instead
+of text, for a log collector. Unset, empty or `text` keeps the text output; any
+other value stops `serve` at startup with an error naming the accepted values.
+
 ## 8. A worked container command line
 
 ```text

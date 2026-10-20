@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **The published container image is built with TLS**, so `--tls-cert` and `--tls-key` work at container start without a custom build (HO-01). CI now runs the server's TLS tests with `--features tls`.
+- JSON logs: set `MUSHROOMDB_LOG_FORMAT=json` for structured output (one JSON object per line on stderr); an unrecognised value stops `serve` at startup
 
 ### Fixed
 
