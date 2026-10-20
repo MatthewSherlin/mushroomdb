@@ -184,6 +184,28 @@ pub enum WalRecord {
         dst: u32,
         count: u64,
     },
+    // ── Unique-constraint variants (appended after multiplicity; 24, 25) ─────
+    //
+    // Declarations only, like `EnableIndex`: replay registers or withdraws the
+    // constraint and never checks the data it covers — a WAL may hold
+    // duplicates written before the constraint was declared, and replay must
+    // never fail on them. The check runs at write time only.
+    //
+    // Format-V11 records: a 0.9.x reader cannot decode them, so they reach the
+    // WAL only once the V11 format is in place (0.10 TY-12).
+    /// Declare a unique constraint on `(label, field)`. Replay also enables the
+    /// backing equality index for the pair if it is not already enabled.
+    /// Discriminant 24.
+    CreateConstraint {
+        name: String,
+        label: String,
+        field: String,
+    },
+    /// Withdraw the unique constraint `name`. Its backing equality index stays.
+    /// Discriminant 25.
+    DropConstraint {
+        name: String,
+    },
 }
 
 /// The opt-in declaration: this store records insert-count multiplicity.
@@ -902,6 +924,39 @@ mod tests {
         assert_eq!(consumed, bytes.len());
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0], r);
+    }
+
+    /// Pin discriminants 24 (CreateConstraint) and 25 (DropConstraint).
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    #[test]
+    fn constraint_discriminants_pinned() {
+        let create = WalRecord::CreateConstraint {
+            name: "uniq_email".into(),
+            label: "User".into(),
+            field: "email".into(),
+        };
+        let cp = bincode::serialize(&create).unwrap();
+        assert_eq!(
+            &cp[0..4],
+            &[24, 0, 0, 0],
+            "CreateConstraint discriminant changed — a variant was inserted before position 24"
+        );
+        let drop = WalRecord::DropConstraint {
+            name: "uniq_email".into(),
+        };
+        let dp = bincode::serialize(&drop).unwrap();
+        assert_eq!(
+            &dp[0..4],
+            &[25, 0, 0, 0],
+            "DropConstraint discriminant changed — a variant was inserted before position 25"
+        );
+        let mut bytes = encode_record(&create);
+        bytes.extend(encode_record(&drop));
+        let (recs, consumed) = decode_all(&bytes);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(recs, vec![create, drop]);
     }
 
     /// The opt-in declaration and a real count share the discriminant and are

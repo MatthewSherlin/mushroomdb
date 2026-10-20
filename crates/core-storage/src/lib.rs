@@ -20,8 +20,9 @@ pub use interner::Interner;
 pub use topology::{Direction, Topology};
 pub use types::{
     list_tokens, namespace_of_value, tagged_text, v11_display_text, v11_only_type,
-    v11_type_refusal, valid_namespace, value_from_tagged_text, GraphError, Result, Value, ValueKey,
-    BINARY_MAX_BYTES, MAX_OFFSET_SECONDS, NS_DEFAULT, NS_MAX_LEN, NS_PROP, V11_TAGS,
+    v11_record_refusal, v11_type_refusal, valid_namespace, value_from_tagged_text, GraphError,
+    Result, UniqueConstraint, Value, ValueKey, BINARY_MAX_BYTES, MAX_OFFSET_SECONDS, NS_DEFAULT,
+    NS_MAX_LEN, NS_PROP, V11_TAGS,
 };
 pub use v8::seam::EdgePropsView;
 pub use wal::{decode_all, encode_record, WalRecord};

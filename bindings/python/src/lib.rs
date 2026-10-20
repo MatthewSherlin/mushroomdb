@@ -3033,6 +3033,11 @@ fn graph_err(e: GraphError) -> PyErr {
                 v.setattr("floor_ms", *floor_ms)?;
                 v.setattr("floor_commit", *floor_commit)
             }),
+            // 0.10 errors with no class of their own yet: the base class, with
+            // the engine's message.
+            GraphError::ConstraintViolation { .. }
+            | GraphError::ConstraintCreationConflict { .. }
+            | GraphError::ValueTooLarge { .. } => MushroomError::new_err(msg),
         }
     })
 }

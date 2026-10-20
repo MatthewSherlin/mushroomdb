@@ -108,6 +108,30 @@ pub fn v11_type_refusal(type_name: &str) -> String {
     )
 }
 
+/// The refusal a write gets when it would append a format-V11 record — a unique
+/// constraint declaration or withdrawal — before the V11 format exists.
+///
+/// `what` names the declaration in the plural ("unique constraints").
+pub fn v11_record_refusal(what: &str) -> String {
+    format!(
+        "not supported in mushroomdb 0.10 yet: {what} cannot be declared until the V11 format \
+         lands"
+    )
+}
+
+/// A declared unique constraint: no two live nodes of `label` hold equal
+/// values for `field`.
+///
+/// Equal means equal as an equality-index key ([`ValueKey`]): two `DateTime`s
+/// at the same UTC instant are equal whatever their offsets, and a value with
+/// no key (a list, a map, a `Duration`) is never in conflict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UniqueConstraint {
+    pub name: String,
+    pub label: String,
+    pub field: String,
+}
+
 // ---------------------------------------------------------------------------
 // Text forms of the V11 types: ISO 8601 and base64.
 //
@@ -884,6 +908,29 @@ pub enum GraphError {
         dst: String,
         dst_ns: String,
     },
+    /// A write would give two live nodes of a label the same value for a
+    /// property a [`UniqueConstraint`] declares unique.
+    ///
+    /// Deliberately says nothing about the node already holding the value — no
+    /// key, no label, not whether the caller can see it — so the answer is the
+    /// same for a visible node, a hidden one and another node in the same
+    /// write. Nothing was written.
+    ConstraintViolation {
+        constraint: String,
+        field: String,
+    },
+    /// A unique constraint cannot be declared because live nodes already
+    /// violate it. `violations` lists every `(node_key, value)` in conflict.
+    ConstraintCreationConflict {
+        violations: Vec<(String, Value)>,
+    },
+    /// A value is larger than the store accepts: `size` bytes for property
+    /// `field`, against `limit` (see [`BINARY_MAX_BYTES`]). Nothing was written.
+    ValueTooLarge {
+        field: String,
+        size: usize,
+        limit: usize,
+    },
 }
 
 /// The reserved property that names a node's namespace.
@@ -1014,6 +1061,20 @@ impl std::fmt::Display for GraphError {
                 f,
                 "edge {src} → {dst} crosses a namespace boundary ({src_ns} → {dst_ns}); \
                  only a global rule may derive one"
+            ),
+            GraphError::ConstraintViolation { constraint, field } => write!(
+                f,
+                "constraint violation: property '{field}' is declared unique by constraint \
+                 '{constraint}'; a node with that value already exists"
+            ),
+            GraphError::ConstraintCreationConflict { violations } => write!(
+                f,
+                "cannot create the constraint: {} existing nodes hold duplicate values",
+                violations.len()
+            ),
+            GraphError::ValueTooLarge { field, size, limit } => write!(
+                f,
+                "value too large: property '{field}' is {size} bytes; the limit is {limit} bytes"
             ),
         }
     }

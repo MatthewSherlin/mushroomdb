@@ -6685,6 +6685,80 @@ async fn cypher_set_with_a_tagged_date_param_is_refused_and_writes_nothing() {
     .await;
 }
 
+// ---------------------------------------------------------------------------
+// Unique constraints (0.10 TY-5): every HTTP write path is refused with 409 and
+// appends nothing when it would duplicate a constrained value. The constraint
+// is declared through the test hook, because until the V11 format lands its
+// WAL record is refused like a V11 value.
+// ---------------------------------------------------------------------------
+
+const CONSTRAINT_VIOLATION: &str = "constraint violation: property 'email' is declared unique \
+                                    by constraint 'uniq_email'; a node with that value already \
+                                    exists";
+
+async fn assert_constraint_refused(name: &str, uri: &str, body: Json) {
+    let dir = tmp(name);
+    let db = SharedDb::open(&dir).unwrap();
+    {
+        let mut w = db.write();
+        w.unlock_v11_format_for_test();
+        w.create_constraint("uniq_email", "User", "email").unwrap();
+        w.insert_node(
+            "User",
+            "alice",
+            vec![
+                ("id".into(), Value::Str("alice".into())),
+                ("email".into(), Value::Str("a@x".into())),
+            ],
+        )
+        .unwrap();
+    }
+    let before = wal_bytes(&dir);
+    let (status, resp, _) = send(router(db.clone()), json_req("POST", uri, body)).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{uri}: {}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert_eq!(
+        parse_json(&resp)["error"].as_str().unwrap(),
+        CONSTRAINT_VIOLATION
+    );
+    assert_eq!(
+        wal_bytes(&dir),
+        before,
+        "{uri}: a refused write appended to the WAL"
+    );
+    assert_eq!(db.read().node_count(), 1);
+}
+
+#[tokio::test]
+async fn http_writes_refuse_a_unique_constraint_duplicate() {
+    assert_constraint_refused(
+        "uc-create-node",
+        "/nodes",
+        json!({"label": "User", "key": "bob", "props": {"email": "a@x"}}),
+    )
+    .await;
+    assert_constraint_refused(
+        "uc-ingest",
+        "/ingest",
+        json!({
+            "label": "User",
+            "rows": [{"id": "bob", "email": "a@x"}],
+            "options": {"auto_fk": "off"}
+        }),
+    )
+    .await;
+    assert_constraint_refused(
+        "uc-cypher-create",
+        "/query",
+        json!({"cypher": "CREATE (n:User {id: 'bob', email: 'a@x'})"}),
+    )
+    .await;
+}
+
 /// The read path is open: a tagged parameter comes back in its tagged form.
 #[tokio::test]
 async fn query_returns_tagged_params_in_their_wire_form() {
