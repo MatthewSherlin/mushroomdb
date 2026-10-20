@@ -462,6 +462,12 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "copies an existing store; the backup must match the source",
     ),
     ("run_export", "reads an existing store out to a file"),
+    (
+        "run_import_with_progress",
+        "general-purpose bulk loader of the user's own labels and properties; \
+         declaring the memory schema would add full-text indexes the data did \
+         not ask for and slow the load — schema is opt-in via `schema apply`",
+    ),
     ("run_algo", "runs a graph algorithm over an existing store"),
     (
         "read_stats",

@@ -6,6 +6,7 @@
 pub mod doctor;
 pub mod export;
 pub(crate) mod hook;
+pub mod import;
 pub mod ingest_git;
 pub mod install;
 pub mod recall;
@@ -387,6 +388,13 @@ pub enum Command {
         dest: PathBuf,
         format: ExportFormat,
     },
+    /// Bulk-load a nodes CSV and a relationships CSV.
+    Import {
+        db_dir: PathBuf,
+        nodes: Option<PathBuf>,
+        relationships: Option<PathBuf>,
+        opts: import::ImportOptions,
+    },
     /// Build (or incrementally sync) a graph of a git repository.
     IngestGit {
         db_dir: PathBuf,
@@ -517,6 +525,14 @@ Usage:
                      --restore-from seeds an empty <db-dir> from the newest backup under <dir>
                      (or from <dir> itself if it is one); a no-op when <db-dir> already holds a store
                      --tls-cert and --tls-key go together and need a build with the `tls` feature
+  mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--delimiter <c>]
+                    [--array-delimiter <c>] [--ignore-errors] [--batch-size N]
+                                   bulk-load CSV files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                   nodes need an :ID and a :LABEL column, relationships :START_ID, :END_ID and :TYPE;
+                                   other columns are properties, typed by a suffix: age:int weight:float active:boolean tags:string[]
+                                   one label per node: Person;Employee is refused; relationship properties are not supported
+                                   rules the store already has fire per batch; import first, then declare rules, to backfill once
+                                   an error stops the import at its file and line, batches already committed stay; --ignore-errors skips bad rows
   mushroomdb ingest-git <db-dir> <repo-dir> [--exclude <pattern>]... [--max-commits-per-file N]
                         [--recurse-submodules] [--prs] [--no-structure] [--no-docs] [--ensure-gitignore]
                                    graph a git repo (authors, commits, files, symbols, imports, calls, mentions); re-run to sync
@@ -874,6 +890,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, String> {
         "verify" => parse_one_dir("verify", &args[1..]).map(|db_dir| Command::Verify { db_dir }),
         "backup" => parse_backup(&args[1..]),
         "export" => parse_export(&args[1..]),
+        "import" => parse_import(&args[1..]),
         "recall" => parse_dir_or_auto("recall", &args[1..])
             .map(|(db_dir, auto)| Command::Recall { db_dir, auto }),
         "brief" => parse_dir_or_auto("brief", &args[1..])
@@ -1979,6 +1996,86 @@ fn parse_backup(args: &[&str]) -> Result<Command, String> {
     Ok(Command::Backup { db_dir, dest })
 }
 
+/// Take the value of `--flag value` or `--flag=value` at `args[*i]`.
+fn flag_value<'a>(args: &[&'a str], i: &mut usize, flag: &str) -> Result<Option<&'a str>, String> {
+    let a = args[*i];
+    if a == flag {
+        let val = args
+            .get(*i + 1)
+            .copied()
+            .ok_or_else(|| format!("missing value for {flag}"))?;
+        *i += 2;
+        Ok(Some(val))
+    } else if let Some(val) = a.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+        *i += 1;
+        Ok(Some(val))
+    } else {
+        Ok(None)
+    }
+}
+
+/// A one-character option value; `tab` and `\t` name the tab.
+fn single_char(flag: &str, val: &str) -> Result<char, String> {
+    let val = if val == "tab" || val == "\\t" {
+        "\t"
+    } else {
+        val
+    };
+    let mut chars = val.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(c),
+        _ => Err(format!("{flag} takes one character, got '{val}'")),
+    }
+}
+
+fn parse_import(args: &[&str]) -> Result<Command, String> {
+    let mut db_dir = PathBuf::from("mushroomdb-data");
+    let mut nodes = None;
+    let mut relationships = None;
+    let mut opts = import::ImportOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--ignore-errors" {
+            opts.ignore_errors = true;
+            i += 1;
+        } else if let Some(v) = flag_value(args, &mut i, "--nodes")? {
+            nodes = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--relationships")? {
+            relationships = Some(PathBuf::from(v));
+        } else if let Some(v) = flag_value(args, &mut i, "--db")? {
+            db_dir = PathBuf::from(v);
+        } else if let Some(v) = flag_value(args, &mut i, "--delimiter")? {
+            let c = single_char("--delimiter", v)?;
+            opts.delimiter = u8::try_from(u32::from(c))
+                .ok()
+                .filter(u8::is_ascii)
+                .ok_or_else(|| format!("--delimiter must be an ASCII character, got '{v}'"))?;
+        } else if let Some(v) = flag_value(args, &mut i, "--array-delimiter")? {
+            opts.array_delimiter = single_char("--array-delimiter", v)?;
+        } else if let Some(v) = flag_value(args, &mut i, "--batch-size")? {
+            opts.batch_size = v
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| format!("--batch-size must be a positive integer, got '{v}'"))?;
+        } else if a.starts_with('-') {
+            return Err(format!("unexpected flag: {a}"));
+        } else {
+            return Err(format!("unexpected argument: {a}"));
+        }
+    }
+    if nodes.is_none() && relationships.is_none() {
+        return Err("import needs --nodes <file>, --relationships <file>, or both".to_string());
+    }
+    Ok(Command::Import {
+        db_dir,
+        nodes,
+        relationships,
+        opts,
+    })
+}
+
 fn parse_export(args: &[&str]) -> Result<Command, String> {
     let mut db_dir = None;
     let mut dest = None;
@@ -2049,6 +2146,16 @@ pub fn format_backup(dest: &Path, report: &BackupReport) -> String {
     writeln!(out, "  bytes: {}", report.bytes).unwrap();
     writeln!(out, "  verified: {}", report.verified).unwrap();
     out
+}
+
+/// Bulk-load CSV files into `db_dir`; the text `mushroomdb import` prints.
+pub fn run_import(
+    db_dir: &Path,
+    nodes: Option<&Path>,
+    relationships: Option<&Path>,
+    opts: &import::ImportOptions,
+) -> Result<import::ImportReport, CliError> {
+    import::run_import(db_dir, nodes, relationships, opts)
 }
 
 /// Export all data from `db_dir` to `dest` in `format`.
