@@ -2023,7 +2023,12 @@ fn eval_func(
                 None => None,
                 Some(Value::Float(f)) => Some(Value::Float(f)),
                 Some(Value::Int(n)) => Some(Value::Float(n as f64)),
-                Some(Value::Str(s)) => s.trim().parse::<f64>().ok().map(Value::Float),
+                Some(Value::Str(s)) => s
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .map(Value::Float),
                 Some(_) => None,
             })
         }
@@ -2100,7 +2105,7 @@ fn resolve_fn_args(
     vars: &VarTable,
     row: &Row,
     params: &Params,
-) -> Result<Vec<Option<Value>>, String> {
+) -> Result<[Option<Value>; 3], String> {
     if !arity.contains(&args.len()) {
         let want = if arity.start() == arity.end() {
             format!("exactly {}", arity.start())
@@ -2112,9 +2117,12 @@ fn resolve_fn_args(
             args.len()
         ));
     }
-    args.iter()
-        .map(|a| resolve_operand(view, vars, row, a, params))
-        .collect()
+    // No heap allocation: these run per row and no function takes over 3.
+    let mut out = [None, None, None];
+    for (slot, arg) in out.iter_mut().zip(args) {
+        *slot = resolve_operand(view, vars, row, arg, params)?;
+    }
+    Ok(out)
 }
 
 /// String functions that only take a string; anything else is null.
@@ -2123,6 +2131,17 @@ fn string_arg(v: &Option<Value>) -> Option<&str> {
         Some(Value::Str(s)) => Some(s),
         _ => None,
     }
+}
+
+/// `len` characters of `s` from character `start`, as one exact allocation.
+fn char_slice(s: &str, start: usize, len: usize) -> String {
+    if len == 0 {
+        return String::new();
+    }
+    let mut offsets = s.char_indices().map(|(i, _)| i).skip(start);
+    let from = offsets.next().unwrap_or(s.len());
+    let to = offsets.nth(len - 1).unwrap_or(s.len());
+    s[from..to].to_owned()
 }
 
 /// A non-negative integer argument; negative, null or non-integer is null.
@@ -2170,23 +2189,23 @@ fn eval_string_scalar(
             _ => None,
         },
         "left" => match (string_arg(&a[0]), count_arg(&a[1])) {
-            (Some(s), Some(n)) => Some(Value::Str(s.chars().take(n).collect())),
+            (Some(s), Some(n)) => Some(Value::Str(char_slice(s, 0, n))),
             _ => None,
         },
         "right" => match (string_arg(&a[0]), count_arg(&a[1])) {
             (Some(s), Some(n)) => {
                 let skip = s.chars().count().saturating_sub(n);
-                Some(Value::Str(s.chars().skip(skip).collect()))
+                Some(Value::Str(char_slice(s, skip, n)))
             }
             _ => None,
         },
         "substring" => match (string_arg(&a[0]), count_arg(&a[1])) {
-            (Some(s), Some(start)) if start <= s.chars().count() => match a.get(2) {
-                None => Some(Value::Str(s.chars().skip(start).collect())),
-                Some(l) => {
-                    count_arg(l).map(|n| Value::Str(s.chars().skip(start).take(n).collect()))
+            (Some(s), Some(start)) if start <= s.chars().count() => {
+                match (args.len() > 2).then_some(&a[2]) {
+                    None => Some(Value::Str(char_slice(s, start, usize::MAX))),
+                    Some(l) => count_arg(l).map(|n| Value::Str(char_slice(s, start, n))),
                 }
-            },
+            }
             _ => None,
         },
         "reverse" => match &a[0] {
@@ -2298,7 +2317,11 @@ fn eval_convert_scalar(
         "tofloatornull" => match &a[0] {
             Some(Value::Float(f)) => Some(Value::Float(*f)),
             Some(Value::Int(n)) => Some(Value::Float(*n as f64)),
-            Some(Value::Str(s)) => s.parse::<f64>().ok().map(Value::Float),
+            Some(Value::Str(s)) => s
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .map(Value::Float),
             _ => None,
         },
         _ => return Err(format!("unknown conversion function `{name}`")),
@@ -9325,6 +9348,10 @@ LIMIT 10";
         assert_eq!(eval("substring(\"hello\", 1)"), Some(s("ello")));
         assert_eq!(eval("substring(\"hello\", 5)"), Some(s("")));
         assert_eq!(eval("substring(\"hello\", 3, 99)"), Some(s("lo")));
+        assert_eq!(eval("left(\"h\u{e9}llo\", 2)"), Some(s("h\u{e9}")));
+        assert_eq!(eval("right(\"h\u{e9}llo\", 4)"), Some(s("\u{e9}llo")));
+        assert_eq!(eval("substring(\"h\u{e9}llo\", 1, 2)"), Some(s("\u{e9}l")));
+        assert_eq!(eval("left(\"abc\", 0)"), Some(s("")));
         assert_eq!(eval("reverse(\"abc\")"), Some(s("cba")));
         assert_eq!(
             eval("reverse($l)"),
@@ -9511,6 +9538,10 @@ LIMIT 10";
         assert_eq!(eval("toIntegerOrNull(\"abc\")"), None);
         assert_eq!(eval("toIntegerOrNull(true)"), None);
         assert_eq!(eval("toFloatOrNull(\"x\")"), None);
+        for bad in ["NaN", "inf", "infinity", "-inf"] {
+            assert_eq!(eval(&format!("toFloatOrNull(\"{bad}\")")), None, "{bad}");
+            assert_eq!(eval(&format!("toFloat(\"{bad}\")")), None, "toFloat {bad}");
+        }
         assert_eq!(eval("toFloatOrNull(true)"), None);
     }
 

@@ -12,6 +12,8 @@
 
 - **Cypher conversion functions `toBoolean`, `toBooleanOrNull`, `toIntegerOrNull` and `toFloatOrNull`.** Anything that cannot convert gives null, never an error: `toBoolean("maybe")`, `toIntegerOrNull("abc")`, a list argument. `toBoolean` reads "true"/"false" in any case and an integer (non-zero is true).
 
+- **`toFloat` and `toFloatOrNull` give null for `"NaN"`, `"inf"` and `"infinity"`** instead of a non-finite float.
+
 ## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
 
 No format version change. A 0.9.1 store opens under 0.9.2, and a 0.9.2 snapshot opens under 0.9.1: the one addition, an optional snapshot section (16), is ignored by 0.9.1.
