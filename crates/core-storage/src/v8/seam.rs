@@ -356,6 +356,7 @@ mod tests {
             last_change: HashMap::new(),
             fulltext_blob: Vec::new(),
             wal_mark: Vec::new(),
+            prov_reconciled: false,
         }
     }
 

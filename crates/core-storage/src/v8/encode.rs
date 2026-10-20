@@ -107,6 +107,11 @@ pub struct V8Meta {
     /// its WAL.
     #[serde(skip)]
     pub wal_mark: Vec<u8>,
+    /// Whether the state handed over has had the lost-provenance repair,
+    /// written as section 16 when true. False leaves the section out, and the
+    /// next open repairs at its first write.
+    #[serde(skip)]
+    pub prov_reconciled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -254,14 +259,20 @@ pub fn encode_v8<W: Write>(
     ];
     // The optional sections. The index and the mark are left out entirely
     // when there is nothing to carry, so a store with no full-text pair that
-    // does not keep its WAL writes only the swept marker beside what it
-    // always wrote. None goes at the end: the last section stays a small,
-    // eagerly-CRC'd one.
+    // does not keep its WAL writes only the swept marker, and the reconciled
+    // one when its state has had the repair, beside what it always wrote.
+    // None goes at the end: the last section stays a small, eagerly-CRC'd one.
     let swept: &[u8] = crate::v8::SWEPT_MAGIC;
+    let reconciled: &[u8] = if meta.prov_reconciled {
+        crate::v8::RECONCILED_MAGIC
+    } else {
+        &[]
+    };
     for (id, bytes) in [
         (SECTION_FULLTEXT, meta.fulltext_blob.as_slice()),
         (SECTION_WAL_MARK, meta.wal_mark.as_slice()),
         (crate::v8::SECTION_EDGES_SWEPT, swept),
+        (crate::v8::SECTION_PROV_RECONCILED, reconciled),
     ] {
         if bytes.is_empty() {
             continue;
