@@ -95,11 +95,6 @@ fn render_tok(t: &Tok) -> String {
         Tok::Slash => "/".into(),
         Tok::Percent => "%".into(),
         Tok::Caret => "^".into(),
-        Tok::Remove => "REMOVE".into(),
-        Tok::Foreach => "FOREACH".into(),
-        Tok::Exists => "EXISTS".into(),
-        Tok::Call => "CALL".into(),
-        Tok::Explain => "EXPLAIN".into(),
         Tok::Create => "CREATE".into(),
         Tok::Set => "SET".into(),
         Tok::Delete => "DELETE".into(),
@@ -202,7 +197,7 @@ fn str_like() -> impl Strategy<Value = String> {
 
 /// Every unit `Tok` variant, uniformly.
 fn unit_tok() -> impl Strategy<Value = Tok> {
-    (0u8..29).prop_map(|i| match i {
+    (0u8..31).prop_map(|i| match i {
         0 => Tok::Match,
         1 => Tok::Where,
         2 => Tok::Return,
@@ -231,6 +226,8 @@ fn unit_tok() -> impl Strategy<Value = Tok> {
         25 => Tok::Le,
         26 => Tok::Gt,
         27 => Tok::Ge,
+        28 => Tok::Percent,
+        29 => Tok::Caret,
         _ => Tok::Dash,
     })
 }
@@ -240,6 +237,8 @@ fn tok_strategy() -> impl Strategy<Value = Tok> {
     prop_oneof![
         29 => unit_tok(),
         1 => ident_like().prop_map(Tok::Ident),
+        1 => proptest::sample::select(vec!["REMOVE", "foreach", "Exists", "call", "EXPLAIN"])
+            .prop_map(|w| Tok::Ident(w.to_string())),
         1 => str_like().prop_map(Tok::Str),
         1 => any::<i64>().prop_map(Tok::Int),
         1 => any::<f64>().prop_map(Tok::Float),

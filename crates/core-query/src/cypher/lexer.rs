@@ -27,16 +27,6 @@ pub enum Tok {
     Delete,
     Detach,
     Merge,
-    /// `REMOVE` — contextual: still an identifier where a name is expected.
-    Remove,
-    /// `FOREACH` — contextual, as `Remove`.
-    Foreach,
-    /// `EXISTS` — contextual, as `Remove`.
-    Exists,
-    /// `CALL` — contextual, as `Remove`.
-    Call,
-    /// `EXPLAIN` — contextual, as `Remove`.
-    Explain,
     Ident(String),
     Str(String),
     Int(i64),
@@ -119,18 +109,16 @@ pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
             '\'' | '"' => toks.push(lex_string(i, ch, &mut chars)?),
             '$' => toks.push(lex_param(input, i, &mut chars)?),
             '0'..='9' => toks.push(lex_number(input, i, ch, &mut chars)?),
-            'A'..='Z' | 'a'..='z' | '_' => {
-                let (tok, end) = lex_word(input, i, ch, &mut chars);
-                toks.push(demote_contextual(tok, input, i, end, toks.last()));
-            }
+            'A'..='Z' | 'a'..='z' | '_' => toks.push(lex_word(input, i, ch, &mut chars)),
             _ => return Err(format!("illegal character {ch:?} at position {i}")),
         }
     }
     Ok(toks)
 }
 
-/// Lex a string literal opened by `quote` (`'` or `"`). Escapes: `\\`, `\'`
-/// and `\"` in either quote style; any other escape is an error.
+/// Lex a string literal opened by `quote` (`'` or `"`). Escapes, in either quote
+/// style: `\\`, `\'`, `\"`, `\n`, `\t`, `\r`, `\b`, `\f` and `\uXXXX`; any other
+/// escape is an error.
 fn lex_string(
     start: usize,
     quote: char,
@@ -143,6 +131,12 @@ fn lex_string(
             Some((_, ch)) if ch == quote => return Ok(Tok::Str(out)),
             Some((_, '\\')) => match chars.next() {
                 Some((_, ch @ ('\'' | '"' | '\\'))) => out.push(ch),
+                Some((_, 'n')) => out.push('\n'),
+                Some((_, 't')) => out.push('\t'),
+                Some((_, 'r')) => out.push('\r'),
+                Some((_, 'b')) => out.push('\u{8}'),
+                Some((_, 'f')) => out.push('\u{c}'),
+                Some((pos, 'u')) => out.push(lex_unicode_escape(pos, chars)?),
                 Some((pos, ch)) => {
                     return Err(format!("invalid escape '\\{ch}' at position {pos}"));
                 }
@@ -151,6 +145,36 @@ fn lex_string(
             Some((_, ch)) => out.push(ch),
         }
     }
+}
+
+/// Four hex digits after `\u`. A high surrogate must be followed by a `\uXXXX`
+/// low surrogate; the pair is one character.
+fn lex_unicode_escape(
+    pos: usize,
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+) -> Result<char, String> {
+    let bad = || format!("invalid unicode escape at position {pos}");
+    let hex4 = |chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>| {
+        let mut v = 0u32;
+        for _ in 0..4 {
+            let (_, c) = chars.next().ok_or_else(bad)?;
+            v = v * 16 + c.to_digit(16).ok_or_else(bad)?;
+        }
+        Ok::<u32, String>(v)
+    };
+    let first = hex4(chars)?;
+    if (0xD800..0xDC00).contains(&first) {
+        if !matches!(chars.next(), Some((_, '\\'))) || !matches!(chars.next(), Some((_, 'u'))) {
+            return Err(bad());
+        }
+        let second = hex4(chars)?;
+        if !(0xDC00..0xE000).contains(&second) {
+            return Err(bad());
+        }
+        let code = 0x10000 + ((first - 0xD800) << 10) + (second - 0xDC00);
+        return char::from_u32(code).ok_or_else(bad);
+    }
+    char::from_u32(first).ok_or_else(bad)
 }
 
 fn lex_param(
@@ -220,7 +244,7 @@ fn lex_word(
     start: usize,
     first: char,
     chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
-) -> (Tok, usize) {
+) -> Tok {
     let mut end = start + first.len_utf8();
     while let Some(&(p, ch)) = chars.peek() {
         if is_ident_cont(ch) {
@@ -230,75 +254,7 @@ fn lex_word(
             break;
         }
     }
-    let tok =
-        keyword(&input[start..end]).unwrap_or_else(|| Tok::Ident(input[start..end].to_string()));
-    (tok, end)
-}
-
-/// `REMOVE`, `FOREACH`, `EXISTS`, `CALL` and `EXPLAIN` are contextual keywords:
-/// queries written before they existed use them as variables, aliases, labels,
-/// relationship types, property keys and map keys, and must keep parsing. Tokens
-/// carry no case, so the lexer decides from its neighbours and, where the word
-/// is a name, keeps the source spelling as `Tok::Ident`.
-fn demote_contextual(tok: Tok, input: &str, start: usize, end: usize, prev: Option<&Tok>) -> Tok {
-    if !matches!(
-        tok,
-        Tok::Remove | Tok::Foreach | Tok::Exists | Tok::Call | Tok::Explain
-    ) {
-        return tok;
-    }
-    let next = input[end..].chars().find(|c| !c.is_whitespace());
-    let is_name = match prev {
-        // `n.call`: a property key.
-        Some(Tok::Dot) => true,
-        // `{call: 1}`, `(call:Label)`: a map key or a pattern variable.
-        Some(Tok::LBrace | Tok::Comma | Tok::LParen) if next == Some(':') => true,
-        // `:Call`, `[:A|:Call]`: a label or relationship type; only `:EXISTS(` is an expression.
-        Some(Tok::Colon) => !(matches!(tok, Tok::Exists) && next == Some('(')),
-        _ => match tok {
-            // An EXISTS predicate is always followed by `(` or `{`.
-            Tok::Exists => next.is_some_and(|c| c != '(' && c != '{'),
-            // A clause keyword starts the input or follows the end of an operand.
-            _ => !at_clause_boundary(prev),
-        },
-    };
-    if is_name {
-        Tok::Ident(input[start..end].to_string())
-    } else {
-        tok
-    }
-}
-
-/// True where a new clause may begin: at the start of the input, after a token
-/// that ends an operand, or after a word that is not a word-operator.
-fn at_clause_boundary(prev: Option<&Tok>) -> bool {
-    match prev {
-        None => true,
-        Some(
-            Tok::RParen
-            | Tok::RBracket
-            | Tok::RBrace
-            | Tok::Int(_)
-            | Tok::Float(_)
-            | Tok::Str(_)
-            | Tok::Param(_)
-            | Tok::Star,
-        ) => true,
-        Some(Tok::Ident(word)) => !matches!(
-            word.to_ascii_lowercase().as_str(),
-            "in" | "is"
-                | "then"
-                | "when"
-                | "else"
-                | "case"
-                | "starts"
-                | "ends"
-                | "contains"
-                | "xor"
-                | "distinct"
-        ),
-        Some(_) => false,
-    }
+    keyword(&input[start..end]).unwrap_or_else(|| Tok::Ident(input[start..end].to_string()))
 }
 
 fn take_ident(input: &str, chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>) -> String {
@@ -349,11 +305,6 @@ fn keyword(word: &str) -> Option<Tok> {
         "delete" => Tok::Delete,
         "detach" => Tok::Detach,
         "merge" => Tok::Merge,
-        "remove" => Tok::Remove,
-        "foreach" => Tok::Foreach,
-        "exists" => Tok::Exists,
-        "call" => Tok::Call,
-        "explain" => Tok::Explain,
         _ => return None,
     })
 }
@@ -620,143 +571,32 @@ mod tests {
     }
 
     #[test]
-    fn new_keywords_lex_case_insensitively() {
-        for (src, tok) in [
-            ("REMOVE", Tok::Remove),
-            ("remove", Tok::Remove),
-            ("Remove", Tok::Remove),
-            ("FOREACH", Tok::Foreach),
-            ("foreach", Tok::Foreach),
-            ("EXISTS", Tok::Exists),
-            ("exists", Tok::Exists),
-            ("CALL", Tok::Call),
-            ("call", Tok::Call),
-            ("EXPLAIN", Tok::Explain),
-            ("explain", Tok::Explain),
-        ] {
-            assert_eq!(lex(src).unwrap(), vec![tok], "{src}");
+    fn the_five_contextual_words_lex_as_identifiers() {
+        for w in ["REMOVE", "foreach", "Exists", "CALL", "explain"] {
+            assert_eq!(lex(w).unwrap(), vec![Tok::Ident(w.into())]);
         }
     }
 
     #[test]
-    fn new_keywords_in_clause_position_stay_keywords() {
+    fn control_and_unicode_escapes() {
         assert_eq!(
-            lex("MATCH (n) REMOVE n.x").unwrap(),
-            vec![
-                Tok::Match,
-                Tok::LParen,
-                Tok::Ident("n".into()),
-                Tok::RParen,
-                Tok::Remove,
-                Tok::Ident("n".into()),
-                Tok::Dot,
-                Tok::Ident("x".into()),
-            ]
+            lex(r"'a\nb\tc\rd\be\ff'").unwrap(),
+            vec![Tok::Str("a\nb\tc\rd\u{8}e\u{c}f".into())]
         );
         assert_eq!(
-            lex("EXPLAIN MATCH").unwrap(),
-            vec![Tok::Explain, Tok::Match]
+            lex(r#""a\nbAé""#).unwrap(),
+            vec![Tok::Str("a\nbA\u{e9}".into())]
         );
-        assert_eq!(
-            lex("WHERE EXISTS(n.x)").unwrap()[..2],
-            [Tok::Where, Tok::Exists]
-        );
-        assert_eq!(lex("MATCH (n) CALL db.stats()").unwrap()[4], Tok::Call);
-        assert_eq!(
-            lex("MATCH (n) FOREACH (x IN [1] | SET n.v = x)").unwrap()[4],
-            Tok::Foreach
-        );
-    }
-
-    #[test]
-    fn new_keywords_remain_usable_as_names() {
-        let id = |s: &str| Tok::Ident(s.into());
-        // property keys, in either case
-        assert_eq!(lex("n.call").unwrap(), vec![id("n"), Tok::Dot, id("call")]);
-        assert_eq!(
-            lex("n.Remove").unwrap(),
-            vec![id("n"), Tok::Dot, id("Remove")]
-        );
-        assert_eq!(
-            lex("n.exists").unwrap(),
-            vec![id("n"), Tok::Dot, id("exists")]
-        );
-        // map keys
-        assert_eq!(
-            lex("{remove: 1, call: 2, Explain: 3, foreach: 4, exists: 5}").unwrap(),
-            vec![
-                Tok::LBrace,
-                id("remove"),
-                Tok::Colon,
-                Tok::Int(1),
-                Tok::Comma,
-                id("call"),
-                Tok::Colon,
-                Tok::Int(2),
-                Tok::Comma,
-                id("Explain"),
-                Tok::Colon,
-                Tok::Int(3),
-                Tok::Comma,
-                id("foreach"),
-                Tok::Colon,
-                Tok::Int(4),
-                Tok::Comma,
-                id("exists"),
-                Tok::Colon,
-                Tok::Int(5),
-                Tok::RBrace,
-            ]
-        );
-        // variables
-        assert_eq!(
-            lex("MATCH (call) RETURN call").unwrap(),
-            vec![
-                Tok::Match,
-                Tok::LParen,
-                id("call"),
-                Tok::RParen,
-                Tok::Return,
-                id("call"),
-            ]
-        );
-        assert_eq!(
-            lex("MATCH (Exists:Remove) RETURN n AS explain").unwrap(),
-            vec![
-                Tok::Match,
-                Tok::LParen,
-                id("Exists"),
-                Tok::Colon,
-                id("Remove"),
-                Tok::RParen,
-                Tok::Return,
-                id("n"),
-                Tok::As,
-                id("explain"),
-            ]
-        );
-        // labels and relationship types
-        assert_eq!(
-            lex("(n:Call {x: 1})-[:FOREACH|:Exists]->(m)").unwrap()[2..5],
-            [Tok::Colon, id("Call"), Tok::LBrace]
-        );
-        let rel = lex("-[:FOREACH|:Exists]->").unwrap();
-        assert_eq!(rel[3], id("FOREACH"));
-        assert_eq!(rel[6], id("Exists"));
-        // alias after AS and WITH
-        assert_eq!(
-            lex("WITH n AS call RETURN call").unwrap(),
-            vec![
-                Tok::With,
-                id("n"),
-                Tok::As,
-                id("call"),
-                Tok::Return,
-                id("call"),
-            ]
-        );
-        // operand positions
-        assert_eq!(lex("WHERE n.a = remove").unwrap()[5], id("remove"));
-        assert_eq!(lex("x IN call").unwrap()[2], id("call"));
+        assert_eq!(lex(r"'😀'").unwrap(), vec![Tok::Str("\u{1F600}".into())]);
+        for bad in [
+            r"'\u12'",
+            r"'\uZZZZ'",
+            r"'\ud83d'",
+            r"'\ud83dx'",
+            r"'\ude00'",
+        ] {
+            let err = lex(bad).expect_err(bad);
+            assert!(err.contains("position"), "{bad}: {err}");
+        }
     }
 }
