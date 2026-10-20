@@ -389,6 +389,8 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         | WalRecord::DisableIndex { .. }
         | WalRecord::CreateConstraint { .. }
         | WalRecord::DropConstraint { .. }
+        | WalRecord::EnableRangeIndex { .. }
+        | WalRecord::DisableRangeIndex { .. }
         | WalRecord::Intern { .. }
         // History markers are no-ops for mutation events — they carry no new
         // state and rules re-derive deterministically on replay.
@@ -403,8 +405,8 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
 }
 
 /// Whether `rec` only declares or withdraws something about the store — a
-/// full-text pair, an equality index, a unique constraint, the multiplicity
-/// opt-in — and writes no
+/// full-text pair, an equality or range index, a unique constraint, the
+/// multiplicity opt-in — and writes no
 /// node, edge or property. These are the records a truncating snapshot
 /// re-emits into its baseline WAL.
 fn is_declaration(rec: &WalRecord) -> bool {
@@ -416,6 +418,8 @@ fn is_declaration(rec: &WalRecord) -> bool {
             | WalRecord::DisableIndex { .. }
             | WalRecord::CreateConstraint { .. }
             | WalRecord::DropConstraint { .. }
+            | WalRecord::EnableRangeIndex { .. }
+            | WalRecord::DisableRangeIndex { .. }
     ) || *rec == core_storage::wal::MULTIPLICITY_ENABLED
 }
 
@@ -5122,36 +5126,37 @@ impl<F: Fs> GraphDb<F> {
                 Arc::make_mut(&mut self.fulltext).disable(label, field);
             }
             WalRecord::EnableIndex { label, field } => {
-                // Replay-over-snapshot idempotency: already enabled → skip.
-                if self.prop_index.is_enabled(label, field) {
+                // Replay-over-snapshot idempotency: already declared → skip.
+                if self.prop_index.is_equality_declared(label, field) {
                     return Ok(());
                 }
+                // A pair a range index maintains already has its postings.
+                let maintained = self.prop_index.is_enabled(label, field);
                 self.prop_index.enable(label, field);
-                // Backfill: index all live nodes of this label that have the field.
-                let n = self.ids.len() as u32;
-                for id in 0..n {
-                    let Some(&sym) = self.labels.get(id as usize) else {
-                        continue;
-                    };
-                    if sym == u32::MAX {
-                        continue; // tombstoned
-                    }
-                    let Some(lbl) = self.syms.resolve(sym) else {
-                        continue;
-                    };
-                    if lbl != label {
-                        continue;
-                    }
-                    if let Some(value) = build_props_view(&self.props, &self.base)
-                        .get(id, field)
-                        .map(|vr| vr.into_value())
-                    {
-                        self.prop_index.set(label, field, id, &value);
-                    }
+                if !maintained {
+                    self.backfill_prop_index(label, field);
                 }
             }
             WalRecord::DisableIndex { label, field } => {
                 self.prop_index.disable(label, field);
+            }
+            // A declaration: the postings come from the backfill here on a live
+            // or refreshed handle, and from `rebuild_all` at the end of an open.
+            WalRecord::EnableRangeIndex { name, label, field } => {
+                // Replay-over-snapshot idempotency: already declared → skip.
+                if self.prop_index.range_index(name).is_some() {
+                    return Ok(());
+                }
+                let maintained = self.prop_index.is_enabled(label, field);
+                self.prop_index.enable_range(name, label, field);
+                // The open rebuilds every declared pair once replay is done, so
+                // a scan here would be thrown away.
+                if !maintained && !self.replaying_at_open {
+                    self.backfill_prop_index(label, field);
+                }
+            }
+            WalRecord::DisableRangeIndex { name } => {
+                self.prop_index.disable_range(name);
             }
             // A declaration only: the data it covers is never checked here.
             // Replay must not fail on duplicates written before the constraint
@@ -5161,8 +5166,10 @@ impl<F: Fs> GraphDb<F> {
                 if self.constraints.iter().any(|c| &c.name == name) {
                     return Ok(());
                 }
-                // The backing index comes with the declaration.
-                if !self.prop_index.is_enabled(label, field) {
+                // The backing index comes with the declaration. It is an
+                // equality declaration even over a range-indexed pair, so that
+                // dropping the range index leaves the constraint its index.
+                if !self.prop_index.is_equality_declared(label, field) {
                     self.apply(&WalRecord::EnableIndex {
                         label: label.clone(),
                         field: field.clone(),
@@ -5224,6 +5231,33 @@ impl<F: Fs> GraphDb<F> {
             }
         }
         Ok(())
+    }
+
+    /// Index every live node of `label` that holds `field` under the declared
+    /// pair `(label, field)`: the scan a new declaration needs on a handle
+    /// whose open has already rebuilt its indexes.
+    fn backfill_prop_index(&mut self, label: &str, field: &str) {
+        let n = self.ids.len() as u32;
+        for id in 0..n {
+            let Some(&sym) = self.labels.get(id as usize) else {
+                continue;
+            };
+            if sym == u32::MAX {
+                continue; // tombstoned
+            }
+            let Some(lbl) = self.syms.resolve(sym) else {
+                continue;
+            };
+            if lbl != label {
+                continue;
+            }
+            if let Some(value) = build_props_view(&self.props, &self.base)
+                .get(id, field)
+                .map(|vr| vr.into_value())
+            {
+                self.prop_index.set(label, field, id, &value);
+            }
+        }
     }
 
     /// Intern `s` in `syms` and emit a WAL `Intern` record so `*Id` records
@@ -6881,6 +6915,8 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::DisableIndex { .. }
             | WalRecord::CreateConstraint { .. }
             | WalRecord::DropConstraint { .. }
+            | WalRecord::EnableRangeIndex { .. }
+            | WalRecord::DisableRangeIndex { .. }
             | WalRecord::Intern { .. }
             // History markers produce no DbEvent — the engine delta already
             // fired the EdgeFired/EdgeRetracted subscription events.
@@ -8200,6 +8236,18 @@ impl<F: Fs> GraphDb<F> {
                 ),
             });
         }
+        // A view writes its property without passing the property index, so a
+        // range index over it would answer from stale postings until the next
+        // open rebuilt them.
+        if let Some(index) = self.prop_index.range_index_on(&def.label, &def.view_prop) {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{}' on label '{}' is covered by range index '{index}'; a view \
+                     cannot own it",
+                    def.view_prop, def.label
+                ),
+            });
+        }
         if let Some(existing) = self.view_store.view_for_prop(&def.view_prop) {
             return Err(GraphError::RuleInvalid {
                 detail: format!(
@@ -8568,7 +8616,16 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
-        if !self.prop_index.is_enabled(label, field) {
+        if !self.prop_index.is_equality_declared(label, field) {
+            // A pair only a range index covers is withdrawn by that index's name.
+            if let Some(index) = self.prop_index.range_index_on(label, field) {
+                return Err(GraphError::QueryError {
+                    detail: format!(
+                        "the index on ({label}, {field}) is range index '{index}'; drop it with \
+                         disable_range_index"
+                    ),
+                });
+            }
             return Err(GraphError::RuleNotFound {
                 name: format!("index({label},{field})"),
             });
@@ -8592,6 +8649,117 @@ impl<F: Fs> GraphDb<F> {
             label: label.into(),
             field: field.into(),
         })
+    }
+
+    /// Declare the range index `name` on `(label, field)`.
+    ///
+    /// A range index answers range (`<`, `<=`, `>`, `>=`), `STARTS WITH` and
+    /// exact-match lookups over the field's scalar values, for nodes of
+    /// `label`. Existing nodes are indexed at once; the declaration is one WAL
+    /// record, and the postings are rebuilt from the stored values at every
+    /// open. An equality index on the same pair shares the postings and is
+    /// unaffected by this or by [`disable_range_index`](Self::disable_range_index).
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::QueryError`]: a range index named `name` already
+    ///   exists; `(label, field)` already has a range index; a view owns
+    ///   `(label, field)`; or, until the V11 format lands, always — an
+    ///   `EnableRangeIndex` record is format-V11 and a 0.9.x reader cannot
+    ///   decode it.
+    pub fn enable_range_index(&mut self, name: &str, label: &str, field: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if self.prop_index.range_index(name).is_some() {
+            return Err(GraphError::QueryError {
+                detail: format!("a range index named '{name}' already exists"),
+            });
+        }
+        if let Some(existing) = self.prop_index.range_index_on(label, field) {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{field}' on label '{label}' already has range index '{existing}'"
+                ),
+            });
+        }
+        // A view writes its property inside `apply` without passing the
+        // property index, so the postings would go stale under it.
+        if let Some(view) = self
+            .view_store
+            .views()
+            .find(|v| v.label == label && v.view_prop == field)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{field}' on label '{label}' is owned by view '{}'; a range index \
+                     cannot cover it",
+                    view.name
+                ),
+            });
+        }
+        self.log_dense(vec![WalRecord::EnableRangeIndex {
+            name: name.into(),
+            label: label.into(),
+            field: field.into(),
+        }])
+    }
+
+    /// Withdraw the range index `name`. An equality index on the same pair —
+    /// from [`enable_index`](Self::enable_index) or a unique constraint —
+    /// stays; otherwise the pair is no longer indexed.
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::QueryError`]: no range index is named `name`; or, until
+    ///   the V11 format lands, the refusal `enable_range_index` documents.
+    pub fn disable_range_index(&mut self, name: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if self.prop_index.range_index(name).is_none() {
+            return Err(GraphError::QueryError {
+                detail: format!("no range index named '{name}'"),
+            });
+        }
+        self.log_dense(vec![WalRecord::DisableRangeIndex { name: name.into() }])
+    }
+
+    /// The declared range indexes as `(name, label, field)`, sorted by name.
+    pub fn range_indexes(&self) -> Vec<(String, String, String)> {
+        self.prop_index
+            .range_indexes()
+            .map(|(name, (label, field))| (name.clone(), label.clone(), field.clone()))
+            .collect()
+    }
+
+    /// The node keys the range index on `(label, field)` holds between `lo`
+    /// and `hi`, in index order — the answer
+    /// [`UnifiedIndex::lookup_range`](core_storage::UnifiedIndex::lookup_range)
+    /// gives, by key. Lets tests compare the postings across a reopen, a
+    /// snapshot and `open_at` until the planner reads them (0.10 TY-10).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn range_lookup_keys_for_test(
+        &self,
+        label: &str,
+        field: &str,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+    ) -> Vec<String> {
+        let key = |b: Option<(&Value, bool)>| {
+            b.map(|(v, incl)| (ValueKey::from_value(v).expect("a scalar bound"), incl))
+        };
+        let (lo, hi) = (key(lo), key(hi));
+        self.prop_index
+            .lookup_range(
+                label,
+                field,
+                lo.as_ref().map(|(k, i)| (k, *i)),
+                hi.as_ref().map(|(k, i)| (k, *i)),
+            )
+            .filter_map(|id| self.ids.key_of(id).map(str::to_string))
+            .collect()
     }
 
     /// Declare a unique constraint: no two live nodes of `label` may hold equal
@@ -13613,7 +13781,9 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::EnableIndex { .. }
             | WalRecord::DisableIndex { .. }
             | WalRecord::CreateConstraint { .. }
-            | WalRecord::DropConstraint { .. } => {}
+            | WalRecord::DropConstraint { .. }
+            | WalRecord::EnableRangeIndex { .. }
+            | WalRecord::DisableRangeIndex { .. } => {}
             // RenameNode: node id is stable; update last_change via the new key.
             // Called after apply(), so ids already reflects new_key.
             WalRecord::RenameNode { new_key, .. } => {
@@ -15491,8 +15661,18 @@ impl<F: Fs> GraphDb<F> {
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
-            for (label, field) in self.prop_index.enabled_pairs() {
+            for (label, field) in self.prop_index.equality_pairs() {
                 let rec = WalRecord::EnableIndex {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            // Only a store that holds `EnableRangeIndex` records has any, so a
+            // store without them gets no V11 record here.
+            for (name, (label, field)) in self.prop_index.range_indexes() {
+                let rec = WalRecord::EnableRangeIndex {
+                    name: name.clone(),
                     label: label.clone(),
                     field: field.clone(),
                 };
@@ -15697,8 +15877,18 @@ impl<F: Fs> GraphDb<F> {
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
-            for (label, field) in self.prop_index.enabled_pairs() {
+            for (label, field) in self.prop_index.equality_pairs() {
                 let rec = WalRecord::EnableIndex {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            // Only a store that holds `EnableRangeIndex` records has any, so a
+            // store without them gets no V11 record here.
+            for (name, (label, field)) in self.prop_index.range_indexes() {
+                let rec = WalRecord::EnableRangeIndex {
+                    name: name.clone(),
                     label: label.clone(),
                     field: field.clone(),
                 };
@@ -15888,18 +16078,24 @@ fn v11_only_value(rec: &WalRecord) -> Option<&'static str> {
         | WalRecord::DisableIndex { .. }
         | WalRecord::SetEdgeCount { .. }
         | WalRecord::CreateConstraint { .. }
-        | WalRecord::DropConstraint { .. } => None,
+        | WalRecord::DropConstraint { .. }
+        | WalRecord::EnableRangeIndex { .. }
+        | WalRecord::DisableRangeIndex { .. } => None,
     }
 }
 
 /// Why `rec` may not be appended to the WAL until the V11 format lands, if it
 /// may not: it carries a format-V11 value (see [`v11_only_value`]), or it is a
 /// format-V11 record — a unique-constraint declaration or withdrawal
-/// (discriminants 24 and 25), which a 0.9.x reader cannot decode either.
+/// (discriminants 24 and 25) or a range-index one (26 and 27), which a 0.9.x
+/// reader cannot decode either.
 fn v11_refusal(rec: &WalRecord) -> Option<String> {
     match rec {
         WalRecord::CreateConstraint { .. } | WalRecord::DropConstraint { .. } => {
             Some(core_storage::v11_record_refusal("unique constraints"))
+        }
+        WalRecord::EnableRangeIndex { .. } | WalRecord::DisableRangeIndex { .. } => {
+            Some(core_storage::v11_record_refusal("range indexes"))
         }
         WalRecord::Batch(inner) => inner.iter().find_map(v11_refusal),
         _ => v11_only_value(rec).map(core_storage::v11_type_refusal),
