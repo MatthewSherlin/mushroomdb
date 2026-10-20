@@ -70,6 +70,59 @@ fn enable_range_index_is_refused_until_the_v11_format_lands() {
     assert!(!reopened.is_index_enabled("Score", "val"));
 }
 
+/// Ledger row 125: an equality index answered `= 2` with the `Int` 2 only,
+/// where a scan also finds the `Float` 2.0 — so declaring an index changed a
+/// query's answer. The index now answers as the scan does.
+#[test]
+fn an_equality_index_finds_int_and_float_alike() {
+    let dir = tmp("row-125");
+    let mut db = GraphDb::open(&dir).unwrap();
+    for (k, v) in [
+        ("i2", Value::Int(2)),
+        ("f2", Value::Float(2.0)),
+        ("f25", Value::Float(2.5)),
+        ("z", Value::Int(0)),
+        ("nz", Value::Float(-0.0)),
+    ] {
+        db.insert_node("U", k, vec![("v".into(), v.clone())])
+            .unwrap();
+        db.insert_node("Plain", &format!("p-{k}"), vec![("v".into(), v)])
+            .unwrap();
+    }
+    db.enable_index("U", "v").unwrap();
+    let keys = |db: &GraphDb, label: &str, x: Value| {
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("x".to_string(), x);
+        let rs = db
+            .query(
+                &format!("MATCH (n:{label} {{v: $x}}) RETURN key(n) AS k"),
+                &params,
+            )
+            .unwrap();
+        let mut ks: Vec<String> = (0..rs.len())
+            .filter_map(|i| match rs.get(i, "k") {
+                Some(Value::Str(k)) => Some(k.trim_start_matches("p-").to_string()),
+                _ => None,
+            })
+            .collect();
+        ks.sort();
+        ks
+    };
+    for x in [
+        Value::Int(2),
+        Value::Float(2.0),
+        Value::Int(0),
+        Value::Float(0.0),
+    ] {
+        let scanned = keys(&db, "Plain", x.clone());
+        assert_eq!(keys(&db, "U", x.clone()), scanned, "= {x:?}");
+    }
+    assert_eq!(keys(&db, "U", Value::Int(2)), vec!["f2", "i2"]);
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(keys(&db, "U", Value::Float(0.0)), vec!["nz", "z"]);
+}
+
 #[cfg(feature = "test-hooks")]
 mod unlocked {
     use super::*;
@@ -430,6 +483,19 @@ mod unlocked {
     }
 
     #[test]
+    fn enable_index_on_a_range_indexed_pair_names_the_range_index() {
+        let (_dir, mut db) = open_temp("enable-eq");
+        db.enable_range_index("idx", "Score", "val").unwrap();
+        match db.enable_index("Score", "val") {
+            Err(GraphError::RuleInvalid { detail }) => assert_eq!(
+                detail,
+                "property index for (\"Score\", \"val\") already enabled: range index 'idx' covers it"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn a_second_name_or_a_second_range_index_on_a_pair_is_refused() {
         let (dir, mut db) = open_temp("dups");
         db.enable_range_index("idx", "Score", "val").unwrap();
@@ -505,5 +571,202 @@ mod unlocked {
         }
         assert_eq!(wal_bytes(&dir), before);
         assert!(db.views().is_empty());
+    }
+
+    // ── Index against scan, through the store ──────────────────────────────
+
+    /// xorshift64*: deterministic, no dependency.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    fn pool() -> Vec<Value> {
+        let dt = |us: i64, off: i32| Value::DateTime {
+            micros_utc: us,
+            offset_seconds: off,
+        };
+        vec![
+            Value::Int(-1),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(5),
+            Value::Int((1 << 60) + 1),
+            Value::Float(-0.0),
+            Value::Float(0.0),
+            Value::Float(2.0),
+            Value::Float(5.5),
+            Value::Float(f64::NAN),
+            Value::Float((1u64 << 60) as f64),
+            Value::Str("a".into()),
+            Value::Str("ab".into()),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Date(3),
+            Value::LocalDateTime(7),
+            dt(10, 0),
+            dt(10, 3600),
+            dt(30, 0),
+            Value::Binary(vec![1]),
+            Value::Duration {
+                months: 0,
+                days: 1,
+                nanos: 0,
+            },
+        ]
+    }
+
+    /// Every operator and BETWEEN, over every live `S` node: the index (the
+    /// range lookup, and Cypher equality, which reads the index) against
+    /// `eval_cmp` applied to what the store reads back.
+    fn assert_index_matches_scan(
+        db: &GraphDb,
+        keys: &[String],
+        values: &[Value],
+        rng: &mut Rng,
+        ctx: &str,
+    ) {
+        use core_query::{eval_cmp, CmpOp};
+        let stored: Vec<(String, Value)> = keys
+            .iter()
+            .filter_map(|k| {
+                let n = db.node_info(k)?;
+                (n.label == "S").then_some(())?;
+                n.props.get("v").cloned().map(|v| (k.clone(), v))
+            })
+            .collect();
+        let scan = |pred: &dyn Fn(&Value) -> bool| {
+            let mut ks: Vec<String> = stored
+                .iter()
+                .filter(|(_, v)| pred(v))
+                .map(|(k, _)| k.clone())
+                .collect();
+            ks.sort();
+            ks
+        };
+        let sorted = |mut ks: Vec<String>| {
+            ks.sort();
+            ks
+        };
+        for _ in 0..8 {
+            let a = &values[rng.below(values.len())];
+            let b = &values[rng.below(values.len())];
+            for (op, lo, hi) in [
+                (CmpOp::Lt, None, Some((a, false))),
+                (CmpOp::Le, None, Some((a, true))),
+                (CmpOp::Gt, Some((a, false)), None),
+                (CmpOp::Ge, Some((a, true)), None),
+            ] {
+                let got = sorted(db.range_lookup_keys_for_test("S", "v", lo, hi));
+                assert_eq!(got, scan(&|v| eval_cmp(&op, v, a)), "{ctx}: {op:?} {a:?}");
+            }
+            for (li, hincl) in [(true, true), (true, false), (false, true), (false, false)] {
+                let got = sorted(db.range_lookup_keys_for_test(
+                    "S",
+                    "v",
+                    Some((a, li)),
+                    Some((b, hincl)),
+                ));
+                let want = scan(&|v| {
+                    eval_cmp(if li { &CmpOp::Ge } else { &CmpOp::Gt }, v, a)
+                        && eval_cmp(if hincl { &CmpOp::Le } else { &CmpOp::Lt }, v, b)
+                });
+                assert_eq!(got, want, "{ctx}: BETWEEN {a:?} ({li}) AND {b:?} ({hincl})");
+            }
+            let mut params = BTreeMap::new();
+            params.insert("x".to_string(), a.clone());
+            let rs = db
+                .query("MATCH (n:S {v: $x}) RETURN key(n) AS k", &params)
+                .unwrap();
+            let got = sorted(
+                (0..rs.len())
+                    .filter_map(|i| match rs.get(i, "k") {
+                        Some(Value::Str(k)) => Some(k.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            );
+            assert_eq!(got, scan(&|v| eval_cmp(&CmpOp::Eq, v, a)), "{ctx}: = {a:?}");
+        }
+    }
+
+    /// Random inserts (some without the property, some of another label),
+    /// updates, removals, deletes and renames; the index is checked against
+    /// the scan as it goes, then reopened, then snapshotted and reopened.
+    #[test]
+    fn the_index_matches_a_scan_under_random_writes() {
+        let values = pool();
+        for seed in 1..=6u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let (dir, mut db) = open_temp("differential");
+            db.enable_range_index("idx", "S", "v").unwrap();
+            let mut keys: Vec<String> = Vec::new();
+            for step in 0..120 {
+                let pick = |rng: &mut Rng| values[rng.below(values.len())].clone();
+                match rng.below(10) {
+                    0..=3 => {
+                        let key = format!("k{step}");
+                        let label = if rng.below(5) == 0 { "T" } else { "S" };
+                        let props = if rng.below(6) == 0 {
+                            vec![]
+                        } else {
+                            vec![("v".to_string(), pick(&mut rng))]
+                        };
+                        db.insert_node(label, &key, props).unwrap();
+                        keys.push(key);
+                    }
+                    4..=5 if !keys.is_empty() => {
+                        let key = keys[rng.below(keys.len())].clone();
+                        let v = pick(&mut rng);
+                        db.set_prop(&key, "v", v).unwrap();
+                    }
+                    6 if !keys.is_empty() => {
+                        let key = keys[rng.below(keys.len())].clone();
+                        db.remove_prop(&key, "v").unwrap();
+                    }
+                    7 if !keys.is_empty() => {
+                        let key = keys.swap_remove(rng.below(keys.len()));
+                        db.delete_node(&key).unwrap();
+                    }
+                    8 if !keys.is_empty() => {
+                        let at = rng.below(keys.len());
+                        let new_key = format!("{}-r{step}", keys[at]);
+                        db.rename_node(&keys[at], &new_key).unwrap();
+                        keys[at] = new_key;
+                    }
+                    _ => {}
+                }
+                if step % 10 == 9 {
+                    let ctx = format!("seed {seed} step {step}");
+                    assert_index_matches_scan(&db, &keys, &values, &mut rng, &ctx);
+                }
+            }
+            let mut db = reopen(&dir, db);
+            assert_index_matches_scan(
+                &db,
+                &keys,
+                &values,
+                &mut rng,
+                &format!("seed {seed} reopened"),
+            );
+            db.snapshot().unwrap();
+            let db = reopen(&dir, db);
+            assert_index_matches_scan(
+                &db,
+                &keys,
+                &values,
+                &mut rng,
+                &format!("seed {seed} snapshotted"),
+            );
+        }
     }
 }

@@ -8591,12 +8591,22 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
-    /// - [`GraphError::RuleInvalid`]: `(label, field)` is already indexed.
+    /// - [`GraphError::RuleInvalid`]: `(label, field)` is already indexed, by
+    ///   an equality index or by a range index (named in the error).
     pub fn enable_index(&mut self, label: &str, field: &str) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
         if self.prop_index.is_enabled(label, field) {
+            // A range index already answers equality on the pair.
+            if let Some(index) = self.prop_index.range_index_on(label, field) {
+                return Err(GraphError::RuleInvalid {
+                    detail: format!(
+                        "property index for ({label:?}, {field:?}) already enabled: range index \
+                         '{index}' covers it"
+                    ),
+                });
+            }
             return Err(GraphError::RuleInvalid {
                 detail: format!("property index for ({label:?}, {field:?}) already enabled"),
             });
@@ -8747,17 +8757,8 @@ impl<F: Fs> GraphDb<F> {
         lo: Option<(&Value, bool)>,
         hi: Option<(&Value, bool)>,
     ) -> Vec<String> {
-        let key = |b: Option<(&Value, bool)>| {
-            b.map(|(v, incl)| (ValueKey::from_value(v).expect("a scalar bound"), incl))
-        };
-        let (lo, hi) = (key(lo), key(hi));
         self.prop_index
-            .lookup_range(
-                label,
-                field,
-                lo.as_ref().map(|(k, i)| (k, *i)),
-                hi.as_ref().map(|(k, i)| (k, *i)),
-            )
+            .lookup_range(label, field, lo, hi)
             .filter_map(|id| self.ids.key_of(id).map(str::to_string))
             .collect()
     }

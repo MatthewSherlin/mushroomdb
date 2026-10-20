@@ -13,6 +13,14 @@
 //! records the current key so an update or delete removes the stale entry in
 //! `O(log n)` without knowing the previous value.
 //!
+//! **Answers equal the scan's.** [`UnifiedIndex::lookup`] returns exactly the
+//! nodes whose value `core-query`'s `values_equal` finds equal, and
+//! [`UnifiedIndex::lookup_range`] exactly those its `eval_cmp` puts within the
+//! bounds. Keys are stored by variant, so the lookups bridge what the keys do
+//! not: `Int` and `Float` are one numeric class (`2 = 2.0`), compared as `f64`
+//! by total order (`-0.0 < 0.0`, `NaN` above `+inf`); `Bool` is not ordered;
+//! two `DateTime`s at one instant are equal yet ordered by offset.
+//!
 //! Nothing here is persisted: declarations replay from the WAL and the
 //! postings rebuild at open ([`UnifiedIndex::rebuild_all`]).
 
@@ -45,13 +53,14 @@ pub struct UnifiedIndex {
     /// `(label, field)` → value → set of node ids holding that value.
     forward: BTreeMap<Pair, Postings>,
     /// `(label, field)` → id → the node's current indexed key, so an update or
-    /// delete can drop the stale forward entry without the old value.
-    ///
-    /// Derived from `forward` on demand: [`rebuild_all`](Self::rebuild_all)
-    /// leaves a pair's map out, and the first update or delete touching the
-    /// pair builds it (see `reverse_of`), so an open does not pay for maps no
-    /// write may ever need. A pair absent here is one whose map is not built.
+    /// delete can drop the stale forward entry without the old value. Built
+    /// with the postings, at open too, so no write pays for it.
     reverse: BTreeMap<Pair, BTreeMap<u32, ValueKey>>,
+    /// `(label, field)` → id → UTC offset, for the nodes whose value is a
+    /// `DateTime` with a non-zero offset. The key holds the instant only — two
+    /// `DateTime`s at one instant are equal — but `<` orders such a tie by
+    /// offset, so a range needs it to answer as a scan does.
+    offsets: BTreeMap<Pair, BTreeMap<u32, i32>>,
     /// The kind of every maintained pair: `Range` while a range index is
     /// declared on it, else `Equality`.
     kind: BTreeMap<Pair, IndexKind>,
@@ -187,17 +196,24 @@ impl UnifiedIndex {
         self.kind.remove(p);
         self.forward.remove(p);
         self.reverse.remove(p);
+        self.offsets.remove(p);
     }
 
     /// Upsert node `id`'s value for `(label, field)`. Removes any prior entry
-    /// first, then indexes `value` if it is a scalar. A no-op when the pair is
-    /// not declared or `value` is a list/map.
+    /// first, then indexes `value` if it has an index key. A no-op when the
+    /// pair is not declared.
     pub fn set(&mut self, label: &str, field: &str, id: u32, value: &Value) {
-        self.update(label, field, id, None, ValueKey::from_value(value));
+        let offset = match value {
+            Value::DateTime { offset_seconds, .. } => *offset_seconds,
+            _ => 0,
+        };
+        self.put(label, field, id, ValueKey::from_value(value), offset);
     }
 
     /// Move node `id`'s entry for `(label, field)` to `new`, or drop it when
-    /// `new` is `None`. A no-op when the pair is not declared.
+    /// `new` is `None`. A no-op when the pair is not declared. A `DateTime`
+    /// key given here carries no offset and is indexed as UTC; [`set`](Self::set)
+    /// keeps the value's own.
     ///
     /// `old` is the key the caller believes it replaces. The reverse map is
     /// authoritative — the node's current entry is removed whatever `old`
@@ -211,55 +227,71 @@ impl UnifiedIndex {
         old: Option<ValueKey>,
         new: Option<ValueKey>,
     ) {
-        if !self.is_enabled(label, field) {
-            return;
-        }
-        let current = self.remove_node_key(label, field, id);
+        let current = self.put(label, field, id, new, 0);
         debug_assert!(
             old.is_none() || old == current,
             "update of ({label}, {field}, {id}) named {old:?}; the index held {current:?}"
         );
+    }
+
+    /// Replace node `id`'s entry for a declared pair, returning the key it
+    /// held.
+    fn put(
+        &mut self,
+        label: &str,
+        field: &str,
+        id: u32,
+        new: Option<ValueKey>,
+        offset: i32,
+    ) -> Option<ValueKey> {
+        if !self.is_enabled(label, field) {
+            return None;
+        }
+        let p = pair(label, field);
+        let current = self.remove_entry(&p, id);
         if let Some(vk) = new {
-            let p = pair(label, field);
+            if offset != 0 && matches!(vk, ValueKey::DateTimeMicrosUtc(_)) {
+                self.offsets
+                    .entry(p.clone())
+                    .or_default()
+                    .insert(id, offset);
+            }
             self.forward
                 .entry(p.clone())
                 .or_default()
                 .entry(vk.clone())
                 .or_default()
                 .insert(id);
-            self.reverse_of(&p).insert(id, vk);
+            self.reverse.entry(p).or_default().insert(id, vk);
         }
-    }
-
-    /// `p`'s reverse map, derived from its postings first if it is not built.
-    fn reverse_of(&mut self, p: &Pair) -> &mut BTreeMap<u32, ValueKey> {
-        if !self.reverse.contains_key(p) {
-            let by_id = self.forward.get(p).map(reverse_from).unwrap_or_default();
-            self.reverse.insert(p.clone(), by_id);
-        }
-        self.reverse.get_mut(p).expect("inserted above")
+        current
     }
 
     /// Remove every entry for node `id` across all declared pairs. Used when a
     /// node is deleted (mirrors [`crate::fulltext::FulltextIndex::remove_node`]).
     pub fn remove_node_all(&mut self, id: u32) {
-        let pairs: Vec<Pair> = self.forward.keys().cloned().collect();
-        for p in pairs {
-            if let Some(old) = self.reverse_of(&p).remove(&id) {
-                remove_posting(self.forward.get_mut(&p), &old, id);
+        for (p, by_id) in self.reverse.iter_mut() {
+            if let Some(old) = by_id.remove(&id) {
+                remove_posting(self.forward.get_mut(p), &old, id);
+                if let Some(offsets) = self.offsets.get_mut(p) {
+                    offsets.remove(&id);
+                }
             }
         }
     }
 
-    /// Remove node `id`'s entry for `(label, field)` if present.
+    /// Remove node `id`'s entry for `(label, field)` if present. Touches
+    /// nothing for a pair that is not declared.
     pub fn remove_node(&mut self, label: &str, field: &str, id: u32) {
-        self.remove_node_key(label, field, id);
+        self.remove_entry(&pair(label, field), id);
     }
 
-    fn remove_node_key(&mut self, label: &str, field: &str, id: u32) -> Option<ValueKey> {
-        let p = pair(label, field);
-        let old = self.reverse_of(&p).remove(&id)?;
-        remove_posting(self.forward.get_mut(&p), &old, id);
+    fn remove_entry(&mut self, p: &Pair, id: u32) -> Option<ValueKey> {
+        let old = self.reverse.get_mut(p)?.remove(&id)?;
+        remove_posting(self.forward.get_mut(p), &old, id);
+        if let Some(offsets) = self.offsets.get_mut(p) {
+            offsets.remove(&id);
+        }
         Some(old)
     }
 
@@ -270,76 +302,111 @@ impl UnifiedIndex {
         self.forward.get(&pair(label, field))
     }
 
-    /// Node ids of `label` whose `field` equals `value`, ascending. Empty when
-    /// the pair is not declared, `value` is non-scalar, or nothing matches.
-    pub fn lookup(&self, label: &str, field: &str, value: &Value) -> Vec<u32> {
-        let Some(vk) = ValueKey::from_value(value) else {
-            return Vec::new();
-        };
-        self.lookup_eq(label, field, &vk)
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default()
+    /// Whether [`lookup`](Self::lookup) can answer `= value`: it holds only
+    /// values with an index key, so a `List`, `Map` or `Duration` operand —
+    /// which a scan can find equal to a stored one — must be answered by a scan.
+    pub fn answers_eq(value: &Value) -> bool {
+        ValueKey::from_value(value).is_some()
     }
 
-    /// The nodes of `label` whose `field` has index key `key`, `None` when
-    /// none does.
+    /// Node ids of `label` whose `field` equals `value` as a scan's
+    /// `values_equal` judges it, ascending: an `Int` finds the equal `Float`s
+    /// and a `Float` the equal `Int`s, `0.0` and `-0.0` are equal, `NaN`
+    /// equals nothing, and a `DateTime` ignores its offset. Empty when the pair
+    /// is not declared or nothing matches, and for an operand
+    /// [`answers_eq`](Self::answers_eq) refuses.
+    pub fn lookup(&self, label: &str, field: &str, value: &Value) -> Vec<u32> {
+        let Some(postings) = self.postings(label, field) else {
+            return Vec::new();
+        };
+        let mut out: Vec<u32> = Vec::new();
+        let mut take = |key: &ValueKey| {
+            if let Some(ids) = postings.get(key) {
+                out.extend(ids.iter().copied());
+            }
+        };
+        match value {
+            Value::Int(i) => {
+                take(&ValueKey::Int(*i));
+                for f in with_other_zero(*i as f64) {
+                    take(&ValueKey::FloatBits(f.to_bits()));
+                }
+            }
+            Value::Float(f) if f.is_nan() => {}
+            Value::Float(f) => {
+                for g in with_other_zero(*f) {
+                    take(&ValueKey::FloatBits(g.to_bits()));
+                }
+                // The `Int`s whose conversion is `f`: one below 2^53, a run of
+                // neighbours above it, all between `f`'s float neighbours.
+                if f.is_finite() && f.fract() == 0.0 {
+                    let (lo, hi) = (f.next_down() as i64, f.next_up() as i64);
+                    for (key, ids) in postings.range(ValueKey::Int(lo)..=ValueKey::Int(hi)) {
+                        if matches!(key, ValueKey::Int(j) if *j as f64 == *f) {
+                            out.extend(ids.iter().copied());
+                        }
+                    }
+                }
+            }
+            other => {
+                if let Some(key) = ValueKey::from_value(other) {
+                    take(&key);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The nodes of `label` whose `field` has exactly index key `key`, `None`
+    /// when none does. A raw key lookup: [`lookup`](Self::lookup) is the one
+    /// that answers as a scan does.
     pub fn lookup_eq(&self, label: &str, field: &str, key: &ValueKey) -> Option<&BTreeSet<u32>> {
         self.postings(label, field)?.get(key)
     }
 
     /// The nodes of `label` whose `field` lies between `lo` and `hi`, each
-    /// bound given as `(key, inclusive)` and `None` for unbounded.
+    /// bound given as `(value, inclusive)` and `None` for unbounded: exactly
+    /// the nodes a scan's `eval_cmp` admits for `field >= lo` (or `>`) and
+    /// `field <= hi` (or `<`).
     ///
-    /// The match is by type: a bound's [`ValueKey`] variant names the type
-    /// asked for, and only keys of that variant are returned — an `Int` range
-    /// never yields a `Str`, a `Float` or a `Bool`, so a column holding mixed
-    /// types answers with the matching ones only. Bounds of two different
-    /// variants match nothing, as does an empty or inverted range. A `Float`
-    /// range compares numerically (negative values included), and a `NaN`
-    /// bound matches nothing. With both bounds `None`, every indexed node is
-    /// returned.
+    /// So, as in the scan: a bound orders only with its own class — numbers
+    /// (`Int` and `Float` together, compared as `f64` by total order: `-0.0`
+    /// sorts below `0.0`, `NaN` above `+inf` and `-NaN` below `-inf`), `Str`,
+    /// `Date`, `LocalDateTime`, `DateTime` (by instant, then by offset), or
+    /// `Binary`; a `Bool`, `List`, `Map` or `Duration` bound, or two bounds of
+    /// different classes, match nothing; an empty or inverted range matches
+    /// nothing. With both bounds `None`, every indexed node is returned.
     ///
-    /// Ids come in key order, ascending within one key. The pair need not be
-    /// a `Range` kind: the postings are the same, and which predicates to send
-    /// here is the planner's decision.
+    /// Ids come in value order (ties by id). The pair need not be a `Range`
+    /// kind: the postings are the same, and which predicates to send here is
+    /// the planner's decision.
     pub fn lookup_range(
         &self,
         label: &str,
         field: &str,
-        lo: Option<(&ValueKey, bool)>,
-        hi: Option<(&ValueKey, bool)>,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
     ) -> impl Iterator<Item = u32> + '_ {
         let Some(postings) = self.postings(label, field) else {
             return empty();
         };
-        let variant = match (lo, hi) {
+        let class = match (lo.map(|b| order_class(b.0)), hi.map(|b| order_class(b.0))) {
             (None, None) => return ids_of(postings.iter()),
-            (Some((l, _)), Some((h, _))) if !same_variant(l, h) => return empty(),
-            (Some((k, _)), _) | (None, Some((k, _))) => k.clone(),
+            (Some(None), _) | (_, Some(None)) => return empty(),
+            (Some(Some(a)), Some(Some(b))) if a != b => return empty(),
+            (Some(Some(c)), _) | (None, Some(Some(c))) => c,
         };
-        if let ValueKey::FloatBits(_) = variant {
-            return float_range(postings, lo, hi);
-        }
-        if let (Some((l, li)), Some((h, hi_incl))) = (lo, hi) {
-            if l > h || (l == h && !(li && hi_incl)) {
-                return empty();
+        match class {
+            OrderClass::Numeric => numeric_range(postings, lo, hi),
+            OrderClass::DateTime => {
+                datetime_range(postings, self.offsets.get(&pair(label, field)), lo, hi)
+            }
+            OrderClass::Str | OrderClass::Date | OrderClass::LocalDateTime | OrderClass::Binary => {
+                key_range(postings, lo, hi)
             }
         }
-        let start = match lo {
-            Some((k, true)) => Bound::Included(k.clone()),
-            Some((k, false)) => Bound::Excluded(k.clone()),
-            None => Bound::Included(variant_min(&variant)),
-        };
-        let end = match hi {
-            Some((k, true)) => Bound::Included(k.clone()),
-            Some((k, false)) => Bound::Excluded(k.clone()),
-            None => Bound::Unbounded,
-        };
-        ids_of(
-            postings
-                .range((start, end))
-                .take_while(move |(k, _)| same_variant(k, &variant)),
-        )
     }
 
     /// The nodes of `label` whose `field` is a string starting with `prefix`,
@@ -368,10 +435,10 @@ impl UnifiedIndex {
     /// Called at open end to correct any drift from per-record replay; a no-op
     /// when nothing is declared. Mirrors [`crate::fulltext::FulltextIndex::rebuild_all`].
     ///
-    /// One pass per pair over the label's nodes, then the postings are built
-    /// from sorted input in one go rather than by a search-and-insert per
-    /// node, and the reverse map is left to the first write that needs it: at
-    /// open this is the whole cost a range index adds.
+    /// One pass per pair over the label's nodes; the postings and the reverse
+    /// map are then each built from sorted input in one go rather than by a
+    /// search-and-insert per node. At open this is the whole cost an index
+    /// adds, and the first write pays nothing extra.
     pub fn rebuild_all(
         &mut self,
         ids: &IdMap,
@@ -390,6 +457,7 @@ impl UnifiedIndex {
             // of the build, and its cost is moving the elements.
             let mut fixed: Vec<(u8, u64, u32)> = Vec::new();
             let mut variable: Vec<(ValueKey, u32)> = Vec::new();
+            let mut offsets: BTreeMap<u32, i32> = BTreeMap::new();
             // A label no node carries has no symbol, and no entries.
             if let Some(sym) = syms.get(&p.0) {
                 for (id, &node_sym) in labels.iter().enumerate().take(n) {
@@ -397,15 +465,29 @@ impl UnifiedIndex {
                         continue;
                     }
                     let id = id as u32;
-                    let key = props
-                        .get(id, &p.1)
-                        .and_then(|vr| ValueKey::from_value(vr.as_value()));
+                    let Some(vr) = props.get(id, &p.1) else {
+                        continue;
+                    };
+                    let value = vr.as_value();
+                    if let Value::DateTime { offset_seconds, .. } = value {
+                        if *offset_seconds != 0 {
+                            offsets.insert(id, *offset_seconds);
+                        }
+                    }
+                    let key = ValueKey::from_value(value);
                     match key.as_ref().and_then(fixed_width) {
                         Some((variant, ordinal)) => fixed.push((variant, ordinal, id)),
                         None => variable.extend(key.map(|k| (k, id))),
                     }
                 }
             }
+            // Both lists are in id order here: two sorted runs, which
+            // `collect` merges and builds in bulk.
+            let by_id: BTreeMap<u32, ValueKey> = fixed
+                .iter()
+                .map(|&(variant, ordinal, id)| (id, from_fixed_width(variant, ordinal)))
+                .chain(variable.iter().map(|(key, id)| (*id, key.clone())))
+                .collect();
             // By key; the ids of one key are gathered into a set, so their
             // order here does not matter.
             fixed.sort_unstable();
@@ -432,16 +514,18 @@ impl UnifiedIndex {
                     _ => variable_runs.push((key, single(id))),
                 }
             }
-            // Two sorted runs of distinct keys: `collect` merges them and
-            // builds the tree in bulk.
             let by_value: Postings = runs.into_iter().chain(variable_runs).collect();
-            // The reverse map is derived from these postings when a write
-            // first needs it.
-            self.reverse.remove(&p);
             if by_value.is_empty() {
                 self.forward.remove(&p);
+                self.reverse.remove(&p);
             } else {
-                self.forward.insert(p, by_value);
+                self.forward.insert(p.clone(), by_value);
+                self.reverse.insert(p.clone(), by_id);
+            }
+            if offsets.is_empty() {
+                self.offsets.remove(&p);
+            } else {
+                self.offsets.insert(p, offsets);
             }
         }
     }
@@ -487,17 +571,6 @@ fn single(id: u32) -> BTreeSet<u32> {
     ids
 }
 
-/// The id → key map of one pair's postings.
-fn reverse_from(by_value: &Postings) -> BTreeMap<u32, ValueKey> {
-    let mut by_id: Vec<(u32, ValueKey)> = by_value
-        .iter()
-        .flat_map(|(key, ids)| ids.iter().map(move |&id| (id, key.clone())))
-        .collect();
-    // An id holds one key per pair, so the ids are distinct.
-    by_id.sort_unstable_by_key(|(id, _)| *id);
-    by_id.into_iter().collect()
-}
-
 /// Drop `id` from the `old` bucket of one pair's postings, and the bucket
 /// with it once it is empty.
 fn remove_posting(by_value: Option<&mut Postings>, old: &ValueKey, id: u32) {
@@ -508,6 +581,38 @@ fn remove_posting(by_value: Option<&mut Postings>, old: &ValueKey, id: u32) {
                 by_value.remove(old);
             }
         }
+    }
+}
+
+/// `x`, and the other zero too when `x` is one: `0.0 == -0.0`.
+fn with_other_zero(x: f64) -> Vec<f64> {
+    if x == 0.0 {
+        vec![0.0, -0.0]
+    } else {
+        vec![x]
+    }
+}
+
+/// The classes a scan's `<` orders within (`core-query`'s `is_orderable_pair`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderClass {
+    Numeric,
+    Str,
+    Date,
+    LocalDateTime,
+    DateTime,
+    Binary,
+}
+
+fn order_class(v: &Value) -> Option<OrderClass> {
+    match v {
+        Value::Int(_) | Value::Float(_) => Some(OrderClass::Numeric),
+        Value::Str(_) => Some(OrderClass::Str),
+        Value::Date(_) => Some(OrderClass::Date),
+        Value::LocalDateTime(_) => Some(OrderClass::LocalDateTime),
+        Value::DateTime { .. } => Some(OrderClass::DateTime),
+        Value::Binary(_) => Some(OrderClass::Binary),
+        Value::Bool(_) | Value::List(_) | Value::Map(_) | Value::Duration { .. } => None,
     }
 }
 
@@ -525,8 +630,56 @@ fn same_variant(a: &ValueKey, b: &ValueKey) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b)
 }
 
-/// The smallest key of `k`'s variant. Not used for `FloatBits`, whose bit
-/// order is not numeric order.
+/// Whether `ord`, a stored value compared with a bound, satisfies the bound.
+fn admits(ord: std::cmp::Ordering, lower: bool, inclusive: bool) -> bool {
+    use std::cmp::Ordering::*;
+    match (ord, lower) {
+        (Equal, _) => inclusive,
+        (Greater, true) | (Less, false) => true,
+        _ => false,
+    }
+}
+
+/// A range over a class whose key order is the scan's order: `Str`, `Date`,
+/// `LocalDateTime` and `Binary`.
+fn key_range<'a>(
+    postings: &'a Postings,
+    lo: Option<(&Value, bool)>,
+    hi: Option<(&Value, bool)>,
+) -> IdIter<'a> {
+    let key = |b: Option<(&Value, bool)>| {
+        b.map(|(v, incl)| {
+            (
+                ValueKey::from_value(v).expect("an ordered class has keys"),
+                incl,
+            )
+        })
+    };
+    let (lo, hi) = (key(lo), key(hi));
+    if let (Some((l, li)), Some((h, hincl))) = (&lo, &hi) {
+        if l > h || (l == h && !(*li && *hincl)) {
+            return empty();
+        }
+    }
+    let variant = lo.as_ref().or(hi.as_ref()).expect("a bound").0.clone();
+    let start = match lo {
+        Some((k, true)) => Bound::Included(k),
+        Some((k, false)) => Bound::Excluded(k),
+        None => Bound::Included(variant_min(&variant)),
+    };
+    let end = match hi {
+        Some((k, true)) => Bound::Included(k),
+        Some((k, false)) => Bound::Excluded(k),
+        None => Bound::Unbounded,
+    };
+    ids_of(
+        postings
+            .range((start, end))
+            .take_while(move |(k, _)| same_variant(k, &variant)),
+    )
+}
+
+/// The smallest key of `k`'s variant.
 fn variant_min(k: &ValueKey) -> ValueKey {
     match k {
         ValueKey::Int(_) => ValueKey::Int(i64::MIN),
@@ -540,84 +693,135 @@ fn variant_min(k: &ValueKey) -> ValueKey {
     }
 }
 
-fn as_f64(k: &ValueKey) -> Option<f64> {
-    match k {
-        ValueKey::FloatBits(b) => Some(f64::from_bits(*b)),
-        _ => None,
+/// A numeric bound as the scan compares it: an `Int` converted to `f64`.
+fn as_number(v: &Value) -> f64 {
+    match v {
+        Value::Int(i) => *i as f64,
+        Value::Float(f) => *f,
+        _ => unreachable!("a numeric bound"),
     }
 }
 
-/// A numeric `Float` range over keys stored as raw `f64` bits.
+/// `f64` bits remapped so that unsigned order is `f64::total_cmp` order.
+fn total_order(bits: u64) -> u64 {
+    const SIGN: u64 = 1 << 63;
+    if bits & SIGN != 0 {
+        !bits
+    } else {
+        bits | SIGN
+    }
+}
+
+/// A numeric range: `Int` and `Float` keys together, compared as the scan
+/// compares them — the `Int` converted to `f64`, then `f64::total_cmp`.
 ///
-/// Bit order is numeric order for non-negative floats (sign bit clear) and the
-/// reverse of it for negative ones (sign bit set), with `NaN`s past both
-/// infinities. So the range is two bit runs: the negative run walked backwards,
-/// then the non-negative run forwards. Each run is narrowed by the bounds and
-/// then filtered by an exact numeric comparison, which settles the open ends,
-/// `-0.0 == 0.0`, and keeps every `NaN` out.
-fn float_range<'a>(
+/// Each side is narrowed to a conservative key run and then filtered by that
+/// exact comparison. `Int`s convert monotonically, so theirs is one run
+/// between the integers just outside the bounds' float neighbours. `Float`
+/// keys are raw bits, whose order is total order for a clear sign bit and its
+/// reverse for a set one, so theirs is up to two runs.
+fn numeric_range<'a>(
     postings: &'a Postings,
-    lo: Option<(&ValueKey, bool)>,
-    hi: Option<(&ValueKey, bool)>,
+    lo: Option<(&Value, bool)>,
+    hi: Option<(&Value, bool)>,
 ) -> IdIter<'a> {
-    let lo = lo.and_then(|(k, incl)| as_f64(k).map(|v| (v, incl)));
-    let hi = hi.and_then(|(k, incl)| as_f64(k).map(|v| (v, incl)));
-    if lo.is_some_and(|(v, _)| v.is_nan()) || hi.is_some_and(|(v, _)| v.is_nan()) {
+    const SIGN: u64 = 1 << 63;
+    let lo = lo.map(|(v, incl)| (as_number(v), incl));
+    let hi = hi.map(|(v, incl)| (as_number(v), incl));
+    let within = move |x: f64| {
+        lo.is_none_or(|(b, incl)| admits(x.total_cmp(&b), true, incl))
+            && hi.is_none_or(|(b, incl)| admits(x.total_cmp(&b), false, incl))
+    };
+    let mut hits: Vec<(f64, u32)> = Vec::new();
+
+    // `Int`s: `as i64` saturates, and a NaN bound admits every integer or none.
+    let int_lo = match lo {
+        None => Some(i64::MIN),
+        Some((b, _)) if b.is_nan() => b.is_sign_negative().then_some(i64::MIN),
+        Some((b, _)) => Some(b.next_down().floor() as i64),
+    };
+    let int_hi = match hi {
+        None => Some(i64::MAX),
+        Some((b, _)) if b.is_nan() => b.is_sign_positive().then_some(i64::MAX),
+        Some((b, _)) => Some(b.next_up().ceil() as i64),
+    };
+    if let (Some(a), Some(b)) = (int_lo, int_hi) {
+        if a <= b {
+            for (key, ids) in postings.range(ValueKey::Int(a)..=ValueKey::Int(b)) {
+                if let ValueKey::Int(j) = key {
+                    let x = *j as f64;
+                    if within(x) {
+                        hits.extend(ids.iter().map(|&id| (x, id)));
+                    }
+                }
+            }
+        }
+    }
+
+    // `Float`s, in total-order space.
+    let t_lo = lo.map_or(0, |(b, _)| total_order(b.to_bits()));
+    let t_hi = hi.map_or(u64::MAX, |(b, _)| total_order(b.to_bits()));
+    if t_lo <= t_hi {
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        // Clear sign bit: raw bits are total order with the sign bit removed.
+        if t_hi >= SIGN {
+            runs.push((t_lo.max(SIGN) ^ SIGN, t_hi ^ SIGN));
+        }
+        // Set sign bit: raw bits are the complement, so the run reverses.
+        if t_lo < SIGN {
+            runs.push((!t_hi.min(SIGN - 1), !t_lo));
+        }
+        for (a, b) in runs {
+            for (key, ids) in postings.range(ValueKey::FloatBits(a)..=ValueKey::FloatBits(b)) {
+                if let ValueKey::FloatBits(bits) = key {
+                    let x = f64::from_bits(*bits);
+                    if within(x) {
+                        hits.extend(ids.iter().map(|&id| (x, id)));
+                    }
+                }
+            }
+        }
+    }
+    hits.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    Box::new(hits.into_iter().map(|(_, id)| id))
+}
+
+/// A `DateTime` range. The scan orders by `(instant, offset)`, the key holds
+/// the instant, and `offsets` the non-zero offsets: the instants between the
+/// bounds' are a key run, filtered by the exact pair comparison.
+fn datetime_range<'a>(
+    postings: &'a Postings,
+    offsets: Option<&'a BTreeMap<u32, i32>>,
+    lo: Option<(&Value, bool)>,
+    hi: Option<(&Value, bool)>,
+) -> IdIter<'a> {
+    let pair_of = |b: Option<(&Value, bool)>| {
+        b.map(|(v, incl)| match v {
+            Value::DateTime {
+                micros_utc,
+                offset_seconds,
+            } => ((*micros_utc, *offset_seconds), incl),
+            _ => unreachable!("a DateTime bound"),
+        })
+    };
+    let (lo, hi) = (pair_of(lo), pair_of(hi));
+    let start = lo.map_or(i64::MIN, |((us, _), _)| us);
+    let end = hi.map_or(i64::MAX, |((us, _), _)| us);
+    if start > end {
         return empty();
     }
-    let within = move |x: f64| {
-        let above = match lo {
-            None => true,
-            Some((v, true)) => x >= v,
-            Some((v, false)) => x > v,
+    let range = ValueKey::DateTimeMicrosUtc(start)..=ValueKey::DateTimeMicrosUtc(end);
+    Box::new(postings.range(range).flat_map(move |(key, ids)| {
+        let ValueKey::DateTimeMicrosUtc(us) = *key else {
+            unreachable!("a DateTime key run")
         };
-        let below = match hi {
-            None => true,
-            Some((v, true)) => x <= v,
-            Some((v, false)) => x < v,
-        };
-        !x.is_nan() && above && below
-    };
-    let bits = |v: f64| ValueKey::FloatBits(v.to_bits());
-    // Negative run, bits from nearest zero to most negative.
-    let neg = if lo.is_some_and(|(v, _)| v > 0.0) {
-        None
-    } else {
-        let near = match hi {
-            Some((v, _)) if v < 0.0 => v,
-            _ => -0.0,
-        };
-        let far = match lo {
-            Some((v, _)) => -v.abs(),
-            None => f64::NEG_INFINITY,
-        };
-        (near.to_bits() <= far.to_bits()).then(|| (bits(near), bits(far)))
-    };
-    // Non-negative run, bits from zero to largest.
-    let pos = if hi.is_some_and(|(v, _)| v < 0.0) {
-        None
-    } else {
-        let low = match lo {
-            Some((v, _)) if v > 0.0 => v,
-            _ => 0.0,
-        };
-        let high = match hi {
-            Some((v, _)) => v.abs(),
-            None => f64::INFINITY,
-        };
-        (low.to_bits() <= high.to_bits()).then(|| (bits(low), bits(high)))
-    };
-    let neg_entries = neg
-        .into_iter()
-        .flat_map(move |(near, far)| postings.range(near..=far).rev());
-    let pos_entries = pos
-        .into_iter()
-        .flat_map(move |(low, high)| postings.range(low..=high));
-    ids_of(
-        neg_entries
-            .chain(pos_entries)
-            .filter(move |(k, _)| as_f64(k).is_some_and(within)),
-    )
+        ids.iter().copied().filter(move |id| {
+            let offset = offsets.and_then(|o| o.get(id)).copied().unwrap_or(0);
+            let stored = (us, offset);
+            lo.is_none_or(|(b, incl)| admits(stored.cmp(&b), true, incl))
+                && hi.is_none_or(|(b, incl)| admits(stored.cmp(&b), false, incl))
+        })
+    }))
 }
 
 #[cfg(test)]
@@ -632,10 +836,18 @@ mod tests {
         ValueKey::FloatBits(f.to_bits())
     }
 
+    fn iv(i: i64) -> Value {
+        Value::Int(i)
+    }
+
+    fn fv(f: f64) -> Value {
+        Value::Float(f)
+    }
+
     fn range(
         ix: &UnifiedIndex,
-        lo: Option<(&ValueKey, bool)>,
-        hi: Option<(&ValueKey, bool)>,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
     ) -> Vec<u32> {
         ix.lookup_range("N", "v", lo, hi).collect()
     }
@@ -651,8 +863,8 @@ mod tests {
             .lookup_range(
                 "Score",
                 "val",
-                Some((&ValueKey::Int(3), true)),
-                Some((&ValueKey::Int(7), true)),
+                Some((&Value::Int(3), true)),
+                Some((&Value::Int(7), true)),
             )
             .collect();
         assert_eq!(hits, vec![1, 2, 3]);
@@ -675,102 +887,179 @@ mod tests {
         let mut ix = UnifiedIndex::new();
         ix.enable_range("idx", "N", "v");
         for (node, v) in [(0u32, -5i64), (1, 0), (2, 3), (3, 3), (4, 8)] {
-            ix.update("N", "v", node, None, Some(int(v)));
+            ix.set("N", "v", node, &iv(v));
         }
-        assert_eq!(range(&ix, None, Some((&int(3), false))), vec![0, 1]);
-        assert_eq!(range(&ix, None, Some((&int(3), true))), vec![0, 1, 2, 3]);
-        assert_eq!(range(&ix, Some((&int(3), false)), None), vec![4]);
-        assert_eq!(range(&ix, Some((&int(3), true)), None), vec![2, 3, 4]);
+        assert_eq!(range(&ix, None, Some((&iv(3), false))), vec![0, 1]);
+        assert_eq!(range(&ix, None, Some((&iv(3), true))), vec![0, 1, 2, 3]);
+        assert_eq!(range(&ix, Some((&iv(3), false)), None), vec![4]);
+        assert_eq!(range(&ix, Some((&iv(3), true)), None), vec![2, 3, 4]);
         assert_eq!(
-            range(&ix, Some((&int(0), true)), Some((&int(8), false))),
+            range(&ix, Some((&iv(0), true)), Some((&iv(8), false))),
             vec![1, 2, 3]
         );
         assert_eq!(
-            range(&ix, Some((&int(3), true)), Some((&int(3), true))),
+            range(&ix, Some((&iv(3), true)), Some((&iv(3), true))),
             vec![2, 3]
         );
         // Empty and inverted ranges match nothing and do not panic.
-        assert!(range(&ix, Some((&int(3), false)), Some((&int(3), true))).is_empty());
-        assert!(range(&ix, Some((&int(3), true)), Some((&int(3), false))).is_empty());
-        assert!(range(&ix, Some((&int(8), true)), Some((&int(0), true))).is_empty());
+        assert!(range(&ix, Some((&iv(3), false)), Some((&iv(3), true))).is_empty());
+        assert!(range(&ix, Some((&iv(3), true)), Some((&iv(3), false))).is_empty());
+        assert!(range(&ix, Some((&iv(8), true)), Some((&iv(0), true))).is_empty());
         assert_eq!(range(&ix, None, None), vec![0, 1, 2, 3, 4]);
     }
 
-    /// A column holding several types: a bound's type selects keys of that
-    /// type only, in both directions, and mixed-type bounds match nothing.
+    /// The scan's classes: numbers together, every other ordered type alone,
+    /// `Bool` never ordered, and bounds of two classes match nothing.
     #[test]
-    fn a_range_matches_only_keys_of_its_own_type() {
+    fn a_range_matches_its_class_as_the_scan_does() {
         let mut ix = UnifiedIndex::new();
         ix.enable_range("idx", "N", "v");
-        ix.update("N", "v", 0, None, Some(int(1)));
-        ix.update("N", "v", 1, None, Some(float(2.0)));
-        ix.update("N", "v", 2, None, Some(ValueKey::Str("3".into())));
-        ix.update("N", "v", 3, None, Some(ValueKey::Bool(true)));
-        ix.update("N", "v", 4, None, Some(int(5)));
-        ix.update("N", "v", 5, None, Some(ValueKey::DateDays(10)));
-        assert_eq!(range(&ix, Some((&int(0), true)), None), vec![0, 4]);
-        assert_eq!(range(&ix, None, Some((&int(100), true))), vec![0, 4]);
-        assert_eq!(range(&ix, Some((&float(0.0), true)), None), vec![1]);
+        ix.set("N", "v", 0, &iv(1));
+        ix.set("N", "v", 1, &fv(2.0));
+        ix.set("N", "v", 2, &Value::Str("3".into()));
+        ix.set("N", "v", 3, &Value::Bool(true));
+        ix.set("N", "v", 4, &iv(5));
+        ix.set("N", "v", 5, &Value::Date(10));
+        assert_eq!(range(&ix, Some((&iv(0), true)), None), vec![0, 1, 4]);
+        assert_eq!(range(&ix, None, Some((&fv(1.5), true))), vec![0]);
         assert_eq!(
-            range(&ix, None, Some((&ValueKey::Str("z".into()), true))),
+            range(&ix, Some((&iv(0), true)), Some((&fv(9.0), true))),
+            vec![0, 1, 4]
+        );
+        assert_eq!(
+            range(&ix, None, Some((&Value::Str("z".into()), true))),
             vec![2]
         );
-        assert_eq!(
-            range(&ix, Some((&ValueKey::DateDays(0), true)), None),
-            vec![5]
-        );
-        assert!(range(&ix, Some((&int(0), true)), Some((&float(9.0), true))).is_empty());
+        assert_eq!(range(&ix, Some((&Value::Date(0), true)), None), vec![5]);
+        assert!(range(&ix, Some((&Value::Bool(false), false)), None).is_empty());
+        assert!(range(
+            &ix,
+            Some((&iv(0), true)),
+            Some((&Value::Str("z".into()), true))
+        )
+        .is_empty());
+        assert!(range(&ix, Some((&Value::List(vec![]), true)), None).is_empty());
     }
 
-    /// `Float` keys are raw bits, whose order is not numeric for negatives.
+    /// Numbers order by `f64::total_cmp`, as the scan's do.
     #[test]
-    fn a_float_range_is_numeric_across_zero() {
+    fn a_numeric_range_uses_total_order() {
         let mut ix = UnifiedIndex::new();
         ix.enable_range("idx", "N", "v");
         let values = [
-            (0u32, -10.5),
-            (1, -1.0),
-            (2, -0.0),
-            (3, 0.0),
-            (4, 0.25),
-            (5, 7.0),
-            (6, f64::INFINITY),
-            (7, f64::NEG_INFINITY),
-            (8, f64::NAN),
+            (0u32, fv(-10.5)),
+            (1, fv(-1.0)),
+            (2, fv(-0.0)),
+            (3, fv(0.0)),
+            (4, fv(0.25)),
+            (5, fv(7.0)),
+            (6, fv(f64::INFINITY)),
+            (7, fv(f64::NEG_INFINITY)),
+            (8, fv(f64::NAN)),
+            (9, iv(0)),
+            (10, iv(7)),
+            (11, fv(-f64::NAN)),
         ];
-        for (node, v) in values {
-            ix.update("N", "v", node, None, Some(float(v)));
+        for (node, v) in &values {
+            ix.set("N", "v", *node, v);
         }
         assert_eq!(
-            range(&ix, Some((&float(-2.0), true)), Some((&float(1.0), true))),
-            vec![1, 2, 3, 4]
+            range(&ix, Some((&fv(-2.0), true)), Some((&fv(1.0), true))),
+            vec![1, 2, 3, 9, 4]
         );
         assert_eq!(
-            range(&ix, None, Some((&float(0.0), false))),
-            vec![7, 0, 1],
-            "ascending, and -0.0 is not below 0.0"
-        );
-        assert_eq!(range(&ix, Some((&float(0.0), false)), None), vec![4, 5, 6]);
-        assert_eq!(
-            range(&ix, Some((&float(-0.0), true)), Some((&float(0.0), true))),
-            vec![2, 3]
+            range(&ix, None, Some((&fv(0.0), false))),
+            vec![11, 7, 0, 1, 2],
+            "-0.0 sorts below 0.0, -NaN below everything"
         );
         assert_eq!(
-            range(
-                &ix,
-                Some((&float(-11.0), true)),
-                Some((&float(-1.0), false))
-            ),
+            range(&ix, Some((&fv(0.0), true)), None),
+            vec![3, 9, 4, 5, 10, 6, 8]
+        );
+        assert_eq!(
+            range(&ix, Some((&fv(100.0), false)), None),
+            vec![6, 8],
+            "NaN is above +inf"
+        );
+        assert_eq!(
+            range(&ix, Some((&iv(7), true)), Some((&iv(7), true))),
+            vec![5, 10]
+        );
+        assert!(range(&ix, Some((&fv(5.0), true)), Some((&fv(1.0), true))).is_empty());
+        assert_eq!(range(&ix, Some((&fv(f64::NAN), true)), None), vec![8]);
+    }
+
+    /// Equality is the scan's: numbers across `Int` and `Float`, both zeros,
+    /// no `NaN`, and the `Int`s that round to a large `Float`.
+    #[test]
+    fn equality_is_numeric_as_the_scan_is() {
+        let mut ix = UnifiedIndex::new();
+        ix.enable("N", "v");
+        ix.set("N", "v", 0, &iv(2));
+        ix.set("N", "v", 1, &fv(2.0));
+        ix.set("N", "v", 2, &fv(-0.0));
+        ix.set("N", "v", 3, &iv(0));
+        ix.set("N", "v", 4, &fv(f64::NAN));
+        let big = 1i64 << 60;
+        ix.set("N", "v", 5, &iv(big));
+        ix.set("N", "v", 6, &iv(big + 1));
+        ix.set("N", "v", 7, &fv(big as f64));
+        ix.set("N", "v", 8, &fv(2.5));
+        let eq = |v: &Value| ix.lookup("N", "v", v);
+        assert_eq!(eq(&iv(2)), vec![0, 1]);
+        assert_eq!(eq(&fv(2.0)), vec![0, 1]);
+        assert_eq!(eq(&fv(0.0)), vec![2, 3]);
+        assert_eq!(eq(&iv(0)), vec![2, 3]);
+        assert!(eq(&fv(f64::NAN)).is_empty());
+        assert_eq!(eq(&fv(big as f64)), vec![5, 6, 7]);
+        assert_eq!(eq(&iv(big + 1)), vec![6, 7]);
+        assert_eq!(eq(&fv(2.5)), vec![8]);
+        assert!(!UnifiedIndex::answers_eq(&Value::List(vec![])));
+        assert!(UnifiedIndex::answers_eq(&iv(1)));
+    }
+
+    /// The key keeps the instant only; the scan's `<` breaks a tie by offset.
+    #[test]
+    fn a_datetime_range_orders_a_tie_by_offset() {
+        let dt = |us: i64, off: i32| Value::DateTime {
+            micros_utc: us,
+            offset_seconds: off,
+        };
+        let mut ix = UnifiedIndex::new();
+        ix.enable_range("idx", "N", "v");
+        ix.set("N", "v", 0, &dt(10, 0));
+        ix.set("N", "v", 1, &dt(10, 3600));
+        ix.set("N", "v", 2, &dt(10, -3600));
+        ix.set("N", "v", 3, &dt(20, 0));
+        assert_eq!(range(&ix, None, Some((&dt(10, 0), false))), vec![2]);
+        assert_eq!(range(&ix, Some((&dt(10, 0), false)), None), vec![1, 3]);
+        assert_eq!(
+            range(&ix, Some((&dt(10, 0), true)), Some((&dt(10, 0), true))),
             vec![0]
         );
-        assert!(range(&ix, Some((&float(5.0), true)), Some((&float(1.0), true))).is_empty());
-        assert!(range(&ix, Some((&float(f64::NAN), true)), None).is_empty());
-        let unbounded_lo: Vec<u32> = range(&ix, Some((&float(f64::NEG_INFINITY), true)), None);
+        assert_eq!(ix.lookup("N", "v", &dt(10, 7200)), vec![0, 1, 2]);
+        // An update moves the offset with the value.
+        ix.set("N", "v", 1, &dt(10, 0));
         assert_eq!(
-            unbounded_lo,
-            vec![7, 0, 1, 2, 3, 4, 5, 6],
-            "NaN never matches"
+            range(&ix, Some((&dt(10, 0), true)), Some((&dt(10, 0), true))),
+            vec![0, 1]
         );
+        ix.remove_node_all(2);
+        assert_eq!(
+            range(&ix, None, Some((&dt(10, 0), false))),
+            Vec::<u32>::new()
+        );
+    }
+
+    /// Minor 6: removing from a pair nobody declared leaves nothing behind.
+    #[test]
+    fn removing_from_an_undeclared_pair_allocates_nothing() {
+        let mut ix = UnifiedIndex::new();
+        ix.enable("N", "v");
+        ix.remove_node("Other", "v", 3);
+        ix.remove_node("N", "v", 3);
+        assert!(ix.reverse.is_empty());
+        assert!(ix.offsets.is_empty());
     }
 
     #[test]
@@ -881,13 +1170,18 @@ mod tests {
         rebuilt.enable_range("r", "N", "v");
         rebuilt.rebuild_all(&ids, &labels, &syms, ColumnsView::owned(&cols));
         assert_eq!(rebuilt.postings("N", "v"), incremental.postings("N", "v"));
-        // The reverse map the rebuild left out is derived on the first write.
+        assert_eq!(
+            rebuilt.reverse, incremental.reverse,
+            "the rebuild builds the reverse map"
+        );
+        assert_eq!(rebuilt.offsets, incremental.offsets);
         rebuilt.set("N", "v", 0, &Value::Int(100));
         incremental.set("N", "v", 0, &Value::Int(100));
         rebuilt.remove_node_all(1);
         incremental.remove_node_all(1);
         assert_eq!(rebuilt.postings("N", "v"), incremental.postings("N", "v"));
         assert_eq!(rebuilt.reverse, incremental.reverse);
+        assert_eq!(rebuilt.offsets, incremental.offsets);
     }
 
     #[test]
