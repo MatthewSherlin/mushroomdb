@@ -14,11 +14,15 @@ use crate::view::GraphView;
 use core_storage::{Value, ValueKey};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-/// Test-only counter incremented each time the fused ScanLabel+Filter arm
-/// executes.  Lets property tests assert the fast path actually fires for
-/// matching query shapes (and does NOT fire for fallback shapes).
+// Test-only counter incremented each time the fused ScanLabel+Filter arm
+// executes.  Lets property tests assert the fast path actually fires for
+// matching query shapes (and does NOT fire for fallback shapes). Per thread,
+// so a test that runs the fused path in parallel cannot move another test's
+// count.
 #[cfg(test)]
-static FUSED_SCAN_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static FUSED_SCAN_FIRES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Test-only counter incremented each time a `ScanKey` arm executes.
 /// Lets tests assert the point-lookup path actually fires (and does not
@@ -4345,7 +4349,7 @@ fn pull_rows(
                 // Fused scan+filter: column resolved once, comparison done
                 // inline — no recursive call into pull_rows for the Filter arm.
                 #[cfg(test)]
-                FUSED_SCAN_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                FUSED_SCAN_FIRES.with(|c| c.set(c.get() + 1));
                 let col = ctx.view.props.column(field);
                 let rest_after_filter = &rest[1..];
                 for (i, &sym) in ctx.view.labels.iter().enumerate() {
@@ -5902,10 +5906,10 @@ LIMIT 10";
 
             // Snapshot counter before executing the fused-shape query.
             let fires_before =
-                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+                super::FUSED_SCAN_FIRES.with(std::cell::Cell::get);
             let bounded = run(&v, &bounded_q, &params).expect("fused bounded must not error");
             let fires_after =
-                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+                super::FUSED_SCAN_FIRES.with(std::cell::Cell::get);
 
             // The planner must have emitted ScanLabel→Filter{Cmp} for this shape;
             // assert the fused arm actually executed (counter advanced).
@@ -5945,11 +5949,11 @@ LIMIT 10";
                 op_str, threshold, skip, limit
             );
             let fires_before_compound =
-                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+                super::FUSED_SCAN_FIRES.with(std::cell::Cell::get);
             let compound_bounded =
                 run(&v, &compound_q, &params).expect("compound-AND bounded must not error");
             let fires_after_compound =
-                super::FUSED_SCAN_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+                super::FUSED_SCAN_FIRES.with(std::cell::Cell::get);
 
             // Compound AND must NOT activate the fused arm.
             prop_assert_eq!(
@@ -10450,5 +10454,135 @@ LIMIT 10";
         assert_eq!(rs.get(0, "a"), Some(&i(1)));
         assert_eq!(rs.get(0, "b"), Some(&i(1)));
         assert_eq!(rs.get(0, "m"), Some(&map_of(vec![("null", i(1))])));
+    }
+
+    // ── QL-17 fix round 1: comparisons against null are three-valued ────────
+
+    /// Keys a WHERE keeps, through the staged path, the bounded (fused
+    /// scan+filter) path and an indexed view; all three must agree.
+    fn where_keys(
+        fx: &Fx,
+        pi: &core_storage::property_index::PropertyIndex,
+        w: &str,
+    ) -> Vec<String> {
+        let keys = |rs: ResultSet| {
+            let mut k: Vec<String> = col(&rs, "k")
+                .into_iter()
+                .map(|v| match v {
+                    Some(Value::Str(s)) => s,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            k.sort();
+            k
+        };
+        let p = BTreeMap::new();
+        let staged = keys(
+            run(
+                &fx.view(),
+                &format!("MATCH (n:L) WHERE {w} RETURN key(n) AS k"),
+                &p,
+            )
+            .unwrap(),
+        );
+        let bounded = keys(
+            run(
+                &fx.view(),
+                &format!("MATCH (n:L) WHERE {w} RETURN key(n) AS k LIMIT 100"),
+                &p,
+            )
+            .unwrap(),
+        );
+        let indexed = keys(
+            run(
+                &fx.view_indexed(pi),
+                &format!("MATCH (n:L) WHERE {w} RETURN key(n) AS k LIMIT 100"),
+                &p,
+            )
+            .unwrap(),
+        );
+        assert_eq!(staged, bounded, "LIMIT changed the answer for `{w}`");
+        assert_eq!(staged, indexed, "an index changed the answer for `{w}`");
+        staged
+    }
+
+    #[test]
+    fn ql17_comparisons_with_null_agree_with_and_without_limit() {
+        use core_storage::property_index::PropertyIndex;
+        let mut fx = Fx::new();
+        let a = fx.add(
+            "L",
+            "a",
+            vec![("x", i(1)), ("tags", list_of(vec![i(1), i(2)]))],
+        );
+        let b = fx.add("L", "b", vec![("x", i(2))]);
+        fx.add("L", "c", vec![]);
+        let mut pi = PropertyIndex::new();
+        pi.enable("L", "x");
+        pi.set("L", "x", a, &i(1));
+        pi.set("L", "x", b, &i(2));
+
+        let none: Vec<String> = vec![];
+        let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            // A null operand: every comparison is null, so the row is dropped.
+            ("n.x = null", none.clone()),
+            ("n.x <> null", none.clone()),
+            ("null <> n.x", none.clone()),
+            ("n.x < null", none.clone()),
+            ("n.x >= null", none.clone()),
+            ("null = null", none.clone()),
+            // IN: a null element never matches; a real one still does.
+            ("n.x IN [null]", none.clone()),
+            ("n.x IN [1, null]", k(&["a"])),
+            ("null IN [1, 2]", none.clone()),
+            ("n.x IS NULL", k(&["c"])),
+            ("n.x IS NOT NULL", k(&["a", "b"])),
+            ("[n.x, null][1] IS NULL", k(&["a", "b", "c"])),
+            // Ordinary comparisons are unchanged.
+            ("n.x = 1", k(&["a"])),
+            ("n.x <> 1", k(&["b"])),
+            ("n.x >= 2", k(&["b"])),
+            // A null element and a missing property agree.
+            ("[n.x] = [1]", k(&["a"])),
+            ("[n.x] <> [1]", k(&["b"])),
+            // List equality is three-valued.
+            ("[n.x, null] = [1, null]", none.clone()),
+            ("[n.x, null] <> [2, null]", k(&["a"])),
+            ("[1, null] <> [1, null]", none.clone()),
+            ("[1, null] = [1, null]", none.clone()),
+            ("[1, null] <> [2, null]", k(&["a", "b", "c"])),
+            ("[1, null] <> [1]", k(&["a", "b", "c"])),
+            ("{a: null} = {a: null}", none.clone()),
+            ("{a: null} <> {b: null}", k(&["a", "b", "c"])),
+            ("n.tags = [1, null]", none.clone()),
+            ("n.tags <> [1, null]", none.clone()),
+            ("n.tags <> [3, null]", k(&["a"])),
+            ("n.tags IN [[1, null]]", none.clone()),
+        ];
+        for (w, want) in cases {
+            assert_eq!(where_keys(&fx, &pi, w), want, "`{w}`");
+        }
+    }
+
+    #[test]
+    fn ql17_list_equality_in_a_write_return_is_three_valued() {
+        // The review's examples, through RETURN with CASE (the same eval_cmp).
+        assert_eq!(
+            eval("CASE WHEN [1, null] = [1, null] THEN 't' ELSE 'f' END"),
+            Some(s("f"))
+        );
+        assert_eq!(
+            eval("CASE WHEN [1, null] <> [1, null] THEN 't' ELSE 'f' END"),
+            Some(s("f"))
+        );
+        assert_eq!(
+            eval("CASE WHEN [1, null] <> [2, null] THEN 't' ELSE 'f' END"),
+            Some(s("t"))
+        );
+        assert_eq!(
+            eval("CASE WHEN [1, null] = [2, null] THEN 't' ELSE 'f' END"),
+            Some(s("f"))
+        );
     }
 }

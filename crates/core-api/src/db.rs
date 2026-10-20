@@ -22,7 +22,7 @@ use core_storage::v8::encode::{
     archived_views_to_owned, decode_last_change_bytes, decode_meta, encode_v8, V8Meta,
 };
 use core_storage::v8::seam::TopologyView;
-use core_storage::wal::{decode_all, encode_record, WalRecord};
+use core_storage::wal::{decode_all, encode_record, try_encode_record, WalRecord};
 use core_storage::EdgePropsView;
 use core_storage::{
     namespace_of_value, ColumnStore, Direction, EdgeProps, GraphError, IdMap, Interner, Result,
@@ -6043,7 +6043,9 @@ impl<F: Fs> GraphDb<F> {
             v11_only_value(&rec).is_none(),
             "a format-V11 value reached the WAL append without the dense rewrite"
         );
-        let frame = encode_record(&rec);
+        // Fallible only for a record that carries a null property value, which
+        // `rewrite_wal_dense` has already refused; nothing is appended then.
+        let frame = try_encode_record(&rec)?;
         self.fs.append(FileId::Wal, &frame)?;
         // The cursor advances by exactly the bytes appended: these frames are
         // ours and already applied, so a later refresh must not replay them.

@@ -247,3 +247,48 @@ fn null_as_a_whole_property_value_keeps_its_existing_errors() {
     assert!(db.node_info("c").is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The serde JSON form of every `Value` variant (external tagging, as the
+/// `/subscribe` stream carries rows). Pinned so a reorder or rename fails here
+/// as well as in core-storage's bincode pin.
+#[test]
+fn value_serde_json_form_is_pinned() {
+    let cases: Vec<(Value, &str)> = vec![
+        (Value::Int(-7), r#"{"Int":-7}"#),
+        (Value::Float(1.5), r#"{"Float":1.5}"#),
+        (Value::Str("s".into()), r#"{"Str":"s"}"#),
+        (Value::Bool(true), r#"{"Bool":true}"#),
+        (Value::List(vec![Value::Int(1)]), r#"{"List":[{"Int":1}]}"#),
+        (
+            Value::Map(BTreeMap::from([("k".to_string(), Value::Int(2))])),
+            r#"{"Map":{"k":{"Int":2}}}"#,
+        ),
+        (Value::Date(19_737), r#"{"Date":19737}"#),
+        (
+            Value::LocalDateTime(1_705_322_096_789_012),
+            r#"{"LocalDateTime":1705322096789012}"#,
+        ),
+        (
+            Value::DateTime {
+                micros_utc: 1_705_302_296_789_012,
+                offset_seconds: 19_800,
+            },
+            r#"{"DateTime":{"micros_utc":1705302296789012,"offset_seconds":19800}}"#,
+        ),
+        (
+            Value::Duration {
+                months: 14,
+                days: 3,
+                nanos: 14_706_789_000_000,
+            },
+            r#"{"Duration":{"months":14,"days":3,"nanos":14706789000000}}"#,
+        ),
+        (Value::Binary(vec![0xDE, 0xAD]), r#"{"Binary":[222,173]}"#),
+        (Value::Null, r#""Null""#),
+    ];
+    for (v, json) in cases {
+        assert_eq!(serde_json::to_string(&v).unwrap(), json);
+        let back: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(back, v);
+    }
+}

@@ -41,6 +41,53 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// openCypher equality, three-valued: `None` is null (unknown).
+///
+/// A null on either side is null. Two lists (or maps) with a definite
+/// mismatch — a different length, different keys, or an element pair that is
+/// unequal — are `false` even when other elements are null; with no mismatch
+/// but a null pair the answer is null: `[1, null] = [1, null]` is null,
+/// `[1, null] = [2, null]` is false. Everything else is [`values_equal`].
+///
+/// A comparison reads null as "drop the row", so this is what keeps a null
+/// list element and a missing property (`[n.missing] <> [5]` and
+/// `n.missing <> 5`) agreeing.
+pub fn equality(a: &Value, b: &Value) -> Option<bool> {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::List(x), Value::List(y)) => {
+            if x.len() != y.len() {
+                return Some(false);
+            }
+            all_equal(x.iter().zip(y.iter()))
+        }
+        (Value::Map(x), Value::Map(y)) => {
+            if x.len() != y.len() || x.keys().zip(y.keys()).any(|(k1, k2)| k1 != k2) {
+                return Some(false);
+            }
+            all_equal(x.values().zip(y.values()))
+        }
+        _ => Some(values_equal(a, b)),
+    }
+}
+
+/// Fold element equalities: any `false` wins, then any null, else `true`.
+fn all_equal<'a>(pairs: impl Iterator<Item = (&'a Value, &'a Value)>) -> Option<bool> {
+    let mut unknown = false;
+    for (l, r) in pairs {
+        match equality(l, r) {
+            Some(false) => return Some(false),
+            None => unknown = true,
+            Some(true) => {}
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(true)
+    }
+}
+
 fn class_rank(v: &Value) -> u8 {
     match v {
         Value::Int(_) | Value::Float(_) => 0,
@@ -181,6 +228,7 @@ pub fn index_list(base: Option<Value>, index: Option<Value>) -> Option<Value> {
 /// [`Value::Null`] element is query null (`None`). Every place that takes an
 /// element out of a list goes through this, so `Some(Value::Null)` never
 /// reaches a row, a comparison or `IS NULL`.
+#[inline]
 pub fn element(v: Value) -> Option<Value> {
     match v {
         Value::Null => None,
@@ -190,8 +238,14 @@ pub fn element(v: Value) -> Option<Value> {
 
 /// A query value stored as a list element or map value: query null becomes
 /// [`Value::Null`].
+#[inline]
 pub fn into_element(v: Option<Value>) -> Value {
-    v.unwrap_or(Value::Null)
+    // A `match`, not `unwrap_or`: no default value is built and dropped for
+    // the common non-null element.
+    match v {
+        Some(v) => v,
+        None => Value::Null,
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +343,49 @@ mod tests {
                 &Value::List(vec![Value::Str("a".into())]),
             ),
             Less
+        );
+    }
+
+    #[test]
+    fn equality_is_three_valued_over_null_elements() {
+        use super::equality;
+        let l = |items: Vec<Value>| Value::List(items);
+        let (one, two) = (Value::Int(1), Value::Int(2));
+        assert_eq!(equality(&Value::Null, &Value::Null), None);
+        assert_eq!(equality(&one, &Value::Null), None);
+        assert_eq!(
+            equality(
+                &l(vec![one.clone(), Value::Null]),
+                &l(vec![one.clone(), Value::Null])
+            ),
+            None
+        );
+        assert_eq!(
+            equality(
+                &l(vec![one.clone(), Value::Null]),
+                &l(vec![two.clone(), Value::Null])
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            equality(&l(vec![one.clone(), Value::Null]), &l(vec![one.clone()])),
+            Some(false)
+        );
+        assert_eq!(
+            equality(
+                &l(vec![one.clone(), two.clone()]),
+                &l(vec![one.clone(), two.clone()])
+            ),
+            Some(true)
+        );
+        let m = |v: Value| Value::Map([("a".to_string(), v)].into_iter().collect());
+        assert_eq!(equality(&m(Value::Null), &m(Value::Null)), None);
+        assert_eq!(equality(&m(Value::Null), &m(one.clone())), None);
+        let other_key = Value::Map([("b".to_string(), Value::Null)].into_iter().collect());
+        assert_eq!(equality(&m(Value::Null), &other_key), Some(false));
+        assert_eq!(
+            equality(&l(vec![l(vec![Value::Null])]), &l(vec![l(vec![one])])),
+            None
         );
     }
 

@@ -1,4 +1,4 @@
-use crate::types::Value;
+use crate::types::{GraphError, Result, Value};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -206,19 +206,61 @@ impl WalRecord {
     }
 }
 
+impl WalRecord {
+    /// True if a property value this record carries is, or holds, a
+    /// [`Value::Null`]. A stored property is never null, so such a record is
+    /// never framed.
+    pub fn carries_null(&self) -> bool {
+        match self {
+            WalRecord::InsertNode { props, .. } => props.iter().any(|(_, v)| v.contains_null()),
+            WalRecord::InsertNodeId { props, .. } => props.iter().any(|(_, v)| v.contains_null()),
+            WalRecord::SetProp { value, .. } | WalRecord::SetPropId { value, .. } => {
+                value.contains_null()
+            }
+            WalRecord::Batch(inner) => inner.iter().any(WalRecord::carries_null),
+            _ => false,
+        }
+    }
+}
+
 /// Encode a single WAL record as a framed byte sequence: `[len u32][crc u32][payload]`.
+///
+/// A record that carries a null property value is refused with an error: the
+/// write path refuses it first (`rewrite_wal_dense` in core-api), and this is
+/// the backstop that keeps one off disk if that check is ever bypassed.
 ///
 /// # Panics (debug builds)
 /// Panics if `rec` is a `Batch` that contains a nested `Batch` — nested batches
 /// are semantically invalid.
-pub fn encode_record(rec: &WalRecord) -> Vec<u8> {
+pub fn try_encode_record(rec: &WalRecord) -> Result<Vec<u8>> {
     if let WalRecord::Batch(inner) = rec {
         debug_assert!(
             !inner.iter().any(|r| matches!(r, WalRecord::Batch(_))),
             "nested Batch is invalid: a Batch may not contain another Batch"
         );
     }
-    let payload = bincode::serialize(rec).expect("walrecord serialize cannot fail");
+    if rec.carries_null() {
+        return Err(GraphError::Corrupt {
+            detail: "refusing to write a WAL frame whose property value holds a null".into(),
+        });
+    }
+    let payload = bincode::serialize(rec).map_err(|e| GraphError::Corrupt {
+        detail: format!("WAL record failed to encode: {e}"),
+    })?;
+    Ok(frame(payload))
+}
+
+/// [`try_encode_record`] for a record known to carry no property value that
+/// holds a null: every record the engine builds itself, and tests.
+///
+/// # Panics
+/// Panics if the record carries a null. The user write path calls
+/// [`try_encode_record`].
+pub fn encode_record(rec: &WalRecord) -> Vec<u8> {
+    try_encode_record(rec).expect("walrecord encode")
+}
+
+fn frame(payload: Vec<u8>) -> Vec<u8> {
     let crc = crc32fast::hash(&payload);
     let mut out = Vec::with_capacity(8 + payload.len());
     out.extend((payload.len() as u32).to_le_bytes());
@@ -878,24 +920,57 @@ mod tests {
         );
     }
 
+    fn set_prop_id(value: Value) -> WalRecord {
+        WalRecord::SetPropId {
+            id: 0,
+            field: 0,
+            value,
+        }
+    }
+
+    #[test]
+    fn a_null_value_is_refused_by_the_frame_encoder() {
+        // The write path refuses a null before it reaches the encoder; if one
+        // ever got this far the encoder returns an error rather than write a
+        // frame holding a value that can never be stored.
+        let null_list = Value::List(vec![Value::Int(1), Value::Null]);
+        for rec in [
+            set_prop_id(null_list.clone()),
+            WalRecord::InsertNode {
+                label: "L".into(),
+                key: "k".into(),
+                props: vec![("p".into(), Value::Null)],
+            },
+            WalRecord::Batch(vec![
+                WalRecord::DeleteNode { key: "x".into() },
+                WalRecord::SetProp {
+                    key: "k".into(),
+                    field: "p".into(),
+                    value: null_list.clone(),
+                },
+            ]),
+        ] {
+            assert!(rec.carries_null(), "{rec:?}");
+            let err = try_encode_record(&rec).expect_err("a null is never framed");
+            assert!(err.to_string().contains("null"), "{err}");
+        }
+        assert!(!set_prop_id(Value::Int(1)).carries_null());
+    }
+
+    #[test]
+    fn every_storable_value_variant_round_trips_through_a_frame() {
+        for v in crate::types::pinned::storable_values() {
+            let frame = try_encode_record(&set_prop_id(v.clone())).unwrap();
+            let (recs, used) = decode_all(&frame);
+            assert_eq!(used, frame.len());
+            assert_eq!(recs, vec![set_prop_id(v)]);
+        }
+    }
+
     /// Pin discriminant 23 (SetEdgeCount).
     ///
     /// **If this test fails you have broken every existing database file.**
     /// WAL variants must ONLY be appended — never reordered or inserted.
-    #[test]
-    #[should_panic(expected = "walrecord serialize cannot fail")]
-    fn a_null_value_is_never_encoded_into_a_frame() {
-        // The write path refuses a null before it reaches the encoder; if one
-        // ever got this far the encoder stops rather than write bytes no
-        // release can decode.
-        let rec = WalRecord::SetPropId {
-            id: 0,
-            field: 0,
-            value: Value::List(vec![Value::Int(1), Value::Null]),
-        };
-        let _ = encode_record(&rec);
-    }
-
     #[test]
     fn set_edge_count_discriminant_pinned() {
         let r = WalRecord::SetEdgeCount {

@@ -644,7 +644,7 @@ fn columns_merge_to_data(
 /// together: the columns carry ids, the table carries the vocabulary.
 fn columnstore_to_data(store: &ColumnStore) -> Result<(ColumnsData, StringTableData)> {
     let mut buf = Vec::new();
-    store.pack(&mut buf);
+    store.pack(&mut buf)?;
     let (mut data, strings) = decode_all_columns(&buf)?;
     // Post-process: promote Mixed columns that are pure all-float lists of equal
     // dimension to ColumnData::Vector for zero-copy raw-f64 access (B2).
@@ -1382,4 +1382,24 @@ pub fn archived_hnsw_to_owned(
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod null_backstop_tests {
+    use super::columnstore_to_data;
+    use crate::types::Value;
+    use crate::ColumnStore;
+
+    #[test]
+    fn the_v8_column_encoder_refuses_a_null_value() {
+        let mut store = ColumnStore::default();
+        store.set(0, "ok", Value::Int(1));
+        store.set(0, "tags", Value::List(vec![Value::Null]));
+        let err = columnstore_to_data(&store).expect_err("a null never reaches a snapshot");
+        assert!(err.to_string().contains("null"), "{err}");
+        // The same store without the null encodes.
+        let mut clean = ColumnStore::default();
+        clean.set(0, "tags", Value::List(vec![Value::Int(1)]));
+        assert!(columnstore_to_data(&clean).is_ok());
+    }
 }

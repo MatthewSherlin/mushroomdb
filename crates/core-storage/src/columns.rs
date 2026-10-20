@@ -706,7 +706,7 @@ impl Column {
         }
     }
 
-    fn pack(&self, intern: &StrIntern, out: &mut Vec<u8>) {
+    fn pack(&self, intern: &StrIntern, out: &mut Vec<u8>) -> StoreResult<()> {
         debug_assert!(
             !matches!(
                 self,
@@ -787,13 +787,19 @@ impl Column {
                 present.pack(out);
             }
             Column::Mixed(map) => {
+                if map.values().any(Value::contains_null) {
+                    return Err(null_in_column());
+                }
                 out.push(4);
-                let blob = bincode::serialize(map).expect("mixed column serialize cannot fail");
+                let blob = bincode::serialize(map).map_err(|e| GraphError::Corrupt {
+                    detail: format!("mixed column failed to encode: {e}"),
+                })?;
                 push_u32(out, blob.len() as u32);
                 out.extend_from_slice(&blob);
             }
         }
         let _ = intern;
+        Ok(())
     }
 
     fn unpack(src: &[u8], pos: &mut usize) -> StoreResult<Self> {
@@ -1167,15 +1173,19 @@ impl ColumnStore {
     }
 
     /// V7 packed columns: intern table, then sorted field name + typed payload.
-    pub(crate) fn pack(&self, out: &mut Vec<u8>) {
+    ///
+    /// Refuses a column holding a null value: the write path never lets one
+    /// in, and this keeps one off disk if that check is ever bypassed.
+    pub(crate) fn pack(&self, out: &mut Vec<u8>) -> StoreResult<()> {
         self.intern.pack(out);
         let mut fields: Vec<&String> = self.cols.keys().collect();
         fields.sort();
         push_u32(out, fields.len() as u32);
         for f in fields {
             push_str(out, f);
-            self.cols[f].pack(&self.intern, out);
+            self.cols[f].pack(&self.intern, out)?;
         }
+        Ok(())
     }
 
     pub(crate) fn unpack(src: &[u8]) -> StoreResult<(Self, usize)> {
@@ -1199,9 +1209,23 @@ impl ColumnStore {
     }
 }
 
+/// The refusal a column encoder gives a null value (query-only, never stored).
+fn null_in_column() -> GraphError {
+    GraphError::Corrupt {
+        detail: "refusing to encode a column whose property value holds a null".into(),
+    }
+}
+
 impl Serialize for ColumnStore {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
+        use serde::ser::{Error, SerializeStruct};
+        let holds_null = self.cols.values().any(|c| match c {
+            Column::Mixed(map) => map.values().any(Value::contains_null),
+            _ => false,
+        });
+        if holds_null {
+            return Err(S::Error::custom(null_in_column()));
+        }
         let mut state = serializer.serialize_struct("ColumnStore", 1)?;
         state.serialize_field("cols", &self.to_wire())?;
         state.end()
@@ -1358,12 +1382,38 @@ mod tests {
     #[test]
     fn a_null_value_is_never_encoded_into_a_column() {
         // The write path refuses a null before it reaches the store. If one
-        // got into a column anyway, encoding the store fails instead of
-        // writing bytes no release can decode.
+        // got into a column anyway, both column encoders refuse it: `pack`
+        // (the v7/v8 snapshot form) and the serde form.
         let mut store = ColumnStore::default();
         store.set(0, "tags", Value::List(vec![Value::Int(1), Value::Null]));
         assert!(store.is_mixed("tags"));
+        let mut buf = Vec::new();
+        let err = store.pack(&mut buf).expect_err("pack refuses a null");
+        assert!(err.to_string().contains("null"), "{err}");
         assert!(bincode::serialize(&store).is_err());
+    }
+
+    #[test]
+    fn every_storable_value_variant_round_trips_through_both_column_encoders() {
+        let mut store = ColumnStore::default();
+        for (node, v) in crate::types::pinned::storable_values()
+            .into_iter()
+            .enumerate()
+        {
+            store.set(node as u32, "mixed", v);
+        }
+        let check = |back: &ColumnStore| {
+            for (node, v) in crate::types::pinned::storable_values().iter().enumerate() {
+                assert_eq!(back.get(node as u32, "mixed"), Some(v));
+            }
+        };
+        let mut buf = Vec::new();
+        store.pack(&mut buf).unwrap();
+        let (back, used) = ColumnStore::unpack(&buf).unwrap();
+        assert_eq!(used, buf.len());
+        check(&back);
+        let back: ColumnStore = bincode::deserialize(&bincode::serialize(&store).unwrap()).unwrap();
+        check(&back);
     }
 
     #[test]
@@ -1429,7 +1479,7 @@ mod tests {
 
     fn pack_round_trip(col: &Column, intern: &StrIntern) -> Column {
         let mut buf = Vec::new();
-        col.pack(intern, &mut buf);
+        col.pack(intern, &mut buf).unwrap();
         let mut pos = 0;
         let back = Column::unpack(&buf, &mut pos).unwrap();
         assert_eq!(pos, buf.len());
@@ -1564,7 +1614,7 @@ mod tests {
         c.set(0, "mix", Value::Date(1));
         c.set(1, "mix", Value::Binary(vec![3]));
         let mut buf = Vec::new();
-        c.pack(&mut buf);
+        c.pack(&mut buf).unwrap();
         let (back, consumed) = ColumnStore::unpack(&buf).unwrap();
         assert_eq!(consumed, buf.len());
         let via_serde: ColumnStore =
@@ -1593,7 +1643,7 @@ mod tests {
         ] {
             let col = Column::from_first(0, v, &mut intern);
             let mut buf = Vec::new();
-            col.pack(&intern, &mut buf);
+            col.pack(&intern, &mut buf).unwrap();
             for cut in 1..buf.len() {
                 let mut pos = 0;
                 assert!(Column::unpack(&buf[..cut], &mut pos).is_err(), "cut {cut}");
@@ -1619,7 +1669,7 @@ mod tests {
         c.set(1, "mix", Value::Str("x".into()));
         c.set(3, "tags", Value::List(vec![Value::Int(1)]));
         let mut buf = Vec::new();
-        c.pack(&mut buf);
+        c.pack(&mut buf).unwrap();
         let (back, consumed) = ColumnStore::unpack(&buf).unwrap();
         assert_eq!(consumed, buf.len());
         assert_eq!(back.get(0, "name"), Some(&Value::Str("ada".into())));
