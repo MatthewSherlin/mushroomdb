@@ -6796,4 +6796,137 @@ async fn bad_tagged_payloads_are_errors_naming_the_field() {
         "a refused write appended to the WAL"
     );
     assert_eq!(db.read().node_count(), 1);
+
+// ---- CORS (HO-03) ----
+
+fn cors_app(spec: Option<&str>, token: Option<&str>, name: &str) -> Router {
+    let db = SharedDb::open(&tmp(name)).unwrap();
+    let layer = spec.and_then(|s| server::parse_cors_origins(s).unwrap());
+    server::router_with_cors(db, token.map(String::from), layer)
+}
+
+fn preflight(origin: &str) -> Request<Body> {
+    Request::builder()
+        .method("OPTIONS")
+        .uri("/query")
+        .header("origin", origin)
+        .header("access-control-request-method", "POST")
+        .header(
+            "access-control-request-headers",
+            "authorization,content-type",
+        )
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cors_wildcard_adds_header() {
+    let app = cors_app(Some("*"), None, "cors-wild");
+    let res = app.oneshot(preflight("https://app.example")).await.unwrap();
+    assert!(res.status().is_success());
+    let h = res.headers();
+    assert_eq!(h["access-control-allow-origin"], "*");
+    assert!(h.get("access-control-allow-credentials").is_none());
+}
+
+#[tokio::test]
+async fn cors_unset_no_header() {
+    let app = cors_app(None, None, "cors-unset");
+    let mut req = get("/health");
+    req.headers_mut()
+        .insert("origin", "https://app.example".parse().unwrap());
+    let res = app.oneshot(req).await.unwrap();
+    assert!(res
+        .headers()
+        .keys()
+        .all(|k| !k.as_str().starts_with("access-control-")));
+}
+
+#[tokio::test]
+async fn cors_unset_responses_match_plain_router() {
+    let plain = open("cors-plain").0;
+    let unset = cors_app(None, None, "cors-plain2");
+    let mut seen = Vec::new();
+    for app in [plain, unset] {
+        let mut req = get("/health");
+        req.headers_mut()
+            .insert("origin", "https://app.example".parse().unwrap());
+        let res = app.oneshot(req).await.unwrap();
+        let mut names: Vec<String> = res.headers().keys().map(|k| k.to_string()).collect();
+        names.sort();
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        seen.push((names, body.len()));
+    }
+    assert_eq!(seen[0], seen[1]);
+}
+
+#[tokio::test]
+async fn cors_explicit_origin_allows_credentials_and_only_listed_origins() {
+    let app = cors_app(
+        Some("https://app.example, http://localhost:3000"),
+        Some("secret"),
+        "cors-list",
+    );
+    let res = app
+        .clone()
+        .oneshot(preflight("https://app.example"))
+        .await
+        .unwrap();
+    let h = res.headers();
+    assert_eq!(h["access-control-allow-origin"], "https://app.example");
+    assert_eq!(h["access-control-allow-credentials"], "true");
+    let vary = res.headers().get_all("vary");
+    assert!(vary
+        .iter()
+        .any(|v| v.to_str().unwrap().to_ascii_lowercase().contains("origin")));
+    let res = app
+        .oneshot(preflight("https://evil.example"))
+        .await
+        .unwrap();
+    for name in [
+        "access-control-allow-origin",
+        "access-control-allow-credentials",
+        "access-control-allow-methods",
+        "access-control-allow-headers",
+    ] {
+        assert!(
+            res.headers().get(name).is_none(),
+            "{name} on disallowed origin"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cors_401_to_disallowed_origin_has_no_cors_headers() {
+    let app = cors_app(Some("https://app.example"), Some("secret"), "cors-401");
+    let mut req = json_req("POST", "/query", json!({"cypher": "MATCH (n) RETURN n"}));
+    req.headers_mut()
+        .insert("origin", "https://evil.example".parse().unwrap());
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert!(res
+        .headers()
+        .keys()
+        .all(|k| !k.as_str().starts_with("access-control-")));
+}
+
+#[tokio::test]
+async fn cors_preflight_needs_no_token_but_actual_request_does() {
+    let app = cors_app(Some("https://app.example"), Some("secret"), "cors-auth");
+    let res = app
+        .clone()
+        .oneshot(preflight("https://app.example"))
+        .await
+        .unwrap();
+    assert!(res.status().is_success());
+    // The real request without a token is still refused, and says so to the page.
+    let mut req = json_req("POST", "/query", json!({"cypher": "MATCH (n) RETURN n"}));
+    req.headers_mut()
+        .insert("origin", "https://app.example".parse().unwrap());
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        res.headers()["access-control-allow-origin"],
+        "https://app.example"
+    );
 }

@@ -55,6 +55,11 @@ use tower_http::services::ServeDir;
 /// `tokio::task::spawn_blocking` and drop the write guard before `.await`.
 /// Reads stay on the worker (neighborhood is µs). `suggest` and `algo`
 /// already use the blocking pool.
+///
+/// Every `router_*` entry point reads `MUSHROOMDB_CORS_ORIGINS` (except
+/// [`router_with_cors`], which takes the layer explicitly). Fail-fast on an
+/// invalid value holds only for the CLI; a library caller gets CORS off and an
+/// error log. Validate with [`crate::cors_layer_from_env`] first to fail early.
 pub fn router(db: SharedDb) -> Router {
     router_with_auth(db, None)
 }
@@ -90,6 +95,26 @@ pub fn router_with_ready_flag(
         default_advertise_addr(),
         false,
         ready,
+    )
+}
+
+/// [`router_with_auth`] with an explicit CORS layer (see [`crate::parse_cors_origins`]).
+/// `None` adds no CORS headers. The other routers read `MUSHROOMDB_CORS_ORIGINS`
+/// instead; this one ignores the environment.
+pub fn router_with_cors(
+    db: SharedDb,
+    token: Option<String>,
+    cors: Option<tower_http::cors::CorsLayer>,
+) -> Router {
+    build_app_with_cors(
+        db,
+        token,
+        HashMap::new(),
+        UiFallback::None,
+        default_advertise_addr(),
+        false,
+        Arc::new(AtomicBool::new(true)),
+        cors,
     )
 }
 
@@ -691,6 +716,8 @@ fn build_app(
     )
 }
 
+/// Reads `MUSHROOMDB_CORS_ORIGINS`. An invalid value does not fail here: the CLI
+/// validates before opening the store; other callers get CORS off plus an error log.
 fn build_app_with_ready(
     db: SharedDb,
     token: Option<String>,
@@ -699,6 +726,26 @@ fn build_app_with_ready(
     addr: SocketAddr,
     tls_active: bool,
     ready: Arc<AtomicBool>,
+) -> Router {
+    // The CLI validates the variable before it opens the store; an invalid value
+    // reaching here (library use) fails closed: no CORS, and an error logged.
+    let cors = crate::cors::cors_layer_from_env().unwrap_or_else(|e| {
+        tracing::error!("{e}; CORS disabled");
+        None
+    });
+    build_app_with_cors(db, token, role_tokens, ui, addr, tls_active, ready, cors)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_app_with_cors(
+    db: SharedDb,
+    token: Option<String>,
+    role_tokens: HashMap<String, String>,
+    ui: UiFallback,
+    addr: SocketAddr,
+    tls_active: bool,
+    ready: Arc<AtomicBool>,
+    cors: Option<tower_http::cors::CorsLayer>,
 ) -> Router {
     debug_assert!(
         !db.read().has_event_sink(),
@@ -815,14 +862,23 @@ fn build_app_with_ready(
         #[cfg(feature = "embed-ui")]
         UiFallback::Embedded => app.fallback(embedded_fallback),
     };
-    app.layer(middleware::from_fn_with_state(state, auth_middleware))
+    let app = app
+        .layer(middleware::from_fn_with_state(state, auth_middleware))
         // Outside auth, so a 401 is logged too — an unauthenticated flood is
         // exactly the thing an operator needs to see.
         .layer(middleware::from_fn(log_middleware))
         // Cap request bodies (default axum limit is only 2 MiB; we allow larger
         // ingest batches but reject multi-GB bodies that would OOM the collector
         // before any handler runs).
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES));
+    // Outermost: a preflight is answered here, before auth (it carries no
+    // credentials), and a 401 still gets CORS headers so a page can read it.
+    match cors {
+        Some(cors) => app
+            .layer(cors)
+            .layer(middleware::from_fn(crate::cors::strip_unless_allowed)),
+        None => app,
+    }
 }
 
 /// Maximum accepted HTTP request body size (64 MiB). Large enough for batched

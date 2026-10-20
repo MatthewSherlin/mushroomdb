@@ -26,6 +26,10 @@ that cookie itself when it answers an explorer page to a request that carried th
 token, so a browser opened with `?token=` stays signed in. The header is read first, then the
 query, then the cookie. Grants access to all endpoints.
 
+**Cross-origin pages:** set `MUSHROOMDB_CORS_ORIGINS` to let a browser page on another origin call the API
+(`*`, or a comma-separated list of origins). Unset, no CORS headers are sent. It does not protect
+`/watch`; see [Browser access (CORS)](deployment.md#browser-access-cors).
+
 **Role-bound tokens** (`--role-token TOKEN:ROLE` / `MUSHROOMDB_ROLE_TOKENS="tok1:role1,tok2:role2"`):
 read the same three ways, though the server never sets the cookie for one. A role token
 receives a node-visibility mask derived from the
