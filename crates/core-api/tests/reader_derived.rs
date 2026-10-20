@@ -204,29 +204,141 @@ fn a_scoped_read_reports_the_same_derived_flags() {
     }
 }
 
-/// Timing of `reader().node_edges` on a 100k-node store carrying derived
-/// edges. Run with `--release -- --ignored --nocapture`.
+/// One batch that moves `c` off its team and back (or the reverse), in the
+/// orders a commit's deltas can arrive. The engine reports each move as a
+/// retraction and a re-derivation of the same edges, in order; keeping only
+/// which kind each was lost the order, and the reader then dropped or flagged
+/// those edges wrongly — in the tail, and after the next fold.
+fn batch_shape_probe(name: &str, setup_off_team: bool, moves: &[&str]) {
+    let dir = tmp(name);
+    let mut db = populated(&dir);
+    if setup_off_team {
+        db.set_prop("c", "team", Value::Str("blue".into())).unwrap();
+    }
+    let mut batch = db.batch();
+    for team_name in moves {
+        batch.set_prop("c", "team", Value::Str((*team_name).into()));
+    }
+    batch.commit().unwrap();
+    // In the delta tail.
+    assert_reader_matches_live(&db);
+    // After the next fold.
+    for i in 0..FOLD_EVERY_K {
+        db.insert_node("Person", &format!("filler{i}"), team("green"))
+            .unwrap();
+    }
+    assert_reader_matches_live(&db);
+    // After a snapshot.
+    db.snapshot().unwrap();
+    assert_reader_matches_live(&db);
+    // After a reopen.
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert_reader_matches_live(&db);
+}
+
+#[test]
+fn a_batch_that_retracts_then_re_derives() {
+    batch_shape_probe("batch-retract-derive", false, &["blue", "red"]);
+}
+
+#[test]
+fn a_batch_that_re_derives_then_retracts() {
+    batch_shape_probe("batch-derive-retract", true, &["red", "blue"]);
+}
+
+#[test]
+fn a_batch_that_does_both_several_times() {
+    batch_shape_probe(
+        "batch-several",
+        false,
+        &["blue", "red", "blue", "red", "blue", "red"],
+    );
+    batch_shape_probe(
+        "batch-several-odd",
+        false,
+        &["blue", "red", "blue", "red", "blue"],
+    );
+}
+
+/// A WAL tail after a snapshot: the reopen replays commits whose derived edges
+/// the reader must report, retracted ones included, with no snapshot of them.
+#[test]
+fn a_snapshot_with_a_wal_tail_then_reopen() {
+    let dir = tmp("wal-tail");
+    let mut db = populated(&dir);
+    db.snapshot().unwrap();
+    db.set_prop("c", "team", Value::Str("blue".into())).unwrap();
+    db.set_prop("d", "team", Value::Str("red".into())).unwrap();
+    db.insert_node("Person", "f", team("red")).unwrap();
+    drop(db);
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert!(assert_reader_matches_live(&db) > 0);
+    // And onward: more commits, a fold, a snapshot.
+    db.set_prop("c", "team", Value::Str("red".into())).unwrap();
+    assert_reader_matches_live(&db);
+    db.snapshot().unwrap();
+    assert_reader_matches_live(&db);
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn median(mut samples: Vec<std::time::Duration>) -> std::time::Duration {
+    samples.sort();
+    samples[samples.len() / 2]
+}
+
+/// Timing probe: open, first read, and 2000 `node_edges` reads on a 100k-node
+/// store holding 900k derived edges (teams of ten), against whichever build
+/// runs it. Set `MDB_BENCH_STORE` to a directory to build the store once and
+/// share it between builds. Run with `--release -- --ignored --nocapture`.
 #[test]
 #[ignore = "timing probe; run in release"]
-fn node_edges_timing_100k() {
-    let dir = tmp("timing");
-    let mut db = GraphDb::open(&dir).unwrap();
-    db.create_rule(team_rule()).unwrap();
-    // Teams of ten: nine derived edges each way per node.
-    for chunk in 0..100 {
-        let mut batch = db.batch();
-        for i in 0..1000 {
-            let n = chunk * 1000 + i;
-            batch.insert_node("Person", &format!("n{n}"), team(&format!("t{}", n / 10)));
+fn reader_derived_bench() {
+    use std::time::Instant;
+    let store = std::env::var("MDB_BENCH_STORE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| tmp("bench"));
+    let clean = store.join("clean");
+    let one_commit = store.join("one-commit");
+    if !clean.exists() {
+        let mut db = GraphDb::open(&clean).unwrap();
+        db.create_rule(team_rule()).unwrap();
+        for chunk in 0..100 {
+            let mut batch = db.batch();
+            for i in 0..1000 {
+                let n = chunk * 1000 + i;
+                batch.insert_node("Person", &format!("n{n}"), team(&format!("t{}", n / 10)));
+            }
+            batch.commit().unwrap();
         }
-        batch.commit().unwrap();
+        db.snapshot().unwrap();
+        drop(db);
+        copy_dir(&clean, &one_commit);
+        let mut db = GraphDb::open(&one_commit).unwrap();
+        db.set_prop("n5", "team", Value::Str("t7".into())).unwrap();
     }
-    db.snapshot().unwrap();
+    let work = tmp("bench-work");
+    let fresh = |from: &std::path::Path, i: usize| {
+        let dir = work.join(format!("{i}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        copy_dir(from, &dir);
+        dir
+    };
     let probes: Vec<String> = (0..2000).map(|i| format!("n{}", i * 50)).collect();
-    let mut samples = Vec::new();
-    for _ in 0..7 {
-        let reader = db.reader();
-        let start = std::time::Instant::now();
+    let read_all = |reader: &mushroomdb::ReaderSnapshot| {
+        let start = Instant::now();
         let mut derived = 0;
         for key in &probes {
             derived += reader
@@ -236,11 +348,71 @@ fn node_edges_timing_100k() {
                 .filter(|e| e.derived)
                 .count();
         }
-        samples.push((start.elapsed(), derived));
+        (start.elapsed(), derived)
+    };
+
+    for (label, from) in [
+        ("open clean snapshot", &clean),
+        ("open snapshot+1 WAL commit", &one_commit),
+    ] {
+        let mut samples = Vec::new();
+        for i in 0..7 {
+            let dir = fresh(from, i);
+            let start = Instant::now();
+            let db = GraphDb::open(&dir).unwrap();
+            samples.push(start.elapsed());
+            drop(db);
+        }
+        eprintln!("BENCH {label}: {:?}", median(samples));
     }
-    samples.sort();
-    eprintln!(
-        "node_edges x2000 median: {:?} (derived seen: {})",
-        samples[3].0, samples[3].1
-    );
+
+    let mut first = Vec::new();
+    for i in 0..7 {
+        let dir = fresh(&clean, i);
+        let db = GraphDb::open(&dir).unwrap();
+        let reader = db.reader();
+        let start = Instant::now();
+        reader.node_edges("n50").unwrap();
+        first.push(start.elapsed());
+    }
+    eprintln!("BENCH first read after open: {:?}", median(first));
+
+    for scenario in ["empty tail", "60-commit tail", "20-batch tail"] {
+        let dir = fresh(&clean, 0);
+        let mut db = GraphDb::open(&dir).unwrap();
+        match scenario {
+            "60-commit tail" => {
+                for c in 0..60 {
+                    db.set_prop(
+                        &format!("n{}", c * 50),
+                        "team",
+                        Value::Str(format!("t{}", c + 1)),
+                    )
+                    .unwrap();
+                }
+            }
+            "20-batch tail" => {
+                for b in 0..20 {
+                    let mut batch = db.batch();
+                    for j in 0..100 {
+                        batch.insert_node(
+                            "Person",
+                            &format!("new{b}-{j}"),
+                            team(&format!("t{}", b * 100 + j)),
+                        );
+                    }
+                    batch.commit().unwrap();
+                }
+            }
+            _ => {}
+        }
+        let reader = db.reader();
+        let first_pass = read_all(&reader).0;
+        let steady: Vec<_> = (0..7).map(|_| read_all(&reader).0).collect();
+        eprintln!(
+            "BENCH 2000 reads, {scenario}: steady {:?} (first pass {:?})",
+            median(steady),
+            first_pass
+        );
+    }
 }

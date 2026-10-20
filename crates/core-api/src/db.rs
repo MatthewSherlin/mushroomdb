@@ -1700,6 +1700,10 @@ pub struct GraphDb<F: Fs> {
     /// `open_at_with`; refreshed every `FOLD_EVERY_K` commits.
     /// `None` only between struct creation and the first fold.
     fold_overlay: Option<Arc<crate::reader::FrozenOverlay>>,
+    /// Whether the engine's provenance began as the snapshot base's PROVENANCE
+    /// section (`restore_v8_base`) — so the base can serve as the root of the
+    /// reader's derived edges — rather than as a decoded legacy snapshot's.
+    engine_from_base: bool,
     /// Per-commit deltas accumulated since the last fold.
     delta_tail: Vec<Arc<crate::reader::CommitDelta>>,
     /// How many commits have occurred since the last fold.
@@ -2449,6 +2453,7 @@ impl<F: Fs> GraphDb<F> {
             total_wal_commits: 0,
             base: None,
             fold_overlay: None,
+            engine_from_base: false,
             delta_tail: Vec::new(),
             commits_since_fold: 0,
             defer_events: false,
@@ -2502,6 +2507,7 @@ impl<F: Fs> GraphDb<F> {
         self.node_ns = Vec::new();
         self.edge_props = Arc::new(EdgeProps::new());
         self.engine = RuleEngine::new();
+        self.engine_from_base = false;
         self.view_store = ViewStore::new();
         self.fulltext = Arc::new(FulltextIndex::new());
         self.prop_index = PropertyIndex::new();
@@ -3251,6 +3257,7 @@ impl<F: Fs> GraphDb<F> {
             .collect::<Result<Vec<_>>>()?;
         self.engine =
             RuleEngine::from_persist(defs, state.provenance, state.rule_tripped, state.rule_fires);
+        self.engine_from_base = false;
         // Candidate indexes are rebuilt lazily on the first mutation (see
         // RuleEngine::on_node_changed).  HNSW blobs and IVF centroids from the
         // snapshot are retained without deserializing so that:
@@ -3383,6 +3390,7 @@ impl<F: Fs> GraphDb<F> {
             })
             .collect::<Result<Vec<_>>>()?;
         self.engine = RuleEngine::from_persist(defs, BTreeMap::new(), rule_tripped, rule_fires);
+        self.engine_from_base = true;
         // C4+C5: provenance, HNSW, and IVF sections are NOT read here.
         // `ensure_v8_base_sections_loaded` reads them on first use from
         // `self.base` (set by the caller immediately after this returns).
@@ -3782,17 +3790,35 @@ impl<F: Fs> GraphDb<F> {
     /// the delta tail. Called automatically every `FOLD_EVERY_K` commits and at
     /// the end of `open_with` / `open_at_with` to prime the reader.
     fn fold_now(&mut self) {
-        let derived = self.derived_at_reload();
+        // What the engine's provenance has done since the last fold, each triple
+        // netted to its final state. Taken on every fold, so it never holds more
+        // than one fold's worth.
+        let changes = self.engine.take_derived_changes();
+        let derived = match &self.fold_overlay {
+            // The previous fold, moved on by what changed since: a fold on the
+            // write path, a refresh, a change of roles. Costs the changes, not
+            // the size of the store's provenance.
+            Some(previous) => previous.derived.extended(changes, &self.base),
+            // A load whose engine began as the snapshot base's provenance: that
+            // section, read where it lies, and replay's changes over it.
+            None if self.engine_from_base && self.base.is_some() => {
+                crate::reader::DerivedEdges::from_base().extended(changes, &self.base)
+            }
+            // Any other load (a store with no snapshot, an as-of view): take
+            // the engine's provenance whole.
+            None => crate::reader::DerivedEdges::from_triples(self.engine.derived_triples()),
+        };
         self.fold_with(derived);
     }
 
-    /// The fold taken on the write path after a commit: the previous fold's
-    /// derived edges with the delta tail applied, rather than the engine's
-    /// provenance read again from the top.
-    fn fold_after_commit(&mut self) {
-        let derived = match &self.fold_overlay {
-            Some(previous) => previous.derived.extended(&self.delta_tail),
-            None => self.derived_at_reload(),
+    /// The fold after a snapshot: the engine's provenance is exactly the
+    /// section just written, so the reader reads that and nothing is layered.
+    fn fold_after_snapshot(&mut self) {
+        let _ = self.engine.take_derived_changes();
+        let derived = if self.base.is_some() {
+            crate::reader::DerivedEdges::from_base()
+        } else {
+            crate::reader::DerivedEdges::from_triples(self.engine.derived_triples())
         };
         self.fold_with(derived);
     }
@@ -3826,25 +3852,6 @@ impl<F: Fs> GraphDb<F> {
         // The fold holds every view value as it stands; what replay or a
         // refresh touched on the way here is not owed to any delta.
         self.view_store.clear_touched();
-    }
-
-    /// The rule-derived edges as this handle has them, for a fold that reloads
-    /// them: open, refresh, snapshot, a change of roles.
-    ///
-    /// While the engine's provenance is still the snapshot base's — nothing
-    /// has mutated it, so its bytes are unread or retained — the reader decodes
-    /// the base's own section when it first needs it: an open must not decode
-    /// provenance for readers that never ask. Once the engine has taken the
-    /// provenance into its live fields the fold copies them.
-    fn derived_at_reload(&self) -> crate::reader::DerivedEdges {
-        use crate::reader::DerivedEdges;
-        let sections_loaded = self
-            .v8_sections_loaded
-            .load(std::sync::atomic::Ordering::Acquire);
-        if self.base.is_some() && (!sections_loaded || self.engine.provenance_is_retained()) {
-            return DerivedEdges::from_base();
-        }
-        DerivedEdges::from_triples(self.engine.derived_triples())
     }
 
     /// The view properties the commit of `rec` left on the nodes it touched,
@@ -3974,6 +3981,7 @@ impl<F: Fs> GraphDb<F> {
             }],
             derived_inserts: Vec::new(),
             derived_deletes: Vec::new(),
+            derived: Default::default(),
             view_values: Vec::new(),
         }));
     }
@@ -6068,16 +6076,26 @@ impl<F: Fs> GraphDb<F> {
         // stored as-is (including any nested Batch / Intern records); the
         // ReaderSnapshot's apply_one function handles all variants.
         {
-            let derived_inserts = engine_deltas
+            // Each triple in the state the commit left it. The engine reports a
+            // retraction and a re-derivation of one edge as two deltas, in
+            // order; reading them as two lists lost that order and made the
+            // edge disappear (or stay) wrongly.
+            let mut net: std::collections::HashMap<(u32, u32, u32), bool> =
+                std::collections::HashMap::new();
+            for d in &engine_deltas {
+                net.insert((d.etype_sym, d.src_id, d.dst_id), d.fired);
+            }
+            let derived_inserts = net
                 .iter()
-                .filter(|d| d.fired)
-                .map(|d| (d.etype_sym, d.src_id, d.dst_id))
+                .filter(|(_, &fired)| fired)
+                .map(|(&triple, _)| triple)
                 .collect();
-            let derived_deletes = engine_deltas
+            let derived_deletes = net
                 .iter()
-                .filter(|d| !d.fired)
-                .map(|d| (d.etype_sym, d.src_id, d.dst_id))
+                .filter(|(_, &fired)| !fired)
+                .map(|(&triple, _)| triple)
                 .collect();
+            let derived = crate::reader::DerivedChanges::from_net(&net);
             // `None`: the commit moved more view values than a delta should
             // carry, so the fold below takes them instead.
             let view_values = self.view_values_of_commit(&rec);
@@ -6086,12 +6104,13 @@ impl<F: Fs> GraphDb<F> {
                 records: vec![rec.clone()],
                 derived_inserts,
                 derived_deletes,
+                derived,
                 view_values: view_values.unwrap_or_default(),
             });
             self.delta_tail.push(delta);
             self.commits_since_fold += 1;
             if fold || self.commits_since_fold >= crate::reader::FOLD_EVERY_K {
-                self.fold_after_commit();
+                self.fold_now();
             }
         }
 
@@ -15317,7 +15336,7 @@ impl<F: Fs> GraphDb<F> {
         // After snapshot the overlay may have changed (V8 merge path clears
         // self.topo and self.props). Refresh the MVCC fold so future readers
         // see the post-snapshot state rather than stale overlay data.
-        self.fold_now();
+        self.fold_after_snapshot();
         // We wrote the snapshot and (unless keep_wal) replaced the WAL, so both
         // markers this handle uses to detect other processes' work must be
         // re-taken from disk. Skipping this would make our own snapshot look

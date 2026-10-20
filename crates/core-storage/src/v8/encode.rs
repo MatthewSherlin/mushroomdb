@@ -1234,6 +1234,36 @@ pub fn decode_provenance_bytes(
     }
 }
 
+/// Every triple of a PROVENANCE section, across rules, as one flat list: the
+/// reader's input for telling which edges are derived, without the per-rule
+/// maps (and their `String` keys, and their ordered sets) that
+/// [`decode_provenance_bytes`] builds.
+///
+/// `None` for bytes that do not validate, which a reader treats as an absent
+/// section, as [`decode_provenance_bytes`] does. A triple two rules own appears
+/// twice.
+pub fn provenance_triples(bytes: &[u8]) -> Option<Vec<(u32, u32, u32)>> {
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    let archived = rkyv::access::<
+        crate::v8::layout::ArchivedProvenanceSectionData,
+        rkyv::rancor::Error,
+    >(bytes)
+    .ok()?;
+    let total = archived.entries.iter().map(|e| e.triples.len()).sum();
+    let mut triples = Vec::with_capacity(total);
+    for entry in archived.entries.iter() {
+        triples.extend(
+            entry
+                .triples
+                .iter()
+                .map(|t| (u32::from(t.etype), u32::from(t.src), u32::from(t.dst))),
+        );
+    }
+    Some(triples)
+}
+
 /// Return type for `archived_rules_meta_to_owned`.
 pub type RulesMetaOwned = (Vec<Vec<u8>>, BTreeMap<String, bool>, BTreeMap<String, u64>);
 
