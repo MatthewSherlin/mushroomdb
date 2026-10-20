@@ -25,7 +25,6 @@
 //! fails the `PULL` with a `FAILURE`; nothing from that `PULL` is sent.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mushroomdb::{is_write_query, GraphError, ResultSet, SharedDb, Transaction, Value};
@@ -34,11 +33,7 @@ use super::{check_depth, MAX_PACK_LEN, TAG_RECORD};
 use crate::connection::{OpenTransaction, ResultCursor};
 use crate::error::BoltError;
 use crate::messages::hello::Identity;
-use crate::messages::route::RoutingConfig;
 use crate::packstream::{PackStruct, PackValue, MAX_DEPTH};
-
-/// Whether `requested` (the `db` field of a request) selects this store.
-pub type DatabaseCheck = Arc<dyn Fn(Option<&str>) -> Result<(), BoltError> + Send + Sync>;
 
 /// How long a statement waits for the store to reach a bookmark.
 pub const DEFAULT_BOOKMARK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -233,7 +228,6 @@ fn tx_role_refusal() -> BoltError {
 #[derive(Clone)]
 pub struct QueryService {
     db: SharedDb,
-    check_database: DatabaseCheck,
     bookmark_timeout: Duration,
 }
 
@@ -244,29 +238,19 @@ impl std::fmt::Debug for QueryService {
 }
 
 impl QueryService {
-    /// `check_database` must refuse every name that does not select this store
-    /// (with `DatabaseNotFound`); a check that accepts everything would let a
-    /// client name a database that does not exist.
-    pub fn new(db: SharedDb, check_database: DatabaseCheck) -> Self {
+    /// The service holds no database check on purpose: which databases a
+    /// connection may name is decided by its `ConnectionConfig::routing`, in
+    /// `Connection`, the same config that answers `ROUTE`. Nothing outside the
+    /// crate can build a service, so nothing outside can supply a permissive
+    /// check.
+    pub(crate) fn new(db: SharedDb) -> Self {
         Self {
             db,
-            check_database,
             bookmark_timeout: DEFAULT_BOOKMARK_TIMEOUT,
         }
     }
 
-    /// A service whose database selection is the routing config's, the one
-    /// `ROUTE` uses: `RUN` names a database as `ROUTE` does, and an unknown one
-    /// fails with the same error. Build it from the config the listener passes
-    /// in `ConnectionConfig::routing`.
-    pub fn for_routing(db: SharedDb, routing: RoutingConfig) -> Self {
-        Self::new(
-            db,
-            Arc::new(move |requested| routing.check_database(requested)),
-        )
-    }
-
-    pub fn with_bookmark_timeout(mut self, timeout: Duration) -> Self {
+    pub(crate) fn with_bookmark_timeout(mut self, timeout: Duration) -> Self {
         self.bookmark_timeout = timeout;
         self
     }
@@ -280,7 +264,6 @@ impl QueryService {
         identity: &Identity,
         request: &RunRequest,
     ) -> Result<Box<dyn ResultCursor>, BoltError> {
-        (self.check_database)(request.database.as_deref())?;
         let params = request.params()?;
         let is_write = is_write_query(&request.query).map_err(BoltError::SyntaxError)?;
         self.wait_for_bookmarks(&request.bookmarks)?;
@@ -763,6 +746,7 @@ mod tests {
         use crate::connection::Connection;
         use crate::messages::hello::{AuthToken, Hello, TokenAuthenticator};
         use crate::messages::{ClientMessage, MessageKind, ServerMessage};
+        use std::sync::Arc;
 
         let mut conn = Connection::new(
             Arc::new(TokenAuthenticator::new(None, Default::default())),

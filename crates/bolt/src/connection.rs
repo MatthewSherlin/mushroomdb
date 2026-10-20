@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mushroomdb::Value;
+use mushroomdb::{SharedDb, Value};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -43,7 +43,7 @@ use crate::handshake;
 use crate::messages::hello::{hello_success, Identity, TokenAuthenticator};
 use crate::messages::reset::reset_success;
 use crate::messages::route::{requested_database, RoutingConfig};
-use crate::messages::run::{QueryService, RunRequest, StreamRequest};
+use crate::messages::run::{QueryService, RunRequest, StreamRequest, DEFAULT_BOOKMARK_TIMEOUT};
 use crate::messages::{ClientMessage, MessageKind, ServerMessage};
 use crate::packstream::PackValue;
 
@@ -189,9 +189,15 @@ impl Connection {
         self
     }
 
-    /// Gives the connection a store to run `RUN` against.
-    pub fn with_query_service(mut self, service: Arc<QueryService>) -> Self {
-        self.service = Some(service);
+    /// Gives the connection a store to run `RUN` against. Which database names
+    /// a `RUN` may carry is decided by the connection's routing config (see
+    /// [`with_routing`](Self::with_routing)), the one that answers `ROUTE`.
+    /// With none, only an absent or empty name selects the store.
+    /// `bookmark_timeout` is how long a statement waits for a bookmark.
+    pub fn with_database(mut self, db: SharedDb, bookmark_timeout: Duration) -> Self {
+        self.service = Some(Arc::new(
+            QueryService::new(db).with_bookmark_timeout(bookmark_timeout),
+        ));
         self
     }
 
@@ -448,6 +454,9 @@ impl Connection {
             Ok(request) => request,
             Err(err) => return self.violate(err),
         };
+        if let Err(err) = select_database(self.routing.as_ref(), request.database.as_deref()) {
+            return self.fail(err);
+        }
         let started = Instant::now();
         let in_tx = matches!(self.state, ConnectionState::InTx { .. });
         let opened = match &mut self.state {
@@ -564,6 +573,22 @@ impl Connection {
     }
 }
 
+/// Whether a `RUN`'s `db` selects the store: the routing config's rule, which
+/// is also `ROUTE`'s. A connection with no routing config does not know the
+/// store's name, so it accepts only an absent or empty one.
+fn select_database(
+    routing: Option<&RoutingConfig>,
+    requested: Option<&str>,
+) -> Result<(), BoltError> {
+    match (routing, requested) {
+        (Some(routing), requested) => routing.check_database(requested),
+        (None, None | Some("")) => Ok(()),
+        (None, Some(name)) => Err(BoltError::DatabaseNotFound(format!(
+            "database {name:?} does not exist"
+        ))),
+    }
+}
+
 fn elapsed_millis(since: Instant) -> i64 {
     i64::try_from(since.elapsed().as_millis()).unwrap_or(i64::MAX)
 }
@@ -589,6 +614,8 @@ pub struct ConnectionConfig {
     pub pre_auth_max_message_bytes: usize,
     /// Answers `ROUTE`. `None` leaves `ROUTE` unsupported.
     pub routing: Option<RoutingConfig>,
+    /// How long a statement waits for the store to reach a bookmark.
+    pub bookmark_timeout: Duration,
 }
 
 impl Default for ConnectionConfig {
@@ -601,6 +628,7 @@ impl Default for ConnectionConfig {
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             pre_auth_max_message_bytes: DEFAULT_PRE_AUTH_MAX_MESSAGE_BYTES,
             routing: None,
+            bookmark_timeout: DEFAULT_BOOKMARK_TIMEOUT,
         }
     }
 }
@@ -643,7 +671,8 @@ where
     serve_connection_with(stream, authenticator, connection_id, config, None).await
 }
 
-/// [`serve_connection`] with a store for `RUN` to run against. Messages are
+/// [`serve_connection`] with a store for `RUN` to run against; the database
+/// names `RUN` accepts come from `config.routing`, as `ROUTE`'s do. Messages are
 /// then handled on a blocking thread, because a statement can wait on a write
 /// lock, an fsync or a bookmark.
 pub async fn serve_connection_with<S>(
@@ -651,7 +680,7 @@ pub async fn serve_connection_with<S>(
     authenticator: Arc<TokenAuthenticator>,
     connection_id: String,
     config: ConnectionConfig,
-    service: Option<Arc<QueryService>>,
+    database: Option<SharedDb>,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -679,11 +708,11 @@ where
         return Ok(());
     };
 
-    let blocking = service.is_some();
+    let blocking = database.is_some();
     let mut connection = Connection::new(authenticator, config.tx_timeout, connection_id, version)
         .with_routing(config.routing.clone());
-    if let Some(service) = service {
-        connection = connection.with_query_service(service);
+    if let Some(database) = database {
+        connection = connection.with_database(database, config.bookmark_timeout);
     }
     let mut buf: Vec<u8> = Vec::new();
     // When the bytes now in `buf` began to wait for the rest of their message.

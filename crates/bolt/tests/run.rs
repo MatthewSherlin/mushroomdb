@@ -10,7 +10,8 @@ use bolt::connection::{
 use bolt::error::BoltError;
 use bolt::framing;
 use bolt::messages::hello::{AuthToken, Hello, Identity, TokenAuthenticator};
-use bolt::messages::run::{format_bookmark, QueryService};
+use bolt::messages::route::RoutingConfig;
+use bolt::messages::run::format_bookmark;
 use bolt::messages::{
     ClientMessage, MessageKind, ServerMessage, TAG_FAILURE, TAG_GOODBYE, TAG_HELLO, TAG_PULL,
     TAG_RECORD, TAG_RUN, TAG_SUCCESS,
@@ -29,16 +30,16 @@ fn authenticator() -> Arc<TokenAuthenticator> {
     Arc::new(TokenAuthenticator::new(Some(FULL.into()), roles))
 }
 
-fn service(db: &SharedDb) -> Arc<QueryService> {
-    // Accepts what a driver sends when it names no database, and the store's
-    // own name; the real check comes from the routing config.
-    let check = Arc::new(|requested: Option<&str>| match requested {
-        None | Some("") | Some(STORE_NAME) => Ok(()),
-        Some(other) => Err(BoltError::DatabaseNotFound(format!(
-            "no database {other:?}"
-        ))),
-    });
-    Arc::new(QueryService::new(db.clone(), check).with_bookmark_timeout(Duration::from_millis(100)))
+const BOOKMARK_WAIT: Duration = Duration::from_millis(100);
+
+/// The routing config that drives both ROUTE and RUN's database selection.
+fn routing() -> RoutingConfig {
+    RoutingConfig::new(
+        "127.0.0.1:7687".parse().unwrap(),
+        Some("db.example.test"),
+        STORE_NAME,
+    )
+    .unwrap()
 }
 
 fn open_db(_label: &str) -> (SharedDb, tempfile::TempDir) {
@@ -48,7 +49,8 @@ fn open_db(_label: &str) -> (SharedDb, tempfile::TempDir) {
 
 fn connected(db: &SharedDb, token: &str) -> Connection {
     let mut conn = Connection::new(authenticator(), Duration::from_secs(30), "c".into(), (5, 0))
-        .with_query_service(service(db));
+        .with_routing(Some(routing()))
+        .with_database(db.clone(), BOOKMARK_WAIT);
     let out = conn.handle(ClientMessage::Hello(Hello {
         user_agent: None,
         auth: AuthToken::Basic {
@@ -836,36 +838,59 @@ fn activity_keeps_an_auto_commit_result_open() {
 }
 
 #[test]
-fn the_database_check_sees_none_when_the_client_names_no_database() {
-    use std::sync::Mutex;
-    let (db, _dir) = open_db("default-db");
-    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
-    let record = seen.clone();
-    let check = Arc::new(move |requested: Option<&str>| {
-        record.lock().unwrap().push(requested.map(str::to_string));
-        Ok(())
-    });
-    let service = Arc::new(QueryService::new(db.clone(), check));
-    let mut conn = Connection::new(authenticator(), Duration::from_secs(30), "c".into(), (5, 0))
-        .with_query_service(service);
-    conn.handle(ClientMessage::Hello(Hello {
-        user_agent: None,
-        auth: AuthToken::Basic {
-            principal: None,
-            credentials: FULL.into(),
-        },
-    }));
-    conn.handle(run("MATCH (n) RETURN COUNT(n)"));
-    conn.handle(pull(-1));
-    conn.handle(run_message(
-        "MATCH (n) RETURN COUNT(n)",
-        vec![("db".into(), s("named"))],
-    ));
-    assert_eq!(
-        *seen.lock().unwrap(),
-        vec![None, Some("named".to_string())],
-        "an absent db reaches the check as None, the default path"
-    );
+fn a_connection_with_no_routing_config_accepts_only_an_absent_or_empty_database() {
+    let (db, _dir) = open_db("no-routing");
+    let bare = || {
+        let mut conn =
+            Connection::new(authenticator(), Duration::from_secs(30), "c".into(), (5, 0))
+                .with_database(db.clone(), BOOKMARK_WAIT);
+        conn.handle(ClientMessage::Hello(Hello {
+            user_agent: None,
+            auth: AuthToken::Basic {
+                principal: None,
+                credentials: FULL.into(),
+            },
+        }));
+        conn
+    };
+    for accepted in [
+        vec![],
+        vec![("db".to_string(), PackValue::Null)],
+        vec![("db".to_string(), s(""))],
+    ] {
+        let out = bare().handle(run_message("MATCH (n) RETURN COUNT(n)", accepted));
+        assert!(
+            matches!(out.as_slice(), [ServerMessage::Success(_)]),
+            "{out:?}"
+        );
+    }
+    // It does not know the store's name, so it refuses that too, and the
+    // default name drivers use, rather than accept everything.
+    for refused in [
+        STORE_NAME,
+        "elsewhere",
+        bolt::messages::route::DRIVER_DEFAULT_DATABASE,
+    ] {
+        let out = bare().handle(run_message(
+            "MATCH (n) RETURN COUNT(n)",
+            vec![("db".into(), s(refused))],
+        ));
+        assert_eq!(
+            failure_code(&out),
+            "Neo.ClientError.Database.DatabaseNotFound",
+            "{refused}"
+        );
+    }
+}
+
+/// The public surface cannot take a database check: a store goes in as a
+/// `SharedDb` and a bookmark wait, and which names a `RUN` may carry comes only
+/// from the connection's routing config. `QueryService` has no public
+/// constructor at all.
+#[test]
+fn the_public_api_takes_no_database_check() {
+    let _: fn(Connection, SharedDb, Duration) -> Connection = Connection::with_database;
+    let _: fn(Connection, Option<RoutingConfig>) -> Connection = Connection::with_routing;
 }
 
 // ----------------------------------------------------------------- the wire
@@ -912,8 +937,12 @@ async fn wire_connect_hello_run_pull_goodbye() {
         server,
         authenticator(),
         "wire".into(),
-        ConnectionConfig::default(),
-        Some(service(&db)),
+        ConnectionConfig {
+            routing: Some(routing()),
+            bookmark_timeout: BOOKMARK_WAIT,
+            ..ConnectionConfig::default()
+        },
+        Some(db.clone()),
     ));
     client.write_all(&OFFER).await.unwrap();
     let mut reply = [0u8; 4];

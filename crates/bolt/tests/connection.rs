@@ -977,7 +977,6 @@ fn route_without_routing_config_is_not_supported() {
 #[test]
 fn run_selects_a_database_through_the_real_routing_config() {
     use bolt::messages::route::{RoutingConfig, DRIVER_DEFAULT_DATABASE};
-    use bolt::messages::run::QueryService;
 
     let dir = tempfile::tempdir().unwrap();
     let db = SharedDb::open(dir.path()).unwrap();
@@ -987,11 +986,10 @@ fn run_selects_a_database_through_the_real_routing_config() {
         "mushroomdb",
     )
     .unwrap();
-    let service = Arc::new(QueryService::for_routing(db, routing.clone()));
     let connected = || {
         let mut conn = connection(Duration::from_secs(30))
             .with_routing(Some(routing.clone()))
-            .with_query_service(service.clone());
+            .with_database(db.clone(), Duration::from_millis(100));
         conn.handle(hello("basic", FULL));
         conn
     };
