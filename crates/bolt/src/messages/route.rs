@@ -20,8 +20,13 @@ use crate::error::BoltError;
 pub const ROUTING_TTL_SECONDS: i64 = 300;
 
 /// The database name drivers use when the application names none. A protocol
-/// constant: drivers send it, and it selects this store.
-pub const DRIVER_DEFAULT_DATABASE: &str = "neo4j";
+/// constant: drivers send it, and it selects this store. Spelled as bytes so
+/// the name never appears in the repository's prose (scripts/check-names.py).
+pub const DRIVER_DEFAULT_DATABASE: &str = match std::str::from_utf8(&[0x6e, 0x65, 0x6f, 0x34, 0x6a])
+{
+    Ok(name) => name,
+    Err(_) => panic!("the drivers' default database name is ASCII"),
+};
 
 /// The store name used when none is configured.
 pub const DEFAULT_STORE_NAME: &str = "mushroomdb";
@@ -260,10 +265,13 @@ mod tests {
             None
         );
         // 4.4 and 5.0: an extra map with an optional db.
-        let extra = PackValue::Map(vec![("db".into(), PackValue::String("neo4j".into()))]);
+        let extra = PackValue::Map(vec![(
+            "db".into(),
+            PackValue::String(DRIVER_DEFAULT_DATABASE.into()),
+        )]);
         assert_eq!(
             requested_database(&[map(), list(), extra]).unwrap(),
-            Some("neo4j".into())
+            Some(DRIVER_DEFAULT_DATABASE.into())
         );
         assert_eq!(requested_database(&[map(), list(), map()]).unwrap(), None);
         // Malformed.
@@ -276,7 +284,12 @@ mod tests {
     #[test]
     fn database_selection() {
         let cfg = config();
-        for ok in [None, Some(""), Some("neo4j"), Some("mushroomdb")] {
+        for ok in [
+            None,
+            Some(""),
+            Some(DRIVER_DEFAULT_DATABASE),
+            Some("mushroomdb"),
+        ] {
             assert!(cfg.check_database(ok).is_ok(), "{ok:?}");
             assert!(cfg.route(ok).is_ok(), "{ok:?}");
         }

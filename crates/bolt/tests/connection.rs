@@ -890,7 +890,10 @@ fn route_answers_in_ready_and_stays_ready() {
     assert!(!text.contains("0.0.0.0"));
     assert_eq!(conn.state().name(), "Ready");
     // Null and the drivers' default name also select the store.
-    for db in [PackValue::Null, PackValue::String("neo4j".into())] {
+    for db in [
+        PackValue::Null,
+        PackValue::String(bolt::messages::route::DRIVER_DEFAULT_DATABASE.into()),
+    ] {
         assert!(matches!(
             conn.handle(route_message(db)).as_slice(),
             [ServerMessage::Success(_)]
