@@ -308,10 +308,17 @@ fn paragraphs(docs: &Path) -> Vec<String> {
     out
 }
 
-fn terms(db: &Db, docs: &Path, zipf: &Zipf, seed: u64) {
+fn terms(db: &mut Db, docs: &Path, zipf: &Zipf, seed: u64) {
     println!("\n## cap 1: MAX_QUERY_TERMS = {MAX_QUERY_TERMS}");
     // (a) Saturation: how many terms do real-looking prompts produce?
     let paras = paragraphs(docs);
+    if paras.is_empty() {
+        eprintln!(
+            "caps_bench: CAPS_DOCS={} holds no .md paragraphs of 3+ words; point it at a directory of markdown files",
+            docs.display()
+        );
+        std::process::exit(2);
+    }
     let mut counts: Vec<usize> = Vec::new();
     let mut lat: Vec<Duration> = Vec::new();
     for p in &paras {
@@ -394,6 +401,53 @@ fn terms(db: &Db, docs: &Path, zipf: &Zipf, seed: u64) {
         "400-word topic -> RecallRows::terms = {}",
         recall_rows(db, &long).terms
     );
+    // (d) The real `recall_rows` on text that matches. Each topic's words are
+    // planted in one Concept.summary, so the index returns candidates and the
+    // coverage filter and the digest rows actually run. (The stand-in prompts
+    // in (a) match nothing, which is why their recall is ~1 ms.)
+    println!("\nrecall_rows on matching text (100 planted nodes per row; each topic is the planted node's own words)");
+    println!(
+        "| terms | p50 | p95 | hits returned (mean) | covered == terms |\n|---|---|---|---|---|"
+    );
+    let mut rng = Rng(seed ^ 0xd4);
+    for count in [6usize, 12, 24] {
+        let mut topics: Vec<String> = Vec::new();
+        db.write_batch(|b| {
+            for t in 0..100 {
+                let mut seen = HashSet::new();
+                let mut words: Vec<String> = Vec::new();
+                while words.len() < count {
+                    let w = zipf.word(&mut rng).to_string();
+                    if seen.insert(stem(&w)) {
+                        words.push(w);
+                    }
+                }
+                let text = words.join(" ");
+                b.insert_node(
+                    "Concept",
+                    &format!("wide{count:02}-{t:03}"),
+                    vec![("summary".to_string(), Value::Str(text.clone()))],
+                );
+                topics.push(text);
+            }
+        })
+        .unwrap();
+        let (mut samples, mut hits, mut full) = (Vec::new(), 0usize, 0usize);
+        for topic in &topics {
+            let t = Instant::now();
+            let r = recall_rows(db, topic);
+            samples.push(t.elapsed());
+            hits += r.hits.len();
+            full += r.hits.iter().filter(|h| h.covered == r.terms).count();
+        }
+        println!(
+            "| {count} | {} | {} | {:.1} | {} |",
+            ms(median(samples.clone())),
+            ms(p95(samples)),
+            hits as f64 / topics.len() as f64,
+            full
+        );
+    }
 }
 
 // --- cap 2: the half-coverage floor ------------------------------------------
@@ -719,6 +773,10 @@ fn main() {
     let phases = std::env::var("CAPS_PHASES")
         .unwrap_or_else(|_| "build,terms,floor,fulltext,provisional,analyze".to_string());
     let want = |p: &str| phases.split(',').any(|x| x == p);
+    if cfg!(debug_assertions) && n >= 100_000 {
+        eprintln!("caps_bench: refusing a debug build at {n} nodes; its numbers mean nothing. Use `cargo run --release`.");
+        std::process::exit(2);
+    }
     let seed = 20_261_020u64;
     let zipf = Zipf::new(&mut Rng(seed ^ 0x9e37_79b9));
     let dir_a = root.join("a8");
@@ -776,7 +834,7 @@ fn main() {
     // Read-only phases first, then the writes; the two stores take their
     // remember calls in the same order, each on a freshly opened handle.
     if want("terms") {
-        terms(&a, &docs, &zipf, seed);
+        terms(&mut a, &docs, &zipf, seed);
     }
     if want("floor") {
         floor(&a, &zipf, seed);

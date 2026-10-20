@@ -99,3 +99,47 @@ store B: one call naming 40 fresh labels: declared 0 (engine report), pairs now 
 enable_fulltext(Person, team_id) on populated label: 423.260 ms
 enable_fulltext(Org, team_id) on populated label: 111.124 ms
 ```
+
+## Re-run of the `terms` phase with `recall_rows` on matching text (fix round 1)
+
+Same stores (store A had since taken the remember phases: 32 declared pairs and the provisional stubs; the reads here are unaffected). `uptime` at start: `load averages: 14.51 12.44 15.44` on 12 cores; at end `15.25 16.23 16.43`. The load during the main run above was not recorded, so treat every latency in this file as loaded. Open times above are not evidence of anything and are not published.
+
+```text
+# caps_bench N=1000000 build=release os=macos cores=12
+
+open from snapshot, 8 pairs: median 5566.758 ms (runs 5869.314 ms, 5566.758 ms, 5361.660 ms, 5263.827 ms, 5952.643 ms)
+open from snapshot, 32 pairs: median 3800.091 ms (runs 3830.940 ms, 4029.102 ms, 3491.833 ms, 3328.974 ms, 3800.091 ms)
+store size: 8 pairs 127.6 MiB, 32 pairs 126.0 MiB
+store A: 1006881 nodes, 34 pairs, rss 936 MiB
+
+## cap 1: MAX_QUERY_TERMS = 24
+stand-in prompts: 2022 paragraphs of docs/site; terms/prompt min 0 p50 14 p90 24 p99 24 max 24; at the cap 502 (24.8 %); recall p50 4.761 ms p95 23.737 ms
+| terms | word source | p50 | p95 | note |
+|---|---|---|---|---|
+| 1 | zipf | 8.911 ms | 313.459 ms |  |
+| 2 | zipf | 125.046 ms | 302.608 ms |  |
+| 4 | zipf | 131.877 ms | 332.701 ms |  |
+| 8 | zipf | 191.714 ms | 274.526 ms |  |
+| 12 | zipf | 220.033 ms | 404.323 ms |  |
+| 24 | zipf | 299.892 ms | 390.994 ms | the cap |
+| 32 | zipf | 355.188 ms | 555.684 ms | past the cap: not reachable through recall |
+| 48 | zipf | 409.087 ms | 730.619 ms | past the cap: not reachable through recall |
+| 96 | zipf | 580.356 ms | 2658.922 ms | past the cap: not reachable through recall |
+| 1 | head-100 | 10.215 ms | 164.394 ms |  |
+| 2 | head-100 | 53.182 ms | 540.644 ms |  |
+| 4 | head-100 | 74.681 ms | 658.058 ms |  |
+| 8 | head-100 | 222.778 ms | 515.799 ms |  |
+| 12 | head-100 | 416.630 ms | 897.248 ms |  |
+| 24 | head-100 | 509.834 ms | 947.763 ms | the cap |
+| 32 | head-100 | 255.156 ms | 407.678 ms | past the cap: not reachable through recall |
+| 48 | head-100 | 632.423 ms | 1381.933 ms | past the cap: not reachable through recall |
+| 96 | head-100 | 715.888 ms | 961.963 ms | past the cap: not reachable through recall |
+400-word topic -> RecallRows::terms = 24
+
+recall_rows on matching text (100 planted nodes per row; each topic is the planted node's own words)
+| terms | p50 | p95 | hits returned (mean) | covered == terms |
+|---|---|---|---|---|
+| 6 | 132.058 ms | 206.472 ms | 5.4 | 106 |
+| 12 | 193.979 ms | 251.259 ms | 1.4 | 100 |
+| 24 | 280.344 ms | 325.400 ms | 1.0 | 100 |
+```

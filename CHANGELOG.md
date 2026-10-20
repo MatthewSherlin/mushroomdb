@@ -10,7 +10,7 @@
 
 ### Measured
 
-- **The four engine caps were measured at 1,000,000 nodes and none changed.** `MAX_QUERY_TERMS` (24), the half-coverage floor, `MAX_FULLTEXT_PAIRS` (32) and `MAX_PROVISIONAL_PER_COMMIT` (20) are justified with numbers in `docs/site/limits.md` ("Engine caps"), and `analyze` is timed at 1M nodes (clusters 5.3 s). The harness is `crates/core-api/examples/caps_bench.rs` (row 62).
+- **The cost of the four engine caps was measured at 1,000,000 nodes and none changed.** For `MAX_QUERY_TERMS` (24), the half-coverage floor, `MAX_FULLTEXT_PAIRS` (32) and `MAX_PROVISIONAL_PER_COMMIT` (20), `docs/site/limits.md` ("Engine caps") gives what each costs and what happens past it, on a loaded machine with synthetic text; how much real callers need of caps 3 and 4 is not measured, because there is no telemetry. `analyze` is timed at 1M nodes (clusters 5.3 s). The harness is `crates/core-api/examples/caps_bench.rs` (row 62).
 
 ## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
 
