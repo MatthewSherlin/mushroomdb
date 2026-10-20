@@ -236,6 +236,9 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist
+          # Idempotent, so a fresh dispatch can re-run the adapter jobs (which
+          # need this one) without failing on "file exists".
+          skip-existing: true
 
   # ── PyPI: adapter packages ─────────────────────────────────────────────────
   # langchain-mushroomdb and llama-index-graph-stores-mushroomdb are pure-Python
@@ -246,7 +249,9 @@ jobs:
   #     PyPI project name: llama-index-graph-stores-mushroomdb
   #     Owner: MatthewSherlin   Repository name: mushroomdb
   #     Workflow name: publish.yml   Environment name: pypi
-  # Both jobs sit behind the `pypi` environment, so each needs owner approval.
+  # Register BOTH before approving the adapter jobs (a pending publisher does
+  # not reserve the name until the first successful publish). Both jobs sit
+  # behind the `pypi` environment, so each needs owner approval.
   publish-langchain:
     name: PyPI (langchain-mushroomdb)
     # After the main wheel, so an adapter never lands pointing at a
@@ -285,13 +290,14 @@ jobs:
 
       # skip-existing keeps a re-run after a partial failure idempotent, as the
       # crates.io and npm jobs are.
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+      - id: upload
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: integrations/langchain-mushroomdb/dist/
           skip-existing: true
 
       - name: how to fix a rejected publisher
-        if: failure()
+        if: failure() && steps.upload.outcome == 'failure'
         run: |
           echo "If the upload above was rejected as an invalid or unregistered trusted publisher," >&2
           echo "the owner has not yet registered the pending publisher. On pypi.org > Publishing >" >&2
@@ -337,13 +343,14 @@ jobs:
 
       # skip-existing keeps a re-run after a partial failure idempotent, as the
       # crates.io and npm jobs are.
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+      - id: upload
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: integrations/llama-index-mushroomdb/dist/
           skip-existing: true
 
       - name: how to fix a rejected publisher
-        if: failure()
+        if: failure() && steps.upload.outcome == 'failure'
         run: |
           echo "If the upload above was rejected as an invalid or unregistered trusted publisher," >&2
           echo "the owner has not yet registered the pending publisher. On pypi.org > Publishing >" >&2

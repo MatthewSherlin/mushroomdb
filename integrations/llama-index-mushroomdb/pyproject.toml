@@ -6,7 +6,10 @@
 #   Repository name:   mushroomdb
 #   Workflow name:     publish.yml
 #   Environment name:  pypi
-# The version below is set by scripts/bump-version.sh; do not edit it by hand.
+# The version below and the `mushroomdb` dependency range are set by
+# scripts/bump-version.sh; do not edit them by hand. Register BOTH pending
+# publishers before approving the adapter jobs; a pending publisher does not
+# reserve the name until the first successful publish.
 
 [build-system]
 requires = ["setuptools>=42"]
@@ -29,7 +32,7 @@ classifiers = [
 ]
 dependencies = [
     "llama-index-core>=0.14",
-    "mushroomdb",
+    "mushroomdb>=0.9.2,<0.10",
 ]
 
 [project.optional-dependencies]
