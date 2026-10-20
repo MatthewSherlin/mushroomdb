@@ -3,7 +3,10 @@
 ## Unreleased
 
 - **The published container image is built with TLS**, so `--tls-cert` and `--tls-key` work at container start without a custom build (HO-01). CI now runs the server's TLS tests with `--features tls`.
-- JSON logs: set `MUSHROOMDB_LOG_FORMAT=json` for structured output (one JSON object per line on stderr); an unrecognised value stops `serve` at startup
+
+### Fixed
+
+- **A Cypher read anchored on a key, `MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k`, is a point lookup, not a scan of the label.** The key filter used to run after every node of the label had been expanded: 593 ms at 1M nodes, now about 0.006 ms. Results are unchanged, under masks, namespaces and `open_at` too (row 102).
 
 ### Fixed
 
