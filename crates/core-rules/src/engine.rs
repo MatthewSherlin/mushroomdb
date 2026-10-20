@@ -370,8 +370,12 @@ pub struct RuleEngine {
     /// cost), consuming and replacing `retained_hnsw_blobs`.
     indexes_populated: bool,
     /// Whether [`RuleEngine::reconcile_lost_provenance`] has run for this
-    /// handle's snapshot. It runs at most once per open.
+    /// handle's snapshot. It runs at most once per open, and not at all when
+    /// the snapshot says it already ran or there is no snapshot.
     lost_provenance_reconciled: bool,
+    /// Set by a test hook that injects damage the repair has not seen, so no
+    /// later snapshot of this handle says the repair ran.
+    reconciled_mark_withheld: bool,
     /// Raw HNSW blobs retained from the last snapshot, not yet deserialized.
     ///
     /// Populated by `store_snapshot_state`.  Consumed (deserialized into each
@@ -2400,6 +2404,7 @@ impl RuleEngine {
             // lazy init in the mutation hooks (clean open, first-write cost).
             indexes_populated: false,
             lost_provenance_reconciled: false,
+            reconciled_mark_withheld: false,
             retained_hnsw_blobs: Mutex::new(BTreeMap::new()),
             retained_ivf_bytes: Mutex::new(None),
             retained_node_count: AtomicU32::new(0),
@@ -3182,6 +3187,20 @@ impl RuleEngine {
         self.intern_rule = intern_rule;
     }
 
+    /// Whether this handle's state has had the lost-provenance repair: it ran,
+    /// or the state came from a snapshot that says it had, or from none. A
+    /// snapshot of the state says so when this is true.
+    pub fn lost_provenance_reconciled(&self) -> bool {
+        self.lost_provenance_reconciled && !self.reconciled_mark_withheld
+    }
+
+    /// Record that this handle's state needs no lost-provenance repair: the
+    /// snapshot it came from says the repair ran, or there was no snapshot.
+    /// The repair is then skipped, which on such a state changes nothing.
+    pub fn mark_lost_provenance_reconciled(&mut self) {
+        self.lost_provenance_reconciled = true;
+    }
+
     /// Give back the derived edges a snapshot's provenance counts and its graph
     /// does not hold.
     ///
@@ -3263,8 +3282,10 @@ impl RuleEngine {
     /// Called once from `reconcile_lost_provenance` to repair stores where
     /// 0.8.0's double-ownership took an edge out of both the graph and
     /// provenance (ledger row 113).  Idempotent on a store that was never
-    /// damaged: every source holds exactly k edges, so the scan produces no
-    /// work.
+    /// damaged, but not free: a source with fewer candidates than its cap is
+    /// short of k on any store, so the pass usually builds every index and
+    /// re-evaluates those sources. A snapshot that says the repair ran
+    /// (section 16) is opened without it.
     fn fill_undertopk_sources(&mut self, g: &mut GraphMut<'_>) {
         let doomed = self.doomed;
         // Collect (rule_name, src) pairs where prov count < k.
@@ -3371,6 +3392,7 @@ impl RuleEngine {
                 .is_none(),
             "inject_double_ownership_for_test: call ensure_provenance_loaded_mut first"
         );
+        self.reconciled_mark_withheld = true;
         let triple = (etype, src, dst);
         // Insert into the named rule's provenance set.  The triple is already in
         // `owned` (another rule holds it); that set is a union so no change there.

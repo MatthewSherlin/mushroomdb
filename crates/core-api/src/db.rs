@@ -2628,6 +2628,11 @@ impl<F: Fs> GraphDb<F> {
             if !db.base.as_ref().is_some_and(|base| base.edges_swept()) {
                 db.drop_edges_of_retired_nodes();
             }
+            // Only a snapshot whose state has not had the lost-provenance
+            // repair is repaired at the first write (ledger rows 111, 113).
+            if db.base.as_ref().is_some_and(|base| base.prov_reconciled()) {
+                db.engine.mark_lost_provenance_reconciled();
+            }
             db.load_fulltext_from_base();
             trace_open!("full-text index read from the snapshot", _t0);
         } else if !snap_header.is_empty() {
@@ -2637,7 +2642,11 @@ impl<F: Fs> GraphDb<F> {
                 db.restore_snapshot_state(state)?;
             }
         }
-        // else: snap_header is empty = no snapshot file, fresh store.
+        // else: snap_header is empty = no snapshot file, fresh store. A store
+        // with no snapshot has nothing for the lost-provenance repair to find.
+        if snap_header.is_empty() {
+            db.engine.mark_lost_provenance_reconciled();
+        }
         //
         // Seed commit_seq from the highest seq persisted in last_change so that
         // WAL-replay frames (which start at commit_seq+1) always exceed any seq
@@ -3970,6 +3979,14 @@ impl<F: Fs> GraphDb<F> {
         // base copy (from the prior snapshot) plus this overlay copy — making the
         // next snapshot's header one too high per duplicated edge.
         Arc::make_mut(&mut self.topo).add_edge(etype, src, dst);
+    }
+
+    /// Whether this handle's state has had the lost-provenance repair (ledger
+    /// rows 111, 113), so that a snapshot of it says so.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn lost_provenance_reconciled_for_test(&self) -> bool {
+        self.engine.lost_provenance_reconciled()
     }
 
     /// The raw `edge_count` field from the current V8 snapshot header, without
@@ -14774,6 +14791,7 @@ impl<F: Fs> GraphDb<F> {
                 last_change: self.last_change.clone(),
                 fulltext_blob: self.fulltext_blob(),
                 wal_mark: wal_mark.clone(),
+                prov_reconciled: self.engine.lost_provenance_reconciled(),
             };
             let mut buf: Vec<u8> = Vec::new();
             {
@@ -14903,6 +14921,7 @@ impl<F: Fs> GraphDb<F> {
                 last_change: self.last_change.clone(),
                 fulltext_blob: self.fulltext_blob(),
                 wal_mark: wal_mark.clone(),
+                prov_reconciled: self.engine.lost_provenance_reconciled(),
             };
             let mut buf = Vec::new();
             let encoded = encode_v8(

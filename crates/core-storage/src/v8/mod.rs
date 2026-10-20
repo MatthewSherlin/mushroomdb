@@ -110,6 +110,16 @@ pub const SECTION_WAL_MARK: u8 = 14;
 pub const SECTION_EDGES_SWEPT: u8 = 15;
 /// The whole payload of [`SECTION_EDGES_SWEPT`].
 pub const SWEPT_MAGIC: &[u8; 4] = b"MSWP";
+/// Says the state this snapshot holds has had the lost-provenance repair
+/// (ledger rows 111 and 113): no rule counts an edge the graph does not hold,
+/// and no top-k source is short of an edge 0.8.0 took from it. Written only
+/// by a writer that ran the repair, opened a snapshot that says so, or opened
+/// no snapshot at all. An open of a snapshot with it skips the repair, which
+/// on such a state changes nothing; an open of one without it runs the
+/// repair at the first write. Four bytes, [`RECONCILED_MAGIC`].
+pub const SECTION_PROV_RECONCILED: u8 = 16;
+/// The whole payload of [`SECTION_PROV_RECONCILED`].
+pub const RECONCILED_MAGIC: &[u8; 4] = b"MREC";
 
 /// The leading part of a WAL that a snapshot already holds.
 ///
@@ -279,6 +289,7 @@ fn is_large_section(id: u8) -> bool {
             | SECTION_FULLTEXT
             | SECTION_WAL_MARK
             | SECTION_EDGES_SWEPT
+            | SECTION_PROV_RECONCILED
     )
 }
 
@@ -436,6 +447,7 @@ impl MappedBase {
             SECTION_FULLTEXT => "fulltext",
             SECTION_WAL_MARK => "wal_mark",
             SECTION_EDGES_SWEPT => "edges_swept",
+            SECTION_PROV_RECONCILED => "prov_reconciled",
             _ => "unknown",
         };
         self.dir
@@ -838,6 +850,17 @@ impl MappedBase {
                 .is_ok_and(|bytes| bytes == SWEPT_MAGIC)
     }
 
+    /// Whether this snapshot says the lost-provenance repair has run on the
+    /// state it holds (section 16). False for a snapshot written before the
+    /// section existed, by a writer that had not run the repair, or with a
+    /// damaged one.
+    pub fn prov_reconciled(&self) -> bool {
+        self.has_section(SECTION_PROV_RECONCILED)
+            && self
+                .section_bytes(SECTION_PROV_RECONCILED)
+                .is_ok_and(|bytes| bytes == RECONCILED_MAGIC)
+    }
+
     /// The WAL mark this snapshot carries (section 14), if it carries one
     /// that reads back. `None` for a snapshot with no such section and for
     /// one whose mark is damaged: either way the open replays the whole WAL,
@@ -1007,6 +1030,7 @@ mod tests {
             last_change: HashMap::new(),
             fulltext_blob: Vec::new(),
             wal_mark: Vec::new(),
+            prov_reconciled: false,
         }
     }
 

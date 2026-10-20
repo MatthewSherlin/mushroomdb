@@ -1531,3 +1531,117 @@ fn deleting_a_via_node_counts_its_derived_edge_in_the_report() {
         "p→t must be gone after via node deleted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The repair runs once per store, not once per open
+// ---------------------------------------------------------------------------
+
+/// Whether the store's snapshot says the lost-provenance repair has run on
+/// the state it holds (section 16).
+fn says_reconciled(dir: &std::path::Path) -> bool {
+    core_storage::v8::MappedBase::map(&dir.join("snapshot.bin"))
+        .unwrap()
+        .prov_reconciled()
+}
+
+/// A snapshot taken before the repair has run holds the damage, so it must
+/// not say the repair ran: the next open still repairs it.
+#[test]
+fn a_snapshot_taken_before_the_repair_does_not_say_it_ran() {
+    let (mut db, dir) = open_v080_lost_edge_store("reconciled-before");
+    assert!(!says_reconciled(&dir), "0.8.0 wrote no such mark");
+    db.snapshot().unwrap();
+    assert!(!says_reconciled(&dir), "no write, so no repair yet");
+    drop(db);
+
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    db.insert_node("B", "unrelated", vec![]).unwrap();
+    assert_eq!(same_edges_present(&db), 2, "{}", stats_line(&db));
+}
+
+/// A snapshot taken after the repair says so, and every way of reading the
+/// store over it — reopened, written to, replayed, as of a commit — reads
+/// what the repaired handle read.
+#[test]
+fn a_snapshot_taken_after_the_repair_says_so_and_reads_the_same() {
+    let (mut db, dir) = open_v080_lost_edge_store("reconciled-after");
+    db.insert_node("B", "unrelated", vec![]).unwrap();
+    let repaired = dump(&db, &["n0", "n5"]);
+    assert_eq!(same_edges_present(&db), 2, "{repaired:?}");
+    db.snapshot().unwrap();
+    assert!(says_reconciled(&dir));
+    drop(db);
+
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    assert_eq!(dump(&db, &["n0", "n5"]), repaired, "reopened over the mark");
+    db.insert_node("B", "unrelated-2", vec![]).unwrap();
+    assert_eq!(dump(&db, &["n0", "n5"]), repaired, "after the first write");
+    assert_eq!(db.stats().edges, 3, "{}", stats_line(&db));
+    drop(db);
+
+    let db: Db = GraphDb::open(&dir).unwrap();
+    assert_eq!(dump(&db, &["n0", "n5"]), repaired, "after a WAL reopen");
+    let commit = db.wal_total_commits().unwrap() - 1;
+    let at: Db = GraphDb::open_at(&dir, commit).unwrap();
+    assert_eq!(dump(&at, &["n0", "n5"]), repaired, "open_at({commit})");
+}
+
+/// A store with no snapshot has nothing to repair, so its first snapshot
+/// says the repair ran, written to or not.
+#[test]
+fn a_first_snapshot_says_the_repair_ran() {
+    let dir = tmp("reconciled-fresh");
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    db.create_rule(rule("topk", "A", "A", overlap(0.3), Some(5)))
+        .unwrap();
+    db.insert_node("A", "a", vec![("tags".into(), tags(&["x", "y"]))])
+        .unwrap();
+    db.insert_node("A", "b", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    drop(db);
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    db.snapshot().unwrap();
+    assert!(says_reconciled(&dir));
+}
+
+/// An open of a snapshot that says the repair ran does not run it again; an
+/// open of one that does not, does.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn an_open_of_a_marked_snapshot_skips_the_repair() {
+    let (mut db, dir) = open_v080_lost_edge_store("reconciled-skip");
+    assert!(!db.lost_provenance_reconciled_for_test());
+    db.insert_node("B", "unrelated", vec![]).unwrap();
+    assert!(db.lost_provenance_reconciled_for_test());
+    db.snapshot().unwrap();
+    drop(db);
+
+    let db: Db = GraphDb::open(&dir).unwrap();
+    assert!(
+        db.lost_provenance_reconciled_for_test(),
+        "the mark is read at open"
+    );
+}
+
+/// Damage injected by a test hook is damage the repair has not seen, so the
+/// next snapshot must not say the repair ran.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn injected_damage_withholds_the_mark() {
+    let dir = tmp("reconciled-injected");
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+    db.create_rule(rule("a_rule", "A", "A", overlap(0.3), Some(1)))
+        .unwrap();
+    db.create_rule(rule("b_rule", "A", "A", overlap(0.5), Some(1)))
+        .unwrap();
+    db.insert_node("A", "n0", vec![("tags".into(), tags(&["x", "y", "z"]))])
+        .unwrap();
+    db.insert_node("A", "n5", vec![("tags".into(), tags(&["x", "y", "w"]))])
+        .unwrap();
+    db.snapshot().unwrap();
+    assert!(says_reconciled(&dir));
+    db.inject_double_ownership_for_test("b_rule", "SAME", "n0", "n5");
+    db.set_prop("n5", "tags", tags(&["q"])).unwrap();
+    db.snapshot().unwrap();
+    assert!(!says_reconciled(&dir));
+}
