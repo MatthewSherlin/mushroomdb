@@ -67,6 +67,9 @@ pub enum UnwindExpr {
     Prop { var: String, field: String },
     /// A previously bound alias (from a prior WITH): `alias`.
     Var(String),
+    /// A list expression that is not a plain literal list: `[n.x, 1 + 1]`,
+    /// `[{a: 1}, {a: 2}]`'s non-constant forms.
+    Expr(Operand),
 }
 
 /// One WITH stage in a pipeline:
@@ -236,6 +239,16 @@ pub enum Operand {
         base: Box<Operand>,
         index: Box<Operand>,
     },
+    /// List literal with at least one non-constant element: `[n.x, 1 + 1]`.
+    /// A list whose elements are all constants is folded to
+    /// `Operand::Lit(Value::List(..))` at parse time. Evaluates to
+    /// `Value::List`; an element that evaluates to null is an error because
+    /// `Value` has no null variant.
+    ListLit(Vec<Operand>),
+    /// Map literal with at least one non-constant value: `{k: n.x}`. Keys are
+    /// unique (a duplicate is a parse error). All-constant maps fold to
+    /// `Operand::Lit(Value::Map(..))`. Evaluates to `Value::Map`.
+    MapLit(Vec<(String, Operand)>),
     /// Generic `CASE WHEN <cond> THEN <value> [WHEN …] [ELSE <value>] END`.
     /// Evaluates each branch's condition in order, returning the first matching
     /// value; the `default` (ELSE) or null if none match.
@@ -267,6 +280,8 @@ pub fn operand_label(op: &Operand) -> String {
         Operand::FuncCall { name, .. } => format!("{name}(...)"),
         Operand::BinArith { .. } => "<arith>".to_string(),
         Operand::Case { .. } => "<case>".to_string(),
+        Operand::ListLit(_) => "<list>".to_string(),
+        Operand::MapLit(_) => "<map>".to_string(),
         Operand::Index { base, index } => {
             format!("{}[{}]", operand_label(base), subscript_label(index))
         }

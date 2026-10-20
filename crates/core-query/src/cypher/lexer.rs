@@ -107,6 +107,7 @@ pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
                 }
             }
             '\'' | '"' => toks.push(lex_string(i, ch, &mut chars)?),
+            '`' => toks.push(lex_quoted_ident(i, &mut chars)?),
             '$' => toks.push(lex_param(input, i, &mut chars)?),
             '0'..='9' => toks.push(lex_number(input, i, ch, &mut chars)?),
             'A'..='Z' | 'a'..='z' | '_' => toks.push(lex_word(input, i, ch, &mut chars)),
@@ -114,6 +115,37 @@ pub fn lex(input: &str) -> Result<Vec<Tok>, String> {
         }
     }
     Ok(toks)
+}
+
+/// Lex a backtick-quoted identifier (`` `c d` ``). It lexes as an ordinary
+/// `Ident` whose text is whatever sits between the backticks; a doubled
+/// backtick is one literal backtick. An empty name or an unterminated quote
+/// is an error.
+fn lex_quoted_ident(
+    start: usize,
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+) -> Result<Tok, String> {
+    let mut out = String::new();
+    loop {
+        match chars.next() {
+            None => {
+                return Err(format!(
+                    "unterminated quoted identifier at position {start}"
+                ))
+            }
+            Some((_, '`')) => {
+                if matches!(chars.peek(), Some((_, '`'))) {
+                    chars.next();
+                    out.push('`');
+                } else if out.is_empty() {
+                    return Err(format!("empty quoted identifier at position {start}"));
+                } else {
+                    return Ok(Tok::Ident(out));
+                }
+            }
+            Some((_, ch)) => out.push(ch),
+        }
+    }
 }
 
 /// Lex a string literal opened by `quote` (`'` or `"`). Escapes, in either quote
@@ -598,5 +630,13 @@ mod tests {
             let err = lex(bad).expect_err(bad);
             assert!(err.contains("position"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn backtick_quoted_identifiers_lex_as_idents() {
+        assert_eq!(lex("`c d`").unwrap(), vec![Tok::Ident("c d".into())]);
+        assert_eq!(lex("`a``b`").unwrap(), vec![Tok::Ident("a`b".into())]);
+        assert!(lex("`abc").unwrap_err().contains("unterminated"));
+        assert!(lex("``").unwrap_err().contains("empty"));
     }
 }

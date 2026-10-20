@@ -187,6 +187,7 @@ pub enum PlanOp {
     /// - `list: UnwindExpr::Lit(v)` → use a literal list.
     /// - `list: UnwindExpr::Prop { var, field }` → resolve the list from a node property.
     /// - `list: UnwindExpr::Var(name)` → look up a scalar binding from a prior WITH.
+    /// - `list: UnwindExpr::Expr(op)` → evaluate a list expression per row.
     ///
     /// null / empty list → 0 output rows (openCypher).
     /// Non-list → named error at execution time.
@@ -1334,6 +1335,18 @@ fn check_operand_bound(
             check_operand_bound(base, bound, clause)?;
             check_operand_bound(index, bound, clause)
         }
+        Operand::ListLit(items) => {
+            for item in items {
+                check_operand_bound(item, bound, clause)?;
+            }
+            Ok(())
+        }
+        Operand::MapLit(entries) => {
+            for (_, value) in entries {
+                check_operand_bound(value, bound, clause)?;
+            }
+            Ok(())
+        }
         Operand::FuncCall { args, .. } => {
             for arg in args {
                 check_operand_bound(arg, bound, clause)?;
@@ -1357,6 +1370,7 @@ fn check_operand_bound(
 fn check_unwind_bound(expr: &UnwindExpr, bound: &BTreeSet<String>) -> Result<(), String> {
     match expr {
         UnwindExpr::Lit(_) => Ok(()),
+        UnwindExpr::Expr(op) => check_operand_bound(op, bound, "UNWIND"),
         UnwindExpr::Prop { var, .. } => require_bound(var, bound, "UNWIND"),
         UnwindExpr::Var(name) => require_bound(name, bound, "UNWIND"),
     }
