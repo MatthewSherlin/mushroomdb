@@ -281,6 +281,126 @@ fn a_snapshot_with_a_wal_tail_then_reopen() {
     assert_reader_matches_live(&db);
 }
 
+// ── Section 17 (DERIVED_BITS) ────────────────────────────────────────────────
+
+const DERIVED_BITS_ID: u8 = 17;
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+/// Whether the snapshot file's directory names section `id`.
+fn snapshot_has_section(dir: &std::path::Path, id: u8) -> bool {
+    let bytes = std::fs::read(dir.join("snapshot.bin")).unwrap();
+    let count = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+    (0..count).any(|i| bytes[8 + 16 * i] == id)
+}
+
+/// Rewrite the snapshot's directory without section `id`, which leaves the
+/// file as a snapshot written before that section existed would be: the
+/// payload stays where it was, unnamed. Returns whether it was named.
+fn strip_section(dir: &std::path::Path, id: u8) -> bool {
+    let path = dir.join("snapshot.bin");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let count = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+    let Some(at) = (0..count).find(|&i| bytes[8 + 16 * i] == id) else {
+        return false;
+    };
+    let entries_end = 8 + 16 * count;
+    bytes.copy_within(8 + 16 * (at + 1)..entries_end + 4, 8 + 16 * at);
+    let new_count = count - 1;
+    bytes[6..8].copy_from_slice(&(new_count as u16).to_le_bytes());
+    let dir_end = 8 + 16 * new_count;
+    let crc = crc32(&bytes[0..dir_end]);
+    bytes[dir_end..dir_end + 4].copy_from_slice(&crc.to_le_bytes());
+    // What followed the old CRC in the header page is zero padding.
+    for byte in &mut bytes[dir_end + 4..entries_end + 4] {
+        *byte = 0;
+    }
+    std::fs::write(&path, bytes).unwrap();
+    true
+}
+
+#[test]
+fn a_snapshot_with_derived_edges_carries_section_17_and_one_without_leaves_it_out() {
+    let dir = tmp("section-17");
+    let mut db = populated(&dir);
+    db.snapshot().unwrap();
+    assert!(snapshot_has_section(&dir, DERIVED_BITS_ID));
+    assert!(assert_reader_matches_live(&db) > 0);
+    // No derived edge left: the section is not written.
+    db.delete_rule("same_team").unwrap();
+    db.snapshot().unwrap();
+    assert!(!snapshot_has_section(&dir, DERIVED_BITS_ID));
+    assert_reader_matches_live(&db);
+}
+
+/// A snapshot with the section and the same one without it (as a build from
+/// before the section wrote it), each read in the states a reader meets: as
+/// opened, with a tail over it, after the next snapshot, reopened, and at an
+/// earlier commit.
+#[test]
+fn with_the_section_and_without_it() {
+    for strip in [false, true] {
+        let dir = tmp(if strip { "no-section" } else { "section" });
+        let mut db = populated(&dir);
+        db.snapshot().unwrap();
+        drop(db);
+        if strip {
+            assert!(strip_section(&dir, DERIVED_BITS_ID));
+            assert!(!snapshot_has_section(&dir, DERIVED_BITS_ID));
+        }
+
+        // As opened.
+        let mut db = GraphDb::open(&dir).unwrap();
+        assert!(assert_reader_matches_live(&db) > 0);
+
+        // With a tail over it: a retraction, a derivation, a new node.
+        db.set_prop("c", "team", Value::Str("blue".into())).unwrap();
+        db.set_prop("d", "team", Value::Str("red".into())).unwrap();
+        db.insert_node("Person", "f", team("red")).unwrap();
+        assert!(assert_reader_matches_live(&db) > 0);
+
+        // After another snapshot, which carries the section either way.
+        db.snapshot().unwrap();
+        assert!(snapshot_has_section(&dir, DERIVED_BITS_ID));
+        assert!(assert_reader_matches_live(&db) > 0);
+
+        // Reopened.
+        drop(db);
+        let mut db = GraphDb::open(&dir).unwrap();
+        assert!(assert_reader_matches_live(&db) > 0);
+
+        // As of a commit past the snapshot, over its base.
+        db.set_prop("c", "team", Value::Str("red".into())).unwrap();
+        let Err(mushroomdb::GraphError::CommitOutOfRange { total, .. }) =
+            GraphDb::open_at(&dir, u64::MAX)
+        else {
+            panic!("open_at past the end must say how far the log goes");
+        };
+        let past = GraphDb::open_at(&dir, total - 1).unwrap();
+        let reader = past.reader();
+        for key in KEYS {
+            assert_eq!(
+                reader.node_edges(key).unwrap(),
+                past.node_edges(key).unwrap(),
+                "open_at: node_edges({key})"
+            );
+        }
+    }
+}
+
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
@@ -329,6 +449,11 @@ fn reader_derived_bench() {
         let mut db = GraphDb::open(&one_commit).unwrap();
         db.set_prop("n5", "team", Value::Str("t7".into())).unwrap();
     }
+    let nosection = store.join("clean-nosection");
+    if !nosection.exists() {
+        copy_dir(&clean, &nosection);
+        strip_section(&nosection, DERIVED_BITS_ID);
+    }
     let work = tmp("bench-work");
     let fresh = |from: &std::path::Path, i: usize| {
         let dir = work.join(format!("{i}"));
@@ -376,6 +501,31 @@ fn reader_derived_bench() {
         first.push(start.elapsed());
     }
     eprintln!("BENCH first read after open: {:?}", median(first));
+
+    let mut first = Vec::new();
+    for i in 0..7 {
+        let dir = fresh(&nosection, i);
+        let db = GraphDb::open(&dir).unwrap();
+        let reader = db.reader();
+        let start = Instant::now();
+        reader.node_edges("n50").unwrap();
+        first.push(start.elapsed());
+    }
+    eprintln!(
+        "BENCH first read after open, snapshot without section 17: {:?}",
+        median(first)
+    );
+
+    let mut writes = Vec::new();
+    for i in 0..3 {
+        let dir = fresh(&clean, i);
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.set_prop("n5", "team", Value::Str("t7".into())).unwrap();
+        let start = Instant::now();
+        db.snapshot().unwrap();
+        writes.push(start.elapsed());
+    }
+    eprintln!("BENCH snapshot write: {:?}", median(writes));
 
     for scenario in ["empty tail", "60-commit tail", "20-batch tail"] {
         let dir = fresh(&clean, 0);

@@ -1704,6 +1704,8 @@ pub struct GraphDb<F: Fs> {
     /// section (`restore_v8_base`) — so the base can serve as the root of the
     /// reader's derived edges — rather than as a decoded legacy snapshot's.
     engine_from_base: bool,
+    /// The derived-edge changes of `delta_tail`, indexed by node.
+    tail_derived: Arc<crate::reader::TailDerived>,
     /// Per-commit deltas accumulated since the last fold.
     delta_tail: Vec<Arc<crate::reader::CommitDelta>>,
     /// How many commits have occurred since the last fold.
@@ -2454,6 +2456,7 @@ impl<F: Fs> GraphDb<F> {
             base: None,
             fold_overlay: None,
             engine_from_base: false,
+            tail_derived: Arc::default(),
             delta_tail: Vec::new(),
             commits_since_fold: 0,
             defer_events: false,
@@ -2539,6 +2542,7 @@ impl<F: Fs> GraphDb<F> {
         self.base = None;
         self.fold_overlay = None;
         self.delta_tail = Vec::new();
+        self.tail_derived = Arc::default();
         self.commits_since_fold = 0;
         self.deferred_events = Vec::new();
         self.v8_sections_loaded
@@ -3848,6 +3852,8 @@ impl<F: Fs> GraphDb<F> {
         };
         self.fold_overlay = Some(Arc::new(frozen));
         self.delta_tail.clear();
+        // The tail's derived changes moved into the fold's layers.
+        self.tail_derived = Arc::new(crate::reader::TailDerived::default());
         self.commits_since_fold = 0;
         // The fold holds every view value as it stands; what replay or a
         // refresh touched on the way here is not owed to any delta.
@@ -3939,6 +3945,7 @@ impl<F: Fs> GraphDb<F> {
                 .expect("fold_overlay is always Some after open_with; call reader() after open"),
             self.base.clone(),
             self.delta_tail.clone(),
+            Arc::clone(&self.tail_derived),
             // The snapshot's effective state is exactly this handle's state at
             // this commit, so it shares the memo and its version key.
             self.commit_seq,
@@ -3981,7 +3988,6 @@ impl<F: Fs> GraphDb<F> {
             }],
             derived_inserts: Vec::new(),
             derived_deletes: Vec::new(),
-            derived: Default::default(),
             view_values: Vec::new(),
         }));
     }
@@ -6095,7 +6101,8 @@ impl<F: Fs> GraphDb<F> {
                 .filter(|(_, &fired)| !fired)
                 .map(|(&triple, _)| triple)
                 .collect();
-            let derived = crate::reader::DerivedChanges::from_net(&net);
+            Arc::make_mut(&mut self.tail_derived)
+                .append(&crate::reader::DerivedChanges::from_net(&net));
             // `None`: the commit moved more view values than a delta should
             // carry, so the fold below takes them instead.
             let view_values = self.view_values_of_commit(&rec);
@@ -6104,7 +6111,6 @@ impl<F: Fs> GraphDb<F> {
                 records: vec![rec.clone()],
                 derived_inserts,
                 derived_deletes,
-                derived,
                 view_values: view_values.unwrap_or_default(),
             });
             self.delta_tail.push(delta);

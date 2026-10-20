@@ -72,17 +72,38 @@ impl<'a> TopologyView<'a> {
     /// Edge deletions from base are tracked by the overlay; see
     /// `MergedNeighbors` for the planned tombstone subtraction (Task 3).
     pub fn neighbors(&self, etype: u32, dir: Direction, v: u32) -> Cow<'a, [u32]> {
+        self.neighbors_with_base_row(etype, dir, v).0
+    }
+
+    /// [`Self::neighbors`], and the base's own stored row for the same
+    /// `(etype, dir, v)` — before the overlay's tombstones and edges are laid
+    /// over it — found by the one lookup, not a second.
+    ///
+    /// The row is what a reader needs to tell where a base edge sits in the
+    /// snapshot (see [`DerivedBits`]).
+    pub fn neighbors_with_base_row(
+        &self,
+        etype: u32,
+        dir: Direction,
+        v: u32,
+    ) -> (Cow<'a, [u32]>, Option<&'a [ArchivedNeighbor]>) {
         let overlay_nbrs = self.overlay.neighbors(etype, dir, v);
         let base = match self.base {
-            None => return overlay_nbrs,
+            None => return (overlay_nbrs, None),
             Some(b) => b,
         };
 
         // Locate the etype entry in the sorted archived CSR.
-        let base_nbrs = base_neighbors_from_archived(base, etype, dir, v);
+        let row = archived_csr_row(base, etype, dir, v).map(|r| r.neighbors.as_slice());
+        let Some(row_slice) = row else {
+            return (overlay_nbrs, None);
+        };
+        #[cfg(test)]
+        BASE_NEIGHBOR_COLLECTS.with(|c| c.set(c.get() + 1));
+        let base_nbrs: Vec<u32> = row_slice.iter().map(|n| u32::from(*n)).collect();
 
         if base_nbrs.is_empty() {
-            return overlay_nbrs;
+            return (overlay_nbrs, row);
         }
 
         // Subtract overlay tombstones from base neighbors before merging.
@@ -93,15 +114,18 @@ impl<'a> TopologyView<'a> {
         let filtered_base_nbrs = subtract_tombstones(base_nbrs, etype, dir, v, self.overlay);
 
         if filtered_base_nbrs.is_empty() {
-            return overlay_nbrs;
+            return (overlay_nbrs, row);
         }
         if overlay_nbrs.is_empty() {
-            return Cow::Owned(filtered_base_nbrs);
+            return (Cow::Owned(filtered_base_nbrs), row);
         }
-        Cow::Owned(merge_sorted_unique(
-            overlay_nbrs.as_ref(),
-            &filtered_base_nbrs,
-        ))
+        (
+            Cow::Owned(merge_sorted_unique(
+                overlay_nbrs.as_ref(),
+                &filtered_base_nbrs,
+            )),
+            row,
+        )
     }
 
     /// Total edge count: (base - tombstones) + overlay.
@@ -166,6 +190,9 @@ impl<'a> TopologyView<'a> {
     }
 }
 
+/// A neighbour id as the snapshot stores it.
+pub type ArchivedNeighbor = rkyv::Archived<u32>;
+
 /// Look up the archived CSR row for `(etype, dir, v)`.
 fn archived_csr_row(
     base: &ArchivedCsr,
@@ -210,22 +237,6 @@ fn archived_row_degree(base: &ArchivedCsr, etype: u32, dir: Direction, v: u32) -
 #[cfg(test)]
 thread_local! {
     static BASE_NEIGHBOR_COLLECTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Look up neighbors in an archived CSR for `(etype, dir, v)`.
-/// Returns an empty Vec if not found.
-fn base_neighbors_from_archived(
-    base: &ArchivedCsr,
-    etype: u32,
-    dir: Direction,
-    v: u32,
-) -> Vec<u32> {
-    #[cfg(test)]
-    BASE_NEIGHBOR_COLLECTS.with(|c| c.set(c.get() + 1));
-    match archived_csr_row(base, etype, dir, v) {
-        None => Vec::new(),
-        Some(row) => row.neighbors.iter().map(|n| u32::from(*n)).collect(),
-    }
 }
 
 /// Merge two sorted-unique slices into a sorted-unique Vec.
@@ -276,6 +287,118 @@ fn subtract_tombstones(
         Some(t) if t.is_empty() => nbrs,
         Some(t) => nbrs.into_iter().filter(|n| !t.contains(n)).collect(),
     }
+}
+
+/// Which of a snapshot's edges a rule derived: section 17, one bit per `u32`
+/// of the TOPOLOGY section, set for each neighbour entry (in an out-row or an
+/// in-row) that is a rule-derived edge. The bit for an entry is indexed by the
+/// entry's own byte offset in the topology section divided by four, so a reader
+/// holding a row it found for another reason reads the answer where it lies,
+/// with no search and nothing built.
+pub struct DerivedBits<'a> {
+    pub(crate) bits: &'a [u8],
+    /// Address of the first byte of the TOPOLOGY section.
+    pub(crate) topology_start: usize,
+}
+
+impl DerivedBits<'_> {
+    /// Whether the row entry `neighbor` — an element of a row of the base CSR
+    /// this section was written beside — is a derived edge.
+    pub fn is_derived(&self, neighbor: &ArchivedNeighbor) -> bool {
+        let offset =
+            (neighbor as *const ArchivedNeighbor as usize).wrapping_sub(self.topology_start);
+        let slot = offset / 4;
+        self.bits
+            .get(slot / 8)
+            .is_some_and(|byte| byte >> (slot % 8) & 1 == 1)
+    }
+
+    /// Whether the base edge `src -> dst` of `etype` is derived, by a search
+    /// of `src`'s out-row. `false` for an edge the base does not hold.
+    pub fn edge_is_derived(&self, csr: &ArchivedCsr, etype: u32, src: u32, dst: u32) -> bool {
+        archived_csr_row(csr, etype, Direction::Out, src).is_some_and(|row| {
+            row.neighbors
+                .binary_search_by_key(&dst, |n| u32::from(*n))
+                .map(|i| self.is_derived(&row.neighbors[i]))
+                .unwrap_or(false)
+        })
+    }
+}
+
+/// The topology-section byte offset, divided by four, of each neighbour entry
+/// of `csr` that is one of `triples` — in both its out-row and its in-row. What
+/// [`DerivedBits`] reads; `csr` must be the archive of the very bytes that
+/// start at `topology_start`.
+pub(crate) fn derived_slots(
+    csr: &ArchivedCsr,
+    topology_start: usize,
+    triples: impl Iterator<Item = (u32, u32, u32)>,
+) -> Vec<usize> {
+    let mut by_source: Vec<(u32, u32, u32)> = triples.collect();
+    by_source.sort_unstable();
+    by_source.dedup();
+    // The same edges as (etype, destination, source), for the in-rows.
+    let mut by_destination: Vec<(u32, u32, u32)> = by_source
+        .iter()
+        .map(|&(etype, src, dst)| (etype, dst, src))
+        .collect();
+    by_destination.sort_unstable();
+
+    let mut slots = Vec::with_capacity(by_source.len() * 2);
+    let slot_of = |element: &ArchivedNeighbor| {
+        ((element as *const ArchivedNeighbor as usize) - topology_start) / 4
+    };
+    // Rows and entries both ascend, so each pass is one walk over the rows
+    // with the sorted keys alongside: no search per edge.
+    for (dir, keys) in [
+        (Direction::Out, &by_source),
+        (Direction::In, &by_destination),
+    ] {
+        let mut start = 0;
+        while start < keys.len() {
+            let etype = keys[start].0;
+            let end = start + keys[start..].partition_point(|k| k.0 == etype);
+            let group = &keys[start..end];
+            start = end;
+            let Ok(position) = csr
+                .etypes
+                .binary_search_by_key(&etype, |e| u32::from(e.etype))
+            else {
+                continue;
+            };
+            let entry = &csr.etypes[position];
+            let rows = match dir {
+                Direction::Out => &entry.out_adj.rows,
+                Direction::In => &entry.in_adj.rows,
+            };
+            let mut row_at = 0;
+            let mut neighbor_at = 0;
+            let mut current_vertex = None;
+            for &(_, vertex, neighbor) in group {
+                if current_vertex != Some(vertex) {
+                    current_vertex = Some(vertex);
+                    neighbor_at = 0;
+                    while row_at < rows.len() && u32::from(rows[row_at].vertex) < vertex {
+                        row_at += 1;
+                    }
+                }
+                let Some(row) = rows.get(row_at).filter(|r| u32::from(r.vertex) == vertex) else {
+                    continue;
+                };
+                while neighbor_at < row.neighbors.len()
+                    && u32::from(row.neighbors[neighbor_at]) < neighbor
+                {
+                    neighbor_at += 1;
+                }
+                if neighbor_at < row.neighbors.len()
+                    && u32::from(row.neighbors[neighbor_at]) == neighbor
+                {
+                    slots.push(slot_of(&row.neighbors[neighbor_at]));
+                }
+            }
+        }
+    }
+    slots
 }
 
 /// An iterator over the sorted-unique merged neighbor list.
@@ -572,6 +695,110 @@ mod tests {
         assert_eq!(view.degree(1, Direction::Out, 0), 2);
         assert_eq!(view.degree(1, Direction::In, 1), 1);
         assert_eq!(view.degree(9, Direction::Out, 0), 0);
+    }
+
+    /// Section 17 marks exactly the neighbour entries — in out-rows and in-rows —
+    /// of the edges provenance names, and a snapshot with no such edge has none.
+    #[test]
+    fn derived_bits_mark_exactly_the_owned_edges() {
+        use std::collections::BTreeSet;
+        let edges: [(u32, u32, u32); 9] = [
+            (1, 0, 1),
+            (1, 0, 2),
+            (1, 1, 2),
+            (1, 3, 0),
+            (1, 3, 3),
+            (2, 0, 1),
+            (2, 2, 0),
+            (2, 2, 3),
+            (7, 5, 6),
+        ];
+        let owned: BTreeSet<(u32, u32, u32)> = [
+            (1, 0, 2),
+            (2, 0, 1),
+            (1, 3, 0),
+            (1, 3, 3),
+            (7, 5, 6),
+            (9, 1, 1),
+        ]
+        .into_iter()
+        .collect();
+        let mut topo = Topology::new();
+        for &(etype, src, dst) in &edges {
+            topo.add_edge(etype, src, dst);
+        }
+        let mut ids = IdMap::new();
+        for key in ["a", "b", "c", "d", "e", "f", "g"] {
+            ids.get_or_insert(key);
+        }
+
+        let encode = |provenance: BTreeMap<String, BTreeSet<(u32, u32, u32)>>| {
+            let mut meta = tiny_meta();
+            meta.provenance = provenance;
+            let mut bytes = Vec::new();
+            encode_v8(
+                None,
+                None,
+                None,
+                None,
+                None,
+                &topo,
+                &ColumnStore::new(),
+                &ids,
+                &Interner::new(),
+                &meta,
+                &mut bytes,
+            )
+            .expect("encode_v8");
+            MappedBase::from_bytes(bytes).expect("from_bytes")
+        };
+
+        let base = encode(BTreeMap::from([
+            ("r1".to_string(), owned.iter().copied().take(3).collect()),
+            ("r2".to_string(), owned.iter().copied().skip(3).collect()),
+        ]));
+        let bits = base.derived_bits().expect("section 17 present");
+        let csr = base.topology().unwrap();
+        let mut marked = 0;
+        for et in csr.etypes.iter() {
+            let etype = u32::from(et.etype);
+            for (dir, adj) in [(Direction::Out, &et.out_adj), (Direction::In, &et.in_adj)] {
+                for row in adj.rows.iter() {
+                    for neighbor in row.neighbors.iter() {
+                        let (src, dst) = match dir {
+                            Direction::Out => (u32::from(row.vertex), u32::from(*neighbor)),
+                            Direction::In => (u32::from(*neighbor), u32::from(row.vertex)),
+                        };
+                        let expected = owned.contains(&(etype, src, dst));
+                        assert_eq!(
+                            bits.is_derived(neighbor),
+                            expected,
+                            "{etype} {src}->{dst} {dir:?}"
+                        );
+                        marked += usize::from(expected);
+                    }
+                }
+            }
+        }
+        // Five owned edges are in the topology, each in two rows.
+        assert_eq!(marked, 10);
+        assert!(bits.edge_is_derived(csr, 1, 0, 2));
+        assert!(!bits.edge_is_derived(csr, 1, 0, 1));
+        assert!(
+            !bits.edge_is_derived(csr, 9, 1, 1),
+            "an owned edge the topology lacks"
+        );
+        for (id, name, _, status) in base.verify_integrity() {
+            assert!(status.is_ok(), "section {id} {name}");
+        }
+
+        // Nothing owned: no section.
+        assert!(encode(BTreeMap::new()).derived_bits().is_none());
+        let none_in_topology = encode(BTreeMap::from([(
+            "r".to_string(),
+            BTreeSet::from([(9, 1, 1)]),
+        )]));
+        assert!(none_in_topology.derived_bits().is_none());
     }
 }
 

@@ -262,6 +262,7 @@ pub fn encode_v8<W: Write>(
     // does not keep its WAL writes only the swept marker, and the reconciled
     // one when its state has had the repair, beside what it always wrote.
     // None goes at the end: the last section stays a small, eagerly-CRC'd one.
+    let derived_bits_bytes = derived_bits_section(&topo_bytes, &meta.provenance);
     let swept: &[u8] = crate::v8::SWEPT_MAGIC;
     let reconciled: &[u8] = if meta.prov_reconciled {
         crate::v8::RECONCILED_MAGIC
@@ -273,6 +274,10 @@ pub fn encode_v8<W: Write>(
         (SECTION_WAL_MARK, meta.wal_mark.as_slice()),
         (crate::v8::SECTION_EDGES_SWEPT, swept),
         (crate::v8::SECTION_PROV_RECONCILED, reconciled),
+        (
+            crate::v8::SECTION_DERIVED_BITS,
+            derived_bits_bytes.as_slice(),
+        ),
     ] {
         if bytes.is_empty() {
             continue;
@@ -1126,6 +1131,39 @@ fn hnsw_to_data(hnsw: &BTreeMap<String, (Vec<u8>, Vec<u8>)>) -> HnswSectionData 
         .collect();
     rules.sort_by(|a, b| a.name.cmp(&b.name));
     HnswSectionData { rules }
+}
+
+/// Section 17's payload for the topology bytes `topo_bytes` and the edges
+/// `provenance` says a rule owns: the magic and one bit per `u32` of the
+/// topology section. Empty — the section is left out — when no such edge is in
+/// the topology.
+fn derived_bits_section(
+    topo_bytes: &[u8],
+    provenance: &BTreeMap<String, BTreeSet<(u32, u32, u32)>>,
+) -> Vec<u8> {
+    if provenance.values().all(BTreeSet::is_empty) {
+        return Vec::new();
+    }
+    // SAFETY: `topo_bytes` is what `rkyv_encode` just produced from a `CsrData`,
+    // in an allocation of its own.
+    let csr = unsafe { rkyv::access_unchecked::<crate::v8::layout::ArchivedCsr>(topo_bytes) };
+    let slots = crate::v8::seam::derived_slots(
+        csr,
+        topo_bytes.as_ptr() as usize,
+        provenance.values().flatten().copied(),
+    );
+    if slots.is_empty() {
+        return Vec::new();
+    }
+    let mut out =
+        Vec::with_capacity(crate::v8::DERIVED_BITS_MAGIC.len() + topo_bytes.len() / 32 + 1);
+    out.extend_from_slice(crate::v8::DERIVED_BITS_MAGIC);
+    out.resize(out.len() + topo_bytes.len() / 32 + 1, 0);
+    let bits = crate::v8::DERIVED_BITS_MAGIC.len();
+    for slot in slots {
+        out[bits + slot / 8] |= 1 << (slot % 8);
+    }
+    out
 }
 
 /// Build `ProvenanceSectionData` from owned provenance map.
