@@ -1209,12 +1209,325 @@ fn the_first_write_after_open_restores_the_edges_080_had_lost() {
     );
 }
 
-/// A node deleted as the first write counts only the edges the graph holds:
-/// the hand-written one, and none of the two 0.8.0 lost.
+/// Deleting a node on the 0.8.0-damaged store: the first write triggers
+/// reconcile, which restores the two SAME edges the store had lost.  The
+/// delete then retracts them.  `manual_edges` counts the LINK; `derived_edges`
+/// counts the two SAME edges the reconcile pass restored and the delete then
+/// removed.
 #[test]
-fn deleting_a_node_first_on_a_store_that_lost_edges_counts_its_hand_written_edge() {
+fn deleting_a_node_first_on_a_store_that_lost_edges_counts_restored_derived_edges() {
     let (mut db, _) = open_v080_lost_edge_store("row111-delete");
     let report = db.delete_node("n0").unwrap();
-    assert_eq!((report.manual_edges, report.derived_edges), (1, 0));
+    // manual: LINK n0→n5 (1); derived: SAME n0→n5 + SAME n5→n0 restored by
+    // reconcile and then retracted by the delete (2).
+    assert_eq!((report.manual_edges, report.derived_edges), (1, 2));
     assert_eq!(db.stats().edges, 0, "{}", stats_line(&db));
+}
+
+// ---------------------------------------------------------------------------
+// Row 112 — open_at deduplicates double-owned provenance (from_persist)
+// ---------------------------------------------------------------------------
+
+/// An as-of handle opened against the v0.8.0-damaged snapshot must
+/// deduplicate double-owned edges the same way a regular open does
+/// (ledger row 112).  Before the fix, `from_persist` skipped the dedup, so
+/// `explain` on the double-owned edge showed two owners.
+///
+/// The v080_snapshotted fixture has WAL floor == total (every commit was
+/// flushed into the snapshot; the live WAL is empty).  `open_at` requires at
+/// least one accessible WAL frame, so we add a dummy write first to lift
+/// `wal_total_commits` one above the floor.  `open_at(floor)` then replays
+/// from the snapshot (triggering `restore_snapshot_state` → `from_persist`
+/// with the snapshot's double-owned provenance) plus that one dummy frame.
+#[test]
+fn open_at_deduplicates_double_owned_provenance() {
+    // Write the v080_snapshotted fixture to a fresh dir.
+    let dir = tmp("row112");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("snapshot.bin"),
+        &include_bytes!("fixtures/v080_snapshotted/snapshot.bin")[..],
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("wal.bin"),
+        &include_bytes!("fixtures/v080_snapshotted/wal.bin")[..],
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("wal.floor"),
+        &include_bytes!("fixtures/v080_snapshotted/wal.floor")[..],
+    )
+    .unwrap();
+
+    // Open the live handle and add one write so the WAL has a frame above
+    // the floor.  Without this, total == floor and open_at has no valid range.
+    let mut live = GraphDb::open(&dir).unwrap();
+    let floor = live.wal_total_commits().unwrap();
+    // Unrelated label so no rule fires and the SAME edges are untouched.
+    live.insert_node("_dummy_", "dummy_row112", vec![]).unwrap();
+    // floor is now the first accessible commit index.
+    // open_at(floor) replays from snapshot + exactly the dummy write.
+    let at: Db = GraphDb::open_at(&dir, floor).unwrap();
+
+    // Both edges must be readable.
+    assert_eq!(
+        at.neighbors("n0", "SAME", Direction::Out).unwrap(),
+        vec!["n5"],
+        "open_at: n0→n5 readable"
+    );
+
+    // `explain` must show exactly one owner for the n0→n5 directed edge
+    // (dedup removed the duplicate claim the snapshot carried).  Both n0→n5
+    // and n5→n0 exist in the fixture, so filter to the specific direction.
+    let owners_n0_n5: Vec<String> = at
+        .explain("n0", "n5")
+        .unwrap()
+        .iter()
+        .filter(|e| e.src_key == "n0" && e.dst_key == "n5")
+        .map(|e| e.rule.clone())
+        .collect();
+    assert_eq!(
+        owners_n0_n5.len(),
+        1,
+        "open_at: n0→n5 must have exactly one owner after dedup; got {owners_n0_n5:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 84 — rebuild pushes to retracted so the second pass runs
+// ---------------------------------------------------------------------------
+
+/// `rebuild_rule` on the owning rule must not discard edges another rule still
+/// desires (ledger row 84, rebuild path).  After the owning rule is rebuilt in
+/// a state where it no longer desires the edge, the second-pass reclaim gives
+/// the edge to the surviving rule.
+///
+/// The stale-provenance state required for rebuild to retract cannot be created
+/// through the public API (every write goes through the incremental path, which
+/// keeps provenance current).  The rebuild-specific code path is therefore
+/// tested at unit level in `crates/core-rules/src/engine.rs`
+/// (`rebuild_retract_pushes_to_retracted_so_reclaim_fires`).
+///
+/// This integration test covers the incremental reclaim path as a regression
+/// guard for the same rule-pair scenario: two rules compete for an edge, the
+/// owner's predicate no longer holds, and the surviving rule reclaims.
+#[test]
+fn competing_rule_reclaims_after_incremental_retraction() {
+    let dir = tmp("row84-incremental");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_rule(rule("a_high", "A", "A", overlap(0.6), None))
+        .unwrap();
+    db.create_rule(rule("b_low", "A", "A", overlap(0.3), None))
+        .unwrap();
+    db.insert_node(
+        "A",
+        "n0",
+        vec![("tags".into(), tags(&["x", "y", "z", "w"]))],
+    )
+    .unwrap();
+    db.insert_node(
+        "A",
+        "n1",
+        vec![("tags".into(), tags(&["x", "y", "z", "w"]))],
+    )
+    .unwrap();
+    // Jaccard = 1.0: a_high owns n0→n1 (alphabetically first).
+    let owners: Vec<String> = db
+        .explain("n0", "n1")
+        .unwrap()
+        .iter()
+        .filter(|e| e.src_key == "n0" && e.dst_key == "n1")
+        .map(|e| e.rule.clone())
+        .collect();
+    assert_eq!(owners, vec!["a_high"], "setup: a_high owns n0→n1");
+
+    // Drop Jaccard to 0.4 via incremental write: a_high retracts (< 0.6),
+    // b_low reclaims (≥ 0.3).  n1={x,y}: |{x,y,z,w}∩{x,y}|/|{x,y,z,w}| = 0.5.
+    db.set_prop("n1", "tags", tags(&["x", "y"])).unwrap();
+    let after_drop: Vec<String> = db
+        .explain("n0", "n1")
+        .unwrap()
+        .iter()
+        .filter(|e| e.src_key == "n0" && e.dst_key == "n1")
+        .map(|e| e.rule.clone())
+        .collect();
+    assert_eq!(
+        after_drop,
+        vec!["b_low"],
+        "b_low reclaimed n0→n1 after a_high retracted"
+    );
+
+    // Explicitly rebuild the no-longer-owning rule: must leave b_low's edge alone.
+    db.rebuild_rule("a_high").unwrap();
+    let after_rebuild: Vec<String> = db
+        .explain("n0", "n1")
+        .unwrap()
+        .iter()
+        .filter(|e| e.src_key == "n0" && e.dst_key == "n1")
+        .map(|e| e.rule.clone())
+        .collect();
+    assert_eq!(
+        after_rebuild,
+        vec!["b_low"],
+        "rebuild_rule(a_high) must not disturb b_low's ownership"
+    );
+    assert_eq!(
+        db.neighbors("n0", "SAME", Direction::Out).unwrap(),
+        vec!["n1"],
+        "n0→n1 must still be in the graph after rebuild"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 113 — reconcile gives back edges absent from both provenance and graph
+// ---------------------------------------------------------------------------
+
+/// Two top-k rules (k=1) both claim the same edge, then both retract it in
+/// the same write.  The edge leaves both the graph and both provenance sets.
+/// The first subsequent write must restore it via the undertopk pass
+/// (ledger row 113).
+#[cfg(feature = "test-hooks")]
+#[test]
+fn undertopk_pass_restores_edge_absent_from_both_graph_and_provenance() {
+    let dir = tmp("row113");
+    let mut db = GraphDb::open(&dir).unwrap();
+    // Two rules, k=1.  `a_rule` sorts before `b_rule` so a_rule owns on a
+    // fresh derivation.  Jaccard(n0, n5) = 0.5: both thresholds fire.
+    db.create_rule(rule("a_rule", "A", "A", overlap(0.3), Some(1)))
+        .unwrap();
+    db.create_rule(rule("b_rule", "A", "A", overlap(0.5), Some(1)))
+        .unwrap();
+    db.insert_node("A", "n0", vec![("tags".into(), tags(&["x", "y", "z"]))])
+        .unwrap();
+    db.insert_node("A", "n5", vec![("tags".into(), tags(&["x", "y", "w"]))])
+        .unwrap();
+    // Both rules fire; a_rule owns n0→n5 and n5→n0.
+    assert!(
+        db.neighbors("n0", "SAME", Direction::Out)
+            .unwrap()
+            .contains(&"n5".to_string()),
+        "fixture: n0→n5 present"
+    );
+
+    // Snapshot to put the edges in the base CSR.
+    db.snapshot().unwrap();
+    drop(db);
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+
+    // Inject double ownership: b_rule also claims n0→n5.  Now both a_rule and
+    // b_rule hold (SAME, n0, n5) in their provenance.
+    db.inject_double_ownership_for_test("b_rule", "SAME", "n0", "n5");
+
+    // Change n5's tags so Jaccard < 0.3: both rules stop wanting n0→n5.
+    // a_rule retracts it (removes from graph and a_rule's provenance);
+    // b_rule also retracts (removes from b_rule's provenance).
+    // n0→n5 is now absent from BOTH the graph and BOTH provenance sets.
+    db.set_prop("n5", "tags", tags(&["q"])).unwrap();
+    assert!(
+        db.neighbors("n0", "SAME", Direction::Out)
+            .unwrap()
+            .is_empty(),
+        "after tag change: n0→n5 gone from graph"
+    );
+
+    // Snapshot and reopen so from_persist sees the damaged state.
+    db.snapshot().unwrap();
+    drop(db);
+    let mut db: Db = GraphDb::open(&dir).unwrap();
+
+    // Restore n5's tags so both rules want n0→n5 again.
+    // This is the first non-declaration write: reconcile runs.
+    // The undertopk pass finds n0 has 0 edges (< k=1) and re-evaluates.
+    db.set_prop("n5", "tags", tags(&["x", "y", "w"])).unwrap();
+    assert!(
+        db.neighbors("n0", "SAME", Direction::Out)
+            .unwrap()
+            .contains(&"n5".to_string()),
+        "after repair write: n0→n5 restored; stats: {}",
+        stats_line(&db)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 115 — forget prop reports derived_edges on a damaged store
+// ---------------------------------------------------------------------------
+
+/// On the v0.8.0-damaged store, forgetting a node property that a rule reads
+/// must report the edges the rule retracted, even though the store's first
+/// write (the remove_prop) is what restores them first (ledger row 115).
+#[test]
+fn forgetting_a_prop_on_damaged_store_reports_derived_edges() {
+    use mushroomdb::memory::forget::{forget, ForgetTarget};
+    let (mut db, _) = open_v080_lost_edge_store("row115");
+    // Before the fix, `before` was read before reconcile ran, so it was 0;
+    // after the remove_prop, `after` was also 0, and the diff reported 0.
+    // With the fix, ensure_reconcile_for_report restores the edges first,
+    // so `before` = 2 and `after` = 0 → derived_edges = 2.
+    let report = forget(
+        &mut db,
+        &ForgetTarget::Prop {
+            key: "n0".into(),
+            prop: "tags".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        report.derived_edges >= 1,
+        "forgetting tags on damaged store must report retracted derived edges; \
+         got derived_edges={} (expected ≥ 1)",
+        report.derived_edges
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 50 — delete_node counts via-hop derived edges
+// ---------------------------------------------------------------------------
+
+/// Deleting the via node of a via-hop rule must count the derived edge it
+/// carried as a derived edge removed (ledger row 50).
+///
+/// Before the fix, `provenance_touching(via_id)` missed edges where `via_id`
+/// is neither src nor dst, so `derived_edges` was 0.  With the fix the
+/// post-apply retraction count includes the via-hop retraction.
+#[test]
+fn deleting_a_via_node_counts_its_derived_edge_in_the_report() {
+    let dir = tmp("row50-via-delete");
+    let mut db = GraphDb::open(&dir).unwrap();
+    // Rule: if P→O (WORKS_AT), and O and T overlap, derive P→T (SAME).
+    // Via node = O.  Deleting O should report derived_edges ≥ 1.
+    let mut via_r = rule("via", "P", "T", overlap(0.3), None);
+    via_r.via_label = Some("O".into());
+    via_r.via_edge = Some("WORKS_AT".into());
+    via_r.via_dir = Some(Direction::Out);
+    db.create_rule(via_r).unwrap();
+    db.insert_node("O", "o", vec![("tags".into(), tags(&["x", "y", "w"]))])
+        .unwrap();
+    db.insert_node("P", "p", vec![("tags".into(), tags(&["x"]))])
+        .unwrap();
+    db.insert_node("T", "t", vec![("tags".into(), tags(&["x", "y", "z"]))])
+        .unwrap();
+    db.insert_edge("WORKS_AT", "p", "o").unwrap();
+    // The rule derives p→t through o.
+    assert_eq!(
+        db.neighbors("p", "SAME", Direction::Out).unwrap(),
+        vec!["t".to_string()],
+        "fixture: p→t derived through o"
+    );
+    // Delete o (the via node).
+    let report = db.delete_node("o").unwrap();
+    // p→t was derived through o; deleting o must retract p→t and report it.
+    assert!(
+        report.derived_edges >= 1,
+        "deleting via node must count the derived edge it carried; \
+         got derived_edges={} (expected ≥ 1)",
+        report.derived_edges
+    );
+    // p→t is gone.
+    assert!(
+        db.neighbors("p", "SAME", Direction::Out)
+            .unwrap()
+            .is_empty(),
+        "p→t must be gone after via node deleted"
+    );
 }

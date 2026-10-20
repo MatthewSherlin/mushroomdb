@@ -1848,6 +1848,14 @@ pub struct GraphDb<F: Fs> {
     ///
     /// `None` on stores with no V8 base (WAL-only or V5/V7 snapshot opens).
     base_edge_count_from_rows: Option<u64>,
+    /// The number of derived-edge retractions the most recent
+    /// `log_then_apply_with` call produced, counting only the apply's own
+    /// deltas (not the preceding reconcile pass's restorations).
+    ///
+    /// Reset to 0 before every apply and set after `drain_deltas`.  Used by
+    /// `delete_node` to count via-hop derived edges that `provenance_touching`
+    /// cannot see (ledger row 50).
+    last_apply_retraction_count: u64,
 }
 
 /// One group of deferred event notifications, held until the group fsync
@@ -2473,6 +2481,7 @@ impl<F: Fs> GraphDb<F> {
             lock_denied: false,
             pinned: false,
             base_edge_count_from_rows: None,
+            last_apply_retraction_count: 0,
         }
     }
 
@@ -5739,6 +5748,32 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
+    /// Ensure provenance is loaded and the one-time lost-provenance repair has
+    /// run, then drain the engine's pending deltas so the next commit satisfies
+    /// invariant I-1 (zero pending deltas at entry).
+    ///
+    /// Call this before reading derived-edge counts for a report when the first
+    /// non-declaration commit has not yet run — for example, before comparing
+    /// the edge set either side of a `remove_prop` that is itself the first
+    /// write on a damaged store.  Without it, the repair runs *inside* the
+    /// commit, making a "before" snapshot taken before the commit see no edges
+    /// (the store looks empty before reconcile) while the "after" snapshot sees
+    /// zero as well (the property is gone), and the diff reports nothing removed
+    /// (ledger row 115).
+    ///
+    /// Safe to call multiple times: `reconcile_lost_provenance` is a no-op on
+    /// its second and subsequent calls, and `drain_deltas` returns nothing
+    /// when no deltas are pending.  Does not write to the WAL.
+    pub fn ensure_reconcile_for_report(&mut self) {
+        self.load_provenance_for_write();
+        self.reconcile_lost_provenance();
+        // Drain the deltas reconcile produced.  The view store was already
+        // notified by reconcile_lost_provenance; the deltas themselves are
+        // transient bookkeeping consumed at the next log_then_apply_with call.
+        // Draining here satisfies I-1 for any commit that follows.
+        let _ = self.engine.drain_deltas();
+    }
+
     fn log_then_apply(&mut self, rec: WalRecord) -> Result<()> {
         self.log_then_apply_with(rec, None, self.fsync)
     }
@@ -5876,6 +5911,9 @@ impl<F: Fs> GraphDb<F> {
         if !is_declaration(&rec) {
             self.reconcile_lost_provenance();
         }
+        // Capture the delta cursor after reconcile so we can measure apply's
+        // own retractions below (ledger row 50).
+        let pre_apply_delta = self.engine.pending_delta_count();
         let apply_result = self.apply(&rec);
         // For Batch frames, post-validation apply must be infallible (see above).
         // A debug_assert here catches any future change that makes apply fallible
@@ -5894,6 +5932,7 @@ impl<F: Fs> GraphDb<F> {
             // _emit_guard restores emit_deltas on drop automatically.
             let _ = self.engine.drain_deltas();
             let _ = self.engine.take_rebuild_needed();
+            self.last_apply_retraction_count = 0;
             apply_result?;
         }
         self.commit_seq += 1;
@@ -5905,6 +5944,14 @@ impl<F: Fs> GraphDb<F> {
         // MutationEvent sink fires — both happen post-fsync, post-apply.
         // _emit_guard restores emit_deltas after this line when it drops.
         let engine_deltas = self.engine.drain_deltas();
+        // Count retractions from the apply only (not reconcile's restorations).
+        // `delete_node` uses this to count via-hop derived edges that
+        // `provenance_touching` cannot see because the via node is not a src or
+        // dst of the derived edge (ledger row 50).
+        self.last_apply_retraction_count = engine_deltas
+            .get(pre_apply_delta..)
+            .map(|s| s.iter().filter(|d| !d.fired).count() as u64)
+            .unwrap_or(0);
 
         // Append history-marker WAL records for any derived-edge changes so
         // that `edge_history` and `was_linked` can surface rule-attributed
@@ -7443,18 +7490,18 @@ impl<F: Fs> GraphDb<F> {
             .get(key)
             .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
 
-        // Count edges before the delete is applied so we can report counts.
-        // Only the derived edges the graph holds: on a store where 0.8.0 lost
-        // an edge a rule still counts (ledger row 111), the report is computed
-        // before the commit's repair, and the lost edge is no edge to remove.
+        // Count total graph edges touching this node before the delete so we can
+        // derive the manual-edges count.  We also count direct derived edges (those
+        // where `id` is src or dst in provenance) for the manual-edges subtraction;
+        // via-hop derived edges (where `id` is the via node) do not appear in
+        // provenance_touching, so they are excluded from this pre-delete scan.
+        // The post-apply retraction count (ledger row 50) captures both.
         let tv = self.topo_view();
-        let derived_set: BTreeSet<(u32, u32, u32)> = self
+        let direct_derived_in_graph: u64 = self
             .engine
             .provenance_touching(id)
-            .map(|(_, etype, src, dst)| (etype, src, dst))
-            .filter(|&(etype, src, dst)| tv.neighbors(etype, Direction::Out, src).contains(&dst))
-            .collect();
-        let derived_edges = derived_set.len() as u64;
+            .filter(|&(_, etype, src, dst)| tv.neighbors(etype, Direction::Out, src).contains(&dst))
+            .count() as u64;
 
         let mut total_topo = 0u64;
         for et in tv.etypes() {
@@ -7464,9 +7511,18 @@ impl<F: Fs> GraphDb<F> {
         // For symmetric rules (e.g. Overlap), a→b and b→a are two separate directed
         // triples in both the topo scan (Out and In from id) and in provenance_touching.
         // The subtraction remains correct because both counts include both directions.
-        let manual_edges = total_topo.saturating_sub(derived_edges);
+        //
+        // Via-hop derived edges are not in `direct_derived_in_graph`, so they are
+        // not subtracted here — they count as manual edges in the pre-delete view,
+        // which would be wrong.  We tolerate this because the final `derived_edges`
+        // value comes from the post-apply retraction count, which includes via-hop
+        // edges, and `manual_edges` is clamped by saturating_sub.
+        let manual_edges = total_topo.saturating_sub(direct_derived_in_graph);
 
         self.log_then_apply(WalRecord::DeleteNode { key: key.into() })?;
+        // Use the engine's retraction count from the apply: includes direct and
+        // via-hop derived edges removed by the delete (ledger row 50).
+        let derived_edges = self.last_apply_retraction_count;
         Ok(DeleteReport {
             manual_edges,
             derived_edges,
