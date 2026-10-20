@@ -38,6 +38,8 @@ pub struct DiskState {
     pub snapshot: Option<Ident>,
     /// `wal.bin`'s length in bytes (0 when absent).
     pub wal_len: u64,
+    /// Which file `wal.bin` is ([`mushroomdb::WalPosition::wal`]'s form).
+    pub wal: Option<u64>,
     /// Whether `snapshot.intent` holds anything: a snapshot is running, or
     /// one stopped half-way.
     pub intent_nonempty: bool,
@@ -46,14 +48,45 @@ pub struct DiskState {
 pub fn observe(dir: &Path) -> io::Result<DiskState> {
     let snapshot =
         not_found_is_none(std::fs::metadata(dir.join("snapshot.bin")))?.map(|m| ident_of(&m));
-    let wal_len = not_found_is_none(std::fs::metadata(dir.join("wal.bin")))?.map_or(0, |m| m.len());
+    let wal_meta = not_found_is_none(std::fs::metadata(dir.join("wal.bin")))?;
+    let wal_len = wal_meta.as_ref().map_or(0, |m| m.len());
+    let wal = wal_meta.as_ref().and_then(file_ident);
     let intent_nonempty = not_found_is_none(std::fs::metadata(dir.join("snapshot.intent")))?
         .is_some_and(|m| m.len() > 0);
     Ok(DiskState {
         snapshot,
         wal_len,
+        wal,
         intent_nonempty,
     })
+}
+
+impl DiskState {
+    /// Nothing that pairs a snapshot with a WAL changed between `self` and a
+    /// later look `after`: no snapshot was running at either, the same
+    /// snapshot and the same WAL file are there, and the WAL only grew.
+    pub fn unchanged_until(&self, after: &DiskState) -> bool {
+        !self.intent_nonempty
+            && !after.intent_nonempty
+            && self.snapshot == after.snapshot
+            && self.wal == after.wal
+            && after.wal_len >= self.wal_len
+    }
+}
+
+/// The inode number on Unix; `None` elsewhere. The same identity the engine
+/// records for `wal.bin`.
+fn file_ident(meta: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some(meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
 }
 
 /// `snapshot.bin` opened, with the identity of the file actually opened.

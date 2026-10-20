@@ -277,3 +277,45 @@ fn a_peer_snapshot_shows_until_the_handle_catches_up() {
     assert_eq!(pos.frames, Some(server.read().wal_total_commits().unwrap()));
     assert_on_frame_boundary(&dir, pos);
 }
+
+/// A handle that reloaded while another process was between writing its
+/// snapshot and replacing the WAL holds the new snapshot's identity and an
+/// offset into the old WAL file. When the WAL file under the name changes —
+/// here replaced by a longer copy, so a length check alone would read a tail
+/// at the old offset — the refresh must reload, and the position must name
+/// the file on disk.
+#[cfg(unix)]
+#[test]
+fn a_replaced_wal_file_reloads_even_when_it_is_longer() {
+    let dir = tmp("walident");
+    let a = SharedDb::open(&dir).unwrap();
+    a.write().insert_node("A", "a", vec![]).unwrap();
+    {
+        let peer = SharedDb::open(&dir).unwrap();
+        for k in ["b", "c", "d"] {
+            peer.write().insert_node("A", k, vec![]).unwrap();
+        }
+    }
+    let copy = dir.join("wal.copy");
+    std::fs::copy(dir.join("wal.bin"), &copy).unwrap();
+    std::fs::rename(&copy, dir.join("wal.bin")).unwrap();
+    let before = a.durable_wal_position();
+    assert_ne!(before.wal, mushroomdb::disk_wal_ident(&dir).unwrap());
+    a.refresh_if_stale_now();
+    let pos = a.durable_wal_position();
+    assert!(pos.generation > before.generation, "the handle reloaded");
+    assert_eq!(pos.wal, mushroomdb::disk_wal_ident(&dir).unwrap());
+    assert_eq!(a.read().node_count(), 4);
+}
+
+#[cfg(unix)]
+#[test]
+fn the_first_append_learns_which_wal_file_it_created() {
+    let dir = tmp("walcreate");
+    let db = SharedDb::open(&dir).unwrap();
+    assert_eq!(db.durable_wal_position().wal, None);
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let pos = db.durable_wal_position();
+    assert!(pos.wal.is_some());
+    assert_eq!(pos.wal, mushroomdb::disk_wal_ident(&dir).unwrap());
+}

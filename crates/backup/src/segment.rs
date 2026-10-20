@@ -38,6 +38,55 @@ pub fn complete_frames(bytes: &[u8]) -> (usize, u64) {
     (pos, frames)
 }
 
+/// Counts frames in a WAL read in arbitrary chunks, by their headers.
+///
+/// For a whole file the engine wrote (an archive), the count equals what its
+/// decoder finds. A trailing partial frame is not counted.
+#[derive(Debug, Default)]
+pub struct FrameCounter {
+    header: [u8; FRAME_HEADER_LEN],
+    have: usize,
+    /// Payload bytes of the current frame still to come.
+    remaining: u64,
+    in_frame: bool,
+    frames: u64,
+}
+
+impl FrameCounter {
+    pub fn feed(&mut self, mut buf: &[u8]) {
+        while !buf.is_empty() {
+            if self.in_frame {
+                let take = (self.remaining as usize).min(buf.len());
+                self.remaining -= take as u64;
+                buf = &buf[take..];
+                if self.remaining == 0 {
+                    self.in_frame = false;
+                    self.frames += 1;
+                }
+            } else {
+                let take = (FRAME_HEADER_LEN - self.have).min(buf.len());
+                self.header[self.have..self.have + take].copy_from_slice(&buf[..take]);
+                self.have += take;
+                buf = &buf[take..];
+                if self.have == FRAME_HEADER_LEN {
+                    self.have = 0;
+                    self.remaining =
+                        u32::from_le_bytes(self.header[..4].try_into().unwrap()) as u64;
+                    if self.remaining == 0 {
+                        self.frames += 1;
+                    } else {
+                        self.in_frame = true;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+}
+
 fn frame_len_at(bytes: &[u8], pos: usize) -> Option<usize> {
     let header = bytes.get(pos..pos + FRAME_HEADER_LEN)?;
     Some(u32::from_le_bytes(header[..4].try_into().unwrap()) as usize)
@@ -128,6 +177,31 @@ mod tests {
         b.extend(&frame(b"three")[..5]);
         assert_eq!(complete_frames(&b), (two, 2));
         assert_eq!(complete_frames(&[]), (0, 0));
+    }
+
+    #[test]
+    fn the_counter_finds_the_same_frames_in_any_chunking() {
+        let mut b = Vec::new();
+        for p in [
+            &b""[..],
+            b"one",
+            b"a much longer payload than the rest",
+            b"x",
+        ] {
+            b.extend(frame(p));
+        }
+        let (_, whole) = complete_frames(&b);
+        assert_eq!(whole, 4);
+        for chunk in [1, 3, 7, 8, 9, 100] {
+            let mut c = FrameCounter::default();
+            for piece in b.chunks(chunk) {
+                c.feed(piece);
+            }
+            assert_eq!(c.frames(), whole, "chunk {chunk}");
+        }
+        let mut c = FrameCounter::default();
+        c.feed(&b[..b.len() - 1]);
+        assert_eq!(c.frames(), 3, "a partial last frame is not counted");
     }
 
     #[test]

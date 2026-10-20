@@ -71,7 +71,7 @@ pub const FIND_SIMILAR_DEFAULT_MIN: f64 = 0.8;
 /// store's stamp against this with `>=`, never `==` — see `cli::run_migrate`,
 /// which would otherwise report an opted-in store as `V10 -> V9`.
 pub const SNAPSHOT_VERSION: u16 = core_storage::snapshot::VERSION;
-pub use durable_wal::{disk_snapshot_ident, WalPosition};
+pub use durable_wal::{disk_snapshot_ident, disk_wal_ident, WalPosition};
 pub use history::{EdgeEvent, EdgeHistoryEvent, HistoryChange, HistoryEntry, HistoryResult};
 pub use ingest::{
     json_to_rows, json_to_value, tagged_json, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,

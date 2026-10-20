@@ -37,6 +37,11 @@ pub struct WalPosition {
     /// caught up yet: its WAL offsets describe a file that is gone. Computed
     /// exactly as [`disk_snapshot_ident`] computes it.
     pub snapshot: Option<(u64, u64)>,
+    /// Identity of the `wal.bin` file `len` is an offset into (the inode
+    /// number on Unix; `None` elsewhere or when there is no WAL). A different
+    /// file on disk means this handle has not caught up with a WAL another
+    /// process replaced.
+    pub wal: Option<u64>,
     /// True while a snapshot is running. `snapshot.bin` and `wal.bin` may then
     /// be between states on disk (the new snapshot renamed in, the old WAL not
     /// yet replaced), so a reader pairing the two must wait.
@@ -48,6 +53,12 @@ pub struct WalPosition {
 pub fn disk_snapshot_ident(dir: &std::path::Path) -> std::io::Result<Option<(u64, u64)>> {
     use core_storage::fs::Fs as _;
     core_storage::fs::RealFs::new(dir)?.snapshot_ident()
+}
+
+/// The identity of `dir/wal.bin` in the form [`WalPosition::wal`] uses.
+pub fn disk_wal_ident(dir: &std::path::Path) -> std::io::Result<Option<u64>> {
+    use core_storage::fs::Fs as _;
+    core_storage::fs::RealFs::new(dir)?.wal_ident()
 }
 
 #[derive(Debug, Default)]
@@ -100,12 +111,14 @@ impl DurableWal {
     pub(crate) fn loaded(
         &self,
         snapshot: Option<(u64, u64)>,
+        wal: Option<u64>,
         base_frames: u64,
         len: u64,
         frames: u64,
     ) {
         let mut s = self.lock();
         s.pos.snapshot = snapshot;
+        s.pos.wal = wal;
         s.pos.len = 0;
         s.pos.frames = Some(base_frames);
         s.unvouched = (len > 0).then_some((len, frames));
@@ -120,9 +133,12 @@ impl DurableWal {
         }
     }
 
-    /// The handle's state is now based on the snapshot identified `ident`.
-    pub(crate) fn snapshot_is(&self, ident: Option<(u64, u64)>) {
-        self.lock().pos.snapshot = ident;
+    /// The handle's state is now based on the snapshot identified `ident`,
+    /// with its cursor in the WAL file identified `wal`.
+    pub(crate) fn snapshot_is(&self, ident: Option<(u64, u64)>, wal: Option<u64>) {
+        let mut s = self.lock();
+        s.pos.snapshot = ident;
+        s.pos.wal = wal;
     }
 
     /// `(generation, len, frames)` of bytes waiting to be vouched for.

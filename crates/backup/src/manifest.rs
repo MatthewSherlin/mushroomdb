@@ -31,7 +31,9 @@ pub struct Manifest {
     pub created_at: String,
     /// Global frame index one past the last frame this restore point holds —
     /// the index space `open_at` and `--at <commit>` use: what a store opened
-    /// from `files` plus `segments` reports as `wal_total_commits`. Also the
+    /// from `files` plus `segments` reports as `wal_total_commits`. Computed
+    /// from exactly those objects: `oldest_commit_seq` (the `wal.floor` it
+    /// lists) plus every listed archive's and segment's `frames`. Also the
     /// manifest's key, so manifests sort by it.
     pub commit_seq: u64,
     /// The first global frame index still reachable through the archives
@@ -57,6 +59,10 @@ pub struct FileEntry {
     pub size: u64,
     /// CRC-32 of the object's bytes, as eight lowercase hex digits.
     pub crc32: String,
+    /// WAL frames in the object: an archive's frame count, 0 for any other
+    /// file.
+    #[serde(default)]
+    pub frames: u64,
 }
 
 /// One WAL segment named by a manifest. Its byte range is in its key.
@@ -65,6 +71,9 @@ pub struct SegmentEntry {
     pub key: String,
     /// CRC-32 of the segment's bytes, as eight lowercase hex digits.
     pub crc32: String,
+    /// WAL frames in the segment.
+    #[serde(default)]
+    pub frames: u64,
 }
 
 impl Manifest {

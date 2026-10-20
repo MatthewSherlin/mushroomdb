@@ -184,11 +184,13 @@ fn manifest_round_trip() {
             key: "pfx/snapshots/12-4712.bin".into(),
             size: 18_432_000,
             crc32: "cbf43926".into(),
+            frames: 0,
         }],
         wal_generation: 12,
         segments: vec![SegmentEntry {
             key: "pfx/wal/12/00000000000000000000-00000000000000065536".into(),
             crc32: "00000000".into(),
+            frames: 17,
         }],
     };
     let json = m.to_json();
@@ -530,13 +532,27 @@ async fn snapshot_intent_is_never_uploaded() {
         .iter()
         .all(|k| !k.contains("snapshot.intent")));
 
-    // A non-empty intent is a snapshot stopped half-way: no restore point is
-    // built on it.
+    // A non-empty intent is a snapshot in progress — here or in another
+    // process — or one stopped half-way: nothing is read beside it, and that
+    // is a deferral, not a failure.
     std::fs::write(dir.path().join("snapshot.intent"), [1u8; 32]).unwrap();
     let fresh = mem();
     let mut w = worker(&fresh, &db, dir.path());
-    assert!(w.run_once().await.is_err());
-    assert!(latest(&fresh).await.is_none());
+    let c = w.counters();
+    w.step().await;
+    assert_eq!(
+        c.error_count.load(Ordering::Acquire),
+        0,
+        "a deferral is not an error"
+    );
+    assert!(
+        c.healthy.load(Ordering::Acquire),
+        "not unhealthy yet: no lag limit passed"
+    );
+    assert!(
+        latest(&fresh).await.is_none(),
+        "nothing was built beside the intent"
+    );
 }
 
 #[tokio::test]
@@ -951,4 +967,359 @@ async fn lag_is_zero_when_everything_durable_has_shipped() {
     assert_eq!(c.lag_s.load(Ordering::Acquire), 0);
     assert!(c.healthy.load(Ordering::Acquire));
     assert!(c.last_success_ts.load(Ordering::Acquire) > 0);
+}
+
+// ── Fix round 2 probes ───────────────────────────────────────────────────────
+
+/// Critical probe: another process runs a storm of truncating, archiving and
+/// keep-WAL snapshots, with writes between them, while the worker steps and
+/// the server keeps reading (each read may refresh mid-snapshot). Every
+/// manifest must verify, its `commit_seq` must be what the restored store
+/// holds, and where the live store can still be opened at that commit the
+/// restored store must equal it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_storm_from_another_process_leaves_every_manifest_true() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = SharedDb::open(dir.path()).unwrap();
+    for i in 0..5 {
+        server
+            .write()
+            .insert_node("S", &format!("s{i}"), vec![])
+            .unwrap();
+    }
+    let store = mem();
+    let mut w = BackupWorker::new(
+        BackupConfig {
+            retain_n: 0,
+            manifest_interval_s: 0,
+            ..config(1000)
+        },
+        Arc::clone(&store),
+        Arc::new(server.clone()),
+        dir.path().to_path_buf(),
+    )
+    .unwrap();
+    w.run_once().await.unwrap();
+
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let peer = {
+        let dir = dir.path().to_path_buf();
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let peer = SharedDb::open(&dir).unwrap();
+            // 30 mixed snapshots; then one truncating snapshot and writes
+            // only, so the history from there on is reachable through
+            // `open_at` (a keep-WAL snapshot is no base for it).
+            for i in 0..36i64 {
+                for j in 0..3 {
+                    peer.write()
+                        .insert_node(
+                            "P",
+                            &format!("p{i}-{j}"),
+                            vec![("i".into(), mushroomdb::Value::Int(i))],
+                        )
+                        .unwrap();
+                }
+                if i > 0 {
+                    peer.write()
+                        .insert_edge("E", &format!("p{}-0", i - 1), &format!("p{i}-0"))
+                        .unwrap();
+                }
+                let opts = match i % 3 {
+                    _ if i > 30 => {
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    _ if i == 30 => SnapshotOptions::default(),
+                    0 => SnapshotOptions::default(),
+                    1 => ARCHIVING,
+                    _ => SnapshotOptions {
+                        keep_wal: true,
+                        archive_wal: false,
+                    },
+                };
+                peer.write().snapshot_with(opts).unwrap();
+                std::thread::sleep(Duration::from_millis(3));
+            }
+            done.store(true, Ordering::Release);
+        })
+    };
+    let mut steps = 0;
+    while !done.load(Ordering::Acquire) {
+        w.run_once()
+            .await
+            .expect("a storm defers steps, it never fails them");
+        let _ = server.read().node_count();
+        steps += 1;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    peer.join().unwrap();
+    for _ in 0..3 {
+        w.run_once().await.unwrap();
+    }
+    w.flush().await;
+
+    let manifests = all_manifests(&store).await;
+    assert!(
+        manifests.len() >= 10,
+        "{} manifests in {steps} steps",
+        manifests.len()
+    );
+    let mut compared = 0;
+    for m in &manifests {
+        let into = tempfile::tempdir().unwrap();
+        // Asserts every checksum, contiguity, and commit_seq == the restored
+        // store's frame count.
+        restore(&store, m, into.path()).await;
+        if m.commit_seq == 0 {
+            continue;
+        }
+        if let Ok(at) = GraphDb::open_at(dir.path(), m.commit_seq - 1) {
+            let live_then = (at.node_count(), at.edge_count());
+            drop(at);
+            assert_eq!(
+                counts_of(into.path()),
+                live_then,
+                "manifest at {} restores what the store held then",
+                m.commit_seq
+            );
+            compared += 1;
+        }
+    }
+    if compared == 0 {
+        let total = counts(&server);
+        let last = server.read().wal_total_commits().unwrap();
+        panic!(
+            "no manifest could be compared with open_at; at the end: {:?}",
+            GraphDb::open_at(dir.path(), last - 1).map(|d| (d.node_count(), total))
+        );
+    }
+    let restored = tempfile::tempdir().unwrap();
+    restore_latest(&store, restored.path()).await;
+    assert_eq!(counts_of(restored.path()), counts(&server));
+}
+
+/// A store whose next upload is a snapshot of its own, with nothing before it:
+/// one truncating snapshot (no archive, so no chain files) and a write.
+fn store_with_a_snapshot(dir: &Path) -> SharedDb {
+    let db = SharedDb::open(dir).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    db.write().snapshot().unwrap();
+    db.write().insert_node("A", "b", vec![]).unwrap();
+    db
+}
+
+/// Important probe: a refused snapshot PUT (the bucket answers it with an
+/// error) must be counted and retried, never panic the worker.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_snapshot_put_is_counted_and_retried() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let bucket = tempfile::tempdir().unwrap();
+    let db = store_with_a_snapshot(dir.path());
+    let refused = bucket.path().join(PREFIX).join("snapshots");
+    std::fs::create_dir_all(&refused).unwrap();
+    std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let store: Arc<dyn ObjectStore> =
+        Arc::new(object_store::local::LocalFileSystem::new_with_prefix(bucket.path()).unwrap());
+    let (tx, rx) = watch::channel(BackupTrigger::Idle);
+    let handle = BackupWorker::new(
+        BackupConfig {
+            wal_interval_ms: 50,
+            ..config(50)
+        },
+        Arc::clone(&store),
+        Arc::new(db.clone()),
+        dir.path().to_path_buf(),
+    )
+    .unwrap()
+    .start(rx);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while handle.error_count.load(Ordering::Acquire) < 2 {
+        assert!(tokio::time::Instant::now() < deadline, "no failure counted");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!handle.join.is_finished(), "the worker is still running");
+    assert!(
+        handle
+            .reason
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_none_or(|r| !r.contains("panicked")),
+        "no panic"
+    );
+    // The bucket comes back: the retry succeeds and the backup restores.
+    std::fs::set_permissions(&refused, std::fs::Permissions::from_mode(0o700)).unwrap();
+    wait_for_latest(&store, |m| m.files.iter().any(|f| f.name == "snapshot.bin")).await;
+    tx.send(BackupTrigger::Shutdown).unwrap();
+    handle.join.await.unwrap();
+    let restored = tempfile::tempdir().unwrap();
+    restore_latest(&store, restored.path()).await;
+    assert_eq!(counts_of(restored.path()), counts(&db));
+}
+
+/// Important probe: a snapshot PUT that hangs, with `snapshot.bin` present,
+/// times out and is counted; the worker keeps going and shuts down on time.
+#[tokio::test(start_paused = true)]
+async fn a_hung_snapshot_put_times_out_without_killing_the_worker() {
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    let dir = tempfile::tempdir().unwrap();
+    let db = store_with_a_snapshot(dir.path());
+    let hung: Arc<dyn ObjectStore> = Arc::new(ThrottledStore::new(
+        InMemory::new(),
+        ThrottleConfig {
+            wait_put_per_call: Duration::from_secs(365 * 24 * 3600),
+            ..ThrottleConfig::default()
+        },
+    ));
+    let (tx, rx) = watch::channel(BackupTrigger::Idle);
+    let handle = BackupWorker::spawn(
+        BackupConfig {
+            op_timeout_ms: 200,
+            shutdown_grace_ms: 500,
+            ..config(1000)
+        },
+        hung,
+        Arc::new(db.clone()),
+        dir.path().to_path_buf(),
+        rx,
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(
+        handle.error_count.load(Ordering::Acquire) >= 3,
+        "each timeout is counted"
+    );
+    assert!(
+        !handle.join.is_finished(),
+        "the worker survived every failed PUT"
+    );
+    assert!(
+        !handle.healthy.load(Ordering::Acquire),
+        "three failures in a row"
+    );
+    let reason = handle.reason.lock().unwrap().clone().unwrap();
+    assert!(reason.contains("consecutive failed"), "{reason}");
+    tx.send(BackupTrigger::Shutdown).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle.join)
+        .await
+        .expect("shutdown is bounded")
+        .unwrap();
+}
+
+/// Important probe: if the worker ever dies — here, a forced panic — health
+/// says so, with the reason, and stays that way.
+#[tokio::test]
+async fn a_worker_that_panics_reports_unhealthy_with_the_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let mut w = worker(&mem(), &db, dir.path());
+    w.panic_on_next_step();
+    let (_tx, rx) = watch::channel(BackupTrigger::Idle);
+    let handle = w.start(rx);
+    let healthy = Arc::clone(&handle.healthy);
+    let reason = Arc::clone(&handle.reason);
+    tokio::time::timeout(Duration::from_secs(10), handle.join)
+        .await
+        .expect("the supervisor notices the worker's end")
+        .unwrap();
+    assert!(!healthy.load(Ordering::Acquire));
+    let why = reason.lock().unwrap().clone().unwrap();
+    assert!(
+        why.contains("panicked") && why.contains("test hook"),
+        "{why}"
+    );
+}
+
+/// Minor probe: health flips within one cadence of the 30 s limit, and
+/// `lag_s` counts from when the unshipped durable data was first seen.
+#[tokio::test(start_paused = true)]
+async fn health_flips_within_one_cadence_of_the_lag_limit() {
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let forever = Duration::from_secs(365 * 24 * 3600);
+    // Every request hangs, and the deadline is longer than the test: no
+    // failure is ever counted, so only the lag can make it unhealthy.
+    let hung: Arc<dyn ObjectStore> = Arc::new(ThrottledStore::new(
+        InMemory::new(),
+        ThrottleConfig {
+            wait_put_per_call: forever,
+            wait_get_per_call: forever,
+            wait_list_with_delimiter_per_call: forever,
+            ..ThrottleConfig::default()
+        },
+    ));
+    let (_tx, rx) = watch::channel(BackupTrigger::Idle);
+    let handle = BackupWorker::spawn(
+        BackupConfig {
+            op_timeout_ms: 3_600_000,
+            ..config(1000)
+        },
+        hung,
+        Arc::new(db.clone()),
+        dir.path().to_path_buf(),
+        rx,
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(29_900)).await;
+    assert!(
+        handle.healthy.load(Ordering::Acquire),
+        "29.9 s: within the limit"
+    );
+    assert_eq!(handle.lag_s.load(Ordering::Acquire), 29);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        handle.healthy.load(Ordering::Acquire),
+        "30.5 s: the limit itself"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !handle.healthy.load(Ordering::Acquire),
+        "31.1 s: past it by one cadence at most"
+    );
+    assert_eq!(handle.lag_s.load(Ordering::Acquire), 31);
+    assert_eq!(handle.error_count.load(Ordering::Acquire), 0);
+    let reason = handle.reason.lock().unwrap().clone().unwrap();
+    assert!(reason.contains("unshipped for 31s"), "{reason}");
+}
+
+/// Minor probe: retention's cost does not grow with the number of segments
+/// in a generation that never snapshots.
+#[tokio::test]
+async fn retention_cost_does_not_grow_with_the_segments_of_a_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    let store = mem();
+    let mut w = BackupWorker::new(
+        BackupConfig {
+            retain_n: 2,
+            manifest_interval_s: 0,
+            ..config(1000)
+        },
+        Arc::clone(&store),
+        Arc::new(db.clone()),
+        dir.path().to_path_buf(),
+    )
+    .unwrap();
+    let mut per_cycle = Vec::new();
+    for i in 0..40 {
+        db.write()
+            .insert_node("A", &format!("n{i}"), vec![])
+            .unwrap();
+        let before = w.list_requests();
+        w.run_once().await.unwrap();
+        per_cycle.push(w.list_requests() - before);
+    }
+    let segments = segment_keys(&store, 0).await.len();
+    assert!(segments >= 40, "{segments} segments in one generation");
+    assert_eq!(
+        per_cycle[10], per_cycle[39],
+        "LISTs per manifest write stay flat: {per_cycle:?}"
+    );
+    assert_bucket_sound(&store, "flat retention").await;
 }

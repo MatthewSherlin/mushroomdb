@@ -1923,6 +1923,11 @@ pub struct GraphDb<F: Fs> {
     /// `(len, mtime_nanos)`. A different value means another process replaced
     /// the snapshot and the WAL no longer continues our state: refresh reloads.
     snapshot_ident: Option<(u64, u64)>,
+    /// Identity of the `wal.bin` file this handle's cursor describes
+    /// ([`Fs::wal_ident`]). A different file under the name — another
+    /// process's snapshot replaced it — makes [`refresh`](GraphDb::refresh)
+    /// reload, even when the new file is longer than the cursor.
+    wal_ident: Option<u64>,
     /// The options this handle was opened with. Replayed verbatim when
     /// `refresh` has to rebuild from disk.
     open_opts: OpenOptions,
@@ -2582,6 +2587,7 @@ impl<F: Fs> GraphDb<F> {
             wal_frames_written: 0,
             durable_wal: DurableWal::default(),
             snapshot_ident: None,
+            wal_ident: None,
             open_opts: opts,
             holds_lifetime_lock: false,
             lock_denied: false,
@@ -2655,6 +2661,7 @@ impl<F: Fs> GraphDb<F> {
         self.wal_consumed = 0;
         self.wal_frames_written = 0;
         self.snapshot_ident = None;
+        self.wal_ident = None;
         self.base_edge_count_from_rows = None;
     }
 
@@ -2781,6 +2788,9 @@ impl<F: Fs> GraphDb<F> {
         if let Some(&max_seq) = db.last_change.values().max() {
             db.commit_seq = db.commit_seq.max(max_seq);
         }
+        // Taken before the read: a file replaced between the two then reads
+        // as a different identity later, which reloads — the safe direction.
+        db.wal_ident = db.fs.wal_ident().map_err(GraphError::Io)?;
         let bytes = db.fs.read(FileId::Wal)?;
         let (records, valid_len) = decode_all(&bytes);
         // The valid prefix is replayed either way; `repair_wal` only decides
@@ -2788,6 +2798,7 @@ impl<F: Fs> GraphDb<F> {
         // appender must not persist a truncation the writer never asked for.
         if valid_len < bytes.len() && repair_wal {
             db.fs.write_atomic(FileId::Wal, &bytes[..valid_len])?;
+            db.wal_ident = db.fs.wal_ident().map_err(GraphError::Io)?;
         }
         // WAL-present path: build indexes eagerly BEFORE replay so that the
         // first replayed record does not trigger the lazy-init guard (which
@@ -2924,6 +2935,7 @@ impl<F: Fs> GraphDb<F> {
         // reader of the durable position fsyncs it once before counting it.
         db.durable_wal.loaded(
             db.snapshot_ident,
+            db.wal_ident,
             db.wal_frames_written - decoded_frames,
             db.wal_consumed,
             db.wal_frames_written,
@@ -3157,7 +3169,13 @@ impl<F: Fs> GraphDb<F> {
         }
         let disk_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
         let wal_len = self.fs.wal_len().map_err(GraphError::Io)?;
-        if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed {
+        // The WAL file itself may have been replaced while the snapshot this
+        // handle already saw stayed: it reloaded while another process was
+        // between writing its snapshot and replacing the WAL. Its cursor
+        // describes the old file, so a tail read at that offset in the new
+        // one would apply frames that are not the next ones.
+        let wal_replaced = self.fs.wal_ident().map_err(GraphError::Io)? != self.wal_ident;
+        if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed || wal_replaced {
             // The WAL no longer continues our state: rebuild from disk. State
             // is cleared first, so a failed load leaves an empty handle — mark
             // it degraded rather than let a caller read an empty graph as if
@@ -6306,6 +6324,13 @@ impl<F: Fs> GraphDb<F> {
         );
         let frame = encode_record(&rec);
         self.fs.append(FileId::Wal, &frame)?;
+        // The first append to a store with no WAL creates the file: learn
+        // which one it is. One stat, once (where a file identity exists).
+        if cfg!(unix) && self.wal_ident.is_none() {
+            self.wal_ident = self.fs.wal_ident().map_err(GraphError::Io)?;
+            self.durable_wal
+                .snapshot_is(self.snapshot_ident, self.wal_ident);
+        }
         // The cursor advances by exactly the bytes appended: these frames are
         // ours and already applied, so a later refresh must not replay them.
         self.wal_consumed += frame.len() as u64;
@@ -15932,7 +15957,9 @@ impl<F: Fs> GraphDb<F> {
         // paid a far larger cost than one decode.
         self.wal_frames_written = self.wal_total_commits()?;
         self.snapshot_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
-        self.durable_wal.snapshot_is(self.snapshot_ident);
+        self.wal_ident = self.fs.wal_ident().map_err(GraphError::Io)?;
+        self.durable_wal
+            .snapshot_is(self.snapshot_ident, self.wal_ident);
         // A replacement WAL went in through `write_atomic`, which fsyncs it:
         // all of it is durable.
         if self.durable_wal.get().generation != generation_at_start {
