@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **The published container image is built with TLS**, so `--tls-cert` and `--tls-key` work at container start without a custom build (HO-01). CI now runs the server's TLS tests with `--features tls`.
+- `mushroomdb query` and `mushroomdb asof --query` take the statement from `--stdin` or `--file <path>`, so a quote needs no shell escaping; a trailing newline is dropped, and giving the statement more than one way is refused. `mushroomdb --help` now lists the graph commands first, then data input, then the agent-memory commands. Ledger row 70 stays open until the lexer accepts `\\` and `\"` escapes.
 
 ### Fixed
 
