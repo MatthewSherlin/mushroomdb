@@ -1,0 +1,58 @@
+# mushroomdb with a local S3-compatible store, for development and small
+# self-hosted installs.
+#
+#   MUSHROOMDB_TOKEN=<set-me> docker compose up
+#
+# Replace <owner> with the GitHub owner of the published image.
+#
+# SINGLE WRITER - replicas must be 1. Do not use `docker compose up --scale
+# mushroomdb=N`: a second writer on the same /data volume fails to take the
+# write lock.
+services:
+  mushroomdb:
+    image: ghcr.io/<owner>/mushroomdb:latest
+    ports:
+      - "8080:8080"
+      # The Bolt port (7687) is added by HO-15; it is intentionally absent here.
+    volumes:
+      - mushroomdb-data:/data
+    environment:
+      # Required. The server refuses a non-loopback bind without a token.
+      MUSHROOMDB_TOKEN: ${MUSHROOMDB_TOKEN:?set MUSHROOMDB_TOKEN to a strong secret}
+      MUSHROOMDB_LOG_FORMAT: json
+      # S3 settings the backup worker will read. They are wired to the bundled
+      # object store so HO-14/HO-15 only add the mushroomdb-specific variables.
+      AWS_ENDPOINT_URL: http://minio:9000
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      # TODO(HO-14/HO-15): backup and restore-on-boot variables go here once the
+      # backup worker (HO-07) ships. Nothing in this file configures backup yet.
+    command: ["serve", "/data", "--addr", "0.0.0.0:8080", "--snapshot-every", "300"]
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # Local S3-compatible storage. In production, point at a managed bucket and
+  # remove this service. The default credentials below are for local use only;
+  # override them with MINIO_ROOT_USER / MINIO_ROOT_PASSWORD in the environment.
+  minio:
+    image: minio/minio:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mushroomdb-data:
+  minio-data:

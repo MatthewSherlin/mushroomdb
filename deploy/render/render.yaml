@@ -1,0 +1,27 @@
+# mushroomdb on Render (Blueprint).
+#
+# SINGLE WRITER - replicas must be 1. Keep the instance count at 1: a Render
+# persistent disk attaches to one instance, and a second writer on the same
+# store contends for the write lock. Do not enable autoscaling.
+#
+# Replace <owner> with the GitHub owner of the published image. Secret values
+# are entered in the Render dashboard (sync: false); none live in this file.
+services:
+  - type: web
+    name: mushroomdb
+    runtime: image
+    image:
+      url: ghcr.io/<owner>/mushroomdb:latest
+    numInstances: 1
+    disk:
+      name: mushroomdb-data
+      mountPath: /data
+      sizeGB: 10
+    healthCheckPath: /ready
+    envVars:
+      - key: MUSHROOMDB_TOKEN
+        sync: false
+      - key: MUSHROOMDB_LOG_FORMAT
+        value: json
+      # TODO(HO-14/HO-15): backup and restore-on-boot variables go here once the
+      # backup worker (HO-07) ships. Nothing in this file configures backup yet.

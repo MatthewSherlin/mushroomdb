@@ -1,0 +1,56 @@
+# mushroomdb on Fly.io.
+#
+# Setup:
+#   fly launch --no-deploy --copy-config
+#   fly volumes create mushroomdb_data --size 10 --region iad
+#   fly secrets set MUSHROOMDB_TOKEN=<set-me>
+#   fly deploy
+#
+# Replace <owner> in [build] with the GitHub owner of the published image.
+
+app = "mushroomdb"
+primary_region = "iad"
+
+[build]
+  image = "ghcr.io/<owner>/mushroomdb:latest"
+
+[env]
+  # Non-secret settings only. Secrets (never put values here):
+  #   fly secrets set MUSHROOMDB_TOKEN=<set-me>
+  # Structured logs for the platform log shipper:
+  MUSHROOMDB_LOG_FORMAT = "json"
+  # TODO(HO-14/HO-15): continuous backup and restore-on-boot settings go here
+  # and in `fly secrets` once the backup worker (HO-07) ships. Nothing in this
+  # file configures backup yet.
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [services.concurrency]
+    type = "requests"
+    hard_limit = 256
+    soft_limit = 200
+  [[services.http_checks]]
+    interval = "10s"
+    timeout = "5s"
+    grace_period = "120s"   # allow WAL replay before the first check counts
+    method = "get"
+    path = "/ready"
+
+# The Bolt port (7687) is added by HO-15; it is intentionally absent here.
+
+[[mounts]]
+  source = "mushroomdb_data"
+  destination = "/data"
+
+# SINGLE WRITER - replicas must be 1.
+# mushroomdb is single-writer: two machines sharing one store will fail to
+# acquire the write lock. Run exactly one machine (`fly scale count 1`).
+[deploy]
+  strategy = "immediate"    # a rolling deploy cannot work with a single volume
