@@ -3169,13 +3169,21 @@ impl<F: Fs> GraphDb<F> {
         }
         let disk_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
         let wal_len = self.fs.wal_len().map_err(GraphError::Io)?;
-        // The WAL file itself may have been replaced while the snapshot this
-        // handle already saw stayed: it reloaded while another process was
-        // between writing its snapshot and replacing the WAL. Its cursor
-        // describes the old file, so a tail read at that offset in the new
-        // one would apply frames that are not the next ones.
-        let wal_replaced = self.fs.wal_ident().map_err(GraphError::Io)? != self.wal_ident;
-        if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed || wal_replaced {
+        // A tail is about to be read only when the WAL is longer than the
+        // cursor; only then can a replaced file be mistaken for this one, so
+        // only then is its identity checked. A write scope on a store nobody
+        // else wrote pays nothing for it.
+        //
+        // The case it catches: the WAL file was replaced while the snapshot
+        // this handle already saw stayed — it reloaded while another process
+        // was between writing its snapshot and replacing the WAL. Its cursor
+        // describes the old file, so a tail read at that offset in the new one
+        // would apply frames that are not the next ones.
+        let wal_replaced = || -> Result<bool> {
+            Ok(wal_len > self.wal_consumed
+                && self.fs.wal_ident().map_err(GraphError::Io)? != self.wal_ident)
+        };
+        if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed || wal_replaced()? {
             // The WAL no longer continues our state: rebuild from disk. State
             // is cleared first, so a failed load leaves an empty handle — mark
             // it degraded rather than let a caller read an empty graph as if
