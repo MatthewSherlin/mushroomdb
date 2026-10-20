@@ -5700,15 +5700,15 @@ An error the server's own handlers raise is one JSON object, `{"error": "<what w
 | 401 | A token is configured and the request carries none, or one the server does not know. Body: `{"error":"unauthorized"}` |
 | 403 | A role-bound token asked for something outside its role. The message says what |
 | 404 | A key that does not exist on a read route — `GET /node/{key}` and its `/edges`, `/neighborhood` and `/history` — or one the caller's role may not see; `POST /nodes/{key}/rename` on a key that does not exist |
-| 409 | `POST /nodes/{key}/rename` onto a key that is taken |
-| 413 | A request body over 64 MiB |
+| 409 | `POST /nodes/{key}/rename` onto a key that is taken, or a write that would give a second node a value a unique constraint covers |
+| 413 | A request body over 64 MiB, or a `Binary` value over 1 MiB |
 | 415 | A route that takes a JSON body was sent without `Content-Type: application/json` |
 | 500 | The store is corrupt, or `roles.json` is misconfigured |
 | 503 | Another process holds the write lock (`Retry-After: 1`), or the server is at its concurrency limit |
 
 What is refused before a handler runs is not that object. A body that is not valid JSON is
-400 with a plain-text message (`Failed to parse the request body as JSON: …`), and 408, 413
-and 415 are plain text too. A path that is not a route is 404 with an empty body, unless the
+400 with a plain-text message (`Failed to parse the request body as JSON: …`), and 408, the
+64 MiB body-limit 413, and 415 are plain text too. A path that is not a route is 404 with an empty body, unless the
 server is serving the explorer, which answers instead; a route asked with the wrong method is
 405 with an empty body. A failed `POST /backup` answers 500 with its report.
 
