@@ -42,6 +42,12 @@ const NS_DEFAULT_IDX: u32 = 0;
 /// [`GraphDb::enable_multiplicity`]. The engine owns the name: Cypher `SET` on
 /// it is refused, as the other reserved names are.
 pub const EDGE_COUNT_PROP: &str = "count";
+
+/// The conflict-set entry of a key that changed between a transaction's BEGIN
+/// and the moment the transaction first touched it. No node's `last_change`
+/// is ever `u64::MAX`, so a `NodeUnchangedSince` carrying it always fails —
+/// the same sentinel `Precondition::NodeAbsent` reports as `expected`.
+pub(crate) const TX_CHANGED_SINCE_BEGIN: u64 = u64::MAX;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -788,7 +794,7 @@ pub struct EdgeTypeCensus {
 }
 
 /// Construct the standard write-query result set (columns: created, properties_set, deleted).
-fn write_result_set() -> ResultSet {
+pub(crate) fn write_result_set() -> ResultSet {
     ResultSet::new(vec![
         "created".into(),
         "properties_set".into(),
@@ -796,7 +802,10 @@ fn write_result_set() -> ResultSet {
     ])
 }
 
-fn resolve_merge_set_value(op: &Operand, params: &BTreeMap<String, Value>) -> Result<Value> {
+pub(crate) fn resolve_merge_set_value(
+    op: &Operand,
+    params: &BTreeMap<String, Value>,
+) -> Result<Value> {
     match op {
         Operand::Lit(v) => Ok(v.clone()),
         Operand::Param(name) => params
@@ -846,7 +855,7 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
     }
 }
 
-fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
+pub(crate) fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
     let mut out = Vec::new();
     for item in items {
         match &item.value {
@@ -867,13 +876,13 @@ fn ret_node_vars(items: &[RetItem]) -> Vec<String> {
     out
 }
 
-fn add_var(out: &mut Vec<String>, v: &str) {
+pub(crate) fn add_var(out: &mut Vec<String>, v: &str) {
     if !out.iter().any(|x| x == v) {
         out.push(v.to_string());
     }
 }
 
-fn pattern_node_vars(pats: &[Pattern]) -> Vec<String> {
+pub(crate) fn pattern_node_vars(pats: &[Pattern]) -> Vec<String> {
     let mut out = Vec::new();
     for p in pats {
         if let Some(v) = &p.start.var {
@@ -888,7 +897,7 @@ fn pattern_node_vars(pats: &[Pattern]) -> Vec<String> {
     out
 }
 
-fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
+pub(crate) fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
     let mut out = Vec::new();
     for p in pats {
         for (rel, _) in &p.chain {
@@ -902,7 +911,7 @@ fn pattern_rel_vars(pats: &[Pattern]) -> Vec<String> {
     out
 }
 
-fn rel_type_alias(var: &str) -> String {
+pub(crate) fn rel_type_alias(var: &str) -> String {
     format!("__rt_{var}")
 }
 
@@ -13027,6 +13036,49 @@ impl<F: Fs> GraphDb<F> {
     pub fn last_changed(&self, key: &str) -> Option<u64> {
         let id = self.ids.get(key)?;
         self.last_change.get(&id).copied()
+    }
+
+    /// The `last_change` commit `key` had in the reader snapshot a transaction
+    /// began from, worked out from this live handle.
+    ///
+    /// Used by [`crate::Transaction`] to build its conflict set lazily, when it
+    /// first touches a key, without copying the whole `last_change` map at
+    /// BEGIN. `base_version` and `base_store` are the snapshot's `commit_seq`
+    /// and store identity; `in_base` says whether the key was live in it.
+    ///
+    /// The answer is exact whenever the key has not changed since the
+    /// snapshot: no commit after `base_version` touched it, so its live entry
+    /// is the snapshot's. When it has changed — a commit after `base_version`
+    /// touched it, it was deleted, or it was inserted — the snapshot's value
+    /// is no longer recoverable, and the answer is [`TX_CHANGED_SINCE_BEGIN`],
+    /// which no live entry ever equals, so the commit fails as a conflict. A
+    /// handle that reloaded from disk since the snapshot (another process
+    /// snapshotted) renumbers nothing that persisted but can reseed
+    /// `commit_seq`, so a reload answers "changed" for every key: conservative,
+    /// never a missed conflict.
+    pub(crate) fn tx_base_last_change(
+        &self,
+        key: &str,
+        base_version: u64,
+        base_store: crate::mask::StoreId,
+        in_base: bool,
+    ) -> u64 {
+        if self.store_id != base_store {
+            return TX_CHANGED_SINCE_BEGIN;
+        }
+        match self.ids.get(key) {
+            // Absent now and at BEGIN: `NodeUnchangedSince { expected: 0 }`
+            // conflicts with any insert that lands before the commit.
+            None if !in_base => 0,
+            // Deleted since BEGIN.
+            None => TX_CHANGED_SINCE_BEGIN,
+            // Inserted since BEGIN.
+            Some(_) if !in_base => TX_CHANGED_SINCE_BEGIN,
+            Some(id) => match self.last_change.get(&id).copied().unwrap_or(0) {
+                seq if seq > base_version => TX_CHANGED_SINCE_BEGIN,
+                seq => seq,
+            },
+        }
     }
 
     /// Which loaded store this handle is.
