@@ -6696,7 +6696,7 @@ const CONSTRAINT_VIOLATION: &str = "constraint violation: property 'email' is de
                                     by constraint 'uniq_email'; a node with that value already \
                                     exists";
 
-async fn assert_constraint_refused(name: &str, uri: &str, body: Json) {
+async fn assert_constraint_refused(name: &str, method: &str, uri: &str, body: Json) {
     let dir = tmp(name);
     let db = SharedDb::open(&dir).unwrap();
     {
@@ -6714,7 +6714,7 @@ async fn assert_constraint_refused(name: &str, uri: &str, body: Json) {
         .unwrap();
     }
     let before = wal_bytes(&dir);
-    let (status, resp, _) = send(router(db.clone()), json_req("POST", uri, body)).await;
+    let (status, resp, _) = send(router(db.clone()), json_req(method, uri, body)).await;
     assert_eq!(
         status,
         StatusCode::CONFLICT,
@@ -6737,12 +6737,14 @@ async fn assert_constraint_refused(name: &str, uri: &str, body: Json) {
 async fn http_writes_refuse_a_unique_constraint_duplicate() {
     assert_constraint_refused(
         "uc-create-node",
+        "POST",
         "/nodes",
         json!({"label": "User", "key": "bob", "props": {"email": "a@x"}}),
     )
     .await;
     assert_constraint_refused(
         "uc-ingest",
+        "POST",
         "/ingest",
         json!({
             "label": "User",
@@ -6753,10 +6755,92 @@ async fn http_writes_refuse_a_unique_constraint_duplicate() {
     .await;
     assert_constraint_refused(
         "uc-cypher-create",
+        "POST",
         "/query",
         json!({"cypher": "CREATE (n:User {id: 'bob', email: 'a@x'})"}),
     )
     .await;
+}
+
+#[tokio::test]
+async fn http_put_prop_refuses_a_unique_constraint_duplicate() {
+    // PUT tries to give carol the value alice already holds.
+    let dir = tmp("uc-put-prop");
+    let db = SharedDb::open(&dir).unwrap();
+    {
+        let mut w = db.write();
+        w.unlock_v11_format_for_test();
+        w.create_constraint("uniq_email", "User", "email").unwrap();
+        w.insert_node(
+            "User",
+            "alice",
+            vec![("email".into(), Value::Str("a@x".into()))],
+        )
+        .unwrap();
+        w.insert_node(
+            "User",
+            "carol",
+            vec![("email".into(), Value::Str("c@x".into()))],
+        )
+        .unwrap();
+    }
+    let before = wal_bytes(&dir);
+    let (status, resp, _) = send(
+        router(db.clone()),
+        json_req("PUT", "/node/carol/prop/email", json!({"value": "a@x"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert_eq!(
+        parse_json(&resp)["error"].as_str().unwrap(),
+        CONSTRAINT_VIOLATION
+    );
+    assert_eq!(wal_bytes(&dir), before, "a refused PUT appended to the WAL");
+    assert_eq!(
+        db.read().node_info("carol").unwrap().props.get("email"),
+        Some(&Value::Str("c@x".into()))
+    );
+}
+
+#[tokio::test]
+async fn http_binary_over_the_limit_is_413() {
+    let dir = tmp("value-too-large");
+    let db = SharedDb::open(&dir).unwrap();
+    db.write().unlock_v11_format_for_test();
+    let before = wal_bytes(&dir);
+    let big = mushroomdb::tagged_json(&Value::Binary(vec![0u8; mushroomdb::BINARY_MAX_BYTES + 1]))
+        .unwrap()
+        .unwrap();
+    let (status, resp, _) = send(
+        router(db.clone()),
+        json_req(
+            "POST",
+            "/nodes",
+            json!({"label": "Blob", "key": "b", "props": {"data": big}}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    assert_eq!(
+        parse_json(&resp)["error"].as_str().unwrap(),
+        format!(
+            "value too large: property 'data' is {} bytes; the limit is {} bytes",
+            mushroomdb::BINARY_MAX_BYTES + 1,
+            mushroomdb::BINARY_MAX_BYTES
+        )
+    );
+    assert_eq!(wal_bytes(&dir), before);
+    assert_eq!(db.read().node_count(), 0);
 }
 
 /// The read path is open: a tagged parameter comes back in its tagged form.

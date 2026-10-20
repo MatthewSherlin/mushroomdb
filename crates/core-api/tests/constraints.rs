@@ -81,8 +81,9 @@ fn create_constraint_is_refused_until_the_v11_format_lands() {
 mod unlocked {
     use super::*;
     use mushroomdb::{
-        BatchBuilder, BatchOp, IngestOptions, OnConflict, PropPredicate, RoleDef, SharedDb,
-        SnapshotOptions, UniqueConstraint, WriteAuthz, WriteScope, BINARY_MAX_BYTES,
+        BatchBuilder, BatchOp, Direction, IngestOptions, OnConflict, Precondition, PropPredicate,
+        RoleDef, SharedDb, SnapshotOptions, UniqueConstraint, ViewDef, ViewSource, WriteAuthz,
+        WriteScope, BINARY_MAX_BYTES,
     };
     use std::collections::BTreeMap;
 
@@ -599,6 +600,109 @@ mod unlocked {
             assert!(!text.contains(leak), "{text:?} names {leak:?}");
         }
         assert_eq!(wal_bytes(&dir), before);
+    }
+
+    #[test]
+    fn write_batch_cas_refuses_a_duplicate() {
+        let (dir, mut db) = constrained("p-cas");
+        let before = wal_bytes(&dir);
+        assert_violation(db.write_batch_cas(
+            vec![Precondition::NodeAbsent { key: "bob".into() }],
+            vec![BatchOp::InsertNode {
+                label: "User".into(),
+                key: "bob".into(),
+                props: email("a@x"),
+            }],
+        ));
+        assert_nothing_written(&dir, db, &before);
+    }
+
+    // ── Views write their property after the check, so the two never meet ───
+
+    fn deg_view() -> ViewDef {
+        ViewDef {
+            name: "deg".into(),
+            label: "User".into(),
+            view_prop: "deg".into(),
+            source: ViewSource::Degree {
+                edge_type: "KNOWS".into(),
+                direction: Direction::Out,
+            },
+        }
+    }
+
+    #[test]
+    fn create_constraint_refuses_a_view_owned_property() {
+        let (dir, mut db) = open_temp("view-then-constraint");
+        db.create_view(deg_view()).unwrap();
+        let before = wal_bytes(&dir);
+        match db.create_constraint("uniq_deg", "User", "deg") {
+            Err(GraphError::QueryError { detail }) => assert_eq!(
+                detail,
+                "property 'deg' on label 'User' is owned by view 'deg'; a unique constraint \
+                 cannot cover it"
+            ),
+            other => panic!("expected a QueryError, got {other:?}"),
+        }
+        assert_eq!(wal_bytes(&dir), before);
+        assert!(db.constraints().is_empty());
+        // Another label's `deg` is not the view's.
+        db.create_constraint("uniq_admin_deg", "Admin", "deg")
+            .unwrap();
+    }
+
+    #[test]
+    fn create_view_refuses_a_constrained_property() {
+        let (dir, mut db) = open_temp("constraint-then-view");
+        db.create_constraint("uniq_deg", "User", "deg").unwrap();
+        let before = wal_bytes(&dir);
+        match db.create_view(deg_view()) {
+            Err(GraphError::QueryError { detail }) => assert_eq!(
+                detail,
+                "property 'deg' on label 'User' is declared unique by constraint 'uniq_deg'; a \
+                 view cannot own it"
+            ),
+            other => panic!("expected a QueryError, got {other:?}"),
+        }
+        assert_eq!(wal_bytes(&dir), before);
+        assert!(db.views().is_empty());
+    }
+
+    /// The review's scenario: a Degree view on User and a constraint on its
+    /// property. Each new User got `deg = 0` inside `apply`, after the check,
+    /// so two Users held the same constrained value with no error. In either
+    /// declaration order the second declaration is now refused, so whatever
+    /// constraint exists holds over the nodes written afterwards.
+    #[test]
+    fn a_view_and_a_constraint_cannot_combine_into_duplicates() {
+        for view_first in [true, false] {
+            let (_dir, mut db) = open_temp("view-dups");
+            if view_first {
+                db.create_view(deg_view()).unwrap();
+                assert!(db.create_constraint("uniq_deg", "User", "deg").is_err());
+            } else {
+                db.create_constraint("uniq_deg", "User", "deg").unwrap();
+                assert!(db.create_view(deg_view()).is_err());
+            }
+            db.insert_node("User", "u1", vec![]).unwrap();
+            db.insert_node("User", "u2", vec![]).unwrap();
+            let degs: Vec<_> = ["u1", "u2"]
+                .iter()
+                .map(|k| db.node_info(k).unwrap().props.get("deg").cloned())
+                .collect();
+            let constrained = db
+                .constraints()
+                .iter()
+                .any(|c| c.label == "User" && c.field == "deg");
+            if constrained {
+                assert!(
+                    degs.iter().all(Option::is_none),
+                    "view_first={view_first}: no view may write the constrained property"
+                );
+            } else {
+                assert_eq!(degs, vec![Some(Value::Int(0)), Some(Value::Int(0))]);
+            }
+        }
     }
 
     // ── Replay never checks ─────────────────────────────────────────────────

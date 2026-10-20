@@ -8172,6 +8172,7 @@ impl<F: Fs> GraphDb<F> {
     /// # Errors
     /// - `ReadOnly`: called on an as-of instance.
     /// - `RuleInvalid`: name collision, view_prop collision, or invalid def.
+    /// - `QueryError`: a unique constraint covers `(label, view_prop)`.
     pub fn create_view(&mut self, def: ViewDef) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
@@ -8182,6 +8183,21 @@ impl<F: Fs> GraphDb<F> {
         if self.view_store.has_view(&def.name) {
             return Err(GraphError::RuleInvalid {
                 detail: format!("view {:?} already exists", def.name),
+            });
+        }
+        // A view writes its property inside `apply`, after the unique-constraint
+        // check has run, so a constraint over it could not hold.
+        if let Some(c) = self
+            .constraints
+            .iter()
+            .find(|c| c.label == def.label && c.field == def.view_prop)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{}' on label '{}' is declared unique by constraint '{}'; a view \
+                     cannot own it",
+                    def.view_prop, def.label, c.name
+                ),
             });
         }
         if let Some(existing) = self.view_store.view_for_prop(&def.view_prop) {
@@ -8596,7 +8612,7 @@ impl<F: Fs> GraphDb<F> {
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
     /// - [`GraphError::QueryError`]: a constraint named `name` already exists;
-    ///   or, until the V11 format lands, always — a `CreateConstraint` record
+    ///   a view owns `(label, field)`; or, until the V11 format lands, always — a `CreateConstraint` record
     ///   is format-V11 and a 0.9.x reader cannot decode it.
     pub fn create_constraint(&mut self, name: &str, label: &str, field: &str) -> Result<()> {
         if self.read_only {
@@ -8605,6 +8621,21 @@ impl<F: Fs> GraphDb<F> {
         if self.constraints.iter().any(|c| c.name == name) {
             return Err(GraphError::QueryError {
                 detail: format!("a constraint named '{name}' already exists"),
+            });
+        }
+        // A view writes its property inside `apply`, after the check has run,
+        // so the constraint could not hold over it.
+        if let Some(view) = self
+            .view_store
+            .views()
+            .find(|v| v.label == label && v.view_prop == field)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{field}' on label '{label}' is owned by view '{}'; a unique \
+                     constraint cannot cover it",
+                    view.name
+                ),
             });
         }
         self.log_dense(vec![WalRecord::CreateConstraint {
