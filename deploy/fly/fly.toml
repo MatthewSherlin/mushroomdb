@@ -1,0 +1,71 @@
+# mushroomdb on Fly.io.
+#
+# Setup:
+#   fly launch --no-deploy --copy-config
+#   fly volumes create mushroomdb_data --size 10 --region iad
+#   fly secrets set MUSHROOMDB_TOKEN=<set-me>
+#   fly deploy
+#
+# `app` must be globally unique on Fly; `fly launch --copy-config` prompts for it.
+#
+# VOLUME OWNERSHIP (UNVERIFIED without a real deploy): the image runs as uid
+# 65532, not root, and the server needs /data writable by that uid. A new Fly
+# volume may be root-owned. No in-image fix is known: the image has no shell, so
+# there is nothing to chown with. If the volume is root-owned, serve fails at
+# start - today with the message `store is busy: write lock held` (HO-12b will
+# name the real cause). Workaround you can try: run a one-off root machine on the
+# same volume (for example `fly machine run debian:bookworm-slim --volume
+# mushroomdb_data:/data --command "chown -R 65532:65532 /data"`), then deploy.
+# That command is untested here.
+
+app = "mushroomdb"
+primary_region = "iad"
+
+[build]
+  image = "ghcr.io/matthewsherlin/mushroomdb:latest"
+
+[env]
+  # Non-secret settings only. Secrets (never put values here):
+  #   fly secrets set MUSHROOMDB_TOKEN=<set-me>
+  # Structured logs for the platform log shipper:
+  MUSHROOMDB_LOG_FORMAT = "json"
+  # TODO(HO-14/HO-15): continuous backup and restore-on-boot settings go here
+  # and in `fly secrets` once the backup worker (HO-07) ships. Nothing in this
+  # file configures backup yet.
+
+[processes]
+  # Explicit command: no --demo-if-empty, so a production volume is never seeded.
+  app = "serve /data --addr 0.0.0.0:8080 --snapshot-every 300"
+
+[[services]]
+  processes = ["app"]
+  protocol = "tcp"
+  internal_port = 8080
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+  [services.concurrency]
+    type = "requests"
+    hard_limit = 256
+    soft_limit = 200
+  [[services.http_checks]]
+    interval = "10s"
+    timeout = "5s"
+    grace_period = "120s"   # allow WAL replay before the first check counts
+    method = "get"
+    path = "/ready"
+
+# The Bolt port (7687) is added by HO-15; it is intentionally absent here.
+
+[[mounts]]
+  source = "mushroomdb_data"
+  destination = "/data"
+
+# SINGLE WRITER - replicas must be 1.
+# mushroomdb is single-writer: two machines sharing one store will fail to
+# acquire the write lock. Run exactly one machine (`fly scale count 1`).
+[deploy]
+  strategy = "immediate"    # a rolling deploy cannot work with a single volume
