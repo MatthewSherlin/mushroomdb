@@ -297,3 +297,17 @@ def test_type_stub_declares_every_error_class():
     assert "class MushroomError(RuntimeError):" in stub
     for cls in _error_classes().values():
         assert f"class {cls.__name__}(MushroomError):" in stub, cls.__name__
+
+
+def test_constraint_and_size_errors_have_their_own_classes():
+    # Raised by unique constraints and the value-size limit (0.10). The Python
+    # API that declares a constraint arrives later; the classes and codes are
+    # the compatibility surface now.
+    for name, code in [
+        ("ConstraintViolation", "constraint_violation"),
+        ("ConstraintCreationConflict", "constraint_creation_conflict"),
+        ("ValueTooLarge", "value_too_large"),
+    ]:
+        cls = getattr(mushroomdb, name)
+        assert issubclass(cls, mushroomdb.MushroomError), name
+        assert cls.code == code

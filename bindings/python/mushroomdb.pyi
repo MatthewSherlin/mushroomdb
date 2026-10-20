@@ -251,6 +251,36 @@ class TimeBeforeFloor(MushroomError):
     floor_ms: int
     floor_commit: int
 
+class ConstraintViolation(MushroomError):
+    """A write would give two live nodes the same value under a unique constraint.
+
+    Nothing was written.
+    """
+
+    code: str
+    constraint: str
+    field: str
+
+class ConstraintCreationConflict(MushroomError):
+    """A unique constraint cannot be declared: live nodes already share a value.
+
+    `violations` lists every `(node_key, value)` in conflict.
+    """
+
+    code: str
+    violations: list[tuple[str, Any]]
+
+class ValueTooLarge(MushroomError):
+    """A value is larger than the store accepts; `size` and `limit` are bytes.
+
+    Nothing was written.
+    """
+
+    code: str
+    field: str
+    size: int
+    limit: int
+
 class GraphDb:
     """An embedded mushroomdb store.
 
