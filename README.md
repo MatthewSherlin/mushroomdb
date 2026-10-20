@@ -10,9 +10,9 @@
 
 **An embedded graph database — Cypher queries, self-maintaining rule-derived edges, time travel, and a memory layer for AI agents.**
 
-Single file. Zero server. Opens in 20 ms ([measured on a 100,000-node snapshot](https://matthewsherlin.github.io/mushroomdb/docs/benchmarks.html)).
+Embedded in your process, or run as a server.
 
-mushroomdb is an embedded graph database for any app that reasons over entities. You
+mushroomdb is an embedded graph database for agents and apps that reason over entities. You
 declare a relationship as a rule, once. Every write after that derives the matching edges, scores
 them, and retracts them when they stop being true. It is a directory on disk: no account, no
 server to run, no model call in the write path.
