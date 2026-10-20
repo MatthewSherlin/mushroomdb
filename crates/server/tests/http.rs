@@ -6579,3 +6579,36 @@ async fn a_pagerank_damping_outside_zero_to_one_is_refused() {
         );
     }
 }
+
+/// HO-02. A container platform asks `/ready` before it routes traffic. With the
+/// flag false the answer is 503, with it true 200, and neither call carries a
+/// token even though the server requires one.
+#[tokio::test]
+async fn ready_returns_503_before_open_and_200_after() {
+    let db = SharedDb::open(&tmp("ready-flag")).unwrap();
+    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = server::router_with_ready_flag(db, Some("t".into()), ready.clone());
+
+    let (status, body, _) = send(app.clone(), get("/ready")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        parse_json(&body),
+        json!({"ok": false, "reason": "replaying"})
+    );
+
+    ready.store(true, std::sync::atomic::Ordering::Release);
+    let (status, body, _) = send(app, get("/ready")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(parse_json(&body), json!({"ok": true}));
+}
+
+/// Every entry point but `run_serve` opens the store before it serves, so a
+/// server built without a flag is ready the moment it binds.
+#[tokio::test]
+async fn ready_is_200_on_a_router_built_without_a_flag() {
+    let db = SharedDb::open(&tmp("ready-default")).unwrap();
+    let app = router_with_auth(db, Some("t".into()));
+    let (status, body, _) = send(app, get("/ready")).await;
+    assert_eq!(status, StatusCode::OK, "no token is needed");
+    assert_eq!(parse_json(&body), json!({"ok": true}));
+}

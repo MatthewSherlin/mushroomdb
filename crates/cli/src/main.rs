@@ -14,6 +14,8 @@ use std::io::{self, IsTerminal as _, Read as _, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The default log filter.
@@ -524,6 +526,8 @@ fn run_serve(
         // a snapshot carries it (ledger row 36), and changes what an existing
         // store indexes, so an existing store is never touched here.
         let is_new_store = !mushroomdb::restore::holds_a_store(&db_dir);
+        // `GET /ready` answers 503 until the store is open and its schema is in.
+        let ready_flag = Arc::new(AtomicBool::new(false));
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
         if is_new_store {
             // The first store most HTTP callers open. Declare the memory
@@ -532,6 +536,7 @@ fn run_serve(
                 .apply_schema(&mushroomdb::memory_schema::memory_defaults())
                 .map_err(|e| e.to_string())?;
         }
+        ready_flag.store(true, Ordering::Release);
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Some(period) = snapshot_every {
             let db_snap = db.clone();
@@ -633,12 +638,23 @@ fn run_serve(
                         token,
                         role_tokens,
                         stop_rx,
+                        ready_flag,
                     )
                     .await;
                 }
                 #[cfg(not(feature = "tls"))]
                 {
-                    let _ = (cert, key, db_serve, addr, tx, token, role_tokens, stop_rx);
+                    let _ = (
+                        cert,
+                        key,
+                        db_serve,
+                        addr,
+                        tx,
+                        token,
+                        role_tokens,
+                        stop_rx,
+                        ready_flag,
+                    );
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Unsupported,
                         "this binary was built without TLS support; \
@@ -657,6 +673,7 @@ fn run_serve(
                         token,
                         role_tokens,
                         stop_rx,
+                        ready_flag,
                     )
                     .await
                 }
@@ -668,6 +685,7 @@ fn run_serve(
                         token,
                         role_tokens,
                         stop_rx,
+                        ready_flag,
                     )
                     .await
                 }
@@ -681,6 +699,7 @@ fn run_serve(
                             token,
                             role_tokens,
                             stop_rx,
+                            ready_flag,
                         )
                         .await
                     }
@@ -693,6 +712,7 @@ fn run_serve(
                             token,
                             role_tokens,
                             stop_rx,
+                            ready_flag,
                         )
                         .await
                     }
