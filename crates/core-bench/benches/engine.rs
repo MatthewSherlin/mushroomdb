@@ -353,6 +353,7 @@ fn engine_benches(c: &mut Criterion) {
     ingest_10k_nodes(c);
     neighborhood(c);
     cypher(c);
+    query_shapes(c);
     rules(c);
     explain_pair(c);
     vector_rule_update(c);
@@ -532,6 +533,85 @@ fn cypher(c: &mut Criterion) {
             black_box(db.query(black_box(TWO_HOP), &params).expect("two hop"));
         });
     });
+}
+
+// ── Cypher query shapes (PF-02a) ─────────────────────────────────────────────
+//
+// The standard query shapes users run. The shared `bench_db` dataset carries no
+// `KNOWS` edges and no `score` property, so the shapes run on that same dataset
+// plus a seeded `KNOWS` ring (each person knows the next three) and a numeric
+// `score` on every person. `$k` is one person key drawn once from the dataset.
+
+const KNOWS_FANOUT: usize = 3;
+
+fn query_shape_db(nodes: usize, seed: u64) -> (GraphDb<RealFs>, String) {
+    let mut db = GraphDb::open(&tmp_dir()).expect("open query-shape db");
+    let (orgs, projects, mut people) = dataset_rows(nodes, seed);
+    let opts = ingest_opts();
+    db.ingest("Org", orgs, &opts).expect("ingest orgs");
+    db.ingest("Project", projects, &opts)
+        .expect("ingest projects");
+    let n_people = people.len();
+    let key_of = |i: usize| format!("person-{:04}", i % n_people + 1);
+    let mut knows = Vec::with_capacity(n_people * KNOWS_FANOUT);
+    for (i, person) in people.iter_mut().enumerate() {
+        person.insert(
+            "score".to_string(),
+            Value::Int((mix(seed, i as u64, 7) % 1000) as i64),
+        );
+        for step in 1..=KNOWS_FANOUT {
+            knows.push(("KNOWS".to_string(), key_of(i), key_of(i + step)));
+        }
+    }
+    db.ingest_with_edges("Person", people, &opts, &knows)
+        .expect("ingest people with KNOWS");
+    let pick = (mix(seed, 0xBEEF, 1) % n_people as u64) as usize;
+    (db, key_of(pick))
+}
+
+fn bench_query_shape(c: &mut Criterion, name: &str, db: &GraphDb<RealFs>, cypher: &str, key: &str) {
+    let mut params = empty_params();
+    params.insert("k".to_string(), Value::Str(key.to_string()));
+    c.bench_function(name, |b| {
+        b.iter(|| {
+            black_box(db.query(black_box(cypher), &params).expect(name));
+        });
+    });
+}
+
+fn query_shapes(c: &mut Criterion) {
+    let (db, key) = query_shape_db(N, SEED);
+    let shapes: [(&str, &str); 5] = [
+        (
+            "bench_query_point_key",
+            "MATCH (n) WHERE key(n) = $k RETURN n",
+        ),
+        (
+            "bench_query_key_1hop",
+            "MATCH (n:Person)-[:KNOWS]->(m) WHERE key(n) = $k RETURN m",
+        ),
+        (
+            "bench_query_key_2hop",
+            "MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE key(a) = $k RETURN c",
+        ),
+        ("bench_query_label_agg", "MATCH (n:Person) RETURN count(n)"),
+        (
+            "bench_query_order_limit",
+            "MATCH (n:Person) RETURN n, n.score ORDER BY n.score DESC LIMIT 10",
+        ),
+    ];
+    for (name, cypher) in shapes {
+        let rows = db
+            .query(cypher, &{
+                let mut p = empty_params();
+                p.insert("k".to_string(), Value::Str(key.clone()));
+                p
+            })
+            .expect(name)
+            .len();
+        assert!(rows > 0, "{name} returned no rows; the shape is vacuous");
+        bench_query_shape(c, name, &db, cypher, &key);
+    }
 }
 
 fn rules(c: &mut Criterion) {
