@@ -664,3 +664,80 @@ fn bench_tx_commit_vs_write_batch() {
         );
     }
 }
+
+/// A `DETACH DELETE` advances no neighbour's `last_change` (the WAL holds only
+/// the `DeleteNode`), so a transaction that touched only the neighbour commits:
+/// it never read the removed edge, which snapshot isolation allows.
+#[test]
+fn neighbour_of_concurrent_detach_delete_does_not_conflict() {
+    let dir = tmp("detach-neighbour");
+    let db = SharedDb::open(&dir).unwrap();
+    db.submit_batch(vec![
+        node("x"),
+        node("y"),
+        BatchOp::InsertEdge {
+            edge_type: "KNOWS".into(),
+            src_key: "x".into(),
+            dst_key: "y".into(),
+        },
+    ])
+    .unwrap();
+    let mut tx = db.begin_transaction();
+    tx.execute("MATCH (n:P {id: 'y'}) SET n.v = 1", &p())
+        .unwrap();
+    db.write()
+        .query_write("MATCH (n:P {id: 'x'}) DETACH DELETE n", &p())
+        .unwrap();
+    tx.commit()
+        .expect("the neighbour's last_change did not move");
+    let y = db.reader().node_info("y").unwrap();
+    assert_eq!(y.props.get("v"), Some(&Value::Int(1)));
+    assert!(db.reader().node_info("x").is_none());
+
+    // The other direction: a transaction's own DETACH DELETE records the
+    // neighbour, so a concurrent write to it conflicts.
+    db.submit_batch(vec![
+        node("a"),
+        node("b"),
+        BatchOp::InsertEdge {
+            edge_type: "KNOWS".into(),
+            src_key: "a".into(),
+            dst_key: "b".into(),
+        },
+    ])
+    .unwrap();
+    let mut tx = db.begin_transaction();
+    tx.execute("MATCH (n:P {id: 'a'}) DETACH DELETE n", &p())
+        .unwrap();
+    db.submit_batch(vec![BatchOp::SetProp {
+        key: "b".into(),
+        field: "v".into(),
+        value: Value::Int(2),
+    }])
+    .unwrap();
+    assert!(matches!(
+        tx.commit(),
+        Err(GraphError::CasConflict { ref key, .. }) if key == "b"
+    ));
+}
+
+/// A transaction owns its handle: it can be stored in a map and moved to
+/// another thread while open (the shape TX-2/TX-4/TX-12 need).
+#[test]
+fn transaction_is_owned_and_send() {
+    let dir = tmp("owned-send");
+    let db = SharedDb::open(&dir).unwrap();
+    let mut open: std::collections::HashMap<u64, mushroomdb::Transaction> =
+        std::collections::HashMap::new();
+    let mut tx = db.begin_transaction();
+    tx.execute("CREATE (n:P {id: 'moved'})", &p()).unwrap();
+    open.insert(1, tx);
+    drop(db); // the transaction keeps the store alive on its own
+    let tx = open.remove(&1).unwrap();
+    let seq = std::thread::spawn(move || tx.commit().unwrap())
+        .join()
+        .unwrap();
+    assert!(seq > 0);
+    let reopened = GraphDb::open(&dir).unwrap();
+    assert!(reopened.node_info("moved").is_some());
+}

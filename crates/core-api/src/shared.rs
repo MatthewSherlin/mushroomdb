@@ -729,12 +729,12 @@ impl SharedDb {
     ///
     /// Takes no lock beyond the instant it needs to freeze a
     /// [`ReaderSnapshot`]; see [`Transaction`] for the isolation model.
-    pub fn begin_transaction(&self) -> Transaction<'_> {
+    pub fn begin_transaction(&self) -> Transaction {
         let (base_snap, base_store) = {
             let db = self.read();
             (db.reader(), db.store_id())
         };
-        Transaction::new(self, base_snap, base_store)
+        Transaction::new(self.clone(), base_snap, base_store)
     }
 
     /// Like [`submit_batch`] but with role-scoped write authorization.
