@@ -14,6 +14,7 @@ pub mod roles;
 pub mod schema;
 mod shared;
 pub mod subscription;
+mod transaction;
 
 pub use algo::{
     AlgoDir, Community, CommunityReport, DegreeConfig, DegreeReport, LouvainConfig, PageRankConfig,
@@ -76,6 +77,7 @@ pub use roles::{PropPredicate, RoleDef, WriteScope};
 pub use schema::{Schema, SchemaDiff};
 pub use shared::{SharedDb, WriteGuard};
 pub use subscription::{DbEvent, Subscription, DEFAULT_SUB_CAPACITY};
+pub use transaction::Transaction;
 
 /// One verification entry per section: `(section_id, section_name, bytes_checked, result)`.
 ///
