@@ -62,6 +62,10 @@ core-api/tests/f9_bench.rs::f9_measure — a ~13-minute benchmark that asserts n
 
 # transaction_integration.rs — commit-cost bench; machine-dependent timings
 core-api/tests/transaction_integration.rs::bench_tx_commit_vs_write_batch — measurement by hand: prints tx-commit vs write_batch timings (release, --ignored), nothing asserted
+# transaction_overlay.rs — TX-1b per-statement scaling; builds 1k/100k/1M fixtures, release only
+core-api/tests/transaction_overlay.rs::bench_statement_cost_does_not_scale_with_the_store — measurement by hand: builds a 1M-node fixture and times in-tx statements (release, --ignored); asserts the 2x bound across sizes
+core-api/tests/transaction_overlay.rs::bench_reader_queries_outside_a_tx — measurement by hand: prints reader query timings outside a tx for comparing builds (release, --ignored), nothing asserted
+core-api/tests/transaction_overlay.rs::bench_reader_p99_under_a_fulltext_writer — measurement by hand: the TX-7 gate in process (16 readers vs a 50/s full-text writer at 100k nodes, release, --ignored); asserts p99 <= 2 ms
 
 # reader_derived.rs — reader derived-flag timing probe (TX-6); machine-dependent
 core-api/tests/reader_derived.rs::reader_derived_bench — measurement by hand: prints reader node_edges timings with and without section 17 (release, --ignored), nothing asserted

@@ -22,7 +22,7 @@ static FUSED_SCAN_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 
 /// Test-only counter incremented each time a `ScanKey` arm executes.
 /// Lets tests assert the point-lookup path actually fires (and does not
-/// walk `view.labels`).
+/// walk `view.label_syms()`).
 #[cfg(test)]
 static SCAN_KEY_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -797,7 +797,7 @@ fn execute_inner(
                                 .and_then(|c| match c {
                                     Cell::Scalar(v) => Some(v.clone()),
                                     Cell::Node(id) => {
-                                        view.ids.key_of(*id).map(|k| Value::Str(k.to_owned()))
+                                        view.try_key_of(*id).map(|k| Value::Str(k.to_owned()))
                                     }
                                     Cell::Path(h) => Some(Value::Int(*h as i64)),
                                     Cell::Rel(_) => None,
@@ -1339,7 +1339,7 @@ fn scan_ids(view: &GraphView, label: Option<&str>) -> Vec<u32> {
     let ids = match label {
         Some(label) => view.nodes_with_label(label),
         // Real nodes always have labels; sentinel slots are gaps.
-        None => (0..view.ids.len() as u32)
+        None => (0..view.id_bound())
             .filter(|&id| view.label_of(id).is_some())
             .collect(),
     };
@@ -1874,7 +1874,7 @@ fn eval_func(
             match row.get(slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Rel(e)) => {
                     // Look up the etype string from the symbol table.
-                    let etype = view.syms.resolve(e.etype).unwrap_or("").to_owned();
+                    let etype = view.sym_name(e.etype).unwrap_or("").to_owned();
                     Ok(Some(Value::Str(etype)))
                 }
                 Some(Cell::Node(_)) => Err(format!(
@@ -2508,7 +2508,7 @@ fn resolve_operand(
                 .and_then(|c| c.as_ref())
             {
                 Some(Cell::Scalar(v)) => Ok(Some(v.clone())),
-                Some(Cell::Node(id)) => match view.ids.key_of(*id) {
+                Some(Cell::Node(id)) => match view.try_key_of(*id) {
                     Some(key) => Ok(Some(Value::Str(key.to_owned()))),
                     None => Ok(None),
                 },
@@ -2636,7 +2636,7 @@ fn is_identity_eq_field(field: &str) -> bool {
 /// or `key` field keeps it. `n.id` is an alias of `n.key`.
 fn node_identity_prop(view: &GraphView, id: u32, field: &str) -> Option<Value> {
     match field {
-        "key" | "id" => view.ids.key_of(id).map(|k| Value::Str(k.to_owned())),
+        "key" | "id" => view.try_key_of(id).map(|k| Value::Str(k.to_owned())),
         "label" => view.label_of(id).map(|l| Value::Str(l.to_owned())),
         _ => None,
     }
@@ -2761,7 +2761,7 @@ fn resolve_etypes(view: &GraphView, etypes: &[String]) -> Option<Vec<u32>> {
     } else {
         // Resolve each named type to its symbol, skipping any not interned
         // (a named type with no edges contributes nothing).
-        Some(etypes.iter().filter_map(|n| view.syms.get(n)).collect())
+        Some(etypes.iter().filter_map(|n| view.sym(n)).collect())
     }
 }
 
@@ -3288,7 +3288,7 @@ fn distinct_value(
                 return Ok(None);
             };
             Ok(match row.get(slot).and_then(|c| c.as_ref()) {
-                Some(Cell::Node(id)) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                Some(Cell::Node(id)) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                 Some(Cell::Scalar(val)) => Some(val.clone()),
                 Some(Cell::Path(hops)) => Some(Value::Int(*hops as i64)),
                 Some(Cell::Rel(e)) => Some(Value::Str(format!(
@@ -3430,7 +3430,7 @@ fn update_acc(
                 .and_then(|c| c.as_ref())
                 .and_then(|cell| match cell {
                     Cell::Scalar(x) => Some(x.clone()),
-                    Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                    Cell::Node(id) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                     Cell::Path(h) => Some(Value::Int(*h as i64)),
                     Cell::Rel(_) => None,
                 });
@@ -3852,7 +3852,7 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
                     .and_then(|c| c.as_ref())
                     .and_then(|c| match c {
                         Cell::Scalar(v) => Some(v.clone()),
-                        Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                        Cell::Node(id) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                         Cell::Path(hops) => Some(Value::Int(*hops as i64)),
                         Cell::Rel(_) => None,
                     }),
@@ -4274,7 +4274,7 @@ fn group_stream(
 /// restores it around the recursive call so the caller sees no net change.
 /// This eliminates the per-row `Vec` clone that the staged path requires.
 ///
-/// ScanLabel iterates `view.labels` directly (lazy, no intermediate `Vec<u32>`)
+/// ScanLabel iterates `view.label_syms()` directly (lazy, no intermediate `Vec<u32>`)
 /// so the bound truncates the scan itself — scanning stops as soon as enough
 /// result rows have been collected.
 fn pull_rows(
@@ -4306,7 +4306,7 @@ fn pull_rows(
                 .ok_or_else(|| format!("unbound variable `{var}`"))?;
             // Resolve the label to an interned symbol once. If the label is
             // specified but unknown, there are no matching nodes — return early.
-            let want_sym = label.as_deref().and_then(|l| ctx.view.syms.get(l));
+            let want_sym = label.as_deref().and_then(|l| ctx.view.sym(l));
             if label.is_some() && want_sym.is_none() {
                 return Ok(());
             }
@@ -4350,52 +4350,70 @@ fn pull_rows(
                 FUSED_SCAN_FIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let col = ctx.view.props.column(field);
                 let rest_after_filter = &rest[1..];
-                for (i, &sym) in ctx.view.labels.iter().enumerate() {
-                    if result.len() >= ctx.bound {
-                        break;
-                    }
-                    if sym == u32::MAX {
-                        continue;
-                    }
-                    if let Some(ws) = want_sym {
-                        if sym != ws {
-                            continue;
+                macro_rules! fused_scan {
+                    ($syms:expr) => {
+                        for (i, sym) in $syms.enumerate() {
+                            if result.len() >= ctx.bound {
+                                break;
+                            }
+                            if sym == u32::MAX {
+                                continue;
+                            }
+                            if let Some(ws) = want_sym {
+                                if sym != ws {
+                                    continue;
+                                }
+                            }
+                            let id = i as u32;
+                            if !ctx.view.visible(id) {
+                                continue;
+                            }
+                            if let Some(v) = col.get(id) {
+                                if eval_cmp(cmp_op_ref, v, lit) {
+                                    row[slot] = Some(Cell::Node(id));
+                                    pull_rows(ctx, rest_after_filter, row, result)?;
+                                }
+                            }
                         }
-                    }
-                    let id = i as u32;
-                    if !ctx.view.visible(id) {
-                        continue;
-                    }
-                    if let Some(v) = col.get(id) {
-                        if eval_cmp(cmp_op_ref, v, lit) {
-                            row[slot] = Some(Cell::Node(id));
-                            pull_rows(ctx, rest_after_filter, row, result)?;
-                        }
-                    }
+                    };
+                }
+                // Without a layer the label array is the whole answer: walk
+                // it as a plain slice, the scan's hot loop unchanged.
+                match ctx.view.layer {
+                    None => fused_scan!(ctx.view.labels.iter().copied()),
+                    Some(_) => fused_scan!(ctx.view.label_syms()),
                 }
             } else {
                 // Generic path: iterate label array lazily, no Vec allocation,
                 // with early exit when the row bound is satisfied.
-                for (i, &sym) in ctx.view.labels.iter().enumerate() {
-                    if result.len() >= ctx.bound {
-                        break;
-                    }
-                    // Skip tombstone / gap slots (u32::MAX sentinel).
-                    if sym == u32::MAX {
-                        continue;
-                    }
-                    // Filter by label symbol when a label is requested.
-                    if let Some(ws) = want_sym {
-                        if sym != ws {
-                            continue;
+                macro_rules! scan {
+                    ($syms:expr) => {
+                        for (i, sym) in $syms.enumerate() {
+                            if result.len() >= ctx.bound {
+                                break;
+                            }
+                            // Skip tombstone / gap slots (u32::MAX sentinel).
+                            if sym == u32::MAX {
+                                continue;
+                            }
+                            // Filter by label symbol when a label is requested.
+                            if let Some(ws) = want_sym {
+                                if sym != ws {
+                                    continue;
+                                }
+                            }
+                            let id = i as u32;
+                            if !ctx.view.visible(id) {
+                                continue;
+                            }
+                            row[slot] = Some(Cell::Node(id));
+                            pull_rows(ctx, rest, row, result)?;
                         }
-                    }
-                    let id = i as u32;
-                    if !ctx.view.visible(id) {
-                        continue;
-                    }
-                    row[slot] = Some(Cell::Node(id));
-                    pull_rows(ctx, rest, row, result)?;
+                    };
+                }
+                match ctx.view.layer {
+                    None => scan!(ctx.view.labels.iter().copied()),
+                    Some(_) => scan!(ctx.view.label_syms()),
                 }
             }
             // SAFETY: the `?` inside both scan loops propagates Err directly to
@@ -4829,7 +4847,7 @@ fn project_item(
             match row.get(slot).and_then(|c| c.as_ref()) {
                 // Cell is None — variable is optionally null (from OPTIONAL MATCH).
                 None => Ok(None),
-                Some(Cell::Node(id)) => match view.ids.key_of(*id) {
+                Some(Cell::Node(id)) => match view.try_key_of(*id) {
                     Some(key) => Ok(Some(Value::Str(key.to_owned()))),
                     None => Err(format!("unknown node id {id}")),
                 },
@@ -4991,6 +5009,7 @@ mod tests {
                 edge_props: EdgePropsView::owned(&self.eprops),
                 mask: None,
                 prop_index: None,
+                layer: None,
             }
         }
 

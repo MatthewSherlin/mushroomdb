@@ -3977,7 +3977,9 @@ impl<F: Fs> GraphDb<F> {
         // `props` and `topo` were already cheap for a different reason: on a
         // snapshotted store `restore_v8_base` leaves them as empty overlays over
         // the zero-copy mmap. `ids`, `syms` and `fulltext` were not, and that
-        // inconsistency was the defect.
+        // inconsistency was the defect. The full-text index is no longer
+        // shared at all: no reader reads it, and a shared `Arc` made the next
+        // full-text write copy it whole under the write guard.
         let frozen = crate::reader::FrozenOverlay {
             ids: std::sync::Arc::clone(&self.ids),
             syms: std::sync::Arc::clone(&self.syms),
@@ -3986,7 +3988,6 @@ impl<F: Fs> GraphDb<F> {
             labels: std::sync::Arc::clone(&self.labels),
             edge_props: std::sync::Arc::clone(&self.edge_props),
             roles: self.roles.clone().map(std::sync::Arc::new),
-            fulltext: std::sync::Arc::clone(&self.fulltext),
             derived,
         };
         self.fold_overlay = Some(Arc::new(frozen));
@@ -4103,10 +4104,10 @@ impl<F: Fs> GraphDb<F> {
     /// `#[cfg(test)]` — because its only callers are in `crates/server/tests`,
     /// a different crate, exactly as `core_rules`'s index counters are.
     ///
-    /// [`ReaderSnapshot::effective`](crate::reader::ReaderSnapshot) folds the
-    /// delta tail into a clone of the frozen overlay and answers
+    /// [`ReaderSnapshot::effective`](crate::reader::ReaderSnapshot) lays the
+    /// delta tail over the frozen overlay and answers
     /// [`GraphError::Corrupt`] when a record will not apply. Nothing a caller
-    /// can do produces that state — `apply_one`'s failures are disagreements
+    /// can do produces that state — `DeltaLayer::apply`'s failures are disagreements
     /// between the tail and the fold it is applied to, which the write path
     /// cannot create — so the `Corrupt` arm of every scoped reader method was
     /// reachable only by inspection until this hook existed. An `Intern` record
@@ -6472,7 +6473,7 @@ impl<F: Fs> GraphDb<F> {
 
         // Record MVCC CommitDelta for the epoch reader.  The WAL record is
         // stored as-is (including any nested Batch / Intern records); the
-        // ReaderSnapshot's apply_one function handles all variants.
+        // reader's `DeltaLayer::apply` handles all variants.
         {
             // Each triple in the state the commit left it. The engine reports a
             // retraction and a re-derivation of one edge as two deltas, in
@@ -10845,6 +10846,7 @@ impl<F: Fs> GraphDb<F> {
             edge_props: self.edge_props_view(),
             mask: None,
             prop_index: Some(&self.prop_index),
+            layer: None,
         }
     }
 
@@ -10858,6 +10860,7 @@ impl<F: Fs> GraphDb<F> {
             edge_props: self.edge_props_view(),
             mask: Some(&mask.visible),
             prop_index: Some(&self.prop_index),
+            layer: None,
         }
     }
 

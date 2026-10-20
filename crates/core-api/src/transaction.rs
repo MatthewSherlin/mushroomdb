@@ -50,8 +50,13 @@
 //! # Reads see the transaction's own writes
 //!
 //! Each statement reads the base snapshot with the buffered records layered on
-//! top as a private, uncommitted delta — the same mechanism a reader snapshot
-//! uses for its committed delta tail. Rules and views run at commit only, so
+//! top as a private, uncommitted overlay. The overlay is built at the first
+//! write and each later statement lays only its own records over it; reads
+//! consult it before the base snapshot's state. Nothing below it is copied,
+//! re-applied or re-indexed, so a statement costs the same at any store size
+//! (it grows only with what the statement itself reads and writes). The
+//! overlay starts as a copy of the base snapshot's own delta-tail layer, which
+//! costs the tail's records, not the store. Rules and views run at commit only, so
 //! **rule-derived edges and view values produced by the transaction's own
 //! writes are not visible inside it**; they appear once it commits.
 //! Validation that needs the writer (view-owned properties, namespace and
@@ -87,12 +92,13 @@ use core_query::cypher::{
 };
 use core_query::{GraphView, ResultSet};
 use core_storage::wal::WalRecord;
-use core_storage::{GraphError, Result, Value};
+use core_storage::{Direction, GraphError, Result, Value};
 
 use crate::db::{
     add_var, pattern_rel_vars, resolve_merge_set_value, write_result_set, BatchOp, Precondition,
     EDGE_COUNT_PROP, NS_PROP,
 };
+use crate::layer::DeltaLayer;
 use crate::mask::StoreId;
 use crate::reader::ReaderSnapshot;
 use crate::shared::SharedDb;
@@ -121,14 +127,30 @@ pub struct Transaction {
     base_store: StoreId,
     /// `buffer` as the WAL records the overlay applies.
     records: Vec<WalRecord>,
-    /// `base_snap` plus `records`; `None` while nothing is buffered.
-    overlay: Option<ReaderSnapshot>,
+    /// `base_snap`'s delta-tail layer with `records` laid over it, updated by
+    /// each statement with that statement's records alone; `None` until the
+    /// first write.
+    overlay: Option<DeltaLayer>,
 }
 
 const _: () = {
     fn assert_send<T: Send>() {}
     let _ = assert_send::<Transaction>;
 };
+
+/// What a write statement returns once its records are laid over the
+/// transaction.
+enum Outcome {
+    /// The `created, properties_set, deleted` row.
+    Counts {
+        created: i64,
+        props_set: i64,
+        deleted: i64,
+    },
+    /// The statement's `RETURN`, as a query over the transaction's state with
+    /// the statement applied.
+    Return(Box<Query>),
+}
 
 /// One statement's effect, held until the statement has fully succeeded.
 #[derive(Default)]
@@ -331,11 +353,10 @@ impl Transaction {
             return self.execute_write(stmt, params);
         }
         let union = parse_read(&tokens).map_err(query_err("parse"))?;
-        let view = self.current();
-        let rs = view
+        let rs = self
             .with_view(|v| execute_union(v, &union, &Params(params)))?
             .map_err(query_err("execute"))?;
-        let keys = read_set(view, &union, params);
+        let keys = self.read_set(&union, params);
         self.record_keys(&keys);
         Ok(rs)
     }
@@ -363,6 +384,8 @@ impl Transaction {
             .into_iter()
             .map(|(key, expected)| Precondition::NodeUnchangedSince { key, expected })
             .collect();
+        // The overlay is dropped before the submit, off the commit's path.
+        drop(self.overlay);
         self.db
             .submit_batch_cas_with_seq(preconds, self.buffer)
             .map(|(_, seq)| seq)
@@ -373,9 +396,46 @@ impl Transaction {
 
     // ── Internals ────────────────────────────────────────────────────────────
 
-    /// The state statements read: the base snapshot plus the buffer.
-    fn current(&self) -> &ReaderSnapshot {
-        self.overlay.as_ref().unwrap_or(&self.base_snap)
+    /// Run `f` over the state statements read: the base snapshot with the
+    /// transaction's overlay on top.
+    fn with_view<R>(&self, f: impl FnOnce(&GraphView<'_>) -> R) -> Result<R> {
+        match &self.overlay {
+            None => self.base_snap.with_view(f),
+            Some(overlay) => {
+                let (state, base, _) = self.base_snap.layer_parts()?;
+                Ok(f(&overlay.view(state, base, None)))
+            }
+        }
+    }
+
+    /// Whether `key` is a live node in the transaction's state.
+    fn has_key(&self, key: &str) -> Result<bool> {
+        self.with_view(|v| v.node_id(key).is_some())
+    }
+
+    /// Every distinct edge incident on `key` in the transaction's state, as
+    /// `(src_key, dst_key)`; empty when `key` is not live.
+    fn incident_edges(&self, key: &str) -> Result<Vec<(String, String)>> {
+        self.with_view(|v| {
+            let Some(id) = v.node_id(key) else {
+                return Vec::new();
+            };
+            let mut edges = Vec::new();
+            for etype in v.topo.etypes() {
+                for (dir, flip) in [(Direction::Out, false), (Direction::In, true)] {
+                    for &other in v.topo.neighbors(etype, dir, id).as_ref() {
+                        let (src, dst) = if flip { (other, id) } else { (id, other) };
+                        edges.push((etype, src, dst));
+                    }
+                }
+            }
+            edges.sort_unstable();
+            edges.dedup();
+            edges
+                .into_iter()
+                .map(|(_, src, dst)| (v.key_of(src).to_string(), v.key_of(dst).to_string()))
+                .collect()
+        })
     }
 
     /// Add `keys` not yet in the conflict set, each with the `last_change` it
@@ -396,25 +456,56 @@ impl Transaction {
         }
     }
 
-    /// The overlay `staged` would leave, materialised so a record that will not
-    /// apply surfaces here rather than on the next read.
-    fn candidate(&self, staged: &Staged) -> Result<ReaderSnapshot> {
-        let mut records = self.records.clone();
-        records.extend(staged.records.iter().cloned());
-        let snap = self.base_snap.with_private_delta(records);
-        snap.with_view(|_| ())?;
-        Ok(snap)
+    /// Lay `records` over the overlay, creating it on the first write. On a
+    /// failure the overlay is put back to the accepted buffer alone.
+    fn apply(&mut self, records: &[WalRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        if self.overlay.is_none() {
+            self.overlay = Some(self.fresh_overlay()?);
+        }
+        let (state, base, _) = self.base_snap.layer_parts()?;
+        let overlay = self.overlay.as_mut().expect("set just above");
+        let applied = records
+            .iter()
+            .try_for_each(|rec| overlay.apply(state, base, rec));
+        if applied.is_err() {
+            self.revert()?;
+        }
+        applied
+    }
+
+    /// Rebuild the overlay from the accepted records alone, undoing a failed
+    /// statement's. Costs the transaction's own buffer; runs only when a
+    /// statement fails after its records were laid over the overlay.
+    fn revert(&mut self) -> Result<()> {
+        self.overlay = None;
+        if self.records.is_empty() {
+            return Ok(());
+        }
+        let mut overlay = self.fresh_overlay()?;
+        let (state, base, _) = self.base_snap.layer_parts()?;
+        for rec in &self.records {
+            overlay.apply(state, base, rec)?;
+        }
+        self.overlay = Some(overlay);
+        Ok(())
+    }
+
+    /// The overlay before any of this transaction's writes: a copy of the
+    /// base snapshot's delta-tail layer (it costs the tail, not the store),
+    /// or an empty layer over the fold.
+    fn fresh_overlay(&self) -> Result<DeltaLayer> {
+        let (state, _, tail) = self.base_snap.layer_parts()?;
+        Ok(tail.cloned().unwrap_or_else(|| DeltaLayer::new(state)))
     }
 
     /// Make a fully successful statement part of the transaction.
-    fn accept(&mut self, staged: Staged, overlay: Option<ReaderSnapshot>) {
+    fn accept(&mut self, staged: Staged) {
         self.record_keys(&staged.keys);
-        if staged.ops.is_empty() {
-            return;
-        }
         self.buffer.extend(staged.ops);
         self.records.extend(staged.records);
-        self.overlay = overlay;
     }
 
     fn execute_write(
@@ -423,8 +514,8 @@ impl Transaction {
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
         let mut staged = Staged::default();
-        let result = match stmt {
-            WriteStatement::Create(s) => self.stage_create(s, params, &mut staged)?,
+        let outcome = match stmt {
+            WriteStatement::Create(s) => self.stage_create(s, &mut staged)?,
             WriteStatement::MatchSet(s) => self.stage_match_set(s, params, &mut staged)?,
             WriteStatement::MatchDelete(s) => self.stage_match_delete(s, params, &mut staged)?,
             WriteStatement::MatchDeleteNode(s) => {
@@ -432,41 +523,46 @@ impl Transaction {
             }
             WriteStatement::Merge(s) => self.stage_merge(s, params, &mut staged)?,
         };
-        let (rs, overlay) = result;
-        self.accept(staged, overlay);
+        // Only this statement's records are applied: the overlay already
+        // holds every earlier statement's.
+        self.apply(&staged.records)?;
+        let rs = match outcome {
+            Outcome::Counts {
+                created,
+                props_set,
+                deleted,
+            } => {
+                let mut rs = write_result_set();
+                rs.push_row(vec![
+                    Some(Value::Int(created)),
+                    Some(Value::Int(props_set)),
+                    Some(Value::Int(deleted)),
+                ]);
+                rs
+            }
+            Outcome::Return(q) => match self.with_view(|v| run(v, &q, params)) {
+                Ok(Ok(rs)) => rs,
+                Ok(Err(e)) | Err(e) => {
+                    if !staged.records.is_empty() {
+                        self.revert()?;
+                    }
+                    return Err(e);
+                }
+            },
+        };
+        self.accept(staged);
         Ok(rs)
     }
 
-    /// Write result row `created, properties_set, deleted`, with the
-    /// candidate overlay the statement's ops produce.
-    fn counts(
-        &self,
-        staged: &Staged,
-        created: i64,
-        props_set: i64,
-        deleted: i64,
-    ) -> Result<(ResultSet, Option<ReaderSnapshot>)> {
-        let overlay = if staged.ops.is_empty() {
-            None
-        } else {
-            Some(self.candidate(staged)?)
-        };
-        let mut rs = write_result_set();
-        rs.push_row(vec![
-            Some(Value::Int(created)),
-            Some(Value::Int(props_set)),
-            Some(Value::Int(deleted)),
-        ]);
-        Ok((rs, overlay))
+    fn counts(created: i64, props_set: i64, deleted: i64) -> Outcome {
+        Outcome::Counts {
+            created,
+            props_set,
+            deleted,
+        }
     }
 
-    fn stage_create(
-        &self,
-        stmt: CreateStmt,
-        params: &BTreeMap<String, Value>,
-        staged: &mut Staged,
-    ) -> Result<(ResultSet, Option<ReaderSnapshot>)> {
-        let current = self.current();
+    fn stage_create(&self, stmt: CreateStmt, staged: &mut Staged) -> Result<Outcome> {
         let mut var_to_key: BTreeMap<String, String> = BTreeMap::new();
         for node in &stmt.nodes {
             let var = node.var.as_deref().unwrap_or("_cn0");
@@ -483,7 +579,7 @@ impl Transaction {
             };
             // Caught here, not at COMMIT: the overlay cannot hold two nodes
             // under one key, and the batch would refuse it anyway.
-            if current.resolve_key(&key).is_some() || var_to_key.values().any(|k| k == &key) {
+            if self.has_key(&key)? || var_to_key.values().any(|k| k == &key) {
                 return Err(GraphError::DuplicateKey { key });
             }
             var_to_key.insert(var.to_string(), key);
@@ -505,11 +601,9 @@ impl Transaction {
                 })?;
             staged.insert_edge(&edge.etype, src, dst);
         }
-        let created = stmt.nodes.len() as i64;
         let Some(returns) = stmt.returns else {
-            return self.counts(staged, created, 0, 0);
+            return Ok(Self::counts(stmt.nodes.len() as i64, 0, 0));
         };
-        let overlay = self.candidate(staged)?;
         let patterns = stmt
             .nodes
             .iter()
@@ -520,8 +614,7 @@ impl Transaction {
             .collect();
         let mut q = match_query(patterns, None);
         q.returns = returns;
-        let rs = overlay.with_view(|v| run(v, &q, params))??;
-        Ok((rs, Some(overlay)))
+        Ok(Outcome::Return(Box::new(q)))
     }
 
     fn stage_match_set(
@@ -529,7 +622,7 @@ impl Transaction {
         stmt: MatchSetStmt,
         params: &BTreeMap<String, Value>,
         staged: &mut Staged,
-    ) -> Result<(ResultSet, Option<ReaderSnapshot>)> {
+    ) -> Result<Outcome> {
         if stmt.returns.is_some() {
             return Err(not_supported("MATCH … SET … RETURN"));
         }
@@ -561,7 +654,7 @@ impl Transaction {
                 alias: Some(col.clone()),
             });
         }
-        let match_rs = self.current().with_view(|v| run(v, &q, params))??;
+        let match_rs = self.with_view(|v| run(v, &q, params))??;
         keys_in(&match_rs, &node_vars, &mut staged.keys);
         let mut props_set = 0i64;
         for row in 0..match_rs.len() {
@@ -591,7 +684,7 @@ impl Transaction {
                 props_set += 1;
             }
         }
-        self.counts(staged, 0, props_set, 0)
+        Ok(Self::counts(0, props_set, 0))
     }
 
     fn stage_match_delete(
@@ -599,7 +692,7 @@ impl Transaction {
         stmt: MatchDeleteStmt,
         params: &BTreeMap<String, Value>,
         staged: &mut Staged,
-    ) -> Result<(ResultSet, Option<ReaderSnapshot>)> {
+    ) -> Result<Outcome> {
         let mut matches = stmt.matches;
         let mut node_vars = Vec::new();
         bind_node_vars(&mut matches, &mut 0, &mut node_vars);
@@ -609,7 +702,7 @@ impl Transaction {
         }
         let mut q = match_query(matches, stmt.where_expr);
         q.returns = var_items(&node_vars);
-        let match_rs = self.current().with_view(|v| run(v, &q, params))??;
+        let match_rs = self.with_view(|v| run(v, &q, params))??;
         keys_in(&match_rs, &node_vars, &mut staged.keys);
         let mut deleted = 0i64;
         for row in 0..match_rs.len() {
@@ -628,7 +721,7 @@ impl Transaction {
                 deleted += 1;
             }
         }
-        self.counts(staged, 0, 0, deleted)
+        Ok(Self::counts(0, 0, deleted))
     }
 
     fn stage_match_delete_node(
@@ -636,20 +729,19 @@ impl Transaction {
         stmt: MatchDeleteNodeStmt,
         params: &BTreeMap<String, Value>,
         staged: &mut Staged,
-    ) -> Result<(ResultSet, Option<ReaderSnapshot>)> {
+    ) -> Result<Outcome> {
         let mut matches = stmt.matches;
         let mut node_vars = Vec::new();
         bind_node_vars(&mut matches, &mut 0, &mut node_vars);
         let mut q = match_query(matches, stmt.where_expr);
         q.returns = var_items(&node_vars);
-        let current = self.current();
-        let match_rs = current.with_view(|v| run(v, &q, params))??;
+        let match_rs = self.with_view(|v| run(v, &q, params))??;
         keys_in(&match_rs, &node_vars, &mut staged.keys);
         let mut doomed: Vec<String> = Vec::new();
         keys_in(&match_rs, &stmt.node_vars, &mut doomed);
         let mut deleted = 0i64;
         for key in &doomed {
-            let edges = current.node_edges(key)?;
+            let edges = self.incident_edges(key)?;
             if !stmt.detach && !edges.is_empty() {
                 return Err(GraphError::QueryError {
                     detail: format!(
@@ -660,14 +752,14 @@ impl Transaction {
             }
             // Every edge the delete removes is an edge written: both its
             // endpoints join the conflict set.
-            for e in &edges {
-                staged.touch(&e.src_key);
-                staged.touch(&e.dst_key);
+            for (src, dst) in &edges {
+                staged.touch(src);
+                staged.touch(dst);
             }
             deleted += 1 + edges.len() as i64;
             staged.delete_node(key);
         }
-        self.counts(staged, 0, 0, deleted)
+        Ok(Self::counts(0, 0, deleted))
     }
 
     fn stage_merge(
@@ -675,7 +767,7 @@ impl Transaction {
         stmt: MergeStmt,
         params: &BTreeMap<String, Value>,
         staged: &mut Staged,
-    ) -> Result<(ResultSet, Option<ReaderSnapshot>)> {
+    ) -> Result<Outcome> {
         let key = match &stmt.key_value {
             Value::Str(s) => s.clone(),
             other => {
@@ -696,7 +788,7 @@ impl Transaction {
                 }
             }
         }
-        let existed = self.current().resolve_key(&key).is_some();
+        let existed = self.has_key(&key)?;
         staged.touch(&key);
         let mut created = 0i64;
         if existed {
@@ -717,12 +809,7 @@ impl Transaction {
             created = 1;
         }
         let Some(returns) = stmt.returns else {
-            return self.counts(staged, created, 0, 0);
-        };
-        let overlay = if staged.ops.is_empty() {
-            None
-        } else {
-            Some(self.candidate(staged)?)
+            return Ok(Self::counts(created, 0, 0));
         };
         let var = stmt.var.as_deref().unwrap_or("_mn0");
         let mut q = match_query(
@@ -730,55 +817,49 @@ impl Transaction {
             None,
         );
         q.returns = returns;
-        let view = overlay.as_ref().unwrap_or(self.current());
-        let rs = view.with_view(|v| run(v, &q, params))??;
-        Ok((rs, overlay))
+        Ok(Outcome::Return(Box::new(q)))
     }
-}
 
-/// The node keys a read query matched, for the conflict set.
-///
-/// Each part's top-level `MATCH` / `OPTIONAL MATCH` patterns and `WHERE` are
-/// re-run returning every node they bind, anonymous ones included, so both
-/// endpoints of every matched edge are recorded. Best effort by design: if the
-/// filtered re-run cannot be planned the unfiltered one is used (a wider set is
-/// only more conservative), and a read whose re-run fails records nothing —
-/// snapshot isolation needs the write set, which every write statement records
-/// exactly.
-fn read_set(
-    view: &ReaderSnapshot,
-    union: &UnionQuery,
-    params: &BTreeMap<String, Value>,
-) -> Vec<String> {
-    let mut keys = Vec::new();
-    for part in &union.parts {
-        if part.matches.is_empty() && part.optional_clauses.is_empty() {
-            continue;
+    /// The node keys a read query matched, for the conflict set.
+    ///
+    /// Each part's top-level `MATCH` / `OPTIONAL MATCH` patterns and `WHERE`
+    /// are re-run returning every node they bind, anonymous ones included, so
+    /// both endpoints of every matched edge are recorded. Best effort by
+    /// design: if the filtered re-run cannot be planned the unfiltered one is
+    /// used (a wider set is only more conservative), and a read whose re-run
+    /// fails records nothing — snapshot isolation needs the write set, which
+    /// every write statement records exactly.
+    fn read_set(&self, union: &UnionQuery, params: &BTreeMap<String, Value>) -> Vec<String> {
+        let mut keys = Vec::new();
+        for part in &union.parts {
+            if part.matches.is_empty() && part.optional_clauses.is_empty() {
+                continue;
+            }
+            let mut next = 0;
+            let mut vars = Vec::new();
+            let mut matches = part.matches.clone();
+            bind_node_vars(&mut matches, &mut next, &mut vars);
+            let mut optional_clauses = part.optional_clauses.clone();
+            for oc in &mut optional_clauses {
+                bind_node_vars(&mut oc.patterns, &mut next, &mut vars);
+            }
+            let mut q = match_query(matches, part.where_expr.clone());
+            q.optional_clauses = optional_clauses;
+            q.returns = var_items(&vars);
+            q.distinct = true;
+            let rs = self
+                .with_view(|v| run(v, &q, params))
+                .and_then(|r| r)
+                .or_else(|_| {
+                    q.where_expr = None;
+                    self.with_view(|v| run(v, &q, params)).and_then(|r| r)
+                });
+            if let Ok(rs) = rs {
+                keys_in(&rs, &vars, &mut keys);
+            }
         }
-        let mut next = 0;
-        let mut vars = Vec::new();
-        let mut matches = part.matches.clone();
-        bind_node_vars(&mut matches, &mut next, &mut vars);
-        let mut optional_clauses = part.optional_clauses.clone();
-        for oc in &mut optional_clauses {
-            bind_node_vars(&mut oc.patterns, &mut next, &mut vars);
-        }
-        let mut q = match_query(matches, part.where_expr.clone());
-        q.optional_clauses = optional_clauses;
-        q.returns = var_items(&vars);
-        q.distinct = true;
-        let rs = view
-            .with_view(|v| run(v, &q, params))
-            .and_then(|r| r)
-            .or_else(|_| {
-                q.where_expr = None;
-                view.with_view(|v| run(v, &q, params)).and_then(|r| r)
-            });
-        if let Ok(rs) = rs {
-            keys_in(&rs, &vars, &mut keys);
-        }
+        keys
     }
-    keys
 }
 
 #[cfg(test)]

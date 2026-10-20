@@ -18,7 +18,6 @@ use std::sync::{Arc, OnceLock};
 
 use core_query::cypher::{execute, is_write_tokens, lex, parse, plan, Params};
 use core_query::{expand, neighborhood, Dir, GraphView, ResultSet};
-use core_storage::fulltext::FulltextIndex;
 use core_storage::v8::seam::{ArchivedNeighbor, DerivedBits};
 use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::v8::MappedBase;
@@ -29,6 +28,7 @@ use core_storage::{
 };
 
 use crate::db::{EdgeInfo, NodeInfo};
+use crate::layer::DeltaLayer;
 use crate::mask::{NodeMask, RoleMaskCache};
 use crate::roles::RoleDef;
 
@@ -425,6 +425,12 @@ impl DerivedEdges {
 /// Full clone of overlay state captured at fold time.
 ///
 /// The V8 mmap base is not cloned here; it is `Arc`-shared in `ReaderSnapshot`.
+///
+/// It holds no full-text index. A reader answers no full-text search
+/// (`GraphDb::search` runs on the writer's index; inside a reader query
+/// `textMatches()` reads property values), and sharing the writer's index
+/// here made the writer's first full-text write after every fold copy the
+/// whole index under the write lock, stalling every reader capture.
 #[derive(Clone)]
 pub struct FrozenOverlay {
     pub ids: Arc<IdMap>,
@@ -434,10 +440,16 @@ pub struct FrozenOverlay {
     pub labels: Arc<Vec<u32>>,
     pub edge_props: Arc<EdgeProps>,
     pub roles: Option<Arc<Vec<RoleDef>>>,
-    pub fulltext: Arc<FulltextIndex>,
     /// Which edges in `topo` (and the base under it) a rule derived.
     pub derived: DerivedEdges,
 }
+
+/// A snapshot's fold, the base under it and its delta-tail layer, if any.
+pub(crate) type LayerParts<'a> = (
+    &'a FrozenOverlay,
+    &'a Option<Arc<MappedBase>>,
+    Option<&'a DeltaLayer>,
+);
 
 /// Lock-free reader snapshot: frozen overlay + optional V8 base + pending delta tail.
 ///
@@ -462,19 +474,24 @@ pub struct ReaderSnapshot {
     pub version: u64,
     /// Role → mask memo, shared with the `GraphDb` this snapshot came from.
     role_masks: Arc<RoleMaskCache>,
-    /// Cached materialized overlay (frozen + deltas applied).
+    /// `deltas` as one [`DeltaLayer`] over `frozen`: the effective state is
+    /// `frozen` read through it.
     ///
-    /// Computed at most once per `ReaderSnapshot` on the first call to
-    /// [`Self::effective`] when `deltas` is non-empty.  Stores `Err(String)` if
-    /// WAL application fails so the error is returned to every subsequent caller
-    /// without re-attempting.  When `deltas` is empty this field is never
-    /// populated — `effective` returns `&frozen` directly.
-    cache: OnceLock<std::result::Result<FrozenOverlay, String>>,
+    /// Built at most once per `ReaderSnapshot`, on the first call to
+    /// [`Self::effective`] when `deltas` is non-empty, at the cost of the
+    /// tail's records — nothing below the layer is copied or re-indexed.
+    /// Stores `Err(String)` if a record will not apply, so the error is
+    /// returned to every later caller without re-attempting. When `deltas` is
+    /// empty it is never populated and reads go to `frozen` directly.
+    cache: OnceLock<std::result::Result<DeltaLayer, String>>,
 }
 
 // ── Private view-building helpers ─────────────────────────────────────────────
 
-fn build_tv<'a>(topo: &'a Topology, base: &'a Option<Arc<MappedBase>>) -> TopologyView<'a> {
+pub(crate) fn build_tv<'a>(
+    topo: &'a Topology,
+    base: &'a Option<Arc<MappedBase>>,
+) -> TopologyView<'a> {
     match base {
         None => TopologyView::owned(topo),
         Some(b) => {
@@ -484,7 +501,10 @@ fn build_tv<'a>(topo: &'a Topology, base: &'a Option<Arc<MappedBase>>) -> Topolo
     }
 }
 
-fn build_cv<'a>(props: &'a ColumnStore, base: &'a Option<Arc<MappedBase>>) -> ColumnsView<'a> {
+pub(crate) fn build_cv<'a>(
+    props: &'a ColumnStore,
+    base: &'a Option<Arc<MappedBase>>,
+) -> ColumnsView<'a> {
     match base {
         None => ColumnsView::owned(props),
         Some(b) => {
@@ -500,7 +520,7 @@ fn build_cv<'a>(props: &'a ColumnStore, base: &'a Option<Arc<MappedBase>>) -> Co
     }
 }
 
-fn build_epv<'a>(
+pub(crate) fn build_epv<'a>(
     edge_props: &'a EdgeProps,
     base: &'a Option<Arc<MappedBase>>,
 ) -> EdgePropsView<'a> {
@@ -518,8 +538,12 @@ fn build_epv<'a>(
 fn make_view<'a>(
     state: &'a FrozenOverlay,
     base: &'a Option<Arc<MappedBase>>,
+    layer: Option<&'a DeltaLayer>,
     mask: Option<&'a core_query::visible::VisibleSet>,
 ) -> GraphView<'a> {
+    if let Some(layer) = layer {
+        return layer.view(state, base, mask);
+    }
     GraphView {
         ids: &state.ids,
         syms: &state.syms,
@@ -531,283 +555,24 @@ fn make_view<'a>(
         // MVCC reader snapshots don't carry the equality index; IndexScan
         // falls back to a correct scan+filter on this path.
         prop_index: None,
+        layer: None,
     }
-}
-
-// ── Delta application ─────────────────────────────────────────────────────────
-
-/// Apply a single WAL record (recursing into `Batch`) to mutable working state.
-/// Skips rule/view records that are no-ops on the read path.
-///
-/// Note: fulltext is updated incrementally here for correctness; after all deltas
-/// are applied the caller should call `fulltext.rebuild_all` to correct drift from
-/// multi-field updates and out-of-order incremental additions.
-#[allow(clippy::too_many_arguments)]
-fn apply_one(
-    ids: &mut IdMap,
-    syms: &mut Interner,
-    topo: &mut Topology,
-    props: &mut ColumnStore,
-    edge_props: &mut EdgeProps,
-    labels: &mut Vec<u32>,
-    fulltext: &mut FulltextIndex,
-    base: &Option<Arc<MappedBase>>,
-    rec: &WalRecord,
-) -> Result<()> {
-    match rec {
-        WalRecord::Intern { id, text } => {
-            let got = syms.intern(text);
-            if got != *id {
-                return Err(GraphError::Corrupt {
-                    detail: format!(
-                        "mvcc delta intern mismatch for {text:?}: expected {id}, got {got}"
-                    ),
-                });
-            }
-        }
-
-        WalRecord::InsertNodeId {
-            label,
-            key,
-            props: node_props,
-        } => {
-            let node_id = ids.try_insert(key)?;
-            if labels.len() <= node_id as usize {
-                labels.resize(node_id as usize + 1, u32::MAX);
-            }
-            labels[node_id as usize] = *label;
-            let label_str = syms
-                .resolve(*label)
-                .ok_or_else(|| GraphError::Corrupt {
-                    detail: format!("mvcc delta: unknown label sym {label}"),
-                })?
-                .to_string();
-            for (field_sym, value) in node_props {
-                let field = syms
-                    .resolve(*field_sym)
-                    .ok_or_else(|| GraphError::Corrupt {
-                        detail: format!("mvcc delta: unknown field sym {field_sym}"),
-                    })?
-                    .to_string();
-                props.set(node_id, &field, value.clone());
-                if fulltext.is_enabled(&label_str, &field) {
-                    fulltext.add_tokens(node_id, &field, value);
-                }
-            }
-        }
-
-        WalRecord::InsertNode {
-            label,
-            key,
-            props: node_props,
-        } => {
-            let label_sym = syms.intern(label);
-            let node_id = ids.try_insert(key)?;
-            if labels.len() <= node_id as usize {
-                labels.resize(node_id as usize + 1, u32::MAX);
-            }
-            labels[node_id as usize] = label_sym;
-            for (field, value) in node_props {
-                props.set(node_id, field, value.clone());
-                if fulltext.is_enabled(label, field) {
-                    fulltext.add_tokens(node_id, field, value);
-                }
-            }
-        }
-
-        WalRecord::SetPropId { id, field, value } => {
-            if let Some(field_str) = syms.resolve(*field).map(str::to_string) {
-                props.set(*id, &field_str, value.clone());
-                if let Some(&label_sym) = labels.get(*id as usize) {
-                    if let Some(label_str) = syms.resolve(label_sym) {
-                        if fulltext.is_enabled(label_str, &field_str) {
-                            fulltext.add_tokens(*id, &field_str, value);
-                        }
-                    }
-                }
-            }
-        }
-
-        WalRecord::SetProp { key, field, value } => {
-            if let Some(node_id) = ids.get(key) {
-                props.set(node_id, field, value.clone());
-                if let Some(&label_sym) = labels.get(node_id as usize) {
-                    if let Some(label_str) = syms.resolve(label_sym) {
-                        if fulltext.is_enabled(label_str, field) {
-                            fulltext.add_tokens(node_id, field, value);
-                        }
-                    }
-                }
-            }
-        }
-
-        WalRecord::RemoveProp { key, field } => {
-            if let Some(node_id) = ids.get(key) {
-                props.remove(node_id, field);
-                // A base-resident prop must be masked or ColumnsView falls
-                // through to the archived value (mirrors db.rs WAL replay).
-                // Tombstoning a prop absent from the base is a harmless
-                // false-mask: the overlay short-circuit never reaches it.
-                props.record_prop_tombstone(node_id, field);
-                fulltext.remove_node_field(node_id, field);
-            }
-        }
-
-        WalRecord::DeleteNode { key } => {
-            if let Some(node_id) = ids.delete(key) {
-                props.remove_all(node_id);
-                fulltext.remove_node(node_id);
-                // Mark the label slot as sentinel so label_of returns None.
-                if let Some(slot) = labels.get_mut(node_id as usize) {
-                    *slot = u32::MAX;
-                }
-                // Sweep all edges incident on this node to prevent phantom
-                // adjacency. db.rs deletes these edges inline without emitting
-                // DeleteEdge WAL records, so we must mirror that sweep here —
-                // over the snapshot's edges as well as the overlay's, as
-                // db.rs does.
-                let mut doomed = Vec::new();
-                {
-                    let tv = match base {
-                        None => TopologyView::owned(topo),
-                        Some(b) => match b.topology() {
-                            Ok(archived) => TopologyView::with_base(topo, archived),
-                            Err(_) => TopologyView::owned(topo),
-                        },
-                    };
-                    let etypes: Vec<u32> = tv.etypes().collect();
-                    for et in &etypes {
-                        for &dst in tv.neighbors(*et, Direction::Out, node_id).as_ref() {
-                            doomed.push((*et, node_id, dst));
-                        }
-                        for &src in tv.neighbors(*et, Direction::In, node_id).as_ref() {
-                            if src != node_id {
-                                doomed.push((*et, src, node_id));
-                            }
-                        }
-                    }
-                }
-                for (et, s, d) in doomed {
-                    topo.remove_edge(et, s, d);
-                    edge_props.remove_edge(et, s, d);
-                }
-            }
-        }
-
-        WalRecord::InsertEdgeId { etype, src, dst } => {
-            topo.add_edge(*etype, *src, *dst);
-        }
-
-        WalRecord::InsertEdge {
-            edge_type,
-            src_key,
-            dst_key,
-        } => {
-            let etype = syms.intern(edge_type);
-            if let (Some(src), Some(dst)) = (ids.get(src_key), ids.get(dst_key)) {
-                topo.add_edge(etype, src, dst);
-            }
-        }
-
-        WalRecord::DeleteEdge {
-            edge_type,
-            src_key,
-            dst_key,
-        } => {
-            if let Some(etype) = syms.get(edge_type) {
-                if let (Some(src), Some(dst)) = (ids.get(src_key), ids.get(dst_key)) {
-                    topo.remove_edge(etype, src, dst);
-                }
-            }
-        }
-
-        WalRecord::EnableFulltext { label, field } => {
-            fulltext.enable(label, field);
-        }
-
-        WalRecord::DisableFulltext { label, field } => {
-            fulltext.disable(label, field);
-        }
-
-        WalRecord::Batch(inner) => {
-            for r in inner {
-                apply_one(ids, syms, topo, props, edge_props, labels, fulltext, base, r)?;
-            }
-        }
-
-        // No-ops for the read path: rule and view management do not affect
-        // the structural overlay data that queries read.
-        WalRecord::CreateRule { .. }
-        | WalRecord::DeleteRule { .. }
-        | WalRecord::RebuildRule { .. }
-        | WalRecord::CreateView { .. }
-        | WalRecord::DeleteView { .. }
-        // Property-index declarations are no-ops in the read path: MVCC reader
-        // snapshots do not carry the equality index, so `IndexScan` falls back
-        // to a correct scan+filter for reader queries. Range indexes share
-        // that index, so their declarations are no-ops too.
-        | WalRecord::EnableIndex { .. }
-        | WalRecord::DisableIndex { .. }
-        | WalRecord::EnableRangeIndex { .. }
-        | WalRecord::DisableRangeIndex { .. }
-        // Unique constraints are checked on the write path only; a reader
-        // never writes, so the declarations are no-ops here.
-        | WalRecord::CreateConstraint { .. }
-        | WalRecord::DropConstraint { .. }
-        // The opt-in declaration is a writer-side gate; the read path never
-        // decides whether to write a record. A *count* is not a no-op and is
-        // handled below.
-        | WalRecord::SetEdgeCount { count: 0, .. }
-        // History markers are no-ops in the read path. Rules re-derive their
-        // edges when the ReaderSnapshot queries the live engine; markers only
-        // serve edge_history / was_linked WAL scans.
-        | WalRecord::DerivedEdgeAdded { .. }
-        | WalRecord::DerivedEdgeRetracted { .. } => {}
-
-        // An insert count is an edge property, so the read path carries it the
-        // way it carries any other: absolute, last write wins.
-        WalRecord::SetEdgeCount {
-            etype,
-            src,
-            dst,
-            count,
-        } => {
-            edge_props.set(
-                *etype,
-                *src,
-                *dst,
-                crate::db::EDGE_COUNT_PROP,
-                core_storage::Value::Int(*count as i64),
-            );
-        }
-
-        WalRecord::RenameNode { old_key, new_key } => {
-            // Recovery-safe: if old_key is already gone (frozen overlay or a
-            // prior delta already applied the rename), skip cleanly.
-            if ids.get(old_key).is_some() {
-                ids.rename(old_key, new_key).map_err(|_| GraphError::Corrupt {
-                    detail: format!("mvcc delta RenameNode {old_key}→{new_key} failed"),
-                })?;
-            }
-        }
-    }
-    Ok(())
 }
 
 // ── ReaderSnapshot ────────────────────────────────────────────────────────────
 
-/// Resolve `role` against a frozen overlay — the reader-side twin of
-/// [`crate::db::GraphDb::mask_for_role`], and kept identical to it.
+/// Resolve `role` against a snapshot's effective state — the reader-side twin
+/// of [`crate::db::GraphDb::mask_for_role`], and kept identical to it.
 ///
-/// Takes `base` because a role carrying a `visible_where` predicate has to read
-/// properties, and a node's property may live in the mmap'd base rather than
-/// the overlay.
+/// Reads through `view` because a role carrying a `visible_where` predicate
+/// has to read properties, and a node's property may live in the mmap'd base,
+/// the fold's overlay or the delta tail.
 fn mask_for_role_from(
-    state: &FrozenOverlay,
-    base: &Option<Arc<MappedBase>>,
+    view: &GraphView<'_>,
+    roles: &Option<Arc<Vec<RoleDef>>>,
     role: &str,
 ) -> Result<NodeMask> {
-    let roles = state.roles.as_ref().ok_or_else(|| GraphError::Corrupt {
+    let roles = roles.as_ref().ok_or_else(|| GraphError::Corrupt {
         detail: "roles.json was corrupt at open; fix the file and re-open".into(),
     })?;
     let def = roles
@@ -819,44 +584,42 @@ fn mask_for_role_from(
     let mut visible = HashSet::new();
     // Key leg: an administrative grant, never narrowed by the predicate.
     for key in &def.keys {
-        if let Some(id) = state.ids.get(key) {
+        if let Some(id) = view.node_id(key) {
             visible.insert(id);
         }
     }
-    let props = def
-        .visible_where
-        .as_ref()
-        .map(|_| build_cv(&state.props, base));
     for label_name in &def.labels {
-        if let Some(sym) = state.syms.get(label_name) {
-            for (i, &s) in state.labels.iter().enumerate() {
+        if let Some(sym) = view.sym(label_name) {
+            for (i, s) in view.label_syms().enumerate() {
                 if s != sym {
                     continue;
                 }
                 let id = i as u32;
-                match (&def.visible_where, &props) {
-                    (Some(pred), Some(view)) => {
-                        let value = view.get(id, &pred.field).map(|vr| vr.into_value());
+                match &def.visible_where {
+                    Some(pred) => {
+                        let value = view.props.get(id, &pred.field).map(|vr| vr.into_value());
                         if pred.holds(value.as_ref()) {
                             visible.insert(id);
                         }
                     }
-                    _ => {
+                    None => {
                         visible.insert(id);
                     }
                 }
             }
         }
     }
-    // Namespace leg — the live resolver's retain, against the frozen overlay's
-    // own `ns` column (the reader has no derived `node_ns` array: its effective
-    // state is assembled per snapshot, and reading the column it would mirror is
-    // the same answer by construction). Intersects the key leg too; see
-    // `RoleDef::namespaces`.
+    // Namespace leg — the live resolver's retain, against the effective
+    // state's own `ns` column (the reader has no derived `node_ns` array: its
+    // effective state is assembled per snapshot, and reading the column it
+    // would mirror is the same answer by construction). Intersects the key
+    // leg too; see `RoleDef::namespaces`.
     if def.namespaces.is_some() {
-        let cv = build_cv(&state.props, base);
         visible.retain(|&id| {
-            let value = cv.get(id, core_storage::NS_PROP).map(|vr| vr.into_value());
+            let value = view
+                .props
+                .get(id, core_storage::NS_PROP)
+                .map(|vr| vr.into_value());
             def.sees_namespace(core_storage::namespace_of_value(value.as_ref()))
         });
     }
@@ -864,64 +627,6 @@ fn mask_for_role_from(
 }
 
 impl ReaderSnapshot {
-    /// Apply all pending deltas to a clone of `frozen`.
-    ///
-    /// Returns the frozen state (cloned) with delta changes applied, including
-    /// rule-derived edge inserts/retracts and a rebuilt full-text index.
-    fn materialize(&self) -> Result<FrozenOverlay> {
-        // Cloning the struct now clones eight `Arc`s — refcount bumps, not data.
-        // Each `Arc::make_mut` below copies exactly one structure, once, and only
-        // because this snapshot is about to mutate its own working copy. The
-        // fold this came from keeps its allocation, which is what preserves the
-        // isolation `tests/reader_isolation.rs` pins.
-        //
-        // Before the fields were `Arc`, this deep-copied all eight every time a
-        // snapshot with a non-empty delta tail was read. Now it copies only what
-        // the deltas actually touch.
-        let mut w = (*self.frozen).clone();
-        for delta in &self.deltas {
-            for rec in &delta.records {
-                apply_one(
-                    Arc::make_mut(&mut w.ids),
-                    Arc::make_mut(&mut w.syms),
-                    Arc::make_mut(&mut w.topo),
-                    Arc::make_mut(&mut w.props),
-                    Arc::make_mut(&mut w.edge_props),
-                    Arc::make_mut(&mut w.labels),
-                    Arc::make_mut(&mut w.fulltext),
-                    &self.base,
-                    rec,
-                )?;
-            }
-            for &(etype, src, dst) in &delta.derived_inserts {
-                Arc::make_mut(&mut w.topo).add_edge(etype, src, dst);
-            }
-            for &(etype, src, dst) in &delta.derived_deletes {
-                Arc::make_mut(&mut w.topo).remove_edge(etype, src, dst);
-            }
-            for (node, view_prop, value) in &delta.view_values {
-                let props = Arc::make_mut(&mut w.props);
-                match value {
-                    Some(v) => props.set(*node, view_prop, v.clone()),
-                    None => {
-                        // Tombstoned as well as removed, or the snapshot's
-                        // value is read through (mirrors `clear_view_value`).
-                        props.remove(*node, view_prop);
-                        props.record_prop_tombstone(*node, view_prop);
-                    }
-                }
-            }
-        }
-        if !self.deltas.is_empty() {
-            // Rebuild full-text to correct incremental drift accumulated during
-            // delta application (add_tokens is imprecise for multi-field/deletion paths).
-            let cv = build_cv(&w.props, &self.base);
-            let (ids, labels, syms) = (w.ids.clone(), w.labels.clone(), w.syms.clone());
-            Arc::make_mut(&mut w.fulltext).rebuild_all(&ids, &labels, &syms, cv);
-        }
-        Ok(w)
-    }
-
     /// What the delta tail, the fold's layers and its root say about which of
     /// `node`'s edges are derived.
     fn derived_lookup(&self, node: u32) -> DerivedLookup<'_> {
@@ -967,67 +672,47 @@ impl ReaderSnapshot {
         }
     }
 
-    /// This snapshot with `records` layered on top as one more, private,
-    /// uncommitted delta — the read-your-own-writes view of a transaction.
-    ///
-    /// The records go through the same [`apply_one`] path the committed delta
-    /// tail does, so an uncommitted insert, property write or delete reads
-    /// exactly as it will once committed — except for what only the writer
-    /// computes: rule-derived edges and view values from these records are not
-    /// in the delta (rules fire at commit only).
-    ///
-    /// The result carries a fresh role-mask memo, never the shared one: it
-    /// keeps this snapshot's `version`, and a mask memoised against uncommitted
-    /// state under a committed version would be served to every other reader
-    /// of that version.
-    pub(crate) fn with_private_delta(&self, records: Vec<WalRecord>) -> ReaderSnapshot {
-        let mut deltas = self.deltas.clone();
-        if !records.is_empty() {
-            deltas.push(Arc::new(CommitDelta {
-                records,
-                derived_inserts: Vec::new(),
-                derived_deletes: Vec::new(),
-                view_values: Vec::new(),
-            }));
-        }
-        ReaderSnapshot::new(
-            Arc::clone(&self.frozen),
-            self.base.clone(),
-            deltas,
-            // The private delta carries no derived changes (rules fire at
-            // commit only), so the committed tail's derived set is still exact.
-            Arc::clone(&self.tail_derived),
-            self.version,
-            Arc::new(RoleMaskCache::new()),
-        )
+    /// This snapshot's fold, the base under it and the delta tail's layer —
+    /// what a transaction lays its own writes over (it starts from a copy of
+    /// the tail's layer, which costs the tail, not the store).
+    pub(crate) fn layer_parts(&self) -> Result<LayerParts<'_>> {
+        Ok((&self.frozen, &self.base, self.effective()?))
     }
 
     /// Run `f` over an unmasked [`GraphView`] of this snapshot's effective
     /// state.
     pub(crate) fn with_view<R>(&self, f: impl FnOnce(&GraphView<'_>) -> R) -> Result<R> {
-        let state = self.effective()?;
-        let view = make_view(state, &self.base, None);
-        Ok(f(&view))
+        Ok(f(&self.view(None)?))
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Return a reference to the current effective state.
+    /// A view of the effective state: `frozen` with the delta tail's layer
+    /// on top.
+    fn view<'a>(
+        &'a self,
+        mask: Option<&'a core_query::visible::VisibleSet>,
+    ) -> Result<GraphView<'a>> {
+        Ok(make_view(&self.frozen, &self.base, self.effective()?, mask))
+    }
+
+    /// The delta tail's layer over `frozen`, `None` when the tail is empty.
     ///
-    /// When the delta tail is empty this is a zero-copy borrow of `frozen`.
-    /// Otherwise the delta tail is applied to a clone of `frozen` exactly once
-    /// (cached in `self.cache`) so that all operations within a single
-    /// `ReaderSnapshot` share the same materialized view (F3: no triple
-    /// materialize per request).
-    fn effective(&self) -> Result<&FrozenOverlay> {
+    /// Built from the tail's records exactly once (cached in `self.cache`), so
+    /// that all operations within a single `ReaderSnapshot` share it (F3: no
+    /// triple build per request). It costs the tail's records; the fold below
+    /// it is neither copied nor re-indexed.
+    fn effective(&self) -> Result<Option<&DeltaLayer>> {
         if self.deltas.is_empty() {
-            return Ok(&self.frozen);
+            return Ok(None);
         }
-        let cached = self
-            .cache
-            .get_or_init(|| self.materialize().map_err(|e| e.to_string()));
+        let cached = self.cache.get_or_init(|| {
+            DeltaLayer::from_deltas(&self.frozen, &self.base, &self.deltas)
+                .map_err(|e| e.to_string())
+        });
         cached
             .as_ref()
+            .map(Some)
             .map_err(|e| GraphError::Corrupt { detail: e.clone() })
     }
 
@@ -1045,7 +730,7 @@ impl ReaderSnapshot {
     pub fn mask_for_role(&self, role: &str) -> Result<NodeMask> {
         self.role_masks
             .get_or_build(role, self.version, || {
-                mask_for_role_from(self.effective()?, &self.base, role)
+                mask_for_role_from(&self.view(None)?, &self.frozen.roles, role)
             })
             .map(|m| (*m).clone())
     }
@@ -1057,15 +742,17 @@ impl ReaderSnapshot {
     /// array, exactly as the namespace leg of [`Self::mask_for_role`] is. A name
     /// no node uses gives an empty mask — a namespace scope never widens.
     pub fn mask_for_namespace(&self, namespace: &str) -> Result<NodeMask> {
-        let state = self.effective()?;
-        let cv = build_cv(&state.props, &self.base);
+        let view = self.view(None)?;
         let mut visible = HashSet::new();
-        for (i, &sym) in state.labels.iter().enumerate() {
+        for (i, sym) in view.label_syms().enumerate() {
             if sym == u32::MAX {
                 continue; // tombstoned: the label sentinel is what marks it gone
             }
             let id = i as u32;
-            let value = cv.get(id, core_storage::NS_PROP).map(|vr| vr.into_value());
+            let value = view
+                .props
+                .get(id, core_storage::NS_PROP)
+                .map(|vr| vr.into_value());
             if core_storage::namespace_of_value(value.as_ref()) == namespace {
                 visible.insert(id);
             }
@@ -1078,7 +765,7 @@ impl ReaderSnapshot {
     /// Checks the delta tail (via the cached materialization) so that nodes
     /// inserted since the last fold are visible.
     pub fn resolve_key(&self, key: &str) -> Option<u32> {
-        self.effective().ok()?.ids.get(key)
+        self.view(None).ok()?.node_id(key)
     }
 
     /// Execute a read-only Cypher query over the epoch snapshot.
@@ -1092,8 +779,7 @@ impl ReaderSnapshot {
         let ops = plan(&ast).map_err(|e| GraphError::QueryError {
             detail: format!("plan: {e}"),
         })?;
-        let state = self.effective()?;
-        let view = make_view(state, &self.base, None);
+        let view = self.view(None)?;
         execute(&view, &ops, &Params(params)).map_err(|e| GraphError::QueryError {
             detail: format!("execute: {e}"),
         })
@@ -1122,8 +808,7 @@ impl ReaderSnapshot {
         let ops = plan(&ast).map_err(|e| GraphError::QueryError {
             detail: format!("plan: {e}"),
         })?;
-        let state = self.effective()?;
-        let view = make_view(state, &self.base, Some(&mask.visible));
+        let view = self.view(Some(&mask.visible))?;
         execute(&view, &ops, &Params(params)).map_err(|e| GraphError::QueryError {
             detail: format!("execute: {e}"),
         })
@@ -1131,7 +816,7 @@ impl ReaderSnapshot {
 
     /// Live node info from the epoch snapshot. `None` if key is absent or tombstoned.
     pub fn node_info(&self, key: &str) -> Option<NodeInfo> {
-        node_info_from(key, self.effective().ok()?, &self.base)
+        node_info_from(key, &self.view(None).ok()?)
     }
 
     /// Every directed edge incident on `key`. `derived` is exactly what
@@ -1140,7 +825,7 @@ impl ReaderSnapshot {
     ///
     /// Unknown key → `Err(GraphError::KeyNotFound)`.
     pub fn node_edges(&self, key: &str) -> Result<Vec<EdgeInfo>> {
-        node_edges_from(key, self.effective()?, &self.base, self)
+        node_edges_from(key, &self.view(None)?, self)
     }
 
     /// BFS neighborhood expansion restricted to `mask`-visible nodes.
@@ -1155,15 +840,7 @@ impl ReaderSnapshot {
         dir: Dir,
         mask: &NodeMask,
     ) -> Option<ResultSet> {
-        neighborhood_masked_from(
-            key,
-            self.effective().ok()?,
-            &self.base,
-            depth,
-            edge_types,
-            dir,
-            mask,
-        )
+        neighborhood_masked_from(key, self, depth, edge_types, dir, mask)
     }
 
     /// Every edge incident on `key` that the scope may see.
@@ -1179,11 +856,11 @@ impl ReaderSnapshot {
     ///
     /// Hidden or unknown `key` → [`GraphError::KeyNotFound`].
     pub fn node_edges_scoped(&self, key: &str, mask: &NodeMask) -> Result<Vec<EdgeInfo>> {
-        let state = self.effective()?;
-        if !state.ids.get(key).is_some_and(|id| mask.contains_id(id)) {
+        let view = self.view(None)?;
+        if !view.node_id(key).is_some_and(|id| mask.contains_id(id)) {
             return Err(GraphError::KeyNotFound { key: key.into() });
         }
-        let edges = node_edges_from(key, state, &self.base, self)?;
+        let edges = node_edges_from(key, &view, self)?;
         Ok(edges
             .into_iter()
             .filter(|e| {
@@ -1192,7 +869,7 @@ impl ReaderSnapshot {
                 } else {
                     &e.src_key
                 };
-                state.ids.get(other).is_some_and(|id| mask.contains_id(id))
+                view.node_id(other).is_some_and(|id| mask.contains_id(id))
             })
             .collect())
     }
@@ -1214,32 +891,26 @@ impl ReaderSnapshot {
         dir: Dir,
         mask: &NodeMask,
     ) -> Result<ResultSet> {
-        let state = self.effective()?;
-        if !state.ids.get(key).is_some_and(|id| mask.contains_id(id)) {
+        if !self
+            .view(None)?
+            .node_id(key)
+            .is_some_and(|id| mask.contains_id(id))
+        {
             return Err(GraphError::KeyNotFound { key: key.into() });
         }
-        neighborhood_masked_from(key, state, &self.base, depth, edge_types, dir, mask)
+        neighborhood_masked_from(key, self, depth, edge_types, dir, mask)
             .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })
     }
 }
 
-// ── Free-standing helpers that take state by reference ────────────────────────
+// ── Free-standing helpers that read through a view ───────────────────────────
 
-fn node_info_from(
-    key: &str,
-    state: &FrozenOverlay,
-    base: &Option<Arc<MappedBase>>,
-) -> Option<NodeInfo> {
-    let id = state.ids.get(key)?;
-    let label_sym = *state.labels.get(id as usize)?;
-    if label_sym == u32::MAX {
-        return None;
-    }
-    let label = state.syms.resolve(label_sym)?.to_string();
-    let cv = build_cv(&state.props, base);
+fn node_info_from(key: &str, view: &GraphView<'_>) -> Option<NodeInfo> {
+    let id = view.node_id(key)?;
+    let label = view.label_of(id)?.to_string();
     let mut props = BTreeMap::new();
-    for field in cv.field_names() {
-        if let Some(vr) = cv.get(id, &field) {
+    for field in view.props.field_names() {
+        if let Some(vr) = view.props.get(id, &field) {
             props.insert(field, vr.into_value());
         }
     }
@@ -1289,21 +960,18 @@ impl DerivedLookup<'_> {
 
 fn node_edges_from(
     key: &str,
-    state: &FrozenOverlay,
-    base: &Option<Arc<MappedBase>>,
+    view: &GraphView<'_>,
     snapshot: &ReaderSnapshot,
 ) -> Result<Vec<EdgeInfo>> {
-    let id = state
-        .ids
-        .get(key)
+    let id = view
+        .node_id(key)
         .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
     let derived = snapshot.derived_lookup(id);
-    let tv = build_tv(&state.topo, base);
+    let tv = &view.topo;
     let mut edges = Vec::new();
     for etype in tv.etypes() {
-        let edge_type = state
-            .syms
-            .resolve(etype)
+        let edge_type = view
+            .sym_name(etype)
             .ok_or_else(|| GraphError::Corrupt {
                 detail: format!("reader: topology etype {etype} not in interner"),
             })?
@@ -1330,18 +998,14 @@ fn node_edges_from(
                 let (src_key, dst_key) = match dir {
                     Direction::Out => (
                         key.to_string(),
-                        state
-                            .ids
-                            .key_of(nbr)
+                        view.try_key_of(nbr)
                             .ok_or_else(|| GraphError::Corrupt {
                                 detail: format!("topology id {nbr} has no key"),
                             })?
                             .to_string(),
                     ),
                     Direction::In => (
-                        state
-                            .ids
-                            .key_of(nbr)
+                        view.try_key_of(nbr)
                             .ok_or_else(|| GraphError::Corrupt {
                                 detail: format!("topology id {nbr} has no key"),
                             })?
@@ -1370,21 +1034,17 @@ fn node_edges_from(
 
 fn neighborhood_masked_from(
     key: &str,
-    state: &FrozenOverlay,
-    base: &Option<Arc<MappedBase>>,
+    snapshot: &ReaderSnapshot,
     depth: u32,
     edge_types: Option<&[&str]>,
     dir: Dir,
     mask: &NodeMask,
 ) -> Option<ResultSet> {
-    let start_id = state.ids.get(key)?;
-    let view = make_view(state, base, Some(&mask.visible));
-    let resolved: Option<Vec<u32>> = edge_types.map(|names| {
-        names
-            .iter()
-            .filter_map(|name| view.syms.get(name))
-            .collect()
-    });
+    let raw_view = snapshot.view(None).ok()?;
+    let start_id = raw_view.node_id(key)?;
+    let view = snapshot.view(Some(&mask.visible)).ok()?;
+    let resolved: Option<Vec<u32>> =
+        edge_types.map(|names| names.iter().filter_map(|name| view.sym(name)).collect());
     let nb = neighborhood(&view, start_id, depth, resolved.as_deref(), dir);
     let mut rs = ResultSet::new(vec!["key".into(), "label".into(), "depth".into()]);
     // Collect visible BFS results (start_id at depth 0, BFS nodes after).
@@ -1410,7 +1070,6 @@ fn neighborhood_masked_from(
     // NodeMask::from_ids which defaults to Omit; intersect() hard-returns Omit),
     // so this branch is unreachable on the role path — security is unaffected.
     if mask.mode() == crate::mask::MaskMode::Stub {
-        let raw_view = make_view(state, base, None);
         let mut seen: HashSet<u32> = visited.iter().map(|(id, _)| *id).collect();
         for (node_id, node_depth) in &visited {
             if *node_depth >= depth {
@@ -1419,7 +1078,7 @@ fn neighborhood_masked_from(
             for e in expand(&raw_view, *node_id, resolved.as_deref(), dir) {
                 let nbr = if e.src == *node_id { e.dst } else { e.src };
                 if !mask.contains_id(nbr) && seen.insert(nbr) {
-                    if let Some(k) = state.ids.key_of(nbr) {
+                    if let Some(k) = raw_view.try_key_of(nbr) {
                         rs.push_row(vec![
                             Some(Value::Str(k.to_string())),
                             None,

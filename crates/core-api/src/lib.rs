@@ -5,6 +5,7 @@ mod exact_knn;
 pub mod explain_digest;
 pub mod history;
 mod ingest;
+mod layer;
 pub mod mask;
 pub mod memory;
 pub mod memory_schema;
