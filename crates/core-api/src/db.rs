@@ -1,3 +1,4 @@
+use crate::durable_wal::{DurableWal, WalPosition};
 use crate::ingest::{IngestOptions, IngestReport};
 use crate::roles::{PropPredicate, RoleDef, RolesFile, WriteScope};
 use crate::subscription::{
@@ -1912,6 +1913,12 @@ pub struct GraphDb<F: Fs> {
     /// the same appends advance both, one in frames and one in bytes — so the
     /// two are seeded and rewound at exactly the same places. Keep it that way.
     wal_frames_written: u64,
+    /// How much of the live WAL is known fsynced, for readers outside the
+    /// engine (the backup worker). Set right after each successful WAL fsync
+    /// and when a snapshot replaces `wal.bin`; never read by the engine
+    /// itself. Shared, so a [`SharedDb`](crate::SharedDb) reads it without
+    /// taking the handle's lock. See [`WalPosition`].
+    durable_wal: DurableWal,
     /// Identity of the snapshot this handle's base state came from, as
     /// `(len, mtime_nanos)`. A different value means another process replaced
     /// the snapshot and the WAL no longer continues our state: refresh reloads.
@@ -2573,6 +2580,7 @@ impl<F: Fs> GraphDb<F> {
             started_at: std::time::Instant::now(),
             wal_consumed: 0,
             wal_frames_written: 0,
+            durable_wal: DurableWal::default(),
             snapshot_ident: None,
             open_opts: opts,
             holds_lifetime_lock: false,
@@ -3146,6 +3154,11 @@ impl<F: Fs> GraphDb<F> {
             // is cleared first, so a failed load leaves an empty handle — mark
             // it degraded rather than let a caller read an empty graph as if
             // it were the store's contents.
+            //
+            // The WAL this handle was reading is not the one on disk any more,
+            // so the durable position starts a new generation; what a peer
+            // fsynced is not this handle's to vouch for.
+            self.durable_wal.replaced();
             self.reset_for_reload();
             return match self.load_from_disk(LoadOrigin::Reload) {
                 Ok(frames) => Ok(frames as u64),
@@ -3207,6 +3220,34 @@ impl<F: Fs> GraphDb<F> {
     /// failed group off the tail, so the cursor still describes the file.
     pub(crate) fn set_wal_consumed(&mut self, len: u64) {
         self.wal_consumed = len;
+    }
+
+    /// The global frame index the next appended frame will occupy. The frame
+    /// twin of [`wal_consumed`](GraphDb::wal_consumed).
+    pub(crate) fn wal_frames_written(&self) -> u64 {
+        self.wal_frames_written
+    }
+
+    /// How much of the live WAL is known to be on stable storage — only bytes
+    /// an fsync has covered, ending on a frame boundary. See [`WalPosition`].
+    ///
+    /// Under [`FsyncPolicy::Relaxed`] nothing is fsynced between snapshots, so
+    /// the position advances only when a snapshot replaces the WAL; under
+    /// [`FsyncPolicy::Batched`] it advances at the next batch fsync.
+    pub fn durable_wal_position(&self) -> WalPosition {
+        self.durable_wal.get()
+    }
+
+    /// The shared cell behind [`durable_wal_position`](GraphDb::durable_wal_position),
+    /// for a [`SharedDb`](crate::SharedDb) to read without the handle's lock.
+    pub(crate) fn durable_wal(&self) -> DurableWal {
+        self.durable_wal.clone()
+    }
+
+    /// Record that everything this handle has appended is now fsynced.
+    fn note_wal_synced(&self) {
+        self.durable_wal
+            .synced(self.wal_consumed, self.wal_frames_written);
     }
 
     /// One non-blocking attempt at the cross-process write lock.
@@ -6259,6 +6300,7 @@ impl<F: Fs> GraphDb<F> {
         self.wal_frames_written += 1;
         if Self::wal_needs_sync(policy, &rec) {
             self.fs.sync(FileId::Wal)?;
+            self.note_wal_synced();
         }
         // Marker writing always needs the engine deltas, but the engine only
         // accumulates them when emit_deltas is true (normally gated on subscribers
@@ -7703,10 +7745,15 @@ impl<F: Fs> GraphDb<F> {
         }
         let any_ok = results.iter().any(|r| r.is_ok());
         let sync_err = if self.fsync != FsyncPolicy::Relaxed && any_ok {
-            self.fs
+            let r = self
+                .fs
                 .sync(core_storage::fs::FileId::Wal)
                 .map_err(GraphError::Io)
-                .err()
+                .err();
+            if r.is_none() {
+                self.note_wal_synced();
+            }
+            r
         } else {
             None
         };
@@ -15189,6 +15236,11 @@ impl<F: Fs> GraphDb<F> {
         if self.lock_denied {
             return Err(GraphError::Busy { holder: None });
         }
+        // From here `snapshot.bin` and `wal.bin` may be between states on disk.
+        // A reader outside the engine pairing the two (the backup worker) waits
+        // until the mark drops, on every exit from this function.
+        let _snapshot_mark = self.durable_wal.begin_snapshot();
+        let generation_at_start = self.durable_wal.get().generation;
         // Capture whether snapshot.bin already existed BEFORE this snapshot write.
         // Used by the archive path's conservative genesis-chain check: if a prior
         // snapshot exists but wal.truncated does not, we cannot distinguish a
@@ -15638,6 +15690,7 @@ impl<F: Fs> GraphDb<F> {
             stopped(SnapshotStop::BeforeWalReplacement)?;
             if nothing_to_archive {
                 if live_wal_bytes_for_name != baseline_wal {
+                    self.durable_wal.replaced();
                     self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
                 }
             } else {
@@ -15652,6 +15705,7 @@ impl<F: Fs> GraphDb<F> {
                         ),
                     });
                 }
+                self.durable_wal.replaced();
                 self.fs.archive_wal(archive_n)?;
 
                 // The replacement WAL goes in **immediately**, with no fallible call
@@ -15821,6 +15875,7 @@ impl<F: Fs> GraphDb<F> {
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
             stopped(SnapshotStop::BeforeWalReplacement)?;
+            self.durable_wal.replaced();
             self.fs.write_atomic(FileId::Wal, &baseline_wal)?;
             // Every archive now ends at or below the floor. They are the
             // history this snapshot was asked to discard; removing them here is
@@ -15865,6 +15920,11 @@ impl<F: Fs> GraphDb<F> {
         // paid a far larger cost than one decode.
         self.wal_frames_written = self.wal_total_commits()?;
         self.snapshot_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
+        // A replacement WAL went in through `write_atomic`, which fsyncs it:
+        // all of it is durable.
+        if self.durable_wal.get().generation != generation_at_start {
+            self.note_wal_synced();
+        }
         Ok(())
     }
 }

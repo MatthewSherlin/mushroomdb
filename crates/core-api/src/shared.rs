@@ -126,6 +126,7 @@
 use crate::db::{
     BatchOp, FsyncPolicy, Precondition, WriteAuthz, LOCK_POLL_INTERVAL, WRITE_LOCK_WAIT,
 };
+use crate::durable_wal::{DurableWal, WalPosition};
 use crate::reader::ReaderSnapshot;
 use crate::transaction::Transaction;
 use crate::GraphDb;
@@ -366,6 +367,24 @@ pub struct SharedDb {
     /// across the drain thread and direct writers.  See module-level doc for
     /// the required acquisition order.
     wal_mu: Arc<Mutex<()>>,
+    /// The handle's durable-WAL cell, read without any of the locks above.
+    durable_wal: DurableWal,
+    /// The WAL the open replayed, until something has fsynced it.
+    replayed: Arc<ReplayedWal>,
+}
+
+/// The WAL an open replayed may still be partly in the page cache — written by
+/// a previous process under a relaxed policy, or trailing history markers no
+/// fsync covered. It is fsynced once, by the first reader of the durable
+/// position, so that position can start at the end of what was replayed
+/// instead of at zero. Deferred to that first read on purpose: an open that no
+/// backup ever asks about pays no fsync.
+struct ReplayedWal {
+    /// `(generation, len, frames)` at the end of the replay; `None` once settled.
+    pending: Mutex<Option<(u64, u64, u64)>>,
+    settled: AtomicBool,
+    dir: std::path::PathBuf,
+    sync_fn: SyncWalFn,
 }
 
 const _: () = {
@@ -411,6 +430,20 @@ impl SharedDb {
         dir: std::path::PathBuf,
         sync_fn: SyncWalFn,
     ) -> Self {
+        let durable_wal = db.durable_wal();
+        let pending = (db.wal_consumed() > 0).then(|| {
+            (
+                durable_wal.get().generation,
+                db.wal_consumed(),
+                db.wal_frames_written(),
+            )
+        });
+        let replayed = Arc::new(ReplayedWal {
+            settled: AtomicBool::new(pending.is_none()),
+            pending: Mutex::new(pending),
+            dir: dir.clone(),
+            sync_fn: Arc::clone(&sync_fn),
+        });
         let inner = Arc::new(RwLock::new(db));
         let queue = WriteQueue::new();
         let wal_mu = Arc::new(Mutex::new(()));
@@ -421,6 +454,7 @@ impl SharedDb {
         let drain_dir = Arc::clone(&dir_arc);
         let drain_wal_mu = Arc::clone(&wal_mu);
         let drain_sync_fn = Arc::clone(&sync_fn);
+        let drain_durable = durable_wal.clone();
 
         let handle = thread::Builder::new()
             .name("groupcommit-drain".into())
@@ -431,6 +465,7 @@ impl SharedDb {
                     drain_dir,
                     drain_wal_mu,
                     drain_sync_fn,
+                    drain_durable,
                 )
             })
             .expect("failed to spawn group-commit drain thread");
@@ -443,7 +478,47 @@ impl SharedDb {
                 handle: Some(handle),
             }),
             wal_mu,
+            durable_wal,
+            replayed,
         }
+    }
+
+    /// How much of the live WAL is known to be on stable storage: only bytes
+    /// an fsync has covered, ending on a frame boundary, with a generation
+    /// that changes whenever `wal.bin` is replaced. See [`WalPosition`].
+    ///
+    /// Takes none of the handle's locks — not the RwLock, not the WAL mutex —
+    /// so polling it never delays a reader or a writer. This is what a backup
+    /// reads instead of the file's length, which counts bytes still in the
+    /// page cache.
+    ///
+    /// The first call on a handle whose open replayed a WAL fsyncs that WAL
+    /// once (on the caller's thread, holding none of the handle's locks), so
+    /// the replayed bytes count as durable from then on. Every later call is a
+    /// mutex read.
+    pub fn durable_wal_position(&self) -> WalPosition {
+        if !self.replayed.settled.load(Ordering::Acquire) {
+            self.settle_replayed_wal();
+        }
+        self.durable_wal.get()
+    }
+
+    fn settle_replayed_wal(&self) {
+        let mut pending = self
+            .replayed
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((generation, len, frames)) = *pending {
+            // A failed fsync leaves the position where it is; the next call
+            // tries again, and the next write's fsync covers it anyway.
+            if (self.replayed.sync_fn)(&self.replayed.dir).is_err() {
+                return;
+            }
+            self.durable_wal.synced_at_least(generation, len, frames);
+            *pending = None;
+        }
+        self.replayed.settled.store(true, Ordering::Release);
     }
 
     /// Check whether another process has committed, and if so absorb its
@@ -815,6 +890,7 @@ fn drain_loop(
     dir: Arc<std::path::PathBuf>,
     wal_mu: Arc<Mutex<()>>,
     sync_fn: SyncWalFn,
+    durable_wal: DurableWal,
 ) {
     loop {
         // Wait for work (or shutdown with empty queue).
@@ -918,6 +994,10 @@ fn drain_loop(
         // subscription notifications only fire after the group fsync (R2:
         // durability before notification).  For Relaxed policy events fire
         // immediately (no fsync to wait for).
+        // Where the group ends: the fsync below covers exactly this much. Set
+        // under the write guard, with wal_mu held, so nothing can append
+        // between there and the fsync.
+        let post_group: (u64, u64);
         let (results, should_sync): (Vec<Result<Applied>>, bool) = {
             let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
             let sync_needed = db.fsync_policy() != FsyncPolicy::Relaxed;
@@ -999,6 +1079,7 @@ fn drain_loop(
             if !pending_non_cas.is_empty() {
                 r.extend(uncounted(db.commit_group_nosync(pending_non_cas)));
             }
+            post_group = (db.wal_consumed(), db.wal_frames_written());
             (r, sync_needed)
             // ← RwLock write guard released here; wal_mu still held
         };
@@ -1051,6 +1132,11 @@ fn drain_loop(
                 ))));
             }
             return; // drain loop exits; no further groups accepted
+        }
+
+        // The group's frames are on stable storage now.
+        if should_sync && results.iter().any(|r| r.is_ok()) {
+            durable_wal.synced(post_group.0, post_group.1);
         }
 
         // ── Step 5: Flush deferred events AFTER successful fsync (R2) ────────
