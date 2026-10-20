@@ -10,7 +10,7 @@
 
 ### Added
 
-- **Interactive transactions in the Rust API.** `SharedDb::begin_transaction()` returns an owned, `Send` `Transaction` (it holds its own clone of the handle, so it can be stored or moved between threads while open): `execute` runs Cypher against a snapshot frozen at BEGIN with the transaction's own writes visible, `commit` submits everything as one WAL `Batch` frame (one commit number) and returns that number, and `rollback` (or dropping it) writes nothing. Isolation is snapshot isolation: a commit fails with `CasConflict` when any node it read or wrote changed after BEGIN; write skew through a label scan is possible. Rule-derived edges from a transaction's own writes appear only after it commits. `MATCH … SET … RETURN` is not supported inside a transaction yet and is refused.
+- **A Cypher read anchored on a key, `MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k`, is a point lookup, not a scan of the label.** The key filter used to run after every node of the label had been expanded: 593 ms at 1M nodes, now about 0.006 ms. Results are unchanged, under masks, namespaces and `open_at` too (row 102).
 
 ## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
 
