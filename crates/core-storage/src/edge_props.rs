@@ -38,6 +38,16 @@ impl EdgeProps {
         self.map.get(&(etype, src, dst))?.get(field)
     }
 
+    /// The overlay's own properties for one edge, if it has any.
+    pub fn props_of(
+        &self,
+        etype: u32,
+        src: u32,
+        dst: u32,
+    ) -> Option<&std::collections::BTreeMap<String, Value>> {
+        self.map.get(&(etype, src, dst))
+    }
+
     /// Remove an edge's props from the overlay and record a tombstone so that
     /// archive lookups for this key are also masked.
     pub fn remove_edge(&mut self, etype: u32, src: u32, dst: u32) {

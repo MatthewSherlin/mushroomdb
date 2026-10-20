@@ -1731,6 +1731,12 @@ const SCALAR_FUNCS: &[&str] = &[
     "toBooleanOrNull",
     "toIntegerOrNull",
     "toFloatOrNull",
+    "head",
+    "tail",
+    "last",
+    "range",
+    "keys",
+    "properties",
 ];
 
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
@@ -2088,11 +2094,132 @@ fn eval_func(
         "toboolean" | "tobooleanornull" | "tointegerornull" | "tofloatornull" => {
             eval_convert_scalar(&norm, name, args, view, vars, row, params)
         }
+        "head" | "tail" | "last" | "range" | "keys" | "properties" => {
+            eval_list_scalar(&norm, name, args, view, vars, row, params)
+        }
         _ => Err(format!(
             "unknown function `{name}`; supported: {}",
             SCALAR_FUNCS.join(", ")
         )),
     }
+}
+
+/// The most elements `range()` will build. A bound this size is a caller bug,
+/// and the list would otherwise be allocated before anything could stop it.
+const RANGE_MAX_ELEMENTS: u128 = 10_000_000;
+
+/// `range(start, end, step)` with an inclusive end. Null or non-integer
+/// arguments are null; a zero step is an error.
+fn eval_range(a: &[Option<Value>; 3], has_step: bool) -> Result<Option<Value>, String> {
+    let (Some(Value::Int(start)), Some(Value::Int(end))) = (&a[0], &a[1]) else {
+        return Ok(None);
+    };
+    let step = match (&a[2], has_step) {
+        (_, false) => 1,
+        (Some(Value::Int(step)), true) => *step,
+        (_, true) => return Ok(None),
+    };
+    if step == 0 {
+        return Err("range step must be non-zero".to_string());
+    }
+    let (start, end, step) = (i128::from(*start), i128::from(*end), i128::from(step));
+    let span = if step > 0 { end - start } else { start - end };
+    if span < 0 {
+        return Ok(Some(Value::List(Vec::new())));
+    }
+    let count = span as u128 / step.unsigned_abs() + 1;
+    if count > RANGE_MAX_ELEMENTS {
+        return Err(format!(
+            "range() would build {count} elements; the limit is {RANGE_MAX_ELEMENTS}"
+        ));
+    }
+    // Every element lies between the two i64 ends, so the narrowing is exact.
+    let items = (0..count as i128)
+        .map(|k| Value::Int((start + k * step) as i64))
+        .collect();
+    Ok(Some(Value::List(items)))
+}
+
+/// The properties of a node, relationship or map, in key order. Nothing is
+/// left out: a vector-valued property (an embedding) is a list of floats like
+/// any other and appears like any other list. `None` is null: a null or unmatched binding, a node the scope's
+/// mask hides, or an argument that has no properties.
+fn properties_of_arg(
+    arg: &Operand,
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<BTreeMap<String, Value>>, String> {
+    if let Operand::Var(var) = arg {
+        let cell = vars
+            .slot(var)
+            .ok_or_else(|| format!("unbound variable `{var}`"))
+            .map(|slot| row.get(slot).and_then(|c| c.as_ref()))?;
+        match cell {
+            Some(Cell::Node(id)) => {
+                if !view.visible(*id) {
+                    return Ok(None);
+                }
+                // One pass over the columns; only fields this node has are
+                // allocated, and tombstoned ones do not show.
+                let props = view.props.props_of(*id);
+                return Ok(Some(props));
+            }
+            Some(Cell::Rel(e)) => {
+                return Ok(Some(view.edge_props.props_of(e.etype, e.src, e.dst)));
+            }
+            Some(Cell::Path(_)) | None => return Ok(None),
+            Some(Cell::Scalar(_)) => {}
+        }
+    }
+    Ok(match resolve_operand(view, vars, row, arg, params)? {
+        Some(Value::Map(map)) => Some(map),
+        _ => None,
+    })
+}
+
+/// List and map functions (QL-03c). Null in → null out; an argument of the
+/// wrong type → null, never an error. Only a wrong argument count, a zero
+/// `range` step and an oversized `range` are errors.
+fn eval_list_scalar(
+    norm: &str,
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    if matches!(norm, "keys" | "properties") {
+        if args.len() != 1 {
+            return Err(format!(
+                "{name}() requires exactly 1 argument(s), got {}",
+                args.len()
+            ));
+        }
+        let props = properties_of_arg(&args[0], view, vars, row, params)?;
+        return Ok(props.map(|map| {
+            if norm == "keys" {
+                Value::List(map.into_keys().map(Value::Str).collect())
+            } else {
+                Value::Map(map)
+            }
+        }));
+    }
+    if norm == "range" {
+        let a = resolve_fn_args(name, args, 2..=3, view, vars, row, params)?;
+        return eval_range(&a, args.len() == 3);
+    }
+    let [first, _, _] = resolve_fn_args(name, args, 1..=1, view, vars, row, params)?;
+    let Some(Value::List(list)) = first else {
+        return Ok(None);
+    };
+    Ok(match norm {
+        "head" => list.into_iter().next(),
+        "last" => list.into_iter().next_back(),
+        _ => Some(Value::List(list.into_iter().skip(1).collect())), // tail
+    })
 }
 
 /// Resolve a function's arguments, checking the arity range. The caller
@@ -9326,10 +9453,21 @@ LIMIT 10";
     /// There is no null or list literal in the grammar: `n.nope` is a null
     /// (missing property) and `$l` is the list [1, 2, 3].
     fn eval_params() -> BTreeMap<String, Value> {
-        BTreeMap::from([(
-            "l".to_string(),
-            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
-        )])
+        BTreeMap::from([
+            (
+                "l".to_string(),
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            ),
+            ("empty".to_string(), Value::List(vec![])),
+            ("one".to_string(), Value::List(vec![Value::Int(1)])),
+            (
+                "m".to_string(),
+                Value::Map(BTreeMap::from([
+                    ("b".to_string(), Value::Int(2)),
+                    ("a".to_string(), Value::Int(1)),
+                ])),
+            ),
+        ])
     }
 
     /// Evaluate one expression through the full lex/parse/plan/execute path.
@@ -9594,5 +9732,237 @@ LIMIT 10";
         ] {
             assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
         }
+    }
+
+    fn int_list(items: &[i64]) -> Option<Value> {
+        Some(Value::List(items.iter().map(|n| Value::Int(*n)).collect()))
+    }
+
+    #[test]
+    fn ql03c_head_tail_last() {
+        assert_eq!(eval("head($l)"), Some(i(1)));
+        assert_eq!(eval("head($empty)"), None);
+        assert_eq!(eval("head(n.nope)"), None);
+        assert_eq!(eval("tail($l)"), int_list(&[2, 3]));
+        assert_eq!(eval("tail($one)"), int_list(&[]));
+        assert_eq!(eval("tail($empty)"), int_list(&[]));
+        assert_eq!(eval("tail(n.nope)"), None);
+        assert_eq!(eval("last($l)"), Some(i(3)));
+        assert_eq!(eval("last($empty)"), None);
+        assert_eq!(eval("last(n.nope)"), None);
+    }
+
+    #[test]
+    fn ql03c_range() {
+        assert_eq!(eval("range(1, 5)"), int_list(&[1, 2, 3, 4, 5]));
+        assert_eq!(eval("range(1, 5, 2)"), int_list(&[1, 3, 5]));
+        assert_eq!(eval("range(5, 1, -1)"), int_list(&[5, 4, 3, 2, 1]));
+        assert_eq!(eval("range(1, 6, 2)"), int_list(&[1, 3, 5]));
+        assert_eq!(eval("range(3, 3)"), int_list(&[3]));
+        assert_eq!(eval("range(5, 1)"), int_list(&[]));
+        assert_eq!(eval("range(1, 5, -1)"), int_list(&[]));
+        assert_eq!(eval("range(0, -4, -2)"), int_list(&[0, -2, -4]));
+        let msg = eval_err("range(1, 1, 0)");
+        assert!(msg.contains("step must be non-zero"), "{msg}");
+        let msg = eval_err("range(0, 9223372036854775807)");
+        assert!(msg.contains("range()"), "{msg}");
+        // The ends of the i64 range do not overflow.
+        assert_eq!(
+            eval("range(9223372036854775806, 9223372036854775807)"),
+            int_list(&[i64::MAX - 1, i64::MAX])
+        );
+    }
+
+    #[test]
+    fn ql03c_keys_and_properties_of_values() {
+        assert_eq!(eval("keys($m)"), Some(Value::List(vec![s("a"), s("b")])));
+        assert_eq!(eval("keys($empty)"), None);
+        assert_eq!(eval("keys(n.nope)"), None);
+        assert_eq!(
+            eval("properties($m)"),
+            Some(Value::Map(BTreeMap::from([
+                ("a".to_string(), i(1)),
+                ("b".to_string(), i(2)),
+            ])))
+        );
+        assert_eq!(eval("properties(n.nope)"), None);
+    }
+
+    #[test]
+    fn ql03c_null_and_type_mismatch_give_null() {
+        for expr in [
+            "head(42)",
+            "head(\"abc\")",
+            "tail(42)",
+            "last(42)",
+            "last($m)",
+            "range(n.nope, 5)",
+            "range(1, n.nope)",
+            "range(1, 5, n.nope)",
+            "range(\"a\", 5)",
+            "range(1, 2.5)",
+            "range(1, 5, \"2\")",
+            "keys(42)",
+            "keys(\"abc\")",
+            "properties(42)",
+            "properties($l)",
+        ] {
+            assert_eq!(eval(expr), None, "{expr}");
+        }
+    }
+
+    #[test]
+    fn ql03c_wrong_arity_errors_and_names_are_listed() {
+        assert!(eval_err("head()").contains("head() requires"));
+        assert!(eval_err("tail($l, 1)").contains("tail() requires"));
+        assert!(eval_err("last()").contains("last() requires"));
+        assert!(eval_err("range(1)").contains("range() requires"));
+        assert!(eval_err("range(1, 2, 3, 4)").contains("range() requires"));
+        assert!(eval_err("keys()").contains("keys() requires"));
+        assert!(eval_err("properties(n, n)").contains("properties() requires"));
+        let unknown = eval_err("nosuchfn(1)");
+        for f in ["head", "tail", "last", "range", "keys", "properties"] {
+            assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
+        }
+    }
+
+    fn props_fixture() -> Fx {
+        let mut fx = Fx::new();
+        let a = fx.add(
+            "P",
+            "a",
+            vec![
+                ("name", s("x")),
+                ("age", i(30)),
+                ("embedding", Value::List(vec![f(0.5), f(1.5)])),
+                ("tags", Value::List(vec![s("t"), i(1)])),
+            ],
+        );
+        let b = fx.add("P", "b", vec![("name", s("y"))]);
+        fx.edge(
+            "KNOWS",
+            a,
+            b,
+            vec![("since", i(2020)), ("vec", Value::List(vec![f(1.0)]))],
+        );
+        fx
+    }
+
+    fn run_one(view: &GraphView, query: &str) -> Vec<Vec<Option<Value>>> {
+        rows_of(&run(view, query, &BTreeMap::new()).unwrap_or_else(|e| panic!("{query}: {e}")))
+    }
+
+    #[test]
+    fn ql03c_keys_and_properties_of_a_node() {
+        let fx = props_fixture();
+        let view = fx.view();
+        // Every property shows, a vector-valued one like any other list.
+        assert_eq!(
+            run_one(&view, "MATCH (n:P) WHERE n.name = \"x\" RETURN keys(n)"),
+            vec![vec![Some(Value::List(vec![
+                s("age"),
+                s("embedding"),
+                s("name"),
+                s("tags")
+            ]))]]
+        );
+        assert_eq!(
+            run_one(
+                &view,
+                "MATCH (n:P) WHERE n.name = \"x\" RETURN properties(n)"
+            ),
+            vec![vec![Some(Value::Map(BTreeMap::from([
+                ("age".to_string(), i(30)),
+                ("embedding".to_string(), Value::List(vec![f(0.5), f(1.5)])),
+                ("name".to_string(), s("x")),
+                ("tags".to_string(), Value::List(vec![s("t"), i(1)])),
+            ])))]]
+        );
+    }
+
+    #[test]
+    fn ql03c_an_all_float_list_appears_in_keys_and_properties() {
+        let mut fx = Fx::new();
+        fx.add(
+            "P",
+            "a",
+            vec![("coords", Value::List(vec![f(1.5), f(2.5)]))],
+        );
+        let view = fx.view();
+        assert_eq!(
+            run_one(&view, "MATCH (n:P) RETURN keys(n), properties(n), n.coords"),
+            vec![vec![
+                Some(Value::List(vec![s("coords")])),
+                Some(Value::Map(BTreeMap::from([(
+                    "coords".to_string(),
+                    Value::List(vec![f(1.5), f(2.5)])
+                )]))),
+                Some(Value::List(vec![f(1.5), f(2.5)])),
+            ]]
+        );
+    }
+
+    #[test]
+    fn ql03c_keys_and_properties_of_a_relationship() {
+        let fx = props_fixture();
+        let view = fx.view();
+        assert_eq!(
+            run_one(&view, "MATCH (a:P)-[r:KNOWS]->(b:P) RETURN keys(r)"),
+            vec![vec![Some(Value::List(vec![s("since"), s("vec")]))]]
+        );
+        assert_eq!(
+            run_one(&view, "MATCH (a:P)-[r:KNOWS]->(b:P) RETURN properties(r)"),
+            vec![vec![Some(Value::Map(BTreeMap::from([
+                ("since".to_string(), i(2020)),
+                ("vec".to_string(), Value::List(vec![f(1.0)])),
+            ])))]]
+        );
+    }
+
+    #[test]
+    fn ql03c_keys_of_an_unmatched_optional_binding_is_null() {
+        let fx = props_fixture();
+        let view = fx.view();
+        assert_eq!(
+            run_one(
+                &view,
+                "MATCH (a:P) WHERE a.name = \"y\" OPTIONAL MATCH (a)-[r:KNOWS]->(z) \
+                 RETURN keys(z), properties(z), keys(r)"
+            ),
+            vec![vec![None, None, None]]
+        );
+    }
+
+    #[test]
+    fn ql03c_node_with_no_properties_has_empty_keys() {
+        let mut fx = Fx::new();
+        fx.add("P", "bare", vec![]);
+        let view = fx.view();
+        assert_eq!(
+            run_one(&view, "MATCH (n:P) RETURN keys(n), properties(n)"),
+            vec![vec![
+                Some(Value::List(vec![])),
+                Some(Value::Map(BTreeMap::new()))
+            ]]
+        );
+    }
+
+    #[test]
+    fn ql03c_keys_respect_the_visibility_mask() {
+        let fx = props_fixture();
+        let visible: crate::visible::VisibleSet = [fx.ids.get("b").unwrap()].into_iter().collect();
+        let view = GraphView {
+            mask: Some(&visible),
+            ..fx.view()
+        };
+        // Only `b` is visible: `a`'s keys cannot be reached by any route.
+        assert_eq!(
+            run_one(&view, "MATCH (n:P) RETURN n.name, keys(n)"),
+            vec![vec![Some(s("y")), Some(Value::List(vec![s("name")]))]]
+        );
+        assert_eq!(
+            run_one(&view, "MATCH (a:P)-[r:KNOWS]->(b:P) RETURN keys(r)"),
+            Vec::<Vec<Option<Value>>>::new()
+        );
     }
 }
