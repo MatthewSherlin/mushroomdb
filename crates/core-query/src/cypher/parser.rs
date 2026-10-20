@@ -1790,6 +1790,17 @@ mod tests {
         parse(&lex(src)?)
     }
 
+    #[test]
+    fn words_that_became_keywords_still_parse_as_names() {
+        for src in [
+            "MATCH (call:Remove) WHERE call.exists = 1 RETURN call.explain AS foreach",
+            "MATCH (n:Exists {call: 1, Remove: 2})-[r:FOREACH]->(m) RETURN n.Call, r, m",
+            "MATCH (n) WITH n AS explain RETURN explain.remove",
+        ] {
+            parse_src(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+        }
+    }
+
     fn prop(var: &str, field: &str) -> Operand {
         Operand::Prop {
             var: var.into(),

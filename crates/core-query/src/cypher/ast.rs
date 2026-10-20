@@ -310,6 +310,8 @@ pub enum ArithOp {
     Sub,
     Mul,
     Div,
+    Mod,
+    Pow,
 }
 
 /// RETURN item value: bare variable, `var.field`, an aggregate call, a
