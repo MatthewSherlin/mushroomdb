@@ -96,7 +96,7 @@ Small sections (IDS=2, SYMS=3, META=4, RULES_META=8, VIEWS=9) validate their CRC
 on first access.
 
 Large sections (TOPOLOGY=0, COLUMNS=1, EDGE_PROPS=5, HNSW=6, PROVENANCE=7,
-IVF_STATE=10, STRINGS=12, FULLTEXT=13, WAL_MARK=14, EDGES_SWEPT=15, PROV_RECONCILED=16) **skip** the per-touch CRC on the normal query path (DERIVED_BITS=17 is also large but is the exception: see below). A full-section
+IVF_STATE=10, STRINGS=12, FULLTEXT=13, WAL_MARK=14, EDGES_SWEPT=15, PROV_RECONCILED=16) **skip** the per-touch CRC on the normal query path (DERIVED_BITS=17 is also large but is the exception: it is validated eagerly, once per base, as its row in the table above says). A full-section
 hash of hundreds of MiB costs 50–200 ms per section. Section bounds are validated
 at open time; rkyv archived data on the hot path uses `access_unchecked` (O(1)
 root-pointer lookup, no pointer-walk). This is sound for encoder-produced
