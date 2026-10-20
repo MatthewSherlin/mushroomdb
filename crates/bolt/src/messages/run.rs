@@ -525,6 +525,8 @@ pub fn pack_value(value: &Value, version: (u8, u8), depth: usize) -> Result<Pack
                 .collect::<Result<_, BoltError>>()?,
         ),
         Value::Binary(bytes) => PackValue::Bytes(bytes.clone()),
+        // A null element of a query-built list or map (never stored).
+        Value::Null => PackValue::Null,
         Value::Date(days) => structure(0x44, vec![int(*days)]),
         Value::LocalDateTime(micros) => structure(
             0x64,
@@ -657,6 +659,15 @@ mod tests {
         assert!(StreamRequest::from_fields(fields(-2)).unwrap().is_err());
         assert!(StreamRequest::from_fields(vec![]).is_err());
         assert!(StreamRequest::from_fields(vec![PackValue::Map(vec![])]).is_err());
+    }
+
+    #[test]
+    fn a_null_element_of_a_result_list_packs_as_null() {
+        let list = Value::List(vec![Value::Int(1), Value::Null]);
+        assert_eq!(
+            pack_value(&list, (5, 0), 0).unwrap(),
+            PackValue::List(vec![PackValue::Int(1), PackValue::Null])
+        );
     }
 
     #[test]
