@@ -47,14 +47,26 @@ pub enum MessageKind {
     Route,
 }
 
-/// A decoded client request.
-#[derive(Debug, Clone, PartialEq)]
+/// A decoded client request. `Debug` shows no field values: a request's fields
+/// can hold credentials or query parameters.
+#[derive(Clone, PartialEq)]
 pub enum ClientMessage {
     Hello(hello::Hello),
     Goodbye,
     Reset,
     /// A request handled by a later layer, with its fields undecoded.
     Other(MessageKind, Vec<PackValue>),
+}
+
+impl std::fmt::Debug for ClientMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientMessage::Hello(hello) => f.debug_tuple("Hello").field(hello).finish(),
+            ClientMessage::Goodbye => f.write_str("Goodbye"),
+            ClientMessage::Reset => f.write_str("Reset"),
+            ClientMessage::Other(kind, fields) => write!(f, "{kind:?}({} fields)", fields.len()),
+        }
+    }
 }
 
 impl ClientMessage {
@@ -266,6 +278,15 @@ mod tests {
             panic!()
         };
         assert_eq!(s.tag, TAG_FAILURE);
+    }
+
+    #[test]
+    fn client_message_debug_shows_no_field_values() {
+        let msg = ClientMessage::Other(
+            MessageKind::Run,
+            vec![PackValue::String("secret-param".into())],
+        );
+        assert!(!format!("{msg:?}").contains("secret-param"));
     }
 
     #[test]

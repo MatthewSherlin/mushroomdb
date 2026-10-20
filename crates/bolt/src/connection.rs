@@ -8,9 +8,16 @@
 //!
 //! States follow the Bolt 4.4/5.0 server state machine:
 //! `NotAuthenticated` (the spec's CONNECTED), `Ready`, `Streaming`, `InTx`
-//! (TX_READY and TX_STREAMING), `Failed`, `Interrupted` and `Defunct`. A message
-//! the state does not allow fails the request and moves to `Failed`, where
-//! everything but `RESET` and `GOODBYE` is `IGNORED`. A `RESET` that arrives
+//! (TX_READY and TX_STREAMING), `Failed`, `Interrupted` and `Defunct`.
+//!
+//! A request that fails on its merits (a handler error) moves to `Failed`, where
+//! everything but `RESET` and `GOODBYE` is `IGNORED`. A protocol violation moves
+//! to `Defunct`: the server sends one `FAILURE` and closes. The Bolt server
+//! state machine (section "Server state `DEFUNCT`") says a connection is
+//! defunct "after an unrecoverable error or protocol violation", and its
+//! transition tables list only the messages each state accepts, so an
+//! unparseable message, an unknown signature, or a well-formed message the
+//! current state does not list is a violation. A `RESET` that arrives
 //! while earlier messages are still queued interrupts them: they are `IGNORED`
 //! and the `RESET` returns the connection to `Ready`.
 //!
@@ -36,6 +43,9 @@ pub const DEFAULT_TX_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default limit on a single request message.
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default limit on a request message before the client has authenticated.
+pub const DEFAULT_PRE_AUTH_MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// An open transaction, as the connection sees it. Dropping it discards its
 /// buffer; `rollback` is the explicit form.
@@ -220,19 +230,19 @@ impl Connection {
         }
     }
 
-    /// A request that could not be decoded.
+    /// A request that could not be decoded: a protocol violation, in any state.
     pub fn handle_malformed(&mut self, err: BoltError) -> Vec<ServerMessage> {
-        match self.state {
-            ConnectionState::Defunct => Vec::new(),
-            ConnectionState::NotAuthenticated => {
-                self.state = ConnectionState::Defunct;
-                vec![ServerMessage::Failure(err)]
-            }
-            ConnectionState::Failed | ConnectionState::Interrupted => {
-                vec![ServerMessage::Ignored]
-            }
-            _ => self.fail(err),
+        if self.is_defunct() {
+            return Vec::new();
         }
+        self.violate(err)
+    }
+
+    /// Protocol violation: roll back, send one `FAILURE`, become defunct.
+    fn violate(&mut self, err: BoltError) -> Vec<ServerMessage> {
+        self.discard_work();
+        self.state = ConnectionState::Defunct;
+        vec![ServerMessage::Failure(err)]
     }
 
     fn discard_work(&mut self) {
@@ -308,7 +318,7 @@ impl Connection {
                 self.state = ConnectionState::Ready;
                 vec![reset_success()]
             }
-            ClientMessage::Hello(_) => self.fail(BoltError::Invalid(format!(
+            ClientMessage::Hello(_) => self.violate(BoltError::Invalid(format!(
                 "HELLO is not allowed in state {}",
                 self.state.name()
             ))),
@@ -318,7 +328,7 @@ impl Connection {
                         "{kind:?} is not supported yet"
                     )))
                 } else {
-                    self.fail(BoltError::Invalid(format!(
+                    self.violate(BoltError::Invalid(format!(
                         "{kind:?} is not allowed in state {}",
                         self.state.name()
                     )))
@@ -350,43 +360,62 @@ impl Connection {
 #[derive(Debug, Clone)]
 pub struct ConnectionConfig {
     pub tx_timeout: Duration,
-    /// How long a client may take to send the 20-byte handshake.
-    pub handshake_timeout: Duration,
+    /// How long a client has, from connecting, to finish the handshake and send
+    /// a `HELLO` that authenticates.
+    pub hello_timeout: Duration,
+    /// How long a partly received message may stay unfinished. A client that
+    /// sends nothing, or only keep-alives, between messages is not held to it.
+    pub message_timeout: Duration,
+    /// How long a write to the client may block before the connection is
+    /// dropped.
+    pub write_timeout: Duration,
+    /// Largest request message once the client has authenticated.
     pub max_message_bytes: usize,
+    /// Largest request message before `HELLO` succeeds. Small: nothing an
+    /// unauthenticated client sends needs more, and each connection buffers up
+    /// to this much.
+    pub pre_auth_max_message_bytes: usize,
 }
 
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
             tx_timeout: DEFAULT_TX_TIMEOUT,
-            handshake_timeout: Duration::from_secs(10),
+            hello_timeout: Duration::from_secs(10),
+            message_timeout: Duration::from_secs(60),
+            write_timeout: Duration::from_secs(30),
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
+            pre_auth_max_message_bytes: DEFAULT_PRE_AUTH_MAX_MESSAGE_BYTES,
         }
     }
 }
 
-/// How often the read loop wakes with nothing to read, to expire a transaction.
+/// How often the read loop wakes with nothing to read, to expire a transaction
+/// and check its deadlines.
 const TICK: Duration = Duration::from_secs(1);
 
-/// Drops the `0x0000` chunks at the front of `buf`.
+/// Length of the run of `0x0000` chunks at the front of `buf`.
 ///
 /// `framing::deframe` skips leading no-op chunks but reports `Incomplete`
 /// when the buffer holds nothing else, because an empty message and a no-op are
 /// the same two bytes. The buffer always starts at a message boundary, where a
 /// zero chunk can only be a keep-alive, so they are consumed here: a client
 /// that sends only keep-alives neither grows the buffer nor is waited on.
-fn strip_keepalives(buf: &mut Vec<u8>) {
-    let keep_from = buf
-        .chunks_exact(2)
+fn keepalive_len(buf: &[u8]) -> usize {
+    buf.chunks_exact(2)
         .take_while(|pair| pair[0] == 0 && pair[1] == 0)
         .count()
-        * 2;
-    buf.drain(..keep_from);
+        * 2
+}
+
+/// Why the read loop stopped without the client saying `GOODBYE`.
+fn timed_out(what: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, what.to_string())
 }
 
 /// Runs one client connection to the end: handshake, then the message loop.
-/// Returns when the client says `GOODBYE`, disconnects, or the connection
-/// becomes defunct.
+/// Returns `Ok` when the client says `GOODBYE`, disconnects, or the connection
+/// becomes defunct, and a `TimedOut` error when a deadline passes.
 pub async fn serve_connection<S>(
     mut stream: S,
     authenticator: Arc<TokenAuthenticator>,
@@ -396,26 +425,41 @@ pub async fn serve_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Tokio's clock, so a paused test clock drives every deadline here.
+    let started = tokio::time::Instant::now();
     let mut request = [0u8; handshake::HANDSHAKE_LEN];
-    let read = tokio::time::timeout(config.handshake_timeout, stream.read_exact(&mut request));
+    let read = tokio::time::timeout(config.hello_timeout, stream.read_exact(&mut request));
     match read.await {
         Ok(Ok(_)) => {}
         Ok(Err(err)) => return Err(err),
-        Err(_) => return Ok(()),
+        Err(_) => return Err(timed_out("handshake not received in time")),
     }
     let Ok(offer) = handshake::parse_request(&request) else {
         return Ok(());
     };
     let agreed = handshake::negotiate(offer);
-    stream.write_all(&handshake::response(agreed)).await?;
-    stream.flush().await?;
+    send_bytes(
+        &mut stream,
+        &handshake::response(agreed),
+        config.write_timeout,
+    )
+    .await?;
     let Some(version) = agreed else {
         return Ok(());
     };
 
     let mut connection = Connection::new(authenticator, config.tx_timeout, connection_id, version);
     let mut buf: Vec<u8> = Vec::new();
+    // When the bytes now in `buf` began to wait for the rest of their message.
+    let mut partial_since: Option<tokio::time::Instant> = None;
     loop {
+        let authenticated = connection.identity().is_some();
+        if !authenticated && started.elapsed() >= config.hello_timeout {
+            return Err(timed_out("HELLO not received in time"));
+        }
+        if partial_since.is_some_and(|since| since.elapsed() >= config.message_timeout) {
+            return Err(timed_out("message not completed in time"));
+        }
         match tokio::time::timeout(TICK, stream.read_buf(&mut buf)).await {
             Ok(Ok(0)) => return Ok(()),
             Ok(Ok(_)) => {}
@@ -426,27 +470,46 @@ where
             }
         }
 
+        let cap = if connection.identity().is_some() {
+            config.max_message_bytes
+        } else {
+            config.pre_auth_max_message_bytes
+        };
+        // Parse every complete message, advancing a cursor; the buffer is
+        // drained once at the end, not once per message.
         let mut decoded: Vec<Result<ClientMessage, BoltError>> = Vec::new();
+        let mut pos = 0;
+        let mut oversized = false;
         loop {
-            strip_keepalives(&mut buf);
-            match framing::deframe(&buf) {
+            pos += keepalive_len(&buf[pos..]);
+            match framing::deframe(&buf[pos..]) {
                 Ok((message, used)) => {
-                    buf.drain(..used);
+                    pos += used;
+                    if message.len() > cap {
+                        oversized = true;
+                        break;
+                    }
                     decoded.push(ClientMessage::decode(&message));
                 }
                 Err(framing::FrameError::Incomplete) => break,
             }
         }
-        if buf.len() > config.max_message_bytes {
-            send(
-                &mut stream,
-                &[ServerMessage::Failure(BoltError::TooLarge(
-                    "request message is too large".into(),
-                ))],
-            )
-            .await?;
+        buf.drain(..pos);
+        if oversized || buf.len() > cap {
+            let failure =
+                ServerMessage::Failure(BoltError::TooLarge("request message is too large".into()));
+            send(&mut stream, &[failure], config.write_timeout).await?;
             return Ok(());
         }
+        // The clock runs from when the unfinished message's first bytes
+        // arrived; a message that completed this round starts the next one's.
+        partial_since = if buf.is_empty() {
+            None
+        } else if pos > 0 {
+            Some(tokio::time::Instant::now())
+        } else {
+            partial_since.or_else(|| Some(tokio::time::Instant::now()))
+        };
 
         // A RESET behind other requests interrupts them.
         if decoded
@@ -462,7 +525,7 @@ where
                 Err(err) => connection.handle_malformed(err),
             });
         }
-        send(&mut stream, &responses).await?;
+        send(&mut stream, &responses, config.write_timeout).await?;
         if connection.is_defunct() {
             let _ = stream.shutdown().await;
             return Ok(());
@@ -473,6 +536,7 @@ where
 async fn send<S: AsyncWrite + Unpin>(
     stream: &mut S,
     responses: &[ServerMessage],
+    write_timeout: Duration,
 ) -> std::io::Result<()> {
     if responses.is_empty() {
         return Ok(());
@@ -481,8 +545,24 @@ async fn send<S: AsyncWrite + Unpin>(
     for response in responses {
         framing::frame(&response.encode_or_failure(), &mut out);
     }
-    stream.write_all(&out).await?;
-    stream.flush().await
+    send_bytes(stream, &out, write_timeout).await
+}
+
+/// Writes and flushes within `write_timeout`, so a client that never reads
+/// cannot hold the task.
+async fn send_bytes<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    bytes: &[u8],
+    write_timeout: Duration,
+) -> std::io::Result<()> {
+    let write = async {
+        stream.write_all(bytes).await?;
+        stream.flush().await
+    };
+    match tokio::time::timeout(write_timeout, write).await {
+        Ok(result) => result,
+        Err(_) => Err(timed_out("write to client timed out")),
+    }
 }
 
 #[cfg(test)]
@@ -490,15 +570,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strip_keepalives_removes_only_leading_zero_chunks() {
-        let mut buf = vec![0, 0, 0, 0, 0, 1, 7, 0, 0];
-        strip_keepalives(&mut buf);
-        assert_eq!(buf, vec![0, 1, 7, 0, 0]);
-        let mut only = vec![0, 0, 0, 0, 0];
-        strip_keepalives(&mut only);
-        assert_eq!(only, vec![0]);
-        let mut none: Vec<u8> = vec![];
-        strip_keepalives(&mut none);
-        assert!(none.is_empty());
+    fn keepalive_len_counts_only_leading_zero_chunks() {
+        assert_eq!(keepalive_len(&[0, 0, 0, 0, 0, 1, 7, 0, 0]), 4);
+        assert_eq!(keepalive_len(&[0, 0, 0, 0, 0]), 4);
+        assert_eq!(keepalive_len(&[0, 1, 7, 0, 0]), 0);
+        assert_eq!(keepalive_len(&[]), 0);
     }
 }

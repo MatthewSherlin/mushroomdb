@@ -7,8 +7,13 @@
 //! - `basic`: `credentials` is a mushroomdb token. `principal` is ignored,
 //!   because mushroomdb has no user table: a token carries its role.
 //! - `bearer`: `credentials` is a token, the same way.
-//! - `none`: anonymous, accepted only when unauthenticated access was turned on
-//!   explicitly.
+//! - `none`: no credentials; accepted only when the server has no tokens
+//!   configured.
+//!
+//! Acceptance mirrors the HTTP layer exactly. With no full-access token and no
+//! role-bound tokens configured, every client is `Full`, whatever scheme and
+//! credentials it sends (HTTP accepts a request with any header). With any token
+//! configured, a client must present one that matches.
 //!
 //! Every way of failing returns the same [`BoltError::Unauthorized`], so a
 //! failed login does not say whether a token exists, whether its role is gone,
@@ -20,8 +25,8 @@ use std::sync::Arc;
 use super::{PackValue, ServerMessage};
 use crate::error::BoltError;
 
-/// How the client says it authenticates.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How the client says it authenticates. `Debug` hides the credentials.
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuthToken {
     /// `credentials` is the token; `principal` is kept only for logging.
     Basic {
@@ -37,11 +42,38 @@ pub enum AuthToken {
     Unknown,
 }
 
-/// A decoded `HELLO`.
-#[derive(Debug, Clone, PartialEq)]
+impl std::fmt::Debug for AuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthToken::Basic { principal, .. } => f
+                .debug_struct("Basic")
+                .field("principal", principal)
+                .field("credentials", &"<redacted>")
+                .finish(),
+            AuthToken::Bearer { .. } => f
+                .debug_struct("Bearer")
+                .field("credentials", &"<redacted>")
+                .finish(),
+            AuthToken::None => f.write_str("None"),
+            AuthToken::Unknown => f.write_str("Unknown"),
+        }
+    }
+}
+
+/// A decoded `HELLO`. `Debug` hides the credentials.
+#[derive(Clone, PartialEq)]
 pub struct Hello {
     pub user_agent: Option<String>,
     pub auth: AuthToken,
+}
+
+impl std::fmt::Debug for Hello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hello")
+            .field("user_agent", &self.user_agent)
+            .field("auth", &self.auth)
+            .finish()
+    }
 }
 
 fn string_field<'a>(map: &'a [(String, PackValue)], key: &str) -> Option<&'a str> {
@@ -90,8 +122,6 @@ pub enum Identity {
     /// A role-bound token. The connection resolves the role's mask from the
     /// store at use, as the HTTP layer does.
     Role(String),
-    /// `scheme: none`, with unauthenticated access turned on.
-    Anonymous,
 }
 
 /// Checks whether a role still exists in the store.
@@ -103,7 +133,6 @@ pub type RoleExists = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct TokenAuthenticator {
     full_token: Option<String>,
     role_tokens: HashMap<String, String>,
-    allow_unauthenticated: bool,
     role_exists: Option<RoleExists>,
 }
 
@@ -112,7 +141,6 @@ impl std::fmt::Debug for TokenAuthenticator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenAuthenticator")
             .field("role_tokens", &self.role_tokens.len())
-            .field("allow_unauthenticated", &self.allow_unauthenticated)
             .finish_non_exhaustive()
     }
 }
@@ -131,18 +159,13 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 impl TokenAuthenticator {
-    /// `full_token` is the full-access token, `role_tokens` maps a token to a
-    /// role name. `allow_unauthenticated` must come from an explicit flag; with
-    /// it off, `scheme: none` is refused whatever tokens are configured.
-    pub fn new(
-        full_token: Option<String>,
-        role_tokens: HashMap<String, String>,
-        allow_unauthenticated: bool,
-    ) -> Self {
+    /// `full_token` is the full-access token (an empty one counts as none),
+    /// `role_tokens` maps a token to a role name. With neither configured the
+    /// server is open, as the HTTP layer is.
+    pub fn new(full_token: Option<String>, role_tokens: HashMap<String, String>) -> Self {
         Self {
             full_token: full_token.filter(|t| !t.is_empty()),
             role_tokens,
-            allow_unauthenticated,
             role_exists: None,
         }
     }
@@ -153,12 +176,20 @@ impl TokenAuthenticator {
         self
     }
 
+    /// Whether no token of either kind is configured.
+    pub fn is_open(&self) -> bool {
+        self.full_token.is_none() && self.role_tokens.is_empty()
+    }
+
     pub fn authenticate(&self, auth: &AuthToken) -> Result<Identity, BoltError> {
+        // Same rule as the HTTP middleware: no tokens configured, everyone is Full.
+        if self.is_open() {
+            return Ok(Identity::Full);
+        }
         match auth {
             AuthToken::Basic { credentials, .. } | AuthToken::Bearer { credentials } => {
                 self.resolve_token(credentials)
             }
-            AuthToken::None if self.allow_unauthenticated => Ok(Identity::Anonymous),
             AuthToken::None | AuthToken::Unknown => Err(BoltError::Unauthorized),
         }
     }
@@ -222,7 +253,7 @@ mod tests {
     fn auth() -> TokenAuthenticator {
         let mut roles = HashMap::new();
         roles.insert("role-token".to_string(), "analyst".to_string());
-        TokenAuthenticator::new(Some("full-token".into()), roles, false)
+        TokenAuthenticator::new(Some("full-token".into()), roles)
     }
 
     #[test]
@@ -277,24 +308,57 @@ mod tests {
         }
     }
 
+    /// The four combinations the HTTP layer defines: with no tokens configured
+    /// every client is Full; with tokens, only a matching token is accepted.
     #[test]
-    fn scheme_none_needs_the_explicit_flag() {
-        let hello = Hello::from_fields(map(&[("scheme", "none")])).unwrap();
-        let open = TokenAuthenticator::new(None, HashMap::new(), true);
-        assert_eq!(open.authenticate(&hello.auth), Ok(Identity::Anonymous));
-        // No tokens configured and no flag: still refused.
-        let closed = TokenAuthenticator::new(None, HashMap::new(), false);
-        assert_eq!(
-            closed.authenticate(&hello.auth),
-            Err(BoltError::Unauthorized)
-        );
+    fn acceptance_matches_http_for_open_and_token_servers() {
+        let none = Hello::from_fields(map(&[("scheme", "none")])).unwrap().auth;
+        let valid = Hello::from_fields(map(&[("scheme", "basic"), ("credentials", "full-token")]))
+            .unwrap()
+            .auth;
+        let invalid = Hello::from_fields(map(&[("scheme", "basic"), ("credentials", "bad")]))
+            .unwrap()
+            .auth;
+        let open = TokenAuthenticator::new(None, HashMap::new());
+        assert!(open.is_open());
+        assert_eq!(open.authenticate(&none), Ok(Identity::Full));
+        assert_eq!(open.authenticate(&valid), Ok(Identity::Full));
+        assert_eq!(open.authenticate(&invalid), Ok(Identity::Full));
+        let tokens = auth();
+        assert!(!tokens.is_open());
+        assert_eq!(tokens.authenticate(&none), Err(BoltError::Unauthorized));
+        assert_eq!(tokens.authenticate(&valid), Ok(Identity::Full));
+        assert_eq!(tokens.authenticate(&invalid), Err(BoltError::Unauthorized));
+        // Role-only configuration is not open either.
+        let mut roles = HashMap::new();
+        roles.insert("t".to_string(), "r".to_string());
+        let role_only = TokenAuthenticator::new(None, roles);
+        assert_eq!(role_only.authenticate(&none), Err(BoltError::Unauthorized));
     }
 
     #[test]
-    fn empty_full_token_never_matches() {
-        let a = TokenAuthenticator::new(Some(String::new()), HashMap::new(), false);
-        let hello = Hello::from_fields(map(&[("scheme", "basic"), ("credentials", "")])).unwrap();
-        assert_eq!(a.authenticate(&hello.auth), Err(BoltError::Unauthorized));
+    fn empty_full_token_counts_as_no_token() {
+        let a = TokenAuthenticator::new(Some(String::new()), HashMap::new());
+        assert!(a.is_open());
+    }
+
+    #[test]
+    fn debug_output_hides_credentials() {
+        let hello = Hello::from_fields(map(&[
+            ("scheme", "basic"),
+            ("principal", "who"),
+            ("credentials", "super-secret-token"),
+        ]))
+        .unwrap();
+        let shown = format!("{hello:?} {:?}", hello.auth);
+        assert!(!shown.contains("super-secret-token"), "{shown}");
+        assert!(shown.contains("<redacted>"));
+        let bearer = Hello::from_fields(map(&[
+            ("scheme", "bearer"),
+            ("credentials", "super-secret-token"),
+        ]))
+        .unwrap();
+        assert!(!format!("{bearer:?}").contains("super-secret-token"));
     }
 
     #[test]
