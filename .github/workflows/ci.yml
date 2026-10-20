@@ -30,6 +30,9 @@ jobs:
       # exists behind the `mp-test` feature (so a plain workspace test run never
       # builds it). Cross-process locking has no other coverage.
       - run: cargo test -p mushroomdb --features mp-test --test multiprocess
+      # The published image is built with `--features tls`; nothing else in CI
+      # compiles it, so the TLS tests (gated on the feature) run here.
+      - run: cargo test -p mushroomdb-server --features tls --test tls
       - run: cargo clippy -p mushroomdb --all-targets --features mp-test -- -D warnings
       # Tests that need a store in a state no current write path produces —
       # one 0.8.0 left behind (ledger row 107) — build it through a hook that
