@@ -60,8 +60,21 @@ export type {
   WccReport,
 } from "./client.js";
 export type {
+  BinaryValue,
+  DateTimeValue,
+  DateValue,
   DbEvent,
+  DurationValue,
+  LocalDateTimeValue,
   SubscribeMessage,
+} from "./types.js";
+export {
+  asBinary,
+  asDate,
+  asDateTime,
+  asDuration,
+  asLocalDateTime,
+  binaryBytes,
 } from "./types.js";
 export type {
   SubscribeHandle,

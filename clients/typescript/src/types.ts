@@ -18,6 +18,16 @@
  *   Bool(bool)      → boolean
  *   List(Vec<Value>) → CellValue[]
  *   null cell       → null
+ *   Date            → {@link DateValue}          `{ "$date": "2024-01-15" }`
+ *   LocalDateTime   → {@link LocalDateTimeValue} `{ "$ldt": "2024-01-15T12:34:56.789012" }`
+ *   DateTime        → {@link DateTimeValue}      `{ "$dt": "2024-01-15T12:34:56.789012+05:30" }`
+ *   Duration        → {@link DurationValue}      `{ "$dur": "P1Y2M3DT4H5M6.789S" }`
+ *   Binary          → {@link BinaryValue}        `{ "$binary": "<base64>" }`
+ *
+ * The five tagged forms are the server's JSON for the format-V11 types; the
+ * text inside each is ISO 8601 (or base64). The server both emits and accepts
+ * them. Narrow a cell with {@link asDate}, {@link asLocalDateTime},
+ * {@link asDateTime}, {@link asDuration} and {@link asBinary}.
  *
  * **Precision warning (Int / i64):** JavaScript `number` (IEEE 754 double)
  * safely represents integers only up to ±2^53 − 1 (~9×10^15). Rust `i64`
@@ -26,7 +36,80 @@
  * use a string representation in the graph instead. A future release will
  * offer a BigInt-aware parsing mode.
  */
-export type CellValue = number | string | boolean | null | CellValue[];
+export type CellValue =
+  | number
+  | string
+  | boolean
+  | null
+  | CellValue[]
+  | DateValue
+  | LocalDateTimeValue
+  | DateTimeValue
+  | DurationValue
+  | BinaryValue;
+
+/** A calendar date, `YYYY-MM-DD` (ISO 8601). */
+export type DateValue = { readonly $date: string };
+
+/** A date and time with no time zone, `YYYY-MM-DDTHH:MM:SS[.ffffff]`. */
+export type LocalDateTimeValue = { readonly $ldt: string };
+
+/**
+ * An instant with the UTC offset it was written with, for example
+ * `2024-01-15T12:34:56.789012+05:30` or `...Z`. The offset is within ±18:00.
+ * Two values at the same instant are equal whatever their offsets.
+ */
+export type DateTimeValue = { readonly $dt: string };
+
+/**
+ * An ISO 8601 duration, `PnYnMnDTnHnMn.nS`. Months, days and the time part are
+ * independent: a month is not 30 days.
+ */
+export type DurationValue = { readonly $dur: string };
+
+/** A byte blob, standard base64 with padding. At most 1 MiB decoded. */
+export type BinaryValue = { readonly $binary: string };
+
+/** The string under `tag` when `v` is a one-key object `{ [tag]: string }`. */
+function taggedText(v: CellValue, tag: string): string | undefined {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
+  const keys = Object.keys(v);
+  if (keys.length !== 1 || keys[0] !== tag) return undefined;
+  const text: unknown = (v as Record<string, unknown>)[tag];
+  return typeof text === "string" ? text : undefined;
+}
+
+/** The ISO 8601 date text of a {@link DateValue}, else `undefined`. */
+export function asDate(v: CellValue): string | undefined {
+  return taggedText(v, "$date");
+}
+
+/** The ISO 8601 text of a {@link LocalDateTimeValue}, else `undefined`. */
+export function asLocalDateTime(v: CellValue): string | undefined {
+  return taggedText(v, "$ldt");
+}
+
+/** The ISO 8601 text, with its offset, of a {@link DateTimeValue}, else `undefined`. */
+export function asDateTime(v: CellValue): string | undefined {
+  return taggedText(v, "$dt");
+}
+
+/** The ISO 8601 duration text of a {@link DurationValue}, else `undefined`. */
+export function asDuration(v: CellValue): string | undefined {
+  return taggedText(v, "$dur");
+}
+
+/** The base64 text of a {@link BinaryValue}, else `undefined`. */
+export function asBinary(v: CellValue): string | undefined {
+  return taggedText(v, "$binary");
+}
+
+/** The bytes of a {@link BinaryValue}, else `undefined`. */
+export function binaryBytes(v: CellValue): Uint8Array | undefined {
+  const text = asBinary(v);
+  if (text === undefined) return undefined;
+  return Uint8Array.from(atob(text), (c) => c.charCodeAt(0));
+}
 
 // ---------------------------------------------------------------------------
 // Query result

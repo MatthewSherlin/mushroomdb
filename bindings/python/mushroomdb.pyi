@@ -8,10 +8,37 @@ from __future__ import annotations
 
 from os import PathLike
 from types import TracebackType
+from datetime import date, datetime
 from typing import Any, Literal, Sequence
 
-Scalar = int | float | str | bool | list[Any] | dict[str, Any]
-"""A value the store can hold: int, float, str, bool, list, or dict."""
+class Duration:
+    """A span of time as calendar months, days and nanoseconds, kept apart.
+
+    The three parts are independent and never normalised against each other: a
+    month is not 30 days and a day is not 24 hours, which is why this is not a
+    `datetime.timedelta`. A `timedelta` is refused as a value, with a message
+    that points here. Immutable and hashable; equal when all three parts are.
+    `months` and `days` are 32-bit and `nanos` 64-bit signed integers; a part
+    that does not fit raises `OverflowError`.
+    """
+
+    months: int
+    days: int
+    nanos: int
+    def __init__(self, months: int = 0, days: int = 0, nanos: int = 0) -> None: ...
+
+Scalar = int | float | str | bool | bytes | date | datetime | Duration | list[Any] | dict[str, Any]
+"""A value the store can hold: int, float, str, bool, bytes, date, datetime, Duration, list, or dict.
+
+`bytes` (a `bytearray` or `memoryview` is accepted on the way in) is a binary
+blob of at most 1 MiB. A `datetime.date` is a date; a naive `datetime.datetime`
+is a local date-time; an aware one is a date-time that keeps its UTC offset
+(within +-18:00, whole seconds). A value that cannot be held exactly, such as an
+offset with a fractional second, raises `ValueError` rather than being rounded.
+Reading one back gives the same Python type; a stored date outside Python's
+years 1 to 9999 raises `ValueError`. These five types are not yet storable: a
+write that carries one is refused until the format that holds them lands.
+"""
 
 Params = dict[str, Scalar] | Sequence[tuple[str, Scalar]] | None
 """Query parameters: a name→value dict, a list of (name, value) tuples, or None."""
@@ -416,7 +443,7 @@ class GraphDb:
     ) -> list[Row]:
         """Execute a read query and return one dict per row, keyed by RETURN alias.
 
-        Values must be `int`, `float`, `str`, `bool`, `list` or `dict`.
+        Values must be `int`, `float`, `str`, `bool`, `bytes`, `datetime.date`, `datetime.datetime`, `Duration`, `list` or `dict`.
         Parameters are bound, never interpolated, so string values are safe
         against injection.
 
@@ -436,7 +463,7 @@ class GraphDb:
         """Back-compat alias for `query(cypher, params=[...])` with a tuple list.
 
         Each element of `params` is a `(name, value)` tuple. Values must be
-        `int`, `float`, `str`, `bool`, or a `list` of those. Prefer `query`,
+        `int`, `float`, `str`, `bool`, `bytes`, `datetime.date`, `datetime.datetime`, `Duration`, or a `list` of those. Prefer `query`,
         which accepts the same tuple list and a dict besides.
         """
 
