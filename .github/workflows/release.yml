@@ -198,7 +198,8 @@ jobs:
   # GITHUB_TOKEN (GitHub suppresses GITHUB_TOKEN-caused events), so the
   # v0.2.0 release shipped binaries but silently skipped every registry —
   # dispatch publish.yml explicitly instead (workflow_dispatch IS allowed
-  # from GITHUB_TOKEN).
+  # from GITHUB_TOKEN). That one dispatch also covers the adapter packages
+  # (publish-langchain, publish-llamaindex), which wait on the main wheel.
   trigger-publish:
     needs: [github-release]
     runs-on: ubuntu-latest

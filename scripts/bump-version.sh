@@ -101,13 +101,32 @@ for f in "${json_manifests[@]}"; do
 done
 
 # 4. `pyproject.toml` — maturin reads this, and unlike npm it is not rewritten
-#    from the git tag at publish time.
-cur="$(awk -F'"' '/^version = "/{print $2; exit}' bindings/python/pyproject.toml)"
-if [[ "$cur" != "$NEW" ]]; then
-  if [[ $CHECK -eq 1 ]]; then report "bindings/python/pyproject.toml" "version" "$cur"; else
-    perl -0pi -e 's/^version = "[^"]*"/version = "'"$NEW"'"/m' bindings/python/pyproject.toml
+#    from the git tag at publish time. The two adapter packages under
+#    `integrations/` are built with setuptools from the same kind of file and
+#    release in lockstep with the workspace, so they carry the same version.
+for f in bindings/python/pyproject.toml \
+         integrations/langchain-mushroomdb/pyproject.toml \
+         integrations/llama-index-mushroomdb/pyproject.toml; do
+  cur="$(awk -F'"' '/^version = "/{print $2; exit}' "$f")"
+  [[ "$cur" == "$NEW" ]] && continue
+  if [[ $CHECK -eq 1 ]]; then report "$f" "version" "$cur"; else
+    perl -0pi -e 's/^version = "[^"]*"/version = "'"$NEW"'"/m' "$f"
   fi
-fi
+done
+
+# 4b. The adapters' dependency on the core: `"mushroomdb>=X.Y.Z,<X.(Y+1)"`. They
+#     release in lockstep, so a published adapter must not resolve an older core
+#     than the one it was released with. Any pre-release suffix is dropped from
+#     the bounds. Bumped and checked like the version itself.
+core_range="$(awk -F'[.-]' '{ printf ">=%s.%s.%s,<%s.%s", $1, $2, $3, $1, $2 + 1 }' <<<"$NEW")"
+for f in integrations/langchain-mushroomdb/pyproject.toml \
+         integrations/llama-index-mushroomdb/pyproject.toml; do
+  cur="$(perl -ne 'print "$1\n" if /^\s*"mushroomdb([^"]*)",?\s*$/' "$f")"
+  [[ "$cur" == "$core_range" ]] && continue
+  if [[ $CHECK -eq 1 ]]; then report "$f" "the mushroomdb dependency range" "'$cur' (expected '$core_range')"; else
+    perl -0pi -e 's/^(\s*"mushroomdb)[^"]*(",?\s*)$/${1}'"$core_range"'${2}/m' "$f"
+  fi
+done
 
 # 5. Lockfiles. `--check` read neither until 0.7, and the binding's refresh
 #    below swallowed its own failure, so a lockfile naming the previous version
