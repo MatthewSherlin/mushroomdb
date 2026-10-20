@@ -28,7 +28,10 @@ pub use core_rules::{
     DEFAULT_KEYMATCH_TOP_K, DEFAULT_SCORED_TOP_K, HNSW_BUILD_BATCH, MAX_CHAIN_DEPTH,
 };
 pub use core_storage::fs::RealFs;
-pub use core_storage::{Direction, GraphError, Result, Value};
+pub use core_storage::{
+    tagged_text, v11_display_text, value_from_tagged_text, Direction, GraphError, Result, Value,
+    BINARY_MAX_BYTES,
+};
 pub use db::{
     ambiguous_exactness_last_warning, ambiguous_exactness_warns, ambiguous_exactness_warns_reset,
 };
@@ -69,7 +72,7 @@ pub const FIND_SIMILAR_DEFAULT_MIN: f64 = 0.8;
 pub const SNAPSHOT_VERSION: u16 = core_storage::snapshot::VERSION;
 pub use history::{EdgeEvent, EdgeHistoryEvent, HistoryChange, HistoryEntry, HistoryResult};
 pub use ingest::{
-    json_to_rows, json_to_value, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
+    json_to_rows, json_to_value, tagged_json, AutoFk, FkSkip, IngestOptions, IngestReport, JsonRows,
 };
 pub use mask::{MaskMode, NodeMask, RoleMaskCache, Scope};
 pub use reader::{CommitDelta, FrozenOverlay, ReaderSnapshot, FOLD_EVERY_K};

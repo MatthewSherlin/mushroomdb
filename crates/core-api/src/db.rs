@@ -1044,6 +1044,14 @@ fn eval_set_return_expr<F: Fs>(
                 Some(Value::Str(s)) => !s.is_empty(),
                 Some(Value::List(v)) => !v.is_empty(),
                 Some(Value::Map(m)) => !m.is_empty(),
+                Some(Value::Binary(b)) => !b.is_empty(),
+                // A temporal value is a present value, never "empty".
+                Some(
+                    Value::Date(_)
+                    | Value::LocalDateTime(_)
+                    | Value::DateTime { .. }
+                    | Value::Duration { .. },
+                ) => true,
             })
         }
         Expr::IsNull(op) => {
@@ -5201,7 +5209,23 @@ impl<F: Fs> GraphDb<F> {
     /// carries [`PlannedRec::DuplicateCount`] entries — the shape a batch
     /// produces, where a duplicate's count can only be named once this pass has
     /// assigned the frame's own ids.
+    ///
+    /// This is the one function every value-carrying WAL record passes through
+    /// on its way to the WAL — `insert_node` and `set_prop` via `log_dense`,
+    /// every batch, ingest and Cypher write via `commit_logged_batch` — so it
+    /// is where a format-V11 value is refused (see [`v11_only_value`]). The
+    /// check runs first, before anything is interned, so a refused write
+    /// leaves no state behind. Replay never comes here.
     fn rewrite_wal_dense_planned(&mut self, recs: Vec<PlannedRec>) -> Result<Vec<WalRecord>> {
+        for rec in &recs {
+            if let PlannedRec::Rec(rec) = rec {
+                if let Some(type_name) = v11_only_value(rec) {
+                    return Err(GraphError::QueryError {
+                        detail: core_storage::v11_type_refusal(type_name),
+                    });
+                }
+            }
+        }
         let syms_checkpoint = self.syms.len();
         let result = self.rewrite_wal_dense_inner(recs);
         if result.is_err() {
@@ -5909,6 +5933,12 @@ impl<F: Fs> GraphDb<F> {
         if self.intent_unsettled {
             self.settle_snapshot_intent()?;
         }
+        // Backstop for the refusal in `rewrite_wal_dense_planned`: a path that
+        // reached the WAL without passing through it would show up here.
+        debug_assert!(
+            v11_only_value(&rec).is_none(),
+            "a format-V11 value reached the WAL append without the dense rewrite"
+        );
         let frame = encode_record(&rec);
         self.fs.append(FileId::Wal, &frame)?;
         // The cursor advances by exactly the bytes appended: these frames are
@@ -15445,6 +15475,48 @@ pub struct BatchOutcome {
 /// produces a [`BatchOutcome`].
 fn inserted_pair(outcome: BatchOutcome) -> (usize, usize) {
     (outcome.nodes_inserted, outcome.edges_inserted)
+}
+
+/// The first format-V11 value type (`Date`, `LocalDateTime`, `DateTime`,
+/// `Duration`, `Binary`) a WAL record would write, at any depth.
+///
+/// Until the V11 format lands, no such value may reach the WAL: a 0.9.x reader
+/// cannot decode the frame and stops replaying there, silently losing every
+/// later commit, while the store carries no stamp telling it to refuse. The
+/// match names every record kind so a new kind that carries a value cannot be
+/// added without deciding here.
+fn v11_only_value(rec: &WalRecord) -> Option<&'static str> {
+    match rec {
+        WalRecord::InsertNode { props, .. } => props
+            .iter()
+            .find_map(|(_, v)| core_storage::v11_only_type(v)),
+        WalRecord::InsertNodeId { props, .. } => props
+            .iter()
+            .find_map(|(_, v)| core_storage::v11_only_type(v)),
+        WalRecord::SetProp { value, .. } | WalRecord::SetPropId { value, .. } => {
+            core_storage::v11_only_type(value)
+        }
+        WalRecord::Batch(inner) => inner.iter().find_map(v11_only_value),
+        WalRecord::InsertEdge { .. }
+        | WalRecord::CreateRule { .. }
+        | WalRecord::DeleteRule { .. }
+        | WalRecord::RemoveProp { .. }
+        | WalRecord::DeleteEdge { .. }
+        | WalRecord::DeleteNode { .. }
+        | WalRecord::RebuildRule { .. }
+        | WalRecord::CreateView { .. }
+        | WalRecord::DeleteView { .. }
+        | WalRecord::EnableFulltext { .. }
+        | WalRecord::DisableFulltext { .. }
+        | WalRecord::InsertEdgeId { .. }
+        | WalRecord::Intern { .. }
+        | WalRecord::DerivedEdgeAdded { .. }
+        | WalRecord::DerivedEdgeRetracted { .. }
+        | WalRecord::RenameNode { .. }
+        | WalRecord::EnableIndex { .. }
+        | WalRecord::DisableIndex { .. }
+        | WalRecord::SetEdgeCount { .. } => None,
+    }
 }
 
 /// One entry of a frame the validate pass has decided on, before

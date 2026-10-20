@@ -1648,7 +1648,11 @@ fn tool_what_if(db: &SharedDb, args: &Js, json_out: bool) -> CallOutcome {
     let Some(raw) = args.get("value").filter(|v| !v.is_null()) else {
         return CallOutcome::ToolErr("missing value".into());
     };
-    let Some(value) = json_to_value(raw.clone()) else {
+    let parsed = match json_to_value(raw.clone()) {
+        Ok(parsed) => parsed,
+        Err(e) => return CallOutcome::ToolErr(format!("value: {e}")),
+    };
+    let Some(value) = parsed else {
         return CallOutcome::ToolErr(format!(
             "value is not a supported value type: {}",
             digest::sanitize(&raw.to_string())
@@ -1823,14 +1827,15 @@ fn entities_arg(args: &Js) -> Result<Vec<EntityIn>, String> {
         if let Some(props_obj) = obj.get("props").and_then(Js::as_object) {
             for (field, json_val) in props_obj {
                 match json_to_value(json_val.clone()) {
-                    Some(v) => {
+                    Ok(Some(v)) => {
                         props.insert(field.clone(), v);
                     }
-                    None => {
+                    Ok(None) => {
                         return Err(format!(
                             "entities[].props.{field} is not a supported value type"
                         ))
                     }
+                    Err(e) => return Err(format!("entities[].props.{field}: {e}")),
                 }
             }
         }

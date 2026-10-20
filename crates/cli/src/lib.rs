@@ -3091,6 +3091,11 @@ fn fmt_value(v: &Value) -> String {
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
+        Value::Date(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime { .. }
+        | Value::Duration { .. }
+        | Value::Binary(_) => mushroomdb::v11_display_text(v).unwrap_or_default(),
     }
 }
 

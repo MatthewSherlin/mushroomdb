@@ -2312,7 +2312,7 @@ fn props_from_json_obj(v: &serde_json::Value) -> Result<Vec<(String, Value)>, St
     };
     let mut out = Vec::with_capacity(obj.len());
     for (k, val) in obj {
-        if let Some(v) = json_to_value(val.clone()) {
+        if let Some(v) = json_to_value(val.clone()).map_err(|e| format!("props {k:?}: {e}"))? {
             out.push((k.clone(), v));
         }
     }
@@ -2600,9 +2600,11 @@ async fn set_node_prop(
     Path((key, field)): Path<(String, String)>,
     Json(body): Json<Js>,
 ) -> Response {
-    let value = match body.get("value").and_then(|v| json_to_value(v.clone())) {
-        Some(v) => v,
-        None => {
+    let parsed = body.get("value").map(|v| json_to_value(v.clone()));
+    let value = match parsed {
+        Some(Err(e)) => return err_response(format!("value: {e}")),
+        Some(Ok(Some(v))) => v,
+        Some(Ok(None)) | None => {
             return err_response(
                 "request body must be a JSON object with a \"value\" field, \
                  e.g. {\"value\": \"SanFrancisco\"} or {\"value\": [\"a\", \"b\"]}",

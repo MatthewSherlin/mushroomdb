@@ -699,6 +699,11 @@ fn execute_inner(
                                 Value::Bool(_) => "Bool",
                                 Value::List(_) => unreachable!(),
                                 Value::Map(_) => "Map",
+                                Value::Date(_) => "Date",
+                                Value::LocalDateTime(_) => "LocalDateTime",
+                                Value::DateTime { .. } => "DateTime",
+                                Value::Duration { .. } => "Duration",
+                                Value::Binary(_) => "Binary",
                             };
                             return Err(format!(
                                 "UNWIND requires a list; got {type_name} value for `{alias}`"
@@ -4644,6 +4649,14 @@ fn eval_expr(
                 Some(Value::Str(s)) => !s.is_empty(),
                 Some(Value::List(v)) => !v.is_empty(),
                 Some(Value::Map(m)) => !m.is_empty(),
+                Some(Value::Binary(b)) => !b.is_empty(),
+                // A temporal value is a present value, never "empty".
+                Some(
+                    Value::Date(_)
+                    | Value::LocalDateTime(_)
+                    | Value::DateTime { .. }
+                    | Value::Duration { .. },
+                ) => true,
             })
         }
         Expr::IsNull(op) => {

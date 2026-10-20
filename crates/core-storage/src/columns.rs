@@ -198,6 +198,15 @@ impl Column {
             Value::List(_) => Column::Mixed(HashMap::new()),
             // Map spills to the Mixed path, like List. Never promotes a typed column.
             Value::Map(_) => Column::Mixed(HashMap::new()),
+            // Format V11 types have no typed column yet (TY-2 adds them), and
+            // the engine refuses to write them before the V11 format exists,
+            // so a store never holds one. A direct caller still gets a correct
+            // in-memory column rather than a panic.
+            Value::Date(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime { .. }
+            | Value::Duration { .. }
+            | Value::Binary(_) => Column::Mixed(HashMap::new()),
         };
         col.set(node, value, intern);
         col

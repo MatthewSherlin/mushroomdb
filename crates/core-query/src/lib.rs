@@ -6,7 +6,7 @@ pub mod value_ops;
 pub mod view;
 pub mod visible;
 
-pub use core_storage::Value;
+pub use core_storage::{v11_display_text, Value};
 pub use filter::{eval_cmp, eval_filter, CmpOp, Filter};
 pub use result::ResultSet;
 pub use traverse::{expand, neighborhood, Dir, EdgeRef, Neighborhood};
