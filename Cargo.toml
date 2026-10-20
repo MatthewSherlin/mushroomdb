@@ -11,6 +11,7 @@ members = [
     "crates/cli",
     "crates/core-bench",
     "crates/code-extract",
+    "crates/bolt",
 ]
 
 [workspace.package]
