@@ -133,6 +133,9 @@ jobs:
       # Measured: 3,744,000 B of properties -> 5,200,624 B snapshot (1.39x);
       # the same store under the per-column tables was 36,784,616 B (9.82x).
       - run: cargo test --release -p mushroomdb --test snapshot -- snapshot_size_is_near_the_property_payload --ignored --nocapture
+      # A write that returned survives the process aborting right after it
+      # (PF-06a). Process death, not power loss: see the test's module doc.
+      - run: cargo test --release -p mushroomdb --test process_abort_durability -- write_survives_process_abort --ignored --nocapture
 
   # The TypeScript client is published by publish.yml on every release and,
   # until 0.6.12, was tested by no workflow at all — a broken build would have
