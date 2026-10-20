@@ -3,7 +3,10 @@
 ## Unreleased
 
 - **The published container image is built with TLS**, so `--tls-cert` and `--tls-key` work at container start without a custom build (HO-01). CI now runs the server's TLS tests with `--features tls`.
-- `mushroomdb query` and `mushroomdb asof --query` take the statement from `--stdin` or `--file <path>`, so a quote needs no shell escaping; a leading byte-order mark, trailing whitespace and one trailing `;` are dropped (also from a statement given on the command line), and giving the statement more than one way is refused. `mushroomdb --help` now lists the graph commands first, then data input, then the agent-memory commands. Ledger row 70 stays open until the lexer accepts `\\` and `\"` escapes.
+
+### Fixed
+
+- **A Cypher read anchored on a key, `MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k`, is a point lookup, not a scan of the label.** The key filter used to run after every node of the label had been expanded: 593 ms at 1M nodes, now about 0.006 ms. Results are unchanged, under masks, namespaces and `open_at` too (row 102).
 
 ### Fixed
 
