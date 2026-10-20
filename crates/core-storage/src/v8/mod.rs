@@ -533,12 +533,34 @@ impl MappedBase {
                 let start = bits.offset as usize;
                 let end = start.checked_add(bits.len as usize)?;
                 let payload = self.backing.get(start..end)?;
-                if !payload.starts_with(DERIVED_BITS_MAGIC) {
-                    return None;
-                }
                 self.backing.get(
                     topology.offset as usize..(topology.offset as usize + topology.len as usize),
                 )?;
+                // What the writer wrote for this topology: the magic and one
+                // bit per `u32` of it, rounded up to a byte.
+                let expected = DERIVED_BITS_MAGIC.len() + topology.len as usize / 32 + 1;
+                let problem = if !payload.starts_with(DERIVED_BITS_MAGIC) {
+                    Some("bad magic".to_string())
+                } else if payload.len() != expected {
+                    Some(format!(
+                        "length {} where the topology needs {expected}",
+                        payload.len()
+                    ))
+                } else if crc32fast::hash(payload) != bits.crc32 {
+                    Some("CRC mismatch".to_string())
+                } else {
+                    None
+                };
+                if let Some(problem) = problem {
+                    // Wrong bits would give wrong answers, never an error:
+                    // set the section aside and read PROVENANCE instead.
+                    eprintln!(
+                        "mushroomdb: snapshot section 17 (derived_bits) is unusable \
+                         ({problem}); reading derived edges from provenance instead. \
+                         `mushroomdb verify` reports the section"
+                    );
+                    return None;
+                }
                 Some(DerivedBitsAt {
                     bits: (start + DERIVED_BITS_MAGIC.len(), end),
                     topology_start: topology.offset as usize,

@@ -401,6 +401,64 @@ fn with_the_section_and_without_it() {
     }
 }
 
+/// The byte range of section `id`'s payload in the snapshot file, and the
+/// offset of its directory entry.
+fn section_range(bytes: &[u8], id: u8) -> (usize, usize, usize) {
+    let count = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+    let at = (0..count).find(|&i| bytes[8 + 16 * i] == id).unwrap();
+    let entry = 8 + 16 * at;
+    let offset = u32::from_le_bytes(bytes[entry + 4..entry + 8].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(bytes[entry + 8..entry + 12].try_into().unwrap()) as usize;
+    (offset, len, entry)
+}
+
+/// A section 17 that does not read back — zeroed, filled with ones, one bit
+/// flipped, or the wrong length — is set aside: `derived` still equals the live
+/// handle's, and the CRC audit still names the section.
+#[test]
+fn a_damaged_section_17_gives_no_wrong_answers() {
+    for damage in ["zeros", "ones", "one bit", "truncated"] {
+        let dir = tmp(&format!("damaged-{}", damage.replace(' ', "-")));
+        let mut db = populated(&dir);
+        db.snapshot().unwrap();
+        drop(db);
+        let path = dir.join("snapshot.bin");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let (offset, len, entry) = section_range(&bytes, DERIVED_BITS_ID);
+        match damage {
+            "zeros" => bytes[offset + 4..offset + len].fill(0),
+            "ones" => bytes[offset + 4..offset + len].fill(0xFF),
+            "one bit" => {
+                // Flip a bit that is set: the answer for that edge would change.
+                let at = (offset + 4..offset + len).find(|&i| bytes[i] != 0).unwrap();
+                bytes[at] ^= bytes[at] & bytes[at].wrapping_neg();
+            }
+            _ => {
+                // A shorter length in the directory, the header CRC made good.
+                bytes[entry + 8..entry + 12].copy_from_slice(&((len - 2) as u32).to_le_bytes());
+                let count = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+                let dir_end = 8 + 16 * count;
+                let crc = crc32(&bytes[0..dir_end]);
+                bytes[dir_end..dir_end + 4].copy_from_slice(&crc.to_le_bytes());
+            }
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let db = GraphDb::open(&dir).unwrap();
+        assert!(assert_reader_matches_live(&db) > 0, "{damage}");
+
+        // The audit still reports it (for a truncation the directory CRC no
+        // longer matches the shorter payload as well).
+        let base = core_storage::v8::MappedBase::map(&path).unwrap();
+        let audit = base.verify_integrity();
+        let section = audit.iter().find(|r| r.0 == DERIVED_BITS_ID).unwrap();
+        assert!(
+            section.3.is_err(),
+            "{damage}: verify must report section 17"
+        );
+    }
+}
+
 fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
     std::fs::create_dir_all(to).unwrap();
     for entry in std::fs::read_dir(from).unwrap() {
