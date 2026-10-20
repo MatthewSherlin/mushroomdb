@@ -51,7 +51,17 @@ fn infer_column(rs: &ResultSet, col: usize) -> ColKind {
             kind = observe(kind, v);
         }
     }
+    // A month has no fixed length, so Duration(µs) cannot hold it: one
+    // duration with months makes the whole column canonical ISO 8601 text.
+    if kind == ColKind::Duration && column_has_months(rs, col) {
+        return ColKind::Utf8;
+    }
     kind
+}
+
+fn column_has_months(rs: &ResultSet, col: usize) -> bool {
+    (0..rs.len())
+        .any(|i| matches!(&rs.row(i)[col], Some(Value::Duration { months, .. }) if *months != 0))
 }
 
 fn data_type(kind: ColKind) -> DataType {
@@ -78,10 +88,10 @@ const DATETIME_COLUMN_TZ: &str = "+00:00";
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 /// Microseconds of a duration as Arrow `Duration(Microsecond)` holds it.
-/// LOSSY: months lost in Arrow Duration(Microsecond) (a month has no fixed
-/// length), and nanoseconds below one microsecond are truncated. Saturates at
-/// the `i64` bounds rather than wrapping.
-fn duration_micros(_months: i32, days: i32, nanos: i64) -> i64 {
+/// LOSSY: nanoseconds below one microsecond are truncated. Months never reach
+/// here: a column with any month falls back to Utf8 text (see `infer_column`).
+/// Saturates at the `i64` bounds rather than wrapping.
+fn duration_micros(days: i32, nanos: i64) -> i64 {
     i64::from(days)
         .saturating_mul(MICROS_PER_DAY)
         .saturating_add(nanos / 1_000)
@@ -196,11 +206,7 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
             let vals: Vec<Option<i64>> = (0..rs.len())
                 .map(|i| {
                     rs.row(i)[col].as_ref().map(|v| match v {
-                        Value::Duration {
-                            months,
-                            days,
-                            nanos,
-                        } => duration_micros(*months, *days, *nanos),
+                        Value::Duration { days, nanos, .. } => duration_micros(*days, *nanos),
                         other => unreachable!("duration column saw {other:?}"),
                     })
                 })
@@ -236,7 +242,7 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
 /// Format-V11 types: all-Date → Date32; all-LocalDateTime →
 /// Timestamp(µs, no zone); all-DateTime → Timestamp(µs, "+00:00") holding UTC
 /// instants (per-value offsets dropped, lossy); all-Duration →
-/// Duration(µs) (months dropped and sub-µs nanos truncated, lossy);
+/// Duration(µs) (sub-µs nanos truncated, lossy; a column with any month is Utf8 ISO 8601 text);
 /// all-Binary → LargeBinary. A column mixing these with other types falls
 /// back to Utf8 text like any other mixed column.
 pub fn to_record_batch(rs: &ResultSet) -> Result<RecordBatch, String> {
@@ -363,9 +369,9 @@ mod tests {
                 days: 2,
                 nanos: 1_500,
             }),
-            // months are dropped, sub-microsecond nanos truncated
+            // sub-microsecond nanos truncated
             Some(Value::Duration {
-                months: 14,
+                months: 0,
                 days: 0,
                 nanos: 999,
             }),
@@ -391,10 +397,54 @@ mod tests {
         assert!(a.is_null(3));
     }
 
+    fn dur(months: i32, days: i32, nanos: i64) -> Value {
+        Value::Duration {
+            months,
+            days,
+            nanos,
+        }
+    }
+
     #[test]
     fn test_arrow_duration_extremes_saturate() {
-        assert_eq!(duration_micros(0, i32::MAX, i64::MAX), i64::MAX);
-        assert_eq!(duration_micros(0, i32::MIN, i64::MIN), i64::MIN);
+        let b = one_column(vec![
+            Some(dur(0, i32::MAX, i64::MAX)),
+            Some(dur(0, i32::MIN, i64::MIN)),
+        ]);
+        let a = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<DurationMicrosecondArray>()
+            .unwrap();
+        assert_eq!(a.value(0), i64::MAX);
+        assert_eq!(a.value(1), i64::MIN);
+    }
+
+    #[test]
+    fn test_arrow_duration_with_months_is_text() {
+        let b = one_column(vec![Some(dur(1, 0, 0))]);
+        assert_eq!(b.schema().field(0).data_type(), &DataType::Utf8);
+        let a = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(a.value(0), "P1M");
+    }
+
+    #[test]
+    fn test_arrow_month_free_duration_stays_duration() {
+        let b = one_column(vec![Some(dur(0, 2, 0))]);
+        assert_eq!(
+            b.schema().field(0).data_type(),
+            &DataType::Duration(TimeUnit::Microsecond)
+        );
+    }
+
+    #[test]
+    fn test_arrow_one_month_duration_makes_whole_column_text() {
+        let b = one_column(vec![Some(dur(0, 2, 0)), Some(dur(1, 0, 0)), None]);
+        assert_eq!(b.schema().field(0).data_type(), &DataType::Utf8);
+        let a = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(a.value(0), "P2D");
+        assert_eq!(a.value(1), "P1M");
+        assert!(a.is_null(2));
     }
 
     #[test]

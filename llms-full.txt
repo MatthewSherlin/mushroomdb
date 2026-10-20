@@ -5895,6 +5895,18 @@ send `as_of`.
 
 Default response: Arrow IPC stream (`application/vnd.apache.arrow.stream`).
 
+Arrow column types for the date, time and binary value types. A column
+becomes one of these only when every non-null value in it has that type; a
+column that mixes types is Utf8 text.
+
+| Value type | Arrow type | Loss |
+|---|---|---|
+| `Date` | `Date32` | none |
+| `LocalDateTime` | `Timestamp(microsecond)`, no zone | none |
+| `DateTime` | `Timestamp(microsecond, "+00:00")` | Arrow holds one zone per column, so each value is its UTC instant and its own offset is dropped |
+| `Duration` | `Duration(microsecond)` | nanoseconds below one microsecond are truncated; a column with any non-zero month is Utf8 ISO 8601 text instead, because a month has no fixed length |
+| `Binary` | `LargeBinary` | none |
+
 Add `?format=json` for a JSON response:
 
 ```json
