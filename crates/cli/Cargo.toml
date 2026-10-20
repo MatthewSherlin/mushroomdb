@@ -28,14 +28,14 @@ tls = ["server/tls"]
 
 [dependencies]
 # The subscriber lives in the binary. `env-filter` gives MUSHROOMDB_LOG, and
-# `fmt` is the human-readable writer; JSON output is deliberately not wired
-# until someone needs to ship these somewhere that wants it.
+# `fmt` is the human-readable writer; `json` is `MUSHROOMDB_LOG_FORMAT=json`.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "std",
     "fmt",
     "env-filter",
     "ansi",
+    "json",
 ] }
 mushroomdb = { path = "../core-api", version = "0.9.2" }
 code-extract = { package = "mushroomdb-extract", path = "../code-extract", version = "0.9.2" }
