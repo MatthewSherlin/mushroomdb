@@ -104,6 +104,12 @@ fn bool_literal(name: &str) -> Option<bool> {
     }
 }
 
+/// `null` in any case. Like `true` and `false` it is recognised here, not by
+/// the lexer, so `n.null` and a backtick-quoted `` `null` `` key stay names.
+fn is_null_literal(name: &str) -> bool {
+    name.eq_ignore_ascii_case("null")
+}
+
 struct Parser<'a> {
     toks: &'a [Tok],
     pos: usize,
@@ -154,12 +160,17 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `true` and `false` are literals, so neither can name a variable or an
-    /// alias: an expression that mentions the name would read the literal.
+    /// `true`, `false` and `null` are literals, so none can name a variable or
+    /// an alias: an expression that mentions the name would read the literal.
     fn not_reserved(&self, name: &str) -> Result<(), String> {
         if bool_literal(name).is_some() {
             return Err(self.err(&format!(
                 "`{name}` is a boolean literal and cannot name a variable or an alias"
+            )));
+        }
+        if is_null_literal(name) {
+            return Err(self.err(&format!(
+                "`{name}` is the null literal and cannot name a variable or an alias"
             )));
         }
         Ok(())
@@ -178,8 +189,15 @@ impl<'a> Parser<'a> {
         while self.peek() == Some(&Tok::Match) {
             matches.extend(self.match_clause()?);
         }
-        if matches.is_empty() {
-            return Err(self.err("expected MATCH"));
+        // A query may also open with UNWIND, WITH or RETURN; it then reads
+        // nothing from the graph and runs against one empty row.
+        if matches.is_empty()
+            && !matches!(
+                self.peek(),
+                Some(Tok::Unwind) | Some(Tok::With) | Some(Tok::Return)
+            )
+        {
+            return Err(self.err("expected MATCH, UNWIND, WITH or RETURN"));
         }
         // Optional WHERE clause that follows the required MATCH(es) — may come
         // before or after OPTIONAL MATCH.  In standard Cypher, WHERE applies to
@@ -400,6 +418,10 @@ impl<'a> Parser<'a> {
                 Operand::Lit(Value::List(vals)) => Ok(UnwindExpr::Lit(vals)),
                 other => Ok(UnwindExpr::Expr(other)),
             },
+            Some(Tok::Ident(n)) if is_null_literal(n) => {
+                self.pos += 1;
+                Ok(UnwindExpr::Expr(Operand::Lit(Value::Null)))
+            }
             Some(Tok::Ident(_)) => {
                 let name = self.ident("expected variable or property in UNWIND")?;
                 if self.eat(&Tok::Dot) {
@@ -1110,6 +1132,10 @@ impl<'a> Parser<'a> {
                     Ok(Operand::Prop { var: name, field })
                 } else if let Some(b) = bool_literal(&name) {
                     Ok(Operand::Lit(Value::Bool(b)))
+                } else if is_null_literal(&name) {
+                    // Evaluates to query null; inside a list or map it is kept
+                    // as a `Value::Null` element.
+                    Ok(Operand::Lit(Value::Null))
                 } else {
                     // Bare variable reference (e.g. alias name in WITH … WHERE c > 2).
                     Ok(Operand::Var(name))
@@ -1469,7 +1495,14 @@ impl<'a> Parser<'a> {
                 let mut items = Vec::new();
                 if !self.eat(&Tok::RBracket) {
                     loop {
-                        items.push(self.literal_value(what)?);
+                        // A null element parses so the write path can refuse
+                        // it by name; a top-level `null` keeps the error below.
+                        if matches!(self.peek(), Some(Tok::Ident(n)) if is_null_literal(n)) {
+                            self.pos += 1;
+                            items.push(Value::Null);
+                        } else {
+                            items.push(self.literal_value(what)?);
+                        }
                         if self.eat(&Tok::Comma) {
                             continue;
                         }

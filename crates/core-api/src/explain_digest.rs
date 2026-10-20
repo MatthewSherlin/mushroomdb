@@ -72,6 +72,7 @@ fn value_to_json(v: &Value) -> Js {
             .ok()
             .flatten()
             .unwrap_or(Js::Null),
+        Value::Null => Js::Null,
     }
 }
 
@@ -276,6 +277,7 @@ fn scalar_token(v: &Value) -> Option<(u8, String)> {
         Value::DateTime { micros_utc, .. } => Some((6, micros_utc.to_string())),
         Value::Binary(bytes) => Some((7, core_storage::types::base64_encode(bytes))),
         Value::Duration { .. } => None,
+        Value::Null => None,
     }
 }
 

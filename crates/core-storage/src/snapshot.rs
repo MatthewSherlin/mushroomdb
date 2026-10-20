@@ -295,7 +295,7 @@ pub fn encode_v7(state: &SnapshotState) -> Result<Vec<u8>> {
     let mut topo = Vec::new();
     state.topo.pack(&mut topo);
     let mut props = Vec::new();
-    state.props.pack(&mut props);
+    state.props.pack(&mut props)?;
     let meta = V7Meta {
         ids: state.ids.clone(),
         syms: state.syms.clone(),

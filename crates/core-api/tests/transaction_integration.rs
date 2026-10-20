@@ -784,3 +784,52 @@ fn transaction_is_owned_and_send() {
     let reopened = GraphDb::open(&dir).unwrap();
     assert!(reopened.node_info("moved").is_some());
 }
+
+/// QL-17: a transaction cannot persist a null inside a list or map property.
+/// Whether the statement or the commit refuses it, nothing reaches the WAL,
+/// and the clean statement buffered beside it is not written either.
+#[test]
+fn a_transaction_never_persists_a_null_property_value() {
+    let dir = tmp("null");
+    let db = SharedDb::open(&dir).unwrap();
+    db.submit_batch(vec![node("a")]).unwrap();
+    let wal = || std::fs::metadata(dir.join("wal.bin")).map_or(0, |m| m.len());
+    let before = wal();
+    let null_list = Value::List(vec![Value::Int(1), Value::Null]);
+
+    for (cypher, params) in [
+        ("CREATE (:P {id: 'b', p: [1, null]})", p()),
+        ("MATCH (n:P) WHERE n.id = 'a' SET n.p = [n.x, 1]", p()),
+        (
+            "MATCH (n:P) WHERE n.id = 'a' SET n.p = $l",
+            BTreeMap::from([("l".to_string(), null_list.clone())]),
+        ),
+    ] {
+        let mut tx = db.begin_transaction();
+        tx.execute("MATCH (n:P) WHERE n.id = 'a' SET n.ok = 1", &p())
+            .unwrap();
+        let refused = match tx.execute(cypher, &params) {
+            Err(e) => e,
+            Ok(_) => tx.commit().expect_err("a null property is never committed"),
+        };
+        assert!(
+            refused
+                .to_string()
+                .contains("a property value cannot contain null"),
+            "{cypher}: {refused}"
+        );
+        assert_eq!(wal(), before, "{cypher}: the WAL moved");
+    }
+    let check = |db: &SharedDb| {
+        let rs = db
+            .read()
+            .query("MATCH (n:P) RETURN n.id AS k, n.p AS p, n.ok AS ok", &p())
+            .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs.get(0, "p"), None);
+        assert_eq!(rs.get(0, "ok"), None);
+    };
+    check(&db);
+    drop(db);
+    check(&SharedDb::open(&dir).unwrap());
+}

@@ -820,3 +820,13 @@ def test_what_if_set_prop_previews_without_writing(tmp_path):
     with pytest.raises(RuntimeError, match="not found"):
         db.what_if_set_prop("nope", "team", "red")
     db.close()
+
+
+# ── QL-17: null inside a list or map, queries without MATCH ──────────────────
+
+def test_null_list_element_is_none(tmp_path):
+    """A null element comes back as None, inside the list it belongs to."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    rows = db.query("RETURN [1, null] AS l, {a: null, b: 1} AS m, null AS v")
+    assert rows == [{"l": [1, None], "m": {"a": None, "b": 1}, "v": None}]
+    db.close()

@@ -192,7 +192,9 @@ async fn run(mut socket: WebSocket, state: AppState) {
         tokio::select! {
             ev = event_rx.recv() => {
                 let Some(ev) = ev else { break; }; // bridge thread exited
-                let text = serde_json::to_string(&ev).expect("DbEvent is always serializable");
+                // An event that cannot be serialised is logged and dropped; it
+                // never takes the connection (or the server task) down.
+                let Some(text) = event_text(&ev) else { continue; };
                 if socket.send(Message::Text(text.into())).await.is_err() {
                     break;
                 }
@@ -208,6 +210,17 @@ async fn run(mut socket: WebSocket, state: AppState) {
         }
     }
     // Dropping event_rx causes blocking_send in bridge_loop to fail → thread exits.
+}
+
+/// The JSON text frame for `ev`, or `None` (logged) if it cannot be serialised.
+fn event_text(ev: &DbEvent) -> Option<String> {
+    match serde_json::to_string(ev) {
+        Ok(text) => Some(text),
+        Err(e) => {
+            tracing::error!(error = %e, "subscribe: dropping an event that failed to serialise");
+            None
+        }
+    }
 }
 
 /// Runs in a dedicated blocking thread (one per WS connection).
@@ -259,6 +272,21 @@ fn bridge_loop(subs: Vec<Subscription>, tx: tokio::sync::mpsc::Sender<DbEvent>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mushroomdb::Value;
+
+    #[test]
+    fn a_query_row_with_a_null_element_serialises() {
+        let ev = DbEvent::QueryRowAdded {
+            columns: vec!["l".into()],
+            row: vec![Some(Value::List(vec![Value::Int(9), Value::Null])), None],
+        };
+        let text = event_text(&ev).expect("a null element serialises");
+        let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            j["row"],
+            serde_json::json!([{"List": [{"Int": 9}, "Null"]}, null])
+        );
+    }
 
     #[test]
     fn lagged_event_serializes_to_type_tagged_json() {

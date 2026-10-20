@@ -90,6 +90,8 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             .ok()
             .flatten()
             .unwrap_or(serde_json::Value::Null),
+        // Never stored, so an export never meets one; render it as JSON null.
+        Value::Null => serde_json::Value::Null,
     }
 }
 
@@ -342,6 +344,7 @@ fn value_gml_type(v: &Value) -> GmlType {
         | Value::DateTime { .. }
         | Value::Duration { .. }
         | Value::Binary(_) => GmlType::String,
+        Value::Null => GmlType::String,
     }
 }
 

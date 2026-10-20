@@ -36,6 +36,7 @@ fn fmt_value(v: &Value) -> String {
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
+        Value::Null => "null".to_string(),
         // Dates, times, durations and binary print as their ISO 8601 or
         // base64 text.
         other => mushroomdb::v11_display_text(other).unwrap_or_default(),

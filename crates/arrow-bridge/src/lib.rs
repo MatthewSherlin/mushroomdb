@@ -44,10 +44,18 @@ fn observe(kind: ColKind, v: &Value) -> ColKind {
     }
 }
 
+/// The value in row `i`, column `col`; a `Value::Null` cell (query-only; a
+/// result normally carries a null cell as `None`) is an Arrow null too.
+fn cell_at(rs: &ResultSet, i: usize, col: usize) -> Option<&Value> {
+    rs.row(i)[col]
+        .as_ref()
+        .filter(|v| !matches!(v, Value::Null))
+}
+
 fn infer_column(rs: &ResultSet, col: usize) -> ColKind {
     let mut kind = ColKind::Empty;
     for i in 0..rs.len() {
-        if let Some(v) = &rs.row(i)[col] {
+        if let Some(v) = cell_at(rs, i, col) {
             kind = observe(kind, v);
         }
     }
@@ -128,6 +136,8 @@ fn canonical_display(v: &Value) -> String {
         | Value::DateTime { .. }
         | Value::Duration { .. }
         | Value::Binary(_) => core_query::v11_display_text(v).unwrap_or_default(),
+        // A null list element or map value (a top-level null is a null cell).
+        Value::Null => "null".to_string(),
     }
 }
 
@@ -144,7 +154,7 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
         ColKind::Int => {
             let vals: Vec<Option<i64>> = (0..rs.len())
                 .map(|i| {
-                    rs.row(i)[col].as_ref().map(|v| match v {
+                    cell_at(rs, i, col).map(|v| match v {
                         Value::Int(n) => *n,
                         other => unreachable!("int column saw {other:?}"),
                     })
@@ -154,14 +164,14 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
         }
         ColKind::Float => {
             let vals: Vec<Option<f64>> = (0..rs.len())
-                .map(|i| rs.row(i)[col].as_ref().map(as_f64))
+                .map(|i| cell_at(rs, i, col).map(as_f64))
                 .collect();
             Arc::new(Float64Array::from(vals))
         }
         ColKind::Bool => {
             let vals: Vec<Option<bool>> = (0..rs.len())
                 .map(|i| {
-                    rs.row(i)[col].as_ref().map(|v| match v {
+                    cell_at(rs, i, col).map(|v| match v {
                         Value::Bool(b) => *b,
                         other => unreachable!("bool column saw {other:?}"),
                     })
@@ -172,7 +182,7 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
         ColKind::Date => {
             let vals: Vec<Option<i32>> = (0..rs.len())
                 .map(|i| {
-                    rs.row(i)[col].as_ref().map(|v| match v {
+                    cell_at(rs, i, col).map(|v| match v {
                         Value::Date(d) => *d,
                         other => unreachable!("date column saw {other:?}"),
                     })
@@ -183,7 +193,7 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
         ColKind::LocalDateTime => {
             let vals: Vec<Option<i64>> = (0..rs.len())
                 .map(|i| {
-                    rs.row(i)[col].as_ref().map(|v| match v {
+                    cell_at(rs, i, col).map(|v| match v {
                         Value::LocalDateTime(us) => *us,
                         other => unreachable!("local datetime column saw {other:?}"),
                     })
@@ -194,7 +204,7 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
         ColKind::DateTime => {
             let vals: Vec<Option<i64>> = (0..rs.len())
                 .map(|i| {
-                    rs.row(i)[col].as_ref().map(|v| match v {
+                    cell_at(rs, i, col).map(|v| match v {
                         Value::DateTime { micros_utc, .. } => *micros_utc,
                         other => unreachable!("datetime column saw {other:?}"),
                     })
@@ -205,7 +215,7 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
         ColKind::Duration => {
             let vals: Vec<Option<i64>> = (0..rs.len())
                 .map(|i| {
-                    rs.row(i)[col].as_ref().map(|v| match v {
+                    cell_at(rs, i, col).map(|v| match v {
                         Value::Duration { days, nanos, .. } => duration_micros(*days, *nanos),
                         other => unreachable!("duration column saw {other:?}"),
                     })
@@ -216,7 +226,7 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
         ColKind::Binary => {
             let vals: Vec<Option<&[u8]>> = (0..rs.len())
                 .map(|i| {
-                    rs.row(i)[col].as_ref().map(|v| match v {
+                    cell_at(rs, i, col).map(|v| match v {
                         Value::Binary(b) => b.as_slice(),
                         other => unreachable!("binary column saw {other:?}"),
                     })
@@ -226,7 +236,7 @@ fn build_column(rs: &ResultSet, col: usize, kind: ColKind) -> ArrayRef {
         }
         ColKind::Empty | ColKind::Str | ColKind::Utf8 => {
             let vals: Vec<Option<String>> = (0..rs.len())
-                .map(|i| rs.row(i)[col].as_ref().map(canonical_display))
+                .map(|i| cell_at(rs, i, col).map(canonical_display))
                 .collect();
             Arc::new(StringArray::from(vals))
         }
