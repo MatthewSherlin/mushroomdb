@@ -20,6 +20,13 @@ type Db = CoreDb<RealFs>;
 
 struct Inner(Mutex<Option<Db>>);
 
+/// What `upsert_node` did, decided under the store lock and reported after it.
+enum Upsert {
+    Inserted,
+    Updated,
+    WrongLabel(String),
+}
+
 #[pyclass(name = "GraphDb")]
 struct GraphDb {
     /// The store, shared with every handle `scoped()` produced from this one.
@@ -219,27 +226,38 @@ impl GraphDb {
         // The guard has to come first, exactly as `create_rule`'s does.
         self.refuse_if_scoped()?;
         let mapped = dict_to_props(&props)?;
-        let existing = self.with_ref(|db| Ok(db.node_info(key)))?;
-        let Some(info) = existing else {
-            self.with_mut(|db| db.insert_node(label, key, mapped))?;
-            return Ok("inserted".to_string());
-        };
-        if info.label != label {
-            return Err(PyValueError::new_err(format!(
-                "upsert_node: node '{key}' already exists with label '{}', not '{label}'; \
-                 delete and re-insert to change a node's label",
-                info.label
-            )));
-        }
-        let mut to_set: Vec<(String, Value)> = Vec::new();
-        for (field, value) in mapped {
-            if info.props.get(&field) == Some(&value) {
-                continue; // unchanged: no WAL record, no rule re-fire
+        // The existence read and the write share one lock acquisition. They
+        // used to take two, which was safe only while every write held the GIL;
+        // with the GIL released around writes, two upserts of one key could
+        // both read "absent" and the second insert would raise `DuplicateKey`.
+        // A label mismatch is returned as a value, not an error, so it can be
+        // raised as `ValueError` after the lock is released.
+        let outcome = self.with_mut(|db| {
+            let Some(info) = db.node_info(key) else {
+                db.insert_node(label, key, mapped)?;
+                return Ok(Upsert::Inserted);
+            };
+            if info.label != label {
+                return Ok(Upsert::WrongLabel(info.label));
             }
-            to_set.push((field, value));
+            let mut to_set: Vec<(String, Value)> = Vec::new();
+            for (field, value) in mapped {
+                if info.props.get(&field) == Some(&value) {
+                    continue; // unchanged: no WAL record, no rule re-fire
+                }
+                to_set.push((field, value));
+            }
+            db.set_props(key, to_set)?;
+            Ok(Upsert::Updated)
+        })?;
+        match outcome {
+            Upsert::Inserted => Ok("inserted".to_string()),
+            Upsert::Updated => Ok("updated".to_string()),
+            Upsert::WrongLabel(stored) => Err(PyValueError::new_err(format!(
+                "upsert_node: node '{key}' already exists with label '{stored}', not '{label}'; \
+                 delete and re-insert to change a node's label"
+            ))),
         }
-        self.with_mut(|db| db.set_props(key, to_set))?;
-        Ok("updated".to_string())
     }
 
     /// Insert a user-owned edge.  Returns `True` if it was newly written,
@@ -2627,7 +2645,8 @@ impl GraphDb {
     /// refusal, and it uses [`GraphDb::with_mut_unscoped`] directly.
     fn with_mut<T, F>(&self, f: F) -> PyResult<T>
     where
-        F: FnOnce(&mut Db) -> core_api::Result<T>,
+        T: Send,
+        F: FnOnce(&mut Db) -> core_api::Result<T> + Send,
     {
         self.refuse_if_scoped()?;
         self.with_mut_unscoped(f)
@@ -2635,18 +2654,25 @@ impl GraphDb {
 
     fn with_mut_unscoped<T, F>(&self, f: F) -> PyResult<T>
     where
-        F: FnOnce(&mut Db) -> core_api::Result<T>,
+        T: Send,
+        F: FnOnce(&mut Db) -> core_api::Result<T> + Send,
     {
-        let mut guard = lock(&self.inner.0)?;
-        let out = {
-            let db = guard
-                .as_mut()
-                .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-            f(db)
-        };
-        // Release the store before `graph_err`, which takes the GIL. See
+        // The GIL is released for the whole lock-and-write, so another Python
+        // thread runs during the WAL fsync. `f` holds no Python objects (it is
+        // `Send`), and the store guard is dropped before `graph_err` retakes the
+        // GIL, so the order is always GIL -> store, never store -> GIL. See
         // [`GraphDb::with_scope`] for the inversion that rule prevents.
-        drop(guard);
+        let out = Python::attach(|py| {
+            py.detach(|| {
+                let mut guard = lock(&self.inner.0)?;
+                let db = guard
+                    .as_mut()
+                    .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
+                let out = f(db);
+                drop(guard);
+                Ok::<_, PyErr>(out)
+            })
+        })?;
         out.map_err(graph_err)
     }
 
@@ -2688,18 +2714,22 @@ impl GraphDb {
 
     fn with_ref<T, F>(&self, f: F) -> PyResult<T>
     where
-        F: FnOnce(&Db) -> core_api::Result<T>,
+        T: Send,
+        F: FnOnce(&Db) -> core_api::Result<T> + Send,
     {
-        let guard = lock(&self.inner.0)?;
-        let out = {
-            let db = guard
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-            f(db)
-        };
-        // Release the store before `graph_err`, which takes the GIL. See
-        // [`GraphDb::with_scope`] for the inversion that rule prevents.
-        drop(guard);
+        // Released like `with_mut_unscoped`, so a read waiting for the store
+        // while a writer fsyncs does not hold the GIL against everyone else.
+        let out = Python::attach(|py| {
+            py.detach(|| {
+                let guard = lock(&self.inner.0)?;
+                let db = guard
+                    .as_ref()
+                    .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
+                let out = f(db);
+                drop(guard);
+                Ok::<_, PyErr>(out)
+            })
+        })?;
         out.map_err(graph_err)
     }
 
@@ -2750,19 +2780,25 @@ impl GraphDb {
 
     fn with_scope<T, F>(&self, f: F) -> PyResult<T>
     where
-        F: FnOnce(&Db, Option<&NodeMask>) -> core_api::Result<T>,
+        T: Send,
+        F: FnOnce(&Db, Option<&NodeMask>) -> core_api::Result<T> + Send,
     {
-        let guard = lock(&self.inner.0)?;
-        let out = {
-            let db = guard
-                .as_ref()
-                .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
-            match &self.scope {
-                Some(scope) => scope.resolve(db).and_then(|mask| f(db, Some(&mask))),
-                None => f(db, None),
-            }
-        };
-        drop(guard);
+        // GIL released across the lock and the read, like `with_ref`; the
+        // guard is dropped before `graph_err` retakes it.
+        let out = Python::attach(|py| {
+            py.detach(|| {
+                let guard = lock(&self.inner.0)?;
+                let db = guard
+                    .as_ref()
+                    .ok_or_else(|| PyRuntimeError::new_err("GraphDb is closed"))?;
+                let out = match &self.scope {
+                    Some(scope) => scope.resolve(db).and_then(|mask| f(db, Some(&mask))),
+                    None => f(db, None),
+                };
+                drop(guard);
+                Ok::<_, PyErr>(out)
+            })
+        })?;
         out.map_err(graph_err)
     }
 
