@@ -1703,6 +1703,15 @@ const SCALAR_FUNCS: &[&str] = &[
     "key",
     "id",
     "labels",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "replace",
+    "split",
+    "left",
+    "right",
+    "substring",
+    "reverse",
 ];
 
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
@@ -2046,11 +2055,121 @@ fn eval_func(
                 }
             }
         }
+        "trim" | "ltrim" | "rtrim" | "replace" | "split" | "left" | "right" | "substring"
+        | "reverse" => eval_string_scalar(&norm, name, args, view, vars, row, params),
         _ => Err(format!(
             "unknown function `{name}`; supported: {}",
             SCALAR_FUNCS.join(", ")
         )),
     }
+}
+
+/// Resolve a function's arguments, checking the arity range. The caller
+/// applies null / type-mismatch → null.
+fn resolve_fn_args(
+    name: &str,
+    args: &[Operand],
+    arity: std::ops::RangeInclusive<usize>,
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Vec<Option<Value>>, String> {
+    if !arity.contains(&args.len()) {
+        let want = if arity.start() == arity.end() {
+            format!("exactly {}", arity.start())
+        } else {
+            format!("{} to {}", arity.start(), arity.end())
+        };
+        return Err(format!(
+            "{name}() requires {want} argument(s), got {}",
+            args.len()
+        ));
+    }
+    args.iter()
+        .map(|a| resolve_operand(view, vars, row, a, params))
+        .collect()
+}
+
+/// String functions that only take a string; anything else is null.
+fn string_arg(v: &Option<Value>) -> Option<&str> {
+    match v {
+        Some(Value::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// A non-negative integer argument; negative, null or non-integer is null.
+fn count_arg(v: &Option<Value>) -> Option<usize> {
+    match v {
+        Some(Value::Int(n)) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    }
+}
+
+/// String functions (QL-03a). Null in → null out; an argument of the wrong
+/// type or out of range → null, never an error. Only a wrong argument count
+/// is an error.
+fn eval_string_scalar(
+    norm: &str,
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    let arity = match norm {
+        "trim" | "ltrim" | "rtrim" | "reverse" => 1..=1,
+        "substring" => 2..=3,
+        "replace" => 3..=3,
+        _ => 2..=2, // split, left, right
+    };
+    let a = resolve_fn_args(name, args, arity, view, vars, row, params)?;
+    Ok(match norm {
+        "trim" => string_arg(&a[0]).map(|s| Value::Str(s.trim().to_owned())),
+        "ltrim" => string_arg(&a[0]).map(|s| Value::Str(s.trim_start().to_owned())),
+        "rtrim" => string_arg(&a[0]).map(|s| Value::Str(s.trim_end().to_owned())),
+        "replace" => match (string_arg(&a[0]), string_arg(&a[1]), string_arg(&a[2])) {
+            (Some(s), Some(from), Some(to)) => Some(Value::Str(s.replace(from, to))),
+            _ => None,
+        },
+        "split" => match (string_arg(&a[0]), string_arg(&a[1])) {
+            (Some(s), Some("")) => Some(Value::List(
+                s.chars().map(|c| Value::Str(c.to_string())).collect(),
+            )),
+            (Some(s), Some(d)) => Some(Value::List(
+                s.split(d).map(|p| Value::Str(p.to_owned())).collect(),
+            )),
+            _ => None,
+        },
+        "left" => match (string_arg(&a[0]), count_arg(&a[1])) {
+            (Some(s), Some(n)) => Some(Value::Str(s.chars().take(n).collect())),
+            _ => None,
+        },
+        "right" => match (string_arg(&a[0]), count_arg(&a[1])) {
+            (Some(s), Some(n)) => {
+                let skip = s.chars().count().saturating_sub(n);
+                Some(Value::Str(s.chars().skip(skip).collect()))
+            }
+            _ => None,
+        },
+        "substring" => match (string_arg(&a[0]), count_arg(&a[1])) {
+            (Some(s), Some(start)) if start <= s.chars().count() => match a.get(2) {
+                None => Some(Value::Str(s.chars().skip(start).collect())),
+                Some(l) => {
+                    count_arg(l).map(|n| Value::Str(s.chars().skip(start).take(n).collect()))
+                }
+            },
+            _ => None,
+        },
+        "reverse" => match &a[0] {
+            Some(Value::Str(s)) => Some(Value::Str(s.chars().rev().collect())),
+            Some(Value::List(items)) => Some(Value::List(items.iter().rev().cloned().collect())),
+            _ => None,
+        },
+        _ => return Err(format!("unknown string function `{name}`")),
+    })
 }
 
 fn resolve_operand(
@@ -9010,5 +9129,127 @@ LIMIT 10";
                 vec![Some(s("a2")), Some(s("b1"))],
             ]
         );
+    }
+
+    /// There is no null or list literal in the grammar: `n.nope` is a null
+    /// (missing property) and `$l` is the list [1, 2, 3].
+    fn eval_params() -> BTreeMap<String, Value> {
+        BTreeMap::from([(
+            "l".to_string(),
+            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+        )])
+    }
+
+    /// Evaluate one expression through the full lex/parse/plan/execute path.
+    fn eval(expr: &str) -> Option<Value> {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]);
+        let rs = run(
+            &fx.view(),
+            &format!("MATCH (n:N) RETURN {expr} AS r"),
+            &eval_params(),
+        )
+        .unwrap_or_else(|e| panic!("`{expr}` failed: {e}"));
+        rs.get(0, "r").cloned()
+    }
+
+    fn eval_err(expr: &str) -> String {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]);
+        run(
+            &fx.view(),
+            &format!("MATCH (n:N) RETURN {expr} AS r"),
+            &eval_params(),
+        )
+        .expect_err("must fail")
+    }
+
+    #[test]
+    fn ql03a_string_functions_values() {
+        assert_eq!(eval("trim(\"  hi  \")"), Some(s("hi")));
+        assert_eq!(eval("ltrim(\"  hi\")"), Some(s("hi")));
+        assert_eq!(eval("rtrim(\"hi  \")"), Some(s("hi")));
+        assert_eq!(eval("ltrim(\"  hi  \")"), Some(s("hi  ")));
+        assert_eq!(eval("rtrim(\"  hi  \")"), Some(s("  hi")));
+        assert_eq!(eval("replace(\"abcabc\", \"b\", \"X\")"), Some(s("aXcaXc")));
+        assert_eq!(
+            eval("split(\"a,b,c\", \",\")"),
+            Some(Value::List(vec![s("a"), s("b"), s("c")]))
+        );
+        assert_eq!(
+            eval("split(\"a,b\", \",\")"),
+            Some(Value::List(vec![s("a"), s("b")]))
+        );
+        assert_eq!(
+            eval("split(\"abc\", \"\")"),
+            Some(Value::List(vec![s("a"), s("b"), s("c")]))
+        );
+        assert_eq!(eval("left(\"hello\", 3)"), Some(s("hel")));
+        assert_eq!(eval("left(\"hi\", 9)"), Some(s("hi")));
+        assert_eq!(eval("right(\"hello\", 3)"), Some(s("llo")));
+        assert_eq!(eval("right(\"hi\", 9)"), Some(s("hi")));
+        assert_eq!(eval("substring(\"hello\", 1, 3)"), Some(s("ell")));
+        assert_eq!(eval("substring(\"hello\", 1)"), Some(s("ello")));
+        assert_eq!(eval("substring(\"hello\", 5)"), Some(s("")));
+        assert_eq!(eval("substring(\"hello\", 3, 99)"), Some(s("lo")));
+        assert_eq!(eval("reverse(\"abc\")"), Some(s("cba")));
+        assert_eq!(
+            eval("reverse($l)"),
+            Some(Value::List(vec![
+                Value::Int(3),
+                Value::Int(2),
+                Value::Int(1)
+            ]))
+        );
+    }
+
+    #[test]
+    fn ql03a_string_functions_null_and_type_mismatch_are_null() {
+        for f in ["trim", "ltrim", "rtrim", "reverse"] {
+            assert_eq!(eval(&format!("{f}(n.nope)")), None, "{f}(n.nope)");
+        }
+        assert_eq!(eval("trim(42)"), None);
+        assert_eq!(eval("ltrim(42)"), None);
+        assert_eq!(eval("rtrim(42)"), None);
+        assert_eq!(eval("reverse(42)"), None);
+        assert_eq!(eval("replace(n.nope, \"a\", \"b\")"), None);
+        assert_eq!(eval("replace(42, \"a\", \"b\")"), None);
+        assert_eq!(eval("replace(\"a\", 1, \"b\")"), None);
+        assert_eq!(eval("split(n.nope, \",\")"), None);
+        assert_eq!(eval("split(42, \",\")"), None);
+        assert_eq!(eval("split(\"a\", 1)"), None);
+        assert_eq!(eval("left(n.nope, 1)"), None);
+        assert_eq!(eval("left(42, 1)"), None);
+        assert_eq!(eval("left(\"x\", -1)"), None);
+        assert_eq!(eval("left(\"x\", \"1\")"), None);
+        assert_eq!(eval("right(n.nope, 1)"), None);
+        assert_eq!(eval("right(42, 1)"), None);
+        assert_eq!(eval("right(\"x\", -1)"), None);
+        assert_eq!(eval("substring(n.nope, 1)"), None);
+        assert_eq!(eval("substring(42, 1)"), None);
+        assert_eq!(eval("substring(\"x\", 5, 1)"), None);
+        assert_eq!(eval("substring(\"x\", -1)"), None);
+        assert_eq!(eval("substring(\"x\", 0, -1)"), None);
+        assert_eq!(eval("substring(\"x\", 0, n.nope)"), None);
+    }
+
+    #[test]
+    fn ql03a_string_functions_wrong_arity_errors_and_are_listed() {
+        assert!(eval_err("trim()").contains("trim() requires"));
+        assert!(eval_err("left(\"a\")").contains("left() requires"));
+        let unknown = eval_err("nosuchfn(1)");
+        for f in [
+            "trim",
+            "ltrim",
+            "rtrim",
+            "replace",
+            "split",
+            "left",
+            "right",
+            "substring",
+            "reverse",
+        ] {
+            assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
+        }
     }
 }
