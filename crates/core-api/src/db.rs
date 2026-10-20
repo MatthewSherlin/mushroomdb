@@ -3164,23 +3164,33 @@ impl<F: Fs> GraphDb<F> {
     /// the handle must be reopened. Nothing on disk was damaged — the store
     /// itself is fine, and a fresh open recovers it.
     pub fn refresh(&mut self) -> Result<u64> {
+        self.refresh_checking(false)
+    }
+
+    /// [`refresh`](GraphDb::refresh), with `before_append` set when a write
+    /// scope is about to append at this handle's cursor.
+    ///
+    /// The case the WAL file's identity catches: the file was replaced while
+    /// the snapshot this handle already saw stayed — it reloaded while another
+    /// process was between writing its snapshot and replacing the WAL. Its
+    /// cursor describes the old file. A tail read at that offset in the new
+    /// one would apply frames that are not the next ones; an append there
+    /// would write frames encoded against the wrong state, and the store would
+    /// no longer open.
+    ///
+    /// A read follows a tail only when the WAL is longer than the cursor, so a
+    /// read-only refresh checks the identity only then. An append happens at
+    /// any length — a replacement of exactly the cursor's length included,
+    /// which no length check can see — so before an append it is always
+    /// checked: one stat per cross-process write scope.
+    fn refresh_checking(&mut self, before_append: bool) -> Result<u64> {
         if self.pinned {
             return Ok(0);
         }
         let disk_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
         let wal_len = self.fs.wal_len().map_err(GraphError::Io)?;
-        // A tail is about to be read only when the WAL is longer than the
-        // cursor; only then can a replaced file be mistaken for this one, so
-        // only then is its identity checked. A write scope on a store nobody
-        // else wrote pays nothing for it.
-        //
-        // The case it catches: the WAL file was replaced while the snapshot
-        // this handle already saw stayed — it reloaded while another process
-        // was between writing its snapshot and replacing the WAL. Its cursor
-        // describes the old file, so a tail read at that offset in the new one
-        // would apply frames that are not the next ones.
         let wal_replaced = || -> Result<bool> {
-            Ok(wal_len > self.wal_consumed
+            Ok((before_append || wal_len > self.wal_consumed)
                 && self.fs.wal_ident().map_err(GraphError::Io)? != self.wal_ident)
         };
         if disk_ident != self.snapshot_ident || wal_len < self.wal_consumed || wal_replaced()? {
@@ -3344,7 +3354,7 @@ impl<F: Fs> GraphDb<F> {
         if !acquired || self.holds_lifetime_lock {
             return Ok(());
         }
-        if let Err(e) = self.refresh() {
+        if let Err(e) = self.refresh_checking(true) {
             // Do not hold a lock we cannot use: release it and let the caller
             // see the underlying failure.
             let _ = self.fs.unlock();

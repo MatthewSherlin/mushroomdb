@@ -319,3 +319,78 @@ fn the_first_append_learns_which_wal_file_it_created() {
     assert!(pos.wal.is_some());
     assert_eq!(pos.wal, mushroomdb::disk_wal_ident(&dir).unwrap());
 }
+
+/// Replace this store's `wal.bin` with the WAL of another store that holds
+/// `keys` under the label `B`, and return the replacement's length. The other
+/// label interns differently, so frames this store's handle encodes against
+/// its own interner do not decode on top of the replacement.
+#[cfg(unix)]
+fn replace_wal_with_another_stores(dir: &Path, name: &str, keys: &[&str]) -> u64 {
+    let other = tmp(name);
+    {
+        let db = SharedDb::open(&other).unwrap();
+        for k in keys {
+            db.write().insert_node("B", k, vec![]).unwrap();
+        }
+    }
+    let copy = dir.join("wal.copy");
+    std::fs::copy(other.join("wal.bin"), &copy).unwrap();
+    std::fs::rename(&copy, dir.join("wal.bin")).unwrap();
+    let _ = std::fs::remove_dir_all(&other);
+    wal_len(dir)
+}
+
+/// A write scope appends at this handle's cursor, so it must not append to a
+/// WAL file that is not the one the cursor describes. When a peer replaced
+/// the WAL with a file of exactly the cursor's length, no length check can
+/// tell; only the file's identity can. Frames appended on top of the wrong
+/// file are encoded against the wrong state, and the store no longer opens.
+#[cfg(unix)]
+#[test]
+fn a_write_after_an_equal_length_wal_replacement_leaves_an_openable_store() {
+    let dir = tmp("waleqwrite");
+    let a = SharedDb::open(&dir).unwrap();
+    a.write().insert_node("A", "a", vec![]).unwrap();
+    let cursor = wal_len(&dir);
+    let replaced = replace_wal_with_another_stores(&dir, "waleqother", &["b"]);
+    assert_eq!(replaced, cursor, "the replacement is the cursor's length");
+    assert_ne!(
+        a.durable_wal_position().wal,
+        mushroomdb::disk_wal_ident(&dir).unwrap()
+    );
+    a.write().insert_node("A", "c", vec![]).unwrap();
+    assert_eq!(
+        a.durable_wal_position().wal,
+        mushroomdb::disk_wal_ident(&dir).unwrap(),
+        "the handle reloaded before writing"
+    );
+    assert_eq!(a.read().node_count(), 2);
+    drop(a);
+    let reopened = SharedDb::open(&dir).expect("the store still opens");
+    assert_eq!(reopened.read().node_count(), 2);
+}
+
+/// The same, with a replacement longer than the cursor.
+#[cfg(unix)]
+#[test]
+fn a_write_after_a_longer_wal_replacement_leaves_an_openable_store() {
+    let dir = tmp("wallongwrite");
+    let a = SharedDb::open(&dir).unwrap();
+    a.write().insert_node("A", "a", vec![]).unwrap();
+    let cursor = wal_len(&dir);
+    let replaced = replace_wal_with_another_stores(&dir, "wallongother", &["b", "d"]);
+    assert!(
+        replaced > cursor,
+        "the replacement is longer than the cursor"
+    );
+    a.write().insert_node("A", "c", vec![]).unwrap();
+    assert_eq!(
+        a.durable_wal_position().wal,
+        mushroomdb::disk_wal_ident(&dir).unwrap(),
+        "the handle reloaded before writing"
+    );
+    assert_eq!(a.read().node_count(), 3);
+    drop(a);
+    let reopened = SharedDb::open(&dir).expect("the store still opens");
+    assert_eq!(reopened.read().node_count(), 3);
+}
