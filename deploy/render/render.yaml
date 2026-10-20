@@ -1,0 +1,40 @@
+# mushroomdb on Render (Blueprint).
+#
+# SINGLE WRITER - replicas must be 1. Keep the instance count at 1: a Render
+# persistent disk attaches to one instance, and a second writer on the same
+# store contends for the write lock. Do not enable autoscaling.
+#
+# Secret values are entered in the Render dashboard (sync: false); none live in
+# this file.
+#
+# VOLUME OWNERSHIP (UNVERIFIED without a real deploy): the image runs as uid
+# 65532, not root, and the server needs /data writable by that uid. A Render
+# disk may mount root-owned, and the image has no shell to chown with. Symptom:
+# serve fails at start - today with the message `store is busy: write lock held`
+# (HO-12b will name the real cause). Action: after the first deploy, check the
+# service logs for that message. No in-image fix or Render setting is known; if
+# it appears, report it so the template can change.
+services:
+  - type: web
+    name: mushroomdb
+    runtime: image
+    image:
+      url: ghcr.io/matthewsherlin/mushroomdb:latest
+    numInstances: 1
+    # Explicit command: no --demo-if-empty, so a production disk is never seeded.
+    dockerCommand: serve /data --addr 0.0.0.0:8080 --snapshot-every 300
+    disk:
+      name: mushroomdb-data
+      mountPath: /data
+      sizeGB: 10
+    # Render probes the port named by PORT; the server binds 8080 (--addr above).
+    healthCheckPath: /ready
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: MUSHROOMDB_TOKEN
+        sync: false
+      - key: MUSHROOMDB_LOG_FORMAT
+        value: json
+      # TODO(HO-14/HO-15): backup and restore-on-boot variables go here once the
+      # backup worker (HO-07) ships. Nothing in this file configures backup yet.

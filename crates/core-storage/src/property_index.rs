@@ -123,6 +123,13 @@ impl PropertyIndex {
         }
     }
 
+    /// Every indexed value of `(label, field)` and the node ids holding it, or
+    /// `None` when nothing is indexed under the pair. Lets a caller probing
+    /// many values look the pair up once instead of once per value.
+    pub fn postings(&self, label: &str, field: &str) -> Option<&BTreeMap<ValueKey, BTreeSet<u32>>> {
+        self.forward.get(&(label.to_string(), field.to_string()))
+    }
+
     /// Node ids of `label` whose `field` equals `value`, ascending. Empty when
     /// the pair is not declared, `value` is non-scalar, or nothing matches.
     pub fn lookup(&self, label: &str, field: &str, value: &Value) -> Vec<u32> {

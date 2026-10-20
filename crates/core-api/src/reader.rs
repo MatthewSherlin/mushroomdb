@@ -747,6 +747,10 @@ fn apply_one(
         // to a correct scan+filter for reader queries.
         | WalRecord::EnableIndex { .. }
         | WalRecord::DisableIndex { .. }
+        // Unique constraints are checked on the write path only; a reader
+        // never writes, so the declarations are no-ops here.
+        | WalRecord::CreateConstraint { .. }
+        | WalRecord::DropConstraint { .. }
         // The opt-in declaration is a writer-side gate; the read path never
         // decides whether to write a record. A *count* is not a no-op and is
         // handled below.

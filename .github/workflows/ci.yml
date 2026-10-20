@@ -35,9 +35,11 @@ jobs:
       - run: cargo test -p mushroomdb-server --features tls --test tls
       - run: cargo clippy -p mushroomdb --all-targets --features mp-test -- -D warnings
       # Tests that need a store in a state no current write path produces —
-      # one 0.8.0 left behind (ledger row 107) — build it through a hook that
-      # exists only behind `test-hooks`, so a plain workspace run skips them.
-      - run: cargo test -p mushroomdb --features test-hooks --test shared_edge_rules
+      # one 0.8.0 left behind (ledger row 107), or one holding format-V11
+      # records before the V11 format lands (unique constraints, 0.10 TY-5) —
+      # build it through a hook that exists only behind `test-hooks`, so a
+      # plain workspace run skips them.
+      - run: cargo test -p mushroomdb --features test-hooks --test shared_edge_rules --test constraints
       # Compile-only: CI runners are too noisy for timing gates.
       - run: cargo bench --no-run
       # The first minute on a new store, against the built binary. Every
@@ -273,6 +275,47 @@ jobs:
           MUSHROOMDB: ${{ github.workspace }}/target/debug/mushroomdb
       - run: .venv/bin/python -m pytest ../../benchmarks/test_harness.py -v -q
       - run: .venv/bin/python -m pytest ../../benchmarks/ci/test_compare.py -v -q
+
+  # The two adapter packages under integrations/ test against the binding built
+  # from this checkout, not the last PyPI release. Runs only when a PR touches
+  # the binding, the engine crates or the adapters.
+  test-integrations:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: gate
+        run: |
+          if git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD \
+              | grep -qE '^(bindings/python/|crates/|integrations/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.gate.outputs.run == 'true'
+        run: |
+          rustup toolchain uninstall 1.92.0 || true
+          rustup toolchain install 1.92.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.92.0
+      - if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - if: steps.gate.outputs.run == 'true'
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -U pip maturin
+          (cd bindings/python && ../../.venv/bin/maturin develop)
+      - if: steps.gate.outputs.run == 'true'
+        run: .venv/bin/pip install -e "integrations/langchain-mushroomdb[test]"
+      - if: steps.gate.outputs.run == 'true'
+        run: .venv/bin/pytest integrations/langchain-mushroomdb/tests/
+      - if: steps.gate.outputs.run == 'true'
+        run: .venv/bin/pip install -e "integrations/llama-index-mushroomdb[test]"
+      - if: steps.gate.outputs.run == 'true'
+        run: .venv/bin/pytest integrations/llama-index-mushroomdb/tests/
 
   embed:
     runs-on: ubuntu-latest

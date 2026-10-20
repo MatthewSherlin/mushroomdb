@@ -1302,6 +1302,20 @@ fn graph_err(e: GraphError) -> Response {
         }
         // Transient: another process holds the cross-process write lock.
         busy @ GraphError::Busy { .. } => busy_response(busy.to_string()),
+        // A unique-constraint clash is a conflict with stored state, like a
+        // duplicate key. The text names the constraint and field only.
+        clash @ GraphError::ConstraintViolation { .. } => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": clash.to_string() })),
+        )
+            .into_response(),
+        // A value over the store's size limit: the request is too large for
+        // what it stores, not malformed.
+        big @ GraphError::ValueTooLarge { .. } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({ "error": big.to_string() })),
+        )
+            .into_response(),
         other => err_response(other.to_string()),
     }
 }

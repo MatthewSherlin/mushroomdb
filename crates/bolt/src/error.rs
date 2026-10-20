@@ -118,8 +118,6 @@ const CONFLICT_MESSAGE: &str =
 /// The mapping is exhaustive on purpose: a new `GraphError` variant must fail
 /// to compile here until someone decides its class.
 ///
-/// `ConstraintViolation` (from the constraints work) does not exist on this
-/// base; when it lands, its arm is `ConstraintValidation`.
 impl From<GraphError> for BoltError {
     fn from(err: GraphError) -> Self {
         match err {
@@ -135,7 +133,10 @@ impl From<GraphError> for BoltError {
             GraphError::QueryError { .. } => BoltError::SyntaxError(err.to_string()),
             GraphError::DuplicateKey { .. }
             | GraphError::NamespaceImmutable { .. }
-            | GraphError::CrossNamespace { .. } => BoltError::ConstraintValidation(err.to_string()),
+            | GraphError::CrossNamespace { .. }
+            | GraphError::ConstraintViolation { .. } => {
+                BoltError::ConstraintValidation(err.to_string())
+            }
             GraphError::RoleWriteDenied { .. }
             | GraphError::ReadOnly
             | GraphError::MaskedReadOnly => BoltError::Forbidden(err.to_string()),
@@ -148,7 +149,9 @@ impl From<GraphError> for BoltError {
             | GraphError::ViewPropReadOnly { .. }
             | GraphError::CommitTimeNotMonotonic { .. }
             | GraphError::NoRecordedTime
-            | GraphError::TimeBeforeFloor { .. } => BoltError::Invalid(err.to_string()),
+            | GraphError::TimeBeforeFloor { .. }
+            | GraphError::ConstraintCreationConflict { .. }
+            | GraphError::ValueTooLarge { .. } => BoltError::Invalid(err.to_string()),
         }
     }
 }
@@ -166,6 +169,7 @@ impl BoltError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mushroomdb::Value;
 
     const CLIENT_ERROR: &str = "Neo.ClientError";
     const TRANSIENT_ERROR: &str = "Neo.TransientError";
@@ -182,7 +186,8 @@ mod tests {
             GraphError::QueryError { .. } => "Neo.ClientError.Statement.SyntaxError",
             GraphError::DuplicateKey { .. }
             | GraphError::NamespaceImmutable { .. }
-            | GraphError::CrossNamespace { .. } => {
+            | GraphError::CrossNamespace { .. }
+            | GraphError::ConstraintViolation { .. } => {
                 "Neo.ClientError.Schema.ConstraintValidationFailed"
             }
             GraphError::RoleWriteDenied { .. }
@@ -197,7 +202,9 @@ mod tests {
             | GraphError::ViewPropReadOnly { .. }
             | GraphError::CommitTimeNotMonotonic { .. }
             | GraphError::NoRecordedTime
-            | GraphError::TimeBeforeFloor { .. } => "Neo.ClientError.Request.Invalid",
+            | GraphError::TimeBeforeFloor { .. }
+            | GraphError::ConstraintCreationConflict { .. }
+            | GraphError::ValueTooLarge { .. } => "Neo.ClientError.Request.Invalid",
         }
     }
 
@@ -212,6 +219,18 @@ mod tests {
             GraphError::RuleOwned { detail: "d".into() },
             GraphError::RuleNotFound { name: "n".into() },
             GraphError::QueryError { detail: "d".into() },
+            GraphError::ConstraintViolation {
+                constraint: "c".into(),
+                field: "f".into(),
+            },
+            GraphError::ConstraintCreationConflict {
+                violations: vec![("k".into(), Value::Int(1))],
+            },
+            GraphError::ValueTooLarge {
+                field: "f".into(),
+                size: 2,
+                limit: 1,
+            },
             GraphError::IngestError { detail: "d".into() },
             GraphError::ReadOnly,
             GraphError::CommitOutOfRange {
