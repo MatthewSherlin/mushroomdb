@@ -3,27 +3,45 @@
 //!
 //! # What it reads, and what it never touches
 //!
-//! It reads the store's files through ordinary OS reads, and one value from the
-//! engine: [`WalSource::durable_wal_position`], which says how much of
-//! `wal.bin` is fsynced and which generation of it that is. It takes no engine
-//! lock — not the RwLock, not the WAL mutex — so it cannot slow a write; it
-//! never writes to the store directory.
+//! It reads the store's files through ordinary OS reads on Tokio's blocking
+//! pool, and one value from the engine: [`WalSource::durable_wal_position`],
+//! which says how much of `wal.bin` is fsynced, in which generation, and which
+//! `snapshot.bin` the engine's state is based on. Reading it takes no engine
+//! lock, so it cannot slow a write. The one exception: when the files on disk
+//! show a snapshot or commits the engine has not seen (another process wrote
+//! them), the worker asks the handle to catch up — the same metadata check and
+//! refresh every read makes. It never writes to the store directory.
 //!
 //! # Consistency
 //!
-//! A restore point is a snapshot plus the WAL generation that starts at it.
-//! The engine bumps the generation each time it replaces `wal.bin`, and flags
-//! the whole of a snapshot as in progress. The worker pairs `snapshot.bin`
-//! with a generation only when the position reads the same, and not in
-//! progress, on both sides of opening the file; it ships WAL bytes only when
-//! the generation is unchanged across the read. Anything else is retried on
-//! the next tick.
+//! A restore point is a snapshot plus the WAL that starts beside it. Which
+//! snapshot and which WAL that is comes from the files on disk, not from the
+//! handle's memory: a restore point is built only when the snapshot on disk is
+//! the one the engine's position names, and a new generation starts whenever
+//! the snapshot on disk changes or the engine replaces `wal.bin`. A snapshot
+//! that kept its WAL carries a mark of the prefix it holds, and the open of a
+//! restored store skips that prefix by itself, so shipping the whole WAL from
+//! offset 0 beside it is always correct.
+//!
+//! The pair is checked on both sides of opening `snapshot.bin`, WAL bytes are
+//! kept only when neither the engine's generation nor the snapshot on disk
+//! changed across the read, and anything else is retried on the next tick.
+//!
+//! # Objects and ordering
+//!
+//! Every object a manifest names is immutable (see [`crate::manifest`]); a
+//! manifest is written only after every object it names exists, and `LATEST`
+//! only after its manifest. Retention deletes only what no retained manifest
+//! names. So at any point — a crash between any two requests included — every
+//! manifest in the bucket verifies, and `LATEST` names one of them.
 
+use crate::disk::{self, DiskState, Ident};
 use crate::manifest::{
-    archive_key, crc32_hex, format_crc32, latest_key, manifest_key, object_key, parse_archive_key,
-    parse_segment_key, segment_key, FileEntry, Manifest, SegmentEntry, MANIFEST_VERSION,
+    archive_key, crc32_hex, format_crc32, latest_key, manifest_key, object_key, parse_archive_name,
+    parse_segment_key, parse_versioned_generation, segment_key, side_key, snapshot_key, FileEntry,
+    Manifest, SegmentEntry, MANIFEST_VERSION,
 };
-use crate::segment::read_new_segment;
+use crate::segment::{complete_frames, read_new_segment};
 use crate::store::BackupConfig;
 use crate::BackupError;
 use mushroomdb::{SharedDb, WalPosition};
@@ -31,6 +49,7 @@ use object_store::buffered::BufWriter;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, PutPayload};
 use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -58,6 +77,9 @@ pub const UNHEALTHY_AFTER_FAILURES: u32 = 3;
 pub const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 /// Longest retry delay.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// The shortest lag that makes the worker unhealthy: durable data unshipped
+/// for longer than `max(MIN_UNHEALTHY_LAG, 10 × wal_interval)`.
+pub const MIN_UNHEALTHY_LAG: Duration = Duration::from_secs(30);
 /// Read size when streaming a snapshot or archive.
 const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
 
@@ -67,11 +89,19 @@ const UPLOAD_CHUNK: usize = 8 * 1024 * 1024;
 /// how the handle is held.
 pub trait WalSource: Send + Sync + 'static {
     fn durable_wal_position(&self) -> WalPosition;
+
+    /// Absorb whatever another process committed or snapshotted. Called, on a
+    /// blocking thread, only when the files on disk are ahead of the position.
+    fn catch_up(&self) {}
 }
 
 impl WalSource for SharedDb {
     fn durable_wal_position(&self) -> WalPosition {
         SharedDb::durable_wal_position(self)
+    }
+
+    fn catch_up(&self) {
+        self.refresh_if_stale_now();
     }
 }
 
@@ -79,7 +109,7 @@ impl WalSource for SharedDb {
 ///
 /// A `watch` keeps only the latest value, so a `Snapshot` followed quickly by
 /// a `Shutdown` is seen as `Shutdown` alone. That is safe: the worker finds a
-/// new snapshot by itself (the WAL generation changes), and its shutdown flush
+/// new snapshot by itself (the files on disk change), and its shutdown flush
 /// uploads it. `Snapshot` only makes that happen now instead of at the next
 /// tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -89,14 +119,16 @@ pub enum BackupTrigger {
     Idle,
     /// A snapshot finished: upload it now.
     Snapshot,
-    /// Flush what is pending, write a final manifest, and stop.
+    /// Flush what is pending, write a final manifest, and stop — within
+    /// `shutdown_grace_ms`, abandoning an upload still in flight then.
     Shutdown,
 }
 
 /// The running worker, as the serve loop holds it.
 ///
 /// There is one way to stop it: send [`BackupTrigger::Shutdown`] (or drop the
-/// sender), then await `join`.
+/// sender), then await `join`. It finishes within `shutdown_grace_ms`, however
+/// unresponsive the bucket is.
 #[derive(Debug)]
 pub struct BackupHandle {
     /// Failed steps since start (`mushroomdb_backup_upload_errors_total`).
@@ -104,9 +136,13 @@ pub struct BackupHandle {
     /// Unix seconds of the last step that left nothing durable unshipped; 0
     /// before the first.
     pub last_success_ts: Arc<AtomicU64>,
-    /// False after [`UNHEALTHY_AFTER_FAILURES`] consecutive failures, true
-    /// again after the next success.
+    /// False after [`UNHEALTHY_AFTER_FAILURES`] consecutive failures, or while
+    /// durable data has stayed unshipped for longer than
+    /// `max(30 s, 10 × wal_interval)`; true again once both clear.
     pub healthy: Arc<AtomicBool>,
+    /// `backup_lag_s`: seconds the oldest durable, unshipped WAL byte has
+    /// waited; 0 when everything durable is shipped.
+    pub lag_s: Arc<AtomicU64>,
     /// Finishes when the worker has flushed and stopped.
     pub join: JoinHandle<()>,
 }
@@ -117,33 +153,32 @@ pub struct BackupCounters {
     pub error_count: Arc<AtomicU64>,
     pub last_success_ts: Arc<AtomicU64>,
     pub healthy: Arc<AtomicBool>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdent {
-    len: u64,
-    modified: Option<SystemTime>,
-}
-
-impl FileIdent {
-    fn of(meta: &std::fs::Metadata) -> Self {
-        Self {
-            len: meta.len(),
-            modified: meta.modified().ok(),
-        }
-    }
+    pub lag_s: Arc<AtomicU64>,
 }
 
 /// The WAL generation being shipped.
 #[derive(Debug, Clone)]
 struct Generation {
-    /// The engine's generation this one ships.
-    engine: u64,
     /// Its number in the bucket (`wal_generation`).
     number: u64,
+    /// The engine's generation it ships.
+    engine: u64,
+    /// The `snapshot.bin` it starts beside.
+    snapshot: Option<Ident>,
     /// Bytes of `wal.bin` shipped so far.
     cursor: u64,
+    /// Frames in those bytes.
+    frames_shipped: u64,
+    /// Global frame index of the WAL's first frame, once a position has shown
+    /// it (`frames` at a `len` the cursor reached).
+    base_frames: Option<u64>,
     segments: Vec<SegmentEntry>,
+}
+
+impl Generation {
+    fn commit_seq(&self) -> Option<u64> {
+        self.base_frames.map(|b| b + self.frames_shipped)
+    }
 }
 
 /// The backup worker. [`BackupWorker::spawn`] runs it as a task; tests drive
@@ -157,24 +192,30 @@ pub struct BackupWorker {
     error_count: Arc<AtomicU64>,
     last_success_ts: Arc<AtomicU64>,
     healthy: Arc<AtomicBool>,
+    lag_s: Arc<AtomicU64>,
     consecutive_failures: u32,
     backoff: Duration,
+    /// Since when durable WAL bytes have been waiting to ship; `None` when
+    /// none are.
+    unshipped_since: Option<Instant>,
     /// Whether the bucket's previous state has been read.
     resumed: bool,
     next_generation: u64,
     current: Option<Generation>,
-    /// Snapshot of the current restore point, with the local file identity it
-    /// was uploaded from.
-    snapshot: Option<(FileIdent, FileEntry)>,
-    /// Archives already in the bucket. Archives are immutable: never re-uploaded.
-    archives: BTreeMap<u64, FileEntry>,
+    /// The snapshot the current generation starts beside.
+    snapshot: Option<FileEntry>,
+    /// Archives in the bucket, by number, with the local length they were
+    /// uploaded from. An archive is immutable: never uploaded twice.
+    archives: BTreeMap<u64, (u64, FileEntry)>,
     /// Archives the current restore point names.
     base_archives: Vec<u64>,
-    /// Side files uploaded, by name.
-    side: BTreeMap<&'static str, (FileIdent, FileEntry)>,
-    commit_seq: u64,
+    /// Side files uploaded, by name, with the local identity they came from.
+    side: BTreeMap<&'static str, (Ident, FileEntry)>,
     manifest_dirty: bool,
     last_manifest_at: Option<Instant>,
+    /// Test hook: requests that change the bucket still allowed before the
+    /// worker behaves as if killed. See [`BackupWorker::fail_after_writes`].
+    write_budget: Option<u64>,
 }
 
 impl BackupWorker {
@@ -196,8 +237,10 @@ impl BackupWorker {
             error_count: Arc::new(AtomicU64::new(0)),
             last_success_ts: Arc::new(AtomicU64::new(0)),
             healthy: Arc::new(AtomicBool::new(true)),
+            lag_s: Arc::new(AtomicU64::new(0)),
             consecutive_failures: 0,
             backoff: FIRST_BACKOFF,
+            unshipped_since: None,
             resumed: false,
             next_generation: 0,
             current: None,
@@ -205,9 +248,9 @@ impl BackupWorker {
             archives: BTreeMap::new(),
             base_archives: Vec::new(),
             side: BTreeMap::new(),
-            commit_seq: 0,
             manifest_dirty: false,
             last_manifest_at: None,
+            write_budget: None,
         })
     }
 
@@ -230,12 +273,14 @@ impl BackupWorker {
             error_count,
             last_success_ts,
             healthy,
+            lag_s,
         } = worker.counters();
         let join = tokio::spawn(worker.run(snapshot_rx));
         Ok(BackupHandle {
             error_count,
             last_success_ts,
             healthy,
+            lag_s,
             join,
         })
     }
@@ -247,7 +292,17 @@ impl BackupWorker {
             error_count: Arc::clone(&self.error_count),
             last_success_ts: Arc::clone(&self.last_success_ts),
             healthy: Arc::clone(&self.healthy),
+            lag_s: Arc::clone(&self.lag_s),
         }
+    }
+
+    /// Test hook: allow `n` more requests that change the bucket (PUTs and
+    /// DELETEs), then fail every one as if the process had been killed just
+    /// before it. Drop the worker after the first failure to model a kill
+    /// between two requests.
+    #[doc(hidden)]
+    pub fn fail_after_writes(&mut self, n: u64) {
+        self.write_budget = Some(n);
     }
 
     async fn run(mut self, mut rx: watch::Receiver<BackupTrigger>) {
@@ -255,18 +310,40 @@ impl BackupWorker {
         loop {
             let shutdown = tokio::select! {
                 _ = tokio::time::sleep(delay) => false,
-                changed = rx.changed() => match changed {
-                    // The sender is gone: nobody can ask for a shutdown any
-                    // more, so this is it.
-                    Err(_) => true,
-                    Ok(()) => *rx.borrow_and_update() == BackupTrigger::Shutdown,
-                },
+                changed = rx.changed() => is_shutdown(changed, &mut rx),
             };
             if shutdown {
-                self.flush().await;
-                return;
+                break;
             }
-            delay = self.step().await;
+            // A step blocked on an unresponsive bucket must not hold up a
+            // shutdown: the step is dropped — its in-flight request abandoned
+            // — the moment one arrives.
+            let stepped = {
+                let step = self.step();
+                tokio::pin!(step);
+                loop {
+                    tokio::select! {
+                        d = &mut step => break Some(d),
+                        changed = rx.changed() => {
+                            if is_shutdown(changed, &mut rx) {
+                                break None;
+                            }
+                        }
+                    }
+                }
+            };
+            match stepped {
+                Some(d) => delay = d,
+                None => break,
+            }
+        }
+        let grace = Duration::from_millis(self.config.shutdown_grace_ms);
+        if tokio::time::timeout(grace, self.flush()).await.is_err() {
+            self.error_count.fetch_add(1, Ordering::AcqRel);
+            tracing::warn!(
+                grace_ms = self.config.shutdown_grace_ms,
+                "backup flush did not finish within the shutdown grace; abandoned"
+            );
         }
     }
 
@@ -274,20 +351,16 @@ impl BackupWorker {
     /// to wait before the next one: the WAL interval after a success, the
     /// back-off after a failure.
     pub async fn step(&mut self) -> Duration {
-        match self.run_once().await {
+        let result = self.run_once().await;
+        let delay = match result {
             Ok(()) => {
                 self.consecutive_failures = 0;
                 self.backoff = FIRST_BACKOFF;
-                self.healthy.store(true, Ordering::Release);
-                self.last_success_ts.store(unix_now(), Ordering::Release);
                 Duration::from_millis(self.config.wal_interval_ms)
             }
             Err(e) => {
                 self.error_count.fetch_add(1, Ordering::AcqRel);
                 self.consecutive_failures += 1;
-                if self.consecutive_failures >= UNHEALTHY_AFTER_FAILURES {
-                    self.healthy.store(false, Ordering::Release);
-                }
                 let delay = self.backoff;
                 self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
                 tracing::warn!(
@@ -298,20 +371,42 @@ impl BackupWorker {
                 );
                 delay
             }
+        };
+        self.update_health().await;
+        delay
+    }
+
+    /// Recompute lag and health from what is durable now and what has
+    /// shipped.
+    async fn update_health(&mut self) {
+        let pos = self.position().await;
+        let caught_up = self.current.as_ref().is_some_and(|g| {
+            g.engine == pos.generation && g.snapshot == pos.snapshot && g.cursor >= pos.len
+        });
+        if caught_up {
+            self.unshipped_since = None;
+            self.last_success_ts.store(unix_now(), Ordering::Release);
+        } else if self.unshipped_since.is_none() {
+            self.unshipped_since = Some(Instant::now());
         }
+        let lag = self.unshipped_since.map_or(Duration::ZERO, |t| t.elapsed());
+        self.lag_s.store(lag.as_secs(), Ordering::Release);
+        let limit = MIN_UNHEALTHY_LAG.max(Duration::from_millis(self.config.wal_interval_ms) * 10);
+        let healthy = self.consecutive_failures < UNHEALTHY_AFTER_FAILURES && lag <= limit;
+        self.healthy.store(healthy, Ordering::Release);
     }
 
     /// Ship pending WAL bytes and write a final manifest, retrying a failure
-    /// twice. Used on shutdown.
+    /// twice. Used on shutdown, under the shutdown grace.
     pub async fn flush(&mut self) {
-        for attempt in 0..3 {
+        for attempt in 0..3u32 {
             let done = match self.run_once().await {
-                Ok(()) if self.current.is_some() => self.write_manifest().await,
+                Ok(()) => self.write_manifest().await,
                 other => other,
             };
             match done {
                 Ok(()) => {
-                    self.last_success_ts.store(unix_now(), Ordering::Release);
+                    self.update_health().await;
                     return;
                 }
                 Err(e) => {
@@ -326,24 +421,29 @@ impl BackupWorker {
     }
 
     /// One step: read the bucket's previous state if not done yet; upload a
-    /// new restore point when the snapshot or the WAL generation changed; ship
-    /// the WAL bytes fsynced since the last step; write a manifest when one is
-    /// due.
+    /// new restore point when the snapshot on disk or the engine's WAL
+    /// generation changed; ship the WAL bytes fsynced since the last step;
+    /// write a manifest when one is due.
     pub async fn run_once(&mut self) -> Result<(), BackupError> {
         if !self.resumed {
             self.resume().await?;
         }
-        let pos = self.source.durable_wal_position();
-        if pos.snapshot_in_progress {
+        let mut disk = self.observe().await?;
+        let mut pos = self.position().await;
+        // The disk is ahead of the handle: another process snapshotted, or
+        // committed. Let the handle catch up before trusting its offsets.
+        if pos.snapshot != disk.snapshot || disk.wal_len > pos.len {
+            self.catch_up().await?;
+            disk = self.observe().await?;
+            pos = self.position().await;
+        }
+        if pos.snapshot_in_progress || pos.snapshot != disk.snapshot {
+            // Between states, or still behind; next step.
             return Ok(());
         }
-        let new_generation = self.current.as_ref().map(|g| g.engine) != Some(pos.generation);
-        let snapshot_changed = self.local_snapshot_ident()? != self.snapshot.as_ref().map(|s| s.0);
-        if new_generation || snapshot_changed {
-            // A restore point was written, or the files were between states
-            // and nothing changed; either way this step is done.
-            self.upload_base(pos, new_generation).await?;
-            return Ok(());
+        let current = self.current.as_ref().map(|g| (g.engine, g.snapshot));
+        if current != Some((pos.generation, disk.snapshot)) {
+            return self.upload_base(pos, disk).await;
         }
         self.ship_segments().await?;
         if self.manifest_due() {
@@ -360,29 +460,58 @@ impl BackupWorker {
                 .is_none_or(|t| t.elapsed() >= interval)
     }
 
+    async fn observe(&self) -> Result<DiskState, BackupError> {
+        let dir = self.dir.clone();
+        Ok(blocking(move || disk::observe(&dir)).await?)
+    }
+
+    /// The engine's durable position, read on the blocking pool: the first
+    /// read after the handle applied WAL bytes it did not write fsyncs them.
+    async fn position(&self) -> WalPosition {
+        let source = Arc::clone(&self.source);
+        match tokio::task::spawn_blocking(move || source.durable_wal_position()).await {
+            Ok(p) => p,
+            // The read itself cannot fail; a panicked blocking task falls back
+            // to reading here.
+            Err(_) => self.source.durable_wal_position(),
+        }
+    }
+
+    async fn catch_up(&self) -> Result<(), BackupError> {
+        let source = Arc::clone(&self.source);
+        blocking(move || {
+            source.catch_up();
+            Ok(())
+        })
+        .await?;
+        Ok(())
+    }
+
     // ── Resume ──────────────────────────────────────────────────────────────
 
     /// Read what a previous run left in the bucket, so this run never reuses a
-    /// generation number and never re-uploads an archive.
+    /// generation number and never re-uploads an archive the latest manifest
+    /// names.
     async fn resume(&mut self) -> Result<(), BackupError> {
         let mut highest: Option<u64> = None;
         let wal_dir = ObjectPath::from(object_key(&self.prefix, "wal"));
-        for p in self
-            .store
-            .list_with_delimiter(Some(&wal_dir))
-            .await?
-            .common_prefixes
-        {
+        for p in self.list(&wal_dir).await?.common_prefixes {
             if let Some(g) = p.filename().and_then(|s| s.parse::<u64>().ok()) {
                 highest = highest.max(Some(g));
             }
         }
+        for dir in ["snapshots", "archives"] {
+            let path = ObjectPath::from(object_key(&self.prefix, dir));
+            for o in self.list(&path).await?.objects {
+                let g = parse_versioned_generation(&self.prefix, o.location.as_ref());
+                highest = highest.max(g);
+            }
+        }
         if let Some(m) = self.latest_manifest().await? {
             highest = highest.max(Some(m.wal_generation));
-            self.commit_seq = m.commit_seq;
             for f in &m.files {
-                if let Some(n) = parse_archive_key(&self.prefix, &f.key) {
-                    self.archives.insert(n, f.clone());
+                if let Some(n) = parse_archive_name(&f.name) {
+                    self.archives.insert(n, (f.size, f.clone()));
                 }
             }
         }
@@ -391,7 +520,7 @@ impl BackupWorker {
         Ok(())
     }
 
-    async fn latest_manifest(&self) -> Result<Option<Manifest>, BackupError> {
+    async fn latest_manifest(&mut self) -> Result<Option<Manifest>, BackupError> {
         let key = match self.get(&latest_key(&self.prefix)).await? {
             Some(b) => String::from_utf8(b)
                 .map_err(|_| BackupError::Manifest("LATEST is not UTF-8".into()))?,
@@ -407,28 +536,14 @@ impl BackupWorker {
 
     // ── Restore points ──────────────────────────────────────────────────────
 
-    fn local_snapshot_ident(&self) -> Result<Option<FileIdent>, BackupError> {
-        match std::fs::metadata(self.dir.join("snapshot.bin")) {
-            Ok(m) => Ok(Some(FileIdent::of(&m))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Upload a restore point: the snapshot (when changed), new archives, the
-    /// side files, and — after a WAL replacement — a new generation whose
-    /// segments start at 0. Ships the new generation's durable bytes, then
-    /// writes the manifest.
-    async fn upload_base(
-        &mut self,
-        pos: WalPosition,
-        new_generation: bool,
-    ) -> Result<(), BackupError> {
-        let intent = self.dir.join("snapshot.intent");
-        if std::fs::metadata(&intent).is_ok_and(|m| m.len() > 0) {
+    /// Start a generation beside the snapshot on disk: upload the snapshot,
+    /// new archives and changed side files under keys of their own, ship the
+    /// generation's durable WAL bytes from offset 0, then write the manifest.
+    async fn upload_base(&mut self, pos: WalPosition, disk: DiskState) -> Result<(), BackupError> {
+        if disk.intent_nonempty {
             // A snapshot that started since `pos` was read writes the intent
             // first; that is not a failure, just a step to retry.
-            if self.source.durable_wal_position().snapshot_in_progress {
+            if self.position().await.snapshot_in_progress {
                 return Ok(());
             }
             // A snapshot on this machine stopped between writing snapshot.bin
@@ -441,39 +556,47 @@ impl BackupWorker {
                     .into(),
             ));
         }
-        let snapshot_file = match std::fs::File::open(self.dir.join("snapshot.bin")) {
-            Ok(f) => Some(f),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
+        let Some(frames_now) = pos.frames else {
+            return Ok(());
         };
-        let after = self.source.durable_wal_position();
-        if after.generation != pos.generation || after.snapshot_in_progress {
-            // A snapshot ran or started while the file was opened: the file
-            // may not go with this generation. Next step.
+        let dir = self.dir.clone();
+        let opened = blocking(move || disk::open_snapshot(&dir)).await?;
+        if opened.as_ref().map(|(_, ident)| *ident) != disk.snapshot {
             return Ok(());
         }
-        if let Some(file) = snapshot_file {
-            let ident = FileIdent::of(&file.metadata()?);
-            let key = object_key(&self.prefix, "snapshot.bin");
-            let unchanged = self.snapshot.as_ref().is_some_and(|(i, _)| *i == ident);
-            if !unchanged {
-                let entry = self.put_file(&key, file).await?;
-                self.snapshot = Some((ident, entry));
+        let after = self.position().await;
+        if after.generation != pos.generation
+            || after.snapshot_in_progress
+            || after.snapshot != disk.snapshot
+        {
+            // A snapshot ran or started while the file was opened: the file
+            // may not go with this WAL. Next step.
+            return Ok(());
+        }
+        // Burn the number now: objects a failed attempt leaves behind belong
+        // to a generation no manifest will ever name.
+        let number = self.next_generation;
+        self.next_generation += 1;
+        let snapshot = match opened {
+            Some((file, _)) => {
+                let key = snapshot_key(&self.prefix, number, frames_now);
+                Some(self.put_file("snapshot.bin", &key, file).await?)
             }
-        } else {
-            self.snapshot = None;
-        }
-        self.base_archives = self.upload_new_archives().await?;
+            None => None,
+        };
+        let archives = self.upload_new_archives(number).await?;
         self.sync_side_files().await?;
-        if new_generation {
-            self.current = Some(Generation {
-                engine: pos.generation,
-                number: self.next_generation,
-                cursor: 0,
-                segments: Vec::new(),
-            });
-            self.next_generation += 1;
-        }
+        self.snapshot = snapshot;
+        self.base_archives = archives;
+        self.current = Some(Generation {
+            number,
+            engine: pos.generation,
+            snapshot: disk.snapshot,
+            cursor: 0,
+            frames_shipped: 0,
+            base_frames: None,
+            segments: Vec::new(),
+        });
         self.manifest_dirty = true;
         self.ship_segments().await?;
         self.write_manifest().await
@@ -481,31 +604,23 @@ impl BackupWorker {
 
     /// Upload every local archive not yet in the bucket; return the numbers of
     /// all local archives.
-    async fn upload_new_archives(&mut self) -> Result<Vec<u64>, BackupError> {
-        let mut local = Vec::new();
-        for entry in std::fs::read_dir(&self.dir)? {
-            let name = entry?.file_name();
-            let name = name.to_string_lossy();
-            if let Some(n) = name
-                .strip_prefix("wal.")
-                .and_then(|r| r.strip_suffix(".archive"))
-                .and_then(|n| n.parse::<u64>().ok())
-            {
-                local.push(n);
-            }
-        }
-        local.sort_unstable();
+    async fn upload_new_archives(&mut self, generation: u64) -> Result<Vec<u64>, BackupError> {
+        let dir = self.dir.clone();
+        let local = blocking(move || disk::local_archives(&dir)).await?;
         let mut present = Vec::new();
-        for n in local {
-            if !self.archives.contains_key(&n) {
-                let file = match std::fs::File::open(self.dir.join(format!("wal.{n}.archive"))) {
+        for (n, len) in local {
+            if self.archives.get(&n).is_none_or(|(l, _)| *l != len) {
+                let path = self.dir.join(format!("wal.{n}.archive"));
+                let file = match blocking(move || std::fs::File::open(path)).await {
                     Ok(f) => f,
                     // Pruned by a snapshot since the listing.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => return Err(e.into()),
                 };
-                let entry = self.put_file(&archive_key(&self.prefix, n), file).await?;
-                self.archives.insert(n, entry);
+                let name = format!("wal.{n}.archive");
+                let key = archive_key(&self.prefix, generation, n);
+                let entry = self.put_file(&name, &key, file).await?;
+                self.archives.insert(n, (entry.size, entry));
             }
             present.push(n);
         }
@@ -513,38 +628,36 @@ impl BackupWorker {
     }
 
     /// Upload each side file whose local copy changed since it was last
-    /// uploaded; forget one that no longer exists locally.
+    /// uploaded, under a key addressed by its content; forget one that no
+    /// longer exists locally.
     async fn sync_side_files(&mut self) -> Result<(), BackupError> {
         for name in SIDE_FILES {
-            let path = self.dir.join(name);
-            let meta = match std::fs::metadata(&path) {
-                Ok(m) => m,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if self.side.remove(name).is_some() {
-                        self.manifest_dirty = true;
-                    }
-                    continue;
+            let known = self.side.get(name).map(|(i, _)| *i);
+            let dir = self.dir.clone();
+            let read = blocking(move || disk::read_side(&dir, name, known)).await?;
+            let Some((ident, bytes)) = read else {
+                if self.side.remove(name).is_some() {
+                    self.manifest_dirty = true;
                 }
-                Err(e) => return Err(e.into()),
-            };
-            let ident = FileIdent::of(&meta);
-            if self.side.get(name).is_some_and(|(i, _)| *i == ident) {
                 continue;
+            };
+            let Some(bytes) = bytes else {
+                continue;
+            };
+            let crc32 = crc32_hex(&bytes);
+            let size = bytes.len() as u64;
+            let key = side_key(&self.prefix, name, &crc32, size);
+            if self.side.get(name).is_none_or(|(_, e)| e.key != key) {
+                self.put(&key, bytes).await?;
+                self.manifest_dirty = true;
             }
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            let key = object_key(&self.prefix, name);
             let entry = FileEntry {
-                key: key.clone(),
-                size: bytes.len() as u64,
-                crc32: crc32_hex(&bytes),
+                name: name.to_string(),
+                key,
+                size,
+                crc32,
             };
-            self.put(&key, bytes).await?;
             self.side.insert(name, (ident, entry));
-            self.manifest_dirty = true;
         }
         Ok(())
     }
@@ -553,71 +666,91 @@ impl BackupWorker {
 
     /// Ship every fsynced WAL byte of the current generation not shipped yet.
     async fn ship_segments(&mut self) -> Result<(), BackupError> {
-        let wal = self.dir.join("wal.bin");
         loop {
-            let Some(engine_gen) = self.current.as_ref().map(|g| g.engine) else {
+            let Some(g) = self.current.as_ref() else {
                 return Ok(());
             };
-            let pos = self.source.durable_wal_position();
-            if pos.generation != engine_gen {
+            let (engine, snap, cursor, number) = (g.engine, g.snapshot, g.cursor, g.number);
+            let pos = self.position().await;
+            if pos.generation != engine || pos.snapshot != snap {
                 return Ok(());
             }
-            let cursor = self.current.as_ref().map_or(0, |g| g.cursor);
             if pos.len <= cursor {
                 if pos.len == cursor {
-                    self.commit_seq = self.commit_seq.max(pos.frames);
+                    self.note_base_frames(pos);
                 }
                 return Ok(());
             }
-            let read = read_new_segment(&wal, cursor, pos.len)?;
-            if self.source.durable_wal_position().generation != pos.generation {
-                // wal.bin was replaced during the read: the bytes may be the
-                // new file's. Drop them; the next step starts the new
-                // generation.
+            let wal = self.dir.join("wal.bin");
+            let len = pos.len;
+            let read = blocking(move || read_new_segment(&wal, cursor, len)).await?;
+            // wal.bin may have been replaced during the read — by this
+            // handle's snapshot (its generation moves) or another process's
+            // (the snapshot on disk moves). The bytes may then be the new
+            // file's: drop them, and let the next step start the new
+            // generation.
+            let disk = self.observe().await?;
+            if self.position().await.generation != pos.generation || disk.snapshot != snap {
                 return Ok(());
             }
             let Some((start, end, bytes)) = read else {
                 return Ok(());
             };
-            let number = self.current.as_ref().map_or(0, |g| g.number);
+            let (_, frames) = complete_frames(&bytes);
             let key = segment_key(&self.prefix, number, start, end);
             let crc32 = crc32_hex(&bytes);
             self.put(&key, bytes).await?;
             if let Some(g) = self.current.as_mut() {
                 g.cursor = end;
+                g.frames_shipped += frames;
                 g.segments.push(SegmentEntry { key, crc32 });
             }
             if end == pos.len {
-                self.commit_seq = self.commit_seq.max(pos.frames);
+                self.note_base_frames(pos);
             }
             self.manifest_dirty = true;
+        }
+    }
+
+    /// The cursor stands at `pos.len`: learn the generation's first frame
+    /// index from it.
+    fn note_base_frames(&mut self, pos: WalPosition) {
+        if let (Some(g), Some(frames)) = (self.current.as_mut(), pos.frames) {
+            if g.base_frames.is_none() {
+                g.base_frames = frames.checked_sub(g.frames_shipped);
+            }
         }
     }
 
     // ── Manifests and retention ─────────────────────────────────────────────
 
     /// Write a manifest for the current restore point and point `LATEST` at
-    /// it, then apply retention.
+    /// it, then apply retention. Nothing is written until the generation's
+    /// first frame index is known, so `commit_seq` always matches what the
+    /// files and segments hold.
     async fn write_manifest(&mut self) -> Result<(), BackupError> {
         self.sync_side_files().await?;
         let Some(generation) = self.current.as_ref() else {
             return Ok(());
         };
+        let Some(commit_seq) = generation.commit_seq() else {
+            return Ok(());
+        };
         let mut files = Vec::new();
-        if let Some((_, e)) = &self.snapshot {
-            files.push(e.clone());
-        }
+        files.extend(self.snapshot.clone());
         for n in &self.base_archives {
-            if let Some(e) = self.archives.get(n) {
+            if let Some((_, e)) = self.archives.get(n) {
                 files.push(e.clone());
             }
         }
         files.extend(self.side.values().map(|(_, e)| e.clone()));
+        let dir = self.dir.clone();
+        let oldest_commit_seq = blocking(move || Ok(disk::floor(&dir))).await?;
         let manifest = Manifest {
             version: MANIFEST_VERSION,
             created_at: now_rfc3339(),
-            commit_seq: self.commit_seq,
-            oldest_commit_seq: self.local_floor(),
+            commit_seq,
+            oldest_commit_seq,
             files,
             wal_generation: generation.number,
             segments: generation.segments.clone(),
@@ -634,29 +767,17 @@ impl BackupWorker {
         Ok(())
     }
 
-    /// The store's horizon floor (`wal.floor`), or 0.
-    fn local_floor(&self) -> u64 {
-        std::fs::read(self.dir.join("wal.floor"))
-            .ok()
-            .and_then(|b| {
-                b.get(..8)
-                    .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
-            })
-            .unwrap_or(0)
-    }
-
-    /// Keep the newest `retain_n` manifests. Then delete every segment of a
-    /// generation older than any kept manifest's, and every archive no kept
-    /// manifest names. `snapshot.bin`, the side files and `LATEST` are never
-    /// deleted.
+    /// Keep the newest `retain_n` manifests, then delete every snapshot,
+    /// archive, side file and segment no kept manifest names — except the
+    /// current generation's segments, which the next manifest will. `LATEST`
+    /// and anything outside those four directories is never touched.
     ///
     /// Conservative on doubt: when a kept manifest cannot be read, nothing but
     /// the surplus manifests is deleted.
     async fn apply_retention(&mut self) -> Result<(), BackupError> {
         let dir = ObjectPath::from(object_key(&self.prefix, "manifest"));
         let mut keys: Vec<String> = self
-            .store
-            .list_with_delimiter(Some(&dir))
+            .list(&dir)
             .await?
             .objects
             .into_iter()
@@ -671,7 +792,6 @@ impl BackupWorker {
         for k in &keys[..surplus] {
             self.delete(k).await?;
         }
-        let mut min_generation = u64::MAX;
         let mut referenced: HashSet<String> = HashSet::new();
         for k in &keys[surplus..] {
             let Some(bytes) = self.get(k).await? else {
@@ -680,64 +800,102 @@ impl BackupWorker {
             let Ok(m) = Manifest::from_json(&bytes) else {
                 return Ok(());
             };
-            min_generation = min_generation.min(m.wal_generation);
             referenced.extend(m.files.into_iter().map(|f| f.key));
+            referenced.extend(m.segments.into_iter().map(|s| s.key));
         }
-        let wal_dir = ObjectPath::from(object_key(&self.prefix, "wal"));
-        for gen_dir in self
-            .store
-            .list_with_delimiter(Some(&wal_dir))
-            .await?
-            .common_prefixes
-        {
-            let Some(g) = gen_dir.filename().and_then(|s| s.parse::<u64>().ok()) else {
-                continue;
-            };
-            if g >= min_generation {
-                continue;
-            }
-            for o in self
-                .store
-                .list_with_delimiter(Some(&gen_dir))
-                .await?
-                .objects
-            {
-                let k = o.location.to_string();
-                if parse_segment_key(&self.prefix, &k).is_some_and(|(sg, _, _)| sg == g) {
-                    self.delete(&k).await?;
+        let current_number = self.current.as_ref().map(|g| g.number);
+        let mut doomed = Vec::new();
+        for top in ["snapshots", "archives", "side", "wal"] {
+            for k in self.list_all(&object_key(&self.prefix, top)).await? {
+                if referenced.contains(&k) {
+                    continue;
                 }
-            }
-        }
-        let top = (!self.prefix.is_empty()).then(|| ObjectPath::from(self.prefix.as_str()));
-        for o in self.store.list_with_delimiter(top.as_ref()).await?.objects {
-            let k = o.location.to_string();
-            if let Some(n) = parse_archive_key(&self.prefix, &k) {
-                if !referenced.contains(&k) {
-                    self.delete(&k).await?;
-                    self.archives.remove(&n);
+                if let Some((g, _, _)) = parse_segment_key(&self.prefix, &k) {
+                    if Some(g) == current_number || current_number.is_some_and(|c| g > c) {
+                        continue;
+                    }
                 }
+                doomed.push(k);
             }
         }
+        for k in doomed {
+            self.delete(&k).await?;
+        }
+        let keep: HashSet<&String> = referenced.iter().collect();
+        self.archives.retain(|_, (_, e)| keep.contains(&e.key));
         Ok(())
     }
 
-    // ── Object store calls ──────────────────────────────────────────────────
-
-    async fn put(&self, key: &str, bytes: Vec<u8>) -> Result<(), BackupError> {
-        self.store
-            .put(&ObjectPath::from(key), PutPayload::from(bytes))
-            .await?;
-        Ok(())
+    /// Every object key under `prefix`, recursively.
+    async fn list_all(&self, prefix: &str) -> Result<Vec<String>, BackupError> {
+        let mut out = Vec::new();
+        let mut dirs = vec![ObjectPath::from(prefix)];
+        while let Some(d) = dirs.pop() {
+            let r = self.list(&d).await?;
+            out.extend(r.objects.into_iter().map(|o| o.location.to_string()));
+            dirs.extend(r.common_prefixes);
+        }
+        Ok(out)
     }
 
-    /// Stream `file` to `key`, multipart when large; return its entry.
-    async fn put_file(&self, key: &str, file: std::fs::File) -> Result<FileEntry, BackupError> {
+    // ── Object store calls, each under the operation deadline ───────────────
+
+    fn op_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.op_timeout_ms)
+    }
+
+    async fn deadline<T>(
+        &self,
+        what: impl FnOnce() -> String,
+        fut: impl Future<Output = Result<T, BackupError>>,
+    ) -> Result<T, BackupError> {
+        match tokio::time::timeout(self.op_timeout(), fut).await {
+            Ok(r) => r,
+            Err(_) => Err(BackupError::Timeout(what())),
+        }
+    }
+
+    /// Spend one request of the test hook's budget, if one is set.
+    fn spend_write(&mut self) -> Result<(), BackupError> {
+        match self.write_budget.as_mut() {
+            Some(0) => Err(BackupError::Inconsistent(
+                "test hook: the process is gone".into(),
+            )),
+            Some(n) => {
+                *n -= 1;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    async fn put(&mut self, key: &str, bytes: Vec<u8>) -> Result<(), BackupError> {
+        self.spend_write()?;
+        let path = ObjectPath::from(key);
+        let store = Arc::clone(&self.store);
+        self.deadline(|| format!("PUT {key}"), async move {
+            store.put(&path, PutPayload::from(bytes)).await?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Stream `file` to `key`, multipart when large; return its entry. Each
+    /// chunk, and the final commit, is under the operation deadline.
+    async fn put_file(
+        &mut self,
+        name: &str,
+        key: &str,
+        file: std::fs::File,
+    ) -> Result<FileEntry, BackupError> {
+        self.spend_write()?;
         let mut file = tokio::fs::File::from_std(file);
         let mut writer = BufWriter::new(Arc::clone(&self.store), ObjectPath::from(key));
         let mut hasher = crc32fast::Hasher::new();
         let mut size = 0u64;
         let mut buf = vec![0u8; UPLOAD_CHUNK];
-        let streamed: std::io::Result<()> = async {
+        let timeout = self.op_timeout();
+        let streamed: Result<(), BackupError> = async {
             loop {
                 let n = file.read(&mut buf).await?;
                 if n == 0 {
@@ -745,16 +903,22 @@ impl BackupWorker {
                 }
                 hasher.update(&buf[..n]);
                 size += n as u64;
-                writer.write_all(&buf[..n]).await?;
+                tokio::time::timeout(timeout, writer.write_all(&buf[..n]))
+                    .await
+                    .map_err(|_| BackupError::Timeout(format!("upload of {key}")))??;
             }
-            writer.shutdown().await
+            tokio::time::timeout(timeout, writer.shutdown())
+                .await
+                .map_err(|_| BackupError::Timeout(format!("upload of {key}")))??;
+            Ok(())
         }
         .await;
         if let Err(e) = streamed {
-            let _ = writer.abort().await;
-            return Err(e.into());
+            let _ = tokio::time::timeout(timeout, writer.abort()).await;
+            return Err(e);
         }
         Ok(FileEntry {
+            name: name.to_string(),
             key: key.to_string(),
             size,
             crc32: format_crc32(hasher.finalize()),
@@ -762,19 +926,60 @@ impl BackupWorker {
     }
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, BackupError> {
-        match self.store.get(&ObjectPath::from(key)).await {
-            Ok(r) => Ok(Some(r.bytes().await?.to_vec())),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        let path = ObjectPath::from(key);
+        let store = Arc::clone(&self.store);
+        self.deadline(|| format!("GET {key}"), async move {
+            match store.get(&path).await {
+                Ok(r) => Ok(Some(r.bytes().await?.to_vec())),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
     }
 
-    async fn delete(&self, key: &str) -> Result<(), BackupError> {
-        match self.store.delete(&ObjectPath::from(key)).await {
-            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+    async fn delete(&mut self, key: &str) -> Result<(), BackupError> {
+        self.spend_write()?;
+        let path = ObjectPath::from(key);
+        let store = Arc::clone(&self.store);
+        self.deadline(|| format!("DELETE {key}"), async move {
+            match store.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
     }
+
+    async fn list(&self, dir: &ObjectPath) -> Result<object_store::ListResult, BackupError> {
+        let store = Arc::clone(&self.store);
+        let d = dir.clone();
+        self.deadline(|| format!("LIST {dir}"), async move {
+            Ok(store.list_with_delimiter(Some(&d)).await?)
+        })
+        .await
+    }
+}
+
+fn is_shutdown(
+    changed: Result<(), watch::error::RecvError>,
+    rx: &mut watch::Receiver<BackupTrigger>,
+) -> bool {
+    match changed {
+        // The sender is gone: nobody can ask for a shutdown any more, so this
+        // is it.
+        Err(_) => true,
+        Ok(()) => *rx.borrow_and_update() == BackupTrigger::Shutdown,
+    }
+}
+
+/// Run a file-system call on Tokio's blocking pool.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> std::io::Result<T> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(format!("blocking read failed: {e}"))))
 }
 
 fn unix_now() -> u64 {

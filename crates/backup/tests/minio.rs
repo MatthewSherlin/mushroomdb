@@ -76,8 +76,7 @@ async fn restore_latest(b: &Bucket, into: &Path) -> Manifest {
             (bytes.len() as u64, crc32_hex(&bytes)),
             (f.size, f.crc32.clone())
         );
-        let name = f.key.rsplit('/').next().unwrap();
-        std::fs::write(into.join(name), bytes).unwrap();
+        std::fs::write(into.join(&f.name), bytes).unwrap();
     }
     let mut wal = Vec::new();
     for s in &m.segments {
@@ -144,9 +143,49 @@ async fn s3_round_trip_with_a_multipart_snapshot() {
     assert!(m
         .files
         .iter()
-        .any(|f| f.key.ends_with("/snapshot.bin") && f.size > 10 << 20));
+        .any(|f| f.name == "snapshot.bin" && f.size > 10 << 20));
     assert!(!m.segments.is_empty());
     let r = GraphDb::open(restored.path()).unwrap();
     assert_eq!(r.node_count(), db.read().node_count());
     assert_eq!(r.node_count(), 210);
+}
+
+/// A refused request's body can carry the access key id; the error the worker
+/// logs must not.
+#[tokio::test]
+async fn s3_refusals_are_logged_without_the_access_key_id() {
+    let Ok(endpoint) = std::env::var("MUSHROOMDB_TEST_S3_ENDPOINT") else {
+        eprintln!("MUSHROOMDB_TEST_S3_ENDPOINT is not set: skipping the S3 test");
+        return;
+    };
+    let name =
+        std::env::var("MUSHROOMDB_TEST_S3_BUCKET").unwrap_or_else(|_| "mushroomdb-test".into());
+    let config = BackupConfig::new(format!("minio://{name}/ho07-refused"));
+    let key_id = "AKIAIOSFODNN7EXAMPLE";
+    let env = |k: &str| match k {
+        "AWS_ENDPOINT_URL" => Some(endpoint.clone()),
+        "AWS_ACCESS_KEY_ID" => Some(key_id.to_string()),
+        "AWS_SECRET_ACCESS_KEY" => Some("not-the-secret".to_string()),
+        _ => None,
+    };
+    let store = build_store_with(&config, env).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let mut w = BackupWorker::new(
+        BackupConfig {
+            op_timeout_ms: 5_000,
+            ..config
+        },
+        store,
+        Arc::new(db.clone()),
+        dir.path().to_path_buf(),
+    )
+    .unwrap();
+    let err = w
+        .run_once()
+        .await
+        .expect_err("the bucket refuses unknown keys");
+    let shown = err.to_string();
+    assert!(!shown.contains(key_id), "{shown}");
 }

@@ -369,22 +369,10 @@ pub struct SharedDb {
     wal_mu: Arc<Mutex<()>>,
     /// The handle's durable-WAL cell, read without any of the locks above.
     durable_wal: DurableWal,
-    /// The WAL the open replayed, until something has fsynced it.
-    replayed: Arc<ReplayedWal>,
-}
-
-/// The WAL an open replayed may still be partly in the page cache — written by
-/// a previous process under a relaxed policy, or trailing history markers no
-/// fsync covered. It is fsynced once, by the first reader of the durable
-/// position, so that position can start at the end of what was replayed
-/// instead of at zero. Deferred to that first read on purpose: an open that no
-/// backup ever asks about pays no fsync.
-struct ReplayedWal {
-    /// `(generation, len, frames)` at the end of the replay; `None` once settled.
-    pending: Mutex<Option<(u64, u64, u64)>>,
-    settled: AtomicBool,
-    dir: std::path::PathBuf,
-    sync_fn: SyncWalFn,
+    /// Where this handle's WAL lives, and how it is fsynced: for vouching
+    /// for WAL bytes it applied but did not write (see
+    /// [`durable_wal_position`](SharedDb::durable_wal_position)).
+    vouch: Arc<(std::path::PathBuf, SyncWalFn)>,
 }
 
 const _: () = {
@@ -431,19 +419,7 @@ impl SharedDb {
         sync_fn: SyncWalFn,
     ) -> Self {
         let durable_wal = db.durable_wal();
-        let pending = (db.wal_consumed() > 0).then(|| {
-            (
-                durable_wal.get().generation,
-                db.wal_consumed(),
-                db.wal_frames_written(),
-            )
-        });
-        let replayed = Arc::new(ReplayedWal {
-            settled: AtomicBool::new(pending.is_none()),
-            pending: Mutex::new(pending),
-            dir: dir.clone(),
-            sync_fn: Arc::clone(&sync_fn),
-        });
+        let vouch = Arc::new((dir.clone(), Arc::clone(&sync_fn)));
         let inner = Arc::new(RwLock::new(db));
         let queue = WriteQueue::new();
         let wal_mu = Arc::new(Mutex::new(()));
@@ -479,7 +455,7 @@ impl SharedDb {
             }),
             wal_mu,
             durable_wal,
-            replayed,
+            vouch,
         }
     }
 
@@ -492,33 +468,30 @@ impl SharedDb {
     /// reads instead of the file's length, which counts bytes still in the
     /// page cache.
     ///
-    /// The first call on a handle whose open replayed a WAL fsyncs that WAL
-    /// once (on the caller's thread, holding none of the handle's locks), so
-    /// the replayed bytes count as durable from then on. Every later call is a
-    /// mutex read.
+    /// WAL bytes this handle applied without writing them itself — what its
+    /// open replayed, or what a refresh absorbed from another process — are
+    /// fsynced once here, on the caller's thread and holding none of the
+    /// handle's locks, before they count as durable. An open that nobody asks
+    /// about this pays no fsync.
     pub fn durable_wal_position(&self) -> WalPosition {
-        if !self.replayed.settled.load(Ordering::Acquire) {
-            self.settle_replayed_wal();
+        if let Some((generation, len, frames)) = self.durable_wal.unvouched() {
+            // A failed fsync leaves the position where it is; the next call
+            // tries again, and this handle's next write's fsync covers it.
+            let (dir, sync_fn) = &*self.vouch;
+            if sync_fn(dir).is_ok() {
+                self.durable_wal.vouch(generation, len, frames);
+            }
         }
         self.durable_wal.get()
     }
 
-    fn settle_replayed_wal(&self) {
-        let mut pending = self
-            .replayed
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some((generation, len, frames)) = *pending {
-            // A failed fsync leaves the position where it is; the next call
-            // tries again, and the next write's fsync covers it anyway.
-            if (self.replayed.sync_fn)(&self.replayed.dir).is_err() {
-                return;
-            }
-            self.durable_wal.synced_at_least(generation, len, frames);
-            *pending = None;
-        }
-        self.replayed.settled.store(true, Ordering::Release);
+    /// Catch up with another process's commits or snapshot, if there are any.
+    ///
+    /// The same metadata-only check every read makes. For a reader that does
+    /// not otherwise read — the backup worker, when the disk shows a snapshot
+    /// this handle has not seen.
+    pub fn refresh_if_stale_now(&self) {
+        self.refresh_if_stale();
     }
 
     /// Check whether another process has committed, and if so absorb its

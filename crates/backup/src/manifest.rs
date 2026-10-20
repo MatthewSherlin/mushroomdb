@@ -4,6 +4,13 @@
 //! CRC-32 (`crc32`, eight lowercase hex digits) instead of a SHA-256. The
 //! checksum is there to catch corruption, not tampering, and S3 verifies every
 //! upload with its own SHA-256 checksum besides.
+//!
+//! Every object a manifest names has an immutable key: the snapshot and the
+//! archives carry the generation they were uploaded for, a side file its own
+//! checksum and size, a segment its generation and byte range. Nothing a
+//! manifest names is ever overwritten, so every manifest still in the bucket
+//! verifies — not only the newest. Each entry also says which file of the
+//! store it restores to (`name`), since the key no longer does.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,8 +30,9 @@ pub struct Manifest {
     /// When the manifest was written, RFC 3339 in UTC.
     pub created_at: String,
     /// Global frame index one past the last frame this restore point holds —
-    /// the index space `open_at` and `--at <commit>` use. Also the manifest's
-    /// key, so manifests sort by it.
+    /// the index space `open_at` and `--at <commit>` use: what a store opened
+    /// from `files` plus `segments` reports as `wal_total_commits`. Also the
+    /// manifest's key, so manifests sort by it.
     pub commit_seq: u64,
     /// The first global frame index still reachable through the archives
     /// (the store's `wal.floor`; 0 when nothing was ever pruned). A point in
@@ -42,6 +50,9 @@ pub struct Manifest {
 /// One whole object named by a manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
+    /// The store file it restores to: `snapshot.bin`, `wal.N.archive`,
+    /// `commit_times.bin`, ….
+    pub name: String,
     pub key: String,
     pub size: u64,
     /// CRC-32 of the object's bytes, as eight lowercase hex digits.
@@ -122,14 +133,35 @@ pub fn latest_key(prefix: &str) -> String {
     object_key(prefix, "LATEST")
 }
 
-/// `{prefix}/wal.{n}.archive`.
-pub fn archive_key(prefix: &str, n: u64) -> String {
-    object_key(prefix, &format!("wal.{n}.archive"))
+/// `{prefix}/snapshots/{generation}-{commit_seq}.bin`: the snapshot uploaded
+/// for `generation`, when the store's durable position was `commit_seq`.
+pub fn snapshot_key(prefix: &str, generation: u64, commit_seq: u64) -> String {
+    object_key(prefix, &format!("snapshots/{generation}-{commit_seq}.bin"))
 }
 
-/// The archive number an archive key names, or `None`.
-pub fn parse_archive_key(prefix: &str, key: &str) -> Option<u64> {
-    key.strip_prefix(&object_key(prefix, "wal."))?
+/// `{prefix}/archives/{generation}-wal.{n}.archive`: archive `n`, uploaded
+/// while shipping `generation`.
+pub fn archive_key(prefix: &str, generation: u64, n: u64) -> String {
+    object_key(prefix, &format!("archives/{generation}-wal.{n}.archive"))
+}
+
+/// `{prefix}/side/{name}/{crc32}-{size}`: a side file, addressed by content.
+pub fn side_key(prefix: &str, name: &str, crc32: &str, size: u64) -> String {
+    object_key(prefix, &format!("side/{name}/{crc32}-{size}"))
+}
+
+/// The generation a snapshot or archive key was uploaded for, or `None` for
+/// any other key.
+pub fn parse_versioned_generation(prefix: &str, key: &str) -> Option<u64> {
+    let rest = key
+        .strip_prefix(&object_key(prefix, "snapshots/"))
+        .or_else(|| key.strip_prefix(&object_key(prefix, "archives/")))?;
+    rest.split_once('-')?.0.parse().ok()
+}
+
+/// The archive number in a store file name `wal.{n}.archive`.
+pub fn parse_archive_name(name: &str) -> Option<u64> {
+    name.strip_prefix("wal.")?
         .strip_suffix(".archive")?
         .parse()
         .ok()
@@ -154,9 +186,23 @@ mod tests {
             "p/manifest/00000000000000000042.json"
         );
         assert_eq!(latest_key(""), "LATEST");
-        assert_eq!(archive_key("a/b", 7), "a/b/wal.7.archive");
-        assert_eq!(parse_archive_key("a/b", "a/b/wal.7.archive"), Some(7));
-        assert_eq!(parse_archive_key("a/b", "a/b/wal.floor"), None);
+        assert_eq!(archive_key("a/b", 3, 7), "a/b/archives/3-wal.7.archive");
+        assert_eq!(snapshot_key("p", 4, 99), "p/snapshots/4-99.bin");
+        assert_eq!(
+            side_key("p", "wal.floor", "0000abcd", 8),
+            "p/side/wal.floor/0000abcd-8"
+        );
+        assert_eq!(
+            parse_versioned_generation("p", "p/snapshots/4-99.bin"),
+            Some(4)
+        );
+        assert_eq!(
+            parse_versioned_generation("a/b", "a/b/archives/3-wal.7.archive"),
+            Some(3)
+        );
+        assert_eq!(parse_versioned_generation("p", "p/side/x/1-2"), None);
+        assert_eq!(parse_archive_name("wal.7.archive"), Some(7));
+        assert_eq!(parse_archive_name("wal.floor"), None);
     }
 
     #[test]

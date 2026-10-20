@@ -13,6 +13,10 @@ pub const DEFAULT_MANIFEST_INTERVAL_S: u64 = 60;
 pub const DEFAULT_RETAIN_N: usize = 7;
 /// Default bucket-lease TTL in seconds (`MUSHROOMDB_BACKUP_LEASE_TTL`).
 pub const DEFAULT_LEASE_TTL_S: u64 = 30;
+/// Default deadline on each object-store operation (`MUSHROOMDB_BACKUP_OP_TIMEOUT_MS`).
+pub const DEFAULT_OP_TIMEOUT_MS: u64 = 10_000;
+/// Default bound on the shutdown flush (`MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS`).
+pub const DEFAULT_SHUTDOWN_GRACE_MS: u64 = 10_000;
 
 /// Backup settings, read from the environment by [`BackupConfig::from_env`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +36,14 @@ pub struct BackupConfig {
     pub sse: Option<String>,
     /// `MUSHROOMDB_BACKUP_LEASE_TTL`: bucket-lease TTL in seconds.
     pub lease_ttl_s: u64,
+    /// `MUSHROOMDB_BACKUP_OP_TIMEOUT_MS`: the most one object-store request
+    /// (one PUT, one part, one GET, one LIST, one DELETE) may take before the
+    /// worker gives up on it and counts a failure. The client's own retries
+    /// can otherwise hold a black-holed bucket for minutes.
+    pub op_timeout_ms: u64,
+    /// `MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS`: how long the shutdown flush may
+    /// take before the in-flight upload is abandoned and the worker stops.
+    pub shutdown_grace_ms: u64,
 }
 
 /// Where a backup URL points.
@@ -90,6 +102,17 @@ impl BackupConfig {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty()),
             lease_ttl_s: number("MUSHROOMDB_BACKUP_LEASE_TTL", DEFAULT_LEASE_TTL_S)?,
+            op_timeout_ms: positive(
+                number("MUSHROOMDB_BACKUP_OP_TIMEOUT_MS", DEFAULT_OP_TIMEOUT_MS)?,
+                "MUSHROOMDB_BACKUP_OP_TIMEOUT_MS",
+            )?,
+            shutdown_grace_ms: positive(
+                number(
+                    "MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS",
+                    DEFAULT_SHUTDOWN_GRACE_MS,
+                )?,
+                "MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS",
+            )?,
         }))
     }
 
@@ -102,6 +125,8 @@ impl BackupConfig {
             retain_n: DEFAULT_RETAIN_N,
             sse: None,
             lease_ttl_s: DEFAULT_LEASE_TTL_S,
+            op_timeout_ms: DEFAULT_OP_TIMEOUT_MS,
+            shutdown_grace_ms: DEFAULT_SHUTDOWN_GRACE_MS,
         }
     }
 
@@ -109,6 +134,13 @@ impl BackupConfig {
     pub fn location(&self) -> Result<S3Location, BackupError> {
         parse_location(&self.s3_url)
     }
+}
+
+fn positive(v: u64, key: &str) -> Result<u64, BackupError> {
+    if v == 0 {
+        return Err(BackupError::Config(format!("{key} must be at least 1")));
+    }
+    Ok(v)
 }
 
 /// Split `scheme://bucket/prefix`.
@@ -235,6 +267,8 @@ mod tests {
             ("MUSHROOMDB_BACKUP_RETAIN_N", "0"),
             ("MUSHROOMDB_BACKUP_SSE", "AES256"),
             ("MUSHROOMDB_BACKUP_LEASE_TTL", "9"),
+            ("MUSHROOMDB_BACKUP_OP_TIMEOUT_MS", "1500"),
+            ("MUSHROOMDB_BACKUP_SHUTDOWN_GRACE_MS", "2500"),
         ]))
         .unwrap()
         .unwrap();
@@ -248,6 +282,7 @@ mod tests {
             (250, 5, 0, 9)
         );
         assert_eq!(c.sse.as_deref(), Some("AES256"));
+        assert_eq!((c.op_timeout_ms, c.shutdown_grace_ms), (1500, 2500));
         let loc = c.location().unwrap();
         assert_eq!((loc.bucket.as_str(), loc.prefix.as_str()), ("bk", "a/b"));
     }

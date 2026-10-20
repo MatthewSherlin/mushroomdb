@@ -2920,6 +2920,14 @@ impl<F: Fs> GraphDb<F> {
         // every open, and costs nothing on a store that has never archived.
         db.wal_frames_written = db.wal_horizon_floor + db.archive_frame_count()? + decoded_frames;
         db.snapshot_ident = db.fs.snapshot_ident().map_err(GraphError::Io)?;
+        // What was just replayed is not this handle's fsync to vouch for: a
+        // reader of the durable position fsyncs it once before counting it.
+        db.durable_wal.loaded(
+            db.snapshot_ident,
+            db.wal_frames_written - decoded_frames,
+            db.wal_consumed,
+            db.wal_frames_written,
+        );
         trace_open!("wal replay done", _t0);
         // Rebuild view values after WAL replay only when there is no V8 base.
         // With a V8 base, view values are correct in the snapshot and are updated
@@ -3192,6 +3200,10 @@ impl<F: Fs> GraphDb<F> {
         // incomplete trailing frame stays unconsumed for the next refresh.
         self.wal_consumed += valid_len as u64;
         self.wal_frames_written += decoded_frames;
+        // Another process wrote these frames; whether it fsynced them is not
+        // this handle's to say.
+        self.durable_wal
+            .absorbed(self.wal_consumed, self.wal_frames_written);
         // The peer that wrote those frames also stamped them. Absorbing the
         // frames without the stamps leaves this handle resolving dates from a
         // prefix of the store's history, and — while our own map is still
@@ -15920,6 +15932,7 @@ impl<F: Fs> GraphDb<F> {
         // paid a far larger cost than one decode.
         self.wal_frames_written = self.wal_total_commits()?;
         self.snapshot_ident = self.fs.snapshot_ident().map_err(GraphError::Io)?;
+        self.durable_wal.snapshot_is(self.snapshot_ident);
         // A replacement WAL went in through `write_atomic`, which fsyncs it:
         // all of it is durable.
         if self.durable_wal.get().generation != generation_at_start {

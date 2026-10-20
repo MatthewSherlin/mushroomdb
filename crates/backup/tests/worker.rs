@@ -93,13 +93,21 @@ async fn latest(store: &Arc<dyn ObjectStore>) -> Option<Manifest> {
 /// checksum and that the segments are contiguous from offset 0.
 async fn restore_latest(store: &Arc<dyn ObjectStore>, into: &Path) -> Manifest {
     let m = latest(store).await.expect("a manifest was written");
+    restore(store, &m, into).await;
+    m
+}
+
+/// Rebuild a store in `into` from `m`, verifying every checksum, that the
+/// segments are contiguous from offset 0, and that the store opened from it
+/// holds exactly `m.commit_seq` frames.
+async fn restore(store: &Arc<dyn ObjectStore>, m: &Manifest, into: &Path) {
     std::fs::create_dir_all(into).unwrap();
     for f in &m.files {
         let bytes = get(store, &f.key).await.expect("a named file exists");
         assert_eq!(bytes.len() as u64, f.size, "{}", f.key);
         assert_eq!(crc32_hex(&bytes), f.crc32, "{}", f.key);
-        let name = f.key.strip_prefix(&format!("{PREFIX}/")).unwrap();
-        std::fs::write(into.join(name), bytes).unwrap();
+        assert!(!f.name.contains('/') && !f.name.is_empty(), "{}", f.name);
+        std::fs::write(into.join(&f.name), bytes).unwrap();
     }
     let mut wal = Vec::new();
     for s in &m.segments {
@@ -116,7 +124,12 @@ async fn restore_latest(store: &Arc<dyn ObjectStore>, into: &Path) -> Manifest {
         wal.extend(bytes);
     }
     std::fs::write(into.join("wal.bin"), wal).unwrap();
-    m
+    let opened = GraphDb::open(into).expect("a restored store opens");
+    assert_eq!(
+        opened.wal_total_commits().unwrap(),
+        m.commit_seq,
+        "commit_seq matches what the manifest's files and segments hold"
+    );
 }
 
 fn counts_of(dir: &Path) -> (usize, u64) {
@@ -167,7 +180,8 @@ fn manifest_round_trip() {
         commit_seq: 4712,
         oldest_commit_seq: 12,
         files: vec![FileEntry {
-            key: "pfx/snapshot.bin".into(),
+            name: "snapshot.bin".into(),
+            key: "pfx/snapshots/12-4712.bin".into(),
             size: 18_432_000,
             crc32: "cbf43926".into(),
         }],
@@ -253,25 +267,30 @@ async fn worker_uploads_snapshot_on_trigger() {
     )
     .unwrap();
     let first = wait_for_latest(&store, |_| true).await;
-    assert!(get(&store, "pfx/snapshot.bin").await.is_none());
+    assert!(first.files.iter().all(|f| f.name != "snapshot.bin"));
 
     db.write().insert_node("A", "b", vec![]).unwrap();
     db.write().snapshot_with(ARCHIVING).unwrap();
     tx.send(BackupTrigger::Snapshot).unwrap();
 
     let m = wait_for_latest(&store, |m| m.wal_generation > first.wal_generation).await;
-    let snap = get(&store, "pfx/snapshot.bin")
-        .await
-        .expect("snapshot.bin uploaded");
+    let entry = m
+        .files
+        .iter()
+        .find(|f| f.name == "snapshot.bin")
+        .expect("the manifest names the snapshot");
+    assert!(
+        entry
+            .key
+            .starts_with(&format!("pfx/snapshots/{}-", m.wal_generation)),
+        "a versioned key: {}",
+        entry.key
+    );
+    let snap = get(&store, &entry.key).await.expect("snapshot uploaded");
     assert_eq!(
         snap,
         std::fs::read(dir.path().join("snapshot.bin")).unwrap()
     );
-    let entry = m
-        .files
-        .iter()
-        .find(|f| f.key == "pfx/snapshot.bin")
-        .expect("the manifest names the snapshot");
     assert_eq!(entry.crc32, crc32_hex(&snap));
     assert_eq!(handle.error_count.load(Ordering::Acquire), 0);
 }
@@ -646,4 +665,290 @@ async fn failed_uploads_back_off_and_turn_health_off_then_on() {
     let restored = tempfile::tempdir().unwrap();
     restore_latest(&store, restored.path()).await;
     assert_eq!(counts_of(restored.path()), (1, 0));
+}
+
+// ── Fix round 1 probes ───────────────────────────────────────────────────────
+
+/// Every manifest in the bucket, oldest first.
+async fn all_manifests(store: &Arc<dyn ObjectStore>) -> Vec<Manifest> {
+    let mut out = Vec::new();
+    for k in keys(store).await {
+        if k.contains("/manifest/") {
+            out.push(Manifest::from_json(&get(store, &k).await.unwrap()).unwrap());
+        }
+    }
+    out
+}
+
+/// Every manifest in the bucket verifies and restores to a store holding
+/// exactly its `commit_seq` frames; `LATEST`, when present, names one of them.
+async fn assert_bucket_sound(store: &Arc<dyn ObjectStore>, context: &str) {
+    let manifests = all_manifests(store).await;
+    for m in &manifests {
+        let into = tempfile::tempdir().unwrap();
+        restore(store, m, into.path()).await;
+    }
+    if let Some(bytes) = get(store, &format!("{PREFIX}/LATEST")).await {
+        let key = String::from_utf8(bytes).unwrap();
+        assert!(
+            get(store, &key).await.is_some(),
+            "{context}: LATEST names {key}, which is gone"
+        );
+    }
+}
+
+fn prop(db: &SharedDb, key: &str, field: &str) -> Option<mushroomdb::Value> {
+    db.read().get_prop(key, field)
+}
+
+/// Critical probe: a snapshot taken by another process — the CLI, while
+/// `serve` runs — must not be paired with the previous WAL generation. The
+/// server handle has not refreshed when the worker looks.
+#[tokio::test]
+async fn a_peer_process_snapshot_restores_to_the_live_store() {
+    for archive in [false, true] {
+        let options = SnapshotOptions {
+            keep_wal: false,
+            archive_wal: archive,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let server = SharedDb::open(dir.path()).unwrap();
+        server
+            .write()
+            .insert_node("A", "a1", vec![("v".into(), mushroomdb::Value::Int(1))])
+            .unwrap();
+        for i in 0..5 {
+            server
+                .write()
+                .insert_node("A", &format!("s{i}"), vec![])
+                .unwrap();
+        }
+        let store = mem();
+        let mut w = worker(&store, &server, dir.path());
+        w.run_once().await.unwrap();
+        {
+            let peer = SharedDb::open(dir.path()).unwrap();
+            peer.write()
+                .set_prop("a1", "v", mushroomdb::Value::Int(99))
+                .unwrap();
+            for i in 0..5 {
+                peer.write()
+                    .insert_node("B", &format!("p{i}"), vec![])
+                    .unwrap();
+            }
+            peer.write().snapshot_with(options).unwrap();
+        }
+        // No read on the server in between: its handle is behind the disk.
+        w.run_once().await.unwrap();
+        w.flush().await;
+
+        let restored = tempfile::tempdir().unwrap();
+        let m = restore_latest(&store, restored.path()).await;
+        let r = GraphDb::open(restored.path()).unwrap();
+        let v = r.get_prop("a1", "v");
+        drop(r);
+        assert_eq!(v, Some(mushroomdb::Value::Int(99)), "archive={archive}");
+        assert_eq!(prop(&server, "a1", "v"), Some(mushroomdb::Value::Int(99)));
+        assert_eq!(
+            counts_of(restored.path()),
+            counts(&server),
+            "archive={archive}"
+        );
+        assert_eq!(
+            m.commit_seq,
+            server.read().wal_total_commits().unwrap(),
+            "archive={archive}: commit_seq is the live store's"
+        );
+        assert_bucket_sound(&store, "peer").await;
+    }
+}
+
+/// The run every kill-point probe replays: writes, segment shipping, an
+/// archiving and a truncating snapshot, retention at 2. Returns whether the
+/// worker was "killed" (its write budget ran out) before the end.
+async fn scenario(
+    dir: &Path,
+    store: &Arc<dyn ObjectStore>,
+    budget: Option<u64>,
+) -> (SharedDb, bool) {
+    let db = SharedDb::open(dir).unwrap();
+    let mut w = BackupWorker::new(
+        BackupConfig {
+            retain_n: 2,
+            manifest_interval_s: 0,
+            ..config(1000)
+        },
+        Arc::clone(store),
+        Arc::new(db.clone()),
+        dir.to_path_buf(),
+    )
+    .unwrap();
+    if let Some(n) = budget {
+        w.fail_after_writes(n);
+    }
+    let mut next = 0;
+    for round in 0..4 {
+        for _ in 0..3 {
+            db.write()
+                .insert_node("A", &format!("n{next}"), vec![])
+                .unwrap();
+            next += 1;
+        }
+        if w.run_once().await.is_err() {
+            return (db, true);
+        }
+        match round {
+            1 => db.write().snapshot_with(ARCHIVING).unwrap(),
+            2 => db.write().snapshot().unwrap(),
+            _ => {}
+        }
+        if w.run_once().await.is_err() {
+            return (db, true);
+        }
+    }
+    (db, false)
+}
+
+/// Important probe: a kill between any two requests that change the bucket.
+/// After every one, every manifest left verifies and restores, and `LATEST`
+/// names an existing manifest; a restarted worker then brings the bucket to
+/// the live store.
+#[tokio::test]
+async fn a_kill_between_any_two_requests_leaves_every_manifest_restorable() {
+    let mut kill_points = 0;
+    for budget in 0.. {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mem();
+        let (db, killed) = scenario(dir.path(), &store, Some(budget)).await;
+        if !killed {
+            break;
+        }
+        kill_points += 1;
+        assert_bucket_sound(&store, &format!("killed after {budget} writes")).await;
+        drop(db);
+        // The restart: a new process, a new worker, the same bucket.
+        let db = SharedDb::open(dir.path()).unwrap();
+        let mut w = worker(&store, &db, dir.path());
+        w.run_once().await.unwrap();
+        let restored = tempfile::tempdir().unwrap();
+        restore_latest(&store, restored.path()).await;
+        assert_eq!(
+            counts_of(restored.path()),
+            counts(&db),
+            "after kill {budget}"
+        );
+        assert_bucket_sound(&store, &format!("restarted after kill {budget}")).await;
+    }
+    assert!(
+        kill_points > 20,
+        "the scenario makes many writes: {kill_points}"
+    );
+}
+
+/// Important probe: side files change under the same name, and every
+/// retained manifest must still verify after many cycles, not only the newest.
+#[tokio::test]
+async fn every_retained_manifest_verifies_after_many_cycles() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mem();
+    let (db, killed) = scenario(dir.path(), &store, None).await;
+    assert!(!killed);
+    let manifests = all_manifests(&store).await;
+    assert_eq!(manifests.len(), 2, "retention keeps two");
+    assert_bucket_sound(&store, "cycles").await;
+    let restored = tempfile::tempdir().unwrap();
+    restore_latest(&store, restored.path()).await;
+    assert_eq!(counts_of(restored.path()), counts(&db));
+    // Every object a manifest names is immutable: no key appears under two
+    // different checksums across manifests.
+    let mut seen = std::collections::HashMap::new();
+    for m in &manifests {
+        for f in &m.files {
+            let prev = seen.insert(f.key.clone(), f.crc32.clone());
+            assert!(
+                prev.is_none_or(|c| c == f.crc32),
+                "{} was overwritten",
+                f.key
+            );
+        }
+    }
+}
+
+/// Important probe: a black-holed bucket. Every request hangs forever; the
+/// worker must count failures, go unhealthy once durable data has waited
+/// longer than 30 s, report the lag, and still stop within the shutdown grace.
+#[tokio::test(start_paused = true)]
+async fn a_hung_bucket_is_reported_and_does_not_hold_up_shutdown() {
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let forever = Duration::from_secs(365 * 24 * 3600);
+    let hung: Arc<dyn ObjectStore> = Arc::new(ThrottledStore::new(
+        InMemory::new(),
+        ThrottleConfig {
+            wait_put_per_call: forever,
+            wait_get_per_call: forever,
+            wait_list_per_call: forever,
+            wait_list_with_delimiter_per_call: forever,
+            wait_delete_per_call: forever,
+            ..ThrottleConfig::default()
+        },
+    ));
+    let (tx, rx) = watch::channel(BackupTrigger::Idle);
+    let handle = BackupWorker::spawn(
+        BackupConfig {
+            op_timeout_ms: 200,
+            shutdown_grace_ms: 500,
+            ..config(1000)
+        },
+        hung,
+        Arc::new(db.clone()),
+        dir.path().to_path_buf(),
+        rx,
+    )
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        handle.error_count.load(Ordering::Acquire) > 0,
+        "timeouts count as failures"
+    );
+
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    assert!(
+        !handle.healthy.load(Ordering::Acquire),
+        "unhealthy after 30 s of lag"
+    );
+    assert!(
+        handle.lag_s.load(Ordering::Acquire) >= 30,
+        "lag is reported"
+    );
+
+    let asked = tokio::time::Instant::now();
+    tx.send(BackupTrigger::Shutdown).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle.join)
+        .await
+        .expect("shutdown is bounded however hung the bucket is")
+        .unwrap();
+    assert!(
+        asked.elapsed() <= Duration::from_millis(1000),
+        "{:?}",
+        asked.elapsed()
+    );
+}
+
+/// Lag and health come back once the bucket answers again.
+#[tokio::test]
+async fn lag_is_zero_when_everything_durable_has_shipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SharedDb::open(dir.path()).unwrap();
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    let store = mem();
+    let mut w = worker(&store, &db, dir.path());
+    let c = w.counters();
+    w.step().await;
+    assert_eq!(c.lag_s.load(Ordering::Acquire), 0);
+    assert!(c.healthy.load(Ordering::Acquire));
+    assert!(c.last_success_ts.load(Ordering::Acquire) > 0);
 }

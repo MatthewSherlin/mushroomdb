@@ -6,7 +6,9 @@
 //! failed group fsync, a snapshot, a reopen — is pinned here.
 
 use core_storage::wal::decode_all;
-use mushroomdb::{BatchOp, FsyncPolicy, SharedDb, SnapshotOptions, SnapshotStop, WalPosition};
+use mushroomdb::{
+    disk_snapshot_ident, BatchOp, FsyncPolicy, SharedDb, SnapshotOptions, SnapshotStop, WalPosition,
+};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -57,7 +59,7 @@ fn a_strict_direct_write_is_durable_up_to_its_last_frame() {
     assert_eq!(pos.generation, before.generation);
     assert!(pos.len > before.len);
     assert_eq!(pos.len, wal_len(&dir));
-    assert_eq!(pos.frames, db.read().wal_total_commits().unwrap());
+    assert_eq!(pos.frames, Some(db.read().wal_total_commits().unwrap()));
     assert!(!pos.snapshot_in_progress);
     assert_on_frame_boundary(&dir, pos);
 }
@@ -70,7 +72,7 @@ fn a_group_commit_is_durable_once_its_fsync_returns() {
     db.submit_batch(insert("b")).unwrap();
     let pos = db.durable_wal_position();
     assert_eq!(pos.len, wal_len(&dir));
-    assert_eq!(pos.frames, db.read().wal_total_commits().unwrap());
+    assert_eq!(pos.frames, Some(db.read().wal_total_commits().unwrap()));
     assert_on_frame_boundary(&dir, pos);
 }
 
@@ -131,7 +133,7 @@ fn a_truncating_snapshot_starts_a_new_generation_at_its_baseline() {
     let pos = db.durable_wal_position();
     assert_eq!(pos.generation, before.generation + 1);
     assert_eq!(pos.len, wal_len(&dir), "the baseline is written durably");
-    assert_eq!(pos.frames, db.read().wal_total_commits().unwrap());
+    assert_eq!(pos.frames, Some(db.read().wal_total_commits().unwrap()));
     assert!(!pos.snapshot_in_progress);
     assert_on_frame_boundary(&dir, pos);
 }
@@ -154,7 +156,7 @@ fn an_archiving_snapshot_starts_a_new_generation() {
     // Frames keep counting across the archive: the archived ones are still
     // addressable history.
     assert!(pos.frames >= before.frames);
-    assert_eq!(pos.frames, db.read().wal_total_commits().unwrap());
+    assert_eq!(pos.frames, Some(db.read().wal_total_commits().unwrap()));
 }
 
 #[test]
@@ -212,7 +214,7 @@ fn a_reopen_starts_at_the_end_of_what_it_replayed() {
         wal_len(&dir),
         "the first read fsyncs what the open replayed"
     );
-    assert_eq!(pos.frames, db.read().wal_total_commits().unwrap());
+    assert_eq!(pos.frames, Some(db.read().wal_total_commits().unwrap()));
     assert_on_frame_boundary(&dir, pos);
 }
 
@@ -226,4 +228,52 @@ fn reading_the_position_never_waits_for_the_write_lock() {
     let pos = db.durable_wal_position();
     assert!(pos.len > 0);
     drop(guard);
+}
+
+#[test]
+fn a_snapshot_names_the_snapshot_on_disk() {
+    let dir = tmp("snapident");
+    let db = SharedDb::open(&dir).unwrap();
+    assert_eq!(db.durable_wal_position().snapshot, None);
+    db.write().insert_node("A", "a", vec![]).unwrap();
+    db.write().snapshot().unwrap();
+    let ident = disk_snapshot_ident(&dir).unwrap();
+    assert!(ident.is_some());
+    assert_eq!(db.durable_wal_position().snapshot, ident);
+}
+
+/// Another handle on the same store (a separate open description of the lock
+/// file, exactly as another process has) snapshots. Until this handle catches
+/// up, its position names the old snapshot — which is how a reader can tell
+/// its offsets describe a file that is gone. After the refresh it is in a new
+/// generation, and once vouched for, durable to the end of the peer's WAL.
+#[test]
+fn a_peer_snapshot_shows_until_the_handle_catches_up() {
+    let dir = tmp("peer");
+    let server = SharedDb::open(&dir).unwrap();
+    server.write().insert_node("A", "a", vec![]).unwrap();
+    let before = server.durable_wal_position();
+    {
+        let peer = SharedDb::open(&dir).unwrap();
+        peer.write().insert_node("A", "b", vec![]).unwrap();
+        peer.write().snapshot().unwrap();
+        peer.write().insert_node("A", "c", vec![]).unwrap();
+    }
+    let disk = disk_snapshot_ident(&dir).unwrap();
+    assert_ne!(
+        server.durable_wal_position().snapshot,
+        disk,
+        "behind the disk"
+    );
+    server.refresh_if_stale_now();
+    let pos = server.durable_wal_position();
+    assert_eq!(pos.snapshot, disk);
+    assert!(pos.generation > before.generation);
+    assert_eq!(
+        pos.len,
+        wal_len(&dir),
+        "the peer's WAL is fsynced and vouched for"
+    );
+    assert_eq!(pos.frames, Some(server.read().wal_total_commits().unwrap()));
+    assert_on_frame_boundary(&dir, pos);
 }
