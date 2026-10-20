@@ -8259,6 +8259,42 @@ LIMIT 10";
         assert_eq!(rows_of(&rs), vec![vec![Some(s("alice"))]]);
     }
 
+    /// Ledger row 102: a key-anchored hop seeds from a point lookup, not a
+    /// label scan, and still returns the label scan's rows.
+    #[test]
+    fn key_anchored_hop_uses_scan_key_not_a_label_scan() {
+        let mut fx = Fx::new();
+        let a = fx.add("Person", "a", vec![("score", Value::Int(1))]);
+        let b = fx.add("Person", "b", vec![("score", Value::Int(7))]);
+        let c = fx.add("Person", "c", vec![("score", Value::Int(2))]);
+        fx.edge("KNOWS", a, b, vec![]);
+        fx.edge("KNOWS", a, c, vec![]);
+        fx.edge("KNOWS", b, c, vec![]);
+        let mut params = BTreeMap::new();
+        params.insert("k".to_string(), s("a"));
+        let fires_before = super::SCAN_KEY_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+        let rs = run(
+            &fx.view(),
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k RETURN key(q) AS dst ORDER BY dst",
+            &params,
+        )
+        .unwrap();
+        let fires_after = super::SCAN_KEY_FIRES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fires_after > fires_before,
+            "SCAN_KEY_FIRES must increment; before={fires_before} after={fires_after}"
+        );
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("b"))], vec![Some(s("c"))]]);
+        // The residual on the destination survives the fold.
+        let rs = run(
+            &fx.view(),
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k AND q.score > 5 RETURN key(q)",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(rows_of(&rs), vec![vec![Some(s("b"))]]);
+    }
+
     /// `WHERE n.key = $k` uses ScanKey.
     #[test]
     fn where_n_key_eq_param_uses_scan_key() {

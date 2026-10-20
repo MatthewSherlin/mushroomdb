@@ -405,6 +405,7 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
     // Fold WHERE single-equality predicates into IndexScan ops before any
     // aggregate or project ops are appended.
     ops = fold_where_equalities(ops);
+    ops = fold_key_anchor_after_expand(ops);
 
     // Post-UNWIND WHERE: filter expanded rows using UNWIND alias bindings.
     if let Some(expr) = &q.post_unwind_where {
@@ -964,6 +965,69 @@ pub(super) fn fold_where_equalities(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
         }
     }
 
+    ops
+}
+
+/// Post-pass: turn `ScanLabel -> Expand.. -> Filter(key(n) = v)` into
+/// `ScanKey -> Expand..` so a key-anchored traversal is a point lookup rather
+/// than a scan of the whole label (ledger row 102).
+///
+/// `fold_where_equalities` refuses to fold across an `Expand`. This pass
+/// handles only the `key(n)` / `id(n)` function form (a plain id-map point
+/// lookup that `ScanKey` already restricts by label and visibility), and only
+/// when every op between the scan and the first `Filter` is an `Expand`,
+/// `LookupProps` or `JoinBound`: those neither rebind the scan variable nor
+/// change which scan rows survive, so applying the equality before them yields
+/// the same rows. Any other op (`With`, aggregate, optional, a second scan,
+/// `VarExpand`...) leaves the plan unchanged. Remaining AND terms stay as a
+/// residual `Filter` in place.
+pub(super) fn fold_key_anchor_after_expand(mut ops: Vec<PlanOp>) -> Vec<PlanOp> {
+    let Some(scan_pos) = ops
+        .iter()
+        .position(|op| matches!(op, PlanOp::ScanLabel { .. }))
+    else {
+        return ops;
+    };
+    let (scan_var, scan_label) = match &ops[scan_pos] {
+        PlanOp::ScanLabel { var, label } => (var.clone(), label.clone()),
+        _ => unreachable!(),
+    };
+    let mut saw_expand = false;
+    let mut filter_pos = None;
+    for (i, op) in ops.iter().enumerate().skip(scan_pos + 1) {
+        match op {
+            PlanOp::Expand { .. } => saw_expand = true,
+            PlanOp::LookupProps { .. } | PlanOp::JoinBound { .. } => {}
+            PlanOp::Filter { .. } => {
+                filter_pos = Some(i);
+                break;
+            }
+            _ => return ops,
+        }
+    }
+    // Without an Expand this is `fold_where_equalities`' case.
+    let Some(filter_pos) = filter_pos.filter(|_| saw_expand) else {
+        return ops;
+    };
+    let PlanOp::Filter { expr } = &ops[filter_pos] else {
+        unreachable!()
+    };
+    let mut terms = split_and(expr.clone());
+    let Some((idx, IdentityEqForm::Func, value)) = find_identity_eq(&terms, &scan_var) else {
+        return ops;
+    };
+    terms.remove(idx);
+    ops[scan_pos] = PlanOp::ScanKey {
+        var: scan_var,
+        key: value,
+        label: scan_label,
+    };
+    match join_and(terms) {
+        Some(residual) => ops[filter_pos] = PlanOp::Filter { expr: residual },
+        None => {
+            ops.remove(filter_pos);
+        }
+    }
     ops
 }
 
@@ -1748,6 +1812,101 @@ LIMIT 10";
                 },
             ]
         );
+    }
+
+    fn count_ops(ops: &[PlanOp], pred: impl Fn(&PlanOp) -> bool) -> usize {
+        ops.iter().filter(|op| pred(op)).count()
+    }
+
+    /// Ledger row 102: `WHERE key(p) = $k` after an `Expand` anchors on
+    /// `ScanKey`; no label scan and no `Filter` remain.
+    #[test]
+    fn key_anchor_after_expand_becomes_scan_key() {
+        let ops =
+            plan_src("MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k RETURN key(q)").unwrap();
+        assert!(
+            matches!(&ops[0], PlanOp::ScanKey { var, label, key }
+                if var == "p" && label.as_deref() == Some("Person")
+                    && matches!(key, Operand::Param(n) if n == "k")),
+            "{ops:?}"
+        );
+        assert_eq!(
+            count_ops(&ops, |o| matches!(o, PlanOp::ScanLabel { .. })),
+            0
+        );
+        assert_eq!(count_ops(&ops, |o| matches!(o, PlanOp::Filter { .. })), 0);
+        assert_eq!(count_ops(&ops, |o| matches!(o, PlanOp::Expand { .. })), 1);
+    }
+
+    #[test]
+    fn key_anchor_after_expand_accepts_a_literal_and_id_func() {
+        for src in [
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = 'k0' RETURN key(q)",
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE id(p) = $k RETURN key(q)",
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE $k = key(p) RETURN key(q)",
+        ] {
+            let ops = plan_src(src).unwrap();
+            let folded = matches!(&ops[0], PlanOp::ScanKey { .. });
+            // `$k = key(p)` (value on the left) is not a recognised form; it
+            // must simply stay a correct label scan plus filter.
+            if src.contains("$k = key") {
+                assert!(!folded && count_ops(&ops, |o| matches!(o, PlanOp::Filter { .. })) == 1);
+            } else {
+                assert!(folded, "{src}: {ops:?}");
+            }
+        }
+    }
+
+    /// The residual predicates stay as a `Filter` after the key term is lifted.
+    #[test]
+    fn key_anchor_after_expand_keeps_residual_terms() {
+        let ops = plan_src(
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k AND q.score > 5 RETURN key(q)",
+        )
+        .unwrap();
+        assert!(matches!(&ops[0], PlanOp::ScanKey { .. }), "{ops:?}");
+        let filters: Vec<&PlanOp> = ops
+            .iter()
+            .filter(|o| matches!(o, PlanOp::Filter { .. }))
+            .collect();
+        assert_eq!(filters.len(), 1, "{ops:?}");
+        let PlanOp::Filter { expr } = filters[0] else {
+            unreachable!()
+        };
+        assert!(
+            matches!(expr, Expr::Cmp { op: CmpOp::Gt, .. }),
+            "only q.score > 5 may remain: {expr:?}"
+        );
+    }
+
+    /// Not a plain key equality: an OR, the stored-wins `p.key` form, or a key
+    /// on a node that is not the scan variable all keep the label scan.
+    #[test]
+    fn key_anchor_after_expand_does_not_fold_other_shapes() {
+        for src in [
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k OR q.score > 5 RETURN key(q)",
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(q) = $k RETURN key(p)",
+            "MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) <> $k RETURN key(q)",
+        ] {
+            let ops = plan_src(src).unwrap();
+            assert!(
+                matches!(&ops[0], PlanOp::ScanLabel { .. }),
+                "{src} must keep ScanLabel: {ops:?}"
+            );
+            assert_eq!(
+                count_ops(&ops, |o| matches!(o, PlanOp::Filter { .. })),
+                1,
+                "{src}: {ops:?}"
+            );
+        }
+    }
+
+    /// Without an Expand the earlier pass owns the fold, and still does.
+    #[test]
+    fn key_anchor_without_expand_still_folds() {
+        let ops = plan_src("MATCH (p:Person) WHERE key(p) = $k RETURN key(p)").unwrap();
+        assert!(matches!(&ops[0], PlanOp::ScanKey { .. }), "{ops:?}");
+        assert_eq!(count_ops(&ops, |o| matches!(o, PlanOp::Filter { .. })), 0);
     }
 
     #[test]
