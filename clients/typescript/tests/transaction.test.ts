@@ -18,7 +18,7 @@ interface Seen {
   auth: string | undefined;
 }
 
-type Reply = { status: number; body?: unknown };
+type Reply = { status: number; body?: unknown; destroy?: boolean };
 
 let server: Server;
 let client: MushroomClient;
@@ -43,6 +43,10 @@ beforeEach(async () => {
     };
     seen.push(entry);
     const reply = handler(entry);
+    if (reply.destroy) {
+      req.socket.destroy();
+      return;
+    }
     res.statusCode = reply.status;
     res.setHeader("content-type", "application/json");
     res.end(reply.body === undefined ? "" : JSON.stringify(reply.body));
@@ -135,9 +139,68 @@ describe("beginTransaction", () => {
     await tx.commit();
     await expect(tx.execute("RETURN 1")).rejects.toBeInstanceOf(MushroomError);
     await expect(tx.commit()).rejects.toBeInstanceOf(MushroomError);
-    const before = seen.length;
+    expect(seen.map((s) => s.path)).toEqual(["/tx/begin", "/tx/abc123/commit"]);
     await tx.rollback(); // a no-op, not an error
-    expect(seen.length).toBe(before);
+    expect(seen.map((s) => s.path)).toEqual(["/tx/begin", "/tx/abc123/commit"]);
+  });
+
+  const beginThen = (after: Reply | (() => Reply)) => {
+    handler = (req) =>
+      req.path === "/tx/begin"
+        ? { status: 200, body: { tx_id: "abc123", expires_at: 1 } }
+        : typeof after === "function"
+          ? after()
+          : after;
+  };
+
+  it("after a commit network failure the outcome is unknown and the handle refuses use", async () => {
+    beginThen({ status: 200, destroy: true });
+    const tx = await client.beginTransaction();
+    const err = await tx.commit().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(MushroomError);
+    const count = seen.length;
+    await expect(tx.commit()).rejects.toThrow(/outcome is unknown/);
+    await expect(tx.execute("RETURN 1")).rejects.toThrow(/outcome is unknown/);
+    await expect(tx.rollback()).rejects.toThrow(/outcome is unknown/);
+    expect(seen.length).toBe(count);
+  });
+
+  it("after a rollback network failure a retry is allowed", async () => {
+    let calls = 0;
+    beginThen(() => (++calls === 1 ? { status: 200, destroy: true } : { status: 200, body: {} }));
+    const tx = await client.beginTransaction();
+    await expect(tx.rollback()).rejects.toBeInstanceOf(Error);
+    expect(tx.isFinished).toBe(false);
+    await expect(tx.rollback()).resolves.toBeUndefined();
+    expect(tx.isFinished).toBe(true);
+  });
+
+  it("a network failure mid-transaction surfaces from execute and leaves the handle open", async () => {
+    let calls = 0;
+    beginThen(() =>
+      ++calls === 1 ? { status: 200, destroy: true } : { status: 200, body: { columns: [], rows: [] } },
+    );
+    const tx = await client.beginTransaction();
+    await expect(tx.execute("RETURN 1")).rejects.toBeInstanceOf(Error);
+    await expect(tx.execute("RETURN 1")).resolves.toEqual({ columns: [], rows: [] });
+  });
+
+  it("a second commit while one is in flight throws without a request", async () => {
+    beginThen({ status: 200, body: { bookmark: 7 } });
+    const tx = await client.beginTransaction();
+    const first = tx.commit();
+    await expect(tx.commit()).rejects.toThrow(/in flight/);
+    expect(await first).toBe(7);
+    expect(seen.filter((s) => s.path.endsWith("/commit")).length).toBe(1);
+  });
+
+  it("a 404 on begin says the server does not support transactions", async () => {
+    handler = () => ({ status: 404 });
+    const err = await client.beginTransaction().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MushroomError);
+    expect(err).not.toBeInstanceOf(TransactionExpiredError);
+    expect((err as MushroomError).detail).toMatch(/does not support transactions/);
   });
 
   it("maps 409 on commit to TransactionConflictError", async () => {
@@ -221,6 +284,36 @@ describe("transaction(callback)", () => {
         throw boom;
       }),
     ).rejects.toBe(boom);
+  });
+
+  it("attaches a failed rollback (HTTP 500) to the original error as rollbackError", async () => {
+    handler = (req) =>
+      req.path === "/tx/begin"
+        ? { status: 200, body: { tx_id: "abc123", expires_at: 1 } }
+        : { status: 500, body: { error: "rollback broke" } };
+    const boom = new Error("boom");
+    const err = await client
+      .transaction(async () => {
+        throw boom;
+      })
+      .catch((e: unknown) => e);
+    expect(err).toBe(boom);
+    expect((err as { rollbackError?: MushroomError }).rollbackError?.detail).toBe("rollback broke");
+  });
+
+  it("attaches a network-level rollback failure to the original error", async () => {
+    handler = (req) =>
+      req.path === "/tx/begin"
+        ? { status: 200, body: { tx_id: "abc123", expires_at: 1 } }
+        : { status: 200, destroy: true };
+    const boom = new Error("boom");
+    const err = await client
+      .transaction(async () => {
+        throw boom;
+      })
+      .catch((e: unknown) => e);
+    expect(err).toBe(boom);
+    expect((err as { rollbackError?: unknown }).rollbackError).toBeInstanceOf(Error);
   });
 
   it("surfaces a commit conflict as TransactionConflictError", async () => {
