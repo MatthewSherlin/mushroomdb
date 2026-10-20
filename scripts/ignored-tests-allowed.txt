@@ -59,3 +59,4 @@ core-api/tests/hnsw_open.rs::bench_open_2k_embeddings — timing bench: set MUSH
 
 # f9_bench.rs — very slow; asserts nothing
 core-api/tests/f9_bench.rs::f9_measure — a ~13-minute benchmark that asserts nothing; run it with --ignored
+cli/tests/csv_import.rs::csv_import_throughput_above_50k_per_second — builds a 100k-node store (1M with MUSHROOMDB_IMPORT_BENCH_NODES) and prints import vs incremental-ingest timings; run in release with --ignored

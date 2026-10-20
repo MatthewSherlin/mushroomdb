@@ -16081,8 +16081,30 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.overlay
             .extra_labels
             .insert(key.to_string(), label.to_string());
-        self.overlay.extra_props.retain(|(k, _), _| k != key);
-        self.overlay.removed_props.retain(|(k, _)| k != key);
+        // A range lookup on the ordered `(key, field)` pairs, not a `retain`:
+        // `retain` walks every overlay entry, so a batch of N inserts cost
+        // O(N²) here (200k nodes in 50k batches spent over 90% of its time in
+        // it). Same entries removed, in O(log N + entries of this key).
+        let stale: Vec<(String, String)> = self
+            .overlay
+            .extra_props
+            .range((key.to_string(), String::new())..)
+            .take_while(|((k, _), _)| k == key)
+            .map(|(pair, _)| pair.clone())
+            .collect();
+        for pair in stale {
+            self.overlay.extra_props.remove(&pair);
+        }
+        let stale: Vec<(String, String)> = self
+            .overlay
+            .removed_props
+            .range((key.to_string(), String::new())..)
+            .take_while(|(k, _)| k == key)
+            .cloned()
+            .collect();
+        for pair in stale {
+            self.overlay.removed_props.remove(&pair);
+        }
         for (field, value) in props {
             self.overlay
                 .extra_props

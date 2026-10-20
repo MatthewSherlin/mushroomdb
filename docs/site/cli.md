@@ -248,6 +248,21 @@ mushroomdb export <db-dir> <dest> --format jsonl|parquet|graphml   export all da
 
 Export nodes, edges, and rules. JSONL is byte-identical across runs; Parquet is not across library versions. GraphML exports nodes and edges only, as a single `.graphml` file, for import into generic graph viewers and analysis tools
 
+### `import`
+
+```text
+mushroomdb import [--nodes <file>] [--relationships <file>] [--db <dir>] [--delimiter <c>]
+                  [--array-delimiter <c>] [--ignore-errors] [--batch-size N]
+                                 bulk-load CSV files into <dir> (default ./mushroomdb-data), then write one snapshot
+                                 nodes need an :ID and a :LABEL column, relationships :START_ID, :END_ID and :TYPE;
+                                 other columns are properties, typed by a suffix: age:int weight:float active:boolean tags:string[]
+                                 one label per node: Person;Employee is refused; relationship properties are not supported
+                                 rules the store already has fire per batch; import first, then declare rules, to backfill once
+                                 an error stops the import at its file and line, batches already committed stay; --ignore-errors skips bad rows
+```
+
+Bulk-load a nodes CSV and a relationships CSV. A node row needs `:ID` (the key) and one `:LABEL`; a relationship row needs `:START_ID`, `:END_ID` and `:TYPE`, and both ids must be nodes in the nodes file or the store. Every other column is a property; a suffix types it (`age:int`, `weight:float`, `active:boolean`, `tags:string[]`), and a column without one, or with a suffix the importer does not know (which it warns about), is a string. An empty cell is an absent property. Each batch is one atomic WAL frame, so an import that is killed leaves every batch that committed and none of the one in flight; one snapshot is written last. Rules are never declared by the import: rules the store already has fire per batch like any write, so for the fastest load import into a store with no rules and declare them afterwards, which backfills once. Malformed quoting is found before anything is written and is fatal even with `--ignore-errors`, because the row boundaries cannot be trusted
+
 ## Hook bodies
 
 `install` wires these two into the assistant; they are not meant to be typed.

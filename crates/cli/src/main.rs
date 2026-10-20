@@ -3,7 +3,7 @@
 use cli::{
     format_backup, format_demo, format_stats, format_suggest, install, maybe_run_demo_if_empty,
     parse_args, read_stats, run_algo, run_asof, run_backup, run_build_index, run_demo, run_export,
-    run_migrate, run_query, run_schema_apply, run_schema_apply_memory_defaults,
+    run_import, run_migrate, run_query, run_schema_apply, run_schema_apply_memory_defaults,
     run_schema_apply_memory_identity, run_snapshot, run_suggest, run_verify, usage, Command,
     ServeUi,
 };
@@ -355,6 +355,30 @@ fn main() -> ExitCode {
                     eprintln!("warning: backup verification failed");
                     return ExitCode::from(1);
                 }
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e.to_string()),
+        },
+        Ok(Command::Import {
+            db_dir,
+            nodes,
+            relationships,
+            opts,
+        }) => match run_import(&db_dir, nodes.as_deref(), relationships.as_deref(), &opts) {
+            Ok(report) => {
+                for w in &report.warnings {
+                    eprintln!("warning: {w}");
+                }
+                for e in &report.errors {
+                    eprintln!("skipped: {e}");
+                }
+                if report.rows_skipped > report.errors.len() {
+                    eprintln!(
+                        "skipped: ... and {} more",
+                        report.rows_skipped - report.errors.len()
+                    );
+                }
+                print!("{}", cli::import::format_import(&report));
                 ExitCode::SUCCESS
             }
             Err(e) => fail(&e.to_string()),
