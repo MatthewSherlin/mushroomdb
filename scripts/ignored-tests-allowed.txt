@@ -59,3 +59,6 @@ core-api/tests/hnsw_open.rs::bench_open_2k_embeddings — timing bench: set MUSH
 
 # f9_bench.rs — very slow; asserts nothing
 core-api/tests/f9_bench.rs::f9_measure — a ~13-minute benchmark that asserts nothing; run it with --ignored
+
+# transaction_integration.rs — commit-cost bench; machine-dependent timings
+core-api/tests/transaction_integration.rs::bench_tx_commit_vs_write_batch — measurement by hand: prints tx-commit vs write_batch timings (release, --ignored), nothing asserted
