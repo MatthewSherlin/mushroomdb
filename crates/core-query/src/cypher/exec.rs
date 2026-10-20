@@ -660,6 +660,7 @@ fn execute_inner(
                 for row in &rows {
                     let list_val: Option<Value> = match expr {
                         UnwindExpr::Lit(vals) => Some(Value::List(vals.clone())),
+                        UnwindExpr::Expr(op) => resolve_operand(view, &vars, row, op, params)?,
                         UnwindExpr::Prop { var, field } => {
                             resolve_prop(view, &vars, row, var, field)?
                         }
@@ -973,6 +974,16 @@ fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<St
             collect_operand(left, names, seen);
             collect_operand(right, names, seen);
         }
+        Operand::ListLit(items) => {
+            for item in items {
+                collect_operand(item, names, seen);
+            }
+        }
+        Operand::MapLit(entries) => {
+            for (_, value) in entries {
+                collect_operand(value, names, seen);
+            }
+        }
         _ => {}
     }
 }
@@ -1178,6 +1189,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                     UnwindExpr::Var(name) => {
                         vars.intern(name);
                     }
+                    UnwindExpr::Expr(op) => intern_operand(&mut vars, op),
                     UnwindExpr::Lit(_) => {}
                 }
             }
@@ -1263,6 +1275,16 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
         Operand::Index { base, index } => {
             intern_operand(vars, base);
             intern_operand(vars, index);
+        }
+        Operand::ListLit(items) => {
+            for item in items {
+                intern_operand(vars, item);
+            }
+        }
+        Operand::MapLit(entries) => {
+            for (_, value) in entries {
+                intern_operand(vars, value);
+            }
         }
     }
 }
@@ -2460,6 +2482,10 @@ fn eval_convert_scalar(
     })
 }
 
+/// `Value` has no null variant, so a list or map literal cannot hold one.
+const NULL_IN_LITERAL: &str =
+    "a list or map literal cannot contain null (an element evaluated to null)";
+
 fn resolve_operand(
     view: &GraphView,
     vars: &VarTable,
@@ -2496,6 +2522,28 @@ fn resolve_operand(
             let base_val = resolve_operand(view, vars, row, base, params)?;
             let idx_val = resolve_operand(view, vars, row, index, params)?;
             Ok(crate::value_ops::index_list(base_val, idx_val))
+        }
+        Operand::ListLit(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match resolve_operand(view, vars, row, item, params)? {
+                    Some(v) => out.push(v),
+                    None => return Err(NULL_IN_LITERAL.to_string()),
+                }
+            }
+            Ok(Some(Value::List(out)))
+        }
+        Operand::MapLit(entries) => {
+            let mut out = BTreeMap::new();
+            for (key, value) in entries {
+                match resolve_operand(view, vars, row, value, params)? {
+                    Some(v) => {
+                        out.insert(key.clone(), v);
+                    }
+                    None => return Err(NULL_IN_LITERAL.to_string()),
+                }
+            }
+            Ok(Some(Value::Map(out)))
         }
         Operand::Case { branches, default } => {
             for (cond, value) in branches {
@@ -9977,5 +10025,226 @@ LIMIT 10";
             run_one(&view, "MATCH (a:P)-[r:KNOWS]->(b:P) RETURN keys(r)"),
             Vec::<Vec<Option<Value>>>::new()
         );
+    }
+
+    // ── QL-16: list and map literals ─────────────────────────────────────────
+
+    fn map_of(entries: Vec<(&str, Value)>) -> Value {
+        Value::Map(
+            entries
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        )
+    }
+
+    fn list_of(items: Vec<Value>) -> Value {
+        Value::List(items)
+    }
+
+    #[test]
+    fn ql16_list_literal_values() {
+        assert_eq!(
+            eval("[1, 'a', 2.5, [1, 2], {k: 1}]"),
+            Some(list_of(vec![
+                i(1),
+                s("a"),
+                f(2.5),
+                list_of(vec![i(1), i(2)]),
+                map_of(vec![("k", i(1))]),
+            ]))
+        );
+        assert_eq!(eval("[]"), Some(list_of(vec![])));
+        assert_eq!(eval("[[]]"), Some(list_of(vec![list_of(vec![])])));
+        assert_eq!(
+            eval("[true, false]"),
+            Some(list_of(vec![Value::Bool(true), Value::Bool(false)]))
+        );
+    }
+
+    #[test]
+    fn ql16_map_literal_values() {
+        assert_eq!(
+            eval("{a: 1, b: [1, 2], `c d`: 'x'}"),
+            Some(map_of(vec![
+                ("a", i(1)),
+                ("b", list_of(vec![i(1), i(2)])),
+                ("c d", s("x")),
+            ]))
+        );
+        assert_eq!(eval("{}"), Some(map_of(vec![])));
+        assert_eq!(
+            eval("{a: {b: {c: 1}}}"),
+            Some(map_of(vec![(
+                "a",
+                map_of(vec![("b", map_of(vec![("c", i(1))]))])
+            )]))
+        );
+    }
+
+    #[test]
+    fn ql16_literals_as_function_arguments() {
+        assert_eq!(eval("head([1, 2, 3])"), Some(i(1)));
+        assert_eq!(eval("last([1, 2, 3])"), Some(i(3)));
+        assert_eq!(eval("tail([1, 2, 3])"), int_list(&[2, 3]));
+        assert_eq!(eval("size([1, 2, 3])"), Some(i(3)));
+        assert_eq!(eval("size([])"), Some(i(0)));
+        assert_eq!(
+            eval("keys({a: 1, b: 2})"),
+            Some(list_of(vec![s("a"), s("b")]))
+        );
+        assert_eq!(eval("properties({a: 1})"), Some(map_of(vec![("a", i(1))])));
+        assert_eq!(eval("range(0, 2)"), eval("[0, 1, 2]"));
+        assert_eq!(eval("head([[1, 2], [3]])"), int_list(&[1, 2]));
+    }
+
+    #[test]
+    fn ql16_literal_elements_are_expressions() {
+        // `n.x` is the fixture's bound node; it has no `x`, so use arithmetic,
+        // functions and parameters as the elements.
+        assert_eq!(
+            eval("[1 + 2, toUpper('a'), head($l), size($l) * 2]"),
+            Some(list_of(vec![i(3), s("A"), i(1), i(6)]))
+        );
+        assert_eq!(
+            eval("{sum: 1 + 2, up: toUpper('a'), l: $l}"),
+            Some(map_of(vec![
+                ("sum", i(3)),
+                ("up", s("A")),
+                ("l", list_of(vec![i(1), i(2), i(3)])),
+            ]))
+        );
+        // A literal can be subscripted.
+        assert_eq!(eval("[10, 20, 30][1]"), Some(i(20)));
+        assert_eq!(eval("[10, 20, 30][-1]"), Some(i(30)));
+    }
+
+    #[test]
+    fn ql16_literal_elements_read_bound_properties() {
+        let mut fx = Fx::new();
+        fx.add("L", "a", vec![("x", i(5))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) RETURN [n.x, n.x + 1, toUpper('a')] AS l, {v: n.x} AS m",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.get(0, "l"), Some(&list_of(vec![i(5), i(6), s("A")])));
+        assert_eq!(rs.get(0, "m"), Some(&map_of(vec![("v", i(5))])));
+    }
+
+    #[test]
+    fn ql16_null_inside_a_literal_is_a_named_error() {
+        // `Value` has no null variant, so a list or map cannot hold one.
+        for expr in ["[1, n.nope]", "{a: n.nope}"] {
+            let msg = eval_err(expr);
+            assert!(msg.contains("null"), "{expr}: {msg}");
+        }
+    }
+
+    fn five_node_fixture() -> Fx {
+        let mut fx = Fx::new();
+        for n in 1..=5 {
+            fx.add("L", &format!("n{n}"), vec![("x", i(n))]);
+        }
+        fx
+    }
+
+    #[test]
+    fn ql16_in_a_literal_list_filters_rows() {
+        let fx = five_node_fixture();
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x IN [1, 3] RETURN n.x AS x ORDER BY x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "x"), vec![Some(i(1)), Some(i(3))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x IN [1 + 1, 2 * 2] RETURN n.x AS x ORDER BY x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "x"), vec![Some(i(2)), Some(i(4))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x IN [] RETURN n.x AS x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.len(), 0);
+    }
+
+    #[test]
+    fn ql16_unwind_a_literal_list() {
+        let fx = five_node_fixture();
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x = 1 UNWIND [1, 2, 3] AS x RETURN x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "x"), vec![Some(i(1)), Some(i(2)), Some(i(3))]);
+        // Elements that are not plain literals, and map elements.
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x = 1 UNWIND [1 + 1, 2 * 3] AS x RETURN x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "x"), vec![Some(i(2)), Some(i(6))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x = 1 UNWIND [{a: 1}, {a: 2}] AS m RETURN m",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            col(&rs, "m"),
+            vec![
+                Some(map_of(vec![("a", i(1))])),
+                Some(map_of(vec![("a", i(2))]))
+            ]
+        );
+    }
+
+    #[test]
+    fn ql16_unwind_a_list_reading_a_binding() {
+        let fx = five_node_fixture();
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x = 2 UNWIND [n.x, n.x + 1] AS y RETURN y",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "y"), vec![Some(i(2)), Some(i(3))]);
+    }
+
+    #[test]
+    fn ql16_literals_in_with_order_by_and_case() {
+        let fx = five_node_fixture();
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) WHERE n.x = 1 WITH [n.x, 9] AS l RETURN head(l) AS h, l",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "h"), vec![Some(i(1))]);
+        let rs = run(
+            &fx.view(),
+            "MATCH (n:L) RETURN n.x AS x, CASE WHEN n.x > 3 THEN [1] ELSE [] END AS c ORDER BY x",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(col(&rs, "c")[4], Some(list_of(vec![i(1)])));
+        assert_eq!(col(&rs, "c")[0], Some(list_of(vec![])));
+    }
+
+    #[test]
+    fn ql16_literal_parameters_are_collected() {
+        // A `$p` read only inside a literal must still be reported missing.
+        let msg = eval_err("[$nope]");
+        assert!(msg.contains("nope"), "{msg}");
     }
 }

@@ -851,6 +851,16 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
             operand_node_vars(base, out);
             operand_node_vars(index, out);
         }
+        Operand::ListLit(items) => {
+            for item in items {
+                operand_node_vars(item, out);
+            }
+        }
+        Operand::MapLit(entries) => {
+            for (_, value) in entries {
+                operand_node_vars(value, out);
+            }
+        }
         Operand::Lit(_) | Operand::Param(_) => {}
     }
 }
@@ -989,6 +999,35 @@ fn eval_set_return_operand<F: Fs>(
             let idx_val = eval_set_return_operand(db, match_rs, row, rel_vars, index, params)?;
             Ok(core_query::value_ops::index_list(base_val, idx_val))
         }
+        Operand::ListLit(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match eval_set_return_operand(db, match_rs, row, rel_vars, item, params)? {
+                    Some(v) => out.push(v),
+                    None => return Err(literal_null_error()),
+                }
+            }
+            Ok(Some(Value::List(out)))
+        }
+        Operand::MapLit(entries) => {
+            let mut out = BTreeMap::new();
+            for (key, value) in entries {
+                match eval_set_return_operand(db, match_rs, row, rel_vars, value, params)? {
+                    Some(v) => {
+                        out.insert(key.clone(), v);
+                    }
+                    None => return Err(literal_null_error()),
+                }
+            }
+            Ok(Some(Value::Map(out)))
+        }
+    }
+}
+
+/// `Value` has no null variant, so a list or map literal cannot hold one.
+fn literal_null_error() -> GraphError {
+    GraphError::QueryError {
+        detail: "a list or map literal cannot contain null (an element evaluated to null)".into(),
     }
 }
 

@@ -19,6 +19,7 @@ pub fn parse(tokens: &[Tok]) -> Result<Query, String> {
     let mut p = Parser {
         toks: tokens,
         pos: 0,
+        literal_depth: 0,
     };
     let q = p.query()?;
     if p.pos < p.toks.len() {
@@ -49,6 +50,7 @@ pub fn parse_read(tokens: &[Tok]) -> Result<UnionQuery, String> {
     let mut p = Parser {
         toks: tokens,
         pos: 0,
+        literal_depth: 0,
     };
     let mut parts = vec![p.query()?];
     let mut all_flags = Vec::new();
@@ -73,6 +75,7 @@ pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
     let mut p = Parser {
         toks: tokens,
         pos: 0,
+        literal_depth: 0,
     };
     p.write_statement()
 }
@@ -104,6 +107,8 @@ fn bool_literal(name: &str) -> Option<bool> {
 struct Parser<'a> {
     toks: &'a [Tok],
     pos: usize,
+    /// How many list/map literals enclose the position being parsed.
+    literal_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -386,26 +391,15 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse the list expression in an UNWIND clause:
-    /// - `[v1, v2, …]` — literal list.
+    /// - `[e1, e2, …]` — list literal (any expressions as elements).
     /// - `var.field`   — property reference.
     /// - `var`         — bare variable (alias from a prior WITH).
     fn unwind_expr(&mut self) -> Result<UnwindExpr, String> {
         match self.peek() {
-            Some(Tok::LBracket) => {
-                self.pos += 1; // consume '['
-                let mut vals = Vec::new();
-                if !self.eat(&Tok::RBracket) {
-                    loop {
-                        vals.push(self.literal_value("UNWIND list element")?);
-                        if self.eat(&Tok::Comma) {
-                            continue;
-                        }
-                        self.expect(&Tok::RBracket, "expected ']' to close UNWIND list")?;
-                        break;
-                    }
-                }
-                Ok(UnwindExpr::Lit(vals))
-            }
+            Some(Tok::LBracket) => match self.arith_expr()? {
+                Operand::Lit(Value::List(vals)) => Ok(UnwindExpr::Lit(vals)),
+                other => Ok(UnwindExpr::Expr(other)),
+            },
             Some(Tok::Ident(_)) => {
                 let name = self.ident("expected variable or property in UNWIND")?;
                 if self.eat(&Tok::Dot) {
@@ -935,9 +929,97 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::RParen, "expected ')' to close arithmetic expression")?;
             return Ok(inner);
         }
-        // Delegate to the existing atom parser (no unary minus here — handled above).
-        let atom = self.operand_atom()?;
+        let atom = match self.peek() {
+            Some(Tok::LBracket) => self.list_literal()?,
+            Some(Tok::LBrace) => self.map_literal()?,
+            // The existing atom parser (no unary minus here — handled above).
+            _ => self.operand_atom()?,
+        };
         self.subscripts(atom)
+    }
+
+    /// Enter one level of literal nesting, or fail before the stack does.
+    fn enter_literal(&mut self) -> Result<(), String> {
+        if self.literal_depth >= MAX_PAREN_DEPTH {
+            return Err(self.err("list or map literal nesting too deep"));
+        }
+        self.literal_depth += 1;
+        Ok(())
+    }
+
+    /// `[]` or `[e1, e2, …]`; each element is any expression. A list whose
+    /// elements are all constants folds to one `Lit(Value::List)`. A trailing
+    /// comma is refused.
+    fn list_literal(&mut self) -> Result<Operand, String> {
+        self.expect(&Tok::LBracket, "expected '['")?;
+        self.enter_literal()?;
+        let mut items = Vec::new();
+        if !self.eat(&Tok::RBracket) {
+            loop {
+                items.push(self.arith_expr()?);
+                if self.eat(&Tok::Comma) {
+                    if self.peek() == Some(&Tok::RBracket) {
+                        return Err(self.err("trailing comma in a list literal is not allowed"));
+                    }
+                    continue;
+                }
+                self.expect(&Tok::RBracket, "expected ',' or ']' in a list literal")?;
+                break;
+            }
+        }
+        self.literal_depth -= 1;
+        if items.iter().all(|o| matches!(o, Operand::Lit(_))) {
+            let values = items
+                .into_iter()
+                .filter_map(|o| match o {
+                    Operand::Lit(v) => Some(v),
+                    _ => None,
+                })
+                .collect();
+            return Ok(Operand::Lit(Value::List(values)));
+        }
+        Ok(Operand::ListLit(items))
+    }
+
+    /// `{}` or `{k1: e1, k2: e2}`; keys are identifiers (backtick-quoted
+    /// allowed), values are any expression. A duplicate key is refused (some
+    /// engines keep the last one; silently dropping a value hides a typo). An
+    /// all-constant map folds to one `Lit(Value::Map)`.
+    fn map_literal(&mut self) -> Result<Operand, String> {
+        self.expect(&Tok::LBrace, "expected '{'")?;
+        self.enter_literal()?;
+        let mut entries: Vec<(String, Operand)> = Vec::new();
+        if !self.eat(&Tok::RBrace) {
+            loop {
+                let key = self.ident("expected a map key")?;
+                if entries.iter().any(|(k, _)| *k == key) {
+                    return Err(self.err(&format!("duplicate map key `{key}` in a map literal")));
+                }
+                self.expect(&Tok::Colon, "expected ':' after a map key")?;
+                let value = self.arith_expr()?;
+                entries.push((key, value));
+                if self.eat(&Tok::Comma) {
+                    if self.peek() == Some(&Tok::RBrace) {
+                        return Err(self.err("trailing comma in a map literal is not allowed"));
+                    }
+                    continue;
+                }
+                self.expect(&Tok::RBrace, "expected ',' or '}' in a map literal")?;
+                break;
+            }
+        }
+        self.literal_depth -= 1;
+        if entries.iter().all(|(_, o)| matches!(o, Operand::Lit(_))) {
+            let map = entries
+                .into_iter()
+                .filter_map(|(k, o)| match o {
+                    Operand::Lit(v) => Some((k, v)),
+                    _ => None,
+                })
+                .collect();
+            return Ok(Operand::Lit(Value::Map(map)));
+        }
+        Ok(Operand::MapLit(entries))
     }
 
     /// Apply any postfix `[index]` subscripts to an already-parsed operand.
@@ -1642,7 +1724,9 @@ impl<'a> Parser<'a> {
                 | Tok::Str(_)
                 | Tok::Param(_)
                 | Tok::Dash
-                | Tok::Ident(_),
+                | Tok::Ident(_)
+                | Tok::LBracket
+                | Tok::LBrace,
             ) => {
                 let op = self.arith_expr()?;
                 match &op {
@@ -1651,6 +1735,8 @@ impl<'a> Parser<'a> {
                     | Operand::BinArith { .. }
                     | Operand::FuncCall { .. }
                     | Operand::Index { .. }
+                    | Operand::ListLit(_)
+                    | Operand::MapLit(_)
                     | Operand::Case { .. } => op,
                     Operand::Prop { .. } | Operand::Var(_) => {
                         return Err(self.err(
@@ -1660,9 +1746,6 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            // List-literal RHS: `SET n.tags = ['a', 'b']`. Lists are pure
-            // literals (no arithmetic), so parse directly into `Operand::Lit`.
-            Some(Tok::LBracket) => Operand::Lit(self.literal_value("SET value")?),
             _ => {
                 return Err(
                     self.err("expected literal, $parameter, or arithmetic expression as SET value")
@@ -2968,5 +3051,84 @@ LIMIT 10";
                 Value::Str("y".into())
             ]))
         );
+    }
+
+    // ── QL-16: list and map literals ─────────────────────────────────────────
+
+    fn parse_err_of(src: &str) -> String {
+        match parse_src(src) {
+            Ok(q) => panic!("`{src}` must not parse, got {q:?}"),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn ql16_all_literal_lists_and_maps_fold_to_values() {
+        assert_eq!(
+            return_expr("[1, 'a', [2]]"),
+            Operand::Lit(Value::List(vec![
+                Value::Int(1),
+                Value::Str("a".into()),
+                Value::List(vec![Value::Int(2)]),
+            ]))
+        );
+        assert_eq!(return_expr("[]"), Operand::Lit(Value::List(vec![])));
+        assert_eq!(
+            return_expr("{a: 1, `b c`: 2}"),
+            Operand::Lit(Value::Map(
+                [
+                    ("a".to_string(), Value::Int(1)),
+                    ("b c".to_string(), Value::Int(2))
+                ]
+                .into_iter()
+                .collect()
+            ))
+        );
+    }
+
+    #[test]
+    fn ql16_non_literal_elements_stay_expressions() {
+        assert_eq!(
+            return_expr("[n.x, 1]"),
+            Operand::ListLit(vec![prop("n", "x"), int(1)])
+        );
+        assert_eq!(
+            return_expr("{k: n.x}"),
+            Operand::MapLit(vec![("k".to_string(), prop("n", "x"))])
+        );
+    }
+
+    #[test]
+    fn ql16_literal_errors_are_clear() {
+        assert!(parse_err_of("MATCH (n) RETURN [1, 2,] AS x").contains("trailing comma"));
+        assert!(parse_err_of("MATCH (n) RETURN {a: 1,} AS x").contains("trailing comma"));
+        assert!(
+            parse_err_of("MATCH (n) RETURN {a: 1, a: 2} AS x").contains("duplicate map key `a`")
+        );
+        assert!(parse_err_of("MATCH (n) RETURN [1, 2 AS x").contains("']'"));
+        assert!(parse_err_of("MATCH (n) RETURN {a: 1 AS x").contains("'}'"));
+        assert!(parse_err_of("MATCH (n) RETURN {a 1} AS x").contains("':'"));
+        assert!(parse_err_of("MATCH (n) RETURN [").contains("expected"));
+        assert!(parse_err_of("MATCH (n) RETURN {").contains("expected"));
+    }
+
+    #[test]
+    fn ql16_pattern_maps_and_relationship_brackets_parse_as_before() {
+        let q = parse_src("MATCH (a:L {k: 1})-[r:T]->(b) RETURN a").unwrap();
+        let pat = &q.matches[0];
+        assert_eq!(pat.start.props, vec![("k".to_string(), int(1))]);
+        assert_eq!(pat.chain[0].0.etypes, vec!["T".to_string()]);
+        // A list-valued property in a pattern now parses as an operand.
+        assert!(parse_src("MATCH (a:L {k: [1, 2]}) RETURN a").is_ok());
+    }
+
+    #[test]
+    fn ql16_deeply_nested_literals_are_an_error_not_a_stack_overflow() {
+        let src = format!(
+            "MATCH (n) RETURN {}1{} AS x",
+            "[".repeat(5000),
+            "]".repeat(5000)
+        );
+        assert!(parse_err_of(&src).contains("too deep"));
     }
 }
