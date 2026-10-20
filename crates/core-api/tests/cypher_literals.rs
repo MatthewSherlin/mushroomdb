@@ -209,6 +209,16 @@ fn every_write_path_refuses_a_null_at_the_choke_point() {
     let err = batch.commit().unwrap_err();
     assert!(err.to_string().contains(NULL_PROPERTY), "{err}");
 
+    // A collection mixing a format-V11 type and a null: both refusals sit
+    // at the same choke point, and either one stops the write.
+    let mixed = Value::List(vec![Value::Date(19_737), Value::Null]);
+    let err = db.set_prop("a", "p", mixed).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains(NULL_PROPERTY) || msg.contains("Date values cannot be stored"),
+        "{msg}"
+    );
+
     // A parameter that holds a null.
     let params = BTreeMap::from([("l".to_string(), with_null)]);
     let err = db
@@ -291,4 +301,32 @@ fn value_serde_json_form_is_pinned() {
         let back: Value = serde_json::from_str(json).unwrap();
         assert_eq!(back, v);
     }
+}
+
+/// QL-17 through the TX-6 reader: a lock-free snapshot evaluates null
+/// elements, three-valued comparisons and a MATCH-less query the same way.
+#[test]
+fn the_reader_snapshot_evaluates_nulls_the_same_way() {
+    let (db, dir) = open("reader");
+    let snap = db.reader();
+    let rs = snap
+        .query("MATCH (n:T) RETURN [n.x, n.missing] AS l", &no_params())
+        .unwrap();
+    assert_eq!(
+        rs.get(0, "l"),
+        Some(&Value::List(vec![Value::Int(7), Value::Null]))
+    );
+    let rs = snap
+        .query(
+            "MATCH (n:T) WHERE n.x <> null RETURN n.x AS x LIMIT 5",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 0);
+    let rs = snap
+        .query("UNWIND [1, null] AS x RETURN x", &no_params())
+        .unwrap();
+    assert_eq!(rs.len(), 2);
+    assert_eq!(rs.row(1)[0], None);
+    let _ = std::fs::remove_dir_all(&dir);
 }

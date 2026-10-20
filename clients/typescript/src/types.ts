@@ -17,7 +17,7 @@
  *   Str(String)     → string
  *   Bool(bool)      → boolean
  *   List(Vec<Value>) → CellValue[]
- *   null cell       → null
+ *   null cell       → null (also a null element inside a list, `[1, null]`)
  *   Date            → {@link DateValue}          `{ "$date": "2024-01-15" }`
  *   LocalDateTime   → {@link LocalDateTimeValue} `{ "$ldt": "2024-01-15T12:34:56.789012" }`
  *   DateTime        → {@link DateTimeValue}      `{ "$dt": "2024-01-15T12:34:56.789012+05:30" }`
