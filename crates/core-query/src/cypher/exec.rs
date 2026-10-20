@@ -1703,6 +1703,34 @@ const SCALAR_FUNCS: &[&str] = &[
     "key",
     "id",
     "labels",
+    "trim",
+    "ltrim",
+    "rtrim",
+    "replace",
+    "split",
+    "left",
+    "right",
+    "substring",
+    "reverse",
+    "floor",
+    "ceil",
+    "sign",
+    "sqrt",
+    "log",
+    "log10",
+    "exp",
+    "sin",
+    "cos",
+    "tan",
+    "atan",
+    "atan2",
+    "pi",
+    "e",
+    "rand",
+    "toBoolean",
+    "toBooleanOrNull",
+    "toIntegerOrNull",
+    "toFloatOrNull",
 ];
 
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
@@ -1995,7 +2023,12 @@ fn eval_func(
                 None => None,
                 Some(Value::Float(f)) => Some(Value::Float(f)),
                 Some(Value::Int(n)) => Some(Value::Float(n as f64)),
-                Some(Value::Str(s)) => s.trim().parse::<f64>().ok().map(Value::Float),
+                Some(Value::Str(s)) => s
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .map(Value::Float),
                 Some(_) => None,
             })
         }
@@ -2046,11 +2079,253 @@ fn eval_func(
                 }
             }
         }
+        "trim" | "ltrim" | "rtrim" | "replace" | "split" | "left" | "right" | "substring"
+        | "reverse" => eval_string_scalar(&norm, name, args, view, vars, row, params),
+        "floor" | "ceil" | "sign" | "sqrt" | "log" | "log10" | "exp" | "sin" | "cos" | "tan"
+        | "atan" | "atan2" | "pi" | "e" | "rand" => {
+            eval_math_scalar(&norm, name, args, view, vars, row, params)
+        }
+        "toboolean" | "tobooleanornull" | "tointegerornull" | "tofloatornull" => {
+            eval_convert_scalar(&norm, name, args, view, vars, row, params)
+        }
         _ => Err(format!(
             "unknown function `{name}`; supported: {}",
             SCALAR_FUNCS.join(", ")
         )),
     }
+}
+
+/// Resolve a function's arguments, checking the arity range. The caller
+/// applies null / type-mismatch → null.
+fn resolve_fn_args(
+    name: &str,
+    args: &[Operand],
+    arity: std::ops::RangeInclusive<usize>,
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<[Option<Value>; 3], String> {
+    if !arity.contains(&args.len()) {
+        let want = if arity.start() == arity.end() {
+            format!("exactly {}", arity.start())
+        } else {
+            format!("{} to {}", arity.start(), arity.end())
+        };
+        return Err(format!(
+            "{name}() requires {want} argument(s), got {}",
+            args.len()
+        ));
+    }
+    // No heap allocation: these run per row and no function takes over 3.
+    let mut out = [None, None, None];
+    for (slot, arg) in out.iter_mut().zip(args) {
+        *slot = resolve_operand(view, vars, row, arg, params)?;
+    }
+    Ok(out)
+}
+
+/// String functions that only take a string; anything else is null.
+fn string_arg(v: &Option<Value>) -> Option<&str> {
+    match v {
+        Some(Value::Str(s)) => Some(s),
+        _ => None,
+    }
+}
+
+/// `len` characters of `s` from character `start`, as one exact allocation.
+fn char_slice(s: &str, start: usize, len: usize) -> String {
+    if len == 0 {
+        return String::new();
+    }
+    let mut offsets = s.char_indices().map(|(i, _)| i).skip(start);
+    let from = offsets.next().unwrap_or(s.len());
+    let to = offsets.nth(len - 1).unwrap_or(s.len());
+    s[from..to].to_owned()
+}
+
+/// A non-negative integer argument; negative, null or non-integer is null.
+fn count_arg(v: &Option<Value>) -> Option<usize> {
+    match v {
+        Some(Value::Int(n)) if *n >= 0 => Some(*n as usize),
+        _ => None,
+    }
+}
+
+/// String functions (QL-03a). Null in → null out; an argument of the wrong
+/// type or out of range → null, never an error. Only a wrong argument count
+/// is an error.
+fn eval_string_scalar(
+    norm: &str,
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    let arity = match norm {
+        "trim" | "ltrim" | "rtrim" | "reverse" => 1..=1,
+        "substring" => 2..=3,
+        "replace" => 3..=3,
+        _ => 2..=2, // split, left, right
+    };
+    let a = resolve_fn_args(name, args, arity, view, vars, row, params)?;
+    Ok(match norm {
+        "trim" => string_arg(&a[0]).map(|s| Value::Str(s.trim().to_owned())),
+        "ltrim" => string_arg(&a[0]).map(|s| Value::Str(s.trim_start().to_owned())),
+        "rtrim" => string_arg(&a[0]).map(|s| Value::Str(s.trim_end().to_owned())),
+        "replace" => match (string_arg(&a[0]), string_arg(&a[1]), string_arg(&a[2])) {
+            (Some(s), Some(from), Some(to)) => Some(Value::Str(s.replace(from, to))),
+            _ => None,
+        },
+        "split" => match (string_arg(&a[0]), string_arg(&a[1])) {
+            (Some(s), Some("")) => Some(Value::List(
+                s.chars().map(|c| Value::Str(c.to_string())).collect(),
+            )),
+            (Some(s), Some(d)) => Some(Value::List(
+                s.split(d).map(|p| Value::Str(p.to_owned())).collect(),
+            )),
+            _ => None,
+        },
+        "left" => match (string_arg(&a[0]), count_arg(&a[1])) {
+            (Some(s), Some(n)) => Some(Value::Str(char_slice(s, 0, n))),
+            _ => None,
+        },
+        "right" => match (string_arg(&a[0]), count_arg(&a[1])) {
+            (Some(s), Some(n)) => {
+                let skip = s.chars().count().saturating_sub(n);
+                Some(Value::Str(char_slice(s, skip, n)))
+            }
+            _ => None,
+        },
+        "substring" => match (string_arg(&a[0]), count_arg(&a[1])) {
+            (Some(s), Some(start)) if start <= s.chars().count() => {
+                match (args.len() > 2).then_some(&a[2]) {
+                    None => Some(Value::Str(char_slice(s, start, usize::MAX))),
+                    Some(l) => count_arg(l).map(|n| Value::Str(char_slice(s, start, n))),
+                }
+            }
+            _ => None,
+        },
+        "reverse" => match &a[0] {
+            Some(Value::Str(s)) => Some(Value::Str(s.chars().rev().collect())),
+            Some(Value::List(items)) => Some(Value::List(items.iter().rev().cloned().collect())),
+            _ => None,
+        },
+        _ => return Err(format!("unknown string function `{name}`")),
+    })
+}
+
+/// Math functions (QL-03b). Null in → null out; a non-numeric argument or one
+/// outside the function's domain → null.
+fn eval_math_scalar(
+    norm: &str,
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    let arity = match norm {
+        "pi" | "e" | "rand" => 0..=0,
+        "atan2" => 2..=2,
+        _ => 1..=1,
+    };
+    let a = resolve_fn_args(name, args, arity, view, vars, row, params)?;
+    let float_fn = |f: fn(f64) -> f64| {
+        a[0].as_ref()
+            .and_then(numeric_val)
+            .map(|x| Value::Float(f(x)))
+    };
+    Ok(match norm {
+        "floor" | "ceil" => match &a[0] {
+            Some(Value::Int(n)) => Some(Value::Int(*n)),
+            Some(Value::Float(f)) if f.is_finite() => Some(Value::Int(if norm == "floor" {
+                f.floor() as i64
+            } else {
+                f.ceil() as i64
+            })),
+            _ => None,
+        },
+        "sign" => match &a[0] {
+            Some(Value::Int(n)) => Some(Value::Int(n.signum())),
+            Some(Value::Float(f)) if !f.is_nan() => Some(Value::Int(if *f > 0.0 {
+                1
+            } else if *f < 0.0 {
+                -1
+            } else {
+                0
+            })),
+            _ => None,
+        },
+        "sqrt" => match a[0].as_ref().and_then(numeric_val) {
+            Some(x) if x >= 0.0 => Some(Value::Float(x.sqrt())),
+            _ => None,
+        },
+        "log" | "log10" => match a[0].as_ref().and_then(numeric_val) {
+            Some(x) if x > 0.0 => {
+                Some(Value::Float(if norm == "log" { x.ln() } else { x.log10() }))
+            }
+            _ => None,
+        },
+        "exp" => float_fn(f64::exp),
+        "sin" => float_fn(f64::sin),
+        "cos" => float_fn(f64::cos),
+        "tan" => float_fn(f64::tan),
+        "atan" => float_fn(f64::atan),
+        "atan2" => match (
+            a[0].as_ref().and_then(numeric_val),
+            a[1].as_ref().and_then(numeric_val),
+        ) {
+            (Some(y), Some(x)) => Some(Value::Float(y.atan2(x))),
+            _ => None,
+        },
+        "pi" => Some(Value::Float(std::f64::consts::PI)),
+        "e" => Some(Value::Float(std::f64::consts::E)),
+        "rand" => Some(Value::Float(rand::random::<f64>())),
+        _ => return Err(format!("unknown math function `{name}`")),
+    })
+}
+
+/// Type-conversion functions (QL-03d). Every failure to convert is null.
+fn eval_convert_scalar(
+    norm: &str,
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    let a = resolve_fn_args(name, args, 1..=1, view, vars, row, params)?;
+    Ok(match norm {
+        "toboolean" | "tobooleanornull" => match &a[0] {
+            Some(Value::Bool(b)) => Some(Value::Bool(*b)),
+            Some(Value::Int(n)) => Some(Value::Bool(*n != 0)),
+            Some(Value::Str(s)) if s.eq_ignore_ascii_case("true") => Some(Value::Bool(true)),
+            Some(Value::Str(s)) if s.eq_ignore_ascii_case("false") => Some(Value::Bool(false)),
+            _ => None,
+        },
+        "tointegerornull" => match &a[0] {
+            Some(Value::Int(n)) => Some(Value::Int(*n)),
+            Some(Value::Float(f)) if f.is_finite() => Some(Value::Int(*f as i64)),
+            Some(Value::Str(s)) => s.parse::<i64>().ok().map(Value::Int),
+            _ => None,
+        },
+        "tofloatornull" => match &a[0] {
+            Some(Value::Float(f)) => Some(Value::Float(*f)),
+            Some(Value::Int(n)) => Some(Value::Float(*n as f64)),
+            Some(Value::Str(s)) => s
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .map(Value::Float),
+            _ => None,
+        },
+        _ => return Err(format!("unknown conversion function `{name}`")),
+    })
 }
 
 fn resolve_operand(
@@ -9046,5 +9321,278 @@ LIMIT 10";
                 vec![Some(s("a2")), Some(s("b1"))],
             ]
         );
+    }
+
+    /// There is no null or list literal in the grammar: `n.nope` is a null
+    /// (missing property) and `$l` is the list [1, 2, 3].
+    fn eval_params() -> BTreeMap<String, Value> {
+        BTreeMap::from([(
+            "l".to_string(),
+            Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+        )])
+    }
+
+    /// Evaluate one expression through the full lex/parse/plan/execute path.
+    fn eval(expr: &str) -> Option<Value> {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]);
+        let rs = run(
+            &fx.view(),
+            &format!("MATCH (n:N) RETURN {expr} AS r"),
+            &eval_params(),
+        )
+        .unwrap_or_else(|e| panic!("`{expr}` failed: {e}"));
+        rs.get(0, "r").cloned()
+    }
+
+    fn eval_err(expr: &str) -> String {
+        let mut fx = Fx::new();
+        fx.add("N", "x", vec![]);
+        run(
+            &fx.view(),
+            &format!("MATCH (n:N) RETURN {expr} AS r"),
+            &eval_params(),
+        )
+        .expect_err("must fail")
+    }
+
+    #[test]
+    fn ql03a_string_functions_values() {
+        assert_eq!(eval("trim(\"  hi  \")"), Some(s("hi")));
+        assert_eq!(eval("ltrim(\"  hi\")"), Some(s("hi")));
+        assert_eq!(eval("rtrim(\"hi  \")"), Some(s("hi")));
+        assert_eq!(eval("ltrim(\"  hi  \")"), Some(s("hi  ")));
+        assert_eq!(eval("rtrim(\"  hi  \")"), Some(s("  hi")));
+        assert_eq!(eval("replace(\"abcabc\", \"b\", \"X\")"), Some(s("aXcaXc")));
+        assert_eq!(
+            eval("split(\"a,b,c\", \",\")"),
+            Some(Value::List(vec![s("a"), s("b"), s("c")]))
+        );
+        assert_eq!(
+            eval("split(\"a,b\", \",\")"),
+            Some(Value::List(vec![s("a"), s("b")]))
+        );
+        assert_eq!(
+            eval("split(\"abc\", \"\")"),
+            Some(Value::List(vec![s("a"), s("b"), s("c")]))
+        );
+        assert_eq!(eval("left(\"hello\", 3)"), Some(s("hel")));
+        assert_eq!(eval("left(\"hi\", 9)"), Some(s("hi")));
+        assert_eq!(eval("right(\"hello\", 3)"), Some(s("llo")));
+        assert_eq!(eval("right(\"hi\", 9)"), Some(s("hi")));
+        assert_eq!(eval("substring(\"hello\", 1, 3)"), Some(s("ell")));
+        assert_eq!(eval("substring(\"hello\", 1)"), Some(s("ello")));
+        assert_eq!(eval("substring(\"hello\", 5)"), Some(s("")));
+        assert_eq!(eval("substring(\"hello\", 3, 99)"), Some(s("lo")));
+        assert_eq!(eval("left(\"h\u{e9}llo\", 2)"), Some(s("h\u{e9}")));
+        assert_eq!(eval("right(\"h\u{e9}llo\", 4)"), Some(s("\u{e9}llo")));
+        assert_eq!(eval("substring(\"h\u{e9}llo\", 1, 2)"), Some(s("\u{e9}l")));
+        assert_eq!(eval("left(\"abc\", 0)"), Some(s("")));
+        assert_eq!(eval("reverse(\"abc\")"), Some(s("cba")));
+        assert_eq!(
+            eval("reverse($l)"),
+            Some(Value::List(vec![
+                Value::Int(3),
+                Value::Int(2),
+                Value::Int(1)
+            ]))
+        );
+    }
+
+    #[test]
+    fn ql03a_string_functions_null_and_type_mismatch_are_null() {
+        for f in ["trim", "ltrim", "rtrim", "reverse"] {
+            assert_eq!(eval(&format!("{f}(n.nope)")), None, "{f}(n.nope)");
+        }
+        assert_eq!(eval("trim(42)"), None);
+        assert_eq!(eval("ltrim(42)"), None);
+        assert_eq!(eval("rtrim(42)"), None);
+        assert_eq!(eval("reverse(42)"), None);
+        assert_eq!(eval("replace(n.nope, \"a\", \"b\")"), None);
+        assert_eq!(eval("replace(42, \"a\", \"b\")"), None);
+        assert_eq!(eval("replace(\"a\", 1, \"b\")"), None);
+        assert_eq!(eval("split(n.nope, \",\")"), None);
+        assert_eq!(eval("split(42, \",\")"), None);
+        assert_eq!(eval("split(\"a\", 1)"), None);
+        assert_eq!(eval("left(n.nope, 1)"), None);
+        assert_eq!(eval("left(42, 1)"), None);
+        assert_eq!(eval("left(\"x\", -1)"), None);
+        assert_eq!(eval("left(\"x\", \"1\")"), None);
+        assert_eq!(eval("right(n.nope, 1)"), None);
+        assert_eq!(eval("right(42, 1)"), None);
+        assert_eq!(eval("right(\"x\", -1)"), None);
+        assert_eq!(eval("substring(n.nope, 1)"), None);
+        assert_eq!(eval("substring(42, 1)"), None);
+        assert_eq!(eval("substring(\"x\", 5, 1)"), None);
+        assert_eq!(eval("substring(\"x\", -1)"), None);
+        assert_eq!(eval("substring(\"x\", 0, -1)"), None);
+        assert_eq!(eval("substring(\"x\", 0, n.nope)"), None);
+    }
+
+    #[test]
+    fn ql03a_string_functions_wrong_arity_errors_and_are_listed() {
+        assert!(eval_err("trim()").contains("trim() requires"));
+        assert!(eval_err("left(\"a\")").contains("left() requires"));
+        let unknown = eval_err("nosuchfn(1)");
+        for f in [
+            "trim",
+            "ltrim",
+            "rtrim",
+            "replace",
+            "split",
+            "left",
+            "right",
+            "substring",
+            "reverse",
+        ] {
+            assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
+        }
+    }
+
+    fn float_of(expr: &str) -> f64 {
+        match eval(expr) {
+            Some(Value::Float(f)) => f,
+            other => panic!("`{expr}` gave {other:?}, want a float"),
+        }
+    }
+
+    #[test]
+    fn ql03b_math_values() {
+        assert_eq!(eval("floor(2.9)"), Some(Value::Int(2)));
+        assert_eq!(eval("floor(2.0)"), Some(Value::Int(2)));
+        assert_eq!(eval("floor(-2.1)"), Some(Value::Int(-3)));
+        assert_eq!(eval("floor(5)"), Some(Value::Int(5)));
+        assert_eq!(eval("ceil(2.1)"), Some(Value::Int(3)));
+        assert_eq!(eval("ceil(-2.9)"), Some(Value::Int(-2)));
+        assert_eq!(eval("ceil(5)"), Some(Value::Int(5)));
+        assert_eq!(eval("sign(-5)"), Some(Value::Int(-1)));
+        assert_eq!(eval("sign(0)"), Some(Value::Int(0)));
+        assert_eq!(eval("sign(3)"), Some(Value::Int(1)));
+        assert_eq!(eval("sign(-2.5)"), Some(Value::Int(-1)));
+        assert_eq!(eval("sign(0.0)"), Some(Value::Int(0)));
+        assert_eq!(float_of("sqrt(4.0)"), 2.0);
+        assert_eq!(float_of("sqrt(9)"), 3.0);
+        assert_eq!(float_of("log(1.0)"), 0.0);
+        assert_eq!(float_of("log10(100.0)"), 2.0);
+        assert_eq!(float_of("exp(0.0)"), 1.0);
+        assert_eq!(float_of("sin(0.0)"), 0.0);
+        assert_eq!(float_of("cos(0.0)"), 1.0);
+        assert_eq!(float_of("tan(0.0)"), 0.0);
+        assert_eq!(float_of("atan(0.0)"), 0.0);
+        assert!((float_of("atan2(1.0, 1.0)") - std::f64::consts::FRAC_PI_4).abs() < 1e-15);
+        assert!((float_of("pi()") - std::f64::consts::PI).abs() < 1e-15);
+        assert!((float_of("e()") - std::f64::consts::E).abs() < 1e-15);
+    }
+
+    #[test]
+    fn ql03b_math_domain_errors_are_null() {
+        assert_eq!(eval("sqrt(-1.0)"), None);
+        assert_eq!(eval("log(0.0)"), None);
+        assert_eq!(eval("log(-1.0)"), None);
+        assert_eq!(eval("log10(0.0)"), None);
+        assert_eq!(eval("log10(-1)"), None);
+    }
+
+    #[test]
+    fn ql03b_math_null_and_type_mismatch_are_null() {
+        for f in [
+            "floor", "ceil", "sign", "sqrt", "log", "log10", "exp", "sin", "cos", "tan", "atan",
+        ] {
+            assert_eq!(eval(&format!("{f}(n.nope)")), None, "{f}(n.nope)");
+            assert_eq!(eval(&format!("{f}(\"x\")")), None, "{f}(\"x\")");
+        }
+        assert_eq!(eval("atan2(n.nope, 1.0)"), None);
+        assert_eq!(eval("atan2(1.0, n.nope)"), None);
+        assert_eq!(eval("atan2(\"x\", 1.0)"), None);
+        assert_eq!(eval("atan2(1.0, \"x\")"), None);
+    }
+
+    #[test]
+    fn ql03b_rand_is_a_float_in_unit_interval() {
+        for _ in 0..200 {
+            let r = float_of("rand()");
+            assert!((0.0..1.0).contains(&r), "rand() gave {r}");
+        }
+    }
+
+    #[test]
+    fn ql03b_zero_arg_functions_reject_arguments_and_names_are_listed() {
+        assert!(eval_err("pi(1)").contains("pi() requires"));
+        assert!(eval_err("rand(1)").contains("rand() requires"));
+        assert!(eval_err("atan2(1.0)").contains("atan2() requires"));
+        let unknown = eval_err("nosuchfn(1)");
+        for f in [
+            "floor", "ceil", "sign", "sqrt", "log", "log10", "exp", "sin", "cos", "tan", "atan",
+            "atan2", "pi", "e", "rand",
+        ] {
+            assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
+        }
+    }
+
+    #[test]
+    fn ql03b_percent_and_caret_operators() {
+        assert_eq!(eval("7 % 3"), Some(Value::Int(1)));
+        assert_eq!(eval("7.5 % 2"), Some(Value::Float(1.5)));
+        assert_eq!(eval("2 ^ 10"), Some(Value::Float(1024.0)));
+        assert_eq!(eval("n.nope % 3"), None);
+        assert_eq!(eval("2 ^ n.nope"), None);
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is the brief's literal, not an attempt at pi
+    fn ql03d_conversion_values() {
+        assert_eq!(eval("toBoolean(\"true\")"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(\"false\")"), Some(Value::Bool(false)));
+        assert_eq!(eval("toBoolean(\"TRUE\")"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(true)"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(1)"), Some(Value::Bool(true)));
+        assert_eq!(eval("toBoolean(0)"), Some(Value::Bool(false)));
+        assert_eq!(eval("toBooleanOrNull(\"false\")"), Some(Value::Bool(false)));
+        assert_eq!(eval("toBooleanOrNull(1)"), Some(Value::Bool(true)));
+        assert_eq!(eval("toIntegerOrNull(\"42\")"), Some(Value::Int(42)));
+        assert_eq!(eval("toIntegerOrNull(7)"), Some(Value::Int(7)));
+        assert_eq!(eval("toIntegerOrNull(3.9)"), Some(Value::Int(3)));
+        assert_eq!(eval("toFloatOrNull(\"3.14\")"), Some(Value::Float(3.14)));
+        assert_eq!(eval("toFloatOrNull(2)"), Some(Value::Float(2.0)));
+        assert_eq!(eval("toFloatOrNull(2.5)"), Some(Value::Float(2.5)));
+    }
+
+    #[test]
+    fn ql03d_conversion_failures_null_and_type_mismatch_are_null() {
+        for f in [
+            "toBoolean",
+            "toBooleanOrNull",
+            "toIntegerOrNull",
+            "toFloatOrNull",
+        ] {
+            assert_eq!(eval(&format!("{f}(n.nope)")), None, "{f}(n.nope)");
+            assert_eq!(eval(&format!("{f}($l)")), None, "{f}(list)");
+        }
+        assert_eq!(eval("toBoolean(\"maybe\")"), None);
+        assert_eq!(eval("toBooleanOrNull(\"x\")"), None);
+        assert_eq!(eval("toBooleanOrNull(1.5)"), None);
+        assert_eq!(eval("toIntegerOrNull(\"abc\")"), None);
+        assert_eq!(eval("toIntegerOrNull(true)"), None);
+        assert_eq!(eval("toFloatOrNull(\"x\")"), None);
+        for bad in ["NaN", "inf", "infinity", "-inf"] {
+            assert_eq!(eval(&format!("toFloatOrNull(\"{bad}\")")), None, "{bad}");
+            assert_eq!(eval(&format!("toFloat(\"{bad}\")")), None, "toFloat {bad}");
+        }
+        assert_eq!(eval("toFloatOrNull(true)"), None);
+    }
+
+    #[test]
+    fn ql03d_arity_errors_and_names_are_listed() {
+        assert!(eval_err("toBoolean()").contains("toBoolean() requires"));
+        assert!(eval_err("toFloatOrNull(1, 2)").contains("toFloatOrNull() requires"));
+        let unknown = eval_err("nosuchfn(1)");
+        for f in [
+            "toBoolean",
+            "toBooleanOrNull",
+            "toIntegerOrNull",
+            "toFloatOrNull",
+        ] {
+            assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
+        }
     }
 }
