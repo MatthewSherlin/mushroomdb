@@ -2227,7 +2227,7 @@ impl RuleEngine {
     ///
     /// When `true`, `provenance()` and `provenance_touching*` dispatch to
     /// `lazy_provenance`; when `false` they use the live mutable fields.
-    fn provenance_is_retained(&self) -> bool {
+    pub fn provenance_is_retained(&self) -> bool {
         self.retained_provenance_bytes
             .lock()
             .expect("lock poisoned")
@@ -2245,6 +2245,14 @@ impl RuleEngine {
         } else {
             &self.provenance
         }
+    }
+
+    /// Every triple any rule owns, from the live provenance.
+    ///
+    /// Empty while provenance bytes are still retained: the caller reads those
+    /// from the snapshot they came from (see [`Self::provenance_is_retained`]).
+    pub fn derived_triples(&self) -> BTreeSet<(u32, u32, u32)> {
+        self.provenance.values().flatten().copied().collect()
     }
 
     /// O(degree) reverse-index lookup: every provenance triple that touches `node`.

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A reader's `node_edges` and `node_edges_scoped` now say which edges a rule derived.** A lock-free `reader()` snapshot reported `derived: false` for every edge, on a store with no snapshot too, where the write handle reported `true`. The reader now answers as the write handle does, including for edges derived since the last fold and edges a snapshot carries (row 114).
+
 ## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
 
 No format version change. A 0.9.1 store opens under 0.9.2, and a 0.9.2 snapshot opens under 0.9.1: the one addition, an optional snapshot section (16), is ignored by 0.9.1.

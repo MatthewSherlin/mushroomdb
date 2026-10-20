@@ -13,7 +13,7 @@
 //! 3. **Delta chain bounded**: at most `FOLD_EVERY_K − 1` deltas in the tail
 //!    (fold resets the counter synchronously on the write path).
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use core_query::cypher::{execute, is_write_tokens, lex, parse, plan, Params};
@@ -51,6 +51,106 @@ pub struct CommitDelta {
     pub view_values: Vec<(u32, String, Option<Value>)>,
 }
 
+/// An edge as the rule engine owns it: `(etype_sym, src_id, dst_id)`.
+type DerivedTriple = (u32, u32, u32);
+
+/// Every derived triple touching a node, sorted; a triple is listed under both
+/// of its endpoints. One map probe per `node_edges` call, however many edges
+/// the node has, rather than one probe of a set the size of the store per edge.
+type DerivedIndex = HashMap<u32, Box<[DerivedTriple]>>;
+
+/// Layers a fold carries before it merges them into one.
+const MAX_DERIVED_LAYERS: usize = 8;
+
+fn index_of(triples: impl IntoIterator<Item = DerivedTriple>) -> DerivedIndex {
+    let mut lists: HashMap<u32, Vec<DerivedTriple>> = HashMap::new();
+    for triple @ (_, src, dst) in triples {
+        lists.entry(src).or_default().push(triple);
+        if dst != src {
+            lists.entry(dst).or_default().push(triple);
+        }
+    }
+    lists
+        .into_iter()
+        .map(|(node, mut list)| {
+            list.sort_unstable();
+            list.dedup();
+            (node, list.into_boxed_slice())
+        })
+        .collect()
+}
+
+enum DerivedRoot {
+    /// Taken from the engine's provenance when the fold was built.
+    Index(DerivedIndex),
+    /// The engine had not diverged from the snapshot base: its provenance is
+    /// the base's provenance section. Decoded by the first `node_edges` that
+    /// needs it, once for every reader taken from this fold, so an open does
+    /// not pay for a decode no reader may ask for.
+    Base(OnceLock<DerivedIndex>),
+}
+
+/// The rule-derived edges as of a fold: what `node_edges` consults to say
+/// whether an edge is derived. The reader holds no rule engine, so the writer
+/// hands it the answer.
+///
+/// A root, taken whole when the state is reloaded (open, refresh, snapshot),
+/// under a few layers of changes, one per fold since: a fold on the write path
+/// costs what its commits changed, not the size of the store's provenance.
+#[derive(Clone)]
+pub struct DerivedEdges {
+    root: Arc<DerivedRoot>,
+    /// Oldest first; a later layer overrides an earlier one and the root.
+    layers: Vec<Arc<HashMap<DerivedTriple, bool>>>,
+}
+
+impl DerivedEdges {
+    /// A root taken from the engine's live provenance.
+    pub fn from_triples(triples: impl IntoIterator<Item = DerivedTriple>) -> Self {
+        Self {
+            root: Arc::new(DerivedRoot::Index(index_of(triples))),
+            layers: Vec::new(),
+        }
+    }
+
+    /// A root that is the provenance of the base the fold is taken over,
+    /// decoded when first read.
+    pub fn from_base() -> Self {
+        Self {
+            root: Arc::new(DerivedRoot::Base(OnceLock::new())),
+            layers: Vec::new(),
+        }
+    }
+
+    /// This fold's derived edges with `tail`'s commits applied: the next fold.
+    pub fn extended(&self, tail: &[Arc<CommitDelta>]) -> Self {
+        let mut layer = HashMap::new();
+        for delta in tail {
+            for &triple in &delta.derived_inserts {
+                layer.insert(triple, true);
+            }
+            for &triple in &delta.derived_deletes {
+                layer.insert(triple, false);
+            }
+        }
+        let mut next = self.clone();
+        if layer.is_empty() {
+            return next;
+        }
+        if next.layers.len() >= MAX_DERIVED_LAYERS {
+            let mut merged = HashMap::new();
+            for older in &next.layers {
+                merged.extend(older.iter().map(|(&k, &v)| (k, v)));
+            }
+            merged.extend(layer);
+            next.layers = vec![Arc::new(merged)];
+        } else {
+            next.layers.push(Arc::new(layer));
+        }
+        next
+    }
+}
+
 /// Full clone of overlay state captured at fold time.
 ///
 /// The V8 mmap base is not cloned here; it is `Arc`-shared in `ReaderSnapshot`.
@@ -64,6 +164,8 @@ pub struct FrozenOverlay {
     pub edge_props: Arc<EdgeProps>,
     pub roles: Option<Arc<Vec<RoleDef>>>,
     pub fulltext: Arc<FulltextIndex>,
+    /// Which edges in `topo` (and the base under it) a rule derived.
+    pub derived: DerivedEdges,
 }
 
 /// Lock-free reader snapshot: frozen overlay + optional V8 base + pending delta tail.
@@ -540,6 +642,38 @@ impl ReaderSnapshot {
         Ok(w)
     }
 
+    /// What the fold and the delta tail say about which edges are derived.
+    fn derived_lookup(&self) -> DerivedLookup<'_> {
+        let derived = &self.frozen.derived;
+        let root = match derived.root.as_ref() {
+            DerivedRoot::Index(index) => Some(index),
+            DerivedRoot::Base(cell) => self.base.as_ref().map(|base| {
+                cell.get_or_init(|| {
+                    let bytes = base.provenance_raw_bytes().unwrap_or_default();
+                    index_of(
+                        core_storage::v8::encode::decode_provenance_bytes(bytes)
+                            .into_values()
+                            .flatten(),
+                    )
+                })
+            }),
+        };
+        let mut tail = HashMap::new();
+        for delta in &self.deltas {
+            for &triple in &delta.derived_inserts {
+                tail.insert(triple, true);
+            }
+            for &triple in &delta.derived_deletes {
+                tail.insert(triple, false);
+            }
+        }
+        DerivedLookup {
+            root,
+            layers: &derived.layers,
+            tail,
+        }
+    }
+
     /// Construct a `ReaderSnapshot` from its constituent parts.
     ///
     /// Used by [`crate::db::GraphDb::reader`] — the only site that builds a
@@ -685,12 +819,13 @@ impl ReaderSnapshot {
         node_info_from(key, self.effective().ok()?, &self.base)
     }
 
-    /// Every directed edge incident on `key`. `derived` is always `false` since
-    /// the reader snapshot has no rule engine.
+    /// Every directed edge incident on `key`. `derived` is exactly what
+    /// [`GraphDb::node_edges`](crate::GraphDb::node_edges) reports: whether a
+    /// rule owns the edge.
     ///
     /// Unknown key → `Err(GraphError::KeyNotFound)`.
     pub fn node_edges(&self, key: &str) -> Result<Vec<EdgeInfo>> {
-        node_edges_from(key, self.effective()?, &self.base)
+        node_edges_from(key, self.effective()?, &self.base, &self.derived_lookup())
     }
 
     /// BFS neighborhood expansion restricted to `mask`-visible nodes.
@@ -725,8 +860,7 @@ impl ReaderSnapshot {
     /// dropped — a visible node must not become a window onto its hidden
     /// neighbours.
     ///
-    /// `derived` is always `false`, as it is on [`Self::node_edges`]: a snapshot
-    /// carries no rule engine.
+    /// `derived` is reported as [`Self::node_edges`] reports it.
     ///
     /// Hidden or unknown `key` → [`GraphError::KeyNotFound`].
     pub fn node_edges_scoped(&self, key: &str, mask: &NodeMask) -> Result<Vec<EdgeInfo>> {
@@ -734,7 +868,7 @@ impl ReaderSnapshot {
         if !state.ids.get(key).is_some_and(|id| mask.contains_id(id)) {
             return Err(GraphError::KeyNotFound { key: key.into() });
         }
-        let edges = node_edges_from(key, state, &self.base)?;
+        let edges = node_edges_from(key, state, &self.base, &self.derived_lookup())?;
         Ok(edges
             .into_iter()
             .filter(|e| {
@@ -801,15 +935,46 @@ fn node_info_from(
     })
 }
 
+/// [`ReaderSnapshot::derived_lookup`]'s answer: the fold's derived edges
+/// under the delta tail's changes to them.
+struct DerivedLookup<'a> {
+    root: Option<&'a DerivedIndex>,
+    layers: &'a [Arc<HashMap<DerivedTriple, bool>>],
+    tail: HashMap<DerivedTriple, bool>,
+}
+
+impl DerivedLookup<'_> {
+    /// The derived triples the root holds for `node`: all there is to ask it.
+    fn root_triples(&self, node: u32) -> &[DerivedTriple] {
+        self.root
+            .and_then(|index| index.get(&node))
+            .map_or(&[], |list| list)
+    }
+
+    fn is_derived(&self, root_triples: &[DerivedTriple], triple: DerivedTriple) -> bool {
+        if let Some(&derived) = self.tail.get(&triple) {
+            return derived;
+        }
+        for layer in self.layers.iter().rev() {
+            if let Some(&derived) = layer.get(&triple) {
+                return derived;
+            }
+        }
+        root_triples.binary_search(&triple).is_ok()
+    }
+}
+
 fn node_edges_from(
     key: &str,
     state: &FrozenOverlay,
     base: &Option<Arc<MappedBase>>,
+    derived: &DerivedLookup<'_>,
 ) -> Result<Vec<EdgeInfo>> {
     let id = state
         .ids
         .get(key)
         .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })?;
+    let root_triples = derived.root_triples(id);
     let tv = build_tv(&state.topo, base);
     let mut edges = Vec::new();
     for etype in tv.etypes() {
@@ -822,6 +987,10 @@ fn node_edges_from(
             .to_string();
         for dir in [Direction::Out, Direction::In] {
             for &nbr in tv.neighbors(etype, dir, id).as_ref() {
+                let (src_id, dst_id) = match dir {
+                    Direction::Out => (id, nbr),
+                    Direction::In => (nbr, id),
+                };
                 let (src_key, dst_key) = match dir {
                     Direction::Out => (
                         key.to_string(),
@@ -848,7 +1017,7 @@ fn node_edges_from(
                     edge_type: edge_type.clone(),
                     src_key,
                     dst_key,
-                    derived: false,
+                    derived: derived.is_derived(root_triples, (etype, src_id, dst_id)),
                 });
             }
         }

@@ -3782,6 +3782,22 @@ impl<F: Fs> GraphDb<F> {
     /// the delta tail. Called automatically every `FOLD_EVERY_K` commits and at
     /// the end of `open_with` / `open_at_with` to prime the reader.
     fn fold_now(&mut self) {
+        let derived = self.derived_at_reload();
+        self.fold_with(derived);
+    }
+
+    /// The fold taken on the write path after a commit: the previous fold's
+    /// derived edges with the delta tail applied, rather than the engine's
+    /// provenance read again from the top.
+    fn fold_after_commit(&mut self) {
+        let derived = match &self.fold_overlay {
+            Some(previous) => previous.derived.extended(&self.delta_tail),
+            None => self.derived_at_reload(),
+        };
+        self.fold_with(derived);
+    }
+
+    fn fold_with(&mut self, derived: crate::reader::DerivedEdges) {
         // Eight `Arc::clone`s — refcount bumps, O(1). This used to deep-copy the
         // whole overlay: `IdMap` alone is a `HashMap<String, u32>` plus a
         // `Vec<String>`, so every node key was copied twice, on every open,
@@ -3802,6 +3818,7 @@ impl<F: Fs> GraphDb<F> {
             edge_props: std::sync::Arc::clone(&self.edge_props),
             roles: self.roles.clone().map(std::sync::Arc::new),
             fulltext: std::sync::Arc::clone(&self.fulltext),
+            derived,
         };
         self.fold_overlay = Some(Arc::new(frozen));
         self.delta_tail.clear();
@@ -3809,6 +3826,25 @@ impl<F: Fs> GraphDb<F> {
         // The fold holds every view value as it stands; what replay or a
         // refresh touched on the way here is not owed to any delta.
         self.view_store.clear_touched();
+    }
+
+    /// The rule-derived edges as this handle has them, for a fold that reloads
+    /// them: open, refresh, snapshot, a change of roles.
+    ///
+    /// While the engine's provenance is still the snapshot base's — nothing
+    /// has mutated it, so its bytes are unread or retained — the reader decodes
+    /// the base's own section when it first needs it: an open must not decode
+    /// provenance for readers that never ask. Once the engine has taken the
+    /// provenance into its live fields the fold copies them.
+    fn derived_at_reload(&self) -> crate::reader::DerivedEdges {
+        use crate::reader::DerivedEdges;
+        let sections_loaded = self
+            .v8_sections_loaded
+            .load(std::sync::atomic::Ordering::Acquire);
+        if self.base.is_some() && (!sections_loaded || self.engine.provenance_is_retained()) {
+            return DerivedEdges::from_base();
+        }
+        DerivedEdges::from_triples(self.engine.derived_triples())
     }
 
     /// The view properties the commit of `rec` left on the nodes it touched,
@@ -6055,7 +6091,7 @@ impl<F: Fs> GraphDb<F> {
             self.delta_tail.push(delta);
             self.commits_since_fold += 1;
             if fold || self.commits_since_fold >= crate::reader::FOLD_EVERY_K {
-                self.fold_now();
+                self.fold_after_commit();
             }
         }
 
