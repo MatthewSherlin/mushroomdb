@@ -8,10 +8,6 @@
 
 - **A Cypher read anchored on a key, `MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k`, is a point lookup, not a scan of the label.** The key filter used to run after every node of the label had been expanded: 593 ms at 1M nodes, now about 0.006 ms. Results are unchanged, under masks, namespaces and `open_at` too (row 102).
 
-### Fixed
-
-- **A Cypher read anchored on a key, `MATCH (p:Person)-[:KNOWS]->(q) WHERE key(p) = $k`, is a point lookup, not a scan of the label.** The key filter used to run after every node of the label had been expanded: 593 ms at 1M nodes, now about 0.006 ms. Results are unchanged, under masks, namespaces and `open_at` too (row 102).
-
 ## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
 
 No format version change. A 0.9.1 store opens under 0.9.2, and a 0.9.2 snapshot opens under 0.9.1: the one addition, an optional snapshot section (16), is ignored by 0.9.1.
