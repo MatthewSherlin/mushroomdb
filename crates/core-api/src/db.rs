@@ -1091,6 +1091,15 @@ fn eval_set_return_arith(
                     }
                     a.checked_div(b).unwrap_or(i64::MAX)
                 }
+                ArithOp::Mod => {
+                    if b == 0 {
+                        return Err(GraphError::QueryError {
+                            detail: "division by zero".into(),
+                        });
+                    }
+                    a.checked_rem(b).unwrap_or(0)
+                }
+                ArithOp::Pow => return Ok(Some(Value::Float((a as f64).powf(b as f64)))),
             };
             Ok(Some(Value::Int(result)))
         }
@@ -1125,6 +1134,8 @@ fn eval_set_return_arith(
                     }
                     a / b
                 }
+                ArithOp::Mod => a % b,
+                ArithOp::Pow => a.powf(b),
             };
             Ok(Some(Value::Float(result)))
         }
