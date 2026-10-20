@@ -1712,6 +1712,21 @@ const SCALAR_FUNCS: &[&str] = &[
     "right",
     "substring",
     "reverse",
+    "floor",
+    "ceil",
+    "sign",
+    "sqrt",
+    "log",
+    "log10",
+    "exp",
+    "sin",
+    "cos",
+    "tan",
+    "atan",
+    "atan2",
+    "pi",
+    "e",
+    "rand",
 ];
 
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
@@ -2057,6 +2072,10 @@ fn eval_func(
         }
         "trim" | "ltrim" | "rtrim" | "replace" | "split" | "left" | "right" | "substring"
         | "reverse" => eval_string_scalar(&norm, name, args, view, vars, row, params),
+        "floor" | "ceil" | "sign" | "sqrt" | "log" | "log10" | "exp" | "sin" | "cos" | "tan"
+        | "atan" | "atan2" | "pi" | "e" | "rand" => {
+            eval_math_scalar(&norm, name, args, view, vars, row, params)
+        }
         _ => Err(format!(
             "unknown function `{name}`; supported: {}",
             SCALAR_FUNCS.join(", ")
@@ -2169,6 +2188,78 @@ fn eval_string_scalar(
             _ => None,
         },
         _ => return Err(format!("unknown string function `{name}`")),
+    })
+}
+
+/// Math functions (QL-03b). Null in → null out; a non-numeric argument or one
+/// outside the function's domain → null.
+fn eval_math_scalar(
+    norm: &str,
+    name: &str,
+    args: &[Operand],
+    view: &GraphView,
+    vars: &VarTable,
+    row: &Row,
+    params: &Params,
+) -> Result<Option<Value>, String> {
+    let arity = match norm {
+        "pi" | "e" | "rand" => 0..=0,
+        "atan2" => 2..=2,
+        _ => 1..=1,
+    };
+    let a = resolve_fn_args(name, args, arity, view, vars, row, params)?;
+    let float_fn = |f: fn(f64) -> f64| {
+        a[0].as_ref()
+            .and_then(numeric_val)
+            .map(|x| Value::Float(f(x)))
+    };
+    Ok(match norm {
+        "floor" | "ceil" => match &a[0] {
+            Some(Value::Int(n)) => Some(Value::Int(*n)),
+            Some(Value::Float(f)) if f.is_finite() => Some(Value::Int(if norm == "floor" {
+                f.floor() as i64
+            } else {
+                f.ceil() as i64
+            })),
+            _ => None,
+        },
+        "sign" => match &a[0] {
+            Some(Value::Int(n)) => Some(Value::Int(n.signum())),
+            Some(Value::Float(f)) if !f.is_nan() => Some(Value::Int(if *f > 0.0 {
+                1
+            } else if *f < 0.0 {
+                -1
+            } else {
+                0
+            })),
+            _ => None,
+        },
+        "sqrt" => match a[0].as_ref().and_then(numeric_val) {
+            Some(x) if x >= 0.0 => Some(Value::Float(x.sqrt())),
+            _ => None,
+        },
+        "log" | "log10" => match a[0].as_ref().and_then(numeric_val) {
+            Some(x) if x > 0.0 => {
+                Some(Value::Float(if norm == "log" { x.ln() } else { x.log10() }))
+            }
+            _ => None,
+        },
+        "exp" => float_fn(f64::exp),
+        "sin" => float_fn(f64::sin),
+        "cos" => float_fn(f64::cos),
+        "tan" => float_fn(f64::tan),
+        "atan" => float_fn(f64::atan),
+        "atan2" => match (
+            a[0].as_ref().and_then(numeric_val),
+            a[1].as_ref().and_then(numeric_val),
+        ) {
+            (Some(y), Some(x)) => Some(Value::Float(y.atan2(x))),
+            _ => None,
+        },
+        "pi" => Some(Value::Float(std::f64::consts::PI)),
+        "e" => Some(Value::Float(std::f64::consts::E)),
+        "rand" => Some(Value::Float(rand::random::<f64>())),
+        _ => return Err(format!("unknown math function `{name}`")),
     })
 }
 
@@ -9251,5 +9342,94 @@ LIMIT 10";
         ] {
             assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
         }
+    }
+
+    fn float_of(expr: &str) -> f64 {
+        match eval(expr) {
+            Some(Value::Float(f)) => f,
+            other => panic!("`{expr}` gave {other:?}, want a float"),
+        }
+    }
+
+    #[test]
+    fn ql03b_math_values() {
+        assert_eq!(eval("floor(2.9)"), Some(Value::Int(2)));
+        assert_eq!(eval("floor(2.0)"), Some(Value::Int(2)));
+        assert_eq!(eval("floor(-2.1)"), Some(Value::Int(-3)));
+        assert_eq!(eval("floor(5)"), Some(Value::Int(5)));
+        assert_eq!(eval("ceil(2.1)"), Some(Value::Int(3)));
+        assert_eq!(eval("ceil(-2.9)"), Some(Value::Int(-2)));
+        assert_eq!(eval("ceil(5)"), Some(Value::Int(5)));
+        assert_eq!(eval("sign(-5)"), Some(Value::Int(-1)));
+        assert_eq!(eval("sign(0)"), Some(Value::Int(0)));
+        assert_eq!(eval("sign(3)"), Some(Value::Int(1)));
+        assert_eq!(eval("sign(-2.5)"), Some(Value::Int(-1)));
+        assert_eq!(eval("sign(0.0)"), Some(Value::Int(0)));
+        assert_eq!(float_of("sqrt(4.0)"), 2.0);
+        assert_eq!(float_of("sqrt(9)"), 3.0);
+        assert_eq!(float_of("log(1.0)"), 0.0);
+        assert_eq!(float_of("log10(100.0)"), 2.0);
+        assert_eq!(float_of("exp(0.0)"), 1.0);
+        assert_eq!(float_of("sin(0.0)"), 0.0);
+        assert_eq!(float_of("cos(0.0)"), 1.0);
+        assert_eq!(float_of("tan(0.0)"), 0.0);
+        assert_eq!(float_of("atan(0.0)"), 0.0);
+        assert!((float_of("atan2(1.0, 1.0)") - std::f64::consts::FRAC_PI_4).abs() < 1e-15);
+        assert!((float_of("pi()") - std::f64::consts::PI).abs() < 1e-15);
+        assert!((float_of("e()") - std::f64::consts::E).abs() < 1e-15);
+    }
+
+    #[test]
+    fn ql03b_math_domain_errors_are_null() {
+        assert_eq!(eval("sqrt(-1.0)"), None);
+        assert_eq!(eval("log(0.0)"), None);
+        assert_eq!(eval("log(-1.0)"), None);
+        assert_eq!(eval("log10(0.0)"), None);
+        assert_eq!(eval("log10(-1)"), None);
+    }
+
+    #[test]
+    fn ql03b_math_null_and_type_mismatch_are_null() {
+        for f in [
+            "floor", "ceil", "sign", "sqrt", "log", "log10", "exp", "sin", "cos", "tan", "atan",
+        ] {
+            assert_eq!(eval(&format!("{f}(n.nope)")), None, "{f}(n.nope)");
+            assert_eq!(eval(&format!("{f}(\"x\")")), None, "{f}(\"x\")");
+        }
+        assert_eq!(eval("atan2(n.nope, 1.0)"), None);
+        assert_eq!(eval("atan2(1.0, n.nope)"), None);
+        assert_eq!(eval("atan2(\"x\", 1.0)"), None);
+        assert_eq!(eval("atan2(1.0, \"x\")"), None);
+    }
+
+    #[test]
+    fn ql03b_rand_is_a_float_in_unit_interval() {
+        for _ in 0..200 {
+            let r = float_of("rand()");
+            assert!((0.0..1.0).contains(&r), "rand() gave {r}");
+        }
+    }
+
+    #[test]
+    fn ql03b_zero_arg_functions_reject_arguments_and_names_are_listed() {
+        assert!(eval_err("pi(1)").contains("pi() requires"));
+        assert!(eval_err("rand(1)").contains("rand() requires"));
+        assert!(eval_err("atan2(1.0)").contains("atan2() requires"));
+        let unknown = eval_err("nosuchfn(1)");
+        for f in [
+            "floor", "ceil", "sign", "sqrt", "log", "log10", "exp", "sin", "cos", "tan", "atan",
+            "atan2", "pi", "e", "rand",
+        ] {
+            assert!(unknown.contains(f), "SCALAR_FUNCS lacks {f}: {unknown}");
+        }
+    }
+
+    #[test]
+    fn ql03b_percent_and_caret_operators() {
+        assert_eq!(eval("7 % 3"), Some(Value::Int(1)));
+        assert_eq!(eval("7.5 % 2"), Some(Value::Float(1.5)));
+        assert_eq!(eval("2 ^ 10"), Some(Value::Float(1024.0)));
+        assert_eq!(eval("n.nope % 3"), None);
+        assert_eq!(eval("2 ^ n.nope"), None);
     }
 }

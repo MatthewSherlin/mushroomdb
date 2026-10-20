@@ -8,6 +8,8 @@
 
 - **Cypher string functions `trim`, `ltrim`, `rtrim`, `replace`, `split`, `left`, `right`, `substring` and `reverse`.** A null argument gives null; so does an argument of the wrong type, a negative count, or a `substring` start past the end. `reverse` also reverses a list. `substring` starts at 0.
 
+- **Cypher math functions `floor`, `ceil`, `sign`, `sqrt`, `log`, `log10`, `exp`, `sin`, `cos`, `tan`, `atan`, `atan2`, `pi()`, `e()` and `rand()`.** `floor` and `ceil` return an integer; `sign` returns -1, 0 or 1. A null or non-numeric argument gives null, as does `sqrt` of a negative number or `log` of zero or less. `rand()` is a float in [0, 1). The `%` and `^` operators from the lexer change run in the executor too (`^` always yields a float).
+
 ## v0.9.2 — the last edges 0.8.0 lost come back, and rebuilds hand edges on
 
 No format version change. A 0.9.1 store opens under 0.9.2, and a 0.9.2 snapshot opens under 0.9.1: the one addition, an optional snapshot section (16), is ignored by 0.9.1.
