@@ -623,7 +623,7 @@ fn columns_merge_to_data(
     //    columns still carry their own tables — that is the migration path.
     let mut merged = archived_to_columnstore(base, base_strings);
     // 2. Apply tombstones (base-only props deleted since last snapshot).
-    for (node, fields) in &overlay.prop_tombstones {
+    for (node, fields) in overlay.prop_tombstones.iter() {
         for field in fields {
             merged.remove(*node, field);
         }
@@ -843,10 +843,9 @@ fn unpack_bitmap(buf: &[u8], pos: &mut usize) -> Option<Vec<u64>> {
 }
 
 fn idmap_to_data(ids: &IdMap) -> IdMapData {
-    let to_key: Vec<String> = ids.all_keys().to_vec();
+    let to_key: Vec<String> = ids.all_keys().cloned().collect();
     let tombstones: Vec<u32> = ids
         .all_keys()
-        .iter()
         .enumerate()
         .filter_map(|(i, _)| {
             let id = i as u32;

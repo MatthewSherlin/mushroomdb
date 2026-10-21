@@ -1,16 +1,22 @@
+use crate::cow::{CowMap, CowVec, HashIndex};
 use crate::pack::{
-    push_f64s, push_i64s, push_str, push_u32, push_u32s, read_exact, read_f64s, read_i64s,
-    read_str, read_u32, read_u32s,
+    push_str, push_u32, read_exact, read_f64s, read_i64s, read_str, read_u32, read_u32s,
 };
 use crate::types::Result as StoreResult;
 use crate::types::{GraphError, Value};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
+
+// Every structure here is copy-on-write in pieces (`crate::cow`): the write
+// path shares the column store with the reader's fold, and the first commit
+// after a fold copies only the chunks it writes, not the store (ledger row
+// 126).
 
 /// Presence bitmap: bit i is set iff node i has a value. Unset bits are nulls.
 #[derive(Debug, Default, Clone)]
 struct Bitmap {
-    bits: Vec<u64>,
+    bits: CowVec<u64>,
 }
 
 impl Bitmap {
@@ -27,12 +33,15 @@ impl Bitmap {
         let word = i / 64;
         let bit = i % 64;
         if word >= self.bits.len() {
-            self.bits.resize(word + 1, 0);
+            self.bits.grow_to(word + 1, 0);
         }
         let mask = 1u64 << bit;
-        let newly = self.bits[word] & mask == 0;
-        self.bits[word] |= mask;
-        newly
+        let w = self.bits[word];
+        if w & mask != 0 {
+            return false;
+        }
+        self.bits.set(word, w | mask);
+        true
     }
 
     /// Clear bit `i`. Returns true if it was previously set.
@@ -40,13 +49,15 @@ impl Bitmap {
         let i = i as usize;
         let word = i / 64;
         let bit = i % 64;
-        let Some(w) = self.bits.get_mut(word) else {
+        let Some(&w) = self.bits.get(word) else {
             return false;
         };
         let mask = 1u64 << bit;
-        let was = *w & mask != 0;
-        *w &= !mask;
-        was
+        if w & mask == 0 {
+            return false;
+        }
+        self.bits.set(word, w & !mask);
+        true
     }
 
     fn for_each(&self, mut f: impl FnMut(u32)) {
@@ -66,7 +77,7 @@ impl Bitmap {
 
     fn pack(&self, out: &mut Vec<u8>) {
         push_u32(out, self.bits.len() as u32);
-        for w in &self.bits {
+        for w in self.bits.iter() {
             out.extend_from_slice(&w.to_le_bytes());
         }
     }
@@ -78,30 +89,40 @@ impl Bitmap {
         for chunk in bytes.chunks_exact(8) {
             bits.push(u64::from_le_bytes(chunk.try_into().unwrap())); // infallible: chunks_exact(8) yields 8-byte slices
         }
-        Ok(Self { bits })
+        Ok(Self {
+            bits: CowVec::from_vec(bits),
+        })
     }
 }
 
 /// Append-only intern of `Value::Str`. Homogeneous string columns store ids here.
+///
+/// Strings are found through a [`HashIndex`], which holds hashes and not the
+/// strings, so a clone copies no string and a new string copies one shard.
 #[derive(Debug, Default, Clone)]
 struct StrIntern {
-    to_id: HashMap<String, u32>,
-    values: Vec<Value>,
+    index: HashIndex,
+    values: CowVec<Value>,
 }
 
 impl StrIntern {
+    fn find(&self, s: &str, h: u64) -> Option<u32> {
+        self.index
+            .get_hashed(s, h, |id| match self.values.get(id as usize) {
+                Some(Value::Str(x)) => Some(x.as_str()),
+                _ => None,
+            })
+    }
+
     fn intern(&mut self, s: String) -> u32 {
-        use std::collections::hash_map::Entry;
-        match self.to_id.entry(s) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let id = self.values.len() as u32;
-                let cloned = e.key().clone();
-                e.insert(id);
-                self.values.push(Value::Str(cloned));
-                id
-            }
+        let h = HashIndex::hash(&s);
+        if let Some(id) = self.find(&s, h) {
+            return id;
         }
+        let id = self.values.len() as u32;
+        self.index.insert_hashed(&s, h, id);
+        self.values.push(Value::Str(s));
+        id
     }
 
     fn get(&self, id: u32) -> &Value {
@@ -110,7 +131,7 @@ impl StrIntern {
 
     fn pack(&self, out: &mut Vec<u8>) {
         push_u32(out, self.values.len() as u32);
-        for v in &self.values {
+        for v in self.values.iter() {
             let Value::Str(s) = v else {
                 unreachable!("StrIntern values are always Value::Str");
             };
@@ -121,87 +142,96 @@ impl StrIntern {
     fn unpack(src: &[u8], pos: &mut usize) -> StoreResult<Self> {
         let n = read_u32(src, pos)? as usize;
         let mut intern = Self::default();
-        intern.values.reserve(n);
-        intern.to_id.reserve(n);
         for i in 0..n {
             let s = read_str(src, pos)?;
-            intern.to_id.insert(s.clone(), i as u32);
+            // A string an image lists twice keeps its first id, as `intern`
+            // would have given it.
+            let h = HashIndex::hash(&s);
+            if intern.find(&s, h).is_none() {
+                intern.index.insert_hashed(&s, h, i as u32);
+            }
             intern.values.push(Value::Str(s));
         }
         Ok(intern)
     }
 }
 
-fn grow<T: Clone>(data: &mut Vec<T>, adapter: &mut Vec<Value>, node: u32, fill: T, dummy: Value) {
+fn grow<T: Clone>(
+    data: &mut CowVec<T>,
+    adapter: &mut CowVec<Value>,
+    node: u32,
+    fill: T,
+    dummy: Value,
+) {
     let n = node as usize + 1;
     if data.len() < n {
-        data.resize(n, fill);
-        adapter.resize(n, dummy);
+        data.grow_to(n, fill);
+        adapter.grow_to(n, dummy);
     }
 }
 
 #[derive(Debug, Clone)]
 enum Column {
     Int {
-        data: Vec<i64>,
+        data: CowVec<i64>,
         present: Bitmap,
-        adapter: Vec<Value>,
+        adapter: CowVec<Value>,
         live: usize,
     },
     Float {
-        data: Vec<f64>,
+        data: CowVec<f64>,
         present: Bitmap,
-        adapter: Vec<Value>,
+        adapter: CowVec<Value>,
         live: usize,
     },
     Bool {
-        data: Vec<bool>,
+        data: CowVec<bool>,
         present: Bitmap,
-        adapter: Vec<Value>,
+        adapter: CowVec<Value>,
         live: usize,
     },
     Str {
-        ids: Vec<u32>,
+        ids: CowVec<u32>,
         present: Bitmap,
         live: usize,
     },
     /// `Value::Date` as days since 1970-01-01.
     Date {
-        data: Vec<i32>,
+        data: CowVec<i32>,
         present: Bitmap,
-        adapter: Vec<Value>,
+        adapter: CowVec<Value>,
         live: usize,
     },
     /// `Value::LocalDateTime` as microseconds since the epoch, no offset.
     Ldt {
-        data: Vec<i64>,
+        data: CowVec<i64>,
         present: Bitmap,
-        adapter: Vec<Value>,
+        adapter: CowVec<Value>,
         live: usize,
     },
     /// `Value::DateTime` as `(micros_utc, offset_seconds)`.
     Dt {
-        data: Vec<(i64, i32)>,
+        data: CowVec<(i64, i32)>,
         present: Bitmap,
-        adapter: Vec<Value>,
+        adapter: CowVec<Value>,
         live: usize,
     },
     /// `Value::Duration` as `(months, days, nanos)`.
     Dur {
-        data: Vec<(i32, i32, i64)>,
+        data: CowVec<(i32, i32, i64)>,
         present: Bitmap,
-        adapter: Vec<Value>,
+        adapter: CowVec<Value>,
         live: usize,
     },
     /// `Value::Binary`. Each slot holds a `Value::Binary` inline (an empty one
     /// for an unset slot), so `get` can hand out a `&Value` with no adapter.
     Binary {
-        data: Vec<Value>,
+        data: CowVec<Value>,
         present: Bitmap,
         live: usize,
     },
     /// Slow path: mixed-type fields and `Value::List`. Never demoted back to homogeneous.
-    Mixed(HashMap<u32, Value>),
+    Mixed(CowMap<u32, Value>),
 }
 
 fn empty_binary() -> Value {
@@ -210,7 +240,7 @@ fn empty_binary() -> Value {
 
 /// Store `value` at `node` in a fixed-width typed column.
 fn set_fixed<T: Clone>(
-    (data, present, adapter, live): (&mut Vec<T>, &mut Bitmap, &mut Vec<Value>, &mut usize),
+    (data, present, adapter, live): (&mut CowVec<T>, &mut Bitmap, &mut CowVec<Value>, &mut usize),
     node: u32,
     fill: T,
     raw: T,
@@ -218,25 +248,29 @@ fn set_fixed<T: Clone>(
     dummy: Value,
 ) {
     grow(data, adapter, node, fill, dummy);
-    data[node as usize] = raw;
-    adapter[node as usize] = value;
+    data.set(node as usize, raw);
+    adapter.set(node as usize, value);
     if present.set(node) {
         *live += 1;
     }
 }
 
 /// Append `n` little-endian fixed-width records, count first.
-fn push_records<T>(
+fn push_records<T: Clone>(
     out: &mut Vec<u8>,
-    items: &[T],
+    items: &CowVec<T>,
     width: usize,
     mut write: impl FnMut(&T, &mut Vec<u8>),
 ) {
     push_u32(out, items.len() as u32);
     out.reserve(items.len().saturating_mul(width));
-    for item in items {
+    for item in items.iter() {
         write(item, out);
     }
+}
+
+fn le_bytes_i64(v: &i64, out: &mut Vec<u8>) {
+    out.extend_from_slice(&v.to_le_bytes());
 }
 
 /// Read a count-prefixed run of `width`-byte records. The byte length is
@@ -266,63 +300,63 @@ impl Column {
     fn from_first(node: u32, value: Value, intern: &mut StrIntern) -> Self {
         let mut col = match &value {
             Value::Int(_) => Column::Int {
-                data: Vec::new(),
+                data: CowVec::new(),
                 present: Bitmap::default(),
-                adapter: Vec::new(),
+                adapter: CowVec::new(),
                 live: 0,
             },
             Value::Float(_) => Column::Float {
-                data: Vec::new(),
+                data: CowVec::new(),
                 present: Bitmap::default(),
-                adapter: Vec::new(),
+                adapter: CowVec::new(),
                 live: 0,
             },
             Value::Bool(_) => Column::Bool {
-                data: Vec::new(),
+                data: CowVec::new(),
                 present: Bitmap::default(),
-                adapter: Vec::new(),
+                adapter: CowVec::new(),
                 live: 0,
             },
             Value::Str(_) => Column::Str {
-                ids: Vec::new(),
+                ids: CowVec::new(),
                 present: Bitmap::default(),
                 live: 0,
             },
-            Value::List(_) => Column::Mixed(HashMap::new()),
+            Value::List(_) => Column::Mixed(CowMap::new()),
             // Map spills to the Mixed path, like List. Never promotes a typed column.
-            Value::Map(_) => Column::Mixed(HashMap::new()),
+            Value::Map(_) => Column::Mixed(CowMap::new()),
             Value::Date(_) => Column::Date {
-                data: Vec::new(),
+                data: CowVec::new(),
                 present: Bitmap::default(),
-                adapter: Vec::new(),
+                adapter: CowVec::new(),
                 live: 0,
             },
             Value::LocalDateTime(_) => Column::Ldt {
-                data: Vec::new(),
+                data: CowVec::new(),
                 present: Bitmap::default(),
-                adapter: Vec::new(),
+                adapter: CowVec::new(),
                 live: 0,
             },
             Value::DateTime { .. } => Column::Dt {
-                data: Vec::new(),
+                data: CowVec::new(),
                 present: Bitmap::default(),
-                adapter: Vec::new(),
+                adapter: CowVec::new(),
                 live: 0,
             },
             Value::Duration { .. } => Column::Dur {
-                data: Vec::new(),
+                data: CowVec::new(),
                 present: Bitmap::default(),
-                adapter: Vec::new(),
+                adapter: CowVec::new(),
                 live: 0,
             },
             Value::Binary(_) => Column::Binary {
-                data: Vec::new(),
+                data: CowVec::new(),
                 present: Bitmap::default(),
                 live: 0,
             },
             // Never reached: every write path refuses a null value before it
             // gets here (see `Value::contains_null`). Mixed is the safe home.
-            Value::Null => Column::Mixed(HashMap::new()),
+            Value::Null => Column::Mixed(CowMap::new()),
         };
         col.set(node, value, intern);
         col
@@ -362,8 +396,8 @@ impl Column {
                 Value::Int(v),
             ) => {
                 grow(data, adapter, node, 0, Value::Int(0));
-                data[node as usize] = v;
-                adapter[node as usize] = Value::Int(v);
+                data.set(node as usize, v);
+                adapter.set(node as usize, Value::Int(v));
                 if present.set(node) {
                     *live += 1;
                 }
@@ -378,8 +412,8 @@ impl Column {
                 Value::Float(v),
             ) => {
                 grow(data, adapter, node, 0.0, Value::Float(0.0));
-                data[node as usize] = v;
-                adapter[node as usize] = Value::Float(v);
+                data.set(node as usize, v);
+                adapter.set(node as usize, Value::Float(v));
                 if present.set(node) {
                     *live += 1;
                 }
@@ -394,8 +428,8 @@ impl Column {
                 Value::Bool(v),
             ) => {
                 grow(data, adapter, node, false, Value::Bool(false));
-                data[node as usize] = v;
-                adapter[node as usize] = Value::Bool(v);
+                data.set(node as usize, v);
+                adapter.set(node as usize, Value::Bool(v));
                 if present.set(node) {
                     *live += 1;
                 }
@@ -404,9 +438,9 @@ impl Column {
                 let id = intern.intern(s);
                 let n = node as usize + 1;
                 if ids.len() < n {
-                    ids.resize(n, 0);
+                    ids.grow_to(n, 0);
                 }
-                ids[node as usize] = id;
+                ids.set(node as usize, id);
                 if present.set(node) {
                     *live += 1;
                 }
@@ -506,9 +540,9 @@ impl Column {
             ) => {
                 let n = node as usize + 1;
                 if data.len() < n {
-                    data.resize(n, empty_binary());
+                    data.grow_to(n, empty_binary());
                 }
-                data[node as usize] = v;
+                data.set(node as usize, v);
                 if present.set(node) {
                     *live += 1;
                 }
@@ -678,7 +712,7 @@ impl Column {
                     return None;
                 }
                 *live -= 1;
-                Some(std::mem::replace(&mut data[node as usize], empty_binary()))
+                Some(data.replace(node as usize, empty_binary()))
             }
             Column::Mixed(map) => map.remove(&node),
         }
@@ -699,10 +733,14 @@ impl Column {
         }
     }
 
-    fn take_map(&mut self, intern: &StrIntern) -> HashMap<u32, Value> {
-        match std::mem::replace(self, Column::Mixed(HashMap::new())) {
+    fn take_map(&mut self, intern: &StrIntern) -> CowMap<u32, Value> {
+        match std::mem::replace(self, Column::Mixed(CowMap::new())) {
             Column::Mixed(map) => map,
-            other => other.to_map(intern),
+            other => {
+                let mut entries: Vec<(u32, Value)> = other.to_map(intern).into_iter().collect();
+                entries.sort_unstable_by_key(|(node, _)| *node);
+                CowMap::from_sorted(entries)
+            }
         }
     }
 
@@ -721,26 +759,26 @@ impl Column {
         match self {
             Column::Int { data, present, .. } => {
                 out.push(0);
-                push_i64s(out, data);
+                push_records(out, data, 8, le_bytes_i64);
                 present.pack(out);
             }
             Column::Float { data, present, .. } => {
                 out.push(1);
-                push_f64s(out, data);
+                push_records(out, data, 8, |v, o| o.extend_from_slice(&v.to_le_bytes()));
                 present.pack(out);
             }
             Column::Bool { data, present, .. } => {
                 out.push(2);
                 push_u32(out, data.len() as u32);
                 out.reserve(data.len());
-                for b in data {
+                for b in data.iter() {
                     out.push(u8::from(*b));
                 }
                 present.pack(out);
             }
             Column::Str { ids, present, .. } => {
                 out.push(3);
-                push_u32s(out, ids);
+                push_records(out, ids, 4, |v, o| o.extend_from_slice(&v.to_le_bytes()));
                 present.pack(out);
             }
             // Tags 5-9 exist only in a V11 snapshot (TY-12 owns the version
@@ -754,7 +792,7 @@ impl Column {
             }
             Column::Ldt { data, present, .. } => {
                 out.push(6);
-                push_i64s(out, data);
+                push_records(out, data, 8, le_bytes_i64);
                 present.pack(out);
             }
             Column::Dt { data, present, .. } => {
@@ -777,7 +815,7 @@ impl Column {
             Column::Binary { data, present, .. } => {
                 out.push(9);
                 push_u32(out, data.len() as u32);
-                for v in data {
+                for v in data.iter() {
                     let Value::Binary(bytes) = v else {
                         unreachable!("Binary column slots are always Value::Binary");
                     };
@@ -791,7 +829,8 @@ impl Column {
                     return Err(null_in_column());
                 }
                 out.push(4);
-                let blob = bincode::serialize(map).map_err(|e| GraphError::Corrupt {
+                let map: HashMap<u32, Value> = map.iter().map(|(k, v)| (*k, v.clone())).collect();
+                let blob = bincode::serialize(&map).map_err(|e| GraphError::Corrupt {
                     detail: format!("mixed column failed to encode: {e}"),
                 })?;
                 push_u32(out, blob.len() as u32);
@@ -812,7 +851,7 @@ impl Column {
                 let live = present.live_count();
                 let adapter = data.iter().copied().map(Value::Int).collect();
                 Ok(Column::Int {
-                    data,
+                    data: CowVec::from_vec(data),
                     present,
                     adapter,
                     live,
@@ -824,7 +863,7 @@ impl Column {
                 let live = present.live_count();
                 let adapter = data.iter().copied().map(Value::Float).collect();
                 Ok(Column::Float {
-                    data,
+                    data: CowVec::from_vec(data),
                     present,
                     adapter,
                     live,
@@ -838,7 +877,7 @@ impl Column {
                 let live = present.live_count();
                 let adapter = data.iter().copied().map(Value::Bool).collect();
                 Ok(Column::Bool {
-                    data,
+                    data: CowVec::from_vec(data),
                     present,
                     adapter,
                     live,
@@ -848,7 +887,11 @@ impl Column {
                 let ids = read_u32s(src, pos)?;
                 let present = Bitmap::unpack(src, pos)?;
                 let live = present.live_count();
-                Ok(Column::Str { ids, present, live })
+                Ok(Column::Str {
+                    ids: CowVec::from_vec(ids),
+                    present,
+                    live,
+                })
             }
             4 => {
                 let n = read_u32(src, pos)? as usize;
@@ -857,7 +900,9 @@ impl Column {
                     bincode::deserialize(blob).map_err(|e| GraphError::Corrupt {
                         detail: format!("snapshot: mixed column: {e}"),
                     })?;
-                Ok(Column::Mixed(map))
+                let mut entries: Vec<(u32, Value)> = map.into_iter().collect();
+                entries.sort_unstable_by_key(|(node, _)| *node);
+                Ok(Column::Mixed(CowMap::from_sorted(entries)))
             }
             5 => {
                 let data: Vec<i32> = read_records(src, pos, 4)?.map(le_i32).collect();
@@ -865,7 +910,7 @@ impl Column {
                 let live = present.live_count();
                 let adapter = data.iter().copied().map(Value::Date).collect();
                 Ok(Column::Date {
-                    data,
+                    data: CowVec::from_vec(data),
                     present,
                     adapter,
                     live,
@@ -877,7 +922,7 @@ impl Column {
                 let live = present.live_count();
                 let adapter = data.iter().copied().map(Value::LocalDateTime).collect();
                 Ok(Column::Ldt {
-                    data,
+                    data: CowVec::from_vec(data),
                     present,
                     adapter,
                     live,
@@ -897,7 +942,7 @@ impl Column {
                     })
                     .collect();
                 Ok(Column::Dt {
-                    data,
+                    data: CowVec::from_vec(data),
                     present,
                     adapter,
                     live,
@@ -918,7 +963,7 @@ impl Column {
                     })
                     .collect();
                 Ok(Column::Dur {
-                    data,
+                    data: CowVec::from_vec(data),
                     present,
                     adapter,
                     live,
@@ -936,7 +981,7 @@ impl Column {
                 let present = Bitmap::unpack(src, pos)?;
                 let live = present.live_count();
                 Ok(Column::Binary {
-                    data,
+                    data: CowVec::from_vec(data),
                     present,
                     live,
                 })
@@ -949,7 +994,7 @@ impl Column {
 
     fn to_map(&self, intern: &StrIntern) -> HashMap<u32, Value> {
         match self {
-            Column::Mixed(map) => map.clone(),
+            Column::Mixed(map) => map.iter().map(|(k, v)| (*k, v.clone())).collect(),
             Column::Int {
                 data,
                 present,
@@ -1063,12 +1108,14 @@ impl<'a> ColumnHandle<'a> {
 /// On-disk (V6) shape is still `HashMap<String, HashMap<u32, Value>>`.
 #[derive(Debug, Default, Clone)]
 pub struct ColumnStore {
-    cols: HashMap<String, Column>,
+    /// Each column behind its own `Arc`, so a clone copies the field list and
+    /// a write copies the one column's chunk lists, never the others.
+    cols: HashMap<String, Arc<Column>>,
     intern: StrIntern,
     /// Deleted prop keys for nodes whose value lives only in the V8 mmap'd base.
     /// Consulted by `ColumnsView::get` before falling through to the base section.
     /// Cleared at V8 snapshot merge (all data folds into the new base snapshot).
-    pub(crate) prop_tombstones: HashMap<u32, BTreeSet<String>>,
+    pub(crate) prop_tombstones: CowMap<u32, BTreeSet<String>>,
 }
 
 impl ColumnStore {
@@ -1079,9 +1126,12 @@ impl ColumnStore {
     pub fn set(&mut self, node: u32, field: &str, value: Value) {
         let ColumnStore { cols, intern, .. } = self;
         if let Some(col) = cols.get_mut(field) {
-            col.set(node, value, intern);
+            Arc::make_mut(col).set(node, value, intern);
         } else {
-            cols.insert(field.to_string(), Column::from_first(node, value, intern));
+            cols.insert(
+                field.to_string(),
+                Arc::new(Column::from_first(node, value, intern)),
+            );
         }
     }
 
@@ -1096,7 +1146,7 @@ impl ColumnStore {
     /// Returns a handle that always returns `None` when the field is absent.
     pub fn column(&self, field: &str) -> ColumnHandle<'_> {
         ColumnHandle {
-            col: self.cols.get(field),
+            col: self.cols.get(field).map(|col| &**col),
             intern: &self.intern,
         }
     }
@@ -1109,8 +1159,11 @@ impl ColumnStore {
     /// Prunes the column's inner map entry when it becomes empty.
     pub fn remove(&mut self, node: u32, field: &str) -> Option<Value> {
         let ColumnStore { cols, intern, .. } = self;
-        let old = cols.get_mut(field)?.remove(node, intern)?;
-        if cols.get(field).is_some_and(Column::is_empty) {
+        let col = cols.get_mut(field)?;
+        // Absent: nothing to remove, and nothing to copy.
+        col.get(node, intern)?;
+        let old = Arc::make_mut(col).remove(node, intern)?;
+        if col.is_empty() {
             cols.remove(field);
         }
         Some(old)
@@ -1123,7 +1176,10 @@ impl ColumnStore {
     pub fn remove_all(&mut self, node: u32) {
         let ColumnStore { cols, intern, .. } = self;
         cols.retain(|_, col| {
-            col.remove(node, intern);
+            // Only a column holding the node is written, and so copied.
+            if col.get(node, intern).is_some() {
+                Arc::make_mut(col).remove(node, intern);
+            }
             !col.is_empty()
         });
     }
@@ -1144,8 +1200,7 @@ impl ColumnStore {
     /// resurrected by base fallback reads.  Consumed (cleared) at snapshot merge.
     pub fn record_prop_tombstone(&mut self, node: u32, field: &str) {
         self.prop_tombstones
-            .entry(node)
-            .or_default()
+            .get_or_insert_with(node, BTreeSet::new)
             .insert(field.to_string());
     }
 
@@ -1169,7 +1224,7 @@ impl ColumnStore {
 
     #[cfg(test)]
     fn is_mixed(&self, field: &str) -> bool {
-        matches!(self.cols.get(field), Some(Column::Mixed(_)))
+        matches!(self.cols.get(field).map(|c| &**c), Some(Column::Mixed(_)))
     }
 
     /// V7 packed columns: intern table, then sorted field name + typed payload.
@@ -1196,13 +1251,13 @@ impl ColumnStore {
         for _ in 0..n {
             let name = read_str(src, &mut pos)?;
             let col = Column::unpack(src, &mut pos)?;
-            cols.insert(name, col);
+            cols.insert(name, Arc::new(col));
         }
         Ok((
             Self {
                 cols,
                 intern,
-                prop_tombstones: HashMap::new(),
+                prop_tombstones: CowMap::new(),
             },
             pos,
         ))
@@ -1219,7 +1274,7 @@ fn null_in_column() -> GraphError {
 impl Serialize for ColumnStore {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::{Error, SerializeStruct};
-        let holds_null = self.cols.values().any(|c| match c {
+        let holds_null = self.cols.values().any(|c| match &**c {
             Column::Mixed(map) => map.values().any(Value::contains_null),
             _ => false,
         });
@@ -1685,5 +1740,64 @@ mod tests {
         assert_eq!(back.get(3, "tags"), Some(&Value::List(vec![Value::Int(1)])));
         assert!(back.is_mixed("mix"));
         assert!(back.is_mixed("tags"));
+    }
+
+    /// Ledger row 126: the reader's fold holds a clone of the column store and
+    /// the writer goes on writing its own. Every kind of write to the writer's
+    /// copy — across chunk boundaries, typed and mixed columns, a promotion to
+    /// mixed, removals, a node's whole row, tombstones, new interned strings —
+    /// leaves the clone exactly as it was, with real hashes and with every
+    /// string's hash the same.
+    #[test]
+    fn a_clone_keeps_its_contents_while_the_original_is_written() {
+        for forced in [None, Some(7_u64)] {
+            crate::cow::FORCED_HASH.with(|f| f.set(forced));
+            let n = 3_000u32;
+            let mut live = ColumnStore::new();
+            for i in 0..n {
+                live.set(i, "name", Value::Str(format!("n{i}")));
+                live.set(i, "age", Value::Int(i64::from(i)));
+                if i % 3 == 0 {
+                    live.set(i, "tags", Value::List(vec![Value::Int(i64::from(i))]));
+                }
+            }
+            let frozen = live.clone();
+            for i in (0..n).step_by(7) {
+                live.set(i, "name", Value::Str(format!("renamed {i}")));
+                live.set(i, "age", Value::Int(-1));
+            }
+            live.set(5, "age", Value::Str("promoted".into()));
+            live.remove(14, "name");
+            live.remove_all(21);
+            live.set(n + 500, "name", Value::Str("n1".into()));
+            live.record_prop_tombstone(3, "gone");
+            for i in 0..n {
+                assert_eq!(frozen.get(i, "name"), Some(&Value::Str(format!("n{i}"))));
+                assert_eq!(frozen.get(i, "age"), Some(&Value::Int(i64::from(i))));
+                let tags = (i % 3 == 0).then(|| Value::List(vec![Value::Int(i64::from(i))]));
+                assert_eq!(frozen.get(i, "tags"), tags.as_ref());
+            }
+            assert_eq!(frozen.get(n + 500, "name"), None);
+            assert!(!frozen.is_mixed("age") && live.is_mixed("age"));
+            assert!(!frozen.is_tombstoned(3, "gone") && live.is_tombstoned(3, "gone"));
+            assert_eq!(live.get(7, "name"), Some(&Value::Str("renamed 7".into())));
+            assert_eq!(live.get(14, "name"), None);
+            assert_eq!(live.get(21, "age"), None);
+            assert!(std::ptr::eq(
+                live.get(n + 500, "name").unwrap(),
+                live.get(1, "name").unwrap()
+            ));
+            let (back, _) = ColumnStore::unpack(&{
+                let mut b = Vec::new();
+                live.pack(&mut b).unwrap();
+                b
+            })
+            .unwrap();
+            for i in 0..n {
+                assert_eq!(back.get(i, "name"), live.get(i, "name"));
+                assert_eq!(back.get(i, "tags"), live.get(i, "tags"));
+            }
+            crate::cow::FORCED_HASH.with(|f| f.set(None));
+        }
     }
 }
