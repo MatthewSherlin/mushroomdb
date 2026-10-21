@@ -25,6 +25,7 @@
 //! 10. wal_consumed_tracks_bytes_exactly
 //! 11. refresh_on_unchanged_store_is_zero_cost
 //! 12. read_sees_a_peer_commit_that_lands_microseconds_later
+//! 13. a_capture_sees_a_peer_commit_while_another_reader_holds_the_read_lock
 
 use core_storage::fs::{FileId, Fs, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
@@ -695,6 +696,60 @@ fn a_peers_commit_times_survive_this_handles_first_write() {
         "both processes' writes are in the store"
     );
 
+    drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ── TX-5 round 2. A lock-free capture sees a peer's commit while another ──────
+// ── in-process reader holds the read lock ─────────────────────────────────────
+
+/// `SharedDb::reader()` serves the published snapshot when it cannot take the
+/// read lock. A stale handle must not take that shortcut merely because some
+/// other reader (a long `/suggest`, an `as_of` query) holds a read guard: the
+/// peer's commit would be missing until this process next wrote. The capture
+/// applies the peer's tail instead, waiting for the guards already held.
+#[test]
+fn a_capture_sees_a_peer_commit_while_another_reader_holds_the_read_lock() {
+    use std::sync::atomic::AtomicBool;
+
+    let d = tmp("peer-under-read-guard");
+    let db = SharedDb::open(&d).unwrap();
+    db.write().insert_node("Person", "local", vec![]).unwrap();
+    assert!(db.reader().node_info("local").is_some());
+
+    // A long read in this process.
+    let held = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+    let holder = {
+        let (db, held, released) = (db.clone(), Arc::clone(&held), Arc::clone(&released));
+        std::thread::spawn(move || {
+            let guard = db.read();
+            held.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(1500));
+            released.store(true, Ordering::SeqCst);
+            drop(guard);
+        })
+    };
+    while !held.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // A peer commits, and returns, while that guard is held.
+    let (code, _) = run_worker(&d, &["write", "peer", "3"]);
+    assert_eq!(code, 0, "peer writer must succeed");
+    assert!(
+        !released.load(Ordering::SeqCst),
+        "the peer finished after the read guard was released; the test proves nothing"
+    );
+
+    let snap = db.reader();
+    for k in ["peer-0", "peer-1", "peer-2", "local"] {
+        assert!(
+            snap.node_info(k).is_some(),
+            "{k} is missing from a capture taken after the peer's commit returned"
+        );
+    }
+    holder.join().unwrap();
     drop(db);
     let _ = std::fs::remove_dir_all(&d);
 }

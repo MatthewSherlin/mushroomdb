@@ -1,10 +1,11 @@
 //! Cypher executor: `PlanOp` sequence → `ResultSet` over a binding table.
 
 use crate::cypher::ast::{
-    ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem, OrderTarget, RetItem,
-    RetVal, UnwindExpr,
+    operand_label, ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem,
+    OrderTarget, RetItem, RetVal, UnwindExpr,
 };
 use crate::cypher::plan::PlanOp;
+use crate::cypher::temporal;
 use crate::cypher::RelDir;
 use crate::filter::eval_cmp;
 use crate::result::ResultSet;
@@ -26,7 +27,7 @@ thread_local! {
 
 /// Test-only counter incremented each time a `ScanKey` arm executes.
 /// Lets tests assert the point-lookup path actually fires (and does not
-/// walk `view.labels`).
+/// walk `view.label_syms()`).
 #[cfg(test)]
 static SCAN_KEY_FIRES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -399,7 +400,7 @@ fn execute_inner(
     // executor can emit the final ResultSet from `rows` when no Project follows.
     let mut pipeline_group_columns: Option<Vec<String>> = None;
 
-    for op in plan {
+    for (op_index, op) in plan.iter().enumerate() {
         match op {
             PlanOp::ScanLabel { var, label } => {
                 rows = scan_label(view, &vars, &rows, var, label.as_deref())?;
@@ -486,12 +487,16 @@ fn execute_inner(
                     return Err("DISTINCT requires a Project".into());
                 }
             }
-            PlanOp::OrderBy { items } => {
+            PlanOp::OrderBy {
+                items,
+                visible_columns,
+            } => {
+                let keep = order_keep_bound(&plan[op_index + 1..], params);
                 if let Some(table) = projected.as_mut() {
-                    exec_order_by(table, items)?;
+                    exec_order_by(table, items, *visible_columns, keep)?;
                 } else {
                     // Pipeline mode: ORDER BY on raw rows (before any Project).
-                    exec_order_by_rows(&vars, &mut rows, items, view);
+                    exec_order_by_rows(&vars, &mut rows, items, view, params, keep)?;
                 }
             }
             PlanOp::Skip(ls) => {
@@ -603,10 +608,21 @@ fn execute_inner(
                 // Project each input row through the WITH items first so that
                 // output aliases (e.g. `p.age AS age`) are available for the
                 // subsequent WHERE filter, ORDER BY, SKIP, and LIMIT.
+                //
+                // ORDER BY may name a variable the WITH does not carry
+                // (`WITH n.name AS name ORDER BY n.score`), so each projected
+                // row starts as a copy of its input row and the WITH items are
+                // written over it; the columns the WITH does not name are
+                // cleared once the sort is done.
                 let row_len = vars.names.len();
+                let keep_input = !order_by.is_empty();
                 let mut new_rows: Vec<Row> = Vec::with_capacity(rows.len());
                 for row in &rows {
-                    let mut new_row: Row = vec![None; row_len];
+                    let mut new_row: Row = if keep_input {
+                        row.clone()
+                    } else {
+                        vec![None; row_len]
+                    };
                     for item in items {
                         let col = column_name(item);
                         let Some(dst_slot) = vars.slot(&col) else {
@@ -615,9 +631,9 @@ fn execute_inner(
                         match &item.value {
                             RetVal::Var(v) => {
                                 // Carry the existing cell (node binding or scalar alias).
-                                if let Some(src_slot) = vars.slot(v) {
-                                    new_row[dst_slot] = row.get(src_slot).cloned().flatten();
-                                }
+                                new_row[dst_slot] = vars
+                                    .slot(v)
+                                    .and_then(|src_slot| row.get(src_slot).cloned().flatten());
                             }
                             RetVal::Prop { var, field } => {
                                 let val = resolve_prop(view, &vars, row, var, field)?;
@@ -643,7 +659,8 @@ fn execute_inner(
                 }
                 // ORDER BY / SKIP / LIMIT on projected rows.
                 if !order_by.is_empty() {
-                    exec_order_by_rows(&vars, &mut rows, order_by, view);
+                    let keep = skip_limit_bound(skip.as_ref(), limit.as_ref(), params);
+                    exec_order_by_rows(&vars, &mut rows, order_by, view, params, keep)?;
                 }
                 if let Some(ls) = skip {
                     let n = resolve_ls(ls, params)?;
@@ -652,6 +669,19 @@ fn execute_inner(
                 if let Some(ls) = limit {
                     let n = resolve_ls(ls, params)?;
                     apply_limit(&mut rows, n);
+                }
+                if keep_input {
+                    let carried: Vec<usize> = items
+                        .iter()
+                        .filter_map(|item| vars.slot(&column_name(item)))
+                        .collect();
+                    for row in &mut rows {
+                        let mut cleared: Row = vec![None; row_len];
+                        for &slot in &carried {
+                            cleared[slot] = row[slot].take();
+                        }
+                        *row = cleared;
+                    }
                 }
             }
             // UNWIND: expand each input row into N rows by iterating a list value.
@@ -803,7 +833,7 @@ fn execute_inner(
                                 .and_then(|c| match c {
                                     Cell::Scalar(v) => Some(v.clone()),
                                     Cell::Node(id) => {
-                                        view.ids.key_of(*id).map(|k| Value::Str(k.to_owned()))
+                                        view.try_key_of(*id).map(|k| Value::Str(k.to_owned()))
                                     }
                                     Cell::Path(h) => Some(Value::Int(*h as i64)),
                                     Cell::Rel(_) => None,
@@ -989,6 +1019,23 @@ fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<St
             for (_, value) in entries {
                 collect_operand(value, names, seen);
             }
+        }
+        Operand::ListComprehension {
+            list, filter, map, ..
+        } => {
+            collect_operand(list, names, seen);
+            if let Some(f) = filter {
+                // Depth is bounded by the parser's nesting limit.
+                let _ = collect_expr(f, names, seen, 0);
+            }
+            collect_operand(map, names, seen);
+        }
+        Operand::Reduce {
+            init, list, body, ..
+        } => {
+            collect_operand(init, names, seen);
+            collect_operand(list, names, seen);
+            collect_operand(body, names, seen);
         }
         _ => {}
     }
@@ -1183,6 +1230,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                         OrderTarget::Prop { var, .. } => {
                             vars.intern(var);
                         }
+                        OrderTarget::Expr(op) => intern_operand(&mut vars, op),
                     }
                 }
             }
@@ -1292,6 +1340,34 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
                 intern_operand(vars, value);
             }
         }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            // The variable needs a row slot to be bound in.
+            vars.intern(var);
+            intern_operand(vars, list);
+            if let Some(f) = filter {
+                intern_expr(vars, f);
+            }
+            intern_operand(vars, map);
+        }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            // Both variables need a row slot to be bound in.
+            vars.intern(acc_var);
+            vars.intern(iter_var);
+            intern_operand(vars, init);
+            intern_operand(vars, list);
+            intern_operand(vars, body);
+        }
     }
 }
 
@@ -1345,7 +1421,7 @@ fn scan_ids(view: &GraphView, label: Option<&str>) -> Vec<u32> {
     let ids = match label {
         Some(label) => view.nodes_with_label(label),
         // Real nodes always have labels; sentinel slots are gaps.
-        None => (0..view.ids.len() as u32)
+        None => (0..view.id_bound())
             .filter(|&id| view.label_of(id).is_some())
             .collect(),
     };
@@ -1770,6 +1846,12 @@ const SCALAR_FUNCS: &[&str] = &[
     "range",
     "keys",
     "properties",
+    "date",
+    "localdatetime",
+    "datetime",
+    "duration",
+    "time",
+    "localtime",
 ];
 
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
@@ -1880,7 +1962,7 @@ fn eval_func(
             match row.get(slot).and_then(|c| c.as_ref()) {
                 Some(Cell::Rel(e)) => {
                     // Look up the etype string from the symbol table.
-                    let etype = view.syms.resolve(e.etype).unwrap_or("").to_owned();
+                    let etype = view.sym_name(e.etype).unwrap_or("").to_owned();
                     Ok(Some(Value::Str(etype)))
                 }
                 Some(Cell::Node(_)) => Err(format!(
@@ -2085,7 +2167,7 @@ fn eval_func(
                 Some(Value::Int(n)) => Some(Value::Str(n.to_string())),
                 Some(Value::Float(f)) => Some(Value::Str(f.to_string())),
                 Some(Value::Bool(b)) => Some(Value::Str(b.to_string())),
-                Some(_) => None, // list/map have no scalar string form
+                Some(other) => temporal::to_text(&other).map(Value::Str), // list/map: null
             })
         }
         "decay" => {
@@ -2129,6 +2211,17 @@ fn eval_func(
         }
         "head" | "tail" | "last" | "range" | "keys" | "properties" => {
             eval_list_scalar(&norm, name, args, view, vars, row, params)
+        }
+        // QL-13: the time-of-day types are not in 0.10 (contract C3).
+        "time" | "localtime" => Err(temporal::TIME_TYPES_REFUSAL.to_string()),
+        "date" | "localdatetime" | "datetime" | "duration" => {
+            let a = resolve_fn_args(name, args, 0..=1, view, vars, row, params)?;
+            let [arg, _, _] = a;
+            // A null argument is null; no argument is the current instant.
+            if args.len() == 1 && arg.is_none() {
+                return Ok(None);
+            }
+            Ok(temporal::construct(&norm, arg, args.is_empty()))
         }
         _ => Err(format!(
             "unknown function `{name}`; supported: {}",
@@ -2515,7 +2608,7 @@ fn resolve_operand(
                 .and_then(|c| c.as_ref())
             {
                 Some(Cell::Scalar(v)) => Ok(Some(v.clone())),
-                Some(Cell::Node(id)) => match view.ids.key_of(*id) {
+                Some(Cell::Node(id)) => match view.try_key_of(*id) {
                     Some(key) => Ok(Some(Value::Str(key.to_owned()))),
                     None => Ok(None),
                 },
@@ -2538,6 +2631,74 @@ fn resolve_operand(
                 out.push(crate::value_ops::into_element(v));
             }
             Ok(Some(Value::List(out)))
+        }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            let source = match resolve_operand(view, vars, row, list, params)? {
+                Some(Value::List(items)) => items,
+                // A null or non-list source gives null.
+                _ => return Ok(None),
+            };
+            let slot = vars
+                .slot(var)
+                .filter(|s| *s < row.len())
+                .ok_or_else(|| format!("list comprehension variable `{var}` has no slot"))?;
+            // One copy of the row; the outer row keeps its own binding of
+            // `var`, so the shadowing ends with the comprehension.
+            let mut scoped = row.clone();
+            let mut out = Vec::with_capacity(source.len());
+            for item in source {
+                scoped[slot] = match item {
+                    Value::Null => None,
+                    other => Some(Cell::Scalar(other)),
+                };
+                if let Some(f) = filter {
+                    if !eval_expr(view, vars, &scoped, f, params, 0)? {
+                        continue;
+                    }
+                }
+                let v = resolve_operand(view, vars, &scoped, map, params)?;
+                out.push(crate::value_ops::into_element(v));
+            }
+            Ok(Some(Value::List(out)))
+        }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            // The init and the list are read in the enclosing scope.
+            let mut acc = resolve_operand(view, vars, row, init, params)?;
+            let source = match resolve_operand(view, vars, row, list, params)? {
+                Some(Value::List(items)) => items,
+                // A null or non-list source gives null.
+                _ => return Ok(None),
+            };
+            let slot_of = |name: &str| {
+                vars.slot(name)
+                    .filter(|s| *s < row.len())
+                    .ok_or_else(|| format!("reduce variable `{name}` has no slot"))
+            };
+            let acc_slot = slot_of(acc_var)?;
+            let iter_slot = slot_of(iter_var)?;
+            // One copy of the row; the outer row keeps its own bindings, so
+            // the shadowing ends with the reduce.
+            let mut scoped = row.clone();
+            for item in source {
+                scoped[iter_slot] = match item {
+                    Value::Null => None,
+                    other => Some(Cell::Scalar(other)),
+                };
+                scoped[acc_slot] = acc.take().map(Cell::Scalar);
+                acc = resolve_operand(view, vars, &scoped, body, params)?;
+            }
+            Ok(acc)
         }
         Operand::MapLit(entries) => {
             let mut out = BTreeMap::new();
@@ -2588,6 +2749,16 @@ fn resolve_operand(
                     Ok(Some(Value::Int(result)))
                 }
                 (Some(lv), Some(rv)) => {
+                    if let Some(temporal_result) = temporal::arith(op, &lv, &rv) {
+                        return Ok(temporal_result);
+                    }
+                    // `+` also joins strings and lists; every other operator
+                    // on them is a type error below.
+                    if matches!(op, ArithOp::Add) {
+                        if let Some(joined) = crate::value_ops::plus_non_numeric(&lv, &rv) {
+                            return Ok(Some(joined));
+                        }
+                    }
                     let a = match &lv {
                         Value::Float(f) => *f,
                         Value::Int(i) => *i as f64,
@@ -2638,7 +2809,7 @@ fn is_identity_eq_field(field: &str) -> bool {
 /// or `key` field keeps it. `n.id` is an alias of `n.key`.
 fn node_identity_prop(view: &GraphView, id: u32, field: &str) -> Option<Value> {
     match field {
-        "key" | "id" => view.ids.key_of(id).map(|k| Value::Str(k.to_owned())),
+        "key" | "id" => view.try_key_of(id).map(|k| Value::Str(k.to_owned())),
         "label" => view.label_of(id).map(|l| Value::Str(l.to_owned())),
         _ => None,
     }
@@ -2763,7 +2934,7 @@ fn resolve_etypes(view: &GraphView, etypes: &[String]) -> Option<Vec<u32>> {
     } else {
         // Resolve each named type to its symbol, skipping any not interned
         // (a named type with no edges contributes nothing).
-        Some(etypes.iter().filter_map(|n| view.syms.get(n)).collect())
+        Some(etypes.iter().filter_map(|n| view.sym(n)).collect())
     }
 }
 
@@ -3290,7 +3461,7 @@ fn distinct_value(
                 return Ok(None);
             };
             Ok(match row.get(slot).and_then(|c| c.as_ref()) {
-                Some(Cell::Node(id)) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                Some(Cell::Node(id)) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                 Some(Cell::Scalar(val)) => Some(val.clone()),
                 Some(Cell::Path(hops)) => Some(Value::Int(*hops as i64)),
                 Some(Cell::Rel(e)) => Some(Value::Str(format!(
@@ -3432,7 +3603,7 @@ fn update_acc(
                 .and_then(|c| c.as_ref())
                 .and_then(|cell| match cell {
                     Cell::Scalar(x) => Some(x.clone()),
-                    Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                    Cell::Node(id) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                     Cell::Path(h) => Some(Value::Int(*h as i64)),
                     Cell::Rel(_) => None,
                 });
@@ -3840,7 +4011,14 @@ fn group_result_to_rows(
 /// for example, inside a non-aggregate WITH stage or after a pipeline
 /// GroupAggregate.  `OrderTarget::Prop` is resolved by looking up the node
 /// property; `Alias` / `Var` are resolved from `Cell::Scalar` in the row.
-fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem], view: &GraphView) {
+fn exec_order_by_rows(
+    vars: &VarTable,
+    rows: &mut Vec<Row>,
+    items: &[OrderItem],
+    view: &GraphView,
+    params: &Params,
+    keep: Option<usize>,
+) -> Result<(), String> {
     // Pre-compute sort-key values for all rows.  This avoids re-resolving
     // inside the comparator (the closure cannot return Err, so we pre-compute).
     let mut key_table: Vec<Vec<Option<Value>>> = Vec::with_capacity(rows.len());
@@ -3854,7 +4032,7 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
                     .and_then(|c| c.as_ref())
                     .and_then(|c| match c {
                         Cell::Scalar(v) => Some(v.clone()),
-                        Cell::Node(id) => view.ids.key_of(*id).map(|k| Value::Str(k.to_owned())),
+                        Cell::Node(id) => view.try_key_of(*id).map(|k| Value::Str(k.to_owned())),
                         Cell::Path(hops) => Some(Value::Int(*hops as i64)),
                         Cell::Rel(_) => None,
                     }),
@@ -3870,14 +4048,15 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
                         Cell::Rel(e) => view.edge_props.get(e.etype, e.src, e.dst, field),
                         _ => None,
                     }),
+                OrderTarget::Expr(op) => resolve_operand(view, vars, row, op, params)?,
             };
             row_key.push(val);
         }
         key_table.push(row_key);
     }
-    // Sort using a stable, index-based sort to keep equal rows in encounter order.
-    let mut indices: Vec<usize> = (0..rows.len()).collect();
-    indices.sort_by(|&a, &b| {
+    // Stable: equal keys keep encounter order; with a bound only the rows a
+    // following SKIP/LIMIT can reach are selected and sorted.
+    let order = sorted_prefix(rows.len(), keep, |a, b| {
         for (ki, item) in items.iter().enumerate() {
             let c = cmp_optional(
                 key_table[a].get(ki).and_then(|x| x.as_ref()),
@@ -3890,8 +4069,12 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
         }
         std::cmp::Ordering::Equal
     });
-    let sorted: Vec<Row> = indices.into_iter().map(|i| rows[i].clone()).collect();
+    let sorted: Vec<Row> = order
+        .into_iter()
+        .map(|i| std::mem::take(&mut rows[i]))
+        .collect();
     *rows = sorted;
+    Ok(())
 }
 
 /// Streaming grouped-aggregate executor.
@@ -3942,9 +4125,15 @@ fn execute_group_aggregate(
     }
     let mut projected = build_group_projected(keys, aggs, key_order, &mut groups);
     // Apply OrderBy / Skip / Limit from the tail of the plan.
-    for op in tail {
+    for (tail_index, op) in tail.iter().enumerate() {
         match op {
-            PlanOp::OrderBy { items } => exec_order_by(&mut projected, items)?,
+            PlanOp::OrderBy {
+                items,
+                visible_columns,
+            } => {
+                let keep = order_keep_bound(&tail[tail_index + 1..], params);
+                exec_order_by(&mut projected, items, *visible_columns, keep)?;
+            }
             PlanOp::Skip(ls) => {
                 let n = resolve_ls(ls, params)?;
                 apply_skip(&mut projected.rows, n);
@@ -4276,7 +4465,7 @@ fn group_stream(
 /// restores it around the recursive call so the caller sees no net change.
 /// This eliminates the per-row `Vec` clone that the staged path requires.
 ///
-/// ScanLabel iterates `view.labels` directly (lazy, no intermediate `Vec<u32>`)
+/// ScanLabel iterates `view.label_syms()` directly (lazy, no intermediate `Vec<u32>`)
 /// so the bound truncates the scan itself — scanning stops as soon as enough
 /// result rows have been collected.
 fn pull_rows(
@@ -4308,7 +4497,7 @@ fn pull_rows(
                 .ok_or_else(|| format!("unbound variable `{var}`"))?;
             // Resolve the label to an interned symbol once. If the label is
             // specified but unknown, there are no matching nodes — return early.
-            let want_sym = label.as_deref().and_then(|l| ctx.view.syms.get(l));
+            let want_sym = label.as_deref().and_then(|l| ctx.view.sym(l));
             if label.is_some() && want_sym.is_none() {
                 return Ok(());
             }
@@ -4352,52 +4541,70 @@ fn pull_rows(
                 FUSED_SCAN_FIRES.with(|c| c.set(c.get() + 1));
                 let col = ctx.view.props.column(field);
                 let rest_after_filter = &rest[1..];
-                for (i, &sym) in ctx.view.labels.iter().enumerate() {
-                    if result.len() >= ctx.bound {
-                        break;
-                    }
-                    if sym == u32::MAX {
-                        continue;
-                    }
-                    if let Some(ws) = want_sym {
-                        if sym != ws {
-                            continue;
+                macro_rules! fused_scan {
+                    ($syms:expr) => {
+                        for (i, sym) in $syms.enumerate() {
+                            if result.len() >= ctx.bound {
+                                break;
+                            }
+                            if sym == u32::MAX {
+                                continue;
+                            }
+                            if let Some(ws) = want_sym {
+                                if sym != ws {
+                                    continue;
+                                }
+                            }
+                            let id = i as u32;
+                            if !ctx.view.visible(id) {
+                                continue;
+                            }
+                            if let Some(v) = col.get(id) {
+                                if eval_cmp(cmp_op_ref, v, lit) {
+                                    row[slot] = Some(Cell::Node(id));
+                                    pull_rows(ctx, rest_after_filter, row, result)?;
+                                }
+                            }
                         }
-                    }
-                    let id = i as u32;
-                    if !ctx.view.visible(id) {
-                        continue;
-                    }
-                    if let Some(v) = col.get(id) {
-                        if eval_cmp(cmp_op_ref, v, lit) {
-                            row[slot] = Some(Cell::Node(id));
-                            pull_rows(ctx, rest_after_filter, row, result)?;
-                        }
-                    }
+                    };
+                }
+                // Without a layer the label array is the whole answer: walk
+                // it as a plain slice, the scan's hot loop unchanged.
+                match ctx.view.layer {
+                    None => fused_scan!(ctx.view.labels.iter().copied()),
+                    Some(_) => fused_scan!(ctx.view.label_syms()),
                 }
             } else {
                 // Generic path: iterate label array lazily, no Vec allocation,
                 // with early exit when the row bound is satisfied.
-                for (i, &sym) in ctx.view.labels.iter().enumerate() {
-                    if result.len() >= ctx.bound {
-                        break;
-                    }
-                    // Skip tombstone / gap slots (u32::MAX sentinel).
-                    if sym == u32::MAX {
-                        continue;
-                    }
-                    // Filter by label symbol when a label is requested.
-                    if let Some(ws) = want_sym {
-                        if sym != ws {
-                            continue;
+                macro_rules! scan {
+                    ($syms:expr) => {
+                        for (i, sym) in $syms.enumerate() {
+                            if result.len() >= ctx.bound {
+                                break;
+                            }
+                            // Skip tombstone / gap slots (u32::MAX sentinel).
+                            if sym == u32::MAX {
+                                continue;
+                            }
+                            // Filter by label symbol when a label is requested.
+                            if let Some(ws) = want_sym {
+                                if sym != ws {
+                                    continue;
+                                }
+                            }
+                            let id = i as u32;
+                            if !ctx.view.visible(id) {
+                                continue;
+                            }
+                            row[slot] = Some(Cell::Node(id));
+                            pull_rows(ctx, rest, row, result)?;
                         }
-                    }
-                    let id = i as u32;
-                    if !ctx.view.visible(id) {
-                        continue;
-                    }
-                    row[slot] = Some(Cell::Node(id));
-                    pull_rows(ctx, rest, row, result)?;
+                    };
+                }
+                match ctx.view.layer {
+                    None => scan!(ctx.view.labels.iter().copied()),
+                    Some(_) => scan!(ctx.view.label_syms()),
                 }
             }
             // SAFETY: the `?` inside both scan loops propagates Err directly to
@@ -4832,7 +5039,7 @@ fn project_item(
             match row.get(slot).and_then(|c| c.as_ref()) {
                 // Cell is None — variable is optionally null (from OPTIONAL MATCH).
                 None => Ok(None),
-                Some(Cell::Node(id)) => match view.ids.key_of(*id) {
+                Some(Cell::Node(id)) => match view.try_key_of(*id) {
                     Some(key) => Ok(Some(Value::Str(key.to_owned()))),
                     None => Err(format!("unknown node id {id}")),
                 },
@@ -4860,10 +5067,72 @@ fn order_column(item: &OrderItem) -> String {
     match &item.target {
         OrderTarget::Alias(name) | OrderTarget::Var(name) => name.clone(),
         OrderTarget::Prop { var, field } => format!("{var}.{field}"),
+        // `plan()` never leaves an expression key on an OrderBy over a
+        // projection; it rewrites it to the column that carries its value.
+        OrderTarget::Expr(op) => operand_label(op),
     }
 }
 
-fn exec_order_by(table: &mut Projected, items: &[OrderItem]) -> Result<(), String> {
+/// How many leading rows of the sorted result the ops after an `OrderBy` can
+/// still see: `SKIP s LIMIT k` reads only the first `s + k`. `None` when no
+/// `LIMIT` follows (every row is needed) or a parameter cannot be resolved
+/// (the later `Limit` op reports that error itself).
+fn order_keep_bound(following: &[PlanOp], params: &Params) -> Option<usize> {
+    let mut skip = None;
+    let mut limit = None;
+    for op in following {
+        match op {
+            PlanOp::Skip(ls) => skip = Some(ls),
+            PlanOp::Limit(ls) => limit = Some(ls),
+            _ => break,
+        }
+    }
+    skip_limit_bound(skip, limit, params)
+}
+
+fn skip_limit_bound(
+    skip: Option<&LimitSkip>,
+    limit: Option<&LimitSkip>,
+    params: &Params,
+) -> Option<usize> {
+    let skip = match skip {
+        Some(ls) => resolve_ls(ls, params).ok()?,
+        None => 0,
+    };
+    let total = skip.checked_add(resolve_ls(limit?, params).ok()?)?;
+    usize::try_from(total).ok()
+}
+
+/// The first `keep` positions (all when `None`) of `0..len` in the order
+/// `cmp` gives, ties broken by position so the result is exactly the prefix of
+/// a stable full sort. With a bound this is a partition (`select_nth_unstable`)
+/// plus a sort of the prefix, O(n + k log k), instead of an O(n log n) sort.
+fn sorted_prefix(
+    len: usize,
+    keep: Option<usize>,
+    cmp: impl Fn(usize, usize) -> std::cmp::Ordering,
+) -> Vec<usize> {
+    let total = |a: &usize, b: &usize| cmp(*a, *b).then(a.cmp(b));
+    let mut indices: Vec<usize> = (0..len).collect();
+    match keep {
+        Some(k) if k < len => {
+            if k > 0 {
+                indices.select_nth_unstable_by(k - 1, total);
+            }
+            indices.truncate(k);
+            indices.sort_unstable_by(total);
+        }
+        _ => indices.sort_unstable_by(total),
+    }
+    indices
+}
+
+fn exec_order_by(
+    table: &mut Projected,
+    items: &[OrderItem],
+    visible_columns: Option<usize>,
+    keep: Option<usize>,
+) -> Result<(), String> {
     let mut keys = Vec::with_capacity(items.len());
     for item in items {
         let name = order_column(item);
@@ -4874,11 +5143,12 @@ fn exec_order_by(table: &mut Projected, items: &[OrderItem]) -> Result<(), Strin
             .ok_or_else(|| format!("ORDER BY target `{name}` is not a projected column"))?;
         keys.push((idx, item.descending));
     }
-    table.rows.sort_by(|a, b| {
+    let rows = &mut table.rows;
+    let order = sorted_prefix(rows.len(), keep, |a, b| {
         for &(idx, desc) in &keys {
             let c = cmp_optional(
-                a.get(idx).and_then(|x| x.as_ref()),
-                b.get(idx).and_then(|x| x.as_ref()),
+                rows[a].get(idx).and_then(|x| x.as_ref()),
+                rows[b].get(idx).and_then(|x| x.as_ref()),
                 desc,
             );
             if c != std::cmp::Ordering::Equal {
@@ -4887,6 +5157,18 @@ fn exec_order_by(table: &mut Projected, items: &[OrderItem]) -> Result<(), Strin
         }
         std::cmp::Ordering::Equal
     });
+    let sorted: Vec<_> = order
+        .into_iter()
+        .map(|i| std::mem::take(&mut rows[i]))
+        .collect();
+    *rows = sorted;
+    // Drop the hidden columns that only carried sort keys.
+    if let Some(n) = visible_columns {
+        table.columns.truncate(n);
+        for row in &mut table.rows {
+            row.truncate(n);
+        }
+    }
     Ok(())
 }
 
@@ -4930,6 +5212,18 @@ fn apply_limit<T>(rows: &mut Vec<T>, n: u64) {
 }
 
 #[cfg(test)]
+#[path = "tests/ql_13.rs"]
+mod ql_13;
+
+#[cfg(test)]
+#[path = "tests/ql_14.rs"]
+mod ql_14;
+
+#[cfg(test)]
+#[path = "tests/ql_15.rs"]
+mod ql_15;
+
+#[cfg(test)]
 mod tests {
     use super::{execute, resolve_operand, Params, Row, VarTable};
     use crate::cypher::ast::{
@@ -4944,7 +5238,7 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeMap;
 
-    struct Fx {
+    pub(super) struct Fx {
         ids: IdMap,
         syms: Interner,
         labels: Vec<u32>,
@@ -4954,7 +5248,7 @@ mod tests {
     }
 
     impl Fx {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Fx {
                 ids: IdMap::new(),
                 syms: Interner::new(),
@@ -4965,7 +5259,7 @@ mod tests {
             }
         }
 
-        fn add(&mut self, label: &str, key: &str, props: Vec<(&str, Value)>) -> u32 {
+        pub(super) fn add(&mut self, label: &str, key: &str, props: Vec<(&str, Value)>) -> u32 {
             let id = self.ids.get_or_insert(key);
             let sym = self.syms.intern(label);
             self.labels.resize(id as usize + 1, u32::MAX);
@@ -4984,7 +5278,7 @@ mod tests {
             }
         }
 
-        fn view(&self) -> GraphView<'_> {
+        pub(super) fn view(&self) -> GraphView<'_> {
             GraphView {
                 ids: &self.ids,
                 syms: &self.syms,
@@ -4994,6 +5288,7 @@ mod tests {
                 edge_props: EdgePropsView::owned(&self.eprops),
                 mask: None,
                 prop_index: None,
+                layer: None,
             }
         }
 
@@ -5012,7 +5307,7 @@ mod tests {
         plan(&parse(&lex(src).expect("lex")).expect("parse")).expect("plan")
     }
 
-    fn run(
+    pub(super) fn run(
         view: &GraphView,
         src: &str,
         params: &BTreeMap<String, Value>,
@@ -5385,8 +5680,414 @@ LIMIT 10";
         assert!(err.contains("tid"), "got: {err}");
     }
 
+    /// Ten people with a score each; `ada`..`jan` score 10..100 shuffled so
+    /// that scan order is not score order.
+    fn scored_people() -> Fx {
+        let mut fx = Fx::new();
+        for (name, score) in [
+            ("ada", 40),
+            ("bob", 90),
+            ("cam", 10),
+            ("dan", 70),
+            ("eve", 100),
+            ("fay", 20),
+            ("gus", 60),
+            ("hal", 30),
+            ("ivy", 80),
+            ("jan", 50),
+        ] {
+            fx.add("Person", name, vec![("name", s(name)), ("score", i(score))]);
+        }
+        fx
+    }
+
+    fn plan_error(src: &str) -> String {
+        plan(&parse(&lex(src).expect("lex")).expect("parse")).expect_err("plan must fail")
+    }
+
+    fn names(rs: &ResultSet) -> Vec<String> {
+        (0..rs.len())
+            .map(|r| match rs.row(r)[0].clone() {
+                Some(Value::Str(v)) => v,
+                other => panic!("expected a string, got {other:?}"),
+            })
+            .collect()
+    }
+
     #[test]
-    fn order_by_none_last_then_skip_limit() {
+    fn ql_ob_order_by_a_property_that_is_not_returned() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY n.score DESC LIMIT 3",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["eve", "bob", "ivy"]);
+        assert_eq!(rs.columns(), ["n.name"], "the hidden key column is dropped");
+        assert_eq!(rs.row(0).len(), 1);
+    }
+
+    #[test]
+    fn ql_ob_order_by_a_bare_node_variable_that_is_not_returned() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.score ORDER BY n LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // Node keys sort as strings: ada, bob.
+        assert_eq!(rows_of(&rs), vec![vec![Some(i(40))], vec![Some(i(90))]]);
+    }
+
+    #[test]
+    fn ql_ob_expression_and_function_keys() {
+        let fx = scored_people();
+        let v = fx.view();
+        // Distance from 55: jan(5) gus(5)... use a score that has a unique order.
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY abs(n.score - 55), n.name LIMIT 4",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // |score-55|: jan 5, gus 5, ada 15, dan 15 -> ties broken by name.
+        assert_eq!(names(&rs), ["gus", "jan", "ada", "dan"]);
+
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY n.score + n.score DESC LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["eve", "bob"]);
+
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY toUpper(n.name) DESC LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["jan", "ivy"]);
+    }
+
+    #[test]
+    fn ql_ob_projected_alias_inside_an_expression() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name AS who, n.score AS s ORDER BY s * -1 LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["who", "s"]);
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("eve")), Some(i(100))],
+                vec![Some(s("bob")), Some(i(90))],
+            ]
+        );
+    }
+
+    #[test]
+    fn ql_ob_mixed_keys_with_mixed_directions() {
+        let mut fx = Fx::new();
+        for (name, team, score) in [
+            ("a", "red", 3),
+            ("b", "blue", 5),
+            ("c", "red", 5),
+            ("d", "blue", 1),
+            ("e", "red", 3),
+        ] {
+            fx.add(
+                "P",
+                name,
+                vec![("name", s(name)), ("team", s(team)), ("score", i(score))],
+            );
+        }
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN n.name ORDER BY n.team ASC, n.score DESC, n.name DESC",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // blue: b(5) d(1); red: c(5) then the two 3s by name descending: e, a.
+        assert_eq!(names(&rs), ["b", "d", "c", "e", "a"]);
+    }
+
+    /// Null (a missing property) is the largest value: last ascending, first
+    /// descending (openCypher). A hidden key must agree with a projected column.
+    #[test]
+    fn ql_ob_null_keys_place_like_a_projected_column() {
+        let mut fx = Fx::new();
+        fx.add("P", "ada", vec![("name", s("ada")), ("age", i(30))]);
+        fx.add("P", "bob", vec![("name", s("bob"))]);
+        fx.add("P", "cam", vec![("name", s("cam")), ("age", i(10))]);
+        let v = fx.view();
+        let asc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name ORDER BY n.age",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let desc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name ORDER BY n.age DESC",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let projected_asc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name, n.age ORDER BY n.age",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&asc), ["cam", "ada", "bob"]);
+        let projected_desc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name, n.age ORDER BY n.age DESC",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&desc), ["bob", "ada", "cam"]);
+        assert_eq!(names(&asc), names(&projected_asc));
+        assert_eq!(names(&desc), names(&projected_desc));
+    }
+
+    #[test]
+    fn ql_ob_skip_limit_apply_after_the_hidden_sort() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY n.score SKIP 2 LIMIT 3",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["hal", "ada", "jan"]);
+    }
+
+    #[test]
+    fn ql_ob_distinct_and_aggregate_need_projected_keys() {
+        let mut fx = Fx::new();
+        fx.add("P", "a", vec![("city", s("x")), ("age", i(1))]);
+        fx.add("P", "b", vec![("city", s("y")), ("age", i(2))]);
+        fx.add("P", "c", vec![("city", s("x")), ("age", i(3))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+        for q in [
+            "MATCH (n:P) RETURN DISTINCT n.city ORDER BY n.age",
+            "MATCH (n:P) RETURN n.city, count(*) AS c ORDER BY n.age",
+        ] {
+            let err = plan_error(q);
+            assert!(
+                err.contains("ORDER BY over a non-projected expression is not allowed with DISTINCT/aggregation"),
+                "{q}: {err}"
+            );
+        }
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN DISTINCT n.city ORDER BY n.city DESC",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["y", "x"]);
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN n.city, count(*) AS c ORDER BY c DESC, n.city",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("x")), Some(i(2))],
+                vec![Some(s("y")), Some(i(1))],
+            ]
+        );
+    }
+
+    #[test]
+    fn ql_ob_with_stage_orders_and_limits_per_stage() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) WITH n ORDER BY n.score LIMIT 2 RETURN n.name",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["cam", "fay"]);
+    }
+
+    #[test]
+    fn ql_ob_with_stage_orders_by_a_variable_it_does_not_carry() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) WITH n.name AS name ORDER BY n.score DESC LIMIT 2 RETURN name",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["eve", "bob"]);
+        // The dropped variable is out of scope for what follows.
+        let err = plan_error(
+            "MATCH (n:Person) WITH n.name AS name ORDER BY n.score LIMIT 2 RETURN n.score",
+        );
+        assert!(err.contains("unbound variable `n`"), "{err}");
+    }
+
+    #[test]
+    fn ql_ob_with_stage_expression_over_a_projected_alias() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) WITH n.name AS name, n.score AS s ORDER BY s % 30, name LIMIT 3 RETURN name",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // s % 30: ada 10, bob 0, cam 10, dan 10, eve 10, fay 20, gus 0, hal 0, ivy 20, jan 20
+        assert_eq!(names(&rs), ["bob", "gus", "hal"]);
+    }
+
+    #[test]
+    fn ql_ob_unbound_variable_in_an_expression_is_an_error() {
+        let err = plan_error("MATCH (n:Person) RETURN n.name ORDER BY nope.score + 1");
+        assert!(err.contains("unbound variable `nope`"), "{err}");
+    }
+
+    #[test]
+    fn ql_ob_union_branches_each_order_by_their_own_key() {
+        let fx = scored_people();
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let union = crate::cypher::parse_read(
+            &lex(
+                "MATCH (n:Person) WHERE n.score >= 90 RETURN n.name ORDER BY n.score DESC \
+                  UNION ALL \
+                  MATCH (n:Person) WHERE n.score <= 20 RETURN n.name ORDER BY n.score",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let rs = super::execute_union(&v, &union, &Params(&params)).unwrap();
+        assert_eq!(names(&rs), ["eve", "bob", "cam", "fay"]);
+    }
+
+    /// Deterministic pseudo-random stream (xorshift), so a failure reproduces.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The bounded selection is exactly the prefix of a stable full sort,
+    /// ties and nulls included, for every bound.
+    #[test]
+    fn ql_ob_sorted_prefix_equals_a_stable_full_sort() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for round in 0..200 {
+            let len = (xorshift(&mut state) % 60) as usize;
+            // Few distinct keys, so ties are everywhere; None is a key too.
+            let keys: Vec<Option<Value>> = (0..len)
+                .map(|_| match xorshift(&mut state) % 6 {
+                    0 => None,
+                    n => Some(i(n as i64)),
+                })
+                .collect();
+            for descending in [false, true] {
+                let cmp = |a: usize, b: usize| {
+                    crate::cmp_optional(keys[a].as_ref(), keys[b].as_ref(), descending)
+                };
+                let mut reference: Vec<usize> = (0..len).collect();
+                reference.sort_by(|&a, &b| cmp(a, b)); // std sort_by is stable
+                for keep in [
+                    None,
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                    Some(5),
+                    Some(17),
+                    Some(len),
+                    Some(len + 3),
+                ] {
+                    let got = super::sorted_prefix(len, keep, cmp);
+                    let want = match keep {
+                        Some(k) => reference[..k.min(len)].to_vec(),
+                        None => reference.clone(),
+                    };
+                    assert_eq!(
+                        got, want,
+                        "round {round} len {len} keep {keep:?} desc {descending}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whole-query differential: `ORDER BY … SKIP s LIMIT k` returns the
+    /// slice `[s, s + k)` of the same query without SKIP/LIMIT, for ties,
+    /// nulls, both directions, a hidden key and a WITH stage.
+    #[test]
+    fn ql_ob_top_k_equals_full_sort_then_slice() {
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut fx = Fx::new();
+        for n in 0..120 {
+            let mut props = vec![("name", s(&format!("p{n:03}")))];
+            // Heavy ties on `a`, 1 in 5 missing; `b` breaks some ties.
+            if !xorshift(&mut state).is_multiple_of(5) {
+                props.push(("a", i((xorshift(&mut state) % 7) as i64)));
+            }
+            props.push(("b", i((xorshift(&mut state) % 3) as i64)));
+            fx.add("P", &format!("p{n:03}"), props);
+        }
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let shapes = [
+            ("MATCH (n:P) RETURN n.name ORDER BY n.a", ""),
+            ("MATCH (n:P) RETURN n.name ORDER BY n.a DESC, n.b", ""),
+            ("MATCH (n:P) RETURN n.name, n.a AS a ORDER BY a DESC", ""),
+            (
+                "MATCH (n:P) RETURN n.name ORDER BY n.b + n.a DESC, n.name DESC",
+                "",
+            ),
+            (
+                "MATCH (n:P) WITH n ORDER BY n.a DESC, n.b",
+                " RETURN n.name",
+            ),
+        ];
+        for (head, tail) in shapes {
+            let full = names(&run(&v, &format!("{head}{tail}"), &params).unwrap());
+            assert_eq!(full.len(), 120);
+            for skip in [0usize, 1, 7, 119, 130] {
+                for limit in [0usize, 1, 2, 10, 50, 119, 120, 500] {
+                    let q = format!("{head} SKIP {skip} LIMIT {limit}{tail}");
+                    let got = names(&run(&v, &q, &params).unwrap());
+                    let want: Vec<String> = full.iter().skip(skip).take(limit).cloned().collect();
+                    assert_eq!(got, want, "{q}");
+                }
+            }
+            // LIMIT alone, and a LIMIT parameter.
+            let got = names(&run(&v, &format!("{head} LIMIT 10{tail}"), &params).unwrap());
+            assert_eq!(got, full[..10].to_vec(), "{head}");
+            let mut with_param = BTreeMap::new();
+            with_param.insert("k".to_string(), i(10));
+            let got = names(&run(&v, &format!("{head} LIMIT $k{tail}"), &with_param).unwrap());
+            assert_eq!(got, full[..10].to_vec(), "{head} (param)");
+        }
+    }
+
+    #[test]
+    fn order_by_null_is_largest_then_skip_limit() {
         let mut fx = Fx::new();
         fx.add("Person", "ada", vec![("age", i(30))]);
         fx.add("Person", "bob", vec![]); // missing age → None
@@ -5419,10 +6120,10 @@ LIMIT 10";
         assert_eq!(
             rows_of(&desc),
             vec![
+                vec![Some(s("bob")), None],
                 vec![Some(s("ada")), Some(i(30))],
                 vec![Some(s("dan")), Some(i(20))],
                 vec![Some(s("cam")), Some(i(10))],
-                vec![Some(s("bob")), None],
             ]
         );
 
@@ -5449,8 +6150,8 @@ LIMIT 10";
         assert_eq!(
             rows_of(&desc_sl),
             vec![
+                vec![Some(s("ada")), Some(i(30))],
                 vec![Some(s("dan")), Some(i(20))],
-                vec![Some(s("cam")), Some(i(10))],
             ]
         );
     }
@@ -5646,6 +6347,7 @@ LIMIT 10";
                     target: OrderTarget::Alias("nope".into()),
                     descending: false,
                 }],
+                visible_columns: None,
             }],
             vec![PlanOp::Filter {
                 expr: crate::cypher::ast::Expr::Cmp {
@@ -9535,7 +10237,7 @@ LIMIT 10";
     }
 
     /// Evaluate one expression through the full lex/parse/plan/execute path.
-    fn eval(expr: &str) -> Option<Value> {
+    pub(super) fn eval(expr: &str) -> Option<Value> {
         let mut fx = Fx::new();
         fx.add("N", "x", vec![]);
         let rs = run(
@@ -9547,7 +10249,7 @@ LIMIT 10";
         rs.get(0, "r").cloned()
     }
 
-    fn eval_err(expr: &str) -> String {
+    pub(super) fn eval_err(expr: &str) -> String {
         let mut fx = Fx::new();
         fx.add("N", "x", vec![]);
         run(

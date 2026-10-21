@@ -185,20 +185,23 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
     }
 }
 
+/// Ordering for ORDER BY: null (a missing property or `Value::Null`) is the
+/// largest value, as openCypher has it, so ascending puts nulls last and
+/// descending puts them first. This is ordering only; equality is
+/// `values_equal` and is unchanged.
 pub fn cmp_optional(a: Option<&Value>, b: Option<&Value>, descending: bool) -> Ordering {
-    match (a, b) {
+    let a = a.filter(|v| !matches!(v, Value::Null));
+    let b = b.filter(|v| !matches!(v, Value::Null));
+    let ascending = match (a, b) {
         (None, None) => Ordering::Equal,
-        // None sorts LAST regardless of ascending/descending.
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
-        (Some(x), Some(y)) => {
-            let c = cmp_values(x, y);
-            if descending {
-                c.reverse()
-            } else {
-                c
-            }
-        }
+        (Some(x), Some(y)) => cmp_values(x, y),
+    };
+    if descending {
+        ascending.reverse()
+    } else {
+        ascending
     }
 }
 
@@ -245,6 +248,52 @@ pub fn into_element(v: Option<Value>) -> Value {
     match v {
         Some(v) => v,
         None => Value::Null,
+    }
+}
+
+/// A number in the text form `toString()` gives it.
+fn number_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Int(n) => Some(n.to_string()),
+        Value::Float(f) => Some(f.to_string()),
+        _ => None,
+    }
+}
+
+/// `left + right` for the operand pairs that are not both numbers: string
+/// joins, list joins, and list-with-element (openCypher). Returns `None`
+/// when the pair is none of those, so the caller raises its type error.
+///
+/// Both arithmetic evaluators (the read executor's and the write-statement
+/// RETURN's) call this, so `+` means the same in every position. Null is
+/// handled by the callers before this is reached.
+pub fn plus_non_numeric(left: &Value, right: &Value) -> Option<Value> {
+    match (left, right) {
+        (Value::Str(l), Value::Str(r)) => Some(Value::Str(format!("{l}{r}"))),
+        // A number joins a string as its `toString()` text.
+        (Value::Str(l), n @ (Value::Int(_) | Value::Float(_))) => {
+            Some(Value::Str(format!("{l}{}", number_text(n)?)))
+        }
+        (n @ (Value::Int(_) | Value::Float(_)), Value::Str(r)) => {
+            Some(Value::Str(format!("{}{r}", number_text(n)?)))
+        }
+        (Value::List(l), Value::List(r)) => {
+            let mut joined = l.clone();
+            joined.extend(r.iter().cloned());
+            Some(Value::List(joined))
+        }
+        (Value::List(l), element) => {
+            let mut joined = l.clone();
+            joined.push(element.clone());
+            Some(Value::List(joined))
+        }
+        (element, Value::List(r)) => {
+            let mut joined = Vec::with_capacity(r.len() + 1);
+            joined.push(element.clone());
+            joined.extend(r.iter().cloned());
+            Some(Value::List(joined))
+        }
+        _ => None,
     }
 }
 
@@ -390,13 +439,15 @@ mod tests {
     }
 
     #[test]
-    fn cmp_optional_none_last_both_directions() {
+    fn cmp_optional_null_is_the_largest_value() {
         let a = Value::Int(1);
         let b = Value::Int(2);
         assert_eq!(cmp_optional(None, Some(&a), false), Greater);
         assert_eq!(cmp_optional(Some(&a), None, false), Less);
-        assert_eq!(cmp_optional(None, Some(&a), true), Greater);
-        assert_eq!(cmp_optional(Some(&a), None, true), Less);
+        assert_eq!(cmp_optional(None, Some(&a), true), Less);
+        assert_eq!(cmp_optional(Some(&a), None, true), Greater);
+        assert_eq!(cmp_optional(Some(&Value::Null), None, false), Equal);
+        assert_eq!(cmp_optional(Some(&Value::Null), Some(&a), true), Less);
         assert_eq!(cmp_optional(None, None, false), Equal);
         assert_eq!(cmp_optional(None, None, true), Equal);
         assert_eq!(cmp_optional(Some(&a), Some(&b), false), Less);

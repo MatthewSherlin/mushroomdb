@@ -975,6 +975,13 @@ impl<'a> Parser<'a> {
     fn list_literal(&mut self) -> Result<Operand, String> {
         self.expect(&Tok::LBracket, "expected '['")?;
         self.enter_literal()?;
+        if let (Some(Tok::Ident(_)), Some(Tok::Ident(kw))) =
+            (self.peek(), self.toks.get(self.pos + 1))
+        {
+            if kw.eq_ignore_ascii_case("in") {
+                return self.list_comprehension();
+            }
+        }
         let mut items = Vec::new();
         if !self.eat(&Tok::RBracket) {
             loop {
@@ -1001,6 +1008,65 @@ impl<'a> Parser<'a> {
             return Ok(Operand::Lit(Value::List(values)));
         }
         Ok(Operand::ListLit(items))
+    }
+
+    /// The rest of `[x IN list [WHERE pred] [| expr]]`, after the `[` and the
+    /// literal-depth entry. A comprehension nests like a list literal, so it
+    /// shares `literal_depth` and its limit.
+    fn list_comprehension(&mut self) -> Result<Operand, String> {
+        let var = self.ident("expected a comprehension variable")?;
+        self.eat_ident_kw("in");
+        let list = self.arith_expr()?;
+        let filter = if self.eat(&Tok::Where) {
+            Some(Box::new(self.expr(0)?))
+        } else {
+            None
+        };
+        let map = if self.eat(&Tok::Pipe) {
+            self.arith_expr()?
+        } else {
+            Operand::Var(var.clone())
+        };
+        self.expect(&Tok::RBracket, "expected ']' to close a list comprehension")?;
+        self.literal_depth -= 1;
+        Ok(Operand::ListComprehension {
+            var,
+            list: Box::new(list),
+            filter,
+            map: Box::new(map),
+        })
+    }
+
+    /// The rest of `reduce(acc = init, x IN list | body)`, after the name.
+    /// It nests like a list literal, so it shares `literal_depth` and its
+    /// limit.
+    fn reduce_call(&mut self) -> Result<Operand, String> {
+        const SHAPE: &str = "reduce() takes (acc = init, x IN list | expression)";
+        self.expect(&Tok::LParen, "expected '(' after reduce")?;
+        self.enter_literal()?;
+        let acc_var = self.ident(SHAPE)?;
+        self.expect(&Tok::Eq, SHAPE)?;
+        let init = self.arith_expr()?;
+        self.expect(&Tok::Comma, SHAPE)?;
+        let iter_var = self.ident(SHAPE)?;
+        if !self.eat_ident_kw("in") {
+            return Err(self.err(SHAPE));
+        }
+        if acc_var == iter_var {
+            return Err(self.err("reduce() accumulator and element variables must differ"));
+        }
+        let list = self.arith_expr()?;
+        self.expect(&Tok::Pipe, SHAPE)?;
+        let body = self.arith_expr()?;
+        self.expect(&Tok::RParen, "expected ')' to close reduce()")?;
+        self.literal_depth -= 1;
+        Ok(Operand::Reduce {
+            acc_var,
+            init: Box::new(init),
+            iter_var,
+            list: Box::new(list),
+            body: Box::new(body),
+        })
     }
 
     /// `{}` or `{k1: e1, k2: e2}`; keys are identifiers (backtick-quoted
@@ -1113,6 +1179,9 @@ impl<'a> Parser<'a> {
                         "collect() is only supported as a top-level RETURN/WITH aggregate"
                             .to_string(),
                     );
+                }
+                if name.eq_ignore_ascii_case("reduce") && self.peek() == Some(&Tok::LParen) {
+                    return self.reduce_call();
                 }
                 if self.peek() == Some(&Tok::LParen) {
                     // Scalar function call: name(arg, ...)
@@ -1301,14 +1370,11 @@ impl<'a> Parser<'a> {
     }
 
     fn order_item(&mut self, aliases: &[&str]) -> Result<OrderItem, String> {
-        let name = self.ident("expected ORDER BY target")?;
-        let target = if self.eat(&Tok::Dot) {
-            let field = self.ident("expected field name after '.'")?;
-            OrderTarget::Prop { var: name, field }
-        } else if aliases.contains(&name.as_str()) {
-            OrderTarget::Alias(name)
-        } else {
-            OrderTarget::Var(name)
+        let target = match self.arith_expr()? {
+            Operand::Prop { var, field } => OrderTarget::Prop { var, field },
+            Operand::Var(name) if aliases.contains(&name.as_str()) => OrderTarget::Alias(name),
+            Operand::Var(name) => OrderTarget::Var(name),
+            other => OrderTarget::Expr(other),
         };
         let descending = if self.eat(&Tok::Desc) {
             true
@@ -1770,6 +1836,8 @@ impl<'a> Parser<'a> {
                     | Operand::Index { .. }
                     | Operand::ListLit(_)
                     | Operand::MapLit(_)
+                    | Operand::ListComprehension { .. }
+                    | Operand::Reduce { .. }
                     | Operand::Case { .. } => op,
                     Operand::Prop { .. } | Operand::Var(_) => {
                         return Err(self.err(
