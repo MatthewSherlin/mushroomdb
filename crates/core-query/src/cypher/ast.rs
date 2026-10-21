@@ -245,6 +245,19 @@ pub enum Operand {
     /// `Value::List`; an element that evaluates to null is an error because
     /// `Value` has no null variant.
     ListLit(Vec<Operand>),
+    /// List comprehension: `[x IN list WHERE pred | expr]`.
+    ///
+    /// `var` is bound to each element of `list` inside `filter` and `map`
+    /// only; it shadows an outer variable of the same name there. A null
+    /// `list` (or a non-list) yields null. An element for which `filter` is
+    /// false or null is dropped. `map` is `Operand::Var(var)` when the source
+    /// has no `| expr` part. A null mapped value stays in the list as null.
+    ListComprehension {
+        var: String,
+        list: Box<Operand>,
+        filter: Option<Box<Expr>>,
+        map: Box<Operand>,
+    },
     /// Map literal with at least one non-constant value: `{k: n.x}`. Keys are
     /// unique (a duplicate is a parse error). All-constant maps fold to
     /// `Operand::Lit(Value::Map(..))`. Evaluates to `Value::Map`.
@@ -282,6 +295,7 @@ pub fn operand_label(op: &Operand) -> String {
         Operand::Case { .. } => "<case>".to_string(),
         Operand::ListLit(_) => "<list>".to_string(),
         Operand::MapLit(_) => "<map>".to_string(),
+        Operand::ListComprehension { .. } => "<listcomp>".to_string(),
         Operand::Index { base, index } => {
             format!("{}[{}]", operand_label(base), subscript_label(index))
         }

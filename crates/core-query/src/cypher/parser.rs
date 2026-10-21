@@ -975,6 +975,13 @@ impl<'a> Parser<'a> {
     fn list_literal(&mut self) -> Result<Operand, String> {
         self.expect(&Tok::LBracket, "expected '['")?;
         self.enter_literal()?;
+        if let (Some(Tok::Ident(_)), Some(Tok::Ident(kw))) =
+            (self.peek(), self.toks.get(self.pos + 1))
+        {
+            if kw.eq_ignore_ascii_case("in") {
+                return self.list_comprehension();
+            }
+        }
         let mut items = Vec::new();
         if !self.eat(&Tok::RBracket) {
             loop {
@@ -1001,6 +1008,33 @@ impl<'a> Parser<'a> {
             return Ok(Operand::Lit(Value::List(values)));
         }
         Ok(Operand::ListLit(items))
+    }
+
+    /// The rest of `[x IN list [WHERE pred] [| expr]]`, after the `[` and the
+    /// literal-depth entry. A comprehension nests like a list literal, so it
+    /// shares `literal_depth` and its limit.
+    fn list_comprehension(&mut self) -> Result<Operand, String> {
+        let var = self.ident("expected a comprehension variable")?;
+        self.eat_ident_kw("in");
+        let list = self.arith_expr()?;
+        let filter = if self.eat(&Tok::Where) {
+            Some(Box::new(self.expr(0)?))
+        } else {
+            None
+        };
+        let map = if self.eat(&Tok::Pipe) {
+            self.arith_expr()?
+        } else {
+            Operand::Var(var.clone())
+        };
+        self.expect(&Tok::RBracket, "expected ']' to close a list comprehension")?;
+        self.literal_depth -= 1;
+        Ok(Operand::ListComprehension {
+            var,
+            list: Box::new(list),
+            filter,
+            map: Box::new(map),
+        })
     }
 
     /// `{}` or `{k1: e1, k2: e2}`; keys are identifiers (backtick-quoted
@@ -1767,6 +1801,7 @@ impl<'a> Parser<'a> {
                     | Operand::Index { .. }
                     | Operand::ListLit(_)
                     | Operand::MapLit(_)
+                    | Operand::ListComprehension { .. }
                     | Operand::Case { .. } => op,
                     Operand::Prop { .. } | Operand::Var(_) => {
                         return Err(self.err(

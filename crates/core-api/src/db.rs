@@ -873,6 +873,7 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
                 operand_node_vars(value, out);
             }
         }
+        Operand::ListComprehension { list, .. } => operand_node_vars(list, out),
         Operand::Lit(_) | Operand::Param(_) => {}
     }
 }
@@ -946,6 +947,55 @@ fn ret_column_name(item: &RetItem) -> String {
     // An aggregate is not legal in a write-statement RETURN; it keeps the
     // placeholder it always had.
     ret_val_label(&item.value).unwrap_or_else(|| "<agg>".to_string())
+}
+
+/// The refusal for a list comprehension in a write statement's RETURN.
+const COMPREHENSION_IN_WRITE_RETURN: &str =
+    "a list comprehension is not supported in the RETURN of a write statement; \
+     compute it in a read query, or RETURN the list and filter it afterwards";
+
+fn expr_has_comprehension(expr: &Expr) -> bool {
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) => expr_has_comprehension(a) || expr_has_comprehension(b),
+        Expr::Not(e) => expr_has_comprehension(e),
+        Expr::Cmp { lhs, rhs, .. } => {
+            operand_has_comprehension(lhs) || operand_has_comprehension(rhs)
+        }
+        Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_has_comprehension(o),
+        Expr::In { expr, list } => {
+            operand_has_comprehension(expr) || list.iter().any(operand_has_comprehension)
+        }
+    }
+}
+
+fn operand_has_comprehension(op: &Operand) -> bool {
+    match op {
+        Operand::ListComprehension { .. } => true,
+        Operand::FuncCall { args, .. } => args.iter().any(operand_has_comprehension),
+        Operand::BinArith { left, right, .. } => {
+            operand_has_comprehension(left) || operand_has_comprehension(right)
+        }
+        Operand::Index { base, index } => {
+            operand_has_comprehension(base) || operand_has_comprehension(index)
+        }
+        Operand::ListLit(items) => items.iter().any(operand_has_comprehension),
+        Operand::MapLit(entries) => entries.iter().any(|(_, v)| operand_has_comprehension(v)),
+        Operand::Case { branches, default } => {
+            branches
+                .iter()
+                .any(|(c, v)| expr_has_comprehension(c) || operand_has_comprehension(v))
+                || default.as_deref().is_some_and(operand_has_comprehension)
+        }
+        Operand::Prop { .. } | Operand::Lit(_) | Operand::Param(_) | Operand::Var(_) => false,
+    }
+}
+
+fn returns_have_comprehension(returns: &[RetItem]) -> bool {
+    returns.iter().any(|item| match &item.value {
+        RetVal::FuncCall { args, .. } => args.iter().any(operand_has_comprehension),
+        RetVal::ScalarExpr(op) => operand_has_comprehension(op),
+        _ => false,
+    })
 }
 
 fn eval_set_return_operand<F: Fs>(
@@ -1022,6 +1072,11 @@ fn eval_set_return_operand<F: Fs>(
             }
             Ok(Some(Value::List(out)))
         }
+        // Refused by name before the write commits (`exec_match_set`); this
+        // arm is only a backstop and never sees a comprehension.
+        Operand::ListComprehension { .. } => Err(GraphError::QueryError {
+            detail: COMPREHENSION_IN_WRITE_RETURN.into(),
+        }),
         Operand::MapLit(entries) => {
             let mut out = BTreeMap::new();
             for (key, value) in entries {
@@ -12671,6 +12726,16 @@ impl<F: Fs> GraphDb<F> {
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
         let project_returns = stmt.returns.clone();
+        // Refused before anything is written: the projection runs after the
+        // commit, and must not fail (or differ) once the write has happened.
+        if project_returns
+            .as_deref()
+            .is_some_and(returns_have_comprehension)
+        {
+            return Err(GraphError::QueryError {
+                detail: COMPREHENSION_IN_WRITE_RETURN.into(),
+            });
+        }
         // Collect unique node vars targeted by SET clauses, plus RETURN bindings
         // so the post-write projection can look them up by key.
         let mut set_vars: Vec<String> = Vec::new();

@@ -1441,6 +1441,21 @@ fn check_operand_bound(
             }
             Ok(())
         }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            check_operand_bound(list, bound, clause)?;
+            // The variable is bound inside the filter and the map only.
+            let mut inner = bound.clone();
+            inner.insert(var.clone());
+            if let Some(f) = filter {
+                check_expr_bound(f, &inner)?;
+            }
+            check_operand_bound(map, &inner, clause)
+        }
         Operand::FuncCall { args, .. } => {
             for arg in args {
                 check_operand_bound(arg, bound, clause)?;
@@ -1660,6 +1675,28 @@ fn inline_aliases(op: &Operand, returns: &[RetItem]) -> Operand {
         Operand::ListLit(items) => Operand::ListLit(items.iter().map(go).collect()),
         Operand::MapLit(entries) => {
             Operand::MapLit(entries.iter().map(|(k, v)| (k.clone(), go(v))).collect())
+        }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            // A RETURN alias named like the variable does not reach inside:
+            // the variable shadows it there.
+            let inner: Vec<RetItem> = returns
+                .iter()
+                .filter(|r| r.alias.as_deref() != Some(var.as_str()))
+                .cloned()
+                .collect();
+            Operand::ListComprehension {
+                var: var.clone(),
+                list: Box::new(go(list)),
+                filter: filter
+                    .as_ref()
+                    .map(|f| Box::new(inline_aliases_expr(f, &inner))),
+                map: Box::new(inline_aliases(map, &inner)),
+            }
         }
         Operand::Case { branches, default } => Operand::Case {
             branches: branches

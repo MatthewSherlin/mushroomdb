@@ -1020,6 +1020,16 @@ fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<St
                 collect_operand(value, names, seen);
             }
         }
+        Operand::ListComprehension {
+            list, filter, map, ..
+        } => {
+            collect_operand(list, names, seen);
+            if let Some(f) = filter {
+                // Depth is bounded by the parser's nesting limit.
+                let _ = collect_expr(f, names, seen, 0);
+            }
+            collect_operand(map, names, seen);
+        }
         _ => {}
     }
 }
@@ -1322,6 +1332,20 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
             for (_, value) in entries {
                 intern_operand(vars, value);
             }
+        }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            // The variable needs a row slot to be bound in.
+            vars.intern(var);
+            intern_operand(vars, list);
+            if let Some(f) = filter {
+                intern_expr(vars, f);
+            }
+            intern_operand(vars, map);
         }
     }
 }
@@ -2583,6 +2607,40 @@ fn resolve_operand(
             let mut out = Vec::with_capacity(items.len());
             for item in items {
                 let v = resolve_operand(view, vars, row, item, params)?;
+                out.push(crate::value_ops::into_element(v));
+            }
+            Ok(Some(Value::List(out)))
+        }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            let source = match resolve_operand(view, vars, row, list, params)? {
+                Some(Value::List(items)) => items,
+                // A null or non-list source gives null.
+                _ => return Ok(None),
+            };
+            let slot = vars
+                .slot(var)
+                .filter(|s| *s < row.len())
+                .ok_or_else(|| format!("list comprehension variable `{var}` has no slot"))?;
+            // One copy of the row; the outer row keeps its own binding of
+            // `var`, so the shadowing ends with the comprehension.
+            let mut scoped = row.clone();
+            let mut out = Vec::with_capacity(source.len());
+            for item in source {
+                scoped[slot] = match item {
+                    Value::Null => None,
+                    other => Some(Cell::Scalar(other)),
+                };
+                if let Some(f) = filter {
+                    if !eval_expr(view, vars, &scoped, f, params, 0)? {
+                        continue;
+                    }
+                }
+                let v = resolve_operand(view, vars, &scoped, map, params)?;
                 out.push(crate::value_ops::into_element(v));
             }
             Ok(Some(Value::List(out)))
@@ -5076,6 +5134,10 @@ fn apply_limit<T>(rows: &mut Vec<T>, n: u64) {
 #[cfg(test)]
 #[path = "tests/ql_13.rs"]
 mod ql_13;
+
+#[cfg(test)]
+#[path = "tests/ql_15.rs"]
+mod ql_15;
 
 #[cfg(test)]
 mod tests {
