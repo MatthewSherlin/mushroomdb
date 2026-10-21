@@ -1,0 +1,4 @@
+### Fixed
+
+- **A unique constraint now means what the query language's `=` means for numbers.** A constraint on a property refuses `2.0` beside `2` (and the reverse, and `-0.0` beside `0`), where it used to accept both and `MATCH (n {v: 2})` then returned both. A `NaN` equals nothing and never conflicts. Past 2^53 an integer equals the float it rounds to, and two integers are equal only when they are the same integer, as a query judges them.
+- **An equality index over a property a view owns is refused (ledger row 123).** It answered from stale values until the store was reopened, so a query's answer changed with a reopen. `enable_index` now refuses a property a view owns, and `create_view` refuses a property an equality index covers. A store that already holds both opens, drops that index, and answers by scan.

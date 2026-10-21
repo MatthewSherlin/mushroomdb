@@ -9,7 +9,9 @@ use core_query::cypher::{
     plan, Expr, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem,
     RetVal, WriteStatement,
 };
-use core_query::{eval_cmp, eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
+use core_query::{
+    eval_cmp, eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet,
+};
 use core_rules::{
     decode_rule_def, ef_max, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView,
     Predicate, RuleDef, RuleEngine, ViewDef, ViewStore,
@@ -2417,6 +2419,34 @@ impl GraphDb<RealFs> {
     }
 }
 
+/// Where two values the scan can find equal always share a bucket: numbers by
+/// the bit pattern of their `f64` (so `Int` 2, `Float` 2.0, and both zeros
+/// meet), every other indexable value by its index key. `None` for a value
+/// that equals nothing a constraint could hold — `NaN`, or one with no index
+/// key (list, map, duration).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum EqualityBucket {
+    Number(u64),
+    Key(ValueKey),
+}
+
+fn equality_bucket(value: &Value) -> Option<EqualityBucket> {
+    let number = |f: f64| {
+        if f.is_nan() {
+            None
+        } else if f == 0.0 {
+            Some(EqualityBucket::Number(0.0_f64.to_bits()))
+        } else {
+            Some(EqualityBucket::Number(f.to_bits()))
+        }
+    };
+    match value {
+        Value::Int(i) => number(*i as f64),
+        Value::Float(f) => number(*f),
+        other => ValueKey::from_value(other).map(EqualityBucket::Key),
+    }
+}
+
 impl<F: Fs> GraphDb<F> {
     /// Open over an arbitrary [`Fs`], repairing a torn WAL tail as usual.
     pub fn open_with(fs: F) -> Result<Self> {
@@ -2915,6 +2945,7 @@ impl<F: Fs> GraphDb<F> {
             );
         }
         trace_open!("full-text index ready", _t0);
+        db.drop_indexes_over_view_properties();
         db.prop_index.rebuild_all(
             &db.ids,
             &db.labels,
@@ -3809,6 +3840,7 @@ impl<F: Fs> GraphDb<F> {
             &db.syms,
             build_props_view(&db.props, &db.base),
         );
+        db.drop_indexes_over_view_properties();
         db.prop_index.rebuild_all(
             &db.ids,
             &db.labels,
@@ -5682,12 +5714,10 @@ impl<F: Fs> GraphDb<F> {
         }
 
         let committed = self.ids.len();
-        let postings: Vec<_> = self
-            .constraints
-            .iter()
-            .map(|c| self.prop_index.postings(&c.label, &c.field))
-            .collect();
-        let mut claimed: HashSet<(usize, ValueKey)> = HashSet::new();
+        // What earlier nodes of this frame hold, per constraint, in the
+        // bucket `equality_bucket` gives; values in one bucket are compared
+        // with `values_equal`, the scan's own equality.
+        let mut claimed: HashMap<(usize, EqualityBucket), Vec<Value>> = HashMap::new();
         for &id in &touched {
             if dead.contains(&id) {
                 continue;
@@ -5718,27 +5748,31 @@ impl<F: Fs> GraphDb<F> {
                 let Some(value) = value else {
                     continue;
                 };
-                let Some(key) = ValueKey::from_value(&value) else {
+                // A value no scan can find equal to another — one with no
+                // index key, or a NaN — never conflicts.
+                let Some(bucket) = equality_bucket(&value) else {
                     continue;
                 };
                 let violation = || GraphError::ConstraintViolation {
                     constraint: c.name.clone(),
                     field: c.field.clone(),
                 };
-                // A holder the frame does not touch keeps its value.
-                if postings[ci]
-                    .and_then(|by_value| by_value.get(&key))
-                    .is_some_and(|holders| {
-                        holders
-                            .iter()
-                            .any(|holder| *holder != id && !touched.contains(holder))
-                    })
+                // A holder the frame does not touch keeps its value. The
+                // index answers as the scan does: an `Int` finds the equal
+                // `Float`, and the reverse.
+                if self
+                    .prop_index
+                    .lookup(&c.label, &c.field, &value)
+                    .into_iter()
+                    .any(|holder| holder != id && !touched.contains(&holder))
                 {
                     return Err(violation());
                 }
-                if !claimed.insert((ci, key)) {
+                let held = claimed.entry((ci, bucket)).or_default();
+                if held.iter().any(|other| values_equal(other, &value)) {
                     return Err(violation());
                 }
+                held.push(value);
             }
         }
         Ok(())
@@ -8208,7 +8242,8 @@ impl<F: Fs> GraphDb<F> {
     /// # Errors
     /// - `ReadOnly`: called on an as-of instance.
     /// - `RuleInvalid`: name collision, view_prop collision, or invalid def.
-    /// - `QueryError`: a unique constraint covers `(label, view_prop)`.
+    /// - `QueryError`: a unique constraint, an equality index or a range index
+    ///   covers `(label, view_prop)`.
     pub fn create_view(&mut self, def: ViewDef) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
@@ -8244,6 +8279,19 @@ impl<F: Fs> GraphDb<F> {
                 detail: format!(
                     "property '{}' on label '{}' is covered by range index '{index}'; a view \
                      cannot own it",
+                    def.view_prop, def.label
+                ),
+            });
+        }
+        // The same for an equality index (ledger row 123).
+        if self
+            .prop_index
+            .is_equality_declared(&def.label, &def.view_prop)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{}' on label '{}' is covered by an equality index; a view cannot \
+                     own it",
                     def.view_prop, def.label
                 ),
             });
@@ -8593,9 +8641,26 @@ impl<F: Fs> GraphDb<F> {
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
     /// - [`GraphError::RuleInvalid`]: `(label, field)` is already indexed, by
     ///   an equality index or by a range index (named in the error).
+    /// - [`GraphError::QueryError`]: a view owns `(label, field)`.
     pub fn enable_index(&mut self, label: &str, field: &str) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
+        }
+        // A view writes its property inside `apply` without passing the
+        // property index, so an equality index over it would answer from
+        // stale postings until the next open rebuilt them (ledger row 123).
+        if let Some(view) = self
+            .view_store
+            .views()
+            .find(|v| v.label == label && v.view_prop == field)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{field}' on label '{label}' is owned by view '{}'; an equality \
+                     index cannot cover it",
+                    view.name
+                ),
+            });
         }
         if self.prop_index.is_enabled(label, field) {
             // A range index already answers equality on the pair.
@@ -8772,8 +8837,10 @@ impl<F: Fs> GraphDb<F> {
     /// are one commit. From then on every write that would give a second node
     /// of `label` a value already held fails with
     /// [`GraphError::ConstraintViolation`] and writes nothing. Values compare
-    /// as index keys: two `DateTime`s at one UTC instant are equal whatever
-    /// their offsets, and a list, map or `Duration` never conflicts.
+    /// as a query's `=` does: `Int` 2 and `Float` 2.0 are one value, so are the two zeros
+    /// and every `Int` that rounds to a `Float`, `NaN` equals nothing, two `DateTime`s at one
+    /// UTC instant are equal whatever their offsets, and a list, map or `Duration` never
+    /// conflicts.
     ///
     /// The existing data is not checked here; a store that already holds
     /// duplicates keeps them (the pre-scan is 0.10 TY-6).
@@ -10616,6 +10683,27 @@ impl<F: Fs> GraphDb<F> {
         // updated role definitions without waiting for the next K-commit fold.
         self.fold_now();
         Ok(())
+    }
+
+    /// Forget the equality indexes that cover a property a view owns.
+    ///
+    /// A view writes its property without passing the property index, so such
+    /// an index answers from stale postings while the handle lives (ledger row
+    /// 123). Declaring one is refused now (`enable_index`, `create_view`), but
+    /// a store written before the refusal can hold both, and must still open
+    /// and answer correctly: the pair is dropped in memory, so a query on it
+    /// scans, and the next snapshot no longer re-emits the declaration. Runs
+    /// once, after replay, before the postings are built.
+    fn drop_indexes_over_view_properties(&mut self) {
+        let owned: Vec<(String, String)> = self
+            .view_store
+            .views()
+            .filter(|v| self.prop_index.is_equality_declared(&v.label, &v.view_prop))
+            .map(|v| (v.label.clone(), v.view_prop.clone()))
+            .collect();
+        for (label, field) in owned {
+            self.prop_index.disable(&label, &field);
+        }
     }
 
     fn view(&self) -> GraphView<'_> {

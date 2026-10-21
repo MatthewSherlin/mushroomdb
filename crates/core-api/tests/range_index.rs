@@ -123,6 +123,111 @@ fn an_equality_index_finds_int_and_float_alike() {
     assert_eq!(keys(&db, "U", Value::Float(0.0)), vec!["nz", "z"]);
 }
 
+// ── Ledger row 123: an equality index over a view property (TY-5b) ─────────
+
+fn user_deg_view() -> mushroomdb::ViewDef {
+    mushroomdb::ViewDef {
+        name: "deg".into(),
+        label: "User".into(),
+        view_prop: "deg".into(),
+        source: mushroomdb::ViewSource::Degree {
+            edge_type: "KNOWS".into(),
+            direction: mushroomdb::Direction::Out,
+        },
+    }
+}
+
+/// Keys of the Users the query `WHERE n.deg = 1` returns.
+fn users_with_deg_1(db: &GraphDb) -> Vec<String> {
+    let rs = db
+        .query(
+            "MATCH (n:User) WHERE n.deg = 1 RETURN key(n) AS k",
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+    let mut ks: Vec<String> = (0..rs.len())
+        .filter_map(|i| match rs.get(i, "k") {
+            Some(Value::Str(k)) => Some(k.clone()),
+            _ => None,
+        })
+        .collect();
+    ks.sort();
+    ks
+}
+
+/// A view writes its property without passing the property index, so an
+/// equality index over it answered from stale postings until a reopen. The two
+/// declarations are now refused in either order, with the WAL untouched.
+#[test]
+fn an_equality_index_cannot_cover_a_view_property() {
+    let dir = tmp("row-123-view-then-index");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.create_view(user_deg_view()).unwrap();
+    let before = wal_bytes(&dir);
+    match db.enable_index("User", "deg") {
+        Err(GraphError::QueryError { detail }) => assert_eq!(
+            detail,
+            "property 'deg' on label 'User' is owned by view 'deg'; an equality index cannot \
+             cover it"
+        ),
+        other => panic!("expected a view refusal, got {other:?}"),
+    }
+    assert_eq!(wal_bytes(&dir), before);
+    assert!(!db.is_index_enabled("User", "deg"));
+    // Another label's `deg` is not the view's.
+    db.enable_index("Admin", "deg").unwrap();
+
+    let dir = tmp("row-123-index-then-view");
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.enable_index("User", "deg").unwrap();
+    let before = wal_bytes(&dir);
+    match db.create_view(user_deg_view()) {
+        Err(GraphError::QueryError { detail }) => assert_eq!(
+            detail,
+            "property 'deg' on label 'User' is covered by an equality index; a view cannot own it"
+        ),
+        other => panic!("expected an index refusal, got {other:?}"),
+    }
+    assert_eq!(wal_bytes(&dir), before);
+    assert!(db.views().is_empty());
+}
+
+/// The review's reproduction: a store that already holds an equality index and
+/// a view over one property — written before the refusal existed — opens, and
+/// answers the same live as after a reopen, whatever the view does next.
+#[test]
+fn a_store_with_an_index_over_a_view_property_opens_and_answers_correctly() {
+    let dir = tmp("row-123-existing");
+    {
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.create_view(user_deg_view()).unwrap();
+        db.insert_node("User", "a", vec![]).unwrap();
+        db.insert_node("User", "b", vec![]).unwrap();
+    }
+    // The index record an older release would have logged after the view.
+    let frame = core_storage::encode_record(&core_storage::WalRecord::EnableIndex {
+        label: "User".into(),
+        field: "deg".into(),
+    });
+    let mut wal = wal_bytes(&dir);
+    wal.extend(frame);
+    std::fs::write(dir.join("wal.bin"), wal).unwrap();
+
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert!(users_with_deg_1(&db).is_empty());
+    db.insert_edge("KNOWS", "a", "b").unwrap();
+    assert_eq!(users_with_deg_1(&db), vec!["a"], "live");
+    drop(db);
+    let mut db = GraphDb::open(&dir).unwrap();
+    assert_eq!(users_with_deg_1(&db), vec!["a"], "after a reopen");
+    db.insert_edge("KNOWS", "b", "a").unwrap();
+    assert_eq!(users_with_deg_1(&db), vec!["a", "b"], "live, again");
+    db.snapshot().unwrap();
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(users_with_deg_1(&db), vec!["a", "b"], "after a snapshot");
+}
+
 #[cfg(feature = "test-hooks")]
 mod unlocked {
     use super::*;
