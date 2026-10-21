@@ -753,6 +753,201 @@ mod unlocked {
         assert_eq!(GraphDb::open_at(&dir, 2).unwrap().constraints().len(), 1);
     }
 
+    // ── A store whose data predates its constraint ─────────────────────────
+    //
+    // The decision (TY-7): such a store opens, and the constraint is in force.
+    // Existing duplicates are kept as they are — nothing deletes or rewrites
+    // data, and replay never re-checks a frame. A new write is judged by what
+    // it leaves behind for the nodes it touches: it may not give a node a value
+    // another live node holds, but a write that leaves a duplicate's value as
+    // it was, or moves it somewhere free, or removes the node, is allowed.
+
+    /// A store holding `alice` and `bob` with one email, `carol` with another,
+    /// and a `uniq_email` declaration appended by hand (no create-time scan).
+    fn store_with_grandfathered_duplicates(name: &str) -> (PathBuf, GraphDb) {
+        let (dir, mut db) = open_temp(name);
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        db.insert_node("User", "bob", email("a@x")).unwrap();
+        db.insert_node("User", "carol", email("c@x")).unwrap();
+        drop(db);
+        append_constraint_record(&dir);
+        let mut db = GraphDb::open(&dir).expect("replay must never fail");
+        db.unlock_v11_format_for_test();
+        assert_eq!(db.constraints().len(), 1);
+        (dir, db)
+    }
+
+    fn append_constraint_record(dir: &Path) {
+        let record = core_storage::encode_record(&core_storage::WalRecord::CreateConstraint {
+            name: "uniq_email".into(),
+            label: "User".into(),
+            field: "email".into(),
+        });
+        let mut wal = wal_bytes(dir);
+        wal.extend_from_slice(&record);
+        std::fs::write(dir.join("wal.bin"), wal).unwrap();
+    }
+
+    #[test]
+    fn test_constraint_replay_does_not_enforce_old_data() {
+        let (dir, db) = store_with_grandfathered_duplicates("grandfather-replay");
+        drop(db);
+        let reopened = GraphDb::open(&dir).expect("replay must never fail");
+        assert_eq!(reopened.node_count(), 3);
+        assert_eq!(reopened.constraints().len(), 1);
+        for key in ["alice", "bob"] {
+            assert_eq!(
+                reopened.get_prop(key, "email"),
+                Some(Value::Str("a@x".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_open_at_before_constraint_declaration() {
+        let (dir, mut db) = open_temp("open-at-before");
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        // `open_at` takes a 0-based commit index; the last commit made is one less
+        // than the count.
+        let before_commit = db.commit_seq() - 1;
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        let after_commit = db.commit_seq() - 1;
+        drop(db);
+        let historical = GraphDb::open_at(&dir, before_commit).unwrap();
+        assert!(historical.constraints().is_empty());
+        assert!(
+            !historical.is_index_enabled("User", "email"),
+            "the backing index comes with the declaration"
+        );
+        assert_eq!(historical.node_count(), 1);
+        let later = GraphDb::open_at(&dir, after_commit).unwrap();
+        assert_eq!(later.constraints().len(), 1);
+        assert_eq!(later.node_count(), 2);
+    }
+
+    #[test]
+    fn a_grandfathered_duplicate_survives_a_snapshot_and_a_reopen() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-snapshot");
+        db.snapshot().unwrap();
+        db.snapshot().unwrap();
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).expect("a snapshot of such a store opens");
+        reopened.unlock_v11_format_for_test();
+        assert_eq!(reopened.constraints().len(), 1);
+        assert_eq!(reopened.node_count(), 3);
+        for key in ["alice", "bob"] {
+            assert_eq!(
+                reopened.get_prop(key, "email"),
+                Some(Value::Str("a@x".into()))
+            );
+        }
+        assert_violation(reopened.insert_node("User", "dave", email("a@x")));
+        reopened.insert_node("User", "dave", email("d@x")).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_leaves_a_duplicates_value_alone_is_allowed() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-unrelated");
+        // Another property, through each path that can touch the node.
+        db.set_prop("bob", "age", Value::Int(3)).unwrap();
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("alice", "age", Value::Int(5));
+            b.set_prop("bob", "age", Value::Int(6));
+        })
+        .unwrap();
+        cypher(&mut db, "MATCH (n:User) WHERE n.id = 'bob' SET n.age = 7").unwrap();
+        assert_eq!(db.get_prop("bob", "age"), Some(Value::Int(7)));
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // A new node still may not join them.
+        assert_violation(db.insert_node("User", "dave", email("a@x")));
+        // Nor may a frame that touches a duplicate and takes its value.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "age", Value::Int(8));
+            b.insert_node("User", "dave", email("a@x"));
+        }));
+        // Nor may carol take it.
+        assert_violation(db.set_prop("carol", "email", Value::Str("a@x".into())));
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(reopened.node_count(), 3);
+        assert_eq!(reopened.get_prop("bob", "age"), Some(Value::Int(7)));
+        assert_eq!(
+            reopened.get_prop("bob", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+    }
+
+    #[test]
+    fn a_grandfathered_duplicate_can_be_fixed_or_removed() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-fix");
+        // Re-asserting the value it shares is a new write of a duplicate.
+        assert_violation(db.set_prop("bob", "email", Value::Str("a@x".into())));
+        // Moving it somewhere free fixes it, and alice is then the only holder.
+        db.set_prop("bob", "email", Value::Str("b@x".into()))
+            .unwrap();
+        assert_violation(db.insert_node("User", "dave", email("a@x")));
+        // Deleting a holder frees its value.
+        db.delete_node("alice").unwrap();
+        db.insert_node("User", "dave", email("a@x")).unwrap();
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(
+            reopened.get_prop("dave", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+        assert_eq!(
+            reopened.get_prop("bob", "email"),
+            Some(Value::Str("b@x".into()))
+        );
+    }
+
+    #[test]
+    fn replay_is_the_same_live_reopened_and_as_of() {
+        // Every frame was valid when written, and the sequence leans on the
+        // order: a value handed on, swapped, freed by a delete.
+        let (dir, mut db) = constrained("replay-differential");
+        let mut live: Vec<Vec<(String, Option<Value>)>> = Vec::new();
+        let mut seqs = Vec::new();
+        let observe = |db: &GraphDb| -> Vec<(String, Option<Value>)> {
+            ["alice", "bob", "carol"]
+                .iter()
+                .map(|k| (k.to_string(), db.get_prop(k, "email")))
+                .collect()
+        };
+        let mut record = |db: &GraphDb| {
+            live.push(observe(db));
+            seqs.push(db.commit_seq() - 1);
+        };
+        record(&db);
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        record(&db);
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("alice", "email", Value::Str("b@x".into()));
+            b.set_prop("bob", "email", Value::Str("a@x".into()));
+        })
+        .unwrap();
+        record(&db);
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.delete_node("alice");
+            b.insert_node("User", "carol", email("b@x"));
+        })
+        .unwrap();
+        record(&db);
+        db.drop_constraint("uniq_email").unwrap();
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        record(&db);
+        drop(db);
+
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(&observe(&reopened), live.last().unwrap());
+        assert!(reopened.constraints().is_empty());
+        for (seq, expected) in seqs.iter().zip(&live) {
+            let at = GraphDb::open_at(&dir, *seq).unwrap();
+            assert_eq!(&observe(&at), expected, "open_at {seq}");
+        }
+    }
+
     // ── What the frame leaves behind is what is judged ──────────────────────
 
     #[test]

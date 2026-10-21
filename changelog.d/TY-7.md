@@ -1,0 +1,3 @@
+### Fixed
+
+- **A store whose WAL declares a unique constraint after data that already breaks it opens, and so does a reader that refreshes onto it.** Replay and a peer's refresh never check a record against a constraint, `open_at` before the declaration sees no constraint, and a snapshot of such a store keeps both the duplicates and the declaration. The constraint then applies to new writes only: a write that leaves a node holding a value another live node holds is refused, while one that leaves a duplicate alone, gives it a free value or deletes it is allowed. Only a store written before the create-time scan existed can be in this state.
