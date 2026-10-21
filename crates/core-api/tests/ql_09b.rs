@@ -929,6 +929,295 @@ fn create_set_remove_delete_statements_replay_identically_live_reopened_and_snap
     assert_eq!(dump(&after), live, "after a snapshot");
 }
 
+// ── Fix round 1: values are read as the statement goes ─────────────────────
+
+fn counter_db(name: &str) -> GraphDb {
+    let mut db = GraphDb::open(&tmp(name)).unwrap();
+    run(&mut db, "CREATE (:C {id: 'c', count: 0, v: 1})", &none());
+    db
+}
+
+#[test]
+fn a_later_row_reads_what_an_earlier_row_set() {
+    let mut db = counter_db("counter");
+    let rs = run(
+        &mut db,
+        "UNWIND [1, 1] AS x MATCH (n:C {id: 'c'}) SET n.count = n.count + 1",
+        &none(),
+    );
+    assert_eq!(db.get_prop("c", "count"), Some(Value::Int(2)));
+    assert_eq!(count(&rs, "properties_set"), 2);
+    assert_eq!(
+        db.commit_seq(),
+        2,
+        "setup plus one commit for the statement"
+    );
+}
+
+#[test]
+fn a_later_set_clause_reads_what_an_earlier_one_set() {
+    let mut db = counter_db("chain");
+    run(
+        &mut db,
+        "UNWIND [1] AS x MATCH (n:C {id: 'c'}) SET n.v = 10 SET n.w = n.v",
+        &none(),
+    );
+    assert_eq!(db.get_prop("c", "w"), Some(Value::Int(10)));
+    run(
+        &mut db,
+        "UNWIND [1] AS x MATCH (n:C {id: 'c'}) SET n.a = 5, n.b = n.a + 1",
+        &none(),
+    );
+    assert_eq!(db.get_prop("c", "b"), Some(Value::Int(6)));
+}
+
+#[test]
+fn a_plain_match_set_item_reads_what_an_earlier_item_set() {
+    let mut db = counter_db("plain-chain");
+    run(
+        &mut db,
+        "MATCH (n:C {id: 'c'}) SET n.v = 10, n.w = n.v + 0",
+        &none(),
+    );
+    assert_eq!(db.get_prop("c", "w"), Some(Value::Int(10)));
+}
+
+#[test]
+fn a_plain_match_set_reads_the_writes_of_an_earlier_row_for_the_same_node() {
+    let mut db = counter_db("plain-rows");
+    run(&mut db, "CREATE (:D {id: 'd1'})", &none());
+    run(&mut db, "CREATE (:D {id: 'd2'})", &none());
+    run(
+        &mut db,
+        "MATCH (n:C {id: 'c'}), (m:D) SET n.count = n.count + 1",
+        &none(),
+    );
+    assert_eq!(
+        db.get_prop("c", "count"),
+        Some(Value::Int(2)),
+        "one row per D"
+    );
+    run(
+        &mut db,
+        "MATCH (n:C {id: 'c'}), (m:D) SET n += {count: n.count + 10}",
+        &none(),
+    );
+    assert_eq!(db.get_prop("c", "count"), Some(Value::Int(22)));
+}
+
+#[test]
+fn a_plain_match_set_counter_reads_per_row() {
+    let mut db = counter_db("plain-counter");
+    run(&mut db, "CREATE (:C {id: 'd', count: 5})", &none());
+    run(&mut db, "MATCH (n:C) SET n.count = n.count + 1", &none());
+    assert_eq!(db.get_prop("c", "count"), Some(Value::Int(1)));
+    assert_eq!(db.get_prop("d", "count"), Some(Value::Int(6)));
+}
+
+#[test]
+fn merge_on_match_counts_each_duplicate_key() {
+    let mut db = GraphDb::open(&tmp("merge-counter")).unwrap();
+    run(
+        &mut db,
+        "UNWIND ['a', 'a', 'a', 'b'] AS k MERGE (n:C {id: k}) \
+         ON CREATE SET n.count = 1 ON MATCH SET n.count = n.count + 1",
+        &none(),
+    );
+    assert_eq!(db.get_prop("a", "count"), Some(Value::Int(3)));
+    assert_eq!(db.get_prop("b", "count"), Some(Value::Int(1)));
+    run(
+        &mut db,
+        "UNWIND ['a', 'a'] AS k MERGE (n:C {id: k}) ON MATCH SET n.count = n.count + 1",
+        &none(),
+    );
+    assert_eq!(
+        db.get_prop("a", "count"),
+        Some(Value::Int(5)),
+        "against the store too"
+    );
+}
+
+#[test]
+fn a_value_may_read_a_property_of_a_node_created_in_the_statement() {
+    let mut db = GraphDb::open(&tmp("create-then-read")).unwrap();
+    run(
+        &mut db,
+        "UNWIND [1] AS x CREATE (n:C {id: 'a', v: 3}) SET n.w = n.v + 1",
+        &none(),
+    );
+    assert_eq!(db.get_prop("a", "w"), Some(Value::Int(4)));
+}
+
+#[test]
+fn a_set_value_that_reads_an_unset_property_is_null_and_refused() {
+    let mut db = counter_db("read-missing");
+    let e = db
+        .query_write(
+            "UNWIND [1] AS x MATCH (n:C {id: 'c'}) SET n.w = n.nope + 1",
+            &none(),
+        )
+        .unwrap_err();
+    assert!(detail(e).contains("evaluated to null"));
+    assert_eq!(db.get_prop("c", "w"), None);
+}
+
+#[test]
+fn a_value_reads_a_removed_property_as_absent_and_a_function_of_a_node() {
+    let mut db = counter_db("read-removed");
+    let e = db
+        .query_write(
+            "UNWIND [1] AS x MATCH (n:C {id: 'c'}) REMOVE n.v SET n.w = n.v + 1",
+            &none(),
+        )
+        .unwrap_err();
+    assert!(detail(e).contains("evaluated to null"));
+    run(
+        &mut db,
+        "UNWIND [1] AS x MATCH (n:C {id: 'c'}) SET n.k = key(n), n.l = n.id",
+        &none(),
+    );
+    assert_eq!(db.get_prop("c", "k"), Some(s("c")));
+    assert_eq!(db.get_prop("c", "l"), Some(s("c")));
+}
+
+#[test]
+fn a_map_set_reads_the_statements_own_writes() {
+    let mut db = counter_db("map-reads");
+    run(
+        &mut db,
+        "UNWIND [1, 1] AS x MATCH (n:C {id: 'c'}) SET n += {count: n.count + 1}",
+        &none(),
+    );
+    assert_eq!(db.get_prop("c", "count"), Some(Value::Int(2)));
+}
+
+#[test]
+fn a_failing_dependent_row_still_writes_nothing() {
+    let dir = tmp("dependent-fail");
+    let mut db = GraphDb::open(&dir).unwrap();
+    run(&mut db, "CREATE (:C {id: 'c', count: 0})", &none());
+    let before = wal_bytes(&dir);
+    let e = db
+        .query_write(
+            "UNWIND [1, 0] AS x MATCH (n:C {id: 'c'}) SET n.count = n.count + 10 / x",
+            &none(),
+        )
+        .unwrap_err();
+    assert!(detail(e).contains("division by zero"));
+    assert_eq!(wal_bytes(&dir), before);
+    assert_eq!(db.get_prop("c", "count"), Some(Value::Int(0)));
+}
+
+#[test]
+fn return_after_a_set_of_a_filtered_property_still_returns_the_row() {
+    let mut db = GraphDb::open(&tmp("ret-filtered")).unwrap();
+    run(&mut db, "CREATE (:C {id: 'a', s: 'old'})", &none());
+    let rs = run(
+        &mut db,
+        "UNWIND [1] AS x MATCH (n:C {id: 'a', s: 'old'}) SET n.s = 'new' RETURN n.s AS v",
+        &none(),
+    );
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "v"), Some(&s("new")), "the post-write value");
+    let rs = run(
+        &mut db,
+        "UNWIND [1] AS x MATCH (n:C) WHERE n.s = 'new' SET n.s = 'newer' RETURN n.s AS v",
+        &none(),
+    );
+    assert_eq!((rs.len(), rs.get(0, "v")), (1, Some(&s("newer"))));
+}
+
+#[test]
+fn return_after_remove_of_a_filtered_property_still_returns_the_row() {
+    let mut db = GraphDb::open(&tmp("ret-remove")).unwrap();
+    run(&mut db, "CREATE (:C {id: 'a', f: 1})", &none());
+    let rs = run(
+        &mut db,
+        "UNWIND [1] AS x MATCH (n:C {id: 'a', f: 1}) REMOVE n.f RETURN n.id AS v",
+        &none(),
+    );
+    assert_eq!((rs.len(), rs.get(0, "v")), (1, Some(&s("a"))));
+}
+
+#[test]
+fn return_count_after_detach_delete_counts_the_deleted_rows() {
+    let mut db = GraphDb::open(&tmp("ret-delete")).unwrap();
+    run(&mut db, CREATE_PEOPLE, &rows_param(&["a", "b"]));
+    let rs = run(
+        &mut db,
+        "UNWIND ['a', 'b'] AS k MATCH (n:Person {id: k}) DETACH DELETE n RETURN count(*) AS c",
+        &none(),
+    );
+    assert_eq!(count(&rs, "c"), 2);
+    assert!(!db.has_node("a") && !db.has_node("b"));
+}
+
+#[test]
+fn return_after_create_with_a_nondeterministic_key_returns_every_row() {
+    let mut db = GraphDb::open(&tmp("ret-rand")).unwrap();
+    let rs = run(
+        &mut db,
+        "UNWIND range(1, 3) AS i CREATE (n:N {id: toString(rand())}) RETURN n.id AS v",
+        &none(),
+    );
+    assert_eq!(rs.len(), 3);
+    let mut seen: Vec<String> = (0..3).map(|i| format!("{:?}", rs.get(i, "v"))).collect();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 3, "each row returns its own node");
+    assert!(seen.iter().all(|v| !v.contains("None")));
+}
+
+#[test]
+fn return_projects_the_value_variables_and_properties_of_written_nodes() {
+    let mut db = GraphDb::open(&tmp("ret-values")).unwrap();
+    let rs = run(
+        &mut db,
+        "UNWIND $rows AS r CREATE (n:P {id: r.id, name: r.name}) \
+         RETURN r.id AS rid, n.name AS nm, n.id AS nid ORDER BY rid",
+        &rows_param(&["b", "a"]),
+    );
+    assert_eq!(rs.len(), 2);
+    assert_eq!(rs.get(0, "rid"), Some(&s("a")));
+    assert_eq!(rs.get(0, "nm"), Some(&s("name-a")));
+    assert_eq!(rs.get(1, "nid"), Some(&s("b")));
+}
+
+#[test]
+fn a_plain_delete_beside_many_created_edges_deletes_each_and_keeps_the_edges() {
+    let mut db = GraphDb::open(&tmp("delete-beside-edges")).unwrap();
+    run(
+        &mut db,
+        "UNWIND range(1, 2000) AS i CREATE (:X {id: toString(i)})",
+        &none(),
+    );
+    let rs = run(
+        &mut db,
+        "UNWIND [1] AS u MATCH (x:X) \
+         CREATE (a:N {id: toString(rand())})-[:T]->(b:N {id: toString(rand())}) DELETE x",
+        &none(),
+    );
+    assert_eq!(count(&rs, "created"), 4000);
+    assert_eq!(count(&rs, "deleted"), 2000);
+    assert_eq!(db.edge_count(), 2000);
+}
+
+#[test]
+fn a_node_deleted_in_the_statement_no_longer_holds_the_edges_made_to_it() {
+    let mut db = GraphDb::open(&tmp("delete-pending-edge")).unwrap();
+    run(&mut db, CREATE_PEOPLE, &rows_param(&["a"]));
+    // The edge is made, then its end is detached; a plain delete of the other
+    // end then finds no edge left in the statement.
+    let rs = run(
+        &mut db,
+        "UNWIND ['a'] AS k \
+         MERGE (n:Person {id: k})-[:T]->(m:Person {id: 'm'}) DETACH DELETE n DELETE m",
+        &none(),
+    );
+    assert_eq!(count(&rs, "deleted"), 2);
+    assert_eq!(db.edge_count(), 0);
+}
+
 // ── Scale ───────────────────────────────────────────────────────────────────
 
 #[test]

@@ -9,7 +9,7 @@ use core_storage::Value;
 
 fn write(q: &str) -> Result<UnwindWriteStmt, String> {
     match parse_write(&lex(q).unwrap())? {
-        WriteStatement::UnwindWrite(s) => Ok(s),
+        WriteStatement::UnwindWrite(s) => Ok(*s),
         other => panic!("expected UnwindWrite, got {other:?}"),
     }
 }
@@ -41,6 +41,20 @@ fn a_create_after_unwind_keeps_the_read_part_and_one_write_clause() {
                 field: "id".into()
             }
         )
+    );
+}
+
+#[test]
+fn the_statement_names_every_node_variable_including_the_ones_the_writes_bind() {
+    let s = write(
+        "UNWIND $rows AS r MATCH (m:A {id: r.id}) \
+         CREATE (n:B {id: r.b}) MERGE (k:C {id: r.c}) SET n.x = m.x + 1",
+    )
+    .unwrap();
+    assert_eq!(s.scope, vec!["r".to_string(), "m".to_string()]);
+    assert_eq!(
+        s.node_vars,
+        vec!["m".to_string(), "n".to_string(), "k".to_string()]
     );
 }
 

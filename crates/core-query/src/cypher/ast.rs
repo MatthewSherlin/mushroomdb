@@ -392,7 +392,7 @@ pub enum WriteStatement {
     Merge(MergeStmt),
     /// `UNWIND … [MATCH|WITH …]* <write clause>+ [RETURN …]`: the write clauses
     /// run once per row the read part produces.
-    UnwindWrite(UnwindWriteStmt),
+    UnwindWrite(Box<UnwindWriteStmt>),
 }
 
 /// `CREATE (a:L {id: 'x', ...})[-[:T]->(b:L2 {id: 'y', ...})] [RETURN …]`
@@ -589,6 +589,9 @@ pub struct UnwindWriteStmt {
     /// Names in scope at the end of the read part that hold a node or a value
     /// (not a relationship); a `RETURN` after the writes is evaluated with them.
     pub scope: Vec<String>,
+    /// Every name that holds a node at the end of the statement: the nodes of
+    /// the read part and the ones the write clauses create or merge.
+    pub node_vars: Vec<String>,
     /// The write clauses, in source order.
     pub writes: Vec<RowWrite>,
     /// Optional `RETURN [DISTINCT] … [ORDER BY …] [SKIP …] [LIMIT …]`.

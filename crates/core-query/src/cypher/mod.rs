@@ -11,7 +11,7 @@ pub use ast::{
     RelPat, RetItem, RetVal, RowCreateNode, RowMerge, RowMergeEdge, RowMergeNode, RowReturn,
     RowWrite, SetClause, UnwindClause, UnwindExpr, UnwindWriteStmt, WithStage, WriteStatement,
 };
-pub use exec::{execute, execute_union, Params};
+pub use exec::{eval_operand, execute, execute_union, Binding, Params};
 pub use lexer::{lex, Tok};
 pub use parser::{is_write_tokens, parse, parse_read, parse_write, UnionQuery};
 pub use plan::{is_subscribable, plan, PlanOp};

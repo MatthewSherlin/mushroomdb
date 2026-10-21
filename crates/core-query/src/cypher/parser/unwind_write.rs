@@ -104,6 +104,15 @@ impl Scope {
             .collect()
     }
 
+    /// The names that hold a node.
+    fn node_names(&self) -> Vec<String> {
+        self.vars
+            .iter()
+            .filter(|(_, kind)| *kind == VarKind::Node)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// The names that hold a node or a value.
     fn carried_names(&self) -> Vec<String> {
         self.vars
@@ -255,7 +264,7 @@ impl<'a> Parser<'a> {
         if self.pos < self.toks.len() {
             return Err(self.unsupported_or_unexpected("unexpected tokens after the write clauses"));
         }
-        Ok(WriteStatement::UnwindWrite(UnwindWriteStmt {
+        Ok(WriteStatement::UnwindWrite(Box::new(UnwindWriteStmt {
             read: Query {
                 matches: Vec::new(),
                 optional_clauses: Vec::new(),
@@ -270,9 +279,10 @@ impl<'a> Parser<'a> {
                 limit: None,
             },
             scope: read_scope,
+            node_vars: scope.node_names(),
             writes,
             returns,
-        }))
+        })))
     }
 
     /// `{key: expr, …}`: property values of a per-row CREATE or MERGE.

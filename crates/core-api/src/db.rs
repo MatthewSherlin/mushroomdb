@@ -36,6 +36,7 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
 
+mod row_eval;
 mod unwind_write;
 
 /// The reserved edge property holding a pair's insert count (§5.13).
@@ -12390,7 +12391,7 @@ impl<F: Fs> GraphDb<F> {
             WriteStatement::MatchDelete(s) => self.exec_match_delete(s, params),
             WriteStatement::MatchDeleteNode(s) => self.exec_match_delete_node(s, params),
             WriteStatement::Merge(s) => self.exec_merge(s, params),
-            WriteStatement::UnwindWrite(s) => self.exec_unwind_write(s, params),
+            WriteStatement::UnwindWrite(s) => self.exec_unwind_write(*s, params),
         }
     }
 
@@ -12615,9 +12616,26 @@ impl<F: Fs> GraphDb<F> {
         })?;
 
         // Collect (key, field, value) for each matched row × each SET clause.
+        //
+        // A value that reads a node's properties is evaluated as its turn comes,
+        // against what the statement has written so far, so two rows for one
+        // node (`MATCH (n), (m) SET n.c = n.c + 1`) and two items of one clause
+        // (`SET n.v = 10, n.w = n.v`) read each other's writes, as in openCypher.
+        // A value with no such read keeps its column from the MATCH.
+        let node_names = pattern_node_vars(&stmt.matches);
+        let dynamic: Vec<bool> = stmt
+            .sets
+            .iter()
+            .map(|sc| {
+                row_eval::reads_node(&sc.value, &node_names)
+                    && !row_eval::reads_node(&sc.value, &rel_vars)
+            })
+            .collect();
+        let any_dynamic = dynamic.iter().any(|d| *d);
+        let mut overlay = row_eval::Overlay::default();
         let mut set_ops: Vec<(String, String, Value)> = Vec::new();
         for row_i in 0..match_rs.len() {
-            for (sc, col) in stmt.sets.iter().zip(&set_val_cols) {
+            for ((sc, col), is_dynamic) in stmt.sets.iter().zip(&set_val_cols).zip(&dynamic) {
                 let key = match match_rs.get(row_i, &sc.var) {
                     Some(Value::Str(k)) => k.clone(),
                     _ => {
@@ -12629,18 +12647,28 @@ impl<F: Fs> GraphDb<F> {
                         })
                     }
                 };
-                // The SET value was already evaluated by the executor.
-                let value = match match_rs.get(row_i, col) {
-                    Some(v) => v.clone(),
-                    None => {
-                        return Err(GraphError::QueryError {
-                            detail: format!(
-                                "SET value for {}.{} evaluated to null",
-                                sc.var, sc.field
-                            ),
+                let evaluated = if *is_dynamic {
+                    let node_key = |name: &str| -> Option<Option<String>> {
+                        node_names.iter().any(|n| n == name).then(|| {
+                            match match_rs.get(row_i, name) {
+                                Some(Value::Str(k)) => Some(k.clone()),
+                                _ => None,
+                            }
                         })
-                    }
+                    };
+                    self.uw_eval(&mut overlay, &sc.value, &node_key, &[], params)?
+                } else {
+                    // The SET value was already evaluated by the executor.
+                    match_rs.get(row_i, col).cloned()
                 };
+                let Some(value) = evaluated.filter(|v| !matches!(v, Value::Null)) else {
+                    return Err(GraphError::QueryError {
+                        detail: format!("SET value for {}.{} evaluated to null", sc.var, sc.field),
+                    });
+                };
+                if any_dynamic {
+                    overlay.note_set(&key, &sc.field, &value);
+                }
                 set_ops.push((key, sc.field.clone(), value));
             }
         }
@@ -12754,6 +12782,11 @@ impl<F: Fs> GraphDb<F> {
         // One entry list per matched row, in row order. A node bound by several
         // rows is written by each in turn under `+=`; under `=` the last row's
         // map is the node's final state, so earlier rows for it are dropped.
+        let node_names = pattern_node_vars(&stmt.matches);
+        let map_dynamic = stmt.map.iter().any(|(_, operand)| {
+            row_eval::reads_node(operand, &node_names) && !row_eval::reads_node(operand, &rel_vars)
+        });
+        let mut overlay = row_eval::Overlay::default();
         let mut per_node: Vec<(String, MapEntries)> = Vec::new();
         for row_i in 0..match_rs.len() {
             let key = match match_rs.get(row_i, &stmt.var) {
@@ -12800,18 +12833,32 @@ impl<F: Fs> GraphDb<F> {
                 per_node.push((key, entries));
                 continue;
             }
-            let entries: MapEntries = stmt
-                .map
-                .iter()
-                .zip(&value_cols)
-                .map(|((field, _), col)| {
-                    let value = match match_rs.get(row_i, col) {
+            let mut entries: MapEntries = Vec::with_capacity(stmt.map.len());
+            for ((field, operand), col) in stmt.map.iter().zip(&value_cols) {
+                let value = if row_eval::reads_node(operand, &node_names)
+                    && !row_eval::reads_node(operand, &rel_vars)
+                {
+                    // Read as its turn comes, against the statement's own writes.
+                    let node_key = |name: &str| -> Option<Option<String>> {
+                        node_names.iter().any(|n| n == name).then(|| {
+                            match match_rs.get(row_i, name) {
+                                Some(Value::Str(k)) => Some(k.clone()),
+                                _ => None,
+                            }
+                        })
+                    };
+                    self.uw_eval(&mut overlay, operand, &node_key, &[], params)?
+                } else {
+                    match match_rs.get(row_i, col) {
                         None | Some(Value::Null) => None,
                         Some(v) => Some(v.clone()),
-                    };
-                    (field.clone(), value)
-                })
-                .collect();
+                    }
+                };
+                entries.push((field.clone(), value));
+            }
+            if map_dynamic {
+                self.uw_apply_map(&mut overlay, &key, stmt.merge, &entries);
+            }
             if !stmt.merge {
                 per_node.retain(|(k, _)| k != &key);
             }

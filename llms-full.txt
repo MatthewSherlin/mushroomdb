@@ -5111,6 +5111,10 @@ SET n.score = 99
 - Multiple SET clauses in one statement are allowed.
 - Combined MATCH … SET … RETURN is supported: the write commits, then RETURN
   projects from the post-write view.
+- A value that reads a property (`n.count + 1`) reads what the statement has set
+  so far: when two matched rows bind the same node (`MATCH (n:C), (m:D) SET
+  n.count = n.count + 1`), the count goes up once per row, and in `SET n.v = 10,
+  n.w = n.v + 0` the second item reads 10.
 - When a SET touches a property that a rule evaluates, the rule engine
   re-evaluates incrementally: derived edges appear or retract within the same
   WAL frame.
@@ -5292,23 +5296,36 @@ MERGE (n:Person {id: r.id})
   constraint, a refused `id` or namespace write, a role scope) writes nothing.
   Every write meets the same checks as a single `CREATE`, `MERGE` or `SET`, and
   rules re-evaluate for every assignment.
-- **A row sees the rows before it.** `UNWIND [1, 1] AS x MERGE (:N {id: x})`
-  creates one node; a `MERGE` after a `CREATE` of the same key in the same
-  statement finds it. A `CREATE` of a key that exists, or that an earlier row
-  already created, is a `DuplicateKey` error.
+- **A row sees the rows before it, and a clause the clause before it.** The
+  writes run in order, row by row, and each reads what the statement has written
+  so far, node properties included. `UNWIND [1, 1] AS x MERGE (:N {id: x})`
+  creates one node. `UNWIND [1, 1] AS x MATCH (n:C {id: 'c'}) SET n.count =
+  n.count + 1` adds two, because the second row reads the first row's `count`.
+  `SET n.v = 10 SET n.w = n.v` sets `w` to 10. `UNWIND $keys AS k MERGE (n:C {id:
+  k}) ON CREATE SET n.count = 1 ON MATCH SET n.count = n.count + 1` counts each
+  key as often as it occurs in the list. A `MERGE` after a `CREATE` of the same
+  key in the same statement finds it. A `CREATE` of a key that exists, or that an
+  earlier row already created, is a `DuplicateKey` error.
 - **Reads come first.** The `MATCH`, `WITH` and `WHERE` run once, against the
-  state before the statement, and every value a write needs is computed from that
-  result. A `MATCH`, `UNWIND` or `WITH` after a write clause is refused by name.
-  A row whose `MATCH` found no node writes nothing; an `OPTIONAL MATCH` that found
-  none skips the `SET`, `REMOVE` and `DELETE` that name it.
+  state before the statement, so which rows exist and which nodes they bind do
+  not change as the writes go: a node a `MATCH` found is still a row after an
+  earlier row deleted it, and a row is not added because an earlier row created a
+  node the `MATCH` would now find. Only the values written read the statement's
+  own writes. A `MATCH`, `UNWIND` or `WITH` after a write clause is refused by
+  name. A row whose `MATCH` found no node writes nothing; an `OPTIONAL MATCH`
+  that found none skips the `SET`, `REMOVE` and `DELETE` that name it.
 - **Null.** A property whose value is null in `CREATE` is left out, so a sparse
   row creates a node without it. `SET n.f = <null>` is an error, as for a single
   `SET`; in a map, a null entry removes the property under `+=` and is an absent
   key under `=`. A `MERGE` key must be a string.
-- **`RETURN`.** Evaluated after the commit: the read part runs again and finds
-  each created or merged node by its key, so `RETURN n.name`, `RETURN count(*)`
-  and `ORDER BY` / `SKIP` / `LIMIT` work. A node deleted by the statement is
-  no longer there to return.
+- **`RETURN`.** One row for each row the writes ran for, in order, after the
+  commit. The read part is not run again: each row keeps the nodes and values it
+  wrote with, and `RETURN` reads their properties from the committed state, so a
+  `SET` of a property the `MATCH` filtered on still returns its row (with the new
+  value), `DETACH DELETE n RETURN count(*)` counts the deleted rows, and a
+  `CREATE` with a `rand()` key returns the nodes it created. `RETURN n.name`,
+  `RETURN count(*)`, `DISTINCT` and `ORDER BY` / `SKIP` / `LIMIT` work. A node the
+  statement deleted reads as null.
 - **Counts.** Without `RETURN` the row is `created` (nodes inserted),
   `properties_set` (properties set, plus those removed that existed) and
   `deleted` (nodes deleted).
