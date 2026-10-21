@@ -120,6 +120,24 @@ jobs:
       # MUSHROOMDB_VECTOR_SCAN=1 takes 147 s to create and also scores 1.0000.
       - run: cargo test --release -p sim-harness -- exact_vector_rule_recall_5k --ignored --nocapture
 
+  # The 0.10 concurrency gate (TX-7). Unlike the timing benches above, this one
+  # runs on every push, because it is what holds the lock-free reader to its
+  # promise: on a 10k-node store with a writer committing 50 times a second,
+  # 16 concurrent neighbourhood reads keep p50 <= 0.5 ms and p99 <= 2 ms. It
+  # also holds the writer where the owner accepted it on 2026-10-21: a plain
+  # commit under readers within 2x its cost alone while they complete
+  # >= 10k reads/s (about 1.4x was measured; 1.16-1.21x v0.9.2). Reader and
+  # writer threads are capped by the runner's cores, so a small runner times
+  # the code, not the scheduler. Release only: the test is #[ignore]d out of
+  # the debug workspace run.
+  concurrency-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # 1.92.0
+        with: { toolchain: "1.92.0" }
+      - run: cargo test --release -p core-bench --test concurrency_gate -- concurrency_gate --ignored --nocapture
+
   # Every historical snapshot format (V5..V9) must open, migrate, and preserve
   # data, forever. Naming this job separately means a regression says
   # "format-compat" in CI, not the generic "test" job name.
