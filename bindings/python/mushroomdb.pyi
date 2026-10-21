@@ -186,6 +186,23 @@ class MushroomBusy(MushroomError):
     code: str
     holder: int | None
 
+class Unwritable(MushroomError):
+    """The store's data directory is not writable by this process.
+
+    The filesystem refused permission (`EACCES`, `EPERM` or a read-only mount)
+    on the directory or a file the store must create in it. This is a
+    deployment fault, not contention: it is not `MushroomBusy`, and retrying
+    cannot help until the directory's ownership or mount changes. The message
+    names the path, the effective uid, the directory's owner and mode, and what
+    to change.
+
+    `path` is the file or directory refused; `detail` is also the message.
+    """
+
+    code: str
+    path: str
+    detail: str
+
 class NamespaceImmutable(MushroomError):
     """A namespace is set at insert and fixed for the node's lifetime.
 

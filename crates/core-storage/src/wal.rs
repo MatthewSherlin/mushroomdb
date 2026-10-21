@@ -206,6 +206,26 @@ pub enum WalRecord {
     DropConstraint {
         name: String,
     },
+    // ── Range-index variants (appended after the constraints; 26, 27) ────────
+    //
+    // Declarations only, like `EnableIndex`: the postings are rebuilt from
+    // live data at open, never persisted. A range index is a named index on
+    // `(label, field)` that answers range and prefix lookups as well as exact
+    // ones; it shares its postings with an `EnableIndex` on the same pair.
+    //
+    // Format-V11 records: a 0.9.x reader cannot decode them, so they reach the
+    // WAL only once the V11 format is in place (0.10 TY-12).
+    /// Declare the range index `name` on `(label, field)`. Discriminant 26.
+    EnableRangeIndex {
+        name: String,
+        label: String,
+        field: String,
+    },
+    /// Withdraw the range index `name`. An `EnableIndex` on the same pair
+    /// stays. Discriminant 27.
+    DisableRangeIndex {
+        name: String,
+    },
 }
 
 /// The opt-in declaration: this store records insert-count multiplicity.
@@ -1046,6 +1066,39 @@ mod tests {
         let (recs, consumed) = decode_all(&bytes);
         assert_eq!(consumed, bytes.len());
         assert_eq!(recs, vec![create, drop]);
+    }
+
+    /// Pin discriminants 26 (EnableRangeIndex) and 27 (DisableRangeIndex).
+    ///
+    /// **If this test fails you have broken every existing database file.**
+    /// WAL variants must ONLY be appended — never reordered or inserted.
+    #[test]
+    fn range_index_discriminants_pinned() {
+        let enable = WalRecord::EnableRangeIndex {
+            name: "idx_score".into(),
+            label: "Score".into(),
+            field: "val".into(),
+        };
+        let ep = bincode::serialize(&enable).unwrap();
+        assert_eq!(
+            &ep[0..4],
+            &[26, 0, 0, 0],
+            "EnableRangeIndex discriminant changed — a variant was inserted before position 26"
+        );
+        let disable = WalRecord::DisableRangeIndex {
+            name: "idx_score".into(),
+        };
+        let dp = bincode::serialize(&disable).unwrap();
+        assert_eq!(
+            &dp[0..4],
+            &[27, 0, 0, 0],
+            "DisableRangeIndex discriminant changed — a variant was inserted before position 27"
+        );
+        let mut bytes = encode_record(&enable);
+        bytes.extend(encode_record(&disable));
+        let (recs, consumed) = decode_all(&bytes);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(recs, vec![enable, disable]);
     }
 
     /// The opt-in declaration and a real count share the discriminant and are

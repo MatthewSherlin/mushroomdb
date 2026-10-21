@@ -10,7 +10,9 @@ use core_query::cypher::{
     plan, Expr, MatchDeleteNodeStmt, NodePat, Operand, Params, Pattern, PlanOp, Query, RetItem,
     RetVal, WriteStatement,
 };
-use core_query::{eval_cmp, eval_filter, expand, neighborhood, Dir, Filter, GraphView, ResultSet};
+use core_query::{
+    eval_cmp, eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet,
+};
 use core_rules::{
     decode_rule_def, ef_max, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView,
     Predicate, RuleDef, RuleEngine, ViewDef, ViewStore,
@@ -390,6 +392,8 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
         | WalRecord::DisableIndex { .. }
         | WalRecord::CreateConstraint { .. }
         | WalRecord::DropConstraint { .. }
+        | WalRecord::EnableRangeIndex { .. }
+        | WalRecord::DisableRangeIndex { .. }
         | WalRecord::Intern { .. }
         // History markers are no-ops for mutation events — they carry no new
         // state and rules re-derive deterministically on replay.
@@ -404,8 +408,8 @@ fn event_from_record(rec: &WalRecord, intern: &Interner, ids: &IdMap) -> Option<
 }
 
 /// Whether `rec` only declares or withdraws something about the store — a
-/// full-text pair, an equality index, a unique constraint, the multiplicity
-/// opt-in — and writes no
+/// full-text pair, an equality or range index, a unique constraint, the
+/// multiplicity opt-in — and writes no
 /// node, edge or property. These are the records a truncating snapshot
 /// re-emits into its baseline WAL.
 fn is_declaration(rec: &WalRecord) -> bool {
@@ -417,6 +421,8 @@ fn is_declaration(rec: &WalRecord) -> bool {
             | WalRecord::DisableIndex { .. }
             | WalRecord::CreateConstraint { .. }
             | WalRecord::DropConstraint { .. }
+            | WalRecord::EnableRangeIndex { .. }
+            | WalRecord::DisableRangeIndex { .. }
     ) || *rec == core_storage::wal::MULTIPLICITY_ENABLED
 }
 
@@ -1672,6 +1678,11 @@ pub struct GraphDb<F: Fs> {
     /// [`rewrite_wal_dense_planned`](Self::rewrite_wal_dense_planned). Replay
     /// never checks them.
     constraints: Vec<UniqueConstraint>,
+    /// The `(label, field)` equality indexes this open dropped because a view
+    /// owns the property (ledger row 123). Empty for every store written
+    /// since the refusal. Not persisted: a reopen finds the same pairs again
+    /// until a snapshot stops re-emitting their declarations.
+    dropped_view_indexes: Vec<(String, String)>,
     /// Lets format-V11 values and records reach the WAL on this handle.
     ///
     /// Always `false` outside tests: until the V11 format lands (0.10 TY-12)
@@ -1950,6 +1961,11 @@ pub struct GraphDb<F: Fs> {
     /// that failed. Makes every WAL-appending mutation in that scope return
     /// [`GraphError::Busy`] instead of writing.
     lock_denied: bool,
+    /// Set with `lock_denied` when the lock attempt failed with an I/O error
+    /// rather than because a peer holds it (a refused permission, or any other
+    /// fault opening `LOCK`). Makes those mutations report the real cause, never
+    /// `Busy`, which is reserved for a lock another process holds.
+    lock_failure: Option<GraphError>,
     /// True for an as-of view opened via [`GraphDb::open_at`]. Such a view is
     /// pinned to one commit, so it is never stale and never refreshes — later
     /// commits by any process are deliberately invisible to it.
@@ -2481,6 +2497,39 @@ impl GraphDb<RealFs> {
     }
 }
 
+/// Where two values the scan can find equal always share a bucket: numbers by
+/// the bit pattern of their `f64` (so `Int` 2, `Float` 2.0, and both zeros
+/// meet), every other indexable value by its index key. `None` for a value
+/// that equals nothing a constraint could hold — `NaN`, or one with no index
+/// key (list, map, duration).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum EqualityBucket {
+    Number(u64),
+    Key(ValueKey),
+}
+
+///
+/// **TY-6 (the create-time scan over existing data) must group values with
+/// this and compare each bucket with `values_equal`, never by `ValueKey`: a
+/// `ValueKey` keeps `Int` 2 and `Float` 2.0 apart, so a scan keyed on it would
+/// accept a store the write path then refuses.
+pub(crate) fn equality_bucket(value: &Value) -> Option<EqualityBucket> {
+    let number = |f: f64| {
+        if f.is_nan() {
+            None
+        } else if f == 0.0 {
+            Some(EqualityBucket::Number(0.0_f64.to_bits()))
+        } else {
+            Some(EqualityBucket::Number(f.to_bits()))
+        }
+    };
+    match value {
+        Value::Int(i) => number(*i as f64),
+        Value::Float(f) => number(*f),
+        other => ValueKey::from_value(other).map(EqualityBucket::Key),
+    }
+}
+
 impl<F: Fs> GraphDb<F> {
     /// Open over an arbitrary [`Fs`], repairing a torn WAL tail as usual.
     pub fn open_with(fs: F) -> Result<Self> {
@@ -2543,6 +2592,7 @@ impl<F: Fs> GraphDb<F> {
             prop_index: PropertyIndex::new(),
             multiplicity: false,
             constraints: Vec::new(),
+            dropped_view_indexes: Vec::new(),
             v11_unlocked: false,
             event_sink: None,
             fsync: FsyncPolicy::Strict,
@@ -2602,6 +2652,7 @@ impl<F: Fs> GraphDb<F> {
             open_opts: opts,
             holds_lifetime_lock: false,
             lock_denied: false,
+            lock_failure: None,
             pinned: false,
             base_edge_count_from_rows: None,
             last_apply_retraction_count: 0,
@@ -2633,6 +2684,7 @@ impl<F: Fs> GraphDb<F> {
         // WAL, and the opt-in comes back from it or not at all.
         self.multiplicity = false;
         self.constraints = Vec::new();
+        self.dropped_view_indexes = Vec::new();
         self.commit_seq = 0;
         self.commit_times = core_storage::commit_times::CommitTimes::default();
         self.commit_times_poisoned = false;
@@ -2999,6 +3051,7 @@ impl<F: Fs> GraphDb<F> {
             );
         }
         trace_open!("full-text index ready", _t0);
+        db.drop_indexes_over_view_properties();
         db.prop_index.rebuild_all(
             &db.ids,
             &db.labels,
@@ -3320,7 +3373,25 @@ impl<F: Fs> GraphDb<F> {
         if self.holds_lifetime_lock {
             return Ok(true);
         }
-        self.fs.try_lock_exclusive().map_err(GraphError::Io)
+        self.fs.try_lock_exclusive().map_err(|e| {
+            // A filesystem that refuses to create or open `LOCK` is a deployment
+            // fault, not a peer holding the lock: say which, so the caller never
+            // reports it as `Busy`.
+            match (
+                core_storage::fs::is_permission_refusal(&e),
+                self.fs.wal_path(),
+            ) {
+                (true, Some(wal)) => match wal.parent() {
+                    Some(dir) => core_storage::fs::unwritable_error(
+                        dir,
+                        &dir.join(core_storage::fs::LOCK_FILE),
+                        &e,
+                    ),
+                    None => GraphError::Io(e),
+                },
+                _ => GraphError::Io(e),
+            }
+        })
     }
 
     /// Poll for the cross-process write lock until `wait` elapses.
@@ -3362,6 +3433,7 @@ impl<F: Fs> GraphDb<F> {
     /// no other process can have written, so there is nothing to pick up.
     pub(crate) fn enter_write_scope(&mut self, acquired: bool) -> Result<()> {
         self.lock_denied = !acquired;
+        self.lock_failure = None;
         if !acquired || self.holds_lifetime_lock {
             return Ok(());
         }
@@ -3375,11 +3447,27 @@ impl<F: Fs> GraphDb<F> {
         Ok(())
     }
 
+    /// Record why a lock attempt failed, for the scope [`enter_write_scope`]
+    /// (with `false`) is about to open: an [`GraphError::Unwritable`] or
+    /// [`GraphError::Io`] is kept and reported instead of [`GraphError::Busy`].
+    pub(crate) fn note_lock_failure(&mut self, err: &GraphError) {
+        self.lock_failure = copy_lock_failure(err);
+    }
+
+    /// The error a mutation returns while the write scope is denied.
+    fn lock_denied_error(&self) -> GraphError {
+        self.lock_failure
+            .as_ref()
+            .and_then(copy_lock_failure)
+            .unwrap_or(GraphError::Busy { holder: None })
+    }
+
     /// Close a cross-process write scope opened by
     /// [`enter_write_scope`](GraphDb::enter_write_scope): release the lock and
     /// clear the Busy latch. Safe to call when the lock was never taken.
     pub(crate) fn end_write_lock(&mut self) {
         self.lock_denied = false;
+        self.lock_failure = None;
         if !self.holds_lifetime_lock {
             // Releasing a lock we do not hold is a no-op; a failure to release
             // is reported by the OS closing the descriptor at handle drop.
@@ -3956,6 +4044,7 @@ impl<F: Fs> GraphDb<F> {
             &db.syms,
             build_props_view(&db.props, &db.base),
         );
+        db.drop_indexes_over_view_properties();
         db.prop_index.rebuild_all(
             &db.ids,
             &db.labels,
@@ -5311,36 +5400,37 @@ impl<F: Fs> GraphDb<F> {
                 Arc::make_mut(&mut self.fulltext).disable(label, field);
             }
             WalRecord::EnableIndex { label, field } => {
-                // Replay-over-snapshot idempotency: already enabled → skip.
-                if self.prop_index.is_enabled(label, field) {
+                // Replay-over-snapshot idempotency: already declared → skip.
+                if self.prop_index.is_equality_declared(label, field) {
                     return Ok(());
                 }
+                // A pair a range index maintains already has its postings.
+                let maintained = self.prop_index.is_enabled(label, field);
                 self.prop_index.enable(label, field);
-                // Backfill: index all live nodes of this label that have the field.
-                let n = self.ids.len() as u32;
-                for id in 0..n {
-                    let Some(&sym) = self.labels.get(id as usize) else {
-                        continue;
-                    };
-                    if sym == u32::MAX {
-                        continue; // tombstoned
-                    }
-                    let Some(lbl) = self.syms.resolve(sym) else {
-                        continue;
-                    };
-                    if lbl != label {
-                        continue;
-                    }
-                    if let Some(value) = build_props_view(&self.props, &self.base)
-                        .get(id, field)
-                        .map(|vr| vr.into_value())
-                    {
-                        self.prop_index.set(label, field, id, &value);
-                    }
+                if !maintained {
+                    self.backfill_prop_index(label, field);
                 }
             }
             WalRecord::DisableIndex { label, field } => {
                 self.prop_index.disable(label, field);
+            }
+            // A declaration: the postings come from the backfill here on a live
+            // or refreshed handle, and from `rebuild_all` at the end of an open.
+            WalRecord::EnableRangeIndex { name, label, field } => {
+                // Replay-over-snapshot idempotency: already declared → skip.
+                if self.prop_index.range_index(name).is_some() {
+                    return Ok(());
+                }
+                let maintained = self.prop_index.is_enabled(label, field);
+                self.prop_index.enable_range(name, label, field);
+                // The open rebuilds every declared pair once replay is done, so
+                // a scan here would be thrown away.
+                if !maintained && !self.replaying_at_open {
+                    self.backfill_prop_index(label, field);
+                }
+            }
+            WalRecord::DisableRangeIndex { name } => {
+                self.prop_index.disable_range(name);
             }
             // A declaration only: the data it covers is never checked here.
             // Replay must not fail on duplicates written before the constraint
@@ -5350,8 +5440,10 @@ impl<F: Fs> GraphDb<F> {
                 if self.constraints.iter().any(|c| &c.name == name) {
                     return Ok(());
                 }
-                // The backing index comes with the declaration.
-                if !self.prop_index.is_enabled(label, field) {
+                // The backing index comes with the declaration. It is an
+                // equality declaration even over a range-indexed pair, so that
+                // dropping the range index leaves the constraint its index.
+                if !self.prop_index.is_equality_declared(label, field) {
                     self.apply(&WalRecord::EnableIndex {
                         label: label.clone(),
                         field: field.clone(),
@@ -5413,6 +5505,33 @@ impl<F: Fs> GraphDb<F> {
             }
         }
         Ok(())
+    }
+
+    /// Index every live node of `label` that holds `field` under the declared
+    /// pair `(label, field)`: the scan a new declaration needs on a handle
+    /// whose open has already rebuilt its indexes.
+    fn backfill_prop_index(&mut self, label: &str, field: &str) {
+        let n = self.ids.len() as u32;
+        for id in 0..n {
+            let Some(&sym) = self.labels.get(id as usize) else {
+                continue;
+            };
+            if sym == u32::MAX {
+                continue; // tombstoned
+            }
+            let Some(lbl) = self.syms.resolve(sym) else {
+                continue;
+            };
+            if lbl != label {
+                continue;
+            }
+            if let Some(value) = build_props_view(&self.props, &self.base)
+                .get(id, field)
+                .map(|vr| vr.into_value())
+            {
+                self.prop_index.set(label, field, id, &value);
+            }
+        }
     }
 
     /// Intern `s` in `syms` and emit a WAL `Intern` record so `*Id` records
@@ -5841,12 +5960,10 @@ impl<F: Fs> GraphDb<F> {
         }
 
         let committed = self.ids.len();
-        let postings: Vec<_> = self
-            .constraints
-            .iter()
-            .map(|c| self.prop_index.postings(&c.label, &c.field))
-            .collect();
-        let mut claimed: HashSet<(usize, ValueKey)> = HashSet::new();
+        // What earlier nodes of this frame hold, per constraint, in the
+        // bucket `equality_bucket` gives; values in one bucket are compared
+        // with `values_equal`, the scan's own equality.
+        let mut claimed: HashMap<(usize, EqualityBucket), Vec<Value>> = HashMap::new();
         for &id in &touched {
             if dead.contains(&id) {
                 continue;
@@ -5877,27 +5994,31 @@ impl<F: Fs> GraphDb<F> {
                 let Some(value) = value else {
                     continue;
                 };
-                let Some(key) = ValueKey::from_value(&value) else {
+                // A value no scan can find equal to another — one with no
+                // index key, or a NaN — never conflicts.
+                let Some(bucket) = equality_bucket(&value) else {
                     continue;
                 };
                 let violation = || GraphError::ConstraintViolation {
                     constraint: c.name.clone(),
                     field: c.field.clone(),
                 };
-                // A holder the frame does not touch keeps its value.
-                if postings[ci]
-                    .and_then(|by_value| by_value.get(&key))
-                    .is_some_and(|holders| {
-                        holders
-                            .iter()
-                            .any(|holder| *holder != id && !touched.contains(holder))
-                    })
+                // A holder the frame does not touch keeps its value. The
+                // index answers as the scan does: an `Int` finds the equal
+                // `Float`, and the reverse.
+                if self
+                    .prop_index
+                    .lookup(&c.label, &c.field, &value)
+                    .into_iter()
+                    .any(|holder| holder != id && !touched.contains(&holder))
                 {
                     return Err(violation());
                 }
-                if !claimed.insert((ci, key)) {
+                let held = claimed.entry((ci, bucket)).or_default();
+                if held.iter().any(|other| values_equal(other, &value)) {
                     return Err(violation());
                 }
+                held.push(value);
             }
         }
         Ok(())
@@ -6326,7 +6447,7 @@ impl<F: Fs> GraphDb<F> {
         // lock and did not get it. Writing anyway would append frames on top of
         // a WAL another process is extending, so refuse instead.
         if self.lock_denied {
-            return Err(GraphError::Busy { holder: None });
+            return Err(self.lock_denied_error());
         }
         // Ensure retained provenance bytes are decoded into the live mutable
         // fields before any mutation touches self.engine.provenance.  This is a
@@ -7095,6 +7216,8 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::DisableIndex { .. }
             | WalRecord::CreateConstraint { .. }
             | WalRecord::DropConstraint { .. }
+            | WalRecord::EnableRangeIndex { .. }
+            | WalRecord::DisableRangeIndex { .. }
             | WalRecord::Intern { .. }
             // History markers produce no DbEvent — the engine delta already
             // fired the EdgeFired/EdgeRetracted subscription events.
@@ -8391,7 +8514,8 @@ impl<F: Fs> GraphDb<F> {
     /// # Errors
     /// - `ReadOnly`: called on an as-of instance.
     /// - `RuleInvalid`: name collision, view_prop collision, or invalid def.
-    /// - `QueryError`: a unique constraint covers `(label, view_prop)`.
+    /// - `QueryError`: a unique constraint, an equality index or a range index
+    ///   covers `(label, view_prop)`.
     pub fn create_view(&mut self, def: ViewDef) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
@@ -8416,6 +8540,31 @@ impl<F: Fs> GraphDb<F> {
                     "property '{}' on label '{}' is declared unique by constraint '{}'; a view \
                      cannot own it",
                     def.view_prop, def.label, c.name
+                ),
+            });
+        }
+        // A view writes its property without passing the property index, so a
+        // range index over it would answer from stale postings until the next
+        // open rebuilt them.
+        if let Some(index) = self.prop_index.range_index_on(&def.label, &def.view_prop) {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{}' on label '{}' is covered by range index '{index}'; a view \
+                     cannot own it",
+                    def.view_prop, def.label
+                ),
+            });
+        }
+        // The same for an equality index (ledger row 123).
+        if self
+            .prop_index
+            .is_equality_declared(&def.label, &def.view_prop)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{}' on label '{}' is covered by an equality index; a view cannot \
+                     own it",
+                    def.view_prop, def.label
                 ),
             });
         }
@@ -8762,12 +8911,39 @@ impl<F: Fs> GraphDb<F> {
     ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
-    /// - [`GraphError::RuleInvalid`]: `(label, field)` is already indexed.
+    /// - [`GraphError::RuleInvalid`]: `(label, field)` is already indexed, by
+    ///   an equality index or by a range index (named in the error).
+    /// - [`GraphError::QueryError`]: a view owns `(label, field)`.
     pub fn enable_index(&mut self, label: &str, field: &str) -> Result<()> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
+        // A view writes its property inside `apply` without passing the
+        // property index, so an equality index over it would answer from
+        // stale postings until the next open rebuilt them (ledger row 123).
+        if let Some(view) = self
+            .view_store
+            .views()
+            .find(|v| v.label == label && v.view_prop == field)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{field}' on label '{label}' is owned by view '{}'; an equality \
+                     index cannot cover it",
+                    view.name
+                ),
+            });
+        }
         if self.prop_index.is_enabled(label, field) {
+            // A range index already answers equality on the pair.
+            if let Some(index) = self.prop_index.range_index_on(label, field) {
+                return Err(GraphError::RuleInvalid {
+                    detail: format!(
+                        "property index for ({label:?}, {field:?}) already enabled: range index \
+                         '{index}' covers it"
+                    ),
+                });
+            }
             return Err(GraphError::RuleInvalid {
                 detail: format!("property index for ({label:?}, {field:?}) already enabled"),
             });
@@ -8787,7 +8963,16 @@ impl<F: Fs> GraphDb<F> {
         if self.read_only {
             return Err(GraphError::ReadOnly);
         }
-        if !self.prop_index.is_enabled(label, field) {
+        if !self.prop_index.is_equality_declared(label, field) {
+            // A pair only a range index covers is withdrawn by that index's name.
+            if let Some(index) = self.prop_index.range_index_on(label, field) {
+                return Err(GraphError::QueryError {
+                    detail: format!(
+                        "the index on ({label}, {field}) is range index '{index}'; drop it with \
+                         disable_range_index"
+                    ),
+                });
+            }
             return Err(GraphError::RuleNotFound {
                 name: format!("index({label},{field})"),
             });
@@ -8813,6 +8998,108 @@ impl<F: Fs> GraphDb<F> {
         })
     }
 
+    /// Declare the range index `name` on `(label, field)`.
+    ///
+    /// A range index answers range (`<`, `<=`, `>`, `>=`), `STARTS WITH` and
+    /// exact-match lookups over the field's scalar values, for nodes of
+    /// `label`. Existing nodes are indexed at once; the declaration is one WAL
+    /// record, and the postings are rebuilt from the stored values at every
+    /// open. An equality index on the same pair shares the postings and is
+    /// unaffected by this or by [`disable_range_index`](Self::disable_range_index).
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::QueryError`]: a range index named `name` already
+    ///   exists; `(label, field)` already has a range index; a view owns
+    ///   `(label, field)`; or, until the V11 format lands, always — an
+    ///   `EnableRangeIndex` record is format-V11 and a 0.9.x reader cannot
+    ///   decode it.
+    pub fn enable_range_index(&mut self, name: &str, label: &str, field: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if self.prop_index.range_index(name).is_some() {
+            return Err(GraphError::QueryError {
+                detail: format!("a range index named '{name}' already exists"),
+            });
+        }
+        if let Some(existing) = self.prop_index.range_index_on(label, field) {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{field}' on label '{label}' already has range index '{existing}'"
+                ),
+            });
+        }
+        // A view writes its property inside `apply` without passing the
+        // property index, so the postings would go stale under it.
+        if let Some(view) = self
+            .view_store
+            .views()
+            .find(|v| v.label == label && v.view_prop == field)
+        {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "property '{field}' on label '{label}' is owned by view '{}'; a range index \
+                     cannot cover it",
+                    view.name
+                ),
+            });
+        }
+        self.log_dense(vec![WalRecord::EnableRangeIndex {
+            name: name.into(),
+            label: label.into(),
+            field: field.into(),
+        }])
+    }
+
+    /// Withdraw the range index `name`. An equality index on the same pair —
+    /// from [`enable_index`](Self::enable_index) or a unique constraint —
+    /// stays; otherwise the pair is no longer indexed.
+    ///
+    /// # Errors
+    /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::QueryError`]: no range index is named `name`; or, until
+    ///   the V11 format lands, the refusal `enable_range_index` documents.
+    pub fn disable_range_index(&mut self, name: &str) -> Result<()> {
+        if self.read_only {
+            return Err(GraphError::ReadOnly);
+        }
+        if self.prop_index.range_index(name).is_none() {
+            return Err(GraphError::QueryError {
+                detail: format!("no range index named '{name}'"),
+            });
+        }
+        self.log_dense(vec![WalRecord::DisableRangeIndex { name: name.into() }])
+    }
+
+    /// The declared range indexes as `(name, label, field)`, sorted by name.
+    pub fn range_indexes(&self) -> Vec<(String, String, String)> {
+        self.prop_index
+            .range_indexes()
+            .map(|(name, (label, field))| (name.clone(), label.clone(), field.clone()))
+            .collect()
+    }
+
+    /// The node keys the range index on `(label, field)` holds between `lo`
+    /// and `hi`, in index order — the answer
+    /// [`UnifiedIndex::lookup_range`](core_storage::UnifiedIndex::lookup_range)
+    /// gives, by key. Lets tests compare the postings across a reopen, a
+    /// snapshot and `open_at` until the planner reads them (0.10 TY-10).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn range_lookup_keys_for_test(
+        &self,
+        label: &str,
+        field: &str,
+        lo: Option<(&Value, bool)>,
+        hi: Option<(&Value, bool)>,
+    ) -> Vec<String> {
+        self.prop_index
+            .lookup_range(label, field, lo, hi)
+            .filter_map(|id| self.ids.key_of(id).map(str::to_string))
+            .collect()
+    }
+
     /// Declare a unique constraint: no two live nodes of `label` may hold equal
     /// values for `field`.
     ///
@@ -8822,8 +9109,10 @@ impl<F: Fs> GraphDb<F> {
     /// are one commit. From then on every write that would give a second node
     /// of `label` a value already held fails with
     /// [`GraphError::ConstraintViolation`] and writes nothing. Values compare
-    /// as index keys: two `DateTime`s at one UTC instant are equal whatever
-    /// their offsets, and a list, map or `Duration` never conflicts.
+    /// as a query's `=` does: `Int` 2 and `Float` 2.0 are one value, so are the two zeros
+    /// and every `Int` that rounds to a `Float`, `NaN` equals nothing, two `DateTime`s at one
+    /// UTC instant are equal whatever their offsets, and a list, map or `Duration` never
+    /// conflicts.
     ///
     /// The existing data is not checked here; a store that already holds
     /// duplicates keeps them (the pre-scan is 0.10 TY-6).
@@ -10666,6 +10955,44 @@ impl<F: Fs> GraphDb<F> {
         // updated role definitions without waiting for the next K-commit fold.
         self.fold_now();
         Ok(())
+    }
+
+    /// Forget the equality indexes that cover a property a view owns.
+    ///
+    /// A view writes its property without passing the property index, so such
+    /// an index answers from stale postings while the handle lives (ledger row
+    /// 123). Declaring one is refused now (`enable_index`, `create_view`), but
+    /// a store written before the refusal can hold both, and must still open
+    /// and answer correctly: the pair is dropped in memory, so a query on it
+    /// scans, and the next snapshot no longer re-emits the declaration. Runs
+    /// once, after replay, before the postings are built.
+    fn drop_indexes_over_view_properties(&mut self) {
+        let owned: Vec<(String, String)> = self
+            .view_store
+            .views()
+            .filter(|v| self.prop_index.is_equality_declared(&v.label, &v.view_prop))
+            .map(|v| (v.label.clone(), v.view_prop.clone()))
+            .collect();
+        for (label, field) in owned {
+            self.prop_index.disable(&label, &field);
+            // Once per pair per open: the only signal that a query on it now
+            // scans, where the declaration said it would not.
+            eprintln!(
+                "[mushroomdb] dropped the equality index on ({label}, {field}): a view owns \
+                 property '{field}' on label '{label}', so the index would answer from stale \
+                 values. Queries on it are answered by scan; the next snapshot no longer \
+                 carries the declaration."
+            );
+            self.dropped_view_indexes.push((label, field));
+        }
+    }
+
+    /// The `(label, field)` equality indexes the open of this handle dropped
+    /// because a view owns the property (ledger row 123), in view order. Empty
+    /// unless the store was written before `enable_index` and `create_view`
+    /// refused the combination.
+    pub fn dropped_view_indexes(&self) -> &[(String, String)] {
+        &self.dropped_view_indexes
     }
 
     fn view(&self) -> GraphView<'_> {
@@ -13832,7 +14159,9 @@ impl<F: Fs> GraphDb<F> {
             | WalRecord::EnableIndex { .. }
             | WalRecord::DisableIndex { .. }
             | WalRecord::CreateConstraint { .. }
-            | WalRecord::DropConstraint { .. } => {}
+            | WalRecord::DropConstraint { .. }
+            | WalRecord::EnableRangeIndex { .. }
+            | WalRecord::DisableRangeIndex { .. } => {}
             // RenameNode: node id is stable; update last_change via the new key.
             // Called after apply(), so ids already reflects new_key.
             WalRecord::RenameNode { new_key, .. } => {
@@ -15306,7 +15635,7 @@ impl<F: Fs> GraphDb<F> {
             )));
         }
         if self.lock_denied {
-            return Err(GraphError::Busy { holder: None });
+            return Err(self.lock_denied_error());
         }
         // From here `snapshot.bin` and `wal.bin` may be between states on disk.
         // A reader outside the engine pairing the two (the backup worker) waits
@@ -15715,8 +16044,18 @@ impl<F: Fs> GraphDb<F> {
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
-            for (label, field) in self.prop_index.enabled_pairs() {
+            for (label, field) in self.prop_index.equality_pairs() {
                 let rec = WalRecord::EnableIndex {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            // Only a store that holds `EnableRangeIndex` records has any, so a
+            // store without them gets no V11 record here.
+            for (name, (label, field)) in self.prop_index.range_indexes() {
+                let rec = WalRecord::EnableRangeIndex {
+                    name: name.clone(),
                     label: label.clone(),
                     field: field.clone(),
                 };
@@ -15928,8 +16267,18 @@ impl<F: Fs> GraphDb<F> {
                 };
                 baseline_wal.extend_from_slice(&encode_record(&rec));
             }
-            for (label, field) in self.prop_index.enabled_pairs() {
+            for (label, field) in self.prop_index.equality_pairs() {
                 let rec = WalRecord::EnableIndex {
+                    label: label.clone(),
+                    field: field.clone(),
+                };
+                baseline_wal.extend_from_slice(&encode_record(&rec));
+            }
+            // Only a store that holds `EnableRangeIndex` records has any, so a
+            // store without them gets no V11 record here.
+            for (name, (label, field)) in self.prop_index.range_indexes() {
+                let rec = WalRecord::EnableRangeIndex {
+                    name: name.clone(),
                     label: label.clone(),
                     field: field.clone(),
                 };
@@ -16128,18 +16477,24 @@ fn v11_only_value(rec: &WalRecord) -> Option<&'static str> {
         | WalRecord::DisableIndex { .. }
         | WalRecord::SetEdgeCount { .. }
         | WalRecord::CreateConstraint { .. }
-        | WalRecord::DropConstraint { .. } => None,
+        | WalRecord::DropConstraint { .. }
+        | WalRecord::EnableRangeIndex { .. }
+        | WalRecord::DisableRangeIndex { .. } => None,
     }
 }
 
 /// Why `rec` may not be appended to the WAL until the V11 format lands, if it
 /// may not: it carries a format-V11 value (see [`v11_only_value`]), or it is a
 /// format-V11 record — a unique-constraint declaration or withdrawal
-/// (discriminants 24 and 25), which a 0.9.x reader cannot decode either.
+/// (discriminants 24 and 25) or a range-index one (26 and 27), which a 0.9.x
+/// reader cannot decode either.
 fn v11_refusal(rec: &WalRecord) -> Option<String> {
     match rec {
         WalRecord::CreateConstraint { .. } | WalRecord::DropConstraint { .. } => {
             Some(core_storage::v11_record_refusal("unique constraints"))
+        }
+        WalRecord::EnableRangeIndex { .. } | WalRecord::DisableRangeIndex { .. } => {
+            Some(core_storage::v11_record_refusal("range indexes"))
         }
         WalRecord::Batch(inner) => inner.iter().find_map(v11_refusal),
         _ => v11_only_value(rec).map(core_storage::v11_type_refusal),
@@ -17334,6 +17689,25 @@ impl<'a, F: Fs> NodeRef<'a, F> {
             .into_iter()
             .map(|(k, v)| (k, v.into_iter().collect()))
             .collect()
+    }
+}
+
+/// A copy of a lock-attempt failure that a denied write scope can return more
+/// than once. Only the two I/O-derived kinds are kept; `GraphError` is not
+/// `Clone`, and an `io::Error` is rebuilt from its kind and text.
+fn copy_lock_failure(err: &GraphError) -> Option<GraphError> {
+    match err {
+        GraphError::Unwritable {
+            path,
+            detail,
+            read_only_filesystem,
+        } => Some(GraphError::Unwritable {
+            path: path.clone(),
+            detail: detail.clone(),
+            read_only_filesystem: *read_only_filesystem,
+        }),
+        GraphError::Io(e) => Some(GraphError::Io(std::io::Error::new(e.kind(), e.to_string()))),
+        _ => None,
     }
 }
 

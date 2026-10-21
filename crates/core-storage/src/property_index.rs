@@ -7,187 +7,24 @@
 //! an `O(N_label)` scan — the hot path behind `WHERE n.field = $x`.
 //!
 //! Only scalar values are indexable (`Int`, `Float`, `Str`, `Bool` via
-//! [`ValueKey`]); list- and map-valued properties are skipped (a list has no
+//! [`crate::types::ValueKey`]); list- and map-valued properties are skipped (a list has no
 //! single equality key). A per-node reverse map records the current key so an
 //! update or delete removes the stale entry in `O(log n)` without knowing the
 //! previous value.
+//!
+//! Since 0.10 the equality index is one kind of the unified index in
+//! [`crate::range_index`]; `PropertyIndex` is its old name, kept so existing
+//! callers compile unchanged.
 
-use crate::idmap::IdMap;
-use crate::interner::Interner;
-use crate::types::{Value, ValueKey};
-use crate::v8::seam::ColumnsView;
-use std::collections::{BTreeMap, BTreeSet};
+pub use crate::range_index::{IndexKind, UnifiedIndex};
 
-/// Equality index over declared `(label, field)` pairs.
-#[derive(Debug, Clone, Default)]
-pub struct PropertyIndex {
-    /// Declared `(label, field)` pairs. A pair not present here is not indexed.
-    enabled: BTreeSet<(String, String)>,
-    /// `(label, field)` → value → set of node ids holding that value.
-    forward: BTreeMap<(String, String), BTreeMap<ValueKey, BTreeSet<u32>>>,
-    /// `(label, field, id)` → the node's current indexed key, so an update or
-    /// delete can drop the stale forward entry without the old value.
-    reverse: BTreeMap<(String, String, u32), ValueKey>,
-}
-
-impl PropertyIndex {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Whether `(label, field)` is declared as an index.
-    pub fn is_enabled(&self, label: &str, field: &str) -> bool {
-        self.enabled
-            .contains(&(label.to_string(), field.to_string()))
-    }
-
-    /// Whether any declared index covers `field` (any label). Cheap guard for
-    /// the maintenance hooks, matching `FulltextIndex::field_indexed`.
-    pub fn field_indexed(&self, field: &str) -> bool {
-        self.enabled.iter().any(|(_, f)| f == field)
-    }
-
-    /// Whether any field is declared for `label`.
-    pub fn has_label(&self, label: &str) -> bool {
-        self.enabled.iter().any(|(l, _)| l == label)
-    }
-
-    /// Iterate all declared `(label, field)` pairs.
-    pub fn enabled_pairs(&self) -> impl Iterator<Item = &(String, String)> {
-        self.enabled.iter()
-    }
-
-    /// Declare `(label, field)` as an index. Returns `true` if newly added.
-    pub fn enable(&mut self, label: &str, field: &str) -> bool {
-        self.enabled.insert((label.to_string(), field.to_string()))
-    }
-
-    /// Remove the `(label, field)` index and all its entries. Returns `true`
-    /// if it had been declared.
-    pub fn disable(&mut self, label: &str, field: &str) -> bool {
-        let key = (label.to_string(), field.to_string());
-        let was = self.enabled.remove(&key);
-        self.forward.remove(&key);
-        self.reverse
-            .retain(|(l, f, _), _| !(l == label && f == field));
-        was
-    }
-
-    /// Upsert node `id`'s value for `(label, field)`. Removes any prior entry
-    /// first, then indexes `value` if it is a scalar. A no-op when the pair is
-    /// not declared or `value` is a list/map.
-    pub fn set(&mut self, label: &str, field: &str, id: u32, value: &Value) {
-        if !self.is_enabled(label, field) {
-            return;
-        }
-        self.remove_node(label, field, id);
-        if let Some(vk) = ValueKey::from_value(value) {
-            self.forward
-                .entry((label.to_string(), field.to_string()))
-                .or_default()
-                .entry(vk.clone())
-                .or_default()
-                .insert(id);
-            self.reverse
-                .insert((label.to_string(), field.to_string(), id), vk);
-        }
-    }
-
-    /// Remove every entry for node `id` across all declared pairs. Used when a
-    /// node is deleted (mirrors [`crate::fulltext::FulltextIndex::remove_node`]).
-    pub fn remove_node_all(&mut self, id: u32) {
-        let pairs: Vec<(String, String)> = self
-            .reverse
-            .keys()
-            .filter(|(_, _, i)| *i == id)
-            .map(|(l, f, _)| (l.clone(), f.clone()))
-            .collect();
-        for (l, f) in pairs {
-            self.remove_node(&l, &f, id);
-        }
-    }
-
-    /// Remove node `id`'s entry for `(label, field)` if present.
-    pub fn remove_node(&mut self, label: &str, field: &str, id: u32) {
-        let rkey = (label.to_string(), field.to_string(), id);
-        if let Some(old) = self.reverse.remove(&rkey) {
-            let fkey = (label.to_string(), field.to_string());
-            if let Some(by_value) = self.forward.get_mut(&fkey) {
-                if let Some(ids) = by_value.get_mut(&old) {
-                    ids.remove(&id);
-                    if ids.is_empty() {
-                        by_value.remove(&old);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Every indexed value of `(label, field)` and the node ids holding it, or
-    /// `None` when nothing is indexed under the pair. Lets a caller probing
-    /// many values look the pair up once instead of once per value.
-    pub fn postings(&self, label: &str, field: &str) -> Option<&BTreeMap<ValueKey, BTreeSet<u32>>> {
-        self.forward.get(&(label.to_string(), field.to_string()))
-    }
-
-    /// Node ids of `label` whose `field` equals `value`, ascending. Empty when
-    /// the pair is not declared, `value` is non-scalar, or nothing matches.
-    pub fn lookup(&self, label: &str, field: &str, value: &Value) -> Vec<u32> {
-        let Some(vk) = ValueKey::from_value(value) else {
-            return Vec::new();
-        };
-        self.forward
-            .get(&(label.to_string(), field.to_string()))
-            .and_then(|by_value| by_value.get(&vk))
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default()
-    }
-
-    /// Rebuild all postings for the declared pairs from live column data.
-    /// Called at open end to correct any drift from per-record replay; a no-op
-    /// when nothing is declared. Mirrors [`crate::fulltext::FulltextIndex::rebuild_all`].
-    pub fn rebuild_all(
-        &mut self,
-        ids: &IdMap,
-        labels: &[u32],
-        syms: &Interner,
-        props: ColumnsView<'_>,
-    ) {
-        if self.enabled.is_empty() {
-            return;
-        }
-        let enabled_vec: Vec<(String, String)> = self.enabled.iter().cloned().collect();
-        for pair in &enabled_vec {
-            self.forward.remove(pair);
-        }
-        self.reverse
-            .retain(|(l, f, _), _| !enabled_vec.iter().any(|(el, ef)| el == l && ef == f));
-        let n = ids.len() as u32;
-        for id in 0..n {
-            let Some(&sym) = labels.get(id as usize) else {
-                continue;
-            };
-            if sym == u32::MAX {
-                continue;
-            }
-            let Some(label) = syms.resolve(sym) else {
-                continue;
-            };
-            for (lbl, field) in &enabled_vec {
-                if lbl == label {
-                    if let Some(vr) = props.get(id, field) {
-                        let value = vr.into_value();
-                        self.set(lbl, field, id, &value);
-                    }
-                }
-            }
-        }
-    }
-}
+/// The equality index's name before it became [`UnifiedIndex`].
+pub type PropertyIndex = UnifiedIndex;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Value;
 
     fn s(x: &str) -> Value {
         Value::Str(x.into())

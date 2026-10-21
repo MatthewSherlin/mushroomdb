@@ -3002,6 +3002,14 @@ fn graph_err(e: GraphError) -> PyErr {
             GraphError::Busy { holder } => err_with(py, MushroomBusy::new_err(msg), |v| {
                 v.setattr("holder", *holder)
             }),
+            // A deployment fault (the data directory's ownership or mount), not
+            // contention: retrying cannot help, so it must not be `MushroomBusy`.
+            GraphError::Unwritable { path, detail, .. } => {
+                err_with(py, Unwritable::new_err(msg), |v| {
+                    v.setattr("path", path.as_str())?;
+                    v.setattr("detail", detail.as_str())
+                })
+            }
             GraphError::NamespaceImmutable { key, from, to } => {
                 err_with(py, NamespaceImmutable::new_err(msg), |v| {
                     v.setattr("key", key.as_str())?;
@@ -3862,6 +3870,7 @@ engine_errors! {
     MaskedReadOnly, "masked_read_only", "A write statement reached a scoped or masked query path, which is read-only.";
     RoleWriteDenied, "role_write_denied", "A role-bound write was denied. Carries `.reason`, which is also the message.";
     MushroomBusy, "busy", "Another process holds the store's write lock.\n\nNothing was written, so retrying later is always safe. Raised only by write calls: opening read-only and reading never take the lock. Carries `.holder`, the holding process id when the platform makes it cheaply knowable and `None` otherwise — a diagnostic hint, never something to branch on.";
+    Unwritable, "unwritable", "The store's data directory is not writable by this process.\n\nThe filesystem refused permission (`EACCES`, `EPERM` or a read-only mount) on the directory or a file the store must create in it. This is a deployment fault, not contention: it is not `MushroomBusy`, and retrying cannot help until the directory's ownership or mount changes. The message names the path, the effective uid, the directory's owner and mode, and what to change. Carries `.path`, the file or directory refused, and `.detail`, which is also the message.";
     NamespaceImmutable, "namespace_immutable", "A namespace is set at insert and fixed for the node's lifetime. Carries `.key`, `.from_` (spelled with a trailing underscore: `from` is a Python keyword) and `.to`.";
     CrossNamespace, "cross_namespace", "A hand-written edge would cross a namespace boundary. Carries `.src`, `.src_ns`, `.dst`, `.dst_ns`.";
     CommitTimeNotMonotonic, "commit_time_not_monotonic", "An asserted commit time would move the store's recorded history backwards. Carries `.supplied_ms` and `.newest_ms`. Raised by `record_commits_at` only — the live clock is never held to this, so an NTP step backwards still commits. Backfill in chronological order.";

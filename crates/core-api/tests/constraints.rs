@@ -785,6 +785,151 @@ mod unlocked {
         }));
     }
 
+    // ── Uniqueness means what the query language's equality means (TY-5b) ───
+
+    fn num(v: Value) -> Vec<(String, Value)> {
+        vec![("v".into(), v)]
+    }
+
+    fn is_violation<T: std::fmt::Debug>(r: &Result<T, GraphError>) -> bool {
+        matches!(r, Err(GraphError::ConstraintViolation { constraint, field })
+            if constraint == "uniq_v" && field == "v")
+    }
+
+    fn numeric_store(name: &str) -> (PathBuf, GraphDb) {
+        let (dir, mut db) = open_temp(name);
+        db.create_constraint("uniq_v", "N", "v").unwrap();
+        (dir, db)
+    }
+
+    /// `Int` 2 and `Float` 2.0 are one value to `MATCH (n {v: 2})`, so they are
+    /// one value to the constraint, in either order and by every route.
+    #[test]
+    fn an_int_and_the_equal_float_conflict() {
+        for (first, second) in [
+            (Value::Int(2), Value::Float(2.0)),
+            (Value::Float(2.0), Value::Int(2)),
+            (Value::Int(0), Value::Float(-0.0)),
+            (Value::Float(-0.0), Value::Int(0)),
+            (Value::Float(0.0), Value::Float(-0.0)),
+        ] {
+            // Across commits.
+            let (dir, mut db) = numeric_store("int-float");
+            db.insert_node("N", "a", num(first.clone())).unwrap();
+            let before = wal_bytes(&dir);
+            let r = db.insert_node("N", "b", num(second.clone()));
+            assert!(is_violation(&r), "{first:?} then {second:?}: {r:?}");
+            assert_eq!(wal_bytes(&dir), before);
+            // By set_prop on an existing node.
+            db.insert_node("N", "c", num(Value::Str("free".into())))
+                .unwrap();
+            let r = db.set_prop("c", "v", second.clone());
+            assert!(is_violation(&r), "{first:?} then set {second:?}: {r:?}");
+            // Inside one batch.
+            let (_dir, mut db) = numeric_store("int-float-batch");
+            let r = db.write_batch(|b: &mut Batch<'_>| {
+                b.insert_node("N", "a", num(first.clone()));
+                b.insert_node("N", "b", num(second.clone()));
+            });
+            assert!(is_violation(&r), "batch {first:?} + {second:?}: {r:?}");
+            assert_eq!(db.node_count(), 0);
+            // The query language agrees that they are equal.
+            let (_dir, mut db) = open_temp("int-float-scan");
+            db.insert_node("N", "a", num(first.clone())).unwrap();
+            db.insert_node("N", "b", num(second.clone())).unwrap();
+            let rows = db
+                .query(
+                    &format!("MATCH (n:N {{v: {}}}) RETURN n", cypher(&first)),
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+            assert_eq!(
+                rows.len(),
+                2,
+                "{first:?} and {second:?} are equal in a scan"
+            );
+        }
+    }
+
+    fn cypher(v: &Value) -> String {
+        match v {
+            Value::Int(i) => i.to_string(),
+            Value::Float(f) => format!("{f:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Different numbers, and `NaN` (equal to nothing), never conflict.
+    #[test]
+    fn unequal_numbers_and_nan_do_not_conflict() {
+        let (_dir, mut db) = numeric_store("distinct");
+        db.insert_node("N", "a", num(Value::Int(2))).unwrap();
+        db.insert_node("N", "b", num(Value::Float(2.5))).unwrap();
+        db.insert_node("N", "c", num(Value::Int(3))).unwrap();
+        db.insert_node("N", "d", num(Value::Float(f64::NAN)))
+            .unwrap();
+        db.insert_node("N", "e", num(Value::Float(f64::NAN)))
+            .unwrap();
+        // The same value written again by its own node is no conflict.
+        db.set_prop("a", "v", Value::Float(2.0)).unwrap();
+        db.set_prop("a", "v", Value::Int(2)).unwrap();
+    }
+
+    /// Past 2^53 the scan's equality is `i as f64 == f`: two `Int`s differ
+    /// whenever their values do, and an `Int` equals the `Float` it rounds to.
+    /// The constraint follows exactly that, as the index does (TY-8).
+    #[test]
+    fn large_integers_follow_the_scans_equality() {
+        let big = 1_i64 << 53;
+        let (_dir, mut db) = numeric_store("large");
+        db.insert_node("N", "a", num(Value::Int(big))).unwrap();
+        // Another Int is another value, even though both convert to one f64.
+        db.insert_node("N", "b", num(Value::Int(big + 1))).unwrap();
+        // The Float 2^53 equals Int(2^53) (and Int(2^53 + 1) too).
+        let r = db.insert_node("N", "c", num(Value::Float(big as f64)));
+        assert!(is_violation(&r), "{r:?}");
+        // The next Float up equals no stored value.
+        db.insert_node("N", "d", num(Value::Float((big as f64).next_up())))
+            .unwrap();
+        // And the reverse: a Float first, then each Int that rounds to it.
+        let (_dir, mut db) = numeric_store("large-float-first");
+        db.insert_node("N", "f", num(Value::Float(big as f64)))
+            .unwrap();
+        assert!(is_violation(&db.insert_node(
+            "N",
+            "a",
+            num(Value::Int(big))
+        )));
+        assert!(is_violation(&db.insert_node(
+            "N",
+            "b",
+            num(Value::Int(big + 1))
+        )));
+        // i64::MAX rounds to 2^63 as a float.
+        let (_dir, mut db) = numeric_store("large-max");
+        db.insert_node("N", "a", num(Value::Int(i64::MAX))).unwrap();
+        assert!(is_violation(&db.insert_node(
+            "N",
+            "b",
+            num(Value::Float(9_223_372_036_854_775_808.0))
+        )));
+    }
+
+    /// The same answer after a reopen, where the index is rebuilt from columns.
+    #[test]
+    fn numeric_uniqueness_survives_a_reopen() {
+        let (dir, mut db) = numeric_store("numeric-reopen");
+        db.insert_node("N", "a", num(Value::Int(2))).unwrap();
+        drop(db);
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.unlock_v11_format_for_test();
+        assert!(is_violation(&db.insert_node(
+            "N",
+            "b",
+            num(Value::Float(2.0))
+        )));
+    }
+
     #[test]
     fn values_without_an_index_key_and_other_labels_never_conflict() {
         let (_dir, mut db) = constrained("no-key");

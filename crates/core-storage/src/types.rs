@@ -812,6 +812,13 @@ pub fn list_tokens(v: &Value) -> Option<std::collections::BTreeSet<ValueKey>> {
     }
 }
 
+impl GraphError {
+    /// What a remote client is told for [`GraphError::Unwritable`]. The path,
+    /// uid, owner and mode stay in the server's log: they describe the host.
+    pub const UNWRITABLE_CLIENT_MESSAGE: &'static str =
+        "the data directory is not writable by the server process; see the server log";
+}
+
 #[derive(Debug)]
 pub enum GraphError {
     KeyNotFound {
@@ -931,6 +938,26 @@ pub enum GraphError {
     /// never branch on it.
     Busy {
         holder: Option<u32>,
+    },
+    /// The store's data directory (or a file the store must create in it, such
+    /// as `LOCK`) is not writable by this process: the filesystem answered
+    /// `EACCES`, `EPERM` or `EROFS`.
+    ///
+    /// This is a deployment fault, not contention: retrying cannot help until
+    /// someone changes the directory's ownership or mount. It is deliberately
+    /// not [`GraphError::Busy`], which says another process holds the write
+    /// lock. Nothing was written.
+    ///
+    /// `path` is the file or directory the filesystem refused. `detail` is the
+    /// full human-readable message: the path, the effective uid, the
+    /// directory's owner and mode, and what to do about it.
+    Unwritable {
+        path: String,
+        detail: String,
+        /// True when the refusal was `EROFS`: the filesystem is mounted
+        /// read-only, which is a deliberate configuration a server may serve
+        /// reads from, unlike an ownership mistake.
+        read_only_filesystem: bool,
     },
     /// A write tried to change a node's namespace.
     ///
@@ -1093,6 +1120,7 @@ impl std::fmt::Display for GraphError {
             GraphError::Busy { holder: None } => {
                 write!(f, "store is busy: write lock held by another process")
             }
+            GraphError::Unwritable { detail, .. } => write!(f, "{detail}"),
             GraphError::NamespaceImmutable { key, from, to } => write!(
                 f,
                 "node {key} is in namespace {from}; a namespace is set at insert and cannot \

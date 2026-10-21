@@ -617,6 +617,25 @@ fn run_serve(
         // `GET /ready` answers 503 until the store is open and its schema is in.
         let ready_flag = Arc::new(AtomicBool::new(false));
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
+        // A shared open takes no lock, so an unwritable data directory would
+        // otherwise surface at the first write, long after the platform called
+        // the deploy healthy. Try the write lock once: only a permission
+        // refusal is fatal. A peer holding the lock (`Busy`) is not this
+        // check's business, and serving reads alongside it stays as it was.
+        match db.write_with_wait(Duration::ZERO) {
+            // A read-only mount is a deliberate setup that 0.9.2 served reads
+            // from, so an existing store on one still starts; its writes fail
+            // with the cause. A new store has nothing to serve without a write.
+            Err(GraphError::Unwritable {
+                detail,
+                read_only_filesystem: true,
+                ..
+            }) if !is_new_store => {
+                eprintln!("serve: read-only store, writes will fail: {detail}");
+            }
+            Err(e @ GraphError::Unwritable { .. }) => return Err(e.to_string()),
+            _ => {}
+        }
         if is_new_store {
             // The first store most HTTP callers open. Declare the memory
             // schema before the first write so `recall` can answer on it.

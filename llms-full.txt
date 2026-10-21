@@ -9178,6 +9178,7 @@ attributes. Classes may be added; a `code` is never respelled.
 | `MaskedReadOnly` | — | A write statement reached a scoped or masked query path, which is read-only. |
 | `RoleWriteDenied` | `reason: str` | A role-bound write was denied. |
 | `MushroomBusy` | `holder: int \| None` | Another process holds the store's write lock. |
+| `Unwritable` | `path: str`, `detail: str` | The store's data directory is not writable by this process. |
 | `NamespaceImmutable` | `key: str`, `from_: str`, `to: str` | A namespace is set at insert and fixed for the node's lifetime. |
 | `CrossNamespace` | `src: str`, `src_ns: str`, `dst: str`, `dst_ns: str` | A hand-written edge would cross a namespace boundary. |
 | `CommitTimeNotMonotonic` | `supplied_ms: int`, `newest_ms: int` | An asserted commit time would move the store's recorded history backwards. |
@@ -12450,6 +12451,52 @@ MUSHROOMDB_CORS_ORIGINS=https://app.example.com,http://localhost:3000
 - **`/watch` is not covered.** CORS does not govern WebSocket upgrades, so this
   setting does not protect `/watch` or `/subscribe` from a page on another origin;
   the token does.
+
+## Volume ownership on managed platforms
+
+The container image runs as uid 65532 (not root) and has no shell, so it cannot
+fix the ownership of its own data volume. Fly and Render mount a new volume
+owned by root; the server then cannot create `LOCK` or `wal.bin` in `/data`. It
+refuses to start and says so:
+
+```text
+the data directory is not writable: Permission denied (os error 13) on /data/LOCK.
+This process runs as uid 65532; /data is owned by uid 0 gid 0 with mode 0755. …
+```
+
+(An older release reported this as `store is busy: write lock held`. That was
+wrong: nothing held a lock. A genuinely held lock still reports `busy`.) An
+existing store on a deliberately read-only mount still starts, as before, and
+serves reads; its writes fail with the same cause.
+
+Fix the volume once, before the first deploy. The image stays non-root.
+
+| Platform | Recipe |
+| --- | --- |
+| Fly | Run a one-off machine on the volume that changes its owner, then deploy. The volume and the machine must share a region. `fly machine run busybox:stable chown -R 65532:65532 /data --app <app> --region <region> --volume mushroomdb_data:/data --rm` |
+| Render | Render has no setting for disk ownership. Build a thin wrapper image that starts as root, changes the owner of `/data`, then drops to uid 65532 before it execs the server (below). Point the service at the wrapper instead of the stock image. |
+| Railway | Set the service variable `RAILWAY_RUN_UID=0`. This runs the container as root on Railway; the image itself is unchanged. |
+| Docker Compose | Nothing to do. A named volume is initialised from the image's `/data`, which is owned by 65532. A bind mount must be owned by uid 65532 on the host: `sudo chown -R 65532:65532 ./data`. |
+
+Render wrapper image (replace the owner and tag with yours). `runtime: image`
+cannot build a Dockerfile, so build this one and push it to a registry Render can
+pull from (for example `ghcr.io/<you>/mushroomdb-render:latest`), then set that as
+the service's image URL; or keep it in your repository and use `runtime: docker`
+with `dockerfilePath`:
+
+```dockerfile
+FROM ghcr.io/matthewsherlin/mushroomdb:latest AS app
+
+FROM debian:12-slim
+COPY --from=app /usr/local/bin/mushroomdb /usr/local/bin/mushroomdb
+ENTRYPOINT ["/bin/sh", "-c", "chown 65532:65532 /data && exec setpriv --reuid=65532 --regid=65532 --clear-groups /usr/local/bin/mushroomdb \"$@\"", "--"]
+CMD ["serve", "/data", "--addr", "0.0.0.0:8080", "--snapshot-every", "300"]
+```
+
+**Status: not yet confirmed on a real deploy.** The Fly, Render and Railway
+recipes are the most reliable routes known, written without a live account.
+They are confirmed or corrected at the release gate by a real deploy on each
+platform, and this page changes with what that shows.
 
 ## Loopback-first posture
 
