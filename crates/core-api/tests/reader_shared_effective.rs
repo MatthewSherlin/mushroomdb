@@ -283,3 +283,61 @@ fn indexed_lookups_on_the_reader_match_the_live_index_under_concurrent_writes() 
         "the index served only {indexed} of {checked} versions"
     );
 }
+
+/// TX-5 fix round 3: the writer builds a version's delta-tail layer and query
+/// index as it publishes, so a reader served the published snapshot (here,
+/// while another writer holds the lock) finds both built and pays no first
+/// build — after a bulk commit that was the whole batch.
+#[test]
+fn the_published_snapshot_arrives_with_its_layer_and_index_built() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let db = SharedDb::open(&tmp("eager")).unwrap();
+    db.write().enable_index("N", "name").unwrap();
+    let bulk: Vec<BatchOp> = (0..5_000)
+        .map(|i| BatchOp::InsertNode {
+            label: "N".into(),
+            key: format!("b{i}"),
+            props: vec![("name".into(), Value::Str(format!("n{}", i % 50)))],
+        })
+        .collect();
+    db.submit_batch(bulk).unwrap();
+    db.write()
+        .set_prop("b7", "name", Value::Str("moved".into()))
+        .unwrap();
+
+    let held = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let holder = {
+        let (db, held, release) = (db.clone(), Arc::clone(&held), Arc::clone(&release));
+        std::thread::spawn(move || {
+            let _guard = db.write();
+            held.store(true, Ordering::SeqCst);
+            while !release.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    };
+    while !held.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let snap = db.reader();
+    assert!(
+        !snap.deltas.is_empty(),
+        "the bulk commit must be in the tail"
+    );
+    assert!(
+        snap.layer_and_index_built(),
+        "the published snapshot's layer or index was left for the reader to build"
+    );
+    let rs = snap
+        .query(
+            "MATCH (n:N {name: 'moved'}) RETURN n.key AS k",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 1);
+    release.store(true, Ordering::SeqCst);
+    holder.join().unwrap();
+}

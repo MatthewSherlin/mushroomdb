@@ -1140,6 +1140,28 @@ impl ReaderSnapshot {
         Some(Some(layer))
     }
 
+    /// Whether this snapshot's delta-tail layer, and its query index when one
+    /// applies, are already built — what a reader finds after the writer
+    /// published it.
+    #[doc(hidden)]
+    pub fn layer_and_index_built(&self) -> bool {
+        let layer = self.deltas.is_empty() || self.cache.get().is_some();
+        let index = self.deltas.is_empty()
+            || self.frozen.prop_index.enabled_pairs().next().is_none()
+            || self.index.get().is_some();
+        layer && index
+    }
+
+    /// Build this snapshot's delta-tail layer and query index now, into the
+    /// cells it shares with every snapshot of its version. The writer calls it
+    /// as it publishes, so readers find both built. A tail that will not apply
+    /// is left for the reader to report.
+    pub(crate) fn prepare(&self) {
+        if self.effective().is_ok() {
+            let _ = self.query_index();
+        }
+    }
+
     /// Whether this snapshot's queries answer equality lookups from an index
     /// (the fold's, or the fold's layered with the tail) rather than a scan.
     #[doc(hidden)]

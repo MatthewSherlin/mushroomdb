@@ -297,13 +297,33 @@ pub(crate) struct Published(Mutex<Option<ReaderSnapshot>>);
 
 impl Published {
     fn new(db: &GraphDb<RealFs>) -> Self {
-        Self(Mutex::new(db.try_reader()))
+        let snap = db.try_reader();
+        if let Some(snap) = &snap {
+            snap.prepare();
+        }
+        Self(Mutex::new(snap))
     }
 
+    /// Publish `db`'s state, then build its delta-tail layer and query index
+    /// here, on the writer, so no reader pays the first build — after a bulk
+    /// commit that was the whole batch, rebuilt by the first reader of every
+    /// version until the fold.
+    ///
+    /// The new snapshot replaces the old one before the build, so the old
+    /// version's cells are no longer held here and the build extends them in
+    /// place instead of copying them; a reader capturing meanwhile shares the
+    /// new cells and waits only for that extension.
     fn set(&self, db: &GraphDb<RealFs>) {
-        if let Some(snap) = db.try_reader() {
-            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
-        }
+        let Some(snap) = db.try_reader() else {
+            return;
+        };
+        let old = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(snap.share());
+        drop(old);
+        snap.prepare();
     }
 
     fn get(&self) -> Option<ReaderSnapshot> {
