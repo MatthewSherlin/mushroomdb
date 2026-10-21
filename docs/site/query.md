@@ -1,7 +1,7 @@
 # Cypher Query Reference
 
 mushroomdb supports a Cypher subset for pattern matching, filtering,
-aggregation, ordering, and writes (`CREATE`, `SET`, `DELETE`, `DETACH DELETE`,
+aggregation, ordering, and writes (`CREATE`, `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`,
 `MERGE`). This page documents the full grammar, with a dedicated section on
 variable-length paths and `shortestPath`.
 
@@ -423,6 +423,30 @@ SET n.score = 99
   re-evaluates incrementally: derived edges appear or retract within the same
   WAL frame.
 
+### MATCH … REMOVE (property)
+
+```cypher
+MATCH (n:Person)
+WHERE n.id = 'alice'
+REMOVE n.score, n.nickname
+```
+
+- `REMOVE n.prop [, m.prop …]` removes properties from the matched nodes.
+  Removing a property a node does not have does nothing and is not an error.
+- It goes through the same write path as `remove_prop`: rules re-evaluate, so a
+  derived edge that depended on the property retracts in the same WAL frame; a
+  property a view owns, and `ns` on a node outside `default`, are refused with
+  the error `remove_prop` gives.
+- `MATCH … REMOVE … RETURN` is supported: the write commits, then RETURN
+  projects from the post-write view, where a removed property reads as null.
+- The write result's `properties_set` column counts the properties removed.
+- `REMOVE n:Label` is refused: `not supported in mushroomdb 0.10: REMOVE n:Label
+  (label removal)`. A node has one label in 0.10.
+- `REMOVE r.prop` on a relationship, or on a name `MATCH` did not bind, is a
+  parse error.
+- Inside an interactive transaction `REMOVE` buffers like `SET`; with `RETURN`
+  it is refused as `not supported in mushroomdb 0.10 inside a transaction`.
+
 ### MATCH … DELETE (edge)
 
 ```cypher
@@ -704,6 +728,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
 | `MATCH … SET n.prop = $param` | `MATCH (n) WHERE n.id = $id SET n.score = $val` |
 | `MATCH … SET … RETURN` | `MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x` — write commits, then RETURN from post-write state. `CASE` and list subscripts (`n.tags[0]`) evaluate the same as a read RETURN; `n.key` / `n.id` / `n.label` use identity fallback |
+| `MATCH … REMOVE n.prop [, …]` | `MATCH (n) WHERE n.id = 'x' REMOVE n.score, n.nickname` — a missing property is a no-op; `RETURN` projects the post-write state |
 | `MERGE … ON CREATE SET` / `ON MATCH SET` | `MERGE (n:L {id:'new'}) ON CREATE SET n.born = 1 ON MATCH SET n.hit = 1 RETURN n` |
 | `MATCH … DELETE r` (manual edge) | `MATCH (a)-[r:KNOWS]->(b) DELETE r` |
 | `MATCH … DETACH DELETE n` | `MATCH (n) WHERE n.id = 'x' DETACH DELETE n` |

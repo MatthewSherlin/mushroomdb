@@ -228,8 +228,8 @@ changed to tenant-b — delete and re-insert the node instead
 
 **Removing `ns` is changing it**, to `default` — the namespace an absent property
 names — so it is refused with the same error: `remove_prop`, a batched
-`RemoveProp`, and `DELETE /node/{key}/prop/ns` all return it. (The Cypher dialect
-has no `REMOVE`, so that spelling is a query error before it reaches this check.)
+`RemoveProp`, `DELETE /node/{key}/prop/ns` and Cypher `MATCH … REMOVE n.ns` all
+return it.
 
 Writing the namespace a node is already in is a no-op, not an error, and so is
 removing `ns` from a node already in `default`: neither changes a namespace, and

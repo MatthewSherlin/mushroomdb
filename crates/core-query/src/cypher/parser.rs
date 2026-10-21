@@ -2,9 +2,9 @@
 
 use super::ast::{
     AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
-    LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand,
-    OptionalClause, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal,
-    SetClause, UnwindClause, UnwindExpr, WithStage, WriteStatement,
+    LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetStmt, MergeStmt,
+    NodePat, Operand, OptionalClause, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat,
+    RetItem, RetVal, SetClause, UnwindClause, UnwindExpr, WithStage, WriteStatement,
 };
 use super::Tok;
 use crate::filter::CmpOp;
@@ -86,9 +86,27 @@ pub fn parse_write(tokens: &[Tok]) -> Result<WriteStatement, String> {
 pub fn is_write_tokens(tokens: &[Tok]) -> bool {
     match tokens.first() {
         Some(Tok::Create) | Some(Tok::Merge) => true,
-        Some(Tok::Match) => tokens.iter().any(|t| matches!(t, Tok::Set | Tok::Delete)),
+        Some(Tok::Match) => {
+            tokens.iter().any(|t| matches!(t, Tok::Set | Tok::Delete)) || has_remove_clause(tokens)
+        }
         _ => false,
     }
+}
+
+/// True if the tokens hold a `REMOVE var.field` or `REMOVE var:Label` clause.
+/// `REMOVE` is an ordinary identifier, so it counts only in clause position:
+/// followed by `name` and then `.` or `:`, and not itself a property or label
+/// name (`n.remove`, `(x:Remove)`).
+fn has_remove_clause(tokens: &[Tok]) -> bool {
+    tokens.iter().enumerate().any(|(i, tok)| {
+        kw(Some(tok), "remove")
+            && !matches!(
+                i.checked_sub(1).and_then(|j| tokens.get(j)),
+                Some(Tok::Dot | Tok::Colon)
+            )
+            && matches!(tokens.get(i + 1), Some(Tok::Ident(_)))
+            && matches!(tokens.get(i + 2), Some(Tok::Dot | Tok::Colon))
+    })
 }
 
 /// `true` or `false` in any case, as the literal it spells; `None` for any
@@ -1726,10 +1744,69 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            _ if self.peek_kw("remove") => {
+                self.pos += 1; // consume REMOVE
+                let removals = self.remove_items(&matches)?;
+                let returns = if self.eat(&Tok::Return) {
+                    Some(self.return_items()?)
+                } else {
+                    None
+                };
+                if self.pos < self.toks.len() {
+                    return Err(self.unsupported_or_unexpected("unexpected tokens after REMOVE"));
+                }
+                Ok(WriteStatement::MatchRemove(MatchRemoveStmt {
+                    matches,
+                    where_expr,
+                    removals,
+                    returns,
+                }))
+            }
             _ => Err(self.err(
-                "expected SET or DELETE after MATCH [WHERE]; \
+                "expected SET, REMOVE or DELETE after MATCH [WHERE]; \
                  combined MATCH…RETURN is a read query, not a write statement",
             )),
+        }
+    }
+
+    /// `var.field [, var.field …]` after REMOVE. Each `var` must be a node bound
+    /// by `matches`. A label removal (`n:Label`) is refused by name: a node has
+    /// one label in 0.10.
+    fn remove_items(&mut self, matches: &[Pattern]) -> Result<Vec<(String, String)>, String> {
+        let mut items = Vec::new();
+        loop {
+            let var = self.ident("expected variable after REMOVE")?;
+            if self.peek() == Some(&Tok::Colon) {
+                return Err(
+                    "not supported in mushroomdb 0.10: REMOVE n:Label (label removal)".to_string(),
+                );
+            }
+            self.expect(&Tok::Dot, "expected '.' after variable in REMOVE")?;
+            let field = self.ident("expected property name after '.' in REMOVE")?;
+            let is_rel = matches
+                .iter()
+                .flat_map(|p| p.chain.iter())
+                .any(|(rel, _)| rel.var.as_deref() == Some(var.as_str()));
+            if is_rel {
+                return Err(format!(
+                    "REMOVE {var}.{field}: '{var}' is a relationship; REMOVE works on node properties"
+                ));
+            }
+            let is_node = matches.iter().any(|p| {
+                p.start.var.as_deref() == Some(var.as_str())
+                    || p.chain
+                        .iter()
+                        .any(|(_, dest)| dest.var.as_deref() == Some(var.as_str()))
+            });
+            if !is_node {
+                return Err(format!(
+                    "REMOVE {var}.{field}: '{var}' is not a node variable bound by MATCH"
+                ));
+            }
+            items.push((var, field));
+            if !self.eat(&Tok::Comma) {
+                return Ok(items);
+            }
         }
     }
 

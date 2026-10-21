@@ -64,13 +64,14 @@
 //!
 //! - `CREATE (a:L {id: …}) [-[:T]->(b:L {id: …})] [RETURN …]`
 //! - `MATCH … [WHERE …] SET n.f = … [, …]` (without `RETURN`)
+//! - `MATCH … [WHERE …] REMOVE n.f [, …]` (without `RETURN`)
 //! - `MATCH … [WHERE …] DELETE r` (edges)
 //! - `MATCH … [WHERE …] [DETACH] DELETE n` (nodes)
 //! - `MERGE (n:L {id: …}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]`
 //!
 //! Every read query the engine accepts runs as it would outside a
 //! transaction. A write form that cannot be expressed as buffered ops yet —
-//! today `MATCH … SET … RETURN` — fails with a `QueryError` reading
+//! today `MATCH … SET … RETURN` and `MATCH … REMOVE … RETURN` — fails with a `QueryError` reading
 //! `not supported in mushroomdb 0.10 inside a transaction: <form>`, and nothing
 //! is buffered; it is never applied outside the transaction.
 //!
@@ -82,8 +83,8 @@ use std::time::Instant;
 
 use core_query::cypher::{
     execute, execute_union, is_write_tokens, lex, parse_read, parse_write, plan, CreateStmt,
-    MatchDeleteNodeStmt, MatchDeleteStmt, MatchSetStmt, MergeStmt, NodePat, Operand, Params,
-    Pattern, Query, RetItem, RetVal, UnionQuery, WriteStatement,
+    MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetStmt, MergeStmt, NodePat,
+    Operand, Params, Pattern, Query, RetItem, RetVal, UnionQuery, WriteStatement,
 };
 use core_query::{GraphView, ResultSet};
 use core_storage::wal::WalRecord;
@@ -178,6 +179,18 @@ impl Staged {
             key: key.into(),
             field: field.into(),
             value,
+        });
+        self.touch(key);
+    }
+
+    fn remove_prop(&mut self, key: &str, field: &str) {
+        self.records.push(WalRecord::RemoveProp {
+            key: key.into(),
+            field: field.into(),
+        });
+        self.ops.push(BatchOp::RemoveProp {
+            key: key.into(),
+            field: field.into(),
         });
         self.touch(key);
     }
@@ -426,6 +439,7 @@ impl Transaction {
         let result = match stmt {
             WriteStatement::Create(s) => self.stage_create(s, params, &mut staged)?,
             WriteStatement::MatchSet(s) => self.stage_match_set(s, params, &mut staged)?,
+            WriteStatement::MatchRemove(s) => self.stage_match_remove(s, params, &mut staged)?,
             WriteStatement::MatchDelete(s) => self.stage_match_delete(s, params, &mut staged)?,
             WriteStatement::MatchDeleteNode(s) => {
                 self.stage_match_delete_node(s, params, &mut staged)?
@@ -592,6 +606,60 @@ impl Transaction {
             }
         }
         self.counts(staged, 0, props_set, 0)
+    }
+
+    fn stage_match_remove(
+        &self,
+        stmt: MatchRemoveStmt,
+        params: &BTreeMap<String, Value>,
+        staged: &mut Staged,
+    ) -> Result<(ResultSet, Option<ReaderSnapshot>)> {
+        if stmt.returns.is_some() {
+            return Err(not_supported("MATCH … REMOVE … RETURN"));
+        }
+        let mut matches = stmt.matches;
+        let mut node_vars = Vec::new();
+        bind_node_vars(&mut matches, &mut 0, &mut node_vars);
+        let mut lookup = node_vars.clone();
+        for (var, _) in &stmt.removals {
+            add_var(&mut lookup, var);
+        }
+        let mut q = match_query(matches, stmt.where_expr);
+        q.returns = var_items(&lookup);
+        let current = self.current();
+        let match_rs = current.with_view(|v| run(v, &q, params))??;
+        keys_in(&match_rs, &node_vars, &mut staged.keys);
+        let mut targets: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for row in 0..match_rs.len() {
+            for (var, field) in &stmt.removals {
+                let key = match match_rs.get(row, var) {
+                    Some(Value::Str(k)) => k.clone(),
+                    _ => {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "REMOVE variable '{var}' did not resolve to a node key"
+                            ),
+                        })
+                    }
+                };
+                let pair = (key, field.clone());
+                if seen.insert(pair.clone()) {
+                    targets.push(pair);
+                }
+            }
+        }
+        let mut props_removed = 0i64;
+        for (key, field) in &targets {
+            if let Some(id) = current.resolve_key(key) {
+                if current.with_view(|v| v.prop(id, field).is_some())? {
+                    props_removed += 1;
+                }
+            }
+            staged.remove_prop(key, field);
+        }
+        self.counts(staged, 0, props_removed, 0)
     }
 
     fn stage_match_delete(

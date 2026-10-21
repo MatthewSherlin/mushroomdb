@@ -12226,6 +12226,7 @@ impl<F: Fs> GraphDb<F> {
         match stmt {
             WriteStatement::Create(s) => self.exec_create(s, params),
             WriteStatement::MatchSet(s) => self.exec_match_set(s, params),
+            WriteStatement::MatchRemove(s) => self.exec_match_remove(s, params),
             WriteStatement::MatchDelete(s) => self.exec_match_delete(s, params),
             WriteStatement::MatchDeleteNode(s) => self.exec_match_delete_node(s, params),
             WriteStatement::Merge(s) => self.exec_merge(s, params),
@@ -12499,6 +12500,128 @@ impl<F: Fs> GraphDb<F> {
         rs.push_row(vec![
             Some(Value::Int(0)),
             Some(Value::Int(props_set as i64)),
+            Some(Value::Int(0)),
+        ]);
+        Ok(rs)
+    }
+
+    /// `MATCH … [WHERE …] REMOVE n.f [, …] [RETURN …]`.
+    ///
+    /// The MATCH runs first (masked under a role-scoped write, so a hidden node
+    /// is absent and nothing is removed from it); the removals then commit as
+    /// one batch of `RemoveProp` ops, which meet the same `prepare_remove_prop`
+    /// choke-point as `remove_prop`: view-owned fields and `ns` are refused there,
+    /// a field the node lacks is a no-op, and rules re-evaluate each removal.
+    /// The result row's `properties_set` slot counts the properties that existed
+    /// and were removed.
+    fn exec_match_remove(
+        &mut self,
+        stmt: core_query::cypher::MatchRemoveStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let project_returns = stmt.returns.clone();
+        let rel_vars = pattern_rel_vars(&stmt.matches);
+        let mut lookup_vars: Vec<String> = Vec::new();
+        for (var, _) in &stmt.removals {
+            add_var(&mut lookup_vars, var);
+        }
+        for v in pattern_node_vars(&stmt.matches) {
+            add_var(&mut lookup_vars, &v);
+        }
+        if let Some(ref returns) = project_returns {
+            for v in ret_node_vars(returns) {
+                if !rel_vars.iter().any(|r| r == &v) {
+                    add_var(&mut lookup_vars, &v);
+                }
+            }
+        }
+        let mut match_returns: Vec<RetItem> = lookup_vars
+            .iter()
+            .map(|v| RetItem {
+                value: RetVal::Var(v.clone()),
+                alias: None,
+            })
+            .collect();
+        // Capture relationship types while r is bound, as SET does.
+        for r in &rel_vars {
+            match_returns.push(RetItem {
+                value: RetVal::FuncCall {
+                    name: "type".into(),
+                    args: vec![Operand::Var(r.clone())],
+                },
+                alias: Some(rel_type_alias(r)),
+            });
+        }
+        let read_q = Query {
+            matches: stmt.matches.clone(),
+            optional_clauses: vec![],
+            where_expr: stmt.where_expr.clone(),
+            unwinds: vec![],
+            post_unwind_where: None,
+            stages: vec![],
+            returns: match_returns,
+            distinct: false,
+            order_by: vec![],
+            skip: None,
+            limit: None,
+        };
+        let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        let match_rs = {
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            }
+        }
+        .map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })?;
+
+        // Each (node, field) once, however many rows bound the node.
+        let mut targets: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for row_i in 0..match_rs.len() {
+            for (var, field) in &stmt.removals {
+                let key = match match_rs.get(row_i, var) {
+                    Some(Value::Str(k)) => k.clone(),
+                    _ => {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "REMOVE variable '{var}' did not resolve to a node key"
+                            ),
+                        })
+                    }
+                };
+                let pair = (key, field.clone());
+                if seen.insert(pair.clone()) {
+                    targets.push(pair);
+                }
+            }
+        }
+
+        // Counted before the commit, from the state the removals act on.
+        let props_removed = targets
+            .iter()
+            .filter(|(key, field)| self.get_prop(key, field).is_some())
+            .count() as i64;
+        let mut batch = self.batch();
+        for (key, field) in &targets {
+            batch.remove_prop(key, field);
+        }
+        batch.commit()?;
+
+        if let Some(returns) = project_returns {
+            return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
+        }
+
+        let mut rs = write_result_set();
+        rs.push_row(vec![
+            Some(Value::Int(0)),
+            Some(Value::Int(props_removed)),
             Some(Value::Int(0)),
         ]);
         Ok(rs)

@@ -3361,7 +3361,7 @@ heading or a line break in an agent's context.
 | `schema` | — | The store's labels with their fields, its edge types and what derives them, every rule with its predicate, the full-text fields `recall` searches, the equality indexes, and how many provisional nodes `remember` created. |
 | `analyze` | `kind`, `top?`, `edge_type?` | `central` (PageRank), `degree`, `components` (connected groups with sizes), `clusters` (communities of two or more; singletons counted, not listed) or `identities` (`SAME_AS` links resolved by complete linkage, oldest node canonical). The whole store with no role or mask; at most 50 rows; the same store always gets the same answer. |
 | `suggest_rules` | — | Rules the store proposes from its own values, each with an estimate, examples and `create_rule_args` to pass to `create_rule` unchanged. Fields the store writes for itself — `ns`, `kind`, `ts`, `source`, `provisional`, `id`, `aliases`, `alias_keys` — are never proposed, and every proposal is global. It creates nothing. On a store with entities and no `SAME_AS` rule it names the `schema apply --memory-identity` command. |
-| `forget` | `key`, or `key` and `prop`, or `fact` | Tombstone a node, remove one property — the only property removal on MCP, since this Cypher has no `REMOVE` — or retract one fact edge. A rule-derived edge is refused with the rule named. Removing a property reports the derived edges a rule loses with it; removing an entity's `name` rewrites its `aliases` in the same write, so the name's words leave at once, and says so; removing `aliases` says when the declared ones remain in `alias_keys`, which has to be forgotten separately. The notes that still state what was forgotten are listed, not deleted. The reply says history keeps it until `mushroomdb migrate`, `snapshot --truncate` or `--retention` prunes the log. No role check. |
+| `forget` | `key`, or `key` and `prop`, or `fact` | Tombstone a node, remove one property — the only property removal on MCP — or retract one fact edge. A rule-derived edge is refused with the rule named. Removing a property reports the derived edges a rule loses with it; removing an entity's `name` rewrites its `aliases` in the same write, so the name's words leave at once, and says so; removing `aliases` says when the declared ones remain in `alias_keys`, which has to be forgotten separately. The notes that still state what was forgotten are listed, not deleted. The reply says history keeps it until `mushroomdb migrate`, `snapshot --truncate` or `--retention` prunes the log. No role check. |
 
 Each of the eleven also accepts `json` (boolean, default false), which swaps
 the rendered digest for the report.
@@ -4667,7 +4667,7 @@ Slots 2 and 3 of every current driver contain 5.0 and 4.4, so a server that spea
 # Cypher Query Reference
 
 mushroomdb supports a Cypher subset for pattern matching, filtering,
-aggregation, ordering, and writes (`CREATE`, `SET`, `DELETE`, `DETACH DELETE`,
+aggregation, ordering, and writes (`CREATE`, `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`,
 `MERGE`). This page documents the full grammar, with a dedicated section on
 variable-length paths and `shortestPath`.
 
@@ -5089,6 +5089,30 @@ SET n.score = 99
   re-evaluates incrementally: derived edges appear or retract within the same
   WAL frame.
 
+### MATCH … REMOVE (property)
+
+```cypher
+MATCH (n:Person)
+WHERE n.id = 'alice'
+REMOVE n.score, n.nickname
+```
+
+- `REMOVE n.prop [, m.prop …]` removes properties from the matched nodes.
+  Removing a property a node does not have does nothing and is not an error.
+- It goes through the same write path as `remove_prop`: rules re-evaluate, so a
+  derived edge that depended on the property retracts in the same WAL frame; a
+  property a view owns, and `ns` on a node outside `default`, are refused with
+  the error `remove_prop` gives.
+- `MATCH … REMOVE … RETURN` is supported: the write commits, then RETURN
+  projects from the post-write view, where a removed property reads as null.
+- The write result's `properties_set` column counts the properties removed.
+- `REMOVE n:Label` is refused: `not supported in mushroomdb 0.10: REMOVE n:Label
+  (label removal)`. A node has one label in 0.10.
+- `REMOVE r.prop` on a relationship, or on a name `MATCH` did not bind, is a
+  parse error.
+- Inside an interactive transaction `REMOVE` buffers like `SET`; with `RETURN`
+  it is refused as `not supported in mushroomdb 0.10 inside a transaction`.
+
 ### MATCH … DELETE (edge)
 
 ```cypher
@@ -5370,6 +5394,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
 | `MATCH … SET n.prop = $param` | `MATCH (n) WHERE n.id = $id SET n.score = $val` |
 | `MATCH … SET … RETURN` | `MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x` — write commits, then RETURN from post-write state. `CASE` and list subscripts (`n.tags[0]`) evaluate the same as a read RETURN; `n.key` / `n.id` / `n.label` use identity fallback |
+| `MATCH … REMOVE n.prop [, …]` | `MATCH (n) WHERE n.id = 'x' REMOVE n.score, n.nickname` — a missing property is a no-op; `RETURN` projects the post-write state |
 | `MERGE … ON CREATE SET` / `ON MATCH SET` | `MERGE (n:L {id:'new'}) ON CREATE SET n.born = 1 ON MATCH SET n.hit = 1 RETURN n` |
 | `MATCH … DELETE r` (manual edge) | `MATCH (a)-[r:KNOWS]->(b) DELETE r` |
 | `MATCH … DETACH DELETE n` | `MATCH (n) WHERE n.id = 'x' DETACH DELETE n` |
@@ -6051,6 +6076,7 @@ Relationship patterns `->`, `<-`, `-` with optional type and variable.
 **Write statements** sent to `/query` (server routes to write-lock automatically):
 - `CREATE (n:Label {id: 'key', ...})` — insert node(s) and optional edges
 - `MATCH … SET n.field = value` — update properties
+- `MATCH … REMOVE n.field` — remove properties (a missing property is a no-op)
 - `MATCH … DELETE r` — delete a manual edge; error if derived
 - `MATCH (n) DETACH DELETE n` — delete node + all incident edges (derived edges retracted via rule engine; top-k backfill fires)
 - `MATCH (n) DELETE n` — delete isolated node (error if any edges remain — use DETACH DELETE)
@@ -8112,7 +8138,7 @@ def query_write(self, cypher: str, params: Params = None) -> list[Row]
 
 Execute a Cypher write statement.
 
-CREATE / MATCH…SET / MATCH…DELETE / MATCH…DETACH DELETE / MERGE.
+CREATE / MATCH…SET / MATCH…REMOVE / MATCH…DELETE / MATCH…DETACH DELETE / MERGE.
 
 Returns a one-row result dict with keys `created`, `properties_set` and
 `deleted`, unless the statement carries its own `RETURN` projection, in
@@ -11649,8 +11675,8 @@ changed to tenant-b — delete and re-insert the node instead
 
 **Removing `ns` is changing it**, to `default` — the namespace an absent property
 names — so it is refused with the same error: `remove_prop`, a batched
-`RemoveProp`, and `DELETE /node/{key}/prop/ns` all return it. (The Cypher dialect
-has no `REMOVE`, so that spelling is a query error before it reaches this check.)
+`RemoveProp`, `DELETE /node/{key}/prop/ns` and Cypher `MATCH … REMOVE n.ns` all
+return it.
 
 Writing the namespace a node is already in is a no-op, not an error, and so is
 removing `ns` from a node already in `default`: neither changes a namespace, and
@@ -12578,7 +12604,7 @@ What mushroomdb does not do, or does only up to a point. Each row says what was 
 | Peer writes do not notify subscribers | Commits another process made are picked up by `refresh()` and are there on the next read, but they fire no `EdgeFired`/`EdgeRetracted` event, so `/watch` and `/subscribe` see only writes made through this process. Poll if you need to react to a hook's writes. |
 | Cold start without a snapshot re-fires all rules | Snapshots persist derived edges, ANN state, and view definitions. At 100k nodes / ~10M derived edges: **0.02 s** from a snapshot (measured on V8; the format is V9 now, V10 with multiplicity) vs **8.16 min** WAL-only (ANN re-fit dominates). Call `snapshot()` before close. See [`dogfood/results/scale-100k.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-100k.md). |
 | Two-hop Cypher joins at scale | Dense patterns producing >1,000,000 intermediate rows error without `LIMIT`. Add `LIMIT n` — the pull-based executor stops early and never materializes the full binding table. |
-| Cypher write subset | CREATE, MATCH…SET, MATCH…DELETE, MATCH…DETACH DELETE, and MERGE (single-key, with `ON CREATE SET` / `ON MATCH SET`) are supported. Derived edges cannot be deleted manually. Variable-length paths are hard-capped at 10 hops; unbounded `*min..` is rejected at parse time. Full coverage table: [`docs/site/query.md`](query.md). |
+| Cypher write subset | CREATE, MATCH…SET, MATCH…REMOVE (properties), MATCH…DELETE, MATCH…DETACH DELETE, and MERGE (single-key, with `ON CREATE SET` / `ON MATCH SET`) are supported. Derived edges cannot be deleted manually. Variable-length paths are hard-capped at 10 hops; unbounded `*min..` is rejected at parse time. Full coverage table: [`docs/site/query.md`](query.md). |
 | Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection. Per-query recall floors min 0.90 / mean 0.95, measured 1.0 / 1.0 at 5k / dim 1536 (fixed-seed probe). Review the trade-off before using it in completeness-critical workloads. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
 | Python bindings return dicts | pandas/polars zero-copy is not wired yet. HTTP `POST /query` defaults to Arrow IPC; JSON via `?format=json`. |

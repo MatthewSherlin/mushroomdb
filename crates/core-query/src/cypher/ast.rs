@@ -385,6 +385,7 @@ pub struct OrderItem {
 pub enum WriteStatement {
     Create(CreateStmt),
     MatchSet(MatchSetStmt),
+    MatchRemove(MatchRemoveStmt),
     MatchDelete(MatchDeleteStmt),
     MatchDeleteNode(MatchDeleteNodeStmt),
     Merge(MergeStmt),
@@ -429,6 +430,20 @@ pub struct MatchSetStmt {
     pub matches: Vec<Pattern>,
     pub where_expr: Option<Expr>,
     pub sets: Vec<SetClause>,
+    /// Optional RETURN clause: project matched bindings from post-write state.
+    pub returns: Option<Vec<RetItem>>,
+}
+
+/// `MATCH patterns [WHERE expr] REMOVE var.field [, …] [RETURN …]`
+///
+/// Every `var` is a node variable bound by `matches` (the parser checks).
+/// Removing a property a node does not have is a no-op, not an error.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchRemoveStmt {
+    pub matches: Vec<Pattern>,
+    pub where_expr: Option<Expr>,
+    /// `(var, field)` in source order.
+    pub removals: Vec<(String, String)>,
     /// Optional RETURN clause: project matched bindings from post-write state.
     pub returns: Option<Vec<RetItem>>,
 }
