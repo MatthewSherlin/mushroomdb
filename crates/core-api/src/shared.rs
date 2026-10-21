@@ -282,6 +282,80 @@ impl Drop for DrainHandle {
     }
 }
 
+// ── Published snapshot ────────────────────────────────────────────────────────
+
+/// The reader snapshot of the last state a writer released.
+///
+/// [`SharedDb::reader`] hands this out when the RwLock is held or awaited by
+/// a writer, so capturing a reader never waits behind a `db.write()` holder —
+/// a Cypher write, `/ingest`, `create_rule`, a group apply — however long it
+/// holds the lock. Every write guard publishes as it is released, still under
+/// the lock (see [`PublishingGuard`]), so a read issued after a write returned
+/// sees that write: either it takes the read lock and reads live state, or a
+/// writer holds the lock and this slot already holds the released state.
+pub(crate) struct Published(Mutex<Option<ReaderSnapshot>>);
+
+impl Published {
+    fn new(db: &GraphDb<RealFs>) -> Self {
+        Self(Mutex::new(db.try_reader()))
+    }
+
+    fn set(&self, db: &GraphDb<RealFs>) {
+        if let Some(snap) = db.try_reader() {
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+        }
+    }
+
+    fn get(&self) -> Option<ReaderSnapshot> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(ReaderSnapshot::share)
+    }
+}
+
+/// The RwLock write guard, publishing the state it leaves behind to
+/// [`Published`] as it is released.
+pub(crate) struct PublishingGuard<'a> {
+    guard: std::sync::RwLockWriteGuard<'a, GraphDb<RealFs>>,
+    published: &'a Published,
+}
+
+impl Drop for PublishingGuard<'_> {
+    fn drop(&mut self) {
+        // A panic mid-write may have left the handle half-updated; the slot
+        // keeps the last state a writer finished with.
+        if !std::thread::panicking() {
+            self.published.set(&self.guard);
+        }
+    }
+}
+
+impl Deref for PublishingGuard<'_> {
+    type Target = GraphDb<RealFs>;
+    fn deref(&self) -> &GraphDb<RealFs> {
+        &self.guard
+    }
+}
+
+impl DerefMut for PublishingGuard<'_> {
+    fn deref_mut(&mut self) -> &mut GraphDb<RealFs> {
+        &mut self.guard
+    }
+}
+
+/// Take `inner`'s write lock; the state is published when the guard drops.
+fn write_publishing<'a>(
+    inner: &'a RwLock<GraphDb<RealFs>>,
+    published: &'a Published,
+) -> PublishingGuard<'a> {
+    PublishingGuard {
+        guard: inner.write().unwrap_or_else(|e| e.into_inner()),
+        published,
+    }
+}
+
 // ── WriteGuard ────────────────────────────────────────────────────────────────
 
 /// Compound write guard returned by [`SharedDb::write`].
@@ -308,7 +382,7 @@ impl Drop for DrainHandle {
 /// up front instead.
 pub struct WriteGuard<'a> {
     /// RwLock write guard — dropped first (field declared first).
-    inner: std::sync::RwLockWriteGuard<'a, GraphDb<RealFs>>,
+    inner: PublishingGuard<'a>,
     /// WAL mutex guard — dropped second (field declared second).
     _wal: std::sync::MutexGuard<'a, ()>,
 }
@@ -359,6 +433,8 @@ impl<'a> DerefMut for WriteGuard<'a> {
 #[derive(Clone)]
 pub struct SharedDb {
     inner: Arc<RwLock<GraphDb<RealFs>>>,
+    /// The last released state, for captures a writer would otherwise block.
+    published: Arc<Published>,
     queue: Arc<WriteQueue>,
     /// Keeps the drain thread alive; signals + joins on last drop.
     _drain: Arc<DrainHandle>,
@@ -411,12 +487,14 @@ impl SharedDb {
         dir: std::path::PathBuf,
         sync_fn: SyncWalFn,
     ) -> Self {
+        let published = Arc::new(Published::new(&db));
         let inner = Arc::new(RwLock::new(db));
         let queue = WriteQueue::new();
         let wal_mu = Arc::new(Mutex::new(()));
         let dir_arc = Arc::new(dir);
 
         let drain_inner = Arc::clone(&inner);
+        let drain_published = Arc::clone(&published);
         let drain_queue = Arc::clone(&queue);
         let drain_dir = Arc::clone(&dir_arc);
         let drain_wal_mu = Arc::clone(&wal_mu);
@@ -427,6 +505,7 @@ impl SharedDb {
             .spawn(move || {
                 drain_loop(
                     drain_inner,
+                    drain_published,
                     drain_queue,
                     drain_dir,
                     drain_wal_mu,
@@ -437,6 +516,7 @@ impl SharedDb {
 
         SharedDb {
             inner,
+            published,
             queue: Arc::clone(&queue),
             _drain: Arc::new(DrainHandle {
                 queue,
@@ -480,7 +560,7 @@ impl SharedDb {
             .is_stale()
             .unwrap_or(false);
         if stale {
-            let mut db = self.inner.write().unwrap_or_else(|e| e.into_inner());
+            let mut db = write_publishing(&self.inner, &self.published);
             if let Err(e) = db.refresh() {
                 // `refresh` degrades the handle on failure, so mutations
                 // already refuse. Tell the write queue too, so a submitter gets
@@ -605,17 +685,51 @@ impl SharedDb {
         wal: std::sync::MutexGuard<'a, ()>,
         acquired: bool,
     ) -> (WriteGuard<'a>, Result<()>) {
-        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let mut inner = write_publishing(&self.inner, &self.published);
         let entered = inner.enter_write_scope(acquired);
         (WriteGuard { inner, _wal: wal }, entered)
     }
 
     /// Capture a lock-free [`ReaderSnapshot`] of the current db state.
     ///
-    /// Acquires the read lock only long enough to clone a handful of `Arc`
-    /// handles.  Subsequent reads on the returned snapshot are lock-free.
+    /// Never waits behind a writer in this process. When the read lock is
+    /// free it is taken only long enough to clone a handful of `Arc` handles.
+    /// When a writer holds or awaits it, the snapshot is the state the last
+    /// writer released — which includes every write this process has
+    /// returned, so a read issued after such a write still sees it.
+    ///
+    /// Another process's commits are followed as [`Self::read`] follows them:
+    /// when the handle is stale, this applies the peer's WAL tail before
+    /// capturing, under the write lock, waiting for the read guards already
+    /// held (no new one is granted while it waits). A peer commit that has
+    /// returned is therefore in the next capture, whoever holds a read guard.
+    /// The wait happens only on a capture that finds the handle stale — one
+    /// per peer commit, not per read — and is bounded by the longest read
+    /// guard then held, as it was before 0.10. A stale handle found while a
+    /// writer holds the lock needs no wait: that writer refreshes when it
+    /// opens its write scope and publishes the result as it releases.
+    ///
+    /// Subsequent reads on the returned snapshot are lock-free.
     pub fn reader(&self) -> ReaderSnapshot {
-        self.read().reader()
+        use std::sync::TryLockError;
+        match self.inner.try_read() {
+            Ok(db) => {
+                if !db.is_stale().unwrap_or(false) {
+                    return db.reader();
+                }
+                drop(db);
+                // Another process committed. Serving the published state here
+                // would hide its commit for as long as any read guard is held,
+                // so apply it, waiting for those guards, then capture.
+                self.refresh_if_stale();
+                self.read().reader()
+            }
+            Err(TryLockError::Poisoned(p)) => p.into_inner().reader(),
+            Err(TryLockError::WouldBlock) => match self.published.get() {
+                Some(snap) => snap,
+                None => self.read().reader(),
+            },
+        }
     }
 
     /// Enqueue a mutation batch for the group-committing writer.
@@ -811,6 +925,7 @@ fn uncounted(results: Vec<Result<(usize, usize)>>) -> impl Iterator<Item = Resul
 
 fn drain_loop(
     inner: Arc<RwLock<GraphDb<RealFs>>>,
+    published: Arc<Published>,
     queue: Arc<WriteQueue>,
     dir: Arc<std::path::PathBuf>,
     wal_mu: Arc<Mutex<()>>,
@@ -861,7 +976,7 @@ fn drain_loop(
         // contains bytes we have not made durable, and another process's
         // snapshot must not truncate them away.
         let lock_outcome = poll_cross_process_lock(&inner, WRITE_LOCK_WAIT).and_then(|acquired| {
-            let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+            let mut db = write_publishing(&inner, &published);
             db.enter_write_scope(acquired).map(|()| acquired)
         });
         match lock_outcome {
@@ -872,7 +987,7 @@ fn drain_loop(
                 // again — a busy peer is a transient condition, not a failure
                 // of this database handle.
                 {
-                    let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+                    let mut db = write_publishing(&inner, &published);
                     db.end_write_lock();
                 }
                 drop(wal_guard);
@@ -889,7 +1004,7 @@ fn drain_loop(
                 // than failing every future group identically.
                 let reason = format!("refresh under the write lock failed: {e}; reopen required");
                 {
-                    let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+                    let mut db = write_publishing(&inner, &published);
                     db.discard_deferred_events();
                     db.set_deferred_events_mode(false);
                     db.set_degraded();
@@ -919,7 +1034,7 @@ fn drain_loop(
         // durability before notification).  For Relaxed policy events fire
         // immediately (no fsync to wait for).
         let (results, should_sync): (Vec<Result<Applied>>, bool) = {
-            let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+            let mut db = write_publishing(&inner, &published);
             let sync_needed = db.fsync_policy() != FsyncPolicy::Relaxed;
             if sync_needed {
                 db.set_deferred_events_mode(true);
@@ -1027,7 +1142,7 @@ fn drain_loop(
             // Acquire write lock to update in-memory degraded state.
             // Lock order maintained: wal_mu (held) → RwLock write.
             {
-                let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+                let mut db = write_publishing(&inner, &published);
                 db.discard_deferred_events();
                 db.set_deferred_events_mode(false);
                 // Mark degraded so db.write().insert_node(...) etc. also fail.
@@ -1062,7 +1177,7 @@ fn drain_loop(
         // for wal_mu.  Event delivery is pure in-memory (subscriber callbacks
         // only); no WAL I/O occurs in flush_deferred_events.
         if should_sync {
-            let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+            let mut db = write_publishing(&inner, &published);
             db.flush_deferred_events();
             db.set_deferred_events_mode(false);
             // inner.write() released here (RAII) before wal_mu below.
@@ -1073,7 +1188,7 @@ fn drain_loop(
         // The group's bytes are now fsynced, so another process may safely
         // snapshot or truncate around them.
         {
-            let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+            let mut db = write_publishing(&inner, &published);
             db.end_write_lock();
         }
 

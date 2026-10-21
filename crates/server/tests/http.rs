@@ -2423,14 +2423,29 @@ async fn a_corrupt_overlay_under_a_warm_role_mask_is_not_a_404() {
         );
     }
 
-    // A full token reads the same damaged store through the unscoped path —
-    // pinned here so the role branches' answer can be read against it.
-    let (status, _, _) = send(app, authed_get("/node/pub1/edges", "admin")).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "the full-token path does not read the delta tail"
-    );
+    // A full token reads the same lock-free snapshot since TX-5, so it meets the
+    // same damage and answers it the same way — never a 404, never a 200 built
+    // from state the snapshot cannot reach. Pinned here so the role branches'
+    // answer can be read against it.
+    for uri in [
+        "/node/pub1",
+        "/node/pub1/edges",
+        "/node/pub1/neighborhood",
+        "/node/pub1?mask=pub1",
+        "/node/pub1/edges?mask=pub1",
+        "/node/pub1/neighborhood?mask=pub1",
+    ] {
+        let (status, body, _) = send(app.clone(), authed_get(uri, "admin")).await;
+        let err = parse_json(&body)["error"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}: {err}");
+        assert!(
+            err.contains("mvcc delta intern mismatch"),
+            "{uri} must name the corruption: {err}"
+        );
+    }
 }
 
 // ── Fix round-1: C1 — /edges filters hidden neighbor endpoints ────────────────

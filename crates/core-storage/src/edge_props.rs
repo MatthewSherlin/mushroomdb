@@ -18,7 +18,17 @@ pub struct EdgeProps {
     /// to disk by themselves.  Skipping preserves V5–V7 bincode wire shapes.
     #[serde(skip)]
     tombstones: BTreeSet<(u32, u32, u32)>,
+    /// Every key `set` or `remove_edge` has written since the last
+    /// [`take_touched`](Self::take_touched): the journal a reader's delta tail
+    /// is built from, since a rule writes edge properties (its weights) with no
+    /// WAL record of its own. In-memory only, like `tombstones`.
+    #[serde(skip)]
+    touched: BTreeSet<(u32, u32, u32)>,
 }
+
+/// One edge's overlay entry as it stands: its properties, if the overlay holds
+/// any, and whether it is tombstoned. See [`EdgeProps::entry`].
+pub type EdgePropsEntry = (Option<BTreeMap<String, Value>>, bool);
 
 impl EdgeProps {
     pub fn new() -> Self {
@@ -28,6 +38,7 @@ impl EdgeProps {
     pub fn set(&mut self, etype: u32, src: u32, dst: u32, field: &str, value: Value) {
         // A set un-tombstones the edge (it is being (re-)created).
         self.tombstones.remove(&(etype, src, dst));
+        self.touched.insert((etype, src, dst));
         self.map
             .entry((etype, src, dst))
             .or_default()
@@ -53,6 +64,42 @@ impl EdgeProps {
     pub fn remove_edge(&mut self, etype: u32, src: u32, dst: u32) {
         self.map.remove(&(etype, src, dst));
         self.tombstones.insert((etype, src, dst));
+        self.touched.insert((etype, src, dst));
+    }
+
+    /// Whether any key was written since the last [`take_touched`](Self::take_touched).
+    pub fn has_touched(&self) -> bool {
+        !self.touched.is_empty()
+    }
+
+    /// The keys written since the last call, emptying the journal.
+    pub fn take_touched(&mut self) -> BTreeSet<(u32, u32, u32)> {
+        std::mem::take(&mut self.touched)
+    }
+
+    /// One edge's overlay entry exactly as it stands.
+    pub fn entry(&self, etype: u32, src: u32, dst: u32) -> EdgePropsEntry {
+        let key = (etype, src, dst);
+        (self.map.get(&key).cloned(), self.tombstones.contains(&key))
+    }
+
+    /// Make one edge's overlay entry exactly `entry`, as [`Self::entry`] read
+    /// it elsewhere. Not journalled: it copies a state, it does not write one.
+    pub fn restore_entry(&mut self, etype: u32, src: u32, dst: u32, entry: &EdgePropsEntry) {
+        let key = (etype, src, dst);
+        match &entry.0 {
+            Some(props) => {
+                self.map.insert(key, props.clone());
+            }
+            None => {
+                self.map.remove(&key);
+            }
+        }
+        if entry.1 {
+            self.tombstones.insert(key);
+        } else {
+            self.tombstones.remove(&key);
+        }
     }
 
     /// True if `(etype, src, dst)` is tombstoned (deleted from overlay or base).
@@ -117,6 +164,32 @@ mod tests {
         assert!(!e.is_clean());
         assert!(e.is_tombstoned(0, 1, 2));
         assert!(!e.is_tombstoned(0, 2, 1));
+    }
+
+    #[test]
+    fn writes_are_journalled_and_an_entry_restores_exactly() {
+        let mut e = EdgeProps::new();
+        assert!(!e.has_touched());
+        e.set(0, 1, 2, "score", Value::Float(1.0));
+        e.set(0, 3, 4, "score", Value::Float(2.0));
+        e.remove_edge(0, 3, 4);
+        assert!(e.has_touched());
+        let touched = e.take_touched();
+        assert_eq!(
+            touched.into_iter().collect::<Vec<_>>(),
+            [(0, 1, 2), (0, 3, 4)]
+        );
+        assert!(!e.has_touched());
+
+        let mut copy = EdgeProps::new();
+        copy.set(0, 3, 4, "stale", Value::Int(9));
+        for (et, s, d) in [(0, 1, 2), (0, 3, 4)] {
+            copy.restore_entry(et, s, d, &e.entry(et, s, d));
+        }
+        assert_eq!(copy.get(0, 1, 2, "score"), Some(&Value::Float(1.0)));
+        assert_eq!(copy.get(0, 3, 4, "stale"), None);
+        assert!(copy.is_tombstoned(0, 3, 4));
+        assert!(!copy.is_tombstoned(0, 1, 2));
     }
 
     #[test]

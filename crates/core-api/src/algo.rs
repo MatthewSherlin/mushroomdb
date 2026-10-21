@@ -29,7 +29,7 @@
 //! if you need the degree of every node available in every Cypher query →
 //! create a Degree view.
 
-use core_query::Dir;
+use core_query::{Dir, GraphView};
 use core_storage::v8::seam::TopologyView;
 use core_storage::{Direction, EdgePropsView, IdMap, Interner, Value};
 use serde::{Deserialize, Serialize};
@@ -44,18 +44,14 @@ use std::time::{Duration, Instant};
 ///
 /// Returns `(ids, keys)` where `ids[i]` is the internal u32 id for `keys[i]`.
 /// Tombstoned slots are skipped.  Stable order: ascending internal id.
-fn live_nodes(idmap: &IdMap, labels: &[u32]) -> (Vec<u32>, Vec<String>) {
-    let n = idmap.len() as u32;
+fn live_nodes(view: &GraphView) -> (Vec<u32>, Vec<String>) {
     let mut ids = Vec::new();
     let mut keys = Vec::new();
-    for id in 0..n {
-        let Some(key) = idmap.key_of(id) else {
+    for id in 0..view.id_bound() {
+        let Some(key) = view.try_key_of(id) else {
             continue;
         };
-        let Some(&sym) = labels.get(id as usize) else {
-            continue;
-        };
-        if sym == u32::MAX {
+        if view.label_sym(id).is_none() {
             continue; // tombstoned
         }
         ids.push(id);
@@ -69,11 +65,11 @@ fn live_nodes(idmap: &IdMap, labels: &[u32]) -> (Vec<u32>, Vec<String>) {
 /// Returns `None` if `edge_type` is `Some(name)` that is not interned (meaning
 /// no edges of that type exist).  Returns `Some(None)` when `edge_type` is
 /// `None` (all types).
-fn resolve_etype(syms: &Interner, edge_type: Option<&str>) -> Option<Option<u32>> {
+fn resolve_etype(view: &GraphView, edge_type: Option<&str>) -> Option<Option<u32>> {
     match edge_type {
         None => Some(None), // all etypes
         Some(name) => {
-            let sym = syms.get(name)?; // not interned → no such edges
+            let sym = view.sym(name)?; // not interned → no such edges
             Some(Some(sym))
         }
     }
@@ -284,14 +280,9 @@ impl From<Dir> for AlgoDir {
 /// Run PageRank on the unified topology.
 ///
 /// Returns a [`PageRankReport`] with scores sorted descending (ties: key asc).
-pub(crate) fn pagerank(
-    topo: &TopologyView,
-    idmap: &IdMap,
-    syms: &Interner,
-    labels: &[u32],
-    edge_props: &EdgePropsView,
-    config: &PageRankConfig,
-) -> PageRankReport {
+pub(crate) fn pagerank(view: &GraphView, config: &PageRankConfig) -> PageRankReport {
+    let topo = &view.topo;
+    let edge_props = &view.edge_props;
     let weighted = config.weight_prop.is_some() || config.min_weight.is_some();
     let deadline = if config.budget_ms > 0 {
         Some(Instant::now() + Duration::from_millis(config.budget_ms))
@@ -299,7 +290,7 @@ pub(crate) fn pagerank(
         None
     };
 
-    let (node_ids, node_keys) = live_nodes(idmap, labels);
+    let (node_ids, node_keys) = live_nodes(view);
     let n = node_ids.len();
 
     if n == 0 {
@@ -318,7 +309,7 @@ pub(crate) fn pagerank(
     }
 
     // Resolve etype filter.
-    let etype_filter = match resolve_etype(syms, config.edge_type.as_deref()) {
+    let etype_filter = match resolve_etype(view, config.edge_type.as_deref()) {
         None => {
             // Edge type specified but not in graph → no edges, PR is uniform.
             let score = 1.0 / n as f64;
@@ -533,14 +524,9 @@ impl UnionFind {
 /// Run weakly-connected components on the unified topology (undirected).
 ///
 /// Component ID is the smallest member key in each component (deterministic).
-pub(crate) fn wcc(
-    topo: &TopologyView,
-    idmap: &IdMap,
-    syms: &Interner,
-    labels: &[u32],
-    edge_props: &EdgePropsView,
-    config: &WccConfig,
-) -> WccReport {
+pub(crate) fn wcc(view: &GraphView, config: &WccConfig) -> WccReport {
+    let topo = &view.topo;
+    let edge_props = &view.edge_props;
     let weighted = config.weight_prop.is_some() || config.min_weight.is_some();
     let deadline = if config.budget_ms > 0 {
         Some(Instant::now() + Duration::from_millis(config.budget_ms))
@@ -548,7 +534,7 @@ pub(crate) fn wcc(
         None
     };
 
-    let (node_ids, node_keys) = live_nodes(idmap, labels);
+    let (node_ids, node_keys) = live_nodes(view);
     let n = node_ids.len();
 
     if n == 0 {
@@ -565,7 +551,7 @@ pub(crate) fn wcc(
     }
 
     // Resolve etype filter.
-    let etype_filter = match resolve_etype(syms, config.edge_type.as_deref()) {
+    let etype_filter = match resolve_etype(view, config.edge_type.as_deref()) {
         None => {
             // No edges of this type → every node is its own component.
             let mut components: Vec<(String, String)> =
@@ -710,14 +696,9 @@ pub struct DegreeReport {
 }
 
 /// Compute degree centrality for all live nodes.
-pub(crate) fn degree_centrality(
-    topo: &TopologyView,
-    idmap: &IdMap,
-    syms: &Interner,
-    labels: &[u32],
-    edge_props: &EdgePropsView,
-    config: &DegreeConfig,
-) -> DegreeReport {
+pub(crate) fn degree_centrality(view: &GraphView, config: &DegreeConfig) -> DegreeReport {
+    let topo = &view.topo;
+    let edge_props = &view.edge_props;
     let weighted = config.weight_prop.is_some() || config.min_weight.is_some();
     let deadline = if config.budget_ms > 0 {
         Some(Instant::now() + Duration::from_millis(config.budget_ms))
@@ -725,7 +706,7 @@ pub(crate) fn degree_centrality(
         None
     };
 
-    let (node_ids, node_keys) = live_nodes(idmap, labels);
+    let (node_ids, node_keys) = live_nodes(view);
     let n = node_ids.len();
 
     if n == 0 {
@@ -736,7 +717,7 @@ pub(crate) fn degree_centrality(
     }
 
     // Resolve etype filter.
-    let etype_filter = match resolve_etype(syms, config.edge_type.as_deref()) {
+    let etype_filter = match resolve_etype(view, config.edge_type.as_deref()) {
         None => {
             // No edges of this type → all degrees are 0.
             let scores = node_keys.iter().map(|k| (k.clone(), 0u64)).collect();

@@ -16,18 +16,21 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use core_query::cypher::{execute, is_write_tokens, lex, parse, plan, Params};
+use core_query::cypher::{execute_union, is_write_tokens, lex, parse_read, Params};
 use core_query::{expand, neighborhood, Dir, GraphView, ResultSet};
+use core_storage::property_index::PropertyIndex;
 use core_storage::v8::seam::{ArchivedNeighbor, DerivedBits};
 use core_storage::v8::seam::{ColumnsView, TopologyView};
 use core_storage::v8::MappedBase;
 use core_storage::wal::WalRecord;
 use core_storage::{
-    ColumnStore, Direction, EdgeProps, EdgePropsView, GraphError, IdMap, Interner, Result,
-    Topology, Value,
+    ColumnStore, Direction, EdgeProps, EdgePropsEntry, EdgePropsView, GraphError, IdMap, Interner,
+    Result, Topology, Value,
 };
 
-use crate::db::{EdgeInfo, NodeInfo};
+use crate::db::{
+    EdgeInfo, MaskedEdge, MaskedNodeResult, NodeInfo, SlowQuerySink, SlowQuerySnapshot,
+};
 use crate::layer::DeltaLayer;
 use crate::mask::{NodeMask, RoleMaskCache};
 use crate::roles::RoleDef;
@@ -37,6 +40,10 @@ use crate::roles::RoleDef;
 pub const FOLD_EVERY_K: usize = 64;
 
 /// Per-commit overlay change record. Immutable after creation.
+///
+/// `#[non_exhaustive]`: the reader gains fields as it learns to carry more
+/// of a commit (0.10 added `edge_props`), so it is built only in this crate.
+#[non_exhaustive]
 pub struct CommitDelta {
     /// WAL records for this commit (including `Intern` records, in WAL order).
     pub records: Vec<WalRecord>,
@@ -50,6 +57,10 @@ pub struct CommitDelta {
     /// records change — so the reader is handed the result rather than made
     /// to recompute it.
     pub view_values: Vec<(u32, String, Option<Value>)>,
+    /// Edge-property overlay entries as this commit left them, for every edge
+    /// whose properties it wrote. A rule writes its weights with no record of
+    /// their own, so — as with view values — the reader is handed the result.
+    pub edge_props: Vec<((u32, u32, u32), EdgePropsEntry)>,
 }
 
 /// An edge as the rule engine owns it: `(etype_sym, src_id, dst_id)`.
@@ -431,7 +442,11 @@ impl DerivedEdges {
 /// `textMatches()` reads property values), and sharing the writer's index
 /// here made the writer's first full-text write after every fold copy the
 /// whole index under the write lock, stalling every reader capture.
+///
+/// `#[non_exhaustive]` for the same reason as [`CommitDelta`] (0.10 added
+/// `prop_index`).
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct FrozenOverlay {
     pub ids: Arc<IdMap>,
     pub syms: Arc<Interner>,
@@ -440,6 +455,10 @@ pub struct FrozenOverlay {
     pub labels: Arc<Vec<u32>>,
     pub edge_props: Arc<EdgeProps>,
     pub roles: Option<Arc<Vec<RoleDef>>>,
+    /// The equality index as it stood at the fold. A snapshot answers an
+    /// indexed lookup from it, with the nodes its tail touched re-indexed
+    /// over the top (see [`ReaderSnapshot`]'s `index`).
+    pub prop_index: Arc<PropertyIndex>,
     /// Which edges in `topo` (and the base under it) a rule derived.
     pub derived: DerivedEdges,
 }
@@ -483,7 +502,173 @@ pub struct ReaderSnapshot {
     /// Stores `Err(String)` if a record will not apply, so the error is
     /// returned to every later caller without re-attempting. When `deltas` is
     /// empty it is never populated and reads go to `frozen` directly.
-    cache: OnceLock<std::result::Result<DeltaLayer, String>>,
+    cache: Arc<EffectiveCell>,
+    /// What the snapshot knows of the handle beyond its graph state: where
+    /// slow queries go, the counts at capture, the WAL's path.
+    context: ReadContext,
+    /// The index this snapshot's queries use: the fold's, layered with the
+    /// tail's touched nodes; `None` inside when no index applies. Built at
+    /// most once, on the first query, and shared like `cache`.
+    index: Arc<IndexCell>,
+    /// The layer and index of an earlier snapshot whose tail is a prefix of
+    /// this one's, for `cache` and `index` to extend instead of rebuild.
+    seeds: Arc<Seeds>,
+}
+
+/// The latest built cells of one fold, which a later version takes and
+/// extends; see [`SharedEffective`]. Only built cells are registered.
+#[derive(Default)]
+pub(crate) struct Seeds {
+    layer: std::sync::Mutex<Option<(Arc<EffectiveCell>, usize)>>,
+    index: std::sync::Mutex<Option<(Arc<IndexCell>, usize)>>,
+}
+
+/// Offer a built `cell` for `len` deltas to the fold's register, keeping
+/// whichever of it and the registered one covers more of the tail.
+fn register<T>(slot: &std::sync::Mutex<Option<(Arc<T>, usize)>>, cell: &Arc<T>, len: usize) {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.as_ref().is_none_or(|(_, have)| *have < len) {
+        *slot = Some((Arc::clone(cell), len));
+    }
+}
+
+/// The value a built cell holds — by move when no one else holds the cell,
+/// by clone otherwise — or `None` when it was never built.
+fn take_cell<T: Clone>(cell: Arc<OnceLock<T>>) -> Option<T> {
+    match Arc::try_unwrap(cell) {
+        Ok(once) => once.into_inner(),
+        Err(shared) => shared.get().cloned(),
+    }
+}
+
+/// What a [`ReaderSnapshot`] carries of its handle beyond the graph.
+#[derive(Clone)]
+pub(crate) struct ReadContext {
+    /// Where [`ReaderSnapshot::query`] reports a slow query: the handle's
+    /// threshold and ring, so `/metrics` sees reader queries too.
+    pub(crate) slow: SlowQuerySink,
+    /// `(nodes_live, nodes_tombstoned, edges)` as `GraphDb::stats` counted
+    /// them at capture — this snapshot's version — from the handle's own
+    /// exact counters.
+    pub(crate) counts: (usize, usize, u64),
+    /// The WAL file, for [`ReaderSnapshot::wal_size_bytes`].
+    pub(crate) wal_path: Option<std::path::PathBuf>,
+}
+
+impl ReadContext {
+    fn none() -> Self {
+        Self {
+            slow: SlowQuerySink::disabled(),
+            counts: (0, 0, 0),
+            wal_path: None,
+        }
+    }
+}
+
+/// A snapshot's delta-tail layer, built at most once.
+type EffectiveCell = OnceLock<std::result::Result<DeltaLayer, String>>;
+
+/// A snapshot's query index, built at most once. See [`ReaderSnapshot::query_index`].
+type IndexCell = OnceLock<Option<PropertyIndex>>;
+
+/// The layer and index every snapshot of one fold and delta tail shares.
+///
+/// A snapshot's effective state is a pure function of its fold, its base and
+/// its delta tail. Between two commits every snapshot taken has the same
+/// three, so they share one [`EffectiveCell`] (and one [`IndexCell`]) instead
+/// of each building the tail's layer again — which, with a snapshot per HTTP
+/// request, would be once per request.
+///
+/// And because the tail only grows between folds, a version's cells start
+/// from the longest cell already built for the same fold (`seeds`, one
+/// register per fold): the layer is extended by the new deltas' records and
+/// the index layer re-indexes only the nodes they touched, so a commit costs
+/// readers its own records, not the whole tail. Without this, a bulk commit
+/// (an ingest batch) was re-applied by every version until the next fold.
+///
+/// The entry holds the fold, base and last delta it was keyed on, not their
+/// addresses alone, so none of them can be freed and its address reused while
+/// the entry could still match it.
+///
+/// # Memory ceiling
+///
+/// The slot keeps the current version's cells; the register keeps the latest
+/// built ones until a later version takes them. A seed is taken by move when
+/// nothing else holds it, so the layer is not copied; when an older snapshot
+/// still holds it, it is cloned (the size of the tail's changes). Nothing
+/// chains: a cell holds no seed.
+pub(crate) struct SharedEffective {
+    frozen: Arc<FrozenOverlay>,
+    base: Option<Arc<MappedBase>>,
+    len: usize,
+    last: Option<Arc<CommitDelta>>,
+    cell: Arc<EffectiveCell>,
+    index: Arc<IndexCell>,
+    seeds: Arc<Seeds>,
+}
+
+/// What [`SharedEffective::cell_for`] hands a new snapshot.
+pub(crate) struct SharedCell {
+    cell: Arc<EffectiveCell>,
+    index: Arc<IndexCell>,
+    seeds: Arc<Seeds>,
+}
+
+fn same_arc<T>(a: Option<&Arc<T>>, b: Option<&Arc<T>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+impl SharedEffective {
+    /// The cells for `(frozen, base, deltas)`, reusing the ones in `slot` when
+    /// they were made for exactly that state and replacing them otherwise.
+    ///
+    /// The delta tail only grows between folds and a fold replaces `frozen`,
+    /// so the fold, the tail's length and its last entry identify the tail.
+    pub(crate) fn cell_for(
+        slot: &std::sync::Mutex<Option<SharedEffective>>,
+        frozen: &Arc<FrozenOverlay>,
+        base: &Option<Arc<MappedBase>>,
+        deltas: &[Arc<CommitDelta>],
+    ) -> SharedCell {
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seeds = None;
+        if let Some(entry) = slot.as_ref() {
+            let same_fold =
+                Arc::ptr_eq(&entry.frozen, frozen) && same_arc(entry.base.as_ref(), base.as_ref());
+            if same_fold
+                && entry.len == deltas.len()
+                && same_arc(entry.last.as_ref(), deltas.last())
+            {
+                return SharedCell {
+                    cell: Arc::clone(&entry.cell),
+                    index: Arc::clone(&entry.index),
+                    seeds: Arc::clone(&entry.seeds),
+                };
+            }
+            // One register per fold: every tail of a fold extends every
+            // shorter one, so a built cell of any earlier version seeds this.
+            if same_fold {
+                seeds = Some(Arc::clone(&entry.seeds));
+            }
+        }
+        let cell = Arc::new(EffectiveCell::new());
+        let index = Arc::new(IndexCell::new());
+        let seeds = seeds.unwrap_or_default();
+        *slot = Some(SharedEffective {
+            frozen: Arc::clone(frozen),
+            base: base.clone(),
+            len: deltas.len(),
+            last: deltas.last().cloned(),
+            cell: Arc::clone(&cell),
+            index: Arc::clone(&index),
+            seeds: Arc::clone(&seeds),
+        });
+        SharedCell { cell, index, seeds }
+    }
 }
 
 // ── Private view-building helpers ─────────────────────────────────────────────
@@ -668,7 +853,42 @@ impl ReaderSnapshot {
             tail_derived,
             version,
             role_masks,
-            cache: OnceLock::new(),
+            cache: Arc::new(EffectiveCell::new()),
+            context: ReadContext::none(),
+            index: Arc::new(IndexCell::new()),
+            seeds: Arc::new(Seeds::default()),
+        }
+    }
+
+    /// This snapshot, with its handle's `context`.
+    pub(crate) fn with_read_context(mut self, context: ReadContext) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// This snapshot, building its layer and index into the cells shared with
+    /// every other snapshot of the same fold and tail (see [`SharedEffective`]).
+    pub(crate) fn with_shared_effective(mut self, shared: SharedCell) -> Self {
+        self.cache = shared.cell;
+        self.index = shared.index;
+        self.seeds = shared.seeds;
+        self
+    }
+
+    /// Another handle on exactly this snapshot: same state, same shared
+    /// layer and index.
+    pub(crate) fn share(&self) -> ReaderSnapshot {
+        ReaderSnapshot {
+            frozen: Arc::clone(&self.frozen),
+            base: self.base.clone(),
+            deltas: self.deltas.clone(),
+            tail_derived: Arc::clone(&self.tail_derived),
+            version: self.version,
+            role_masks: Arc::clone(&self.role_masks),
+            cache: Arc::clone(&self.cache),
+            context: self.context.clone(),
+            index: Arc::clone(&self.index),
+            seeds: Arc::clone(&self.seeds),
         }
     }
 
@@ -706,10 +926,18 @@ impl ReaderSnapshot {
         if self.deltas.is_empty() {
             return Ok(None);
         }
+        let mut built = false;
         let cached = self.cache.get_or_init(|| {
-            DeltaLayer::from_deltas(&self.frozen, &self.base, &self.deltas)
-                .map_err(|e| e.to_string())
+            built = true;
+            match self.seeded_layer() {
+                Some(extended) => extended,
+                None => DeltaLayer::from_deltas(&self.frozen, &self.base, &self.deltas),
+            }
+            .map_err(|e| e.to_string())
         });
+        if built && cached.is_ok() {
+            register(&self.seeds.layer, &self.cache, self.deltas.len());
+        }
         cached
             .as_ref()
             .map(Some)
@@ -769,23 +997,36 @@ impl ReaderSnapshot {
     }
 
     /// Execute a read-only Cypher query over the epoch snapshot.
+    ///
+    /// The snapshot twin of [`GraphDb::query`](crate::GraphDb::query): the same
+    /// `UNION` / `UNION ALL` chain, the same stage-prefixed error text
+    /// (`lex:` / `parse:` / `execute:`), the same slow-query report into the
+    /// originating handle's ring, and equality lookups served from an index.
     pub fn query(&self, cypher: &str, params: &BTreeMap<String, Value>) -> Result<ResultSet> {
         let tokens = lex(cypher).map_err(|e| GraphError::QueryError {
             detail: format!("lex: {e}"),
         })?;
-        let ast = parse(&tokens).map_err(|e| GraphError::QueryError {
+        let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
-        let ops = plan(&ast).map_err(|e| GraphError::QueryError {
-            detail: format!("plan: {e}"),
-        })?;
-        let view = self.view(None)?;
-        execute(&view, &ops, &Params(params)).map_err(|e| GraphError::QueryError {
-            detail: format!("execute: {e}"),
-        })
+        let mut view = self.view(None)?;
+        view.prop_index = self.query_index()?;
+        let t0 = std::time::Instant::now();
+        let result =
+            execute_union(&view, &union, &Params(params)).map_err(|e| GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            });
+        self.context
+            .slow
+            .record(t0.elapsed().as_millis() as u64, cypher, self.version);
+        result
     }
 
     /// Execute a read-only Cypher query with a node visibility mask.
+    ///
+    /// The snapshot twin of [`GraphDb::query_masked`](crate::GraphDb::query_masked),
+    /// `UNION` included: every part of the chain runs against the same masked
+    /// view.
     ///
     /// Returns `Err` when `cypher` is a write statement (CREATE / MATCH…SET / DELETE).
     pub fn query_masked(
@@ -802,16 +1043,217 @@ impl ReaderSnapshot {
                 detail: "masked queries are read-only".into(),
             });
         }
-        let ast = parse(&tokens).map_err(|e| GraphError::QueryError {
+        let union = parse_read(&tokens).map_err(|e| GraphError::QueryError {
             detail: format!("parse: {e}"),
         })?;
-        let ops = plan(&ast).map_err(|e| GraphError::QueryError {
-            detail: format!("plan: {e}"),
-        })?;
-        let view = self.view(Some(&mask.visible))?;
-        execute(&view, &ops, &Params(params)).map_err(|e| GraphError::QueryError {
+        let mut view = self.view(Some(&mask.visible))?;
+        view.prop_index = self.query_index()?;
+        execute_union(&view, &union, &Params(params)).map_err(|e| GraphError::QueryError {
             detail: format!("execute: {e}"),
         })
+    }
+
+    /// The equality index this snapshot's queries use.
+    ///
+    /// With no tail it is the fold's index itself. With a tail it is the
+    /// fold's index layered with the nodes the tail touched, re-indexed from
+    /// their current values — exact without copying the index per commit
+    /// (see [`PropertyIndex::layered_over`]). `None` when nothing is indexed,
+    /// or the tail declares or drops an index (the writer folds on such a
+    /// commit, so this is a safeguard); a query then scans, which answers the
+    /// same.
+    fn query_index(&self) -> Result<Option<&PropertyIndex>> {
+        let frozen = &self.frozen.prop_index;
+        if frozen.enabled_pairs().next().is_none() {
+            return Ok(None);
+        }
+        if self.deltas.is_empty() {
+            return Ok(Some(frozen));
+        }
+        let view = self.view(None)?;
+        let mut built = false;
+        let index = self.index.get_or_init(|| {
+            built = true;
+            self.seeded_index(&view)
+                .unwrap_or_else(|| self.layered_index(&view))
+        });
+        if built && index.is_some() {
+            register(&self.seeds.index, &self.index, self.deltas.len());
+        }
+        Ok(index.as_ref())
+    }
+
+    /// The seed's layer extended by the deltas after it, or `None` when there
+    /// is no usable seed (the caller then builds the layer from the tail).
+    fn seeded_layer(&self) -> Option<Result<DeltaLayer>> {
+        let (cell, len) = self
+            .seeds
+            .layer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()?;
+        if len > self.deltas.len() {
+            register(&self.seeds.layer, &cell, len);
+            return None;
+        }
+        let mut layer = take_cell(cell)?.ok()?;
+        Some(
+            layer
+                .extend(&self.frozen, &self.base, &self.deltas[len..])
+                .map(|()| layer),
+        )
+    }
+
+    /// The seed's index layer with the nodes the later deltas touched
+    /// re-indexed, or `None` when there is no usable seed.
+    fn seeded_index(&self, view: &GraphView<'_>) -> Option<Option<PropertyIndex>> {
+        let (cell, len) = self
+            .seeds
+            .index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()?;
+        if len > self.deltas.len() {
+            register(&self.seeds.index, &cell, len);
+            return None;
+        }
+        let mut layer = take_cell(cell)??;
+        let mut stale = std::collections::BTreeSet::new();
+        let mut unresolved = false;
+        for delta in &self.deltas[len..] {
+            for rec in &delta.records {
+                if !touched_nodes(rec, &self.frozen.ids, view, &mut stale, &mut unresolved) {
+                    return Some(None);
+                }
+            }
+            stale.extend(delta.view_values.iter().map(|(node, _, _)| *node));
+        }
+        if unresolved {
+            return None;
+        }
+        let pairs: Vec<(String, String)> =
+            self.frozen.prop_index.enabled_pairs().cloned().collect();
+        for id in stale {
+            layer.restale(id);
+            reindex(&mut layer, &pairs, view, id);
+        }
+        Some(Some(layer))
+    }
+
+    /// Whether this snapshot's queries answer equality lookups from an index
+    /// (the fold's, or the fold's layered with the tail) rather than a scan.
+    #[doc(hidden)]
+    pub fn queries_use_index(&self) -> bool {
+        self.query_index().ok().flatten().is_some()
+    }
+
+    /// Build the layered index [`Self::query_index`] serves over a tail;
+    /// `view` is this snapshot's unmasked effective state.
+    fn layered_index(&self, view: &GraphView<'_>) -> Option<PropertyIndex> {
+        let frozen = &self.frozen.prop_index;
+        let mut stale = std::collections::BTreeSet::new();
+        let mut unresolved = false;
+        for delta in &self.deltas {
+            for rec in &delta.records {
+                if !touched_nodes(rec, &self.frozen.ids, view, &mut stale, &mut unresolved) {
+                    return None;
+                }
+            }
+            stale.extend(delta.view_values.iter().map(|(node, _, _)| *node));
+        }
+        if unresolved {
+            // A key neither state can name (renamed, then deleted, inside the
+            // tail): find every node whose liveness or label moved instead.
+            for id in 0..view.id_bound() {
+                let below = self
+                    .frozen
+                    .labels
+                    .get(id as usize)
+                    .copied()
+                    .filter(|&s| s != u32::MAX);
+                if below != view.label_sym(id) {
+                    stale.insert(id);
+                }
+            }
+        }
+        let pairs: Vec<(String, String)> = frozen.enabled_pairs().cloned().collect();
+        let mut layer = PropertyIndex::layered_over(Arc::clone(frozen), stale.clone());
+        for &id in &stale {
+            reindex(&mut layer, &pairs, view, id);
+        }
+        Some(layer)
+    }
+
+    /// Materialise this snapshot's effective state now, returning the error
+    /// the delta tail raises if it cannot be applied.
+    ///
+    /// The `Option`-returning reads ([`Self::node_info`],
+    /// [`Self::neighborhood`], [`Self::neighborhood_masked`],
+    /// [`Self::node_info_masked`]) answer `None` for an unreadable tail exactly
+    /// as for an absent key. A caller that must tell a damaged store from a
+    /// missing node calls this first: once it returns `Ok`, the state is cached
+    /// and those reads can no longer fail.
+    pub fn ensure_readable(&self) -> Result<()> {
+        self.effective().map(|_| ())
+    }
+
+    /// `(nodes_live, nodes_tombstoned, edges)` exactly as
+    /// [`GraphDb::stats`](crate::GraphDb::stats) counts them, at this
+    /// snapshot's version.
+    pub fn counts(&self) -> (usize, usize, u64) {
+        self.context.counts
+    }
+
+    /// The commit sequence this snapshot reads, as
+    /// [`GraphDb::commit_seq`](crate::GraphDb::commit_seq) reported it.
+    pub fn commit_seq(&self) -> u64 {
+        self.version
+    }
+
+    /// The WAL file's size on disk now, as
+    /// [`GraphDb::wal_size_bytes`](crate::GraphDb::wal_size_bytes) reads it.
+    pub fn wal_size_bytes(&self) -> std::io::Result<u64> {
+        let path = self.context.wal_path.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "wal_path not available for this Fs implementation",
+            )
+        })?;
+        Ok(std::fs::metadata(path)?.len())
+    }
+
+    /// The handle's slow-query ring, as
+    /// [`GraphDb::slow_query_snapshot`](crate::GraphDb::slow_query_snapshot)
+    /// reports it.
+    pub fn slow_query_snapshot(&self) -> SlowQuerySnapshot {
+        self.context.slow.snapshot()
+    }
+
+    /// PageRank over this snapshot: the twin of
+    /// [`GraphDb::pagerank`](crate::GraphDb::pagerank).
+    pub fn pagerank(
+        &self,
+        config: &crate::algo::PageRankConfig,
+    ) -> Result<crate::algo::PageRankReport> {
+        Ok(crate::algo::pagerank(&self.view(None)?, config))
+    }
+
+    /// Weakly-connected components over this snapshot: the twin of
+    /// [`GraphDb::connected_components`](crate::GraphDb::connected_components).
+    pub fn connected_components(
+        &self,
+        config: &crate::algo::WccConfig,
+    ) -> Result<crate::algo::WccReport> {
+        Ok(crate::algo::wcc(&self.view(None)?, config))
+    }
+
+    /// Degree centrality over this snapshot: the twin of
+    /// [`GraphDb::degree_centrality`](crate::GraphDb::degree_centrality).
+    pub fn degree_centrality(
+        &self,
+        config: &crate::algo::DegreeConfig,
+    ) -> Result<crate::algo::DegreeReport> {
+        Ok(crate::algo::degree_centrality(&self.view(None)?, config))
     }
 
     /// Live node info from the epoch snapshot. `None` if key is absent or tombstoned.
@@ -841,6 +1283,98 @@ impl ReaderSnapshot {
         mask: &NodeMask,
     ) -> Option<ResultSet> {
         neighborhood_masked_from(key, self, depth, edge_types, dir, mask)
+    }
+
+    /// Unmasked BFS expansion from `key`: the snapshot twin of
+    /// [`NodeRef::neighborhood`](crate::NodeRef::neighborhood). Columns
+    /// `["key", "label", "depth"]`, BFS order, the start node excluded.
+    ///
+    /// Returns `None` when `key` does not exist.
+    pub fn neighborhood(
+        &self,
+        key: &str,
+        depth: u32,
+        edge_types: Option<&[&str]>,
+        dir: Dir,
+    ) -> Option<ResultSet> {
+        let view = self.view(None).ok()?;
+        let start_id = view.node_id(key)?;
+        let resolved: Option<Vec<u32>> =
+            edge_types.map(|names| names.iter().filter_map(|name| view.sym(name)).collect());
+        let nb = neighborhood(&view, start_id, depth, resolved.as_deref(), dir);
+        let mut rs = ResultSet::new(vec!["key".into(), "label".into(), "depth".into()]);
+        for (nid, d) in nb.nodes {
+            let k = view.key_of(nid);
+            let lbl = view
+                .label_of(nid)
+                .expect("real nodes always have a label; u32::MAX sentinel cannot occur");
+            rs.push_row(vec![
+                Some(Value::Str(k.to_string())),
+                Some(Value::Str(lbl.to_string())),
+                Some(Value::Int(d as i64)),
+            ]);
+        }
+        Some(rs)
+    }
+
+    /// Mask-aware node lookup: the snapshot twin of
+    /// [`GraphDb::node_info_masked`](crate::GraphDb::node_info_masked).
+    ///
+    /// Unknown key → `None`; visible → `Visible`; hidden → `None` under
+    /// [`MaskMode::Omit`](crate::MaskMode::Omit), `Restricted` under
+    /// [`MaskMode::Stub`](crate::MaskMode::Stub).
+    ///
+    /// **SECURITY**: only for client-mask (full-token) callers; a scoped
+    /// caller must never be shown a stub.
+    pub fn node_info_masked(&self, key: &str, mask: &NodeMask) -> Option<MaskedNodeResult> {
+        let view = self.view(None).ok()?;
+        let id = view.node_id(key)?;
+        if mask.contains_id(id) {
+            Some(MaskedNodeResult::Visible(node_info_from(key, &view)?))
+        } else {
+            match mask.mode() {
+                crate::mask::MaskMode::Stub => Some(MaskedNodeResult::Restricted),
+                crate::mask::MaskMode::Omit => None,
+            }
+        }
+    }
+
+    /// Edges of `key` with mask-aware hidden-endpoint handling: the snapshot
+    /// twin of [`GraphDb::node_edges_masked`](crate::GraphDb::node_edges_masked).
+    ///
+    /// Omit mode drops every edge whose other endpoint is hidden; Stub mode
+    /// keeps it and flags that endpoint restricted. `derived` is reported as
+    /// [`Self::node_edges`] reports it.
+    ///
+    /// Unknown key → [`GraphError::KeyNotFound`].
+    ///
+    /// **SECURITY**: only for client-mask (full-token) callers.
+    pub fn node_edges_masked(&self, key: &str, mask: &NodeMask) -> Result<Vec<MaskedEdge>> {
+        let view = self.view(None)?;
+        let edges = node_edges_from(key, &view, self)?;
+        let hidden = |k: &str| !view.node_id(k).is_some_and(|id| mask.contains_id(id));
+        let mut out = Vec::with_capacity(edges.len());
+        for e in edges {
+            // The subject's own side is never flagged, as the live twin walks
+            // each edge from the subject outward; a self-loop is an out-edge.
+            let (src_restricted, dst_restricted) = if e.src_key == key {
+                (false, hidden(&e.dst_key))
+            } else {
+                (hidden(&e.src_key), false)
+            };
+            if (src_restricted || dst_restricted) && mask.mode() == crate::mask::MaskMode::Omit {
+                continue;
+            }
+            out.push(MaskedEdge {
+                edge_type: e.edge_type,
+                src_key: e.src_key,
+                src_restricted,
+                dst_key: e.dst_key,
+                dst_restricted,
+                derived: e.derived,
+            });
+        }
+        Ok(out)
     }
 
     /// Every edge incident on `key` that the scope may see.
@@ -901,6 +1435,66 @@ impl ReaderSnapshot {
         neighborhood_masked_from(key, self, depth, edge_types, dir, mask)
             .ok_or_else(|| GraphError::KeyNotFound { key: key.into() })
     }
+}
+
+/// Write node `id`'s current indexed values, read through `view`, into `layer`.
+fn reindex(layer: &mut PropertyIndex, pairs: &[(String, String)], view: &GraphView<'_>, id: u32) {
+    let Some(label) = view.label_of(id) else {
+        return;
+    };
+    for (l, field) in pairs {
+        if l == label {
+            if let Some(vr) = view.props.get(id, field) {
+                layer.set(l, field, id, &vr.into_value());
+            }
+        }
+    }
+}
+
+/// Add to `stale` every node `rec` may have changed an indexed value of,
+/// resolving keys against both the fold's ids and the effective view. Sets
+/// `*unresolved` for a deletion neither can name. Returns `false` when `rec`
+/// declares or drops an index, which no layer over the fold can express.
+fn touched_nodes(
+    rec: &WalRecord,
+    frozen: &IdMap,
+    effective: &GraphView<'_>,
+    stale: &mut std::collections::BTreeSet<u32>,
+    unresolved: &mut bool,
+) -> bool {
+    let by_key = |key: &str, stale: &mut std::collections::BTreeSet<u32>| {
+        let a = frozen.get(key);
+        let b = effective.node_id(key);
+        stale.extend(a);
+        stale.extend(b);
+        a.is_some() || b.is_some()
+    };
+    match rec {
+        WalRecord::EnableIndex { .. } | WalRecord::DisableIndex { .. } => return false,
+        WalRecord::InsertNode { key, .. }
+        | WalRecord::InsertNodeId { key, .. }
+        | WalRecord::SetProp { key, .. }
+        | WalRecord::RemoveProp { key, .. } => {
+            by_key(key, stale);
+        }
+        WalRecord::DeleteNode { key } => {
+            if !by_key(key, stale) {
+                *unresolved = true;
+            }
+        }
+        WalRecord::SetPropId { id, .. } => {
+            stale.insert(*id);
+        }
+        WalRecord::Batch(inner) => {
+            for r in inner {
+                if !touched_nodes(r, frozen, effective, stale, unresolved) {
+                    return false;
+                }
+            }
+        }
+        _ => {}
+    }
+    true
 }
 
 // ── Free-standing helpers that read through a view ───────────────────────────

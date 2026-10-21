@@ -71,6 +71,21 @@ impl DeltaLayer {
         Ok(layer)
     }
 
+    /// This layer with `deltas` laid over it too — the next snapshot's layer
+    /// when its tail extends this one's (same fold, this tail a prefix). Costs
+    /// the new deltas' records.
+    pub(crate) fn extend(
+        &mut self,
+        state: &FrozenOverlay,
+        base: &Option<Arc<MappedBase>>,
+        deltas: &[Arc<CommitDelta>],
+    ) -> Result<()> {
+        for delta in deltas {
+            self.apply_delta(state, base, delta)?;
+        }
+        Ok(())
+    }
+
     /// A view of `state` (over `base`) with this layer on top.
     pub(crate) fn view<'a>(
         &'a self,
@@ -116,6 +131,12 @@ impl DeltaLayer {
                 // Removed as well as hidden, or the fold's value reads through.
                 None => self.props.remove(*node, view_prop),
             }
+        }
+        // The edge properties the commit wrote with no record of their own —
+        // a rule's weights — exactly as the writer's overlay holds them
+        // (ledger row 124). Last, so the commit's final state wins.
+        for &((etype, src, dst), ref entry) in &delta.edge_props {
+            self.edge_props.restore_entry(etype, src, dst, entry);
         }
         Ok(())
     }

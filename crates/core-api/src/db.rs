@@ -508,13 +508,76 @@ pub struct SlowQuerySnapshot {
 
 /// Internal ring-buffer state protected by a `Mutex` so `query(&self)` can
 /// write to it without a mutable borrow.
-struct SlowQueryLog {
+pub(crate) struct SlowQueryLog {
     entries: std::collections::VecDeque<SlowQueryEntry>,
     total: u64,
 }
 
 /// Maximum number of entries kept in the slow-query ring buffer.
 const SLOW_QUERY_RING_CAP: usize = 16;
+
+/// Where an unmasked read query reports itself when it is slow: the handle's
+/// threshold and ring buffer. A [`crate::reader::ReaderSnapshot`] carries one,
+/// so a query run on the lock-free reader lands in the same `/metrics` ring a
+/// query run under the read lock does.
+#[derive(Clone)]
+pub(crate) struct SlowQuerySink {
+    threshold_ms: u64,
+    log: Arc<std::sync::Mutex<SlowQueryLog>>,
+}
+
+impl SlowQuerySink {
+    /// A sink that records nothing (threshold 0), for snapshots that must not
+    /// report into a shared ring.
+    pub(crate) fn disabled() -> Self {
+        Self {
+            threshold_ms: 0,
+            log: Arc::new(std::sync::Mutex::new(SlowQueryLog {
+                entries: std::collections::VecDeque::new(),
+                total: 0,
+            })),
+        }
+    }
+
+    /// The ring and threshold as [`GraphDb::slow_query_snapshot`] reports them.
+    pub(crate) fn snapshot(&self) -> SlowQuerySnapshot {
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        SlowQuerySnapshot {
+            threshold_ms: self.threshold_ms,
+            count: log.total,
+            last: log.entries.iter().cloned().collect(),
+        }
+    }
+
+    /// Record `cypher` if `elapsed_ms` reaches the threshold.
+    pub(crate) fn record(&self, elapsed_ms: u64, cypher: &str, at_commit: u64) {
+        let threshold = self.threshold_ms;
+        if threshold > 0 && elapsed_ms >= threshold {
+            eprintln!("[mushroomdb] slow query ({elapsed_ms}ms): {cypher}");
+            let entry = SlowQueryEntry {
+                ms: elapsed_ms,
+                query: cypher.to_string(),
+                at_commit,
+            };
+            if let Ok(mut log) = self.log.lock() {
+                if log.entries.len() == SLOW_QUERY_RING_CAP {
+                    log.entries.pop_front();
+                }
+                log.entries.push_back(entry);
+                log.total += 1;
+            }
+        }
+    }
+}
+
+/// Whether `rec` declares or drops an equality index, inside a batch or not.
+fn declares_an_index(rec: &WalRecord) -> bool {
+    match rec {
+        WalRecord::EnableIndex { .. } | WalRecord::DisableIndex { .. } => true,
+        WalRecord::Batch(inner) => inner.iter().any(declares_an_index),
+        _ => false,
+    }
+}
 
 /// Wire summary of a [`Predicate`]. JSON only — `Explanation` is never
 /// bincode-persisted (WAL/snapshots store `RuleDef` bytes, not this type).
@@ -1649,7 +1712,7 @@ pub struct GraphDb<F: Fs> {
     /// Opt-in equality index over scalar node properties.
     /// Rebuild-on-open: declarations replay from the WAL, postings rebuild at
     /// open end (mirrors `fulltext`).
-    prop_index: PropertyIndex,
+    prop_index: Arc<PropertyIndex>,
     /// Whether this store records insert-count multiplicity (§5.13).
     ///
     /// Declared like `prop_index`'s enabled pairs — a WAL record replayed at
@@ -1807,6 +1870,10 @@ pub struct GraphDb<F: Fs> {
     tail_derived: Arc<crate::reader::TailDerived>,
     /// Per-commit deltas accumulated since the last fold.
     delta_tail: Vec<Arc<crate::reader::CommitDelta>>,
+    /// The materialised effective state shared by every reader snapshot of
+    /// the same fold and delta tail, so a snapshot per request does not apply
+    /// the tail once per request. See [`crate::reader::SharedEffective`].
+    shared_effective: std::sync::Mutex<Option<crate::reader::SharedEffective>>,
     /// How many commits have occurred since the last fold.
     commits_since_fold: usize,
     /// When true, `log_then_apply_with` buffers event notifications instead of
@@ -1880,7 +1947,7 @@ pub struct GraphDb<F: Fs> {
     slow_query_threshold_ms: u64,
     /// Ring buffer of recent slow queries (interior-mutable so `query(&self)`
     /// can record entries without requiring `&mut self`).
-    slow_queries: std::sync::Mutex<SlowQueryLog>,
+    slow_queries: Arc<std::sync::Mutex<SlowQueryLog>>,
     /// `(field, label, caller)` triples whose exact-versus-approximate
     /// ambiguity this handle has already explained once. See
     /// [`note_ambiguous_exactness`](GraphDb::note_ambiguous_exactness).
@@ -2561,7 +2628,7 @@ impl<F: Fs> GraphDb<F> {
             engine: RuleEngine::new(),
             view_store: ViewStore::new(),
             fulltext: Arc::new(FulltextIndex::new()),
-            prop_index: PropertyIndex::new(),
+            prop_index: Arc::new(PropertyIndex::new()),
             multiplicity: false,
             constraints: Vec::new(),
             dropped_view_indexes: Vec::new(),
@@ -2593,6 +2660,7 @@ impl<F: Fs> GraphDb<F> {
             engine_from_base: false,
             tail_derived: Arc::default(),
             delta_tail: Vec::new(),
+            shared_effective: std::sync::Mutex::new(None),
             commits_since_fold: 0,
             defer_events: false,
             deferred_events: Vec::new(),
@@ -2610,10 +2678,10 @@ impl<F: Fs> GraphDb<F> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100),
-            slow_queries: std::sync::Mutex::new(SlowQueryLog {
+            slow_queries: Arc::new(std::sync::Mutex::new(SlowQueryLog {
                 entries: std::collections::VecDeque::new(),
                 total: 0,
-            }),
+            })),
             warned_ambiguous_exactness: std::sync::Mutex::new(HashSet::new()),
             started_at: std::time::Instant::now(),
             wal_consumed: 0,
@@ -2648,7 +2716,7 @@ impl<F: Fs> GraphDb<F> {
         self.engine_from_base = false;
         self.view_store = ViewStore::new();
         self.fulltext = Arc::new(FulltextIndex::new());
-        self.prop_index = PropertyIndex::new();
+        self.prop_index = Arc::new(PropertyIndex::new());
         // Cleared like every other declaration: a reload replays the store's own
         // WAL, and the opt-in comes back from it or not at all.
         self.multiplicity = false;
@@ -3007,7 +3075,7 @@ impl<F: Fs> GraphDb<F> {
         }
         trace_open!("full-text index ready", _t0);
         db.drop_indexes_over_view_properties();
-        db.prop_index.rebuild_all(
+        Arc::make_mut(&mut db.prop_index).rebuild_all(
             &db.ids,
             &db.labels,
             &db.syms,
@@ -3904,7 +3972,7 @@ impl<F: Fs> GraphDb<F> {
             build_props_view(&db.props, &db.base),
         );
         db.drop_indexes_over_view_properties();
-        db.prop_index.rebuild_all(
+        Arc::make_mut(&mut db.prop_index).rebuild_all(
             &db.ids,
             &db.labels,
             &db.syms,
@@ -3967,6 +4035,11 @@ impl<F: Fs> GraphDb<F> {
     }
 
     fn fold_with(&mut self, derived: crate::reader::DerivedEdges) {
+        // The fold holds every edge property as it stands, so nothing written
+        // so far (replay, a refresh, a commit's own writes) is owed to a delta.
+        if self.edge_props.has_touched() {
+            Arc::make_mut(&mut self.edge_props).take_touched();
+        }
         // Eight `Arc::clone`s — refcount bumps, O(1). This used to deep-copy the
         // whole overlay: `IdMap` alone is a `HashMap<String, u32>` plus a
         // `Vec<String>`, so every node key was copied twice, on every open,
@@ -3988,6 +4061,7 @@ impl<F: Fs> GraphDb<F> {
             labels: std::sync::Arc::clone(&self.labels),
             edge_props: std::sync::Arc::clone(&self.edge_props),
             roles: self.roles.clone().map(std::sync::Arc::new),
+            prop_index: std::sync::Arc::clone(&self.prop_index),
             derived,
         };
         self.fold_overlay = Some(Arc::new(frozen));
@@ -4079,10 +4153,22 @@ impl<F: Fs> GraphDb<F> {
     /// handful of `Arc` handles). Subsequent query operations run without any
     /// lock.
     pub fn reader(&self) -> crate::reader::ReaderSnapshot {
-        crate::reader::ReaderSnapshot::new(
-            self.fold_overlay
-                .clone()
-                .expect("fold_overlay is always Some after open_with; call reader() after open"),
+        self.try_reader()
+            .expect("fold_overlay is always Some after open_with; call reader() after open")
+    }
+
+    /// [`Self::reader`], or `None` while the handle has no fold (between a
+    /// reload's reset and its fold) — when there is no state to publish.
+    pub(crate) fn try_reader(&self) -> Option<crate::reader::ReaderSnapshot> {
+        let frozen = self.fold_overlay.clone()?;
+        let effective = crate::reader::SharedEffective::cell_for(
+            &self.shared_effective,
+            &frozen,
+            &self.base,
+            &self.delta_tail,
+        );
+        let snap = crate::reader::ReaderSnapshot::new(
+            frozen,
             self.base.clone(),
             self.delta_tail.clone(),
             Arc::clone(&self.tail_derived),
@@ -4091,6 +4177,17 @@ impl<F: Fs> GraphDb<F> {
             self.commit_seq,
             Arc::clone(&self.role_masks),
         )
+        .with_read_context(crate::reader::ReadContext {
+            slow: self.slow_query_sink(),
+            counts: (
+                self.ids.live_len(),
+                self.ids.len() - self.ids.live_len(),
+                self.corrected_edge_count(),
+            ),
+            wal_path: self.fs.wal_path(),
+        })
+        .with_shared_effective(effective);
+        Some(snap)
     }
 
     /// Append a delta the reader cannot apply, so that a corrupt overlay is
@@ -4129,6 +4226,7 @@ impl<F: Fs> GraphDb<F> {
             derived_inserts: Vec::new(),
             derived_deletes: Vec::new(),
             view_values: Vec::new(),
+            edge_props: Vec::new(),
         }));
     }
 
@@ -4292,7 +4390,7 @@ impl<F: Fs> GraphDb<F> {
                 // Property (equality) index maintenance.
                 if self.prop_index.has_label(label) {
                     for (field, value) in props {
-                        self.prop_index.set(label, field, id, value);
+                        Arc::make_mut(&mut self.prop_index).set(label, field, id, value);
                     }
                 }
             }
@@ -4449,7 +4547,7 @@ impl<F: Fs> GraphDb<F> {
                         }
                     });
                     if let Some(label) = label_opt {
-                        self.prop_index.set(label, field, id, value);
+                        Arc::make_mut(&mut self.prop_index).set(label, field, id, value);
                     }
                 }
             }
@@ -4559,7 +4657,7 @@ impl<F: Fs> GraphDb<F> {
                         let Some(field) = self.syms.resolve(*field_sym) else {
                             continue;
                         };
-                        self.prop_index.set(&label_str, field, id, value);
+                        Arc::make_mut(&mut self.prop_index).set(&label_str, field, id, value);
                     }
                 }
             }
@@ -4718,7 +4816,7 @@ impl<F: Fs> GraphDb<F> {
                         }
                     });
                     if let Some(label) = label_opt {
-                        self.prop_index.set(label, &field_str, *id, value);
+                        Arc::make_mut(&mut self.prop_index).set(label, &field_str, *id, value);
                     }
                 }
             }
@@ -4898,7 +4996,7 @@ impl<F: Fs> GraphDb<F> {
                     if let Some(label) = self.labels.get(id as usize).and_then(|&sym| {
                         (sym != u32::MAX).then(|| self.syms.resolve(sym)).flatten()
                     }) {
-                        self.prop_index.remove_node(label, field, id);
+                        Arc::make_mut(&mut self.prop_index).remove_node(label, field, id);
                     }
                 }
             }
@@ -5085,7 +5183,7 @@ impl<F: Fs> GraphDb<F> {
                 // Full-text index maintenance: remove all tokens for this node.
                 Arc::make_mut(&mut self.fulltext).remove_node(n);
                 // Property (equality) index maintenance: drop all entries for n.
-                self.prop_index.remove_node_all(n);
+                Arc::make_mut(&mut self.prop_index).remove_node_all(n);
 
                 // (4) Retire the dense id and stamp the label sentinel.
                 Arc::make_mut(&mut self.ids).delete(key);
@@ -5266,13 +5364,13 @@ impl<F: Fs> GraphDb<F> {
                 }
                 // A pair a range index maintains already has its postings.
                 let maintained = self.prop_index.is_enabled(label, field);
-                self.prop_index.enable(label, field);
+                Arc::make_mut(&mut self.prop_index).enable(label, field);
                 if !maintained {
                     self.backfill_prop_index(label, field);
                 }
             }
             WalRecord::DisableIndex { label, field } => {
-                self.prop_index.disable(label, field);
+                Arc::make_mut(&mut self.prop_index).disable(label, field);
             }
             // A declaration: the postings come from the backfill here on a live
             // or refreshed handle, and from `rebuild_all` at the end of an open.
@@ -5282,7 +5380,7 @@ impl<F: Fs> GraphDb<F> {
                     return Ok(());
                 }
                 let maintained = self.prop_index.is_enabled(label, field);
-                self.prop_index.enable_range(name, label, field);
+                Arc::make_mut(&mut self.prop_index).enable_range(name, label, field);
                 // The open rebuilds every declared pair once replay is done, so
                 // a scan here would be thrown away.
                 if !maintained && !self.replaying_at_open {
@@ -5290,7 +5388,7 @@ impl<F: Fs> GraphDb<F> {
                 }
             }
             WalRecord::DisableRangeIndex { name } => {
-                self.prop_index.disable_range(name);
+                Arc::make_mut(&mut self.prop_index).disable_range(name);
             }
             // A declaration only: the data it covers is never checked here.
             // Replay must not fail on duplicates written before the constraint
@@ -5389,7 +5487,7 @@ impl<F: Fs> GraphDb<F> {
                 .get(id, field)
                 .map(|vr| vr.into_value())
             {
-                self.prop_index.set(label, field, id, &value);
+                Arc::make_mut(&mut self.prop_index).set(label, field, id, &value);
             }
         }
     }
@@ -6499,12 +6597,27 @@ impl<F: Fs> GraphDb<F> {
             // `None`: the commit moved more view values than a delta should
             // carry, so the fold below takes them instead.
             let view_values = self.view_values_of_commit(&rec);
-            let fold = view_values.is_none();
+            // A commit that declares or drops an equality index folds too: a
+            // snapshot answers indexed lookups from the fold's index, and the
+            // fold's pairs must be the store's (see `ReaderSnapshot::query_index`).
+            let fold = view_values.is_none() || declares_an_index(&rec);
+            // Every edge whose properties this commit wrote — a rule's weights
+            // above all, which no record carries — as the commit left it.
+            let edge_props = if self.edge_props.has_touched() {
+                let touched = Arc::make_mut(&mut self.edge_props).take_touched();
+                touched
+                    .into_iter()
+                    .map(|(et, s, d)| ((et, s, d), self.edge_props.entry(et, s, d)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             let delta = Arc::new(crate::reader::CommitDelta {
                 records: vec![rec.clone()],
                 derived_inserts,
                 derived_deletes,
                 view_values: view_values.unwrap_or_default(),
+                edge_props,
             });
             self.delta_tail.push(delta);
             self.commits_since_fold += 1;
@@ -9674,16 +9787,7 @@ impl<F: Fs> GraphDb<F> {
     /// `config.converged` is `true` only when the power iteration converged
     /// within `config.max_iters` and within any time budget.
     pub fn pagerank(&self, config: &crate::algo::PageRankConfig) -> crate::algo::PageRankReport {
-        let topo = build_topo_view(&self.topo, &self.base);
-        let edge_props = self.edge_props_view();
-        crate::algo::pagerank(
-            &topo,
-            &self.ids,
-            &self.syms,
-            &self.labels,
-            &edge_props,
-            config,
-        )
+        crate::algo::pagerank(&self.view(), config)
     }
 
     /// Weakly-connected components over the unified topology (treated as
@@ -9692,16 +9796,7 @@ impl<F: Fs> GraphDb<F> {
     /// Component IDs are the key of the smallest member in the component
     /// (deterministic).  Result sorted by (component_id, key).
     pub fn connected_components(&self, config: &crate::algo::WccConfig) -> crate::algo::WccReport {
-        let topo = build_topo_view(&self.topo, &self.base);
-        let edge_props = self.edge_props_view();
-        crate::algo::wcc(
-            &topo,
-            &self.ids,
-            &self.syms,
-            &self.labels,
-            &edge_props,
-            config,
-        )
+        crate::algo::wcc(&self.view(), config)
     }
 
     /// Degree centrality for every live node.
@@ -9715,16 +9810,7 @@ impl<F: Fs> GraphDb<F> {
         &self,
         config: &crate::algo::DegreeConfig,
     ) -> crate::algo::DegreeReport {
-        let topo = build_topo_view(&self.topo, &self.base);
-        let edge_props = self.edge_props_view();
-        crate::algo::degree_centrality(
-            &topo,
-            &self.ids,
-            &self.syms,
-            &self.labels,
-            &edge_props,
-            config,
-        )
+        crate::algo::degree_centrality(&self.view(), config)
     }
 
     /// Louvain community detection over the unified topology (undirected).
@@ -10815,7 +10901,7 @@ impl<F: Fs> GraphDb<F> {
             .map(|v| (v.label.clone(), v.view_prop.clone()))
             .collect();
         for (label, field) in owned {
-            self.prop_index.disable(&label, &field);
+            Arc::make_mut(&mut self.prop_index).disable(&label, &field);
             // Once per pair per open: the only signal that a query on it now
             // scans, where the declaration said it would not.
             eprintln!(
@@ -12324,23 +12410,17 @@ impl<F: Fs> GraphDb<F> {
             }
         });
         let elapsed_ms = t0.elapsed().as_millis() as u64;
-        let threshold = self.slow_query_threshold_ms;
-        if threshold > 0 && elapsed_ms >= threshold {
-            eprintln!("[mushroomdb] slow query ({elapsed_ms}ms): {cypher}");
-            let entry = SlowQueryEntry {
-                ms: elapsed_ms,
-                query: cypher.to_string(),
-                at_commit: self.commit_seq,
-            };
-            if let Ok(mut log) = self.slow_queries.lock() {
-                if log.entries.len() == SLOW_QUERY_RING_CAP {
-                    log.entries.pop_front();
-                }
-                log.entries.push_back(entry);
-                log.total += 1;
-            }
-        }
+        self.slow_query_sink()
+            .record(elapsed_ms, cypher, self.commit_seq);
         result
+    }
+
+    /// This handle's slow-query threshold and ring, shareable with a snapshot.
+    pub(crate) fn slow_query_sink(&self) -> SlowQuerySink {
+        SlowQuerySink {
+            threshold_ms: self.slow_query_threshold_ms,
+            log: Arc::clone(&self.slow_queries),
+        }
     }
 
     /// Convenience entry-point that accepts a slice of `(name, value)` pairs
