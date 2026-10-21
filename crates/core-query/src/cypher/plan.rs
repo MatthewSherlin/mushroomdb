@@ -11,6 +11,16 @@ use super::ast::{
 use crate::filter::CmpOp;
 use std::collections::BTreeSet;
 
+/// One hop of a named path: the relationship binding and the node it lands
+/// on. A variable-length or shortest-path hop also names the hidden variable
+/// that holds the walk, since its `rel_var` only carries a hop count.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathHop {
+    pub rel_var: String,
+    pub to_var: String,
+    pub trail_var: Option<String>,
+}
+
 /// One operator in the logical plan. Patterns compile left-to-right into
 /// scan / join / expand ops; WHERE is a single `Filter`; then `Project`,
 /// rewritten `OrderBy`, `Skip`, `Limit` in that order.
@@ -154,6 +164,9 @@ pub enum PlanOp {
         to: String,
         min: u8,
         max: u8,
+        /// When set (the pattern is a named path), the hidden variable that
+        /// receives the nodes and relationships this hop walked.
+        trail_var: Option<String>,
     },
     /// Shortest path between two already-bound nodes via BFS.
     ///
@@ -173,6 +186,17 @@ pub enum PlanOp {
         dir: RelDir,
         to: String,
         max_hops: u8,
+        /// As on `VarExpand`: the hidden variable that receives the walk.
+        trail_var: Option<String>,
+    },
+    /// Bind a named path (`MATCH p = (a)-[r]->(b)`): assemble the nodes and
+    /// relationships the pattern's other ops bound, in pattern order, into
+    /// one path value bound to `path_var`. Emitted after the pattern's last
+    /// hop. A zero-hop pattern (`p = (a)`) has no `hops`.
+    BindPath {
+        path_var: String,
+        start_var: String,
+        hops: Vec<PathHop>,
     },
     /// Non-aggregate WITH: apply filter / order / skip / limit to the current
     /// row set without projecting. Node bindings in the row survive as-is so
@@ -276,6 +300,10 @@ pub fn row_bound(ops: &[PlanOp]) -> Option<usize> {
         .iter()
         .any(|op| matches!(op, PlanOp::VarExpand { .. } | PlanOp::ShortestPath { .. }))
     {
+        return None;
+    }
+    // A named path is assembled from the whole binding table.
+    if ops.iter().any(|op| matches!(op, PlanOp::BindPath { .. })) {
         return None;
     }
     // Pipeline plans (WITH / UNWIND / LeftOuterApply) always use the staged
@@ -1180,6 +1208,7 @@ fn compile_pattern(
         // has no dest label/prop filter, so reversing would drop start checks.
         let (rel, dest) = &pat.chain[0];
         let dest_name = name_node(dest, node_anon, bound);
+        let dest_name_for_path = dest_name.clone();
         let rel_name = name_rel(rel, rel_anon, bound);
         bound.insert(rel_name.clone());
         rel_bound.insert(rel_name.clone());
@@ -1192,14 +1221,23 @@ fn compile_pattern(
         }
         ops.push(PlanOp::Expand {
             from: dest_name,
-            rel_var: Some(rel_name),
+            rel_var: Some(rel_name.clone()),
             etypes: rel.etypes.clone(),
             dir: invert_dir(rel.dir),
             to: start.clone(),
             to_label: pat.start.label.clone(),
             to_props: pat.start.props.clone(),
         });
-        bound.insert(start);
+        bound.insert(start.clone());
+        if let Some(path_var) = &pat.path_var {
+            // The walk reads start -> dest, the order the pattern is written in.
+            let hops = vec![PathHop {
+                rel_var: rel_name.clone(),
+                to_var: dest_name_for_path,
+                trail_var: None,
+            }];
+            bind_path(ops, bound, path_var, start, hops);
+        }
         return Ok(());
     } else if let Some(key) = id_lookup(&pat.start.props) {
         ops.push(PlanOp::ScanKey {
@@ -1237,12 +1275,21 @@ fn compile_pattern(
         bound.insert(start.clone());
     }
 
+    let path_start = start.clone();
+    let mut path_hops: Vec<PathHop> = Vec::new();
     let mut from = start;
     for (rel, dest) in &pat.chain {
         let rel_name = name_rel(rel, rel_anon, bound);
         bound.insert(rel_name.clone());
         rel_bound.insert(rel_name.clone());
         let to = name_node(dest, node_anon, bound);
+        let trail_var =
+            (pat.path_var.is_some() && rel.hops.is_some()).then(|| format!("{rel_name}#trail"));
+        path_hops.push(PathHop {
+            rel_var: rel_name.clone(),
+            to_var: to.clone(),
+            trail_var: trail_var.clone(),
+        });
 
         if let Some(hops) = rel.hops {
             if pat.shortest {
@@ -1271,6 +1318,7 @@ fn compile_pattern(
                     dir: rel.dir,
                     to: to.clone(),
                     max_hops: hops.max,
+                    trail_var,
                 });
             } else {
                 ops.push(PlanOp::VarExpand {
@@ -1281,6 +1329,7 @@ fn compile_pattern(
                     to: to.clone(),
                     min: hops.min,
                     max: hops.max,
+                    trail_var,
                 });
                 bound.insert(to.clone());
             }
@@ -1298,7 +1347,26 @@ fn compile_pattern(
         }
         from = to;
     }
+    if let Some(path_var) = &pat.path_var {
+        bind_path(ops, bound, path_var, path_start, path_hops);
+    }
     Ok(())
+}
+
+/// Emit the `BindPath` op for a named path and put its name in scope.
+fn bind_path(
+    ops: &mut Vec<PlanOp>,
+    bound: &mut BTreeSet<String>,
+    path_var: &str,
+    start_var: String,
+    hops: Vec<PathHop>,
+) {
+    bound.insert(path_var.to_owned());
+    ops.push(PlanOp::BindPath {
+        path_var: path_var.to_owned(),
+        start_var,
+        hops,
+    });
 }
 
 /// Compile one `OPTIONAL MATCH` clause into a `LeftOuterApply` op.
@@ -2553,6 +2621,7 @@ LIMIT 10";
                 },
                 chain: vec![],
                 shortest: false,
+                path_var: None,
             }],
             optional_clauses: vec![],
             where_expr: Some(Expr::Not(Box::new(Expr::Cmp {

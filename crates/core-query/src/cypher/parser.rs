@@ -372,7 +372,7 @@ impl<'a> Parser<'a> {
     fn optional_match_clause(&mut self) -> Result<OptionalClause, String> {
         self.expect(&Tok::Optional, "expected OPTIONAL")?;
         self.expect(&Tok::Match, "expected MATCH after OPTIONAL")?;
-        let patterns = vec![self.pattern()?];
+        let patterns = vec![self.match_pattern()?];
         // Optional WHERE inside the optional scope.
         let where_expr = if self.eat(&Tok::Where) {
             Some(self.expr(0)?)
@@ -518,13 +518,29 @@ impl<'a> Parser<'a> {
 
     /// One pattern inside a MATCH clause: `shortestPath(…)` or a plain chain.
     fn match_pattern(&mut self) -> Result<Pattern, String> {
+        let path_var = self.path_binding()?;
         // Detect `shortestPath(...)`.
-        if let Some(Tok::Ident(s)) = self.peek() {
-            if s.eq_ignore_ascii_case("shortestpath") {
-                return self.shortest_path_clause();
+        let mut pat = match self.peek() {
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("shortestpath") => {
+                self.shortest_path_clause()?
             }
+            _ => self.pattern()?,
+        };
+        pat.path_var = path_var;
+        Ok(pat)
+    }
+
+    /// The `p =` that names a path: an identifier followed by `=`. Anything
+    /// else leaves the position alone.
+    fn path_binding(&mut self) -> Result<Option<String>, String> {
+        let is_binding = matches!(self.peek(), Some(Tok::Ident(_)))
+            && self.toks.get(self.pos + 1) == Some(&Tok::Eq);
+        if !is_binding {
+            return Ok(None);
         }
-        self.pattern()
+        let name = self.binding("expected a path name before '='")?;
+        self.pos += 1; // consume '='
+        Ok(Some(name))
     }
 
     fn shortest_path_clause(&mut self) -> Result<Pattern, String> {
@@ -543,6 +559,7 @@ impl<'a> Parser<'a> {
             start,
             chain: vec![(rel, dest)],
             shortest: true,
+            path_var: None,
         })
     }
 
@@ -558,6 +575,7 @@ impl<'a> Parser<'a> {
             start,
             chain,
             shortest: false,
+            path_var: None,
         })
     }
 
@@ -2476,6 +2494,7 @@ SKIP 1 LIMIT 5";
                     ),
                 ],
                 shortest: false,
+                path_var: None,
             }],
             optional_clauses: vec![],
             unwinds: vec![],
@@ -2676,6 +2695,7 @@ LIMIT 10";
                     ),
                     chain: vec![],
                     shortest: false,
+                    path_var: None,
                 },
                 Pattern {
                     start: node(Some("c"), Some("Company"), vec![]),
@@ -2689,6 +2709,7 @@ LIMIT 10";
                         node(Some("t"), None, vec![]),
                     )],
                     shortest: false,
+                    path_var: None,
                 },
                 Pattern {
                     start: node(Some("c"), None, vec![]),
@@ -2702,6 +2723,7 @@ LIMIT 10";
                         node(Some("t"), None, vec![]),
                     )],
                     shortest: false,
+                    path_var: None,
                 },
             ],
             optional_clauses: vec![],

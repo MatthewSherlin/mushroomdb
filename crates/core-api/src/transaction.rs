@@ -311,6 +311,7 @@ fn node_by_key(var: &str, label: &str, key: Value) -> Pattern {
         },
         chain: vec![],
         shortest: false,
+        path_var: None,
     }
 }
 
@@ -1087,6 +1088,7 @@ impl Transaction {
                     ),
                 )],
                 shortest: false,
+                path_var: None,
             }],
             None,
         );

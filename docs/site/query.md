@@ -206,6 +206,48 @@ parse.
 
 ---
 
+## Named paths
+
+Bind a whole pattern to a name with `p = …` and return it, or read it with
+`.length`, `.nodes` and `.relationships`:
+
+```cypher
+MATCH p = (a:Person)-[:KNOWS*1..3]->(b:Person)
+RETURN p
+```
+
+```cypher
+MATCH p = (a:Person {id: 'ada'})-[:KNOWS]->(b)-[:WORKS_AT]->(c:Company)
+WHERE p.length = 2
+RETURN p.nodes
+```
+
+A path is a **map** with three fields, so it comes back the same way on every
+surface (Rust, HTTP JSON, Python, TypeScript, Arrow, Bolt) as any other map:
+
+| Field | Value |
+|---|---|
+| `nodes` | the node keys, in walk order |
+| `relationships` | one map per relationship: `type`, `start` and `end` (the keys of its stored direction) |
+| `length` | the number of relationships |
+
+`p = (a)` is a path of one node with length 0. A path works in `RETURN`,
+`WITH`, `WHERE`, `ORDER BY`, `DISTINCT`, `count(p)` and `collect(p)`; it works
+in `OPTIONAL MATCH` (a pattern that finds nothing gives a null path) and with
+`shortestPath`: `MATCH p = shortestPath((a)-[:T*..5]->(b))`.
+
+- **Masks.** A path through a node the caller cannot see does not exist: the
+  whole row is dropped, never returned with that node left out.
+- **Ordering.** `ORDER BY p` sorts paths as maps, which puts shorter paths first.
+- **Not a node or a relationship.** `key(p)`, `labels(p)` and `type(p)` are
+  errors that name `p`. `SET n.x = p` is refused like any bare variable on the
+  right of `SET`.
+- **Not supported.** Named paths in `CREATE` and `MERGE`, and `DELETE p`.
+- Relationship properties are not part of a path; match the relationship with
+  its own variable to read them.
+
+---
+
 ## WITH pipelines
 
 `WITH` turns the executor into a multi-stage pipeline: each clause projects,
@@ -955,6 +997,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `OPTIONAL MATCH` + aggregation | `OPTIONAL MATCH (a)-[r]->(b) RETURN a, COUNT(r)` |
 | Variable-length `*1..n`, `*n`, `*..n`, bare `*` | `MATCH (a)-[r:T*1..5]->(b) RETURN r.length` |
 | `shortestPath((a)-[r*..n]->(b))` | `MATCH (a {id: 'x'}), (b {id: 'y'}) MATCH shortestPath((a)-[r*..5]->(b)) RETURN r.length` |
+| Named path `p = (a)-[:T*1..n]->(b)` | `MATCH p = (a)-[:T*1..3]->(b) RETURN p.length, p.nodes` |
 | `CREATE (n:L {id: 'x', …})` | `CREATE (n:Person {id: 'alice', age: 30})` |
 | `CREATE (a:L {id: 'x'})-[:T]->(b:L {id: 'y'})` | node-edge chain |
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |

@@ -144,6 +144,8 @@ pub struct Pattern {
     pub chain: Vec<(RelPat, NodePat)>,
     /// True when parsed as `MATCH shortestPath(...)`.
     pub shortest: bool,
+    /// The name bound before `=` in `MATCH p = (a)-[r]->(b)`.
+    pub path_var: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
