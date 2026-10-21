@@ -214,6 +214,12 @@ fn a_store_with_an_index_over_a_view_property_opens_and_answers_correctly() {
     std::fs::write(dir.join("wal.bin"), wal).unwrap();
 
     let mut db = GraphDb::open(&dir).unwrap();
+    // The drop is reported, and the declaration is gone.
+    assert_eq!(
+        db.dropped_view_indexes(),
+        [("User".to_string(), "deg".to_string())]
+    );
+    assert!(!db.is_index_enabled("User", "deg"));
     assert!(users_with_deg_1(&db).is_empty());
     db.insert_edge("KNOWS", "a", "b").unwrap();
     assert_eq!(users_with_deg_1(&db), vec!["a"], "live");
@@ -226,6 +232,9 @@ fn a_store_with_an_index_over_a_view_property_opens_and_answers_correctly() {
     drop(db);
     let db = GraphDb::open(&dir).unwrap();
     assert_eq!(users_with_deg_1(&db), vec!["a", "b"], "after a snapshot");
+    // The snapshot no longer carries the declaration: nothing to drop now.
+    assert!(db.dropped_view_indexes().is_empty());
+    assert!(!db.is_index_enabled("User", "deg"));
 }
 
 #[cfg(feature = "test-hooks")]

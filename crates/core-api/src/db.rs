@@ -1627,6 +1627,11 @@ pub struct GraphDb<F: Fs> {
     /// [`rewrite_wal_dense_planned`](Self::rewrite_wal_dense_planned). Replay
     /// never checks them.
     constraints: Vec<UniqueConstraint>,
+    /// The `(label, field)` equality indexes this open dropped because a view
+    /// owns the property (ledger row 123). Empty for every store written
+    /// since the refusal. Not persisted: a reopen finds the same pairs again
+    /// until a snapshot stops re-emitting their declarations.
+    dropped_view_indexes: Vec<(String, String)>,
     /// Lets format-V11 values and records reach the WAL on this handle.
     ///
     /// Always `false` outside tests: until the V11 format lands (0.10 TY-12)
@@ -2425,12 +2430,17 @@ impl GraphDb<RealFs> {
 /// that equals nothing a constraint could hold — `NaN`, or one with no index
 /// key (list, map, duration).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum EqualityBucket {
+pub(crate) enum EqualityBucket {
     Number(u64),
     Key(ValueKey),
 }
 
-fn equality_bucket(value: &Value) -> Option<EqualityBucket> {
+///
+/// **TY-6 (the create-time scan over existing data) must group values with
+/// this and compare each bucket with `values_equal`, never by `ValueKey`: a
+/// `ValueKey` keeps `Int` 2 and `Float` 2.0 apart, so a scan keyed on it would
+/// accept a store the write path then refuses.
+pub(crate) fn equality_bucket(value: &Value) -> Option<EqualityBucket> {
     let number = |f: f64| {
         if f.is_nan() {
             None
@@ -2509,6 +2519,7 @@ impl<F: Fs> GraphDb<F> {
             prop_index: PropertyIndex::new(),
             multiplicity: false,
             constraints: Vec::new(),
+            dropped_view_indexes: Vec::new(),
             v11_unlocked: false,
             event_sink: None,
             fsync: FsyncPolicy::Strict,
@@ -2594,6 +2605,7 @@ impl<F: Fs> GraphDb<F> {
         // WAL, and the opt-in comes back from it or not at all.
         self.multiplicity = false;
         self.constraints = Vec::new();
+        self.dropped_view_indexes = Vec::new();
         self.commit_seq = 0;
         self.commit_times = core_storage::commit_times::CommitTimes::default();
         self.commit_times_poisoned = false;
@@ -10703,7 +10715,24 @@ impl<F: Fs> GraphDb<F> {
             .collect();
         for (label, field) in owned {
             self.prop_index.disable(&label, &field);
+            // Once per pair per open: the only signal that a query on it now
+            // scans, where the declaration said it would not.
+            eprintln!(
+                "[mushroomdb] dropped the equality index on ({label}, {field}): a view owns \
+                 property '{field}' on label '{label}', so the index would answer from stale \
+                 values. Queries on it are answered by scan; the next snapshot no longer \
+                 carries the declaration."
+            );
+            self.dropped_view_indexes.push((label, field));
         }
+    }
+
+    /// The `(label, field)` equality indexes the open of this handle dropped
+    /// because a view owns the property (ledger row 123), in view order. Empty
+    /// unless the store was written before `enable_index` and `create_view`
+    /// refused the combination.
+    pub fn dropped_view_indexes(&self) -> &[(String, String)] {
+        &self.dropped_view_indexes
     }
 
     fn view(&self) -> GraphView<'_> {
