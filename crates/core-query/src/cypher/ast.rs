@@ -545,4 +545,27 @@ pub struct MergeStmt {
     pub on_match: Vec<SetClause>,
     /// Optional RETURN clause: project the node after commit.
     pub returns: Option<Vec<RetItem>>,
+    /// `Some` for `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'})`: the one
+    /// relationship and its end node. The fields above describe the start node.
+    pub edge: Option<MergeEdgePat>,
+}
+
+/// The relationship and end node of a `MERGE (a)-[:T]->(b)` pattern. Exactly
+/// one relationship is allowed in 0.10; the start node is the `MergeStmt`'s own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeEdgePat {
+    /// The single relationship type.
+    pub etype: String,
+    /// `Right`: start -> end. `Left`: end -> start. Undirected is refused at parse time.
+    pub dir: RelDir,
+    pub end_label: String,
+    /// The end node's single identifying property.
+    pub end_key_field: String,
+    pub end_key_value: core_storage::Value,
+    /// Optional `ns` named on the end node, as `MergeStmt::ns` is for the start.
+    pub end_ns: Option<core_storage::Value>,
+    /// Bound variable of the end node (`ON … SET b.x = …`, `RETURN b`).
+    pub end_var: Option<String>,
+    /// Bound variable of the relationship (`RETURN r`); it takes no SET.
+    pub rel_var: Option<String>,
 }

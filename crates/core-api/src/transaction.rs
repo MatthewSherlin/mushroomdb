@@ -758,12 +758,179 @@ impl Transaction {
         self.counts(staged, 0, 0, deleted)
     }
 
+    /// Whether `src -[etype]-> dst` is in the state statements read.
+    fn edge_present(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
+        self.current().node_edges(src_key).is_ok_and(|edges| {
+            edges
+                .iter()
+                .any(|e| e.edge_type == edge_type && e.src_key == src_key && e.dst_key == dst_key)
+        })
+    }
+
+    /// `MERGE (a)-[:T]->(b)`: the same decisions as `GraphDb::exec_merge_edge`,
+    /// buffered. Both nodes are found or created by key, then the edge; `ON
+    /// MATCH` runs when all three existed, `ON CREATE` otherwise.
+    fn stage_merge_edge(
+        &self,
+        stmt: MergeStmt,
+        params: &BTreeMap<String, Value>,
+        staged: &mut Staged,
+    ) -> Result<(ResultSet, Option<ReaderSnapshot>)> {
+        let Some(edge) = stmt.edge.clone() else {
+            return Err(GraphError::QueryError {
+                detail: "MERGE relationship pattern missing".into(),
+            });
+        };
+        let key_of = |v: &Value| match v {
+            Value::Str(s) => Ok(s.clone()),
+            other => Err(GraphError::QueryError {
+                detail: format!("MERGE key value must be a string (got {other:?})"),
+            }),
+        };
+        let start_key = key_of(&stmt.key_value)?;
+        let end_key = key_of(&edge.end_key_value)?;
+        if start_key == end_key && stmt.label != edge.end_label {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "MERGE: key '{start_key}' is given both label '{}' and label '{}'",
+                    stmt.label, edge.end_label
+                ),
+            });
+        }
+        // A SET item names the start node or the end node, never the relationship.
+        let set_target = |var: &str| -> Result<&str> {
+            if stmt.var.as_deref() == Some(var) {
+                Ok(start_key.as_str())
+            } else if edge.end_var.as_deref() == Some(var) {
+                Ok(end_key.as_str())
+            } else {
+                Err(GraphError::QueryError {
+                    detail: format!(
+                        "SET variable '{var}' does not match a MERGE node variable \
+                         (a relationship takes no SET)"
+                    ),
+                })
+            }
+        };
+        let mut create_sets = Vec::new();
+        for sc in &stmt.on_create {
+            create_sets.push((set_target(&sc.var)?, sc));
+        }
+        let mut match_sets = Vec::new();
+        for sc in &stmt.on_match {
+            match_sets.push((set_target(&sc.var)?, sc));
+        }
+        let start_existed = self.current().resolve_key(&start_key).is_some();
+        let end_existed = self.current().resolve_key(&end_key).is_some();
+        let (src_key, dst_key) = match edge.dir {
+            core_query::cypher::RelDir::Left => (end_key.as_str(), start_key.as_str()),
+            _ => (start_key.as_str(), end_key.as_str()),
+        };
+        let edge_existed =
+            start_existed && end_existed && self.edge_present(&edge.etype, src_key, dst_key);
+        staged.touch(&start_key);
+        staged.touch(&end_key);
+        let mut created = 0i64;
+        if !start_existed {
+            staged.insert_node(
+                &stmt.label,
+                &start_key,
+                merge_node_props(&stmt.key_field, &stmt.key_value, stmt.ns.as_ref()),
+            );
+            created += 1;
+        }
+        if !end_existed && end_key != start_key {
+            staged.insert_node(
+                &edge.end_label,
+                &end_key,
+                merge_node_props(
+                    &edge.end_key_field,
+                    &edge.end_key_value,
+                    edge.end_ns.as_ref(),
+                ),
+            );
+            created += 1;
+        }
+        let sets = if edge_existed {
+            &match_sets
+        } else {
+            staged.insert_edge(&edge.etype, src_key, dst_key);
+            &create_sets
+        };
+        for (key, sc) in sets {
+            let value = resolve_merge_set_value(&sc.value, params)?;
+            if sc.field == "id" {
+                let stored = if edge_existed
+                    || (stmt.var.as_deref() == Some(sc.var.as_str()) && start_existed)
+                    || (edge.end_var.as_deref() == Some(sc.var.as_str()) && end_existed)
+                {
+                    self.stored_prop(key, "id")
+                } else if stmt.var.as_deref() == Some(sc.var.as_str()) {
+                    (stmt.key_field == "id").then(|| stmt.key_value.clone())
+                } else {
+                    (edge.end_key_field == "id").then(|| edge.end_key_value.clone())
+                };
+                crate::db::check_key_property_write(key, stored.as_ref(), Some(&value))?;
+            }
+            staged.set_prop(key, &sc.field, value);
+        }
+        let Some(returns) = stmt.returns else {
+            return self.counts(staged, created, 0, 0);
+        };
+        let overlay = if staged.ops.is_empty() {
+            None
+        } else {
+            Some(self.candidate(staged)?)
+        };
+        let node =
+            |var: Option<&String>, default: &str, label: &str, field: &str, key: &str| NodePat {
+                var: Some(var.cloned().unwrap_or_else(|| default.to_string())),
+                label: Some(label.to_string()),
+                props: vec![(field.to_string(), Operand::Lit(Value::Str(key.to_string())))],
+            };
+        let mut q = match_query(
+            vec![Pattern {
+                start: node(
+                    stmt.var.as_ref(),
+                    "_mn0",
+                    &stmt.label,
+                    &stmt.key_field,
+                    &start_key,
+                ),
+                chain: vec![(
+                    core_query::cypher::RelPat {
+                        var: edge.rel_var.clone(),
+                        etypes: vec![edge.etype.clone()],
+                        dir: edge.dir,
+                        hops: None,
+                    },
+                    node(
+                        edge.end_var.as_ref(),
+                        "_mn1",
+                        &edge.end_label,
+                        &edge.end_key_field,
+                        &end_key,
+                    ),
+                )],
+                shortest: false,
+            }],
+            None,
+        );
+        q.returns = returns;
+        let view = overlay.as_ref().unwrap_or(self.current());
+        let rs = view.with_view(|v| run(v, &q, params))??;
+        Ok((rs, overlay))
+    }
+
     fn stage_merge(
         &self,
         stmt: MergeStmt,
         params: &BTreeMap<String, Value>,
         staged: &mut Staged,
     ) -> Result<(ResultSet, Option<ReaderSnapshot>)> {
+        if stmt.edge.is_some() {
+            return self.stage_merge_edge(stmt, params, staged);
+        }
         let key = match &stmt.key_value {
             Value::Str(s) => s.clone(),
             other => {
@@ -834,6 +1001,20 @@ impl Transaction {
         let rs = view.with_view(|v| run(v, &q, params))??;
         Ok((rs, overlay))
     }
+}
+
+/// The properties a MERGE create arm inserts: the identifying key, plus `ns`
+/// when the pattern named one.
+fn merge_node_props(
+    key_field: &str,
+    key_value: &Value,
+    ns: Option<&Value>,
+) -> Vec<(String, Value)> {
+    let mut props = vec![(key_field.to_string(), key_value.clone())];
+    if let Some(ns) = ns {
+        props.push((NS_PROP.to_string(), ns.clone()));
+    }
+    props
 }
 
 /// The node keys a read query matched, for the conflict set.

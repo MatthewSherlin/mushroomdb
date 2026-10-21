@@ -3,9 +3,9 @@
 use super::ast::{
     AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
     LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetMapStmt,
-    MatchSetStmt, MergeStmt, NodePat, Operand, OptionalClause, OrderItem, OrderTarget, Pattern,
-    Query, RelDir, RelPat, RetItem, RetVal, SetClause, UnwindClause, UnwindExpr, WithStage,
-    WriteStatement,
+    MatchSetStmt, MergeEdgePat, MergeStmt, NodePat, Operand, OptionalClause, OrderItem,
+    OrderTarget, Pattern, Query, RelDir, RelPat, RetItem, RetVal, SetClause, UnwindClause,
+    UnwindExpr, WithStage, WriteStatement,
 };
 /// A parsed `SET var = {…}` / `SET var += {…}` clause: the variable, whether it
 /// is the merge (`+=`) form, and the map's entries.
@@ -131,6 +131,15 @@ fn bool_literal(name: &str) -> Option<bool> {
 /// the lexer, so `n.null` and a backtick-quoted `` `null` `` key stay names.
 fn is_null_literal(name: &str) -> bool {
     name.eq_ignore_ascii_case("null")
+}
+
+/// A parsed MERGE node pattern.
+struct MergeNode {
+    var: Option<String>,
+    label: String,
+    key_field: String,
+    key_value: Value,
+    ns: Option<Value>,
 }
 
 struct Parser<'a> {
@@ -1579,9 +1588,9 @@ impl<'a> Parser<'a> {
 
     // ── MERGE ─────────────────────────────────────────────────────────────────
 
-    fn merge_stmt(&mut self) -> Result<WriteStatement, String> {
-        self.expect(&Tok::Merge, "expected MERGE")?;
-        self.expect(&Tok::LParen, "expected '(' after MERGE")?;
+    /// One MERGE node pattern `(var:Label {key: 'x' [, ns: 'y']})`.
+    fn merge_node(&mut self, open_msg: &str) -> Result<MergeNode, String> {
+        self.expect(&Tok::LParen, open_msg)?;
         // Optional var: `MERGE (n:Label {…})` — capture n for RETURN projection.
         let var = match self.peek() {
             Some(Tok::Ident(_)) => {
@@ -1634,6 +1643,75 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Tok::RParen, "expected ')' to close MERGE pattern")?;
+        let (key_field, key_value) = rest.remove(0);
+        Ok(MergeNode {
+            var,
+            label,
+            key_field,
+            key_value,
+            ns,
+        })
+    }
+
+    /// The `-[:T]->` / `<-[:T]-` of a MERGE pattern: one typed, directed,
+    /// single-hop relationship.
+    fn merge_rel(&mut self) -> Result<(Option<String>, String, RelDir), String> {
+        let rel = self.rel()?;
+        if rel.hops.is_some() {
+            return Err(
+                "not supported in mushroomdb 0.10: MERGE with a variable-length relationship"
+                    .to_string(),
+            );
+        }
+        if rel.dir == RelDir::Undirected {
+            return Err(
+                "not supported in mushroomdb 0.10: MERGE with an undirected relationship; \
+                 give it a direction (-[:T]-> or <-[:T]-)"
+                    .to_string(),
+            );
+        }
+        match rel.etypes.as_slice() {
+            [one] => Ok((rel.var, one.clone(), rel.dir)),
+            [] => Err("MERGE requires a relationship type (e.g., -[:KNOWS]->)".to_string()),
+            _ => Err(
+                "not supported in mushroomdb 0.10: MERGE with alternative relationship types"
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn merge_stmt(&mut self) -> Result<WriteStatement, String> {
+        self.expect(&Tok::Merge, "expected MERGE")?;
+        let start = self.merge_node("expected '(' after MERGE")?;
+        let edge = if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
+            let (rel_var, etype, dir) = self.merge_rel()?;
+            let end = self.merge_node("expected '(' to start the MERGE end node")?;
+            if matches!(self.peek(), Some(Tok::Dash) | Some(Tok::Lt)) {
+                return Err(
+                    "not supported in mushroomdb 0.10: MERGE with more than one relationship"
+                        .to_string(),
+                );
+            }
+            Some(MergeEdgePat {
+                etype,
+                dir,
+                end_label: end.label,
+                end_key_field: end.key_field,
+                end_key_value: end.key_value,
+                end_ns: end.ns,
+                end_var: end.var,
+                rel_var,
+            })
+        } else {
+            None
+        };
+        let MergeNode {
+            var,
+            label,
+            key_field,
+            key_value,
+            ns,
+        } = start;
         let mut on_create = Vec::new();
         let mut on_match = Vec::new();
         while self.eat_ident_kw("on") {
@@ -1656,7 +1734,6 @@ impl<'a> Parser<'a> {
         if self.pos < self.toks.len() {
             return Err(self.unsupported_or_unexpected("unexpected tokens after MERGE"));
         }
-        let (key_field, key_value) = rest.remove(0);
         Ok(WriteStatement::Merge(MergeStmt {
             label,
             key_field,
@@ -1666,6 +1743,7 @@ impl<'a> Parser<'a> {
             on_create,
             on_match,
             returns,
+            edge,
         }))
     }
 

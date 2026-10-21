@@ -537,6 +537,33 @@ MERGE (n:Person {id: 'alice'})
   insert-or-skip. Both may appear on one MERGE.
 - Other extra properties are not supported.
 
+#### MERGE with a relationship
+
+```cypher
+MERGE (a:Person {id: 'alice'})-[:KNOWS]->(b:Person {id: 'bob'})
+  ON CREATE SET a.met = true
+  ON MATCH SET b.seen = true
+RETURN a, b
+```
+
+- Finds or creates each end node by its key, then finds or creates the edge
+  between them. Running the statement again changes nothing: the edge is never
+  duplicated, and a write that matches in full logs nothing.
+- `ON MATCH SET` runs when both nodes and the edge already existed; otherwise the
+  missing nodes and the edge are created and `ON CREATE SET` runs. A `SET` item
+  names the start or the end node (`a.x`, `b.x`), never the relationship.
+- Everything is one write batch: one commit, rules re-evaluate for every
+  assignment, and every write meets the usual checks (constraints, the `id`
+  rule, namespaces: both nodes must share one, as for any edge).
+- `<-[:T]-` is the same edge written from the other end. The reverse direction,
+  another type and another end node are distinct edges.
+- A role-scoped write needs create or update scope on both labels and the edge
+  type in `create_edge_types`; a hidden end node reads as absent.
+- One relationship, with one type and a direction. Undirected, variable-length,
+  `[:A|B]`, an untyped relationship, relationship properties and a second
+  relationship are refused by name (`not supported in mushroomdb 0.10: …`).
+- Inside an interactive transaction it is buffered like the single-node form.
+
 ---
 
 ## OPTIONAL MATCH
@@ -778,6 +805,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH … DETACH DELETE n` | `MATCH (n) WHERE n.id = 'x' DETACH DELETE n` |
 | `MATCH … DELETE n` (isolated node) | `MATCH (n:Tmp) WHERE n.id = 'x' DELETE n` |
 | `MERGE (n:L {id: 'x'})` (single-key upsert) | `MERGE (n:Person {id: 'alice'})` |
+| `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'})` | `MERGE (a:Person {id: 'alice'})-[:KNOWS]->(b:Person {id: 'bob'})` — find-or-create both nodes and the edge; idempotent; `ON CREATE SET` / `ON MATCH SET` may name `a` or `b` |
 | `MERGE (n:L {id: 'x'}) RETURN …` | `MERGE (n:Person {id: 'alice'}) RETURN n` — returns node whether created or matched |
 | `CREATE … RETURN …` | `CREATE (n:Person {id: 'alice'}) RETURN n.id, id(n), n.key` — single-statement create + projection |
 | `WHERE … IS NULL / IS NOT NULL` | `WHERE n.score IS NULL`, `WHERE b IS NOT NULL` — null-check predicate; composes with AND/OR |
@@ -803,6 +831,7 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 |---|---|
 | Bare `RETURN r` for a relationship variable | `cannot return relationship variable '…' bare; return its properties (….field) instead` |
 | `MERGE (n:L {id: 'x', extra: 2})` (multi-property other than `ns`) | `MERGE supports exactly one key property (got 2)` |
+| `MERGE (a)-[:T]-(b)` (undirected), `-[:T*1..3]->`, `-[:A\|B]->`, a second relationship | `not supported in mushroomdb 0.10: MERGE with an undirected relationship` (and its variable-length, alternative-types and more-than-one-relationship siblings) |
 | `MERGE (n:L {id: 'x'})` by a role bound to two namespaces | `role-bound token: MERGE create requires the role to name one namespace` |
 | `DELETE n` when node has incident edges | `Cannot delete node … because it still has incident edges. Use DETACH DELETE…` |
 | `DELETE r` on derived (rule-owned) edge | `cannot delete derived edge; retract via the rule or change the property` |

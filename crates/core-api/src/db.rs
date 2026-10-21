@@ -13237,12 +13237,278 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
+    /// Whether the MERGE node `key` exists, after the role-scope check (when
+    /// the write is role-scoped). See the comments inside for the oracle rules.
+    fn merge_node_existed(&self, label: &str, key: &str) -> Result<bool> {
+        if let Some(authz) = self.pending_write_authz.clone() {
+            let has_create = authz.scope.create_labels.iter().any(|l| l == label);
+            let has_update = authz.scope.update_labels.iter().any(|l| l == label);
+            if !has_create && !has_update {
+                // Scope-before-lookup: 403 without has_node call (timing oracle
+                // closure — see test_merge_unscoped_no_key_lookup).
+                return Err(GraphError::RoleWriteDenied {
+                    reason: format!(
+                        "role-bound token: label '{}' not in write scope (create_labels)",
+                        label
+                    ),
+                });
+            }
+            // Key lookup under mask.
+            match self.ids.get(key) {
+                Some(id) if authz.mask.contains_id(id) => {
+                    // Visible: must have update scope to proceed to match arm.
+                    if !has_update {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: label '{}' not in write scope (update_labels)",
+                                label
+                            ),
+                        });
+                    }
+                    Ok(true) // existed = true → match arm
+                }
+                Some(_) => {
+                    // Hidden: same error as absent to the role (spec §3.1/§3.3).
+                    Err(GraphError::RoleWriteDenied {
+                        reason: "role-bound token: target node not visible".into(),
+                    })
+                }
+                None => {
+                    // Absent: must have create scope to proceed to the create arm.
+                    //
+                    // Update-only roles (create_labels empty, update_labels set):
+                    // return the SAME "not visible" error as the hidden-key branch
+                    // so hidden ≡ absent — no distinguishing oracle (spec §6.1
+                    // "confirm existence of hidden nodes: No").
+                    //
+                    // Create-scoped roles (has_create=true): absent → create arm
+                    // as before.  The accepted structural key-existence disclosure
+                    // (§THREAT-MODEL) applies only when the role holds create scope.
+                    if !has_create {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: "role-bound token: target node not visible".into(),
+                        });
+                    }
+                    Ok(false) // existed = false → create arm
+                }
+            }
+        } else {
+            // Full authority: use the existing non-masked has_node check.
+            Ok(self.has_node(key))
+        }
+    }
+
+    /// Whether the manual-or-derived edge `src -[etype]-> dst` is in the applied state.
+    fn merge_edge_present(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
+        self.ensure_v8_base_sections_loaded();
+        let (Some(src), Some(dst), Some(sym)) = (
+            self.ids.get(src_key),
+            self.ids.get(dst_key),
+            self.syms.get(edge_type),
+        ) else {
+            return false;
+        };
+        self.topo_view()
+            .neighbors(sym, Direction::Out, src)
+            .binary_search(&dst)
+            .is_ok()
+    }
+
+    /// `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]`.
+    ///
+    /// Find-or-create each end node by key, then the edge between them. The
+    /// pattern matched as a whole (both nodes and the edge existed) → `ON
+    /// MATCH`; otherwise the missing nodes and the edge are created and `ON
+    /// CREATE` runs. One batch, so one commit and one WAL frame; every write
+    /// meets the usual commit-time checks.
+    fn exec_merge_edge(
+        &mut self,
+        stmt: core_query::cypher::MergeStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let Some(edge) = stmt.edge.clone() else {
+            return Err(GraphError::QueryError {
+                detail: "MERGE relationship pattern missing".into(),
+            });
+        };
+        let key_of = |v: &Value| match v {
+            Value::Str(s) => Ok(s.clone()),
+            other => Err(GraphError::QueryError {
+                detail: format!("MERGE key value must be a string (got {other:?})"),
+            }),
+        };
+        let start_key = key_of(&stmt.key_value)?;
+        let end_key = key_of(&edge.end_key_value)?;
+        if start_key == end_key && stmt.label != edge.end_label {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "MERGE: key '{start_key}' is given both label '{}' and label '{}'",
+                    stmt.label, edge.end_label
+                ),
+            });
+        }
+        // A SET item names the start node or the end node, never the relationship.
+        let set_target = |var: &str| -> Result<&str> {
+            if stmt.var.as_deref() == Some(var) {
+                Ok(start_key.as_str())
+            } else if edge.end_var.as_deref() == Some(var) {
+                Ok(end_key.as_str())
+            } else {
+                Err(GraphError::QueryError {
+                    detail: format!(
+                        "SET variable '{var}' does not match a MERGE node variable \
+                         (a relationship takes no SET)"
+                    ),
+                })
+            }
+        };
+        let mut create_sets = Vec::new();
+        for sc in &stmt.on_create {
+            create_sets.push((set_target(&sc.var)?, &sc.field, &sc.value));
+        }
+        let mut match_sets = Vec::new();
+        for sc in &stmt.on_match {
+            match_sets.push((set_target(&sc.var)?, &sc.field, &sc.value));
+        }
+
+        // Scope checks on both nodes before either key is looked up beyond them.
+        let start_existed = self.merge_node_existed(&stmt.label, &start_key)?;
+        let end_existed = if end_key == start_key {
+            start_existed
+        } else {
+            self.merge_node_existed(&edge.end_label, &end_key)?
+        };
+        let (src_key, dst_key) = match edge.dir {
+            core_query::cypher::RelDir::Left => (end_key.as_str(), start_key.as_str()),
+            _ => (start_key.as_str(), end_key.as_str()),
+        };
+        let edge_existed =
+            start_existed && end_existed && self.merge_edge_present(&edge.etype, src_key, dst_key);
+
+        let start_create = if start_existed {
+            None
+        } else {
+            Some(self.merge_create_props(&stmt.key_field, &stmt.key_value, stmt.ns.as_ref())?)
+        };
+        let end_create = if end_existed || end_key == start_key {
+            None
+        } else {
+            Some(self.merge_create_props(
+                &edge.end_key_field,
+                &edge.end_key_value,
+                edge.end_ns.as_ref(),
+            )?)
+        };
+        let mut created = 0i64;
+        let mut batch = self.batch();
+        if let Some(props) = start_create {
+            batch.insert_node(&stmt.label, &start_key, props);
+            created += 1;
+        }
+        if let Some(props) = end_create {
+            batch.insert_node(&edge.end_label, &end_key, props);
+            created += 1;
+        }
+        let sets = if edge_existed {
+            &match_sets
+        } else {
+            batch.insert_edge(&edge.etype, src_key, dst_key);
+            &create_sets
+        };
+        for (key, field, value) in sets {
+            batch.set_prop(key, field, resolve_merge_set_value(value, params)?);
+        }
+        batch.commit()?;
+
+        // Refresh the role mask so created nodes are visible to this
+        // statement's RETURN (read-after-write); see `exec_merge`.
+        if created > 0 {
+            if let Some(role) = self.pending_write_authz.as_ref().map(|a| a.role.clone()) {
+                let new_mask = self.mask_for_role(&role)?;
+                if let Some(a) = self.pending_write_authz.as_mut() {
+                    a.mask = new_mask;
+                }
+            }
+        }
+
+        if let Some(returns) = stmt.returns {
+            let node =
+                |var: Option<&String>, default: &str, label: &str, field: &str, key: &str| {
+                    NodePat {
+                        var: Some(var.cloned().unwrap_or_else(|| default.to_string())),
+                        label: Some(label.to_string()),
+                        props: vec![(field.to_string(), Operand::Lit(Value::Str(key.to_string())))],
+                    }
+                };
+            let q = Query {
+                matches: vec![Pattern {
+                    start: node(
+                        stmt.var.as_ref(),
+                        "_mn0",
+                        &stmt.label,
+                        &stmt.key_field,
+                        &start_key,
+                    ),
+                    chain: vec![(
+                        core_query::cypher::RelPat {
+                            var: edge.rel_var.clone(),
+                            etypes: vec![edge.etype.clone()],
+                            dir: edge.dir,
+                            hops: None,
+                        },
+                        node(
+                            edge.end_var.as_ref(),
+                            "_mn1",
+                            &edge.end_label,
+                            &edge.end_key_field,
+                            &end_key,
+                        ),
+                    )],
+                    shortest: false,
+                }],
+                optional_clauses: vec![],
+                where_expr: None,
+                unwinds: vec![],
+                post_unwind_where: None,
+                stages: vec![],
+                returns,
+                distinct: false,
+                order_by: vec![],
+                skip: None,
+                limit: None,
+            };
+            let ops = plan(&q).map_err(|e| GraphError::QueryError {
+                detail: format!("plan: {e}"),
+            })?;
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            return (if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            })
+            .map_err(|e| GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            });
+        }
+
+        let mut rs = write_result_set();
+        rs.push_row(vec![
+            Some(Value::Int(created)),
+            Some(Value::Int(0)),
+            Some(Value::Int(0)),
+        ]);
+        Ok(rs)
+    }
+
     fn exec_merge(
         &mut self,
         stmt: core_query::cypher::MergeStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
         // MERGE: check if a node with the given key already exists.
+        if stmt.edge.is_some() {
+            return self.exec_merge_edge(stmt, params);
+        }
         let key = match &stmt.key_value {
             Value::Str(s) => s.clone(),
             _ => {
@@ -13277,62 +13543,7 @@ impl<F: Fs> GraphDb<F> {
         //
         // Clone to avoid holding a borrow on `self.pending_write_authz` while
         // also calling `self.ids.get(key)`.
-        let merge_existed: bool = if let Some(authz) = self.pending_write_authz.clone() {
-            let has_create = authz.scope.create_labels.contains(&stmt.label);
-            let has_update = authz.scope.update_labels.contains(&stmt.label);
-            if !has_create && !has_update {
-                // Scope-before-lookup: 403 without has_node call (timing oracle
-                // closure — see test_merge_unscoped_no_key_lookup).
-                return Err(GraphError::RoleWriteDenied {
-                    reason: format!(
-                        "role-bound token: label '{}' not in write scope (create_labels)",
-                        stmt.label
-                    ),
-                });
-            }
-            // Key lookup under mask.
-            match self.ids.get(key.as_str()) {
-                Some(id) if authz.mask.contains_id(id) => {
-                    // Visible: must have update scope to proceed to match arm.
-                    if !has_update {
-                        return Err(GraphError::RoleWriteDenied {
-                            reason: format!(
-                                "role-bound token: label '{}' not in write scope (update_labels)",
-                                stmt.label
-                            ),
-                        });
-                    }
-                    true // existed = true → match arm
-                }
-                Some(_) => {
-                    // Hidden: same error as absent to the role (spec §3.1/§3.3).
-                    return Err(GraphError::RoleWriteDenied {
-                        reason: "role-bound token: target node not visible".into(),
-                    });
-                }
-                None => {
-                    // Absent: must have create scope to proceed to the create arm.
-                    //
-                    // Update-only roles (create_labels empty, update_labels set):
-                    // return the SAME "not visible" error as the hidden-key branch
-                    // so hidden ≡ absent — no distinguishing oracle (spec §6.1
-                    // "confirm existence of hidden nodes: No").
-                    //
-                    // Create-scoped roles (has_create=true): absent → create arm
-                    // as before.  The accepted structural key-existence disclosure
-                    // (§THREAT-MODEL) applies only when the role holds create scope.
-                    if !has_create {
-                        return Err(GraphError::RoleWriteDenied {
-                            reason: "role-bound token: target node not visible".into(),
-                        });
-                    }
-                    false // existed = false → create arm
-                }
-            }
-        } else {
-            // Full authority: use the existing non-masked has_node check.
-            self.has_node(&key)
-        };
+        let merge_existed: bool = self.merge_node_existed(&stmt.label, &key)?;
 
         let existed = merge_existed;
         let create_props = if existed {
