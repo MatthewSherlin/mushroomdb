@@ -1,4 +1,4 @@
-use core_storage::property_index::PropertyIndex;
+use core_storage::property_index::{PropertyIndex, UnifiedIndex};
 use core_storage::v8::seam::{ColumnsView, EdgePropsView, TopologyView, ValueRef};
 use core_storage::{IdMap, Interner, Value};
 
@@ -64,7 +64,9 @@ impl<'a> GraphView<'a> {
     /// `Some(ids)` — possibly empty — when the index answers the query.
     pub fn nodes_with_prop(&self, label: &str, field: &str, value: &Value) -> Option<Vec<u32>> {
         let index = self.prop_index?;
-        if !index.is_enabled(label, field) {
+        // An operand with no index key (a list, a map, a duration) can still
+        // equal a stored value, which the index does not hold: scan for it.
+        if !index.is_enabled(label, field) || !UnifiedIndex::answers_eq(value) {
             return None;
         }
         let ids = index
