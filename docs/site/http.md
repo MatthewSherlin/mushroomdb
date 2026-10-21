@@ -472,6 +472,12 @@ Request body:
 }
 ```
 
+`params` (optional): an object of query parameters. A JSON `null` binds as a null, at
+the top level and inside a list or an object, so `WHERE $p IS NULL` is true for
+`{"p": null}`. (Before 0.10 a null parameter was left out and the query failed with
+`missing parameter`.) Writes keep their own rules: `SET n.p = $p` with a null `$p` is
+a 400, and a list holding a null cannot be stored.
+
 `stub_hidden` (optional, default `false`): when `true`, hidden nodes in the mask the
 request resolved to appear as `{"key": "…", "restricted": true}` rather than being
 omitted. That mask is whichever one applies — a client `mask`, a `namespace` alone, or

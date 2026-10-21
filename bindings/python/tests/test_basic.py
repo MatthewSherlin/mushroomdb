@@ -830,3 +830,26 @@ def test_null_list_element_is_none(tmp_path):
     rows = db.query("RETURN [1, null] AS l, {a: null, b: 1} AS m, null AS v")
     assert rows == [{"l": [1, None], "m": {"a": None, "b": 1}, "v": None}]
     db.close()
+
+
+def test_query_params_none_binds_as_null(tmp_path):
+    """QL-17i: a Python None parameter is a null, as a JSON null is over HTTP."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("NP", "a", {"n": 1})
+    rows = db.query("MATCH (n:NP) WHERE $p IS NULL RETURN key(n) AS k", {"p": None})
+    assert rows == [{"k": "a"}]
+    rows = db.query(
+        "MATCH (n:NP) WHERE $p IS NULL RETURN key(n) AS k", [("p", None)]
+    )
+    assert rows == [{"k": "a"}]
+    rows = db.query_with_params(
+        "MATCH (n:NP) WHERE $p IS NULL RETURN key(n) AS k", [("p", None)]
+    )
+    assert rows == [{"k": "a"}]
+    # Inside a list and a map the null stays an element.
+    rows = db.query(
+        "RETURN size($ids) AS n, $ids AS ids, $m AS m",
+        {"ids": [1, None], "m": {"a": None}},
+    )
+    assert rows == [{"n": 2, "ids": [1, None], "m": {"a": None}}]
+    db.close()

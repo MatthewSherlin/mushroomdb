@@ -1,0 +1,2 @@
+### Changed
+- **A null query parameter binds as `null` over HTTP and in Python, as it does over Bolt.** A JSON `null` (top level, or inside a list or map) and a Python `None` reach the query as a null, so `WHERE $p IS NULL` is true for it. Before, HTTP left a null parameter out and the query failed with `missing parameter`, and Python raised `TypeError`. Writes keep their rules: `SET n.p = $p` with a null `$p` is still refused, and a list holding a null cannot be stored.
