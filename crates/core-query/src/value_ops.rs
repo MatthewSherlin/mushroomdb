@@ -185,20 +185,23 @@ pub fn cmp_values(a: &Value, b: &Value) -> Ordering {
     }
 }
 
+/// Ordering for ORDER BY: null (a missing property or `Value::Null`) is the
+/// largest value, as openCypher has it, so ascending puts nulls last and
+/// descending puts them first. This is ordering only; equality is
+/// `values_equal` and is unchanged.
 pub fn cmp_optional(a: Option<&Value>, b: Option<&Value>, descending: bool) -> Ordering {
-    match (a, b) {
+    let a = a.filter(|v| !matches!(v, Value::Null));
+    let b = b.filter(|v| !matches!(v, Value::Null));
+    let ascending = match (a, b) {
         (None, None) => Ordering::Equal,
-        // None sorts LAST regardless of ascending/descending.
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
-        (Some(x), Some(y)) => {
-            let c = cmp_values(x, y);
-            if descending {
-                c.reverse()
-            } else {
-                c
-            }
-        }
+        (Some(x), Some(y)) => cmp_values(x, y),
+    };
+    if descending {
+        ascending.reverse()
+    } else {
+        ascending
     }
 }
 
@@ -390,13 +393,15 @@ mod tests {
     }
 
     #[test]
-    fn cmp_optional_none_last_both_directions() {
+    fn cmp_optional_null_is_the_largest_value() {
         let a = Value::Int(1);
         let b = Value::Int(2);
         assert_eq!(cmp_optional(None, Some(&a), false), Greater);
         assert_eq!(cmp_optional(Some(&a), None, false), Less);
-        assert_eq!(cmp_optional(None, Some(&a), true), Greater);
-        assert_eq!(cmp_optional(Some(&a), None, true), Less);
+        assert_eq!(cmp_optional(None, Some(&a), true), Less);
+        assert_eq!(cmp_optional(Some(&a), None, true), Greater);
+        assert_eq!(cmp_optional(Some(&Value::Null), None, false), Equal);
+        assert_eq!(cmp_optional(Some(&Value::Null), Some(&a), true), Less);
         assert_eq!(cmp_optional(None, None, false), Equal);
         assert_eq!(cmp_optional(None, None, true), Equal);
         assert_eq!(cmp_optional(Some(&a), Some(&b), false), Less);

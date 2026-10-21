@@ -89,9 +89,9 @@ Value is the median of five full runs of each bench's criterion point estimate.
 | `bench_query_key_1hop` | 4.89 µs | `MATCH (n:Person)-[:KNOWS]->(m) WHERE key(n) = $k RETURN m` |
 | `bench_query_key_2hop` | 9.45 µs | `MATCH (a:Person)-[:KNOWS]->(b)-[:KNOWS]->(c) WHERE key(a) = $k RETURN c` |
 | `bench_query_label_agg` | 145 µs | `MATCH (n:Person) RETURN count(n)` |
-| `bench_query_order_limit` | 1.45 ms | `MATCH (n:Person) RETURN n ORDER BY n.score DESC LIMIT 10` |
+| `bench_query_order_limit` | 722 µs | `MATCH (n:Person) RETURN n ORDER BY n.score DESC LIMIT 10` |
 
 Run-to-run spread under load was large (one run was ~3x slower on every shape), so read these as
-order-of-magnitude until re-measured. The `bench_query_order_limit` figure was measured when
-`ORDER BY` keys had to appear in `RETURN`, so it timed `RETURN n, n.score`; the shape is now the
-natural one above and the figure is pending a re-measure.
+order-of-magnitude until re-measured. `bench_query_order_limit` was re-measured on 2026-10-21 (same machine, five runs, default
+sample size) after `ORDER BY … LIMIT` became a bounded top-k selection and a key no longer had to be
+a `RETURN` column; its earlier 1.45 ms timed `RETURN n, n.score` with a full sort.

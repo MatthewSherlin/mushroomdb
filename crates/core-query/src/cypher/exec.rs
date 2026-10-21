@@ -399,7 +399,7 @@ fn execute_inner(
     // executor can emit the final ResultSet from `rows` when no Project follows.
     let mut pipeline_group_columns: Option<Vec<String>> = None;
 
-    for op in plan {
+    for (op_index, op) in plan.iter().enumerate() {
         match op {
             PlanOp::ScanLabel { var, label } => {
                 rows = scan_label(view, &vars, &rows, var, label.as_deref())?;
@@ -490,11 +490,12 @@ fn execute_inner(
                 items,
                 visible_columns,
             } => {
+                let keep = order_keep_bound(&plan[op_index + 1..], params);
                 if let Some(table) = projected.as_mut() {
-                    exec_order_by(table, items, *visible_columns)?;
+                    exec_order_by(table, items, *visible_columns, keep)?;
                 } else {
                     // Pipeline mode: ORDER BY on raw rows (before any Project).
-                    exec_order_by_rows(&vars, &mut rows, items, view, params)?;
+                    exec_order_by_rows(&vars, &mut rows, items, view, params, keep)?;
                 }
             }
             PlanOp::Skip(ls) => {
@@ -657,7 +658,8 @@ fn execute_inner(
                 }
                 // ORDER BY / SKIP / LIMIT on projected rows.
                 if !order_by.is_empty() {
-                    exec_order_by_rows(&vars, &mut rows, order_by, view, params)?;
+                    let keep = skip_limit_bound(skip.as_ref(), limit.as_ref(), params);
+                    exec_order_by_rows(&vars, &mut rows, order_by, view, params, keep)?;
                 }
                 if let Some(ls) = skip {
                     let n = resolve_ls(ls, params)?;
@@ -3874,6 +3876,7 @@ fn exec_order_by_rows(
     items: &[OrderItem],
     view: &GraphView,
     params: &Params,
+    keep: Option<usize>,
 ) -> Result<(), String> {
     // Pre-compute sort-key values for all rows.  This avoids re-resolving
     // inside the comparator (the closure cannot return Err, so we pre-compute).
@@ -3910,9 +3913,9 @@ fn exec_order_by_rows(
         }
         key_table.push(row_key);
     }
-    // Sort using a stable, index-based sort to keep equal rows in encounter order.
-    let mut indices: Vec<usize> = (0..rows.len()).collect();
-    indices.sort_by(|&a, &b| {
+    // Stable: equal keys keep encounter order; with a bound only the rows a
+    // following SKIP/LIMIT can reach are selected and sorted.
+    let order = sorted_prefix(rows.len(), keep, |a, b| {
         for (ki, item) in items.iter().enumerate() {
             let c = cmp_optional(
                 key_table[a].get(ki).and_then(|x| x.as_ref()),
@@ -3925,7 +3928,10 @@ fn exec_order_by_rows(
         }
         std::cmp::Ordering::Equal
     });
-    let sorted: Vec<Row> = indices.into_iter().map(|i| rows[i].clone()).collect();
+    let sorted: Vec<Row> = order
+        .into_iter()
+        .map(|i| std::mem::take(&mut rows[i]))
+        .collect();
     *rows = sorted;
     Ok(())
 }
@@ -3978,12 +3984,15 @@ fn execute_group_aggregate(
     }
     let mut projected = build_group_projected(keys, aggs, key_order, &mut groups);
     // Apply OrderBy / Skip / Limit from the tail of the plan.
-    for op in tail {
+    for (tail_index, op) in tail.iter().enumerate() {
         match op {
             PlanOp::OrderBy {
                 items,
                 visible_columns,
-            } => exec_order_by(&mut projected, items, *visible_columns)?,
+            } => {
+                let keep = order_keep_bound(&tail[tail_index + 1..], params);
+                exec_order_by(&mut projected, items, *visible_columns, keep)?;
+            }
             PlanOp::Skip(ls) => {
                 let n = resolve_ls(ls, params)?;
                 apply_skip(&mut projected.rows, n);
@@ -4905,10 +4914,65 @@ fn order_column(item: &OrderItem) -> String {
     }
 }
 
+/// How many leading rows of the sorted result the ops after an `OrderBy` can
+/// still see: `SKIP s LIMIT k` reads only the first `s + k`. `None` when no
+/// `LIMIT` follows (every row is needed) or a parameter cannot be resolved
+/// (the later `Limit` op reports that error itself).
+fn order_keep_bound(following: &[PlanOp], params: &Params) -> Option<usize> {
+    let mut skip = None;
+    let mut limit = None;
+    for op in following {
+        match op {
+            PlanOp::Skip(ls) => skip = Some(ls),
+            PlanOp::Limit(ls) => limit = Some(ls),
+            _ => break,
+        }
+    }
+    skip_limit_bound(skip, limit, params)
+}
+
+fn skip_limit_bound(
+    skip: Option<&LimitSkip>,
+    limit: Option<&LimitSkip>,
+    params: &Params,
+) -> Option<usize> {
+    let skip = match skip {
+        Some(ls) => resolve_ls(ls, params).ok()?,
+        None => 0,
+    };
+    let total = skip.checked_add(resolve_ls(limit?, params).ok()?)?;
+    usize::try_from(total).ok()
+}
+
+/// The first `keep` positions (all when `None`) of `0..len` in the order
+/// `cmp` gives, ties broken by position so the result is exactly the prefix of
+/// a stable full sort. With a bound this is a partition (`select_nth_unstable`)
+/// plus a sort of the prefix, O(n + k log k), instead of an O(n log n) sort.
+fn sorted_prefix(
+    len: usize,
+    keep: Option<usize>,
+    cmp: impl Fn(usize, usize) -> std::cmp::Ordering,
+) -> Vec<usize> {
+    let total = |a: &usize, b: &usize| cmp(*a, *b).then(a.cmp(b));
+    let mut indices: Vec<usize> = (0..len).collect();
+    match keep {
+        Some(k) if k < len => {
+            if k > 0 {
+                indices.select_nth_unstable_by(k - 1, total);
+            }
+            indices.truncate(k);
+            indices.sort_unstable_by(total);
+        }
+        _ => indices.sort_unstable_by(total),
+    }
+    indices
+}
+
 fn exec_order_by(
     table: &mut Projected,
     items: &[OrderItem],
     visible_columns: Option<usize>,
+    keep: Option<usize>,
 ) -> Result<(), String> {
     let mut keys = Vec::with_capacity(items.len());
     for item in items {
@@ -4920,11 +4984,12 @@ fn exec_order_by(
             .ok_or_else(|| format!("ORDER BY target `{name}` is not a projected column"))?;
         keys.push((idx, item.descending));
     }
-    table.rows.sort_by(|a, b| {
+    let rows = &mut table.rows;
+    let order = sorted_prefix(rows.len(), keep, |a, b| {
         for &(idx, desc) in &keys {
             let c = cmp_optional(
-                a.get(idx).and_then(|x| x.as_ref()),
-                b.get(idx).and_then(|x| x.as_ref()),
+                rows[a].get(idx).and_then(|x| x.as_ref()),
+                rows[b].get(idx).and_then(|x| x.as_ref()),
                 desc,
             );
             if c != std::cmp::Ordering::Equal {
@@ -4933,6 +4998,11 @@ fn exec_order_by(
         }
         std::cmp::Ordering::Equal
     });
+    let sorted: Vec<_> = order
+        .into_iter()
+        .map(|i| std::mem::take(&mut rows[i]))
+        .collect();
+    *rows = sorted;
     // Drop the hidden columns that only carried sort keys.
     if let Some(n) = visible_columns {
         table.columns.truncate(n);
@@ -5579,9 +5649,8 @@ LIMIT 10";
         assert_eq!(names(&rs), ["b", "d", "c", "e", "a"]);
     }
 
-    /// Nulls (a missing property) sort last whichever way the key runs; that
-    /// is what ORDER BY on a projected column has always done, and a hidden
-    /// key must agree with it.
+    /// Null (a missing property) is the largest value: last ascending, first
+    /// descending (openCypher). A hidden key must agree with a projected column.
     #[test]
     fn ql_ob_null_keys_place_like_a_projected_column() {
         let mut fx = Fx::new();
@@ -5608,8 +5677,15 @@ LIMIT 10";
         )
         .unwrap();
         assert_eq!(names(&asc), ["cam", "ada", "bob"]);
-        assert_eq!(names(&desc), ["ada", "cam", "bob"]);
+        let projected_desc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name, n.age ORDER BY n.age DESC",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&desc), ["bob", "ada", "cam"]);
         assert_eq!(names(&asc), names(&projected_asc));
+        assert_eq!(names(&desc), names(&projected_desc));
     }
 
     #[test]
@@ -5734,8 +5810,112 @@ LIMIT 10";
         assert_eq!(names(&rs), ["eve", "bob", "cam", "fay"]);
     }
 
+    /// Deterministic pseudo-random stream (xorshift), so a failure reproduces.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// The bounded selection is exactly the prefix of a stable full sort,
+    /// ties and nulls included, for every bound.
     #[test]
-    fn order_by_none_last_then_skip_limit() {
+    fn ql_ob_sorted_prefix_equals_a_stable_full_sort() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for round in 0..200 {
+            let len = (xorshift(&mut state) % 60) as usize;
+            // Few distinct keys, so ties are everywhere; None is a key too.
+            let keys: Vec<Option<Value>> = (0..len)
+                .map(|_| match xorshift(&mut state) % 6 {
+                    0 => None,
+                    n => Some(i(n as i64)),
+                })
+                .collect();
+            for descending in [false, true] {
+                let cmp = |a: usize, b: usize| {
+                    crate::cmp_optional(keys[a].as_ref(), keys[b].as_ref(), descending)
+                };
+                let mut reference: Vec<usize> = (0..len).collect();
+                reference.sort_by(|&a, &b| cmp(a, b)); // std sort_by is stable
+                for keep in [
+                    None,
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                    Some(5),
+                    Some(17),
+                    Some(len),
+                    Some(len + 3),
+                ] {
+                    let got = super::sorted_prefix(len, keep, cmp);
+                    let want = match keep {
+                        Some(k) => reference[..k.min(len)].to_vec(),
+                        None => reference.clone(),
+                    };
+                    assert_eq!(
+                        got, want,
+                        "round {round} len {len} keep {keep:?} desc {descending}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whole-query differential: `ORDER BY … SKIP s LIMIT k` returns the
+    /// slice `[s, s + k)` of the same query without SKIP/LIMIT, for ties,
+    /// nulls, both directions, a hidden key and a WITH stage.
+    #[test]
+    fn ql_ob_top_k_equals_full_sort_then_slice() {
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut fx = Fx::new();
+        for n in 0..120 {
+            let mut props = vec![("name", s(&format!("p{n:03}")))];
+            // Heavy ties on `a`, 1 in 5 missing; `b` breaks some ties.
+            if !xorshift(&mut state).is_multiple_of(5) {
+                props.push(("a", i((xorshift(&mut state) % 7) as i64)));
+            }
+            props.push(("b", i((xorshift(&mut state) % 3) as i64)));
+            fx.add("P", &format!("p{n:03}"), props);
+        }
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let shapes = [
+            ("MATCH (n:P) RETURN n.name ORDER BY n.a", ""),
+            ("MATCH (n:P) RETURN n.name ORDER BY n.a DESC, n.b", ""),
+            ("MATCH (n:P) RETURN n.name, n.a AS a ORDER BY a DESC", ""),
+            (
+                "MATCH (n:P) RETURN n.name ORDER BY n.b + n.a DESC, n.name DESC",
+                "",
+            ),
+            (
+                "MATCH (n:P) WITH n ORDER BY n.a DESC, n.b",
+                " RETURN n.name",
+            ),
+        ];
+        for (head, tail) in shapes {
+            let full = names(&run(&v, &format!("{head}{tail}"), &params).unwrap());
+            assert_eq!(full.len(), 120);
+            for skip in [0usize, 1, 7, 119, 130] {
+                for limit in [0usize, 1, 2, 10, 50, 119, 120, 500] {
+                    let q = format!("{head} SKIP {skip} LIMIT {limit}{tail}");
+                    let got = names(&run(&v, &q, &params).unwrap());
+                    let want: Vec<String> = full.iter().skip(skip).take(limit).cloned().collect();
+                    assert_eq!(got, want, "{q}");
+                }
+            }
+            // LIMIT alone, and a LIMIT parameter.
+            let got = names(&run(&v, &format!("{head} LIMIT 10{tail}"), &params).unwrap());
+            assert_eq!(got, full[..10].to_vec(), "{head}");
+            let mut with_param = BTreeMap::new();
+            with_param.insert("k".to_string(), i(10));
+            let got = names(&run(&v, &format!("{head} LIMIT $k{tail}"), &with_param).unwrap());
+            assert_eq!(got, full[..10].to_vec(), "{head} (param)");
+        }
+    }
+
+    #[test]
+    fn order_by_null_is_largest_then_skip_limit() {
         let mut fx = Fx::new();
         fx.add("Person", "ada", vec![("age", i(30))]);
         fx.add("Person", "bob", vec![]); // missing age → None
@@ -5768,10 +5948,10 @@ LIMIT 10";
         assert_eq!(
             rows_of(&desc),
             vec![
+                vec![Some(s("bob")), None],
                 vec![Some(s("ada")), Some(i(30))],
                 vec![Some(s("dan")), Some(i(20))],
                 vec![Some(s("cam")), Some(i(10))],
-                vec![Some(s("bob")), None],
             ]
         );
 
@@ -5798,8 +5978,8 @@ LIMIT 10";
         assert_eq!(
             rows_of(&desc_sl),
             vec![
+                vec![Some(s("ada")), Some(i(30))],
                 vec![Some(s("dan")), Some(i(20))],
-                vec![Some(s("cam")), Some(i(10))],
             ]
         );
     }
