@@ -5477,6 +5477,11 @@ POST /query
 }
 ```
 
+A null parameter binds as a null: `None` in Python, JSON `null` over HTTP (top
+level, or inside a list or map), `Value::Null` in Rust, matching Bolt. So
+`WHERE $p IS NULL` is true for it, and the query does not fail with a missing
+parameter.
+
 ### Error: unknown parameter
 
 If `$name` appears in the query but is not supplied, the executor returns:
@@ -6260,6 +6265,12 @@ Request body:
   "stub_hidden": false
 }
 ```
+
+`params` (optional): an object of query parameters. A JSON `null` binds as a null, at
+the top level and inside a list or an object, so `WHERE $p IS NULL` is true for
+`{"p": null}`. (Before 0.10 a null parameter was left out and the query failed with
+`missing parameter`.) Writes keep their own rules: `SET n.p = $p` with a null `$p` is
+a 400, and a list holding a null cannot be stored. A null inside a map parameter reaches `SET n += $m` (which removes that key) and `SET n = $m` (which replaces the properties with the non-null entries); before 0.10 the null was dropped and the key stayed.
 
 `stub_hidden` (optional, default `false`): when `true`, hidden nodes in the mask the
 request resolved to appear as `{"key": "…", "restricted": true}` rather than being
@@ -7961,10 +7972,12 @@ write that carries one is refused until the format that holds them lands.
 ### `Params`
 
 ```python
-Params = dict[str, Scalar] | Sequence[tuple[str, Scalar]] | None
+Params = dict[str, Scalar | None] | Sequence[tuple[str, Scalar | None]] | None
 ```
 
 Query parameters: a name→value dict, a list of (name, value) tuples, or None.
+
+A `None` value binds as a null, so `$p IS NULL` is true for it; it may also sit inside a list or dict value.
 
 ### `Row`
 
@@ -8405,7 +8418,7 @@ this one call; these arguments are its per-call form.
 
 ```python
 def query_with_params(
-    self, cypher: str, params: Sequence[tuple[str, Scalar]]
+    self, cypher: str, params: Sequence[tuple[str, Scalar | None]]
 ) -> list[Row]
 ```
 

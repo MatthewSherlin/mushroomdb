@@ -151,7 +151,7 @@ Run a Cypher query (read or write). The server detects write statements and
 acquires the write lock automatically. Returns `{ columns: string[], rows: CellValue[][] }`.
 
 `opts.params` — bound parameters; values must be JSON scalars
-(`string | number | boolean`).
+(`string | number | boolean | null`); `null` binds as a null.
 
 `opts.as_of` — time-travel: run the query on the graph as it was at this WAL
 commit index (0 to `commit_seq − 1` inclusive, read-only). Obtain a commit

@@ -7170,3 +7170,164 @@ async fn http_prop_routes_refuse_an_id_that_is_not_the_key() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(id_of(&db), Some(Value::Str("x".into())));
 }
+
+/// POST `/query` with `params` and return the status and the JSON body.
+async fn query_with_params(app: axum::Router, cypher: &str, params: Json) -> (StatusCode, Json) {
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({"cypher": cypher, "params": params}),
+        ),
+    )
+    .await;
+    (status, parse_json(&body))
+}
+
+/// QL-17i: a JSON `null` parameter binds as `null`, as it does over Bolt, so
+/// `$p IS NULL` is true instead of "missing parameter".
+#[tokio::test]
+async fn http_null_param_binds_as_null() {
+    let (app, _db) = open("http-null-param");
+    let (status, _) = query_with_params(app.clone(), "CREATE (n:NP {id: 'a'})", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, v) = query_with_params(
+        app,
+        "MATCH (n:NP) WHERE $p IS NULL RETURN n.id AS x",
+        json!({"p": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([["a"]]));
+}
+
+/// QL-17i: a null inside a list or a map parameter stays a null element.
+#[tokio::test]
+async fn http_null_param_inside_list_and_map() {
+    let (app, _db) = open("http-null-param-nested");
+    let (status, v) = query_with_params(
+        app.clone(),
+        "RETURN size($ids) AS n, $ids[0] AS first, $ids[1] AS second",
+        json!({"ids": [1, null]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([[2, 1, null]]));
+
+    let (status, v) = query_with_params(
+        app.clone(),
+        "RETURN $m AS m, keys($m) AS ks",
+        json!({"m": {"a": null, "b": 2}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([[{"a": null, "b": 2}, ["a", "b"]]]));
+
+    let (status, v) =
+        query_with_params(app, "RETURN $p AS p", json!({"p": [null, {"k": null}]})).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([[[null, {"k": null}]]]));
+}
+
+/// QL-17i: a typed parameter object keeps its meaning next to the null change.
+#[tokio::test]
+async fn http_typed_param_object_still_decodes() {
+    let (app, _db) = open("http-null-param-typed");
+    let (status, v) = query_with_params(
+        app,
+        "RETURN $d AS d, $p AS p",
+        json!({"d": {"$date": "2024-01-15"}, "p": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([[{"$date": "2024-01-15"}, null]]));
+}
+
+/// QL-17i: a write with a null parameter is the engine's call, not the route's:
+/// `SET n.p = $p` with a null `$p` is refused by name, as it is embedded, and
+/// leaves the stored property alone.
+#[tokio::test]
+async fn http_write_with_null_param_follows_the_engine() {
+    let (app, _db) = open("http-null-param-write");
+    let (status, _) =
+        query_with_params(app.clone(), "CREATE (n:NP {id: 'a', p: 1})", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) SET n.p = $p",
+        json!({"p": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], json!("SET value for n.p evaluated to null"));
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) RETURN n.p AS p",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["rows"], json!([[1]]));
+
+    // A null inside a stored list is still refused at the engine's choke point.
+    let (status, v) = query_with_params(
+        app,
+        "MATCH (n:NP {id: 'a'}) SET n.l = $l",
+        json!({"l": [1, null]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("a property value cannot contain null")),
+        "{v}"
+    );
+}
+
+/// QL-17i: a null inside a map parameter now reaches the engine, so the map
+/// forms of SET follow openCypher: `+=` removes the key, `=` replaces every
+/// user property with the map's non-null entries. Before, HTTP dropped the
+/// null and the key stayed.
+#[tokio::test]
+async fn http_null_map_param_in_set_removes_the_key() {
+    let (app, _db) = open("http-null-param-set-map");
+    let (status, _) = query_with_params(
+        app.clone(),
+        "CREATE (n:NP {id: 'a', p: 1, y: 2})",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) SET n += $m",
+        json!({"m": {"y": null}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let (_, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) RETURN n.p AS p, n.y AS y",
+        json!({}),
+    )
+    .await;
+    assert_eq!(v["rows"], json!([[1, null]]), "+= with a null removes y");
+
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) SET n = $m",
+        json!({"m": {"z": null, "w": 1}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let (_, v) = query_with_params(
+        app,
+        "MATCH (n:NP {id: 'a'}) RETURN n.p AS p, n.w AS w",
+        json!({}),
+    )
+    .await;
+    assert_eq!(v["rows"], json!([[null, 1]]), "= replaces the properties");
+}

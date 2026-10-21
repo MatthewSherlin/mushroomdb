@@ -773,6 +773,11 @@ POST /query
 }
 ```
 
+A null parameter binds as a null: `None` in Python, JSON `null` over HTTP (top
+level, or inside a list or map), `Value::Null` in Rust, matching Bolt. So
+`WHERE $p IS NULL` is true for it, and the query does not fail with a missing
+parameter.
+
 ### Error: unknown parameter
 
 If `$name` appears in the query but is not supplied, the executor returns:

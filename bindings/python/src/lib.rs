@@ -497,7 +497,8 @@ impl GraphDb {
     /// - a `dict` mapping name→value (ergonomic form)
     /// - a list of `(name, value)` tuples (back-compat with `query_with_params`)
     ///
-    /// Values must be `int`, `float`, `str`, `bool`, `list`, or `dict`.
+    /// Values must be `int`, `float`, `str`, `bool`, `None`, `list`, or `dict`;
+    /// `None` binds as a null, so `$p IS NULL` is true for it.
     /// Parameters are bound, never interpolated, so string values are safe
     /// against injection.
     ///
@@ -585,7 +586,7 @@ impl GraphDb {
                 ));
             }
             let name: String = tuple.get_item(0)?.extract()?;
-            let val = py_to_value(&tuple.get_item(1)?)?;
+            let val = py_to_param(&tuple.get_item(1)?)?;
             map.insert(name, val);
         }
         let rs = self.with_scope(|db, mask| match mask {
@@ -3157,6 +3158,33 @@ fn py_to_where(dict: &Bound<'_, PyDict>) -> PyResult<PropPredicate> {
     Ok(pred)
 }
 
+/// A query parameter. `None` binds as [`Value::Null`], at the top level and
+/// inside a list or dict, as a JSON null does over HTTP (QL-17i). Stored
+/// values keep going through [`py_to_value`], which has no null.
+fn py_to_param(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if obj.is_none() {
+        return Ok(Value::Null);
+    }
+    if let Ok(list) = obj.downcast::<PyList>() {
+        let mut out = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            out.push(py_to_param(&item)?);
+        }
+        return Ok(Value::List(out));
+    }
+    if let Ok(dict) = obj.downcast::<PyDict>() {
+        let mut map = BTreeMap::new();
+        for (k, v) in dict.iter() {
+            let key: String = k.extract().map_err(|_| {
+                PyTypeError::new_err("dict keys must be str to convert to Value::Map")
+            })?;
+            map.insert(key, py_to_param(&v)?);
+        }
+        return Ok(Value::Map(map));
+    }
+    py_to_value(obj)
+}
+
 fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if obj.is_instance_of::<PyBool>() {
         return Ok(Value::Bool(obj.extract()?));
@@ -3504,7 +3532,7 @@ fn params_to_map(params: Option<Bound<'_, PyAny>>) -> PyResult<BTreeMap<String, 
             let name: String = k.extract().map_err(|_| {
                 pyo3::exceptions::PyTypeError::new_err("params dict keys must be str")
             })?;
-            map.insert(name, py_to_value(&v)?);
+            map.insert(name, py_to_param(&v)?);
         }
         return Ok(map);
     }
@@ -3523,7 +3551,7 @@ fn params_to_map(params: Option<Bound<'_, PyAny>>) -> PyResult<BTreeMap<String, 
                 ));
             }
             let name: String = tuple.get_item(0)?.extract()?;
-            let val = py_to_value(&tuple.get_item(1)?)?;
+            let val = py_to_param(&tuple.get_item(1)?)?;
             map.insert(name, val);
         }
         return Ok(map);

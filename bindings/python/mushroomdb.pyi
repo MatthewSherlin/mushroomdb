@@ -40,8 +40,10 @@ years 1 to 9999 raises `ValueError`. These five types are not yet storable: a
 write that carries one is refused until the format that holds them lands.
 """
 
-Params = dict[str, Scalar] | Sequence[tuple[str, Scalar]] | None
-"""Query parameters: a name→value dict, a list of (name, value) tuples, or None."""
+Params = dict[str, Scalar | None] | Sequence[tuple[str, Scalar | None]] | None
+"""Query parameters: a name→value dict, a list of (name, value) tuples, or None.
+
+A `None` value binds as a null, so `$p IS NULL` is true for it; it may also sit inside a list or dict value."""
 
 Row = dict[str, Any]
 """One result row, keyed by RETURN alias."""
@@ -507,7 +509,7 @@ class GraphDb:
         """
 
     def query_with_params(
-        self, cypher: str, params: Sequence[tuple[str, Scalar]]
+        self, cypher: str, params: Sequence[tuple[str, Scalar | None]]
     ) -> list[Row]:
         """Back-compat alias for `query(cypher, params=[...])` with a tuple list.
 

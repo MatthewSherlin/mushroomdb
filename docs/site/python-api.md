@@ -44,10 +44,12 @@ write that carries one is refused until the format that holds them lands.
 ### `Params`
 
 ```python
-Params = dict[str, Scalar] | Sequence[tuple[str, Scalar]] | None
+Params = dict[str, Scalar | None] | Sequence[tuple[str, Scalar | None]] | None
 ```
 
 Query parameters: a name→value dict, a list of (name, value) tuples, or None.
+
+A `None` value binds as a null, so `$p IS NULL` is true for it; it may also sit inside a list or dict value.
 
 ### `Row`
 
@@ -488,7 +490,7 @@ this one call; these arguments are its per-call form.
 
 ```python
 def query_with_params(
-    self, cypher: str, params: Sequence[tuple[str, Scalar]]
+    self, cypher: str, params: Sequence[tuple[str, Scalar | None]]
 ) -> list[Row]
 ```
 
