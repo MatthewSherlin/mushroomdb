@@ -650,7 +650,11 @@ MERGE (n:Person {id: r.id})
   value), `DETACH DELETE n RETURN count(*)` counts the deleted rows, and a
   `CREATE` with a `rand()` key returns the nodes it created. `RETURN n.name`,
   `RETURN count(*)`, `DISTINCT` and `ORDER BY` / `SKIP` / `LIMIT` work. A node the
-  statement deleted reads as null.
+  statement deleted reads as null. A `RETURN` captures only what it names, so a
+  bare `count(*)` carries a row count and nothing else. A relationship variable
+  of the read part or of a `MERGE` (`RETURN type(r), r.count`) is found again
+  between its two end nodes; a variable-length relationship (`[r:T*1..3]`) in
+  such a `RETURN` is refused by name.
 - **Counts.** Without `RETURN` the row is `created` (nodes inserted),
   `properties_set` (properties set, plus those removed that existed) and
   `deleted` (nodes deleted).

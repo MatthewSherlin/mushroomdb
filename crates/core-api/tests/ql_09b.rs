@@ -1218,6 +1218,149 @@ fn a_node_deleted_in_the_statement_no_longer_holds_the_edges_made_to_it() {
     assert_eq!(db.edge_count(), 0);
 }
 
+// ── Fix round 2: a relationship variable in RETURN ─────────────────────────
+
+fn edge_db(name: &str) -> GraphDb {
+    let mut db = GraphDb::open(&tmp(name)).unwrap();
+    run(
+        &mut db,
+        "CREATE (a:A {id: 'a1'})-[:T]->(b:A {id: 'b1'})",
+        &none(),
+    );
+    run(
+        &mut db,
+        "CREATE (a:A {id: 'a2'})-[:T]->(b:A {id: 'b2'})",
+        &none(),
+    );
+    db
+}
+
+#[test]
+fn return_names_a_relationship_matched_before_a_set() {
+    let mut db = edge_db("ret-rel-set");
+    let rs = run(
+        &mut db,
+        "UNWIND [1] AS x MATCH (a:A)-[r:T]->(b:A) SET a.x = 1 \
+         RETURN type(r) AS t, b.id AS b ORDER BY b",
+        &none(),
+    );
+    assert_eq!(rs.len(), 2);
+    assert_eq!(rs.get(0, "t"), Some(&s("T")));
+    assert_eq!(rs.get(0, "b"), Some(&s("b1")));
+    assert_eq!(rs.get(1, "b"), Some(&s("b2")));
+    assert_eq!(db.get_prop("a1", "x"), Some(Value::Int(1)));
+}
+
+#[test]
+fn return_reads_a_relationships_property_and_count_after_a_set() {
+    let mut db = edge_db("ret-rel-props");
+    // `count` is the insert count the engine keeps on every edge.
+    let rs = run(
+        &mut db,
+        "UNWIND [1] AS x MATCH (a:A)-[r:T]->(b:A) SET b.y = 2 \
+         RETURN r.count AS c, count(*) AS n",
+        &none(),
+    );
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "n"), Some(&Value::Int(2)));
+}
+
+#[test]
+fn return_names_the_relationship_of_a_merge() {
+    let mut db = GraphDb::open(&tmp("ret-rel-merge")).unwrap();
+    let rs = run(
+        &mut db,
+        "UNWIND ['x', 'y'] AS k MERGE (a:A {id: k})-[r:T]->(b:B {id: 'b'}) \
+         RETURN type(r) AS t, a.id AS a ORDER BY a",
+        &none(),
+    );
+    assert_eq!(rs.len(), 2);
+    assert_eq!(rs.get(0, "t"), Some(&s("T")));
+    assert_eq!(rs.get(1, "a"), Some(&s("y")));
+    assert_eq!(db.edge_count(), 2);
+    // Run again: the edges exist, the relationship is still returned.
+    let rs = run(
+        &mut db,
+        "UNWIND ['x'] AS k MERGE (a:A {id: k})-[r:T]->(b:B {id: 'b'}) RETURN type(r) AS t",
+        &none(),
+    );
+    assert_eq!((rs.len(), rs.get(0, "t")), (1, Some(&s("T"))));
+}
+
+#[test]
+fn return_names_the_relationship_of_a_merge_after_a_set() {
+    let mut db = GraphDb::open(&tmp("ret-rel-merge-set")).unwrap();
+    let rs = run(
+        &mut db,
+        "UNWIND ['x'] AS k MERGE (a:A {id: k})-[r:T]->(b:B {id: 'b'}) \
+         ON CREATE SET a.made = true SET b.seen = 1 RETURN type(r) AS t, b.seen AS seen",
+        &none(),
+    );
+    assert_eq!(rs.get(0, "t"), Some(&s("T")));
+    assert_eq!(rs.get(0, "seen"), Some(&Value::Int(1)));
+}
+
+#[test]
+fn return_after_a_create_of_an_edge_between_matched_nodes_names_a_matched_relationship() {
+    let mut db = edge_db("ret-rel-create");
+    let rs = run(
+        &mut db,
+        "UNWIND ['a1'] AS k MATCH (a:A {id: k})-[r:T]->(b:A) \
+         CREATE (c:A {id: 'c1'})-[:U]->(b) RETURN type(r) AS t, c.id AS c",
+        &none(),
+    );
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "t"), Some(&s("T")));
+    assert_eq!(rs.get(0, "c"), Some(&s("c1")));
+}
+
+#[test]
+fn a_relationship_with_anonymous_ends_and_a_type_alternation_is_returned() {
+    let mut db = edge_db("ret-rel-anon");
+    run(
+        &mut db,
+        "CREATE (a:A {id: 'a3'})-[:U]->(b:A {id: 'b3'})",
+        &none(),
+    );
+    let rs = run(
+        &mut db,
+        "UNWIND [1] AS x MATCH (a:A)-[r:T|U]->() SET a.x = 2 \
+         RETURN type(r) AS t, a.id AS a ORDER BY a",
+        &none(),
+    );
+    assert_eq!(rs.len(), 3);
+    assert_eq!(rs.get(2, "t"), Some(&s("U")));
+    assert_eq!(rs.get(0, "t"), Some(&s("T")));
+}
+
+#[test]
+fn a_relationship_whose_end_the_statement_deleted_is_null() {
+    let mut db = edge_db("ret-rel-deleted");
+    let rs = run(
+        &mut db,
+        "UNWIND ['a1'] AS k MATCH (a:A {id: k})-[r:T]->(b:A) DETACH DELETE a \
+         RETURN type(r) AS t, count(*) AS n",
+        &none(),
+    );
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "n"), Some(&Value::Int(1)));
+    assert_eq!(rs.get(0, "t"), None, "the relationship went with its end");
+}
+
+#[test]
+fn a_variable_length_relationship_in_return_is_refused_by_name_and_writes_nothing() {
+    let mut db = edge_db("ret-rel-varlen");
+    let e = db
+        .query_write(
+            "UNWIND [1] AS x MATCH (a:A)-[r:T*1..2]->(b:A) SET a.x = 1 RETURN r.length AS n",
+            &none(),
+        )
+        .unwrap_err();
+    assert!(detail(e)
+        .contains("not supported in mushroomdb 0.10: the variable-length relationship `r`"));
+    assert_eq!(db.get_prop("a1", "x"), None);
+}
+
 // ── Scale ───────────────────────────────────────────────────────────────────
 
 #[test]

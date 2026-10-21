@@ -113,6 +113,15 @@ impl Scope {
             .collect()
     }
 
+    /// The names that hold a relationship.
+    fn rel_names(&self) -> Vec<String> {
+        self.vars
+            .iter()
+            .filter(|(_, kind)| *kind == VarKind::Rel)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// The names that hold a node or a value.
     fn carried_names(&self) -> Vec<String> {
         self.vars
@@ -280,6 +289,7 @@ impl<'a> Parser<'a> {
             },
             scope: read_scope,
             node_vars: scope.node_names(),
+            rel_vars: scope.rel_names(),
             writes,
             returns,
         })))

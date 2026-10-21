@@ -28,8 +28,8 @@
 use super::row_eval::{reads_node, Overlay};
 use super::*;
 use core_query::cypher::{
-    ast::OptionalClause, RowCreateNode, RowMerge, RowMergeNode, RowReturn, RowWrite, SetClause,
-    UnwindClause, UnwindExpr, UnwindWriteStmt,
+    ast::OptionalClause, RelDir, RelPat, RowCreateNode, RowMerge, RowMergeNode, RowReturn,
+    RowWrite, SetClause, UnwindClause, UnwindExpr, UnwindWriteStmt,
 };
 
 /// The parameter that carries the captured rows to the `RETURN` query.
@@ -81,9 +81,134 @@ fn err(detail: String) -> GraphError {
     GraphError::QueryError { detail }
 }
 
+/// The text a `RETURN` clause's names are looked for in. An extra match only
+/// costs a lookup or a captured value, and every name the clause uses appears
+/// in it as a quoted string, so a name that is used is never missed.
+fn used_text(ret: &RowReturn) -> String {
+    format!("{:?}{:?}", ret.items, ret.order_by)
+}
+
+fn names_used(used: &str, name: &str) -> bool {
+    used.contains(&format!("{name:?}"))
+}
+
+/// A relationship variable the `RETURN` names, and what the write pass captures
+/// to find the relationship again after the commit: its two end nodes' keys and
+/// its type. The end nodes are the pattern's own (`left` and `right` as
+/// written, with `dir` between them).
+struct RelCapture {
+    var: String,
+    left: String,
+    right: String,
+    dir: RelDir,
+    etypes: Vec<String>,
+    /// Bound by a `MERGE` of the statement (its ends and type come from the
+    /// merge), not by the read part.
+    merged: bool,
+}
+
+impl RelCapture {
+    /// The key of a captured field in the row map; `tag` is `l`, `r` or `t`.
+    fn field(&self, tag: &str) -> String {
+        format!("__uwr{tag}_{}", self.var)
+    }
+}
+
+/// Name the anonymous end nodes of every pattern that binds a relationship
+/// variable in `wanted`, so their keys can be projected, and describe each such
+/// relationship. A variable-length relationship has no single end pair and is
+/// refused by name.
+fn read_rel_captures(read: &mut Query, wanted: &[String]) -> Result<Vec<RelCapture>> {
+    let mut found: Vec<RelCapture> = Vec::new();
+    let mut anonymous = 0usize;
+    let mut refused: Option<String> = None;
+    let mut visit = |pattern: &mut Pattern| {
+        if pattern.shortest {
+            return;
+        }
+        let mut name = |node: &mut NodePat| -> String {
+            node.var
+                .get_or_insert_with(|| {
+                    anonymous += 1;
+                    format!("_uwn{anonymous}")
+                })
+                .clone()
+        };
+        let mut left = name(&mut pattern.start);
+        for (rel, dest) in &mut pattern.chain {
+            let right = name(dest);
+            if let Some(var) = rel.var.as_ref().filter(|v| wanted.contains(v)) {
+                if rel.hops.is_some() {
+                    refused = Some(var.clone());
+                } else {
+                    found.push(RelCapture {
+                        var: var.clone(),
+                        left: left.clone(),
+                        right: right.clone(),
+                        dir: rel.dir,
+                        etypes: rel.etypes.clone(),
+                        merged: false,
+                    });
+                }
+            }
+            left = right;
+        }
+    };
+    for p in &mut read.matches {
+        visit(p);
+    }
+    for oc in &mut read.optional_clauses {
+        oc.patterns.iter_mut().for_each(&mut visit);
+    }
+    for stage in &mut read.stages {
+        stage.matches.iter_mut().for_each(&mut visit);
+        for oc in &mut stage.optional_clauses {
+            oc.patterns.iter_mut().for_each(&mut visit);
+        }
+    }
+    if let Some(var) = refused {
+        return Err(err(format!(
+            "not supported in mushroomdb 0.10: the variable-length relationship `{var}` in the \
+             RETURN of a write statement that begins with UNWIND"
+        )));
+    }
+    Ok(found)
+}
+
+/// The relationships the `RETURN` names: the read part's (the clone of the read
+/// part it returns has its anonymous end nodes named) and the `MERGE`s'.
+fn rel_captures(stmt: &UnwindWriteStmt, used: &str) -> Result<(Query, Vec<RelCapture>)> {
+    let wanted: Vec<String> = stmt
+        .rel_vars
+        .iter()
+        .filter(|v| names_used(used, v))
+        .cloned()
+        .collect();
+    let mut read = stmt.read.clone();
+    let mut rels = read_rel_captures(&mut read, &wanted)?;
+    for write in &stmt.writes {
+        if let RowWrite::Merge(merge) = write {
+            if let Some(edge) = &merge.edge {
+                if let Some(var) = edge.rel_var.as_ref().filter(|v| wanted.contains(v)) {
+                    rels.retain(|r| &r.var != var);
+                    rels.push(RelCapture {
+                        var: var.clone(),
+                        left: merge.start.var.clone(),
+                        right: edge.end.var.clone(),
+                        dir: edge.dir,
+                        etypes: vec![edge.etype.clone()],
+                        merged: true,
+                    });
+                }
+            }
+        }
+    }
+    Ok((read, rels))
+}
+
 /// The columns the read part projects: every variable the write clauses or the
 /// `RETURN` need, and one per write operand that does not read a node.
-fn plan_columns(stmt: &UnwindWriteStmt) -> Columns {
+fn plan_columns(stmt: &UnwindWriteStmt, used: &str, rels: &[RelCapture]) -> Columns {
     let mut cols = Columns {
         by_operand: HashMap::new(),
         items: Vec::new(),
@@ -147,15 +272,45 @@ fn plan_columns(stmt: &UnwindWriteStmt) -> Columns {
     }
     // A write evaluated at its turn, or a RETURN, needs every variable of the
     // row, not only the nodes a write clause names.
-    let wanted: Vec<String> = if cols.dynamic || stmt.returns.is_some() {
+    // A write evaluated at its turn needs every variable of the row; a `RETURN`
+    // only the ones it names.
+    let wanted: Vec<String> = if cols.dynamic {
         stmt.scope.clone()
     } else {
-        var_names
+        let mut names = var_names;
+        if stmt.returns.is_some() {
+            for name in &stmt.scope {
+                if names_used(used, name) && !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        names
     };
+    let mut projected: Vec<String> = wanted.clone();
     for name in wanted {
         cols.items.push(RetItem {
             value: RetVal::Var(name),
             alias: None,
+        });
+    }
+    // The ends and the type of each relationship the RETURN names.
+    for rel in rels.iter().filter(|r| !r.merged) {
+        for end in [&rel.left, &rel.right] {
+            if !projected.contains(end) {
+                projected.push(end.clone());
+                cols.items.push(RetItem {
+                    value: RetVal::Var(end.clone()),
+                    alias: None,
+                });
+            }
+        }
+        cols.items.push(RetItem {
+            value: RetVal::FuncCall {
+                name: "type".into(),
+                args: vec![Operand::Var(rel.var.clone())],
+            },
+            alias: Some(rel.field("t")),
         });
     }
     cols
@@ -173,7 +328,7 @@ fn merge_operands(node: &RowMergeNode, cols: &mut Columns, nodes: &[String]) {
 /// variables, and finds each node variable again by its key with an
 /// `OPTIONAL MATCH`, so a node the statement deleted is null rather than a
 /// dropped row. The read part is not run again.
-fn return_query(stmt: &UnwindWriteStmt, ret: &RowReturn) -> Query {
+fn return_query(stmt: &UnwindWriteStmt, ret: &RowReturn, rels: &[RelCapture]) -> Query {
     let row_field = |name: &str| Operand::Prop {
         var: ROW_VAR.to_string(),
         field: name.to_string(),
@@ -189,16 +344,14 @@ fn return_query(stmt: &UnwindWriteStmt, ret: &RowReturn) -> Query {
             names.push(node);
         }
     }
-    // A node variable the RETURN never names is not looked up (`RETURN count(*)`
-    // over a bulk load reads no node). The test is on the clause's debug text:
-    // an extra match only costs a lookup, and every name the clause uses appears
-    // in it as a quoted string.
-    let used = format!("{:?}{:?}", ret.items, ret.order_by);
+    // A variable the RETURN never names is neither captured nor looked up
+    // (`RETURN count(*)` over a bulk load reads nothing but the row count).
+    let used = used_text(ret);
     for name in names {
+        if !names_used(&used, name) {
+            continue;
+        }
         if stmt.node_vars.contains(name) {
-            if !used.contains(&format!("{name:?}")) {
-                continue;
-            }
             optional_clauses.push(OptionalClause {
                 patterns: vec![Pattern {
                     start: NodePat {
@@ -218,6 +371,38 @@ fn return_query(stmt: &UnwindWriteStmt, ret: &RowReturn) -> Query {
                 alias: Some(name.clone()),
             });
         }
+    }
+    // Each relationship the RETURN names is found again between its captured
+    // ends, of its captured type.
+    for rel in rels {
+        let end = |tag: &str, side: &str| NodePat {
+            var: Some(format!("__uw_{side}_{}", rel.var)),
+            label: None,
+            props: vec![("id".to_string(), row_field(&rel.field(tag)))],
+        };
+        optional_clauses.push(OptionalClause {
+            patterns: vec![Pattern {
+                start: end("l", "l"),
+                chain: vec![(
+                    RelPat {
+                        var: Some(rel.var.clone()),
+                        etypes: rel.etypes.clone(),
+                        dir: rel.dir,
+                        hops: None,
+                    },
+                    end("r", "r"),
+                )],
+                shortest: false,
+            }],
+            where_expr: Some(core_query::cypher::Expr::Cmp {
+                lhs: Operand::FuncCall {
+                    name: "type".into(),
+                    args: vec![Operand::Var(rel.var.clone())],
+                },
+                op: core_query::CmpOp::Eq,
+                rhs: row_field(&rel.field("t")),
+            }),
+        });
     }
     Query {
         matches: Vec::new(),
@@ -293,9 +478,11 @@ impl<F: Fs> GraphDb<F> {
     ) -> Result<ResultSet> {
         // Plan the RETURN first: a statement that cannot be projected must not
         // commit.
+        let used = stmt.returns.as_ref().map(used_text).unwrap_or_default();
+        let (mut read, rels) = rel_captures(&stmt, &used)?;
         let return_plan = match &stmt.returns {
             Some(ret) => {
-                let query = return_query(&stmt, ret);
+                let query = return_query(&stmt, ret, &rels);
                 plan(&query).map_err(|e| err(format!("plan: {e}")))?;
                 Some(query)
             }
@@ -303,8 +490,7 @@ impl<F: Fs> GraphDb<F> {
         };
 
         // Phase 1: the read part, one row per iteration.
-        let mut cols = plan_columns(&stmt);
-        let mut read = stmt.read.clone();
+        let mut cols = plan_columns(&stmt, &used, &rels);
         read.returns = std::mem::take(&mut cols.items);
         let ops = plan(&read).map_err(|e| err(format!("plan: {e}")))?;
         cols.items = read.returns;
@@ -360,12 +546,38 @@ impl<F: Fs> GraphDb<F> {
                 self.uw_write(write, &ctx, &mut env, &mut ov, &mut ops, &mut tally)?;
             }
             if capture {
+                // Only what the RETURN names: a bare `count(*)` captures an
+                // empty row.
                 let mut entry: BTreeMap<String, Value> = BTreeMap::new();
                 for (name, v) in &ctx.values {
-                    entry.insert((*name).to_string(), v.clone());
+                    if names_used(&used, name) {
+                        entry.insert((*name).to_string(), v.clone());
+                    }
                 }
                 for (name, key) in &env {
-                    entry.insert((*name).to_string(), Value::Str(key.clone()));
+                    if names_used(&used, name) {
+                        entry.insert((*name).to_string(), Value::Str(key.clone()));
+                    }
+                }
+                for rel in &rels {
+                    let (left, right, etype) = if rel.merged {
+                        (
+                            env.get(rel.left.as_str()).cloned(),
+                            env.get(rel.right.as_str()).cloned(),
+                            rel.etypes.first().cloned(),
+                        )
+                    } else {
+                        let text = |col: &str| match rows.get(row, col) {
+                            Some(Value::Str(k)) => Some(k.clone()),
+                            _ => None,
+                        };
+                        (text(&rel.left), text(&rel.right), text(&rel.field("t")))
+                    };
+                    for (tag, value) in [("l", left), ("r", right), ("t", etype)] {
+                        if let Some(v) = value {
+                            entry.insert(rel.field(tag), Value::Str(v));
+                        }
+                    }
                 }
                 captured.push(Value::Map(entry));
             }

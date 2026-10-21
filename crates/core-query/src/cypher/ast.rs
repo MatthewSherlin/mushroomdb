@@ -592,6 +592,9 @@ pub struct UnwindWriteStmt {
     /// Every name that holds a node at the end of the statement: the nodes of
     /// the read part and the ones the write clauses create or merge.
     pub node_vars: Vec<String>,
+    /// Every name that holds a relationship at the end of the statement: the
+    /// read part's, and the ones a `MERGE` pattern binds.
+    pub rel_vars: Vec<String>,
     /// The write clauses, in source order.
     pub writes: Vec<RowWrite>,
     /// Optional `RETURN [DISTINCT] … [ORDER BY …] [SKIP …] [LIMIT …]`.
