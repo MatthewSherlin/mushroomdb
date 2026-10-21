@@ -1,8 +1,9 @@
 """The `id` property mirrors the node's key (defect ledger row 128).
 
-A write that gives a node an `id` other than its key, or removes `id`, is a
-`QueryError` on every path. Restating the key is accepted, and `rename_node`
-still moves a matching `id` with the key.
+On a node whose `id` equals its key, a write that sets `id` to another value,
+or removes it, is a `QueryError` on every path. Restating the key is accepted,
+`rename_node` still moves a matching `id`, and a node whose `id` differs from
+its key (or has none) treats `id` as an ordinary property.
 """
 
 from __future__ import annotations
@@ -59,12 +60,16 @@ def test_remove_prop_of_id_is_refused(db):
     _untouched(db)
 
 
-def test_insert_node_with_an_id_that_is_not_the_key_is_refused(db):
-    with pytest.raises(QueryError) as e:
-        db.insert_node("P", "carol", {"id": "other"})
-    _refused(e)
-    assert db.node_info("carol") is None
-    db.insert_node("P", "carol", {"id": "carol"})
+def test_a_node_whose_id_is_not_its_key_treats_id_as_ordinary(db):
+    db.insert_node("P", "carol", {"id": "badge-7"})
+    db.insert_node("P", "dave", {"n": 1})
+    db.set_prop("carol", "id", "other")
+    db.set_prop("dave", "id", 5)
+    assert db.node_info("carol")["props"]["id"] == "other"
+    assert db.remove_prop("carol", "id") is True
+    assert "id" not in db.node_info("carol")["props"]
+    db.query_write("MATCH (n:P) WHERE key(n) = 'dave' SET n.id = 'x'")
+    assert db.node_info("dave")["props"]["id"] == "x"
 
 
 def test_cypher_set_and_remove_of_id_are_refused(db):

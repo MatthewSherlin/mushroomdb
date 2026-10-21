@@ -756,7 +756,6 @@ fn a_parameter_map_meets_the_same_protections_as_a_literal() {
     for (name, entries) in [
         ("view", vec![("pop", Value::Int(5))]),
         ("view-null", vec![("pop", Value::Null)]),
-        ("id", vec![("id", Value::Str("other".into()))]),
     ] {
         let params = map_param(entries);
         let before = db.commit_seq();
@@ -772,6 +771,19 @@ fn a_parameter_map_meets_the_same_protections_as_a_literal() {
         );
         assert_eq!(db.commit_seq(), before, "{name}");
     }
+    let mut id_db = GraphDb::open(&tmp("param-id")).unwrap();
+    seed(&mut id_db);
+    let err = id_db
+        .query_write(
+            "MATCH (n:P) WHERE n.id = 'alice' SET n += $props",
+            &map_param(vec![("id", Value::Str("other".into()))]),
+        )
+        .unwrap_err();
+    assert!(matches!(err, GraphError::QueryError { .. }), "{err:?}");
+    assert_eq!(
+        id_db.get_prop("alice", "id"),
+        Some(Value::Str("alice".into()))
+    );
     let mut ns_db = namespaced("param-ns");
     let err = ns_db
         .query_write(
@@ -858,7 +870,12 @@ fn set_and_remove_of_the_key_property_are_refused_like_the_map_form() {
 fn key_property_refusals_hold_inside_a_transaction_too() {
     let dir = tmp("id-tx");
     let db: SharedDb = SharedDb::open(&dir).unwrap();
-    db.submit_batch(vec![node("x")]).unwrap();
+    db.submit_batch(vec![BatchOp::InsertNode {
+        label: "P".into(),
+        key: "x".into(),
+        props: vec![("id".into(), Value::Str("x".into()))],
+    }])
+    .unwrap();
     let mut tx = db.begin_transaction();
     for q in [
         "MATCH (n:P) WHERE n.id = 'x' SET n.id = 'y'",
@@ -893,4 +910,76 @@ fn merge_set_with_a_map_is_refused_by_name() {
         }
     }
     assert!(db.node_info("m").is_none());
+}
+
+// ── A node that does not carry `id == key` is not covered ───────────────────
+
+#[test]
+fn a_node_keyed_on_another_field_treats_id_as_an_ordinary_property() {
+    let mut db = GraphDb::open(&tmp("sku")).unwrap();
+    // Imported with key_field = sku; `id` is just a column here.
+    run(&mut db, "CREATE (n:Item {id: 'seed'})");
+    db.insert_node(
+        "Item",
+        "sku-1",
+        vec![("id".into(), Value::Int(1001)), ("n".into(), Value::Int(1))],
+    )
+    .unwrap();
+    db.insert_node("Item", "sku-2", vec![("n".into(), Value::Int(2))])
+        .unwrap();
+    run(
+        &mut db,
+        "MATCH (n:Item) WHERE key(n) = 'sku-1' SET n.id = 2002",
+    );
+    assert_eq!(db.get_prop("sku-1", "id"), Some(Value::Int(2002)));
+    run(
+        &mut db,
+        "MATCH (n:Item) WHERE key(n) = 'sku-1' SET n += {id: 'x'}",
+    );
+    assert_eq!(db.get_prop("sku-1", "id"), Some(Value::Str("x".into())));
+    run(
+        &mut db,
+        "MATCH (n:Item) WHERE key(n) = 'sku-2' SET n.id = 'free'",
+    );
+    assert_eq!(db.get_prop("sku-2", "id"), Some(Value::Str("free".into())));
+    run(&mut db, "MATCH (n:Item) WHERE key(n) = 'sku-1' REMOVE n.id");
+    assert_eq!(db.get_prop("sku-1", "id"), None);
+    // `=` replaces it like any property.
+    run(
+        &mut db,
+        "MATCH (n:Item) WHERE key(n) = 'sku-2' SET n = {n: 5}",
+    );
+    assert_eq!(db.get_prop("sku-2", "id"), None);
+    // The convention node beside them is still protected.
+    for q in [
+        "MATCH (n:Item) WHERE key(n) = 'seed' SET n.id = 'x'",
+        "MATCH (n:Item) WHERE key(n) = 'seed' REMOVE n.id",
+    ] {
+        assert!(
+            matches!(query_err(&mut db, q), GraphError::QueryError { .. }),
+            "{q}"
+        );
+    }
+    assert_eq!(db.get_prop("seed", "id"), Some(Value::Str("seed".into())));
+}
+
+#[test]
+fn set_id_on_an_id_equals_key_node_is_refused_and_remove_too() {
+    let mut db = GraphDb::open(&tmp("convention")).unwrap();
+    seed(&mut db);
+    for q in [
+        "MATCH (n:P) WHERE n.id = 'alice' SET n.id = 'mallory'",
+        "MATCH (n:P) WHERE n.id = 'alice' REMOVE n.id",
+    ] {
+        match query_err(&mut db, q) {
+            GraphError::QueryError { detail } => {
+                assert!(
+                    detail.contains("key property `id`") && detail.contains("rename_node"),
+                    "{detail}"
+                )
+            }
+            other => panic!("{q}: {other:?}"),
+        }
+    }
+    assert_eq!(db.get_prop("alice", "id"), Some(Value::Str("alice".into())));
 }

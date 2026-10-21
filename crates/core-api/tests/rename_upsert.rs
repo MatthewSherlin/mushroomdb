@@ -596,22 +596,27 @@ fn rename_moves_a_stored_id_that_equals_the_key() {
     );
 }
 
-/// A stored `id` that is not the key can no longer be written (ledger row 128),
-/// so there is no such node for rename to leave alone: the insert is refused.
 #[test]
-fn an_id_that_is_not_the_key_cannot_be_stored_so_rename_never_meets_one() {
+fn rename_leaves_an_id_that_was_not_the_key() {
     let dir = tmp("id-foreign");
     let mut db = GraphDb::open(&dir).unwrap();
-    for id in [Value::Str("badge-7".into()), Value::Int(7)] {
-        let err = db
-            .insert_node("Person", "q1", vec![("id".into(), id)])
-            .unwrap_err();
-        assert!(
-            matches!(&err, GraphError::QueryError { detail } if detail.contains("key property `id`")),
-            "{err:?}"
-        );
-    }
-    assert!(!db.has_node("q1"));
+    db.insert_node(
+        "Person",
+        "q1",
+        vec![("id".into(), Value::Str("badge-7".into()))],
+    )
+    .unwrap();
+    db.insert_node("Person", "n1", vec![("id".into(), Value::Int(7))])
+        .unwrap();
+    db.rename_node("q1", "q2").unwrap();
+    db.rename_node("n1", "n2").unwrap();
+
+    assert_eq!(
+        db.get_prop("q2", "id"),
+        Some(Value::Str("badge-7".into())),
+        "an id a caller wrote as something else is the caller's"
+    );
+    assert_eq!(db.get_prop("n2", "id"), Some(Value::Int(7)));
 }
 
 #[test]
@@ -787,12 +792,12 @@ fn a_batch_removes_a_stored_prop_from_a_node_it_just_renamed() {
 }
 
 /// Binding: two renames in one batch leave what the same two renames as two
-/// commits leave. The node's stored `id` is its key, so it moves with the first
-/// rename and again with the second.
+/// commits leave. The node's stored `id` is `b`, so it does not move with the
+/// first rename (it is not the key) and does move with the second (it is).
 #[test]
 fn a_chained_rename_in_one_batch_moves_a_stored_id_as_two_commits_would() {
     let seed = |db: &mut GraphDb<core_storage::fs::RealFs>| {
-        db.insert_node("Person", "a", vec![("id".into(), Value::Str("a".into()))])
+        db.insert_node("Person", "a", vec![("id".into(), Value::Str("b".into()))])
             .unwrap();
     };
 

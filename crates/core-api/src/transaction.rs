@@ -386,6 +386,11 @@ impl Transaction {
 
     // ── Internals ────────────────────────────────────────────────────────────
 
+    /// A stored property of `key` as statements see it (base plus buffer).
+    fn stored_prop(&self, key: &str, field: &str) -> Option<Value> {
+        self.current().node_info(key)?.props.get(field).cloned()
+    }
+
     /// The state statements read: the base snapshot plus the buffer.
     fn current(&self) -> &ReaderSnapshot {
         self.overlay.as_ref().unwrap_or(&self.base_snap)
@@ -607,7 +612,11 @@ impl Transaction {
                             ),
                         })?;
                 if sc.field == "id" && !rel_vars.iter().any(|r| r == &sc.var) {
-                    crate::db::check_key_property_write(&key, Some(&value))?;
+                    crate::db::check_key_property_write(
+                        &key,
+                        self.stored_prop(&key, "id").as_ref(),
+                        Some(&value),
+                    )?;
                 }
                 staged.set_prop(&key, &sc.field, value);
                 props_set += 1;
@@ -625,7 +634,6 @@ impl Transaction {
         if stmt.returns.is_some() {
             return Err(not_supported("MATCH … REMOVE … RETURN"));
         }
-        crate::db::refuse_key_property_removal(&stmt.removals)?;
         let mut matches = stmt.matches;
         let mut node_vars = Vec::new();
         bind_node_vars(&mut matches, &mut 0, &mut node_vars);
@@ -665,6 +673,9 @@ impl Transaction {
                 if current.with_view(|v| v.prop(id, field).is_some())? {
                     props_removed += 1;
                 }
+            }
+            if field == "id" {
+                crate::db::check_key_property_removal(key, self.stored_prop(key, "id").as_ref())?;
             }
             staged.remove_prop(key, field);
         }
@@ -780,7 +791,11 @@ impl Transaction {
             for sc in &stmt.on_match {
                 let value = resolve_merge_set_value(&sc.value, params)?;
                 if sc.field == "id" {
-                    crate::db::check_key_property_write(&key, Some(&value))?;
+                    crate::db::check_key_property_write(
+                        &key,
+                        self.stored_prop(&key, "id").as_ref(),
+                        Some(&value),
+                    )?;
                 }
                 staged.set_prop(&key, &sc.field, value);
             }
@@ -793,7 +808,9 @@ impl Transaction {
             for sc in &stmt.on_create {
                 let value = resolve_merge_set_value(&sc.value, params)?;
                 if sc.field == "id" {
-                    crate::db::check_key_property_write(&key, Some(&value))?;
+                    // The new node's `id` is its key exactly when MERGE keys on `id`.
+                    let stored = (stmt.key_field == "id").then(|| stmt.key_value.clone());
+                    crate::db::check_key_property_write(&key, stored.as_ref(), Some(&value))?;
                 }
                 staged.set_prop(&key, &sc.field, value);
             }

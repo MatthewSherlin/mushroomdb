@@ -93,7 +93,7 @@ fn seed(dir: &std::path::Path) -> Db {
         "d",
         vec![
             ("g".into(), Value::Int(2)),
-            ("id".into(), Value::Str("d".into())),
+            ("id".into(), Value::Str("b".into())),
         ],
     )
     .insert_edge("KNOWS", "a", "d")
@@ -274,7 +274,7 @@ fn a_key_reused_inside_a_batch_names_the_new_node() {
             vec![Op::Rename("c", "b"), Op::EdgeUpsert("KNOWS", "c", "a")],
             vec![
                 Op::Rename("a", "b"),
-                Op::Insert("P", "a", vec![("id", s("a"))]),
+                Op::Insert("P", "a", vec![("id", s("c"))]),
                 Op::Set("a", "g", Value::Int(1)),
             ],
             vec![
