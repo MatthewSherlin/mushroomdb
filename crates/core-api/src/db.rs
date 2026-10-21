@@ -799,6 +799,89 @@ pub struct EdgeTypeCensus {
     pub sample: Option<(String, String)>,
 }
 
+/// A SET map's keys with each value evaluated for one matched row; `None` is null.
+type MapEntries = Vec<(String, Option<Value>)>;
+
+/// One property write a Cypher `SET n = {…}` / `SET n += {…}` plans for a node.
+#[derive(Debug, Clone, PartialEq)]
+enum MapWrite {
+    Set { field: String, value: Value },
+    Remove { field: String },
+}
+
+/// The writes `SET n = map` (`merge == false`) or `SET n += map` (`merge ==
+/// true`) makes to the node `key`, whose current properties are `existing`.
+/// `entries` pairs each map key with its evaluated value; `None` is null.
+///
+/// Decisions, each pinned by a test:
+/// - `+=`: a non-null value sets the property; a null value removes it (a
+///   no-op when the node lacks it); every other property is left alone.
+/// - `=`: the node's properties become exactly the non-null entries. A null
+///   entry is an absent key, so it removes the property if the node has it.
+///   Removals are listed before sets in the batch.
+/// - `id` is the node's key. It is never removed by `=`, and a map that names
+///   it must name the node's own key (then it is a no-op); any other value, or
+///   null, is refused — a key change is `rename_node`.
+/// - `ns` is never removed by `=` (a map without it keeps the namespace). A
+///   map that sets it is checked by the batch (`NamespaceImmutable` for a
+///   different one); `+= {ns: null}` is a removal, refused there the same way.
+/// - A view-owned property is never removed by `=` (`is_view_owned`), the same
+///   filter `on_conflict="replace"` applies. Naming one in the map, with a value
+///   or null, reaches the batch and is `ViewPropReadOnly`.
+fn plan_map_write(
+    key: &str,
+    existing: &BTreeMap<String, Value>,
+    merge: bool,
+    entries: &[(String, Option<Value>)],
+    is_view_owned: &dyn Fn(&str) -> bool,
+) -> Result<Vec<MapWrite>> {
+    let mut sets = Vec::new();
+    let mut removes = Vec::new();
+    for (field, value) in entries {
+        if field == "id" {
+            if matches!(value, Some(Value::Str(s)) if s == key) {
+                continue;
+            }
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "cannot change the key property `id` of node {key} with a SET map; \
+                     renaming a node is rename_node"
+                ),
+            });
+        }
+        match value {
+            Some(v) => sets.push(MapWrite::Set {
+                field: field.clone(),
+                value: v.clone(),
+            }),
+            None => removes.push(MapWrite::Remove {
+                field: field.clone(),
+            }),
+        }
+    }
+    if !merge {
+        let kept: BTreeSet<&str> = entries
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(f, _)| f.as_str())
+            .collect();
+        // A null entry is already a removal above; do not plan it twice.
+        for field in existing.keys() {
+            let protected = field == "id" || field == NS_PROP || is_view_owned(field);
+            let already = removes
+                .iter()
+                .any(|w| matches!(w, MapWrite::Remove { field: f } if f == field));
+            if !protected && !kept.contains(field.as_str()) && !already {
+                removes.push(MapWrite::Remove {
+                    field: field.clone(),
+                });
+            }
+        }
+    }
+    removes.extend(sets);
+    Ok(removes)
+}
+
 /// Construct the standard write-query result set (columns: created, properties_set, deleted).
 pub(crate) fn write_result_set() -> ResultSet {
     ResultSet::new(vec![
@@ -12226,6 +12309,7 @@ impl<F: Fs> GraphDb<F> {
         match stmt {
             WriteStatement::Create(s) => self.exec_create(s, params),
             WriteStatement::MatchSet(s) => self.exec_match_set(s, params),
+            WriteStatement::MatchSetMap(s) => self.exec_match_set_map(s, params),
             WriteStatement::MatchRemove(s) => self.exec_match_remove(s, params),
             WriteStatement::MatchDelete(s) => self.exec_match_delete(s, params),
             WriteStatement::MatchDeleteNode(s) => self.exec_match_delete_node(s, params),
@@ -12500,6 +12584,163 @@ impl<F: Fs> GraphDb<F> {
         rs.push_row(vec![
             Some(Value::Int(0)),
             Some(Value::Int(props_set as i64)),
+            Some(Value::Int(0)),
+        ]);
+        Ok(rs)
+    }
+
+    /// `MATCH … [WHERE …] SET n = {…}` and `SET n += {…}`.
+    ///
+    /// The MATCH runs first (masked under a role-scoped write); each map value
+    /// is evaluated per matched row by the same executor that evaluates
+    /// `SET n.f = expr`. The resulting `SetProp`/`RemoveProp` ops commit as one
+    /// batch, so they meet the same choke-point as every other write: TY-5
+    /// constraints, `ns` immutability, the view-owned refusal, and rule
+    /// re-evaluation for each removal. See [`plan_map_write`] for which
+    /// properties each form touches.
+    fn exec_match_set_map(
+        &mut self,
+        stmt: core_query::cypher::MatchSetMapStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let project_returns = stmt.returns.clone();
+        let rel_vars = pattern_rel_vars(&stmt.matches);
+        let mut lookup_vars: Vec<String> = Vec::new();
+        add_var(&mut lookup_vars, &stmt.var);
+        for v in pattern_node_vars(&stmt.matches) {
+            add_var(&mut lookup_vars, &v);
+        }
+        if let Some(ref returns) = project_returns {
+            for v in ret_node_vars(returns) {
+                if !rel_vars.iter().any(|r| r == &v) {
+                    add_var(&mut lookup_vars, &v);
+                }
+            }
+        }
+        let mut match_returns: Vec<RetItem> = lookup_vars
+            .iter()
+            .map(|v| RetItem {
+                value: RetVal::Var(v.clone()),
+                alias: None,
+            })
+            .collect();
+        let value_cols: Vec<String> = (0..stmt.map.len()).map(|i| format!("__sv_{i}")).collect();
+        for ((_, operand), col) in stmt.map.iter().zip(&value_cols) {
+            match_returns.push(RetItem {
+                value: RetVal::ScalarExpr(operand.clone()),
+                alias: Some(col.clone()),
+            });
+        }
+        for r in &rel_vars {
+            match_returns.push(RetItem {
+                value: RetVal::FuncCall {
+                    name: "type".into(),
+                    args: vec![Operand::Var(r.clone())],
+                },
+                alias: Some(rel_type_alias(r)),
+            });
+        }
+        let read_q = Query {
+            matches: stmt.matches.clone(),
+            optional_clauses: vec![],
+            where_expr: stmt.where_expr.clone(),
+            unwinds: vec![],
+            post_unwind_where: None,
+            stages: vec![],
+            returns: match_returns,
+            distinct: false,
+            order_by: vec![],
+            skip: None,
+            limit: None,
+        };
+        let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        let match_rs = {
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            }
+        }
+        .map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })?;
+
+        // One entry list per matched row, in row order. A node bound by several
+        // rows is written by each in turn under `+=`; under `=` the last row's
+        // map is the node's final state, so earlier rows for it are dropped.
+        let mut per_node: Vec<(String, MapEntries)> = Vec::new();
+        for row_i in 0..match_rs.len() {
+            let key = match match_rs.get(row_i, &stmt.var) {
+                Some(Value::Str(k)) => k.clone(),
+                _ => {
+                    return Err(GraphError::QueryError {
+                        detail: format!(
+                            "SET variable '{}' did not resolve to a node key",
+                            stmt.var
+                        ),
+                    })
+                }
+            };
+            let entries: MapEntries = stmt
+                .map
+                .iter()
+                .zip(&value_cols)
+                .map(|((field, _), col)| {
+                    let value = match match_rs.get(row_i, col) {
+                        None | Some(Value::Null) => None,
+                        Some(v) => Some(v.clone()),
+                    };
+                    (field.clone(), value)
+                })
+                .collect();
+            if !stmt.merge {
+                per_node.retain(|(k, _)| k != &key);
+            }
+            per_node.push((key, entries));
+        }
+
+        let mut writes: Vec<(String, MapWrite)> = Vec::new();
+        let mut props_changed = 0i64;
+        for (key, entries) in &per_node {
+            let existing = self.node_info(key).map(|n| n.props).unwrap_or_default();
+            let node_writes = plan_map_write(key, &existing, stmt.merge, entries, &|field| {
+                self.view_store.view_for_prop(field).is_some()
+            })?;
+            for write in node_writes {
+                match &write {
+                    MapWrite::Set { .. } => props_changed += 1,
+                    MapWrite::Remove { field } => {
+                        if existing.contains_key(field) {
+                            props_changed += 1;
+                        }
+                    }
+                }
+                writes.push((key.clone(), write));
+            }
+        }
+        let mut batch = self.batch();
+        for (key, write) in writes {
+            match write {
+                MapWrite::Set { field, value } => {
+                    batch.set_prop(&key, &field, value);
+                }
+                MapWrite::Remove { field } => {
+                    batch.remove_prop(&key, &field);
+                }
+            }
+        }
+        batch.commit()?;
+
+        if let Some(returns) = project_returns {
+            return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
+        }
+        let mut rs = write_result_set();
+        rs.push_row(vec![
+            Some(Value::Int(0)),
+            Some(Value::Int(props_changed)),
             Some(Value::Int(0)),
         ]);
         Ok(rs)

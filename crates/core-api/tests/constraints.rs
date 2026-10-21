@@ -877,4 +877,70 @@ mod unlocked {
         assert_eq!(reopened.constraints().len(), 1);
         assert_violation(reopened.insert_node("User", "bob", email("a@x")));
     }
+    // ── Cypher REMOVE and SET maps (QL-05, QL-06) ────────────────────────────
+
+    fn cypher(db: &mut GraphDb, q: &str) -> Result<mushroomdb::ResultSet, GraphError> {
+        db.query_write(q, &BTreeMap::new())
+    }
+
+    #[test]
+    fn cypher_remove_of_a_unique_property_frees_the_value_for_another_node() {
+        let (dir, mut db) = constrained("cypher-remove");
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' REMOVE n.email",
+        )
+        .unwrap();
+        assert_eq!(db.get_prop("alice", "email"), None);
+        cypher(&mut db, "CREATE (n:User {id: 'bob', email: 'a@x'})").unwrap();
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // Alice can no longer take it back.
+        assert_violation(cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' SET n.email = 'a@x'",
+        ));
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(reopened.get_prop("alice", "email"), None);
+        assert_eq!(
+            reopened.get_prop("bob", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+    }
+
+    #[test]
+    fn cypher_set_maps_meet_the_unique_constraint_and_write_nothing_when_refused() {
+        let (dir, mut db) = constrained("cypher-set-map");
+        cypher(&mut db, "CREATE (n:User {id: 'bob', email: 'b@x', age: 3})").unwrap();
+        let before = wal_bytes(&dir);
+        for q in [
+            "MATCH (n:User) WHERE n.id = 'bob' SET n = {email: 'a@x'}",
+            "MATCH (n:User) WHERE n.id = 'bob' SET n += {email: 'a@x', age: 4}",
+        ] {
+            assert_violation(cypher(&mut db, q));
+            assert_eq!(wal_bytes(&dir), before, "{q}: a refused write appended");
+            assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("b@x".into())));
+            assert_eq!(db.get_prop("bob", "age"), Some(Value::Int(3)), "{q}");
+        }
+        // A replace that drops the property frees its value in the same store.
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' SET n = {name: 'A'}",
+        )
+        .unwrap();
+        assert_eq!(db.get_prop("alice", "email"), None);
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'bob' SET n += {email: 'a@x'}",
+        )
+        .unwrap();
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // `+= {email: null}` frees it again.
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'bob' SET n += {email: null}",
+        )
+        .unwrap();
+        cypher(&mut db, "CREATE (n:User {id: 'carol', email: 'a@x'})").unwrap();
+    }
 }

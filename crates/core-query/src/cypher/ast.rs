@@ -385,6 +385,7 @@ pub struct OrderItem {
 pub enum WriteStatement {
     Create(CreateStmt),
     MatchSet(MatchSetStmt),
+    MatchSetMap(MatchSetMapStmt),
     MatchRemove(MatchRemoveStmt),
     MatchDelete(MatchDeleteStmt),
     MatchDeleteNode(MatchDeleteNodeStmt),
@@ -430,6 +431,24 @@ pub struct MatchSetStmt {
     pub matches: Vec<Pattern>,
     pub where_expr: Option<Expr>,
     pub sets: Vec<SetClause>,
+    /// Optional RETURN clause: project matched bindings from post-write state.
+    pub returns: Option<Vec<RetItem>>,
+}
+
+/// `MATCH patterns [WHERE expr] SET var = {…} | SET var += {…} [RETURN …]`
+///
+/// `merge` is `true` for `+=` (set the listed keys, leave every other property,
+/// a null value removes that property) and `false` for `=` (the node's user
+/// properties become exactly the map; the key `id`, the namespace `ns` and view
+/// owned properties are never removed, and a null value is an absent key).
+/// `var` is a node variable bound by `matches` (the parser checks).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchSetMapStmt {
+    pub matches: Vec<Pattern>,
+    pub where_expr: Option<Expr>,
+    pub merge: bool,
+    pub var: String,
+    pub map: Vec<(String, Operand)>,
     /// Optional RETURN clause: project matched bindings from post-write state.
     pub returns: Option<Vec<RetItem>>,
 }

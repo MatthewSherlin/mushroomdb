@@ -2,10 +2,15 @@
 
 use super::ast::{
     AggArg, AggFunc, ArithOp, CreateEdge, CreateNode, CreateStmt, EdgeDelete, Expr, HopRange,
-    LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetStmt, MergeStmt,
-    NodePat, Operand, OptionalClause, OrderItem, OrderTarget, Pattern, Query, RelDir, RelPat,
-    RetItem, RetVal, SetClause, UnwindClause, UnwindExpr, WithStage, WriteStatement,
+    LimitSkip, MatchDeleteNodeStmt, MatchDeleteStmt, MatchRemoveStmt, MatchSetMapStmt,
+    MatchSetStmt, MergeStmt, NodePat, Operand, OptionalClause, OrderItem, OrderTarget, Pattern,
+    Query, RelDir, RelPat, RetItem, RetVal, SetClause, UnwindClause, UnwindExpr, WithStage,
+    WriteStatement,
 };
+/// A parsed `SET var = {…}` / `SET var += {…}` clause: the variable, whether it
+/// is the merge (`+=`) form, and the map's entries.
+type SetMapClause = (String, bool, Vec<(String, Operand)>);
+
 use super::Tok;
 use crate::filter::CmpOp;
 use core_storage::{Value, NS_PROP};
@@ -1683,6 +1688,26 @@ impl<'a> Parser<'a> {
         };
         // Dispatch on SET, DETACH DELETE, or DELETE.
         match self.peek() {
+            Some(Tok::Set) if self.set_map_form_ahead() => {
+                self.pos += 1; // consume SET
+                let (var, merge, map) = self.set_map_clause(&matches)?;
+                let returns = if self.eat(&Tok::Return) {
+                    Some(self.return_items()?)
+                } else {
+                    None
+                };
+                if self.pos < self.toks.len() {
+                    return Err(self.unsupported_or_unexpected("unexpected tokens after SET"));
+                }
+                Ok(WriteStatement::MatchSetMap(MatchSetMapStmt {
+                    matches,
+                    where_expr,
+                    merge,
+                    var,
+                    map,
+                    returns,
+                }))
+            }
             Some(Tok::Set) => {
                 self.pos += 1; // consume SET
                 let sets = self.set_clauses()?;
@@ -1767,6 +1792,70 @@ impl<'a> Parser<'a> {
                  combined MATCH…RETURN is a read query, not a write statement",
             )),
         }
+    }
+
+    /// True when the SET at the cursor is a map form: `SET var = …` or
+    /// `SET var += …` (a name straight after SET, then `=` or `+ =`, no `.`).
+    fn set_map_form_ahead(&self) -> bool {
+        matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(_)))
+            && matches!(
+                (self.toks.get(self.pos + 2), self.toks.get(self.pos + 3)),
+                (Some(Tok::Eq), _) | (Some(Tok::Plus), Some(Tok::Eq))
+            )
+    }
+
+    /// `var = {…}` or `var += {…}` after SET: the variable, whether it is the
+    /// merge form, and the map's entries. The variable must be
+    /// a node bound by `matches`; the right side must be a map literal (a
+    /// `$parameter` or another variable is refused by name); a second SET item
+    /// after the map is refused, since the forms do not mix in one clause.
+    fn set_map_clause(&mut self, matches: &[Pattern]) -> Result<SetMapClause, String> {
+        let var = self.ident("expected variable after SET")?;
+        let merge = self.eat(&Tok::Plus);
+        self.expect(&Tok::Eq, "expected '=' in SET clause")?;
+        if self.peek() != Some(&Tok::LBrace) {
+            return Err(format!(
+                "not supported in mushroomdb 0.10: SET {var} {}= with a right side that is not a \
+                 map literal ({{key: value, …}})",
+                if merge { "+" } else { "" }
+            ));
+        }
+        let is_rel = matches
+            .iter()
+            .flat_map(|p| p.chain.iter())
+            .any(|(rel, _)| rel.var.as_deref() == Some(var.as_str()));
+        let is_node = matches.iter().any(|p| {
+            p.start.var.as_deref() == Some(var.as_str())
+                || p.chain
+                    .iter()
+                    .any(|(_, dest)| dest.var.as_deref() == Some(var.as_str()))
+        });
+        if is_rel {
+            return Err(format!(
+                "SET {var} = map: '{var}' is a relationship; the map forms work on nodes"
+            ));
+        }
+        if !is_node {
+            return Err(format!(
+                "SET {var} = map: '{var}' is not a node variable bound by MATCH"
+            ));
+        }
+        let map = match self.map_literal()? {
+            Operand::Lit(Value::Map(entries)) => entries
+                .into_iter()
+                .map(|(k, v)| (k, Operand::Lit(v)))
+                .collect(),
+            Operand::MapLit(entries) => entries,
+            _ => return Err(self.err("expected a map literal after SET")),
+        };
+        if self.peek() == Some(&Tok::Comma) {
+            return Err(
+                "not supported in mushroomdb 0.10: a SET map form followed by another SET item; \
+                 use one SET clause per statement"
+                    .to_string(),
+            );
+        }
+        Ok((var, merge, map))
     }
 
     /// `var.field [, var.field …]` after REMOVE. Each `var` must be a node bound

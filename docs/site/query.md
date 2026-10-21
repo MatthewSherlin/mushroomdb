@@ -447,6 +447,39 @@ REMOVE n.score, n.nickname
 - Inside an interactive transaction `REMOVE` buffers like `SET`; with `RETURN`
   it is refused as `not supported in mushroomdb 0.10 inside a transaction`.
 
+### MATCH … SET n = {…} / SET n += {…}
+
+```cypher
+MATCH (n:Person) WHERE n.id = 'alice'
+SET n += {score: 2.5, nickname: null}
+
+MATCH (n:Person) WHERE n.id = 'alice'
+SET n = {name: 'Alice', score: 1}
+```
+
+- `SET n += {…}` (merge) sets each listed key and leaves every other property.
+  A `null` value removes that property (a no-op when the node lacks it).
+- `SET n = {…}` (replace) leaves the node with exactly the listed non-null keys:
+  every other user property is removed, and a `null` value is an absent key.
+  `SET n = {}` removes them all and keeps the node.
+- Never removed by `=`: the key property `id`, the namespace `ns`, and a
+  property a view owns. A map that names `id` must name the node's own key
+  (then it is a no-op); another value, or null, is an error (`rename_node`
+  changes a key). A map that names a different `ns`, or `+= {ns: null}` on a node
+  outside `default`, is `NamespaceImmutable`; a map that names a view-owned
+  property, with a value or null, is `ViewPropReadOnly`.
+- It goes through the same write path as `SET n.prop = …` and `REMOVE`, in one
+  WAL frame: unique constraints apply, rules re-evaluate every set and every
+  removal, and one refusal applies nothing.
+- Map values are expressions evaluated per matched row (`SET n += {a: n.a + 1,
+  b: $p}`). The map must be a literal: `SET n = $props` and `SET n = m` are
+  refused (`not supported in mushroomdb 0.10`), as is mixing the map form with
+  `SET n.prop = …` in one clause. `n` must be a node.
+- `RETURN` projects the post-write state. `properties_set` counts the
+  properties set plus the properties removed.
+- Inside an interactive transaction the map forms are refused:
+  `not supported in mushroomdb 0.10 inside a transaction`.
+
 ### MATCH … DELETE (edge)
 
 ```cypher
@@ -728,6 +761,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
 | `MATCH … SET n.prop = $param` | `MATCH (n) WHERE n.id = $id SET n.score = $val` |
 | `MATCH … SET … RETURN` | `MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x` — write commits, then RETURN from post-write state. `CASE` and list subscripts (`n.tags[0]`) evaluate the same as a read RETURN; `n.key` / `n.id` / `n.label` use identity fallback |
+| `MATCH … SET n += {…}` / `SET n = {…}` | `MATCH (n) WHERE n.id = 'x' SET n += {score: 2, old: null}` — merge (null removes) or replace; `id`, `ns` and view-owned properties are never removed |
 | `MATCH … REMOVE n.prop [, …]` | `MATCH (n) WHERE n.id = 'x' REMOVE n.score, n.nickname` — a missing property is a no-op; `RETURN` projects the post-write state |
 | `MERGE … ON CREATE SET` / `ON MATCH SET` | `MERGE (n:L {id:'new'}) ON CREATE SET n.born = 1 ON MATCH SET n.hit = 1 RETURN n` |
 | `MATCH … DELETE r` (manual edge) | `MATCH (a)-[r:KNOWS]->(b) DELETE r` |

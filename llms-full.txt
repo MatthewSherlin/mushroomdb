@@ -5113,6 +5113,39 @@ REMOVE n.score, n.nickname
 - Inside an interactive transaction `REMOVE` buffers like `SET`; with `RETURN`
   it is refused as `not supported in mushroomdb 0.10 inside a transaction`.
 
+### MATCH … SET n = {…} / SET n += {…}
+
+```cypher
+MATCH (n:Person) WHERE n.id = 'alice'
+SET n += {score: 2.5, nickname: null}
+
+MATCH (n:Person) WHERE n.id = 'alice'
+SET n = {name: 'Alice', score: 1}
+```
+
+- `SET n += {…}` (merge) sets each listed key and leaves every other property.
+  A `null` value removes that property (a no-op when the node lacks it).
+- `SET n = {…}` (replace) leaves the node with exactly the listed non-null keys:
+  every other user property is removed, and a `null` value is an absent key.
+  `SET n = {}` removes them all and keeps the node.
+- Never removed by `=`: the key property `id`, the namespace `ns`, and a
+  property a view owns. A map that names `id` must name the node's own key
+  (then it is a no-op); another value, or null, is an error (`rename_node`
+  changes a key). A map that names a different `ns`, or `+= {ns: null}` on a node
+  outside `default`, is `NamespaceImmutable`; a map that names a view-owned
+  property, with a value or null, is `ViewPropReadOnly`.
+- It goes through the same write path as `SET n.prop = …` and `REMOVE`, in one
+  WAL frame: unique constraints apply, rules re-evaluate every set and every
+  removal, and one refusal applies nothing.
+- Map values are expressions evaluated per matched row (`SET n += {a: n.a + 1,
+  b: $p}`). The map must be a literal: `SET n = $props` and `SET n = m` are
+  refused (`not supported in mushroomdb 0.10`), as is mixing the map form with
+  `SET n.prop = …` in one clause. `n` must be a node.
+- `RETURN` projects the post-write state. `properties_set` counts the
+  properties set plus the properties removed.
+- Inside an interactive transaction the map forms are refused:
+  `not supported in mushroomdb 0.10 inside a transaction`.
+
 ### MATCH … DELETE (edge)
 
 ```cypher
@@ -5394,6 +5427,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH … SET n.prop = literal` | `MATCH (n) WHERE n.id = 'x' SET n.score = 99` |
 | `MATCH … SET n.prop = $param` | `MATCH (n) WHERE n.id = $id SET n.score = $val` |
 | `MATCH … SET … RETURN` | `MATCH (n {id:'a'}) SET n.x = 2 RETURN n.x` — write commits, then RETURN from post-write state. `CASE` and list subscripts (`n.tags[0]`) evaluate the same as a read RETURN; `n.key` / `n.id` / `n.label` use identity fallback |
+| `MATCH … SET n += {…}` / `SET n = {…}` | `MATCH (n) WHERE n.id = 'x' SET n += {score: 2, old: null}` — merge (null removes) or replace; `id`, `ns` and view-owned properties are never removed |
 | `MATCH … REMOVE n.prop [, …]` | `MATCH (n) WHERE n.id = 'x' REMOVE n.score, n.nickname` — a missing property is a no-op; `RETURN` projects the post-write state |
 | `MERGE … ON CREATE SET` / `ON MATCH SET` | `MERGE (n:L {id:'new'}) ON CREATE SET n.born = 1 ON MATCH SET n.hit = 1 RETURN n` |
 | `MATCH … DELETE r` (manual edge) | `MATCH (a)-[r:KNOWS]->(b) DELETE r` |
@@ -6077,6 +6111,7 @@ Relationship patterns `->`, `<-`, `-` with optional type and variable.
 - `CREATE (n:Label {id: 'key', ...})` — insert node(s) and optional edges
 - `MATCH … SET n.field = value` — update properties
 - `MATCH … REMOVE n.field` — remove properties (a missing property is a no-op)
+- `MATCH … SET n += {k: v, …}` / `SET n = {k: v, …}` — merge a map into the node's properties (a null value removes that one), or replace them all
 - `MATCH … DELETE r` — delete a manual edge; error if derived
 - `MATCH (n) DETACH DELETE n` — delete node + all incident edges (derived edges retracted via rule engine; top-k backfill fires)
 - `MATCH (n) DELETE n` — delete isolated node (error if any edges remain — use DETACH DELETE)
@@ -11675,8 +11710,9 @@ changed to tenant-b — delete and re-insert the node instead
 
 **Removing `ns` is changing it**, to `default` — the namespace an absent property
 names — so it is refused with the same error: `remove_prop`, a batched
-`RemoveProp`, `DELETE /node/{key}/prop/ns` and Cypher `MATCH … REMOVE n.ns` all
-return it.
+`RemoveProp`, `DELETE /node/{key}/prop/ns` and Cypher `MATCH … REMOVE n.ns`, `SET n += {ns: null}` and a `SET n = {…}` that
+names a different `ns` all return it. A `SET n = {…}` that leaves `ns` out keeps the
+namespace, as it keeps `id`.
 
 Writing the namespace a node is already in is a no-op, not an error, and so is
 removing `ns` from a node already in `default`: neither changes a namespace, and
@@ -12604,7 +12640,7 @@ What mushroomdb does not do, or does only up to a point. Each row says what was 
 | Peer writes do not notify subscribers | Commits another process made are picked up by `refresh()` and are there on the next read, but they fire no `EdgeFired`/`EdgeRetracted` event, so `/watch` and `/subscribe` see only writes made through this process. Poll if you need to react to a hook's writes. |
 | Cold start without a snapshot re-fires all rules | Snapshots persist derived edges, ANN state, and view definitions. At 100k nodes / ~10M derived edges: **0.02 s** from a snapshot (measured on V8; the format is V9 now, V10 with multiplicity) vs **8.16 min** WAL-only (ANN re-fit dominates). Call `snapshot()` before close. See [`dogfood/results/scale-100k.md`](https://github.com/MatthewSherlin/mushroomdb/blob/main/dogfood/results/scale-100k.md). |
 | Two-hop Cypher joins at scale | Dense patterns producing >1,000,000 intermediate rows error without `LIMIT`. Add `LIMIT n` — the pull-based executor stops early and never materializes the full binding table. |
-| Cypher write subset | CREATE, MATCH…SET, MATCH…REMOVE (properties), MATCH…DELETE, MATCH…DETACH DELETE, and MERGE (single-key, with `ON CREATE SET` / `ON MATCH SET`) are supported. Derived edges cannot be deleted manually. Variable-length paths are hard-capped at 10 hops; unbounded `*min..` is rejected at parse time. Full coverage table: [`docs/site/query.md`](query.md). |
+| Cypher write subset | CREATE, MATCH…SET (including `SET n = {…}` and `SET n += {…}`), MATCH…REMOVE (properties), MATCH…DELETE, MATCH…DETACH DELETE, and MERGE (single-key, with `ON CREATE SET` / `ON MATCH SET`) are supported. Derived edges cannot be deleted manually. Variable-length paths are hard-capped at 10 hops; unbounded `*min..` is rejected at parse time. Full coverage table: [`docs/site/query.md`](query.md). |
 | Approximate vector mode is opt-in | `approximate: true` enables HNSW candidate selection. Per-query recall floors min 0.90 / mean 0.95, measured 1.0 / 1.0 at 5k / dim 1536 (fixed-seed probe). Review the trade-off before using it in completeness-critical workloads. |
 | Demo refuses existing directories | `mushroomdb demo` exits 1 if the target directory is non-empty, including hidden files (`.DS_Store` counts). Use a fresh path. |
 | Python bindings return dicts | pandas/polars zero-copy is not wired yet. HTTP `POST /query` defaults to Arrow IPC; JSON via `?format=json`. |

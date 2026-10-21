@@ -439,6 +439,11 @@ impl Transaction {
         let result = match stmt {
             WriteStatement::Create(s) => self.stage_create(s, params, &mut staged)?,
             WriteStatement::MatchSet(s) => self.stage_match_set(s, params, &mut staged)?,
+            WriteStatement::MatchSetMap(_) => {
+                // The replace form must know which properties the node has and
+                // which a view owns; the buffer cannot answer the second.
+                return Err(not_supported("MATCH … SET n = {…} / SET n += {…}"));
+            }
             WriteStatement::MatchRemove(s) => self.stage_match_remove(s, params, &mut staged)?,
             WriteStatement::MatchDelete(s) => self.stage_match_delete(s, params, &mut staged)?,
             WriteStatement::MatchDeleteNode(s) => {

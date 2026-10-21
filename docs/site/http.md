@@ -571,6 +571,7 @@ Relationship patterns `->`, `<-`, `-` with optional type and variable.
 - `CREATE (n:Label {id: 'key', ...})` — insert node(s) and optional edges
 - `MATCH … SET n.field = value` — update properties
 - `MATCH … REMOVE n.field` — remove properties (a missing property is a no-op)
+- `MATCH … SET n += {k: v, …}` / `SET n = {k: v, …}` — merge a map into the node's properties (a null value removes that one), or replace them all
 - `MATCH … DELETE r` — delete a manual edge; error if derived
 - `MATCH (n) DETACH DELETE n` — delete node + all incident edges (derived edges retracted via rule engine; top-k backfill fires)
 - `MATCH (n) DELETE n` — delete isolated node (error if any edges remain — use DETACH DELETE)
