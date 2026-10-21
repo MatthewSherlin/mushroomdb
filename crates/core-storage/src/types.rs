@@ -932,6 +932,22 @@ pub enum GraphError {
     Busy {
         holder: Option<u32>,
     },
+    /// The store's data directory (or a file the store must create in it, such
+    /// as `LOCK`) is not writable by this process: the filesystem answered
+    /// `EACCES`, `EPERM` or `EROFS`.
+    ///
+    /// This is a deployment fault, not contention: retrying cannot help until
+    /// someone changes the directory's ownership or mount. It is deliberately
+    /// not [`GraphError::Busy`], which says another process holds the write
+    /// lock. Nothing was written.
+    ///
+    /// `path` is the file or directory the filesystem refused. `detail` is the
+    /// full human-readable message: the path, the effective uid, the
+    /// directory's owner and mode, and what to do about it.
+    Unwritable {
+        path: String,
+        detail: String,
+    },
     /// A write tried to change a node's namespace.
     ///
     /// A namespace is a tenancy boundary, set when the node is inserted and
@@ -1093,6 +1109,7 @@ impl std::fmt::Display for GraphError {
             GraphError::Busy { holder: None } => {
                 write!(f, "store is busy: write lock held by another process")
             }
+            GraphError::Unwritable { detail, .. } => write!(f, "{detail}"),
             GraphError::NamespaceImmutable { key, from, to } => write!(
                 f,
                 "node {key} is in namespace {from}; a namespace is set at insert and cannot \

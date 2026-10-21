@@ -311,3 +311,12 @@ def test_constraint_and_size_errors_have_their_own_classes():
         cls = getattr(mushroomdb, name)
         assert issubclass(cls, mushroomdb.MushroomError), name
         assert cls.code == code
+
+
+def test_an_unwritable_directory_has_its_own_class_not_busy():
+    # A permission refusal on the data directory is a deployment fault, not a
+    # peer holding the lock (HO-12b). It must not be `MushroomBusy`.
+    cls = mushroomdb.Unwritable
+    assert issubclass(cls, mushroomdb.MushroomError)
+    assert not issubclass(cls, mushroomdb.MushroomBusy)
+    assert cls.code == "unwritable"

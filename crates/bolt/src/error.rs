@@ -128,7 +128,12 @@ impl From<GraphError> for BoltError {
             }
             // Database errors: a fault in the store, not in the request. The
             // message is fixed so a path or file detail cannot reach a client.
-            GraphError::Corrupt { .. } => BoltError::Internal(INTERNAL_MESSAGE.into()),
+            // An unwritable data directory is a deployment fault on the server,
+            // not something the client can fix or retry away; the message names
+            // paths and uids, so it stays in the server's own logs.
+            GraphError::Corrupt { .. } | GraphError::Unwritable { .. } => {
+                BoltError::Internal(INTERNAL_MESSAGE.into())
+            }
             // Client errors whose text is about the request, not the host.
             GraphError::QueryError { .. } => BoltError::SyntaxError(err.to_string()),
             GraphError::DuplicateKey { .. }
@@ -182,7 +187,9 @@ mod tests {
             GraphError::Io(_) | GraphError::Busy { .. } => {
                 "Neo.TransientError.General.DatabaseUnavailable"
             }
-            GraphError::Corrupt { .. } => "Neo.DatabaseError.General.UnknownError",
+            GraphError::Corrupt { .. } | GraphError::Unwritable { .. } => {
+                "Neo.DatabaseError.General.UnknownError"
+            }
             GraphError::QueryError { .. } => "Neo.ClientError.Statement.SyntaxError",
             GraphError::DuplicateKey { .. }
             | GraphError::NamespaceImmutable { .. }
@@ -258,6 +265,10 @@ mod tests {
             },
             GraphError::RoleWriteDenied { reason: "r".into() },
             GraphError::Busy { holder: Some(1) },
+            GraphError::Unwritable {
+                path: s(),
+                detail: s(),
+            },
             GraphError::NamespaceImmutable {
                 key: "k".into(),
                 from: "a".into(),

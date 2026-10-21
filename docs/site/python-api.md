@@ -1572,6 +1572,7 @@ attributes. Classes may be added; a `code` is never respelled.
 | `MaskedReadOnly` | — | A write statement reached a scoped or masked query path, which is read-only. |
 | `RoleWriteDenied` | `reason: str` | A role-bound write was denied. |
 | `MushroomBusy` | `holder: int \| None` | Another process holds the store's write lock. |
+| `Unwritable` | `path: str`, `detail: str` | The store's data directory is not writable by this process. |
 | `NamespaceImmutable` | `key: str`, `from_: str`, `to: str` | A namespace is set at insert and fixed for the node's lifetime. |
 | `CrossNamespace` | `src: str`, `src_ns: str`, `dst: str`, `dst_ns: str` | A hand-written edge would cross a namespace boundary. |
 | `CommitTimeNotMonotonic` | `supplied_ms: int`, `newest_ms: int` | An asserted commit time would move the store's recorded history backwards. |

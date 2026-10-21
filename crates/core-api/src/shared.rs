@@ -590,13 +590,20 @@ impl SharedDb {
     /// [`SharedDb`]; the [`RwLock`] is not re-entrant; doing so deadlocks.
     pub fn write(&self) -> WriteGuard<'_> {
         let _wal = self.wal_mu.lock().unwrap_or_else(|e| e.into_inner());
-        let acquired = self
-            .poll_cross_process_lock(WRITE_LOCK_WAIT)
-            .unwrap_or(false);
+        let (acquired, failure) = match self.poll_cross_process_lock(WRITE_LOCK_WAIT) {
+            Ok(acquired) => (acquired, None),
+            Err(e) => (false, Some(e)),
+        };
         // The outcome is latched on the db itself, so it surfaces on the first
-        // mutation: a denied lock as `Busy`, and a refresh failure under a
-        // taken lock as the degraded error (`refresh` marks the handle).
-        self.enter_write_scope(_wal, acquired).0
+        // mutation: a denied lock as `Busy` (or `Unwritable` when the
+        // filesystem refused permission rather than a peer holding the lock),
+        // and a refresh failure under a taken lock as the degraded error
+        // (`refresh` marks the handle).
+        let (mut guard, _) = self.enter_write_scope(_wal, acquired);
+        if let Some(e) = &failure {
+            guard.note_lock_failure(e);
+        }
+        guard
     }
 
     /// Like [`write`](SharedDb::write) but with an explicit wait budget, and
@@ -927,6 +934,24 @@ fn drain_loop(
                 drop(wal_guard);
                 for sub in group {
                     let _ = sub.done.send(Err(GraphError::Busy { holder: None }));
+                }
+                continue;
+            }
+            Err(GraphError::Unwritable { path, detail }) => {
+                // The filesystem refused permission to take the lock at all:
+                // a deployment fault, not a peer. Say so to every submitter.
+                // The handle is not degraded - fixing the directory's
+                // ownership lets the next group proceed.
+                {
+                    let mut db = inner.write().unwrap_or_else(|e| e.into_inner());
+                    db.end_write_lock();
+                }
+                drop(wal_guard);
+                for sub in group {
+                    let _ = sub.done.send(Err(GraphError::Unwritable {
+                        path: path.clone(),
+                        detail: detail.clone(),
+                    }));
                 }
                 continue;
             }

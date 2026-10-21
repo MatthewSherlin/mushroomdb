@@ -1950,6 +1950,10 @@ pub struct GraphDb<F: Fs> {
     /// that failed. Makes every WAL-appending mutation in that scope return
     /// [`GraphError::Busy`] instead of writing.
     lock_denied: bool,
+    /// Set with `lock_denied` when the lock was denied because the filesystem
+    /// refused permission, not because a peer holds it: the `(path, detail)` of
+    /// [`GraphError::Unwritable`]. Makes those mutations report the real cause.
+    lock_unwritable: Option<(String, String)>,
     /// True for an as-of view opened via [`GraphDb::open_at`]. Such a view is
     /// pinned to one commit, so it is never stale and never refreshes — later
     /// commits by any process are deliberately invisible to it.
@@ -2602,6 +2606,7 @@ impl<F: Fs> GraphDb<F> {
             open_opts: opts,
             holds_lifetime_lock: false,
             lock_denied: false,
+            lock_unwritable: None,
             pinned: false,
             base_edge_count_from_rows: None,
             last_apply_retraction_count: 0,
@@ -3320,7 +3325,25 @@ impl<F: Fs> GraphDb<F> {
         if self.holds_lifetime_lock {
             return Ok(true);
         }
-        self.fs.try_lock_exclusive().map_err(GraphError::Io)
+        self.fs.try_lock_exclusive().map_err(|e| {
+            // A filesystem that refuses to create or open `LOCK` is a deployment
+            // fault, not a peer holding the lock: say which, so the caller never
+            // reports it as `Busy`.
+            match (
+                core_storage::fs::is_permission_refusal(&e),
+                self.fs.wal_path(),
+            ) {
+                (true, Some(wal)) => match wal.parent() {
+                    Some(dir) => core_storage::fs::unwritable_error(
+                        dir,
+                        &dir.join(core_storage::fs::LOCK_FILE),
+                        &e,
+                    ),
+                    None => GraphError::Io(e),
+                },
+                _ => GraphError::Io(e),
+            }
+        })
     }
 
     /// Poll for the cross-process write lock until `wait` elapses.
@@ -3362,6 +3385,7 @@ impl<F: Fs> GraphDb<F> {
     /// no other process can have written, so there is nothing to pick up.
     pub(crate) fn enter_write_scope(&mut self, acquired: bool) -> Result<()> {
         self.lock_denied = !acquired;
+        self.lock_unwritable = None;
         if !acquired || self.holds_lifetime_lock {
             return Ok(());
         }
@@ -3375,11 +3399,34 @@ impl<F: Fs> GraphDb<F> {
         Ok(())
     }
 
+    /// Record why a lock attempt failed, for the scope [`enter_write_scope`]
+    /// (with `false`) is about to open. Only a permission refusal is kept: it
+    /// makes the denied scope report [`GraphError::Unwritable`] instead of
+    /// [`GraphError::Busy`]. Any other failure leaves the scope reporting `Busy`.
+    pub(crate) fn note_lock_failure(&mut self, err: &GraphError) {
+        self.lock_unwritable = match err {
+            GraphError::Unwritable { path, detail } => Some((path.clone(), detail.clone())),
+            _ => None,
+        };
+    }
+
+    /// The error a mutation returns while the write scope is denied.
+    fn lock_denied_error(&self) -> GraphError {
+        match &self.lock_unwritable {
+            Some((path, detail)) => GraphError::Unwritable {
+                path: path.clone(),
+                detail: detail.clone(),
+            },
+            None => GraphError::Busy { holder: None },
+        }
+    }
+
     /// Close a cross-process write scope opened by
     /// [`enter_write_scope`](GraphDb::enter_write_scope): release the lock and
     /// clear the Busy latch. Safe to call when the lock was never taken.
     pub(crate) fn end_write_lock(&mut self) {
         self.lock_denied = false;
+        self.lock_unwritable = None;
         if !self.holds_lifetime_lock {
             // Releasing a lock we do not hold is a no-op; a failure to release
             // is reported by the OS closing the descriptor at handle drop.
@@ -6326,7 +6373,7 @@ impl<F: Fs> GraphDb<F> {
         // lock and did not get it. Writing anyway would append frames on top of
         // a WAL another process is extending, so refuse instead.
         if self.lock_denied {
-            return Err(GraphError::Busy { holder: None });
+            return Err(self.lock_denied_error());
         }
         // Ensure retained provenance bytes are decoded into the live mutable
         // fields before any mutation touches self.engine.provenance.  This is a
@@ -15306,7 +15353,7 @@ impl<F: Fs> GraphDb<F> {
             )));
         }
         if self.lock_denied {
-            return Err(GraphError::Busy { holder: None });
+            return Err(self.lock_denied_error());
         }
         // From here `snapshot.bin` and `wal.bin` may be between states on disk.
         // A reader outside the engine pairing the two (the backup worker) waits

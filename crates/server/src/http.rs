@@ -1302,6 +1302,18 @@ fn graph_err(e: GraphError) -> Response {
         }
         // Transient: another process holds the cross-process write lock.
         busy @ GraphError::Busy { .. } => busy_response(busy.to_string()),
+        // The data directory is not writable by the server's user. That is the
+        // operator's to fix and no request can change it, so it is a 500, not
+        // the 400 the catch-all would give. The full message (paths, uids) goes
+        // to the log; the client gets a fixed one.
+        GraphError::Unwritable { path, detail } => {
+            tracing::error!(path = %path, "{detail}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "the server's data directory is not writable" })),
+            )
+                .into_response()
+        }
         // A unique-constraint clash is a conflict with stored state, like a
         // duplicate key. The text names the constraint and field only.
         clash @ GraphError::ConstraintViolation { .. } => (

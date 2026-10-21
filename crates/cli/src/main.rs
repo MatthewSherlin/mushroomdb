@@ -617,6 +617,14 @@ fn run_serve(
         // `GET /ready` answers 503 until the store is open and its schema is in.
         let ready_flag = Arc::new(AtomicBool::new(false));
         let db = SharedDb::open(&db_dir).map_err(|e| e.to_string())?;
+        // A shared open takes no lock, so an unwritable data directory would
+        // otherwise surface at the first write, long after the platform called
+        // the deploy healthy. Try the write lock once: only a permission
+        // refusal is fatal. A peer holding the lock (`Busy`) is not this
+        // check's business, and serving reads alongside it stays as it was.
+        if let Err(e @ GraphError::Unwritable { .. }) = db.write_with_wait(Duration::ZERO) {
+            return Err(e.to_string());
+        }
         if is_new_store {
             // The first store most HTTP callers open. Declare the memory
             // schema before the first write so `recall` can answer on it.
