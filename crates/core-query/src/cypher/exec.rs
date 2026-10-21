@@ -635,19 +635,8 @@ fn execute_inner(
             PlanOp::Expand { .. } => {
                 rows = exec_expand(view, &vars, &rows, op, params)?;
             }
-            PlanOp::VarExpand {
-                from,
-                rel_var,
-                etypes,
-                dir,
-                to,
-                min,
-                max,
-                trail_var,
-            } => {
-                rows = exec_var_expand(
-                    view, &vars, &rows, from, rel_var, etypes, *dir, to, *min, *max, trail_var,
-                )?;
+            PlanOp::VarExpand { .. } => {
+                rows = exec_var_expand(view, &vars, &rows, op, params)?;
             }
             PlanOp::ShortestPath {
                 from,
@@ -1052,7 +1041,7 @@ fn execute_inner(
 /// without the routing checks, aggregate fast-paths, or `check_params` (those
 /// are handled by the outer call).  Only the ops that can appear inside an
 /// OPTIONAL MATCH inner plan are needed: ScanLabel, JoinBound, LookupProps,
-/// Expand, Filter.
+/// Expand, VarExpand, BindPath, Filter.
 fn exec_left_outer_inner(
     view: &GraphView,
     vars: &VarTable,
@@ -1076,6 +1065,9 @@ fn exec_left_outer_inner(
             }
             PlanOp::Expand { .. } => {
                 rows = exec_expand(view, vars, &rows, op, params)?;
+            }
+            PlanOp::VarExpand { .. } => {
+                rows = exec_var_expand(view, vars, &rows, op, params)?;
             }
             PlanOp::BindPath {
                 path_var,
@@ -1128,6 +1120,9 @@ fn collect_params_from_ops(
             PlanOp::LookupProps { props, .. }
             | PlanOp::JoinBound { props, .. }
             | PlanOp::Expand {
+                to_props: props, ..
+            }
+            | PlanOp::VarExpand {
                 to_props: props, ..
             } => {
                 for (_, operand) in props {
@@ -1330,10 +1325,23 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                 from,
                 rel_var,
                 to,
+                to_props,
                 trail_var,
                 ..
+            } => {
+                vars.intern(from);
+                vars.intern(to);
+                if let Some(r) = rel_var {
+                    vars.intern(r);
+                }
+                if let Some(t) = trail_var {
+                    vars.intern(t);
+                }
+                for (_, operand) in to_props {
+                    intern_operand(&mut vars, operand);
+                }
             }
-            | PlanOp::ShortestPath {
+            PlanOp::ShortestPath {
                 from,
                 rel_var,
                 to,
@@ -1493,6 +1501,19 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                             vars.intern(to);
                             if let Some(r) = rel_var {
                                 vars.intern(r);
+                            }
+                        }
+                        PlanOp::VarExpand {
+                            from,
+                            rel_var,
+                            to,
+                            trail_var,
+                            ..
+                        } => {
+                            vars.intern(from);
+                            vars.intern(to);
+                            for name in rel_var.iter().chain(trail_var) {
+                                vars.intern(name);
                             }
                         }
                         PlanOp::JoinBound { var, .. } | PlanOp::LookupProps { var, .. } => {
@@ -3348,22 +3369,35 @@ fn exec_expand(
 /// relationship isomorphism).  A single path never reuses the same `EdgeRef`;
 /// node revisits are allowed.
 ///
-/// Emits one row per (start, end, depth) combination where `min ≤ depth ≤ max`.
+/// Emits one row per (start, end, depth) combination where `min ≤ depth ≤ max`
+/// and the end node passes the destination's label and inline properties.
+/// Nodes a walk passes through are not filtered.
 /// The 1 M intermediate-row budget applies to `out.len()`.
-#[allow(clippy::too_many_arguments)]
 fn exec_var_expand(
     view: &GraphView,
     vars: &VarTable,
     rows: &[Row],
-    from: &str,
-    rel_var: &Option<String>,
-    etypes: &[String],
-    dir: RelDir,
-    to: &str,
-    min: u8,
-    max: u8,
-    trail_var: &Option<String>,
+    op: &PlanOp,
+    params: &Params,
 ) -> Result<Vec<Row>, String> {
+    let PlanOp::VarExpand {
+        from,
+        rel_var,
+        etypes,
+        dir,
+        to,
+        to_label,
+        to_props,
+        min,
+        max,
+        trail_var,
+    } = op
+    else {
+        return Err("internal: expected VarExpand".into());
+    };
+    let (dir, min, max) = (*dir, *min, *max);
+    // Checked once so an unfiltered hop pays nothing per emitted row.
+    let dest_filtered = to_label.is_some() || !to_props.is_empty();
     let etypes = resolve_etypes(view, etypes);
     let exp_dir = map_dir(dir);
     let to_slot = vars
@@ -3429,7 +3463,16 @@ fn exec_var_expand(
                         let dest_matches = match bound_to {
                             Some(want) => nbr == want,
                             None => true,
-                        };
+                        } && (!dest_filtered
+                            || node_matches(
+                                view,
+                                vars,
+                                row,
+                                nbr,
+                                to_label.as_deref(),
+                                to_props,
+                                params,
+                            )?);
                         if dest_matches {
                             if out.len() >= cap {
                                 return Err(row_cap_err(cap));
@@ -4224,28 +4267,13 @@ fn agg_stream(
                 agg_stream(ctx, rest, row, acc)?;
             }
         }
-        PlanOp::VarExpand {
-            from,
-            rel_var,
-            etypes,
-            dir,
-            to,
-            min,
-            max,
-            trail_var,
-        } => {
+        PlanOp::VarExpand { .. } => {
             let new_rows = exec_var_expand(
                 ctx.view,
                 ctx.vars,
                 std::slice::from_ref(row),
-                from,
-                rel_var,
-                etypes,
-                *dir,
-                to,
-                *min,
-                *max,
-                trail_var,
+                op,
+                ctx.params,
             )?;
             for nr in &new_rows {
                 agg_stream(ctx, rest, nr, acc)?;
@@ -4794,28 +4822,13 @@ fn group_stream(
                 group_stream(ctx, rest, row, groups, key_order)?;
             }
         }
-        PlanOp::VarExpand {
-            from,
-            rel_var,
-            etypes,
-            dir,
-            to,
-            min,
-            max,
-            trail_var,
-        } => {
+        PlanOp::VarExpand { .. } => {
             let new_rows = exec_var_expand(
                 ctx.view,
                 ctx.vars,
                 std::slice::from_ref(row),
-                from,
-                rel_var,
-                etypes,
-                *dir,
-                to,
-                *min,
-                *max,
-                trail_var,
+                op,
+                ctx.params,
             )?;
             for nr in &new_rows {
                 group_stream(ctx, rest, nr, groups, key_order)?;
@@ -5700,6 +5713,10 @@ mod ql_15;
 mod ql_07;
 
 #[cfg(test)]
+#[path = "tests/ql_vl.rs"]
+mod ql_vl;
+
+#[cfg(test)]
 mod tests {
     use super::{execute, resolve_operand, Params, Row, VarTable};
     use crate::cypher::ast::{
@@ -5768,7 +5785,7 @@ mod tests {
             }
         }
 
-        fn view_indexed<'a>(
+        pub(super) fn view_indexed<'a>(
             &'a self,
             index: &'a core_storage::property_index::PropertyIndex,
         ) -> GraphView<'a> {
@@ -8363,6 +8380,8 @@ LIMIT 10";
             etypes: vec![],
             dir: crate::cypher::RelDir::Right,
             to: "b".into(),
+            to_label: None,
+            to_props: vec![],
             min: 1,
             max: 3,
             trail_var: None,

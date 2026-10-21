@@ -154,6 +154,11 @@ zero-length variable-length paths are not supported; minimum hop count is 1
 - **Per-path edge uniqueness** — a relationship may not appear twice within the
   same path (Cypher relationship isomorphism).  This guarantees termination on
   cyclic graphs.
+- **The end node is filtered, the nodes in between are not** — the
+  destination's label and inline properties (`(b:Person {active: true})`,
+  `{id: $id}`) apply to the node each path ends at.  A path may pass through
+  nodes that fail them.  This holds in every hop form, for a hop in the middle
+  of a pattern, in `OPTIONAL MATCH`, and with a named path.
 - **Intermediate-row budget** — if the output row count reaches 1,000,000 the
   query is aborted with an error naming the limit.  Use tighter ranges or a
   `WHERE` filter to stay within budget on dense graphs.

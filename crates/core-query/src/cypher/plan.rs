@@ -154,6 +154,10 @@ pub enum PlanOp {
     /// allowed.  `rel_var`, when present, is bound to a virtual path cell
     /// whose sole accessible property is `length` (hop count as `Int`).
     ///
+    /// The destination's label and inline properties (`to_label` /
+    /// `to_props`) are checked on the node a walk ends at, never on the nodes
+    /// it passes through: a walk may continue through a node that fails them.
+    ///
     /// Always executes via the **staged path** regardless of LIMIT.
     /// The 1 M intermediate-row budget applies to the output row count.
     VarExpand {
@@ -162,6 +166,8 @@ pub enum PlanOp {
         etypes: Vec<String>,
         dir: RelDir,
         to: String,
+        to_label: Option<String>,
+        to_props: Vec<(String, Operand)>,
         min: u8,
         max: u8,
         /// When set (the pattern is a named path), the hidden variable that
@@ -1204,8 +1210,8 @@ fn compile_pattern(
     {
         // Expand-from-bound: leftmost unbound, rightmost dest already bound,
         // single-rel *fixed-hop* pattern. Start from dest, invert dir, expand
-        // toward start. Variable-length (`*min..max`) is not reversed: VarExpand
-        // has no dest label/prop filter, so reversing would drop start checks.
+        // toward start. Variable-length (`*min..max`) is not reversed: the walk
+        // runs in pattern order and the start's filter is applied by its scan.
         let (rel, dest) = &pat.chain[0];
         let dest_name = name_node(dest, node_anon, bound);
         let dest_name_for_path = dest_name.clone();
@@ -1311,6 +1317,15 @@ fn compile_pattern(
                         hops.min
                     ));
                 }
+                // The destination is already bound; its pattern label and
+                // properties still have to hold (defect-ledger row 132).
+                if dest.label.is_some() || !dest.props.is_empty() {
+                    ops.push(PlanOp::JoinBound {
+                        var: to.clone(),
+                        label: dest.label.clone(),
+                        props: dest.props.clone(),
+                    });
+                }
                 ops.push(PlanOp::ShortestPath {
                     from: from.clone(),
                     rel_var: Some(rel_name),
@@ -1327,6 +1342,8 @@ fn compile_pattern(
                     etypes: rel.etypes.clone(),
                     dir: rel.dir,
                     to: to.clone(),
+                    to_label: dest.label.clone(),
+                    to_props: dest.props.clone(),
                     min: hops.min,
                     max: hops.max,
                     trail_var,
@@ -2294,9 +2311,9 @@ LIMIT 10";
         }
     }
 
-    /// VarExpand has no dest label/prop filter. Reversing
-    /// `MATCH (c:Company)-[*1..2]->(t)` would drop `:Company` and bind
-    /// non-Company `c`. Keep LTR: ScanLabel Company then VarExpand.
+    /// A variable-length hop is not reversed onto a bound end:
+    /// `MATCH (c:Company)-[*1..2]->(t)` stays LTR, ScanLabel Company then
+    /// VarExpand, so `:Company` is applied by the start scan.
     #[test]
     fn plan_does_not_reverse_variable_length_from_bound() {
         let cy = "MATCH (t {id: $tid}) MATCH (c:Company)-[*1..2]->(t) RETURN c";
