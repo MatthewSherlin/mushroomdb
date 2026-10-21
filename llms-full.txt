@@ -12465,7 +12465,9 @@ This process runs as uid 65532; /data is owned by uid 0 gid 0 with mode 0755. â€
 ```
 
 (An older release reported this as `store is busy: write lock held`. That was
-wrong: nothing held a lock. A genuinely held lock still reports `busy`.)
+wrong: nothing held a lock. A genuinely held lock still reports `busy`.) An
+existing store on a deliberately read-only mount still starts, as before, and
+serves reads; its writes fail with the same cause.
 
 Fix the volume once, before the first deploy. The image stays non-root.
 
@@ -12476,7 +12478,11 @@ Fix the volume once, before the first deploy. The image stays non-root.
 | Railway | Set the service variable `RAILWAY_RUN_UID=0`. This runs the container as root on Railway; the image itself is unchanged. |
 | Docker Compose | Nothing to do. A named volume is initialised from the image's `/data`, which is owned by 65532. A bind mount must be owned by uid 65532 on the host: `sudo chown -R 65532:65532 ./data`. |
 
-Render wrapper image (replace the owner and tag with yours):
+Render wrapper image (replace the owner and tag with yours). `runtime: image`
+cannot build a Dockerfile, so build this one and push it to a registry Render can
+pull from (for example `ghcr.io/<you>/mushroomdb-render:latest`), then set that as
+the service's image URL; or keep it in your repository and use `runtime: docker`
+with `dockerfilePath`:
 
 ```dockerfile
 FROM ghcr.io/matthewsherlin/mushroomdb:latest AS app

@@ -296,19 +296,30 @@ pub fn unwritable_error(
 ) -> crate::GraphError {
     let uid = effective_uid();
     let observed = describe_dir(dir);
+    let read_only_filesystem = cause.raw_os_error() == Some(libc::EROFS);
+    let guidance = if read_only_filesystem {
+        format!(
+            "{} is on a read-only mount; remount it read-write to write",
+            dir.display()
+        )
+    } else {
+        format!(
+            "Make {dir} writable by uid {uid} (the image runs as a non-root user and has no \
+             shell, so fix the volume, not the image) - on Fly: run a one-off machine on the \
+             volume that does `chown -R {uid}:{uid} /data`; on Render: see the volume-ownership \
+             recipe in the deployment guide (docs/site/deployment.md)",
+            dir = dir.display(),
+        )
+    };
     let detail = format!(
         "the data directory is not writable: {cause} on {refused}. \
-         This process runs as uid {uid}; {observed}. \
-         Make {dir} writable by uid {uid} (the image runs as a non-root user and has no \
-         shell, so fix the volume, not the image) - on Fly: run a one-off machine on the \
-         volume that does `chown -R {uid}:{uid} /data`; on Render: see the volume-ownership \
-         recipe in the deployment guide (docs/site/deployment.md).",
+         This process runs as uid {uid}; {observed}. {guidance}.",
         refused = refused.display(),
-        dir = dir.display(),
     );
     crate::GraphError::Unwritable {
         path: refused.display().to_string(),
         detail,
+        read_only_filesystem,
     }
 }
 

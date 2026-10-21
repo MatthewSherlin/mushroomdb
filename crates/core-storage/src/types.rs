@@ -812,6 +812,13 @@ pub fn list_tokens(v: &Value) -> Option<std::collections::BTreeSet<ValueKey>> {
     }
 }
 
+impl GraphError {
+    /// What a remote client is told for [`GraphError::Unwritable`]. The path,
+    /// uid, owner and mode stay in the server's log: they describe the host.
+    pub const UNWRITABLE_CLIENT_MESSAGE: &'static str =
+        "the data directory is not writable by the server process; see the server log";
+}
+
 #[derive(Debug)]
 pub enum GraphError {
     KeyNotFound {
@@ -947,6 +954,10 @@ pub enum GraphError {
     Unwritable {
         path: String,
         detail: String,
+        /// True when the refusal was `EROFS`: the filesystem is mounted
+        /// read-only, which is a deliberate configuration a server may serve
+        /// reads from, unlike an ownership mistake.
+        read_only_filesystem: bool,
     },
     /// A write tried to change a node's namespace.
     ///

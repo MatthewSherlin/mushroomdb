@@ -1306,11 +1306,11 @@ fn graph_err(e: GraphError) -> Response {
         // operator's to fix and no request can change it, so it is a 500, not
         // the 400 the catch-all would give. The full message (paths, uids) goes
         // to the log; the client gets a fixed one.
-        GraphError::Unwritable { path, detail } => {
+        GraphError::Unwritable { path, detail, .. } => {
             tracing::error!(path = %path, "{detail}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "the server's data directory is not writable" })),
+                Json(json!({ "error": GraphError::UNWRITABLE_CLIENT_MESSAGE })),
             )
                 .into_response()
         }
@@ -3147,6 +3147,26 @@ mod tests {
     use super::*;
     use crate::json::result_set_json;
     use mushroomdb::{DegreeConfig, PageRankConfig, ResultSet, Value, WccConfig};
+
+    #[tokio::test]
+    async fn an_unwritable_directory_is_a_500_with_a_short_client_message() {
+        let resp = graph_err(GraphError::Unwritable {
+            path: "/secret/dir/LOCK".into(),
+            detail: "uid 65532 owner 0 /secret/dir".into(),
+            read_only_filesystem: false,
+        });
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            text.contains(GraphError::UNWRITABLE_CLIENT_MESSAGE),
+            "{text}"
+        );
+        assert!(
+            !text.contains("secret") && !text.contains("65532"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn nan_float_cell_serializes_as_null() {

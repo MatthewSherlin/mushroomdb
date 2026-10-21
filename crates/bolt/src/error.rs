@@ -131,8 +131,9 @@ impl From<GraphError> for BoltError {
             // An unwritable data directory is a deployment fault on the server,
             // not something the client can fix or retry away; the message names
             // paths and uids, so it stays in the server's own logs.
-            GraphError::Corrupt { .. } | GraphError::Unwritable { .. } => {
-                BoltError::Internal(INTERNAL_MESSAGE.into())
+            GraphError::Corrupt { .. } => BoltError::Internal(INTERNAL_MESSAGE.into()),
+            GraphError::Unwritable { .. } => {
+                BoltError::Internal(GraphError::UNWRITABLE_CLIENT_MESSAGE.into())
             }
             // Client errors whose text is about the request, not the host.
             GraphError::QueryError { .. } => BoltError::SyntaxError(err.to_string()),
@@ -268,6 +269,7 @@ mod tests {
             GraphError::Unwritable {
                 path: s(),
                 detail: s(),
+                read_only_filesystem: false,
             },
             GraphError::NamespaceImmutable {
                 key: "k".into(),

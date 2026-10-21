@@ -937,7 +937,11 @@ fn drain_loop(
                 }
                 continue;
             }
-            Err(GraphError::Unwritable { path, detail }) => {
+            Err(GraphError::Unwritable {
+                path,
+                detail,
+                read_only_filesystem,
+            }) => {
                 // The filesystem refused permission to take the lock at all:
                 // a deployment fault, not a peer. Say so to every submitter.
                 // The handle is not degraded - fixing the directory's
@@ -951,6 +955,7 @@ fn drain_loop(
                     let _ = sub.done.send(Err(GraphError::Unwritable {
                         path: path.clone(),
                         detail: detail.clone(),
+                        read_only_filesystem,
                     }));
                 }
                 continue;

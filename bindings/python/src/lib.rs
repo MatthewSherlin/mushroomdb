@@ -3004,7 +3004,7 @@ fn graph_err(e: GraphError) -> PyErr {
             }),
             // A deployment fault (the data directory's ownership or mount), not
             // contention: retrying cannot help, so it must not be `MushroomBusy`.
-            GraphError::Unwritable { path, detail } => {
+            GraphError::Unwritable { path, detail, .. } => {
                 err_with(py, Unwritable::new_err(msg), |v| {
                     v.setattr("path", path.as_str())?;
                     v.setattr("detail", detail.as_str())

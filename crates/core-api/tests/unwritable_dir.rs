@@ -36,9 +36,15 @@ fn make_read_only(dir: &Path) -> bool {
     true
 }
 
-fn restore(dir: &Path) {
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
-    let _ = std::fs::remove_dir_all(dir);
+/// Puts the directory's permissions back and removes it when dropped, so a
+/// failed assertion does not leave a 0555 directory behind.
+struct Restore<'a>(&'a Path);
+
+impl Drop for Restore<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(self.0);
+    }
 }
 
 fn assert_names_the_cause(err: &GraphError, dir: &Path) {
@@ -58,20 +64,19 @@ fn assert_names_the_cause(err: &GraphError, dir: &Path) {
 #[test]
 fn opening_a_read_only_directory_for_writing_names_the_directory_not_a_lock() {
     let dir = tmp("open");
+    let _restore = Restore(&dir);
     if !make_read_only(&dir) {
-        restore(&dir);
         return;
     }
     let err = GraphDb::open(&dir).err().expect("open must fail");
     assert_names_the_cause(&err, &dir);
-    restore(&dir);
 }
 
 #[test]
 fn a_shared_handle_on_a_read_only_directory_fails_its_first_write_with_the_cause() {
     let dir = tmp("shared");
+    let _restore = Restore(&dir);
     if !make_read_only(&dir) {
-        restore(&dir);
         return;
     }
     let db = SharedDb::open(&dir).expect("a shared open takes no lock");
@@ -86,14 +91,13 @@ fn a_shared_handle_on_a_read_only_directory_fails_its_first_write_with_the_cause
         .err()
         .expect("write_with_wait must fail");
     assert_names_the_cause(&err, &dir);
-    restore(&dir);
 }
 
 #[test]
 fn a_group_commit_on_a_read_only_directory_fails_with_the_cause_and_the_handle_stays_usable() {
     let dir = tmp("group");
+    let _restore = Restore(&dir);
     if !make_read_only(&dir) {
-        restore(&dir);
         return;
     }
     let db = SharedDb::open(&dir).expect("a shared open takes no lock");
@@ -109,7 +113,6 @@ fn a_group_commit_on_a_read_only_directory_fails_with_the_cause_and_the_handle_s
     // Not degraded: the queue keeps answering with the same cause.
     let again = db.submit_batch(insert()).expect_err("still unwritable");
     assert_names_the_cause(&again, &dir);
-    restore(&dir);
 }
 
 #[test]
@@ -120,4 +123,28 @@ fn a_genuinely_held_lock_is_still_busy() {
     assert!(matches!(err, GraphError::Busy { .. }), "got {err:?}");
     drop(_holder);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_lock_failure_that_is_not_a_permission_refusal_is_not_busy_on_any_path() {
+    // `LOCK` is a directory, so opening it fails with EISDIR: an I/O fault, not
+    // a peer holding the lock and not a permission problem.
+    let dir = tmp("lockdir");
+    let _restore = Restore(&dir);
+    std::fs::create_dir_all(dir.join("LOCK")).unwrap();
+
+    let err = GraphDb::open(&dir).err().expect("open must fail");
+    assert!(matches!(err, GraphError::Io(_)), "open: {err:?}");
+
+    let db = SharedDb::open(&dir).expect("a shared open takes no lock");
+    let err = db
+        .write()
+        .insert_node("N", "a", vec![])
+        .expect_err("the write must fail");
+    assert!(matches!(err, GraphError::Io(_)), "write(): {err:?}");
+    let err = db
+        .write_with_wait(std::time::Duration::ZERO)
+        .err()
+        .expect("write_with_wait must fail");
+    assert!(matches!(err, GraphError::Io(_)), "write_with_wait: {err:?}");
 }

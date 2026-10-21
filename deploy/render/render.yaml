@@ -13,7 +13,8 @@
 # not writable ... uid 65532`, deploy a thin wrapper image instead of the stock
 # one: it starts as root, chowns /data, then drops to uid 65532 before it execs
 # the server. The Dockerfile is in docs/site/deployment.md, "Volume ownership on
-# managed platforms". Status: confirmed at the release gate by a real Render
+# managed platforms" (push the wrapper to a registry, or use runtime: docker).
+# Status: confirmed at the release gate by a real Render
 # deploy; it has not been run yet.
 services:
   - type: web
