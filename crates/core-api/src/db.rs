@@ -36,6 +36,8 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
 
+mod unwind_write;
+
 /// The reserved edge property holding a pair's insert count (§5.13).
 ///
 /// Absent means 1 — the count is written only from the second insert of a
@@ -12388,6 +12390,7 @@ impl<F: Fs> GraphDb<F> {
             WriteStatement::MatchDelete(s) => self.exec_match_delete(s, params),
             WriteStatement::MatchDeleteNode(s) => self.exec_match_delete_node(s, params),
             WriteStatement::Merge(s) => self.exec_merge(s, params),
+            WriteStatement::UnwindWrite(s) => self.exec_unwind_write(s, params),
         }
     }
 

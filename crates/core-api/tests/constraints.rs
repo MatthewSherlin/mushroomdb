@@ -943,4 +943,46 @@ mod unlocked {
         .unwrap();
         cypher(&mut db, "CREATE (n:User {id: 'carol', email: 'a@x'})").unwrap();
     }
+
+    #[test]
+    fn unwind_create_meets_the_unique_constraint_and_writes_nothing_when_a_row_violates_it() {
+        let (dir, mut db) = constrained("cypher-unwind-create");
+        let before = wal_bytes(&dir);
+        let row = |id: &str, mail: &str| {
+            Value::Map(BTreeMap::from([
+                ("id".to_string(), Value::Str(id.into())),
+                ("email".to_string(), Value::Str(mail.into())),
+            ]))
+        };
+        // Row 3 repeats alice's email.
+        let params = BTreeMap::from([(
+            "rows".to_string(),
+            Value::List(vec![
+                row("u1", "1@x"),
+                row("u2", "2@x"),
+                row("u3", "a@x"),
+                row("u4", "4@x"),
+            ]),
+        )]);
+        let q = "UNWIND $rows AS r CREATE (:User {id: r.id, email: r.email})";
+        assert_violation(db.query_write(q, &params));
+        assert_eq!(wal_bytes(&dir), before, "a refused statement appended");
+        for key in ["u1", "u2", "u3", "u4"] {
+            assert!(!db.has_node(key), "{key} was written");
+        }
+        // Two rows of one statement that share a value are refused too.
+        let params = BTreeMap::from([(
+            "rows".to_string(),
+            Value::List(vec![row("v1", "same@x"), row("v2", "same@x")]),
+        )]);
+        assert_violation(db.query_write(q, &params));
+        assert_eq!(wal_bytes(&dir), before);
+        // Rows that are distinct commit as one frame.
+        let params = BTreeMap::from([(
+            "rows".to_string(),
+            Value::List(vec![row("w1", "w1@x"), row("w2", "w2@x")]),
+        )]);
+        db.query_write(q, &params).unwrap();
+        assert!(db.has_node("w1") && db.has_node("w2"));
+    }
 }

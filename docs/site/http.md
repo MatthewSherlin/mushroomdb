@@ -575,6 +575,7 @@ Relationship patterns `->`, `<-`, `-` with optional type and variable.
 - `MATCH … DELETE r` — delete a manual edge; error if derived
 - `MATCH (n) DETACH DELETE n` — delete node + all incident edges (derived edges retracted via rule engine; top-k backfill fires)
 - `MATCH (n) DELETE n` — delete isolated node (error if any edges remain — use DETACH DELETE)
+- `UNWIND $rows AS r CREATE (:Label {id: r.id, …})` — and `… MERGE …`, `… MATCH … SET …`: the writes run per row and commit as one batch; each write is scope-checked as the single statement is, so one row outside scope refuses the whole statement
 - `MERGE (n:Label {id: 'key'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]` — match-or-create with optional per-clause SET and projection. A single-namespace role's create arm stamps that namespace when the pattern does not name `ns`; a two-namespace role must name one (`MERGE (n:Label {id: 'key', ns: 'tenant-a'})`). `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'})` finds or creates both nodes and the edge (never a duplicate); the role needs scope on both labels and the edge type
 
 **Aggregate functions** in `RETURN`:

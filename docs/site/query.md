@@ -310,6 +310,22 @@ List source forms:
 Passing a non-list value (e.g., a plain integer property) is a named error.
 Intermediate rows produced by `UNWIND` count against the 1,000,000-row budget.
 
+A map element is read with `.`: `UNWIND $rows AS r RETURN r.id, r.name` returns the
+entry, or null when the map has no such key. `MATCH`, `OPTIONAL MATCH`, a second
+`UNWIND` and `WITH` may follow an `UNWIND`, each correlated on what is already
+bound:
+
+```cypher
+UNWIND $ids AS id
+MATCH (n:Person {id: id})
+RETURN n.name
+```
+
+A `MATCH` after a `WHERE` that follows an `UNWIND` starts a new stage, as
+`WITH … MATCH` does; a relationship variable is not carried into it. A write
+clause after the `UNWIND` makes the statement a write: see
+[UNWIND … write clauses](#unwind--write-clauses).
+
 ---
 
 ## Aggregation
@@ -565,6 +581,75 @@ RETURN a, b
   relationship are refused by name (`not supported in mushroomdb 0.10: …`).
 - Inside an interactive transaction it is buffered like the single-node form.
 
+### UNWIND … write clauses
+
+The bulk-load idiom: the write clauses run once for each row the `UNWIND` (and
+any `MATCH`, `WITH` or `WHERE` after it) produces.
+
+```cypher
+UNWIND $rows AS r
+CREATE (:Person {id: r.id, name: r.name})
+```
+
+```cypher
+UNWIND $edges AS e
+MATCH (a:Person {id: e.from}), (b:Person {id: e.to})
+CREATE (a)-[:KNOWS]->(b)
+```
+
+```cypher
+UNWIND $rows AS r
+MERGE (n:Person {id: r.id})
+  ON CREATE SET n.created = r.at
+  ON MATCH SET n.seen = r.at
+```
+
+- **Clauses.** After the read part: `CREATE` (a node, a chain, comma-separated
+  patterns, or `(a)` naming a node an earlier clause bound), `MERGE` (a node, or
+  a node-relationship-node pattern, with `ON CREATE SET` / `ON MATCH SET`),
+  `SET n.f = expr [, …]`, `SET n = <map>` and `SET n += <map>` (the map is a
+  literal, a `$parameter`, a row or any expression that evaluates to a map),
+  `REMOVE n.f`, `DELETE n` and `DETACH DELETE n`, then an optional `RETURN`. A
+  value on the right of `=`, or in a property map, is any expression over the
+  row: `r.id`, `$tenant`, `toUpper(r.name)`, `r.n + 1`, a literal.
+- **One batch.** The whole statement is one WAL frame and one commit, however
+  many rows. It is atomic: a failure on any row (a duplicate key, a unique
+  constraint, a refused `id` or namespace write, a role scope) writes nothing.
+  Every write meets the same checks as a single `CREATE`, `MERGE` or `SET`, and
+  rules re-evaluate for every assignment.
+- **A row sees the rows before it.** `UNWIND [1, 1] AS x MERGE (:N {id: x})`
+  creates one node; a `MERGE` after a `CREATE` of the same key in the same
+  statement finds it. A `CREATE` of a key that exists, or that an earlier row
+  already created, is a `DuplicateKey` error.
+- **Reads come first.** The `MATCH`, `WITH` and `WHERE` run once, against the
+  state before the statement, and every value a write needs is computed from that
+  result. A `MATCH`, `UNWIND` or `WITH` after a write clause is refused by name.
+  A row whose `MATCH` found no node writes nothing; an `OPTIONAL MATCH` that found
+  none skips the `SET`, `REMOVE` and `DELETE` that name it.
+- **Null.** A property whose value is null in `CREATE` is left out, so a sparse
+  row creates a node without it. `SET n.f = <null>` is an error, as for a single
+  `SET`; in a map, a null entry removes the property under `+=` and is an absent
+  key under `=`. A `MERGE` key must be a string.
+- **`RETURN`.** Evaluated after the commit: the read part runs again and finds
+  each created or merged node by its key, so `RETURN n.name`, `RETURN count(*)`
+  and `ORDER BY` / `SKIP` / `LIMIT` work. A node deleted by the statement is
+  no longer there to return.
+- **Counts.** Without `RETURN` the row is `created` (nodes inserted),
+  `properties_set` (properties set, plus those removed that existed) and
+  `deleted` (nodes deleted).
+- **Cost.** One pass over the rows; 10,000 `CREATE` rows take about as long as
+  `ingest` of the same rows.
+- Inside an interactive transaction (and so a Bolt `BEGIN`) it is refused by
+  name: `not supported in mushroomdb 0.10 inside a transaction: UNWIND … CREATE /
+  MERGE / SET / REMOVE / DELETE`. Run it as its own statement.
+- Under a role-scoped write the `MATCH` is masked, so a hidden node reads as
+  absent and nothing is written to it; create and update scope are checked per
+  label as for the single statements.
+- Not supported: deleting a relationship (`DELETE r`) after `UNWIND`, `REMOVE
+  n:Label`, a map form followed by another `SET` item in the same clause (use two
+  `SET` clauses), and a statement that starts with `MATCH` and then `UNWIND` a
+  write clause.
+
 ---
 
 ## OPTIONAL MATCH
@@ -789,6 +874,11 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `UNWIND expr AS x` (any list-valued expression) | `UNWIND range(1, 5) AS i RETURN i` |
 | `UNWIND alias AS x` (from prior WITH) | `WITH n.tags AS ts UNWIND ts AS t RETURN t` |
 | `UNWIND … WHERE` (filter after UNWIND) | `UNWIND [1,2,3] AS x WHERE x > 1 RETURN x` |
+| `UNWIND … MATCH` / `OPTIONAL MATCH` / `WITH` (clauses after `UNWIND`) | `UNWIND $ids AS id MATCH (n:Person {id: id}) RETURN n.name` |
+| `r.field` on a map element | `UNWIND $rows AS r RETURN r.id, r.name` |
+| `UNWIND … CREATE` (bulk load) | `UNWIND $rows AS r CREATE (:Person {id: r.id, name: r.name})` — one batch, atomic |
+| `UNWIND … MERGE` | `UNWIND $rows AS r MERGE (n:Person {id: r.id}) ON CREATE SET n.at = r.at` — a row sees the rows before it; node and relationship forms |
+| `UNWIND … MATCH … SET` / `SET n += r` / `REMOVE` / `DELETE` / `DETACH DELETE` | `UNWIND $rows AS r MATCH (n {id: r.id}) SET n += r` |
 | `OPTIONAL MATCH` (left-outer-join) | `MATCH (a) OPTIONAL MATCH (a)-[:R]->(b) RETURN a, b` |
 | `OPTIONAL MATCH … WHERE` (filter in optional scope) | `OPTIONAL MATCH (a)-[r]->(b) WHERE b.score > 5` |
 | Multiple chained `OPTIONAL MATCH` | `OPTIONAL MATCH (a)-[:R]->(b) OPTIONAL MATCH (a)-[:S]->(c)` |
@@ -840,6 +930,10 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | `CREATE (a), (b)` comma-separated form | `parse error: unexpected tokens after CREATE pattern (found Comma)` |
 | Variable-length `*0..n` (zero-length min) | `zero-length variable-length paths are not supported; minimum hop count is 1` |
 | Variable-length `*n..` (unbounded upper) | `variable-length paths are capped at 10 hops` |
+| A `MATCH`, `UNWIND` or `WITH` after a write clause of an `UNWIND` statement | `not supported in mushroomdb 0.10: a MATCH, UNWIND or WITH clause after a write clause in the same statement; put the reads first` |
+| `UNWIND … MATCH (a)-[r]->(b) DELETE r` | `not supported in mushroomdb 0.10: DELETE of the relationship `r` after UNWIND; delete nodes, or use MATCH … DELETE` |
+| `UNWIND … SET n += x` where `x` is not a map | `SET n += <map>: the value must be a map, got …` |
+| `UNWIND … <write>` inside a transaction | `not supported in mushroomdb 0.10 inside a transaction: UNWIND … CREATE / MERGE / SET / REMOVE / DELETE` |
 | `UNWIND scalar` (non-list value) | `execute: UNWIND requires a list; got … value for …` |
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH, UNWIND, WITH or RETURN (found …)` |
 | Storing a list or map property that holds a null | ``a property value cannot contain null: property `…` of node `…` holds a null`` — `CREATE (:L {id: 'x', p: [1, null]})`, `SET n.p = [1, n.missing]` or a `$param` holding one; nothing is written. `SET n.p = null` keeps its own error (`SET value for n.p evaluated to null`) |
@@ -884,6 +978,7 @@ unexpected-token parse error or other unspecified result.
 | Multiple patterns in one MATCH | Supported, comma-separated — identical to consecutive MATCH clauses. Still a named error after CREATE |
 | `n.key` / `n.id` / `key(n)` / `id(n)` equality vs lit/`$param` | ScanKey (plus stored-wins). `n.label` / `labels(n)` are not this fold — they still scan the label |
 | UNWIND | Supported — any list-valued expression (list literals, `range(…)`, parameters, list-valued properties, aliases from prior WITH); non-list → named error |
+| UNWIND with write clauses | Supported — `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` per row, one atomic batch; not in a transaction; reads before writes |
 | Variable-length paths: max hops | Capped at 10 |
 | shortestPath with unbound endpoints | Rejected at planning time |
 | Intermediate result budget | 1,000,000 rows (WITH/UNWIND intermediate rows count against this cap) |

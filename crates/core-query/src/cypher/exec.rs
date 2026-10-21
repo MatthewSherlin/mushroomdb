@@ -2675,7 +2675,12 @@ fn resolve_prop(
                 Ok(None)
             }
         }
-        // Scalar alias: has no properties.
+        // A scalar alias holding a map (`UNWIND $rows AS r` → `r.id`): the entry,
+        // null when the key is absent. Any other scalar has no properties.
+        Cell::Scalar(Value::Map(entries)) => Ok(entries
+            .get(field)
+            .cloned()
+            .and_then(crate::value_ops::element)),
         Cell::Scalar(_) => Ok(None),
     }
 }

@@ -94,6 +94,16 @@ pub fn is_write_tokens(tokens: &[Tok]) -> bool {
         Some(Tok::Match) => {
             tokens.iter().any(|t| matches!(t, Tok::Set | Tok::Delete)) || has_remove_clause(tokens)
         }
+        // `UNWIND … CREATE|MERGE|SET|DELETE|REMOVE …`: a write when any write
+        // clause follows; `UNWIND … RETURN` stays a read.
+        Some(Tok::Unwind) => {
+            tokens.iter().any(|t| {
+                matches!(
+                    t,
+                    Tok::Create | Tok::Merge | Tok::Set | Tok::Delete | Tok::Detach
+                )
+            }) || has_remove_clause(tokens)
+        }
         _ => false,
     }
 }
@@ -133,14 +143,19 @@ fn is_null_literal(name: &str) -> bool {
     name.eq_ignore_ascii_case("null")
 }
 
+/// Reads a `{key: value, …}` map whose values are of type `V`.
+type PropsParser<'a, V> = fn(&mut Parser<'a>) -> Result<Vec<(String, V)>, String>;
+
 /// A parsed MERGE node pattern.
-struct MergeNode {
+struct MergeNode<V = Value> {
     var: Option<String>,
     label: String,
     key_field: String,
-    key_value: Value,
-    ns: Option<Value>,
+    key_value: V,
+    ns: Option<V>,
 }
+
+mod unwind_write;
 
 struct Parser<'a> {
     toks: &'a [Tok],
@@ -265,10 +280,17 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // WITH pipeline stages (zero or more).
+        // WITH pipeline stages (zero or more). After an UNWIND the stages may
+        // also be plain MATCH / OPTIONAL MATCH / UNWIND clauses.
         let mut stages = Vec::new();
-        while self.peek() == Some(&Tok::With) {
-            stages.push(self.with_stage()?);
+        if unwinds.is_empty() {
+            while self.peek() == Some(&Tok::With) {
+                stages.push(self.with_stage()?);
+            }
+        } else {
+            let mut scope = unwind_write::Scope::default();
+            scope.bind_clauses(&matches, &optional_clauses, &unwinds);
+            self.stages_after_unwind(&mut scope, &mut stages)?;
         }
         let (distinct, returns) = self.return_clause()?;
         let aliases: Vec<&str> = returns.iter().filter_map(|r| r.alias.as_deref()).collect();
@@ -394,6 +416,34 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let (matches, optional_clauses, stage_unwinds, post_where) = self.with_stage_tail()?;
+        Ok(WithStage {
+            items,
+            where_expr,
+            order_by,
+            skip,
+            limit,
+            matches,
+            optional_clauses,
+            unwinds: stage_unwinds,
+            post_where,
+        })
+    }
+
+    /// The clauses that may follow a WITH (or an UNWIND): `MATCH`es, then
+    /// `OPTIONAL MATCH`es, then `UNWIND`s, then one `WHERE` over all of them.
+    #[allow(clippy::type_complexity)]
+    fn with_stage_tail(
+        &mut self,
+    ) -> Result<
+        (
+            Vec<Pattern>,
+            Vec<OptionalClause>,
+            Vec<UnwindClause>,
+            Option<Expr>,
+        ),
+        String,
+    > {
         // Optional MATCH clauses that follow this WITH.
         let mut matches = Vec::new();
         while self.peek() == Some(&Tok::Match) {
@@ -418,17 +468,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(WithStage {
-            items,
-            where_expr,
-            order_by,
-            skip,
-            limit,
-            matches,
-            optional_clauses,
-            unwinds: stage_unwinds,
-            post_where,
-        })
+        Ok((matches, optional_clauses, stage_unwinds, post_where))
     }
 
     /// Parse `UNWIND <expr> AS <alias>`.
@@ -1370,8 +1410,11 @@ impl<'a> Parser<'a> {
             Some(Tok::Create) => self.create_stmt(),
             Some(Tok::Merge) => self.merge_stmt(),
             Some(Tok::Match) => self.match_write_stmt(),
-            _ => Err(self
-                .err("expected CREATE, MERGE, or MATCH … SET/DELETE (write statement required)")),
+            Some(Tok::Unwind) => self.unwind_write_stmt(),
+            _ => Err(self.err(
+                "expected CREATE, MERGE, MATCH … SET/DELETE, or UNWIND … CREATE/MERGE/SET \
+                 (write statement required)",
+            )),
         }
     }
 
@@ -1582,6 +1625,16 @@ impl<'a> Parser<'a> {
 
     /// One MERGE node pattern `(var:Label {key: 'x' [, ns: 'y']})`.
     fn merge_node(&mut self, open_msg: &str) -> Result<MergeNode, String> {
+        self.merge_node_with(open_msg, Self::literal_props)
+    }
+
+    /// [`merge_node`](Self::merge_node) with the property values read by
+    /// `props`: literals for a plain MERGE, expressions for a per-row one.
+    fn merge_node_with<V>(
+        &mut self,
+        open_msg: &str,
+        props: PropsParser<'a, V>,
+    ) -> Result<MergeNode<V>, String> {
         self.expect(&Tok::LParen, open_msg)?;
         // Optional var: `MERGE (n:Label {…})` — capture n for RETURN projection.
         let var = match self.peek() {
@@ -1605,7 +1658,7 @@ impl<'a> Parser<'a> {
                 "MERGE requires a property map with exactly one key (e.g., MERGE (n:Label {id: 'x'}))",
             ));
         }
-        let props = self.literal_props()?;
+        let props = props(self)?;
         let mut ns = None;
         let mut rest = Vec::new();
         for (k, v) in props {
@@ -1984,6 +2037,12 @@ impl<'a> Parser<'a> {
     /// `set_clauses` for `MERGE … ON CREATE/ON MATCH SET`: the map forms
     /// (`n = {…}`, `n += {…}`) are refused by name; MERGE takes property items.
     fn merge_set_clauses(&mut self) -> Result<Vec<SetClause>, String> {
+        self.merge_set_clauses_with(false)
+    }
+
+    /// [`merge_set_clauses`](Self::merge_set_clauses); `row` allows a property
+    /// or variable on the right side (the per-row form after UNWIND).
+    fn merge_set_clauses_with(&mut self, row: bool) -> Result<Vec<SetClause>, String> {
         let mut sets = Vec::new();
         loop {
             if matches!(self.peek(), Some(Tok::Ident(_)))
@@ -1994,7 +2053,7 @@ impl<'a> Parser<'a> {
             {
                 return Err("not supported in mushroomdb 0.10: MERGE … SET with a map".to_string());
             }
-            sets.push(self.set_clause()?);
+            sets.push(self.set_clause_with(row)?);
             if !self.eat(&Tok::Comma) {
                 return Ok(sets);
             }
@@ -2010,6 +2069,12 @@ impl<'a> Parser<'a> {
     }
 
     fn set_clause(&mut self) -> Result<SetClause, String> {
+        self.set_clause_with(false)
+    }
+
+    /// One `var.field = expr`. `row` is the per-row form (after UNWIND), where a
+    /// bare property or variable is a value like any other.
+    fn set_clause_with(&mut self, row: bool) -> Result<SetClause, String> {
         let var = self.ident("expected variable in SET clause")?;
         self.expect(&Tok::Dot, "expected '.' after variable in SET")?;
         let field = self.ident("expected field name after '.'")?;
@@ -2039,6 +2104,7 @@ impl<'a> Parser<'a> {
                     | Operand::ListLit(_)
                     | Operand::MapLit(_)
                     | Operand::Case { .. } => op,
+                    Operand::Prop { .. } | Operand::Var(_) if row => op,
                     Operand::Prop { .. } | Operand::Var(_) => {
                         return Err(self.err(
                             "SET RHS: bare property/variable reference is not supported; \

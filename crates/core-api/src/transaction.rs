@@ -455,6 +455,13 @@ impl Transaction {
                 self.stage_match_delete_node(s, params, &mut staged)?
             }
             WriteStatement::Merge(s) => self.stage_merge(s, params, &mut staged)?,
+            WriteStatement::UnwindWrite(_) => {
+                // Per-row MERGE must see the rows before it, and the buffer's
+                // candidate overlay is rebuilt per statement, not per row.
+                return Err(not_supported(
+                    "UNWIND … CREATE / MERGE / SET / REMOVE / DELETE",
+                ));
+            }
         };
         let (rs, overlay) = result;
         self.accept(staged, overlay);
