@@ -25,6 +25,12 @@ const MICROS_PER_SECOND: i64 = 1_000_000;
 const MICROS_PER_DAY: i64 = 86_400 * MICROS_PER_SECOND;
 const NANOS_PER_MICRO: i64 = 1_000;
 
+/// The largest year magnitude calendar math is attempted for. A `Date` holds
+/// an `i32` day count, about +-5.88 million years, so anything past this is
+/// out of range anyway; the bound keeps `days_from_civil`'s `i64` arithmetic
+/// from overflowing on a user-supplied year such as `i64::MAX`.
+const MAX_YEAR: u64 = 100_000_000;
+
 /// The error `time()` and `localtime()` give: time-of-day types are not in 0.10.
 pub const TIME_TYPES_REFUSAL: &str = "not supported in mushroomdb 0.10: time types";
 
@@ -188,7 +194,7 @@ impl CivilFields {
     }
 
     fn days(&self) -> Option<i64> {
-        if !(1..=12).contains(&self.month) {
+        if self.year.unsigned_abs() > MAX_YEAR || !(1..=12).contains(&self.month) {
             return None;
         }
         let month = self.month as u32;
@@ -443,6 +449,9 @@ fn shift_days(days_since_epoch: i64, months: i32, days: i32) -> Option<i64> {
         .checked_add(i64::from(month) - 1)?
         .checked_add(i64::from(months))?;
     let (year, month) = (total.div_euclid(12), (total.rem_euclid(12) + 1) as u32);
+    if year.unsigned_abs() > MAX_YEAR {
+        return None;
+    }
     let day = day.min(days_in_month(year, month));
     days_from_civil(year, month, day).checked_add(i64::from(days))
 }

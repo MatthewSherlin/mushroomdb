@@ -353,3 +353,89 @@ fn to_string_is_the_iso_text() {
     );
     assert_eq!(eval("toString(date(\"nope\"))"), None);
 }
+
+#[test]
+fn extreme_years_and_fields_are_null_not_a_panic_or_a_wrap() {
+    for q in [
+        "date({year: 9223372036854775807})",
+        "date({year: -9223372036854775807})",
+        "date({year: 9223372036854775807, month: 12, day: 31})",
+        "datetime({year: 9223372036854775807})",
+        "localdatetime({year: 9223372036854775807})",
+        "localdatetime({year: -9223372036854775807})",
+        "date({year: 2024, month: 9223372036854775807})",
+        "date({year: 2024, day: 9223372036854775807})",
+        "date({year: 2024, month: -9223372036854775807})",
+        "localdatetime({year: 2024, hour: 9223372036854775807})",
+        "localdatetime({year: 2024, second: 9223372036854775807})",
+        "localdatetime({year: 2024, nanosecond: 9223372036854775807})",
+        "duration({years: 9223372036854775807})",
+        "duration({days: 9223372036854775807})",
+        "duration({weeks: 9223372036854775807})",
+        "duration({hours: 9223372036854775807})",
+        "duration({seconds: 9223372036854775807})",
+        "duration({nanoseconds: 9223372036854775807, seconds: 9223372036854775807})",
+        "duration({seconds: 1000000000000000000000000000000.0})",
+        "duration({seconds: 9300000000000000000.0})",
+        "duration({days: -9223372036854775807})",
+        "duration({nanoseconds: -9223372036854775807, hours: -9223372036854775807})",
+        // just outside the Date range (i32 days: 5881580-07-11 is the last day)
+        "date({year: 5881580, month: 7, day: 12})",
+        "date({year: 5881581})",
+        "date({year: -5877641, month: 6, day: 22})",
+        "date({year: -5877642})",
+        // just outside the LocalDateTime range (i64 microseconds)
+        "localdatetime({year: 294248})",
+        "localdatetime({year: -290308})",
+        "datetime({year: 294248})",
+    ] {
+        assert_eq!(eval(q), None, "{q}");
+    }
+}
+
+#[test]
+fn the_edges_of_the_ranges_are_values() {
+    assert_eq!(
+        eval("date({year: 5881580, month: 7, day: 11})"),
+        Some(Value::Date(i32::MAX))
+    );
+    assert_eq!(
+        eval("date({year: -5877641, month: 6, day: 23})"),
+        Some(Value::Date(i32::MIN))
+    );
+    assert!(matches!(
+        eval("localdatetime({year: 294247, month: 1, day: 1})"),
+        Some(Value::LocalDateTime(_))
+    ));
+    assert!(matches!(
+        eval("localdatetime({year: -290307, month: 1, day: 1})"),
+        Some(Value::LocalDateTime(_))
+    ));
+}
+
+#[test]
+fn arithmetic_at_the_edges_is_null_not_a_panic() {
+    for q in [
+        "date({year: 5881580, month: 7, day: 11}) + duration({days: 1})",
+        "date({year: 5881580, month: 7, day: 11}) + duration({months: 1})",
+        "date({year: -5877641, month: 6, day: 23}) - duration({days: 1})",
+        "date(\"2024-01-01\") + duration({days: 2147483647})",
+        "date(\"2024-01-01\") - duration({days: 2147483647, months: 2147483647})",
+        "date(\"2024-01-01\") + duration({months: 2147483647})",
+        "date(\"2024-01-01\") - duration({months: -2147483647})",
+        "localdatetime({year: 294247, month: 1, day: 1}) + duration({years: 1000})",
+        "localdatetime(\"2024-01-01T00:00:00\") + duration({days: 2147483647})",
+        "localdatetime(\"2024-01-01T00:00:00\") - duration({nanoseconds: 9223372036854775807, days: 2147483647})",
+        "datetime({year: 294247, month: 1, day: 1}) + duration({years: 1000})",
+        "duration({days: 2147483647}) + duration({days: 1})",
+        "duration({months: -2147483647}) - duration({months: 2147483647})",
+        "duration({nanoseconds: 9223372036854775807}) + duration({nanoseconds: 1})",
+        "duration({days: 2147483647}) * 2",
+        "duration({days: 1}) * 1000000000000000000000000000000.0",
+        "duration({days: 1}) * 9223372036854775807",
+        "duration({nanoseconds: 9223372036854775807}) * -2",
+        "duration({days: 2147483647}) / 0.0000001",
+    ] {
+        assert_eq!(eval(q), None, "{q}");
+    }
+}

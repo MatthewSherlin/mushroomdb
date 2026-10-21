@@ -628,6 +628,16 @@ days.
 the duration's time part. Durations add, subtract, and scale with `*` and `/` by
 a number. An out-of-range result is null.
 
+Strings must be the extended ISO 8601 form the types print: `datetime` needs a
+time (`datetime("2024-03-15")` is null) and `date` takes no time
+(`date("2024-03-15T10:00:00")` is null; convert with `date(datetime(…))`).
+Compact forms (`20240315`) and named time zones (`[Europe/Paris]`, or a `timezone`
+key in a map) are not supported and give null. A map constructor takes
+`year` (required), `month`, `day`, and, for `localdatetime` and `datetime`,
+`hour`, `minute`, `second`, `millisecond`, `microsecond` and `nanosecond`, all
+integers; a `datetime` map is read as UTC. Years outside about ±5.88 million for
+`Date`, and ±292 thousand for date-times, give null.
+
 Until the V11 format ships, a temporal value cannot be stored: `SET n.d =
 date("2024-01-01")` is refused with a `not supported in mushroomdb 0.10 yet`
 error naming the type.
