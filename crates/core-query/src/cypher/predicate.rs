@@ -2,8 +2,9 @@
 //!
 //! `RETURN n.age > 18`, `[x IN l | x > 1]` and `SET n.flag = NOT n.done`
 //! carry their predicate as `Operand::Pred`. It evaluates to true, false or
-//! null (`None`), following openCypher's truth tables. A WHERE keeps its own
-//! evaluator (`exec::eval_expr`), which reads null as false at every step.
+//! null (`None`), following openCypher's truth tables. A WHERE, a CASE WHEN
+//! and a comprehension filter evaluate with the same function and keep a row
+//! only when the answer is true (`exec::eval_expr`).
 
 use super::ast::{Expr, Operand};
 use crate::filter::{eval_cmp3, CmpOp};
@@ -91,39 +92,60 @@ fn eval<E>(
         Expr::IsNotNull(op) => Some(resolve(op)?.is_some()),
         Expr::In { expr, list } => {
             let needle = resolve(expr)?;
-            let mut items = Vec::new();
-            let mut unknown = false;
-            for item_op in list {
-                match resolve(item_op)? {
-                    // `x IN null` is null.
-                    None => unknown = true,
-                    Some(Value::List(values)) => items.extend(values),
-                    Some(value) => items.push(value),
-                }
-            }
-            in_list(needle.as_ref(), &items, unknown)
+            in_list(needle.as_ref(), list, resolve)?
         }
     })
 }
 
-/// `needle IN items`: true on a match; otherwise null if the needle, an
+/// `needle IN list`: true on a match; otherwise null if the needle, an
 /// element, or the list itself was null; otherwise false. `null IN []` is
-/// false.
-fn in_list(needle: Option<&Value>, items: &[Value], mut unknown: bool) -> Option<bool> {
-    if items.is_empty() && !unknown {
-        return Some(false);
+/// false. Each list operand is a single element, or a list whose elements
+/// all count (`IN $list`).
+///
+/// The operands are read lazily, in order, as a WHERE always read them: the
+/// scan stops at the first match. A null needle against two or more written
+/// elements is null without reading any of them; against one operand, that
+/// operand is read to learn whether it is an empty list. So an operand the
+/// answer does not depend on is never evaluated and cannot raise an error.
+fn in_list<E>(
+    needle: Option<&Value>,
+    list: &[Operand],
+    resolve: &mut dyn FnMut(&Operand) -> Result<Option<Value>, E>,
+) -> Result<Option<bool>, E> {
+    if needle.is_none() && list.len() > 1 {
+        return Ok(None);
     }
-    let needle = needle?;
-    for item in items {
-        match eval_cmp3(&CmpOp::Eq, needle, item) {
-            Some(true) => return Some(true),
-            None => unknown = true,
-            Some(false) => {}
+    let mut unknown = false;
+    for item_op in list {
+        let value = match resolve(item_op)? {
+            // `x IN null` is null.
+            None => {
+                if needle.is_none() {
+                    return Ok(None);
+                }
+                unknown = true;
+                continue;
+            }
+            Some(value) => value,
+        };
+        let Some(needle) = needle else {
+            if matches!(&value, Value::List(items) if items.is_empty()) {
+                continue;
+            }
+            return Ok(None);
+        };
+        // One element, or a list whose elements all count; no allocation.
+        let items = match &value {
+            Value::List(items) => items.as_slice(),
+            other => std::slice::from_ref(other),
+        };
+        for item in items {
+            match eval_cmp3(&CmpOp::Eq, needle, item) {
+                Some(true) => return Ok(Some(true)),
+                None => unknown = true,
+                Some(false) => {}
+            }
         }
     }
-    if unknown {
-        None
-    } else {
-        Some(false)
-    }
+    Ok(if unknown { None } else { Some(false) })
 }

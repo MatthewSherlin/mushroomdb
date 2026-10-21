@@ -11,7 +11,7 @@ use core_query::cypher::{
     RetVal, WriteStatement,
 };
 use core_query::{
-    eval_cmp, eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet,
+    eval_filter, expand, neighborhood, values_equal, Dir, Filter, GraphView, ResultSet,
 };
 use core_rules::{
     decode_rule_def, ef_max, evaluate, BuildProgress, EngineEdgeDelta, GraphMut, NodeView,
@@ -1270,7 +1270,7 @@ fn eval_set_return_operand<F: Fs>(
         }
         Operand::Case { branches, default } => {
             for (cond, value) in branches {
-                if eval_set_return_expr(db, match_rs, row, rel_vars, cond, params, 0)? {
+                if eval_set_return_expr(db, match_rs, row, rel_vars, cond, params)? {
                     return eval_set_return_operand(db, match_rs, row, rel_vars, value, params);
                 }
             }
@@ -1342,6 +1342,8 @@ fn refuse_null_property(key: &str, field: &str, value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A CASE WHEN condition in a write statement's RETURN: true takes the
+/// branch; false and null do not. Three-valued, as in a read query.
 fn eval_set_return_expr<F: Fs>(
     db: &GraphDb<F>,
     match_rs: &ResultSet,
@@ -1349,105 +1351,15 @@ fn eval_set_return_expr<F: Fs>(
     rel_vars: &[String],
     expr: &Expr,
     params: &BTreeMap<String, Value>,
-    depth: u32,
 ) -> Result<bool> {
-    if depth > 256 {
-        return Err(GraphError::QueryError {
+    let value = core_query::cypher::eval_predicate(
+        expr,
+        &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
+        &|| GraphError::QueryError {
             detail: "expression nesting too deep".into(),
-        });
-    }
-    match expr {
-        Expr::And(lhs, rhs) => {
-            let l = eval_set_return_expr(db, match_rs, row, rel_vars, lhs, params, depth + 1)?;
-            let r = eval_set_return_expr(db, match_rs, row, rel_vars, rhs, params, depth + 1)?;
-            Ok(l && r)
-        }
-        Expr::Or(lhs, rhs) => {
-            let l = eval_set_return_expr(db, match_rs, row, rel_vars, lhs, params, depth + 1)?;
-            let r = eval_set_return_expr(db, match_rs, row, rel_vars, rhs, params, depth + 1)?;
-            Ok(l || r)
-        }
-        // Three-valued, as in a read query's WHERE: a null side drops the row.
-        Expr::Xor(..) => {
-            let value = core_query::cypher::eval_predicate(
-                expr,
-                &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
-                &|| GraphError::QueryError {
-                    detail: "expression nesting too deep".into(),
-                },
-            )?;
-            Ok(value == Some(true))
-        }
-        Expr::Not(inner) => Ok(!eval_set_return_expr(
-            db,
-            match_rs,
-            row,
-            rel_vars,
-            inner,
-            params,
-            depth + 1,
-        )?),
-        Expr::Cmp { lhs, op, rhs } => {
-            let l = eval_set_return_operand(db, match_rs, row, rel_vars, lhs, params)?;
-            let r = eval_set_return_operand(db, match_rs, row, rel_vars, rhs, params)?;
-            match (l, r) {
-                (Some(a), Some(b)) => Ok(eval_cmp(op, &a, &b)),
-                _ => Ok(false),
-            }
-        }
-        Expr::Truthy(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(match val {
-                None => false,
-                Some(Value::Bool(b)) => b,
-                Some(Value::Int(n)) => n != 0,
-                Some(Value::Float(f)) => f != 0.0,
-                Some(Value::Str(s)) => !s.is_empty(),
-                Some(Value::List(v)) => !v.is_empty(),
-                Some(Value::Map(m)) => !m.is_empty(),
-                Some(Value::Binary(b)) => !b.is_empty(),
-                // A temporal value is a present value, never "empty".
-                Some(
-                    Value::Date(_)
-                    | Value::LocalDateTime(_)
-                    | Value::DateTime { .. }
-                    | Value::Duration { .. },
-                ) => true,
-                Some(Value::Null) => false,
-            })
-        }
-        Expr::IsNull(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(val.is_none())
-        }
-        Expr::IsNotNull(op) => {
-            let val = eval_set_return_operand(db, match_rs, row, rel_vars, op, params)?;
-            Ok(val.is_some())
-        }
-        Expr::In { expr, list } => {
-            let Some(needle) = eval_set_return_operand(db, match_rs, row, rel_vars, expr, params)?
-            else {
-                return Ok(false);
-            };
-            for item_op in list {
-                match eval_set_return_operand(db, match_rs, row, rel_vars, item_op, params)? {
-                    None => {}
-                    Some(Value::List(items)) => {
-                        for item in items {
-                            if eval_cmp(&core_query::CmpOp::Eq, &needle, &item) {
-                                return Ok(true);
-                            }
-                        }
-                    }
-                    Some(item) if eval_cmp(&core_query::CmpOp::Eq, &needle, &item) => {
-                        return Ok(true);
-                    }
-                    Some(_) => {}
-                }
-            }
-            Ok(false)
-        }
-    }
+        },
+    )?;
+    Ok(value == Some(true))
 }
 
 fn eval_set_return_arith(

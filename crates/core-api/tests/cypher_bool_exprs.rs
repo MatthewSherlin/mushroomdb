@@ -128,3 +128,25 @@ fn per_row_writes_take_predicates() {
     assert_eq!(prop(&db, "a", "top"), Some(Value::Bool(true)));
     assert_eq!(prop(&db, "b", "top"), Some(Value::Bool(true)));
 }
+
+#[test]
+fn a_write_where_drops_a_row_whose_not_is_null() {
+    let (mut db, _dir) = open("write-where-not");
+    // `c` has no score: `NOT (null > 10)` is null, so `c` is not written.
+    db.query_write(
+        "MATCH (n:P) WHERE NOT n.score > 10 SET n.low = true",
+        &no_params(),
+    )
+    .unwrap();
+    assert_eq!(prop(&db, "a", "low"), None);
+    assert_eq!(prop(&db, "b", "low"), Some(Value::Bool(true)));
+    assert_eq!(prop(&db, "c", "low"), None);
+    // A write statement's RETURN reads CASE WHEN three-valued too.
+    let rs = db
+        .query_write(
+            "MATCH (n:P {id: 'a'}) SET n.seen = 1 RETURN CASE WHEN NOT n.missing = 1 THEN 't' ELSE 'f' END AS r",
+            &no_params(),
+        )
+        .unwrap();
+    assert_eq!(rs.get(0, "r"), Some(&Value::Str("f".into())));
+}

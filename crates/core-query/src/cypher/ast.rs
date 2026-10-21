@@ -291,7 +291,8 @@ pub enum Operand {
     /// to `Bool(true)`, `Bool(false)` or null: a comparison or `IN` with a
     /// null side is null, `NOT null` is null, `null AND false` is false and
     /// `null OR true` is true. A WHERE never holds one at its top: the parser
-    /// unwraps it to the `Expr` itself, which WHERE evaluates as before.
+    /// unwraps it to the `Expr` itself, which WHERE evaluates the same
+    /// three-valued way, keeping a row only when it is true.
     Pred(Box<Expr>),
 }
 

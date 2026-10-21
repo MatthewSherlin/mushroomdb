@@ -5537,7 +5537,8 @@ unknown function `name`; supported: toLower, toUpper, size, coalesce, type, abs,
 
 `STARTS WITH`, `ENDS WITH` and `CONTAINS` are infix spellings of the
 `startsWith` / `endsWith` / `contains` functions above, and share their null and
-non-string handling: a missing property is `false`, not an error.
+non-string handling: a missing property is null, not an error, so it never matches
+(and `NOT c.name CONTAINS 'x'` does not match it either).
 
 ```cypher
 MATCH (c:Company) WHERE c.name STARTS WITH 'Acme'   RETURN c.name
@@ -5568,7 +5569,11 @@ Precedence, loosest first: `OR`, `XOR`, `AND`, `NOT`, comparison, then `IN`,
 unary minus and subscripts. So `NOT a = b` is `NOT (a = b)`, `a OR b AND c` is
 `a OR (b AND c)` and `1 + 2 > 2 AND true` is true. Parentheses group either kind
 of expression: `(n.age + 1) > 18`, `(a OR b) AND c`. One comparison per operand
-pair: `a < b < c` is a parse error.
+pair: `a < b < c` is a parse error. Expressions nest at most 64 levels deep
+(parentheses, function arguments, list and map elements and `CASE` branches count
+together, and so does a run of `NOT`s); deeper input is refused with a named
+parse error, `expression nesting too deep` (or `list or map literal nesting too deep`
+for nested literals).
 
 As a value a predicate is three-valued: true, false or null. A comparison or `IN`
 with a null side is null (`RETURN null > 1` is null, `1 IN [2, null]` is null);
@@ -5578,10 +5583,13 @@ do not order (`1 < 'a'`) compare as null; values of different types are unequal
 (`1 = 'a'` is false). A non-boolean operand of `NOT`, `AND`, `OR` or `XOR` reads
 as it does in `WHERE` (a non-empty string or list, or a non-zero number, is true).
 
-`WHERE` keeps the row only when its predicate is true, so a null drops the row.
-It evaluates `NOT`, `AND` and `OR` as it always has, reading a null comparison as
-false at each step: `WHERE NOT n.missing = 1` keeps the row, while
-`RETURN NOT n.missing = 1` returns null. `XOR` is three-valued in `WHERE` too. A
+`WHERE` evaluates its predicate the same three-valued way and keeps the row only
+when it is true: false and null both drop it, `NOT` included. So
+`WHERE NOT n.missing = 1` drops every row (`NOT null` is null), and
+`WHERE NOT (n.age > 18 AND n.missing = 1)` drops an adult (`true AND null` is null)
+but keeps a minor (`false AND null` is false). `CASE WHEN` and a list
+comprehension's `WHERE` read their condition the same way. Before 0.10, `WHERE`
+read a null comparison as false and then applied `NOT`, so it kept those rows. A
 predicate used as a value is never turned into an index lookup; only a `WHERE`
 predicate is. `SET n.flag = n.score > 10` stores a boolean; a predicate that is
 null is the existing `SET value for n.flag evaluated to null` error. An unaliased
@@ -5632,7 +5640,7 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `MATCH (n {key: val})` inline property filter | `MATCH (n:Person {city: 'Austin'}) RETURN n` |
 | `n.key` / `n.id` / `n.label` / `key(n)` / `id(n)` / `labels(n)` | `MATCH (n:Person) WHERE n.id = 'alice' RETURN n.id, id(n), labels(n)` — `n.key`/`n.id`/`n.label` stored-wins; `key(n)`/`id(n)` always the id-map key |
 | Comma-separated patterns in one `MATCH` | `MATCH (t)-[:A]->(c), (t)-[:B]->(c) RETURN key(c)` — identical to consecutive `MATCH` clauses; no shared variable is a product |
-| `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is false, not an error |
+| `STARTS WITH` / `ENDS WITH` / `CONTAINS` (infix) | `WHERE c.name STARTS WITH 'Acme'` — missing property is null (never a match, under `NOT` too), not an error |
 | List subscript `x[i]`, negative index | `RETURN n.location[0], n.tags[-1]` — out of range / non-list / non-integer index → null |
 | `count(DISTINCT x)` / `collect(DISTINCT x)` | `WITH c, count(DISTINCT t) AS n RETURN key(c), n` |
 | `WITH … WHERE <alias>` (non-aggregate) | `WITH t, t.age AS x WHERE x > 11 RETURN key(t), x` — the alias is in scope for WHERE, ORDER BY, SKIP and LIMIT |

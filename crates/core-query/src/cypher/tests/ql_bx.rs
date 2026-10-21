@@ -220,6 +220,9 @@ fn infix_string_predicates_xor_and_in_are_values() {
     assert_eq!(eval("'abc' STARTS WITH 'a'"), b(true));
     assert_eq!(eval("'abc' ENDS WITH 'c'"), b(true));
     assert_eq!(eval("'abc' CONTAINS 'z'"), b(false));
+    // A missing property is null, so neither the predicate nor its NOT matches.
+    assert_eq!(eval("n.missing CONTAINS 'z'"), None);
+    assert_eq!(eval("NOT n.missing STARTS WITH 'z'"), None);
     assert_eq!(eval("2 IN [1, 2]"), b(true));
     assert_eq!(eval("5 IN $l"), b(false));
     assert_eq!(eval("true XOR true"), b(false));
@@ -322,16 +325,141 @@ fn where_is_unchanged_and_now_takes_parenthesised_arithmetic() {
     );
 }
 
+/// The keys a WHERE keeps over `people()`, through the staged path, the
+/// bounded (fused scan+filter) path and an indexed view; all three agree.
+fn where_keys_all_paths(w: &str) -> Vec<String> {
+    use core_storage::property_index::PropertyIndex;
+    let mut fx = Fx::new();
+    let a = fx.add(
+        "P",
+        "a",
+        vec![
+            ("age", Value::Int(30)),
+            ("score", Value::Int(12)),
+            ("name", Value::Str("ann".into())),
+        ],
+    );
+    let b_ = fx.add(
+        "P",
+        "b",
+        vec![
+            ("age", Value::Int(15)),
+            ("score", Value::Int(5)),
+            ("name", Value::Str("bob".into())),
+        ],
+    );
+    fx.add("P", "c", vec![]);
+    let mut pi = PropertyIndex::new();
+    pi.enable("P", "age");
+    pi.set("P", "age", a, &Value::Int(30));
+    pi.set("P", "age", b_, &Value::Int(15));
+    let p = BTreeMap::new();
+    let get = |view: &crate::view::GraphView, q: &str| -> Vec<String> {
+        let rs = run(view, q, &p).unwrap_or_else(|e| panic!("`{q}`: {e}"));
+        let mut k: Vec<String> = (0..rs.len())
+            .map(|i| match rs.get(i, "k") {
+                Some(Value::Str(s)) => s.clone(),
+                other => panic!("`{q}`: {other:?}"),
+            })
+            .collect();
+        k.sort();
+        k
+    };
+    let staged = get(
+        &fx.view(),
+        &format!("MATCH (n:P) WHERE {w} RETURN n.key AS k"),
+    );
+    let bounded = get(
+        &fx.view(),
+        &format!("MATCH (n:P) WHERE {w} RETURN n.key AS k LIMIT 100"),
+    );
+    let indexed = get(
+        &fx.view_indexed(&pi),
+        &format!("MATCH (n:P) WHERE {w} RETURN n.key AS k LIMIT 100"),
+    );
+    assert_eq!(staged, bounded, "LIMIT changed `{w}`");
+    assert_eq!(staged, indexed, "an index changed `{w}`");
+    staged
+}
+
 #[test]
-fn where_not_keeps_its_two_valued_reading_while_a_projection_is_null() {
+fn where_is_three_valued_under_not_and_and_or() {
+    let k = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let none: Vec<String> = vec![];
+    for (w, want) in [
+        // `c` has no age: the comparison is null, so is its NOT; c is dropped.
+        ("NOT n.age = 30", k(&["b"])),
+        ("NOT n.age > 18", k(&["b"])),
+        ("NOT n.age IN [30]", k(&["b"])),
+        ("NOT n.name STARTS WITH 'a'", k(&["b"])),
+        ("NOT n.missing = 1", none.clone()),
+        // NOT (a AND null): true AND null is null, false AND null is false.
+        ("NOT (n.age > 18 AND n.missing = 1)", k(&["b"])),
+        ("NOT (n.age > 18 AND null)", k(&["b"])),
+        ("NOT (false AND null)", k(&["a", "b", "c"])),
+        // AND: false wins over null; true AND null is null.
+        ("n.missing = 1 AND false", none.clone()),
+        ("n.age = 30 AND n.missing = 1", none.clone()),
+        ("NOT (n.missing = 1 AND false)", k(&["a", "b", "c"])),
+        // OR: true wins over null; false OR null is null.
+        ("null OR true", k(&["a", "b", "c"])),
+        ("n.missing = 1 OR true", k(&["a", "b", "c"])),
+        ("null OR false", none.clone()),
+        ("NOT (null OR false)", none.clone()),
+        ("NOT (n.missing = 1 OR n.age = 15)", none.clone()),
+        ("NOT (n.age = 30 OR n.missing = 1)", none.clone()),
+        ("n.age = 30 OR NOT n.age = 30", k(&["a", "b"])),
+        // Unchanged by the ruling: no NOT over a null.
+        ("n.age = 30", k(&["a"])),
+        ("n.age <> 30", k(&["b"])),
+        ("n.age IS NULL", k(&["c"])),
+        ("NOT n.age IS NULL", k(&["a", "b"])),
+    ] {
+        assert_eq!(where_keys_all_paths(w), want, "`{w}`");
+    }
+}
+
+#[test]
+fn case_when_and_a_comprehension_filter_are_three_valued_too() {
+    // NOT null is null, so the branch is not taken.
+    assert_eq!(
+        eval("CASE WHEN NOT n.missing = 1 THEN 't' ELSE 'f' END"),
+        Some(Value::Str("f".into()))
+    );
+    // A null element's NOT is null, so the element is dropped.
+    assert_eq!(
+        eval("[x IN [1, null, 3] WHERE NOT x = 1]"),
+        Some(Value::List(vec![Value::Int(3)]))
+    );
+}
+
+#[test]
+fn in_reads_its_elements_lazily_as_where_always_did() {
+    // A match stops the scan, and a null needle needs no element, so an
+    // element that would fail is never evaluated.
+    assert_eq!(eval("1 IN [1, 1 - 'a']"), b(true));
+    assert_eq!(eval("null IN [1, 1 - 'a']"), None);
+    // With no match, every element is read, so the bad one errors.
+    super::tests::eval_err("2 IN [1, 1 - 'a']");
     let fx = people();
-    // `c` has no age: in WHERE the comparison reads false, NOT makes it true.
+    assert_eq!(
+        keys(
+            &fx,
+            "MATCH (n:P) WHERE n.missing IN [12, 1 - 'a'] RETURN n.key AS k"
+        ),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn where_keeps_exactly_the_rows_a_projection_calls_true() {
+    let fx = people();
     assert_eq!(
         keys(
             &fx,
             "MATCH (n:P) WHERE NOT n.age = 30 RETURN n.key AS k ORDER BY k"
         ),
-        vec!["b", "c"]
+        vec!["b"]
     );
     assert_eq!(
         col(
@@ -394,7 +522,8 @@ fn deep_nesting_is_an_error_not_a_crash() {
         // ...and far past them it is refused, without a stack overflow.
         let src = format!("RETURN {}1{}", open.repeat(5000), close.repeat(5000));
         let toks = lex(&src).expect("lex");
-        assert!(parse(&toks).is_err(), "{open} x5000 must be refused");
+        let err = parse(&toks).expect_err("x5000 must be refused");
+        assert!(err.contains("nesting too deep"), "{open}: {err}");
     }
     // A long AND chain is fine to parse; evaluating it is bounded.
     let chain = vec!["true"; 40].join(" AND ");
@@ -423,15 +552,6 @@ impl P {
             P::And(..) => 2,
             P::Not(_) => 3,
             P::Leaf(..) | P::Paren(_) => 4,
-        }
-    }
-
-    fn has_not(&self) -> bool {
-        match self {
-            P::Leaf(..) => false,
-            P::Not(_) => true,
-            P::And(l, r) | P::Or(l, r) => l.has_not() || r.has_not(),
-            P::Paren(c) => c.has_not(),
         }
     }
 
@@ -601,26 +721,23 @@ proptest! {
             &params,
         );
         prop_assert_eq!(&kept, &bounded, "LIMIT changed `{}`", w);
-        // NOT over a null is null in a projection but true in WHERE, which
-        // keeps its two-valued NOT; the two agree on every NOT-free predicate.
-        if !p.has_not() {
-            let rs = run(
-                &fx.view(),
-                &format!("MATCH (n:M) RETURN n.key AS k, {w} AS r ORDER BY k"),
-                &params,
-            )
-            .unwrap_or_else(|e| panic!("`{w}`: {e}"));
-            let truthy: Vec<Option<Value>> = (0..rs.len())
-                .filter(|i| match rs.get(*i, "r") {
-                    Some(Value::Bool(b)) => *b,
-                    None | Some(Value::Null) => false,
-                    Some(Value::Int(n)) => *n != 0,
-                    Some(Value::Str(s)) => !s.is_empty(),
-                    Some(other) => panic!("`{w}` gave {other:?}"),
-                })
-                .map(|i| rs.get(i, "k").cloned())
-                .collect();
-            prop_assert_eq!(kept, truthy, "`{}`", w);
-        }
+        // WHERE keeps exactly the rows whose projected predicate is true.
+        let rs = run(
+            &fx.view(),
+            &format!("MATCH (n:M) RETURN n.key AS k, {w} AS r ORDER BY k"),
+            &params,
+        )
+        .unwrap_or_else(|e| panic!("`{w}`: {e}"));
+        let truthy: Vec<Option<Value>> = (0..rs.len())
+            .filter(|i| match rs.get(*i, "r") {
+                Some(Value::Bool(b)) => *b,
+                None | Some(Value::Null) => false,
+                Some(Value::Int(n)) => *n != 0,
+                Some(Value::Str(s)) => !s.is_empty(),
+                Some(other) => panic!("`{w}` gave {other:?}"),
+            })
+            .map(|i| rs.get(i, "k").cloned())
+            .collect();
+        prop_assert_eq!(kept, truthy, "`{}`", w);
     }
 }
