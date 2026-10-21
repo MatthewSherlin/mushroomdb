@@ -7,13 +7,15 @@
 # Secret values are entered in the Render dashboard (sync: false); none live in
 # this file.
 #
-# VOLUME OWNERSHIP (UNVERIFIED without a real deploy): the image runs as uid
-# 65532, not root, and the server needs /data writable by that uid. A Render
-# disk may mount root-owned, and the image has no shell to chown with. Symptom:
-# serve fails at start - today with the message `store is busy: write lock held`
-# (HO-12b will name the real cause). Action: after the first deploy, check the
-# service logs for that message. No in-image fix or Render setting is known; if
-# it appears, report it so the template can change.
+# VOLUME OWNERSHIP: the image runs as uid 65532, not root, and has no shell, so
+# it cannot chown its own disk. A Render disk mounts root-owned, and Render has
+# no setting for the owner. If serve exits at start with `the data directory is
+# not writable ... uid 65532`, deploy a thin wrapper image instead of the stock
+# one: it starts as root, chowns /data, then drops to uid 65532 before it execs
+# the server. The Dockerfile is in docs/site/deployment.md, "Volume ownership on
+# managed platforms" (push the wrapper to a registry, or use runtime: docker).
+# Status: confirmed at the release gate by a real Render
+# deploy; it has not been run yet.
 services:
   - type: web
     name: mushroomdb

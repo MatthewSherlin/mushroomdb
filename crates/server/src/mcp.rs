@@ -1163,6 +1163,11 @@ fn parse_where_arg(args: &Js) -> std::result::Result<Option<PropPredicate>, Stri
 pub(crate) fn graph_err_msg(e: GraphError) -> String {
     match e {
         GraphError::QueryError { detail } | GraphError::IngestError { detail } => detail,
+        // The detail names paths and uids; it goes to the server's log only.
+        GraphError::Unwritable { path, detail, .. } => {
+            tracing::error!(path = %path, "{detail}");
+            GraphError::UNWRITABLE_CLIENT_MESSAGE.to_string()
+        }
         other => other.to_string(),
     }
 }
@@ -1636,6 +1641,17 @@ fn write_json(writer: &mut impl Write, value: &Js) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unwritable_directory_reaches_a_client_without_paths_or_uids() {
+        let msg = graph_err_msg(GraphError::Unwritable {
+            path: "/secret/dir/LOCK".into(),
+            detail: "uid 65532 owner 0 /secret/dir".into(),
+            read_only_filesystem: false,
+        });
+        assert_eq!(msg, GraphError::UNWRITABLE_CLIENT_MESSAGE);
+        assert!(!msg.contains("secret") && !msg.contains("65532"));
+    }
     use mushroomdb::{AutoFk, IngestOptions, Predicate, RuleDef, Value};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

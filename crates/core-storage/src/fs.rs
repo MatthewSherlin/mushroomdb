@@ -266,6 +266,97 @@ pub trait FsIntrospect {
 /// for every process that opens the store.
 pub const LOCK_FILE: &str = "LOCK";
 
+/// Whether `err` is the filesystem refusing permission rather than reporting
+/// some other fault: `EACCES`, `EPERM` or a read-only mount (`EROFS`).
+///
+/// Judged on the raw OS error where there is one, because
+/// `ErrorKind::ReadOnlyFilesystem` is not available on every toolchain this
+/// crate builds with and `EPERM` has no kind of its own.
+pub fn is_permission_refusal(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    matches!(
+        err.raw_os_error(),
+        Some(code) if code == libc::EACCES || code == libc::EPERM || code == libc::EROFS
+    )
+}
+
+/// The error for a store that cannot write in `dir`: `refused` is the file or
+/// directory the filesystem turned away, `cause` the I/O error it returned.
+///
+/// The message names the path, this process's effective uid, the directory's
+/// owner and mode, and one line saying what to change. It is the only place a
+/// permission refusal is turned into [`crate::GraphError::Unwritable`], so
+/// every caller words it the same way.
+pub fn unwritable_error(
+    dir: &std::path::Path,
+    refused: &std::path::Path,
+    cause: &std::io::Error,
+) -> crate::GraphError {
+    let uid = effective_uid();
+    let observed = describe_dir(dir);
+    let read_only_filesystem = cause.raw_os_error() == Some(libc::EROFS);
+    let guidance = if read_only_filesystem {
+        format!(
+            "{} is on a read-only mount; remount it read-write to write",
+            dir.display()
+        )
+    } else {
+        format!(
+            "Make {dir} writable by uid {uid} (the image runs as a non-root user and has no \
+             shell, so fix the volume, not the image) - on Fly: run a one-off machine on the \
+             volume that does `chown -R {uid}:{uid} /data`; on Render: see the volume-ownership \
+             recipe in the deployment guide (docs/site/deployment.md)",
+            dir = dir.display(),
+        )
+    };
+    let detail = format!(
+        "the data directory is not writable: {cause} on {refused}. \
+         This process runs as uid {uid}; {observed}. {guidance}.",
+        refused = refused.display(),
+    );
+    crate::GraphError::Unwritable {
+        path: refused.display().to_string(),
+        detail,
+        read_only_filesystem,
+    }
+}
+
+#[cfg(unix)]
+fn effective_uid() -> String {
+    // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
+    unsafe { libc::geteuid() }.to_string()
+}
+
+#[cfg(not(unix))]
+fn effective_uid() -> String {
+    "unknown".to_string()
+}
+
+#[cfg(unix)]
+fn describe_dir(dir: &std::path::Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(dir) {
+        Ok(meta) => format!(
+            "{} is owned by uid {} gid {} with mode {:04o}",
+            dir.display(),
+            meta.uid(),
+            meta.gid(),
+            meta.mode() & 0o7777
+        ),
+        Err(e) => format!("{} could not be inspected ({e})", dir.display()),
+    }
+}
+
+#[cfg(not(unix))]
+fn describe_dir(dir: &std::path::Path) -> String {
+    format!(
+        "{} owner and mode are not reported on this platform",
+        dir.display()
+    )
+}
+
 /// This handle's one open description of the store's `LOCK` file, plus whether
 /// it currently owns the lock.
 ///
