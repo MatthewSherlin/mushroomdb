@@ -715,8 +715,19 @@ mod unlocked {
         let (dir, mut db) = open_temp("replay-dups");
         db.insert_node("User", "alice", email("a@x")).unwrap();
         db.insert_node("User", "bob", email("a@x")).unwrap();
-        // No pre-scan in TY-5 (TY-6 adds it), so this declares over them.
-        db.create_constraint("uniq_email", "User", "email").unwrap();
+        drop(db);
+        // `create_constraint` now refuses this store, so the record is appended
+        // by hand, as a WAL written by a build without the scan holds it.
+        let record = core_storage::encode_record(&core_storage::WalRecord::CreateConstraint {
+            name: "uniq_email".into(),
+            label: "User".into(),
+            field: "email".into(),
+        });
+        let mut wal = wal_bytes(&dir);
+        wal.extend_from_slice(&record);
+        std::fs::write(dir.join("wal.bin"), wal).unwrap();
+        let mut db = GraphDb::open(&dir).expect("replay must never fail");
+        db.unlock_v11_format_for_test();
         db.insert_node("User", "carol", email("c@x")).unwrap();
         let live_count = db.node_count();
         drop(db);
@@ -1129,5 +1140,144 @@ mod unlocked {
         )]);
         db.query_write(q, &params).unwrap();
         assert!(db.has_node("w1") && db.has_node("w2"));
+    }
+
+    // ── The scan over existing data (TY-6) ───────────────────────────────────
+
+    fn conflict(result: Result<(), GraphError>) -> Vec<(String, Value)> {
+        match result {
+            Err(GraphError::ConstraintCreationConflict { violations }) => violations,
+            other => panic!("expected ConstraintCreationConflict, got {other:?}"),
+        }
+    }
+
+    fn sorted(mut v: Vec<(String, Value)>) -> Vec<(String, Value)> {
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    #[test]
+    fn test_constraint_creation_conflict() {
+        let (dir, mut db) = open_temp("scan-conflict");
+        db.insert_node("User", "alice", email("dup@x.com")).unwrap();
+        db.insert_node("User", "bob", email("dup@x.com")).unwrap();
+        db.insert_node("User", "carol", email("c@x.com")).unwrap();
+        let before = wal_bytes(&dir);
+        let violations = conflict(db.create_constraint("uniq_email", "User", "email"));
+        assert_eq!(
+            sorted(violations),
+            vec![
+                ("alice".to_string(), Value::Str("dup@x.com".into())),
+                ("bob".to_string(), Value::Str("dup@x.com".into())),
+            ]
+        );
+        assert_eq!(
+            wal_bytes(&dir),
+            before,
+            "a refused declaration was appended"
+        );
+        assert!(db.constraints().is_empty());
+        assert!(!db.is_index_enabled("User", "email"));
+        // Nothing is enforced, and removing the duplicate lets it through.
+        db.delete_node("bob").unwrap();
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+        assert_eq!(db.constraints().len(), 1);
+    }
+
+    #[test]
+    fn the_scan_compares_with_the_query_languages_equality() {
+        // Int 2 and Float 2.0 are one value; so are the zeros; NaN equals nothing.
+        let (dir, mut db) = open_temp("scan-numbers");
+        let put = |db: &mut GraphDb, key: &str, v: Value| {
+            db.insert_node("N", key, vec![("v".into(), v)]).unwrap();
+        };
+        put(&mut db, "int2", Value::Int(2));
+        put(&mut db, "float2", Value::Float(2.0));
+        put(&mut db, "zero", Value::Int(0));
+        put(&mut db, "negzero", Value::Float(-0.0));
+        put(&mut db, "nan1", Value::Float(f64::NAN));
+        put(&mut db, "nan2", Value::Float(f64::NAN));
+        put(&mut db, "three", Value::Int(3));
+        put(&mut db, "list1", Value::List(vec![Value::Int(1)]));
+        put(&mut db, "list2", Value::List(vec![Value::Int(1)]));
+        let before = wal_bytes(&dir);
+        let violations = sorted(conflict(db.create_constraint("uniq_v", "N", "v")));
+        let keys: Vec<&str> = violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["float2", "int2", "negzero", "zero"]);
+        assert_eq!(violations[0].1, Value::Float(2.0));
+        assert_eq!(violations[1].1, Value::Int(2));
+        assert_eq!(wal_bytes(&dir), before);
+    }
+
+    #[test]
+    fn the_scan_reads_only_live_nodes_of_the_label() {
+        let (_dir, mut db) = open_temp("scan-scope");
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        db.insert_node("Admin", "root", email("a@x")).unwrap();
+        db.insert_node("User", "gone", email("a@x")).unwrap();
+        db.delete_node("gone").unwrap();
+        db.insert_node("User", "noemail", vec![]).unwrap();
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+    }
+
+    #[test]
+    fn the_scan_sees_values_held_in_a_snapshot_and_after_a_reopen() {
+        let (dir, mut db) = open_temp("scan-snapshot");
+        db.insert_node("User", "alice", email("dup@x")).unwrap();
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        db.snapshot().unwrap();
+        // A value moved by the overlay, and a node written after the snapshot.
+        db.set_prop("bob", "email", Value::Str("dup@x".into()))
+            .unwrap();
+        db.insert_node("User", "carol", email("c@x")).unwrap();
+        let live = sorted(conflict(db.create_constraint(
+            "uniq_email",
+            "User",
+            "email",
+        )));
+        assert_eq!(live.len(), 2);
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).unwrap();
+        reopened.unlock_v11_format_for_test();
+        assert_eq!(
+            sorted(conflict(reopened.create_constraint(
+                "uniq_email",
+                "User",
+                "email"
+            ))),
+            live
+        );
+        reopened
+            .set_prop("bob", "email", Value::Str("b@x".into()))
+            .unwrap();
+        reopened
+            .create_constraint("uniq_email", "User", "email")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_constraint_drop_and_recreate_same_field() {
+        // Review Focus #4.
+        let (_dir, mut db) = open_temp("recreate");
+        db.insert_node("User", "alice", email("a@x.com")).unwrap();
+        db.insert_node("User", "bob", email("b@x.com")).unwrap();
+        db.create_constraint("c1", "User", "email").unwrap();
+        db.drop_constraint("c1").unwrap();
+        db.create_constraint("c2", "User", "email").unwrap();
+        assert!(db.constraints().iter().any(|c| c.name == "c2"));
+        assert!(!db.constraints().iter().any(|c| c.name == "c1"));
+    }
+
+    #[test]
+    fn a_view_owned_property_is_refused_before_the_scan() {
+        let (_dir, mut db) = open_temp("scan-view-first");
+        db.insert_node("User", "u1", vec![]).unwrap();
+        db.insert_node("User", "u2", vec![]).unwrap();
+        // Both nodes hold the view's `deg = 0`, so a scan would find a conflict.
+        db.create_view(deg_view()).unwrap();
+        match db.create_constraint("uniq_deg", "User", "deg") {
+            Err(GraphError::QueryError { detail }) => assert!(detail.contains("owned by view")),
+            other => panic!("expected the view refusal, got {other:?}"),
+        }
     }
 }

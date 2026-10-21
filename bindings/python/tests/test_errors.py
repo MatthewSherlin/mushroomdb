@@ -313,6 +313,27 @@ def test_constraint_and_size_errors_have_their_own_classes():
         assert cls.code == code
 
 
+def test_constraint_creation_conflict_carries_the_conflicting_pairs(tmp_path):
+    # Python has no constraint API until the V11 format lands, so this runs only
+    # on a build with the `test-hooks` feature (maturin develop --features
+    # test-hooks) and is skipped on a wheel.
+    db = GraphDb.open(str(tmp_path / "db"))
+    if not hasattr(db, "_declare_constraint_for_test"):
+        pytest.skip("built without the test-hooks feature")
+    db.insert_node("N", "a", {"v": 2})
+    db.insert_node("N", "b", {"v": 2.0})
+    db.insert_node("N", "c", {"v": 3})
+    with pytest.raises(mushroomdb.ConstraintCreationConflict) as raised:
+        db._declare_constraint_for_test("uniq_v", "N", "v")
+    pairs = sorted(raised.value.violations, key=lambda pair: pair[0])
+    assert pairs == [("a", 2), ("b", 2.0)]
+    assert isinstance(pairs[0][1], int) and isinstance(pairs[1][1], float)
+    assert raised.value.code == "constraint_creation_conflict"
+    # Removing one of the pair lets the declaration through.
+    db.delete_node("b")
+    db._declare_constraint_for_test("uniq_v", "N", "v")
+
+
 def test_an_unwritable_directory_has_its_own_class_not_busy():
     # A permission refusal on the data directory is a deployment fault, not a
     # peer holding the lock (HO-12b). It must not be `MushroomBusy`.

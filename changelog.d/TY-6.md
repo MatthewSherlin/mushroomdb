@@ -1,0 +1,3 @@
+### Changed
+
+- **Rust: `GraphDb::create_constraint` checks the existing data first.** If two live nodes of the label already hold equal values for the field, it logs nothing and returns `GraphError::ConstraintCreationConflict`, whose `violations` lists every `(node_key, value)` involved (Python: `ConstraintCreationConflict.violations`). Values compare as a query's `=` does, so `2` beside `2.0` is reported. The scan reads every node of the label while the write is held, so declaring a constraint over a million nodes takes about one to three seconds, most of it building the equality index the constraint is checked against. A constraint over a view-owned property is still refused before the scan. Declaring is still refused until the V11 format lands.

@@ -204,6 +204,19 @@ impl GraphDb {
         self.with_mut(|db| db.insert_node(label, key, mapped))
     }
 
+    /// Declare a unique constraint on a handle with the V11 format unlocked.
+    ///
+    /// Test-only: built with the `test-hooks` feature and never in a wheel.
+    /// Python has no constraint API until the V11 format lands (0.10 TY-12),
+    /// so this is how a test reaches the errors a declaration raises.
+    #[cfg(feature = "test-hooks")]
+    fn _declare_constraint_for_test(&self, name: &str, label: &str, field: &str) -> PyResult<()> {
+        self.with_mut(|db| {
+            db.unlock_v11_format_for_test();
+            db.create_constraint(name, label, field)
+        })
+    }
+
     /// Insert `key` if absent, otherwise update it in place.
     ///
     /// Returns `"inserted"` or `"updated"`.  On update, only the fields

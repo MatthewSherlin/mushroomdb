@@ -2821,8 +2821,9 @@ pub(crate) enum EqualityBucket {
 }
 
 ///
-/// **TY-6 (the create-time scan over existing data) must group values with
-/// this and compare each bucket with `values_equal`, never by `ValueKey`: a
+/// The create-time scan over existing data
+/// (`GraphDb::existing_unique_violations`) groups values with this and
+/// compares each bucket with `values_equal`, never by `ValueKey`: a
 /// `ValueKey` keeps `Int` 2 and `Float` 2.0 apart, so a scan keyed on it would
 /// accept a store the write path then refuses.
 pub(crate) fn equality_bucket(value: &Value) -> Option<EqualityBucket> {
@@ -9537,11 +9538,14 @@ impl<F: Fs> GraphDb<F> {
     /// UTC instant are equal whatever their offsets, and a list, map or `Duration` never
     /// conflicts.
     ///
-    /// The existing data is not checked here; a store that already holds
-    /// duplicates keeps them (the pre-scan is 0.10 TY-6).
+    /// The existing data is checked first: every live node of `label` is read,
+    /// and if two hold equal values for `field` nothing is logged and the error
+    /// lists every node involved.
     ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::ConstraintCreationConflict`]: live nodes of `label` already
+    ///   hold equal values for `field`; `violations` is each `(node_key, value)`.
     /// - [`GraphError::QueryError`]: a constraint named `name` already exists;
     ///   a view owns `(label, field)`; or, until the V11 format lands, always — a `CreateConstraint` record
     ///   is format-V11 and a 0.9.x reader cannot decode it.
@@ -9569,11 +9573,83 @@ impl<F: Fs> GraphDb<F> {
                 ),
             });
         }
+        let violations = self.existing_unique_violations(label, field);
+        if !violations.is_empty() {
+            return Err(GraphError::ConstraintCreationConflict { violations });
+        }
         self.log_dense(vec![WalRecord::CreateConstraint {
             name: name.into(),
             label: label.into(),
             field: field.into(),
         }])
+    }
+
+    /// Every `(node_key, value)` of a live node of `label` whose `field` equals
+    /// another live node's, in node-id order.
+    ///
+    /// One pass over the label column and one props read per node of `label`;
+    /// nodes are grouped by [`equality_bucket`] and compared with
+    /// `values_equal` inside a bucket, the equality the write path judges
+    /// by, so `Int` 2 beside `Float` 2.0 is reported. A bucket holds only
+    /// values that round to one `f64` or share an index key, so the
+    /// distinct values per bucket are few and the comparison does not go
+    /// quadratic on a heavily duplicated value.
+    fn existing_unique_violations(&self, label: &str, field: &str) -> Vec<(String, Value)> {
+        let Some(label_sym) = self.syms.get(label) else {
+            return Vec::new();
+        };
+        let props = self.props_view();
+        // Per bucket: the distinct values seen (each with the ids holding a
+        // value equal to it), kept as classes so a duplicate is one lookup
+        // against a handful of representatives, not against every holder.
+        type Class = (Value, Vec<u32>);
+        let mut buckets: HashMap<EqualityBucket, Vec<Class>> = HashMap::new();
+        for (id, &sym) in self.labels.iter().enumerate() {
+            if sym != label_sym {
+                continue;
+            }
+            let id = id as u32;
+            if self.ids.key_of(id).is_none() {
+                continue;
+            }
+            let Some(value) = props.get(id, field).map(|vr| vr.into_value()) else {
+                continue;
+            };
+            let Some(bucket) = equality_bucket(&value) else {
+                continue;
+            };
+            let classes = buckets.entry(bucket).or_default();
+            match classes
+                .iter_mut()
+                .find(|(rep, _)| values_equal(rep, &value))
+            {
+                Some((_, holders)) => holders.push(id),
+                None => classes.push((value, vec![id])),
+            }
+        }
+        let mut conflicting: Vec<u32> = Vec::new();
+        for classes in buckets.values() {
+            for (i, (rep, holders)) in classes.iter().enumerate() {
+                // Equality past 2^53 is not transitive, so two classes whose
+                // representatives are equal conflict as well.
+                let crosses = classes
+                    .iter()
+                    .enumerate()
+                    .any(|(j, (other, _))| j != i && values_equal(rep, other));
+                if holders.len() > 1 || crosses {
+                    conflicting.extend(holders);
+                }
+            }
+        }
+        conflicting.sort_unstable();
+        conflicting
+            .into_iter()
+            .filter_map(|id| {
+                let key = self.ids.key_of(id)?.to_string();
+                let value = props.get(id, field)?.into_value();
+                Some((key, value))
+            })
+            .collect()
     }
 
     /// Withdraw the unique constraint `name`. Its backing equality index stays
