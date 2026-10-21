@@ -7,6 +7,7 @@ pub mod idmap;
 pub mod interner;
 mod pack;
 pub mod property_index;
+pub mod range_index;
 pub mod snapshot;
 pub mod topology;
 pub mod types;
@@ -17,6 +18,7 @@ pub use edge_props::EdgeProps;
 pub use fs::{sync_wal_at, truncate_wal_at, FileId, Fs, RealFs};
 pub use idmap::IdMap;
 pub use interner::Interner;
+pub use range_index::{IndexKind, UnifiedIndex};
 pub use topology::{Direction, Topology};
 pub use types::{
     list_tokens, namespace_of_value, tagged_text, v11_display_text, v11_only_type,

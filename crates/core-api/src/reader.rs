@@ -744,9 +744,12 @@ fn apply_one(
         | WalRecord::DeleteView { .. }
         // Property-index declarations are no-ops in the read path: MVCC reader
         // snapshots do not carry the equality index, so `IndexScan` falls back
-        // to a correct scan+filter for reader queries.
+        // to a correct scan+filter for reader queries. Range indexes share
+        // that index, so their declarations are no-ops too.
         | WalRecord::EnableIndex { .. }
         | WalRecord::DisableIndex { .. }
+        | WalRecord::EnableRangeIndex { .. }
+        | WalRecord::DisableRangeIndex { .. }
         // Unique constraints are checked on the write path only; a reader
         // never writes, so the declarations are no-ops here.
         | WalRecord::CreateConstraint { .. }
