@@ -1475,6 +1475,22 @@ fn tail_role_mask_with_visible_where_matches_live() {
             assert_eq!(got, want, "{below:?} step {i}");
             saw_rows = saw_rows.max(got.len());
         }
+        // Fold the steps in, then resolve the mask from the fold under a new
+        // tail.
+        for i in 0..mushroomdb::FOLD_EVERY_K {
+            db.submit_batch(vec![p_node(&format!("g{i}"), vec![])])
+                .unwrap();
+        }
+        let reader = db.reader();
+        assert!(!reader.deltas.is_empty());
+        let live = db.read();
+        let reader_mask = reader.mask_for_role("ones").unwrap();
+        let live_mask = live.mask_for_role("ones").unwrap();
+        assert_eq!(
+            dump(&reader.query_masked(probe, &p(), &reader_mask).unwrap()),
+            dump(&live.query_masked(probe, &p(), &live_mask).unwrap()),
+            "{below:?} folded"
+        );
         assert!(saw_rows > 0, "{below:?}: the mask hid everything: vacuous");
     }
 }
