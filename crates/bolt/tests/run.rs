@@ -381,7 +381,7 @@ fn run_parameters_reach_the_query() {
 }
 
 #[test]
-fn null_parameters_are_left_out_like_the_http_route_does() {
+fn a_null_parameter_does_not_stop_other_parameters_working() {
     let (db, _dir) = open_db("nullparam");
     seed_rows(&db, 5);
     let mut conn = connected(&db, FULL);

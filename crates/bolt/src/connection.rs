@@ -21,15 +21,35 @@
 //! while earlier messages are still queued interrupts them: they are `IGNORED`
 //! and the `RESET` returns the connection to `Ready`.
 //!
-//! `RUN`, `PULL` and `DISCARD` are handled here, through the
-//! [`QueryService`] a connection is given with [`Connection::with_query_service`]
-//! (see `messages::run`), and `ROUTE` through the [`RoutingConfig`] in its
-//! config. `BEGIN`, `COMMIT` and `ROLLBACK` belong to later tasks. Until they
-//! land, those messages are checked for legality in the current state and then
-//! answered with a not-supported `FAILURE`. A connection with no query service
-//! answers `RUN` the same way.
+//! `RUN`, `PULL` and `DISCARD` (see `messages::run`) and `BEGIN`, `COMMIT` and
+//! `ROLLBACK` (see `messages::tx`) are handled here, through the
+//! [`QueryService`] a connection is given with [`Connection::with_database`],
+//! and `ROUTE` through the [`RoutingConfig`] in its config. A connection with
+//! no query service answers `RUN` and `BEGIN` with a not-supported `FAILURE`.
+//!
+//! # RESET while a request is running
+//!
+//! With a store, [`serve_connection_with`] runs each batch of messages on a
+//! blocking thread and keeps reading the socket meanwhile. A `RESET` that
+//! arrives sets the connection's interrupt flag ([`Connection::interrupt_flag`]).
+//! It takes effect at the first of these points:
+//!
+//! - a bookmark wait (in `RUN` or `BEGIN`) ends within 10 ms, and the request
+//!   is answered `IGNORED`;
+//! - before the next message of the batch, which is `IGNORED`, as is everything
+//!   queued behind it, up to the `RESET`;
+//! - otherwise after the statement or commit that is running returns. A
+//!   statement in the engine cannot be interrupted: it finishes, its reply is
+//!   sent, and a `COMMIT` or auto-commit write that was already submitted is
+//!   durable and reported as such. The open transaction (if the `RESET` was
+//!   not for a request that committed it) is then rolled back.
+//!
+//! The `RESET` itself is answered `SUCCESS` once everything before it has been
+//! answered. A client that disconnects during a batch sets the same flag; the
+//! transaction is rolled back and the connection ends.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -43,7 +63,10 @@ use crate::handshake;
 use crate::messages::hello::{hello_success, Identity, TokenAuthenticator};
 use crate::messages::reset::reset_success;
 use crate::messages::route::{requested_database, RoutingConfig};
-use crate::messages::run::{QueryService, RunRequest, StreamRequest, DEFAULT_BOOKMARK_TIMEOUT};
+use crate::messages::run::{
+    format_bookmark, QueryService, RunRequest, StreamRequest, DEFAULT_BOOKMARK_TIMEOUT,
+};
+use crate::messages::tx::BeginRequest;
 use crate::messages::{ClientMessage, MessageKind, ServerMessage};
 use crate::packstream::PackValue;
 
@@ -60,6 +83,11 @@ pub const DEFAULT_PRE_AUTH_MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// buffer; `rollback` is the explicit form.
 pub trait OpenTransaction: Send {
     fn rollback(self: Box<Self>);
+
+    /// Makes the transaction's writes durable as one commit and returns the
+    /// commit number (the bookmark). The transaction is consumed whether or
+    /// not it succeeds.
+    fn commit(self: Box<Self>) -> Result<u64, BoltError>;
 
     /// Runs one statement in the transaction and returns its rows.
     fn execute(
@@ -160,6 +188,9 @@ pub struct Connection {
     service: Option<Arc<QueryService>>,
     /// The `qid` handed out for the last statement run in a transaction.
     last_qid: i64,
+    /// Set (from another task) when a `RESET` is waiting behind the request
+    /// now running; cleared when the `RESET` is handled.
+    interrupted: Arc<AtomicBool>,
 }
 
 impl Connection {
@@ -180,7 +211,14 @@ impl Connection {
             routing: None,
             service: None,
             last_qid: -1,
+            interrupted: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// The flag the read loop sets when a `RESET` arrives while this
+    /// connection is busy with an earlier request. See the module docs.
+    pub fn interrupt_flag(&self) -> Arc<AtomicBool> {
+        self.interrupted.clone()
     }
 
     /// Sets the routing config that answers `ROUTE`.
@@ -196,7 +234,9 @@ impl Connection {
     /// `bookmark_timeout` is how long a statement waits for a bookmark.
     pub fn with_database(mut self, db: SharedDb, bookmark_timeout: Duration) -> Self {
         self.service = Some(Arc::new(
-            QueryService::new(db).with_bookmark_timeout(bookmark_timeout),
+            QueryService::new(db)
+                .with_bookmark_timeout(bookmark_timeout)
+                .with_interrupt(self.interrupted.clone()),
         ));
         self
     }
@@ -369,6 +409,7 @@ impl Connection {
         match msg {
             ClientMessage::Reset => {
                 self.pending_failure = None;
+                self.interrupted.store(false, Ordering::SeqCst);
                 self.state = ConnectionState::Ready;
                 vec![reset_success()]
             }
@@ -397,6 +438,7 @@ impl Connection {
             }
             ClientMessage::Reset => {
                 self.discard_work();
+                self.interrupted.store(false, Ordering::SeqCst);
                 self.state = ConnectionState::Ready;
                 vec![reset_success()]
             }
@@ -415,6 +457,9 @@ impl Connection {
                     )));
                 }
                 match kind {
+                    MessageKind::Begin => self.handle_begin(fields),
+                    MessageKind::Commit => self.handle_commit(&fields),
+                    MessageKind::Rollback => self.handle_rollback(&fields),
                     MessageKind::Run => self.handle_run(fields),
                     MessageKind::Pull => self.handle_stream(fields, false),
                     MessageKind::Discard => self.handle_stream(fields, true),
@@ -444,6 +489,101 @@ impl Connection {
         }
     }
 
+    /// The answer to a request cut short by a `RESET` that arrived while it ran:
+    /// `IGNORED`, with the connection interrupted until the `RESET` is handled.
+    /// `None` when no `RESET` is waiting, so the caller reports its own error.
+    fn ignored_if_interrupted(&mut self) -> Option<Vec<ServerMessage>> {
+        if !self.interrupted.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.interrupt();
+        Some(vec![ServerMessage::Ignored])
+    }
+
+    /// `BEGIN`: waits for the request's bookmarks, then opens the transaction.
+    /// A malformed request is a protocol violation; an unknown database, a
+    /// bookmark timeout or a user to impersonate fails.
+    fn handle_begin(&mut self, fields: Vec<PackValue>) -> Vec<ServerMessage> {
+        let Some(service) = self.service.clone() else {
+            return self.fail(BoltError::NotSupported(
+                "BEGIN is not supported on a connection with no database".into(),
+            ));
+        };
+        let request = match BeginRequest::from_fields(fields) {
+            Ok(Ok(request)) => request,
+            Ok(Err(err)) => return self.fail(err),
+            Err(err) => return self.violate(err),
+        };
+        // The database is fixed here, for every statement of the transaction.
+        if let Err(err) = select_database(self.routing.as_ref(), request.database.as_deref()) {
+            return self.fail(err);
+        }
+        let tx = match service.begin(&request) {
+            Ok(tx) => tx,
+            Err(err) => {
+                return self
+                    .ignored_if_interrupted()
+                    .unwrap_or_else(|| self.fail(err))
+            }
+        };
+        self.last_qid = -1;
+        match self.enter_tx(tx, Instant::now()) {
+            Ok(()) => vec![ServerMessage::Success(Vec::new())],
+            Err(tx) => {
+                tx.rollback();
+                self.violate(BoltError::Invalid("BEGIN needs the Ready state".into()))
+            }
+        }
+    }
+
+    /// Takes the open transaction out of the state, leaving `Failed` so that
+    /// a transaction that cannot finish ends the way a failed request does.
+    fn take_tx(&mut self) -> Option<Box<dyn OpenTransaction>> {
+        match std::mem::replace(&mut self.state, ConnectionState::Failed) {
+            ConnectionState::InTx { tx, .. } => Some(tx),
+            other => {
+                self.state = other;
+                None
+            }
+        }
+    }
+
+    /// `COMMIT`: one durable commit, replying with its bookmark. A conflict is
+    /// a transient `FAILURE` (the transaction is gone either way). Open
+    /// results are not allowed (`allows`): the state machine has `COMMIT` in
+    /// `TX_READY` only, so a client pulls or discards first, as the drivers do.
+    fn handle_commit(&mut self, fields: &[PackValue]) -> Vec<ServerMessage> {
+        if !fields.is_empty() {
+            return self.violate(BoltError::Invalid("COMMIT takes no fields".into()));
+        }
+        let Some(tx) = self.take_tx() else {
+            return self.violate(BoltError::Invalid("COMMIT needs a transaction".into()));
+        };
+        match tx.commit() {
+            Ok(seq) => {
+                self.state = ConnectionState::Ready;
+                vec![ServerMessage::Success(vec![(
+                    "bookmark".to_string(),
+                    PackValue::String(format_bookmark(seq)),
+                )])]
+            }
+            Err(err) => vec![ServerMessage::Failure(err)],
+        }
+    }
+
+    /// `ROLLBACK`: drops the buffered writes.
+    fn handle_rollback(&mut self, fields: &[PackValue]) -> Vec<ServerMessage> {
+        if !fields.is_empty() {
+            return self.violate(BoltError::Invalid("ROLLBACK takes no fields".into()));
+        }
+        let Some(tx) = self.take_tx() else {
+            return self.violate(BoltError::Invalid("ROLLBACK needs a transaction".into()));
+        };
+        tx.rollback();
+        self.state = ConnectionState::Ready;
+        vec![ServerMessage::Success(Vec::new())]
+    }
+
     fn handle_run(&mut self, fields: Vec<PackValue>) -> Vec<ServerMessage> {
         let (Some(service), Some(identity)) = (self.service.clone(), self.identity.clone()) else {
             return self.fail(BoltError::NotSupported(
@@ -466,7 +606,11 @@ impl Connection {
         };
         let cursor = match opened {
             Ok(cursor) => cursor,
-            Err(err) => return self.fail(err),
+            Err(err) => {
+                return self
+                    .ignored_if_interrupted()
+                    .unwrap_or_else(|| self.fail(err))
+            }
         };
         let fields = cursor
             .fields()
@@ -714,7 +858,10 @@ where
     if let Some(database) = database {
         connection = connection.with_database(database, config.bookmark_timeout);
     }
+    let interrupt = connection.interrupt_flag();
     let mut buf: Vec<u8> = Vec::new();
+    // Bytes read while a batch ran are in `buf` and have not been decoded.
+    let mut unprocessed = false;
     // When the bytes now in `buf` began to wait for the rest of their message.
     let mut partial_since: Option<tokio::time::Instant> = None;
     loop {
@@ -725,13 +872,17 @@ where
         if partial_since.is_some_and(|since| since.elapsed() >= config.message_timeout) {
             return Err(timed_out("message not completed in time"));
         }
-        match tokio::time::timeout(TICK, stream.read_buf(&mut buf)).await {
-            Ok(Ok(0)) => return Ok(()),
-            Ok(Ok(_)) => {}
-            Ok(Err(err)) => return Err(err),
-            Err(_) => {
-                connection.check_timeout(Instant::now());
-                continue;
+        if std::mem::take(&mut unprocessed) {
+            // The read already happened, while the last batch ran.
+        } else {
+            match tokio::time::timeout(TICK, stream.read_buf(&mut buf)).await {
+                Ok(Ok(0)) => return Ok(()),
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    connection.check_timeout(Instant::now());
+                    continue;
+                }
             }
         }
 
@@ -784,21 +935,74 @@ where
             connection.interrupt();
         }
         let (returned, responses) = if blocking {
-            tokio::task::spawn_blocking(move || {
+            let mut task = tokio::task::spawn_blocking(move || {
                 let responses = handle_batch(&mut connection, decoded);
                 (connection, responses)
-            })
-            .await
-            .map_err(std::io::Error::other)?
+            });
+            // Keep reading while the batch runs, so a RESET (or a hang-up) is
+            // seen at once. The bytes stay in `buf`, to be decoded after.
+            let mut scanned = 0;
+            let mut peer_gone: Option<std::io::Result<()>> = None;
+            let joined = loop {
+                tokio::select! {
+                    joined = &mut task => break joined,
+                    read = stream.read_buf(&mut buf), if peer_gone.is_none() && buf.len() <= cap => {
+                        match read {
+                            Ok(0) => peer_gone = Some(Ok(())),
+                            Ok(_) => {
+                                unprocessed = true;
+                                if holds_reset(&buf, &mut scanned) {
+                                    interrupt.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            Err(err) => peer_gone = Some(Err(err)),
+                        }
+                        if peer_gone.is_some() {
+                            interrupt.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+            };
+            let joined = joined.map_err(std::io::Error::other)?;
+            if let Some(ended) = peer_gone {
+                // Nobody is listening for the replies; dropping the connection
+                // rolls back an open transaction.
+                return ended;
+            }
+            joined
         } else {
             let responses = handle_batch(&mut connection, decoded);
             (connection, responses)
         };
         connection = returned;
+        if unprocessed && partial_since.is_none() {
+            partial_since = Some(tokio::time::Instant::now());
+        }
         send(&mut stream, &responses, config.write_timeout).await?;
         if connection.is_defunct() {
             let _ = stream.shutdown().await;
             return Ok(());
+        }
+    }
+}
+
+/// Whether the complete messages in `buf` from `scanned` on include a `RESET`
+/// (an empty structure with tag `0x0F`). Advances `scanned` past the messages
+/// it has looked at, so each is looked at once.
+fn holds_reset(buf: &[u8], scanned: &mut usize) -> bool {
+    const RESET_MESSAGE: [u8; 2] = [0xB0, 0x0F];
+    let mut found = false;
+    loop {
+        let from = *scanned + keepalive_len(&buf[*scanned..]);
+        match framing::deframe(&buf[from..]) {
+            Ok((message, used)) => {
+                found |= message == RESET_MESSAGE;
+                *scanned = from + used;
+            }
+            Err(framing::FrameError::Incomplete) => {
+                *scanned = from;
+                return found;
+            }
         }
     }
 }
@@ -808,7 +1012,12 @@ fn handle_batch(
     decoded: Vec<Result<ClientMessage, BoltError>>,
 ) -> Vec<ServerMessage> {
     let mut responses = Vec::new();
+    let interrupted = connection.interrupt_flag();
     for item in decoded {
+        // A RESET read while this batch ran: what is left of it is ignored.
+        if interrupted.load(Ordering::SeqCst) {
+            connection.interrupt();
+        }
         responses.extend(match item {
             Ok(message) => connection.handle(message),
             Err(err) => connection.handle_malformed(err),
