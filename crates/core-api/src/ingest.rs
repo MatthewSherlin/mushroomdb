@@ -311,7 +311,17 @@ fn classify_rows<F: Fs>(db: &GraphDb<F>, rows: Vec<PropMap>, key_field: &str) ->
         match row.get(key_field) {
             None => row_errors.push((i, format!("missing key field {key_field}"))),
             Some(Value::Str(key)) => {
-                if db.has_node(key) || seen.contains(key) {
+                // `id` mirrors the key (ledger row 128): a row naming another
+                // `id` is refused here, per row, rather than failing the frame.
+                if let Some(id) = row.get("id").filter(|id| *id != &Value::Str(key.clone())) {
+                    row_errors.push((
+                        i,
+                        format!(
+                            "id property {id:?} does not match the key {key:?}; `id` mirrors \
+                             the key"
+                        ),
+                    ));
+                } else if db.has_node(key) || seen.contains(key) {
                     row_errors.push((i, format!("duplicate key {key}")));
                 } else {
                     seen.insert(key.clone());

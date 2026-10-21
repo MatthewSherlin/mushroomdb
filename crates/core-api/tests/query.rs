@@ -2119,15 +2119,15 @@ fn return_distinct_cities() {
 fn union_distinct_and_union_all() {
     let dir = tmp("union");
     let mut db = GraphDb::open(&dir).unwrap();
-    // Keys are globally unique; the shared `id` value 'x' is what UNION dedups on.
+    // Keys are globally unique; the shared `tag` value 'x' is what UNION dedups on.
     for (label, key, id) in [("A", "ax", "x"), ("A", "ay", "y"), ("B", "bx", "x")] {
-        db.insert_node(label, key, vec![("id".into(), Value::Str(id.into()))])
+        db.insert_node(label, key, vec![("tag".into(), Value::Str(id.into()))])
             .unwrap();
     }
     // UNION dedups: A ids {x,y} ∪ B ids {x} = {x, y} → 2 rows.
     let rs = db
         .query(
-            "MATCH (n:A) RETURN n.id AS id UNION MATCH (m:B) RETURN m.id AS id",
+            "MATCH (n:A) RETURN n.tag AS id UNION MATCH (m:B) RETURN m.tag AS id",
             &BTreeMap::new(),
         )
         .unwrap();
@@ -2136,7 +2136,7 @@ fn union_distinct_and_union_all() {
     // UNION ALL keeps duplicates → 3 rows.
     let rs = db
         .query(
-            "MATCH (n:A) RETURN n.id AS id UNION ALL MATCH (m:B) RETURN m.id AS id",
+            "MATCH (n:A) RETURN n.tag AS id UNION ALL MATCH (m:B) RETURN m.tag AS id",
             &BTreeMap::new(),
         )
         .unwrap();
@@ -2144,7 +2144,7 @@ fn union_distinct_and_union_all() {
 
     // Mismatched column names → error.
     let err = db.query(
-        "MATCH (n:A) RETURN n.id AS a UNION MATCH (m:B) RETURN m.id AS b",
+        "MATCH (n:A) RETURN n.tag AS a UNION MATCH (m:B) RETURN m.tag AS b",
         &BTreeMap::new(),
     );
     assert!(err.is_err(), "UNION with mismatched columns must error");

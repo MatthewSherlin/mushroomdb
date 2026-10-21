@@ -7109,3 +7109,49 @@ async fn query_json_renders_a_null_list_element_as_null() {
     assert_eq!(v["columns"], json!(["l", "m", "v"]));
     assert_eq!(v["rows"], json!([[[1, null], {"a": null}, null]]));
 }
+
+// ── The `id` property mirrors the key (ledger row 128) ──────────────────────
+
+#[tokio::test]
+async fn http_prop_routes_refuse_an_id_that_is_not_the_key() {
+    let (app, db) = open("key-property");
+    db.submit_batch(vec![mushroomdb::BatchOp::InsertNode {
+        label: "P".into(),
+        key: "x".into(),
+        props: vec![("id".into(), Value::Str("x".into()))],
+    }])
+    .unwrap();
+    let id_of = |db: &SharedDb| db.reader().node_info("x").unwrap().props.get("id").cloned();
+
+    let (status, body, _) = send(
+        app.clone(),
+        json_req("PUT", "/node/x/prop/id", json!({"value": "mallory"})),
+    )
+    .await;
+    assert!(status.is_client_error(), "{status}");
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains("key property `id`") && text.contains("rename_node"),
+        "{text}"
+    );
+    assert_eq!(id_of(&db), Some(Value::Str("x".into())));
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/node/x/prop/id")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body, _) = send(app.clone(), req).await;
+    assert!(status.is_client_error(), "{status}");
+    assert!(String::from_utf8_lossy(&body).contains("key property `id`"));
+    assert_eq!(id_of(&db), Some(Value::Str("x".into())));
+
+    // Restating the key is accepted.
+    let (status, _, _) = send(
+        app,
+        json_req("PUT", "/node/x/prop/id", json!({"value": "x"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(id_of(&db), Some(Value::Str("x".into())));
+}

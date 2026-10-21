@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import time
 
-from mushroomdb import GraphDb
+from mushroomdb import GraphDb, QueryError
 
 
 def test_insert_node_label_then_key(tmp_path):
@@ -456,16 +456,16 @@ def test_rename_node_python(tmp_path):
 
 
 def test_rename_node_moves_a_stored_id(tmp_path):
-    """rename_node rewrites a stored `id` that equals the old key, and no other."""
+    """rename_node rewrites a stored `id` that equals the old key. A foreign `id`
+    cannot be stored (ledger row 128), so there is no other case."""
     db = GraphDb.open(str(tmp_path / "db"))
     db.insert_node("Person", "q1", {"id": "q1", "name": "Quinn"})
-    db.insert_node("Person", "b1", {"id": "badge-7"})
+    with pytest.raises(QueryError):
+        db.insert_node("Person", "b1", {"id": "badge-7"})
     db.insert_node("Person", "n1", {"name": "No Id"})
     db.rename_node("q1", "q2")
-    db.rename_node("b1", "b2")
     db.rename_node("n1", "n2")
     assert db.node_info("q2")["props"]["id"] == "q2"
-    assert db.node_info("b2")["props"]["id"] == "badge-7"
     assert "id" not in db.node_info("n2")["props"]
     db.close()
 

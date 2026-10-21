@@ -464,7 +464,7 @@ SET n = {name: 'Alice', score: 1}
   `SET n = {}` removes them all and keeps the node.
 - Never removed by `=`: the key property `id`, the namespace `ns`, and a
   property a view owns. A map that names `id` must name the node's own key
-  (then it is a no-op); another value, or null, is an error (`rename_node`
+  (then it is accepted); another value, or null, is an error (`rename_node`
   changes a key). A map that names a different `ns`, or `+= {ns: null}` on a node
   outside `default`, is `NamespaceImmutable`; a map that names a view-owned
   property, with a value or null, is `ViewPropReadOnly`.
@@ -480,9 +480,9 @@ SET n = {name: 'Alice', score: 1}
   `SET n.prop = …` in one clause, and `MERGE … ON CREATE/ON MATCH SET n = {…}`
   (`not supported in mushroomdb 0.10: MERGE … SET with a map`). `n` must be a
   node.
-- `SET n.id = …` and `REMOVE n.id` follow the same rule as the map forms: `id`
-  mirrors the node's key, so restating the key is a no-op and anything else is
-  an error pointing at `rename_node`.
+- `SET n.id = …` and `REMOVE n.id` follow the same rule as the map forms, and as
+  every other write path: `id` mirrors the node's key, so restating the key is
+  accepted and anything else is an error pointing at `rename_node`.
 - `RETURN` projects the post-write state. `properties_set` counts the
   properties set plus the properties removed.
 - Inside an interactive transaction the map forms are refused:

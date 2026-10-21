@@ -799,9 +799,10 @@ pub struct EdgeTypeCensus {
     pub sample: Option<(String, String)>,
 }
 
-/// The refusal every Cypher write of a node's `id` property makes unless it
-/// restates the node's own key: `id` mirrors the key, and only `rename_node`
-/// moves both together.
+/// The refusal every write of a node's `id` property makes unless it restates
+/// the node's own key: `id` mirrors the key, and only `rename_node` moves both
+/// together. Raised at `rewrite_wal_dense_inner` (insert and set) and
+/// `prepare_remove_prop` (removal), so every API gets it.
 pub(crate) fn key_property_error(key: &str) -> GraphError {
     GraphError::QueryError {
         detail: format!(
@@ -811,21 +812,29 @@ pub(crate) fn key_property_error(key: &str) -> GraphError {
     }
 }
 
-/// `Ok(true)` when `SET n.id = value` (or an `id` map entry) is a real write,
-/// `Ok(false)` when it restates the key and is a no-op, `Err` otherwise.
-pub(crate) fn check_key_property_write(key: &str, value: Option<&Value>) -> Result<bool> {
+/// `Ok(())` when a write of the `id` property restates the node's own key,
+/// `Err` for any other value. The engine enforces this at its write choke
+/// point; a transaction calls it to refuse at the statement, not at commit.
+pub(crate) fn check_key_property_write(key: &str, value: Option<&Value>) -> Result<()> {
     match value {
-        Some(Value::Str(s)) if s == key => Ok(false),
+        Some(Value::Str(s)) if s == key => Ok(()),
         _ => Err(key_property_error(key)),
     }
 }
 
-/// `REMOVE n.id` is always refused: the key property is not removable.
+/// The refusal for removing the key property (`REMOVE n.id`, a null `id`).
+pub(crate) fn key_property_removal_error() -> GraphError {
+    GraphError::QueryError {
+        detail: "cannot REMOVE the key property `id`; renaming a node is rename_node".into(),
+    }
+}
+
+/// `REMOVE n.id` is always refused: the key property is not removable. The
+/// engine refuses it in `prepare_remove_prop`; a transaction calls this to
+/// refuse at the statement.
 pub(crate) fn refuse_key_property_removal(removals: &[(String, String)]) -> Result<()> {
     if removals.iter().any(|(_, field)| field == "id") {
-        return Err(GraphError::QueryError {
-            detail: "cannot REMOVE the key property `id`; renaming a node is rename_node".into(),
-        });
+        return Err(key_property_removal_error());
     }
     Ok(())
 }
@@ -850,9 +859,10 @@ enum MapWrite {
 /// - `=`: the node's properties become exactly the non-null entries. A null
 ///   entry is an absent key, so it removes the property if the node has it.
 ///   Removals are listed before sets in the batch.
-/// - `id` is the node's key. It is never removed by `=`, and a map that names
-///   it must name the node's own key (then it is a no-op); any other value, or
-///   null, is refused — a key change is `rename_node`.
+/// - `id` is the node's key. It is never removed by `=`. A map that names it
+///   writes it like any property and the engine's write choke point decides:
+///   the node's own key passes, any other value, or null, is refused — a key
+///   change is `rename_node`.
 /// - `ns` is never removed by `=` (a map without it keeps the namespace). A
 ///   map that sets it is checked by the batch (`NamespaceImmutable` for a
 ///   different one); `+= {ns: null}` is a removal, refused there the same way.
@@ -860,19 +870,14 @@ enum MapWrite {
 ///   filter `on_conflict="replace"` applies. Naming one in the map, with a value
 ///   or null, reaches the batch and is `ViewPropReadOnly`.
 fn plan_map_write(
-    key: &str,
     existing: &BTreeMap<String, Value>,
     merge: bool,
     entries: &[(String, Option<Value>)],
     is_view_owned: &dyn Fn(&str) -> bool,
-) -> Result<Vec<MapWrite>> {
+) -> Vec<MapWrite> {
     let mut sets = Vec::new();
     let mut removes = Vec::new();
     for (field, value) in entries {
-        if field == "id" {
-            check_key_property_write(key, value.as_ref())?;
-            continue;
-        }
         match value {
             Some(v) => sets.push(MapWrite::Set {
                 field: field.clone(),
@@ -903,7 +908,7 @@ fn plan_map_write(
         }
     }
     removes.extend(sets);
-    Ok(removes)
+    removes
 }
 
 /// Construct the standard write-query result set (columns: created, properties_set, deleted).
@@ -5679,6 +5684,9 @@ impl<F: Fs> GraphDb<F> {
                 WalRecord::InsertNode { label, key, props } => {
                     for (field, value) in &props {
                         refuse_null_property(&key, field, value)?;
+                        if field == "id" {
+                            check_key_property_write(&key, Some(value))?;
+                        }
                     }
                     // Namespace validation and normalisation, on the one seam
                     // every user-visible node insert passes through: insert_node,
@@ -5712,6 +5720,11 @@ impl<F: Fs> GraphDb<F> {
                 }
                 WalRecord::SetProp { key, field, value } => {
                     refuse_null_property(&key, &field, &value)?;
+                    // `id` mirrors the key: a write may restate the key, never
+                    // change it (ledger row 128). Rename moves it with the key.
+                    if field == "id" {
+                        check_key_property_write(&key, Some(&value))?;
+                    }
                     // A namespace is set at insert and fixed after: the write is
                     // refused when it would move the node, and dropped when it
                     // names the namespace the node is already in. Checked here
@@ -12588,12 +12601,6 @@ impl<F: Fs> GraphDb<F> {
                         })
                     }
                 };
-                if sc.field == "id"
-                    && !rel_vars.iter().any(|r| r == &sc.var)
-                    && !check_key_property_write(&key, Some(&value))?
-                {
-                    continue;
-                }
                 set_ops.push((key, sc.field.clone(), value));
             }
         }
@@ -12775,9 +12782,9 @@ impl<F: Fs> GraphDb<F> {
         let mut props_changed = 0i64;
         for (key, entries) in &per_node {
             let existing = self.node_info(key).map(|n| n.props).unwrap_or_default();
-            let node_writes = plan_map_write(key, &existing, stmt.merge, entries, &|field| {
+            let node_writes = plan_map_write(&existing, stmt.merge, entries, &|field| {
                 self.view_store.view_for_prop(field).is_some()
-            })?;
+            });
             for write in node_writes {
                 match &write {
                     MapWrite::Set { .. } => props_changed += 1,
@@ -12829,7 +12836,6 @@ impl<F: Fs> GraphDb<F> {
         stmt: core_query::cypher::MatchRemoveStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
-        refuse_key_property_removal(&stmt.removals)?;
         let project_returns = stmt.returns.clone();
         let rel_vars = pattern_rel_vars(&stmt.matches);
         let mut lookup_vars: Vec<String> = Vec::new();
@@ -13304,18 +13310,12 @@ impl<F: Fs> GraphDb<F> {
                 batch.insert_node(&stmt.label, &key, props);
                 for sc in &stmt.on_create {
                     let value = resolve_merge_set_value(&sc.value, params)?;
-                    if sc.field == "id" && !check_key_property_write(&key, Some(&value))? {
-                        continue;
-                    }
                     batch.set_prop(&key, &sc.field, value);
                 }
                 created = 1;
             } else {
                 for sc in &stmt.on_match {
                     let value = resolve_merge_set_value(&sc.value, params)?;
-                    if sc.field == "id" && !check_key_property_write(&key, Some(&value))? {
-                        continue;
-                    }
                     batch.set_prop(&key, &sc.field, value);
                 }
             }
@@ -17012,6 +17012,11 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     }
 
     fn prepare_remove_prop(&self, key: &str, field: &str) -> Result<bool> {
+        // `id` mirrors the key and is not removable (ledger row 128). Stated
+        // first so the answer does not depend on the key or on any view.
+        if field == "id" {
+            return Err(key_property_removal_error());
+        }
         // A view owns its property, and the refusal has to live here rather
         // than on `GraphDb::remove_prop`: `BatchOp::RemoveProp` never meets
         // that one, and it is what the HTTP `DELETE /node/{key}/prop/{field}`
@@ -17243,7 +17248,10 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             .map(String::as_str)
             .chain(overlay_fields)
             .filter(|field| {
-                *field != NS_PROP && !supplied.contains(field) && self.has_prop(key, field)
+                *field != NS_PROP
+                    && *field != "id"
+                    && !supplied.contains(field)
+                    && self.has_prop(key, field)
             })
             .collect();
         // The view-owned half is kept, and counted: the row still commits and

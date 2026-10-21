@@ -606,11 +606,8 @@ impl Transaction {
                                 sc.var, sc.field
                             ),
                         })?;
-                if sc.field == "id"
-                    && !rel_vars.iter().any(|r| r == &sc.var)
-                    && !crate::db::check_key_property_write(&key, Some(&value))?
-                {
-                    continue;
+                if sc.field == "id" && !rel_vars.iter().any(|r| r == &sc.var) {
+                    crate::db::check_key_property_write(&key, Some(&value))?;
                 }
                 staged.set_prop(&key, &sc.field, value);
                 props_set += 1;
@@ -782,8 +779,8 @@ impl Transaction {
         if existed {
             for sc in &stmt.on_match {
                 let value = resolve_merge_set_value(&sc.value, params)?;
-                if sc.field == "id" && !crate::db::check_key_property_write(&key, Some(&value))? {
-                    continue;
+                if sc.field == "id" {
+                    crate::db::check_key_property_write(&key, Some(&value))?;
                 }
                 staged.set_prop(&key, &sc.field, value);
             }
@@ -795,8 +792,8 @@ impl Transaction {
             staged.insert_node(&stmt.label, &key, props);
             for sc in &stmt.on_create {
                 let value = resolve_merge_set_value(&sc.value, params)?;
-                if sc.field == "id" && !crate::db::check_key_property_write(&key, Some(&value))? {
-                    continue;
+                if sc.field == "id" {
+                    crate::db::check_key_property_write(&key, Some(&value))?;
                 }
                 staged.set_prop(&key, &sc.field, value);
             }
