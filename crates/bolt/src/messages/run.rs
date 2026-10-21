@@ -25,6 +25,8 @@
 //! fails the `PULL` with a `FAILURE`; nothing from that `PULL` is sent.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mushroomdb::{is_write_query, GraphError, ResultSet, SharedDb, Transaction, Value};
@@ -33,6 +35,7 @@ use super::{check_depth, MAX_PACK_LEN, TAG_RECORD};
 use crate::connection::{OpenTransaction, ResultCursor};
 use crate::error::BoltError;
 use crate::messages::hello::Identity;
+use crate::messages::tx::{BeginRequest, ReadOnlyTransaction};
 use crate::packstream::{PackStruct, PackValue, MAX_DEPTH};
 
 /// How long a statement waits for the store to reach a bookmark.
@@ -53,7 +56,7 @@ pub fn parse_bookmark(text: &str) -> Result<u64, BoltError> {
         .ok_or_else(|| BoltError::Invalid(format!("unrecognised bookmark {text:?}")))
 }
 
-fn map_get<'a>(map: &'a [(String, PackValue)], key: &str) -> Option<&'a PackValue> {
+pub(crate) fn map_get<'a>(map: &'a [(String, PackValue)], key: &str) -> Option<&'a PackValue> {
     map.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
@@ -118,61 +121,49 @@ impl RunRequest {
         })
     }
 
-    /// The parameters as engine values, the way the HTTP route reads them:
-    /// `Value` has no null yet, so a null parameter is left out, a null entry
-    /// of a map is dropped, and a list holding a null is left out whole (what
-    /// `json_to_value` does). A structure is refused as a client error.
-    ///
-    /// Carry: after QL-17 lands, a Bolt null parameter maps to `Value::Null`.
+    /// The parameters as engine values. A Bolt null is `Value::Null`, so
+    /// `$p IS NULL` is true for it; it is not left out, as the HTTP route
+    /// leaves a JSON null out. A structure is refused as a client error.
     pub fn params(&self) -> Result<BTreeMap<String, Value>, BoltError> {
         let mut out = BTreeMap::new();
         for (name, value) in &self.parameters {
-            if let Some(value) = param_value(name, value, 0)? {
-                out.insert(name.clone(), value);
-            }
+            out.insert(name.clone(), param_value(name, value, 0)?);
         }
         Ok(out)
     }
 }
 
-fn param_value(name: &str, value: &PackValue, depth: usize) -> Result<Option<Value>, BoltError> {
+fn param_value(name: &str, value: &PackValue, depth: usize) -> Result<Value, BoltError> {
     if depth > MAX_DEPTH {
         return Err(BoltError::Invalid(format!(
             "parameter {name:?} is nested too deeply"
         )));
     }
-    Ok(Some(match value {
-        PackValue::Null => return Ok(None),
+    Ok(match value {
+        PackValue::Null => Value::Null,
         PackValue::Bool(b) => Value::Bool(*b),
         PackValue::Int(i) => Value::Int(*i),
         PackValue::Float(f) => Value::Float(*f),
         PackValue::String(s) => Value::Str(s.clone()),
         PackValue::Bytes(b) => Value::Binary(b.clone()),
-        PackValue::List(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                match param_value(name, item, depth + 1)? {
-                    Some(v) => out.push(v),
-                    None => return Ok(None),
-                }
-            }
-            Value::List(out)
-        }
-        PackValue::Map(entries) => {
-            let mut out = BTreeMap::new();
-            for (k, v) in entries {
-                if let Some(v) = param_value(name, v, depth + 1)? {
-                    out.insert(k.clone(), v);
-                }
-            }
-            Value::Map(out)
-        }
+        PackValue::List(items) => Value::List(
+            items
+                .iter()
+                .map(|item| param_value(name, item, depth + 1))
+                .collect::<Result<_, _>>()?,
+        ),
+        PackValue::Map(entries) => Value::Map(
+            entries
+                .iter()
+                .map(|(k, v)| Ok((k.clone(), param_value(name, v, depth + 1)?)))
+                .collect::<Result<_, BoltError>>()?,
+        ),
         PackValue::Struct(_) => {
             return Err(BoltError::Invalid(format!(
                 "parameter {name:?} is a structure; structure parameters are not supported yet"
             )))
         }
-    }))
+    })
 }
 
 /// A decoded `PULL` or `DISCARD`: the same two fields.
@@ -229,6 +220,9 @@ fn tx_role_refusal() -> BoltError {
 pub struct QueryService {
     db: SharedDb,
     bookmark_timeout: Duration,
+    /// Set when the client's `RESET` arrives while a request is running; a
+    /// bookmark wait ends when it is set.
+    interrupt: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for QueryService {
@@ -247,7 +241,15 @@ impl QueryService {
         Self {
             db,
             bookmark_timeout: DEFAULT_BOOKMARK_TIMEOUT,
+            interrupt: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Makes bookmark waits end when `flag` is set (the connection's `RESET`
+    /// flag).
+    pub(crate) fn with_interrupt(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.interrupt = flag;
+        self
     }
 
     pub(crate) fn with_bookmark_timeout(mut self, timeout: Duration) -> Self {
@@ -319,12 +321,33 @@ impl QueryService {
         tx.execute(&request.query, &request.params()?)
     }
 
-    fn wait_for_bookmarks(&self, bookmarks: &[u64]) -> Result<(), BoltError> {
+    /// Opens a transaction: waits for the request's bookmarks, then freezes
+    /// the snapshot every statement of the transaction reads. Blocks while it
+    /// waits. A `mode: "r"` request gets a transaction that refuses writes.
+    pub fn begin(&self, request: &BeginRequest) -> Result<Box<dyn OpenTransaction>, BoltError> {
+        self.wait_for_bookmarks(&request.bookmarks)?;
+        let tx: Box<dyn OpenTransaction> = Box::new(self.db.begin_transaction());
+        Ok(if request.read_only {
+            Box::new(ReadOnlyTransaction::new(tx))
+        } else {
+            tx
+        })
+    }
+
+    /// Waits until the store has reached the highest of `bookmarks`: polls
+    /// every 10 ms, up to the bookmark timeout, and gives up early when the
+    /// client's `RESET` arrives.
+    pub(crate) fn wait_for_bookmarks(&self, bookmarks: &[u64]) -> Result<(), BoltError> {
         let Some(wanted) = bookmarks.iter().copied().max() else {
             return Ok(());
         };
         let deadline = Instant::now() + self.bookmark_timeout;
         loop {
+            if self.interrupt.load(Ordering::SeqCst) {
+                return Err(BoltError::Unavailable(
+                    "the wait for a bookmark was interrupted by RESET".into(),
+                ));
+            }
             if self.db.reader().version >= wanted {
                 return Ok(());
             }
@@ -343,6 +366,10 @@ impl QueryService {
 impl OpenTransaction for Transaction {
     fn rollback(self: Box<Self>) {
         (*self).rollback();
+    }
+
+    fn commit(self: Box<Self>) -> Result<u64, BoltError> {
+        Transaction::commit(*self).map_err(BoltError::from)
     }
 
     fn execute(
@@ -813,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn params_follow_the_http_rule_for_null() {
+    fn a_bolt_null_parameter_is_value_null_at_every_depth() {
         let req = RunRequest::from_fields(vec![
             PackValue::String("q".into()),
             PackValue::Map(vec![
@@ -836,14 +863,20 @@ mod tests {
         .unwrap();
         let params = req.params().unwrap();
         assert_eq!(params.get("kept"), Some(&Value::Int(1)));
-        assert!(!params.contains_key("top"));
-        assert!(
-            !params.contains_key("list"),
-            "a list holding null is left out whole"
+        assert_eq!(params.get("top"), Some(&Value::Null));
+        assert_eq!(
+            params.get("list"),
+            Some(&Value::List(vec![Value::Int(1), Value::Null]))
         );
         assert_eq!(
             params.get("map"),
-            Some(&Value::Map([("a".to_string(), Value::Int(1))].into()))
+            Some(&Value::Map(
+                [
+                    ("a".to_string(), Value::Int(1)),
+                    ("b".to_string(), Value::Null)
+                ]
+                .into()
+            ))
         );
     }
 }
