@@ -1236,7 +1236,7 @@ fn compile_pattern(
                 to_var: dest_name_for_path,
                 trail_var: None,
             }];
-            bind_path(ops, bound, path_var, start, hops);
+            bind_path(ops, bound, path_var, start, hops)?;
         }
         return Ok(());
     } else if let Some(key) = id_lookup(&pat.start.props) {
@@ -1348,25 +1348,33 @@ fn compile_pattern(
         from = to;
     }
     if let Some(path_var) = &pat.path_var {
-        bind_path(ops, bound, path_var, path_start, path_hops);
+        bind_path(ops, bound, path_var, path_start, path_hops)?;
     }
     Ok(())
 }
 
 /// Emit the `BindPath` op for a named path and put its name in scope.
+///
+/// A path name is a new variable: one already bound (an earlier path, a node
+/// or relationship of this or an earlier pattern, an alias) is an error, as
+/// openCypher has it, rather than a silent rebinding.
 fn bind_path(
     ops: &mut Vec<PlanOp>,
     bound: &mut BTreeSet<String>,
     path_var: &str,
     start_var: String,
     hops: Vec<PathHop>,
-) {
+) -> Result<(), String> {
+    if bound.contains(path_var) {
+        return Err(format!("variable `{path_var}` is already bound"));
+    }
     bound.insert(path_var.to_owned());
     ops.push(PlanOp::BindPath {
         path_var: path_var.to_owned(),
         start_var,
         hops,
     });
+    Ok(())
 }
 
 /// Compile one `OPTIONAL MATCH` clause into a `LeftOuterApply` op.

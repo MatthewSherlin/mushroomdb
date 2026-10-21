@@ -299,16 +299,16 @@ fn group_cap_err() -> String {
 ///
 /// `Int(n)` and `Float(n as f64)` produce the same `FloatBits` key so that
 /// nodes with `score = 1` (Int) and `score = 1.0` (Float) land in the same
-/// group, matching openCypher's `1 = 1.0` equality rule.
-///
-/// Note: integers whose magnitude exceeds 2^53 lose precision when cast to
-/// `f64`, so two large integers that differ only beyond the float mantissa
-/// width could be incorrectly unified. This is a known limitation documented
-/// in `docs/site/query.md`.
+/// group, matching openCypher's `1 = 1.0` equality rule, and the two zeros
+/// are one value. An `Int` that no `f64` holds exactly (beyond 2^53) keeps an
+/// exact key, so two such `Int`s that differ stay two groups, as `=` says.
 fn group_key_normalize(v: &Value) -> Option<ValueKey> {
     match v {
-        Value::Int(n) => Some(ValueKey::FloatBits((*n as f64).to_bits())),
-        Value::Float(f) => Some(ValueKey::FloatBits(f.to_bits())),
+        Value::Int(n) => Some(match exact_float(*n) {
+            Some(f) => ValueKey::FloatBits(float_key_bits(f)),
+            None => ValueKey::Int(*n),
+        }),
+        Value::Float(f) => Some(ValueKey::FloatBits(float_key_bits(*f))),
         // A list or map has no index key, but it is a real value: two
         // different ones must not share the null group. A path renders as a
         // map, so `RETURN DISTINCT p` and `count(p)` per group rely on this.
@@ -321,30 +321,54 @@ fn group_key_normalize(v: &Value) -> Option<ValueKey> {
     }
 }
 
+/// `n` as an `f64`, when the `f64` is exactly `n`.
+fn exact_float(n: i64) -> Option<f64> {
+    let f = n as f64;
+    (f as i128 == i128::from(n)).then_some(f)
+}
+
+/// The bit pattern two numbers that `=` finds equal share: `-0.0` is `0.0`.
+fn float_key_bits(f: f64) -> u64 {
+    if f == 0.0 {
+        0.0_f64.to_bits()
+    } else {
+        f.to_bits()
+    }
+}
+
 /// Marks a [`ValueKey::BinaryBytes`] that stands for a list or a map. A real
 /// binary value would have to begin with these exact bytes to share a group
 /// with one.
 const COMPOSITE_KEY_PREFIX: &[u8] = b"\xFFcomposite\x00";
 
-/// A canonical byte form of `v` for grouping: numbers unify as in
-/// [`group_key_normalize`] (`1` and `1.0` are one value, also inside a list),
-/// and every element is length-prefixed so two different values never encode
-/// alike.
+/// A canonical byte form of `v` for grouping, equal exactly when the scan's
+/// equality (`values_equal`) says two values are, recursively: numbers follow
+/// [`group_key_normalize`] (`2` and `2.0` meet, the zeros meet, `Int`s past
+/// 2^53 stay apart), a `DateTime` is its UTC instant whatever its offset, and
+/// a null is equal to a null (grouping, as openCypher has it). Every element
+/// is length-prefixed so two different values never encode alike.
 fn encode_composite_key(v: &Value, out: &mut Vec<u8>) {
+    let text = |out: &mut Vec<u8>, tag: u8, bytes: &[u8]| {
+        out.push(tag);
+        out.extend((bytes.len() as u64).to_le_bytes());
+        out.extend(bytes);
+    };
     match v {
-        Value::Int(n) => {
-            out.push(1);
-            out.extend((*n as f64).to_bits().to_le_bytes());
-        }
+        Value::Int(n) => match exact_float(*n) {
+            Some(f) => {
+                out.push(1);
+                out.extend(float_key_bits(f).to_le_bytes());
+            }
+            None => {
+                out.push(7);
+                out.extend(n.to_le_bytes());
+            }
+        },
         Value::Float(f) => {
             out.push(1);
-            out.extend(f.to_bits().to_le_bytes());
+            out.extend(float_key_bits(*f).to_le_bytes());
         }
-        Value::Str(text) => {
-            out.push(2);
-            out.extend((text.len() as u64).to_le_bytes());
-            out.extend(text.as_bytes());
-        }
+        Value::Str(s) => text(out, 2, s.as_bytes()),
         Value::Bool(b) => out.extend([3, u8::from(*b)]),
         Value::List(items) => {
             out.push(4);
@@ -363,14 +387,30 @@ fn encode_composite_key(v: &Value, out: &mut Vec<u8>) {
             }
         }
         Value::Null => out.push(0),
-        // Dates, durations and binaries: their derived debug text is
-        // deterministic and complete.
-        other => {
-            let text = format!("{other:?}");
-            out.push(6);
-            out.extend((text.len() as u64).to_le_bytes());
-            out.extend(text.as_bytes());
+        Value::Date(d) => {
+            out.push(8);
+            out.extend(d.to_le_bytes());
         }
+        Value::LocalDateTime(us) => {
+            out.push(9);
+            out.extend(us.to_le_bytes());
+        }
+        // The offset is display-only: one instant is one value.
+        Value::DateTime { micros_utc, .. } => {
+            out.push(10);
+            out.extend(micros_utc.to_le_bytes());
+        }
+        Value::Duration {
+            months,
+            days,
+            nanos,
+        } => {
+            out.push(11);
+            out.extend(months.to_le_bytes());
+            out.extend(days.to_le_bytes());
+            out.extend(nanos.to_le_bytes());
+        }
+        Value::Binary(bytes) => text(out, 12, bytes),
     }
 }
 

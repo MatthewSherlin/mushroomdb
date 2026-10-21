@@ -424,3 +424,135 @@ fn the_parser_records_the_path_name_on_the_pattern() {
     let two = parse_q("MATCH p = (a)-[:T]->(b), q = (b)-[:T]->(c) RETURN p");
     assert_eq!(two.matches[1].path_var.as_deref(), Some("q"));
 }
+
+// ── Fix round 1 ──────────────────────────────────────────────────────────────
+
+/// How many rows `RETURN DISTINCT x` keeps over `UNWIND <list> AS x`.
+fn distinct_count(list: &str) -> usize {
+    let q = format!("UNWIND {list} AS x RETURN DISTINCT x");
+    col(&Fx::new(), &q, "x").len()
+}
+
+/// The number of groups `RETURN x, count(*)` makes over `UNWIND <list> AS x`.
+fn group_count(list: &str) -> usize {
+    let q = format!("UNWIND {list} AS x RETURN x, count(*) AS n");
+    col(&Fx::new(), &q, "n").len()
+}
+
+#[test]
+fn nested_keys_follow_the_scans_equality() {
+    // [0] = [-0.0] is true in a scan.
+    assert_eq!(distinct_count("[[0], [-0.0]]"), 1);
+    assert_eq!(group_count("[[0], [-0.0]]"), 1);
+    // Past 2^53 two Ints differ whenever their values do.
+    assert_eq!(
+        distinct_count("[[9007199254740992], [9007199254740993]]"),
+        2
+    );
+    assert_eq!(group_count("[[9007199254740992], [9007199254740993]]"), 2);
+    // An Int and the Float it equals are one value, also in a map.
+    assert_eq!(distinct_count("[[2], [2.0]]"), 1);
+    assert_eq!(distinct_count("[{a: 2}, {a: 2.0}]"), 1);
+    // The same instant with another offset is the same DateTime.
+    assert_eq!(
+        distinct_count(
+            "[[datetime('2024-01-01T00:00:00Z')], [datetime('2024-01-01T01:00:00+01:00')]]"
+        ),
+        1
+    );
+    assert_eq!(
+        distinct_count(
+            "[[datetime('2024-01-01T00:00:00Z')], [datetime('2024-01-01T02:00:00+01:00')]]"
+        ),
+        2
+    );
+    // Nulls inside a list are equal to each other when grouping.
+    assert_eq!(distinct_count("[[1, null], [1, null], [2, null]]"), 2);
+    assert_eq!(group_count("[[1, null], [1, null]]"), 1);
+    // And a null is not a zero or a missing element.
+    assert_eq!(distinct_count("[[null], [0], []]"), 3);
+}
+
+#[test]
+fn top_level_keys_agree_with_nested_ones() {
+    assert_eq!(distinct_count("[0, -0.0]"), 1);
+    assert_eq!(distinct_count("[9007199254740992, 9007199254740993]"), 2);
+    assert_eq!(distinct_count("[2, 2.0]"), 1);
+    assert_eq!(group_count("[0, -0.0, 2, 2.0]"), 2);
+}
+
+#[test]
+fn a_path_name_is_a_new_variable() {
+    for q in [
+        "MATCH p = (a)-[:E]->(b) MATCH p = (b)-[:E]->(c) RETURN p",
+        "MATCH p = (a)-[:E]->(b), p = (b)-[:E]->(c) RETURN p",
+        "MATCH p = (p)-[:E]->(b) RETURN p",
+        "MATCH p = (a)-[p:E]->(b) RETURN p",
+        "MATCH p = (a)-[:E]->(p) RETURN p",
+        "MATCH (p) MATCH p = (p)-[:E]->(b) RETURN p",
+        "MATCH (a) OPTIONAL MATCH a = (a)-[:E]->(b) RETURN a",
+    ] {
+        let err = compile_err(q);
+        assert!(
+            err.contains("is already bound"),
+            "{q}: expected an already-bound error, got: {err}"
+        );
+    }
+    let err = compile_err("MATCH p = (a)-[:E]->(b) MATCH p = (b)-[:E]->(c) RETURN p");
+    assert!(err.contains("variable `p` is already bound"), "{err}");
+    // Reusing the name after a WITH that drops it is a new variable.
+    let fx = chain();
+    let q = "MATCH p = (a:Person {id: 'ada'})-[:KNOWS]->(b) WITH b \
+             MATCH p = (b)-[:KNOWS]->(c) RETURN p.nodes AS n";
+    assert_eq!(col(&fx, q, "n"), vec![Some(strs(&["bob", "cam"]))]);
+}
+
+#[test]
+fn bind_path_hides_a_node_the_mask_hides_on_its_own() {
+    // Every other mask test is also caught by the scan or the expansion. This
+    // one hands `BindPath` a row that already holds the hidden node.
+    use super::{exec_bind_path, Cell, VarTable};
+    use crate::cypher::plan::PathHop;
+    use crate::traverse::EdgeRef;
+    let fx = chain();
+    let id = |k: &str| fx.ids.get(k).unwrap();
+    let knows = fx.view().sym("KNOWS").unwrap();
+    let vars = VarTable {
+        names: ["a", "b", "r", "p"].map(String::from).to_vec(),
+    };
+    let row = vec![
+        Some(Cell::Node(id("ada"))),
+        Some(Cell::Node(id("bob"))),
+        Some(Cell::Rel(EdgeRef {
+            etype: knows,
+            src: id("ada"),
+            dst: id("bob"),
+        })),
+        None,
+    ];
+    let hops = [PathHop {
+        rel_var: "r".into(),
+        to_var: "b".into(),
+        trail_var: None,
+    }];
+    let only_ada: VisibleSet = [id("ada")].into_iter().collect();
+    let masked = GraphView {
+        mask: Some(&only_ada),
+        ..fx.view()
+    };
+    let rows = [row.clone()];
+    assert!(exec_bind_path(&masked, &vars, &rows, "p", "a", &hops)
+        .unwrap()
+        .is_empty());
+    let both: VisibleSet = [id("ada"), id("bob")].into_iter().collect();
+    let open = GraphView {
+        mask: Some(&both),
+        ..fx.view()
+    };
+    assert_eq!(
+        exec_bind_path(&open, &vars, &rows, "p", "a", &hops)
+            .unwrap()
+            .len(),
+        1
+    );
+}

@@ -4907,16 +4907,22 @@ surface (Rust, HTTP JSON, Python, TypeScript, Arrow, Bolt) as any other map:
 | `length` | the number of relationships |
 
 `p = (a)` is a path of one node with length 0. A path works in `RETURN`,
-`WITH`, `WHERE`, `ORDER BY`, `DISTINCT`, `count(p)` and `collect(p)`; it works
-in `OPTIONAL MATCH` (a pattern that finds nothing gives a null path) and with
-`shortestPath`: `MATCH p = shortestPath((a)-[:T*..5]->(b))`.
+`WITH`, `WHERE`, `ORDER BY`, `DISTINCT`, `count(p)` and `collect(p)`, and with
+`shortestPath`: `MATCH p = shortestPath((a)-[:T*..5]->(b))`. In `OPTIONAL
+MATCH` a named path works for fixed-length hops (a pattern that finds nothing
+gives a null path); an `OPTIONAL MATCH` with a variable-length hop is a
+separate limit that is not lifted here.
 
 - **Masks.** A path through a node the caller cannot see does not exist: the
   whole row is dropped, never returned with that node left out.
 - **Ordering.** `ORDER BY p` sorts paths as maps, which puts shorter paths first.
+- **A new name.** A path name that is already bound, by an earlier path, a node,
+  a relationship or an alias, is an error: ``variable `p` is already bound``.
 - **Not a node or a relationship.** `key(p)`, `labels(p)` and `type(p)` are
-  errors that name `p`. `SET n.x = p` is refused like any bare variable on the
-  right of `SET`.
+  errors that name `p`.
+- **Storing.** `SET x.r = p` is refused like any bare variable on the right of
+  `SET`. A path nested in a list or map (`SET x.r = [p]`) is an ordinary map and
+  is stored as one.
 - **Not supported.** Named paths in `CREATE` and `MERGE`, and `DELETE p`.
 - Relationship properties are not part of a path; match the relationship with
   its own variable to read them.

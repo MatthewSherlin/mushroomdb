@@ -243,3 +243,33 @@ fn a_named_path_in_a_write_match_binds_and_the_write_still_applies() {
     let got = rows(&db, "MATCH (n:Person) WHERE n.seen = 1 RETURN n.id AS id");
     assert_eq!(got, vec![vec![Some(Value::Str("bob".into()))]]);
 }
+
+#[test]
+fn a_path_wrapped_in_a_list_or_map_is_stored_as_an_ordinary_map() {
+    // Only a bare path is refused on the right of SET. A path inside a list
+    // or map literal is a map like any other and is stored as one.
+    let mut db = build_one_batch(&tmp("wrapped"));
+    db.query_write(
+        "MATCH p = (a:Person {id: 'ada'})-[:KNOWS]->(b) SET a.route = [p]",
+        &none(),
+    )
+    .unwrap();
+    let got = rows(&db, "MATCH (a:Person {id: 'ada'}) RETURN a.route AS r");
+    let Some(Value::List(items)) = &got[0][0] else {
+        panic!("a list: {:?}", got[0][0])
+    };
+    let Value::Map(stored) = &items[0] else {
+        panic!("a map: {:?}", items[0])
+    };
+    assert_eq!(stored["length"], Value::Int(1));
+    db.query_write(
+        "MATCH p = (a:Person {id: 'bob'})-[:KNOWS]->(b) SET a.route = {path: p}",
+        &none(),
+    )
+    .unwrap();
+    let got = rows(&db, "MATCH (a:Person {id: 'bob'}) RETURN a.route AS r");
+    let Some(Value::Map(outer)) = &got[0][0] else {
+        panic!("a map")
+    };
+    assert!(matches!(outer["path"], Value::Map(_)));
+}
