@@ -484,7 +484,7 @@ REMOVE n.score, n.nickname
 - Inside an interactive transaction `REMOVE` buffers like `SET`; with `RETURN`
   it is refused as `not supported in mushroomdb 0.10 inside a transaction`.
 
-### MATCH … SET n = {…} / SET n += {…}
+### `MATCH … SET n = {…}` / `SET n += {…}`
 
 ```cypher
 MATCH (n:Person) WHERE n.id = 'alice'
