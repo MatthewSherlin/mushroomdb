@@ -7278,4 +7278,56 @@ async fn http_write_with_null_param_follows_the_engine() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert!(
+        v["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("a property value cannot contain null")),
+        "{v}"
+    );
+}
+
+/// QL-17i: a null inside a map parameter now reaches the engine, so the map
+/// forms of SET follow openCypher: `+=` removes the key, `=` replaces every
+/// user property with the map's non-null entries. Before, HTTP dropped the
+/// null and the key stayed.
+#[tokio::test]
+async fn http_null_map_param_in_set_removes_the_key() {
+    let (app, _db) = open("http-null-param-set-map");
+    let (status, _) = query_with_params(
+        app.clone(),
+        "CREATE (n:NP {id: 'a', p: 1, y: 2})",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) SET n += $m",
+        json!({"m": {"y": null}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let (_, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) RETURN n.p AS p, n.y AS y",
+        json!({}),
+    )
+    .await;
+    assert_eq!(v["rows"], json!([[1, null]]), "+= with a null removes y");
+
+    let (status, v) = query_with_params(
+        app.clone(),
+        "MATCH (n:NP {id: 'a'}) SET n = $m",
+        json!({"m": {"z": null, "w": 1}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let (_, v) = query_with_params(
+        app,
+        "MATCH (n:NP {id: 'a'}) RETURN n.p AS p, n.w AS w",
+        json!({}),
+    )
+    .await;
+    assert_eq!(v["rows"], json!([[null, 1]]), "= replaces the properties");
 }

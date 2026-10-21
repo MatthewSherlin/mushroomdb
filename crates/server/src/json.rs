@@ -113,7 +113,7 @@ pub(crate) fn result_set_json(rs: &ResultSet) -> Js {
 
 /// Map JSON object values to query parameters. Scalars, arrays and objects are
 /// all accepted, and a JSON `null` binds as [`Value::Null`] at the top level and
-/// inside lists and maps, as a Bolt null does (QL-17i).
+/// inside lists and maps, matching Bolt (QL-17i).
 pub(crate) fn params_from_json(v: Option<&Js>) -> Result<BTreeMap<String, Value>, String> {
     let Some(v) = v else {
         return Ok(BTreeMap::new());

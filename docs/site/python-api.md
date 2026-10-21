@@ -490,7 +490,7 @@ this one call; these arguments are its per-call form.
 
 ```python
 def query_with_params(
-    self, cypher: str, params: Sequence[tuple[str, Scalar]]
+    self, cypher: str, params: Sequence[tuple[str, Scalar | None]]
 ) -> list[Row]
 ```
 

@@ -853,3 +853,14 @@ def test_query_params_none_binds_as_null(tmp_path):
     )
     assert rows == [{"n": 2, "ids": [1, None], "m": {"a": None}}]
     db.close()
+
+
+def test_query_null_map_param_in_set_removes_the_key(tmp_path):
+    """QL-17i: a None inside a dict parameter reaches SET, so `+=` removes the key."""
+    db = GraphDb.open(str(tmp_path / "db"))
+    db.insert_node("NP", "a", {"p": 1, "y": 2})
+    db.query_write("MATCH (n:NP) SET n += $m", {"m": {"y": None}})
+    assert db.query("MATCH (n:NP) RETURN n.p AS p, n.y AS y") == [{"p": 1, "y": None}]
+    db.query_write("MATCH (n:NP) SET n = $m", {"m": {"z": None, "w": 1}})
+    assert db.query("MATCH (n:NP) RETURN n.p AS p, n.w AS w") == [{"p": None, "w": 1}]
+    db.close()

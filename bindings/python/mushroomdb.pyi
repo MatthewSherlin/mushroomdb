@@ -507,7 +507,7 @@ class GraphDb:
         """
 
     def query_with_params(
-        self, cypher: str, params: Sequence[tuple[str, Scalar]]
+        self, cypher: str, params: Sequence[tuple[str, Scalar | None]]
     ) -> list[Row]:
         """Back-compat alias for `query(cypher, params=[...])` with a tuple list.
 
