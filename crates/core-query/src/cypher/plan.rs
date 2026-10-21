@@ -1390,22 +1390,28 @@ fn fresh(prefix: &str, counter: &mut u32, bound: &BTreeSet<String>) -> String {
 }
 
 fn check_expr_bound(expr: &Expr, bound: &BTreeSet<String>) -> Result<(), String> {
+    check_expr_bound_in(expr, bound, "WHERE")
+}
+
+/// [`check_expr_bound`] for a predicate in `clause` (a predicate used as a
+/// value names the clause it sits in).
+fn check_expr_bound_in(expr: &Expr, bound: &BTreeSet<String>, clause: &str) -> Result<(), String> {
     match expr {
-        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
-            check_expr_bound(lhs, bound)?;
-            check_expr_bound(rhs, bound)
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) | Expr::Xor(lhs, rhs) => {
+            check_expr_bound_in(lhs, bound, clause)?;
+            check_expr_bound_in(rhs, bound, clause)
         }
-        Expr::Not(inner) => check_expr_bound(inner, bound),
+        Expr::Not(inner) => check_expr_bound_in(inner, bound, clause),
         Expr::Cmp { lhs, rhs, .. } => {
-            check_operand_bound(lhs, bound, "WHERE")?;
-            check_operand_bound(rhs, bound, "WHERE")
+            check_operand_bound(lhs, bound, clause)?;
+            check_operand_bound(rhs, bound, clause)
         }
-        Expr::Truthy(op) => check_operand_bound(op, bound, "WHERE"),
-        Expr::IsNull(op) | Expr::IsNotNull(op) => check_operand_bound(op, bound, "WHERE"),
+        Expr::Truthy(op) => check_operand_bound(op, bound, clause),
+        Expr::IsNull(op) | Expr::IsNotNull(op) => check_operand_bound(op, bound, clause),
         Expr::In { expr, list } => {
-            check_operand_bound(expr, bound, "WHERE")?;
+            check_operand_bound(expr, bound, clause)?;
             for item in list {
-                check_operand_bound(item, bound, "WHERE")?;
+                check_operand_bound(item, bound, clause)?;
             }
             Ok(())
         }
@@ -1488,6 +1494,7 @@ fn check_operand_bound(
             }
             Ok(())
         }
+        Operand::Pred(expr) => check_expr_bound_in(expr, bound, clause),
     }
 }
 
@@ -1746,6 +1753,7 @@ fn inline_aliases(op: &Operand, returns: &[RetItem]) -> Operand {
                 .collect(),
             default: default.as_ref().map(|d| Box::new(go(d))),
         },
+        Operand::Pred(expr) => Operand::Pred(Box::new(inline_aliases_expr(expr, returns))),
     }
 }
 
@@ -1757,6 +1765,10 @@ fn inline_aliases_expr(expr: &Expr, returns: &[RetItem]) -> Expr {
             Box::new(inline_aliases_expr(r, returns)),
         ),
         Expr::Or(l, r) => Expr::Or(
+            Box::new(inline_aliases_expr(l, returns)),
+            Box::new(inline_aliases_expr(r, returns)),
+        ),
+        Expr::Xor(l, r) => Expr::Xor(
             Box::new(inline_aliases_expr(l, returns)),
             Box::new(inline_aliases_expr(r, returns)),
         ),

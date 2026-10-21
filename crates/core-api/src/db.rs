@@ -1060,7 +1060,30 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
             operand_node_vars(init, out);
             operand_node_vars(list, out);
         }
+        Operand::Pred(expr) => expr_node_vars(expr, out),
         Operand::Lit(_) | Operand::Param(_) => {}
+    }
+}
+
+/// [`operand_node_vars`] for every operand of a predicate.
+fn expr_node_vars(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
+            expr_node_vars(a, out);
+            expr_node_vars(b, out);
+        }
+        Expr::Not(e) => expr_node_vars(e, out),
+        Expr::Cmp { lhs, rhs, .. } => {
+            operand_node_vars(lhs, out);
+            operand_node_vars(rhs, out);
+        }
+        Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_node_vars(o, out),
+        Expr::In { expr, list } => {
+            operand_node_vars(expr, out);
+            for o in list {
+                operand_node_vars(o, out);
+            }
+        }
     }
 }
 
@@ -1149,7 +1172,7 @@ const REDUCE_IN_WRITE_RETURN: &str =
 /// or `reduce()`) found in an expression, if any.
 fn expr_write_return_refusal(expr: &Expr) -> Option<&'static str> {
     match expr {
-        Expr::And(a, b) | Expr::Or(a, b) => {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
             expr_write_return_refusal(a).or_else(|| expr_write_return_refusal(b))
         }
         Expr::Not(e) => expr_write_return_refusal(e),
@@ -1183,6 +1206,7 @@ fn operand_write_return_refusal(op: &Operand) -> Option<&'static str> {
                 expr_write_return_refusal(c).or_else(|| operand_write_return_refusal(v))
             })
             .or_else(|| default.as_deref().and_then(operand_write_return_refusal)),
+        Operand::Pred(expr) => expr_write_return_refusal(expr),
         Operand::Prop { .. } | Operand::Lit(_) | Operand::Param(_) | Operand::Var(_) => None,
     }
 }
@@ -1285,6 +1309,16 @@ fn eval_set_return_operand<F: Fs>(
             }
             Ok(Some(Value::Map(out)))
         }
+        Operand::Pred(expr) => {
+            let value = core_query::cypher::eval_predicate(
+                expr,
+                &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
+                &|| GraphError::QueryError {
+                    detail: "expression nesting too deep".into(),
+                },
+            )?;
+            Ok(value.map(Value::Bool))
+        }
     }
 }
 
@@ -1332,6 +1366,17 @@ fn eval_set_return_expr<F: Fs>(
             let l = eval_set_return_expr(db, match_rs, row, rel_vars, lhs, params, depth + 1)?;
             let r = eval_set_return_expr(db, match_rs, row, rel_vars, rhs, params, depth + 1)?;
             Ok(l || r)
+        }
+        // Three-valued, as in a read query's WHERE: a null side drops the row.
+        Expr::Xor(..) => {
+            let value = core_query::cypher::eval_predicate(
+                expr,
+                &mut |o| eval_set_return_operand(db, match_rs, row, rel_vars, o, params),
+                &|| GraphError::QueryError {
+                    detail: "expression nesting too deep".into(),
+                },
+            )?;
+            Ok(value == Some(true))
         }
         Expr::Not(inner) => Ok(!eval_set_return_expr(
             db,

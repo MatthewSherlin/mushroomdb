@@ -7125,6 +7125,29 @@ async fn query_json_renders_a_null_list_element_as_null() {
     assert_eq!(v["rows"], json!([[[1, null], {"a": null}, null]]));
 }
 
+// ── QL-BX: a predicate is a value in a projection ──────────────────────────
+
+#[tokio::test]
+async fn query_json_returns_a_predicate_as_a_boolean_or_null() {
+    let (app, _db) = open("query-predicate-value");
+    let (status, body, _) = send(
+        app,
+        json_req(
+            "POST",
+            "/query?format=json",
+            json!({
+                "cypher": "RETURN $p IS NULL AS a, $p > 1 AS b, NOT (null = 1) AS c, [x IN [1, 2] | x > 1] AS d",
+                "params": {"p": 5}
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let v = parse_json(&body);
+    assert_eq!(v["columns"], json!(["a", "b", "c", "d"]));
+    assert_eq!(v["rows"], json!([[false, true, null, [false, true]]]));
+}
+
 // ── The `id` property mirrors the key (ledger row 128) ──────────────────────
 
 #[tokio::test]

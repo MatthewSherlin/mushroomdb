@@ -176,6 +176,8 @@ pub struct RelPat {
 pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
+    /// `a XOR b`: true when exactly one side is true.
+    Xor(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     Cmp {
         lhs: Operand,
@@ -284,6 +286,13 @@ pub enum Operand {
         branches: Vec<(Expr, Operand)>,
         default: Option<Box<Operand>>,
     },
+    /// A predicate in a value position: `RETURN n.age > 18 AS adult`,
+    /// `[x IN l | x > 1]`, `SET n.flag = NOT n.done`. Evaluates three-valued
+    /// to `Bool(true)`, `Bool(false)` or null: a comparison or `IN` with a
+    /// null side is null, `NOT null` is null, `null AND false` is false and
+    /// `null OR true` is true. A WHERE never holds one at its top: the parser
+    /// unwraps it to the `Expr` itself, which WHERE evaluates as before.
+    Pred(Box<Expr>),
 }
 
 /// The column name an operand gets in a RETURN or WITH item that has no
@@ -312,6 +321,7 @@ pub fn operand_label(op: &Operand) -> String {
         Operand::MapLit(_) => "<map>".to_string(),
         Operand::ListComprehension { .. } => "<listcomp>".to_string(),
         Operand::Reduce { .. } => "<reduce>".to_string(),
+        Operand::Pred(_) => "<pred>".to_string(),
         Operand::Index { base, index } => {
             format!("{}[{}]", operand_label(base), subscript_label(index))
         }

@@ -390,6 +390,7 @@ pub(super) fn map_leaves(
                 body: Box::new(map_leaves(body, &mut inner)),
             }
         }
+        Operand::Pred(expr) => Operand::Pred(Box::new(map_expr(expr, leaf))),
     }
 }
 
@@ -416,6 +417,7 @@ fn map_expr(expr: &Expr, leaf: &mut dyn FnMut(&Operand) -> Option<Operand>) -> E
     match expr {
         Expr::And(a, b) => Expr::And(Box::new(map_expr(a, leaf)), Box::new(map_expr(b, leaf))),
         Expr::Or(a, b) => Expr::Or(Box::new(map_expr(a, leaf)), Box::new(map_expr(b, leaf))),
+        Expr::Xor(a, b) => Expr::Xor(Box::new(map_expr(a, leaf)), Box::new(map_expr(b, leaf))),
         Expr::Not(a) => Expr::Not(Box::new(map_expr(a, leaf))),
         Expr::Cmp { lhs, op, rhs } => Expr::Cmp {
             lhs: map_leaves(lhs, leaf),

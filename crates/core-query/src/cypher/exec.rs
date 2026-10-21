@@ -1037,6 +1037,10 @@ fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<St
             collect_operand(list, names, seen);
             collect_operand(body, names, seen);
         }
+        Operand::Pred(expr) => {
+            // Depth is bounded by the parser's nesting limit.
+            let _ = collect_expr(expr, names, seen, 0);
+        }
         _ => {}
     }
 }
@@ -1051,7 +1055,7 @@ fn collect_expr(
         return Err("expression nesting too deep".into());
     }
     match expr {
-        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) | Expr::Xor(lhs, rhs) => {
             collect_expr(lhs, names, seen, depth + 1)?;
             collect_expr(rhs, names, seen, depth + 1)
         }
@@ -1368,6 +1372,7 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
             intern_operand(vars, list);
             intern_operand(vars, body);
         }
+        Operand::Pred(expr) => intern_expr(vars, expr),
     }
 }
 
@@ -1397,7 +1402,7 @@ fn agg_arg_label(arg: &AggArg) -> String {
 
 fn intern_expr(vars: &mut VarTable, expr: &Expr) {
     match expr {
-        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) | Expr::Xor(lhs, rhs) => {
             intern_expr(vars, lhs);
             intern_expr(vars, rhs);
         }
@@ -2678,12 +2683,13 @@ fn intern_local_vars(vars: &mut VarTable, operand: &Operand) {
             intern_local_vars(vars, list);
             intern_local_vars(vars, body);
         }
+        Operand::Pred(expr) => intern_local_vars_expr(vars, expr),
     }
 }
 
 fn intern_local_vars_expr(vars: &mut VarTable, expr: &Expr) {
     match expr {
-        Expr::And(a, b) | Expr::Or(a, b) => {
+        Expr::And(a, b) | Expr::Or(a, b) | Expr::Xor(a, b) => {
             intern_local_vars_expr(vars, a);
             intern_local_vars_expr(vars, b);
         }
@@ -2836,6 +2842,14 @@ fn resolve_operand(
                 Some(d) => resolve_operand(view, vars, row, d, params),
                 None => Ok(None),
             }
+        }
+        Operand::Pred(expr) => {
+            let value = super::predicate::eval_predicate(
+                expr,
+                &mut |op| resolve_operand(view, vars, row, op, params),
+                &|| "expression nesting too deep".to_string(),
+            )?;
+            Ok(value.map(Value::Bool))
         }
         Operand::BinArith { op, left, right } => {
             use super::ast::ArithOp;
@@ -5010,6 +5024,16 @@ fn eval_expr(
             let r = eval_expr(view, vars, row, rhs, params, depth + 1)?;
             Ok(l || r)
         }
+        // New with QL-BX, so it has no two-valued past to keep: a null side
+        // makes it null, which drops the row.
+        Expr::Xor(..) => {
+            let value = super::predicate::eval_predicate(
+                expr,
+                &mut |op| resolve_operand(view, vars, row, op, params),
+                &|| "expression nesting too deep".to_string(),
+            )?;
+            Ok(value == Some(true))
+        }
         Expr::Not(inner) => Ok(!eval_expr(view, vars, row, inner, params, depth + 1)?),
         Expr::Cmp { lhs, op, rhs } => {
             let l = resolve_operand(view, vars, row, lhs, params)?;
@@ -5347,6 +5371,10 @@ mod ql_14;
 mod ql_15;
 
 #[cfg(test)]
+#[path = "tests/ql_bx.rs"]
+mod ql_bx;
+
+#[cfg(test)]
 mod tests {
     use super::{execute, resolve_operand, Params, Row, VarTable};
     use crate::cypher::ast::{
@@ -5415,7 +5443,7 @@ mod tests {
             }
         }
 
-        fn view_indexed<'a>(
+        pub(super) fn view_indexed<'a>(
             &'a self,
             index: &'a core_storage::property_index::PropertyIndex,
         ) -> GraphView<'a> {

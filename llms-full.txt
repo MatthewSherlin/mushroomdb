@@ -5547,6 +5547,46 @@ MATCH (c:Company) WHERE NOT c.name CONTAINS 'Design' RETURN c.name
 
 `STARTS` or `ENDS` without its `WITH` is a named parse error.
 
+### Comparisons and boolean operators
+
+A comparison (`=`, `<>`, `<`, `<=`, `>`, `>=`), `IS NULL`, `IS NOT NULL`, `IN`,
+`STARTS WITH`, `ENDS WITH`, `CONTAINS`, `NOT`, `AND`, `OR` and `XOR` work in every
+expression position, not only in `WHERE`: `RETURN` and `WITH` items, `ORDER BY`
+keys, list and map elements, a list comprehension's filter and projection, a
+`reduce` body, function arguments, `CASE` branches, `SET` values, the property
+values of a per-row `CREATE` or `MERGE` after `UNWIND`, and an `UNWIND` source.
+
+```cypher
+MATCH (n:Person) RETURN n.name, n.age >= 18 AS adult
+MATCH (n:Person) WITH n, n.score > 10 AS high WHERE high RETURN n.name
+RETURN [x IN [1, 2, 3] | x > 1] AS flags, $p IS NULL AS missing
+MATCH (n:Task) SET n.late = n.due < $today AND NOT n.done
+```
+
+Precedence, loosest first: `OR`, `XOR`, `AND`, `NOT`, comparison, then `IN`,
+`STARTS WITH`, `ENDS WITH`, `CONTAINS`, `IS [NOT] NULL`, then `+ -`, `* / %`, `^`,
+unary minus and subscripts. So `NOT a = b` is `NOT (a = b)`, `a OR b AND c` is
+`a OR (b AND c)` and `1 + 2 > 2 AND true` is true. Parentheses group either kind
+of expression: `(n.age + 1) > 18`, `(a OR b) AND c`. One comparison per operand
+pair: `a < b < c` is a parse error.
+
+As a value a predicate is three-valued: true, false or null. A comparison or `IN`
+with a null side is null (`RETURN null > 1` is null, `1 IN [2, null]` is null);
+`NOT null` is null; `null AND false` is false and `null OR true` is true;
+`null XOR x` is null. `IS NULL` and `IS NOT NULL` are never null. Values that
+do not order (`1 < 'a'`) compare as null; values of different types are unequal
+(`1 = 'a'` is false). A non-boolean operand of `NOT`, `AND`, `OR` or `XOR` reads
+as it does in `WHERE` (a non-empty string or list, or a non-zero number, is true).
+
+`WHERE` keeps the row only when its predicate is true, so a null drops the row.
+It evaluates `NOT`, `AND` and `OR` as it always has, reading a null comparison as
+false at each step: `WHERE NOT n.missing = 1` keeps the row, while
+`RETURN NOT n.missing = 1` returns null. `XOR` is three-valued in `WHERE` too. A
+predicate used as a value is never turned into an index lookup; only a `WHERE`
+predicate is. `SET n.flag = n.score > 10` stores a boolean; a predicate that is
+null is the existing `SET value for n.flag evaluated to null` error. An unaliased
+predicate column is named `<expr>`.
+
 ### List subscripts
 
 A subscript reads one element of a list-valued property or expression. A
@@ -5603,7 +5643,8 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `WHERE =, <>, <, >, <=, >=` | `WHERE n.age > 18` |
 | `WHERE n.prop IN [a, b]` / `IN $list` | `WHERE n.city IN ['Austin', $c]`; `$cities` is `Value::List` |
 | `RETURN DISTINCT` | `RETURN DISTINCT n.city` — hashed after Project; numeric Int/Float unify like grouping; cap 1,000,000 distinct rows |
-| `WHERE AND / OR` | `WHERE n.a = 1 AND n.b = 2` |
+| `WHERE AND / OR / XOR` | `WHERE n.a = 1 AND n.b = 2`, `WHERE n.a XOR n.b` |
+| Comparisons and boolean operators as values | `RETURN n.age >= 18 AS adult`, `[x IN l \| x > 1]`, `SET n.flag = n.score > 10`, `coalesce(n.a IS NULL, false)`, `CASE WHEN … THEN n.a > 1 END` — every expression position; three-valued (`RETURN null > 1` is null, `NOT null` is null, `null IS NULL` is true); see [Comparisons and boolean operators](#comparisons-and-boolean-operators) |
 | `ORDER BY prop ASC / DESC` | `ORDER BY n.name DESC` |
 | `SKIP n LIMIT n` | `SKIP 10 LIMIT 5` |
 | `$param` in WHERE | `WHERE n.age > $min` |
@@ -5705,6 +5746,8 @@ unexpected-token parse error or other unspecified result.
 | Form |
 |---|
 | Pattern comprehension `[(n)-[r]->(m) | m.prop]` |
+| Chained comparisons `a < b < c` (a parse error) |
+| Regular-expression match `=~` |
 | `EXISTS { … }` subquery predicate |
 | `CALL` procedure invocations |
 | Schema operations (`CREATE INDEX`, `CREATE CONSTRAINT`) |
@@ -5717,7 +5760,7 @@ unexpected-token parse error or other unspecified result.
 |---|---|
 | Multi-statement transactions | Supported — BEGIN … COMMIT through `SharedDb::begin_transaction` (Bolt BEGIN/COMMIT lands with TX-12); snapshot isolation, one atomic commit; some write forms are refused inside a transaction (see REMOVE, SET maps, UNWIND above) |
 | Combined MATCH … SET … RETURN | Supported — write commits, then RETURN projects from post-write state |
-| SET RHS expressions | Literals, `$param` references, and arithmetic expressions (`n.x + 1`, `n.score * 1.5`); bare property-to-property copy (`SET n.x = m.y`) is a named error |
+| SET RHS expressions | Literals, `$param` references, arithmetic expressions (`n.x + 1`, `n.score * 1.5`) and predicates (`n.score > 10`, `NOT n.done`); bare property-to-property copy (`SET n.x = m.y`) is a named error |
 | MATCH … DETACH DELETE (node) | Supported — removes node + all edges |
 | Bare DELETE on node with edges | Error — use DETACH DELETE |
 | MERGE ON CREATE / ON MATCH | Supported in the same MERGE / write batch |
