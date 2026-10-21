@@ -245,6 +245,34 @@ pub enum Operand {
     /// `Value::List`; an element that evaluates to null is an error because
     /// `Value` has no null variant.
     ListLit(Vec<Operand>),
+    /// List comprehension: `[x IN list WHERE pred | expr]`.
+    ///
+    /// `var` is bound to each element of `list` inside `filter` and `map`
+    /// only; it shadows an outer variable of the same name there. A null
+    /// `list` (or a non-list) yields null. An element for which `filter` is
+    /// false or null is dropped. `map` is `Operand::Var(var)` when the source
+    /// has no `| expr` part. A null mapped value stays in the list as null.
+    ListComprehension {
+        var: String,
+        list: Box<Operand>,
+        filter: Option<Box<Expr>>,
+        map: Box<Operand>,
+    },
+    /// `reduce(acc = init, x IN list | body)`.
+    ///
+    /// `init` and `list` are evaluated in the enclosing scope; `acc_var` and
+    /// `iter_var` are bound inside `body` only and shadow outer names there.
+    /// Each element of `list` is bound to `iter_var`, the accumulator to
+    /// `acc_var`, and the value of `body` becomes the next accumulator. A null
+    /// or non-list `list` yields null; a null `body` value makes the
+    /// accumulator null for the next step.
+    Reduce {
+        acc_var: String,
+        init: Box<Operand>,
+        iter_var: String,
+        list: Box<Operand>,
+        body: Box<Operand>,
+    },
     /// Map literal with at least one non-constant value: `{k: n.x}`. Keys are
     /// unique (a duplicate is a parse error). All-constant maps fold to
     /// `Operand::Lit(Value::Map(..))`. Evaluates to `Value::Map`.
@@ -282,6 +310,8 @@ pub fn operand_label(op: &Operand) -> String {
         Operand::Case { .. } => "<case>".to_string(),
         Operand::ListLit(_) => "<list>".to_string(),
         Operand::MapLit(_) => "<map>".to_string(),
+        Operand::ListComprehension { .. } => "<listcomp>".to_string(),
+        Operand::Reduce { .. } => "<reduce>".to_string(),
         Operand::Index { base, index } => {
             format!("{}[{}]", operand_label(base), subscript_label(index))
         }
@@ -363,12 +393,14 @@ pub struct RetItem {
 }
 
 /// ORDER BY target. Bare identifiers that match a RETURN alias become `Alias`;
-/// otherwise they stay `Var`. `var.field` is always `Prop`.
+/// otherwise they stay `Var`. `var.field` is always `Prop`. Anything else — an
+/// arithmetic expression, a function call, a subscript, a `CASE` — is `Expr`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderTarget {
     Alias(String),
     Var(String),
     Prop { var: String, field: String },
+    Expr(Operand),
 }
 
 #[derive(Debug, Clone, PartialEq)]

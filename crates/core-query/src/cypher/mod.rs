@@ -3,6 +3,7 @@ pub mod exec;
 pub mod lexer;
 pub mod parser;
 pub mod plan;
+mod temporal;
 
 pub use ast::{
     operand_label, ret_val_label, AggArg, AggFunc, CreateEdge, CreateNode, CreateStmt, EdgeDelete,

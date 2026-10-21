@@ -924,6 +924,11 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
                 operand_node_vars(value, out);
             }
         }
+        Operand::ListComprehension { list, .. } => operand_node_vars(list, out),
+        Operand::Reduce { init, list, .. } => {
+            operand_node_vars(init, out);
+            operand_node_vars(list, out);
+        }
         Operand::Lit(_) | Operand::Param(_) => {}
     }
 }
@@ -997,6 +1002,66 @@ fn ret_column_name(item: &RetItem) -> String {
     // An aggregate is not legal in a write-statement RETURN; it keeps the
     // placeholder it always had.
     ret_val_label(&item.value).unwrap_or_else(|| "<agg>".to_string())
+}
+
+/// The refusal for a list comprehension in a write statement's RETURN.
+const COMPREHENSION_IN_WRITE_RETURN: &str =
+    "a list comprehension is not supported in the RETURN of a write statement; \
+     compute it in a read query, or RETURN the list and filter it afterwards";
+
+/// The refusal for `reduce()` in a write statement's RETURN.
+const REDUCE_IN_WRITE_RETURN: &str =
+    "reduce() is not supported in the RETURN of a write statement; \
+     compute it in a read query, or RETURN the list and fold it afterwards";
+
+/// The refusal for the first scoped-variable construct (a list comprehension
+/// or `reduce()`) found in an expression, if any.
+fn expr_write_return_refusal(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            expr_write_return_refusal(a).or_else(|| expr_write_return_refusal(b))
+        }
+        Expr::Not(e) => expr_write_return_refusal(e),
+        Expr::Cmp { lhs, rhs, .. } => {
+            operand_write_return_refusal(lhs).or_else(|| operand_write_return_refusal(rhs))
+        }
+        Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_write_return_refusal(o),
+        Expr::In { expr, list } => operand_write_return_refusal(expr)
+            .or_else(|| list.iter().find_map(operand_write_return_refusal)),
+    }
+}
+
+fn operand_write_return_refusal(op: &Operand) -> Option<&'static str> {
+    match op {
+        Operand::ListComprehension { .. } => Some(COMPREHENSION_IN_WRITE_RETURN),
+        Operand::Reduce { .. } => Some(REDUCE_IN_WRITE_RETURN),
+        Operand::FuncCall { args, .. } => args.iter().find_map(operand_write_return_refusal),
+        Operand::BinArith { left, right, .. } => {
+            operand_write_return_refusal(left).or_else(|| operand_write_return_refusal(right))
+        }
+        Operand::Index { base, index } => {
+            operand_write_return_refusal(base).or_else(|| operand_write_return_refusal(index))
+        }
+        Operand::ListLit(items) => items.iter().find_map(operand_write_return_refusal),
+        Operand::MapLit(entries) => entries
+            .iter()
+            .find_map(|(_, v)| operand_write_return_refusal(v)),
+        Operand::Case { branches, default } => branches
+            .iter()
+            .find_map(|(c, v)| {
+                expr_write_return_refusal(c).or_else(|| operand_write_return_refusal(v))
+            })
+            .or_else(|| default.as_deref().and_then(operand_write_return_refusal)),
+        Operand::Prop { .. } | Operand::Lit(_) | Operand::Param(_) | Operand::Var(_) => None,
+    }
+}
+
+fn returns_write_return_refusal(returns: &[RetItem]) -> Option<&'static str> {
+    returns.iter().find_map(|item| match &item.value {
+        RetVal::FuncCall { args, .. } => args.iter().find_map(operand_write_return_refusal),
+        RetVal::ScalarExpr(op) => operand_write_return_refusal(op),
+        _ => None,
+    })
 }
 
 fn eval_set_return_operand<F: Fs>(
@@ -1073,6 +1138,14 @@ fn eval_set_return_operand<F: Fs>(
             }
             Ok(Some(Value::List(out)))
         }
+        // Refused by name before the write commits (`exec_match_set`); this
+        // arm is only a backstop and never sees a comprehension.
+        Operand::ListComprehension { .. } => Err(GraphError::QueryError {
+            detail: COMPREHENSION_IN_WRITE_RETURN.into(),
+        }),
+        Operand::Reduce { .. } => Err(GraphError::QueryError {
+            detail: REDUCE_IN_WRITE_RETURN.into(),
+        }),
         Operand::MapLit(entries) => {
             let mut out = BTreeMap::new();
             for (key, value) in entries {
@@ -1234,6 +1307,11 @@ fn eval_set_return_arith(
             Ok(Some(Value::Int(result)))
         }
         (Some(lv), Some(rv)) => {
+            if matches!(op, ArithOp::Add) {
+                if let Some(joined) = core_query::value_ops::plus_non_numeric(&lv, &rv) {
+                    return Ok(Some(joined));
+                }
+            }
             let a = match &lv {
                 Value::Float(f) => *f,
                 Value::Int(i) => *i as f64,
@@ -12800,6 +12878,16 @@ impl<F: Fs> GraphDb<F> {
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
         let project_returns = stmt.returns.clone();
+        // Refused before anything is written: the projection runs after the
+        // commit, and must not fail (or differ) once the write has happened.
+        if let Some(detail) = project_returns
+            .as_deref()
+            .and_then(returns_write_return_refusal)
+        {
+            return Err(GraphError::QueryError {
+                detail: detail.into(),
+            });
+        }
         // Collect unique node vars targeted by SET clauses, plus RETURN bindings
         // so the post-write projection can look them up by key.
         let mut set_vars: Vec<String> = Vec::new();

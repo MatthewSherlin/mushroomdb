@@ -5044,6 +5044,22 @@ SKIP 10
 LIMIT 5
 ```
 
+A sort key is any expression over the variables in scope, not only a column the
+`RETURN` projects: a property, arithmetic, a function call, a subscript or a
+`CASE`, and a projected alias may appear inside it.
+
+```cypher
+MATCH (n:Person)
+RETURN n.name
+ORDER BY n.score DESC, toLower(n.name)
+LIMIT 3
+```
+
+Each key takes its own `ASC` (the default) or `DESC`. Null is the largest value, so
+nulls sort last ascending and first descending. `RETURN DISTINCT` and a `RETURN` with an aggregate sort only what
+they project; any other key is the error `ORDER BY over a non-projected
+expression is not allowed with DISTINCT/aggregation`.
+
 ---
 
 ## Write statements
@@ -5258,6 +5274,39 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `key(n)` | node variable | `String` | always the id-map key. Non-node argument is a named error |
 | `id(n)` | node variable | `String` | alias of `key(n)` (always the id-map key). `n.id` is stored-wins property access |
 | `labels(n)` | node variable | `List` | a one-element list holding the node's label; `n.label` reads it as a scalar |
+| `date([x])` | `String` or `Map` | `Date` | `date("2024-03-15")`, `date({year: 2024, month: 3, day: 15})`; no argument is today (UTC). A `LocalDateTime` or `DateTime` argument is cut to its date. Null, invalid or wrong-type input → null. A result cannot be stored until the V11 format ships |
+| `localdatetime([x])` | `String` or `Map` | `LocalDateTime` | `localdatetime("2024-03-15T10:30:00")`; no argument is now (UTC wall clock). Null, invalid or wrong-type input → null. A result cannot be stored until the V11 format ships |
+| `datetime([x])` | `String` or `Map` | `DateTime` | `datetime("2024-03-15T10:30:00+05:30")`; the offset is kept (within ±18:00), a string with no offset is read as UTC; no argument is now. Null, invalid or wrong-type input → null. A result cannot be stored until the V11 format ships |
+| `duration(x)` | `String` or `Map` | `Duration` | `duration({days: 3, hours: 2})` (keys `years`, `months`, `weeks`, `days`, `hours`, `minutes`, `seconds`, `milliseconds`, `microseconds`, `nanoseconds`) or `duration("P1Y2M3DT4H")`. Null, invalid, unknown key or wrong-type input → null. A result cannot be stored until the V11 format ships |
+| `time(…)`, `localtime(…)` | | | error: `not supported in mushroomdb 0.10: time types` |
+
+### Temporal values
+
+A query can build and return `Date`, `LocalDateTime`, `DateTime` and `Duration`
+values with the functions above, and `toString` gives their ISO 8601 text. They
+compare with `=`, `<`, `<=`, `>`, `>=` within their own type (a `DateTime` by
+instant; a `Date` never equals a `LocalDateTime`), and they sort in `ORDER BY`.
+Durations compare for equality only, component by component: a month is not 30
+days.
+
+`+` and `-` between a date or date-time and a duration move it, months first
+(a day past the end of a shorter month lands on its last day); a `Date` ignores
+the duration's time part. Durations add, subtract, and scale with `*` and `/` by
+a number. An out-of-range result is null.
+
+Strings must be the extended ISO 8601 form the types print: `datetime` needs a
+time (`datetime("2024-03-15")` is null) and `date` takes no time
+(`date("2024-03-15T10:00:00")` is null; convert with `date(datetime(…))`).
+Compact forms (`20240315`) and named time zones (`[Europe/Paris]`, or a `timezone`
+key in a map) are not supported and give null. A map constructor takes
+`year` (required), `month`, `day`, and, for `localdatetime` and `datetime`,
+`hour`, `minute`, `second`, `millisecond`, `microsecond` and `nanosecond`, all
+integers; a `datetime` map is read as UTC. Years outside about ±5.88 million for
+`Date`, and ±292 thousand for date-times, give null.
+
+Until the V11 format ships, a temporal value cannot be stored: `SET n.d =
+date("2024-01-01")` is refused with a `not supported in mushroomdb 0.10 yet`
+error naming the type.
 
 Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
 row's value into a list, per group when grouping keys are present). `count` and
@@ -5382,8 +5431,10 @@ rejected with a clear, actionable message; **Absent** = not implemented (not tes
 | `null` literal (any case) | `RETURN null AS v`, `WHERE null IS NULL` — evaluates to null; `null = null` is null, so a WHERE drops the row. `null` is reserved like `true` / `false`; `n.null` and a backtick-quoted `` `null` `` key are still names |
 | List and map literals | `RETURN [1, n.x, 'a'] AS l, {a: 1, b: [2, 3]} AS m` — elements and values are any expression; `` {`c d`: 1} `` quotes a key. A map's keys come back sorted, not in written order: `keys({b: 1, a: 2})` is `['a', 'b']` |
 | Null inside a list or map | `RETURN [1, null] AS l`, `[n.x, n.missing]`, `{a: null}` — the element stays null in every output (Rust `Value::Null`, JSON `null`, Python `None`, TS `null`, Arrow text `[1, null]`). `size([null]) = 1`, `head([null, 1])` is null, `keys({a: null})` is `['a']`. Equality is three-valued: `[1, null] = [1, null]` is null (the row is dropped), `[1, null] = [2, null]` is false. A stored property cannot hold one (see Named-error) |
+| List comprehensions | `RETURN [x IN n.tags WHERE x <> 'old' \| x] AS active`, `[x IN [1, 2, 3] \| x * 10]`, `[x IN n.scores WHERE x > 0]` — `WHERE` and `\| expr` are each optional (no `\| expr` keeps the element). Usable in `WHERE`, `RETURN`, `ORDER BY`, `UNWIND` and as a function argument, and they nest. The variable exists only inside the comprehension and shadows an outer variable of the same name there. A null list (or a non-list) gives null; a null element is a real element, so it passes through `\| expr`, and a `WHERE` that is null drops it. Not supported in the `RETURN` of a write statement (see Named-error) |
+| `reduce()` | `RETURN reduce(total = 0, x IN n.scores \| total + x) AS sum`, `reduce(s = '', w IN n.words \| s + w)` — `reduce(acc = init, x IN list \| expr)`. `init` and `list` are read in the enclosing scope; `acc` and `x` exist only inside `expr` and shadow outer names there. An empty list gives `init`; a null list (or a non-list) gives null; a null `expr` value makes the accumulator null for the next step. Usable anywhere an expression is, and it nests with itself and with list comprehensions. Not supported in the `RETURN` of a write statement (see Named-error) |
 | Query without `MATCH` | `RETURN 1 + 1 AS x`, `UNWIND [1, 2, 3] AS x RETURN x`, `WITH 1 AS a RETURN a` — reads no graph and runs against one empty row; `UNWIND [] AS x` gives no rows |
-| Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error |
+| Binary arithmetic (`+`, `-`, `*`, `/`) in RETURN, WHERE, SET, function args | `RETURN n.age + 1 AS next`, `WHERE n.score * 2 > 10`, `SET n.x = n.x + 1` — precedence: `*`/`/` over `+`/`-`; parentheses supported; null propagates; integer div by zero is a named error; `+` also joins two strings (`'a' + 'b'`), two lists (`[1] + [2]`), a list and an element (`[1] + 2`, `0 + [1]`), and a number with a string as the number's `toString()` text (`1 + 'a'` is `'1a'`, `'a' + 1.5` is `'a1.5'`); the same in a write statement's `RETURN`; other operators on those types are a type error |
 | Scalar functions (`toLower`, `size`, `contains`, `startsWith`, `endsWith`, `toInteger`, `toFloat`, `toString`, `decay`, `key`, …) | `RETURN abs(n.score), toString(n.weight)` |
 | `collect(x)` aggregation | `MATCH (c:City)<-[:IN]-(p:Person) RETURN c.name, collect(p.name) AS residents` |
 | `CASE WHEN … THEN … [ELSE …] END` | `RETURN CASE WHEN n.age >= 65 THEN 'senior' ELSE 'other' END AS band` — also in `MATCH … SET … RETURN` |
@@ -5409,6 +5460,8 @@ Forms rejected with a clear, actionable error message (executor returns a typed 
 | `UNWIND scalar` (non-list value) | `execute: UNWIND requires a list; got … value for …` |
 | Multi-statement / unknown top-level keyword | `parse error: expected MATCH, UNWIND, WITH or RETURN (found …)` |
 | Storing a list or map property that holds a null | ``a property value cannot contain null: property `…` of node `…` holds a null`` — `CREATE (:L {id: 'x', p: [1, null]})`, `SET n.p = [1, n.missing]` or a `$param` holding one; nothing is written. `SET n.p = null` keeps its own error (`SET value for n.p evaluated to null`) |
+| List comprehension in the `RETURN` of a write statement | `a list comprehension is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and filter it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
+| `reduce()` in the `RETURN` of a write statement | `reduce() is not supported in the RETURN of a write statement; compute it in a read query, or RETURN the list and fold it afterwards` — refused before anything is written. In a `SET` value or a `WHERE` it works |
 | `shortestPath` with unbound endpoints | `plan: shortestPath: source node … is not bound; bind both endpoints before shortestPath` |
 | Unknown function name | `execute: unknown function …; supported: toLower, toUpper, size, coalesce, type, abs, round, textMatches, contains, startsWith, endsWith, toInteger, toFloat, toString, decay, key, id, labels` |
 | `STARTS` / `ENDS` without `WITH` | `expected WITH after STARTS` |
@@ -5428,7 +5481,6 @@ unexpected-token parse error or other unspecified result.
 | Form |
 |---|
 | Pattern comprehension `[(n)-[r]->(m) | m.prop]` |
-| List comprehension `[x IN list WHERE …]` |
 | `EXISTS { … }` subquery predicate |
 | `CALL` procedure invocations |
 | Schema operations (`CREATE INDEX`, `CREATE CONSTRAINT`) |
