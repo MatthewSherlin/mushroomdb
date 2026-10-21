@@ -1698,3 +1698,159 @@ fn a_keep_wal_snapshot_whose_wal_lost_its_tail_does_not_keep_its_index() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// FT-1: a rewrite removes the old value's words, and nothing else changes
+// ---------------------------------------------------------------------------
+
+/// Every query's answers, keys with their scores' bits, in key order: two
+/// stores holding the same documents answer identically whatever their ids.
+fn answers(db: &GraphDb<core_storage::fs::RealFs>, queries: &[&str]) -> Vec<Vec<(String, u64)>> {
+    queries
+        .iter()
+        .map(|q| {
+            let mut r: Vec<(String, u64)> = db
+                .search("name", q)
+                .into_iter()
+                .map(|(k, s)| (k, s.to_bits()))
+                .collect();
+            r.sort();
+            r
+        })
+        .collect()
+}
+
+/// A store built from nothing but the final documents: no rewrite, no removal.
+fn fresh_store(
+    nodes: &BTreeMap<String, (&'static str, Option<Value>)>,
+) -> GraphDb<core_storage::fs::RealFs> {
+    let mut db = open();
+    db.set_fsync_policy(mushroomdb::FsyncPolicy::Relaxed);
+    db.enable_fulltext("A", "name").unwrap();
+    db.enable_fulltext("B", "name").unwrap();
+    db.write_batch(|batch| {
+        for (key, (label, value)) in nodes {
+            let props = value
+                .iter()
+                .map(|v| ("name".to_string(), v.clone()))
+                .collect();
+            batch.insert_node(label, key, props);
+        }
+    })
+    .unwrap();
+    db
+}
+
+#[test]
+fn randomized_rewrites_answer_like_a_store_built_from_the_final_values() {
+    const QUERIES: &[&str] = &[
+        "graph",
+        "run",
+        "rust",
+        "gra*",
+        "r*",
+        "\"graph run\"",
+        "rust -db",
+        "db OR x",
+        "person",
+    ];
+    let words = [
+        "graph", "graphs", "run", "running", "rust", "db", "x", "person",
+    ];
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |m: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % m
+    };
+    let text = |next: &mut dyn FnMut(u64) -> u64| -> Value {
+        let phrase = |next: &mut dyn FnMut(u64) -> u64| {
+            (0..next(5))
+                .map(|_| words[next(8) as usize])
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        match next(5) {
+            0 => Value::Int(next(9) as i64),
+            1 => Value::List((0..next(3)).map(|_| Value::Str(phrase(next))).collect()),
+            _ => Value::Str(phrase(next)),
+        }
+    };
+
+    let dir = tmp_dir();
+    let mut db = GraphDb::open(&dir).unwrap();
+    db.set_fsync_policy(mushroomdb::FsyncPolicy::Relaxed);
+    db.enable_fulltext("A", "name").unwrap();
+    db.enable_fulltext("B", "name").unwrap();
+    // Label C carries `name` too, and nothing indexes it.
+    let labels = ["A", "B", "C"];
+    let mut nodes: BTreeMap<String, (&'static str, Option<Value>)> = BTreeMap::new();
+    let mut checked = 0;
+    for step in 0..600 {
+        let key = format!("k{}", next(40));
+        match (nodes.contains_key(&key), next(10)) {
+            (false, _) => {
+                let label = labels[next(3) as usize];
+                let value = (next(4) > 0).then(|| text(&mut next));
+                let props = value
+                    .iter()
+                    .map(|v| ("name".to_string(), v.clone()))
+                    .collect();
+                db.insert_node(label, &key, props).unwrap();
+                nodes.insert(key, (label, value));
+            }
+            (true, 0) => {
+                db.delete_node(&key).unwrap();
+                nodes.remove(&key);
+            }
+            (true, 1) => {
+                db.remove_prop(&key, "name").unwrap();
+                nodes.get_mut(&key).unwrap().1 = None;
+            }
+            (true, 2) => {
+                // Two rewrites of one node in one batch: the second removes
+                // the words the first one wrote.
+                let (a, b) = (text(&mut next), text(&mut next));
+                db.write_batch(|batch| {
+                    batch.set_prop(&key, "name", a.clone());
+                    batch.set_prop(&key, "name", b.clone());
+                })
+                .unwrap();
+                nodes.get_mut(&key).unwrap().1 = Some(b);
+            }
+            (true, 3) => {
+                let renamed = format!("r{step}");
+                db.rename_node(&key, &renamed).unwrap();
+                let node = nodes.remove(&key).unwrap();
+                nodes.insert(renamed, node);
+            }
+            (true, _) => {
+                let value = text(&mut next);
+                db.set_prop(&key, "name", value.clone()).unwrap();
+                nodes.get_mut(&key).unwrap().1 = Some(value);
+            }
+        }
+        // A snapshot puts the old values in the base, where the rewrite reads them.
+        if step == 200 || step == 400 {
+            db.snapshot().unwrap();
+        }
+        if step % 25 == 24 {
+            assert_eq!(
+                answers(&db, QUERIES),
+                answers(&fresh_store(&nodes), QUERIES),
+                "step {step}"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 24);
+    let want = answers(&fresh_store(&nodes), QUERIES);
+    assert!(
+        want.iter().any(|r| !r.is_empty()),
+        "the queries match something"
+    );
+    drop(db);
+    let db = GraphDb::open(&dir).unwrap();
+    assert_eq!(answers(&db, QUERIES), want, "reopened");
+}

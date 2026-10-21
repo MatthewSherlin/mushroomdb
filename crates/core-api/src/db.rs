@@ -38,6 +38,9 @@ pub use core_storage::{valid_namespace, NS_DEFAULT, NS_MAX_LEN, NS_PROP};
 /// constant and allocates no names.
 const NS_DEFAULT_IDX: u32 = 0;
 
+mod row_eval;
+mod unwind_write;
+
 /// The reserved edge property holding a pair's insert count (§5.13).
 ///
 /// Absent means 1 — the count is written only from the second insert of a
@@ -854,6 +857,134 @@ pub struct EdgeTypeCensus {
     /// `(src key, dst key)` of the first edge of this type in the store's own
     /// id order — a real pair to quote in an example.
     pub sample: Option<(String, String)>,
+}
+
+/// True when a node's stored `id` property is its own key: the convention
+/// `CREATE` and the default ingest follow. A node whose `id` differs from the
+/// key, or that has none, is not covered by the key-property rule.
+pub(crate) fn id_mirrors_key(key: &str, stored_id: Option<&Value>) -> bool {
+    matches!(stored_id, Some(Value::Str(s)) if s == key)
+}
+
+/// The refusal for a write that would break the `id`-equals-key correspondence
+/// of a node that has it: only `rename_node` moves both together. Raised at
+/// `rewrite_wal_dense_inner` (set) and `prepare_remove_prop` (removal), so
+/// every API gets it.
+pub(crate) fn key_property_error(key: &str) -> GraphError {
+    GraphError::QueryError {
+        detail: format!(
+            "cannot change the key property `id` of node {key}; \
+             renaming a node is rename_node"
+        ),
+    }
+}
+
+/// The refusal for removing the key property (`REMOVE n.id`, a null `id`) of a
+/// node whose `id` is its key.
+pub(crate) fn key_property_removal_error() -> GraphError {
+    GraphError::QueryError {
+        detail: "cannot REMOVE the key property `id`; renaming a node is rename_node".into(),
+    }
+}
+
+/// `Err` when setting `id` to `new` on the node `key`, whose stored `id` is
+/// `stored_id`, would break `id == key`. The engine enforces this at its write
+/// choke point; a transaction calls it to refuse at the statement, not at
+/// commit.
+pub(crate) fn check_key_property_write(
+    key: &str,
+    stored_id: Option<&Value>,
+    new: Option<&Value>,
+) -> Result<()> {
+    if id_mirrors_key(key, stored_id) && !id_mirrors_key(key, new) {
+        return Err(key_property_error(key));
+    }
+    Ok(())
+}
+
+/// `Err` when removing `id` from the node `key` whose stored `id` is `stored_id`
+/// would break `id == key`.
+pub(crate) fn check_key_property_removal(key: &str, stored_id: Option<&Value>) -> Result<()> {
+    if id_mirrors_key(key, stored_id) {
+        return Err(key_property_removal_error());
+    }
+    Ok(())
+}
+
+/// A SET map's keys with each value evaluated for one matched row; `None` is null.
+type MapEntries = Vec<(String, Option<Value>)>;
+
+/// One property write a Cypher `SET n = {…}` / `SET n += {…}` plans for a node.
+#[derive(Debug, Clone, PartialEq)]
+enum MapWrite {
+    Set { field: String, value: Value },
+    Remove { field: String },
+}
+
+/// The writes `SET n = map` (`merge == false`) or `SET n += map` (`merge ==
+/// true`) makes to the node `key`, whose current properties are `existing`.
+/// `entries` pairs each map key with its evaluated value; `None` is null.
+///
+/// Decisions, each pinned by a test:
+/// - `+=`: a non-null value sets the property; a null value removes it (a
+///   no-op when the node lacks it); every other property is left alone.
+/// - `=`: the node's properties become exactly the non-null entries. A null
+///   entry is an absent key, so it removes the property if the node has it.
+///   Removals are listed before sets in the batch.
+/// - `id`: on a node whose `id` is its key, `=` never removes it and a map that
+///   names it writes it like any property; the engine's write choke point
+///   decides (the key passes, any other value or null is refused — a key change
+///   is `rename_node`). On a node whose `id` differs from its key, or that has
+///   none, it is an ordinary property.
+/// - `ns` is never removed by `=` (a map without it keeps the namespace). A
+///   map that sets it is checked by the batch (`NamespaceImmutable` for a
+///   different one); `+= {ns: null}` is a removal, refused there the same way.
+/// - A view-owned property is never removed by `=` (`is_view_owned`), the same
+///   filter `on_conflict="replace"` applies. Naming one in the map, with a value
+///   or null, reaches the batch and is `ViewPropReadOnly`.
+fn plan_map_write(
+    key: &str,
+    existing: &BTreeMap<String, Value>,
+    merge: bool,
+    entries: &[(String, Option<Value>)],
+    is_view_owned: &dyn Fn(&str) -> bool,
+) -> Vec<MapWrite> {
+    let mut sets = Vec::new();
+    let mut removes = Vec::new();
+    for (field, value) in entries {
+        match value {
+            Some(v) => sets.push(MapWrite::Set {
+                field: field.clone(),
+                value: v.clone(),
+            }),
+            None => removes.push(MapWrite::Remove {
+                field: field.clone(),
+            }),
+        }
+    }
+    if !merge {
+        let kept: BTreeSet<&str> = entries
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(f, _)| f.as_str())
+            .collect();
+        // A null entry is already a removal above; do not plan it twice.
+        for field in existing.keys() {
+            let protected = (field == "id" && id_mirrors_key(key, existing.get("id")))
+                || field == NS_PROP
+                || is_view_owned(field);
+            let already = removes
+                .iter()
+                .any(|w| matches!(w, MapWrite::Remove { field: f } if f == field));
+            if !protected && !kept.contains(field.as_str()) && !already {
+                removes.push(MapWrite::Remove {
+                    field: field.clone(),
+                });
+            }
+        }
+    }
+    removes.extend(sets);
+    removes
 }
 
 /// Construct the standard write-query result set (columns: created, properties_set, deleted).
@@ -4734,6 +4865,13 @@ impl<F: Fs> GraphDb<F> {
                 let old_value = build_props_view(&self.props, &self.base)
                     .get(id, field)
                     .map(|vr| vr.into_value());
+                // What the full-text index holds for `id`, so the rewrite
+                // below removes that value's words, not the whole vocabulary.
+                let indexed = self
+                    .fulltext
+                    .field_indexed(field)
+                    .then(|| old_value.clone())
+                    .flatten();
                 Arc::make_mut(&mut self.props).set(id, field, value.clone());
                 // Fire rules for the changed field.
                 let cursor = self.engine.pending_delta_count();
@@ -4793,8 +4931,9 @@ impl<F: Fs> GraphDb<F> {
                     });
                     if let Some(label) = label_opt {
                         if self.fulltext.is_enabled(label, field) {
-                            Arc::make_mut(&mut self.fulltext).remove_node_field(id, field);
-                            Arc::make_mut(&mut self.fulltext).add_tokens(id, field, value);
+                            let fulltext = Arc::make_mut(&mut self.fulltext);
+                            fulltext.remove_node_value(id, field, indexed.as_ref());
+                            fulltext.add_tokens(id, field, value);
                         }
                     }
                 }
@@ -5008,6 +5147,12 @@ impl<F: Fs> GraphDb<F> {
                 let old_value = build_props_view(&self.props, &self.base)
                     .get(*id, &field_str)
                     .map(|vr| vr.into_value());
+                // As in `SetProp`: the full-text rewrite removes the old value's words.
+                let indexed = self
+                    .fulltext
+                    .field_indexed(&field_str)
+                    .then(|| old_value.clone())
+                    .flatten();
                 Arc::make_mut(&mut self.props).set(*id, &field_str, value.clone());
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
@@ -5063,8 +5208,9 @@ impl<F: Fs> GraphDb<F> {
                     });
                     if let Some(label) = label_opt {
                         if self.fulltext.is_enabled(label, &field_str) {
-                            Arc::make_mut(&mut self.fulltext).remove_node_field(*id, &field_str);
-                            Arc::make_mut(&mut self.fulltext).add_tokens(*id, &field_str, value);
+                            let fulltext = Arc::make_mut(&mut self.fulltext);
+                            fulltext.remove_node_value(*id, &field_str, indexed.as_ref());
+                            fulltext.add_tokens(*id, &field_str, value);
                         }
                     }
                 }
@@ -5186,6 +5332,12 @@ impl<F: Fs> GraphDb<F> {
                 let old = build_props_view(&self.props, &self.base)
                     .get(id, field)
                     .map(|vr| vr.into_value());
+                // As in `SetProp`: the full-text removal walks the old value's words.
+                let indexed = self
+                    .fulltext
+                    .field_indexed(field)
+                    .then(|| old.clone())
+                    .flatten();
                 Arc::make_mut(&mut self.props).remove(id, field);
                 // If the base still supplies the value after the overlay removal,
                 // record a tombstone so ColumnsView::get does not resurrect it.
@@ -5250,7 +5402,11 @@ impl<F: Fs> GraphDb<F> {
                 );
                 // Full-text index maintenance: remove tokens for this field.
                 if self.fulltext.field_indexed(field) {
-                    Arc::make_mut(&mut self.fulltext).remove_node_field(id, field);
+                    Arc::make_mut(&mut self.fulltext).remove_node_value(
+                        id,
+                        field,
+                        indexed.as_ref(),
+                    );
                 }
                 // Property (equality) index maintenance: drop this node's entry.
                 if self.prop_index.field_indexed(field) {
@@ -5833,6 +5989,11 @@ impl<F: Fs> GraphDb<F> {
         // created in rather than against the store, where it does not exist yet.
         let mut pending_ns: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
+        // Whether each node this frame has inserted, renamed or set `id` on has
+        // `id == key` at that point of the frame. The store alone cannot say:
+        // it does not have the frame's own writes.
+        let mut pending_id_mirrors_key: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
         let mut interned = std::collections::HashSet::<u32>::new();
         let mut next = u32::try_from(self.ids.len()).map_err(|_| GraphError::Corrupt {
             detail: "id space exhausted".into(),
@@ -5911,6 +6072,12 @@ impl<F: Fs> GraphDb<F> {
                     for (field, value) in &props {
                         refuse_null_property(&key, field, value)?;
                     }
+                    pending_id_mirrors_key.insert(
+                        key.clone(),
+                        props
+                            .iter()
+                            .any(|(f, v)| f == "id" && id_mirrors_key(&key, Some(v))),
+                    );
                     // Namespace validation and normalisation, on the one seam
                     // every user-visible node insert passes through: insert_node,
                     // a batch, ingest, Cypher CREATE and MERGE all arrive here
@@ -5943,6 +6110,19 @@ impl<F: Fs> GraphDb<F> {
                 }
                 WalRecord::SetProp { key, field, value } => {
                     refuse_null_property(&key, &field, &value)?;
+                    // `id` mirrors the key: a write may restate the key, never
+                    // change it (ledger row 128). Rename moves it with the key.
+                    if field == "id" {
+                        let mirrors = match pending_id_mirrors_key.get(&key) {
+                            Some(&m) => m,
+                            None => id_mirrors_key(&key, self.get_prop(&key, "id").as_ref()),
+                        };
+                        if mirrors && !id_mirrors_key(&key, Some(&value)) {
+                            return Err(key_property_error(&key));
+                        }
+                        pending_id_mirrors_key
+                            .insert(key.clone(), id_mirrors_key(&key, Some(&value)));
+                    }
                     // A namespace is set at insert and fixed after: the write is
                     // refused when it would move the node, and dropped when it
                     // names the namespace the node is already in. Checked here
@@ -6024,6 +6204,10 @@ impl<F: Fs> GraphDb<F> {
                     pending.remove(old_key.as_str());
                     freed.insert(old_key.clone());
                     pending.insert(new_key.clone(), id);
+                    // The node keeps its `id` value, which was the old key at
+                    // most, so it no longer mirrors the new key.
+                    pending_id_mirrors_key.remove(old_key.as_str());
+                    pending_id_mirrors_key.insert(new_key.clone(), false);
                     out.push(rec);
                 }
                 // # Symbol-order invariant (load-bearing)
@@ -6071,6 +6255,7 @@ impl<F: Fs> GraphDb<F> {
                     out.push(rec);
                 }
                 WalRecord::DeleteNode { ref key } => {
+                    pending_id_mirrors_key.remove(key.as_str());
                     pending.remove(key.as_str());
                     freed.insert(key.clone());
                     out.push(rec);
@@ -12760,9 +12945,12 @@ impl<F: Fs> GraphDb<F> {
         match stmt {
             WriteStatement::Create(s) => self.exec_create(s, params),
             WriteStatement::MatchSet(s) => self.exec_match_set(s, params),
+            WriteStatement::MatchSetMap(s) => self.exec_match_set_map(s, params),
+            WriteStatement::MatchRemove(s) => self.exec_match_remove(s, params),
             WriteStatement::MatchDelete(s) => self.exec_match_delete(s, params),
             WriteStatement::MatchDeleteNode(s) => self.exec_match_delete_node(s, params),
             WriteStatement::Merge(s) => self.exec_merge(s, params),
+            WriteStatement::UnwindWrite(s) => self.exec_unwind_write(*s, params),
         }
     }
 
@@ -12997,9 +13185,26 @@ impl<F: Fs> GraphDb<F> {
         })?;
 
         // Collect (key, field, value) for each matched row × each SET clause.
+        //
+        // A value that reads a node's properties is evaluated as its turn comes,
+        // against what the statement has written so far, so two rows for one
+        // node (`MATCH (n), (m) SET n.c = n.c + 1`) and two items of one clause
+        // (`SET n.v = 10, n.w = n.v`) read each other's writes, as in openCypher.
+        // A value with no such read keeps its column from the MATCH.
+        let node_names = pattern_node_vars(&stmt.matches);
+        let dynamic: Vec<bool> = stmt
+            .sets
+            .iter()
+            .map(|sc| {
+                row_eval::reads_node(&sc.value, &node_names)
+                    && !row_eval::reads_node(&sc.value, &rel_vars)
+            })
+            .collect();
+        let any_dynamic = dynamic.iter().any(|d| *d);
+        let mut overlay = row_eval::Overlay::default();
         let mut set_ops: Vec<(String, String, Value)> = Vec::new();
         for row_i in 0..match_rs.len() {
-            for (sc, col) in stmt.sets.iter().zip(&set_val_cols) {
+            for ((sc, col), is_dynamic) in stmt.sets.iter().zip(&set_val_cols).zip(&dynamic) {
                 let key = match match_rs.get(row_i, &sc.var) {
                     Some(Value::Str(k)) => k.clone(),
                     _ => {
@@ -13011,18 +13216,28 @@ impl<F: Fs> GraphDb<F> {
                         })
                     }
                 };
-                // The SET value was already evaluated by the executor.
-                let value = match match_rs.get(row_i, col) {
-                    Some(v) => v.clone(),
-                    None => {
-                        return Err(GraphError::QueryError {
-                            detail: format!(
-                                "SET value for {}.{} evaluated to null",
-                                sc.var, sc.field
-                            ),
+                let evaluated = if *is_dynamic {
+                    let node_key = |name: &str| -> Option<Option<String>> {
+                        node_names.iter().any(|n| n == name).then(|| {
+                            match match_rs.get(row_i, name) {
+                                Some(Value::Str(k)) => Some(k.clone()),
+                                _ => None,
+                            }
                         })
-                    }
+                    };
+                    self.uw_eval(&mut overlay, &sc.value, &node_key, &[], params)?
+                } else {
+                    // The SET value was already evaluated by the executor.
+                    match_rs.get(row_i, col).cloned()
                 };
+                let Some(value) = evaluated.filter(|v| !matches!(v, Value::Null)) else {
+                    return Err(GraphError::QueryError {
+                        detail: format!("SET value for {}.{} evaluated to null", sc.var, sc.field),
+                    });
+                };
+                if any_dynamic {
+                    overlay.note_set(&key, &sc.field, &value);
+                }
                 set_ops.push((key, sc.field.clone(), value));
             }
         }
@@ -13043,6 +13258,343 @@ impl<F: Fs> GraphDb<F> {
         rs.push_row(vec![
             Some(Value::Int(0)),
             Some(Value::Int(props_set as i64)),
+            Some(Value::Int(0)),
+        ]);
+        Ok(rs)
+    }
+
+    /// `MATCH … [WHERE …] SET n = {…}` and `SET n += {…}`.
+    ///
+    /// The MATCH runs first (masked under a role-scoped write); each map value
+    /// is evaluated per matched row by the same executor that evaluates
+    /// `SET n.f = expr`. The resulting `SetProp`/`RemoveProp` ops commit as one
+    /// batch, so they meet the same choke-point as every other write: TY-5
+    /// constraints, `ns` immutability, the view-owned refusal, and rule
+    /// re-evaluation for each removal. See [`plan_map_write`] for which
+    /// properties each form touches.
+    fn exec_match_set_map(
+        &mut self,
+        stmt: core_query::cypher::MatchSetMapStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let project_returns = stmt.returns.clone();
+        let rel_vars = pattern_rel_vars(&stmt.matches);
+        let mut lookup_vars: Vec<String> = Vec::new();
+        add_var(&mut lookup_vars, &stmt.var);
+        for v in pattern_node_vars(&stmt.matches) {
+            add_var(&mut lookup_vars, &v);
+        }
+        if let Some(ref returns) = project_returns {
+            for v in ret_node_vars(returns) {
+                if !rel_vars.iter().any(|r| r == &v) {
+                    add_var(&mut lookup_vars, &v);
+                }
+            }
+        }
+        let mut match_returns: Vec<RetItem> = lookup_vars
+            .iter()
+            .map(|v| RetItem {
+                value: RetVal::Var(v.clone()),
+                alias: None,
+            })
+            .collect();
+        let value_cols: Vec<String> = (0..stmt.map.len()).map(|i| format!("__sv_{i}")).collect();
+        for ((_, operand), col) in stmt.map.iter().zip(&value_cols) {
+            match_returns.push(RetItem {
+                value: RetVal::ScalarExpr(operand.clone()),
+                alias: Some(col.clone()),
+            });
+        }
+        if let Some(name) = &stmt.param {
+            match_returns.push(RetItem {
+                value: RetVal::ScalarExpr(Operand::Param(name.clone())),
+                alias: Some("__sv_param".into()),
+            });
+        }
+        for r in &rel_vars {
+            match_returns.push(RetItem {
+                value: RetVal::FuncCall {
+                    name: "type".into(),
+                    args: vec![Operand::Var(r.clone())],
+                },
+                alias: Some(rel_type_alias(r)),
+            });
+        }
+        let read_q = Query {
+            matches: stmt.matches.clone(),
+            optional_clauses: vec![],
+            where_expr: stmt.where_expr.clone(),
+            unwinds: vec![],
+            post_unwind_where: None,
+            stages: vec![],
+            returns: match_returns,
+            distinct: false,
+            order_by: vec![],
+            skip: None,
+            limit: None,
+        };
+        let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        let match_rs = {
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            }
+        }
+        .map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })?;
+
+        // One entry list per matched row, in row order. A node bound by several
+        // rows is written by each in turn under `+=`; under `=` the last row's
+        // map is the node's final state, so earlier rows for it are dropped.
+        let node_names = pattern_node_vars(&stmt.matches);
+        let map_dynamic = stmt.map.iter().any(|(_, operand)| {
+            row_eval::reads_node(operand, &node_names) && !row_eval::reads_node(operand, &rel_vars)
+        });
+        let mut overlay = row_eval::Overlay::default();
+        let mut per_node: Vec<(String, MapEntries)> = Vec::new();
+        for row_i in 0..match_rs.len() {
+            let key = match match_rs.get(row_i, &stmt.var) {
+                Some(Value::Str(k)) => k.clone(),
+                _ => {
+                    return Err(GraphError::QueryError {
+                        detail: format!(
+                            "SET variable '{}' did not resolve to a node key",
+                            stmt.var
+                        ),
+                    })
+                }
+            };
+            if let Some(name) = &stmt.param {
+                // The parameter is a map: its keys are the map's, a null value
+                // is a null entry. Anything else is a named error, before any
+                // write.
+                let entries = match match_rs.get(row_i, "__sv_param") {
+                    Some(Value::Map(m)) => m
+                        .iter()
+                        .map(|(k, v)| {
+                            let v = if matches!(v, Value::Null) {
+                                None
+                            } else {
+                                Some(v.clone())
+                            };
+                            (k.clone(), v)
+                        })
+                        .collect::<MapEntries>(),
+                    other => {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "SET {} {}= ${name}: the parameter must be a map, got {}",
+                                stmt.var,
+                                if stmt.merge { "+" } else { "" },
+                                other.map_or("null".to_string(), |v| format!("{v:?}")),
+                            ),
+                        })
+                    }
+                };
+                if !stmt.merge {
+                    per_node.retain(|(k, _)| k != &key);
+                }
+                per_node.push((key, entries));
+                continue;
+            }
+            let mut entries: MapEntries = Vec::with_capacity(stmt.map.len());
+            for ((field, operand), col) in stmt.map.iter().zip(&value_cols) {
+                let value = if row_eval::reads_node(operand, &node_names)
+                    && !row_eval::reads_node(operand, &rel_vars)
+                {
+                    // Read as its turn comes, against the statement's own writes.
+                    let node_key = |name: &str| -> Option<Option<String>> {
+                        node_names.iter().any(|n| n == name).then(|| {
+                            match match_rs.get(row_i, name) {
+                                Some(Value::Str(k)) => Some(k.clone()),
+                                _ => None,
+                            }
+                        })
+                    };
+                    self.uw_eval(&mut overlay, operand, &node_key, &[], params)?
+                } else {
+                    match match_rs.get(row_i, col) {
+                        None | Some(Value::Null) => None,
+                        Some(v) => Some(v.clone()),
+                    }
+                };
+                entries.push((field.clone(), value));
+            }
+            if map_dynamic {
+                self.uw_apply_map(&mut overlay, &key, stmt.merge, &entries);
+            }
+            if !stmt.merge {
+                per_node.retain(|(k, _)| k != &key);
+            }
+            per_node.push((key, entries));
+        }
+
+        let mut writes: Vec<(String, MapWrite)> = Vec::new();
+        let mut props_changed = 0i64;
+        for (key, entries) in &per_node {
+            let existing = self.node_info(key).map(|n| n.props).unwrap_or_default();
+            let node_writes = plan_map_write(key, &existing, stmt.merge, entries, &|field| {
+                self.view_store.view_for_prop(field).is_some()
+            });
+            for write in node_writes {
+                match &write {
+                    MapWrite::Set { .. } => props_changed += 1,
+                    MapWrite::Remove { field } => {
+                        if existing.contains_key(field) {
+                            props_changed += 1;
+                        }
+                    }
+                }
+                writes.push((key.clone(), write));
+            }
+        }
+        let mut batch = self.batch();
+        for (key, write) in writes {
+            match write {
+                MapWrite::Set { field, value } => {
+                    batch.set_prop(&key, &field, value);
+                }
+                MapWrite::Remove { field } => {
+                    batch.remove_prop(&key, &field);
+                }
+            }
+        }
+        batch.commit()?;
+
+        if let Some(returns) = project_returns {
+            return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
+        }
+        let mut rs = write_result_set();
+        rs.push_row(vec![
+            Some(Value::Int(0)),
+            Some(Value::Int(props_changed)),
+            Some(Value::Int(0)),
+        ]);
+        Ok(rs)
+    }
+
+    /// `MATCH … [WHERE …] REMOVE n.f [, …] [RETURN …]`.
+    ///
+    /// The MATCH runs first (masked under a role-scoped write, so a hidden node
+    /// is absent and nothing is removed from it); the removals then commit as
+    /// one batch of `RemoveProp` ops, which meet the same `prepare_remove_prop`
+    /// choke-point as `remove_prop`: view-owned fields and `ns` are refused there,
+    /// a field the node lacks is a no-op, and rules re-evaluate each removal.
+    /// The result row's `properties_set` slot counts the properties that existed
+    /// and were removed.
+    fn exec_match_remove(
+        &mut self,
+        stmt: core_query::cypher::MatchRemoveStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let project_returns = stmt.returns.clone();
+        let rel_vars = pattern_rel_vars(&stmt.matches);
+        let mut lookup_vars: Vec<String> = Vec::new();
+        for (var, _) in &stmt.removals {
+            add_var(&mut lookup_vars, var);
+        }
+        for v in pattern_node_vars(&stmt.matches) {
+            add_var(&mut lookup_vars, &v);
+        }
+        if let Some(ref returns) = project_returns {
+            for v in ret_node_vars(returns) {
+                if !rel_vars.iter().any(|r| r == &v) {
+                    add_var(&mut lookup_vars, &v);
+                }
+            }
+        }
+        let mut match_returns: Vec<RetItem> = lookup_vars
+            .iter()
+            .map(|v| RetItem {
+                value: RetVal::Var(v.clone()),
+                alias: None,
+            })
+            .collect();
+        // Capture relationship types while r is bound, as SET does.
+        for r in &rel_vars {
+            match_returns.push(RetItem {
+                value: RetVal::FuncCall {
+                    name: "type".into(),
+                    args: vec![Operand::Var(r.clone())],
+                },
+                alias: Some(rel_type_alias(r)),
+            });
+        }
+        let read_q = Query {
+            matches: stmt.matches.clone(),
+            optional_clauses: vec![],
+            where_expr: stmt.where_expr.clone(),
+            unwinds: vec![],
+            post_unwind_where: None,
+            stages: vec![],
+            returns: match_returns,
+            distinct: false,
+            order_by: vec![],
+            skip: None,
+            limit: None,
+        };
+        let ops = plan(&read_q).map_err(|e| GraphError::QueryError {
+            detail: format!("plan: {e}"),
+        })?;
+        let match_rs = {
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            }
+        }
+        .map_err(|e| GraphError::QueryError {
+            detail: format!("execute: {e}"),
+        })?;
+
+        // Each (node, field) once, however many rows bound the node.
+        let mut targets: Vec<(String, String)> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for row_i in 0..match_rs.len() {
+            for (var, field) in &stmt.removals {
+                let key = match match_rs.get(row_i, var) {
+                    Some(Value::Str(k)) => k.clone(),
+                    _ => {
+                        return Err(GraphError::QueryError {
+                            detail: format!(
+                                "REMOVE variable '{var}' did not resolve to a node key"
+                            ),
+                        })
+                    }
+                };
+                let pair = (key, field.clone());
+                if seen.insert(pair.clone()) {
+                    targets.push(pair);
+                }
+            }
+        }
+
+        // Counted before the commit, from the state the removals act on.
+        let props_removed = targets
+            .iter()
+            .filter(|(key, field)| self.get_prop(key, field).is_some())
+            .count() as i64;
+        let mut batch = self.batch();
+        for (key, field) in &targets {
+            batch.remove_prop(key, field);
+        }
+        batch.commit()?;
+
+        if let Some(returns) = project_returns {
+            return project_set_return_rows(self, &rel_vars, &match_rs, &returns, params);
+        }
+
+        let mut rs = write_result_set();
+        rs.push_row(vec![
+            Some(Value::Int(0)),
+            Some(Value::Int(props_removed)),
             Some(Value::Int(0)),
         ]);
         Ok(rs)
@@ -13304,12 +13856,278 @@ impl<F: Fs> GraphDb<F> {
         }
     }
 
+    /// Whether the MERGE node `key` exists, after the role-scope check (when
+    /// the write is role-scoped). See the comments inside for the oracle rules.
+    fn merge_node_existed(&self, label: &str, key: &str) -> Result<bool> {
+        if let Some(authz) = self.pending_write_authz.clone() {
+            let has_create = authz.scope.create_labels.iter().any(|l| l == label);
+            let has_update = authz.scope.update_labels.iter().any(|l| l == label);
+            if !has_create && !has_update {
+                // Scope-before-lookup: 403 without has_node call (timing oracle
+                // closure — see test_merge_unscoped_no_key_lookup).
+                return Err(GraphError::RoleWriteDenied {
+                    reason: format!(
+                        "role-bound token: label '{}' not in write scope (create_labels)",
+                        label
+                    ),
+                });
+            }
+            // Key lookup under mask.
+            match self.ids.get(key) {
+                Some(id) if authz.mask.contains_id(id) => {
+                    // Visible: must have update scope to proceed to match arm.
+                    if !has_update {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: format!(
+                                "role-bound token: label '{}' not in write scope (update_labels)",
+                                label
+                            ),
+                        });
+                    }
+                    Ok(true) // existed = true → match arm
+                }
+                Some(_) => {
+                    // Hidden: same error as absent to the role (spec §3.1/§3.3).
+                    Err(GraphError::RoleWriteDenied {
+                        reason: "role-bound token: target node not visible".into(),
+                    })
+                }
+                None => {
+                    // Absent: must have create scope to proceed to the create arm.
+                    //
+                    // Update-only roles (create_labels empty, update_labels set):
+                    // return the SAME "not visible" error as the hidden-key branch
+                    // so hidden ≡ absent — no distinguishing oracle (spec §6.1
+                    // "confirm existence of hidden nodes: No").
+                    //
+                    // Create-scoped roles (has_create=true): absent → create arm
+                    // as before.  The accepted structural key-existence disclosure
+                    // (§THREAT-MODEL) applies only when the role holds create scope.
+                    if !has_create {
+                        return Err(GraphError::RoleWriteDenied {
+                            reason: "role-bound token: target node not visible".into(),
+                        });
+                    }
+                    Ok(false) // existed = false → create arm
+                }
+            }
+        } else {
+            // Full authority: use the existing non-masked has_node check.
+            Ok(self.has_node(key))
+        }
+    }
+
+    /// Whether the manual-or-derived edge `src -[etype]-> dst` is in the applied state.
+    fn merge_edge_present(&self, edge_type: &str, src_key: &str, dst_key: &str) -> bool {
+        self.ensure_v8_base_sections_loaded();
+        let (Some(src), Some(dst), Some(sym)) = (
+            self.ids.get(src_key),
+            self.ids.get(dst_key),
+            self.syms.get(edge_type),
+        ) else {
+            return false;
+        };
+        self.topo_view()
+            .neighbors(sym, Direction::Out, src)
+            .binary_search(&dst)
+            .is_ok()
+    }
+
+    /// `MERGE (a:L {id: 'x'})-[:T]->(b:M {id: 'y'}) [ON CREATE SET …] [ON MATCH SET …] [RETURN …]`.
+    ///
+    /// Find-or-create each end node by key, then the edge between them. The
+    /// pattern matched as a whole (both nodes and the edge existed) → `ON
+    /// MATCH`; otherwise the missing nodes and the edge are created and `ON
+    /// CREATE` runs. One batch, so one commit and one WAL frame; every write
+    /// meets the usual commit-time checks.
+    fn exec_merge_edge(
+        &mut self,
+        stmt: core_query::cypher::MergeStmt,
+        params: &BTreeMap<String, Value>,
+    ) -> Result<ResultSet> {
+        let Some(edge) = stmt.edge.clone() else {
+            return Err(GraphError::QueryError {
+                detail: "MERGE relationship pattern missing".into(),
+            });
+        };
+        let key_of = |v: &Value| match v {
+            Value::Str(s) => Ok(s.clone()),
+            other => Err(GraphError::QueryError {
+                detail: format!("MERGE key value must be a string (got {other:?})"),
+            }),
+        };
+        let start_key = key_of(&stmt.key_value)?;
+        let end_key = key_of(&edge.end_key_value)?;
+        if start_key == end_key && stmt.label != edge.end_label {
+            return Err(GraphError::QueryError {
+                detail: format!(
+                    "MERGE: key '{start_key}' is given both label '{}' and label '{}'",
+                    stmt.label, edge.end_label
+                ),
+            });
+        }
+        // A SET item names the start node or the end node, never the relationship.
+        let set_target = |var: &str| -> Result<&str> {
+            if stmt.var.as_deref() == Some(var) {
+                Ok(start_key.as_str())
+            } else if edge.end_var.as_deref() == Some(var) {
+                Ok(end_key.as_str())
+            } else {
+                Err(GraphError::QueryError {
+                    detail: format!(
+                        "SET variable '{var}' does not match a MERGE node variable \
+                         (a relationship takes no SET)"
+                    ),
+                })
+            }
+        };
+        let mut create_sets = Vec::new();
+        for sc in &stmt.on_create {
+            create_sets.push((set_target(&sc.var)?, &sc.field, &sc.value));
+        }
+        let mut match_sets = Vec::new();
+        for sc in &stmt.on_match {
+            match_sets.push((set_target(&sc.var)?, &sc.field, &sc.value));
+        }
+
+        // Scope checks on both nodes before either key is looked up beyond them.
+        let start_existed = self.merge_node_existed(&stmt.label, &start_key)?;
+        let end_existed = if end_key == start_key {
+            start_existed
+        } else {
+            self.merge_node_existed(&edge.end_label, &end_key)?
+        };
+        let (src_key, dst_key) = match edge.dir {
+            core_query::cypher::RelDir::Left => (end_key.as_str(), start_key.as_str()),
+            _ => (start_key.as_str(), end_key.as_str()),
+        };
+        let edge_existed =
+            start_existed && end_existed && self.merge_edge_present(&edge.etype, src_key, dst_key);
+
+        let start_create = if start_existed {
+            None
+        } else {
+            Some(self.merge_create_props(&stmt.key_field, &stmt.key_value, stmt.ns.as_ref())?)
+        };
+        let end_create = if end_existed || end_key == start_key {
+            None
+        } else {
+            Some(self.merge_create_props(
+                &edge.end_key_field,
+                &edge.end_key_value,
+                edge.end_ns.as_ref(),
+            )?)
+        };
+        let mut created = 0i64;
+        let mut batch = self.batch();
+        if let Some(props) = start_create {
+            batch.insert_node(&stmt.label, &start_key, props);
+            created += 1;
+        }
+        if let Some(props) = end_create {
+            batch.insert_node(&edge.end_label, &end_key, props);
+            created += 1;
+        }
+        let sets = if edge_existed {
+            &match_sets
+        } else {
+            batch.insert_edge(&edge.etype, src_key, dst_key);
+            &create_sets
+        };
+        for (key, field, value) in sets {
+            batch.set_prop(key, field, resolve_merge_set_value(value, params)?);
+        }
+        batch.commit()?;
+
+        // Refresh the role mask so created nodes are visible to this
+        // statement's RETURN (read-after-write); see `exec_merge`.
+        if created > 0 {
+            if let Some(role) = self.pending_write_authz.as_ref().map(|a| a.role.clone()) {
+                let new_mask = self.mask_for_role(&role)?;
+                if let Some(a) = self.pending_write_authz.as_mut() {
+                    a.mask = new_mask;
+                }
+            }
+        }
+
+        if let Some(returns) = stmt.returns {
+            let node =
+                |var: Option<&String>, default: &str, label: &str, field: &str, key: &str| {
+                    NodePat {
+                        var: Some(var.cloned().unwrap_or_else(|| default.to_string())),
+                        label: Some(label.to_string()),
+                        props: vec![(field.to_string(), Operand::Lit(Value::Str(key.to_string())))],
+                    }
+                };
+            let q = Query {
+                matches: vec![Pattern {
+                    start: node(
+                        stmt.var.as_ref(),
+                        "_mn0",
+                        &stmt.label,
+                        &stmt.key_field,
+                        &start_key,
+                    ),
+                    chain: vec![(
+                        core_query::cypher::RelPat {
+                            var: edge.rel_var.clone(),
+                            etypes: vec![edge.etype.clone()],
+                            dir: edge.dir,
+                            hops: None,
+                        },
+                        node(
+                            edge.end_var.as_ref(),
+                            "_mn1",
+                            &edge.end_label,
+                            &edge.end_key_field,
+                            &end_key,
+                        ),
+                    )],
+                    shortest: false,
+                }],
+                optional_clauses: vec![],
+                where_expr: None,
+                unwinds: vec![],
+                post_unwind_where: None,
+                stages: vec![],
+                returns,
+                distinct: false,
+                order_by: vec![],
+                skip: None,
+                limit: None,
+            };
+            let ops = plan(&q).map_err(|e| GraphError::QueryError {
+                detail: format!("plan: {e}"),
+            })?;
+            let mask_opt = self.pending_write_authz.as_ref().map(|a| a.mask.clone());
+            return (if let Some(ref mask) = mask_opt {
+                execute(&self.view_masked(mask), &ops, &Params(params))
+            } else {
+                execute(&self.view(), &ops, &Params(params))
+            })
+            .map_err(|e| GraphError::QueryError {
+                detail: format!("execute: {e}"),
+            });
+        }
+
+        let mut rs = write_result_set();
+        rs.push_row(vec![
+            Some(Value::Int(created)),
+            Some(Value::Int(0)),
+            Some(Value::Int(0)),
+        ]);
+        Ok(rs)
+    }
+
     fn exec_merge(
         &mut self,
         stmt: core_query::cypher::MergeStmt,
         params: &BTreeMap<String, Value>,
     ) -> Result<ResultSet> {
         // MERGE: check if a node with the given key already exists.
+        if stmt.edge.is_some() {
+            return self.exec_merge_edge(stmt, params);
+        }
         let key = match &stmt.key_value {
             Value::Str(s) => s.clone(),
             _ => {
@@ -13344,62 +14162,7 @@ impl<F: Fs> GraphDb<F> {
         //
         // Clone to avoid holding a borrow on `self.pending_write_authz` while
         // also calling `self.ids.get(key)`.
-        let merge_existed: bool = if let Some(authz) = self.pending_write_authz.clone() {
-            let has_create = authz.scope.create_labels.contains(&stmt.label);
-            let has_update = authz.scope.update_labels.contains(&stmt.label);
-            if !has_create && !has_update {
-                // Scope-before-lookup: 403 without has_node call (timing oracle
-                // closure — see test_merge_unscoped_no_key_lookup).
-                return Err(GraphError::RoleWriteDenied {
-                    reason: format!(
-                        "role-bound token: label '{}' not in write scope (create_labels)",
-                        stmt.label
-                    ),
-                });
-            }
-            // Key lookup under mask.
-            match self.ids.get(key.as_str()) {
-                Some(id) if authz.mask.contains_id(id) => {
-                    // Visible: must have update scope to proceed to match arm.
-                    if !has_update {
-                        return Err(GraphError::RoleWriteDenied {
-                            reason: format!(
-                                "role-bound token: label '{}' not in write scope (update_labels)",
-                                stmt.label
-                            ),
-                        });
-                    }
-                    true // existed = true → match arm
-                }
-                Some(_) => {
-                    // Hidden: same error as absent to the role (spec §3.1/§3.3).
-                    return Err(GraphError::RoleWriteDenied {
-                        reason: "role-bound token: target node not visible".into(),
-                    });
-                }
-                None => {
-                    // Absent: must have create scope to proceed to the create arm.
-                    //
-                    // Update-only roles (create_labels empty, update_labels set):
-                    // return the SAME "not visible" error as the hidden-key branch
-                    // so hidden ≡ absent — no distinguishing oracle (spec §6.1
-                    // "confirm existence of hidden nodes: No").
-                    //
-                    // Create-scoped roles (has_create=true): absent → create arm
-                    // as before.  The accepted structural key-existence disclosure
-                    // (§THREAT-MODEL) applies only when the role holds create scope.
-                    if !has_create {
-                        return Err(GraphError::RoleWriteDenied {
-                            reason: "role-bound token: target node not visible".into(),
-                        });
-                    }
-                    false // existed = false → create arm
-                }
-            }
-        } else {
-            // Full authority: use the existing non-masked has_node check.
-            self.has_node(&key)
-        };
+        let merge_existed: bool = self.merge_node_existed(&stmt.label, &key)?;
 
         let existed = merge_existed;
         let create_props = if existed {
@@ -17144,6 +17907,11 @@ impl<'a, F: Fs> MutPreview<'a, F> {
     }
 
     fn prepare_remove_prop(&self, key: &str, field: &str) -> Result<bool> {
+        // `id` is not removable from a node whose `id` is its key (ledger row 128).
+        // Stated first so the answer does not depend on any view.
+        if field == "id" {
+            check_key_property_removal(key, self.prop_value(key, "id").as_ref())?;
+        }
         // A view owns its property, and the refusal has to live here rather
         // than on `GraphDb::remove_prop`: `BatchOp::RemoveProp` never meets
         // that one, and it is what the HTTP `DELETE /node/{key}/prop/{field}`
@@ -17375,7 +18143,10 @@ impl<'a, F: Fs> MutPreview<'a, F> {
             .map(String::as_str)
             .chain(overlay_fields)
             .filter(|field| {
-                *field != NS_PROP && !supplied.contains(field) && self.has_prop(key, field)
+                *field != NS_PROP
+                    && !(*field == "id" && id_mirrors_key(key, self.prop_value(key, "id").as_ref()))
+                    && !supplied.contains(field)
+                    && self.has_prop(key, field)
             })
             .collect();
         // The view-owned half is kept, and counted: the row still commits and

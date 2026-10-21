@@ -517,7 +517,7 @@ class GraphDb:
     def query_write(self, cypher: str, params: Params = None) -> list[Row]:
         """Execute a Cypher write statement.
 
-        CREATE / MATCH…SET / MATCH…DELETE / MATCH…DETACH DELETE / MERGE.
+        CREATE / MATCH…SET / MATCH…REMOVE / MATCH…DELETE / MATCH…DETACH DELETE / MERGE.
 
         Returns a one-row result dict with keys `created`, `properties_set` and
         `deleted`, unless the statement carries its own `RETURN` projection, in

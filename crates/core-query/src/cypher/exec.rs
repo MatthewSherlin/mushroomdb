@@ -2584,6 +2584,124 @@ fn eval_convert_scalar(
     })
 }
 
+/// What a name holds when an operand is evaluated outside a query: a value, or
+/// a stored node (by dense id), so `key(n)` and `labels(n)` read the node.
+pub enum Binding {
+    Value(Value),
+    Node(u32),
+}
+
+/// Evaluate one operand against named bindings, with the same evaluator a
+/// `RETURN` uses. A property of a node binding reads the store's value; a
+/// caller that needs another source for it substitutes the read first.
+pub fn eval_operand(
+    view: &GraphView,
+    operand: &Operand,
+    params: &Params,
+    bindings: &[(&str, Binding)],
+) -> Result<Option<Value>, String> {
+    let mut vars = VarTable { names: Vec::new() };
+    let mut row: Row = Vec::new();
+    for (name, binding) in bindings {
+        let slot = vars.intern(name);
+        if row.len() <= slot {
+            row.resize(slot + 1, None);
+        }
+        row[slot] = Some(match binding {
+            Binding::Value(v) => Cell::Scalar(v.clone()),
+            Binding::Node(id) => Cell::Node(*id),
+        });
+    }
+    // A list comprehension or `reduce` binds its own variables in a row slot,
+    // which the planner allocates inside a query; here they are allocated
+    // alone, so an unbound outer name still errors as it does in a query.
+    intern_local_vars(&mut vars, operand);
+    row.resize(row.len().max(vars.names.len()), None);
+    resolve_operand(view, &vars, &row, operand, params)
+}
+
+/// Intern the variables the list comprehensions and `reduce`s in `operand`
+/// bind, and nothing else.
+fn intern_local_vars(vars: &mut VarTable, operand: &Operand) {
+    match operand {
+        Operand::Prop { .. } | Operand::Var(_) | Operand::Lit(_) | Operand::Param(_) => {}
+        Operand::BinArith { left, right, .. } => {
+            intern_local_vars(vars, left);
+            intern_local_vars(vars, right);
+        }
+        Operand::Index { base, index } => {
+            intern_local_vars(vars, base);
+            intern_local_vars(vars, index);
+        }
+        Operand::FuncCall { args: items, .. } | Operand::ListLit(items) => {
+            for item in items {
+                intern_local_vars(vars, item);
+            }
+        }
+        Operand::MapLit(entries) => {
+            for (_, value) in entries {
+                intern_local_vars(vars, value);
+            }
+        }
+        Operand::Case { branches, default } => {
+            for (cond, value) in branches {
+                intern_local_vars_expr(vars, cond);
+                intern_local_vars(vars, value);
+            }
+            if let Some(d) = default {
+                intern_local_vars(vars, d);
+            }
+        }
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            vars.intern(var);
+            intern_local_vars(vars, list);
+            if let Some(f) = filter {
+                intern_local_vars_expr(vars, f);
+            }
+            intern_local_vars(vars, map);
+        }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            vars.intern(acc_var);
+            vars.intern(iter_var);
+            intern_local_vars(vars, init);
+            intern_local_vars(vars, list);
+            intern_local_vars(vars, body);
+        }
+    }
+}
+
+fn intern_local_vars_expr(vars: &mut VarTable, expr: &Expr) {
+    match expr {
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            intern_local_vars_expr(vars, a);
+            intern_local_vars_expr(vars, b);
+        }
+        Expr::Not(a) => intern_local_vars_expr(vars, a),
+        Expr::Cmp { lhs, rhs, .. } => {
+            intern_local_vars(vars, lhs);
+            intern_local_vars(vars, rhs);
+        }
+        Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => intern_local_vars(vars, o),
+        Expr::In { expr, list } => {
+            intern_local_vars(vars, expr);
+            for o in list {
+                intern_local_vars(vars, o);
+            }
+        }
+    }
+}
+
 fn resolve_operand(
     view: &GraphView,
     vars: &VarTable,
@@ -2846,7 +2964,12 @@ fn resolve_prop(
                 Ok(None)
             }
         }
-        // Scalar alias: has no properties.
+        // A scalar alias holding a map (`UNWIND $rows AS r` → `r.id`): the entry,
+        // null when the key is absent. Any other scalar has no properties.
+        Cell::Scalar(Value::Map(entries)) => Ok(entries
+            .get(field)
+            .cloned()
+            .and_then(crate::value_ops::element)),
         Cell::Scalar(_) => Ok(None),
     }
 }
