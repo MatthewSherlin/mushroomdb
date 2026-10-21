@@ -9,7 +9,7 @@
 //!   equal reads of a copy that applied the same ops through `write_batch`.
 //! - `fulltext_inside_tx_sees_own_writes_not_own_deletes`.
 
-use mushroomdb::{BatchOp, SharedDb, Value};
+use mushroomdb::{BatchOp, Predicate, PropPredicate, RoleDef, RuleDef, SharedDb, Value};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -523,7 +523,8 @@ fn random_statement(
 
 /// After every statement of a random sequence — inserts, SETs, edge and node
 /// deletes, MERGEs, reads — every probe read inside the transaction equals the
-/// same read of a copy that applied the same ops through `write_batch`.
+/// same read of a copy that applied the same ops through `write_batch`, read
+/// through the copy's live handle.
 #[test]
 fn randomized_tx_reads_match_write_batch_after_every_statement() {
     for seed_value in [0xD1FF_0001u64, 0xD1FF_0002, 0xD1FF_0003] {
@@ -578,10 +579,13 @@ fn randomized_tx_reads_match_write_batch_after_every_statement() {
                 live[rng.below(live.len())].clone()
             };
             let params = key_param(&probe_key);
-            let reader = copy.reader();
+            // The oracle is the copy's live write handle, which reads its own
+            // state and never a delta layer: a defect a layered reader shared
+            // with the transaction would not hide.
+            let live_copy = copy.read();
             for probe in DIFF_PROBES {
                 let inside = dump(&tx.execute(probe, &params).unwrap());
-                let want = dump(&reader.query(probe, &params).unwrap());
+                let want = dump(&live_copy.query(probe, &params).unwrap());
                 assert_eq!(
                     inside, want,
                     "seed {seed_value:#x} step {step} after `{cypher}`: probe `{probe}` (k = {probe_key})"
@@ -1088,5 +1092,389 @@ fn reader_tail_layer_matches_the_live_handle_after_every_commit() {
                 "seed {seed_value:#x} step {step}: node_edges"
             );
         }
+    }
+}
+
+// ── Committed-tail cases against the live handle ────────────────────────────
+
+/// How a scenario's store is prepared below its delta tail.
+#[derive(Clone, Copy, Debug)]
+enum Below {
+    /// Never snapshotted: the fold holds everything.
+    NoSnapshot,
+    /// Snapshotted first: the mmap base holds the seed.
+    Snapshot,
+    /// Snapshotted, then a fold's worth of commits: base, folded overlay
+    /// and tail all non-empty.
+    AfterFold,
+}
+
+const BELOW: [Below; 3] = [Below::NoSnapshot, Below::Snapshot, Below::AfterFold];
+
+const TAIL_PROBES: &[&str] = &[
+    "MATCH (a)-[r]->(b) RETURN a.id AS s, type(r) AS t, b.id AS d",
+    "MATCH ()-[r]->() RETURN count(r) AS c",
+    "MATCH (n) RETURN n.id AS k, labels(n) AS l, n.x AS x, n.tags AS tags",
+    "MATCH (n {id: $k})-[]-(m) RETURN m.id AS m",
+];
+
+fn p_node(key: &str, props: Vec<(&str, Value)>) -> BatchOp {
+    let mut all = vec![("id".to_string(), Value::Str(key.into()))];
+    all.extend(props.into_iter().map(|(f, v)| (f.to_string(), v)));
+    BatchOp::InsertNode {
+        label: "P".into(),
+        key: key.into(),
+        props: all,
+    }
+}
+
+fn knows(src: &str, dst: &str) -> BatchOp {
+    BatchOp::InsertEdge {
+        edge_type: "KNOWS".into(),
+        src_key: src.into(),
+        dst_key: dst.into(),
+    }
+}
+
+fn unknows(src: &str, dst: &str) -> BatchOp {
+    BatchOp::DeleteEdge {
+        edge_type: "KNOWS".into(),
+        src_key: src.into(),
+        dst_key: dst.into(),
+    }
+}
+
+fn set(key: &str, field: &str, value: Value) -> BatchOp {
+    BatchOp::SetProp {
+        key: key.into(),
+        field: field.into(),
+        value,
+    }
+}
+
+fn tags(list: &[&str]) -> Value {
+    Value::List(list.iter().map(|t| Value::Str((*t).into())).collect())
+}
+
+/// A store with `a`, `b`, `c` (`KNOWS` a→b, b→c), prepared as `below` says.
+fn tail_store(name: &str, below: Below, setup: impl FnOnce(&SharedDb)) -> SharedDb {
+    let db = SharedDb::open(&tmp(&format!("{name}-{below:?}"))).unwrap();
+    setup(&db);
+    db.submit_batch(vec![
+        p_node("a", vec![("x", Value::Int(1))]),
+        p_node("b", vec![("x", Value::Int(2))]),
+        p_node("c", vec![("x", Value::Int(1))]),
+        knows("a", "b"),
+        knows("b", "c"),
+    ])
+    .unwrap();
+    if !matches!(below, Below::NoSnapshot) {
+        db.write().snapshot().unwrap();
+    }
+    if matches!(below, Below::AfterFold) {
+        for i in 0..(mushroomdb::FOLD_EVERY_K + 2) {
+            db.submit_batch(vec![p_node(&format!("f{i}"), vec![])])
+                .unwrap();
+        }
+    }
+    db
+}
+
+/// A fresh reader — which reads the unfolded tail through its layer — equals
+/// the live handle on every probe and on `node_edges` (`derived` included)
+/// for each of `keys`.
+fn assert_tail_matches_live(db: &SharedDb, keys: &[&str], what: &str) {
+    let reader = db.reader();
+    assert!(
+        !reader.deltas.is_empty(),
+        "{what}: the tail is empty, so the layer is not under test"
+    );
+    let live = db.read();
+    for key in keys {
+        let params = key_param(key);
+        for probe in TAIL_PROBES {
+            assert_eq!(
+                dump(&reader.query(probe, &params).unwrap()),
+                dump(&live.query(probe, &params).unwrap()),
+                "{what}: probe `{probe}` (k = {key})"
+            );
+        }
+        let edges = |r: mushroomdb::Result<Vec<mushroomdb::EdgeInfo>>| {
+            r.ok().map(|es| {
+                es.into_iter()
+                    .map(|e| (e.edge_type, e.src_key, e.dst_key, e.derived))
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            edges(reader.node_edges(key)),
+            edges(live.node_edges(key)),
+            "{what}: node_edges({key})"
+        );
+        assert_eq!(
+            reader.node_info(key).map(|i| (i.label, i.props)),
+            live.node_info(key).map(|i| (i.label, i.props)),
+            "{what}: node_info({key})"
+        );
+    }
+}
+
+/// Run `steps` one commit each over every `Below`, checking after each one and
+/// again once a fold has taken the steps in.
+fn run_tail_case(name: &str, keys: &[&str], steps: impl Fn() -> Vec<Vec<BatchOp>>) {
+    run_tail_case_with(name, keys, |_| {}, steps);
+}
+
+fn run_tail_case_with(
+    name: &str,
+    keys: &[&str],
+    setup: impl Fn(&SharedDb),
+    steps: impl Fn() -> Vec<Vec<BatchOp>>,
+) {
+    for below in BELOW {
+        let db = tail_store(name, below, &setup);
+        for (i, step) in steps().into_iter().enumerate() {
+            db.submit_batch(step).unwrap();
+            assert_tail_matches_live(&db, keys, &format!("{name} {below:?} step {i}"));
+        }
+        // Fold the steps in, then read them from the fold under a new tail.
+        for i in 0..mushroomdb::FOLD_EVERY_K {
+            db.submit_batch(vec![p_node(&format!("g{i}"), vec![])])
+                .unwrap();
+        }
+        assert_tail_matches_live(&db, keys, &format!("{name} {below:?} folded"));
+    }
+}
+
+#[test]
+fn tail_edge_insert_matches_live() {
+    run_tail_case("tail-edge-insert", &["a", "b", "c", "d"], || {
+        vec![
+            vec![knows("c", "a")],
+            vec![p_node("d", vec![]), knows("d", "a"), knows("b", "d")],
+        ]
+    });
+}
+
+#[test]
+fn tail_put_back_matches_live() {
+    // An edge from below deleted, put back and deleted again.
+    run_tail_case("tail-put-back", &["a", "b", "c"], || {
+        vec![
+            vec![unknows("a", "b")],
+            vec![knows("a", "b")],
+            vec![unknows("a", "b")],
+            vec![knows("a", "b"), unknows("b", "c"), knows("b", "c")],
+        ]
+    });
+}
+
+#[test]
+fn tail_self_loop_matches_live() {
+    run_tail_case("tail-self-loop", &["a", "b", "e"], || {
+        vec![
+            vec![knows("a", "a")],
+            vec![p_node("e", vec![]), knows("e", "e"), knows("e", "a")],
+            vec![unknows("a", "a")],
+            vec![BatchOp::DeleteNode { key: "e".into() }],
+        ]
+    });
+}
+
+#[test]
+fn tail_rule_derived_edges_match_live_including_the_derived_flag() {
+    let same_tags = |db: &SharedDb| {
+        db.write()
+            .create_rule(RuleDef {
+                name: "same_tags".into(),
+                src_label: "P".into(),
+                dst_label: "P".into(),
+                predicate: Predicate::Overlap {
+                    field: "tags".into(),
+                    min: 1.0,
+                },
+                edge_type: "SAME".into(),
+                weight_prop: None,
+                max_edges: None,
+                approximate: false,
+                via_label: None,
+                via_edge: None,
+                via_dir: None,
+                namespace: None,
+            })
+            .unwrap();
+    };
+    let steps = || {
+        vec![
+            // Derive a–b.
+            vec![
+                set("a", "tags", tags(&["t"])),
+                set("b", "tags", tags(&["t"])),
+            ],
+            // Extend to c and a new node.
+            vec![
+                set("c", "tags", tags(&["t", "u"])),
+                p_node("h", vec![("tags", tags(&["u"]))]),
+            ],
+            // Retract a's, and delete a derived endpoint.
+            vec![set("a", "tags", tags(&["v"]))],
+            vec![BatchOp::DeleteNode { key: "h".into() }],
+        ]
+    };
+    run_tail_case_with("tail-derived", &["a", "b", "c", "h"], same_tags, steps);
+    // Non-vacuous: the rule did derive edges the check saw.
+    let db = tail_store("tail-derived-count", Below::NoSnapshot, same_tags);
+    db.submit_batch(steps().remove(0)).unwrap();
+    let derived = db
+        .reader()
+        .node_edges("a")
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.derived)
+        .count();
+    assert!(derived > 0, "the rule derived nothing: vacuous");
+}
+
+#[test]
+fn tail_rename_and_reinsert_match_live() {
+    run_tail_case("tail-rename", &["a", "a2", "b", "c", "c2"], || {
+        vec![
+            vec![BatchOp::RenameNode {
+                old_key: "a".into(),
+                new_key: "a2".into(),
+            }],
+            // The old key comes back as a new node.
+            vec![p_node("a", vec![("x", Value::Int(9))]), knows("a", "c")],
+            // Rename and back in one batch.
+            vec![
+                BatchOp::RenameNode {
+                    old_key: "c".into(),
+                    new_key: "c2".into(),
+                },
+                BatchOp::RenameNode {
+                    old_key: "c2".into(),
+                    new_key: "c".into(),
+                },
+            ],
+            vec![BatchOp::DeleteNode { key: "a2".into() }],
+        ]
+    });
+}
+
+#[test]
+fn tail_delete_and_recreate_in_one_batch_matches_live() {
+    run_tail_case("tail-delete-recreate", &["a", "b", "c"], || {
+        vec![
+            vec![
+                BatchOp::DeleteNode { key: "b".into() },
+                p_node("b", vec![("x", Value::Int(7))]),
+                knows("b", "a"),
+            ],
+            vec![BatchOp::DeleteNode { key: "b".into() }, p_node("b", vec![])],
+        ]
+    });
+}
+
+/// A transaction over a committed tail deletes a node and re-creates its key
+/// with a new edge: the read inside equals the live read after the commit.
+#[test]
+fn tx_delete_and_recreate_over_a_tail_matches_live_after_commit() {
+    for below in BELOW {
+        let db = tail_store("tx-delete-recreate", below, |_| {});
+        db.submit_batch(vec![knows("c", "a"), set("b", "x", Value::Int(5))])
+            .unwrap();
+        let mut tx = db.begin_transaction();
+        tx.execute("MATCH (n:P {id: 'b'}) DETACH DELETE n", &p())
+            .unwrap();
+        tx.execute(
+            "CREATE (n:P {id: 'b', x: 3})-[:KNOWS]->(m:P {id: 'z'})",
+            &p(),
+        )
+        .unwrap();
+        let inside: Vec<Vec<String>> = ["a", "b", "c", "z"]
+            .iter()
+            .flat_map(|k| {
+                TAIL_PROBES
+                    .iter()
+                    .map(|q| dump(&tx.execute(q, &key_param(k)).unwrap()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        tx.commit().unwrap();
+        let live = db.read();
+        let after: Vec<Vec<String>> = ["a", "b", "c", "z"]
+            .iter()
+            .flat_map(|k| {
+                TAIL_PROBES
+                    .iter()
+                    .map(|q| dump(&live.query(q, &key_param(k)).unwrap()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(inside, after, "{below:?}");
+    }
+}
+
+/// A role mask whose label leg is narrowed by `visible_where` resolves over
+/// the tail exactly as on the live handle, and so do masked queries.
+#[test]
+fn tail_role_mask_with_visible_where_matches_live() {
+    let role = |db: &SharedDb| {
+        db.write()
+            .apply_schema(&mushroomdb::schema::Schema {
+                roles: vec![RoleDef {
+                    name: "ones".into(),
+                    keys: vec!["k".into()],
+                    labels: vec!["P".into(), "Nope".into()],
+                    visible_where: Some(PropPredicate {
+                        field: "x".into(),
+                        eq: Some(Value::Int(1)),
+                        in_: None,
+                    }),
+                    namespaces: None,
+                    write: None,
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+    };
+    let steps = || {
+        vec![
+            vec![set("b", "x", Value::Int(1))],
+            vec![set("a", "x", Value::Int(2))],
+            vec![BatchOp::RemoveProp {
+                key: "c".into(),
+                field: "x".into(),
+            }],
+            vec![p_node("k", vec![("x", Value::Int(5))])],
+            vec![p_node("n", vec![("x", Value::Int(1))])],
+            vec![BatchOp::RenameNode {
+                old_key: "n".into(),
+                new_key: "n2".into(),
+            }],
+            vec![BatchOp::DeleteNode { key: "b".into() }],
+            vec![
+                BatchOp::DeleteNode { key: "k".into() },
+                p_node("k", vec![("x", Value::Int(1))]),
+            ],
+        ]
+    };
+    let probe = "MATCH (n) RETURN n.id AS k, n.x AS x";
+    for below in BELOW {
+        let db = tail_store("tail-role", below, role);
+        let mut saw_rows = 0;
+        for (i, step) in steps().into_iter().enumerate() {
+            db.submit_batch(step).unwrap();
+            let reader = db.reader();
+            assert!(!reader.deltas.is_empty());
+            let live = db.read();
+            let reader_mask = reader.mask_for_role("ones").unwrap();
+            let live_mask = live.mask_for_role("ones").unwrap();
+            let got = dump(&reader.query_masked(probe, &p(), &reader_mask).unwrap());
+            let want = dump(&live.query_masked(probe, &p(), &live_mask).unwrap());
+            assert_eq!(got, want, "{below:?} step {i}");
+            saw_rows = saw_rows.max(got.len());
+        }
+        assert!(saw_rows > 0, "{below:?}: the mask hid everything: vacuous");
     }
 }
