@@ -608,6 +608,29 @@ projections.  **Null propagation:** if any argument is `null`, the result is
 | `key(n)` | node variable | `String` | always the id-map key. Non-node argument is a named error |
 | `id(n)` | node variable | `String` | alias of `key(n)` (always the id-map key). `n.id` is stored-wins property access |
 | `labels(n)` | node variable | `List` | a one-element list holding the node's label; `n.label` reads it as a scalar |
+| `date([x])` | `String` or `Map` | `Date` | `date("2024-03-15")`, `date({year: 2024, month: 3, day: 15})`; no argument is today (UTC). A `LocalDateTime` or `DateTime` argument is cut to its date. Null, invalid or wrong-type input → null. A result cannot be stored until the V11 format ships |
+| `localdatetime([x])` | `String` or `Map` | `LocalDateTime` | `localdatetime("2024-03-15T10:30:00")`; no argument is now (UTC wall clock). Null, invalid or wrong-type input → null. A result cannot be stored until the V11 format ships |
+| `datetime([x])` | `String` or `Map` | `DateTime` | `datetime("2024-03-15T10:30:00+05:30")`; the offset is kept (within ±18:00), a string with no offset is read as UTC; no argument is now. Null, invalid or wrong-type input → null. A result cannot be stored until the V11 format ships |
+| `duration(x)` | `String` or `Map` | `Duration` | `duration({days: 3, hours: 2})` (keys `years`, `months`, `weeks`, `days`, `hours`, `minutes`, `seconds`, `milliseconds`, `microseconds`, `nanoseconds`) or `duration("P1Y2M3DT4H")`. Null, invalid, unknown key or wrong-type input → null. A result cannot be stored until the V11 format ships |
+| `time(…)`, `localtime(…)` | | | error: `not supported in mushroomdb 0.10: time types` |
+
+### Temporal values
+
+A query can build and return `Date`, `LocalDateTime`, `DateTime` and `Duration`
+values with the functions above, and `toString` gives their ISO 8601 text. They
+compare with `=`, `<`, `<=`, `>`, `>=` within their own type (a `DateTime` by
+instant; a `Date` never equals a `LocalDateTime`), and they sort in `ORDER BY`.
+Durations compare for equality only, component by component: a month is not 30
+days.
+
+`+` and `-` between a date or date-time and a duration move it, months first
+(a day past the end of a shorter month lands on its last day); a `Date` ignores
+the duration's time part. Durations add, subtract, and scale with `*` and `/` by
+a number. An out-of-range result is null.
+
+Until the V11 format ships, a temporal value cannot be stored: `SET n.d =
+date("2024-01-01")` is refused with a `not supported in mushroomdb 0.10 yet`
+error naming the type.
 
 Aggregations: `count`, `sum`, `avg`, `min`, `max`, and `collect(x)` (gather each
 row's value into a list, per group when grouping keys are present). `count` and
