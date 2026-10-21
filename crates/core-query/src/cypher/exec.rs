@@ -5,6 +5,7 @@ use crate::cypher::ast::{
     OrderTarget, RetItem, RetVal, UnwindExpr,
 };
 use crate::cypher::plan::PlanOp;
+use crate::cypher::temporal;
 use crate::cypher::RelDir;
 use crate::filter::eval_cmp;
 use crate::result::ResultSet;
@@ -1800,6 +1801,12 @@ const SCALAR_FUNCS: &[&str] = &[
     "range",
     "keys",
     "properties",
+    "date",
+    "localdatetime",
+    "datetime",
+    "duration",
+    "time",
+    "localtime",
 ];
 
 /// Evaluate a two-string-argument predicate (`contains` / `startsWith` /
@@ -2115,7 +2122,7 @@ fn eval_func(
                 Some(Value::Int(n)) => Some(Value::Str(n.to_string())),
                 Some(Value::Float(f)) => Some(Value::Str(f.to_string())),
                 Some(Value::Bool(b)) => Some(Value::Str(b.to_string())),
-                Some(_) => None, // list/map have no scalar string form
+                Some(other) => temporal::to_text(&other).map(Value::Str), // list/map: null
             })
         }
         "decay" => {
@@ -2159,6 +2166,17 @@ fn eval_func(
         }
         "head" | "tail" | "last" | "range" | "keys" | "properties" => {
             eval_list_scalar(&norm, name, args, view, vars, row, params)
+        }
+        // QL-13: the time-of-day types are not in 0.10 (contract C3).
+        "time" | "localtime" => Err(temporal::TIME_TYPES_REFUSAL.to_string()),
+        "date" | "localdatetime" | "datetime" | "duration" => {
+            let a = resolve_fn_args(name, args, 0..=1, view, vars, row, params)?;
+            let [arg, _, _] = a;
+            // A null argument is null; no argument is the current instant.
+            if args.len() == 1 && arg.is_none() {
+                return Ok(None);
+            }
+            Ok(temporal::construct(&norm, arg, args.is_empty()))
         }
         _ => Err(format!(
             "unknown function `{name}`; supported: {}",
@@ -2618,6 +2636,9 @@ fn resolve_operand(
                     Ok(Some(Value::Int(result)))
                 }
                 (Some(lv), Some(rv)) => {
+                    if let Some(temporal_result) = temporal::arith(op, &lv, &rv) {
+                        return Ok(temporal_result);
+                    }
                     let a = match &lv {
                         Value::Float(f) => *f,
                         Value::Int(i) => *i as f64,
@@ -5053,6 +5074,10 @@ fn apply_limit<T>(rows: &mut Vec<T>, n: u64) {
 }
 
 #[cfg(test)]
+#[path = "tests/ql_13.rs"]
+mod ql_13;
+
+#[cfg(test)]
 mod tests {
     use super::{execute, resolve_operand, Params, Row, VarTable};
     use crate::cypher::ast::{
@@ -5067,7 +5092,7 @@ mod tests {
     use proptest::prelude::*;
     use std::collections::BTreeMap;
 
-    struct Fx {
+    pub(super) struct Fx {
         ids: IdMap,
         syms: Interner,
         labels: Vec<u32>,
@@ -5077,7 +5102,7 @@ mod tests {
     }
 
     impl Fx {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Fx {
                 ids: IdMap::new(),
                 syms: Interner::new(),
@@ -5088,7 +5113,7 @@ mod tests {
             }
         }
 
-        fn add(&mut self, label: &str, key: &str, props: Vec<(&str, Value)>) -> u32 {
+        pub(super) fn add(&mut self, label: &str, key: &str, props: Vec<(&str, Value)>) -> u32 {
             let id = self.ids.get_or_insert(key);
             let sym = self.syms.intern(label);
             self.labels.resize(id as usize + 1, u32::MAX);
@@ -5107,7 +5132,7 @@ mod tests {
             }
         }
 
-        fn view(&self) -> GraphView<'_> {
+        pub(super) fn view(&self) -> GraphView<'_> {
             GraphView {
                 ids: &self.ids,
                 syms: &self.syms,
@@ -5135,7 +5160,7 @@ mod tests {
         plan(&parse(&lex(src).expect("lex")).expect("parse")).expect("plan")
     }
 
-    fn run(
+    pub(super) fn run(
         view: &GraphView,
         src: &str,
         params: &BTreeMap<String, Value>,
@@ -10065,7 +10090,7 @@ LIMIT 10";
     }
 
     /// Evaluate one expression through the full lex/parse/plan/execute path.
-    fn eval(expr: &str) -> Option<Value> {
+    pub(super) fn eval(expr: &str) -> Option<Value> {
         let mut fx = Fx::new();
         fx.add("N", "x", vec![]);
         let rs = run(
@@ -10077,7 +10102,7 @@ LIMIT 10";
         rs.get(0, "r").cloned()
     }
 
-    fn eval_err(expr: &str) -> String {
+    pub(super) fn eval_err(expr: &str) -> String {
         let mut fx = Fx::new();
         fx.add("N", "x", vec![]);
         run(
