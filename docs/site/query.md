@@ -1040,7 +1040,7 @@ unexpected-token parse error or other unspecified result.
 
 | Feature | Status |
 |---|---|
-| Multi-statement transactions | Not supported (one write statement per query in v1) |
+| Multi-statement transactions | Supported — BEGIN … COMMIT through SharedDb::begin_transaction and Bolt; snapshot isolation, one atomic commit; some write forms are refused inside a transaction (see REMOVE, SET maps, UNWIND above) |
 | Combined MATCH … SET … RETURN | Supported — write commits, then RETURN projects from post-write state |
 | SET RHS expressions | Literals, `$param` references, and arithmetic expressions (`n.x + 1`, `n.score * 1.5`); bare property-to-property copy (`SET n.x = m.y`) is a named error |
 | MATCH … DETACH DELETE (node) | Supported — removes node + all edges |

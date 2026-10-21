@@ -302,8 +302,10 @@ cargo test -p sim-harness -- --nocapture 2>&1 | grep -E "crash points|recall|tes
 
 ## What is not yet covered
 
-- **Multi-statement transactions** — not implemented; no test exists or is needed until
-  the feature ships.
+- **Multi-statement transactions** — supported: BEGIN … COMMIT through
+  `SharedDb::begin_transaction` and Bolt, with snapshot isolation and one atomic commit.
+  Covered by `crates/core-api/tests/transaction_integration.rs` and `transaction_overlay.rs`;
+  the write forms refused inside a transaction are listed in [`query.md`](query.md).
 - **Concurrent writer correctness** — the engine is single-writer by design (`RwLock`
   facade). Race conditions between writers are excluded by the architecture, not tested.
 - **Network-layer correctness** — the HTTP and WebSocket layers have golden-shape tests
