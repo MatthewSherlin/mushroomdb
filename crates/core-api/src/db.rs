@@ -17599,6 +17599,75 @@ enum NodeAuthzStatus {
     Absent,
 }
 
+/// An edge as a batch names it: `(edge type, source key, destination key)`.
+type EdgeKey = (String, String, String);
+
+/// A set of batch edges that can also be found by either endpoint.
+///
+/// A node delete or rename in a batch has to find the edges the batch
+/// already added or deleted at that node. Filtering the whole set for them
+/// made a batch of N edge inserts and M node deletes cost O(N × M) (ledger
+/// row 130); the endpoint index finds them in O(log N + edges at the node).
+#[derive(Default)]
+struct EdgeKeys {
+    edges: BTreeSet<EdgeKey>,
+    /// `(endpoint key, edge)` for each endpoint of each edge in `edges`: once
+    /// for a self-loop.
+    by_endpoint: BTreeSet<(String, EdgeKey)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Entries [`EdgeKeys::take_touching`] visited, for the test that pins it
+    /// to the edges at the node.
+    static EDGE_KEYS_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl EdgeKeys {
+    fn contains(&self, k: &EdgeKey) -> bool {
+        self.edges.contains(k)
+    }
+
+    fn insert(&mut self, k: EdgeKey) {
+        if self.edges.contains(&k) {
+            return;
+        }
+        self.by_endpoint.insert((k.1.clone(), k.clone()));
+        if k.2 != k.1 {
+            self.by_endpoint.insert((k.2.clone(), k.clone()));
+        }
+        self.edges.insert(k);
+    }
+
+    fn remove(&mut self, k: &EdgeKey) {
+        if !self.edges.remove(k) {
+            return;
+        }
+        self.by_endpoint.remove(&(k.1.clone(), k.clone()));
+        self.by_endpoint.remove(&(k.2.clone(), k.clone()));
+    }
+
+    /// Remove and return every edge with `key` at either end.
+    fn take_touching(&mut self, key: &str) -> Vec<EdgeKey> {
+        let start = (
+            key.to_string(),
+            (String::new(), String::new(), String::new()),
+        );
+        let touching: Vec<EdgeKey> = self
+            .by_endpoint
+            .range(start..)
+            .take_while(|(endpoint, _)| endpoint == key)
+            .map(|(_, edge)| edge.clone())
+            .collect();
+        #[cfg(test)]
+        EDGE_KEYS_VISITED.with(|v| v.set(v.get() + touching.len()));
+        for edge in &touching {
+            self.remove(edge);
+        }
+        touching
+    }
+}
+
 /// Overlay of ops already accepted earlier in the same batch. Never written
 /// back to the database — validation only.
 #[derive(Default)]
@@ -17616,8 +17685,8 @@ struct Overlay {
     renamed_from: BTreeMap<String, String>,
     extra_props: BTreeMap<(String, String), Value>,
     removed_props: BTreeSet<(String, String)>,
-    extra_edges: BTreeSet<(String, String, String)>,
-    deleted_edges: BTreeSet<(String, String, String)>,
+    extra_edges: EdgeKeys,
+    deleted_edges: EdgeKeys,
     extra_rules: BTreeSet<String>,
     deleted_rules: BTreeSet<String>,
     /// `rule name → (via_edge, edge_type)` for every via-hop rule accepted
@@ -18298,12 +18367,8 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         self.overlay.deleted_keys.insert(key.to_string());
         self.overlay.take_props_of(key);
         self.overlay.take_removed_props_of(key);
-        self.overlay
-            .extra_edges
-            .retain(|(_, s, d)| s != key && d != key);
-        self.overlay
-            .deleted_edges
-            .retain(|(_, s, d)| s != key && d != key);
+        self.overlay.extra_edges.take_touching(key);
+        self.overlay.deleted_edges.take_touching(key);
     }
 
     fn note_create_rule(&mut self, def: &RuleDef) {
@@ -18360,14 +18425,14 @@ impl<'a, F: Fs> MutPreview<'a, F> {
         }
         // Edges the batch added or deleted follow the node to its new key.
         let follow = |k: String| if k == old { new_str.clone() } else { k };
-        self.overlay.extra_edges = std::mem::take(&mut self.overlay.extra_edges)
-            .into_iter()
-            .map(|(t, s, d)| (t, follow(s), follow(d)))
-            .collect();
-        self.overlay.deleted_edges = std::mem::take(&mut self.overlay.deleted_edges)
-            .into_iter()
-            .map(|(t, s, d)| (t, follow(s), follow(d)))
-            .collect();
+        for set in [
+            &mut self.overlay.extra_edges,
+            &mut self.overlay.deleted_edges,
+        ] {
+            for (t, s, d) in set.take_touching(old) {
+                set.insert((t, follow(s), follow(d)));
+            }
+        }
         if let Some(origin) = origin {
             self.overlay.renamed_from.insert(new_str, origin);
         }
@@ -18703,6 +18768,35 @@ fn copy_lock_failure(err: &GraphError) -> Option<GraphError> {
 mod tests {
     use super::*;
     use core_rules::Predicate;
+
+    /// Ledger row 130: a node delete in a batch finds the batch's edges at
+    /// that node through the endpoint index, so 200 deletes beside 200 batch
+    /// edges visit the one edge at the one deleted endpoint, not 200 × 200.
+    #[test]
+    fn a_batch_node_delete_visits_only_the_batch_edges_at_that_node() {
+        let dir = tmp_dir("row130-visits");
+        let mut db = GraphDb::open(&dir).unwrap();
+        let mut b = db.batch();
+        for i in 0..200 {
+            b.insert_node("Old", &format!("old{i}"), vec![]);
+        }
+        b.commit().unwrap();
+        let mut b = db.batch();
+        for i in 0..200 {
+            b.insert_node("P", &format!("s{i}"), vec![])
+                .insert_node("P", &format!("d{i}"), vec![])
+                .insert_edge("KNOWS", &format!("s{i}"), &format!("d{i}"))
+                .delete_node(&format!("old{i}"));
+        }
+        b.delete_node("s0");
+        EDGE_KEYS_VISITED.with(|v| v.set(0));
+        b.commit().unwrap();
+        assert_eq!(EDGE_KEYS_VISITED.with(|v| v.get()), 1);
+        assert_eq!(db.edge_count(), 199);
+        assert!(db.node_info("s0").is_none() && db.node_info("old7").is_none());
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn tmp_dir(name: &str) -> std::path::PathBuf {
         let d =

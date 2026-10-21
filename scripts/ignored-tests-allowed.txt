@@ -70,3 +70,6 @@ core-api/tests/transaction_overlay.rs::bench_reader_p99_under_a_fulltext_writer 
 # reader_derived.rs — reader derived-flag timing probe (TX-6); machine-dependent
 core-api/tests/reader_derived.rs::reader_derived_bench — measurement by hand: prints reader node_edges timings with and without section 17 (release, --ignored), nothing asserted
 cli/tests/csv_import.rs::csv_import_throughput_above_50k_per_second — builds a 100k-node store (1M with MUSHROOMDB_IMPORT_BENCH_NODES) and prints import vs incremental-ingest timings; run in release with --ignored
+
+# batch_vs_commits.rs — ledger row 130 scaling timing (TX-7); machine-dependent
+core-api/tests/batch_vs_commits.rs::bench_create_edges_and_delete_batch_is_linear — measurement by hand: times a create-edges-and-delete batch at 5k and 20k rows (release, --ignored); asserts the 20k/5k ratio < 8x (linear is ~4x, the old quadratic 11–16x)
