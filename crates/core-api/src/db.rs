@@ -4865,6 +4865,13 @@ impl<F: Fs> GraphDb<F> {
                 let old_value = build_props_view(&self.props, &self.base)
                     .get(id, field)
                     .map(|vr| vr.into_value());
+                // What the full-text index holds for `id`, so the rewrite
+                // below removes that value's words, not the whole vocabulary.
+                let indexed = self
+                    .fulltext
+                    .field_indexed(field)
+                    .then(|| old_value.clone())
+                    .flatten();
                 Arc::make_mut(&mut self.props).set(id, field, value.clone());
                 // Fire rules for the changed field.
                 let cursor = self.engine.pending_delta_count();
@@ -4924,8 +4931,9 @@ impl<F: Fs> GraphDb<F> {
                     });
                     if let Some(label) = label_opt {
                         if self.fulltext.is_enabled(label, field) {
-                            Arc::make_mut(&mut self.fulltext).remove_node_field(id, field);
-                            Arc::make_mut(&mut self.fulltext).add_tokens(id, field, value);
+                            let fulltext = Arc::make_mut(&mut self.fulltext);
+                            fulltext.remove_node_value(id, field, indexed.as_ref());
+                            fulltext.add_tokens(id, field, value);
                         }
                     }
                 }
@@ -5139,6 +5147,12 @@ impl<F: Fs> GraphDb<F> {
                 let old_value = build_props_view(&self.props, &self.base)
                     .get(*id, &field_str)
                     .map(|vr| vr.into_value());
+                // As in `SetProp`: the full-text rewrite removes the old value's words.
+                let indexed = self
+                    .fulltext
+                    .field_indexed(&field_str)
+                    .then(|| old_value.clone())
+                    .flatten();
                 Arc::make_mut(&mut self.props).set(*id, &field_str, value.clone());
                 let cursor = self.engine.pending_delta_count();
                 let mut eng = std::mem::take(&mut self.engine);
@@ -5194,8 +5208,9 @@ impl<F: Fs> GraphDb<F> {
                     });
                     if let Some(label) = label_opt {
                         if self.fulltext.is_enabled(label, &field_str) {
-                            Arc::make_mut(&mut self.fulltext).remove_node_field(*id, &field_str);
-                            Arc::make_mut(&mut self.fulltext).add_tokens(*id, &field_str, value);
+                            let fulltext = Arc::make_mut(&mut self.fulltext);
+                            fulltext.remove_node_value(*id, &field_str, indexed.as_ref());
+                            fulltext.add_tokens(*id, &field_str, value);
                         }
                     }
                 }
@@ -5317,6 +5332,12 @@ impl<F: Fs> GraphDb<F> {
                 let old = build_props_view(&self.props, &self.base)
                     .get(id, field)
                     .map(|vr| vr.into_value());
+                // As in `SetProp`: the full-text removal walks the old value's words.
+                let indexed = self
+                    .fulltext
+                    .field_indexed(field)
+                    .then(|| old.clone())
+                    .flatten();
                 Arc::make_mut(&mut self.props).remove(id, field);
                 // If the base still supplies the value after the overlay removal,
                 // record a tombstone so ColumnsView::get does not resurrect it.
@@ -5381,7 +5402,11 @@ impl<F: Fs> GraphDb<F> {
                 );
                 // Full-text index maintenance: remove tokens for this field.
                 if self.fulltext.field_indexed(field) {
-                    Arc::make_mut(&mut self.fulltext).remove_node_field(id, field);
+                    Arc::make_mut(&mut self.fulltext).remove_node_value(
+                        id,
+                        field,
+                        indexed.as_ref(),
+                    );
                 }
                 // Property (equality) index maintenance: drop this node's entry.
                 if self.prop_index.field_indexed(field) {
