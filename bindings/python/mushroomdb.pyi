@@ -281,11 +281,13 @@ class ConstraintViolation(MushroomError):
 class ConstraintCreationConflict(MushroomError):
     """A unique constraint cannot be declared: live nodes already share a value.
 
-    `violations` lists every `(node_key, value)` in conflict.
+    `violations` lists the first 100 `(node_key, value)` in conflict, in node-id
+    order; `total` counts all of them.
     """
 
     code: str
     violations: list[tuple[str, Any]]
+    total: int
 
 class ValueTooLarge(MushroomError):
     """A value is larger than the store accepts; `size` and `limit` are bytes.

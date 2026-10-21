@@ -23,3 +23,9 @@ core-api = { package = "mushroomdb", path = "../../crates/core-api", version = "
 core-storage = { package = "mushroomdb-storage", path = "../../crates/core-storage", version = "0.9.2" }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }
 serde_json = "1"
+
+[features]
+# Exposes `GraphDb._declare_constraint_for_test`, so a Python test can reach the
+# errors a unique-constraint declaration raises before Python has an API for it.
+# Never enabled in a wheel.
+test-hooks = ["core-api/test-hooks"]

@@ -715,8 +715,19 @@ mod unlocked {
         let (dir, mut db) = open_temp("replay-dups");
         db.insert_node("User", "alice", email("a@x")).unwrap();
         db.insert_node("User", "bob", email("a@x")).unwrap();
-        // No pre-scan in TY-5 (TY-6 adds it), so this declares over them.
-        db.create_constraint("uniq_email", "User", "email").unwrap();
+        drop(db);
+        // `create_constraint` now refuses this store, so the record is appended
+        // by hand, as a WAL written by a build without the scan holds it.
+        let record = core_storage::encode_record(&core_storage::WalRecord::CreateConstraint {
+            name: "uniq_email".into(),
+            label: "User".into(),
+            field: "email".into(),
+        });
+        let mut wal = wal_bytes(&dir);
+        wal.extend_from_slice(&record);
+        std::fs::write(dir.join("wal.bin"), wal).unwrap();
+        let mut db = GraphDb::open(&dir).expect("replay must never fail");
+        db.unlock_v11_format_for_test();
         db.insert_node("User", "carol", email("c@x")).unwrap();
         let live_count = db.node_count();
         drop(db);
@@ -740,6 +751,289 @@ mod unlocked {
         let before = GraphDb::open_at(&dir, 1).unwrap();
         assert!(before.constraints().is_empty(), "declared at commit 2");
         assert_eq!(GraphDb::open_at(&dir, 2).unwrap().constraints().len(), 1);
+    }
+
+    // ── A store whose data predates its constraint ─────────────────────────
+    //
+    // The decision (TY-7): such a store opens, and the constraint is in force.
+    // Existing duplicates are kept as they are — nothing deletes or rewrites
+    // data, and replay never re-checks a frame. A new write is judged by what
+    // it leaves behind for the nodes it touches: it may not give a node a value
+    // another live node holds, but a write that leaves a duplicate's value as
+    // it was, or moves it somewhere free, or removes the node, is allowed.
+
+    /// A store holding `alice` and `bob` with one email, `carol` with another,
+    /// and a `uniq_email` declaration appended by hand (no create-time scan).
+    fn store_with_grandfathered_duplicates(name: &str) -> (PathBuf, GraphDb) {
+        let (dir, mut db) = open_temp(name);
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        db.insert_node("User", "bob", email("a@x")).unwrap();
+        db.insert_node("User", "carol", email("c@x")).unwrap();
+        drop(db);
+        append_constraint_record(&dir);
+        let mut db = GraphDb::open(&dir).expect("replay must never fail");
+        db.unlock_v11_format_for_test();
+        assert_eq!(db.constraints().len(), 1);
+        (dir, db)
+    }
+
+    fn append_constraint_record(dir: &Path) {
+        let record = core_storage::encode_record(&core_storage::WalRecord::CreateConstraint {
+            name: "uniq_email".into(),
+            label: "User".into(),
+            field: "email".into(),
+        });
+        let mut wal = wal_bytes(dir);
+        wal.extend_from_slice(&record);
+        std::fs::write(dir.join("wal.bin"), wal).unwrap();
+    }
+
+    #[test]
+    fn test_constraint_replay_does_not_enforce_old_data() {
+        let (dir, db) = store_with_grandfathered_duplicates("grandfather-replay");
+        drop(db);
+        let reopened = GraphDb::open(&dir).expect("replay must never fail");
+        assert_eq!(reopened.node_count(), 3);
+        assert_eq!(reopened.constraints().len(), 1);
+        for key in ["alice", "bob"] {
+            assert_eq!(
+                reopened.get_prop(key, "email"),
+                Some(Value::Str("a@x".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_open_at_before_constraint_declaration() {
+        let (dir, mut db) = open_temp("open-at-before");
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        // `open_at` takes a 0-based commit index; the last commit made is one less
+        // than the count.
+        let before_commit = db.commit_seq() - 1;
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        let after_commit = db.commit_seq() - 1;
+        drop(db);
+        let historical = GraphDb::open_at(&dir, before_commit).unwrap();
+        assert!(historical.constraints().is_empty());
+        assert!(
+            !historical.is_index_enabled("User", "email"),
+            "the backing index comes with the declaration"
+        );
+        assert_eq!(historical.node_count(), 1);
+        let later = GraphDb::open_at(&dir, after_commit).unwrap();
+        assert_eq!(later.constraints().len(), 1);
+        assert_eq!(later.node_count(), 2);
+    }
+
+    #[test]
+    fn a_grandfathered_duplicate_survives_a_snapshot_and_a_reopen() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-snapshot");
+        db.snapshot().unwrap();
+        db.snapshot().unwrap();
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).expect("a snapshot of such a store opens");
+        reopened.unlock_v11_format_for_test();
+        assert_eq!(reopened.constraints().len(), 1);
+        assert_eq!(reopened.node_count(), 3);
+        for key in ["alice", "bob"] {
+            assert_eq!(
+                reopened.get_prop(key, "email"),
+                Some(Value::Str("a@x".into()))
+            );
+        }
+        assert_violation(reopened.insert_node("User", "dave", email("a@x")));
+        reopened.insert_node("User", "dave", email("d@x")).unwrap();
+    }
+
+    #[test]
+    fn a_write_that_leaves_a_duplicates_value_alone_is_allowed() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-unrelated");
+        // Another property, through each path that can touch the node.
+        db.set_prop("bob", "age", Value::Int(3)).unwrap();
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("alice", "age", Value::Int(5));
+            b.set_prop("bob", "age", Value::Int(6));
+        })
+        .unwrap();
+        cypher(&mut db, "MATCH (n:User) WHERE n.id = 'bob' SET n.age = 7").unwrap();
+        assert_eq!(db.get_prop("bob", "age"), Some(Value::Int(7)));
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // A new node still may not join them.
+        assert_violation(db.insert_node("User", "dave", email("a@x")));
+        // Nor may a frame that touches a duplicate and takes its value.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "age", Value::Int(8));
+            b.insert_node("User", "dave", email("a@x"));
+        }));
+        // Nor may carol take it.
+        assert_violation(db.set_prop("carol", "email", Value::Str("a@x".into())));
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(reopened.node_count(), 3);
+        assert_eq!(reopened.get_prop("bob", "age"), Some(Value::Int(7)));
+        assert_eq!(
+            reopened.get_prop("bob", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+    }
+
+    #[test]
+    fn an_upsert_that_resends_a_duplicates_value_is_allowed() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-upsert");
+        let before_resend = |name: &str| {
+            vec![
+                ("name".to_string(), Value::Str(name.into())),
+                ("email".to_string(), Value::Str("a@x".into())),
+            ]
+        };
+        // A client that re-sends the full property set of a duplicate.
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node_on_conflict("User", "bob", before_resend("Bob"), OnConflict::Replace);
+        })
+        .unwrap();
+        // A MERGE that matches it and sets another property.
+        cypher(
+            &mut db,
+            "MERGE (n:User {id: 'bob'}) ON MATCH SET n.name = 'Robert'",
+        )
+        .unwrap();
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' SET n += {name: 'Al'}",
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_prop("bob", "name"),
+            Some(Value::Str("Robert".into()))
+        );
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // A rewrite beside a new claim on the same value is still refused: the
+        // rewritten duplicate holds it.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node_on_conflict("User", "bob", before_resend("B"), OnConflict::Replace);
+            b.insert_node("User", "dave", email("a@x"));
+        }));
+        // An upsert that adds the field to a node without one is a claim.
+        db.insert_node("User", "erin", vec![]).unwrap();
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node_on_conflict("User", "erin", before_resend("E"), OnConflict::Replace);
+        }));
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(
+            reopened.get_prop("bob", "name"),
+            Some(Value::Str("Robert".into()))
+        );
+    }
+
+    #[test]
+    fn only_a_changed_value_is_judged() {
+        let (_dir, mut db) = store_with_grandfathered_duplicates("grandfather-changed");
+        // Carol may not take the shared value, and a Float equal to it is the
+        // same value.
+        assert_violation(db.set_prop("carol", "email", Value::Str("a@x".into())));
+        // A batch that changes bob's value and puts it back leaves it as it was.
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("bob", "email", Value::Str("a@x".into()));
+        })
+        .unwrap();
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // Changed away and back across two frames in one batch of ops, with a
+        // claim in between by another node, is judged on the end state: bob
+        // holds a@x again, so carol cannot have it.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("carol", "email", Value::Str("a@x".into()));
+            b.set_prop("bob", "email", Value::Str("a@x".into()));
+        }));
+        // Bob moving away lets carol have it only while alice does not hold it.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("carol", "email", Value::Str("a@x".into()));
+        }));
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.delete_node("alice");
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("carol", "email", Value::Str("a@x".into()));
+        })
+        .unwrap();
+        assert_eq!(
+            db.get_prop("carol", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+    }
+
+    #[test]
+    fn a_grandfathered_duplicate_can_be_fixed_or_removed() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-fix");
+        // Re-asserting the value it shares changes nothing.
+        db.set_prop("bob", "email", Value::Str("a@x".into()))
+            .unwrap();
+        // Moving it somewhere free fixes it, and alice is then the only holder.
+        db.set_prop("bob", "email", Value::Str("b@x".into()))
+            .unwrap();
+        assert_violation(db.insert_node("User", "dave", email("a@x")));
+        // Deleting a holder frees its value.
+        db.delete_node("alice").unwrap();
+        db.insert_node("User", "dave", email("a@x")).unwrap();
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(
+            reopened.get_prop("dave", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+        assert_eq!(
+            reopened.get_prop("bob", "email"),
+            Some(Value::Str("b@x".into()))
+        );
+    }
+
+    #[test]
+    fn replay_is_the_same_live_reopened_and_as_of() {
+        // Every frame was valid when written, and the sequence leans on the
+        // order: a value handed on, swapped, freed by a delete.
+        let (dir, mut db) = constrained("replay-differential");
+        let mut live: Vec<Vec<(String, Option<Value>)>> = Vec::new();
+        let mut seqs = Vec::new();
+        let observe = |db: &GraphDb| -> Vec<(String, Option<Value>)> {
+            ["alice", "bob", "carol"]
+                .iter()
+                .map(|k| (k.to_string(), db.get_prop(k, "email")))
+                .collect()
+        };
+        let mut record = |db: &GraphDb| {
+            live.push(observe(db));
+            seqs.push(db.commit_seq() - 1);
+        };
+        record(&db);
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        record(&db);
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("alice", "email", Value::Str("b@x".into()));
+            b.set_prop("bob", "email", Value::Str("a@x".into()));
+        })
+        .unwrap();
+        record(&db);
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.delete_node("alice");
+            b.insert_node("User", "carol", email("b@x"));
+        })
+        .unwrap();
+        record(&db);
+        db.drop_constraint("uniq_email").unwrap();
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        record(&db);
+        drop(db);
+
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(&observe(&reopened), live.last().unwrap());
+        assert!(reopened.constraints().is_empty());
+        for (seq, expected) in seqs.iter().zip(&live) {
+            let at = GraphDb::open_at(&dir, *seq).unwrap();
+            assert_eq!(&observe(&at), expected, "open_at {seq}");
+        }
     }
 
     // ── What the frame leaves behind is what is judged ──────────────────────
@@ -1129,5 +1423,237 @@ mod unlocked {
         )]);
         db.query_write(q, &params).unwrap();
         assert!(db.has_node("w1") && db.has_node("w2"));
+    }
+
+    // ── The scan over existing data (TY-6) ───────────────────────────────────
+
+    fn conflict(result: Result<(), GraphError>) -> Vec<(String, Value)> {
+        match result {
+            Err(GraphError::ConstraintCreationConflict { violations, total }) => {
+                assert_eq!(total, violations.len(), "an uncapped conflict lists all");
+                violations
+            }
+            other => panic!("expected ConstraintCreationConflict, got {other:?}"),
+        }
+    }
+
+    fn sorted(mut v: Vec<(String, Value)>) -> Vec<(String, Value)> {
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    #[test]
+    fn test_constraint_creation_conflict() {
+        let (dir, mut db) = open_temp("scan-conflict");
+        db.insert_node("User", "alice", email("dup@x.com")).unwrap();
+        db.insert_node("User", "bob", email("dup@x.com")).unwrap();
+        db.insert_node("User", "carol", email("c@x.com")).unwrap();
+        let before = wal_bytes(&dir);
+        let violations = conflict(db.create_constraint("uniq_email", "User", "email"));
+        assert_eq!(
+            sorted(violations),
+            vec![
+                ("alice".to_string(), Value::Str("dup@x.com".into())),
+                ("bob".to_string(), Value::Str("dup@x.com".into())),
+            ]
+        );
+        assert_eq!(
+            wal_bytes(&dir),
+            before,
+            "a refused declaration was appended"
+        );
+        assert!(db.constraints().is_empty());
+        assert!(!db.is_index_enabled("User", "email"));
+        // Nothing is enforced, and removing the duplicate lets it through.
+        db.delete_node("bob").unwrap();
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+        assert_eq!(db.constraints().len(), 1);
+    }
+
+    #[test]
+    fn the_scan_compares_with_the_query_languages_equality() {
+        // Int 2 and Float 2.0 are one value; so are the zeros; NaN equals nothing.
+        let (dir, mut db) = open_temp("scan-numbers");
+        let put = |db: &mut GraphDb, key: &str, v: Value| {
+            db.insert_node("N", key, vec![("v".into(), v)]).unwrap();
+        };
+        put(&mut db, "int2", Value::Int(2));
+        put(&mut db, "float2", Value::Float(2.0));
+        put(&mut db, "zero", Value::Int(0));
+        put(&mut db, "negzero", Value::Float(-0.0));
+        put(&mut db, "nan1", Value::Float(f64::NAN));
+        put(&mut db, "nan2", Value::Float(f64::NAN));
+        put(&mut db, "three", Value::Int(3));
+        put(&mut db, "list1", Value::List(vec![Value::Int(1)]));
+        put(&mut db, "list2", Value::List(vec![Value::Int(1)]));
+        let before = wal_bytes(&dir);
+        let violations = sorted(conflict(db.create_constraint("uniq_v", "N", "v")));
+        let keys: Vec<&str> = violations.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["float2", "int2", "negzero", "zero"]);
+        assert_eq!(violations[0].1, Value::Float(2.0));
+        assert_eq!(violations[1].1, Value::Int(2));
+        assert_eq!(wal_bytes(&dir), before);
+    }
+
+    #[test]
+    fn the_scan_reads_only_live_nodes_of_the_label() {
+        let (_dir, mut db) = open_temp("scan-scope");
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        db.insert_node("Admin", "root", email("a@x")).unwrap();
+        db.insert_node("User", "gone", email("a@x")).unwrap();
+        db.delete_node("gone").unwrap();
+        db.insert_node("User", "noemail", vec![]).unwrap();
+        db.create_constraint("uniq_email", "User", "email").unwrap();
+    }
+
+    #[test]
+    fn the_scan_sees_values_held_in_a_snapshot_and_after_a_reopen() {
+        let (dir, mut db) = open_temp("scan-snapshot");
+        db.insert_node("User", "alice", email("dup@x")).unwrap();
+        db.insert_node("User", "bob", email("b@x")).unwrap();
+        db.snapshot().unwrap();
+        // A value moved by the overlay, and a node written after the snapshot.
+        db.set_prop("bob", "email", Value::Str("dup@x".into()))
+            .unwrap();
+        db.insert_node("User", "carol", email("c@x")).unwrap();
+        let live = sorted(conflict(db.create_constraint(
+            "uniq_email",
+            "User",
+            "email",
+        )));
+        assert_eq!(live.len(), 2);
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).unwrap();
+        reopened.unlock_v11_format_for_test();
+        assert_eq!(
+            sorted(conflict(reopened.create_constraint(
+                "uniq_email",
+                "User",
+                "email"
+            ))),
+            live
+        );
+        reopened
+            .set_prop("bob", "email", Value::Str("b@x".into()))
+            .unwrap();
+        reopened
+            .create_constraint("uniq_email", "User", "email")
+            .unwrap();
+    }
+
+    #[test]
+    fn test_constraint_drop_and_recreate_same_field() {
+        // Review Focus #4.
+        let (_dir, mut db) = open_temp("recreate");
+        db.insert_node("User", "alice", email("a@x.com")).unwrap();
+        db.insert_node("User", "bob", email("b@x.com")).unwrap();
+        db.create_constraint("c1", "User", "email").unwrap();
+        db.drop_constraint("c1").unwrap();
+        db.create_constraint("c2", "User", "email").unwrap();
+        assert!(db.constraints().iter().any(|c| c.name == "c2"));
+        assert!(!db.constraints().iter().any(|c| c.name == "c1"));
+    }
+
+    #[test]
+    fn a_view_owned_property_is_refused_before_the_scan() {
+        let (_dir, mut db) = open_temp("scan-view-first");
+        db.insert_node("User", "u1", vec![]).unwrap();
+        db.insert_node("User", "u2", vec![]).unwrap();
+        // Both nodes hold the view's `deg = 0`, so a scan would find a conflict.
+        db.create_view(deg_view()).unwrap();
+        match db.create_constraint("uniq_deg", "User", "deg") {
+            Err(GraphError::QueryError { detail }) => assert!(detail.contains("owned by view")),
+            other => panic!("expected the view refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_conflict_list_is_capped_in_node_id_order_and_counts_them_all() {
+        let (dir, mut db) = open_temp("scan-cap");
+        for i in 0..150 {
+            db.insert_node("User", &format!("u{i:03}"), email("dup@x"))
+                .unwrap();
+        }
+        // Id order is insertion order, which is not key order here.
+        db.insert_node("User", "a-last", email("dup@x")).unwrap();
+        let check = |db: &mut GraphDb| match db.create_constraint("uniq_email", "User", "email") {
+            Err(e @ GraphError::ConstraintCreationConflict { .. }) => {
+                let text = e.to_string();
+                let GraphError::ConstraintCreationConflict { violations, total } = e else {
+                    unreachable!()
+                };
+                assert_eq!(total, 151);
+                assert_eq!(violations.len(), 100);
+                let keys: Vec<String> = violations.iter().map(|(k, _)| k.clone()).collect();
+                let expected: Vec<String> = (0..100).map(|i| format!("u{i:03}")).collect();
+                assert_eq!(keys, expected, "node-id order, not sorted");
+                assert!(violations
+                    .iter()
+                    .all(|(_, v)| v == &Value::Str("dup@x".into())));
+                assert_eq!(
+                    text,
+                    "cannot create the constraint: 151 existing nodes hold duplicate values \
+                     (first 100 listed)"
+                );
+            }
+            other => panic!("expected ConstraintCreationConflict, got {other:?}"),
+        };
+        check(&mut db);
+        drop(db);
+        let mut reopened = GraphDb::open(&dir).unwrap();
+        reopened.unlock_v11_format_for_test();
+        check(&mut reopened);
+    }
+
+    /// Past 2^53 an `Int` equals the `Float` it rounds to and two `Int`s are
+    /// equal only when they are the same integer, so equality is not
+    /// transitive: the scan must report a pair of unequal `Int`s that a `Float`
+    /// ties together, and not report the `Int`s alone.
+    #[test]
+    fn the_scan_follows_the_large_integer_equality() {
+        let big = 1_i64 << 53;
+        let put = |db: &mut GraphDb, key: &str, v: Value| {
+            db.insert_node("N", key, vec![("v".into(), v)]).unwrap();
+        };
+        let (_dir, mut db) = open_temp("scan-large-ints-alone");
+        put(&mut db, "a", Value::Int(big));
+        put(&mut db, "b", Value::Int(big + 1));
+        db.create_constraint("uniq_v", "N", "v").unwrap();
+
+        let (_dir, mut db) = open_temp("scan-large-ints-tied");
+        put(&mut db, "a", Value::Int(big));
+        put(&mut db, "b", Value::Int(big + 1));
+        put(&mut db, "c", Value::Float(big as f64));
+        let keys: Vec<String> = conflict(db.create_constraint("uniq_v", "N", "v"))
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, ["a", "b", "c"]);
+
+        // The next float up equals none of them.
+        let (_dir, mut db) = open_temp("scan-large-ints-next-up");
+        put(&mut db, "a", Value::Int(big));
+        put(&mut db, "b", Value::Int(big + 1));
+        put(&mut db, "d", Value::Float((big as f64).next_up()));
+        db.create_constraint("uniq_v", "N", "v").unwrap();
+
+        // i64::MAX rounds to 2^63 as a float.
+        let (_dir, mut db) = open_temp("scan-large-ints-max");
+        put(&mut db, "a", Value::Int(i64::MAX));
+        put(&mut db, "b", Value::Float(9_223_372_036_854_775_808.0));
+        assert_eq!(conflict(db.create_constraint("uniq_v", "N", "v")).len(), 2);
+    }
+
+    #[test]
+    fn a_refused_declaration_does_no_scan_before_the_v11_gate() {
+        // Locked handle, duplicates present: the refusal, not the conflict.
+        let dir = tmp("locked-dups");
+        let mut db = GraphDb::open(&dir).unwrap();
+        db.insert_node("User", "alice", email("a@x")).unwrap();
+        db.insert_node("User", "bob", email("a@x")).unwrap();
+        match db.create_constraint("uniq_email", "User", "email") {
+            Err(GraphError::QueryError { detail }) => assert_eq!(detail, CONSTRAINT_REFUSAL),
+            other => panic!("expected the V11 record refusal, got {other:?}"),
+        }
     }
 }

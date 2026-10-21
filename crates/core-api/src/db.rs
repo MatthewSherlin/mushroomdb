@@ -2809,6 +2809,9 @@ impl GraphDb<RealFs> {
     }
 }
 
+/// How many conflicting nodes `GraphError::ConstraintCreationConflict` lists.
+const CONSTRAINT_CONFLICTS_LISTED: usize = 100;
+
 /// Where two values the scan can find equal always share a bucket: numbers by
 /// the bit pattern of their `f64` (so `Int` 2, `Float` 2.0, and both zeros
 /// meet), every other indexable value by its index key. `None` for a value
@@ -2821,8 +2824,9 @@ pub(crate) enum EqualityBucket {
 }
 
 ///
-/// **TY-6 (the create-time scan over existing data) must group values with
-/// this and compare each bucket with `values_equal`, never by `ValueKey`: a
+/// The create-time scan over existing data
+/// (`GraphDb::existing_unique_violations`) groups values with this and
+/// compares each bucket with `values_equal`, never by `ValueKey`: a
 /// `ValueKey` keeps `Int` 2 and `Float` 2.0 apart, so a scan keyed on it would
 /// accept a store the write path then refuses.
 pub(crate) fn equality_bucket(value: &Value) -> Option<EqualityBucket> {
@@ -6364,6 +6368,7 @@ impl<F: Fs> GraphDb<F> {
         }
 
         let committed = self.ids.len();
+        let props_view = build_props_view(&self.props, &self.base);
         // What earlier nodes of this frame hold, per constraint, in the
         // bucket `equality_bucket` gives; values in one bucket are compared
         // with `values_equal`, the scan's own equality.
@@ -6381,22 +6386,44 @@ impl<F: Fs> GraphDb<F> {
             let Some(label) = label else {
                 continue;
             };
+            // A node the frame moves into a constrained label brings the
+            // value it holds with it; that is a claim like any other.
+            let relabelled = (id as usize) < committed
+                && final_label
+                    .get(&id)
+                    .is_some_and(|sym| self.labels.get(id as usize) != Some(sym));
             for (ci, c) in self.constraints.iter().enumerate() {
                 if c.label != label {
                     continue;
                 }
+                let stored = || {
+                    if (id as usize) < committed {
+                        props_view.get(id, &c.field).map(|vr| vr.into_value())
+                    } else {
+                        None
+                    }
+                };
                 let written = field_syms[ci].and_then(|sym| final_value.get(&(id, sym)));
                 let value = match written {
-                    Some(v) => v.cloned(),
-                    // Not written by the frame: the node keeps what it holds,
-                    // which only a node that existed before the frame can.
-                    None if (id as usize) < committed => build_props_view(&self.props, &self.base)
-                        .get(id, &c.field)
-                        .map(|vr| vr.into_value()),
-                    None => None,
-                };
-                let Some(value) = value else {
-                    continue;
+                    Some(Some(v)) => {
+                        // Only a value the frame changes is judged. One it
+                        // leaves as it was — a rewrite of the same value, or a
+                        // change reverted inside the frame — is not a claim,
+                        // so a duplicate that already exists is not refused
+                        // for being written again.
+                        if !relabelled && stored().is_some_and(|old| values_equal(&old, v)) {
+                            continue;
+                        }
+                        (*v).clone()
+                    }
+                    Some(None) => continue,
+                    // Not written: the node keeps what it holds, and judging
+                    // that is only owed when it has just arrived in the label.
+                    None if relabelled => match stored() {
+                        Some(v) => v,
+                        None => continue,
+                    },
+                    None => continue,
                 };
                 // A value no scan can find equal to another — one with no
                 // index key, or a NaN — never conflicts.
@@ -6407,14 +6434,24 @@ impl<F: Fs> GraphDb<F> {
                     constraint: c.name.clone(),
                     field: c.field.clone(),
                 };
-                // A holder the frame does not touch keeps its value. The
-                // index answers as the scan does: an `Int` finds the equal
-                // `Float`, and the reverse.
+                // A holder keeps its value unless the frame deletes it or
+                // writes the field to something else. The index answers as
+                // the scan does: an `Int` finds the equal `Float`, and the
+                // reverse.
+                let leaves = |holder: u32| {
+                    dead.contains(&holder)
+                        || field_syms[ci]
+                            .and_then(|sym| final_value.get(&(holder, sym)))
+                            .is_some_and(|now| match now {
+                                Some(v) => !values_equal(v, &value),
+                                None => true,
+                            })
+                };
                 if self
                     .prop_index
                     .lookup(&c.label, &c.field, &value)
                     .into_iter()
-                    .any(|holder| holder != id && !touched.contains(&holder))
+                    .any(|holder| holder != id && !leaves(holder))
                 {
                     return Err(violation());
                 }
@@ -9537,11 +9574,16 @@ impl<F: Fs> GraphDb<F> {
     /// UTC instant are equal whatever their offsets, and a list, map or `Duration` never
     /// conflicts.
     ///
-    /// The existing data is not checked here; a store that already holds
-    /// duplicates keeps them (the pre-scan is 0.10 TY-6).
+    /// The existing data is checked first: every live node of `label` is read,
+    /// and if two hold equal values for `field` nothing is logged and the error
+    /// lists the first 100 nodes involved, in node-id order, and counts them all.
+    /// Declaring blocks writers for a time proportional to the label's node
+    /// count (the scan, then the index build); readers are unaffected.
     ///
     /// # Errors
     /// - [`GraphError::ReadOnly`]: called on an as-of instance.
+    /// - [`GraphError::ConstraintCreationConflict`]: live nodes of `label` already
+    ///   hold equal values for `field`; `violations` is each `(node_key, value)`.
     /// - [`GraphError::QueryError`]: a constraint named `name` already exists;
     ///   a view owns `(label, field)`; or, until the V11 format lands, always — a `CreateConstraint` record
     ///   is format-V11 and a 0.9.x reader cannot decode it.
@@ -9569,11 +9611,116 @@ impl<F: Fs> GraphDb<F> {
                 ),
             });
         }
+        // Ahead of the scan: a refused declaration does no O(label) work, and
+        // a pre-V11 caller gets the refusal whatever the data holds.
+        if !self.v11_unlocked {
+            return Err(GraphError::QueryError {
+                detail: core_storage::v11_record_refusal("unique constraints"),
+            });
+        }
+        let (violations, total) = self.existing_unique_violations(label, field);
+        if total > 0 {
+            return Err(GraphError::ConstraintCreationConflict { violations, total });
+        }
         self.log_dense(vec![WalRecord::CreateConstraint {
             name: name.into(),
             label: label.into(),
             field: field.into(),
         }])
+    }
+
+    /// The first [`CONSTRAINT_CONFLICTS_LISTED`] `(node_key, value)` of live
+    /// nodes of `label` whose `field` equals another live node's, in node-id
+    /// order, and the count of all of them.
+    ///
+    /// One pass over the label column and one props read per node of `label`;
+    /// nodes are grouped by [`equality_bucket`] and compared with
+    /// `values_equal` inside a bucket, the equality the write path judges
+    /// by, so `Int` 2 beside `Float` 2.0 is reported. A bucket holds only
+    /// values that round to one `f64` or share an index key, so the
+    /// distinct values per bucket are few and the comparison does not go
+    /// quadratic on a heavily duplicated value.
+    fn existing_unique_violations(
+        &self,
+        label: &str,
+        field: &str,
+    ) -> (Vec<(String, Value)>, usize) {
+        let Some(label_sym) = self.syms.get(label) else {
+            return (Vec::new(), 0);
+        };
+        let props = self.props_view();
+        // Per bucket: the distinct values seen (each with the ids holding a
+        // value equal to it), kept as classes so a duplicate is one lookup
+        // against a handful of representatives, not against every holder.
+        // `forms` is every distinct stored form of the class's value (an `Int`
+        // and the `Float` it equals), for the cross-class check below.
+        struct Class {
+            forms: Vec<Value>,
+            holders: Vec<u32>,
+        }
+        let mut buckets: HashMap<EqualityBucket, Vec<Class>> = HashMap::new();
+        for (id, &sym) in self.labels.iter().enumerate() {
+            if sym != label_sym {
+                continue;
+            }
+            let id = id as u32;
+            if self.ids.key_of(id).is_none() {
+                continue;
+            }
+            let Some(value) = props.get(id, field).map(|vr| vr.into_value()) else {
+                continue;
+            };
+            let Some(bucket) = equality_bucket(&value) else {
+                continue;
+            };
+            let classes = buckets.entry(bucket).or_default();
+            match classes
+                .iter_mut()
+                .find(|class| values_equal(&class.forms[0], &value))
+            {
+                Some(class) => {
+                    class.holders.push(id);
+                    if !class.forms.contains(&value) {
+                        class.forms.push(value);
+                    }
+                }
+                None => classes.push(Class {
+                    forms: vec![value],
+                    holders: vec![id],
+                }),
+            }
+        }
+        let mut conflicting: Vec<u32> = Vec::new();
+        for classes in buckets.values() {
+            for (i, class) in classes.iter().enumerate() {
+                // Equality past 2^53 is not transitive: `Int` 2^53 and
+                // 2^53 + 1 are unequal, yet both equal `Float` 2^53. A class
+                // whose any form equals any form of another conflicts with it.
+                let crosses = classes.iter().enumerate().any(|(j, other)| {
+                    j != i
+                        && class
+                            .forms
+                            .iter()
+                            .any(|a| other.forms.iter().any(|b| values_equal(a, b)))
+                });
+                if class.holders.len() > 1 || crosses {
+                    conflicting.extend(&class.holders);
+                }
+            }
+        }
+        conflicting.sort_unstable();
+        let total = conflicting.len();
+        // Only the returned list is capped; the count above is of them all.
+        let listed = conflicting
+            .into_iter()
+            .take(CONSTRAINT_CONFLICTS_LISTED)
+            .filter_map(|id| {
+                let key = self.ids.key_of(id)?.to_string();
+                let value = props.get(id, field)?.into_value();
+                Some((key, value))
+            })
+            .collect();
+        (listed, total)
     }
 
     /// Withdraw the unique constraint `name`. Its backing equality index stays

@@ -5727,6 +5727,8 @@ unexpected-token parse error or other unspecified result.
 | `n.key` / `n.id` / `key(n)` / `id(n)` equality vs lit/`$param` | ScanKey (plus stored-wins). `n.label` / `labels(n)` are not this fold — they still scan the label |
 | UNWIND | Supported — any list-valued expression (list literals, `range(…)`, parameters, list-valued properties, aliases from prior WITH); non-list → named error |
 | UNWIND with write clauses | Supported — `CREATE`, `MERGE`, `SET`, `REMOVE`, `DELETE` per row, one atomic batch; not in a transaction; reads before writes |
+| Declaring a unique constraint | Scans the label's existing nodes, so it blocks writers for a time proportional to the label's node count (about 1 to 3 seconds at a million nodes); readers are unaffected. Refused, listing the first 100 conflicting nodes and the total, when two already hold equal values |
+| A store whose WAL declares a unique constraint after data that breaks it | Opens normally: replay never checks a record, and a snapshot, a reader's refresh and `open_at` all load it the same way. The duplicates stay as they are. The constraint is in force for new writes: only a value a write changes is judged, so a write that leaves a duplicate's value as it is (another property, or the same value written again) is allowed, and one that gives a node a value another live node holds is refused. To clean up, give all but one holder of each shared value a new value, or delete them; the constraint then holds for the whole label. Only a store written by a build without the create-time scan can be in this state |
 | Variable-length paths: max hops | Capped at 10 |
 | shortestPath with unbound endpoints | Rejected at planning time |
 | Intermediate result budget | 1,000,000 rows (WITH/UNWIND intermediate rows count against this cap) |
@@ -9465,7 +9467,7 @@ attributes. Classes may be added; a `code` is never respelled.
 | `NoRecordedTime` | — | A date was given to a history call on a store that records no commit times. |
 | `TimeBeforeFloor` | `floor_ms: int`, `floor_commit: int` | The date predates the oldest commit time the store still records. |
 | `ConstraintViolation` | `constraint: str`, `field: str` | A write would give two live nodes the same value under a unique constraint. |
-| `ConstraintCreationConflict` | `violations: list[tuple[str, Any]]` | A unique constraint cannot be declared: live nodes already share a value. |
+| `ConstraintCreationConflict` | `violations: list[tuple[str, Any]]`, `total: int` | A unique constraint cannot be declared: live nodes already share a value. |
 | `ValueTooLarge` | `field: str`, `size: int`, `limit: int` | A value is larger than the store accepts; `size` and `limit` are bytes. |
 
 ---

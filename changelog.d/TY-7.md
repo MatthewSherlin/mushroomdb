@@ -1,0 +1,3 @@
+### Changed
+
+- **A unique constraint judges only a value a write changes.** A write that leaves a node's constrained value as it was, such as an upsert that re-sends the full property set or `SET` of another property, is no longer refused when that value is already shared with another node. A write that inserts, changes or adds the value is still checked against the store and the rest of the batch. This matters only for a store whose WAL declares a constraint after data that breaks it: replay and a peer's refresh never check a record, `open_at` before the declaration sees no constraint, and a snapshot keeps both the duplicates and the declaration. Only a build that had no create-time scan can leave such a store.

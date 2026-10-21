@@ -26,6 +26,7 @@
 //! 11. refresh_on_unchanged_store_is_zero_cost
 //! 12. read_sees_a_peer_commit_that_lands_microseconds_later
 //! 13. a_capture_sees_a_peer_commit_while_another_reader_holds_the_read_lock
+//! 14. a_peers_constraint_over_older_duplicates_is_absorbed_not_checked
 
 use core_storage::fs::{FileId, Fs, RealFs};
 use core_storage::wal::{decode_all, encode_record, WalRecord};
@@ -751,5 +752,83 @@ fn a_capture_sees_a_peer_commit_while_another_reader_holds_the_read_lock() {
     }
     holder.join().unwrap();
     drop(db);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+// ── 14. A peer's constraint is absorbed, not re-checked ───────────────────────
+
+#[test]
+fn a_peers_constraint_over_older_duplicates_is_absorbed_not_checked() {
+    let d = tmp("peer-constraint");
+    let shared = SharedDb::open(&d).unwrap();
+    let mut db = shared.write();
+    let email = |s: &str| vec![("email".to_string(), Value::Str(s.into()))];
+    db.insert_node("User", "alice", email("a@x")).unwrap();
+
+    // A peer's tail: a duplicate written before any constraint existed, the
+    // constraint declared over it, and a write made under that constraint.
+    let mut fs = RealFs::new(&d).unwrap();
+    for rec in [
+        WalRecord::InsertNode {
+            label: "User".into(),
+            key: "bob".into(),
+            props: email("a@x"),
+        },
+        WalRecord::CreateConstraint {
+            name: "uniq_email".into(),
+            label: "User".into(),
+            field: "email".into(),
+        },
+        WalRecord::InsertNode {
+            label: "User".into(),
+            key: "carol".into(),
+            props: email("c@x"),
+        },
+    ] {
+        fs.append(FileId::Wal, &encode_record(&rec)).unwrap();
+    }
+    assert_eq!(db.refresh().expect("a peer's tail is never re-checked"), 3);
+    assert_eq!(db.constraints().len(), 1);
+    assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+    assert_eq!(
+        db.get_prop("carol", "email"),
+        Some(Value::Str("c@x".into()))
+    );
+    // The absorbed declaration binds this handle's own writes.
+    assert!(matches!(
+        db.insert_node("User", "dave", email("c@x")),
+        Err(GraphError::ConstraintViolation { .. })
+    ));
+    db.insert_node("User", "dave", email("d@x")).unwrap();
+    drop(db);
+
+    // A peer that folds all of it into a snapshot: this handle reloads from
+    // disk, and the duplicate and the declaration both survive.
+    let (code, _) = run_worker(&d, &["snapshot"]);
+    assert_eq!(code, 0, "the peer's snapshot of such a store must succeed");
+    let mut db = shared.write();
+    db.refresh().expect("reload over a peer's snapshot");
+    assert_eq!(db.constraints().len(), 1);
+    assert_eq!(
+        db.get_prop("alice", "email"),
+        Some(Value::Str("a@x".into()))
+    );
+    assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+    assert!(db.node_info("dave").is_some());
+    drop(db);
+    // A reader's capture of the same state sees both duplicates.
+    let read = shared.read();
+    assert_eq!(
+        read.get_prop("alice", "email"),
+        Some(Value::Str("a@x".into()))
+    );
+    assert_eq!(
+        read.get_prop("bob", "email"),
+        Some(Value::Str("a@x".into()))
+    );
+    drop(read);
+    drop(shared);
+    let reopened = GraphDb::open(&d).expect("the store opens");
+    assert_eq!(reopened.constraints().len(), 1);
     let _ = std::fs::remove_dir_all(&d);
 }
