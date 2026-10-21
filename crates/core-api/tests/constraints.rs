@@ -839,7 +839,7 @@ mod unlocked {
             db.insert_node("N", "b", num(second.clone())).unwrap();
             let rows = db
                 .query(
-                    &format!("MATCH (n:N {{v: {}}}) RETURN n", cypher(&first)),
+                    &format!("MATCH (n:N {{v: {}}}) RETURN n", cypher_literal(&first)),
                     &BTreeMap::new(),
                 )
                 .unwrap();
@@ -851,7 +851,7 @@ mod unlocked {
         }
     }
 
-    fn cypher(v: &Value) -> String {
+    fn cypher_literal(v: &Value) -> String {
         match v {
             Value::Int(i) => i.to_string(),
             Value::Float(f) => format!("{f:?}"),

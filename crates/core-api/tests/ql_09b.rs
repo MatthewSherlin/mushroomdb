@@ -1457,3 +1457,45 @@ fn a_scoped_merge_follows_the_same_scope_rules() {
         .unwrap_err();
     assert!(matches!(e, GraphError::RoleWriteDenied { .. }), "{e:?}");
 }
+
+/// A list comprehension or `reduce` in a per-row SET value reads the node's
+/// properties as the row is written, and a local variable that shares a node
+/// variable's name stays the local variable.
+#[test]
+fn a_comprehension_or_reduce_in_a_set_value_reads_per_row_and_keeps_its_own_variables() {
+    let mut db = counter_db("comprehension");
+    run(
+        &mut db,
+        "UNWIND [1, 1] AS x MATCH (n:C {id: 'c'}) \
+         SET n.count = reduce(acc = n.count, i IN [x] | acc + i)",
+        &none(),
+    );
+    assert_eq!(db.get_prop("c", "count"), Some(Value::Int(2)));
+    run(
+        &mut db,
+        "UNWIND [1] AS x MATCH (n:C {id: 'c'}) \
+         SET n.l = [n IN [1, 2] | n * 10], n.r = reduce(n = 0, i IN [1, 2, 3] | n + i), \
+         n.p = [n IN [{v: 5}] | n.v]",
+        &none(),
+    );
+    assert_eq!(
+        db.get_prop("c", "p"),
+        Some(Value::List(vec![Value::Int(5)])),
+        "`n.v` inside the comprehension reads the local `n`, not the node's `v` (1)"
+    );
+    assert_eq!(
+        db.get_prop("c", "l"),
+        Some(Value::List(vec![Value::Int(10), Value::Int(20)]))
+    );
+    assert_eq!(db.get_prop("c", "r"), Some(Value::Int(6)));
+    run(
+        &mut db,
+        "UNWIND [1, 1] AS x MATCH (n:C {id: 'c'}) \
+         SET n.m = [i IN [n.count] WHERE i > 0 | i + x]",
+        &none(),
+    );
+    assert_eq!(
+        db.get_prop("c", "m"),
+        Some(Value::List(vec![Value::Int(3)]))
+    );
+}

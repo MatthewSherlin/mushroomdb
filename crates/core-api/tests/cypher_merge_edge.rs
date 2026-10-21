@@ -580,6 +580,104 @@ fn a_refused_merge_inside_a_transaction_buffers_nothing() {
     tx.commit().unwrap();
 }
 
+/// `a` and `b` committed, with the `K` edge between them when `with_edge`.
+fn two_nodes(db: &SharedDb, with_edge: bool) {
+    let mut ops = vec![
+        BatchOp::InsertNode {
+            label: "P".into(),
+            key: "a".into(),
+            props: vec![("id".into(), Value::Str("a".into()))],
+        },
+        BatchOp::InsertNode {
+            label: "P".into(),
+            key: "b".into(),
+            props: vec![("id".into(), Value::Str("b".into()))],
+        },
+    ];
+    if with_edge {
+        ops.push(BatchOp::InsertEdge {
+            edge_type: "K".into(),
+            src_key: "a".into(),
+            dst_key: "b".into(),
+        });
+    }
+    db.submit_batch(ops).unwrap();
+}
+
+/// Both ends of a buffered MERGE are in the transaction's conflict set,
+/// whether the MERGE creates the edge or only matches it (ON MATCH writes the
+/// start node alone, and the end node is still read).
+#[test]
+fn a_merge_inside_a_transaction_conflicts_with_a_write_to_either_end() {
+    for with_edge in [false, true] {
+        for end in ["a", "b"] {
+            let name = format!("tx-conflict-{with_edge}-{end}");
+            let db: SharedDb = SharedDb::open(&tmp(&name)).unwrap();
+            two_nodes(&db, with_edge);
+            let mut tx = db.begin_transaction();
+            tx.execute(&format!("{MERGE} ON MATCH SET a.hit = 1"), &p())
+                .unwrap();
+            db.submit_batch(vec![BatchOp::SetProp {
+                key: end.into(),
+                field: "x".into(),
+                value: Value::Int(1),
+            }])
+            .unwrap();
+            let err = tx.commit().unwrap_err();
+            assert!(
+                matches!(err, GraphError::CasConflict { ref key, .. } if key == end),
+                "edge existed: {with_edge}, concurrent write to {end}: {err:?}"
+            );
+            assert_eq!(
+                db.reader().node_info("a").unwrap().props.get("hit"),
+                None,
+                "a conflicted commit writes nothing"
+            );
+        }
+    }
+}
+
+/// A MERGE's RETURN inside a transaction reads the statement's own writes
+/// through the overlay; a RETURN that fails takes the statement's writes back
+/// out of the overlay and buffers nothing.
+#[test]
+fn a_merge_return_inside_a_transaction_reads_its_writes_and_a_failed_one_buffers_nothing() {
+    let dir = tmp("tx-return");
+    let db: SharedDb = SharedDb::open(&dir).unwrap();
+    let mut tx = db.begin_transaction();
+    let rs = tx
+        .execute(
+            "MERGE (a:P {id: 'a'})-[r:K]->(b:P {id: 'b'}) ON CREATE SET b.n = 7 \
+             RETURN a.id AS a, b.n AS n, type(r) AS t",
+            &p(),
+        )
+        .unwrap();
+    assert_eq!(rs.len(), 1);
+    assert_eq!(rs.get(0, "a"), Some(&Value::Str("a".into())));
+    assert_eq!(rs.get(0, "n"), Some(&Value::Int(7)));
+    assert_eq!(rs.get(0, "t"), Some(&Value::Str("K".into())));
+    assert!(tx
+        .execute(
+            "MERGE (a:P {id: 'c'})-[:K]->(b:P {id: 'd'}) RETURN no_such_function(a) AS x",
+            &p(),
+        )
+        .is_err());
+    let inside = tx
+        .execute("MATCH (n:P) RETURN n.id AS id ORDER BY id", &p())
+        .unwrap();
+    assert_eq!(inside.len(), 2, "c and d were taken back out");
+    let edges_inside = tx
+        .execute("MATCH (:P)-[r:K]->(:P) RETURN count(r) AS c", &p())
+        .unwrap();
+    assert_eq!(edges_inside.get(0, "c"), Some(&Value::Int(1)));
+    tx.commit().unwrap();
+    drop(db);
+    let reopened = GraphDb::open(&dir).unwrap();
+    assert_eq!(reopened.node_count(), 2);
+    assert_eq!(reopened.edge_count(), 1);
+    assert_eq!(reopened.get_prop("b", "n"), Some(Value::Int(7)));
+}
+
 // ── Role-scoped writes ──────────────────────────────────────────────────────
 
 fn scoped_store(name: &str, create_labels: &[&str], edge_types: &[&str]) -> GraphDb {

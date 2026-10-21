@@ -352,6 +352,63 @@ pub(super) fn map_leaves(
                 .collect(),
             default: default.as_ref().map(|d| Box::new(map_leaves(d, leaf))),
         },
+        // The list (and `reduce`'s initial value) is read in the enclosing
+        // scope; the body is read with the comprehension's own variables
+        // bound, so a leaf naming one of them is left alone.
+        Operand::ListComprehension {
+            var,
+            list,
+            filter,
+            map,
+        } => {
+            let list = Box::new(map_leaves(list, leaf));
+            let locals = [var];
+            let mut inner = shadowing(&locals, leaf);
+            Operand::ListComprehension {
+                var: var.clone(),
+                list,
+                filter: filter.as_ref().map(|f| Box::new(map_expr(f, &mut inner))),
+                map: Box::new(map_leaves(map, &mut inner)),
+            }
+        }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            let init = Box::new(map_leaves(init, leaf));
+            let list = Box::new(map_leaves(list, leaf));
+            let locals = [acc_var, iter_var];
+            let mut inner = shadowing(&locals, leaf);
+            Operand::Reduce {
+                acc_var: acc_var.clone(),
+                init,
+                iter_var: iter_var.clone(),
+                list,
+                body: Box::new(map_leaves(body, &mut inner)),
+            }
+        }
+    }
+}
+
+/// `leaf`, except that a `Prop` or `Var` leaf naming one of `locals` is kept:
+/// inside a list comprehension or `reduce` that name is the local variable.
+fn shadowing<'a>(
+    locals: &'a [&'a String],
+    leaf: &'a mut dyn FnMut(&Operand) -> Option<Operand>,
+) -> impl FnMut(&Operand) -> Option<Operand> + 'a {
+    move |operand| {
+        let name = match operand {
+            Operand::Prop { var, .. } | Operand::Var(var) => var,
+            _ => return leaf(operand),
+        };
+        if locals.contains(&name) {
+            None
+        } else {
+            leaf(operand)
+        }
     }
 }
 
