@@ -513,6 +513,9 @@ pub struct ReaderSnapshot {
     /// The layer and index of an earlier snapshot whose tail is a prefix of
     /// this one's, for `cache` and `index` to extend instead of rebuild.
     seeds: Arc<Seeds>,
+    /// Set when the background builder built this version's cells; shared
+    /// like `cache`.
+    background: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The latest built cells of one fold, which a later version takes and
@@ -565,6 +568,19 @@ impl ReadContext {
     }
 }
 
+thread_local! {
+    /// How many layer and index cells this thread has built: what lets
+    /// [`ReaderSnapshot::prepare`] tell whether its call did the build.
+    static BUILDS_HERE: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn count_build(layer: bool) {
+    BUILDS_HERE.with(|c| {
+        let (l, i) = c.get();
+        c.set(if layer { (l + 1, i) } else { (l, i + 1) });
+    });
+}
+
 /// A snapshot's delta-tail layer, built at most once.
 type EffectiveCell = OnceLock<std::result::Result<DeltaLayer, String>>;
 
@@ -605,6 +621,7 @@ pub(crate) struct SharedEffective {
     cell: Arc<EffectiveCell>,
     index: Arc<IndexCell>,
     seeds: Arc<Seeds>,
+    background: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// What [`SharedEffective::cell_for`] hands a new snapshot.
@@ -612,6 +629,7 @@ pub(crate) struct SharedCell {
     cell: Arc<EffectiveCell>,
     index: Arc<IndexCell>,
     seeds: Arc<Seeds>,
+    background: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn same_arc<T>(a: Option<&Arc<T>>, b: Option<&Arc<T>>) -> bool {
@@ -647,6 +665,7 @@ impl SharedEffective {
                     cell: Arc::clone(&entry.cell),
                     index: Arc::clone(&entry.index),
                     seeds: Arc::clone(&entry.seeds),
+                    background: Arc::clone(&entry.background),
                 };
             }
             // One register per fold: every tail of a fold extends every
@@ -658,6 +677,7 @@ impl SharedEffective {
         let cell = Arc::new(EffectiveCell::new());
         let index = Arc::new(IndexCell::new());
         let seeds = seeds.unwrap_or_default();
+        let background = Arc::new(std::sync::atomic::AtomicBool::new(false));
         *slot = Some(SharedEffective {
             frozen: Arc::clone(frozen),
             base: base.clone(),
@@ -666,8 +686,14 @@ impl SharedEffective {
             cell: Arc::clone(&cell),
             index: Arc::clone(&index),
             seeds: Arc::clone(&seeds),
+            background: Arc::clone(&background),
         });
-        SharedCell { cell, index, seeds }
+        SharedCell {
+            cell,
+            index,
+            seeds,
+            background,
+        }
     }
 }
 
@@ -857,6 +883,7 @@ impl ReaderSnapshot {
             context: ReadContext::none(),
             index: Arc::new(IndexCell::new()),
             seeds: Arc::new(Seeds::default()),
+            background: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -872,6 +899,7 @@ impl ReaderSnapshot {
         self.cache = shared.cell;
         self.index = shared.index;
         self.seeds = shared.seeds;
+        self.background = shared.background;
         self
     }
 
@@ -889,6 +917,7 @@ impl ReaderSnapshot {
             context: self.context.clone(),
             index: Arc::clone(&self.index),
             seeds: Arc::clone(&self.seeds),
+            background: Arc::clone(&self.background),
         }
     }
 
@@ -929,6 +958,7 @@ impl ReaderSnapshot {
         let mut built = false;
         let cached = self.cache.get_or_init(|| {
             built = true;
+            count_build(true);
             match self.seeded_layer() {
                 Some(extended) => extended,
                 None => DeltaLayer::from_deltas(&self.frozen, &self.base, &self.deltas),
@@ -1074,6 +1104,7 @@ impl ReaderSnapshot {
         let mut built = false;
         let index = self.index.get_or_init(|| {
             built = true;
+            count_build(false);
             self.seeded_index(&view)
                 .unwrap_or_else(|| self.layered_index(&view))
         });
@@ -1156,10 +1187,31 @@ impl ReaderSnapshot {
     /// cells it shares with every snapshot of its version. The writer calls it
     /// as it publishes, so readers find both built. A tail that will not apply
     /// is left for the reader to report.
-    pub(crate) fn prepare(&self) {
-        if self.effective().is_ok() {
-            let _ = self.query_index();
+    /// Returns whether this call built every cell that needed building (a
+    /// cell another thread already built does not count).
+    pub(crate) fn prepare(&self) -> bool {
+        let (l0, i0) = BUILDS_HERE.with(|c| c.get());
+        if self.effective().is_err() {
+            return false;
         }
+        let needs_index = self.query_index().ok().flatten().is_some() && !self.deltas.is_empty();
+        let (l1, i1) = BUILDS_HERE.with(|c| c.get());
+        let layer_ok = self.deltas.is_empty() || l1 > l0;
+        let index_ok = !needs_index || i1 > i0;
+        layer_ok && index_ok
+    }
+
+    /// Mark this version's cells as built by the background builder.
+    pub(crate) fn mark_built_in_background(&self) {
+        self.background
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the background builder built this version's cells — what a
+    /// test checks to know it is reading builder-built cells.
+    #[doc(hidden)]
+    pub fn built_in_background(&self) -> bool {
+        self.background.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether this snapshot's queries answer equality lookups from an index

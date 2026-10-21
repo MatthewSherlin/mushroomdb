@@ -293,45 +293,127 @@ impl Drop for DrainHandle {
 /// the lock (see [`PublishingGuard`]), so a read issued after a write returned
 /// sees that write: either it takes the read lock and reads live state, or a
 /// writer holds the lock and this slot already holds the released state.
-pub(crate) struct Published(Mutex<Option<ReaderSnapshot>>);
+pub(crate) struct Published {
+    slot: Mutex<Option<ReaderSnapshot>>,
+    builder: Arc<Builder>,
+}
 
 impl Published {
-    fn new(db: &GraphDb<RealFs>) -> Self {
+    fn new(db: &GraphDb<RealFs>, builder: Arc<Builder>) -> Self {
         let snap = db.try_reader();
         if let Some(snap) = &snap {
             snap.prepare();
         }
-        Self(Mutex::new(snap))
+        Self {
+            slot: Mutex::new(snap),
+            builder,
+        }
     }
 
-    /// Publish `db`'s state, then build its delta-tail layer and query index
-    /// here, on the writer, so no reader pays the first build — after a bulk
-    /// commit that was the whole batch, rebuilt by the first reader of every
-    /// version until the fold.
+    /// Publish `db`'s state, and hand it to the background builder.
+    ///
+    /// Runs under the write lock, and costs only the capture: the snapshot's
+    /// delta-tail layer and query index are built by [`Builder`] off the lock,
+    /// into the cells every snapshot of the version shares. A reader arriving
+    /// before the build finishes shares those cells: `get_or_init` has it wait
+    /// for the build in flight or do it itself, never twice.
     ///
     /// The new snapshot replaces the old one before the build, so the old
     /// version's cells are no longer held here and the build extends them in
-    /// place instead of copying them; a reader capturing meanwhile shares the
-    /// new cells and waits only for that extension.
+    /// place instead of copying them.
     fn set(&self, db: &GraphDb<RealFs>) {
         let Some(snap) = db.try_reader() else {
             return;
         };
         let old = self
-            .0
+            .slot
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .replace(snap.share());
         drop(old);
-        snap.prepare();
+        self.builder.submit(snap);
     }
 
     fn get(&self) -> Option<ReaderSnapshot> {
-        self.0
+        self.slot
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map(ReaderSnapshot::share)
+    }
+}
+
+/// The one background thread that builds published snapshots' layers and
+/// indexes, off the write lock.
+///
+/// It holds at most one pending snapshot: a newer publish replaces an older
+/// one not yet started, so builds never queue. A superseded version is built,
+/// if anyone reads it, by its first reader, as before.
+pub(crate) struct Builder {
+    pending: Mutex<Option<ReaderSnapshot>>,
+    wake: std::sync::Condvar,
+    shutdown: std::sync::atomic::AtomicBool,
+}
+
+impl Builder {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            pending: Mutex::new(None),
+            wake: std::sync::Condvar::new(),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn submit(&self, snap: ReaderSnapshot) {
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+        self.wake.notify_one();
+    }
+
+    fn run(self: Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let snap = {
+                let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(snap) = pending.take() {
+                        break snap;
+                    }
+                    if self.shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    pending = self.wake.wait(pending).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            if snap.prepare() {
+                snap.mark_built_in_background();
+            }
+        }
+    }
+}
+
+/// Stops the builder thread and joins it when the last `SharedDb` drops.
+struct BuilderHandle {
+    builder: Arc<Builder>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for BuilderHandle {
+    fn drop(&mut self) {
+        self.builder
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Take the lock so the store cannot slip between the thread's check
+        // and its wait.
+        drop(
+            self.builder
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        self.builder.wake.notify_all();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -455,6 +537,8 @@ pub struct SharedDb {
     inner: Arc<RwLock<GraphDb<RealFs>>>,
     /// The last released state, for captures a writer would otherwise block.
     published: Arc<Published>,
+    /// Builds published snapshots' layers and indexes off the write lock.
+    _builder: Arc<BuilderHandle>,
     queue: Arc<WriteQueue>,
     /// Keeps the drain thread alive; signals + joins on last drop.
     _drain: Arc<DrainHandle>,
@@ -507,7 +591,15 @@ impl SharedDb {
         dir: std::path::PathBuf,
         sync_fn: SyncWalFn,
     ) -> Self {
-        let published = Arc::new(Published::new(&db));
+        let builder = Builder::new();
+        let builder_thread = {
+            let builder = Arc::clone(&builder);
+            thread::Builder::new()
+                .name("reader-layer-builder".into())
+                .spawn(move || builder.run())
+                .expect("failed to spawn reader layer builder thread")
+        };
+        let published = Arc::new(Published::new(&db, Arc::clone(&builder)));
         let inner = Arc::new(RwLock::new(db));
         let queue = WriteQueue::new();
         let wal_mu = Arc::new(Mutex::new(()));
@@ -537,6 +629,10 @@ impl SharedDb {
         SharedDb {
             inner,
             published,
+            _builder: Arc::new(BuilderHandle {
+                builder,
+                handle: Some(builder_thread),
+            }),
             queue: Arc::clone(&queue),
             _drain: Arc::new(DrainHandle {
                 queue,

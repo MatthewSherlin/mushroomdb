@@ -23,6 +23,20 @@ fn tmp(name: &str) -> PathBuf {
     dir
 }
 
+/// Wait (up to 10 s) until the background builder has built `snap`'s
+/// version's cells, so what a test then reads is builder-built.
+fn await_background_build(snap: &mushroomdb::ReaderSnapshot) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !snap.built_in_background() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "version {}: the background builder never built its cells",
+            snap.version
+        );
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+}
+
 const KEYS: &[&str] = &["a", "b", "c", "d", "e", "renamed", "gone"];
 const QUERIES: &[&str] = &[
     "MATCH (n:N) RETURN n.key AS k, n.v AS v ORDER BY k",
@@ -161,6 +175,11 @@ fn every_snapshot_matches_the_live_handle_and_keeps_its_own_answer() {
         // Two snapshots of the same state share a cell; the second must see
         // what the first computed, not a half-built or stale state.
         let first = db.reader();
+        // Every write publishes and hands its version to the builder; check
+        // the cells it built, not ones this read would build itself.
+        if !first.deltas.is_empty() {
+            await_background_build(&first);
+        }
         let got = snapshot_answers(&first);
         assert_eq!(got, live_answers(&db), "step {i}: snapshot vs live");
         let second = db.reader();
@@ -258,11 +277,20 @@ fn indexed_lookups_on_the_reader_match_the_live_index_under_concurrent_writes() 
         })
         .collect();
     let params = BTreeMap::new();
-    let (mut checked, mut indexed) = (0usize, 0usize);
+    let (mut checked, mut indexed, mut built_by_builder) = (0usize, 0usize, 0usize);
+    let mut last_version = None;
     while !writer.is_finished() || checked == 0 {
         // One guard: the live handle and a snapshot of the very same version.
         let g = db.read();
         let snap = g.reader();
+        // A version seen for the first time was last published by the writer
+        // and handed to the builder: wait for it, so the cells compared are
+        // the builder's.
+        if last_version != Some(snap.version) && !snap.deltas.is_empty() {
+            await_background_build(&snap);
+            built_by_builder += 1;
+        }
+        last_version = Some(snap.version);
         indexed += usize::from(snap.queries_use_index());
         for q in &queries {
             assert_eq!(
@@ -281,6 +309,12 @@ fn indexed_lookups_on_the_reader_match_the_live_index_under_concurrent_writes() 
     assert!(
         indexed * 2 > checked,
         "the index served only {indexed} of {checked} versions"
+    );
+    // Every version with a tail was compared on builder-built cells (the
+    // wait above fails the test otherwise); make sure there were many.
+    assert!(
+        built_by_builder > 10,
+        "only {built_by_builder} versions were checked on builder-built cells"
     );
 }
 
@@ -327,6 +361,8 @@ fn the_published_snapshot_arrives_with_its_layer_and_index_built() {
         !snap.deltas.is_empty(),
         "the bulk commit must be in the tail"
     );
+    // Built off the write lock by the background builder, not by this read.
+    await_background_build(&snap);
     assert!(
         snap.layer_and_index_built(),
         "the published snapshot's layer or index was left for the reader to build"
