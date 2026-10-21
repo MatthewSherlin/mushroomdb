@@ -6368,6 +6368,7 @@ impl<F: Fs> GraphDb<F> {
         }
 
         let committed = self.ids.len();
+        let props_view = build_props_view(&self.props, &self.base);
         // What earlier nodes of this frame hold, per constraint, in the
         // bucket `equality_bucket` gives; values in one bucket are compared
         // with `values_equal`, the scan's own equality.
@@ -6385,22 +6386,44 @@ impl<F: Fs> GraphDb<F> {
             let Some(label) = label else {
                 continue;
             };
+            // A node the frame moves into a constrained label brings the
+            // value it holds with it; that is a claim like any other.
+            let relabelled = (id as usize) < committed
+                && final_label
+                    .get(&id)
+                    .is_some_and(|sym| self.labels.get(id as usize) != Some(sym));
             for (ci, c) in self.constraints.iter().enumerate() {
                 if c.label != label {
                     continue;
                 }
+                let stored = || {
+                    if (id as usize) < committed {
+                        props_view.get(id, &c.field).map(|vr| vr.into_value())
+                    } else {
+                        None
+                    }
+                };
                 let written = field_syms[ci].and_then(|sym| final_value.get(&(id, sym)));
                 let value = match written {
-                    Some(v) => v.cloned(),
-                    // Not written by the frame: the node keeps what it holds,
-                    // which only a node that existed before the frame can.
-                    None if (id as usize) < committed => build_props_view(&self.props, &self.base)
-                        .get(id, &c.field)
-                        .map(|vr| vr.into_value()),
-                    None => None,
-                };
-                let Some(value) = value else {
-                    continue;
+                    Some(Some(v)) => {
+                        // Only a value the frame changes is judged. One it
+                        // leaves as it was — a rewrite of the same value, or a
+                        // change reverted inside the frame — is not a claim,
+                        // so a duplicate that already exists is not refused
+                        // for being written again.
+                        if !relabelled && stored().is_some_and(|old| values_equal(&old, v)) {
+                            continue;
+                        }
+                        (*v).clone()
+                    }
+                    Some(None) => continue,
+                    // Not written: the node keeps what it holds, and judging
+                    // that is only owed when it has just arrived in the label.
+                    None if relabelled => match stored() {
+                        Some(v) => v,
+                        None => continue,
+                    },
+                    None => continue,
                 };
                 // A value no scan can find equal to another — one with no
                 // index key, or a NaN — never conflicts.
@@ -6411,14 +6434,24 @@ impl<F: Fs> GraphDb<F> {
                     constraint: c.name.clone(),
                     field: c.field.clone(),
                 };
-                // A holder the frame does not touch keeps its value. The
-                // index answers as the scan does: an `Int` finds the equal
-                // `Float`, and the reverse.
+                // A holder keeps its value unless the frame deletes it or
+                // writes the field to something else. The index answers as
+                // the scan does: an `Int` finds the equal `Float`, and the
+                // reverse.
+                let leaves = |holder: u32| {
+                    dead.contains(&holder)
+                        || field_syms[ci]
+                            .and_then(|sym| final_value.get(&(holder, sym)))
+                            .is_some_and(|now| match now {
+                                Some(v) => !values_equal(v, &value),
+                                None => true,
+                            })
+                };
                 if self
                     .prop_index
                     .lookup(&c.label, &c.field, &value)
                     .into_iter()
-                    .any(|holder| holder != id && !touched.contains(&holder))
+                    .any(|holder| holder != id && !leaves(holder))
                 {
                     return Err(violation());
                 }

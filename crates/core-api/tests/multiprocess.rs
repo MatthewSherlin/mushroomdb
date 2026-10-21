@@ -816,6 +816,17 @@ fn a_peers_constraint_over_older_duplicates_is_absorbed_not_checked() {
     assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
     assert!(db.node_info("dave").is_some());
     drop(db);
+    // A reader's capture of the same state sees both duplicates.
+    let read = shared.read();
+    assert_eq!(
+        read.get_prop("alice", "email"),
+        Some(Value::Str("a@x".into()))
+    );
+    assert_eq!(
+        read.get_prop("bob", "email"),
+        Some(Value::Str("a@x".into()))
+    );
+    drop(read);
     drop(shared);
     let reopened = GraphDb::open(&d).expect("the store opens");
     assert_eq!(reopened.constraints().len(), 1);

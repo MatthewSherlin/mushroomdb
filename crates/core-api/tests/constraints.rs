@@ -879,10 +879,98 @@ mod unlocked {
     }
 
     #[test]
+    fn an_upsert_that_resends_a_duplicates_value_is_allowed() {
+        let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-upsert");
+        let before_resend = |name: &str| {
+            vec![
+                ("name".to_string(), Value::Str(name.into())),
+                ("email".to_string(), Value::Str("a@x".into())),
+            ]
+        };
+        // A client that re-sends the full property set of a duplicate.
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node_on_conflict("User", "bob", before_resend("Bob"), OnConflict::Replace);
+        })
+        .unwrap();
+        // A MERGE that matches it and sets another property.
+        cypher(
+            &mut db,
+            "MERGE (n:User {id: 'bob'}) ON MATCH SET n.name = 'Robert'",
+        )
+        .unwrap();
+        cypher(
+            &mut db,
+            "MATCH (n:User) WHERE n.id = 'alice' SET n += {name: 'Al'}",
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_prop("bob", "name"),
+            Some(Value::Str("Robert".into()))
+        );
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // A rewrite beside a new claim on the same value is still refused: the
+        // rewritten duplicate holds it.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node_on_conflict("User", "bob", before_resend("B"), OnConflict::Replace);
+            b.insert_node("User", "dave", email("a@x"));
+        }));
+        // An upsert that adds the field to a node without one is a claim.
+        db.insert_node("User", "erin", vec![]).unwrap();
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.insert_node_on_conflict("User", "erin", before_resend("E"), OnConflict::Replace);
+        }));
+        drop(db);
+        let reopened = GraphDb::open(&dir).unwrap();
+        assert_eq!(
+            reopened.get_prop("bob", "name"),
+            Some(Value::Str("Robert".into()))
+        );
+    }
+
+    #[test]
+    fn only_a_changed_value_is_judged() {
+        let (_dir, mut db) = store_with_grandfathered_duplicates("grandfather-changed");
+        // Carol may not take the shared value, and a Float equal to it is the
+        // same value.
+        assert_violation(db.set_prop("carol", "email", Value::Str("a@x".into())));
+        // A batch that changes bob's value and puts it back leaves it as it was.
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("bob", "email", Value::Str("a@x".into()));
+        })
+        .unwrap();
+        assert_eq!(db.get_prop("bob", "email"), Some(Value::Str("a@x".into())));
+        // Changed away and back across two frames in one batch of ops, with a
+        // claim in between by another node, is judged on the end state: bob
+        // holds a@x again, so carol cannot have it.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("carol", "email", Value::Str("a@x".into()));
+            b.set_prop("bob", "email", Value::Str("a@x".into()));
+        }));
+        // Bob moving away lets carol have it only while alice does not hold it.
+        assert_violation(db.write_batch(|b: &mut Batch<'_>| {
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("carol", "email", Value::Str("a@x".into()));
+        }));
+        db.write_batch(|b: &mut Batch<'_>| {
+            b.delete_node("alice");
+            b.set_prop("bob", "email", Value::Str("z@x".into()));
+            b.set_prop("carol", "email", Value::Str("a@x".into()));
+        })
+        .unwrap();
+        assert_eq!(
+            db.get_prop("carol", "email"),
+            Some(Value::Str("a@x".into()))
+        );
+    }
+
+    #[test]
     fn a_grandfathered_duplicate_can_be_fixed_or_removed() {
         let (dir, mut db) = store_with_grandfathered_duplicates("grandfather-fix");
-        // Re-asserting the value it shares is a new write of a duplicate.
-        assert_violation(db.set_prop("bob", "email", Value::Str("a@x".into())));
+        // Re-asserting the value it shares changes nothing.
+        db.set_prop("bob", "email", Value::Str("a@x".into()))
+            .unwrap();
         // Moving it somewhere free fixes it, and alice is then the only holder.
         db.set_prop("bob", "email", Value::Str("b@x".into()))
             .unwrap();
