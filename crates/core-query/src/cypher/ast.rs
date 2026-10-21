@@ -258,6 +258,21 @@ pub enum Operand {
         filter: Option<Box<Expr>>,
         map: Box<Operand>,
     },
+    /// `reduce(acc = init, x IN list | body)`.
+    ///
+    /// `init` and `list` are evaluated in the enclosing scope; `acc_var` and
+    /// `iter_var` are bound inside `body` only and shadow outer names there.
+    /// Each element of `list` is bound to `iter_var`, the accumulator to
+    /// `acc_var`, and the value of `body` becomes the next accumulator. A null
+    /// or non-list `list` yields null; a null `body` value makes the
+    /// accumulator null for the next step.
+    Reduce {
+        acc_var: String,
+        init: Box<Operand>,
+        iter_var: String,
+        list: Box<Operand>,
+        body: Box<Operand>,
+    },
     /// Map literal with at least one non-constant value: `{k: n.x}`. Keys are
     /// unique (a duplicate is a parse error). All-constant maps fold to
     /// `Operand::Lit(Value::Map(..))`. Evaluates to `Value::Map`.
@@ -296,6 +311,7 @@ pub fn operand_label(op: &Operand) -> String {
         Operand::ListLit(_) => "<list>".to_string(),
         Operand::MapLit(_) => "<map>".to_string(),
         Operand::ListComprehension { .. } => "<listcomp>".to_string(),
+        Operand::Reduce { .. } => "<reduce>".to_string(),
         Operand::Index { base, index } => {
             format!("{}[{}]", operand_label(base), subscript_label(index))
         }

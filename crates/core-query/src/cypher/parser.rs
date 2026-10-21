@@ -1037,6 +1037,38 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// The rest of `reduce(acc = init, x IN list | body)`, after the name.
+    /// It nests like a list literal, so it shares `literal_depth` and its
+    /// limit.
+    fn reduce_call(&mut self) -> Result<Operand, String> {
+        const SHAPE: &str = "reduce() takes (acc = init, x IN list | expression)";
+        self.expect(&Tok::LParen, "expected '(' after reduce")?;
+        self.enter_literal()?;
+        let acc_var = self.ident(SHAPE)?;
+        self.expect(&Tok::Eq, SHAPE)?;
+        let init = self.arith_expr()?;
+        self.expect(&Tok::Comma, SHAPE)?;
+        let iter_var = self.ident(SHAPE)?;
+        if !self.eat_ident_kw("in") {
+            return Err(self.err(SHAPE));
+        }
+        if acc_var == iter_var {
+            return Err(self.err("reduce() accumulator and element variables must differ"));
+        }
+        let list = self.arith_expr()?;
+        self.expect(&Tok::Pipe, SHAPE)?;
+        let body = self.arith_expr()?;
+        self.expect(&Tok::RParen, "expected ')' to close reduce()")?;
+        self.literal_depth -= 1;
+        Ok(Operand::Reduce {
+            acc_var,
+            init: Box::new(init),
+            iter_var,
+            list: Box::new(list),
+            body: Box::new(body),
+        })
+    }
+
     /// `{}` or `{k1: e1, k2: e2}`; keys are identifiers (backtick-quoted
     /// allowed), values are any expression. A duplicate key is refused (some
     /// engines keep the last one; silently dropping a value hides a typo). An
@@ -1147,6 +1179,9 @@ impl<'a> Parser<'a> {
                         "collect() is only supported as a top-level RETURN/WITH aggregate"
                             .to_string(),
                     );
+                }
+                if name.eq_ignore_ascii_case("reduce") && self.peek() == Some(&Tok::LParen) {
+                    return self.reduce_call();
                 }
                 if self.peek() == Some(&Tok::LParen) {
                     // Scalar function call: name(arg, ...)
@@ -1802,6 +1837,7 @@ impl<'a> Parser<'a> {
                     | Operand::ListLit(_)
                     | Operand::MapLit(_)
                     | Operand::ListComprehension { .. }
+                    | Operand::Reduce { .. }
                     | Operand::Case { .. } => op,
                     Operand::Prop { .. } | Operand::Var(_) => {
                         return Err(self.err(

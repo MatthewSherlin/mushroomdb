@@ -1456,6 +1456,22 @@ fn check_operand_bound(
             }
             check_operand_bound(map, &inner, clause)
         }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            // The init and the list see the enclosing scope; the body also
+            // sees the accumulator and the element.
+            check_operand_bound(init, bound, clause)?;
+            check_operand_bound(list, bound, clause)?;
+            let mut inner = bound.clone();
+            inner.insert(acc_var.clone());
+            inner.insert(iter_var.clone());
+            check_operand_bound(body, &inner, clause)
+        }
         Operand::FuncCall { args, .. } => {
             for arg in args {
                 check_operand_bound(arg, bound, clause)?;
@@ -1696,6 +1712,31 @@ fn inline_aliases(op: &Operand, returns: &[RetItem]) -> Operand {
                     .as_ref()
                     .map(|f| Box::new(inline_aliases_expr(f, &inner))),
                 map: Box::new(inline_aliases(map, &inner)),
+            }
+        }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            // A RETURN alias named like either variable does not reach into
+            // the body: the variable shadows it there.
+            let inner: Vec<RetItem> = returns
+                .iter()
+                .filter(|r| {
+                    let alias = r.alias.as_deref();
+                    alias != Some(acc_var.as_str()) && alias != Some(iter_var.as_str())
+                })
+                .cloned()
+                .collect();
+            Operand::Reduce {
+                acc_var: acc_var.clone(),
+                init: Box::new(go(init)),
+                iter_var: iter_var.clone(),
+                list: Box::new(go(list)),
+                body: Box::new(inline_aliases(body, &inner)),
             }
         }
         Operand::Case { branches, default } => Operand::Case {

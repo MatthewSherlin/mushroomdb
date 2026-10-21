@@ -1030,6 +1030,13 @@ fn collect_operand(op: &Operand, names: &mut Vec<String>, seen: &mut BTreeSet<St
             }
             collect_operand(map, names, seen);
         }
+        Operand::Reduce {
+            init, list, body, ..
+        } => {
+            collect_operand(init, names, seen);
+            collect_operand(list, names, seen);
+            collect_operand(body, names, seen);
+        }
         _ => {}
     }
 }
@@ -1346,6 +1353,20 @@ fn intern_operand(vars: &mut VarTable, operand: &Operand) {
                 intern_expr(vars, f);
             }
             intern_operand(vars, map);
+        }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            // Both variables need a row slot to be bound in.
+            vars.intern(acc_var);
+            vars.intern(iter_var);
+            intern_operand(vars, init);
+            intern_operand(vars, list);
+            intern_operand(vars, body);
         }
     }
 }
@@ -2645,6 +2666,40 @@ fn resolve_operand(
             }
             Ok(Some(Value::List(out)))
         }
+        Operand::Reduce {
+            acc_var,
+            init,
+            iter_var,
+            list,
+            body,
+        } => {
+            // The init and the list are read in the enclosing scope.
+            let mut acc = resolve_operand(view, vars, row, init, params)?;
+            let source = match resolve_operand(view, vars, row, list, params)? {
+                Some(Value::List(items)) => items,
+                // A null or non-list source gives null.
+                _ => return Ok(None),
+            };
+            let slot_of = |name: &str| {
+                vars.slot(name)
+                    .filter(|s| *s < row.len())
+                    .ok_or_else(|| format!("reduce variable `{name}` has no slot"))
+            };
+            let acc_slot = slot_of(acc_var)?;
+            let iter_slot = slot_of(iter_var)?;
+            // One copy of the row; the outer row keeps its own bindings, so
+            // the shadowing ends with the reduce.
+            let mut scoped = row.clone();
+            for item in source {
+                scoped[iter_slot] = match item {
+                    Value::Null => None,
+                    other => Some(Cell::Scalar(other)),
+                };
+                scoped[acc_slot] = acc.take().map(Cell::Scalar);
+                acc = resolve_operand(view, vars, &scoped, body, params)?;
+            }
+            Ok(acc)
+        }
         Operand::MapLit(entries) => {
             let mut out = BTreeMap::new();
             for (key, value) in entries {
@@ -2696,6 +2751,21 @@ fn resolve_operand(
                 (Some(lv), Some(rv)) => {
                     if let Some(temporal_result) = temporal::arith(op, &lv, &rv) {
                         return Ok(temporal_result);
+                    }
+                    // `+` joins two strings or two lists; every other
+                    // operator on them is a type error below.
+                    if matches!(op, ArithOp::Add) {
+                        match (&lv, &rv) {
+                            (Value::Str(l), Value::Str(r)) => {
+                                return Ok(Some(Value::Str(format!("{l}{r}"))));
+                            }
+                            (Value::List(l), Value::List(r)) => {
+                                let mut joined = l.clone();
+                                joined.extend(r.iter().cloned());
+                                return Ok(Some(Value::List(joined)));
+                            }
+                            _ => {}
+                        }
                     }
                     let a = match &lv {
                         Value::Float(f) => *f,
@@ -5134,6 +5204,10 @@ fn apply_limit<T>(rows: &mut Vec<T>, n: u64) {
 #[cfg(test)]
 #[path = "tests/ql_13.rs"]
 mod ql_13;
+
+#[cfg(test)]
+#[path = "tests/ql_14.rs"]
+mod ql_14;
 
 #[cfg(test)]
 #[path = "tests/ql_15.rs"]

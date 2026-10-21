@@ -874,6 +874,10 @@ fn operand_node_vars(op: &Operand, out: &mut Vec<String>) {
             }
         }
         Operand::ListComprehension { list, .. } => operand_node_vars(list, out),
+        Operand::Reduce { init, list, .. } => {
+            operand_node_vars(init, out);
+            operand_node_vars(list, out);
+        }
         Operand::Lit(_) | Operand::Param(_) => {}
     }
 }
@@ -954,47 +958,58 @@ const COMPREHENSION_IN_WRITE_RETURN: &str =
     "a list comprehension is not supported in the RETURN of a write statement; \
      compute it in a read query, or RETURN the list and filter it afterwards";
 
-fn expr_has_comprehension(expr: &Expr) -> bool {
+/// The refusal for `reduce()` in a write statement's RETURN.
+const REDUCE_IN_WRITE_RETURN: &str =
+    "reduce() is not supported in the RETURN of a write statement; \
+     compute it in a read query, or RETURN the list and fold it afterwards";
+
+/// The refusal for the first scoped-variable construct (a list comprehension
+/// or `reduce()`) found in an expression, if any.
+fn expr_write_return_refusal(expr: &Expr) -> Option<&'static str> {
     match expr {
-        Expr::And(a, b) | Expr::Or(a, b) => expr_has_comprehension(a) || expr_has_comprehension(b),
-        Expr::Not(e) => expr_has_comprehension(e),
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            expr_write_return_refusal(a).or_else(|| expr_write_return_refusal(b))
+        }
+        Expr::Not(e) => expr_write_return_refusal(e),
         Expr::Cmp { lhs, rhs, .. } => {
-            operand_has_comprehension(lhs) || operand_has_comprehension(rhs)
+            operand_write_return_refusal(lhs).or_else(|| operand_write_return_refusal(rhs))
         }
-        Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_has_comprehension(o),
-        Expr::In { expr, list } => {
-            operand_has_comprehension(expr) || list.iter().any(operand_has_comprehension)
-        }
+        Expr::Truthy(o) | Expr::IsNull(o) | Expr::IsNotNull(o) => operand_write_return_refusal(o),
+        Expr::In { expr, list } => operand_write_return_refusal(expr)
+            .or_else(|| list.iter().find_map(operand_write_return_refusal)),
     }
 }
 
-fn operand_has_comprehension(op: &Operand) -> bool {
+fn operand_write_return_refusal(op: &Operand) -> Option<&'static str> {
     match op {
-        Operand::ListComprehension { .. } => true,
-        Operand::FuncCall { args, .. } => args.iter().any(operand_has_comprehension),
+        Operand::ListComprehension { .. } => Some(COMPREHENSION_IN_WRITE_RETURN),
+        Operand::Reduce { .. } => Some(REDUCE_IN_WRITE_RETURN),
+        Operand::FuncCall { args, .. } => args.iter().find_map(operand_write_return_refusal),
         Operand::BinArith { left, right, .. } => {
-            operand_has_comprehension(left) || operand_has_comprehension(right)
+            operand_write_return_refusal(left).or_else(|| operand_write_return_refusal(right))
         }
         Operand::Index { base, index } => {
-            operand_has_comprehension(base) || operand_has_comprehension(index)
+            operand_write_return_refusal(base).or_else(|| operand_write_return_refusal(index))
         }
-        Operand::ListLit(items) => items.iter().any(operand_has_comprehension),
-        Operand::MapLit(entries) => entries.iter().any(|(_, v)| operand_has_comprehension(v)),
-        Operand::Case { branches, default } => {
-            branches
-                .iter()
-                .any(|(c, v)| expr_has_comprehension(c) || operand_has_comprehension(v))
-                || default.as_deref().is_some_and(operand_has_comprehension)
-        }
-        Operand::Prop { .. } | Operand::Lit(_) | Operand::Param(_) | Operand::Var(_) => false,
+        Operand::ListLit(items) => items.iter().find_map(operand_write_return_refusal),
+        Operand::MapLit(entries) => entries
+            .iter()
+            .find_map(|(_, v)| operand_write_return_refusal(v)),
+        Operand::Case { branches, default } => branches
+            .iter()
+            .find_map(|(c, v)| {
+                expr_write_return_refusal(c).or_else(|| operand_write_return_refusal(v))
+            })
+            .or_else(|| default.as_deref().and_then(operand_write_return_refusal)),
+        Operand::Prop { .. } | Operand::Lit(_) | Operand::Param(_) | Operand::Var(_) => None,
     }
 }
 
-fn returns_have_comprehension(returns: &[RetItem]) -> bool {
-    returns.iter().any(|item| match &item.value {
-        RetVal::FuncCall { args, .. } => args.iter().any(operand_has_comprehension),
-        RetVal::ScalarExpr(op) => operand_has_comprehension(op),
-        _ => false,
+fn returns_write_return_refusal(returns: &[RetItem]) -> Option<&'static str> {
+    returns.iter().find_map(|item| match &item.value {
+        RetVal::FuncCall { args, .. } => args.iter().find_map(operand_write_return_refusal),
+        RetVal::ScalarExpr(op) => operand_write_return_refusal(op),
+        _ => None,
     })
 }
 
@@ -1074,7 +1089,7 @@ fn eval_set_return_operand<F: Fs>(
         }
         // Refused by name before the write commits (`exec_match_set`); this
         // arm is only a backstop and never sees a comprehension.
-        Operand::ListComprehension { .. } => Err(GraphError::QueryError {
+        Operand::ListComprehension { .. } | Operand::Reduce { .. } => Err(GraphError::QueryError {
             detail: COMPREHENSION_IN_WRITE_RETURN.into(),
         }),
         Operand::MapLit(entries) => {
@@ -12728,12 +12743,12 @@ impl<F: Fs> GraphDb<F> {
         let project_returns = stmt.returns.clone();
         // Refused before anything is written: the projection runs after the
         // commit, and must not fail (or differ) once the write has happened.
-        if project_returns
+        if let Some(detail) = project_returns
             .as_deref()
-            .is_some_and(returns_have_comprehension)
+            .and_then(returns_write_return_refusal)
         {
             return Err(GraphError::QueryError {
-                detail: COMPREHENSION_IN_WRITE_RETURN.into(),
+                detail: detail.into(),
             });
         }
         // Collect unique node vars targeted by SET clauses, plus RETURN bindings
