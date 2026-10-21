@@ -484,7 +484,10 @@ pub struct ReaderSnapshot {
     /// Shared mmap base (zero-copy, Arc-ref-counted). `None` for legacy stores.
     pub base: Option<Arc<MappedBase>>,
     /// Commits since the last fold, in arrival order. Length ≤ `FOLD_EVERY_K − 1`.
-    pub deltas: Vec<Arc<CommitDelta>>,
+    ///
+    /// Behind one `Arc`, so handing out another handle on the snapshot — once
+    /// per capture — touches one reference count, not one per delta.
+    pub deltas: Arc<[Arc<CommitDelta>]>,
     /// The derived-edge changes of `deltas`, indexed by node.
     tail_derived: Arc<TailDerived>,
     /// The store's `commit_seq` when this snapshot was taken — the version key
@@ -504,8 +507,9 @@ pub struct ReaderSnapshot {
     /// empty it is never populated and reads go to `frozen` directly.
     cache: Arc<EffectiveCell>,
     /// What the snapshot knows of the handle beyond its graph state: where
-    /// slow queries go, the counts at capture, the WAL's path.
-    context: ReadContext,
+    /// slow queries go, the counts at capture, the WAL's path. Behind one
+    /// `Arc`, so another handle on the snapshot copies no path.
+    context: Arc<ReadContext>,
     /// The index this snapshot's queries use: the fold's, layered with the
     /// tail's touched nodes; `None` inside when no index applies. Built at
     /// most once, on the first query, and shared like `cache`.
@@ -556,16 +560,6 @@ pub(crate) struct ReadContext {
     pub(crate) counts: (usize, usize, u64),
     /// The WAL file, for [`ReaderSnapshot::wal_size_bytes`].
     pub(crate) wal_path: Option<std::path::PathBuf>,
-}
-
-impl ReadContext {
-    fn none() -> Self {
-        Self {
-            slow: SlowQuerySink::disabled(),
-            counts: (0, 0, 0),
-            wal_path: None,
-        }
-    }
 }
 
 thread_local! {
@@ -622,6 +616,18 @@ pub(crate) struct SharedEffective {
     index: Arc<IndexCell>,
     seeds: Arc<Seeds>,
     background: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Everything [`ReaderSnapshot::new`] builds a snapshot from.
+pub(crate) struct SnapshotParts {
+    pub(crate) frozen: Arc<FrozenOverlay>,
+    pub(crate) base: Option<Arc<MappedBase>>,
+    pub(crate) deltas: Arc<[Arc<CommitDelta>]>,
+    pub(crate) tail_derived: Arc<TailDerived>,
+    pub(crate) version: u64,
+    pub(crate) role_masks: Arc<RoleMaskCache>,
+    pub(crate) context: ReadContext,
+    pub(crate) shared: SharedCell,
 }
 
 /// What [`SharedEffective::cell_for`] hands a new snapshot.
@@ -864,14 +870,17 @@ impl ReaderSnapshot {
     ///
     /// Used by [`crate::db::GraphDb::reader`] — the only site that builds a
     /// snapshot — so the private `cache` field stays encapsulated here.
-    pub(crate) fn new(
-        frozen: Arc<FrozenOverlay>,
-        base: Option<Arc<MappedBase>>,
-        deltas: Vec<Arc<CommitDelta>>,
-        tail_derived: Arc<TailDerived>,
-        version: u64,
-        role_masks: Arc<RoleMaskCache>,
-    ) -> Self {
+    pub(crate) fn new(parts: SnapshotParts) -> Self {
+        let SnapshotParts {
+            frozen,
+            base,
+            deltas,
+            tail_derived,
+            version,
+            role_masks,
+            context,
+            shared,
+        } = parts;
         Self {
             frozen,
             base,
@@ -879,28 +888,12 @@ impl ReaderSnapshot {
             tail_derived,
             version,
             role_masks,
-            cache: Arc::new(EffectiveCell::new()),
-            context: ReadContext::none(),
-            index: Arc::new(IndexCell::new()),
-            seeds: Arc::new(Seeds::default()),
-            background: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cache: shared.cell,
+            context: Arc::new(context),
+            index: shared.index,
+            seeds: shared.seeds,
+            background: shared.background,
         }
-    }
-
-    /// This snapshot, with its handle's `context`.
-    pub(crate) fn with_read_context(mut self, context: ReadContext) -> Self {
-        self.context = context;
-        self
-    }
-
-    /// This snapshot, building its layer and index into the cells shared with
-    /// every other snapshot of the same fold and tail (see [`SharedEffective`]).
-    pub(crate) fn with_shared_effective(mut self, shared: SharedCell) -> Self {
-        self.cache = shared.cell;
-        self.index = shared.index;
-        self.seeds = shared.seeds;
-        self.background = shared.background;
-        self
     }
 
     /// Another handle on exactly this snapshot: same state, same shared
@@ -909,12 +902,12 @@ impl ReaderSnapshot {
         ReaderSnapshot {
             frozen: Arc::clone(&self.frozen),
             base: self.base.clone(),
-            deltas: self.deltas.clone(),
+            deltas: Arc::clone(&self.deltas),
             tail_derived: Arc::clone(&self.tail_derived),
             version: self.version,
             role_masks: Arc::clone(&self.role_masks),
             cache: Arc::clone(&self.cache),
-            context: self.context.clone(),
+            context: Arc::clone(&self.context),
             index: Arc::clone(&self.index),
             seeds: Arc::clone(&self.seeds),
             background: Arc::clone(&self.background),
@@ -1227,7 +1220,7 @@ impl ReaderSnapshot {
         let frozen = &self.frozen.prop_index;
         let mut stale = std::collections::BTreeSet::new();
         let mut unresolved = false;
-        for delta in &self.deltas {
+        for delta in self.deltas.iter() {
             for rec in &delta.records {
                 if !touched_nodes(rec, &self.frozen.ids, view, &mut stale, &mut unresolved) {
                     return None;

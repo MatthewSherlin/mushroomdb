@@ -30,7 +30,8 @@ const NODES: usize = 100_000;
 const READERS: usize = 16;
 const PER_READER: usize = 100;
 
-fn build() -> SharedDb {
+/// The store, and its directory for removal once the run is done.
+fn build() -> (SharedDb, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "gates-3-4-{}-{}",
         std::process::id(),
@@ -63,7 +64,7 @@ fn build() -> SharedDb {
             .collect();
         db.submit_batch(edges).unwrap();
     }
-    db
+    (db, dir)
 }
 
 fn start_writer(db: &SharedDb) -> (Arc<AtomicBool>, std::thread::JoinHandle<u64>) {
@@ -241,10 +242,12 @@ fn profile(db: &SharedDb, label: &str) {
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "gate3".into());
     let label = std::env::args().nth(2).unwrap_or_default();
-    let db = build();
+    let (db, dir) = build();
     match mode.as_str() {
         "profile" => profile(&db, &label),
         "gate3" => run_gate(&db, "gate3", &label),
         _ => run_gate(&db, "gate4", &label),
     }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -527,18 +527,6 @@ pub(crate) struct SlowQuerySink {
 }
 
 impl SlowQuerySink {
-    /// A sink that records nothing (threshold 0), for snapshots that must not
-    /// report into a shared ring.
-    pub(crate) fn disabled() -> Self {
-        Self {
-            threshold_ms: 0,
-            log: Arc::new(std::sync::Mutex::new(SlowQueryLog {
-                entries: std::collections::VecDeque::new(),
-                total: 0,
-            })),
-        }
-    }
-
     /// The ring and threshold as [`GraphDb::slow_query_snapshot`] reports them.
     pub(crate) fn snapshot(&self) -> SlowQuerySnapshot {
         let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
@@ -2030,6 +2018,54 @@ pub struct GraphDb<F: Fs> {
     last_apply_retraction_count: u64,
 }
 
+/// A handle's WAL cursor and snapshot identity at one moment: what
+/// [`GraphDb::is_stale`] compares the files on disk against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiskMark {
+    pinned: bool,
+    wal_consumed: u64,
+    snapshot_ident: Option<(u64, u64)>,
+}
+
+impl DiskMark {
+    /// Whether the store under `fs` has moved on from this mark: the WAL's
+    /// length differs from the cursor, or the snapshot file was replaced.
+    /// Metadata only; never true for an as-of view.
+    pub(crate) fn is_stale_on<F: Fs>(&self, fs: &F) -> Result<bool> {
+        if self.pinned {
+            return Ok(false);
+        }
+        if fs.wal_len().map_err(GraphError::Io)? != self.wal_consumed {
+            return Ok(true);
+        }
+        Ok(fs.snapshot_ident().map_err(GraphError::Io)? != self.snapshot_ident)
+    }
+
+    /// [`Self::is_stale_on`], against files already looked at.
+    pub(crate) fn is_stale_at(&self, disk: &DiskState) -> bool {
+        !self.pinned
+            && (disk.wal_len != self.wal_consumed || disk.snapshot_ident != self.snapshot_ident)
+    }
+}
+
+/// What a staleness check reads off the store's files: the WAL's length and
+/// the snapshot file's identity. Metadata only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiskState {
+    wal_len: u64,
+    snapshot_ident: Option<(u64, u64)>,
+}
+
+impl DiskState {
+    /// Look at `fs`'s files, the WAL first, as [`DiskMark::is_stale_on`] does.
+    pub(crate) fn read<F: Fs>(fs: &F) -> Result<Self> {
+        Ok(Self {
+            wal_len: fs.wal_len().map_err(GraphError::Io)?,
+            snapshot_ident: fs.snapshot_ident().map_err(GraphError::Io)?,
+        })
+    }
+}
+
 /// One group of deferred event notifications, held until the group fsync
 /// completes.  Replayed by [`GraphDb::flush_deferred_events`].
 struct DeferredEvent {
@@ -3213,13 +3249,19 @@ impl<F: Fs> GraphDb<F> {
     /// Always false for an as-of view from [`GraphDb::open_at`]: such a view is
     /// pinned to one commit and later commits are deliberately invisible to it.
     pub fn is_stale(&self) -> Result<bool> {
-        if self.pinned {
-            return Ok(false);
+        self.disk_mark().is_stale_on(&self.fs)
+    }
+
+    /// What [`Self::is_stale`] compares the store on disk against, as of now.
+    ///
+    /// Taken under the lock with a published snapshot, it lets a reader ask
+    /// "is that snapshot still the store's state?" with no lock held.
+    pub(crate) fn disk_mark(&self) -> DiskMark {
+        DiskMark {
+            pinned: self.pinned,
+            wal_consumed: self.wal_consumed,
+            snapshot_ident: self.snapshot_ident,
         }
-        if self.fs.wal_len().map_err(GraphError::Io)? != self.wal_consumed {
-            return Ok(true);
-        }
-        Ok(self.fs.snapshot_ident().map_err(GraphError::Io)? != self.snapshot_ident)
     }
 
     /// Bring this handle up to date with every commit other processes have made,
@@ -4167,26 +4209,26 @@ impl<F: Fs> GraphDb<F> {
             &self.base,
             &self.delta_tail,
         );
-        let snap = crate::reader::ReaderSnapshot::new(
+        let snap = crate::reader::ReaderSnapshot::new(crate::reader::SnapshotParts {
             frozen,
-            self.base.clone(),
-            self.delta_tail.clone(),
-            Arc::clone(&self.tail_derived),
+            base: self.base.clone(),
+            deltas: Arc::from(self.delta_tail.as_slice()),
+            tail_derived: Arc::clone(&self.tail_derived),
             // The snapshot's effective state is exactly this handle's state at
             // this commit, so it shares the memo and its version key.
-            self.commit_seq,
-            Arc::clone(&self.role_masks),
-        )
-        .with_read_context(crate::reader::ReadContext {
-            slow: self.slow_query_sink(),
-            counts: (
-                self.ids.live_len(),
-                self.ids.len() - self.ids.live_len(),
-                self.corrected_edge_count(),
-            ),
-            wal_path: self.fs.wal_path(),
-        })
-        .with_shared_effective(effective);
+            version: self.commit_seq,
+            role_masks: Arc::clone(&self.role_masks),
+            context: crate::reader::ReadContext {
+                slow: self.slow_query_sink(),
+                counts: (
+                    self.ids.live_len(),
+                    self.ids.len() - self.ids.live_len(),
+                    self.corrected_edge_count(),
+                ),
+                wal_path: self.fs.wal_path(),
+            },
+            shared: effective,
+        });
         Some(snap)
     }
 
@@ -6592,8 +6634,12 @@ impl<F: Fs> GraphDb<F> {
                 .filter(|(_, &fired)| !fired)
                 .map(|(&triple, _)| triple)
                 .collect();
-            Arc::make_mut(&mut self.tail_derived)
-                .append(&crate::reader::DerivedChanges::from_net(&net));
+            // Only when there is something to add: the published snapshot
+            // shares the tail's index, so touching it copies it.
+            if !net.is_empty() {
+                Arc::make_mut(&mut self.tail_derived)
+                    .append(&crate::reader::DerivedChanges::from_net(&net));
+            }
             // `None`: the commit moved more view values than a delta should
             // carry, so the fold below takes them instead.
             let view_values = self.view_values_of_commit(&rec);

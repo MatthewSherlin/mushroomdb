@@ -12,7 +12,8 @@
 //! Passes: `name` and `score` (plain) with Relaxed fsync, then `score` and
 //! `name` with Strict fsync. With `READERS=1`, 8 threads read the store
 //! (capture, node lookup, indexed query) for the whole run, which is what
-//! makes a reader hold an older version while a commit is published.
+//! makes a reader hold an older version while a commit is published, and
+//! each pass reports how many reads they completed per second.
 //!
 //! Builds against v0.9.2 as well as 0.10, so the same source is the baseline.
 //!
@@ -22,7 +23,7 @@
 
 use mushroomdb::{BatchOp, FsyncPolicy, SharedDb, Value};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -60,9 +61,10 @@ fn main() {
     }
 
     let stop = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicU64::new(0));
     let reader_threads: Vec<_> = (0..if readers { 8 } else { 0 })
         .map(|r| {
-            let (db, stop) = (db.clone(), Arc::clone(&stop));
+            let (db, stop, reads) = (db.clone(), Arc::clone(&stop), Arc::clone(&reads));
             std::thread::spawn(move || {
                 let params = BTreeMap::new();
                 let mut i = r;
@@ -74,6 +76,7 @@ fn main() {
                         &params,
                     );
                     i += 8;
+                    reads.fetch_add(1, Ordering::Relaxed);
                 }
             })
         })
@@ -92,26 +95,32 @@ fn main() {
     let bulk = t.elapsed().as_secs_f64() * 1e3;
     println!("{label}\tn={n}\treaders={readers}\tbulk10k={bulk:.3}");
 
-    // `NAME_LOOP=<secs>`: only commit `name` writes for that long — a steady
-    // target for a sampling profiler.
-    if let Some(secs) = std::env::var("NAME_LOOP")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
+    // `NAME_LOOP=<secs>` / `PLAIN_LOOP=<secs>`: only commit `name` (or plain
+    // `score`) writes for that long, fsync off — a steady target for a
+    // sampling profiler.
+    for (var, field) in [("NAME_LOOP", "name"), ("PLAIN_LOOP", "score")] {
+        let Some(secs) = std::env::var(var).ok().and_then(|v| v.parse::<u64>().ok()) else {
+            continue;
+        };
         let end = Instant::now() + std::time::Duration::from_secs(secs);
         let mut i = 0usize;
         while Instant::now() < end {
+            let value = match field {
+                "name" => Value::Str(format!("renamed {i}")),
+                _ => Value::Int(i as i64),
+            };
             db.write()
-                .set_prop(
-                    &format!("p{}", (i * 7919) % n),
-                    "name",
-                    Value::Str(format!("renamed {i}")),
-                )
+                .set_prop(&format!("p{}", (i * 7919) % n), field, value)
                 .unwrap();
             i += 1;
         }
-        println!("{label}\tname_loop_commits={i}");
+        println!("{label}\t{field}_loop_commits={i}");
         stop.store(true, Ordering::Relaxed);
+        for t in reader_threads {
+            t.join().unwrap();
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
         return;
     }
 
@@ -124,6 +133,7 @@ fn main() {
         db.write().set_fsync_policy(policy);
         let (mut fold, mut first, mut steady) = (Vec::new(), Vec::new(), Vec::new());
         let mut after_fold = false;
+        let (reads_before, pass_start) = (reads.load(Ordering::Relaxed), Instant::now());
         for i in 0..(4 * mushroomdb::FOLD_EVERY_K) {
             let key = format!("p{}", (i * 7919) % n);
             let value = match field {
@@ -144,8 +154,10 @@ fn main() {
             after_fold = folded;
         }
         let fsync = matches!(policy, FsyncPolicy::Strict);
+        let reads_per_s = (reads.load(Ordering::Relaxed) - reads_before) as f64
+            / pass_start.elapsed().as_secs_f64();
         println!(
-            "{label}\tn={n}\treaders={readers}\tfield={field}\tfsync={fsync}\tfold={:.4}\tfirst_after_fold={:.4}\tsteady_p50={:.4}\tsteady_p99={:.4}\tfolds={}",
+            "{label}\tn={n}\treaders={readers}\tfield={field}\tfsync={fsync}\tfold={:.4}\tfirst_after_fold={:.4}\tsteady_p50={:.4}\tsteady_p99={:.4}\tfolds={}\treads_per_s={reads_per_s:.0}",
             pct(&mut fold, 0.5),
             pct(&mut first, 0.5),
             pct(&mut steady, 0.5),
@@ -157,4 +169,6 @@ fn main() {
     for t in reader_threads {
         t.join().unwrap();
     }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

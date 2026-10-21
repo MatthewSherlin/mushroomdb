@@ -124,7 +124,8 @@
 //! last clone is dropped can be silently lost.
 
 use crate::db::{
-    BatchOp, FsyncPolicy, Precondition, WriteAuthz, LOCK_POLL_INTERVAL, WRITE_LOCK_WAIT,
+    BatchOp, DiskMark, DiskState, FsyncPolicy, Precondition, WriteAuthz, LOCK_POLL_INTERVAL,
+    WRITE_LOCK_WAIT,
 };
 use crate::reader::ReaderSnapshot;
 use crate::transaction::Transaction;
@@ -293,21 +294,139 @@ impl Drop for DrainHandle {
 /// the lock (see [`PublishingGuard`]), so a read issued after a write returned
 /// sees that write: either it takes the read lock and reads live state, or a
 /// writer holds the lock and this slot already holds the released state.
+///
+/// It is also what a capture reads first, without taking the RwLock at all:
+/// the slot carries the [`DiskMark`] its snapshot was taken at, and while the
+/// files on disk still match that mark, no write has landed since — in this
+/// process every write publishes before it releases the lock, and another
+/// process's write moves the WAL — so the published snapshot *is* the live
+/// state. Readers then never hold a read guard a writer must wait out, and
+/// never contend with it beyond one `Arc` clone under the slot's mutex.
 pub(crate) struct Published {
-    slot: Mutex<Option<ReaderSnapshot>>,
+    slot: Mutex<Option<Arc<PublishedState>>>,
+    /// Looks at the store's files for the lock-free staleness check. `None`
+    /// if it could not be made; every capture then takes the locked path.
+    probe: Option<DiskProbe>,
+    /// Set while a write guard holds the RwLock, from its acquisition until
+    /// it has published; see [`Self::current`].
+    writing: AtomicBool,
     builder: Arc<Builder>,
 }
 
-impl Published {
-    fn new(db: &GraphDb<RealFs>, builder: Arc<Builder>) -> Self {
-        let snap = db.try_reader();
-        if let Some(snap) = &snap {
-            snap.prepare();
+/// The store's files, looked at by one capture at a time on behalf of all.
+///
+/// A capture must see every commit that returned before it began, so the
+/// look it acts on must have *started* after it began — and any such look
+/// will do, whichever capture made it. Captures arriving while one runs wait
+/// for the next and share it: at most one runs at a time, instead of one per
+/// concurrent reader. Those `stat`s are what a writer's WAL append contends
+/// with in the kernel; eight readers making them back to back cost a
+/// single-node commit more than everything else a capture does.
+struct DiskProbe {
+    /// Its own handle on the directory, so a look needs nothing behind the
+    /// lock; it never takes the store's `LOCK`.
+    fs: RealFs,
+    looks: Mutex<Looks>,
+    done: Condvar,
+}
+
+/// Looks are numbered as they start; they run one at a time, so they finish
+/// in order.
+#[derive(Default)]
+struct Looks {
+    started: u64,
+    finished: u64,
+    running: bool,
+    /// What the last finished look saw; `None` if it failed.
+    seen: Option<DiskState>,
+}
+
+impl DiskProbe {
+    fn new(dir: &Path) -> Option<Self> {
+        Some(Self {
+            fs: RealFs::new(dir).ok()?,
+            looks: Mutex::new(Looks::default()),
+            done: Condvar::new(),
+        })
+    }
+
+    /// The store's files as a look that started after this call did saw
+    /// them, or `None` if that look failed.
+    fn observe(&self) -> Option<DiskState> {
+        let mut looks = self.looks.lock().unwrap_or_else(|e| e.into_inner());
+        // Every look numbered above this one starts after this call did.
+        let after = looks.started;
+        loop {
+            if looks.finished > after {
+                return looks.seen;
+            }
+            if !looks.running {
+                looks.running = true;
+                looks.started += 1;
+                let number = looks.started;
+                drop(looks);
+                let seen = DiskState::read(&self.fs).ok();
+                let mut looks = self.looks.lock().unwrap_or_else(|e| e.into_inner());
+                looks.running = false;
+                looks.finished = number;
+                looks.seen = seen;
+                drop(looks);
+                self.done.notify_all();
+                return seen;
+            }
+            looks = self.done.wait(looks).unwrap_or_else(|e| e.into_inner());
         }
+    }
+}
+
+/// One published state: the snapshot, and the disk mark it is current for
+/// (`None` when it must not be served without the lock — see
+/// [`Published::set`]).
+struct PublishedState {
+    snap: ReaderSnapshot,
+    mark: Option<DiskMark>,
+}
+
+impl Published {
+    fn new(db: &GraphDb<RealFs>, probe: Option<DiskProbe>, builder: Arc<Builder>) -> Self {
+        let state = db.try_reader().map(|snap| {
+            snap.prepare();
+            Arc::new(PublishedState {
+                snap,
+                mark: Some(db.disk_mark()),
+            })
+        });
         Self {
-            slot: Mutex::new(snap),
+            slot: Mutex::new(state),
+            probe,
+            writing: AtomicBool::new(false),
             builder,
         }
+    }
+
+    /// The published state, holding the slot's mutex only to clone the `Arc`.
+    fn state(&self) -> Option<Arc<PublishedState>> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The published snapshot, when the store on disk is still exactly the
+    /// state it was published at. Takes no RwLock.
+    ///
+    /// While a write guard holds the RwLock, the published snapshot is served
+    /// without looking at the disk at all — exactly what a capture that found
+    /// the RwLock held has always been served, and for the same reason: that
+    /// writer refreshes as it opens its write scope and publishes as it
+    /// releases. Looking then would only find its own WAL append in flight,
+    /// and would contend with that append in the kernel.
+    fn current(&self) -> Option<ReaderSnapshot> {
+        let probe = self.probe.as_ref()?;
+        let state = self.state()?;
+        if self.writing.load(Ordering::Acquire) {
+            return Some(state.snap.share());
+        }
+        let mark = state.mark?;
+        let disk = probe.observe()?;
+        (!mark.is_stale_at(&disk)).then(|| state.snap.share())
     }
 
     /// Publish `db`'s state, and hand it to the background builder.
@@ -321,25 +440,35 @@ impl Published {
     /// The new snapshot replaces the old one before the build, so the old
     /// version's cells are no longer held here and the build extends them in
     /// place instead of copying them.
+    ///
+    /// A handle with no state to publish (between a reload's reset and its
+    /// fold) keeps the old snapshot for captures a writer blocks, as before,
+    /// but drops its mark, so no capture takes it for the live state.
     fn set(&self, db: &GraphDb<RealFs>) {
         let Some(snap) = db.try_reader() else {
+            let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(old) = slot.as_ref().filter(|s| s.mark.is_some()) {
+                *slot = Some(Arc::new(PublishedState {
+                    snap: old.snap.share(),
+                    mark: None,
+                }));
+            }
             return;
         };
+        let state = Arc::new(PublishedState {
+            snap,
+            mark: Some(db.disk_mark()),
+        });
         let old = self
             .slot
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .replace(snap.share());
-        drop(old);
-        self.builder.submit(snap);
+            .replace(Arc::clone(&state));
+        self.builder.submit(state, old);
     }
 
     fn get(&self) -> Option<ReaderSnapshot> {
-        self.slot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(ReaderSnapshot::share)
+        self.state().map(|state| state.snap.share())
     }
 }
 
@@ -349,43 +478,66 @@ impl Published {
 /// It holds at most one pending snapshot: a newer publish replaces an older
 /// one not yet started, so builds never queue. A superseded version is built,
 /// if anyone reads it, by its first reader, as before.
+///
+/// It also drops the states a publish replaced. Dropping a snapshot releases
+/// one reference on each of its `Arc`s — the fold, every delta of the tail —
+/// whose counts readers' captures are updating at the same moment, so the
+/// writer leaves that to this thread. They are dropped before the next build,
+/// so a superseded state never holds a cell the build would rather extend in
+/// place than copy.
 pub(crate) struct Builder {
-    pending: Mutex<Option<ReaderSnapshot>>,
+    pending: Mutex<BuilderQueue>,
     wake: std::sync::Condvar,
     shutdown: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct BuilderQueue {
+    next: Option<Arc<PublishedState>>,
+    retired: Vec<Arc<PublishedState>>,
 }
 
 impl Builder {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            pending: Mutex::new(None),
+            pending: Mutex::new(BuilderQueue::default()),
             wake: std::sync::Condvar::new(),
             shutdown: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    fn submit(&self, snap: ReaderSnapshot) {
-        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(snap);
+    /// Queue `state` for its build, and `old`, the state it replaced, for
+    /// dropping.
+    fn submit(&self, state: Arc<PublishedState>, old: Option<Arc<PublishedState>>) {
+        let mut queue = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(superseded) = queue.next.replace(state) {
+            queue.retired.push(superseded);
+        }
+        queue.retired.extend(old);
+        drop(queue);
         self.wake.notify_one();
     }
 
     fn run(self: Arc<Self>) {
         use std::sync::atomic::Ordering;
         loop {
-            let snap = {
-                let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let (next, retired) = {
+                let mut queue = self.pending.lock().unwrap_or_else(|e| e.into_inner());
                 loop {
-                    if let Some(snap) = pending.take() {
-                        break snap;
+                    if queue.next.is_some() || !queue.retired.is_empty() {
+                        break (queue.next.take(), std::mem::take(&mut queue.retired));
                     }
                     if self.shutdown.load(Ordering::Acquire) {
                         return;
                     }
-                    pending = self.wake.wait(pending).unwrap_or_else(|e| e.into_inner());
+                    queue = self.wake.wait(queue).unwrap_or_else(|e| e.into_inner());
                 }
             };
-            if snap.prepare() {
-                snap.mark_built_in_background();
+            drop(retired);
+            if let Some(state) = next {
+                if state.snap.prepare() {
+                    state.snap.mark_built_in_background();
+                }
             }
         }
     }
@@ -431,6 +583,7 @@ impl Drop for PublishingGuard<'_> {
         if !std::thread::panicking() {
             self.published.set(&self.guard);
         }
+        self.published.writing.store(false, Ordering::Release);
     }
 }
 
@@ -452,10 +605,9 @@ fn write_publishing<'a>(
     inner: &'a RwLock<GraphDb<RealFs>>,
     published: &'a Published,
 ) -> PublishingGuard<'a> {
-    PublishingGuard {
-        guard: inner.write().unwrap_or_else(|e| e.into_inner()),
-        published,
-    }
+    let guard = inner.write().unwrap_or_else(|e| e.into_inner());
+    published.writing.store(true, Ordering::Release);
+    PublishingGuard { guard, published }
 }
 
 // ── WriteGuard ────────────────────────────────────────────────────────────────
@@ -546,6 +698,9 @@ pub struct SharedDb {
     /// across the drain thread and direct writers.  See module-level doc for
     /// the required acquisition order.
     wal_mu: Arc<Mutex<()>>,
+    /// Captures that went past the published snapshot to the RwLock.
+    #[cfg(test)]
+    locked_captures: Arc<std::sync::atomic::AtomicU64>,
 }
 
 const _: () = {
@@ -599,7 +754,8 @@ impl SharedDb {
                 .spawn(move || builder.run())
                 .expect("failed to spawn reader layer builder thread")
         };
-        let published = Arc::new(Published::new(&db, Arc::clone(&builder)));
+        let probe = DiskProbe::new(&dir);
+        let published = Arc::new(Published::new(&db, probe, Arc::clone(&builder)));
         let inner = Arc::new(RwLock::new(db));
         let queue = WriteQueue::new();
         let wal_mu = Arc::new(Mutex::new(()));
@@ -639,6 +795,8 @@ impl SharedDb {
                 handle: Some(handle),
             }),
             wal_mu,
+            #[cfg(test)]
+            locked_captures: Arc::default(),
         }
     }
 
@@ -808,8 +966,9 @@ impl SharedDb {
 
     /// Capture a lock-free [`ReaderSnapshot`] of the current db state.
     ///
-    /// Never waits behind a writer in this process. When the read lock is
-    /// free it is taken only long enough to clone a handful of `Arc` handles.
+    /// Never waits behind a writer in this process. Usually it takes no lock
+    /// at all (below); when it does try the read lock and finds it free, it
+    /// holds it only long enough to clone a handful of `Arc` handles.
     /// When a writer holds or awaits it, the snapshot is the state the last
     /// writer released — which includes every write this process has
     /// returned, so a read issued after such a write still sees it.
@@ -826,8 +985,24 @@ impl SharedDb {
     /// opens its write scope and publishes the result as it releases.
     ///
     /// Subsequent reads on the returned snapshot are lock-free.
+    ///
+    /// # No RwLock in the common case
+    ///
+    /// The capture itself first reads the published snapshot with no RwLock:
+    /// when the files on disk still match the mark it was published at, it is
+    /// the live state (see [`Published`]), and the capture costs one `Arc`
+    /// clone under the slot's mutex plus the same metadata-only check a read
+    /// always made. The RwLock is tried only when that check sees a commit —
+    /// another process's, or one in flight here — so concurrent readers do
+    /// not hold read guards a writer has to wait for.
     pub fn reader(&self) -> ReaderSnapshot {
         use std::sync::TryLockError;
+        if let Some(snap) = self.published.current() {
+            return snap;
+        }
+        #[cfg(test)]
+        self.locked_captures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.inner.try_read() {
             Ok(db) => {
                 if !db.is_stale().unwrap_or(false) {
@@ -1317,5 +1492,95 @@ fn drain_loop(
         for (sub, result) in group.into_iter().zip(results) {
             let _ = sub.done.send(result);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Value;
+    use std::sync::atomic::Ordering;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mdb-shared-unit-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn value_of(snap: &ReaderSnapshot, key: &str) -> Option<Value> {
+        snap.node_info(key)?.props.get("v").cloned()
+    }
+
+    fn locked_captures(db: &SharedDb) -> u64 {
+        db.locked_captures.load(Ordering::Relaxed)
+    }
+
+    /// A capture made after a write returned reads that write from the
+    /// published snapshot, without the RwLock, through both write paths and
+    /// across folds.
+    #[test]
+    fn a_capture_after_a_returned_write_reads_it_without_the_lock() {
+        let dir = tmp("no-lock");
+        let db = SharedDb::open(&dir).unwrap();
+        db.write().insert_node("N", "a", vec![]).unwrap();
+        let commits = 2 * crate::FOLD_EVERY_K as i64 + 3;
+        for i in 0..commits {
+            if i % 2 == 0 {
+                db.write().set_prop("a", "v", Value::Int(i)).unwrap();
+            } else {
+                db.submit_batch(vec![BatchOp::SetProp {
+                    key: "a".into(),
+                    field: "v".into(),
+                    value: Value::Int(i),
+                }])
+                .unwrap();
+            }
+            for _ in 0..3 {
+                assert_eq!(value_of(&db.reader(), "a"), Some(Value::Int(i)));
+            }
+        }
+        assert_eq!(
+            locked_captures(&db),
+            0,
+            "a capture with no commit in flight took the RwLock"
+        );
+        assert_eq!(
+            db.reader().version,
+            db.read().reader().version,
+            "the published snapshot is not the live state"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A commit the published snapshot does not include — here another
+    /// handle's, as another process's would be — is seen by the next
+    /// capture, which takes the locked path once and publishes the result.
+    #[test]
+    fn a_commit_outside_the_published_snapshot_is_read_by_the_next_capture() {
+        let dir = tmp("peer");
+        let db = SharedDb::open(&dir).unwrap();
+        db.write().insert_node("N", "a", vec![]).unwrap();
+        assert_eq!(value_of(&db.reader(), "b"), None);
+        assert_eq!(locked_captures(&db), 0);
+        {
+            let mut peer = GraphDb::open(&dir).unwrap();
+            peer.insert_node("N", "b", vec![("v".into(), Value::Int(7))])
+                .unwrap();
+        }
+        assert_eq!(value_of(&db.reader(), "b"), Some(Value::Int(7)));
+        assert_eq!(locked_captures(&db), 1);
+        // Refreshed and republished: the next capture is lock-free again.
+        assert_eq!(value_of(&db.reader(), "b"), Some(Value::Int(7)));
+        assert_eq!(locked_captures(&db), 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
