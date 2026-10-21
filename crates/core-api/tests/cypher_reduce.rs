@@ -76,3 +76,39 @@ fn a_reduce_in_a_write_return_is_refused_and_writes_nothing() {
     assert_eq!(rs.get(0, "y"), None, "the refused statement must not write");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The write-statement RETURN has its own arithmetic evaluator; `+` must
+/// mean the same there as in a read query.
+#[test]
+fn plus_joins_in_a_write_return_as_it_does_in_a_read() {
+    let (mut db, dir) = open("plus");
+    let exprs = [
+        ("'a' + 'b'", Value::Str("ab".into())),
+        ("1 + 'a'", Value::Str("1a".into())),
+        ("'a' + 1.5", Value::Str("a1.5".into())),
+        ("[1] + [2]", Value::List(vec![Value::Int(1), Value::Int(2)])),
+        ("[1] + 2", Value::List(vec![Value::Int(1), Value::Int(2)])),
+        ("0 + [1]", Value::List(vec![Value::Int(0), Value::Int(1)])),
+    ];
+    for (expr, want) in exprs {
+        let read = db
+            .query(&format!("MATCH (n:P) RETURN {expr} AS r"), &no_params())
+            .unwrap();
+        let write = db
+            .query_write(
+                &format!("MATCH (n:P) WHERE n.id = 'a' SET n.y = 1 RETURN {expr} AS r"),
+                &no_params(),
+            )
+            .unwrap_or_else(|e| panic!("`{expr}` in a write RETURN failed: {e}"));
+        assert_eq!(read.get(0, "r"), Some(&want), "{expr} (read)");
+        assert_eq!(write.get(0, "r"), Some(&want), "{expr} (write)");
+    }
+    let err = db
+        .query_write(
+            "MATCH (n:P) WHERE n.id = 'a' SET n.y = 1 RETURN 'a' - 1 AS r",
+            &no_params(),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("must be numeric"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

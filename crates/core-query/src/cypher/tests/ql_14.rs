@@ -227,7 +227,28 @@ fn plus_joins_strings_and_lists_but_no_other_operator_does() {
     assert_eq!(eval("\"ab\" + \"cd\""), Some(Value::Str("abcd".into())));
     assert_eq!(eval("[1] + [2, 3]"), Some(ints(&[1, 2, 3])));
     assert_eq!(eval("\"ab\" + null"), None);
-    for q in ["\"ab\" - \"b\"", "\"ab\" * \"b\"", "\"a\" + 1", "[1] + 2"] {
+    assert_eq!(eval("[1] + null"), None);
+    // A list with an element, either side.
+    assert_eq!(eval("[1] + 2"), Some(ints(&[1, 2])));
+    assert_eq!(eval("0 + [1]"), Some(ints(&[0, 1])));
+    assert_eq!(
+        eval("[1] + \"a\""),
+        Some(Value::List(vec![Value::Int(1), Value::Str("a".into())]))
+    );
+    assert_eq!(eval("[] + 1"), Some(ints(&[1])));
+    // A number and a string join as the number's toString() text.
+    assert_eq!(eval("1 + \"a\""), Some(Value::Str("1a".into())));
+    assert_eq!(eval("\"a\" + 1.5"), Some(Value::Str("a1.5".into())));
+    assert_eq!(eval("\"a\" + 2"), Some(Value::Str("a2".into())));
+    assert_eq!(eval("toString(1.5) + \"x\""), eval("1.5 + \"x\""));
+    for q in [
+        "\"ab\" - \"b\"",
+        "\"ab\" * \"b\"",
+        "\"a\" - 1",
+        "[1] - 2",
+        "[1] * [2]",
+        "true + \"a\"",
+    ] {
         let fx = Fx::new();
         let err = run(&fx.view(), &format!("RETURN {q} AS r"), &BTreeMap::new())
             .expect_err("must be a type error");

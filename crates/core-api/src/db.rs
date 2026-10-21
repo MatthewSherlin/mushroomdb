@@ -1089,8 +1089,11 @@ fn eval_set_return_operand<F: Fs>(
         }
         // Refused by name before the write commits (`exec_match_set`); this
         // arm is only a backstop and never sees a comprehension.
-        Operand::ListComprehension { .. } | Operand::Reduce { .. } => Err(GraphError::QueryError {
+        Operand::ListComprehension { .. } => Err(GraphError::QueryError {
             detail: COMPREHENSION_IN_WRITE_RETURN.into(),
+        }),
+        Operand::Reduce { .. } => Err(GraphError::QueryError {
+            detail: REDUCE_IN_WRITE_RETURN.into(),
         }),
         Operand::MapLit(entries) => {
             let mut out = BTreeMap::new();
@@ -1253,6 +1256,11 @@ fn eval_set_return_arith(
             Ok(Some(Value::Int(result)))
         }
         (Some(lv), Some(rv)) => {
+            if matches!(op, ArithOp::Add) {
+                if let Some(joined) = core_query::value_ops::plus_non_numeric(&lv, &rv) {
+                    return Ok(Some(joined));
+                }
+            }
             let a = match &lv {
                 Value::Float(f) => *f,
                 Value::Int(i) => *i as f64,

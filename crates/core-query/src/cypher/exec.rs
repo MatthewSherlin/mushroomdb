@@ -2752,19 +2752,11 @@ fn resolve_operand(
                     if let Some(temporal_result) = temporal::arith(op, &lv, &rv) {
                         return Ok(temporal_result);
                     }
-                    // `+` joins two strings or two lists; every other
-                    // operator on them is a type error below.
+                    // `+` also joins strings and lists; every other operator
+                    // on them is a type error below.
                     if matches!(op, ArithOp::Add) {
-                        match (&lv, &rv) {
-                            (Value::Str(l), Value::Str(r)) => {
-                                return Ok(Some(Value::Str(format!("{l}{r}"))));
-                            }
-                            (Value::List(l), Value::List(r)) => {
-                                let mut joined = l.clone();
-                                joined.extend(r.iter().cloned());
-                                return Ok(Some(Value::List(joined)));
-                            }
-                            _ => {}
+                        if let Some(joined) = crate::value_ops::plus_non_numeric(&lv, &rv) {
+                            return Ok(Some(joined));
                         }
                     }
                     let a = match &lv {

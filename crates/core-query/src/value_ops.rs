@@ -251,6 +251,52 @@ pub fn into_element(v: Option<Value>) -> Value {
     }
 }
 
+/// A number in the text form `toString()` gives it.
+fn number_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Int(n) => Some(n.to_string()),
+        Value::Float(f) => Some(f.to_string()),
+        _ => None,
+    }
+}
+
+/// `left + right` for the operand pairs that are not both numbers: string
+/// joins, list joins, and list-with-element (openCypher). Returns `None`
+/// when the pair is none of those, so the caller raises its type error.
+///
+/// Both arithmetic evaluators (the read executor's and the write-statement
+/// RETURN's) call this, so `+` means the same in every position. Null is
+/// handled by the callers before this is reached.
+pub fn plus_non_numeric(left: &Value, right: &Value) -> Option<Value> {
+    match (left, right) {
+        (Value::Str(l), Value::Str(r)) => Some(Value::Str(format!("{l}{r}"))),
+        // A number joins a string as its `toString()` text.
+        (Value::Str(l), n @ (Value::Int(_) | Value::Float(_))) => {
+            Some(Value::Str(format!("{l}{}", number_text(n)?)))
+        }
+        (n @ (Value::Int(_) | Value::Float(_)), Value::Str(r)) => {
+            Some(Value::Str(format!("{}{r}", number_text(n)?)))
+        }
+        (Value::List(l), Value::List(r)) => {
+            let mut joined = l.clone();
+            joined.extend(r.iter().cloned());
+            Some(Value::List(joined))
+        }
+        (Value::List(l), element) => {
+            let mut joined = l.clone();
+            joined.push(element.clone());
+            Some(Value::List(joined))
+        }
+        (element, Value::List(r)) => {
+            let mut joined = Vec::with_capacity(r.len() + 1);
+            joined.push(element.clone());
+            joined.extend(r.iter().cloned());
+            Some(Value::List(joined))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{cmp_optional, cmp_values, values_equal};
