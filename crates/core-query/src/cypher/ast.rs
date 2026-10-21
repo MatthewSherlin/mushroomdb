@@ -363,12 +363,14 @@ pub struct RetItem {
 }
 
 /// ORDER BY target. Bare identifiers that match a RETURN alias become `Alias`;
-/// otherwise they stay `Var`. `var.field` is always `Prop`.
+/// otherwise they stay `Var`. `var.field` is always `Prop`. Anything else — an
+/// arithmetic expression, a function call, a subscript, a `CASE` — is `Expr`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OrderTarget {
     Alias(String),
     Var(String),
     Prop { var: String, field: String },
+    Expr(Operand),
 }
 
 #[derive(Debug, Clone, PartialEq)]

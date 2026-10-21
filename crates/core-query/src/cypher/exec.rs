@@ -1,8 +1,8 @@
 //! Cypher executor: `PlanOp` sequence → `ResultSet` over a binding table.
 
 use crate::cypher::ast::{
-    ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem, OrderTarget, RetItem,
-    RetVal, UnwindExpr,
+    operand_label, ret_val_label, AggArg, AggFunc, Expr, LimitSkip, Operand, OrderItem,
+    OrderTarget, RetItem, RetVal, UnwindExpr,
 };
 use crate::cypher::plan::PlanOp;
 use crate::cypher::RelDir;
@@ -486,12 +486,15 @@ fn execute_inner(
                     return Err("DISTINCT requires a Project".into());
                 }
             }
-            PlanOp::OrderBy { items } => {
+            PlanOp::OrderBy {
+                items,
+                visible_columns,
+            } => {
                 if let Some(table) = projected.as_mut() {
-                    exec_order_by(table, items)?;
+                    exec_order_by(table, items, *visible_columns)?;
                 } else {
                     // Pipeline mode: ORDER BY on raw rows (before any Project).
-                    exec_order_by_rows(&vars, &mut rows, items, view);
+                    exec_order_by_rows(&vars, &mut rows, items, view, params)?;
                 }
             }
             PlanOp::Skip(ls) => {
@@ -603,10 +606,21 @@ fn execute_inner(
                 // Project each input row through the WITH items first so that
                 // output aliases (e.g. `p.age AS age`) are available for the
                 // subsequent WHERE filter, ORDER BY, SKIP, and LIMIT.
+                //
+                // ORDER BY may name a variable the WITH does not carry
+                // (`WITH n.name AS name ORDER BY n.score`), so each projected
+                // row starts as a copy of its input row and the WITH items are
+                // written over it; the columns the WITH does not name are
+                // cleared once the sort is done.
                 let row_len = vars.names.len();
+                let keep_input = !order_by.is_empty();
                 let mut new_rows: Vec<Row> = Vec::with_capacity(rows.len());
                 for row in &rows {
-                    let mut new_row: Row = vec![None; row_len];
+                    let mut new_row: Row = if keep_input {
+                        row.clone()
+                    } else {
+                        vec![None; row_len]
+                    };
                     for item in items {
                         let col = column_name(item);
                         let Some(dst_slot) = vars.slot(&col) else {
@@ -615,9 +629,9 @@ fn execute_inner(
                         match &item.value {
                             RetVal::Var(v) => {
                                 // Carry the existing cell (node binding or scalar alias).
-                                if let Some(src_slot) = vars.slot(v) {
-                                    new_row[dst_slot] = row.get(src_slot).cloned().flatten();
-                                }
+                                new_row[dst_slot] = vars
+                                    .slot(v)
+                                    .and_then(|src_slot| row.get(src_slot).cloned().flatten());
                             }
                             RetVal::Prop { var, field } => {
                                 let val = resolve_prop(view, &vars, row, var, field)?;
@@ -643,7 +657,7 @@ fn execute_inner(
                 }
                 // ORDER BY / SKIP / LIMIT on projected rows.
                 if !order_by.is_empty() {
-                    exec_order_by_rows(&vars, &mut rows, order_by, view);
+                    exec_order_by_rows(&vars, &mut rows, order_by, view, params)?;
                 }
                 if let Some(ls) = skip {
                     let n = resolve_ls(ls, params)?;
@@ -652,6 +666,19 @@ fn execute_inner(
                 if let Some(ls) = limit {
                     let n = resolve_ls(ls, params)?;
                     apply_limit(&mut rows, n);
+                }
+                if keep_input {
+                    let carried: Vec<usize> = items
+                        .iter()
+                        .filter_map(|item| vars.slot(&column_name(item)))
+                        .collect();
+                    for row in &mut rows {
+                        let mut cleared: Row = vec![None; row_len];
+                        for &slot in &carried {
+                            cleared[slot] = row[slot].take();
+                        }
+                        *row = cleared;
+                    }
                 }
             }
             // UNWIND: expand each input row into N rows by iterating a list value.
@@ -1183,6 +1210,7 @@ fn collect_vars(plan: &[PlanOp]) -> VarTable {
                         OrderTarget::Prop { var, .. } => {
                             vars.intern(var);
                         }
+                        OrderTarget::Expr(op) => intern_operand(&mut vars, op),
                     }
                 }
             }
@@ -3840,7 +3868,13 @@ fn group_result_to_rows(
 /// for example, inside a non-aggregate WITH stage or after a pipeline
 /// GroupAggregate.  `OrderTarget::Prop` is resolved by looking up the node
 /// property; `Alias` / `Var` are resolved from `Cell::Scalar` in the row.
-fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem], view: &GraphView) {
+fn exec_order_by_rows(
+    vars: &VarTable,
+    rows: &mut Vec<Row>,
+    items: &[OrderItem],
+    view: &GraphView,
+    params: &Params,
+) -> Result<(), String> {
     // Pre-compute sort-key values for all rows.  This avoids re-resolving
     // inside the comparator (the closure cannot return Err, so we pre-compute).
     let mut key_table: Vec<Vec<Option<Value>>> = Vec::with_capacity(rows.len());
@@ -3870,6 +3904,7 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
                         Cell::Rel(e) => view.edge_props.get(e.etype, e.src, e.dst, field),
                         _ => None,
                     }),
+                OrderTarget::Expr(op) => resolve_operand(view, vars, row, op, params)?,
             };
             row_key.push(val);
         }
@@ -3892,6 +3927,7 @@ fn exec_order_by_rows(vars: &VarTable, rows: &mut Vec<Row>, items: &[OrderItem],
     });
     let sorted: Vec<Row> = indices.into_iter().map(|i| rows[i].clone()).collect();
     *rows = sorted;
+    Ok(())
 }
 
 /// Streaming grouped-aggregate executor.
@@ -3944,7 +3980,10 @@ fn execute_group_aggregate(
     // Apply OrderBy / Skip / Limit from the tail of the plan.
     for op in tail {
         match op {
-            PlanOp::OrderBy { items } => exec_order_by(&mut projected, items)?,
+            PlanOp::OrderBy {
+                items,
+                visible_columns,
+            } => exec_order_by(&mut projected, items, *visible_columns)?,
             PlanOp::Skip(ls) => {
                 let n = resolve_ls(ls, params)?;
                 apply_skip(&mut projected.rows, n);
@@ -4860,10 +4899,17 @@ fn order_column(item: &OrderItem) -> String {
     match &item.target {
         OrderTarget::Alias(name) | OrderTarget::Var(name) => name.clone(),
         OrderTarget::Prop { var, field } => format!("{var}.{field}"),
+        // `plan()` never leaves an expression key on an OrderBy over a
+        // projection; it rewrites it to the column that carries its value.
+        OrderTarget::Expr(op) => operand_label(op),
     }
 }
 
-fn exec_order_by(table: &mut Projected, items: &[OrderItem]) -> Result<(), String> {
+fn exec_order_by(
+    table: &mut Projected,
+    items: &[OrderItem],
+    visible_columns: Option<usize>,
+) -> Result<(), String> {
     let mut keys = Vec::with_capacity(items.len());
     for item in items {
         let name = order_column(item);
@@ -4887,6 +4933,13 @@ fn exec_order_by(table: &mut Projected, items: &[OrderItem]) -> Result<(), Strin
         }
         std::cmp::Ordering::Equal
     });
+    // Drop the hidden columns that only carried sort keys.
+    if let Some(n) = visible_columns {
+        table.columns.truncate(n);
+        for row in &mut table.rows {
+            row.truncate(n);
+        }
+    }
     Ok(())
 }
 
@@ -5385,6 +5438,302 @@ LIMIT 10";
         assert!(err.contains("tid"), "got: {err}");
     }
 
+    /// Ten people with a score each; `ada`..`jan` score 10..100 shuffled so
+    /// that scan order is not score order.
+    fn scored_people() -> Fx {
+        let mut fx = Fx::new();
+        for (name, score) in [
+            ("ada", 40),
+            ("bob", 90),
+            ("cam", 10),
+            ("dan", 70),
+            ("eve", 100),
+            ("fay", 20),
+            ("gus", 60),
+            ("hal", 30),
+            ("ivy", 80),
+            ("jan", 50),
+        ] {
+            fx.add("Person", name, vec![("name", s(name)), ("score", i(score))]);
+        }
+        fx
+    }
+
+    fn plan_error(src: &str) -> String {
+        plan(&parse(&lex(src).expect("lex")).expect("parse")).expect_err("plan must fail")
+    }
+
+    fn names(rs: &ResultSet) -> Vec<String> {
+        (0..rs.len())
+            .map(|r| match rs.row(r)[0].clone() {
+                Some(Value::Str(v)) => v,
+                other => panic!("expected a string, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ql_ob_order_by_a_property_that_is_not_returned() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY n.score DESC LIMIT 3",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["eve", "bob", "ivy"]);
+        assert_eq!(rs.columns(), ["n.name"], "the hidden key column is dropped");
+        assert_eq!(rs.row(0).len(), 1);
+    }
+
+    #[test]
+    fn ql_ob_order_by_a_bare_node_variable_that_is_not_returned() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.score ORDER BY n LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // Node keys sort as strings: ada, bob.
+        assert_eq!(rows_of(&rs), vec![vec![Some(i(40))], vec![Some(i(90))]]);
+    }
+
+    #[test]
+    fn ql_ob_expression_and_function_keys() {
+        let fx = scored_people();
+        let v = fx.view();
+        // Distance from 55: jan(5) gus(5)... use a score that has a unique order.
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY abs(n.score - 55), n.name LIMIT 4",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // |score-55|: jan 5, gus 5, ada 15, dan 15 -> ties broken by name.
+        assert_eq!(names(&rs), ["gus", "jan", "ada", "dan"]);
+
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY n.score + n.score DESC LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["eve", "bob"]);
+
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY toUpper(n.name) DESC LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["jan", "ivy"]);
+    }
+
+    #[test]
+    fn ql_ob_projected_alias_inside_an_expression() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name AS who, n.score AS s ORDER BY s * -1 LIMIT 2",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rs.columns(), ["who", "s"]);
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("eve")), Some(i(100))],
+                vec![Some(s("bob")), Some(i(90))],
+            ]
+        );
+    }
+
+    #[test]
+    fn ql_ob_mixed_keys_with_mixed_directions() {
+        let mut fx = Fx::new();
+        for (name, team, score) in [
+            ("a", "red", 3),
+            ("b", "blue", 5),
+            ("c", "red", 5),
+            ("d", "blue", 1),
+            ("e", "red", 3),
+        ] {
+            fx.add(
+                "P",
+                name,
+                vec![("name", s(name)), ("team", s(team)), ("score", i(score))],
+            );
+        }
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN n.name ORDER BY n.team ASC, n.score DESC, n.name DESC",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // blue: b(5) d(1); red: c(5) then the two 3s by name descending: e, a.
+        assert_eq!(names(&rs), ["b", "d", "c", "e", "a"]);
+    }
+
+    /// Nulls (a missing property) sort last whichever way the key runs; that
+    /// is what ORDER BY on a projected column has always done, and a hidden
+    /// key must agree with it.
+    #[test]
+    fn ql_ob_null_keys_place_like_a_projected_column() {
+        let mut fx = Fx::new();
+        fx.add("P", "ada", vec![("name", s("ada")), ("age", i(30))]);
+        fx.add("P", "bob", vec![("name", s("bob"))]);
+        fx.add("P", "cam", vec![("name", s("cam")), ("age", i(10))]);
+        let v = fx.view();
+        let asc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name ORDER BY n.age",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let desc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name ORDER BY n.age DESC",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let projected_asc = run(
+            &v,
+            "MATCH (n:P) RETURN n.name, n.age ORDER BY n.age",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&asc), ["cam", "ada", "bob"]);
+        assert_eq!(names(&desc), ["ada", "cam", "bob"]);
+        assert_eq!(names(&asc), names(&projected_asc));
+    }
+
+    #[test]
+    fn ql_ob_skip_limit_apply_after_the_hidden_sort() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) RETURN n.name ORDER BY n.score SKIP 2 LIMIT 3",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["hal", "ada", "jan"]);
+    }
+
+    #[test]
+    fn ql_ob_distinct_and_aggregate_need_projected_keys() {
+        let mut fx = Fx::new();
+        fx.add("P", "a", vec![("city", s("x")), ("age", i(1))]);
+        fx.add("P", "b", vec![("city", s("y")), ("age", i(2))]);
+        fx.add("P", "c", vec![("city", s("x")), ("age", i(3))]);
+        let v = fx.view();
+        let params = BTreeMap::new();
+        for q in [
+            "MATCH (n:P) RETURN DISTINCT n.city ORDER BY n.age",
+            "MATCH (n:P) RETURN n.city, count(*) AS c ORDER BY n.age",
+        ] {
+            let err = plan_error(q);
+            assert!(
+                err.contains("ORDER BY over a non-projected expression is not allowed with DISTINCT/aggregation"),
+                "{q}: {err}"
+            );
+        }
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN DISTINCT n.city ORDER BY n.city DESC",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["y", "x"]);
+        let rs = run(
+            &v,
+            "MATCH (n:P) RETURN n.city, count(*) AS c ORDER BY c DESC, n.city",
+            &params,
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&rs),
+            vec![
+                vec![Some(s("x")), Some(i(2))],
+                vec![Some(s("y")), Some(i(1))],
+            ]
+        );
+    }
+
+    #[test]
+    fn ql_ob_with_stage_orders_and_limits_per_stage() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) WITH n ORDER BY n.score LIMIT 2 RETURN n.name",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["cam", "fay"]);
+    }
+
+    #[test]
+    fn ql_ob_with_stage_orders_by_a_variable_it_does_not_carry() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) WITH n.name AS name ORDER BY n.score DESC LIMIT 2 RETURN name",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(names(&rs), ["eve", "bob"]);
+        // The dropped variable is out of scope for what follows.
+        let err = plan_error(
+            "MATCH (n:Person) WITH n.name AS name ORDER BY n.score LIMIT 2 RETURN n.score",
+        );
+        assert!(err.contains("unbound variable `n`"), "{err}");
+    }
+
+    #[test]
+    fn ql_ob_with_stage_expression_over_a_projected_alias() {
+        let fx = scored_people();
+        let v = fx.view();
+        let rs = run(
+            &v,
+            "MATCH (n:Person) WITH n.name AS name, n.score AS s ORDER BY s % 30, name LIMIT 3 RETURN name",
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        // s % 30: ada 10, bob 0, cam 10, dan 10, eve 10, fay 20, gus 0, hal 0, ivy 20, jan 20
+        assert_eq!(names(&rs), ["bob", "gus", "hal"]);
+    }
+
+    #[test]
+    fn ql_ob_unbound_variable_in_an_expression_is_an_error() {
+        let err = plan_error("MATCH (n:Person) RETURN n.name ORDER BY nope.score + 1");
+        assert!(err.contains("unbound variable `nope`"), "{err}");
+    }
+
+    #[test]
+    fn ql_ob_union_branches_each_order_by_their_own_key() {
+        let fx = scored_people();
+        let v = fx.view();
+        let params = BTreeMap::new();
+        let union = crate::cypher::parse_read(
+            &lex(
+                "MATCH (n:Person) WHERE n.score >= 90 RETURN n.name ORDER BY n.score DESC \
+                  UNION ALL \
+                  MATCH (n:Person) WHERE n.score <= 20 RETURN n.name ORDER BY n.score",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let rs = super::execute_union(&v, &union, &Params(&params)).unwrap();
+        assert_eq!(names(&rs), ["eve", "bob", "cam", "fay"]);
+    }
+
     #[test]
     fn order_by_none_last_then_skip_limit() {
         let mut fx = Fx::new();
@@ -5646,6 +5995,7 @@ LIMIT 10";
                     target: OrderTarget::Alias("nope".into()),
                     descending: false,
                 }],
+                visible_columns: None,
             }],
             vec![PlanOp::Filter {
                 expr: crate::cypher::ast::Expr::Cmp {

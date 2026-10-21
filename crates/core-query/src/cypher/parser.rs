@@ -1301,14 +1301,11 @@ impl<'a> Parser<'a> {
     }
 
     fn order_item(&mut self, aliases: &[&str]) -> Result<OrderItem, String> {
-        let name = self.ident("expected ORDER BY target")?;
-        let target = if self.eat(&Tok::Dot) {
-            let field = self.ident("expected field name after '.'")?;
-            OrderTarget::Prop { var: name, field }
-        } else if aliases.contains(&name.as_str()) {
-            OrderTarget::Alias(name)
-        } else {
-            OrderTarget::Var(name)
+        let target = match self.arith_expr()? {
+            Operand::Prop { var, field } => OrderTarget::Prop { var, field },
+            Operand::Var(name) if aliases.contains(&name.as_str()) => OrderTarget::Alias(name),
+            Operand::Var(name) => OrderTarget::Var(name),
+            other => OrderTarget::Expr(other),
         };
         let descending = if self.eat(&Tok::Desc) {
             true

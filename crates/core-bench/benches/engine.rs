@@ -597,7 +597,7 @@ fn query_shapes(c: &mut Criterion) {
         ("bench_query_label_agg", "MATCH (n:Person) RETURN count(n)"),
         (
             "bench_query_order_limit",
-            "MATCH (n:Person) RETURN n, n.score ORDER BY n.score DESC LIMIT 10",
+            "MATCH (n:Person) RETURN n ORDER BY n.score DESC LIMIT 10",
         ),
     ];
     for (name, cypher) in shapes {

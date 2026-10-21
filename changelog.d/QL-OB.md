@@ -1,0 +1,2 @@
+### Added
+- **`ORDER BY` any expression in scope** — `MATCH (n:Person) RETURN n.name ORDER BY n.score DESC LIMIT 3` now works: a sort key no longer has to be a `RETURN` column. Keys can be properties, arithmetic, function calls, subscripts or `CASE` over the variables in scope, mixed with projected aliases (`ORDER BY s * -1`), and `WITH … ORDER BY` may name a variable the `WITH` does not carry. `RETURN DISTINCT` and aggregating `RETURN` still sort only what they project, and refuse anything else with a named error.

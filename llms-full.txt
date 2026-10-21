@@ -5044,6 +5044,22 @@ SKIP 10
 LIMIT 5
 ```
 
+A sort key is any expression over the variables in scope, not only a column the
+`RETURN` projects: a property, arithmetic, a function call, a subscript or a
+`CASE`, and a projected alias may appear inside it.
+
+```cypher
+MATCH (n:Person)
+RETURN n.name
+ORDER BY n.score DESC, toLower(n.name)
+LIMIT 3
+```
+
+Each key takes its own `ASC` (the default) or `DESC`. Nulls sort last in both
+directions. `RETURN DISTINCT` and a `RETURN` with an aggregate sort only what
+they project; any other key is the error `ORDER BY over a non-projected
+expression is not allowed with DISTINCT/aggregation`.
+
 ---
 
 ## Write statements

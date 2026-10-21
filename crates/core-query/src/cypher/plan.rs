@@ -93,8 +93,13 @@ pub enum PlanOp {
     /// After `plan`, every item's `target` is `OrderTarget::Alias(column)`
     /// where `column` is a projected column name. The executor resolves
     /// ORDER BY against the post-Project table only.
+    ///
+    /// A key that is not a RETURN item is projected as a trailing hidden
+    /// column; `visible_columns` is then the number of leading columns the
+    /// result keeps once the sort is done. `None` keeps every column.
     OrderBy {
         items: Vec<OrderItem>,
+        visible_columns: Option<usize>,
     },
     Skip(LimitSkip),
     Limit(LimitSkip),
@@ -511,11 +516,11 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         ops.push(PlanOp::GroupAggregate { keys, aggs });
         // ORDER BY + SKIP + LIMIT apply to the finished group result table.
         if !q.order_by.is_empty() {
-            let mut items = Vec::with_capacity(q.order_by.len());
-            for item in &q.order_by {
-                items.push(rewrite_order_item(item, &q.returns, &bound, &rel_bound)?);
-            }
-            ops.push(PlanOp::OrderBy { items });
+            let resolved = resolve_order_items(&q.order_by, &q.returns, &bound, &rel_bound, false)?;
+            ops.push(PlanOp::OrderBy {
+                items: resolved.items,
+                visible_columns: None,
+            });
         }
         if let Some(ls) = &q.skip {
             ops.push(PlanOp::Skip(ls.clone()));
@@ -526,19 +531,37 @@ pub fn plan(q: &Query) -> Result<Vec<PlanOp>, String> {
         return Ok(ops);
     }
 
+    // ORDER BY keys that are not RETURN items ride along as hidden trailing
+    // columns of the projection. DISTINCT forbids them: a hidden column would
+    // change which rows are duplicates.
+    let resolved = if q.order_by.is_empty() {
+        None
+    } else {
+        Some(resolve_order_items(
+            &q.order_by,
+            &q.returns,
+            &bound,
+            &rel_bound,
+            !q.distinct,
+        )?)
+    };
+    let mut project_items = q.returns.clone();
+    if let Some(r) = &resolved {
+        project_items.extend(r.hidden.iter().cloned());
+    }
     ops.push(PlanOp::Project {
-        items: q.returns.clone(),
+        items: project_items,
     });
     if q.distinct {
         ops.push(PlanOp::Distinct);
     }
 
-    if !q.order_by.is_empty() {
-        let mut items = Vec::with_capacity(q.order_by.len());
-        for item in &q.order_by {
-            items.push(rewrite_order_item(item, &q.returns, &bound, &rel_bound)?);
-        }
-        ops.push(PlanOp::OrderBy { items });
+    if let Some(r) = resolved {
+        let visible_columns = (!r.hidden.is_empty()).then_some(q.returns.len());
+        ops.push(PlanOp::OrderBy {
+            items: r.items,
+            visible_columns,
+        });
     }
 
     if let Some(ls) = &q.skip {
@@ -625,10 +648,14 @@ fn compile_with_stage(
                     OrderTarget::Alias(name) => {
                         require_bound(name, bound, "ORDER BY in aggregate WITH")?;
                     }
+                    OrderTarget::Expr(op) => {
+                        check_operand_bound(op, bound, "ORDER BY in aggregate WITH")?;
+                    }
                 }
             }
             ops.push(PlanOp::OrderBy {
                 items: stage.order_by.clone(),
+                visible_columns: None,
             });
         }
         if let Some(ls) = &stage.skip {
@@ -671,6 +698,9 @@ fn compile_with_stage(
                     if !bound.contains(name.as_str()) && !with_col_names.contains(name.as_str()) {
                         return Err(format!("unbound variable `{name}` in ORDER BY in WITH"));
                     }
+                }
+                OrderTarget::Expr(op) => {
+                    check_operand_bound(op, &with_scope, "ORDER BY in WITH")?;
                 }
             }
         }
@@ -1559,54 +1589,215 @@ fn func_name(func: &AggFunc) -> &'static str {
     }
 }
 
-fn rewrite_order_item(
-    item: &OrderItem,
+/// The ORDER BY items of one RETURN, in the form the executor sorts by.
+struct ResolvedOrder {
+    /// Every item targets `OrderTarget::Alias(column)` of the projection.
+    items: Vec<OrderItem>,
+    /// Keys that are not RETURN items, to be projected after the RETURN items
+    /// under their generated column names.
+    hidden: Vec<RetItem>,
+}
+
+/// Column-name prefix of a hidden ORDER BY key. It cannot be typed as an
+/// identifier, so it cannot collide with a RETURN column.
+const HIDDEN_ORDER_COLUMN: &str = "\u{1}order_by_";
+
+/// The expression a RETURN item computes, when it is a plain value.
+fn ret_val_operand(value: &RetVal) -> Option<Operand> {
+    match value {
+        RetVal::Var(v) => Some(Operand::Var(v.clone())),
+        RetVal::Prop { var, field } => Some(Operand::Prop {
+            var: var.clone(),
+            field: field.clone(),
+        }),
+        RetVal::FuncCall { name, args } => Some(Operand::FuncCall {
+            name: name.clone(),
+            args: args.clone(),
+        }),
+        RetVal::ScalarExpr(op) => Some(op.clone()),
+        RetVal::Agg { .. } => None,
+    }
+}
+
+fn operand_ret_val(op: Operand) -> RetVal {
+    match op {
+        Operand::Var(name) => RetVal::Var(name),
+        Operand::Prop { var, field } => RetVal::Prop { var, field },
+        Operand::FuncCall { name, args } => RetVal::FuncCall { name, args },
+        other => RetVal::ScalarExpr(other),
+    }
+}
+
+/// Replace every bare reference to a RETURN alias inside `op` with the
+/// expression the alias names, so the key can be evaluated on the rows before
+/// projection.
+fn inline_aliases(op: &Operand, returns: &[RetItem]) -> Operand {
+    let go = |o: &Operand| inline_aliases(o, returns);
+    match op {
+        Operand::Var(name) => returns
+            .iter()
+            .find(|r| r.alias.as_deref() == Some(name.as_str()))
+            .and_then(|r| ret_val_operand(&r.value))
+            .unwrap_or_else(|| op.clone()),
+        Operand::Prop { .. } | Operand::Lit(_) | Operand::Param(_) => op.clone(),
+        Operand::FuncCall { name, args } => Operand::FuncCall {
+            name: name.clone(),
+            args: args.iter().map(go).collect(),
+        },
+        Operand::BinArith {
+            op: arith,
+            left,
+            right,
+        } => Operand::BinArith {
+            op: arith.clone(),
+            left: Box::new(go(left)),
+            right: Box::new(go(right)),
+        },
+        Operand::Index { base, index } => Operand::Index {
+            base: Box::new(go(base)),
+            index: Box::new(go(index)),
+        },
+        Operand::ListLit(items) => Operand::ListLit(items.iter().map(go).collect()),
+        Operand::MapLit(entries) => {
+            Operand::MapLit(entries.iter().map(|(k, v)| (k.clone(), go(v))).collect())
+        }
+        Operand::Case { branches, default } => Operand::Case {
+            branches: branches
+                .iter()
+                .map(|(cond, value)| (inline_aliases_expr(cond, returns), go(value)))
+                .collect(),
+            default: default.as_ref().map(|d| Box::new(go(d))),
+        },
+    }
+}
+
+fn inline_aliases_expr(expr: &Expr, returns: &[RetItem]) -> Expr {
+    let go = |o: &Operand| inline_aliases(o, returns);
+    match expr {
+        Expr::And(l, r) => Expr::And(
+            Box::new(inline_aliases_expr(l, returns)),
+            Box::new(inline_aliases_expr(r, returns)),
+        ),
+        Expr::Or(l, r) => Expr::Or(
+            Box::new(inline_aliases_expr(l, returns)),
+            Box::new(inline_aliases_expr(r, returns)),
+        ),
+        Expr::Not(inner) => Expr::Not(Box::new(inline_aliases_expr(inner, returns))),
+        Expr::Cmp { lhs, op, rhs } => Expr::Cmp {
+            lhs: go(lhs),
+            op: op.clone(),
+            rhs: go(rhs),
+        },
+        Expr::Truthy(o) => Expr::Truthy(go(o)),
+        Expr::IsNull(o) => Expr::IsNull(go(o)),
+        Expr::IsNotNull(o) => Expr::IsNotNull(go(o)),
+        Expr::In { expr, list } => Expr::In {
+            expr: go(expr),
+            list: list.iter().map(go).collect(),
+        },
+    }
+}
+
+/// The projected column an ORDER BY item already names, if any.
+fn projected_order_column(item: &OrderItem, returns: &[RetItem]) -> Option<String> {
+    match &item.target {
+        OrderTarget::Alias(name) => returns
+            .iter()
+            .any(|r| r.alias.as_deref() == Some(name.as_str()))
+            .then(|| name.clone()),
+        OrderTarget::Var(v) => returns
+            .iter()
+            .find(|r| matches!(&r.value, RetVal::Var(x) if x == v))
+            .map(column_name),
+        OrderTarget::Prop { var, field } => returns
+            .iter()
+            .find(
+                |r| matches!(&r.value, RetVal::Prop { var: v, field: f } if v == var && f == field),
+            )
+            .map(column_name),
+        OrderTarget::Expr(op) => returns
+            .iter()
+            .find(|r| {
+                matches!(&r.value, RetVal::FuncCall { .. } | RetVal::ScalarExpr(_))
+                    && ret_val_operand(&r.value).as_ref() == Some(op)
+            })
+            .map(column_name),
+    }
+}
+
+/// Resolve ORDER BY against a RETURN: a key that is a RETURN item (or alias)
+/// sorts by that column; any other expression over the variables in scope
+/// becomes a hidden projected column when `allow_hidden`, and is the named
+/// error otherwise (DISTINCT and aggregation sort only what they project).
+fn resolve_order_items(
+    order_by: &[OrderItem],
     returns: &[RetItem],
     bound: &BTreeSet<String>,
     rel_bound: &BTreeSet<String>,
-) -> Result<OrderItem, String> {
-    let column = match &item.target {
-        OrderTarget::Alias(name) => {
-            if returns
-                .iter()
-                .any(|r| r.alias.as_deref() == Some(name.as_str()))
-            {
-                name.clone()
-            } else {
+    allow_hidden: bool,
+) -> Result<ResolvedOrder, String> {
+    let mut items = Vec::with_capacity(order_by.len());
+    let mut hidden: Vec<RetItem> = Vec::new();
+    for item in order_by {
+        let value = match &item.target {
+            OrderTarget::Alias(name) if projected_order_column(item, returns).is_none() => {
                 return Err(format!("ORDER BY target `{name}` is not present in RETURN"));
             }
-        }
-        OrderTarget::Var(v) => {
-            require_bound(v, bound, "ORDER BY")?;
-            reject_bare_rel(v, rel_bound)?;
-            match returns
-                .iter()
-                .find(|r| matches!(&r.value, RetVal::Var(x) if x == v))
-            {
-                Some(r) => column_name(r),
-                None => {
-                    return Err(format!("ORDER BY target `{v}` is not present in RETURN"));
-                }
+            OrderTarget::Alias(_) => None,
+            OrderTarget::Var(v) => {
+                require_bound(v, bound, "ORDER BY")?;
+                reject_bare_rel(v, rel_bound)?;
+                Some(RetVal::Var(v.clone()))
             }
-        }
-        OrderTarget::Prop { var, field } => {
-            require_bound(var, bound, "ORDER BY")?;
-            match returns.iter().find(
-                |r| matches!(&r.value, RetVal::Prop { var: v, field: f } if v == var && f == field),
-            ) {
-                Some(r) => column_name(r),
-                None => {
-                    return Err(format!(
-                        "ORDER BY target `{var}.{field}` is not present in RETURN"
-                    ));
-                }
+            OrderTarget::Prop { var, field } => {
+                require_bound(var, bound, "ORDER BY")?;
+                Some(RetVal::Prop {
+                    var: var.clone(),
+                    field: field.clone(),
+                })
             }
-        }
-    };
-    Ok(OrderItem {
-        target: OrderTarget::Alias(column),
-        descending: item.descending,
-    })
+            OrderTarget::Expr(op) => {
+                let op = inline_aliases(op, returns);
+                check_operand_bound(&op, bound, "ORDER BY")?;
+                Some(operand_ret_val(op))
+            }
+        };
+        let projected_item = OrderItem {
+            target: match (&item.target, &value) {
+                (OrderTarget::Expr(_), Some(v)) => {
+                    OrderTarget::Expr(ret_val_operand(v).expect("a scalar RetVal"))
+                }
+                _ => item.target.clone(),
+            },
+            descending: item.descending,
+        };
+        let column = match projected_order_column(&projected_item, returns) {
+            Some(column) => column,
+            None => {
+                let Some(value) = value else {
+                    return Err("internal: ORDER BY alias lost its column".to_string());
+                };
+                if !allow_hidden {
+                    return Err(
+                        "ORDER BY over a non-projected expression is not allowed with \
+                         DISTINCT/aggregation"
+                            .to_string(),
+                    );
+                }
+                let column = format!("{HIDDEN_ORDER_COLUMN}{}", hidden.len());
+                hidden.push(RetItem {
+                    value,
+                    alias: Some(column.clone()),
+                });
+                column
+            }
+        };
+        items.push(OrderItem {
+            target: OrderTarget::Alias(column),
+            descending: item.descending,
+        });
+    }
+    Ok(ResolvedOrder { items, hidden })
 }
 
 #[cfg(test)]
@@ -1732,6 +1923,7 @@ LIMIT 10";
                         descending: true,
                     },
                 ],
+                visible_columns: None,
             },
             PlanOp::Limit(LimitSkip::Exact(10)),
         ];
@@ -2033,13 +2225,40 @@ LIMIT 10";
     }
 
     #[test]
-    fn order_by_target_absent_from_return_is_err() {
-        // `a` is bound, but `a.x` is not a RETURN item.
-        let err = assert_plan_err("MATCH (a) RETURN a ORDER BY a.x", "a.x");
-        assert!(
-            err.to_ascii_lowercase().contains("return"),
-            "expected ORDER BY target-not-in-RETURN context, got: {err}"
+    fn order_by_target_absent_from_distinct_return_is_named_error() {
+        // `a.x` is not a RETURN item, and DISTINCT sorts only what it projects.
+        let err = assert_plan_err("MATCH (a) RETURN DISTINCT a ORDER BY a.x", "non-projected");
+        assert!(err.contains("DISTINCT/aggregation"), "got: {err}");
+    }
+
+    #[test]
+    fn order_by_target_absent_from_aggregate_return_is_named_error() {
+        let err = assert_plan_err(
+            "MATCH (a:P) RETURN a.city, count(*) AS c ORDER BY a.age",
+            "non-projected",
         );
+        assert!(err.contains("DISTINCT/aggregation"), "got: {err}");
+    }
+
+    /// A key that is not a RETURN item is projected as a hidden trailing
+    /// column, and the sort drops it again.
+    #[test]
+    fn order_by_target_absent_from_return_becomes_a_hidden_column() {
+        let ops = plan_src("MATCH (a) RETURN a ORDER BY a.x").unwrap();
+        let PlanOp::Project { items } = &ops[1] else {
+            panic!("expected Project, got {:?}", ops[1]);
+        };
+        assert_eq!(items.len(), 2, "one RETURN item plus one hidden key");
+        match &ops[2] {
+            PlanOp::OrderBy {
+                items,
+                visible_columns,
+            } => {
+                assert_eq!(*visible_columns, Some(1));
+                assert_eq!(items.len(), 1);
+            }
+            other => panic!("expected OrderBy, got {other:?}"),
+        }
     }
 
     /// Alias → that alias's column; bare var → its RETURN column (alias if
@@ -2055,7 +2274,7 @@ LIMIT 10";
         let order = got
             .iter()
             .find_map(|op| match op {
-                PlanOp::OrderBy { items } => Some(items),
+                PlanOp::OrderBy { items, .. } => Some(items),
                 _ => None,
             })
             .expect("plan must contain OrderBy");
@@ -2081,7 +2300,7 @@ LIMIT 10";
         let order = aliased_var
             .iter()
             .find_map(|op| match op {
-                PlanOp::OrderBy { items } => Some(items),
+                PlanOp::OrderBy { items, .. } => Some(items),
                 _ => None,
             })
             .expect("plan must contain OrderBy");
@@ -2214,7 +2433,7 @@ LIMIT 10";
         let order = got
             .iter()
             .find_map(|op| match op {
-                PlanOp::OrderBy { items } => Some(items),
+                PlanOp::OrderBy { items, .. } => Some(items),
                 _ => None,
             })
             .unwrap();
