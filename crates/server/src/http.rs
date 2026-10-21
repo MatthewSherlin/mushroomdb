@@ -26,7 +26,8 @@ use axum::{Json, Router};
 use mushroomdb::{
     is_write_query, json_to_rows, json_to_value, AsOfScope, AutoFk, BackupReport, BatchOp,
     DegreeConfig, Dir, GraphError, IngestOptions, MaskMode, NodeMask, PageRankConfig,
-    PropPredicate, ResultSet, SharedDb, SuggestConfig, Value, WccConfig, SUGGEST_DEFAULT_SEED,
+    PropPredicate, ReaderSnapshot, ResultSet, SharedDb, SuggestConfig, Value, WccConfig,
+    SUGGEST_DEFAULT_SEED,
 };
 use serde_json::{json, Value as Js};
 use std::collections::{BTreeMap, HashMap};
@@ -36,8 +37,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tower_http::services::ServeDir;
 
-/// Build the HTTP router over `db`. Read endpoints take the read lock;
-/// `/ingest` takes the write lock. Guards are dropped before any `.await`.
+/// Build the HTTP router over `db`. The graph read endpoints (`/query`,
+/// `/node/{key}`, its `/edges` and `/neighborhood`), `/health`, `/metrics` and
+/// `/algo/*` run on a lock-free [`ReaderSnapshot`], whose capture never waits
+/// behind a writer (see [`SharedDb::reader`]). `/stats`, `/explain`,
+/// `/suggest`, `/find_similar` and the history routes read the rule engine or
+/// the WAL and take the read lock; `/ingest` takes the write lock. Guards are
+/// dropped before any `.await`.
 /// `GET /watch` upgrades to a WebSocket fed by the post-commit sink.
 ///
 /// **Call at most once per [`SharedDb`].** A second call replaces the sink
@@ -54,7 +60,9 @@ use tower_http::services::ServeDir;
 /// (`query_write`, `/ingest`, `create_rule`) run in
 /// `tokio::task::spawn_blocking` and drop the write guard before `.await`.
 /// Reads stay on the worker (neighborhood is µs). `suggest` and `algo`
-/// already use the blocking pool.
+/// already use the blocking pool. A live (non-`as_of`) graph read holds no
+/// guard while it executes, so a long read never holds the writer up, and an
+/// indexed equality lookup is served from the snapshot's own index.
 ///
 /// Every `router_*` entry point reads `MUSHROOMDB_CORS_ORIGINS` (except
 /// [`router_with_cors`], which takes the layer explicitly). Fail-fast on an
@@ -1004,11 +1012,7 @@ async fn health(
     if !matches!(identity, AuthIdentity::Full) {
         return json_ok(json!({ "ok": true }));
     }
-    let (nodes, edges) = {
-        let g = state.db.read();
-        let s = g.stats();
-        (s.nodes_live, s.edges)
-    };
+    let (nodes, _, edges) = state.db.reader().counts();
     json_ok(json!({
         "ok": true,
         "nodes": nodes,
@@ -1561,8 +1565,8 @@ async fn query(
     // Full token: existing paths below.
 
     // When a client-supplied mask is present, route to query_masked (read-only).
-    // Hold a single read guard for both from_keys and query_masked so the mask
-    // and the query execute on the same database snapshot.
+    // The mask and query_masked resolve against one snapshot so the mask and
+    // the query see the same graph.
     //
     // `stub_hidden: true` opts into MaskMode::Stub for the mask; Cypher query
     // behaviour is identical in both modes (hidden nodes are excluded from
@@ -1597,38 +1601,42 @@ async fn query(
             .get("stub_hidden")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let db = state.db.read();
-        let mask = {
-            let m = match (&mask_keys, namespace.as_deref()) {
-                (Some(keys), Some(ns)) => {
-                    NodeMask::from_keys(&*db, keys.iter().map(String::as_str))
-                        .intersect(&db.mask_for_namespace(ns))
-                }
-                (Some(keys), None) => NodeMask::from_keys(&*db, keys.iter().map(String::as_str)),
-                (None, Some(ns)) => db.mask_for_namespace(ns),
-                (None, None) => unreachable!("one of the two is Some in this branch"),
-            };
+        let with_mode = |m: NodeMask| {
             if stub_hidden {
                 m.with_mode(MaskMode::Stub)
             } else {
                 m
             }
         };
-        return match db.query_masked(&cypher, &params, &mask) {
-            Ok(rs) => format_query_result(rs, format),
-            Err(GraphError::MaskedReadOnly) => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({"error": "masked queries are read-only"})),
-            )
-                .into_response(),
-            Err(e) => graph_err(e),
+        // The mask and the query resolve against one lock-free snapshot, so
+        // they see the same graph without holding the read lock for the query.
+        let snap = state.db.reader();
+        let key_mask = mask_keys
+            .as_ref()
+            .map(|keys| snapshot_mask_from_keys(&snap, keys.iter().map(String::as_str)));
+        let mask = match (key_mask, namespace.as_deref()) {
+            (Some(keys), Some(ns)) => match snap.mask_for_namespace(ns) {
+                Ok(ns_mask) => keys.intersect(&ns_mask),
+                Err(e) => return graph_err(e),
+            },
+            (Some(keys), None) => keys,
+            (None, Some(ns)) => match snap.mask_for_namespace(ns) {
+                Ok(ns_mask) => ns_mask,
+                Err(e) => return graph_err(e),
+            },
+            (None, None) => unreachable!("one of the two is Some in this branch"),
         };
+        return masked_query_response(
+            snap.query_masked(&cypher, &params, &with_mode(mask)),
+            format,
+        );
     }
 
     // Detect write statements to dispatch to the correct lock.
     // Write statements (CREATE / MATCH…SET / MATCH…DELETE / MERGE) need the
     // write lock so mutations flow through WAL + rule engine with fsync before
-    // the response is sent.  Read queries (MATCH … RETURN …) use the read lock.
+    // the response is sent.  Read queries (MATCH … RETURN …) use the
+    // lock-free reader (see `read_query`).
     let is_write = match is_write_query(&cypher) {
         Ok(b) => b,
         Err(e) => return err_response(e),
@@ -1650,13 +1658,61 @@ async fn query(
             Err(e) => return graph_err(e),
         }
     } else {
-        match state.db.read().query(&cypher, &params) {
+        match read_query(&state.db, &cypher, &params) {
             Ok(rs) => rs,
             Err(e) => return graph_err(e),
         }
     };
 
     format_query_result(rs, format)
+}
+
+/// An unmasked, live (non-`as_of`) read query, on the lock-free reader. An
+/// equality lookup on a declared index is served from the snapshot's own
+/// index, so this holds for indexed stores too.
+fn read_query(
+    db: &SharedDb,
+    cypher: &str,
+    params: &BTreeMap<String, Value>,
+) -> mushroomdb::Result<ResultSet> {
+    db.reader().query(cypher, params)
+}
+
+/// The response for a full-token masked `/query`, from either path.
+fn masked_query_response(out: mushroomdb::Result<ResultSet>, format: &str) -> Response {
+    match out {
+        Ok(rs) => format_query_result(rs, format),
+        Err(GraphError::MaskedReadOnly) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "masked queries are read-only"})),
+        )
+            .into_response(),
+        Err(e) => graph_err(e),
+    }
+}
+
+/// [`NodeMask::from_keys`] against a snapshot: keys it does not hold are
+/// ignored, and the mode is `Omit`.
+fn snapshot_mask_from_keys<'a>(
+    snap: &ReaderSnapshot,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> NodeMask {
+    NodeMask::from_ids(keys.into_iter().filter_map(|k| snap.resolve_key(k)))
+}
+
+/// The client mask a full-token `/node/*` route reads from `mask=` and
+/// `stub_hidden=`, resolved against `snap`.
+fn snapshot_client_mask(snap: &ReaderSnapshot, mask_param: &str, stub_hidden: bool) -> NodeMask {
+    let keys = mask_param
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let m = snapshot_mask_from_keys(snap, keys);
+    if stub_hidden {
+        m.with_mode(MaskMode::Stub)
+    } else {
+        m
+    }
 }
 
 /// `GET /stats` — store-wide counts, including the `namespaces` roster.
@@ -1694,14 +1750,11 @@ async fn metrics(
     if let AuthIdentity::Role(_) = identity {
         return forbidden("role-bound token: /metrics requires a full-access token");
     }
-    let (s, commit_seq, wal_size_bytes, slow_snap) = {
-        let g = state.db.read();
-        let s = g.stats();
-        let commit_seq = g.commit_seq();
-        let wal_size_bytes = g.wal_size_bytes().ok();
-        let slow_snap = g.slow_query_snapshot();
-        (s, commit_seq, wal_size_bytes, slow_snap)
-    };
+    let snap = state.db.reader();
+    let (nodes_live, nodes_tombstoned, edges) = snap.counts();
+    let commit_seq = snap.commit_seq();
+    let wal_size_bytes = snap.wal_size_bytes().ok();
+    let slow_snap = snap.slow_query_snapshot();
     let uptime_s = state.started_at.elapsed().as_secs();
     let slow_entries: Vec<Js> = slow_snap
         .last
@@ -1715,9 +1768,9 @@ async fn metrics(
         })
         .collect();
     json_ok(json!({
-        "nodes_live": s.nodes_live,
-        "nodes_tombstoned": s.nodes_tombstoned,
-        "edges": s.edges,
+        "nodes_live": nodes_live,
+        "nodes_tombstoned": nodes_tombstoned,
+        "edges": edges,
         "commit_seq": commit_seq,
         "wal_size_bytes": wal_size_bytes,
         "rss_bytes": rss_bytes(),
@@ -2019,20 +2072,12 @@ async fn node_info(
             .get("stub_hidden")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        let g = state.db.read();
-        let mask = {
-            let keys = mask_param
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let m = NodeMask::from_keys(&*g, keys);
-            if stub_hidden {
-                m.with_mode(MaskMode::Stub)
-            } else {
-                m
-            }
-        };
-        return match g.node_info_masked(&key, &mask) {
+        let snap = state.db.reader();
+        if let Err(e) = snap.ensure_readable() {
+            return graph_err(e);
+        }
+        let mask = snapshot_client_mask(&snap, mask_param, stub_hidden);
+        return match snap.node_info_masked(&key, &mask) {
             Some(mushroomdb::MaskedNodeResult::Visible(info)) => json_ok(node_info_json(&info)),
             Some(mushroomdb::MaskedNodeResult::Restricted) => {
                 json_ok(crate::json::stub_node_json(&key))
@@ -2041,11 +2086,11 @@ async fn node_info(
         };
     }
 
-    let info = {
-        let g = state.db.read();
-        g.node_info(&key)
-    };
-    match info {
+    let snap = state.db.reader();
+    if let Err(e) = snap.ensure_readable() {
+        return graph_err(e);
+    }
+    match snap.node_info(&key) {
         Some(info) => json_ok(node_info_json(&info)),
         None => key_not_found(key),
     }
@@ -2083,31 +2128,19 @@ async fn node_edges(
             .get("stub_hidden")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        let g = state.db.read();
-        let mask = {
-            let keys = mask_param
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let m = NodeMask::from_keys(&*g, keys);
-            if stub_hidden {
-                m.with_mode(MaskMode::Stub)
-            } else {
-                m
-            }
-        };
-        return match g.node_edges_masked(&key, &mask) {
+        let snap = state.db.reader();
+        if let Err(e) = snap.ensure_readable() {
+            return graph_err(e);
+        }
+        let mask = snapshot_client_mask(&snap, mask_param, stub_hidden);
+        return match snap.node_edges_masked(&key, &mask) {
             Ok(edges) => json_ok(crate::json::masked_edges_json(&edges)),
             Err(GraphError::KeyNotFound { key }) => key_not_found(key),
             Err(e) => graph_err(e),
         };
     }
 
-    let out = {
-        let g = state.db.read();
-        g.node_edges(&key)
-    };
-    match out {
+    match state.db.reader().node_edges(&key) {
         Ok(edges) => json_ok(node_edges_json(&edges)),
         Err(GraphError::KeyNotFound { key }) => key_not_found(key),
         Err(e) => graph_err(e),
@@ -2168,37 +2201,25 @@ async fn neighborhood(
             .get("stub_hidden")
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
-        let g = state.db.read();
-        let mask = {
-            let keys = mask_param
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
-            let m = NodeMask::from_keys(&*g, keys);
-            if stub_hidden {
-                m.with_mode(MaskMode::Stub)
-            } else {
-                m
-            }
-        };
-        return match g.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &mask) {
+        let snap = state.db.reader();
+        if let Err(e) = snap.ensure_readable() {
+            return graph_err(e);
+        }
+        let mask = snapshot_client_mask(&snap, mask_param, stub_hidden);
+        return match snap.neighborhood_masked(&key, depth, etype_refs.as_deref(), dir, &mask) {
             Some(rs) => json_ok(result_set_json(&rs)),
             None => key_not_found(key),
         };
     }
 
     // Unmasked full-token path (no mask param).
-    let rs = {
-        let g = state.db.read();
-        match g.node_ref(&key) {
-            Some(n) => Ok(n.neighborhood(depth, etype_refs.as_deref(), dir)),
-            None => Err(GraphError::KeyNotFound { key: key.clone() }),
-        }
-    };
-    match rs {
-        Ok(rs) => json_ok(result_set_json(&rs)),
-        Err(GraphError::KeyNotFound { key }) => key_not_found(key),
-        Err(e) => graph_err(e),
+    let snap = state.db.reader();
+    if let Err(e) = snap.ensure_readable() {
+        return graph_err(e);
+    }
+    match snap.neighborhood(&key, depth, etype_refs.as_deref(), dir) {
+        Some(rs) => json_ok(result_set_json(&rs)),
+        None => key_not_found(key),
     }
 }
 
@@ -2304,9 +2325,9 @@ async fn find_similar(
 /// # Locking and blocking strategy
 ///
 /// PageRank is CPU-intensive and synchronous. This handler offloads the work
-/// to `tokio::task::spawn_blocking` (blocking thread-pool). The read guard is
-/// acquired and held inside the blocking task — reads don't block other reads.
-/// The `budget_ms` field in [`PageRankConfig`] caps lock-hold time.
+/// to `tokio::task::spawn_blocking` (blocking thread-pool), over a lock-free
+/// [`ReaderSnapshot`], so it holds no guard and never holds a writer up. The
+/// `budget_ms` field in [`PageRankConfig`] caps its running time.
 async fn algo_pagerank(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
@@ -2324,16 +2345,17 @@ async fn algo_pagerank(
         return err_response(format!("invalid pagerank config: {e}"));
     }
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || db.read().pagerank(&config)).await {
-        Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+    match tokio::task::spawn_blocking(move || db.reader().pagerank(&config)).await {
+        Ok(Ok(report)) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+        Ok(Err(e)) => graph_err(e),
         Err(_) => err_response("pagerank task panicked"),
     }
 }
 
 /// `POST /algo/wcc` — weakly-connected components over the unified topology.
 ///
-/// Mirrors the `suggest` locking and blocking pattern exactly: spawn_blocking,
-/// read guard inside, `budget_ms` in config caps lock-hold time.
+/// Mirrors `algo_pagerank`: spawn_blocking over a lock-free snapshot,
+/// `budget_ms` in config caps running time.
 async fn algo_wcc(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
@@ -2347,15 +2369,16 @@ async fn algo_wcc(
         Err(e) => return err_response(format!("invalid wcc config: {e}")),
     };
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || db.read().connected_components(&config)).await {
-        Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+    match tokio::task::spawn_blocking(move || db.reader().connected_components(&config)).await {
+        Ok(Ok(report)) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+        Ok(Err(e)) => graph_err(e),
         Err(_) => err_response("wcc task panicked"),
     }
 }
 
 /// `POST /algo/degree` — degree centrality over the unified topology.
 ///
-/// Mirrors the `suggest` locking and blocking pattern exactly.
+/// Mirrors `algo_pagerank`.
 async fn algo_degree(
     State(state): State<AppState>,
     Extension(identity): Extension<AuthIdentity>,
@@ -2369,8 +2392,9 @@ async fn algo_degree(
         Err(e) => return err_response(format!("invalid degree config: {e}")),
     };
     let db = state.db.clone();
-    match tokio::task::spawn_blocking(move || db.read().degree_centrality(&config)).await {
-        Ok(report) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+    match tokio::task::spawn_blocking(move || db.reader().degree_centrality(&config)).await {
+        Ok(Ok(report)) => json_ok(serde_json::to_value(&report).unwrap_or_else(|_| json!({}))),
+        Ok(Err(e)) => graph_err(e),
         Err(_) => err_response("degree task panicked"),
     }
 }
@@ -3281,5 +3305,860 @@ mod tests {
             confine_backup_dest("/srv/backups/x", root).unwrap(),
             PathBuf::from("/srv/backups/x")
         );
+    }
+}
+
+#[cfg(test)]
+mod read_parity_tests {
+    //! TX-5 differential: every HTTP read route that moved from the read lock to
+    //! the lock-free reader answers byte-for-byte what the read-lock path answered.
+    //!
+    //! The `legacy_*` functions are the pre-TX-5 handler bodies, kept here as the
+    //! oracle: each runs under `db.read()` against the `GraphDb` handle, exactly as
+    //! the route did before it moved. Every case sends the same request through the
+    //! live router and compares status, content type and body bytes.
+    //!
+    //! The matrix runs over the house-rule axes: one batch vs separate commits, a
+    //! never-closed handle with a delta tail, a snapshotted store with an overlay
+    //! on top, and a reopened store (WAL replay).
+
+    use super::*;
+    use crate::json::{masked_edges_json, node_edges_json, node_info_json, result_set_json};
+    use axum::body::{to_bytes, Body};
+    use mushroomdb::{Predicate, RoleDef, RuleDef};
+    use tower::ServiceExt;
+
+    // ── The oracle: the read-lock bodies as they were before TX-5 ────────────────
+
+    fn legacy_client_mask(
+        db: &mushroomdb::GraphDb<mushroomdb::RealFs>,
+        mask_param: &str,
+        stub: bool,
+    ) -> NodeMask {
+        let keys = mask_param
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let m = NodeMask::from_keys(db, keys);
+        if stub {
+            m.with_mode(MaskMode::Stub)
+        } else {
+            m
+        }
+    }
+
+    fn legacy_node_info(db: &SharedDb, key: &str, mask: &str, stub: bool) -> Response {
+        let g = db.read();
+        if !mask.is_empty() {
+            let mask = legacy_client_mask(&g, mask, stub);
+            return match g.node_info_masked(key, &mask) {
+                Some(mushroomdb::MaskedNodeResult::Visible(info)) => json_ok(node_info_json(&info)),
+                Some(mushroomdb::MaskedNodeResult::Restricted) => {
+                    json_ok(crate::json::stub_node_json(key))
+                }
+                None => key_not_found(key.to_string()),
+            };
+        }
+        match g.node_info(key) {
+            Some(info) => json_ok(node_info_json(&info)),
+            None => key_not_found(key.to_string()),
+        }
+    }
+
+    fn legacy_node_edges(db: &SharedDb, key: &str, mask: &str, stub: bool) -> Response {
+        let g = db.read();
+        if !mask.is_empty() {
+            let mask = legacy_client_mask(&g, mask, stub);
+            return match g.node_edges_masked(key, &mask) {
+                Ok(edges) => json_ok(masked_edges_json(&edges)),
+                Err(GraphError::KeyNotFound { key }) => key_not_found(key),
+                Err(e) => graph_err(e),
+            };
+        }
+        match g.node_edges(key) {
+            Ok(edges) => json_ok(node_edges_json(&edges)),
+            Err(GraphError::KeyNotFound { key }) => key_not_found(key),
+            Err(e) => graph_err(e),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn legacy_neighborhood(
+        db: &SharedDb,
+        key: &str,
+        depth: u32,
+        edge_types: Option<&[&str]>,
+        dir: Dir,
+        mask: &str,
+        stub: bool,
+    ) -> Response {
+        let g = db.read();
+        if !mask.is_empty() {
+            let mask = legacy_client_mask(&g, mask, stub);
+            return match g.neighborhood_masked(key, depth, edge_types, dir, &mask) {
+                Some(rs) => json_ok(result_set_json(&rs)),
+                None => key_not_found(key.to_string()),
+            };
+        }
+        match g.node_ref(key) {
+            Some(n) => json_ok(result_set_json(&n.neighborhood(depth, edge_types, dir))),
+            None => key_not_found(key.to_string()),
+        }
+    }
+
+    /// The full-token, live `/query` read paths (unmasked, and client mask and/or
+    /// namespace), after the request has been parsed.
+    fn legacy_query(
+        db: &SharedDb,
+        cypher: &str,
+        mask_keys: Option<&[String]>,
+        namespace: Option<&str>,
+        stub: bool,
+        format: &str,
+    ) -> Response {
+        let params = BTreeMap::new();
+        if mask_keys.is_some() || namespace.is_some() {
+            let db = db.read();
+            let m = match (mask_keys, namespace) {
+                (Some(keys), Some(ns)) => {
+                    NodeMask::from_keys(&*db, keys.iter().map(String::as_str))
+                        .intersect(&db.mask_for_namespace(ns))
+                }
+                (Some(keys), None) => NodeMask::from_keys(&*db, keys.iter().map(String::as_str)),
+                (None, Some(ns)) => db.mask_for_namespace(ns),
+                (None, None) => unreachable!(),
+            };
+            let mask = if stub { m.with_mode(MaskMode::Stub) } else { m };
+            return match db.query_masked(cypher, &params, &mask) {
+                Ok(rs) => format_query_result(rs, format),
+                Err(GraphError::MaskedReadOnly) => (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "masked queries are read-only"})),
+                )
+                    .into_response(),
+                Err(e) => graph_err(e),
+            };
+        }
+        // The route classifies the statement before it picks a lock; a statement
+        // that does not lex is refused there, on either path.
+        match is_write_query(cypher) {
+            Ok(false) => {}
+            Ok(true) => unreachable!("writes are not read routes"),
+            Err(e) => return err_response(e),
+        }
+        match db.read().query(cypher, &params) {
+            Ok(rs) => format_query_result(rs, format),
+            Err(e) => graph_err(e),
+        }
+    }
+
+    /// The role-token read of `/query`, resolved the read-lock way: the role's mask
+    /// from the live handle, intersected as the route intersects it, and the query
+    /// run by `GraphDb::query_masked`. The route itself has been on the reader since
+    /// 0.6; this pins that its answer, `UNION` included, is the write handle's.
+    fn legacy_role_query(
+        db: &SharedDb,
+        role: &str,
+        cypher: &str,
+        mask_keys: Option<&[String]>,
+        namespace: Option<&str>,
+    ) -> Response {
+        // The role branch's own checks, which run before any lock on either path.
+        match is_write_query(cypher) {
+            Ok(false) => {}
+            Ok(true) => unreachable!("writes are not read routes"),
+            Err(e) => return err_response(e),
+        }
+        let g = db.read();
+        let role_mask = match g.mask_for_role(role) {
+            Ok(m) => m,
+            Err(e) => return role_mask_err(e),
+        };
+        let mask = match mask_keys {
+            Some(keys) => {
+                role_mask.intersect(&NodeMask::from_keys(&*g, keys.iter().map(String::as_str)))
+            }
+            None => role_mask,
+        };
+        let mask = match namespace {
+            Some(ns) => mask.intersect(&g.mask_for_namespace(ns)),
+            None => mask,
+        };
+        match g.query_masked(cypher, &BTreeMap::new(), &mask) {
+            Ok(rs) => format_query_result(rs, "json"),
+            Err(GraphError::MaskedReadOnly) => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "masked queries are read-only"})),
+            )
+                .into_response(),
+            Err(e) => graph_err(e),
+        }
+    }
+
+    // ── Plumbing ──────────────────────────────────────────────────────────────────
+
+    #[derive(Debug, PartialEq)]
+    struct Answer {
+        status: StatusCode,
+        content_type: Option<String>,
+        body: Vec<u8>,
+    }
+
+    async fn answer(res: Response) -> Answer {
+        let status = res.status();
+        let content_type = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        Answer {
+            status,
+            content_type,
+            body,
+        }
+    }
+
+    async fn routed(app: &Router, req: axum::http::Request<Body>) -> Answer {
+        answer(app.clone().oneshot(req).await.unwrap()).await
+    }
+
+    fn get(uri: &str, token: Option<&str>) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder().method("GET").uri(uri);
+        if let Some(t) = token {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    fn post(uri: &str, body: Js, token: Option<&str>) -> axum::http::Request<Body> {
+        let mut b = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(t) = token {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        b.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d =
+            std::env::temp_dir().join(format!("tx5-parity-{name}-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    const FULL: &str = "admin";
+    const ROLE: &str = "role-tok";
+
+    /// How a fixture reaches its final state.
+    #[derive(Clone, Copy, Debug)]
+    enum Build {
+        /// Every write its own commit, on a handle that never closed: a long
+        /// delta tail over the open-time fold.
+        SeparateCommits,
+        /// The same graph written as one batch.
+        OneBatch,
+        /// Snapshotted part-way, then more writes: an mmap base with an overlay
+        /// and a tail on top.
+        Snapshotted,
+        /// Written, closed, and reopened: the state comes from WAL replay.
+        Reopened,
+        /// Equality indexes declared and folded, then the second half on top:
+        /// indexed lookups answered from the fold's index plus the tail.
+        Indexed,
+    }
+
+    fn rule() -> RuleDef {
+        RuleDef {
+            name: "works_at".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: Predicate::KeyMatch {
+                field: "org_id".into(),
+            },
+            edge_type: "WORKS_AT".into(),
+            weight_prop: None,
+            max_edges: None,
+            approximate: false,
+            via_label: None,
+            via_edge: None,
+            via_dir: None,
+            namespace: None,
+        }
+    }
+
+    /// A weighted rule: its `score` is written on each edge by the rule engine,
+    /// with no WAL record, and refreshed in place when an endpoint changes.
+    fn weighted_rule() -> RuleDef {
+        RuleDef {
+            name: "skill_fit".into(),
+            src_label: "Person".into(),
+            dst_label: "Org".into(),
+            predicate: Predicate::Overlap {
+                field: "skills".into(),
+                min: 0.3,
+            },
+            edge_type: "FITS".into(),
+            weight_prop: Some("score".into()),
+            ..rule()
+        }
+    }
+
+    fn skills(list: &[&str]) -> Value {
+        Value::List(list.iter().map(|s| Value::Str(s.to_string())).collect())
+    }
+
+    fn person(key: &str, org: &str, ns: &str) -> BatchOp {
+        let mine: &[&str] = match key.len() % 3 {
+            0 => &["rust", "sql"],
+            1 => &["rust", "go", "sql"],
+            _ => &["go"],
+        };
+        BatchOp::InsertNode {
+            label: "Person".into(),
+            key: key.into(),
+            props: vec![
+                ("name".into(), Value::Str(key.to_uppercase())),
+                ("org_id".into(), Value::Str(org.into())),
+                ("age".into(), Value::Int(key.len() as i64 * 7)),
+                ("ns".into(), Value::Str(ns.into())),
+                ("skills".into(), skills(mine)),
+            ],
+        }
+    }
+
+    fn edge(t: &str, s: &str, d: &str) -> BatchOp {
+        BatchOp::InsertEdge {
+            edge_type: t.into(),
+            src_key: s.into(),
+            dst_key: d.into(),
+        }
+    }
+
+    /// The graph every fixture holds: two orgs, people in two namespaces, a
+    /// rule-derived `WORKS_AT` per person, asserted `KNOWS` edges (each inside one
+    /// namespace, as the store requires) including a self-loop and a 2-cycle, a
+    /// property removed, and a node deleted.
+    fn first_half() -> Vec<BatchOp> {
+        vec![
+            BatchOp::InsertNode {
+                label: "Org".into(),
+                key: "o1".into(),
+                props: vec![
+                    ("name".into(), Value::Str("Acme".into())),
+                    ("ns".into(), Value::Str("tenant-a".into())),
+                    ("skills".into(), skills(&["rust", "sql", "go"])),
+                ],
+            },
+            BatchOp::InsertNode {
+                label: "Org".into(),
+                key: "o2".into(),
+                props: vec![
+                    ("ns".into(), Value::Str("tenant-b".into())),
+                    ("skills".into(), skills(&["go", "sql"])),
+                ],
+            },
+            person("alice", "o1", "tenant-a"),
+            person("bob", "o1", "tenant-a"),
+            person("carol", "o2", "tenant-b"),
+        ]
+    }
+
+    fn second_half() -> Vec<BatchOp> {
+        vec![
+            person("dave", "o2", "tenant-b"),
+            person("erin", "o1", "tenant-a"),
+            edge("KNOWS", "alice", "bob"),
+            edge("KNOWS", "erin", "bob"),
+            edge("KNOWS", "bob", "alice"),
+            edge("KNOWS", "carol", "dave"),
+            edge("KNOWS", "dave", "dave"),
+            edge("LIKES", "erin", "alice"),
+            edge("LIKES", "alice", "o1"),
+            edge("LIKES", "dave", "o2"),
+            BatchOp::SetProp {
+                key: "bob".into(),
+                field: "age".into(),
+                value: Value::Int(41),
+            },
+            // Moves bob's `FITS` score in place: no edge is derived or retracted.
+            BatchOp::SetProp {
+                key: "bob".into(),
+                field: "skills".into(),
+                value: skills(&["rust", "sql", "go"]),
+            },
+            BatchOp::RemoveProp {
+                key: "carol".into(),
+                field: "age".into(),
+            },
+            person("zed", "o1", "tenant-a"),
+            edge("KNOWS", "zed", "alice"),
+            BatchOp::DeleteNode { key: "zed".into() },
+            // Moves an indexed value: the fold's index still says CAROL.
+            BatchOp::SetProp {
+                key: "carol".into(),
+                field: "name".into(),
+                value: Value::Str("CAROLINE".into()),
+            },
+        ]
+    }
+
+    fn write_ops(db: &SharedDb, ops: Vec<BatchOp>, one_batch: bool) {
+        if one_batch {
+            db.submit_batch(ops).unwrap();
+        } else {
+            for op in ops {
+                db.submit_batch(vec![op]).unwrap();
+            }
+        }
+    }
+
+    fn roles() -> mushroomdb::schema::Schema {
+        mushroomdb::schema::Schema {
+            roles: vec![RoleDef {
+                name: "analyst".into(),
+                labels: vec!["Person".into()],
+                keys: vec!["o1".into()],
+                visible_where: None,
+                namespaces: None,
+                write: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn fixture(name: &str, build: Build) -> (Router, SharedDb) {
+        let dir = tmp(name);
+        let db = SharedDb::open(&dir).unwrap();
+        db.write().apply_schema(&roles()).unwrap();
+        db.write().create_rule(rule()).unwrap();
+        db.write().create_rule(weighted_rule()).unwrap();
+        match build {
+            Build::SeparateCommits => {
+                write_ops(&db, first_half(), false);
+                write_ops(&db, second_half(), false);
+            }
+            Build::OneBatch => {
+                let mut ops = first_half();
+                ops.extend(second_half());
+                write_ops(&db, ops, true);
+            }
+            Build::Snapshotted => {
+                write_ops(&db, first_half(), false);
+                db.write().snapshot().unwrap();
+                write_ops(&db, second_half(), false);
+            }
+            Build::Reopened => {
+                write_ops(&db, first_half(), false);
+                write_ops(&db, second_half(), false);
+            }
+            Build::Indexed => {
+                db.write().enable_index("Person", "name").unwrap();
+                db.write().enable_index("Org", "name").unwrap();
+                write_ops(&db, first_half(), false);
+                // Enough commits to fold, so the indexes and the first half are
+                // in the fold and the second half is the tail.
+                for i in 0..mushroomdb::FOLD_EVERY_K {
+                    db.submit_batch(vec![BatchOp::InsertNode {
+                        label: "Pad".into(),
+                        key: format!("pad{i}"),
+                        props: vec![],
+                    }])
+                    .unwrap();
+                }
+                write_ops(&db, second_half(), false);
+                assert!(db.reader().queries_use_index(), "{name}: index unused");
+            }
+        }
+        let db = match build {
+            Build::Reopened => {
+                drop(db);
+                SharedDb::open(&dir).unwrap()
+            }
+            _ => db,
+        };
+        let app = router_with_role_tokens(
+            db.clone(),
+            Some(FULL.into()),
+            HashMap::from([(ROLE.to_string(), "analyst".to_string())]),
+        );
+        (app, db)
+    }
+
+    const KEYS: &[&str] = &["alice", "bob", "carol", "dave", "o1", "o2", "zed", "nobody"];
+    const MASKS: &[(&str, bool)] = &[
+        ("", false),
+        ("alice,carol,o1", false),
+        ("alice,carol,o1", true),
+        ("dave", true),
+        ("nobody", false),
+    ];
+
+    async fn node_routes_match(app: &Router, db: &SharedDb, label: &str) -> usize {
+        let mut cases = 0;
+        for key in KEYS {
+            for (mask, stub) in MASKS {
+                let qs = if mask.is_empty() {
+                    String::new()
+                } else {
+                    format!("?mask={mask}&stub_hidden={stub}")
+                };
+                let got = routed(app, get(&format!("/node/{key}{qs}"), Some(FULL))).await;
+                let want = answer(legacy_node_info(db, key, mask, *stub)).await;
+                assert_eq!(got, want, "{label}: GET /node/{key}{qs}");
+
+                let got = routed(app, get(&format!("/node/{key}/edges{qs}"), Some(FULL))).await;
+                let want = answer(legacy_node_edges(db, key, mask, *stub)).await;
+                assert_eq!(got, want, "{label}: GET /node/{key}/edges{qs}");
+                cases += 2;
+
+                for (depth, dir, dir_name, types) in [
+                    (1, Dir::Both, "both", None),
+                    (2, Dir::Out, "out", None),
+                    (3, Dir::In, "in", Some("KNOWS")),
+                    (2, Dir::Both, "both", Some("WORKS_AT,LIKES")),
+                ] {
+                    let mut uri = format!("/node/{key}/neighborhood?depth={depth}&dir={dir_name}");
+                    if let Some(t) = types {
+                        uri.push_str(&format!("&edge_types={t}"));
+                    }
+                    if !mask.is_empty() {
+                        uri.push_str(&format!("&mask={mask}&stub_hidden={stub}"));
+                    }
+                    let names: Option<Vec<&str>> = types.map(|t| t.split(',').collect());
+                    let got = routed(app, get(&uri, Some(FULL))).await;
+                    let want = answer(legacy_neighborhood(
+                        db,
+                        key,
+                        depth,
+                        names.as_deref(),
+                        dir,
+                        mask,
+                        *stub,
+                    ))
+                    .await;
+                    assert_eq!(got, want, "{label}: GET {uri}");
+                    cases += 1;
+                }
+            }
+        }
+        cases
+    }
+
+    const CYPHERS: &[&str] = &[
+        "MATCH (n:Person {name: 'BOB'}) RETURN n.key, n.age",
+        "MATCH (n:Person) WHERE n.name = 'CAROLINE' RETURN n.key",
+        "MATCH (n:Person {name: 'CAROL'}) RETURN n.key",
+        "MATCH (n:Person {name: 'ZED'}) RETURN n.key",
+        "MATCH (n:Person {name: 'ERIN'}) RETURN n.key",
+        "MATCH (o:Org {name: 'Acme'})<-[:WORKS_AT]-(p) RETURN p.key",
+        "MATCH (n:Person) RETURN n.name ORDER BY n.name",
+        "MATCH (n:Person)-[:KNOWS]->(m) RETURN n.name, m.name ORDER BY n.name, m.name",
+        "MATCH (n:Person)-[:WORKS_AT]->(o:Org) RETURN n.name, o.name",
+        "MATCH (n:Person)-[r:FITS]->(o:Org) RETURN n.name, o.name, r.score ORDER BY n.name, o.name",
+        "MATCH (n:Person) WHERE n.age > 30 RETURN n.name, n.age",
+        "MATCH (n:Person) RETURN count(n) AS c",
+        "MATCH (n:Person) RETURN n.ns AS ns UNION MATCH (o:Org) RETURN o.ns AS ns",
+        "MATCH (n:Person) RETURN n.org_id AS x UNION ALL MATCH (n:Person) RETURN n.org_id AS x",
+        "MATCH (n:Person) RETURN n.name UNION MATCH (o:Org) RETURN o.key",
+        "MATCH (n:Person RETURN n",
+        "MATCH (n:Person) RETURN",
+        "MATCH (n:Person) RETURN n.name UNION",
+        "MATCH (n) RETURN nosuchfn(n.name)",
+        "MATCH (n:Person) RETURN m.name",
+        "MATCH (n) RETURN \u{1}",
+        "MATCH (n:Person {key: 'zed'}) RETURN n",
+        "CREATE (x:Person {key: 'mallory'})",
+    ];
+
+    async fn query_routes_match(app: &Router, db: &SharedDb, label: &str) -> usize {
+        let mut cases = 0;
+        let masks: [Option<Vec<String>>; 3] = [
+            None,
+            Some(vec!["alice".into(), "carol".into(), "o2".into()]),
+            Some(vec!["nobody".into()]),
+        ];
+        for cypher in CYPHERS {
+            for mask in &masks {
+                for namespace in [None, Some("tenant-a"), Some("no-such-ns")] {
+                    for stub in [false, true] {
+                        // A write without a mask or namespace is not a read route.
+                        if cypher.starts_with("CREATE") && mask.is_none() && namespace.is_none() {
+                            continue;
+                        }
+                        if stub && mask.is_none() && namespace.is_none() {
+                            continue;
+                        }
+                        for format in ["json", ""] {
+                            let mut body = json!({ "cypher": cypher });
+                            if let Some(m) = mask {
+                                body["mask"] = json!(m);
+                            }
+                            if let Some(ns) = namespace {
+                                body["namespace"] = json!(ns);
+                            }
+                            if stub {
+                                body["stub_hidden"] = json!(true);
+                            }
+                            let uri = if format.is_empty() {
+                                "/query".to_string()
+                            } else {
+                                format!("/query?format={format}")
+                            };
+                            let got = routed(app, post(&uri, body.clone(), Some(FULL))).await;
+                            let want = answer(legacy_query(
+                                db,
+                                cypher,
+                                mask.as_deref(),
+                                namespace,
+                                stub,
+                                format,
+                            ))
+                            .await;
+                            assert_eq!(got, want, "{label}: POST {uri} {body}");
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        cases
+    }
+
+    async fn role_queries_match(app: &Router, db: &SharedDb, label: &str) -> usize {
+        let mut cases = 0;
+        let masks: [Option<Vec<String>>; 2] = [None, Some(vec!["alice".into(), "o1".into()])];
+        for cypher in CYPHERS.iter().filter(|c| !c.starts_with("CREATE")) {
+            for mask in &masks {
+                for namespace in [None, Some("tenant-a")] {
+                    let mut body = json!({ "cypher": cypher });
+                    if let Some(m) = mask {
+                        body["mask"] = json!(m);
+                    }
+                    if let Some(ns) = namespace {
+                        body["namespace"] = json!(ns);
+                    }
+                    let got =
+                        routed(app, post("/query?format=json", body.clone(), Some(ROLE))).await;
+                    let want = answer(legacy_role_query(
+                        db,
+                        "analyst",
+                        cypher,
+                        mask.as_deref(),
+                        namespace,
+                    ))
+                    .await;
+                    assert_eq!(got, want, "{label}: role POST /query {body}");
+                    cases += 1;
+                }
+            }
+        }
+        cases
+    }
+
+    async fn all_routes_match(build: Build, name: &str) {
+        let (app, db) = fixture(name, build);
+        // The fixture must exercise what it claims to: a tail the reader applies.
+        if !matches!(build, Build::Reopened) {
+            assert!(
+                !db.read().reader().deltas.is_empty(),
+                "{name}: no delta tail"
+            );
+        }
+        let label = format!("{build:?}");
+        let n = node_routes_match(&app, &db, &label).await
+            + query_routes_match(&app, &db, &label).await
+            + role_queries_match(&app, &db, &label).await
+            + counter_and_algo_routes_match(&app, &db, &label).await;
+        assert!(n > 500, "{label}: only {n} cases ran");
+    }
+
+    // ── /health, /metrics and /algo/* (moved in fix round 1) ──────────────────
+
+    fn legacy_health(db: &SharedDb) -> Response {
+        let (nodes, edges) = {
+            let g = db.read();
+            let s = g.stats();
+            (s.nodes_live, s.edges)
+        };
+        json_ok(json!({
+            "ok": true,
+            "nodes": nodes,
+            "edges": edges,
+            "addr": default_advertise_addr().to_string(),
+        }))
+    }
+
+    /// `/metrics` before TX-5, minus `rss_bytes` and `uptime_s`, which move
+    /// between any two calls.
+    fn legacy_metrics(db: &SharedDb) -> Js {
+        let g = db.read();
+        let s = g.stats();
+        let slow = g.slow_query_snapshot();
+        json!({
+            "nodes_live": s.nodes_live,
+            "nodes_tombstoned": s.nodes_tombstoned,
+            "edges": s.edges,
+            "commit_seq": g.commit_seq(),
+            "wal_size_bytes": g.wal_size_bytes().ok(),
+            "slow_queries": {
+                "threshold_ms": slow.threshold_ms,
+                "count": slow.count,
+                "last": slow.last.iter().map(|e| json!({
+                    "ms": e.ms, "query": e.query, "at_commit": e.at_commit,
+                })).collect::<Vec<_>>(),
+            },
+        })
+    }
+
+    fn legacy_algo(db: &SharedDb, route: &str, body: &Js) -> Response {
+        let g = db.read();
+        let v = match route {
+            "pagerank" => {
+                serde_json::to_value(g.pagerank(&serde_json::from_value(body.clone()).unwrap()))
+            }
+            "wcc" => serde_json::to_value(
+                g.connected_components(&serde_json::from_value(body.clone()).unwrap()),
+            ),
+            _ => serde_json::to_value(
+                g.degree_centrality(&serde_json::from_value(body.clone()).unwrap()),
+            ),
+        };
+        json_ok(v.unwrap_or_else(|_| json!({})))
+    }
+
+    async fn counter_and_algo_routes_match(app: &Router, db: &SharedDb, label: &str) -> usize {
+        let mut cases = 0;
+        let got = routed(app, get("/health", Some(FULL))).await;
+        assert_eq!(got, answer(legacy_health(db)).await, "{label}: /health");
+        let got = routed(app, get("/health", None)).await;
+        assert_eq!(got.body, br#"{"ok":true}"#, "{label}: anonymous /health");
+
+        let got = routed(app, get("/metrics", Some(FULL))).await;
+        assert_eq!(got.status, StatusCode::OK);
+        let mut v: Js = serde_json::from_slice(&got.body).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        assert!(obj.remove("rss_bytes").is_some() && obj.remove("uptime_s").is_some());
+        assert_eq!(v, legacy_metrics(db), "{label}: /metrics");
+        cases += 3;
+
+        for route in ["pagerank", "wcc", "degree"] {
+            for body in [
+                json!({}),
+                json!({"edge_type": "KNOWS"}),
+                json!({"edge_type": "FITS"}),
+            ] {
+                let got = routed(
+                    app,
+                    post(&format!("/algo/{route}"), body.clone(), Some(FULL)),
+                )
+                .await;
+                let want = answer(legacy_algo(db, route, &body)).await;
+                assert_eq!(got, want, "{label}: /algo/{route} {body}");
+                cases += 1;
+            }
+        }
+        cases
+    }
+
+    #[tokio::test]
+    async fn reader_routes_match_the_read_lock_separate_commits() {
+        all_routes_match(Build::SeparateCommits, "separate").await;
+    }
+
+    #[tokio::test]
+    async fn reader_routes_match_the_read_lock_one_batch() {
+        all_routes_match(Build::OneBatch, "batch").await;
+    }
+
+    #[tokio::test]
+    async fn reader_routes_match_the_read_lock_snapshotted() {
+        all_routes_match(Build::Snapshotted, "snapshotted").await;
+    }
+
+    #[tokio::test]
+    async fn reader_routes_match_the_read_lock_reopened() {
+        all_routes_match(Build::Reopened, "reopened").await;
+    }
+
+    /// The cases are only a differential if the two sides can disagree: `UNION` on
+    /// the role path, which the reader refused before TX-5, now answers rows.
+    #[tokio::test]
+    async fn union_answers_on_the_reader_for_both_identities() {
+        let (app, _db) = fixture("union", Build::SeparateCommits);
+        let cypher = "MATCH (n:Person) RETURN n.ns AS ns UNION MATCH (o:Org) RETURN o.ns AS ns";
+        for token in [FULL, ROLE] {
+            let got = routed(
+                &app,
+                post(
+                    "/query?format=json",
+                    json!({ "cypher": cypher }),
+                    Some(token),
+                ),
+            )
+            .await;
+            assert_eq!(got.status, StatusCode::OK, "{token}: {:?}", got.body);
+            let v: Js = serde_json::from_slice(&got.body).unwrap();
+            assert!(
+                !v["rows"].as_array().unwrap().is_empty(),
+                "{token}: UNION returned no rows: {v}"
+            );
+        }
+    }
+
+    /// A store whose indexes are in the fold, with a tail that moves, deletes
+    /// and adds indexed values: the reader serves the lookups from the fold's
+    /// index layered with the tail and answers what the read lock answered.
+    #[tokio::test]
+    async fn reader_routes_match_the_read_lock_indexed() {
+        all_routes_match(Build::Indexed, "indexed").await;
+    }
+
+    /// An unmasked reader query still lands in the `/metrics` slow-query ring.
+    #[tokio::test]
+    async fn a_slow_reader_query_is_still_recorded() {
+        let (app, db) = fixture("slow", Build::SeparateCommits);
+        let bulk = (0..5_000)
+            .map(|i| BatchOp::InsertNode {
+                label: "Bulk".into(),
+                key: format!("bulk{i}"),
+                props: vec![("n".into(), Value::Int(i))],
+            })
+            .collect();
+        db.submit_batch(bulk).unwrap();
+        let before = db.read().slow_query_snapshot().count;
+        // Threshold 1 ms: a filtered scan of 5 000 nodes reaches it, and the count
+        // is what is asserted, not the duration.
+        db.write().set_slow_query_threshold_ms(1);
+        let cypher = "MATCH (n:Bulk) WHERE n.n >= 0 RETURN count(n) AS c";
+        let mut recorded = false;
+        for _ in 0..20 {
+            let got = routed(
+                &app,
+                post(
+                    "/query?format=json",
+                    json!({ "cypher": cypher }),
+                    Some(FULL),
+                ),
+            )
+            .await;
+            assert_eq!(got.status, StatusCode::OK);
+            if db.read().slow_query_snapshot().count > before {
+                recorded = true;
+                break;
+            }
+        }
+        assert!(recorded, "a slow reader query never reached the ring");
+        let last = db.read().slow_query_snapshot().last;
+        assert_eq!(last.last().map(|e| e.query.as_str()), Some(cypher));
     }
 }

@@ -163,6 +163,7 @@ mod tests {
                 edge_props: EdgePropsView::owned(&self.eprops),
                 mask: None,
                 prop_index: None,
+                layer: None,
             }
         }
     }

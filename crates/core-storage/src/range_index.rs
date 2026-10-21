@@ -44,6 +44,14 @@ pub enum IndexKind {
 type Pair = (String, String);
 type Postings = BTreeMap<ValueKey, BTreeSet<u32>>;
 
+/// What a layered index answers beneath its own entries: a frozen index, with
+/// the nodes whose entries there may be stale left out.
+#[derive(Debug, Clone)]
+struct IndexUnder {
+    base: std::sync::Arc<UnifiedIndex>,
+    stale: BTreeSet<u32>,
+}
+
 /// Equality and range index over declared `(label, field)` pairs.
 #[derive(Debug, Clone, Default)]
 pub struct UnifiedIndex {
@@ -70,6 +78,10 @@ pub struct UnifiedIndex {
     equality: BTreeSet<Pair>,
     /// Range index name → the pair it covers.
     range_names: BTreeMap<String, Pair>,
+    /// `Some` only on a read-only layered index (see [`Self::layered_over`]):
+    /// [`Self::lookup`] then also answers from `base`, minus the `stale` nodes,
+    /// whose current entries are this index's own.
+    under: Option<std::sync::Arc<IndexUnder>>,
 }
 
 fn pair(label: &str, field: &str) -> Pair {
@@ -79,6 +91,41 @@ fn pair(label: &str, field: &str) -> Pair {
 impl UnifiedIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A read-only index that answers [`Self::lookup`] as `base` would after
+    /// the nodes in `stale` were re-indexed: `base`'s entries for every other
+    /// node, plus this index's own, which the caller writes with [`Self::set`]
+    /// for each stale node's current values. Declares exactly `base`'s pairs.
+    ///
+    /// Built per reader snapshot so a snapshot can serve indexed equality
+    /// lookups without copying the frozen index. Only [`Self::lookup`] (what a
+    /// query's `nodes_with_prop` calls) and the declaration queries see the
+    /// base; the raw-key, range and prefix lookups see the layer's own entries.
+    pub fn layered_over(base: std::sync::Arc<UnifiedIndex>, stale: BTreeSet<u32>) -> Self {
+        Self {
+            enabled: base.enabled.clone(),
+            kind: base.kind.clone(),
+            equality: base.equality.clone(),
+            range_names: base.range_names.clone(),
+            under: Some(std::sync::Arc::new(IndexUnder { base, stale })),
+            ..Self::default()
+        }
+    }
+
+    /// On a layered index: stop answering `id` from the base, and drop this
+    /// layer's own entries for it, so the caller can [`Self::set`] its current
+    /// values. Extends a layer to a longer tail without rebuilding it. No-op
+    /// on an unlayered index.
+    pub fn restale(&mut self, id: u32) {
+        let Some(under) = self.under.as_mut() else {
+            return;
+        };
+        std::sync::Arc::make_mut(under).stale.insert(id);
+        let pairs: Vec<Pair> = self.enabled.iter().cloned().collect();
+        for (label, field) in pairs {
+            self.remove_node(&label, &field, id);
+        }
     }
 
     /// Whether `(label, field)` is indexed, by either kind.
@@ -316,6 +363,24 @@ impl UnifiedIndex {
     /// is not declared or nothing matches, and for an operand
     /// [`answers_eq`](Self::answers_eq) refuses.
     pub fn lookup(&self, label: &str, field: &str, value: &Value) -> Vec<u32> {
+        let own = self.own_lookup(label, field, value);
+        let Some(under) = &self.under else {
+            return own;
+        };
+        let mut ids: Vec<u32> = under
+            .base
+            .lookup(label, field, value)
+            .into_iter()
+            .filter(|id| !under.stale.contains(id))
+            .chain(own)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// [`Self::lookup`] over this index's own postings only.
+    fn own_lookup(&self, label: &str, field: &str, value: &Value) -> Vec<u32> {
         let Some(postings) = self.postings(label, field) else {
             return Vec::new();
         };
@@ -829,6 +894,34 @@ fn datetime_range<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_layered_index_answers_as_the_reindexed_base() {
+        let mut base = UnifiedIndex::new();
+        base.enable("P", "city");
+        base.set("P", "city", 1, &Value::Str("a".into()));
+        base.set("P", "city", 2, &Value::Str("a".into()));
+        base.set("P", "city", 3, &Value::Str("b".into()));
+        let base = std::sync::Arc::new(base);
+        // Node 2 moved to "b", node 3 was deleted, node 4 is new in "a".
+        let mut layer = UnifiedIndex::layered_over(std::sync::Arc::clone(&base), [2, 3, 4].into());
+        layer.set("P", "city", 2, &Value::Str("b".into()));
+        layer.set("P", "city", 4, &Value::Str("a".into()));
+        assert!(layer.is_enabled("P", "city"));
+        assert_eq!(layer.lookup("P", "city", &Value::Str("a".into())), [1, 4]);
+        assert_eq!(layer.lookup("P", "city", &Value::Str("b".into())), [2]);
+        assert_eq!(base.lookup("P", "city", &Value::Str("a".into())), [1, 2]);
+        // A later commit moves node 2 again and node 1 for the first time.
+        layer.restale(2);
+        layer.set("P", "city", 2, &Value::Str("c".into()));
+        layer.restale(1);
+        assert_eq!(layer.lookup("P", "city", &Value::Str("a".into())), [4]);
+        assert_eq!(
+            layer.lookup("P", "city", &Value::Str("b".into())),
+            Vec::<u32>::new()
+        );
+        assert_eq!(layer.lookup("P", "city", &Value::Str("c".into())), [2]);
+    }
 
     fn int(i: i64) -> ValueKey {
         ValueKey::Int(i)

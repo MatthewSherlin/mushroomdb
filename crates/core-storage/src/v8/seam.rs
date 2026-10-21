@@ -23,7 +23,7 @@ use crate::topology::{Direction, Topology};
 use crate::types::Value;
 use crate::v8::layout::{ArchivedColumnData, ArchivedColumns, ArchivedCsr, ArchivedEdgeProps};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 // ---------------------------------------------------------------------------
 // TopologyView
@@ -40,6 +40,12 @@ use std::collections::{BTreeSet, HashMap};
 pub struct TopologyView<'a> {
     pub overlay: &'a Topology,
     pub base: Option<&'a ArchivedCsr>,
+    /// Edge changes laid over `overlay` and `base` together: a reader
+    /// snapshot's unfolded delta tail, and an open transaction's writes. Its
+    /// adjacency holds the edges inserted, its tombstones the edges deleted
+    /// from below. `None` reads `overlay` and `base` alone. See
+    /// [`TopologyView::with_layer`].
+    pub layer: Option<&'a Topology>,
 }
 
 impl<'a> TopologyView<'a> {
@@ -48,7 +54,20 @@ impl<'a> TopologyView<'a> {
         Self {
             overlay,
             base: None,
+            layer: None,
         }
+    }
+
+    /// This view with a layer of edge changes on top.
+    ///
+    /// `tx` is read as one more overlay over everything this view already
+    /// reads: an edge in its adjacency is present, an edge in its tombstones
+    /// is absent whatever the layers below say. A read costs what it cost
+    /// without the layer plus the layer's entries for the vertex asked about —
+    /// never anything proportional to the store.
+    pub fn with_layer(mut self, tx: &'a Topology) -> Self {
+        self.layer = Some(tx);
+        self
     }
 
     /// Construct a view that merges an mmap'd V8 base with a WAL-replay overlay.
@@ -59,6 +78,7 @@ impl<'a> TopologyView<'a> {
         Self {
             overlay,
             base: Some(base),
+            layer: None,
         }
     }
 
@@ -82,6 +102,21 @@ impl<'a> TopologyView<'a> {
     /// The row is what a reader needs to tell where a base edge sits in the
     /// snapshot (see [`DerivedBits`]).
     pub fn neighbors_with_base_row(
+        &self,
+        etype: u32,
+        dir: Direction,
+        v: u32,
+    ) -> (Cow<'a, [u32]>, Option<&'a [ArchivedNeighbor]>) {
+        let (below, row) = self.below_tx_with_base_row(etype, dir, v);
+        match self.layer {
+            None => (below, row),
+            Some(tx) => (lay_tx_over(below, tx, etype, dir, v), row),
+        }
+    }
+
+    /// [`Self::neighbors_with_base_row`] of the overlay and base alone,
+    /// before the layer.
+    fn below_tx_with_base_row(
         &self,
         etype: u32,
         dir: Direction,
@@ -134,6 +169,40 @@ impl<'a> TopologyView<'a> {
     /// base CSR and were subsequently deleted via `remove_edge`.  They must be
     /// subtracted from the base count to avoid phantom edge counts.
     pub fn edge_count(&self) -> u64 {
+        let below = self.below_tx_edge_count();
+        let Some(tx) = self.layer else {
+            return below;
+        };
+        // Count exactly: an edge counts once whichever layers hold it.
+        let lower = TopologyView {
+            overlay: self.overlay,
+            base: self.base,
+            layer: None,
+        };
+        let has_below = |etype: u32, src: u32, dst: u32| {
+            lower.neighbors(etype, Direction::Out, src).contains(&dst)
+        };
+        let mut count = below;
+        // A tombstoned edge from below is gone unless the layer put it back.
+        for (etype, src, dsts) in tx_tombstones(tx) {
+            for &dst in dsts {
+                let put_back = tx.neighbors(etype, Direction::Out, src).contains(&dst);
+                if has_below(etype, src, dst) && !put_back {
+                    count = count.saturating_sub(1);
+                }
+            }
+        }
+        // The layer's own edges count where nothing below already does.
+        for (etype, src, dst) in tx.all_edges() {
+            if !has_below(etype, src, dst) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// [`Self::edge_count`] of the overlay and base alone.
+    fn below_tx_edge_count(&self) -> u64 {
         let ov = self.overlay.edge_count();
         match self.base {
             None => ov,
@@ -158,6 +227,9 @@ impl<'a> TopologyView<'a> {
     /// there are no tombstones for that tuple (no neighbour-id copy). Otherwise
     /// `|overlay ∪ base − tombstones|` — set subtract, not count-subtract.
     pub fn degree(&self, etype: u32, dir: Direction, v: u32) -> usize {
+        if self.layer.is_some() {
+            return self.neighbors(etype, dir, v).len();
+        }
         match self.base {
             None => self.overlay.degree(etype, dir, v),
             Some(base) => {
@@ -174,20 +246,51 @@ impl<'a> TopologyView<'a> {
 
     /// Edge-type ids present in overlay and/or base, sorted ascending.
     pub fn etypes(&self) -> std::vec::IntoIter<u32> {
-        match self.base {
-            None => {
+        match (self.base, self.layer) {
+            (None, None) => {
                 // Fast path: collect from overlay (already sorted by Topology::etypes).
                 self.overlay.etypes().collect::<Vec<_>>().into_iter()
             }
-            Some(base) => {
+            (base, tx) => {
                 let mut set: BTreeSet<u32> = self.overlay.etypes().collect();
-                for et in base.etypes.iter() {
+                for et in base.iter().flat_map(|b| b.etypes.iter()) {
                     set.insert(u32::from(et.etype));
                 }
+                set.extend(tx.into_iter().flat_map(Topology::etypes));
                 set.into_iter().collect::<Vec<_>>().into_iter()
             }
         }
     }
+}
+
+/// `below` — a vertex's neighbours under a layer — with the
+/// layer's tombstones removed and its own edges merged in.
+fn lay_tx_over<'a>(
+    below: Cow<'a, [u32]>,
+    tx: &'a Topology,
+    etype: u32,
+    dir: Direction,
+    v: u32,
+) -> Cow<'a, [u32]> {
+    let added = tx.neighbors(etype, dir, v);
+    if added.is_empty() && tx.tombstones_are_empty(etype, dir, v) {
+        return below;
+    }
+    let kept = subtract_tombstones(below.into_owned(), etype, dir, v, tx);
+    if added.is_empty() {
+        return Cow::Owned(kept);
+    }
+    if kept.is_empty() {
+        return added;
+    }
+    Cow::Owned(merge_sorted_unique(&kept, added.as_ref()))
+}
+
+/// Every out-direction tombstone in `tx`, as `(etype, src, dsts)`.
+fn tx_tombstones(tx: &Topology) -> impl Iterator<Item = (u32, u32, &BTreeSet<u32>)> {
+    tx.out_tombstones
+        .iter()
+        .flat_map(|(&etype, by_src)| by_src.iter().map(move |(&src, dsts)| (etype, src, dsts)))
 }
 
 /// A neighbour id as the snapshot stores it.
@@ -534,6 +637,7 @@ mod tests {
 
         // Build the merged view.
         let view = TopologyView {
+            layer: None,
             overlay: &overlay,
             base: Some(archived_csr),
         };
@@ -582,6 +686,7 @@ mod tests {
         let mut overlay2 = Topology::new();
         overlay2.remove_edge(etype, a, b); // only tombstone B
         let view2 = TopologyView {
+            layer: None,
             overlay: &overlay2,
             base: Some(archived_csr2),
         };
@@ -695,6 +800,35 @@ mod tests {
         assert_eq!(view.degree(1, Direction::Out, 0), 2);
         assert_eq!(view.degree(1, Direction::In, 1), 1);
         assert_eq!(view.degree(9, Direction::Out, 0), 0);
+    }
+
+    /// A layer adds its edges, hides the ones it tombstoned from
+    /// below — even one it re-adds and deletes again — and counts each edge
+    /// once.
+    #[test]
+    fn tx_layer_adds_and_hides_edges_over_the_overlay() {
+        let mut below = Topology::new();
+        below.add_edge(1, 0, 1);
+        below.add_edge(1, 0, 2);
+        let mut tx = Topology::new();
+        tx.add_edge(1, 0, 3);
+        tx.remove_edge(1, 0, 1); // tombstone over below
+        tx.add_edge(1, 0, 1); // put back
+        tx.remove_overlay_edge(1, 0, 1);
+        tx.remove_edge(1, 0, 1); // and gone again
+        tx.remove_edge(1, 0, 2);
+        tx.add_edge(1, 0, 2); // removed then put back: present
+        tx.add_edge(7, 4, 5);
+        let view = TopologyView::owned(&below).with_layer(&tx);
+        assert_eq!(view.neighbors(1, Direction::Out, 0).as_ref(), &[2, 3]);
+        assert_eq!(view.neighbors(1, Direction::In, 1).as_ref(), &[] as &[u32]);
+        assert_eq!(view.neighbors(1, Direction::In, 2).as_ref(), &[0]);
+        assert_eq!(view.degree(1, Direction::Out, 0), 2);
+        assert_eq!(view.edge_count(), 3);
+        assert_eq!(view.etypes().collect::<Vec<_>>(), vec![1, 7]);
+        // Below is untouched.
+        let plain = TopologyView::owned(&below);
+        assert_eq!(plain.neighbors(1, Direction::Out, 0).as_ref(), &[1, 2]);
     }
 
     /// Section 17 marks exactly the neighbour entries — in out-rows and in-rows —
@@ -943,9 +1077,21 @@ pub struct ColumnsView<'a> {
     /// The snapshot's one shared string table (section 12).  `None` for a
     /// pre-V9 snapshot, where the column's own `strings` is authoritative.
     pub strings: Option<&'a crate::v8::layout::ArchivedStringTable>,
+    /// Property writes of a reader snapshot's unfolded delta tail and an
+    /// open transaction, read before everything else: a value there wins, a
+    /// removal there hides what lies below. `None` reads the rest alone. See
+    /// [`ColumnsView::with_layer`].
+    pub layer: Option<&'a PropLayer>,
 }
 
 impl<'a> ColumnsView<'a> {
+    /// This view with a layer of property writes on top, read
+    /// first by every accessor (the column handle included).
+    pub fn with_layer(mut self, tx: &'a PropLayer) -> Self {
+        self.layer = Some(tx);
+        self
+    }
+
     /// Overlay-only constructor (V5–V7 and the no-base V8 path).
     pub fn owned(overlay: &'a ColumnStore) -> Self {
         Self {
@@ -953,6 +1099,7 @@ impl<'a> ColumnsView<'a> {
             base: None,
             mixed: None,
             strings: None,
+            layer: None,
         }
     }
 
@@ -971,6 +1118,7 @@ impl<'a> ColumnsView<'a> {
             base: Some(base),
             mixed: None,
             strings: None,
+            layer: None,
         }
     }
 
@@ -986,6 +1134,7 @@ impl<'a> ColumnsView<'a> {
             base: Some(base),
             mixed: Some(mixed),
             strings: None,
+            layer: None,
         }
     }
 
@@ -1009,6 +1158,12 @@ impl<'a> ColumnsView<'a> {
     /// Returns `ValueRef::Borrowed` for overlay hits (zero allocation) and
     /// `ValueRef::Owned` for base hits (materialises from archived data).
     pub fn get(&self, id: u32, field: &str) -> Option<ValueRef<'_>> {
+        // The layer's writes first.
+        if let Some(tx) = self.layer {
+            if let Some(own) = tx.get(id, field) {
+                return own.map(ValueRef::Borrowed);
+            }
+        }
         // Overlay first.
         if let Some(v) = self.overlay.get(id, field) {
             return Some(ValueRef::Borrowed(v));
@@ -1118,7 +1273,8 @@ impl<'a> ColumnsView<'a> {
             .base
             .into_iter()
             .flat_map(|b| b.fields.iter().map(|e| e.name.as_str()));
-        for field in self.overlay.fields().chain(base_names) {
+        let tx_names = self.layer.into_iter().flat_map(PropLayer::fields);
+        for field in tx_names.chain(self.overlay.fields()).chain(base_names) {
             if out.contains_key(field) {
                 continue;
             }
@@ -1149,7 +1305,13 @@ impl<'a> ColumnsView<'a> {
     pub fn vector(&self, id: u32, field: &str) -> Option<Cow<'_, [f64]>> {
         // Overlay takes priority: if the overlay has data for (id, field), we
         // do not fall through to base — but we cannot return &[f64] from a
-        // Value::List.  See the doc comment above for the asymmetry.
+        // Value::List.  See the doc comment above for the asymmetry. A
+        // layer is one more overlay here.
+        if let Some(tx) = self.layer {
+            if tx.get(id, field).is_some() {
+                return None;
+            }
+        }
         if self.overlay.get(id, field).is_some() {
             return None;
         }
@@ -1212,6 +1374,9 @@ impl<'a> ColumnsView<'a> {
         for f in self.overlay.fields() {
             seen.insert(f.to_string());
         }
+        for f in self.layer.into_iter().flat_map(PropLayer::fields) {
+            seen.insert(f.to_string());
+        }
         if let Some(base) = self.base {
             for e in base.fields.iter() {
                 seen.insert(e.name.as_str().to_string());
@@ -1226,8 +1391,97 @@ impl<'a> ColumnsView<'a> {
     /// through the returned handle — use `get()` for overlay-then-base reads.
     /// This matches the fused-scan hot path in exec.rs which handles V5–V7 and
     /// V8 post-snapshot overlay data; base reads happen via `get()`.
-    pub fn column(&self, field: &str) -> ColumnHandle<'_> {
-        self.overlay.column(field)
+    ///
+    /// The layer, when the view has one, is consulted first, as
+    /// [`Self::get`] consults it.
+    pub fn column<'f>(&'f self, field: &'f str) -> ViewColumn<'f> {
+        ViewColumn {
+            layer: self.layer.map(|tx| (tx, field)),
+            overlay: self.overlay.column(field),
+        }
+    }
+}
+
+/// Property writes laid over a [`ColumnsView`]: a reader snapshot's
+/// unfolded delta tail, and an open transaction's writes (see
+/// [`ColumnsView::with_layer`]).
+///
+/// Sparse by design: a write costs the entry it writes. The store's
+/// [`ColumnStore`] keeps dense typed columns, so a write to a high node id
+/// there grows the column to that id — the right trade for the store, and a
+/// cost proportional to the store's size for a layer writing to one
+/// node of a large graph.
+#[derive(Debug, Default, Clone)]
+pub struct PropLayer {
+    /// Per node, per field: `Some(value)` written, `None` removed.
+    nodes: HashMap<u32, BTreeMap<String, Option<Value>>>,
+    /// Every field this layer has written or removed, for field listings.
+    fields: BTreeSet<String>,
+}
+
+impl PropLayer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Write `field` of `node`.
+    pub fn set(&mut self, node: u32, field: &str, value: Value) {
+        self.entry(node, field, Some(value));
+    }
+
+    /// Remove `field` of `node`, hiding any value below.
+    pub fn remove(&mut self, node: u32, field: &str) {
+        self.entry(node, field, None);
+    }
+
+    /// Forget every write to `node` (a node the layer deleted, whose
+    /// properties nothing reads again).
+    pub fn remove_all(&mut self, node: u32) {
+        self.nodes.remove(&node);
+    }
+
+    /// This layer's say on `(node, field)`: `None` when it has none (read
+    /// below), `Some(None)` when it removed the field, `Some(Some(v))` when it
+    /// wrote `v`.
+    #[inline]
+    pub fn get(&self, node: u32, field: &str) -> Option<Option<&Value>> {
+        self.nodes.get(&node)?.get(field).map(|own| own.as_ref())
+    }
+
+    /// Every field this layer has touched, in order.
+    pub fn fields(&self) -> impl Iterator<Item = &str> {
+        self.fields.iter().map(String::as_str)
+    }
+
+    fn entry(&mut self, node: u32, field: &str, value: Option<Value>) {
+        if !self.fields.contains(field) {
+            self.fields.insert(field.to_string());
+        }
+        self.nodes
+            .entry(node)
+            .or_default()
+            .insert(field.to_string(), value);
+    }
+}
+
+/// A pre-resolved column of a [`ColumnsView`]: its layer (when
+/// there is one) over the overlay's column. See [`ColumnsView::column`].
+pub struct ViewColumn<'a> {
+    layer: Option<(&'a PropLayer, &'a str)>,
+    overlay: ColumnHandle<'a>,
+}
+
+impl<'a> ViewColumn<'a> {
+    /// The value for `node`: the layer's when it wrote or removed
+    /// one, the overlay's otherwise.
+    #[inline]
+    pub fn get(&self, node: u32) -> Option<&'a Value> {
+        if let Some((tx, field)) = self.layer {
+            if let Some(own) = tx.get(node, field) {
+                return own;
+            }
+        }
+        self.overlay.get(node)
     }
 }
 
@@ -1246,6 +1500,11 @@ impl<'a> ColumnsView<'a> {
 pub struct EdgePropsView<'a> {
     pub overlay: &'a EdgeProps,
     pub base: Option<&'a ArchivedEdgeProps>,
+    /// Edge-property changes of a reader snapshot's unfolded delta tail and
+    /// an open transaction, read first: its tombstones hide an edge's
+    /// properties below. `None` reads the rest alone. See
+    /// [`EdgePropsView::with_layer`].
+    pub layer: Option<&'a EdgeProps>,
 }
 
 impl<'a> EdgePropsView<'a> {
@@ -1254,6 +1513,7 @@ impl<'a> EdgePropsView<'a> {
         Self {
             overlay,
             base: None,
+            layer: None,
         }
     }
 
@@ -1262,6 +1522,22 @@ impl<'a> EdgePropsView<'a> {
         Self {
             overlay,
             base: Some(base),
+            layer: None,
+        }
+    }
+
+    /// This view with a layer of edge-property changes on top.
+    pub fn with_layer(mut self, tx: &'a EdgeProps) -> Self {
+        self.layer = Some(tx);
+        self
+    }
+
+    /// This view without its layer.
+    fn below_tx(&self) -> Self {
+        Self {
+            overlay: self.overlay,
+            base: self.base,
+            layer: None,
         }
     }
 
@@ -1272,6 +1548,15 @@ impl<'a> EdgePropsView<'a> {
     /// 3. Binary-search the archived base (zero-copy decode on hit).
     /// 4. `None` if absent everywhere.
     pub fn get(&self, etype: u32, src: u32, dst: u32, field: &str) -> Option<Value> {
+        if let Some(tx) = self.layer {
+            if tx.is_tombstoned(etype, src, dst) {
+                return None;
+            }
+            if let Some(v) = tx.get(etype, src, dst, field) {
+                return Some(v.clone());
+            }
+            return self.below_tx().get(etype, src, dst, field);
+        }
         // Tombstone check — masks both overlay and base entries.
         if self.overlay.is_tombstoned(etype, src, dst) {
             return None;
@@ -1307,6 +1592,16 @@ impl<'a> EdgePropsView<'a> {
         src: u32,
         dst: u32,
     ) -> std::collections::BTreeMap<String, Value> {
+        if let Some(tx) = self.layer {
+            if tx.is_tombstoned(etype, src, dst) {
+                return std::collections::BTreeMap::new();
+            }
+            let mut out = self.below_tx().props_of(etype, src, dst);
+            if let Some(own) = tx.props_of(etype, src, dst) {
+                out.extend(own.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+            return out;
+        }
         if self.overlay.is_tombstoned(etype, src, dst) {
             return std::collections::BTreeMap::new();
         }
