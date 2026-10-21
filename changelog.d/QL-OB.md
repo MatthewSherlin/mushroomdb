@@ -1,7 +1,7 @@
 #### BREAKING
+- **ORDER BY … DESC now puts nulls first, per openCypher.** Null is the largest value in ordering, so ascending puts nulls last (as before) and descending puts them first (they used to be last in both directions). Equality and comparison operators are unchanged.
 
 ### Changed
-- **ORDER BY … DESC now puts nulls first, per openCypher.** Null is the largest value in ordering, so ascending puts nulls last (as before) and descending puts them first (they used to be last in both directions). Equality and comparison operators are unchanged.
 - **`ORDER BY … LIMIT k` is a bounded top-k selection.** With `LIMIT k` (and optional `SKIP s`) only the first `s + k` rows are selected and sorted instead of sorting every row; ties keep encounter order, so results are identical to a full sort. `ORDER BY n.score DESC LIMIT 10` over 1M nodes went from about 570 ms to 330 ms.
 
 ### Added
